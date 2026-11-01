@@ -470,7 +470,27 @@ an empty listing just asks for one.
   picks by endpoint/model and release their reservation on completion or abort.
   Result merges are serialized and written privately through a synced temporary
   file and atomic replacement; save failures are reported, never silently lost.
-  This setting does not bound provider retries or output by itself.
+  Every logical operational probe (explicit Test, optional background Test,
+  connectivity/tool checks and the two-request cache check) uses one shared
+  30-second deadline, at most eight physical model-endpoint POSTs, and a
+  128-output-token ceiling and one returned choice on every attempt. Probes
+  override Chat `n` and drop known vendor multi-sample/beam controls at the root
+  and in `options`; ordinary Runs retain their configured sampling. The deadline includes credential
+  refresh, admission waits, headers, body/stream parsing, backoff and resends.
+  Vendor fields, reasoning settings and typed repairs cannot remove or increase
+  the final cap; probes may switch a rejected Chat cap spelling once. The
+  scoped probe disables unrelated model failover, redirects and transport-level
+  automatic retries, while retaining the normal provider's credentials, request
+  admission and usage hooks. Ordinary Run requests keep their existing behavior.
+  Probe transport uses the configured proxy and normal factory TLS trust.
+  `TestModel.probe_usage` reports physical sends and only provider-reported
+  counters/costs; missing counters remain unknown, with explicit partial-usage
+  and partial-cost flags. A deadline marks even interim reported counters/costs
+  as partial, retaining their known values and exposing `deadline_exceeded`.
+  Its observer does not commit a second usage charge.
+  Timeout/cancellation drops the current logical request future rather than
+  detaching retries. An already-issued server request may continue or be billed;
+  these are client-side request bounds, not a promise of server cancellation.
 
 ### 4.4 Provider failure handling
 
@@ -819,8 +839,15 @@ task, with quality as a gate**.
   wall-clock cap on a Run unless the user sets one. The user is the limit.
 - **Opt-in spending limits.** `[limits]` `daily_usd` (all Sessions, per
   UTC day), `run_usd` and `run_steps` (per Run), all unset by default and
-  settable from Settings. Dollar limits count only while every model used
-  has a `provider.prices` entry; a Run on an unpriced model says so when
+  settable from Settings. Full dollar totals remain unknown when usage has no
+  reported cost or `provider.prices` entry. Known nonnegative finite reported USD
+  and priced usage still form a spending floor: an unpriced group cannot erase
+  it, and that floor triggers the same 80% note and 100% pre-dispatch refusal.
+  Notes identify an incomplete total as "at least" that amount; usage displays
+  still show unknown totals and unpriced models. Unknown-only or below-limit
+  floors keep the existing unpriced compatibility behavior, not a promise to
+  bound the unknown charge. Native-media unknown-cost refusal and explicit
+  Resume waivers remain unchanged. A Run on an unpriced model says so when
   it starts, and `doctor` lists such models. Model calls made on the Run's
   behalf (`llm.complete` from a Tool, each sub-agent step) count toward
   them and toward usage, and are checked too, and so do the daemon's own

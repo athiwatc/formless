@@ -30,6 +30,7 @@ pub mod optimiser;
 pub mod path_scope;
 pub mod paths;
 pub mod presets;
+mod probe_policy;
 pub mod profile_lock;
 pub mod provenance;
 pub mod provider;
