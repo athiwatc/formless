@@ -58,7 +58,9 @@ fn fingerprint(file: &Path) -> Result<(String, u64)> {
     let mut input = std::fs::File::open(file)?;
     let mut hash = Sha256::new();
     let mut bytes = 0;
-    let mut buffer = [0u8; 65536];
+    // Allocate directly on the heap; Box::new([0; N]) can still construct a
+    // large temporary on the Windows main-thread stack in debug builds.
+    let mut buffer = vec![0u8; 64 * 1024];
     loop {
         let read = input.read(&mut buffer)?;
         if read == 0 {

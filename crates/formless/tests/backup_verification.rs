@@ -1,5 +1,6 @@
 //! Actual CLI commands, isolated directories and child-only environment changes.
 use std::{
+    io::Read,
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
     time::{Duration, Instant},
@@ -33,16 +34,39 @@ fn invoke(root: &Path, args: &[&str]) -> Output {
     // bare-backup configuration loading; it is never used for a request.
     command.env("FORMLESS_API_KEY", "offline-backup-fixture-key");
     let mut child = command.spawn().unwrap();
+    // Man pages and completions exceed a pipe buffer. Drain both streams while
+    // waiting so the timeout measures the CLI, not a blocked test harness.
+    let mut stdout = child.stdout.take().unwrap();
+    let out = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).unwrap();
+        bytes
+    });
+    let mut stderr = child.stderr.take().unwrap();
+    let err = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).unwrap();
+        bytes
+    });
     let deadline = Instant::now() + Duration::from_secs(20);
-    while child.try_wait().unwrap().is_none() {
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
+            let _ = out.join();
+            let _ = err.join();
             panic!("private backup CLI exceeded deadline");
         }
         std::thread::sleep(Duration::from_millis(10));
+    };
+    Output {
+        status,
+        stdout: out.join().unwrap(),
+        stderr: err.join().unwrap(),
     }
-    child.wait_with_output().unwrap()
 }
 #[test]
 fn cli_plan_is_write_free_and_verify_list_restore_drill_read_known_session() {
@@ -178,4 +202,60 @@ fn cli_plan_is_write_free_and_verify_list_restore_drill_read_known_session() {
         .join(root.0.file_name().unwrap())
         .join("daemon.sock")
         .exists());
+}
+
+#[test]
+fn production_main_thread_runs_help_man_and_completions() {
+    let root = Fixture(std::env::temp_dir().join(format!(
+            "fl-cli-stack-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )));
+    std::fs::create_dir(&root.0).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&root.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    for (args, needle) in [
+        (&["--help"][..], "Commands:"),
+        (&["backup", "--help"][..], "verify"),
+        (&["man"][..], ".TH formless"),
+        (&["completions", "bash"][..], "_formless()"),
+    ] {
+        let output = invoke(&root.0, args);
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(text.contains(needle), "{args:?}: missing {needle}");
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn production_windows_executable_has_the_bounded_main_thread_stack_reserve() {
+    // Read the shipped process image, not the test runner. Neither this test
+    // nor its child invocation increases any thread/test-runner stack size.
+    let image = std::fs::read(env!("CARGO_BIN_EXE_formless")).unwrap();
+    assert_eq!(&image[..2], b"MZ");
+    let pe = u32::from_le_bytes(image[0x3c..0x40].try_into().unwrap()) as usize;
+    assert_eq!(&image[pe..pe + 4], b"PE\0\0");
+    let optional = pe + 24;
+    let magic = u16::from_le_bytes(image[optional..optional + 2].try_into().unwrap());
+    let reserve = match magic {
+        0x20b => u64::from_le_bytes(image[optional + 72..optional + 80].try_into().unwrap()),
+        0x10b => u32::from_le_bytes(image[optional + 72..optional + 76].try_into().unwrap()) as u64,
+        other => panic!("unknown PE optional header {other:#x}"),
+    };
+    assert_eq!(
+        reserve,
+        8 * 1024 * 1024,
+        "actual production PE main-thread reserve"
+    );
 }
