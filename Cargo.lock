@@ -1404,6 +1404,7 @@ dependencies = [
  "serde",
  "serde_json",
  "uuid",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1424,6 +1425,7 @@ dependencies = [
  "qrcode",
  "ratatui",
  "serde_json",
+ "sha2",
  "tokio",
  "unicode-segmentation",
  "unicode-width 0.2.0",

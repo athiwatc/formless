@@ -103,6 +103,41 @@ pub fn has_native_media(value: &Value) -> bool {
     has_content_kind(value, &["input_audio", "file", "input_file", "document"])
 }
 
+pub(crate) fn content_parts(value: &Value, mut visit: impl FnMut(&[Value])) {
+    fn parts(items: &[Value], visit: &mut impl FnMut(&[Value])) {
+        visit(items);
+        for part in items {
+            if part["type"] == "tool_result" {
+                if let Some(nested) = part["content"].as_array() {
+                    parts(nested, visit);
+                }
+            }
+        }
+    }
+    fn message(value: &Value, visit: &mut impl FnMut(&[Value])) {
+        if let Some(items) = value["content"].as_array() {
+            parts(items, visit);
+        }
+    }
+    if let Some(messages) = value.as_array() {
+        for value in messages {
+            message(value, &mut visit);
+        }
+        return;
+    }
+    if value.get("role").is_some() {
+        message(value, &mut visit);
+        return;
+    }
+    for key in ["messages", "input"] {
+        if let Some(messages) = value[key].as_array() {
+            for value in messages {
+                message(value, &mut visit);
+            }
+        }
+    }
+}
+
 /// Visit only real API content-part arrays. Schema/default/example objects,
 /// structured tool arguments and vendor fields are data, never control slots.
 pub(crate) fn content_parts_mut(value: &mut Value, mut visit: impl FnMut(&mut Vec<Value>)) {

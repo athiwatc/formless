@@ -704,6 +704,29 @@ task, with quality as a gate**.
   escaping never rewrites stored strings or changes machine `--json` output.
   `formless sessions fork ID [--name NAME] [--up-to-seq N] --json` uses the same
   atomic fork operation as the TUI and other callers; it starts no Run.
+  Branch-summary insertion is an explicit three-step operation: inspect an
+  ordered source/target basis, pay for generation against those exact revisions,
+  then confirm the exact server-owned candidate hash. Revisions hash actual
+  message identities, sequence numbers, roles, content and metadata plus meaningful
+  Session/model selection settings; usage and display counters do not invalidate
+  the generation's own basis. Both Sessions must be live and idle, with unchanged
+  revisions after generation and again inside the atomic append transaction.
+  The source projection contains at most 128 recent whole messages in a 64 KiB
+  data frame. Metadata and attachment bodies are excluded; whole-message and
+  original content-byte omissions are reported, with no claim to summarize an
+  omitted prefix. Known secrets are redacted before inclusion. Source role labels
+  are bounded display data, never provider roles or instructions.
+  Generation uses the target's ordinary provider/role/model selection, admission,
+  credential, breaker and physical-usage hooks, without tools or copied Session
+  instructions. Usage is read from its uniquely tagged physical ledger rows;
+  missing reporting or prices leave total cost unknown. Confirmation appends one
+  attributed `system-note`, marked as untrusted data for every future provider
+  projection, and an atomic durable receipt. It copies no transcript, grants or
+  pending handles and starts no Run. Repeated confirmation returns the same note,
+  including after reconnect/restart, provided that note still matches the receipt.
+  Unconfirmed previews are memory-only (16 previews, 30 minutes, at most two
+  generating operations); restart/expiry requires a new explicit generation.
+  Candidate text is limited to 16 KiB and encoded preview details to 256 KiB.
   **Deleting a Session can be undone for `daemon.delete_undo_secs` (30).**
   It is hidden at once from lists, search and `GetSession`
   (`sessions.deleted_at`, schema v27), and `RestoreSession` brings it
@@ -964,6 +987,11 @@ pasting paths.
   typed and persist across stream retries, touching only real API content parts,
   never Tool schemas, defaults/examples, structured arguments or vendor data.
   Final wire bodies reach input/accounting hooks after optional-body repairs.
+  Provider diagnostics that echo submitted attachment bytes or recognizable
+  encoded prefixes/data URLs are suppressed before display or truncation,
+  including later errors after a content repair. Only actual attempted content
+  parts supply these bounded patterns; schemas and untransmitted sources do not.
+  Raw protocol responses still drive usage parsing and recovery classification.
   Strict dollar limits refuse unknown native input costs before HTTP; existing
   explicit budget waivers retain their meaning. Schema 62 records unknown native
   cost durably: generic text prices cannot replace an unreported media cost,
@@ -1535,8 +1563,50 @@ pattern (§4.4).
     — gated by `fs:read`; `fs.write/append/mkdir/remove/rename` — gated by
     `fs:write` (both paths for rename). Writes create missing parent dirs.
   - `env.get(key)` — gated by `env`. `process.run(cmd, args, {cwd, env,
-    stdin, stdinEncoding, encoding})` → `{code, signal, stdout, stderr}` —
-    gated by `process`, no shell, stdin closed unless given.
+    stdin, stdinEncoding, encoding, timeout_ms})` → `{code, signal, stdout,
+    stderr, timed_out, killed, truncated}` — gated by `process`, no shell,
+    stdin closed unless given. An optional integer `timeout_ms` from 0 to
+    86400000 terminates the owned process group/job on expiry and returns
+    `timed_out: true`; omission preserves cancellation-only execution.
+  - `process.spawn(cmd, args, opts)` takes the same options and checks as
+    `process.run`, returning an Invocation-local handle. `handle.read(size)`
+    blocks for the next available `{stream: "stdout"|"stderr", data, eof:
+    false}` chunk, or `{stream: null, data: "", eof: true}`. The size defaults
+    to 65536 and is clamped to 4–1048576 bytes; UTF-8 chunks do not split a
+    character. The stdout encoding follows `opts.encoding`; stderr is UTF-8,
+    as with `run`. Arrival order between streams is not guaranteed.
+    `handle.wait()` consumes/discards any unread output and returns
+    `{code, signal, timed_out, killed, truncated}`; discards are reported as
+    `truncated: true`, so waiting before reading cannot deadlock full pipes.
+    `handle.kill()` terminates the group/job and waits for cleanup;
+    `handle.close()` does the same without requiring a result. Finished JS
+    handles cache their status and subsequent reads return EOF.
+  - Streamed process output is backpressured: at most 256 KiB is queued per
+    stream, plus a 64 KiB pipe read and at most three UTF-8 carry bytes. There
+    are at most 16 open process handles per Invocation; waiting/closing frees
+    a slot. `run` still retains only `tools.max_process_output_bytes` from
+    each stream and drains the rest with `truncated: true`. Timeouts and
+    cancellation are supervised independently of JS reads or sleeps.
+    Processes cannot outlive their Invocation: normal return, thrown errors,
+    abandoned handles, and cancellation close all owned handles and reap
+    children/pipe workers. A direct child that exits cannot leave background
+    group members holding its pipes indefinitely. Unix uses a private process
+    group, retaining the waitable leader until group termination before
+    reaping it. A Unix parent policy that auto-reaps (`SIGCHLD` ignored or
+    `SA_NOCLDWAIT`) is rejected before spawn, without changing any handler;
+    application code must not independently reap runtime-owned children.
+    Windows assigns a suspended child to a private kill-on-close Job before
+    resuming it, failing closed if Job setup fails. This is process
+    ownership/cleanup, not an OS sandbox for arbitrary granted programs.
+    Before either process API executes, its program is resolved from the exact
+    filtered child environment and working directory. The effective executable
+    receives credential/profile checks, and that same canonical absolute path
+    is passed to the OS; a later PATH change cannot redirect execution after
+    consent. Relative PATH entries are based on the child cwd. Unix PATH removal
+    uses the native default search path; Windows retains Rust's documented
+    application/system/Windows/parent-PATH fallback and implicit `.exe` lookup.
+    PATHEXT spelling for explicit batch-file grants and native Windows argument
+    quoting are preserved; the runtime introduces no shell command parsing.
   - `progress(fraction, label)` — no Capability needed: `fraction` 0..1
     (or null when unknown) and a short label. The daemon broadcasts
     `ToolProgress {tool_name, depth, fraction, label}` (at most 5 a second
@@ -3077,6 +3147,28 @@ run_tool = "network_policy"     # a registry Tool, or…
   (`ForkSession up_to_seq`) and puts the message in its input. An expanded call shows its input and its result or error,
   pretty-printed and highlighted when JSON (capped at a few hundred lines;
   `/open` shows stored outputs in full).
+- **Vim editing (TUI, #626).** `tui.vim_mode = true` (default false), or
+  `/vim [on|off]`, enables modal editing in the composer and internal Tool,
+  module, schema, description and run-input editors. The setting persists;
+  list-view keys and default readline editing are unchanged. Buffers start in
+  Insert, with `INSERT` / `NORMAL` shown in their border and `?` help in Normal.
+  Insert Esc only enters Normal, preserving text and any active Run. Normal
+  composer Esc retains Run-stop/cancel behavior; editor Esc always keeps text,
+  with Ctrl+S save and explicit Ctrl+Q cancel shown in the footer.
+  Supported Normal commands: h/j/k/l, w/b/e and W/B/E, 0/$, gg/G; d/c/y with
+  those motions, dd/cc/yy, iw/aw/iW/aW, single/double/backtick quotes and nested
+  ()/[]/{}/<> objects; i/a/I/A/o/O, x, p/P and dot repeat. Word/character and
+  operator counts are bounded to 999. Yank stays in an internal register;
+  no OS clipboard is read or written. Dot repeats the last editing command
+  and its unmodified Insert keys/paste; movement and yanks do not replace it.
+  Readline control shortcuts in Insert break the current repeat group.
+  Large collapsed pastes expand before modal editing to preserve their actual
+  contents. No Visual mode, Ex commands, macros, syntax-aware objects or full
+  Vim emulation is promised. Semantics follow the official
+  [motion](https://vimhelp.org/motion.txt.html),
+  [change](https://vimhelp.org/change.txt.html) and
+  [repeat](https://vimhelp.org/repeat.txt.html) help (including cw's trailing
+  whitespace exception and grapheme-safe editing).
 - **Input editor (TUI).** The message box is a multi-line editor with
   readline keys:
   - ←/→ move by character and Alt or Ctrl+←/→ by word. Home/End and
@@ -4402,6 +4494,7 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
 | `memory.confirm_writes` | `never` | Ask before keeping a note the agent writes: `never`, `sensitive` (personal details) or `always` (§7.11) |
 | `mcp.idle_secs` | 300 | Stop an MCP server process after this long without calls; it restarts on the next one (§7.9) |
 | `tui.queue_key` | Ctrl+Enter | Kept for compatibility; queueing is Ctrl+Enter (kitty protocol), Ctrl+J or Alt+Enter (§10.5) |
+| `tui.vim_mode` | false | Normal/Insert editing in composer and internal Tool editor; /vim toggles it persistently, Insert Esc enters Normal, Normal Esc stops a Run and editor Ctrl+Q explicitly cancels (§10.2) |
 | `tui.multi_pane` | false | Persistent multi-pane layout on wide terminals (§10.5) |
 | `tui.timestamps` | true | Message times (`now`, `2m`, `3h`, `Tue 14:02`) on chat headers and a separator when the date changes; `/timestamps` toggles it (§10.2) |
 | `tui.animations` | true | Spinners and other moving indicators in the TUI; false (or `REDUCED_MOTION` / `FORMLESS_REDUCED_MOTION` set to anything but empty, `0`, `false`, `no` or `off`) shows a static `●` and a steady cursor (§10.2) |

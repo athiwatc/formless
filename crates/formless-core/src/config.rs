@@ -1563,6 +1563,8 @@ impl CompactionCfg {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TuiCfg {
+    /// Opt into Normal/Insert editing in composer and internal Tool editor.
+    pub vim_mode: bool,
     pub queue_key: String,
     /// Persistent multi-pane layout (sessions/tools beside chat) on wide
     /// terminals. Toggled with `/panes` and remembered across starts.
@@ -1608,6 +1610,7 @@ pub struct TuiCfg {
 impl Default for TuiCfg {
     fn default() -> Self {
         Self {
+            vim_mode: false,
             queue_key: "ctrl+enter".into(),
             multi_pane: false,
             notify: "desktop".into(),
@@ -1753,6 +1756,7 @@ impl Config {
                 "screen_reader": self.tui.screen_reader,
                 "animations": self.tui.animations,
                 "language": self.tui.language,
+                "vim_mode": self.tui.vim_mode,
             },
             // Keys that apply only when the TUI next starts.
             "on_tui_start": ON_TUI_START,

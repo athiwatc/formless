@@ -14,7 +14,7 @@ use crate::Paths;
 /// bootstrap prompt and the optimiser so they never drift apart.
 macro_rules! host_api_doc {
     () => {
-        "Tool code is plain JavaScript defining `function run(input) { ... }` (or `async function run`) returning the output value. On failure, throw an Error: a returned {error: ...} is counted as a failure unless output_schema declares an error property, and swallowing errors hides broken Tools from measurement. Host API (all Capability-gated; data options take encoding \"utf8\" (default) or \"base64\" for binary): fetch(url, {method, headers, body, bodyEncoding, encoding}) -> {status, ok, url, headers, body, text(), json()} (redirects followed only within the granted hosts); fetchChunks(url, opts, size, cb) streams the body in chunks and returns status; fs.read(path, {encoding}), fs.write(path, data, {encoding}), fs.append(path, data, {encoding}), fs.exists(path), fs.stat(path) -> {type, size, modified_ms} or null, fs.list(dir, {details}) -> names or [{name, type, size}], fs.mkdir(path), fs.remove(path, {recursive}), fs.rename(from, to), fs.readChunks(path, size, cb, {encoding}), fs.readLines(path, cb); env.get(key); process.run(cmd, argsArray, {cwd, env, stdin, stdinEncoding, encoding}) -> {code, signal, stdout, stderr} (no shell); tools.call(name, input) -> Promise of the Tool's output (always await it; several in Promise.all run in parallel, and a Tool that returns with a call still pending fails); clipboard.read(), clipboard.write(text); notify(title, body); harness.read() (providers, roles, MCP servers, skills, settings; never keys) and harness.call(op, args, reason) for mcp.add/remove, skills.add/remove/enable, models.set, providers.upsert/remove (no keys; upsert takes base_url or a preset: openai, anthropic, openrouter, gemini, groq, ollama, lmstudio), roles.upsert/delete, config.set: each change is shown to the user with your reason and needs their approval; store.get(key, {ns}), store.set(key, jsonValue, {ns}), store.delete(key, {ns}), store.list(prefix, {ns}) persist small state between Invocations (\"store\" = this Tool's own, \"store:<ns>\" = a shared namespace; 64 KB per value); llm.complete(prompt, {system, model, role}) -> text; agents.run(task, {system, model, role}) -> text (role: a configured Role by name, see the Roles list; it picks the provider and model); requireModule(name) / modules.load(name), modules.list(); emit(chunk) streams large output to an artifact; progress(fraction, label) shows how far long work has got (fraction 0..1 or null; no Capability needed); console.log, sleep(ms), setTimeout/setInterval/clearTimeout (real timers; run() may await them), cryptoRandom(), randomBytes(n) -> base64. Nothing else exists: anything more (URL parsing, base64 decoding to bytes, hashing, compression, formats) you write in JS."
+        "Tool code is plain JavaScript defining `function run(input) { ... }` (or `async function run`) returning the output value. On failure, throw an Error: a returned {error: ...} is counted as a failure unless output_schema declares an error property, and swallowing errors hides broken Tools from measurement. Host API (all Capability-gated; data options take encoding \"utf8\" (default) or \"base64\" for binary): fetch(url, {method, headers, body, bodyEncoding, encoding}) -> {status, ok, url, headers, body, text(), json()} (redirects followed only within the granted hosts); fetchChunks(url, opts, size, cb) streams the body in chunks and returns status; fs.read(path, {encoding}), fs.write(path, data, {encoding}), fs.append(path, data, {encoding}), fs.exists(path), fs.stat(path) -> {type, size, modified_ms} or null, fs.list(dir, {details}) -> names or [{name, type, size}], fs.mkdir(path), fs.remove(path, {recursive}), fs.rename(from, to), fs.readChunks(path, size, cb, {encoding}), fs.readLines(path, cb); env.get(key); process.run(cmd, argsArray, {cwd, env, stdin, stdinEncoding, encoding, timeout_ms}) -> {code, signal, stdout, stderr, timed_out, killed, truncated} (no shell; optional timeout kills its group); process.spawn(cmd, argsArray, opts) takes the same options and returns a handle: read(size) -> {stream, data, eof} with stdout/stderr distinguishable, wait()/kill() -> {code, signal, timed_out, killed, truncated}, close(). Read chunks and emit them while work runs; wait discards unread output (truncated: true). Always wait or close in finally; handles cannot outlive this Invocation; tools.call(name, input) -> Promise of the Tool's output (always await it; several in Promise.all run in parallel, and a Tool that returns with a call still pending fails); clipboard.read(), clipboard.write(text); notify(title, body); harness.read() (providers, roles, MCP servers, skills, settings; never keys) and harness.call(op, args, reason) for mcp.add/remove, skills.add/remove/enable, models.set, providers.upsert/remove (no keys; upsert takes base_url or a preset: openai, anthropic, openrouter, gemini, groq, ollama, lmstudio), roles.upsert/delete, config.set: each change is shown to the user with your reason and needs their approval; store.get(key, {ns}), store.set(key, jsonValue, {ns}), store.delete(key, {ns}), store.list(prefix, {ns}) persist small state between Invocations (\"store\" = this Tool's own, \"store:<ns>\" = a shared namespace; 64 KB per value); llm.complete(prompt, {system, model, role}) -> text; agents.run(task, {system, model, role}) -> text (role: a configured Role by name, see the Roles list; it picks the provider and model); requireModule(name) / modules.load(name), modules.list(); emit(chunk) streams large output to an artifact; progress(fraction, label) shows how far long work has got (fraction 0..1 or null; no Capability needed); console.log, sleep(ms), setTimeout/setInterval/clearTimeout (real timers; run() may await them), cryptoRandom(), randomBytes(n) -> base64. Nothing else exists: anything more (URL parsing, base64 decoding to bytes, hashing, compression, formats) you write in JS."
     };
 }
 pub(crate) use host_api_doc;
@@ -32,7 +32,7 @@ To call existing Tools many times, or chain them with loops, filters and branche
 You have no abilities beyond your Tools, but you can always build one: when a task needs files, the web, processes, the clipboard or anything else outside this conversation, find_tools and, if nothing fits, create_tool and do it. Never say you can't access something, and never ask the user to do a step a Tool could do.\n\
 Make Tools generic: a Tool does one kind of thing (read_text_file, http_get_json, csv_column_sum), and everything task- or project-specific - paths, URLs, hosts, queries, names, column/field names - comes in through its input. Never hardcode such values in implementation_js, the Tool name, or its description. If an existing Tool nearly fits, create a more general new version of it (existing input fields keep working, new ones optional) rather than a new narrow Tool. Specialise only when the logic itself is inherently specific to one project. Give every Tool a short human title for the user (\"Last git author\"); the name stays the machine identifier.\n\
 ", host_api_doc!(), "\n\
-Stream anything large (fs.readChunks / fetchChunks / fs.append / emit); never load it whole. Declare only the Capabilities a Tool needs, as strings like \"net\", \"net:example.com\", \"fs:read:/abs/path\", \"fs:write:/abs/path\", input-bound scopes \"fs:read:$input.path\", \"fs:write:$input.out\", \"net:$input.url\" (granted per call for exactly the path(s)/host named by that input field - string or array of strings - so a generic Tool stays least-privilege; prefer these over fixed project paths), \"env:KEY\", \"process:cmd\", \"clipboard:read\", \"clipboard:write\", \"notify\", \"store\", \"store:<ns>\", \"harness:read\", \"harness:<mcp|skills|models|providers|roles|config>\", \"llm\", \"agent\" (or \"llm:model\"/\"agent:model\"). Prefer retiring a broken Tool and creating a new version over silent workarounds.\n\
+Stream anything large (fs.readChunks / fetchChunks / process.spawn plus handle.read / fs.append / emit); never load it whole. Declare only the Capabilities a Tool needs, as strings like \"net\", \"net:example.com\", \"fs:read:/abs/path\", \"fs:write:/abs/path\", input-bound scopes \"fs:read:$input.path\", \"fs:write:$input.out\", \"net:$input.url\" (granted per call for exactly the path(s)/host named by that input field - string or array of strings - so a generic Tool stays least-privilege; prefer these over fixed project paths), \"env:KEY\", \"process:cmd\", \"clipboard:read\", \"clipboard:write\", \"notify\", \"store\", \"store:<ns>\", \"harness:read\", \"harness:<mcp|skills|models|providers|roles|config>\", \"llm\", \"agent\" (or \"llm:model\"/\"agent:model\"). Prefer retiring a broken Tool and creating a new version over silent workarounds.\n\
 MCP tools (named mcp__<server>__<tool>) can be called directly: do that for one-off use. When the same MCP call or sequence of calls comes up again, or needs fixed arguments, trimmed output or several calls combined, create a Tool that makes them with tools.call and declares the \"mcp:<server>\" Capability: a Tool gets an editable description and schema, measured success and optimisation, which raw MCP tools never do. Never create a Tool that only forwards one MCP call unchanged.\n\
 When the user states a lasting preference or fact about themselves or their setup (tools they use, language, where projects live), save it with remember; never remember secrets or one-off details, and forget a note when asked or when it stops being true.");
 
@@ -1364,6 +1364,28 @@ impl Provider {
         crate::secrets::redact_known(text, &known)
     }
 
+    fn redact_native_diagnostic(
+        &self,
+        text: &str,
+        credential: &str,
+        body: Option<&Value>,
+    ) -> String {
+        let mut current = PayloadRedactions::default();
+        if let Some(body) = body {
+            current.observe(body);
+        }
+        let echoed = current.recognizes(text)
+            || self
+                .native_projection
+                .as_ref()
+                .is_some_and(|projection| projection.sent_payloads.locked().recognizes(text));
+        if echoed {
+            "[provider diagnostic omitted because it echoed submitted attachment data]".into()
+        } else {
+            self.redacted_error(text, credential)
+        }
+    }
+
     /// Route this provider's requests to a stable prompt cache (e.g. one
     /// per Session); off when `provider.cache_key = "off"`.
     pub fn with_cache_key(mut self, key: &str) -> Self {
@@ -1429,6 +1451,7 @@ impl Provider {
             messages: messages.to_vec(),
             sources,
             repairs: std::sync::Mutex::new(NativeRepairs::default()),
+            sent_payloads: std::sync::Mutex::new(PayloadRedactions::default()),
         }));
         dispatch
     }
@@ -2238,6 +2261,9 @@ impl Provider {
                     &credential,
                 )
                 .json(&b);
+                if let Some(projection) = &self.native_projection {
+                    projection.sent_payloads.locked().observe(&b);
+                }
                 let mut server_wait = None;
                 let reason;
                 if let Some(policy) = &self.probe_policy {
@@ -2262,7 +2288,7 @@ impl Provider {
                             crate::tokens::has_native_media(&b),
                         )
                         .map_err(|error| auth.annotate(error))?;
-                        let text = self.redacted_error(&raw_text, &credential);
+                        let text = self.redact_native_diagnostic(&raw_text, &credential, Some(&b));
                         // Save every rejected response before any recovery can
                         // continue, including the final send at the resend cap.
                         last_err = match server_wait {
@@ -2382,7 +2408,8 @@ impl Provider {
                     Err(e) => {
                         self.report_error_usage("", model, crate::tokens::has_native_media(&b))
                             .map_err(|error| auth.annotate(error))?;
-                        last_err = self.redacted_error(&e.to_string(), &credential);
+                        last_err =
+                            self.redact_native_diagnostic(&e.to_string(), &credential, Some(&b));
                         reason = "connection failed".to_string();
                     }
                 }
@@ -2692,7 +2719,7 @@ impl Provider {
                                             attempt += 1;
                                             continue 'request;
                                         }
-                                        return Err(anyhow!("provider error: {message}"));
+                                        return Err(anyhow!("provider error: {}",dispatch.redact_native_diagnostic(&message,&dispatch.api_key,None)));
                                     }
                                     if self.cfg.responses() {
                                         match v["type"].as_str().unwrap_or_default() {
@@ -3057,7 +3084,10 @@ impl Provider {
                     attempt += 1;
                     continue;
                 }
-                return Err(anyhow!("provider error: {why}"));
+                return Err(anyhow!(
+                    "provider error: {}",
+                    dispatch.redact_native_diagnostic(&why, &dispatch.api_key, None)
+                ));
             }
             permit.success();
             let tool_calls = f
@@ -3241,10 +3271,80 @@ pub fn resized_image_dimensions(width: u32, height: u32, max_px: u32) -> (u32, u
     )
 }
 
+/// Retain only small recognizable prefixes of payloads actually attempted on
+/// the wire. Never source these from schemas or untransmitted frozen bytes.
+#[derive(Default)]
+struct PayloadRedactions {
+    prefixes: Vec<String>,
+    data_urls: Vec<String>,
+}
+impl PayloadRedactions {
+    fn observe(&mut self, body: &Value) {
+        fn add(patterns: &mut Vec<String>, pattern: String) {
+            if !pattern.is_empty() && patterns.len() < 64 && !patterns.contains(&pattern) {
+                patterns.push(pattern);
+            }
+        }
+        crate::tokens::content_parts(body, |parts| {
+            for part in parts {
+                let kind = part["type"].as_str().unwrap_or_default();
+                let payload = match kind {
+                    "input_audio" => part["input_audio"]["data"].as_str(),
+                    "file" => part["file"]["file_data"].as_str(),
+                    "input_file" => part["file_data"].as_str(),
+                    "document" | "image" if part["source"]["type"] == "base64" => {
+                        part["source"]["data"].as_str()
+                    }
+                    "image_url" => part["image_url"]["url"]
+                        .as_str()
+                        .or_else(|| part["image_url"].as_str()),
+                    "input_image" => part["image_url"].as_str(),
+                    _ => None,
+                };
+                let Some(payload) = payload else {
+                    continue;
+                };
+                let encoded = if payload.starts_with("data:") {
+                    if let Some((header, data)) = payload.split_once(',') {
+                        add(
+                            &mut self.data_urls,
+                            format!("{},", header.chars().take(128).collect::<String>()),
+                        );
+                        data
+                    } else {
+                        payload
+                    }
+                } else {
+                    payload
+                };
+                // Recognize complete shorter payloads and >=32-character prefixes
+                // of larger ones. This deliberately makes no one-character or
+                // arbitrary decoded/obfuscated-output confidentiality claim.
+                if encoded.len() >= 8 {
+                    add(&mut self.prefixes, encoded.chars().take(32).collect());
+                }
+            }
+        });
+    }
+    fn recognizes(&self, text: &str) -> bool {
+        let contains = |value: &str| {
+            self.prefixes
+                .iter()
+                .chain(&self.data_urls)
+                .any(|pattern| value.contains(pattern))
+        };
+        contains(text)
+            || serde_json::from_str::<Value>(text)
+                .ok()
+                .is_some_and(|value| contains(&value.to_string()))
+    }
+}
+
 struct NativeProjection {
     messages: Vec<Value>,
     sources: Arc<FrozenAttachments>,
     repairs: std::sync::Mutex<NativeRepairs>,
+    sent_payloads: std::sync::Mutex<PayloadRedactions>,
 }
 #[derive(Default)]
 struct NativeRepairs {
@@ -4285,6 +4385,31 @@ mod breaker_tests;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn diagnostic_payload_patterns_use_actual_parts_and_recognize_cropped_json_echoes() {
+        let payload = "opaque_attachment_bytes_0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let schema = json!({"type":"file","file":{"file_data":payload}});
+        let mut patterns = PayloadRedactions::default();
+        patterns.observe(&json!({"tools":[{"function":{"parameters":{"const":schema}}}],"vendor":schema,"messages":[{"role":"user","content":[{"type":"text","text":payload}]}]}));
+        assert!(
+            !patterns.recognizes(payload),
+            "schemas/text confer no payload authority"
+        );
+        patterns.observe(&json!({"input":[{"role":"user","content":[{"type":"input_file","file_data":format!("data:application/pdf;base64,{payload}")}]}]}));
+        assert!(patterns.recognizes(payload));
+        assert!(patterns.recognizes(&payload[..40]));
+        assert!(patterns.recognizes("cropped data:application/pdf;base64,"));
+        let escaped = payload[..40]
+            .chars()
+            .map(|c| format!("\\u{:04x}", c as u32))
+            .collect::<String>();
+        assert!(patterns.recognizes(&format!("{{\"error\":\"{escaped}\"}}")));
+        assert!(!patterns.recognizes("ordinary invalid_request_error"));
+        // A later content repair cannot remove the retained attempted patterns.
+        patterns.observe(&json!({"messages":[{"role":"user","content":"reference only"}]}));
+        assert!(patterns.recognizes(payload));
+        assert!(patterns.prefixes.iter().all(|p| p.len() <= 32));
+    }
 
     #[test]
     fn unsupported_history_images_cannot_reset_native_preview_attempt_prefix() {
