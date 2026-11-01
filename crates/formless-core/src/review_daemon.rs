@@ -336,10 +336,7 @@ impl Daemon {
         let mut state = self.hunk_reviews.locked();
         state.prune();
         #[cfg(windows)]
-        self.with_store(|store| {
-            self.prune_retained_capture_leases_in(store);
-            Ok(())
-        })?;
+        self.prune_retained_capture_leases_in(&inspection_store);
         for entry in state.entries.values() {
             if entry.view.session_id == session
                 && entry.view.run_id.as_deref() == Some(recorded.run_id.as_str())
