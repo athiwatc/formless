@@ -1176,7 +1176,16 @@ mod tests {
             let copy = paths
                 .data_dir
                 .join(format!("formless.db.v{version}-202601{day:02}T120000Z.bak"));
-            std::fs::write(&copy, "backup").unwrap();
+            // Build the actual migration prefix at its stamped version, rather
+            // than restamping a current schema or using non-SQLite bytes.
+            let historical = crate::storage::schema_at(version).unwrap();
+            historical
+                .pragma_update(None, "user_version", version)
+                .unwrap();
+            historical.execute("INSERT INTO sessions(id,name,created_at,updated_at) VALUES('known','historical fixture','','')",[]).unwrap();
+            historical
+                .execute("VACUUM INTO ?1", [copy.to_str().unwrap()])
+                .unwrap();
             copies.push(copy);
         }
         assert_eq!(
@@ -1184,6 +1193,9 @@ mod tests {
             copies.iter().rev().cloned().collect::<Vec<_>>()
         );
         let cfg = Config::default();
+        let sizes: Vec<_> = copies.iter().map(|copy| path_bytes(copy)).collect();
+        crate::backup_verification::verify(&paths, copies.last().unwrap()).unwrap();
+        let receipt_bytes = path_bytes(&backup_dir(&paths));
         let before = usage(&paths, &store).unwrap();
         let backup_bytes = |u: &Value| {
             u["kinds"]
@@ -1195,16 +1207,44 @@ mod tests {
                 .as_u64()
                 .unwrap()
         };
-        assert_eq!(backup_bytes(&before), 24);
-        gc(&paths, &store, &cfg, true).unwrap();
+        assert_eq!(
+            backup_bytes(&before),
+            sizes.iter().sum::<u64>() + receipt_bytes
+        );
+        let dry = gc(&paths, &store, &cfg, true).unwrap();
+        let migration_row = |report: &Value| {
+            report["kinds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["kind"] == "migration backups")
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(migration_row(&dry)["items"], 2);
+        assert_eq!(migration_row(&dry)["bytes"], sizes[0] + sizes[1]);
+        assert_eq!(
+            path_bytes(&backup_dir(&paths)),
+            receipt_bytes,
+            "dry run never rewrites receipts"
+        );
         assert!(
             copies.iter().all(|p| p.exists()),
             "dry run preserves all copies"
         );
-        gc(&paths, &store, &cfg, false).unwrap();
+        let removed = gc(&paths, &store, &cfg, false).unwrap();
+        assert_eq!(migration_row(&removed)["items"], 2);
+        assert_eq!(migration_row(&removed)["bytes"], sizes[0] + sizes[1]);
         assert!(!copies[0].exists() && !copies[1].exists());
         assert!(copies[2].exists() && copies[3].exists());
-        assert_eq!(backup_bytes(&usage(&paths, &store).unwrap()), 12);
+        assert_eq!(
+            migration_backups(&paths),
+            vec![copies[3].clone(), copies[2].clone()]
+        );
+        assert_eq!(
+            backup_bytes(&usage(&paths, &store).unwrap()),
+            sizes[2] + sizes[3] + path_bytes(&backup_dir(&paths))
+        );
         drop(store);
         let _ = std::fs::remove_dir_all(base);
     }
