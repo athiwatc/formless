@@ -660,3 +660,106 @@ async fn probe_http_managed_oauth_401_cannot_refresh_env_token_or_fail_over() {
     assert_eq!(refreshes.load(Ordering::SeqCst), 0);
     assert_eq!(result.probe_usage.unwrap()["requests_sent"], 1);
 }
+
+#[tokio::test]
+async fn probe_http_schema_mode_and_caps_compose_without_echo_driven_repairs() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    env.set("NO_PROXY", "127.0.0.1,localhost");
+    let schema = json!({"type":"object","properties":{"answer":{"const":7}},
+        "required":["answer"],"additionalProperties":false,"default":{"max_tokens":99999}});
+    for style in ["chat", "responses", "anthropic"] {
+        for unrelated in [false, true] {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let captured = seen.clone();
+            let endpoint = match style {
+                "anthropic" => "/messages",
+                "responses" => "/responses",
+                _ => "/chat/completions",
+            };
+            let field = if style == "responses" {
+                "text.format"
+            } else {
+                "response_format"
+            };
+            let (base, _server) = server(Router::new().route(endpoint, post(move |Json(body): Json<Value>| {
+                let index = { let mut rows = captured.locked(); let index = rows.len(); rows.push(body.clone()); index };
+                async move {
+                    if unrelated {
+                        return (StatusCode::BAD_REQUEST, Json(json!({"error":{"param":"temperature","code":"unknown_parameter","message":"Unknown parameter temperature"},"request":body}))).into_response();
+                    }
+                    if style != "anthropic" && index == 0 {
+                        return (StatusCode::BAD_REQUEST, Json(json!({"error":{"param":field,"message":format!("{field} json_schema is not supported")},"request":body}))).into_response();
+                    }
+                    let usage = json!({"input_tokens":3,"output_tokens":2,"prompt_tokens":3,"completion_tokens":2});
+                    let result = match style {
+                        "anthropic" => json!({"model":"probe-model","content":[{"type":"text","text":"{\"answer\":7}"}],"stop_reason":"end_turn","usage":usage}),
+                        "responses" => json!({"model":"probe-model","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"{\"answer\":7}"}]}],"usage":usage}),
+                        _ => json!({"model":"probe-model","choices":[{"message":{"content":"{\"answer\":7}"},"finish_reason":"stop"}],"usage":usage}),
+                    };
+                    Json(result).into_response()
+                }
+            }))).await;
+            let mut config = cfg(base, style);
+            config.extra_body.insert("max_tokens".into(), json!(99999));
+            if style == "chat" {
+                config
+                    .extra_body
+                    .insert("response_format".into(), json!({"type":"json_object"}));
+            } else if style == "responses" {
+                config
+                    .extra_body
+                    .insert("text".into(), json!({"format":{"type":"json_object"}}));
+            }
+            let billed = Arc::new(AtomicUsize::new(0));
+            let hook = billed.clone();
+            let policy = ProbePolicy::default();
+            let provider = Provider::new(config, "private-dummy".into())
+                .unwrap()
+                .with_usage_hook(Arc::new(move |_, _, _| {
+                    hook.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }))
+                .scoped_probe(policy.clone())
+                .unwrap();
+            let options = CompletionOptions::json_schema(schema.clone()).unwrap();
+            let result = policy
+                .run(provider.complete_json(
+                    &[json!({"role":"user","content":"private joint policy fixture"})],
+                    "probe-model",
+                    None,
+                    &options,
+                ))
+                .await
+                .unwrap();
+            let rows = seen.locked();
+            if unrelated {
+                assert!(result.is_err());
+                assert_eq!(
+                    rows.len(),
+                    1,
+                    "echoed schema/cap fields cannot trigger any retry"
+                );
+                assert_eq!(billed.load(Ordering::SeqCst), 0);
+            } else {
+                assert_eq!(result.unwrap().value, json!({"answer":7}));
+                assert_eq!(rows.len(), if style == "anthropic" { 1 } else { 2 });
+                assert_eq!(billed.load(Ordering::SeqCst), 1);
+            }
+            assert_eq!(policy.report()["requests_sent"], rows.len());
+            for row in rows.iter() {
+                assert_cap(row, style, 128);
+            }
+            if style == "chat" {
+                assert_eq!(rows[0]["response_format"]["json_schema"]["schema"], schema);
+                if !unrelated {
+                    assert!(rows[1].get("response_format").is_none());
+                }
+            } else if style == "responses" {
+                assert_eq!(rows[0]["text"]["format"]["schema"], schema);
+                if !unrelated {
+                    assert!(rows[1]["text"].get("format").is_none());
+                }
+            }
+        }
+    }
+}
