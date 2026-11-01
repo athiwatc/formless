@@ -663,3 +663,152 @@ async fn native_formats_sizes_and_foreign_markers_fall_back_without_extra_calls(
         .unwrap();
     owned.close();
 }
+
+#[tokio::test]
+async fn attachment_diagnostics_suppress_full_and_prefix_echoes_after_repairs_and_in_streams() {
+    let env = credential_env::EnvGuard::isolated();
+    env.set("FORMLESS_API_KEY", "private-media-key");
+    env.set("NO_PROXY", "127.0.0.1,localhost");
+    for key in ["FORMLESS_MODEL", "FORMLESS_BASE_URL", "FORMLESS_SECURE"] {
+        env.remove(key);
+    }
+    let owned = Owned::new();
+    for (style, audio) in [
+        ("chat", false),
+        ("responses", false),
+        ("anthropic", false),
+        ("chat", true),
+    ] {
+        let mut bytes = if audio { wav() } else { pdf() };
+        bytes.extend((0..4096).map(|i| ((i * 71 + 193) % 256) as u8));
+        let encoded = STANDARD.encode(&bytes);
+        let (messages, _) = owned.upload(&bytes, audio).await;
+        for mode in ["full", "prefix", "sse"] {
+            for stream in [false, true] {
+                if mode == "sse" && !stream {
+                    continue;
+                }
+                let seen = Arc::new(Mutex::new(Vec::<Value>::new()));
+                let capture = seen.clone();
+                let expected = bytes.clone();
+                let echo = if mode == "full" {
+                    encoded.clone()
+                } else {
+                    encoded.chars().take(80).collect()
+                };
+                let handler = move |Json(body): Json<Value>| {
+                    let mut requests = capture.lock().unwrap();
+                    let index = requests.len();
+                    if index == 0 {
+                        assert_eq!(native_bytes(&body, style, audio).unwrap(), expected);
+                    } else {
+                        assert!(
+                            native_bytes(&body, style, audio).is_none(),
+                            "typed repair must remove native part"
+                        );
+                    }
+                    requests.push(body);
+                    let message = format!(
+                        "unsupported {} submitted {echo}",
+                        if audio { "input_audio" } else { "PDF document" }
+                    );
+                    async move {
+                        if mode == "sse" {
+                            let error = json!({"type":"invalid_request_error","code":"invalid_request_error","message":message});
+                            let event = if style == "responses" {
+                                json!({"type":"response.failed","response":{"error":error}})
+                            } else if style == "anthropic" {
+                                json!({"type":"error","error":error})
+                            } else {
+                                json!({"error":error})
+                            };
+                            (
+                                [("content-type", "text/event-stream")],
+                                format!("data: {event}\n\n"),
+                            )
+                                .into_response()
+                        } else {
+                            (axum::http::StatusCode::BAD_REQUEST, Json(json!({"error":{"type":"invalid_request_error","message":message}}))).into_response()
+                        }
+                    }
+                };
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let base = format!("http://{}", listener.local_addr().unwrap());
+                let app = Router::new()
+                    .route("/chat/completions", post(handler.clone()))
+                    .route("/responses", post(handler.clone()))
+                    .route("/messages", post(handler));
+                let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+                let server = tokio::spawn(async move {
+                    axum::serve(listener, app)
+                        .with_graceful_shutdown(async {
+                            let _ = stopped.await;
+                        })
+                        .await
+                        .unwrap();
+                });
+                let notes = Arc::new(Mutex::new(Vec::<String>::new()));
+                let capture_notes = notes.clone();
+                let cfg = ProviderCfg {
+                    base_url: base,
+                    model: format!("privacy-{}", uuid::Uuid::new_v4()),
+                    api_style: style.into(),
+                    audio_input: Some(true),
+                    pdf_input: Some(true),
+                    max_retries: 0,
+                    fallback_models: vec![],
+                    ..Default::default()
+                };
+                let model = cfg.model.clone();
+                let provider =
+                    Provider::for_profile_with(cfg, owned.paths.clone(), reqwest::Client::new())
+                        .await
+                        .unwrap()
+                        .with_note_hook(Arc::new(move |note| {
+                            capture_notes.lock().unwrap().push(note)
+                        }));
+                let result = tokio::time::timeout(Duration::from_secs(5), async {
+                    if stream {
+                        provider
+                            .chat_stream(
+                                &messages,
+                                &[],
+                                &model,
+                                None,
+                                &CancellationToken::new(),
+                                |_, _| {},
+                            )
+                            .await
+                            .map(|_| ())
+                    } else {
+                        provider.complete(&messages, &model, None).await.map(|_| ())
+                    }
+                })
+                .await
+                .unwrap();
+                let diagnostic = format!("{:#}", result.unwrap_err());
+                assert!(
+                    diagnostic.contains("diagnostic omitted"),
+                    "{style}/{mode}/{stream}: {diagnostic}"
+                );
+                if mode != "sse" {
+                    assert!(diagnostic.contains("400"), "{diagnostic}");
+                }
+                let displayed = format!("{diagnostic} {:?}", notes.lock().unwrap());
+                assert!(!displayed.contains(&encoded));
+                assert!(!displayed.contains(&encoded[..32]));
+                assert_eq!(
+                    seen.lock().unwrap().len(),
+                    if mode == "sse" { 1 } else { 2 },
+                    "no extra API calls; native repair persists"
+                );
+                stop.send(()).unwrap();
+                tokio::time::timeout(Duration::from_secs(5), server)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+        }
+    }
+    owned.close();
+}

@@ -1331,6 +1331,28 @@ impl Provider {
         crate::secrets::redact_known(text, &known)
     }
 
+    fn redact_native_diagnostic(
+        &self,
+        text: &str,
+        credential: &str,
+        body: Option<&Value>,
+    ) -> String {
+        let mut current = PayloadRedactions::default();
+        if let Some(body) = body {
+            current.observe(body);
+        }
+        let echoed = current.recognizes(text)
+            || self
+                .native_projection
+                .as_ref()
+                .is_some_and(|projection| projection.sent_payloads.locked().recognizes(text));
+        if echoed {
+            "[provider diagnostic omitted because it echoed submitted attachment data]".into()
+        } else {
+            self.redacted_error(text, credential)
+        }
+    }
+
     /// Route this provider's requests to a stable prompt cache (e.g. one
     /// per Session); off when `provider.cache_key = "off"`.
     pub fn with_cache_key(mut self, key: &str) -> Self {
@@ -1396,6 +1418,7 @@ impl Provider {
             messages: messages.to_vec(),
             sources,
             repairs: std::sync::Mutex::new(NativeRepairs::default()),
+            sent_payloads: std::sync::Mutex::new(PayloadRedactions::default()),
         }));
         dispatch
     }
@@ -2171,6 +2194,9 @@ impl Provider {
                     &credential,
                 )
                 .json(&b);
+                if let Some(projection) = &self.native_projection {
+                    projection.sent_payloads.locked().observe(&b);
+                }
                 let mut server_wait = None;
                 let reason;
                 match req.send().await {
@@ -2192,7 +2218,7 @@ impl Provider {
                             crate::tokens::has_native_media(&b),
                         )
                         .map_err(|error| auth.annotate(error))?;
-                        let text = self.redacted_error(&raw_text, &credential);
+                        let text = self.redact_native_diagnostic(&raw_text, &credential, Some(&b));
                         // Save every rejected response before any recovery can
                         // continue, including the final send at the resend cap.
                         last_err = match server_wait {
@@ -2304,7 +2330,8 @@ impl Provider {
                     Err(e) => {
                         self.report_error_usage("", model, crate::tokens::has_native_media(&b))
                             .map_err(|error| auth.annotate(error))?;
-                        last_err = self.redacted_error(&e.to_string(), &credential);
+                        last_err =
+                            self.redact_native_diagnostic(&e.to_string(), &credential, Some(&b));
                         reason = "connection failed".to_string();
                     }
                 }
@@ -2614,7 +2641,7 @@ impl Provider {
                                             attempt += 1;
                                             continue 'request;
                                         }
-                                        return Err(anyhow!("provider error: {message}"));
+                                        return Err(anyhow!("provider error: {}",dispatch.redact_native_diagnostic(&message,&dispatch.api_key,None)));
                                     }
                                     if self.cfg.responses() {
                                         match v["type"].as_str().unwrap_or_default() {
@@ -2979,7 +3006,10 @@ impl Provider {
                     attempt += 1;
                     continue;
                 }
-                return Err(anyhow!("provider error: {why}"));
+                return Err(anyhow!(
+                    "provider error: {}",
+                    dispatch.redact_native_diagnostic(&why, &dispatch.api_key, None)
+                ));
             }
             permit.success();
             let tool_calls = f
@@ -3163,10 +3193,80 @@ pub fn resized_image_dimensions(width: u32, height: u32, max_px: u32) -> (u32, u
     )
 }
 
+/// Retain only small recognizable prefixes of payloads actually attempted on
+/// the wire. Never source these from schemas or untransmitted frozen bytes.
+#[derive(Default)]
+struct PayloadRedactions {
+    prefixes: Vec<String>,
+    data_urls: Vec<String>,
+}
+impl PayloadRedactions {
+    fn observe(&mut self, body: &Value) {
+        fn add(patterns: &mut Vec<String>, pattern: String) {
+            if !pattern.is_empty() && patterns.len() < 64 && !patterns.contains(&pattern) {
+                patterns.push(pattern);
+            }
+        }
+        crate::tokens::content_parts(body, |parts| {
+            for part in parts {
+                let kind = part["type"].as_str().unwrap_or_default();
+                let payload = match kind {
+                    "input_audio" => part["input_audio"]["data"].as_str(),
+                    "file" => part["file"]["file_data"].as_str(),
+                    "input_file" => part["file_data"].as_str(),
+                    "document" | "image" if part["source"]["type"] == "base64" => {
+                        part["source"]["data"].as_str()
+                    }
+                    "image_url" => part["image_url"]["url"]
+                        .as_str()
+                        .or_else(|| part["image_url"].as_str()),
+                    "input_image" => part["image_url"].as_str(),
+                    _ => None,
+                };
+                let Some(payload) = payload else {
+                    continue;
+                };
+                let encoded = if payload.starts_with("data:") {
+                    if let Some((header, data)) = payload.split_once(',') {
+                        add(
+                            &mut self.data_urls,
+                            format!("{},", header.chars().take(128).collect::<String>()),
+                        );
+                        data
+                    } else {
+                        payload
+                    }
+                } else {
+                    payload
+                };
+                // Recognize complete shorter payloads and >=32-character prefixes
+                // of larger ones. This deliberately makes no one-character or
+                // arbitrary decoded/obfuscated-output confidentiality claim.
+                if encoded.len() >= 8 {
+                    add(&mut self.prefixes, encoded.chars().take(32).collect());
+                }
+            }
+        });
+    }
+    fn recognizes(&self, text: &str) -> bool {
+        let contains = |value: &str| {
+            self.prefixes
+                .iter()
+                .chain(&self.data_urls)
+                .any(|pattern| value.contains(pattern))
+        };
+        contains(text)
+            || serde_json::from_str::<Value>(text)
+                .ok()
+                .is_some_and(|value| contains(&value.to_string()))
+    }
+}
+
 struct NativeProjection {
     messages: Vec<Value>,
     sources: Arc<FrozenAttachments>,
     repairs: std::sync::Mutex<NativeRepairs>,
+    sent_payloads: std::sync::Mutex<PayloadRedactions>,
 }
 #[derive(Default)]
 struct NativeRepairs {
@@ -4195,6 +4295,31 @@ mod breaker_tests;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn diagnostic_payload_patterns_use_actual_parts_and_recognize_cropped_json_echoes() {
+        let payload = "opaque_attachment_bytes_0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let schema = json!({"type":"file","file":{"file_data":payload}});
+        let mut patterns = PayloadRedactions::default();
+        patterns.observe(&json!({"tools":[{"function":{"parameters":{"const":schema}}}],"vendor":schema,"messages":[{"role":"user","content":[{"type":"text","text":payload}]}]}));
+        assert!(
+            !patterns.recognizes(payload),
+            "schemas/text confer no payload authority"
+        );
+        patterns.observe(&json!({"input":[{"role":"user","content":[{"type":"input_file","file_data":format!("data:application/pdf;base64,{payload}")}]}]}));
+        assert!(patterns.recognizes(payload));
+        assert!(patterns.recognizes(&payload[..40]));
+        assert!(patterns.recognizes("cropped data:application/pdf;base64,"));
+        let escaped = payload[..40]
+            .chars()
+            .map(|c| format!("\\u{:04x}", c as u32))
+            .collect::<String>();
+        assert!(patterns.recognizes(&format!("{{\"error\":\"{escaped}\"}}")));
+        assert!(!patterns.recognizes("ordinary invalid_request_error"));
+        // A later content repair cannot remove the retained attempted patterns.
+        patterns.observe(&json!({"messages":[{"role":"user","content":"reference only"}]}));
+        assert!(patterns.recognizes(payload));
+        assert!(patterns.prefixes.iter().all(|p| p.len() <= 32));
+    }
 
     #[test]
     fn unsupported_history_images_cannot_reset_native_preview_attempt_prefix() {

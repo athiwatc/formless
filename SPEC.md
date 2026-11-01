@@ -948,6 +948,11 @@ pasting paths.
   typed and persist across stream retries, touching only real API content parts,
   never Tool schemas, defaults/examples, structured arguments or vendor data.
   Final wire bodies reach input/accounting hooks after optional-body repairs.
+  Provider diagnostics that echo submitted attachment bytes or recognizable
+  encoded prefixes/data URLs are suppressed before display or truncation,
+  including later errors after a content repair. Only actual attempted content
+  parts supply these bounded patterns; schemas and untransmitted sources do not.
+  Raw protocol responses still drive usage parsing and recovery classification.
   Strict dollar limits refuse unknown native input costs before HTTP; existing
   explicit budget waivers retain their meaning. Schema 62 records unknown native
   cost durably: generic text prices cannot replace an unreported media cost,
