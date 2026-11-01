@@ -2182,6 +2182,11 @@ impl Provider {
             let (mut attempt, mut sends) = (0, 0);
             'attempts: while attempt <= self.cfg.max_retries && sends <= attempt + MAX_RESENDS {
                 sends += 1;
+                // Retain stricter endpoint repairs before extra_body can
+                // overwrite them again on a later physical attempt.
+                if let Some(policy) = &self.probe_policy {
+                    policy.retain_stricter_caps(body);
+                }
                 let mut b = body.clone();
                 b["model"] = json!(model);
                 if let Some(o) = b.as_object_mut() {

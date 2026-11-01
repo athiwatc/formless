@@ -6,7 +6,7 @@ use formless_runtime::LockExt;
 use serde_json::{json, Value};
 use std::future::Future;
 use std::sync::{
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     Arc, Mutex,
 };
 use std::time::Duration;
@@ -21,6 +21,7 @@ struct Inner {
     sends: AtomicUsize,
     maximum: usize,
     tokens: u64,
+    ceiling: AtomicU64,
     completion_field: Mutex<Option<bool>>,
     repaired_field: AtomicBool,
     observed: Mutex<Observed>,
@@ -51,6 +52,7 @@ impl ProbePolicy {
             sends: AtomicUsize::new(0),
             maximum: sends,
             tokens,
+            ceiling: AtomicU64::new(tokens),
             completion_field: Mutex::new(None),
             repaired_field: AtomicBool::new(false),
             observed: Mutex::new(Observed::default()),
@@ -86,10 +88,34 @@ impl ProbePolicy {
             })?;
         Ok(())
     }
+    pub(crate) fn retain_stricter_caps(&self, body: &Value) {
+        for object in [Some(body), body.get("options")].into_iter().flatten() {
+            for key in [
+                "max_tokens",
+                "max_completion_tokens",
+                "max_output_tokens",
+                "max_new_tokens",
+                "num_predict",
+            ] {
+                if let Some(cap) = object
+                    .get(key)
+                    .and_then(Value::as_u64)
+                    .filter(|cap| *cap > 0)
+                {
+                    self.0
+                        .ceiling
+                        .fetch_min(cap.min(self.0.tokens), Ordering::SeqCst);
+                }
+            }
+        }
+    }
+
     /// Runs after vendor fields and repairs on EVERY physical attempt. A
     /// rejected cap can switch spelling, but never disappear or increase.
     pub(crate) fn finalize(&self, body: &mut Value, cfg: &ProviderCfg, model: &str) -> Result<()> {
         self.check()?;
+        self.retain_stricter_caps(body);
+        let ceiling = self.0.ceiling.load(Ordering::SeqCst);
         let completion = if !cfg.anthropic() && !cfg.responses() {
             let mut field = self.0.completion_field.locked();
             *field.get_or_insert_with(|| {
@@ -128,14 +154,14 @@ impl ProbePolicy {
         } else {
             "max_tokens"
         };
-        object.insert(key.into(), json!(self.0.tokens));
+        object.insert(key.into(), json!(ceiling));
         for key in ["max_new_tokens", "num_predict"] {
             if object.contains_key(key) {
-                object.insert(key.into(), json!(self.0.tokens));
+                object.insert(key.into(), json!(ceiling));
             }
         }
         if let Some(options) = object.get_mut("options").and_then(Value::as_object_mut) {
-            options.insert("num_predict".into(), json!(self.0.tokens));
+            options.insert("num_predict".into(), json!(ceiling));
             for key in [
                 "max_tokens",
                 "max_completion_tokens",
@@ -143,7 +169,7 @@ impl ProbePolicy {
                 "max_new_tokens",
             ] {
                 if options.contains_key(key) {
-                    options.insert(key.into(), json!(self.0.tokens));
+                    options.insert(key.into(), json!(ceiling));
                 }
             }
             options.remove("thinking");
@@ -262,6 +288,24 @@ mod tests {
         assert!(
             !policy.repair_token_field("max_completion_tokens unsupported; max_tokens required")
         );
+    }
+    #[test]
+    fn stricter_endpoint_caps_survive_hostile_vendor_overrides() {
+        let policy = ProbePolicy::default();
+        let cfg = ProviderCfg {
+            api_style: "anthropic".into(),
+            ..Default::default()
+        };
+        policy.retain_stricter_caps(&json!({"max_tokens":64}));
+        let mut body =
+            json!({"max_tokens":99999,"max_output_tokens":-1,"options":{"num_predict":99999}});
+        policy.finalize(&mut body, &cfg, "claude-x").unwrap();
+        assert_eq!(body["max_tokens"], 64);
+        assert_eq!(body["options"]["num_predict"], 64);
+        assert!(body.get("max_output_tokens").is_none());
+        let mut next = json!({"max_tokens":-1});
+        policy.finalize(&mut next, &cfg, "claude-x").unwrap();
+        assert_eq!(next["max_tokens"], 64);
     }
     #[test]
     fn send_budget_and_usage_report_do_not_invent_unreported_zeroes() {

@@ -1125,23 +1125,28 @@ pub async fn resolve_provider_token(paths: &Paths, cfg: &ProviderCfg) -> Result<
 /// rotating refresh token (`config_dir/.refresh-<slot>.lock`), held until
 /// the returned file is dropped.
 pub async fn refresh_file_lock(paths: &Paths, slot: &str) -> Result<std::fs::File> {
+    use std::fs::TryLockError;
     let path = paths.config_dir.join(format!(".refresh-{slot}.lock"));
-    tokio::task::spawn_blocking(move || -> Result<std::fs::File> {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("open {}", path.display()))?;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(TryLockError::WouldBlock) => tokio::time::sleep(Duration::from_millis(25)).await,
+            Err(TryLockError::Error(error)) => {
+                return Err(error).with_context(|| format!("lock {}", path.display()))
+            }
         }
-        let f = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&path)
-            .with_context(|| format!("open {}", path.display()))?;
-        f.lock()
-            .with_context(|| format!("lock {}", path.display()))?;
-        Ok(f)
-    })
-    .await
-    .context("refresh lock task")?
+        // The future owns the descriptor. Cancellation drops it at this
+        // await, without abandoning a blocking worker waiting in File::lock.
+    }
 }
 
 /// The stored token as it is, never refreshed (`doctor`, `auth status`):
@@ -1469,3 +1474,7 @@ mod error_redaction_tests {
         assert!(!clean.contains("opaq"));
     }
 }
+
+#[cfg(test)]
+#[path = "auth_lock_tests.rs"]
+mod refresh_lock_tests;
