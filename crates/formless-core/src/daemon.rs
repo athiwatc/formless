@@ -2106,7 +2106,7 @@ impl Daemon {
                 let metadata = crate::descriptions::screen(&description);
                 let changed = before.as_ref().is_some_and(|old| old != &metadata.text);
                 Ok(
-                    json!({"kind":kind,"name":name,"before":before,"after":metadata,"changed":changed,"version":version}),
+                    json!({"kind":kind,"name":crate::descriptions::screen(&name).text,"before":before,"after":metadata,"changed":changed,"version":version}),
                 )
             }
             Request::PreviewDescriptionBundle { bundle } => {
