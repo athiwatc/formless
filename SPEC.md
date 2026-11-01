@@ -1523,8 +1523,12 @@ pattern (§4.4).
     abandoned handles, and cancellation close all owned handles and reap
     children/pipe workers. A direct child that exits cannot leave background
     group members holding its pipes indefinitely. Unix uses a private process
-    group; Windows assigns a suspended child to a private kill-on-close Job
-    before resuming it, failing closed if Job setup fails. This is process
+    group, retaining the waitable leader until group termination before
+    reaping it. A Unix parent policy that auto-reaps (`SIGCHLD` ignored or
+    `SA_NOCLDWAIT`) is rejected before spawn, without changing any handler;
+    application code must not independently reap runtime-owned children.
+    Windows assigns a suspended child to a private kill-on-close Job before
+    resuming it, failing closed if Job setup fails. This is process
     ownership/cleanup, not an OS sandbox for arbitrary granted programs.
   - `progress(fraction, label)` — no Capability needed: `fraction` 0..1
     (or null when unknown) and a short label. The daemon broadcasts

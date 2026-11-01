@@ -75,7 +75,7 @@ impl Process {
         cancel: Arc<AtomicBool>,
         enc: Enc,
     ) -> Result<Self, String> {
-        platform::prepare(&mut command);
+        platform::prepare(&mut command)?;
         let child = command.spawn().map_err(|e| e.to_string())?;
         let mut owned = ChildOwner {
             child,
@@ -398,8 +398,18 @@ fn completion(status: ExitStatus, timed_out: bool, killed: bool) -> Completion {
 #[cfg(unix)]
 mod platform {
     use super::*;
-    pub(super) fn prepare(command: &mut Command) {
+    pub(super) fn prepare(command: &mut Command) -> Result<(), String> {
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        // Read the parent policy without changing a global signal handler.
+        // Auto-reaping makes it impossible to retain the leader's PID safely.
+        if unsafe { libc::sigaction(libc::SIGCHLD, std::ptr::null(), &mut action) } != 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        if action.sa_sigaction == libc::SIG_IGN || action.sa_flags & libc::SA_NOCLDWAIT != 0 {
+            return Err("process supervision requires waitable children; SIGCHLD auto-reaping is enabled, so no child was started".into());
+        }
         std::os::unix::process::CommandExt::process_group(command, 0);
+        Ok(())
     }
     pub(super) fn has_exited(child: &mut Child) -> std::io::Result<bool> {
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
@@ -435,7 +445,9 @@ mod platform {
 #[cfg(not(any(unix, windows)))]
 mod platform {
     use super::*;
-    pub(super) fn prepare(_: &mut Command) {}
+    pub(super) fn prepare(_: &mut Command) -> Result<(), String> {
+        Err("supervised processes are unsupported on this platform".into())
+    }
     pub(super) fn has_exited(child: &mut Child) -> std::io::Result<bool> {
         child.try_wait().map(|status| status.is_some())
     }
@@ -472,8 +484,9 @@ mod platform {
             Threading::{OpenThread, ResumeThread, CREATE_SUSPENDED, THREAD_SUSPEND_RESUME},
         },
     };
-    pub(super) fn prepare(command: &mut Command) {
+    pub(super) fn prepare(command: &mut Command) -> Result<(), String> {
         command.creation_flags(CREATE_SUSPENDED);
+        Ok(())
     }
     pub(super) fn has_exited(child: &mut Child) -> std::io::Result<bool> {
         // The private Job handle retains group identity after the process exits.

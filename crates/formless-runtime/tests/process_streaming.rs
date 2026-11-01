@@ -137,6 +137,41 @@ fn process_fixture_helper() {
             std::io::stdout().flush().unwrap();
             hold();
         }
+        #[cfg(unix)]
+        "unwaitable" => {
+            for flags in [false, true] {
+                let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+                action.sa_sigaction = if flags { libc::SIG_DFL } else { libc::SIG_IGN };
+                if flags {
+                    action.sa_flags = libc::SA_NOCLDWAIT;
+                }
+                unsafe {
+                    libc::sigemptyset(&mut action.sa_mask);
+                }
+                let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
+                assert_eq!(
+                    unsafe { libc::sigaction(libc::SIGCHLD, &action, &mut old) },
+                    0
+                );
+                let f = Fixture::new();
+                let req = f.request(
+                    "function run(i){return process.spawn(i.cmd,i.args,{cwd:i.cwd,env:i.env});}",
+                    "hold",
+                );
+                let result = execute(&req, Arc::new(NoHostOps));
+                // Always restore before assertions; this is a private helper
+                // process, never the parallel test runner or actual daemon.
+                assert_eq!(
+                    unsafe { libc::sigaction(libc::SIGCHLD, &old, std::ptr::null_mut()) },
+                    0
+                );
+                let error = result.unwrap_err();
+                assert!(error.message.contains("requires waitable children"));
+                assert!(!f.0.join("parent.pid").exists());
+            }
+            println!("UNWAITABLE_REJECTED");
+            std::io::stdout().flush().unwrap();
+        }
         "binary" => {
             let mut input = Vec::new();
             std::io::stdin().read_to_end(&mut input).unwrap();
@@ -537,4 +572,21 @@ fn invalid_timeouts_and_consumed_native_handles_never_gain_process_authority() {
     let value = execute(&req, Arc::new(NoHostOps)).unwrap().output;
     assert_eq!(value["status"]["code"], 0);
     assert_eq!(value["rejected"], 3);
+}
+
+#[cfg(unix)]
+#[test]
+fn known_auto_reaping_policy_fails_before_starting_a_child() {
+    let f = Fixture::new();
+    let req = f.request(
+        "function run(i){return process.run(i.cmd,i.args,{cwd:i.cwd,env:i.env,timeout_ms:5000});}",
+        "unwaitable",
+    );
+    let value = execute(&req, Arc::new(NoHostOps)).unwrap().output;
+    assert_eq!(value["code"], 0);
+    assert!(value["stdout"]
+        .as_str()
+        .unwrap()
+        .contains("UNWAITABLE_REJECTED"));
+    assert_reaped(f.pid("parent.pid"));
 }
