@@ -274,6 +274,13 @@ async fn real_concurrent_runs_share_daily_admission_and_commit_before_release() 
         1
     );
     assert_eq!(mock.posts.load(Ordering::SeqCst), 1);
+    let stats = daemon.with_store(|st| st.list_model_stats()).unwrap();
+    assert_eq!(stats.iter().map(|s| s.successes).sum::<i64>(), 1);
+    assert_eq!(
+        stats.iter().map(|s| s.failures).sum::<i64>(),
+        0,
+        "a queued budget refusal is not a failed model request"
+    );
     assert_eq!(
         daemon
             .with_store(|st| st.usage_grouped(None, "purpose"))
@@ -1163,4 +1170,79 @@ async fn cancelling_native_stream_after_reported_input_commits_known_charge() {
     mock.release.notify_one();
     drop(provider);
     teardown(daemon, server).await;
+}
+
+#[test]
+fn model_failures_exclude_typed_admission_and_accounting_errors_only() {
+    let budget = anyhow::Error::new(RequestFailure::budget("arbitrary admission wording"))
+        .context("outer request context");
+    assert!(!is_model_failure(&budget));
+    let accounting = anyhow!("injected persistence detail")
+        .context(crate::provider::UsageAccountingFailure)
+        .context("outer request context");
+    assert!(!is_model_failure(&accounting));
+    assert!(is_model_failure(&anyhow!(
+        "provider error: budget exhausted at remote provider"
+    )));
+    assert!(is_model_failure(&anyhow!(
+        "provider error: 503 unavailable"
+    )));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn run_accounting_failure_is_local_but_actual_http_fault_still_counts() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    for accounting in [true, false] {
+        let mock = Mock::new(false, !accounting);
+        let (_root, paths, mut cfg, daemon, server) =
+            setup(&env, mock.clone(), Some(5.0), true).await;
+        cfg.provider.fallback_models.clear();
+        cfg.save(&paths).unwrap();
+        let db = rusqlite::Connection::open(paths.db_file()).unwrap();
+        if accounting {
+            db.execute_batch("CREATE TRIGGER reject_run_usage BEFORE INSERT ON run_usage BEGIN SELECT RAISE(FAIL,'injected run accounting failure'); END;").unwrap();
+        }
+        let sid = daemon.with_store(|st| st.create_session(None)).unwrap().id;
+        daemon
+            .handle(Request::SendMessage {
+                session_id: sid.clone(),
+                content: "answer".into(),
+                mode: SendMode::Send,
+                client_msg_id: None,
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let status = daemon
+                    .with_store(|st| st.get_session(&sid))
+                    .unwrap()
+                    .unwrap()
+                    .last_run_status;
+                if matches!(
+                    status.as_deref(),
+                    Some("paused" | "failed" | "interrupted" | "completed")
+                ) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(mock.posts.load(Ordering::SeqCst), 1);
+        let failures = daemon
+            .with_store(|st| st.list_model_stats())
+            .unwrap()
+            .iter()
+            .map(|s| s.failures)
+            .sum::<i64>();
+        assert_eq!(
+            failures,
+            if accounting { 0 } else { 1 },
+            "local accounting failure attribution={accounting}"
+        );
+        drop(db);
+        teardown(daemon, server).await;
+    }
 }
