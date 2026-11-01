@@ -148,6 +148,9 @@ fn content_blocks(content: &Value) -> Vec<Value> {
                             |why| json!({"type": "text", "text": format!("[{why}]")}),
                         ))
                     }
+                    Some("file")=>p["file"]["file_data"].as_str()
+                        .and_then(|s|s.strip_prefix("data:application/pdf;base64,"))
+                        .map(|data|json!({"type":"document","source":{"type":"base64","media_type":"application/pdf","data":data}})),
                     _ => None,
                 })
                 .collect()

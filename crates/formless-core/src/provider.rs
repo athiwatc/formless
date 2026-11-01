@@ -760,6 +760,7 @@ pub fn responses_input(messages: &[Value]) -> Vec<Value> {
                         }
                         Some(img)
                     }
+                    Some("file") => Some(json!({"type":"input_file","filename":p["file"]["filename"],"file_data":p["file"]["file_data"]})),
                     _ => None,
                 })
                 .collect();
@@ -1416,7 +1417,11 @@ impl Provider {
             hook: self.on_usage.clone(),
             prompt_hook: self.on_prompt.clone(),
             prompt_key: crate::tokens::provider_key(&self.name, &self.cfg),
-            prompt_estimate: crate::tokens::request(body),
+            prompt_estimate: if crate::tokens::has_native_media(body) {
+                0
+            } else {
+                crate::tokens::request(body)
+            },
             provider: self.name.clone(),
             model: model.to_string(),
         }
@@ -1673,7 +1678,8 @@ impl Provider {
     }
 
     pub fn prepare_attachments(&self, messages: &[Value], model: &str) -> Vec<Value> {
-        self.prepare_attachments_inner(messages, model, None)
+        let frozen = self.freeze_attachments(messages, model, false);
+        self.prepare_attachments_inner(messages, model, None, &frozen)
     }
 
     /// Only the caller-created draft range may resolve metadata-only previews;
@@ -1684,7 +1690,62 @@ impl Provider {
         model: &str,
         previews: Option<(usize, usize, &[formless_protocol::ForecastAttachment])>,
     ) -> Vec<Value> {
-        self.prepare_attachments_inner(messages, model, previews)
+        let frozen = self.freeze_attachments(messages, model, false);
+        self.prepare_attachments_inner(messages, model, previews, &frozen)
+    }
+
+    fn accepts_attachment(&self, mime: &str, model: &str) -> bool {
+        if crate::daemon::is_raster_image(mime) {
+            self.sends_images(model)
+        } else if mime == "application/pdf" {
+            self.cfg.accepts_pdf_input(model)
+        } else {
+            audio_format(mime).is_some_and(|format| self.cfg.accepts_audio_format(model, format))
+        }
+    }
+
+    pub(crate) fn freeze_attachments(
+        &self,
+        messages: &[Value],
+        model: &str,
+        failover: bool,
+    ) -> FrozenAttachments {
+        let mut frozen = FrozenAttachments::default();
+        let mut remaining = MAX_NATIVE_SOURCE_BYTES;
+        let mut models = vec![self.cfg.resolve_alias(model)];
+        if failover {
+            models.extend(
+                self.cfg
+                    .fallback_models
+                    .iter()
+                    .map(|m| self.cfg.resolve_alias(m)),
+            );
+        }
+        for a in messages
+            .iter()
+            .flat_map(|m| m["_attachments"].as_array().into_iter().flatten())
+            .take(MAX_NATIVE_ATTACHMENTS)
+        {
+            let key = attachment_identity(a);
+            // Even repeated references reserve logical source work. Freezing
+            // each request remains bounded before any native encoding.
+            let result = if models
+                .iter()
+                .any(|model| self.accepts_attachment(a["mime"].as_str().unwrap_or_default(), model))
+            {
+                self.attachment_access
+                    .as_ref()
+                    .ok_or_else(|| "no owned artifact authority is available".to_string())
+                    .and_then(|access| {
+                        access.read_charged(a, crate::daemon::MAX_ATTACHMENT_BYTES, &mut remaining)
+                    })
+                    .map(Arc::new)
+            } else {
+                Err("the configured model/API does not accept this attachment natively; artifact reference retained".into())
+            };
+            frozen.sources.entry(key).or_insert(result);
+        }
+        frozen
     }
 
     fn prepare_attachments_inner(
@@ -1692,6 +1753,7 @@ impl Provider {
         messages: &[Value],
         model: &str,
         previews: Option<(usize, usize, &[formless_protocol::ForecastAttachment])>,
+        frozen: &FrozenAttachments,
     ) -> Vec<Value> {
         let vision = self.sends_images(model);
         let mut budget = AttachmentBudget::default();
@@ -1703,7 +1765,7 @@ impl Provider {
             let mut m = Value::Object(original.as_object().unwrap().iter()
                 .filter(|(key,_)| key.as_str() != "_attachments")
                 .map(|(key,value)|(key.clone(),value.clone())).collect());
-            if !vision { return m; }
+            if !vision && atts.iter().all(|a|crate::daemon::is_raster_image(a["mime"].as_str().unwrap_or_default())) { return m; }
             let mut parts = vec![json!({"type":"text","text":m["content"]})];
             let mut omitted = 0usize;
             let mut first_failure = None;
@@ -1714,26 +1776,42 @@ impl Provider {
                     if let Some((draft_index, first, descriptors)) = previews {
                         if message_index == draft_index && attachment_index >= first {
                             if let Some(descriptor) = descriptors.get(attachment_index-first) {
-                                return forecast_image(descriptor, self.cfg.image_max_px, &mut budget);
+                                if !self.accepts_attachment(&descriptor.mime,model) {return Err("the selected model/API does not accept this attachment natively; artifact reference retained".into());}
+                                return forecast_part(descriptor,self.cfg.image_max_px,&mut budget);
                             }
                         }
                     }
                     let (Some(path),Some(mime)) = (a["path"].as_str(),a["mime"].as_str()) else {
                         return Err("no verified owned artifact reference".into());
                     };
-                    self.attachment_access.as_ref()
-                        .ok_or_else(|| "no owned artifact authority is available".to_string())
-                        .and_then(|access| access.read_charged(a, crate::daemon::MAX_ATTACHMENT_BYTES, &mut budget.source_remaining))
-                        .and_then(|bytes| encoded_image(path,mime,self.cfg.image_max_px,bytes,&mut budget))
+                    if !self.accepts_attachment(mime,model) {
+                        return Err("the selected model/API does not accept this attachment natively; artifact reference retained".into());
+                    }
+                    let bytes=frozen.sources.get(&attachment_identity(a))
+                        .ok_or_else(||"the request's source-attachment prefix is exhausted".to_string())?
+                        .as_ref().map_err(Clone::clone)?;
+                    if bytes.len()>budget.source_remaining {return Err("the request's attachment source-byte budget is exhausted".into());}
+                    budget.source_remaining-=bytes.len();
+                    if crate::daemon::is_raster_image(mime) {
+                        encoded_image(path,mime,self.cfg.image_max_px,bytes.as_ref().clone(),&mut budget).map(NativePart::Image)
+                    } else {
+                        use base64::Engine;
+                        if bytes.len()>MAX_IMAGE_BYTES {return Err("native audio/PDF exceeds the 8 MiB inline limit; artifact reference retained".into());}
+                        let actual=crate::daemon::sniff_mime(bytes);
+                        let format=audio_format(mime);
+                        let valid=if mime=="application/pdf" {actual==Some("application/pdf")}
+                            else {format.is_some()&&actual.and_then(audio_format)==format};
+                        if !valid {return Err("the attachment bytes do not match the declared native format".into());}
+                        let encoded=bytes.len().div_ceil(3).saturating_mul(4);
+                        budget.encoded(encoded.saturating_add(if mime=="application/pdf" {"data:application/pdf;base64,".len()} else {0}))?;
+                        let data=base64::engine::general_purpose::STANDARD.encode(bytes.as_ref());
+                        if mime=="application/pdf" {
+                            Ok(NativePart::Pdf{data,filename:attachment_filename(a)})
+                        } else {Ok(NativePart::Audio{data,format:format.unwrap()})}
+                    }
                 });
                 match encoded {
-                    Ok(url) => {
-                        let mut image = json!({"url":url});
-                        if self.cfg.image_detail != "auto" && !self.cfg.image_detail.is_empty() {
-                            image["detail"] = json!(self.cfg.image_detail);
-                        }
-                        parts.push(json!({"type":"image_url","image_url":image}));
-                    }
+                    Ok(part) => parts.push(part.content(&self.cfg.image_detail)),
                     Err(why) => {
                         omitted += 1;
                         first_failure.get_or_insert((name,why));
@@ -1747,8 +1825,9 @@ impl Provider {
             }
             if let Some((name,why)) = first_failure {
                 let rest = if omitted > 1 {format!("; {} additional images were omitted",omitted-1)} else {String::new()};
-                parts.push(json!({"type":"text","text":format!("[image {name} could not be attached: {why}{rest}]")}));
-                self.note(format!("The image {name} wasn't sent to the model: {why}{rest}."));
+                let label=if atts.iter().all(|a|crate::daemon::is_raster_image(a["mime"].as_str().unwrap_or_default())) {"image"} else {"attachment"};
+                parts.push(json!({"type":"text","text":format!("[{label} {name} could not be attached: {why}{rest}]")}));
+                self.note(format!("The {label} {name} wasn't sent to the model: {why}{rest}."));
             }
             m["content"] = json!(parts);
             m
@@ -2920,6 +2999,57 @@ pub fn resized_image_dimensions(width: u32, height: u32, max_px: u32) -> (u32, u
     )
 }
 
+/// Owned source bytes are private request state, never serialized into a wire
+/// request. Keep them canonical so a later physical fallback can re-project.
+#[derive(Clone, Default)]
+pub(crate) struct FrozenAttachments {
+    sources: HashMap<String, std::result::Result<Arc<Vec<u8>>, String>>,
+}
+fn attachment_identity(a: &Value) -> String {
+    use sha2::Digest;
+    format!(
+        "{:x}",
+        sha2::Sha256::digest(serde_json::to_vec(a).unwrap_or_default())
+    )
+}
+
+enum NativePart {
+    Image(String),
+    Audio { data: String, format: &'static str },
+    Pdf { data: String, filename: String },
+}
+impl NativePart {
+    fn content(self, detail: &str) -> Value {
+        match self {
+            Self::Image(url) => {
+                let mut image = json!({"url":url});
+                if detail != "auto" && !detail.is_empty() {
+                    image["detail"] = json!(detail);
+                }
+                json!({"type":"image_url","image_url":image})
+            }
+            Self::Audio { data, format } => {
+                json!({"type":"input_audio","input_audio":{"data":data,"format":format}})
+            }
+            Self::Pdf { data, filename } => {
+                json!({"type":"file","file":{"filename":filename,"file_data":format!("data:application/pdf;base64,{data}")}})
+            }
+        }
+    }
+}
+fn attachment_filename(a: &Value) -> String {
+    let name = a["name"].as_str().unwrap_or("document.pdf");
+    let unquoted = serde_json::from_str::<String>(name).unwrap_or_else(|_| name.into());
+    crate::daemon::cap_name(&crate::daemon::attachment_name(&unquoted), 120)
+}
+fn audio_format(mime: &str) -> Option<&'static str> {
+    match mime {
+        "audio/wav" | "audio/x-wav" | "audio/wave" => Some("wav"),
+        "audio/mpeg" | "audio/mp3" => Some("mp3"),
+        _ => None,
+    }
+}
+
 // Request-wide work limits, shared by ordinary projection and offline previews.
 pub(crate) const MAX_NATIVE_ATTACHMENTS: usize = 16;
 pub(crate) const MAX_NATIVE_SOURCE_BYTES: usize = 32 * 1024 * 1024;
@@ -2965,6 +3095,51 @@ impl AttachmentBudget {
         }
         self.encoded_remaining -= bytes;
         Ok(())
+    }
+}
+
+fn forecast_part(
+    descriptor: &formless_protocol::ForecastAttachment,
+    max_px: u32,
+    budget: &mut AttachmentBudget,
+) -> std::result::Result<NativePart, String> {
+    if crate::daemon::is_raster_image(&descriptor.mime) {
+        return forecast_image(descriptor, max_px, budget).map(NativePart::Image);
+    }
+    let bytes = usize::try_from(descriptor.bytes)
+        .map_err(|_| "the source attachment is too large".to_string())?;
+    if bytes > MAX_IMAGE_BYTES {
+        return Err(
+            "native audio/PDF exceeds the 8 MiB inline limit; artifact reference retained".into(),
+        );
+    }
+    if bytes > crate::daemon::MAX_ATTACHMENT_BYTES || bytes > budget.source_remaining {
+        return Err("the request's attachment source-byte budget is exhausted".into());
+    }
+    budget.source_remaining -= bytes;
+    budget.encoded(bytes.div_ceil(3).saturating_mul(4).saturating_add(
+        if descriptor.mime == "application/pdf" {
+            "data:application/pdf;base64,".len()
+        } else {
+            0
+        },
+    ))?;
+    // Estimator-only placeholders carry no document/audio payload. They never
+    // enter the actual-dispatch private frozen-source map.
+    if descriptor.mime == "application/pdf" {
+        Ok(NativePart::Pdf {
+            data: String::new(),
+            filename: crate::daemon::cap_name(
+                &crate::daemon::attachment_name(&descriptor.name),
+                120,
+            ),
+        })
+    } else {
+        Ok(NativePart::Audio {
+            data: String::new(),
+            format: audio_format(&descriptor.mime)
+                .ok_or_else(|| "unsupported audio format".to_string())?,
+        })
     }
 }
 

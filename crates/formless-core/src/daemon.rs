@@ -14946,6 +14946,17 @@ pub fn sniff_mime(bytes: &[u8]) -> Option<&'static str> {
         Some("image/gif")
     } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
         Some("image/webp")
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WAVE" {
+        Some("audio/wav")
+    } else if bytes.len() >= 10 && bytes.starts_with(b"ID3")
+        || bytes.len() >= 4
+            && bytes[0] == 0xff
+            && bytes[1] & 0xe0 == 0xe0
+            && bytes[1] & 0x18 != 0x08
+            && bytes[2] & 0xf0 != 0xf0
+            && bytes[2] & 0x0c != 0x0c
+    {
+        Some("audio/mpeg")
     } else if bytes.starts_with(b"%PDF-") {
         Some("application/pdf")
     } else {
@@ -14965,12 +14976,19 @@ pub fn is_raster_image(mime: &str) -> bool {
 /// An attachment's type: what its bytes are when they say, else the claim
 /// or the name, except that a claimed image or PDF the bytes don't bear
 /// out becomes text or plain bytes (#855).
+fn audio_format_claim(mime: &str) -> bool {
+    matches!(
+        mime,
+        "audio/wav" | "audio/x-wav" | "audio/wave" | "audio/mpeg" | "audio/mp3"
+    )
+}
+
 pub fn resolve_mime(claimed: Option<&str>, name: &str, bytes: &[u8]) -> String {
     if let Some(real) = sniff_mime(bytes) {
         return real.to_string();
     }
     let said = claimed.unwrap_or_else(|| guess_mime(name));
-    if is_raster_image(said) || said == "application/pdf" {
+    if is_raster_image(said) || said == "application/pdf" || audio_format_claim(said) {
         return if std::str::from_utf8(bytes).is_ok() {
             "text/plain".into()
         } else {
@@ -15051,6 +15069,8 @@ pub fn guess_mime(name: &str) -> &'static str {
         "gif" => "image/gif",
         "webp" => "image/webp",
         "pdf" => "application/pdf",
+        "wav" => "audio/wav",
+        "mp3" => "audio/mpeg",
         "json" => "application/json",
         "csv" => "text/csv",
         "md" => "text/markdown",

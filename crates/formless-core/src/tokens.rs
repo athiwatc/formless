@@ -75,11 +75,31 @@ fn url_dimensions(url: &str) -> Option<(u32, u32)> {
     )
 }
 
+/// PDF page expansion and audio tokenization cannot be inferred from base64.
+/// Keep their cost explicitly unknown and do not train text-only calibration.
+pub fn has_native_media(value: &Value) -> bool {
+    match value {
+        Value::Object(o) => {
+            matches!(
+                o.get("type").and_then(Value::as_str),
+                Some("input_audio" | "file" | "input_file" | "document")
+            ) || o.values().any(has_native_media)
+        }
+        Value::Array(a) => a.iter().any(has_native_media),
+        _ => false,
+    }
+}
+
 /// Replace image payloads with a bounded cost before serializing JSON. All
 /// other keys/values (not just visible content) contribute to the estimate.
 fn scrub_images(value: &Value, images: &mut usize) -> Value {
     if let Some(obj) = value.as_object() {
         let kind = obj.get("type").and_then(Value::as_str).unwrap_or_default();
+        if matches!(kind, "input_audio" | "file" | "input_file" | "document") {
+            // A bounded structural marker is a text-estimate lower bound,
+            // never a claim that the native modality has zero provider tokens.
+            return json!({"type":kind,"native_tokens":"unknown"});
+        }
         if kind == "image_url" || kind == "input_image" || kind == "image" {
             let image = value.get("image_url").unwrap_or(value);
             let detail = image
@@ -110,6 +130,12 @@ fn scrub_images(value: &Value, images: &mut usize) -> Value {
         for (key, value) in obj {
             if key == "_attachments" {
                 for attachment in value.as_array().into_iter().flatten() {
+                    if !attachment["mime"]
+                        .as_str()
+                        .is_some_and(crate::daemon::is_raster_image)
+                    {
+                        continue;
+                    }
                     // Raw metadata (including imported Session metadata) is
                     // never filesystem authority. Final prepared image parts
                     // carry verified dimensions; otherwise use an honest

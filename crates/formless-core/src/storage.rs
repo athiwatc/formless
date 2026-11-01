@@ -6590,10 +6590,11 @@ pub fn provider_message(m: &MessageInfo) -> Value {
                     a["id"].as_str().unwrap_or_default()
                 ));
                 // Only raster images go to a vision model (#855).
-                if a["mime"]
-                    .as_str()
-                    .is_some_and(crate::daemon::is_raster_image)
-                {
+                if a["mime"].as_str().is_some_and(|mime| {
+                    crate::daemon::is_raster_image(mime)
+                        || mime == "application/pdf"
+                        || mime.starts_with("audio/")
+                }) {
                     images.push(json!({"id": a.get("_artifact_id").unwrap_or(&a["id"]), "_source_session":m.session_id,"_source_seq":m.seq,"path": a["path"], "mime": a["mime"], "name": name, "bytes":a["bytes"], "sha256":a["sha256"]}));
                 }
             }

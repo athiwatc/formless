@@ -271,6 +271,10 @@ pub fn documented_shape() -> Config {
     p.reasoning_effort = Some(s("low"));
     p.api_key_header = Some(s("api-key"));
     p.vision = Some(true);
+    p.audio_input = Some(true);
+    p.pdf_input = Some(true);
+    p.model_audio_input.insert(s("*"), true);
+    p.model_pdf_input.insert(s("*"), true);
     p.extra_headers.insert(s("*"), s("v"));
     p.extra_body.insert(s("*"), serde_json::json!(1));
     p.aliases.insert(s("*"), s("m"));
@@ -688,6 +692,10 @@ pub const SETTABLE: &[&str] = &[
     "provider.api_style",
     "provider.tool_mode",
     "provider.vision",
+    "provider.audio_input",
+    "provider.pdf_input",
+    "provider.model_audio_input",
+    "provider.model_pdf_input",
     "provider.prices",
     "daemon.idle_grace_secs",
     "daemon.stall_warning_secs",
@@ -939,6 +947,14 @@ pub struct ProviderCfg {
     /// from the model name (see `provider::is_vision_model`).
     #[serde(default)]
     pub vision: Option<bool>,
+    /// Explicit provider defaults for native media. Unset defaults are limited
+    /// to documented exact models on their known first-party API transport.
+    pub audio_input: Option<bool>,
+    pub pdf_input: Option<bool>,
+    /// Model-specific overrides use resolved model IDs and precede provider
+    /// defaults. Unsupported API styles cannot be enabled by these flags.
+    pub model_audio_input: HashMap<String, bool>,
+    pub model_pdf_input: HashMap<String, bool>,
     /// Longest side, in pixels, of an image sent to a vision model; larger
     /// ones are scaled down once per Session (#616).
     pub image_max_px: u32,
@@ -1048,6 +1064,10 @@ impl Default for ProviderCfg {
             routing_complex_chars: default_routing_complex_chars(),
             auth: AuthCfg::default(),
             vision: None,
+            audio_input: None,
+            pdf_input: None,
+            model_audio_input: HashMap::new(),
+            model_pdf_input: HashMap::new(),
             prices: HashMap::new(),
             stall_notice_secs: 120,
             first_byte_timeout_secs: 0,
@@ -1059,6 +1079,102 @@ impl Default for ProviderCfg {
     }
 }
 impl ProviderCfg {
+    /// No capability probe is performed. Defaults are deliberately exact and
+    /// transport-specific; custom gateways require an explicit override.
+    pub fn accepts_audio_input(&self, model: &str) -> bool {
+        if !self.api_style.eq_ignore_ascii_case("chat") {
+            return false;
+        }
+        let model = self.resolve_alias(model);
+        self.model_audio_input
+            .get(&model)
+            .copied()
+            .or(self.audio_input)
+            .unwrap_or_else(|| self.documented_media_default(&model, true))
+    }
+
+    pub fn accepts_pdf_input(&self, model: &str) -> bool {
+        if !["chat", "responses", "anthropic"]
+            .iter()
+            .any(|style| self.api_style.eq_ignore_ascii_case(style))
+        {
+            return false;
+        }
+        let model = self.resolve_alias(model);
+        self.model_pdf_input
+            .get(&model)
+            .copied()
+            .or(self.pdf_input)
+            .unwrap_or_else(|| self.documented_media_default(&model, false))
+    }
+
+    /// The Gemini compatibility guide demonstrates WAV only. An explicit
+    /// capability override asserts support for both documented Chat formats.
+    pub fn accepts_audio_format(&self, model: &str, format: &str) -> bool {
+        if !matches!(format, "wav" | "mp3") || !self.accepts_audio_input(model) {
+            return false;
+        }
+        if format == "wav" {
+            return true;
+        }
+        let model = self.resolve_alias(model);
+        if self
+            .model_audio_input
+            .get(&model)
+            .copied()
+            .or(self.audio_input)
+            == Some(true)
+        {
+            return true;
+        }
+        reqwest::Url::parse(&self.base_url)
+            .ok()
+            .is_some_and(|url| url.host_str() == Some("api.openai.com"))
+    }
+
+    fn documented_media_default(&self, model: &str, audio: bool) -> bool {
+        let Ok(url) = reqwest::Url::parse(&self.base_url) else {
+            return false;
+        };
+        if url.scheme() != "https"
+            || url.port_or_known_default() != Some(443)
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return false;
+        }
+        let path = url.path().trim_end_matches('/');
+        if audio {
+            // Official audio Chat guides/model pages; no prefix matching that
+            // would accidentally enable a text-only or output-only variant.
+            matches!(
+                (url.host_str(), path, model),
+                (Some("api.openai.com"), "/v1", "gpt-audio-1.5")
+                    | (
+                        Some("generativelanguage.googleapis.com"),
+                        "/v1beta/openai",
+                        "gemini-3.8-flash"
+                    )
+            )
+        } else if self.anthropic() {
+            url.host_str() == Some("api.anthropic.com")
+                && path == "/v1"
+                && matches!(
+                    model,
+                    "claude-opus-5-5"
+                        | "claude-sonnet-5-5"
+                        | "claude-haiku-5-5"
+                        | "claude-fable-5-1"
+                )
+        } else {
+            url.host_str() == Some("api.openai.com")
+                && path == "/v1"
+                && matches!(model, "gpt-4o" | "gpt-4.1" | "gpt-6-astra")
+        }
+    }
+
     /// Send `cache_control` breakpoints to `model` (see `cache_control`)?
     pub fn cache_breakpoints(&self, model: &str) -> bool {
         match self.cache_control.to_ascii_lowercase().as_str() {
@@ -2592,5 +2708,53 @@ base_url = \"http://localhost:11434/v1\"\n";
             .collect();
         assert!(leftovers.is_empty());
         let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+#[cfg(test)]
+mod native_media_capability_tests {
+    use super::*;
+    #[test]
+    fn native_media_defaults_are_exact_transport_scoped_and_overrideable() {
+        let mut c = ProviderCfg {
+            base_url: "https://api.openai.com/v1".into(),
+            ..Default::default()
+        };
+        assert!(c.accepts_audio_input("gpt-audio-1.5"));
+        assert!(c.accepts_audio_format("gpt-audio-1.5", "mp3"));
+        assert!(!c.accepts_audio_input("gpt-4o"));
+        assert!(!c.accepts_audio_input("gpt-audio-1.5-fake"));
+        assert!(c.accepts_pdf_input("gpt-6-astra"));
+        assert!(!c.accepts_pdf_input("gpt-4o-audio-preview"));
+        c.base_url = "https://unknown.example/v1".into();
+        assert!(!c.accepts_pdf_input("gpt-6-astra"));
+        c.pdf_input = Some(true);
+        c.model_pdf_input.insert("denied".into(), false);
+        c.aliases.insert("alias".into(), "denied".into());
+        assert!(c.accepts_pdf_input("custom"));
+        assert!(!c.accepts_pdf_input("alias"));
+        c.api_style = "responses".into();
+        c.audio_input = Some(true);
+        assert!(!c.accepts_audio_input("custom"));
+        assert!(c.accepts_pdf_input("custom"));
+        c.api_style = "not-an-api".into();
+        assert!(!c.accepts_pdf_input("custom"));
+        c = ProviderCfg {
+            base_url: "https://generativelanguage.googleapis.com/v1beta/openai/".into(),
+            ..Default::default()
+        };
+        assert!(c.accepts_audio_format("gemini-3.8-flash", "wav"));
+        assert!(!c.accepts_audio_format("gemini-3.8-flash", "mp3"));
+        assert!(!c.accepts_pdf_input("gemini-3.8-flash"));
+        c.model_audio_input.insert("gemini-3.8-flash".into(), true);
+        assert!(c.accepts_audio_format("gemini-3.8-flash", "mp3"));
+        c = ProviderCfg {
+            base_url: "https://api.anthropic.com/v1".into(),
+            api_style: "anthropic".into(),
+            ..Default::default()
+        };
+        assert!(c.accepts_pdf_input("claude-opus-5-5"));
+        assert!(!c.accepts_pdf_input("claude-mythos-5-1"));
+        assert!(!c.accepts_audio_input("claude-opus-5-5"));
     }
 }
