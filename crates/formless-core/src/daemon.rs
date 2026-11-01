@@ -8745,7 +8745,7 @@ impl Daemon {
                     if let Some(u) = &result.usage {
                         task_tokens += (u.prompt_tokens + u.completion_tokens) as i64;
                         task_cost = task_cost
-                            .zip(cfg.cost_of(
+                            .zip(cfg.cost_of_known(
                                 provider.name(),
                                 &result.model_used,
                                 u.prompt_tokens as i64,
@@ -8753,6 +8753,7 @@ impl Daemon {
                                 u.cached_tokens as i64,
                                 u.cache_write_tokens as i64,
                                 u.cost,
+                                u.cost_unknown,
                             ))
                             .map(|(sum, c)| sum + c);
                     }
@@ -14764,7 +14765,7 @@ impl HostOps for NestedOps {
         // as its model use (§10.4).
         if let (Some(u), Some(inv)) = (usage, &self.parent_inv) {
             let tokens = (u.prompt_tokens + u.completion_tokens) as i64;
-            let cost = self.cfg.cost_of(
+            let cost = self.cfg.cost_of_known(
                 provider.name(),
                 &result.model_used,
                 u.prompt_tokens as i64,
@@ -14772,6 +14773,7 @@ impl HostOps for NestedOps {
                 u.cached_tokens as i64,
                 u.cache_write_tokens as i64,
                 u.cost,
+                u.cost_unknown,
             );
             let _ = self.daemon.with_store(|st| {
                 st.add_invocation_tokens(inv, tokens)?;
