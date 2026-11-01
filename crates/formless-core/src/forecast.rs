@@ -336,9 +336,15 @@ pub(crate) fn estimate_store_with_window(
         .unwrap_or_default();
     let mut logical = Vec::new();
     let mut normalized = held.clone();
+    let held_access =
+        crate::attachment_access::AttachmentAccess::snapshot(st, &[json!({"_attachments":&held})])?;
     for a in &held {
         let bytes = (a["reference"] != true)
-            .then(|| a["path"].as_str().and_then(|p| std::fs::read(p).ok()))
+            .then(|| {
+                held_access
+                    .as_ref()
+                    .and_then(|access| access.read(a, crate::daemon::MAX_ATTACHMENT_BYTES).ok())
+            })
             .flatten();
         let mut descriptor = if let Some(bytes) = bytes {
             attachment(
@@ -369,6 +375,7 @@ pub(crate) fn estimate_store_with_window(
     }
     logical.extend(input.attachments.clone());
     for a in &mut normalized {
+        a["_artifact_id"] = a["id"].clone();
         a["id"] = json!("00000000-0000-0000-0000-000000000000");
     }
     for a in &input.attachments {
@@ -404,7 +411,8 @@ pub(crate) fn estimate_store_with_window(
         String::new(),
         reqwest::Client::builder().no_proxy().build()?,
     )
-    .with_name(name);
+    .with_name(name)
+    .with_attachment_snapshot(st, &ctx)?;
     let key = crate::tokens::provider_key(name, &pcfg);
     let ratio = st.token_ratio(&key, &model)?;
     let mut ctx = provider.prepare_attachments(&ctx, &model);
@@ -870,11 +878,12 @@ mod tests {
     fn byte_bound_attachment_previews_equal_uploaded_input_and_do_not_read_rpc_paths() {
         let root = std::env::temp_dir().join(format!("fl-forecast-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
-        let st = Store::open_in_memory().unwrap();
+        let st = Store::open(&root.join("formless.db")).unwrap();
         let mut c = config();
         c.provider.vision = Some(true);
         let sid = st.create_session(None).unwrap().id;
-        let path = root.join("real.png");
+        std::fs::create_dir_all(root.join("artifacts")).unwrap();
+        let path = root.join("artifacts/real.png");
         image::DynamicImage::new_rgb8(512, 512).save(&path).unwrap();
         let bytes = std::fs::read(&path).unwrap();
         let descriptor = attachment("[real].png".into(), &bytes);
@@ -885,7 +894,10 @@ mod tests {
             ..Default::default()
         };
         let preview = estimate_store(&st, &c, &input).unwrap();
-        st.add_pending_attachment(&sid,&json!({"id":uuid::Uuid::new_v4().to_string(),"name":descriptor.name,"mime":descriptor.mime,"path":path,"bytes":bytes.len()})).unwrap();
+        let artifact_id = st
+            .save_artifact(Some(&sid), path.to_str().unwrap(), "", bytes.len() as i64)
+            .unwrap();
+        st.add_pending_attachment(&sid,&json!({"id":artifact_id,"name":descriptor.name,"mime":descriptor.mime,"path":path,"bytes":bytes.len()})).unwrap();
         let uploaded = estimate_store(
             &st,
             &c,
@@ -1116,7 +1128,11 @@ mod tests {
             .unwrap();
         let bytes = std::fs::read(&path).unwrap();
         for prompt_tools in [false, true] {
-            let st = Store::open_in_memory().unwrap();
+            let profile = root.join(if prompt_tools { "prompt" } else { "native" });
+            std::fs::create_dir_all(profile.join("artifacts")).unwrap();
+            let owned = profile.join("artifacts/wide.png");
+            std::fs::copy(&path, &owned).unwrap();
+            let st = Store::open(&profile.join("formless.db")).unwrap();
             let mut c = config();
             c.provider.vision = Some(true);
             c.provider.image_max_px = 256;
@@ -1131,7 +1147,10 @@ mod tests {
                 ..Default::default()
             };
             let preview = estimate_store(&st, &c, &input).unwrap();
-            st.add_pending_attachment(&sid,&json!({"id":uuid::Uuid::new_v4().to_string(),"path":path,"name":"wide.png","mime":"image/png","bytes":bytes.len()})).unwrap();
+            let artifact_id = st
+                .save_artifact(Some(&sid), owned.to_str().unwrap(), "", bytes.len() as i64)
+                .unwrap();
+            st.add_pending_attachment(&sid,&json!({"id":artifact_id,"path":owned,"name":"wide.png","mime":"image/png","bytes":bytes.len()})).unwrap();
             let uploaded = estimate_store(
                 &st,
                 &c,

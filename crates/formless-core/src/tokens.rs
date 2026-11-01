@@ -110,14 +110,14 @@ fn scrub_images(value: &Value, images: &mut usize) -> Value {
         for (key, value) in obj {
             if key == "_attachments" {
                 for attachment in value.as_array().into_iter().flatten() {
-                    let dims = attachment["path"].as_str().and_then(|path| {
-                        image::ImageReader::open(path)
-                            .ok()?
-                            .with_guessed_format()
-                            .ok()?
-                            .into_dimensions()
-                            .ok()
-                    });
+                    // Raw metadata (including imported Session metadata) is
+                    // never filesystem authority. Final prepared image parts
+                    // carry verified dimensions; otherwise use an honest
+                    // nonzero unknown-dimension estimate, without opening paths.
+                    let dims = attachment["width"]
+                        .as_u64()
+                        .zip(attachment["height"].as_u64())
+                        .and_then(|(w, h)| Some((u32::try_from(w).ok()?, u32::try_from(h).ok()?)));
                     *images = images.saturating_add(image_tokens(
                         dims,
                         attachment["detail"].as_str().unwrap_or("auto"),

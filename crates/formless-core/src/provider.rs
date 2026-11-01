@@ -191,6 +191,7 @@ pub struct Provider {
     /// When set, credentials are re-resolved before each HTTP request so
     /// an OAuth token expiring during a long Run is refreshed in place.
     credential_paths: Option<Paths>,
+    attachment_access: Option<crate::attachment_access::AttachmentAccess>,
     http: reqwest::Client,
     /// Sent as `prompt_cache_key` so the endpoint routes one Session's
     /// requests to the same cache (see `provider.cache_key`).
@@ -1119,6 +1120,7 @@ impl Provider {
             cfg,
             api_key,
             credential_paths: None,
+            attachment_access: None,
             cache_key: None,
             on_retry: None,
             on_note: None,
@@ -1144,6 +1146,7 @@ impl Provider {
             cfg,
             api_key,
             credential_paths: None,
+            attachment_access: None,
             cache_key: None,
             on_retry: None,
             on_note: None,
@@ -1197,6 +1200,7 @@ impl Provider {
         Ok(Self {
             cfg,
             api_key,
+            attachment_access: Some(crate::attachment_access::AttachmentAccess::profile(&paths)),
             credential_paths: Some(paths),
             cache_key: None,
             on_retry: None,
@@ -1306,6 +1310,18 @@ impl Provider {
     pub fn with_usage_hook(mut self, hook: UsageHook) -> Self {
         self.on_usage = Some(hook);
         self
+    }
+
+    /// Forecasts/admission use their already-held Store, never a new connection
+    /// to the source database. No untrusted marker alone grants file access.
+    pub(crate) fn with_attachment_snapshot(
+        mut self,
+        store: &crate::Store,
+        messages: &[Value],
+    ) -> Result<Self> {
+        self.attachment_access =
+            crate::attachment_access::AttachmentAccess::snapshot(store, messages)?;
+        Ok(self)
     }
 
     /// Observe only bodies accepted by an actual successful provider response,
@@ -1677,8 +1693,12 @@ impl Provider {
                     let (Some(path), Some(mime)) = (a["path"].as_str(), a["mime"].as_str()) else {
                         continue;
                     };
-                    let name = a["name"].as_str().unwrap_or(path);
-                    match encoded_image(path, mime, self.cfg.image_max_px) {
+                    let name = crate::daemon::cap_name(&crate::daemon::attachment_name(a["name"].as_str().unwrap_or("attachment")),120);
+                    let encoded = self.attachment_access.as_ref()
+                        .ok_or_else(|| "no owned artifact authority is available".to_string())
+                        .and_then(|access| access.read(a, crate::daemon::MAX_ATTACHMENT_BYTES))
+                        .and_then(|bytes| encoded_image(path, mime, self.cfg.image_max_px, bytes));
+                    match encoded {
                         Ok(url) => {
                             let mut image = json!({"url": url});
                             if self.cfg.image_detail != "auto" && !self.cfg.image_detail.is_empty() {
@@ -1732,6 +1752,7 @@ impl Provider {
         effort: Option<&str>,
     ) -> Result<CompletionResult> {
         let messages = crate::provenance::project(messages);
+        let messages = self.prepare_attachments(&messages, model);
         self.complete_with_usage_inner(&messages, model, effort)
             .await
     }
@@ -2864,17 +2885,31 @@ pub fn resized_image_dimensions(width: u32, height: u32, max_px: u32) -> (u32, u
     )
 }
 
-fn encoded_image(path: &str, mime: &str, max_px: u32) -> std::result::Result<String, String> {
+fn encoded_image(
+    path: &str,
+    mime: &str,
+    max_px: u32,
+    bytes: Vec<u8>,
+) -> std::result::Result<String, String> {
     use base64::Engine;
+    use sha2::Digest;
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
-    static CACHE: OnceLock<Mutex<HashMap<(String, u32), String>>> = OnceLock::new();
+    static CACHE: OnceLock<Mutex<HashMap<(String, u32, [u8; 32]), String>>> = OnceLock::new();
     let cache = CACHE.get_or_init(Default::default);
-    let key = (path.to_string(), max_px);
+    let key = (
+        path.to_string(),
+        max_px,
+        sha2::Sha256::digest(&bytes).into(),
+    );
+    let actual = image::guess_format(&bytes)
+        .map_err(|_| "it is not a supported raster image".to_string())?;
+    if actual.to_mime_type() != mime {
+        return Err("the image type does not match its attachment metadata".into());
+    }
     if let Some(url) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
         return Ok(url.clone());
     }
-    let bytes = std::fs::read(path).map_err(|_| "the file is gone".to_string())?;
     let (bytes, mime) = match image::load_from_memory(&bytes) {
         Ok(img) if max_px > 0 && img.width().max(img.height()) > max_px => {
             let (width, height) = resized_image_dimensions(img.width(), img.height(), max_px);
@@ -2897,7 +2932,6 @@ fn encoded_image(path: &str, mime: &str, max_px: u32) -> std::result::Result<Str
             (out, mime.to_string())
         }
         Ok(_) => (bytes, mime.to_string()),
-        Err(_) if bytes.len() <= MAX_IMAGE_BYTES => (bytes, mime.to_string()),
         Err(_) => return Err("it isn't an image this build can read".into()),
     };
     if bytes.len() > MAX_IMAGE_BYTES {

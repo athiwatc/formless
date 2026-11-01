@@ -1633,6 +1633,9 @@ fn only_image_user(body: &Value, key: &str) -> Value {
 /// image that can't be sent leaves a marker for the model (#616).
 #[tokio::test]
 async fn images_reach_both_apis_and_dropped_ones_are_marked() {
+    let env = credential_env::EnvGuard::isolated();
+    env.set("FORMLESS_API_KEY", "k");
+    env.set("NO_PROXY", "127.0.0.1,localhost");
     let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
     let sse = |s: &std::sync::Arc<std::sync::Mutex<Vec<Value>>>| {
         let s = s.clone();
@@ -1658,21 +1661,31 @@ async fn images_reach_both_apis_and_dropped_ones_are_marked() {
         .route("/responses", post(responses));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
     let dir = std::env::temp_dir().join(format!("fl-img-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
-    let big = dir.join("big.png");
+    let paths = formless_core::Paths::from_dirs(dir.join("data"), dir.join("config")).unwrap();
+    let store = formless_core::Store::open(&paths.db_file()).unwrap();
+    let artifacts = paths.data_dir.join("artifacts");
+    std::fs::create_dir_all(&artifacts).unwrap();
+    let big = artifacts.join("big.png");
     image::RgbImage::from_pixel(3000, 2000, image::Rgb([10, 200, 30]))
         .save(&big)
         .unwrap();
-    let msg = |path: &std::path::Path| json!({"role": "user", "content": "look", "_attachments": [{"path": path.to_str().unwrap(), "mime": "image/png", "name": "big.png"}]});
+    let bytes = std::fs::metadata(&big).unwrap().len();
+    let id = store
+        .save_artifact(None, big.to_str().unwrap(), "", bytes as i64)
+        .unwrap();
+    let msg = |path: &std::path::Path| json!({"role": "user", "content": "look", "_attachments": [{"id":id,"bytes":bytes,"path": path.to_str().unwrap(), "mime": "image/png", "name": "big.png"}]});
     let mut c = cfg(&base);
     c.fallback_models.clear();
     c.vision = Some(true);
     c.image_max_px = 800;
     c.image_detail = "low".into();
-    let p = Provider::new(c.clone(), "k".into()).unwrap();
+    let p = Provider::for_profile_with(c.clone(), paths.clone(), reqwest::Client::new())
+        .await
+        .unwrap();
     p.chat_stream(
         &[msg(&big)],
         &[],
@@ -1704,7 +1717,9 @@ async fn images_reach_both_apis_and_dropped_ones_are_marked() {
     // Responses: the same image as an input_image part.
     let mut r = c.clone();
     r.api_style = "responses".into();
-    let p = Provider::new(r, "k".into()).unwrap();
+    let p = Provider::for_profile_with(r, paths.clone(), reqwest::Client::new())
+        .await
+        .unwrap();
     p.chat_stream(
         &[msg(&big)],
         &[],
@@ -1734,7 +1749,9 @@ async fn images_reach_both_apis_and_dropped_ones_are_marked() {
     );
 
     // A missing file: the model is told, nothing silently vanishes.
-    let p = Provider::new(c, "k".into()).unwrap();
+    let p = Provider::for_profile_with(c, paths, reqwest::Client::new())
+        .await
+        .unwrap();
     p.chat_stream(
         &[msg(&dir.join("gone.png"))],
         &[],
@@ -1750,7 +1767,10 @@ async fn images_reach_both_apis_and_dropped_ones_are_marked() {
     assert_eq!(user["content"][0], json!({"type":"text","text":"look"}));
     let text = user["content"][1]["text"].as_str().unwrap();
     assert!(text.contains("big.png could not be attached"), "{text}");
-    let _ = std::fs::remove_dir_all(dir);
+    server.abort();
+    let _ = server.await;
+    drop(store);
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 /// #1122: opposite streaming styles can coexist, even within one response.

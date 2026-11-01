@@ -24,6 +24,7 @@ pub struct Store {
     // Connection drops before this private directory; source files are never
     // held by a forecast reader or touched by close-time optimize.
     _forecast_snapshot: Option<forecast_snapshot::SnapshotDir>,
+    pub(super) artifact_root: Option<PathBuf>,
     description_notifications: std::sync::Mutex<(Vec<formless_protocol::DescriptionReview>, bool)>,
 }
 
@@ -1084,6 +1085,7 @@ impl Store {
             conn,
             rewrites: Default::default(),
             _forecast_snapshot: None,
+            artifact_root: file.parent().map(|parent| parent.join("artifacts")),
             description_notifications: Default::default(),
         })
     }
@@ -1138,6 +1140,7 @@ impl Store {
             conn,
             rewrites: Default::default(),
             _forecast_snapshot: None,
+            artifact_root: file.parent().map(|parent| parent.join("artifacts")),
             description_notifications: Default::default(),
         })
     }
@@ -1151,6 +1154,7 @@ impl Store {
             conn,
             rewrites: Default::default(),
             _forecast_snapshot: None,
+            artifact_root: None,
             description_notifications: Default::default(),
         })
     }
@@ -1528,6 +1532,7 @@ impl Store {
     }
     pub(crate) fn preview_copy(&self) -> Result<Self> {
         let mut copy = Self::open_in_memory()?;
+        copy.artifact_root = self.artifact_root.clone();
         {
             let backup = rusqlite::backup::Backup::new(&self.conn, &mut copy.conn)?;
             backup.run_to_completion(128, std::time::Duration::ZERO, None)?;
@@ -6523,7 +6528,7 @@ pub fn provider_message(m: &MessageInfo) -> Value {
                     .as_str()
                     .is_some_and(crate::daemon::is_raster_image)
                 {
-                    images.push(json!({"path": a["path"], "mime": a["mime"], "name": name}));
+                    images.push(json!({"id": a.get("_artifact_id").unwrap_or(&a["id"]), "path": a["path"], "mime": a["mime"], "name": name, "bytes":a["bytes"], "sha256":a["sha256"]}));
                 }
             }
             let mut msg = json!({"role": "user", "content": content});

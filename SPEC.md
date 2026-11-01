@@ -852,6 +852,17 @@ pasting paths.
   web the first Send turns it into a chip and stops), reaches only the
   working folder (or `~/…` when written so), and never a credential
   (`.ssh`, `.aws`, `.env`, private keys, …), whoever wrote it.
+- **Provider file authority.** Stored or imported attachment metadata is not
+  permission to read a host path. Native image projection requires an artifact
+  ID and path/size matching this profile's artifact registry, a regular file
+  beneath its artifact directory, and no symbolic links or reparse points.
+  Available hashes and claimed raster MIME are checked before transmission;
+  undecodable bytes never become an image part. Foreign imports/restores keep
+  their artifact-reference text and report that the image could not be attached.
+  Forks may retain verified artifacts owned by their original Session. Public
+  key-only providers have no filesystem authority. Offline forecasts resolve
+  only owned records from their private snapshot; metadata-only RPC descriptors
+  never cause arbitrary host-path reads.
 - **Retention.** Attachments are artifacts, so `artifacts.*` retention
   removes them too. A removed one is marked expired where it was sent:
   clients show "name · expired" and the model's history says it is no
