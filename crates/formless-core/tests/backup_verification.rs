@@ -402,6 +402,13 @@ fn selected_new_format_recovery_wal_and_shm_are_not_retention_candidates() {
     );
     let wal = PathBuf::from(format!("{}-wal", selected.display()));
     let shm = PathBuf::from(format!("{}-shm", selected.display()));
+    let mut ids_before: Vec<_> = source
+        .list_sessions()
+        .unwrap()
+        .into_iter()
+        .map(|s| s.id)
+        .collect();
+    ids_before.sort();
     let before: Vec<_> = [&selected, &wal, &shm]
         .iter()
         .map(|p| std::fs::read(p).unwrap())
@@ -416,14 +423,33 @@ fn selected_new_format_recovery_wal_and_shm_are_not_retention_candidates() {
         housekeeping::list_restore_backups(&paths).len(),
         housekeeping::RESTORE_BACKUPS_KEEP
     );
-    for (path, bytes) in [&selected, &wal, &shm].iter().zip(before) {
+    for (path, bytes) in [&selected, &wal].iter().zip(&before) {
         assert_eq!(
             std::fs::read(path).unwrap(),
-            bytes,
-            "selected source/sidecars are preserved: {}",
+            *bytes,
+            "selected database/WAL bytes are preserved: {}",
             path.display()
         );
     }
+    // SQLite's read-only VACUUM snapshot legitimately updates volatile SHM
+    // readmarks. Require it to survive at its original size, rather than
+    // mistake normal coordination for damage; committed rows and DB/WAL bytes
+    // still have strict before/after oracles.
+    assert_eq!(
+        std::fs::metadata(&shm).unwrap().len(),
+        before[2].len() as u64
+    );
+    let mut ids_after: Vec<_> = source
+        .list_sessions()
+        .unwrap()
+        .into_iter()
+        .map(|s| s.id)
+        .collect();
+    ids_after.sort();
+    assert_eq!(ids_after, ids_before);
+    assert!(ids_after.contains(&later.id));
+    let copies = housekeeping::list_restore_backups(&paths);
+    assert!(!copies.contains(&wal) && !copies.contains(&shm));
     assert!(
         bogus.exists() && fake_dir.exists(),
         "unrecognized files/directories are never pruned"
