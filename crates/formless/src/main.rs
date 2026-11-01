@@ -3840,9 +3840,15 @@ fn run_headless(
                     Event::ApprovalRequested {
                         approval_id,
                         tool_name,
+                        context,
                         ..
                     } => {
                         if progress {
+                            if let Some(context) = &context {
+                                for line in formless_protocol::approval_context_lines(context) {
+                                    eprintln!("{line}");
+                                }
+                            }
                             eprintln!(
                                 "[approval] {} -> {}",
                                 tool_name,
@@ -6538,8 +6544,14 @@ fn tool_run(
                 approval_id,
                 tool_name,
                 capabilities,
+                context,
                 ..
             }) => {
+                if let Some(context) = &context {
+                    for line in formless_protocol::approval_context_lines(context) {
+                        eprintln!("{line}");
+                    }
+                }
                 eprintln!(
                     "[approval] {tool_name} wants {} -> {}",
                     capabilities.join(", "),

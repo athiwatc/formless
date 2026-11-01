@@ -2230,6 +2230,23 @@
       BIDI.lastIndex = 0;
     }
   }
+  function approvalContextCard(context) {
+    if (!context) return null;
+    const call = context.call;
+    return h("div", { class: "approval-context" },
+      (context.scope_warnings || []).map(warning => h("p", { class: "error scope-warning" }, "⚠ " + warning)),
+      (context.sources || []).length ? h("section", { class: "attention source-taint" },
+        h("strong", null, "This Run read external content:"),
+        h("ul", null, context.sources.map(source => h("li", null, source.tool + " (" + source.kind + "): " + source.origin)))) : null,
+      call ? h("details", { open: true, class: "call-preview" }, h("summary", null, "Resolved call arguments (redacted)"),
+        (call.urls || []).map(url => h("div", null, h("strong", null, url.method || "Method unresolved"), " ", h("code", null, url.url),
+          url.body_bytes != null ? h("p", null, "Supplied body: " + url.body_bytes + " bytes") : null,
+          url.body_preview != null ? h("pre", null, "Body preview (redacted): " + url.body_preview) : null)),
+        (call.paths || []).map(path => h("p", null, "Path: ", h("code", null, path))),
+        h("pre", null, JSON.stringify(call.arguments, null, 2)),
+        call.truncated ? h("p", { class: "error" }, "Preview truncated; omitted values remain unresolved here.") : null,
+        h("p", { class: "muted" }, call.note)) : null);
+  }
   function renderApproval() {
     const req = S.approvals[0];
     if (!req) S.approvalLater = false;
@@ -2266,6 +2283,7 @@
           req.version ? " v" + req.version : "",
           promo ? " is ready to be promoted." : " wants sensitive capabilities:") : null,
       promo && req.reason ? h("p", { class: "muted" }, req.reason) : null,
+      approvalContextCard(req.context),
       h("ul", { "aria-label": promo ? "Capabilities" : "Capabilities requested" },
         (req.capabilities.length ? req.capabilities : ["(no capabilities)"]).map((c) =>
           (req.already || []).includes(c)
@@ -2557,6 +2575,7 @@
           onchange: (e) => { if (e.target.checked) S.grantsSelected.add(key); else S.grantsSelected.delete(key); } })),
         h("td", null, g.tool_name),
         h("td", null, h("span", { class: "tag" + (isBroad(g.capability) ? " broad" : "") }, g.capability),
+          g.scope_warning ? h("div", { class: "error scope-warning" }, "⚠ " + g.scope_warning) : null,
           g.trusted ? h("div", { class: "muted path-note" }, "also trusted in config.toml: revoking won't make it ask") : null),
         h("td", null, g.scope === "always" ? "always" : g.scope === "session" ? "this Session" : "for an hour"),
         h("td", { class: "muted" }, when(g.granted_at)),
@@ -3799,7 +3818,7 @@
     if (existing) { if (ev.summary) existing.summary = ev.summary; return; }
     S.approvals.push({ kind, id, tool_id: ev.tool_id || null, tool_name: ev.tool_name,
       version: ev.version, reason: ev.reason, capabilities: ev.capabilities || [], memory_mb: ev.memory_mb,
-      detail: ev.detail || null, summary: ev.summary, already: ev.already_allowed || [],
+      detail: ev.detail || null, context: ev.context || null, summary: ev.summary, already: ev.already_allowed || [],
       code: ev.code_preview || null, batch: ev.batch || null, session_id: ev.session_id,
       pathOptions: ev.path_options || [], picks: {} });
   }

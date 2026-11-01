@@ -561,6 +561,9 @@ pub fn path_note(spec: &str, cwd: Option<&str>) -> Option<(bool, String)> {
 /// One granted Capability, for the central approvals list (SPEC §10.3).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GrantInfo {
+    /// Offline PSL/wildcard warning supplied by the daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_warning: Option<String>,
     pub tool_id: String,
     pub tool_name: String,
     pub capability: String,
@@ -1017,6 +1020,55 @@ pub struct ApprovalContext {
     pub sources: Vec<ApprovalSource>,
     #[serde(default)]
     pub scope_warnings: Vec<String>,
+}
+
+/// Plain text evidence shared by terminal and line-mode clients. The daemon
+/// has already bounded/redacted these display values; no input is resolved here.
+pub fn approval_context_lines(context: &ApprovalContext) -> Vec<String> {
+    let mut lines = Vec::new();
+    for warning in &context.scope_warnings {
+        lines.push(format!("⚠ {warning}"));
+    }
+    if !context.sources.is_empty() {
+        lines.push("This Run read external content:".into());
+        for source in &context.sources {
+            lines.push(format!(
+                "  {} ({}): {}",
+                source.tool, source.kind, source.origin
+            ));
+        }
+    }
+    if let Some(call) = &context.call {
+        lines.push("Resolved call arguments (redacted):".into());
+        for url in &call.urls {
+            lines.push(format!(
+                "  URL {}: {} ({})",
+                url.field,
+                url.url,
+                url.method.as_deref().unwrap_or("method unresolved")
+            ));
+            if let Some(bytes) = url.body_bytes {
+                lines.push(format!("  Supplied body: {bytes} bytes"));
+            }
+            if let Some(preview) = &url.body_preview {
+                lines.push(format!("  Body preview (redacted): {preview}"));
+            }
+        }
+        for path in &call.paths {
+            lines.push(format!("  Path: {path}"));
+        }
+        lines.extend(
+            serde_json::to_string_pretty(&call.arguments)
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string),
+        );
+        if call.truncated {
+            lines.push("Preview truncated; omitted values remain unresolved here.".into());
+        }
+        lines.push(call.note.clone());
+    }
+    lines
 }
 
 /// A bounded single-line third-party description and its review warnings.

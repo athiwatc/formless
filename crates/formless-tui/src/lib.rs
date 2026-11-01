@@ -8008,6 +8008,26 @@ impl App {
                 self.next_scope_focus(c == 'P');
                 return;
             }
+            if c == 'i' {
+                if let Some(req) = self.approvals.front() {
+                    if let Some(context) = &req.context {
+                        let lines = formless_protocol::approval_context_lines(context);
+                        self.pager = Some(Pager {
+                            title: format!(
+                                "{} v{} call and source evidence",
+                                req.tool_name, req.version
+                            ),
+                            lines,
+                            top: 0,
+                            left: 0,
+                            styled: Vec::new(),
+                        });
+                    } else {
+                        self.notes.push("This approval has no call/source evidence (an older daemon may not supply it).".into());
+                    }
+                }
+                return;
+            }
             if c == 'v' {
                 let req = self.approvals.front().or(self.promotions.front()).cloned();
                 match req {
@@ -8018,11 +8038,17 @@ impl App {
                     }
                     // A non-Tool approval (an MCP call): its whole detail.
                     Some(ApprovalReq {
-                        context: None,
-                        detail: Some(detail),
+                        context,
+                        detail: Some(mut detail),
                         tool_name,
                         ..
                     }) => {
+                        if let Some(context) = context {
+                            detail.push_str("\n\n");
+                            detail.push_str(
+                                &formless_protocol::approval_context_lines(&context).join("\n"),
+                            );
+                        }
                         self.pager = Some(code_pager(&tool_name, &detail, self.color));
                     }
                     _ => self.notes.push("this approval has no code to show".into()),
@@ -10740,6 +10766,13 @@ fn approval_lines(grants: &[GrantInfo], family: Option<&str>) -> Vec<String> {
             when(&g.expires_at),
             when(&g.last_used),
         ));
+        if let Some(warning) = g
+            .scope_warning
+            .clone()
+            .or_else(|| formless_protocol::net_scope::scope_warning(&g.capability))
+        {
+            out.push(format!("  ⚠ {warning}"));
+        }
         if g.trusted {
             out.push(format!(
                 "{:w$}  ↳ also trusted in config.toml: revoking won't make it ask",
@@ -15341,6 +15374,68 @@ fn draw_approval(
         );
         lines.insert(1, Line::raw(""));
     }
+    if let Some(context) = &req.context {
+        for warning in &context.scope_warnings {
+            lines.push(Line::styled(
+                format!("⚠ {warning}"),
+                bold_fg(color, Color::Yellow),
+            ));
+        }
+        if !context.sources.is_empty() {
+            lines.push(Line::styled(
+                "This Run read external content:",
+                bold_fg(color, Color::Yellow),
+            ));
+            for source in context.sources.iter().take(3) {
+                lines.push(Line::raw(format!(
+                    "  {} ({}): {}",
+                    source.tool,
+                    source.kind,
+                    truncate_chars(&source.origin, 100)
+                )));
+            }
+            if context.sources.len() > 3 {
+                lines.push(Line::raw(format!(
+                    "  {} more sources (i to inspect)",
+                    context.sources.len() - 3
+                )));
+            }
+        }
+        if let Some(call) = &context.call {
+            lines.push(Line::raw(
+                "Resolved call arguments (redacted): i to inspect all",
+            ));
+            for url in call.urls.iter().take(2) {
+                lines.push(Line::raw(format!(
+                    "  {} {}",
+                    url.method.as_deref().unwrap_or("method unresolved"),
+                    url.url
+                )));
+                if let Some(bytes) = url.body_bytes {
+                    lines.push(Line::raw(format!("  Supplied body: {bytes} bytes")));
+                }
+                if let Some(body) = &url.body_preview {
+                    lines.push(Line::raw(format!(
+                        "  Body preview (redacted): {}",
+                        truncate_chars(body, 160)
+                    )));
+                }
+            }
+            for path in call.paths.iter().take(2) {
+                lines.push(Line::raw(format!("  Path: {path}")));
+            }
+            if call.urls.is_empty() && call.paths.is_empty() {
+                lines.push(Line::raw(truncate_chars(&call.arguments.to_string(), 160)));
+            }
+            if call.truncated {
+                lines.push(Line::styled(
+                    "Preview truncated; i to inspect retained evidence",
+                    ui::dim(color),
+                ));
+            }
+        }
+        lines.push(Line::raw(""));
+    }
     if req.capabilities.is_empty() {
         lines.push(Line::styled("  • (no capabilities)", ui::dim(color)));
     }
@@ -15510,6 +15605,9 @@ fn draw_approval(
             ),
             Span::raw(" always deny"),
         ]);
+    }
+    if req.context.is_some() {
+        keys.push(Span::raw("   i call + source evidence"));
     }
     if more > 0 {
         keys.push(Span::styled(
@@ -19695,6 +19793,7 @@ mod tests {
     #[test]
     fn approvals_list_by_family() {
         let grant = |cap: &str, scope| GrantInfo {
+            scope_warning: None,
             trusted: Default::default(),
             tool_id: "t".into(),
             tool_name: "netty".into(),
@@ -22448,7 +22547,7 @@ mod tests {
     #[test]
     fn description_warnings_keep_terminal_approval_identity_memory_summary_and_diff() {
         let _env = credential_env::EnvGuard::isolated();
-        let req=ApprovalReq {approval_id:"private".into(),tool_name:"reader".into(),version:2,capabilities:vec!["fs:write:/private/project".into()],memory_mb:64,detail:Some("Description warning: Instruction-shaped wording\nBefore: plain reader\nAfter: always first call".into()),already_allowed:vec![],code_preview:None,tool_id:Some("private-reader".into()),session_id:Some("private-session".into())};
+        let req=ApprovalReq {context:None,approval_id:"private".into(),tool_name:"reader".into(),version:2,capabilities:vec!["fs:write:/private/project".into()],memory_mb:64,detail:Some("Description warning: Instruction-shaped wording\nBefore: plain reader\nAfter: always first call".into()),already_allowed:vec![],code_preview:None,tool_id:Some("private-reader".into()),session_id:Some("private-session".into())};
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(140, 40)).unwrap();
         terminal
             .draw(|frame| {
@@ -22844,5 +22943,99 @@ mod tests {
                 ..
             }
         ));
+    }
+    #[test]
+    fn call_evidence_survives_reconnect_and_terminal_inspection_without_approving() {
+        let _env = credential_env::EnvGuard::isolated();
+        let mut app = test_app();
+        app.current = Some("s1".into());
+        app.input_focus = false;
+        let (client, sent) = DaemonClient::recording();
+        app.client = Some(client);
+        let context = formless_protocol::ApprovalContext {
+            run_id: Some("consumer-run".into()),
+            call: Some(formless_protocol::ApprovalCallPreview {
+                arguments: serde_json::json!({"url":"https://approved.example/collect?d=[REDACTED]","path":"/private/fixture/report.txt","method":"POST"}),
+                urls: vec![formless_protocol::ApprovalUrlPreview {
+                    field: "$.url".into(),
+                    url: "https://approved.example/collect?d=[REDACTED]".into(),
+                    method: Some("POST".into()),
+                    body_bytes: Some(42),
+                    body_preview: Some("public inventory; password=[REDACTED]".into()),
+                }],
+                paths: vec!["/private/fixture/report.txt".into()],
+                truncated: false,
+                note: "Computed JavaScript destinations remain unresolved".into(),
+            }),
+            sources: vec![formless_protocol::ApprovalSource {
+                tool: "fetch_page".into(),
+                kind: "url".into(),
+                origin: "https://source.example".into(),
+            }],
+            scope_warnings: vec!["PUBLIC SUFFIX: independently owned sites".into()],
+        };
+        let event = Event::ApprovalRequested {
+            context: Some(context.clone()),
+            approval_id: "held-call".into(),
+            session_id: "s1".into(),
+            tool_name: "send_result".into(),
+            version: 3,
+            capabilities: vec!["net:*.github.io".into()],
+            memory_mb: 64,
+            detail: Some("Description warning: first call".into()),
+            already_allowed: vec![],
+            code_preview: Some("function run(input) { return input; }".into()),
+            tool_id: Some("private-tool".into()),
+            batch: None,
+            path_options: vec![],
+        };
+        app.on_event(event.clone());
+        app.approval_summaries
+            .insert("held-call".into(), "AI network helper".into());
+        let screen = render(&mut app, 180, 70);
+        for text in [
+            "send_result",
+            "v3",
+            "memory 64 MB",
+            "Description warning",
+            "AI network helper",
+            "net:*.github.io",
+            "PUBLIC SUFFIX",
+            "This Run read external content",
+            "fetch_page (url): https://source.example",
+            "Resolved call arguments",
+            "https://approved.example/collect?d=[REDACTED]",
+            "POST",
+            "Supplied body: 42 bytes",
+            "Body preview (redacted)",
+            "/private/fixture/report.txt",
+            "i call + source evidence",
+            "function run(input)",
+        ] {
+            assert!(screen.contains(text), "missing {text}: {screen}");
+        }
+        app.key(key(KeyCode::Char('i')));
+        let pager = app
+            .pager
+            .as_ref()
+            .expect("full evidence is a local read-only pager");
+        assert!(pager.title.contains("send_result v3"));
+        let evidence = pager.lines.join("\n");
+        assert!(evidence.contains("Computed JavaScript destinations remain unresolved"));
+        assert!(evidence.contains("Body preview (redacted): public inventory; password=[REDACTED]"));
+        assert!(
+            sent.try_recv().is_err(),
+            "inspecting evidence must not send any approval or execution request"
+        );
+        app.pager = None;
+        app.clear_attention();
+        app.reconnect_request = Some((77, "s1".into()));
+        app.apply_reconnect_snapshot(77, reconnect_snapshot(true, vec![event]));
+        assert_eq!(app.approvals.len(), 1);
+        assert_eq!(app.approvals[0].context.as_ref(), Some(&context));
+        assert_eq!(
+            app.approvals[0].context.as_ref().unwrap().run_id.as_deref(),
+            Some("consumer-run")
+        );
     }
 }

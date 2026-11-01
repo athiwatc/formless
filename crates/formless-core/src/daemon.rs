@@ -1181,7 +1181,7 @@ impl Daemon {
             let Ok(owner) = USAGE_FOR.try_with(Clone::clone) else {
                 return;
             };
-            if owner.session_id.is_empty() || owner.run_id.is_empty() {
+            if owner.session_id.is_empty() || owner.run_id.is_empty() || owner.run_id == "direct" {
                 return;
             }
             let sources = crate::approval_preview::input_sources(body);
@@ -1224,15 +1224,18 @@ impl Daemon {
         caps: &Capabilities,
         input: Option<&Value>,
     ) -> formless_protocol::ApprovalContext {
-        let mut sources = self
-            .with_reader(|st| st.data_origins(session, run))
-            .unwrap_or_else(|_| {
-                vec![crate::provenance::Origin::new(
-                    "unknown",
-                    "unavailable",
-                    "source evidence unavailable; assume external content",
-                )]
-            });
+        let mut sources = if run == "direct" {
+            Vec::new()
+        } else {
+            self.with_reader(|st| st.data_origins(session, run))
+                .unwrap_or_else(|_| {
+                    vec![crate::provenance::Origin::new(
+                        "unknown",
+                        "unavailable",
+                        "source evidence unavailable; assume external content",
+                    )]
+                })
+        };
         if let Some(memory) = self.input_taint.locked().get(&(session.into(), run.into())) {
             for source in memory {
                 if sources.len() < crate::provenance::MAX_ORIGINS && !sources.contains(source) {
@@ -1241,7 +1244,7 @@ impl Daemon {
             }
         }
         formless_protocol::ApprovalContext {
-            run_id: (!run.is_empty()).then(|| run.to_string()),
+            run_id: (!run.is_empty() && run != "direct").then(|| run.to_string()),
             call: Some(crate::approval_preview::call(input, cfg)),
             sources: sources
                 .iter()
@@ -6490,6 +6493,7 @@ impl Daemon {
         {
             for capability in caps {
                 out.push(GrantInfo {
+                    scope_warning: None,
                     tool_id: tool_id.clone(),
                     tool_name: tool_name.clone(),
                     capability,
@@ -6529,6 +6533,7 @@ impl Daemon {
                 .unwrap_or_default();
             for capability in specs {
                 out.push(GrantInfo {
+                    scope_warning: None,
                     tool_id: tool_id.clone(),
                     tool_name: tool_name.clone(),
                     capability,
@@ -6558,6 +6563,7 @@ impl Daemon {
                 .unwrap_or_default();
             for capability in specs {
                 out.push(GrantInfo {
+                    scope_warning: None,
                     tool_id: tool_id.clone(),
                     tool_name: tool_name.clone(),
                     capability,
@@ -6576,6 +6582,9 @@ impl Daemon {
             for g in &mut out {
                 g.trusted = self.trust_approves(&cfg, &g.tool_id, &g.capability);
             }
+        }
+        for grant in &mut out {
+            grant.scope_warning = formless_protocol::net_scope::scope_warning(&grant.capability);
         }
         Ok(out)
     }
@@ -7325,6 +7334,11 @@ impl Daemon {
         let cfg = self.config()?;
         let cancel = CancellationToken::new();
         let run_id = format!("dry-run:{}", uuid::Uuid::new_v4());
+        let _taint_cleanup = crate::approval_preview::TaintCleanup::new(
+            self.input_taint.clone(),
+            session_id,
+            &run_id,
+        );
         // Reads are real (files, GETs, env), so the usual approval applies.
         if !self
             .ensure_approval(

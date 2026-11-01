@@ -2,6 +2,36 @@
 use crate::{config::Config, provenance::Origin};
 use formless_protocol::{ApprovalCallPreview, ApprovalUrlPreview};
 use serde_json::{json, Value};
+/// Ephemeral non-Run operations must not retain source evidence after a
+/// cancellation, early return or unwind. Real Runs clean up in finish_run.
+pub(crate) struct TaintCleanup {
+    memory:
+        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<(String, String), Vec<Origin>>>>,
+    key: (String, String),
+}
+impl TaintCleanup {
+    pub fn new(
+        memory: std::sync::Arc<
+            std::sync::Mutex<std::collections::HashMap<(String, String), Vec<Origin>>>,
+        >,
+        session: &str,
+        run: &str,
+    ) -> Self {
+        Self {
+            memory,
+            key: (session.into(), run.into()),
+        }
+    }
+}
+impl Drop for TaintCleanup {
+    fn drop(&mut self) {
+        self.memory
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&self.key);
+    }
+}
+
 const MAX_TEXT: usize = 512;
 const MAX_NODES: usize = 96;
 const MAX_CHARS: usize = 4096;

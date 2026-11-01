@@ -150,6 +150,7 @@ pub(crate) fn format_event(ev: &Event, streaming: &mut bool) -> Option<String> {
         Event::RunToolChanges { changes, .. } => format!("{}.", super::tool_changes_text(changes)),
         Event::CompactionNotice { .. } => "Note: the conversation was compacted.".into(),
         Event::ApprovalRequested {
+            context,
             tool_name,
             capabilities,
             detail,
@@ -169,6 +170,16 @@ pub(crate) fn format_event(ev: &Event, streaming: &mut bool) -> Option<String> {
                             .join("; ")
                     }
                 ),
+            };
+            let evidence = context
+                .as_ref()
+                .map(formless_protocol::approval_context_lines)
+                .unwrap_or_default()
+                .join("\n");
+            let what = if evidence.is_empty() {
+                what
+            } else {
+                format!("{what}\n{evidence}")
             };
             format!(
                 "{}Approval needed. {what}. Type y to always allow, o for this once, s for this Session, h for an hour, or n to deny.",
