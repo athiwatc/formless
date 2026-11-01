@@ -8,6 +8,7 @@ use std::process::Command;
 
 pub(super) struct ChildEnv {
     values: Vec<(OsString, Option<OsString>)>,
+    #[cfg(windows)]
     parent_path: Option<OsString>,
 }
 pub(super) struct Program {
@@ -47,6 +48,7 @@ impl ChildEnv {
         }
         Self {
             values,
+            #[cfg(windows)]
             parent_path,
         }
     }

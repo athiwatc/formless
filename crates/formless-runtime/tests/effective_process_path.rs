@@ -3,7 +3,10 @@ use formless_runtime::sensitive_paths::PathPolicy;
 use formless_runtime::{execute, Capabilities, ExecErrorKind, ExecRequest, HostMode, HostOps};
 use serde_json::json;
 use std::path::PathBuf;
-use std::sync::{atomic::AtomicBool, Arc};
+use std::sync::{
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+    Arc,
+};
 
 #[test]
 #[ignore = "private executable helper"]
@@ -116,5 +119,155 @@ fn child_path_override_cannot_execute_a_profile_program_even_with_an_env_grant()
                 "a denied executable ran before its actual path was guarded"
             );
         }
+    }
+}
+
+#[test]
+fn ordinary_child_path_controls_work_for_absolute_and_relative_entries() {
+    for api in ["run", "spawn"] {
+        for relative in [false, true] {
+            let f = Fixture::new();
+            let value = execute(
+                &f.request(api, relative),
+                Arc::new(formless_runtime::NoHostOps),
+            )
+            .unwrap()
+            .output;
+            assert_eq!(value["code"], 0);
+            let actual = PathBuf::from(std::fs::read_to_string(f.root.join("started")).unwrap());
+            assert_eq!(
+                actual.canonicalize().unwrap(),
+                f.private.join(&f.program).canonicalize().unwrap()
+            );
+        }
+    }
+}
+struct AddEarlierProgram {
+    sensitive: PathBuf,
+    source: PathBuf,
+    earlier: PathBuf,
+    count: AtomicUsize,
+}
+impl HostOps for AddEarlierProgram {
+    fn path_policy(&self) -> Result<PathPolicy, String> {
+        PathPolicy::new(
+            vec![],
+            vec![
+                formless_runtime::sensitive_paths::SensitivePathRule::Subtree(
+                    self.sensitive.to_string_lossy().into_owned(),
+                ),
+            ],
+        )
+    }
+    fn approve_sensitive_read(
+        &self,
+        path: &std::path::Path,
+        _: &str,
+        _: &str,
+    ) -> Result<(), String> {
+        assert!(path.starts_with(&self.sensitive));
+        self.count.fetch_add(1, Ordering::SeqCst);
+        std::fs::copy(&self.source, &self.earlier).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+}
+#[test]
+fn consent_cannot_be_redirected_by_inserting_an_earlier_path_candidate() {
+    for api in ["run", "spawn"] {
+        let f = Fixture::new();
+        let first = f.project.join("first");
+        std::fs::create_dir(&first).unwrap();
+        let path = std::env::join_paths([&first, &f.private]).unwrap();
+        let mut req = f.request(api, false);
+        req.input["env"]["PATH"] = json!(path);
+        let host = Arc::new(AddEarlierProgram {
+            sensitive: f.private.clone(),
+            source: std::env::current_exe().unwrap(),
+            earlier: first.join(&f.program),
+            count: AtomicUsize::new(0),
+        });
+        let value = execute(&req, host.clone()).unwrap().output;
+        assert_eq!(value["code"], 0);
+        assert_eq!(
+            host.count.load(Ordering::SeqCst),
+            1,
+            "the actual executable did not receive exact consent"
+        );
+        assert!(
+            first.join(&f.program).is_file(),
+            "the consent callback did not alter PATH selection"
+        );
+        let actual = PathBuf::from(std::fs::read_to_string(f.root.join("started")).unwrap());
+        assert_eq!(
+            actual.canonicalize().unwrap(),
+            f.private.join(&f.program).canonicalize().unwrap(),
+            "the OS searched PATH again after consent and executed an unguarded different file"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn inaccessible_earlier_candidate_does_not_hide_later_executable() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new();
+    let first = f.project.join("first");
+    std::fs::create_dir(&first).unwrap();
+    let inaccessible = first.join(&f.program);
+    std::fs::write(&inaccessible, "not executable").unwrap();
+    std::fs::set_permissions(&inaccessible, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let mut req = f.request("run", false);
+    req.input["env"]["PATH"] = json!(std::env::join_paths([&first, &f.private]).unwrap());
+    let value = execute(&req, Arc::new(formless_runtime::NoHostOps))
+        .unwrap()
+        .output;
+    assert_eq!(value["code"], 0);
+    let actual = PathBuf::from(std::fs::read_to_string(f.root.join("started")).unwrap());
+    assert_eq!(
+        actual.canonicalize().unwrap(),
+        f.private.join(&f.program).canonicalize().unwrap()
+    );
+}
+
+#[test]
+fn removed_path_does_not_fall_back_to_a_private_parent_only_program_on_unix() {
+    // An unknown UUID cannot be found by the platform default lookup. No
+    // global PATH mutation is needed to prove removal cannot use this override.
+    let f = Fixture::new();
+    let mut req = f.request("run", false);
+    req.input["env"]["PATH"] = serde_json::Value::Null;
+    let error = execute(&req, Arc::new(formless_runtime::NoHostOps)).unwrap_err();
+    assert!(error.message.contains("not found"));
+    assert!(!f.root.join("started").exists());
+}
+
+#[test]
+fn explicit_child_relative_programs_are_guarded_and_bound_without_path_lookup() {
+    for api in ["run", "spawn"] {
+        let f = Fixture::new();
+        let mut req = f.request(api, false);
+        let requested = std::path::Path::new("profile")
+            .join(&f.program)
+            .to_string_lossy()
+            .into_owned();
+        req.input["cmd"] = json!(requested);
+        req.input["env"]["PATH"] = json!("missing-directory");
+        req.caps = Capabilities::parse(&[
+            format!("process:{}", f.private.join(&f.program).display()),
+            "env:PATH".into(),
+            format!("fs:read:{}", f.root.display()),
+        ])
+        .unwrap();
+        assert_eq!(
+            execute(&req, Arc::new(Protected(f.private.clone())))
+                .unwrap_err()
+                .kind,
+            ExecErrorKind::Denied
+        );
+        assert!(!f.root.join("started").exists());
+        let value = execute(&req, Arc::new(formless_runtime::NoHostOps))
+            .unwrap()
+            .output;
+        assert_eq!(value["code"], 0);
     }
 }
