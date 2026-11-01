@@ -999,4 +999,73 @@ mod tests {
             assert_eq!(st.last_run(&sid).unwrap().unwrap().1, "paused");
         }
     }
+    #[test]
+    fn attachment_preview_matches_resize_prompt_tools_and_reference_semantics() {
+        let root =
+            std::env::temp_dir().join(format!("fl-forecast-geometry-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("wide.png");
+        image::DynamicImage::new_rgb8(4096, 1024)
+            .save(&path)
+            .unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        for prompt_tools in [false, true] {
+            let st = Store::open_in_memory().unwrap();
+            let mut c = config();
+            c.provider.vision = Some(true);
+            c.provider.image_max_px = 256;
+            if prompt_tools {
+                c.provider.tool_mode = "prompt".into();
+            }
+            let sid = st.create_session(None).unwrap().id;
+            let input = ForecastInput {
+                session_id: Some(sid.clone()),
+                draft: "inspect image".into(),
+                attachments: vec![attachment("wide.png".into(), &bytes)],
+                ..Default::default()
+            };
+            let preview = estimate_store(&st, &c, &input).unwrap();
+            st.add_pending_attachment(&sid,&json!({"id":uuid::Uuid::new_v4().to_string(),"path":path,"name":"wide.png","mime":"image/png","bytes":bytes.len()})).unwrap();
+            let uploaded = estimate_store(
+                &st,
+                &c,
+                &ForecastInput {
+                    attachments: vec![],
+                    ..input
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                preview.basis.prompt_tokens, uploaded.basis.prompt_tokens,
+                "prompt_tools={prompt_tools}"
+            );
+            assert_eq!(preview.fingerprint, uploaded.fingerprint);
+        }
+        let st = Store::open_in_memory().unwrap();
+        let c = config();
+        let sid = st.create_session(None).unwrap().id;
+        // Arbitrary reference metadata cannot cause a local read. It is the
+        // exact text that an independently validated AttachPath would supply.
+        let absent = root.join("not-a-real-directory");
+        let descriptor = reference(&absent, true, 0);
+        let input = ForecastInput {
+            session_id: Some(sid.clone()),
+            draft: "inspect reference".into(),
+            attachments: vec![descriptor],
+            ..Default::default()
+        };
+        let preview = estimate_store(&st, &c, &input).unwrap();
+        st.add_pending_attachment(&sid,&json!({"reference":true,"name":"not-a-real-directory","path":absent,"dir":true,"bytes":0})).unwrap();
+        let uploaded = estimate_store(
+            &st,
+            &c,
+            &ForecastInput {
+                attachments: vec![],
+                ..input
+            },
+        )
+        .unwrap();
+        assert_eq!(preview.fingerprint, uploaded.fingerprint);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

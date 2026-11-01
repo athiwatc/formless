@@ -105,6 +105,7 @@ fn estimate_json_exits_zero_without_http_auth_upload_run_or_marker() {
     let file = root.0.join("attachment.txt");
     std::fs::write(&file, b"private fixture data").unwrap();
     let before = std::fs::read(paths.config_file()).unwrap();
+    drop(st); // Offline snapshot requires no other native SQLite writer.
     let mut cmd = command(&paths);
     cmd.args([
         "run",
@@ -135,6 +136,7 @@ fn estimate_json_exits_zero_without_http_auth_upload_run_or_marker() {
         0,
         "neither completions, /models nor OAuth refresh may be called"
     );
+    let st = formless_core::Store::open(&paths.db_file()).unwrap();
     assert_eq!(st.list_sessions().unwrap().len(), 1);
     assert!(st.list_messages(&sid).unwrap().is_empty());
     assert!(st.run_metrics(100).unwrap().is_empty());

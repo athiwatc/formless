@@ -4980,6 +4980,7 @@ impl Daemon {
         let Ok(cfg) = self.config() else {
             return;
         };
+        let mut held_for_confirmation = false;
         let prepared = self.with_store(|st| {
             st.transaction(|st| {
                 let Some(next) = st.queued_items(&session_id)?.into_iter().next() else {
@@ -4994,6 +4995,7 @@ impl Daemon {
                 let forecast =
                     self.forecast_estimate_selected(st, &cfg, &input, Some(&selected))?;
                 if forecast.confirmation_required {
+                    held_for_confirmation = true;
                     return Ok(None);
                 }
                 let Some(content) = st.pop_queued_message(&session_id)? else {
@@ -5006,6 +5008,9 @@ impl Daemon {
                 Ok(Some((msg, id, admission)))
             })
         });
+        if held_for_confirmation {
+            self.broadcast(Event::Note { session_id: Some(session_id.clone()), text: "Queued message kept: its forecast requires confirmation. Move it to the composer and send to review the current quote.".into() });
+        }
         if let Ok(Some((msg, id, admission))) = prepared {
             self.queue_changed(&session_id);
             self.broadcast(Event::MessageAppended {

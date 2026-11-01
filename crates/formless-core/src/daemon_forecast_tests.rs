@@ -282,3 +282,172 @@ async fn admission_persists_immutable_snapshot_before_any_provider_work() {
         .unwrap();
     assert_eq!(row["calibration_eligible"], false);
 }
+
+async fn cancel_fixture_run(d: &Arc<Daemon>, sid: &str) {
+    if let Some(ctl) = d.runs.locked().get(sid) {
+        ctl.cancel.cancel();
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while d.runs.locked().contains_key(sid) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("forecast fixture Run teardown");
+}
+
+#[tokio::test]
+async fn prospective_edit_retry_and_resume_require_consent_before_any_mutation() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    for operation in 0..3 {
+        let (_root, paths, d, sid, _cfg) = setup(&env);
+        let st = Store::open(&paths.db_file()).unwrap();
+        let user = st.append_message(&sid, "user", "original").unwrap();
+        st.append_message(&sid, "assistant", "answer").unwrap();
+        let paused = st.create_run(&sid).unwrap();
+        st.set_run_status(&paused, "paused").unwrap();
+        let before_messages = serde_json::to_value(st.list_messages(&sid).unwrap()).unwrap();
+        let before_sessions = st.list_sessions().unwrap().len();
+        let before_runs = st.run_metrics(100).unwrap().len();
+        let request = match operation {
+            0 => Request::EditMessage {
+                session_id: sid.clone(),
+                message_id: user.id.clone(),
+                content: "edited".into(),
+            },
+            1 => Request::RetryRun {
+                session_id: sid.clone(),
+                model: None,
+                keep_original: true,
+            },
+            _ => Request::ResumeRun {
+                session_id: sid.clone(),
+            },
+        };
+        let refused = CLIENT
+            .scope((71, "fixture".into()), d.handle(request.clone()))
+            .await;
+        assert!(
+            refused
+                .unwrap_err()
+                .to_string()
+                .contains("forecast confirmation required"),
+            "operation {operation}"
+        );
+        assert_eq!(
+            serde_json::to_value(st.list_messages(&sid).unwrap()).unwrap(),
+            before_messages
+        );
+        assert_eq!(
+            st.list_sessions().unwrap().len(),
+            before_sessions,
+            "denied retry cannot fork"
+        );
+        assert_eq!(st.run_metrics(100).unwrap().len(), before_runs);
+        assert_eq!(st.last_run(&sid).unwrap().unwrap().1, "paused");
+        assert!(!d.budget_waived.locked().contains(&sid));
+        let input = ForecastInput {
+            session_id: Some(sid.clone()),
+            draft: if operation == 0 {
+                "edited".into()
+            } else {
+                String::new()
+            },
+            edit_message_id: (operation == 0).then(|| user.id.clone()),
+            retry: operation == 1,
+            resume: operation == 2,
+            ..Default::default()
+        };
+        let forecast: RunForecast = serde_json::from_value(
+            CLIENT
+                .scope(
+                    (71, "fixture".into()),
+                    d.handle(Request::ForecastRun {
+                        input,
+                        for_send: true,
+                    }),
+                )
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(forecast.confirmation_required);
+        CLIENT
+            .scope(
+                (71, "fixture".into()),
+                d.handle(Request::ConfirmForecast {
+                    id: forecast.confirmation_id.clone().unwrap(),
+                }),
+            )
+            .await
+            .unwrap();
+        CLIENT
+            .scope((71, "fixture".into()), d.handle(request))
+            .await
+            .unwrap();
+        let id = d.runs.locked().get(&sid).unwrap().run_id.clone();
+        let stored = st
+            .recorded_forecasts()
+            .unwrap()
+            .into_iter()
+            .find(|(r, _)| r == &id)
+            .unwrap()
+            .1;
+        assert_eq!(stored.fingerprint, forecast.fingerprint);
+        assert_eq!(stored.basis.model, "model");
+        if operation == 0 {
+            assert_eq!(
+                st.list_messages(&sid).unwrap().last().unwrap().content,
+                "edited"
+            );
+        }
+        if operation == 1 {
+            assert_eq!(st.list_sessions().unwrap().len(), before_sessions + 1);
+        }
+        if operation == 2 {
+            assert!(st
+                .list_messages(&sid)
+                .unwrap()
+                .last()
+                .unwrap()
+                .content
+                .contains("previous run was paused"));
+            assert!(d.budget_waived.locked().contains(&sid));
+        }
+        cancel_fixture_run(&d, &sid).await;
+    }
+}
+
+#[tokio::test]
+async fn retry_override_is_the_immutable_forecast_and_dispatch_model() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let (_root, paths, d, sid, mut cfg) = setup(&env);
+    cfg.limits.forecast_confirm_usd = None;
+    cfg.provider
+        .model_context_tokens
+        .insert("override".into(), 100_000);
+    cfg.save(&paths).unwrap();
+    let st = Store::open(&paths.db_file()).unwrap();
+    st.append_message(&sid, "user", "original").unwrap();
+    d.handle(Request::RetryRun {
+        session_id: sid.clone(),
+        model: Some("override".into()),
+        keep_original: false,
+    })
+    .await
+    .unwrap();
+    let run = d.runs.locked().get(&sid).unwrap().run_id.clone();
+    let f = st
+        .recorded_forecasts()
+        .unwrap()
+        .into_iter()
+        .find(|(r, _)| r == &run)
+        .unwrap()
+        .1;
+    assert_eq!(f.basis.model, "override");
+    assert_eq!(
+        d.run_admissions.locked().get(&run).unwrap().requested,
+        "override"
+    );
+    cancel_fixture_run(&d, &sid).await;
+}
