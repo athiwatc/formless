@@ -238,6 +238,9 @@ async fn mock_optimiser_server(workdir: String) -> String {
             let workdir = workdir.clone();
             async move {
                 let prompt = body["messages"].as_array().map(|m| m.iter().map(|x| x["content"].as_str().unwrap_or_default()).collect::<String>()).unwrap_or_default();
+                assert_eq!(body["response_format"]["type"], "json_schema", "real optimiser generation must use schema mode");
+                assert_eq!(body["response_format"]["json_schema"]["schema"]["properties"]["implementation_js"]["type"], "string");
+                assert_eq!(body["response_format"]["json_schema"]["strict"], false);
                 let cand = |code: String, caps: Value| {
                     json!({
                         "description": "candidate",
