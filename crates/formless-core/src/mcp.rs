@@ -851,6 +851,7 @@ pub fn sync_registry(store: &Store, server: &str, tools: &[McpTool]) -> Result<u
     let mut seen = std::collections::HashSet::new();
     for t in tools {
         let name = registry_name(server, &t.name);
+        let normalized_description = crate::descriptions::screen(&t.description).text;
         seen.insert(name.to_lowercase());
         let schema = t.input_schema.to_string();
         // The server's own tool name rides in the version's code field (never
@@ -858,7 +859,7 @@ pub fn sync_registry(store: &Store, server: &str, tools: &[McpTool]) -> Result<u
         let code = format!("// MCP tool {}\n// annotations {}", t.name, t.annotations);
         match store.get_tool_by_name(&name)? {
             Some((info, v))
-                if info.description == t.description
+                if info.description == normalized_description
                     && v.input_schema == schema
                     && v.code == code =>
             {

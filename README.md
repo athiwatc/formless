@@ -377,6 +377,7 @@ formless daemon serve     # foreground, for watching logs
 formless doctor           # config, dirs, keychain, endpoint + tool-calling probe
 formless tools list       # registry inspection (also export / import)
 formless tools show fetch_page                       # description, schemas, versions, stats
+formless tools reviews                               # retained description warnings and diffs
 formless tools run fetch_page --input '{"url":"https://example.com"}' --yes
 formless reset --force    # destructive: config, key, whole data dir
 ```
@@ -665,11 +666,19 @@ Its tools appear in the registry as `mcp__files__<tool>`. The agent finds them w
 
 ### Skills
 
+Third-party Tool, MCP, Skill and module descriptions are bounded single-line data.
+Instruction-shaped wording is flagged for review, and description changes retain
+before/after evidence. Open **Settings → Description reviews** in the web UI,
+`/descriptionreviews` in the TUI, or `formless tools reviews` after reconnecting.
+These warnings do not establish that unflagged metadata is safe; code and capability
+approval remain separate.
+
 Skills are `SKILL.md` folders of know-how (the Agent Skills format), installed from a folder, a git URL or a `.zip`:
 
 ```bash
 formless skills add https://github.com/example/skills.git --subdir pdf
 formless skills show pdf      # review: new installs start disabled
+formless skills reviews pdf  # retained description warnings and before/after changes
 formless skills enable pdf
 formless skills list
 formless skills export pdf -o pdf.skill.json   # files only, no metrics

@@ -62,8 +62,8 @@ pub fn parse_skill_md(text: &str) -> Result<SkillMeta> {
     let name = fields.remove("name").unwrap_or_default();
     let description = fields.remove("description").unwrap_or_default();
     validate_name(&name)?;
-    if description.is_empty() || description.chars().count() > 1024 {
-        bail!("SKILL.md needs a description of 1-1024 characters");
+    if crate::descriptions::screen(&description).text.is_empty() {
+        bail!("SKILL.md needs a non-empty description");
     }
     Ok(SkillMeta {
         name,
@@ -544,7 +544,11 @@ pub fn distil_input(
         text.push_str("(none)\n");
     }
     for s in existing {
-        text.push_str(&format!("- {}: {}\n", s.name, s.description));
+        text.push_str(&format!(
+            "- {}: {}\n",
+            s.name,
+            crate::descriptions::model_text(&s.description)
+        ));
     }
     text
 }

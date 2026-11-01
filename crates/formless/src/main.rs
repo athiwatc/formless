@@ -455,6 +455,14 @@ enum PromptsAction {
 
 #[derive(Subcommand)]
 enum ToolsAction {
+    /// Retained description warnings and exact before/after changes
+    Reviews {
+        name: Option<String>,
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
     List {
         /// One JSON value instead of a table
         #[arg(long)]
@@ -549,6 +557,12 @@ enum ToolsAction {
 
 #[derive(Subcommand)]
 enum SkillsAction {
+    /// Retained Skill description warnings and changes
+    Reviews {
+        name: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Install from a folder, a git URL or a .zip (installed disabled)
     Add {
         source: String,
@@ -1682,6 +1696,7 @@ fn run_cli(cli: Cli) -> Result<()> {
             let bundle: serde_json::Value =
                 serde_json::from_str(&text).context("not a JSON export")?;
             formless_core::daemon::ensure_daemon(&paths)?;
+            print_bundle_description_preview(&paths, &bundle)?;
             let r = formless_tui::client::request_once(&paths, Request::ImportAll { bundle })?;
             println!(
                 "imported:  {} Tools, {} modules, {} Skills (disabled until you enable them), {} memories, {} jobs (paused), {} Sessions",
@@ -1710,6 +1725,7 @@ fn run_cli(cli: Cli) -> Result<()> {
                 println!("failed:    {}", f.as_str().unwrap_or_default());
             }
             println!("next:      formless auth login / set API keys, then `formless jobs` to enable jobs");
+            description_reviews_cmd(&paths, None, None, false)?;
             Ok(())
         }
         Some(Cmd::Restore { file }) => restore_cmd(&paths, &file),
@@ -4052,6 +4068,86 @@ fn count_sigints() -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
     count
 }
 
+fn print_description_evidence(value: &Value) {
+    let metadata: formless_protocol::DescriptionMetadata =
+        serde_json::from_value(value["description_review"].clone()).unwrap_or_else(|_| {
+            formless_core::descriptions::screen(value["description"].as_str().unwrap_or_default())
+        });
+    if !metadata.flags.is_empty() {
+        println!("Description warning: {}", metadata.flags.join("; "));
+        println!(
+            "Third-party metadata: {}",
+            serde_json::to_string(&metadata.text).unwrap()
+        );
+    }
+    for review in value["description_reviews"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        if let Ok(review) =
+            serde_json::from_value::<formless_protocol::DescriptionReview>(review.clone())
+        {
+            println!("{}", formless_core::descriptions::notice(&review));
+        }
+    }
+}
+
+fn description_reviews_cmd(
+    paths: &Paths,
+    kind: Option<String>,
+    name: Option<String>,
+    json: bool,
+) -> Result<()> {
+    formless_core::daemon::ensure_daemon(paths)?;
+    let rows = formless_tui::client::request_once(
+        paths,
+        Request::ListDescriptionReviews {
+            kind,
+            name,
+            limit: Some(200),
+        },
+    )?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+    } else {
+        let reviews: Vec<formless_protocol::DescriptionReview> = serde_json::from_value(rows)?;
+        if reviews.is_empty() {
+            println!("No description reviews yet.");
+        }
+        for review in reviews {
+            println!("{}\n", formless_core::descriptions::notice(&review));
+        }
+    }
+    Ok(())
+}
+
+fn print_bundle_description_preview(paths: &Paths, bundle: &Value) -> Result<()> {
+    let previews = formless_tui::client::request_once(
+        paths,
+        Request::PreviewDescriptionBundle {
+            bundle: bundle.clone(),
+        },
+    )?;
+    for preview in previews.as_array().into_iter().flatten() {
+        let after: formless_protocol::DescriptionMetadata =
+            serde_json::from_value(preview["after"].clone())?;
+        println!(
+            "{} {} · third-party description metadata",
+            preview["kind"].as_str().unwrap_or_default(),
+            preview["name"].as_str().unwrap_or_default()
+        );
+        if !preview["before"].is_null() {
+            println!("Existing name (imports may rename): {}", preview["before"]);
+        }
+        println!("Incoming: {}", serde_json::to_string(&after.text)?);
+        for flag in after.flags {
+            println!("Warning: {flag}");
+        }
+    }
+    Ok(())
+}
+
 fn skills_cmd(paths: Paths, action: SkillsAction) -> Result<()> {
     let daemon = |req: Request| -> Result<serde_json::Value> {
         formless_core::daemon::ensure_daemon(&paths)?;
@@ -4065,6 +4161,9 @@ fn skills_cmd(paths: Paths, action: SkillsAction) -> Result<()> {
         .map(|_| println!("{} {name}", if enabled { "enabled" } else { "disabled" }))
     };
     match action {
+        SkillsAction::Reviews { name, json } => {
+            description_reviews_cmd(&paths, Some("skill".into()), name, json)?;
+        }
         SkillsAction::Add {
             source,
             subdir,
@@ -4087,6 +4186,7 @@ fn skills_cmd(paths: Paths, action: SkillsAction) -> Result<()> {
                 info["version"],
                 info["description"].as_str().unwrap_or_default()
             );
+            print_description_evidence(&info);
             if info["has_scripts"] == true {
                 println!("note: it bundles scripts; Formless never runs them on the host (port them to a Tool).");
             }
@@ -4120,6 +4220,19 @@ fn skills_cmd(paths: Paths, action: SkillsAction) -> Result<()> {
                     t("disabled", Tone::Warn)
                 };
                 let mut desc = s["description"].as_str().unwrap_or_default().to_string();
+                if let Some(flags) = s["description_review"]["flags"]
+                    .as_array()
+                    .filter(|flags| !flags.is_empty())
+                {
+                    desc.push_str(&format!(
+                        " · Warning: {}",
+                        flags
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    ));
+                }
                 if s["has_scripts"] == true {
                     desc.push_str(" [scripts]");
                 }
@@ -4146,6 +4259,7 @@ fn skills_cmd(paths: Paths, action: SkillsAction) -> Result<()> {
         SkillsAction::Disable { name } => set(name, false)?,
         SkillsAction::Show { name } => {
             let r = daemon(Request::GetSkill { name })?;
+            print_description_evidence(&r["skill"]);
             println!("{}", r["body"].as_str().unwrap_or_default());
             if let Some(scripts) = r["scripts"].as_array().filter(|s| !s.is_empty()) {
                 println!(
@@ -4178,8 +4292,10 @@ fn skills_cmd(paths: Paths, action: SkillsAction) -> Result<()> {
         }
         SkillsAction::Import { file } => {
             let bundle: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file)?)?;
+            print_bundle_description_preview(&paths, &bundle)?;
             let imported = daemon(Request::ImportSkill { bundle })?;
             for info in imported.as_array().into_iter().flatten() {
+                print_description_evidence(info);
                 let name = info["name"].as_str().unwrap_or_default();
                 println!(
                     "imported {name} v{} (disabled) — {}",
@@ -5534,6 +5650,9 @@ fn mcp_cmd(paths: Paths, action: McpAction) -> Result<()> {
                 ]);
             }
             tbl.print();
+            for tool in r["tools"].as_array().into_iter().flatten() {
+                print_description_evidence(tool);
+            }
             println!(
                 "tool list cost: ~{} tokens per request (enabled tools)",
                 r["enabled_tokens"]
@@ -5732,6 +5851,9 @@ fn tools_cmd(paths: Paths, action: ToolsAction) -> Result<()> {
     }
     formless_core::daemon::ensure_daemon(&paths)?;
     match action {
+        ToolsAction::Reviews { name, kind, json } => {
+            description_reviews_cmd(&paths, kind, name, json)
+        }
         ToolsAction::List { json, tag } => {
             let v = request_once(&paths, Request::ListTools)?;
             let mut tools: Vec<formless_protocol::ToolInfo> = serde_json::from_value(v)?;
@@ -5951,8 +6073,10 @@ fn tools_cmd(paths: Paths, action: ToolsAction) -> Result<()> {
             } else {
                 serde_json::from_str(&std::fs::read_to_string(&file)?)?
             };
+            print_bundle_description_preview(&paths, &bundle)?;
             let v = request_once(&paths, Request::ImportTool { bundle })?;
             println!("imported: {v}");
+            description_reviews_cmd(&paths, None, None, false)?;
             Ok(())
         }
     }
@@ -5983,7 +6107,7 @@ fn print_bundle_preview(fetched: &serde_json::Value) {
         println!(
             "── {} ──  {}",
             t["name"].as_str().unwrap_or("?"),
-            t["description"].as_str().unwrap_or_default()
+            formless_core::descriptions::screen(t["description"].as_str().unwrap_or_default()).text
         );
         println!(
             "capabilities: {}",
@@ -6280,6 +6404,7 @@ fn print_tool_detail(d: &formless_protocol::ToolDetail) {
         println!("used by:      {}", d.used_by.join(", "));
     }
     println!("{}", t.description);
+    print_description_evidence(&serde_json::to_value(d).unwrap());
     println!();
     println!(
         "capabilities: {}",

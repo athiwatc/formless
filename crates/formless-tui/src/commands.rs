@@ -340,6 +340,7 @@ pub const COMMANDS: &[Command] = &[
         Tools,
     ),
     cmd("audit", "[FILTER]", "show the audit log", Tools),
+    cmd("descriptionreviews", "", "retained description warnings and before/after changes", Tools),
     cmd(
         "security",
         "",
