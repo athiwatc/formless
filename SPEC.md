@@ -1530,6 +1530,15 @@ pattern (§4.4).
     Windows assigns a suspended child to a private kill-on-close Job before
     resuming it, failing closed if Job setup fails. This is process
     ownership/cleanup, not an OS sandbox for arbitrary granted programs.
+    Before either process API executes, its program is resolved from the exact
+    filtered child environment and working directory. The effective executable
+    receives credential/profile checks, and that same canonical absolute path
+    is passed to the OS; a later PATH change cannot redirect execution after
+    consent. Relative PATH entries are based on the child cwd. Unix PATH removal
+    uses the native default search path; Windows retains Rust's documented
+    application/system/Windows/parent-PATH fallback and implicit `.exe` lookup.
+    PATHEXT spelling for explicit batch-file grants and native Windows argument
+    quoting are preserved; the runtime introduces no shell command parsing.
   - `progress(fraction, label)` — no Capability needed: `fraction` 0..1
     (or null when unknown) and a short label. The daemon broadcasts
     `ToolProgress {tool_name, depth, fraction, label}` (at most 5 a second
