@@ -213,6 +213,12 @@ pub const COMMANDS: &[Command] = &[
     cmd("cancel", "", "cancel the stalled or pending Tool call", Run),
     cmd("resend", "", "re-send a stalled provider request", Run),
     cmd(
+        "summarise-branch",
+        "SOURCE_SESSION",
+        "generate a branch summary for review, then insert one note here",
+        Session,
+    ),
+    cmd(
         "compare",
         "SESSION_A SESSION_B",
         "compare stored branches and recorded usage (no model call)",

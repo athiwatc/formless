@@ -640,6 +640,7 @@ pub struct Daemon {
     missing_models: StdMutex<Vec<String>>,
     /// Comparisons in flight: id → (origin Session, [(fork, model)]).
     comparisons: StdMutex<HashMap<String, (String, Vec<(String, String)>)>>,
+    branch_summary_state: Arc<StdMutex<branch_summary::BranchSummaryState>>,
     /// Sessions in step mode (`/step`), and the step decisions awaited.
     step_sessions: StdMutex<std::collections::HashSet<String>>,
     step_waiters: StdMutex<HashMap<String, tokio::sync::oneshot::Sender<(String, Option<String>)>>>,
@@ -849,6 +850,7 @@ impl Daemon {
             next_run_model: StdMutex::new(Default::default()),
             progress_sent: StdMutex::new(Default::default()),
             comparisons: StdMutex::new(Default::default()),
+            branch_summary_state: Arc::new(StdMutex::new(Default::default())),
             routing_log: StdMutex::new(Default::default()),
             model_test_cache,
             missing_models: StdMutex::new(Vec::new()),
@@ -1707,6 +1709,49 @@ impl Daemon {
                         }
                     })?;
                 Ok(serde_json::to_value(comparison)?)
+            }
+            Request::InspectBranchSummary {
+                source_id,
+                target_id,
+            } => Ok(serde_json::to_value(
+                self.inspect_branch_summary(&source_id, &target_id)
+                    .map_err(branch_summary::summary_error)?,
+            )?),
+            Request::PrepareBranchSummary {
+                source_id,
+                target_id,
+                source_revision,
+                target_revision,
+            } => Ok(serde_json::to_value(
+                self.prepare_branch_summary(
+                    &source_id,
+                    &target_id,
+                    &source_revision,
+                    &target_revision,
+                )
+                .await
+                .map_err(branch_summary::summary_error)?,
+            )?),
+            Request::CommitBranchSummary {
+                preview_id,
+                source_id,
+                target_id,
+                source_revision,
+                target_revision,
+                candidate_hash,
+            } => {
+                let key = crate::storage::BranchSummaryConfirmation {
+                    preview_id,
+                    source_id,
+                    target_id,
+                    source_revision,
+                    target_revision,
+                    candidate_hash,
+                };
+                Ok(serde_json::to_value(
+                    self.commit_branch_summary(key)
+                        .map_err(branch_summary::summary_error)?,
+                )?)
             }
             Request::SearchSessions { query, limit } => {
                 Ok(serde_json::to_value(self.with_reader(|st| {
@@ -16868,6 +16913,9 @@ mod description_daemon_tests;
 #[cfg(test)]
 #[path = "session_comparison_rpc_tests.rs"]
 mod session_comparison_rpc_tests;
+
+#[path = "branch_summary.rs"]
+mod branch_summary;
 
 #[cfg(test)]
 #[path = "approval_daemon_tests.rs"]

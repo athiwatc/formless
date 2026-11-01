@@ -383,3 +383,52 @@ fn final_rpc_budget_also_covers_metadata_and_missing_sessions_stay_typed() {
         Some(SessionComparisonFailure::NotFound)
     ));
 }
+
+#[test]
+fn internal_physical_work_without_run_is_owned_in_full_scope_but_not_guessed_after_cut() {
+    let st = Store::open_in_memory().unwrap();
+    let parent = st.create_session(None).unwrap();
+    st.append_message(&parent.id, "user", "shared").unwrap();
+    let child = st.fork_session(&parent.id, None, None).unwrap().unwrap();
+    usage(
+        &st,
+        &parent.id,
+        "summary-parent-no-Run",
+        "default",
+        "model",
+        "branch-summary",
+        11,
+        Some(0.4),
+    );
+    usage(
+        &st,
+        &child.id,
+        "summary-child-no-Run",
+        "default",
+        "model",
+        "branch-summary",
+        13,
+        Some(0.5),
+    );
+    let result = st
+        .compare_sessions(&parent.id, &child.id, &crate::Config::default())
+        .unwrap();
+    assert_eq!(result.right.usage.requests, 1);
+    assert_eq!(result.right.usage.recorded_prompt_tokens, 13);
+    assert_eq!(result.right.usage.unallocated_requests, 0);
+    assert_eq!(result.right.usage.priced_cost_subtotal, 0.5);
+    assert!(
+        !result.right.usage.usage_complete,
+        "physical row cannot prove no missing internal attempts"
+    );
+    assert_eq!(result.right.usage.cost, None);
+    assert_eq!(result.left.usage.requests, 0);
+    assert_eq!(result.left.usage.unallocated_requests, 1);
+    assert_eq!(result.left.usage.unallocated_prompt_tokens, 11);
+    let full = st
+        .compare_sessions(&parent.id, &parent.id, &crate::Config::default())
+        .unwrap();
+    assert_eq!(full.left.usage.requests, 1);
+    assert_eq!(full.left.usage.recorded_prompt_tokens, 11);
+    assert_eq!(full.left.usage.unallocated_requests, 0);
+}
