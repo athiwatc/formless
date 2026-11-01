@@ -677,6 +677,10 @@ task, with quality as a gate**.
   cap), checked before loading oversized bodies and again after encoding;
   overflow returns a typed error instead of a partial reply or dropped frame.
   Full offline CLI output remains available without this framing limit.
+  Human comparison output renders terminal and bidi controls as visible
+  escapes; content linefeeds remain diff-prefixed lines. Metadata is a quoted
+  JSON string labelled as data, including metadata-only changes. Display
+  escaping never rewrites stored strings or changes machine `--json` output.
   `formless sessions fork ID [--name NAME] [--up-to-seq N] --json` uses the same
   atomic fork operation as the TUI and other callers; it starts no Run.
   **Deleting a Session can be undone for `daemon.delete_undo_secs` (30).**

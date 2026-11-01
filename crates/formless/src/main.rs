@@ -4760,6 +4760,39 @@ fn find_session_in(list: &[SessionInfo], id: &str) -> Result<SessionInfo> {
     }
 }
 
+fn comparison_terminal_control(c: char) -> bool {
+    c.is_control()
+        || matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
+fn comparison_terminal_text(text: &str) -> String {
+    let mut visible = String::with_capacity(text.len());
+    for c in text.chars() {
+        if comparison_terminal_control(c) {
+            visible.extend(c.escape_unicode());
+        } else {
+            visible.push(c);
+        }
+    }
+    visible
+}
+
+fn comparison_quoted_metadata(text: &str) -> Result<String> {
+    use std::fmt::Write as _;
+    let quoted = serde_json::to_string(text)?;
+    let mut visible = String::with_capacity(quoted.len());
+    for c in quoted.chars() {
+        if comparison_terminal_control(c) {
+            // All relevant control/format characters are in the BMP. Keep a
+            // valid JSON string while making bidi and C1 controls visible too.
+            write!(&mut visible, "\\u{:04x}", c as u32).expect("writing to String");
+        } else {
+            visible.push(c);
+        }
+    }
+    Ok(visible)
+}
+
 fn sessions_compare_cmd(paths: &Paths, left: &str, right: &str, json: bool) -> Result<()> {
     let comparison: formless_protocol::SessionComparison =
         if formless_core::daemon::daemon_reachable(paths) {
@@ -4786,24 +4819,28 @@ fn sessions_compare_cmd(paths: &Paths, left: &str, right: &str, json: bool) -> R
     }
     println!(
         "{} ({}) ↔ {} ({})",
-        comparison.left.session.name,
-        comparison.left.session.id,
-        comparison.right.session.name,
-        comparison.right.session.id
+        comparison_terminal_text(&comparison.left.session.name),
+        comparison_terminal_text(&comparison.left.session.id),
+        comparison_terminal_text(&comparison.right.session.name),
+        comparison_terminal_text(&comparison.right.session.id)
     );
     match (&comparison.common_ancestor, comparison.fork_point_seq) {
         (Some(id), Some(seq)) => println!(
-            "Common parent {id}; fork point seq {seq}; diff after seq {}",
+            "Common parent {}; fork point seq {seq}; diff after seq {}",
+            comparison_terminal_text(id),
             comparison.diff_from_seq
         ),
         _ => println!("Full stored-history comparison"),
     }
     for warning in &comparison.warnings {
-        println!("note: {warning}");
+        println!("note: {}", comparison_terminal_text(warning));
     }
     for (label, side) in [("left", &comparison.left), ("right", &comparison.right)] {
         let usage = &side.usage;
-        println!("{label} usage scope: {}", usage.scope);
+        println!(
+            "{label} usage scope: {}",
+            comparison_terminal_text(&usage.scope)
+        );
         let cost = usage
             .cost
             .map(|cost| format!("${cost:.6}"))
@@ -4816,7 +4853,7 @@ fn sessions_compare_cmd(paths: &Paths, left: &str, right: &str, json: bool) -> R
             println!("  allocation range over observed priced records only: ${low:.6}–${high:.6} (excludes missing provider usage)");
         }
         for warning in &usage.warnings {
-            println!("  note: {warning}");
+            println!("  note: {}", comparison_terminal_text(warning));
         }
     }
     for row in comparison.messages {
@@ -4826,12 +4863,19 @@ fn sessions_compare_cmd(paths: &Paths, left: &str, right: &str, json: bool) -> R
             _ => " ",
         };
         if let Some(message) = row.left.or(row.right) {
-            println!("{sign} {} [seq {}]:", message.role, message.seq);
-            for line in message.content.lines() {
-                println!("{sign} {line}");
+            println!(
+                "{sign} {} [seq {}]:",
+                comparison_terminal_text(&message.role),
+                message.seq
+            );
+            for line in message.content.split('\n') {
+                println!("{sign} {}", comparison_terminal_text(line));
             }
             if let Some(meta) = message.meta {
-                println!("{sign} metadata: {meta}");
+                println!(
+                    "{sign} metadata (quoted data): {}",
+                    comparison_quoted_metadata(&meta)?
+                );
             }
         }
     }

@@ -215,6 +215,106 @@ fn comparing_missing_profile_fails_without_creating_it() {
     assert!(!fixture.root.join("config").exists());
 }
 
+#[test]
+fn human_compare_escapes_terminal_controls_and_quotes_metadata_without_changing_json() {
+    let fixture = Fixture::new(true);
+    let mut cfg = Config::default();
+    cfg.provider.base_url = "http://127.0.0.1:9".into();
+    cfg.naming.enabled = false;
+    cfg.skills.auto_create = false;
+    cfg.save(&fixture.paths).unwrap();
+    let name = "Source\x1b]52;c;RkFLRQ==\x07\u{202e}界";
+    let child_name = "Branch\u{2067}\u{009b}31m";
+    let role = "assistant\x1b[31m\u{2066}";
+    let content = "ordinary 界 👩\u{200d}💻\nOSC\x1b]52;c;RkFLRQ==\x07\u{009b}31m\u{202e}\r\tend";
+    let meta = "OVERRIDE instructions\n\x1b]52;c;RkFLRQ==\x07\u{202e}\u{0085}";
+    let other_meta = "DIFFERENT instructions\n\x1b]52;c;RkFLRQ==\x07\u{202e}\u{0085}";
+    let st = Store::open(&fixture.paths.db_file()).unwrap();
+    let parent = st.create_session(Some(name.into())).unwrap();
+    st.append_message(&parent.id, "user", "shared prompt")
+        .unwrap();
+    let child = st
+        .fork_session(&parent.id, Some(child_name.into()), None)
+        .unwrap()
+        .unwrap();
+    st.append_message(&parent.id, role, content).unwrap();
+    st.append_message_meta(&parent.id, role, "", Some(meta.into()))
+        .unwrap();
+    st.append_message(&child.id, role, content).unwrap();
+    st.append_message_meta(&child.id, role, "", Some(other_meta.into()))
+        .unwrap();
+    drop(st);
+    let before = files(&fixture.root);
+    let human = String::from_utf8(success(output(
+        fixture.command(&["sessions", "compare", &parent.id, &child.id]),
+    )))
+    .unwrap();
+    assert!(human.lines().all(|line| line.chars().all(|c| !c.is_control() && !matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}'))), "human comparison emitted terminal or bidi controls");
+    assert!(
+        human.contains("\\u{1b}]52;c;RkFLRQ==\\u{7}"),
+        "OSC must be visible data, never an emitted escape sequence"
+    );
+    assert!(human.contains("\\u{9b}") && human.contains("\\u{202e}"));
+    assert!(
+        human.contains("  ordinary 界 👩\u{200d}💻\n  OSC"),
+        "ordinary Unicode and per-line diff prefixes are preserved"
+    );
+    let metadata: Vec<&str> = human
+        .lines()
+        .filter_map(|line| {
+            line.split_once("metadata (quoted data): ")
+                .map(|(_, value)| value)
+        })
+        .collect();
+    assert_eq!(
+        metadata.len(),
+        2,
+        "empty-content metadata changes remain visible"
+    );
+    let decoded: Vec<String> = metadata
+        .into_iter()
+        .map(|quoted| {
+            serde_json::from_str(quoted).expect("human metadata is a valid quoted JSON string")
+        })
+        .collect();
+    assert!(
+        decoded.iter().any(|value| value == meta)
+            && decoded.iter().any(|value| value == other_meta),
+        "quoted view represents original metadata as data"
+    );
+    let json =
+        success(output(fixture.command(&[
+            "sessions", "compare", &parent.id, &child.id, "--json",
+        ])));
+    let value: Value = serde_json::from_slice(&json).unwrap();
+    assert!(
+        value["left"]["session"]["name"] == name && value["right"]["session"]["name"] == child_name,
+        "machine output preserves names exactly"
+    );
+    let messages = value["messages"].as_array().unwrap();
+    assert!(messages
+        .iter()
+        .filter_map(|row| row["left"]["content"].as_str())
+        .any(|text| text == content));
+    assert!(messages
+        .iter()
+        .filter_map(|row| row["left"]["meta"].as_str())
+        .any(|text| text == meta));
+    assert!(messages
+        .iter()
+        .filter_map(|row| row["right"]["meta"].as_str())
+        .any(|text| text == other_meta));
+    assert!(messages
+        .iter()
+        .filter_map(|row| row["left"]["role"].as_str())
+        .any(|text| text == role));
+    assert_eq!(
+        files(&fixture.root),
+        before,
+        "display escaping never rewrites stored data"
+    );
+}
+
 struct OwnedDaemon(Child);
 impl Drop for OwnedDaemon {
     fn drop(&mut self) {
