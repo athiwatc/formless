@@ -24420,7 +24420,14 @@ mod tests {
             assert!(
                 matches!(request.request,Request::InterruptRun{session_id} if session_id=="s1")
             );
-            assert!(sent.try_recv().is_err());
+            let extra: Vec<RequestEnvelope> = sent
+                .try_iter()
+                .map(|line| serde_json::from_str(&line).unwrap())
+                .collect();
+            assert!(
+                extra.is_empty(),
+                "Run-stop Escape must not reopen completion or emit extra requests: {extra:?}"
+            );
         }
     }
 
