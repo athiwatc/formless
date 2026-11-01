@@ -1,85 +1,28 @@
-// One behaviour matrix for any relay server (#836): HTTP statuses and
-// headers, and the room's control frames.
-//   node relay/conformance.mjs                 (starts dev.mjs and checks it)
-//   node relay/conformance.mjs http://127.0.0.1:8787   (e.g. `wrangler dev`)
-import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
-import { daemonClaim, claimRoom, claimAuthorization } from "./daemon-claim.mjs";
-import { wireOpen, wireWait } from "./test-wire.mjs";
-
-let base = process.argv[2];
-let dev = null;
-if (!base) {
-  const port = 19000 + Math.floor(Math.random() * 1000);
-  const env = { ...process.env };
-  delete env.VAPID_PUBLIC_KEY;
-  delete env.VAPID_PRIVATE_JWK;
-  dev = spawn(process.execPath, [new URL("./dev.mjs", import.meta.url).pathname, "--port", String(port)], { env, stdio: "ignore" });
-  base = "http://127.0.0.1:" + port;
-  await new Promise((r) => setTimeout(r, 500));
+// Same HTTP/control matrix for dev or an explicitly supplied matching relay.
+import assert from 'node:assert/strict';
+import {daemonClaim,claimRoom,claimAuthorization} from './daemon-claim.mjs';
+import {wireOpen,wireWait} from './test-wire.mjs';
+import {server,endpoints,EndpointPeer,deadline} from './test-bounded-wire.mjs';
+let s,base=process.argv[2];
+if(!base){s=await server();base=new URL(s.base).origin.replace(/^ws/,'http');}
+else{
+ const claim=await daemonClaim(crypto.getRandomValues(new Uint8Array(32))),room=await claimRoom(claim),authorization=claimAuthorization(claim),peers=[];
+ const target=base.replace(/^http/,'ws').replace(/\/$/,'')+'/relay/'+room;
+ s={base:target,authorization,async open(role){const peer=await wireOpen(target+`?role=${role}&mux=1&transport=1`,role==='daemon'?authorization:undefined);peers.push(peer);return peer;},async close(){for(const p of peers)p.terminate();}};
 }
-const wsBase = base.replace(/^http/, "ws");
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-try {
-  // HTTP: health, push key without VAPID, a missing asset.
-  const health = await (await fetch(base + "/health")).json();
-  assert.deepEqual([health.ok, health.service, health.version], [true, "formless-relay", 2]);
-  const key = await fetch(base + "/push/key");
-  assert.equal(key.status, 404);
-  assert.match(key.headers.get("content-type") || "", /^text\/plain/);
-  const missing = await fetch(base + "/no-such-file.js");
-  assert.equal(missing.status, 404);
-  assert.ok(missing.headers.get("content-security-policy"), "404s carry the CSP");
-  assert.equal(missing.headers.get("x-content-type-options"), "nosniff");
-
-  // Room: a mux daemon and one browser.
-  const claim = await daemonClaim(crypto.getRandomValues(new Uint8Array(32)));
-  const room = await claimRoom(claim);
-  const authorization = claimAuthorization(claim);
-  const open = (q) => q.includes("role=daemon") ? wireOpen(wsBase + "/relay/" + room + q, authorization) : new Promise((resolve, reject) => {
-    const ws = new WebSocket(wsBase + "/relay/" + room + q);
-    ws.got = [];
-    ws.onmessage = (e) => ws.got.push(String(e.data));
-    ws.onopen = () => resolve(ws);
-    ws.onerror = reject;
-  });
-  const daemon = await open("?role=daemon&mux=1");
-  const client = await open("?role=client");
-  const closed = new Promise((r) => (client.onclose = (e) => r(e.code)));
-  await sleep(150);
-  const opened = daemon.got.map((t) => JSON.parse(t)).find((m) => m.relay === "client_open");
-  assert.ok(opened, daemon.got.join("\n"));
-  assert.ok(client.got.includes('{"relay":"daemon_online"}'), client.got.join("\n"));
-  client.got.length = 0;
-
-  // Spaced control JSON from the daemon is a control frame, not a broadcast.
-  daemon.send('{"relay": "push"}');
-  await sleep(200);
-  assert.deepEqual(client.got, [], "a spaced push is not forwarded to browsers");
-
-  // A malformed browser control frame reaches the daemon as data.
-  daemon.got.length = 0;
-  client.send('{"relay"');
-  await sleep(200);
-  const routed = daemon.got.map((t) => JSON.parse(t)).find((m) => m.f === '{"relay"');
-  assert.ok(routed && routed.cid === opened.cid, daemon.got.join("\n"));
-
-  // A routed reply reaches that browser only.
-  daemon.send(JSON.stringify({ cid: opened.cid, f: "hello" }));
-  await sleep(150);
-  assert.deepEqual(client.got, ["hello"]);
-
-  // Disconnect codes: 4002 for a broken channel.
-  daemon.send(JSON.stringify({ relay: "disconnect", cid: opened.cid, code: 4002 }));
-  assert.equal(await Promise.race([closed, sleep(2000).then(() => "timeout")]), 4002);
-
-  // A room holder cannot squat; an authenticated restart reclaims its slot.
-  await assert.rejects(wireOpen(wsBase + "/relay/" + room + "?role=daemon&mux=1"), /401/);
-  const replacement = await open("?role=daemon&mux=1");
-  assert.equal(await wireWait(daemon, (p) => p.closed), 4003);
-  replacement.close();
-  console.log("conformance ok: " + base);
-} finally {
-  if (dev) dev.kill();
-}
+try{
+ const health=await(await fetch(base+'/health')).json();assert.deepEqual([health.ok,health.service,health.version],[true,'formless-relay',2]);
+ const key=await fetch(base+'/push/key');assert.equal(key.status,404);assert.match(key.headers.get('content-type')||'',/^text\/plain/);
+ const missing=await fetch(base+'/no-such-file.js');assert.equal(missing.status,404);assert.ok(missing.headers.get('content-security-policy'));assert.equal(missing.headers.get('x-content-type-options'),'nosniff');
+ const module=await fetch(base+'/transport.mjs');assert.equal(module.status,200);assert.match(module.headers.get('content-type')||'',/^text\/javascript/);
+ const received=[],{daemon,browser}=await endpoints(s,frame=>received.push(frame));const replies=[];browser.consume=frame=>replies.push(frame);
+ // The callback captured by WireEndpoint calls the current wrapper consumer.
+ daemon.peer.send('{"relay": "push"}');await deadline(daemon.channels.get(browser.cid).start('hello'),'routed reply');assert.deepEqual(replies,['hello'],'spaced push controls cannot be broadcast as transcript data');
+ const broken='{"relay"';browser.peer.send(broken);assert.equal(await wireWait(browser.peer,p=>p.closed),1008,'malformed pre/post-ready text is refused rather than routed as ciphertext');assert.equal(daemon.peer.closed,null,'one bad CID cannot close the shared daemon');
+ const good=new EndpointPeer(await s.open('client'),'client',frame=>replies.push(frame));await good.waitFor(()=>good.cid);const channel=await daemon.waitChannel(good.cid);daemon.peer.send(JSON.stringify({relay:'ready',cid:good.cid,g:channel.generation}));await deadline(Promise.all([good.waitReady(good.cid),daemon.waitReady(good.cid)]),'replacement client ready');
+ await deadline(good.channels.get('browser').start('healthy request'),'healthy client');assert.deepEqual(received,['healthy request']);
+ daemon.peer.send(JSON.stringify({relay:'disconnect',cid:good.cid,code:4002}));assert.equal(await wireWait(good.peer,p=>p.closed),4002);
+ await assert.rejects(wireOpen(s.base+'?role=daemon&mux=1&transport=1'),/401/);
+ const replacement=await s.open('daemon');assert.equal(await wireWait(daemon.peer,p=>p.closed),4003);replacement.close();
+ console.log('conformance ok');
+}finally{await s.close();}

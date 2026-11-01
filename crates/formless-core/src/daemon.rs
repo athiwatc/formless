@@ -26,7 +26,7 @@ struct Subscriber {
     conn: u64,
     /// Bounded (SPEC §9.3): a client that stops reading can't grow the
     /// daemon's memory.
-    tx: mpsc::Sender<ServerMessage>,
+    tx: crate::relay_buffers::ConnectionSender,
     filter: Arc<StdMutex<EventFilter>>,
     /// Cancelled to disconnect a client whose queue overflowed.
     kick: CancellationToken,
@@ -452,8 +452,8 @@ fn send_all(subs: &Subs, ev: Event) {
                 }
                 Err(mpsc::error::TrySendError::Full(_)) => {
                     tracing::warn!(
-                    "client {} stopped reading ({CLIENT_QUEUE} messages queued); disconnecting it",
-                    sub.conn
+                    "client {} stopped reading ({} messages queued); disconnecting it",
+                    sub.conn, sub.tx.max_capacity()
                 );
                     sub.kick.cancel();
                     false
@@ -618,7 +618,8 @@ pub struct Daemon {
     /// Browsers on the relay link, by cid, and a way to close one (set
     /// while the link is up; SPEC §12).
     pub(crate) relay_clients: StdMutex<std::collections::BTreeMap<String, RelayClientInfo>>,
-    pub(crate) relay_kick: StdMutex<Option<mpsc::UnboundedSender<String>>>,
+    pub(crate) relay_kick: StdMutex<Option<mpsc::Sender<String>>>,
+    pub(crate) relay_memory: Arc<crate::relay_buffers::Pool>,
     /// Chunked attachment uploads in progress (#909).
     uploads: StdMutex<HashMap<String, Upload>>,
     /// Spending warnings already given ("run:<id>:<limit>", "day:<date>"),
@@ -843,6 +844,7 @@ impl Daemon {
             relay_clients: StdMutex::new(Default::default()),
             uploads: StdMutex::new(HashMap::new()),
             relay_kick: StdMutex::new(None),
+            relay_memory: Arc::new(crate::relay_buffers::Pool::default()),
             budget_warned: StdMutex::new(Default::default()),
             budget_waived: Arc::new(StdMutex::new(Default::default())),
             budget_admission: Arc::new(Default::default()),
@@ -1523,7 +1525,9 @@ impl Daemon {
                     .lock()
                     .unwrap()
                     .iter()
-                    .map(|s| json!({"conn": s.conn, "queued": CLIENT_QUEUE - s.tx.capacity()}))
+                    .map(
+                        |s| json!({"conn": s.conn, "queued": s.tx.max_capacity() - s.tx.capacity()})
+                    )
                     .collect::<Vec<_>>());
                 Ok(json!({
                     "rate_limits": crate::provider::rate_limits(),
@@ -2543,17 +2547,27 @@ impl Daemon {
             }
             Request::DisconnectRelayClient { cid } => {
                 let known = self.relay_clients.locked().contains_key(&cid);
-                let sent = known
-                    && self
-                        .relay_kick
-                        .lock()
-                        .unwrap()
-                        .as_ref()
-                        .is_some_and(|tx| tx.send(cid.clone()).is_ok());
-                if sent {
-                    let _ = self.with_store(|st| st.audit("user", "relay.disconnect", &cid));
+                if !known {
+                    return Ok(json!({ "disconnected": false }));
                 }
-                Ok(json!({ "disconnected": sent }))
+                {
+                    let kick = self.relay_kick.locked();
+                    let tx = kick.as_ref().ok_or_else(|| {
+                        RequestFailure::busy(
+                            "relay is unavailable; the disconnect command was not queued",
+                        )
+                    })?;
+                    tx.try_send(cid.clone()).map_err(|error| match error {
+                        mpsc::error::TrySendError::Full(_) => RequestFailure::busy(
+                            "relay disconnect queue is full; the command was not queued",
+                        ),
+                        mpsc::error::TrySendError::Closed(_) => RequestFailure::busy(
+                            "relay is unavailable; the disconnect command was not queued",
+                        ),
+                    })?;
+                }
+                let _ = self.with_store(|st| st.audit("user", "relay.disconnect", &cid));
+                Ok(json!({ "disconnected": true }))
             }
             Request::DetachFile { session_id, id } => {
                 let gone = self.with_store(|st| st.remove_pending_attachment(&session_id, &id))?;
@@ -13287,11 +13301,40 @@ impl Daemon {
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
+        self.handle_conn_output(stream, None).await;
+    }
+
+    pub(crate) async fn handle_conn_relay<S>(
+        self: Arc<Self>,
+        stream: S,
+        output: crate::relay_buffers::RelayOutput,
+    ) where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        self.handle_conn_output(stream, Some(output)).await;
+    }
+
+    async fn handle_conn_output<S>(
+        self: Arc<Self>,
+        stream: S,
+        output: Option<crate::relay_buffers::RelayOutput>,
+    ) where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
         let (read_half, mut write_half) = tokio::io::split(stream);
-        let (tx, mut rx) = mpsc::channel::<ServerMessage>(CLIENT_QUEUE);
+        let relay_memory = output.as_ref().map(|out| out.memory.clone());
+        let kick = relay_memory
+            .as_ref()
+            .map(|memory| memory.cancel.clone())
+            .unwrap_or_default();
+        let (tx, rx) = if let Some(output) = output {
+            (crate::relay_buffers::ConnectionSender::Relay(output), None)
+        } else {
+            let (tx, rx) = mpsc::channel::<ServerMessage>(CLIENT_QUEUE);
+            (crate::relay_buffers::ConnectionSender::from(tx), Some(rx))
+        };
         let filter = Arc::new(StdMutex::new(EventFilter::default()));
         let conn = self.next_conn.fetch_add(1, Ordering::Relaxed);
-        let kick = CancellationToken::new();
         self.subs.locked().push(Subscriber {
             conn,
             tx: tx.clone(),
@@ -13318,29 +13361,31 @@ impl Daemon {
         // tasks forever (#1095). The queue bounds messages, not bytes:
         // events are small, and the large replies (exports, snapshots) are
         // one message each, answered only to the client that asked.
-        let writer = tokio::spawn({
-            let kick = kick.clone();
-            let subs = self.subs.clone();
-            async move {
-                loop {
-                    let msg = tokio::select! {
-                        _ = kick.cancelled() => break,
-                        m = rx.recv() => match m {
-                            Some(m) => m,
-                            None => break,
-                        },
-                    };
-                    flush_connection_gaps(&subs, conn);
-                    let Ok(mut line) = serde_json::to_string(&msg) else {
-                        continue;
-                    };
-                    line.push('\n');
-                    tokio::select! {
-                        _ = kick.cancelled() => break,
-                        r = write_half.write_all(line.as_bytes()) => if r.is_err() { break },
+        let writer = rx.map(|mut rx| {
+            tokio::spawn({
+                let kick = kick.clone();
+                let subs = self.subs.clone();
+                async move {
+                    loop {
+                        let msg = tokio::select! {
+                            _ = kick.cancelled() => break,
+                            m = rx.recv() => match m {
+                                Some(m) => m,
+                                None => break,
+                            },
+                        };
+                        flush_connection_gaps(&subs, conn);
+                        let Ok(mut line) = serde_json::to_string(&msg) else {
+                            continue;
+                        };
+                        line.push('\n');
+                        tokio::select! {
+                            _ = kick.cancelled() => break,
+                            r = write_half.write_all(line.as_bytes()) => if r.is_err() { break },
+                        }
                     }
                 }
-            }
+            })
         });
         // Requests run in order on one worker per connection, so a slow one
         // (a smoke test, a big export) never holds up reading: control
@@ -13348,16 +13393,44 @@ impl Daemon {
         // Each queued request carries its arrival number; an InterruptRun
         // (which skips the queue) cancels a SendMessage for that Session
         // that arrived before it and hasn't started (#891).
-        let (work_tx, mut work_rx) = mpsc::channel::<(RequestEnvelope, u64)>(256);
+        let (work_tx, mut work_rx) =
+            mpsc::channel::<(RequestEnvelope, u64, Option<crate::relay_buffers::Lease>)>(
+                if relay_memory.is_some() {
+                    crate::relay_buffers::INBOUND_MESSAGES
+                } else {
+                    256
+                },
+            );
+        let control_slots = relay_memory.as_ref().map(|_| {
+            Arc::new(tokio::sync::Semaphore::new(
+                crate::relay_buffers::CONTROL_TASKS,
+            ))
+        });
         let interrupted: Arc<StdMutex<HashMap<String, u64>>> = Arc::default();
         let mut arrivals: u64 = 0;
         let worker = {
+            let bounded_metadata = relay_memory.is_some();
             let (this, tx, client, kick) = (self.clone(), tx.clone(), client.clone(), kick.clone());
             let interrupted = interrupted.clone();
             tokio::spawn(async move {
-                while let Some((env, arrived)) = work_rx.recv().await {
-                    if let Request::SendMessage { session_id, .. } = &env.request {
-                        let cut = interrupted.locked().get(session_id).copied();
+                while let Some((env, arrived, _input_lease)) = work_rx.recv().await {
+                    // abort() is cooperative: a just-unblocked synchronous
+                    // handler can finish without yielding. Never start another
+                    // queued relay mutation once this CID has been canceled.
+                    if bounded_metadata && kick.is_cancelled() {
+                        break;
+                    }
+                    let session = match &env.request {
+                        Request::SendMessage { session_id, .. } => Some(session_id.as_str()),
+                        _ => None,
+                    };
+                    let cut = crate::relay_buffers::interruption_cut(
+                        &mut interrupted.locked(),
+                        session,
+                        arrived,
+                        bounded_metadata,
+                    );
+                    if matches!(&env.request, Request::SendMessage { .. }) {
                         if cut.is_some_and(|at| at > arrived) {
                             let resp = ServerMessage::err(
                                 env.id,
@@ -13390,11 +13463,20 @@ impl Daemon {
                 }
             })
         };
+        if let Some(memory) = &relay_memory {
+            memory.mark_started();
+        }
         let mut reader = BufReader::new(read_half);
         loop {
-            let line = tokio::select! {
+            let (line, mut input_lease) = tokio::select! {
                 _ = kick.cancelled() => break,
-                r = read_frame(&mut reader, MAX_FRAME) => match r {
+                r = async {
+                    if let Some(memory)=&relay_memory {
+                        crate::relay_buffers::read_frame(&mut reader,memory).await.map(|frame|frame.map(|frame|(frame.line,Some(frame.lease))))
+                    } else {
+                        read_frame(&mut reader,MAX_FRAME).await.map(|frame|frame.map(|line|(line,None)))
+                    }
+                } => match r {
                     Ok(Some(l)) => l,
                     Ok(None) => break,
                     Err(e) => {
@@ -13408,6 +13490,15 @@ impl Daemon {
                 continue;
             }
             arrivals += 1;
+            if let Some(lease) = input_lease.as_mut() {
+                if let Err(error) = crate::relay_input::prepare(&line, lease) {
+                    // No typed AST, business handler or queued request has
+                    // been allocated/admitted. Never echo request data.
+                    tracing::warn!("closing relay client {conn}: {error}");
+                    kick.cancel();
+                    break;
+                }
+            }
             let resp = match serde_json::from_str::<RequestEnvelope>(&line) {
                 Ok(env) => {
                     if !(MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&env.protocol) {
@@ -13425,6 +13516,16 @@ impl Daemon {
                         client: label,
                     } = env.request
                     {
+                        if relay_memory.is_some()
+                            && !crate::relay_buffers::subscription_fits(
+                                sessions.as_deref(),
+                                label.as_deref(),
+                            )
+                        {
+                            let _ = tx.try_send(ServerMessage::err_code(env.id, codes::BAD_REQUEST,
+                                "relay subscription exceeds 1024 Sessions, 64 KiB of Session identities, or 256 label bytes".into()));
+                            continue;
+                        }
                         // Per connection, so handled here rather than in `handle`.
                         let before = {
                             let mut f = filter.locked();
@@ -13442,19 +13543,43 @@ impl Daemon {
                         ServerMessage::ok(env.id, json!({"subscribed": true, "conn": conn}))
                     } else if is_control(&env.request) {
                         if let Request::InterruptRun { session_id } = &env.request {
-                            interrupted
-                                .lock()
-                                .unwrap()
-                                .insert(session_id.clone(), arrivals);
+                            if !crate::relay_buffers::remember_interrupt(
+                                &mut interrupted.locked(),
+                                session_id,
+                                arrivals,
+                                relay_memory.is_some(),
+                            ) {
+                                // Cancel this CID and all queued work. Dropping an old
+                                // cut instead could execute a previously interrupted send.
+                                kick.cancel();
+                                break;
+                            }
                         }
+                        let permit = if let Some(slots) = &control_slots {
+                            match slots.clone().try_acquire_owned() {
+                                Ok(permit) => Some(permit),
+                                Err(_) => {
+                                    kick.cancel();
+                                    break;
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                        let held = input_lease.take();
                         let (this, tx, who, kick) =
                             (self.clone(), tx.clone(), client(), kick.clone());
                         tokio::spawn(async move {
-                            let resp =
-                                match CLIENT.scope(who, handle_safely(&this, env.request)).await {
-                                    Ok(v) => ServerMessage::ok(env.id, v),
-                                    Err(e) => error_reply(env.id, &e),
-                                };
+                            let _permit = permit;
+                            let _input_lease = held;
+                            let result = tokio::select! {
+                                _=kick.cancelled()=>return,
+                                result=CLIENT.scope(who,handle_safely(&this,env.request))=>result,
+                            };
+                            let resp = match result {
+                                Ok(v) => ServerMessage::ok(env.id, v),
+                                Err(e) => error_reply(env.id, &e),
+                            };
                             tokio::select! {
                                 _ = kick.cancelled() => {}
                                 _ = tx.send(resp) => {}
@@ -13464,13 +13589,20 @@ impl Daemon {
                     } else {
                         let queued = tokio::select! {
                             _ = kick.cancelled() => false,
-                            r = work_tx.send((env, arrivals)) => r.is_ok(),
+                            r = work_tx.send((env, arrivals,input_lease.take())) => r.is_ok(),
                         };
                         if !queued {
                             break;
                         }
                         continue;
                     }
+                }
+                Err(e) if relay_memory.is_some() => {
+                    // The original serde diagnostic may own a huge unknown
+                    // variant/field name. Drop it before another parse, and
+                    // collect only bounded metadata without a Value tree.
+                    drop(e);
+                    crate::relay_input::error_reply(&line)
                 }
                 Err(e) => {
                     let id = formless_protocol::lenient_id(&line);
@@ -13510,8 +13642,10 @@ impl Daemon {
         self.sent_keys
             .locked()
             .retain(|(client, _, _), _| *client != Some(conn));
-        writer.abort();
-        let _ = writer.await;
+        if let Some(writer) = writer {
+            writer.abort();
+            let _ = writer.await;
+        }
     }
 
     /// A detached daemon writes its stdout/stderr to `daemon.log`; keep
@@ -15802,7 +15936,7 @@ mod backpressure_tests {
         let kick = CancellationToken::new();
         let subs: Subs = Arc::new(StdMutex::new(vec![Subscriber {
             conn: 1,
-            tx,
+            tx: tx.into(),
             filter: Arc::new(StdMutex::new(EventFilter::default())),
             kick: kick.clone(),
             gaps: BTreeMap::new(),
@@ -15834,7 +15968,7 @@ mod backpressure_tests {
         let (tx, mut rx) = mpsc::channel::<ServerMessage>(3);
         let subs: Subs = Arc::new(StdMutex::new(vec![Subscriber {
             conn: 1,
-            tx,
+            tx: tx.into(),
             filter: Arc::new(StdMutex::new(EventFilter::default())),
             kick: CancellationToken::new(),
             gaps: BTreeMap::new(),
@@ -15869,7 +16003,7 @@ mod backpressure_tests {
         let kick = CancellationToken::new();
         let subs = Arc::new(StdMutex::new(vec![Subscriber {
             conn: 1,
-            tx,
+            tx: tx.into(),
             filter: Arc::new(StdMutex::new(EventFilter::default())),
             kick: kick.clone(),
             gaps: BTreeMap::new(),
@@ -16483,7 +16617,7 @@ mod widen_scope_tests {
         let (tx, mut rx) = mpsc::channel::<ServerMessage>(64);
         daemon.subs.locked().push(Subscriber {
             conn: 1,
-            tx,
+            tx: tx.into(),
             filter: Arc::new(StdMutex::new(EventFilter::default())),
             kick: CancellationToken::new(),
             gaps: BTreeMap::new(),
@@ -16871,7 +17005,7 @@ mod mcp_approval_redaction_tests {
         let (tx, mut rx) = mpsc::channel(16);
         daemon.subs.locked().push(Subscriber {
             conn: 1,
-            tx,
+            tx: tx.into(),
             filter: Arc::new(StdMutex::new(EventFilter::default())),
             kick: CancellationToken::new(),
             gaps: Default::default(),
@@ -17086,7 +17220,7 @@ mod live_snapshot_tests {
         let (events, mut received) = mpsc::channel(8);
         daemon.subs.locked().push(Subscriber {
             conn: 1,
-            tx: events,
+            tx: events.into(),
             filter: Arc::new(StdMutex::new(EventFilter::default())),
             kick: CancellationToken::new(),
             gaps: BTreeMap::new(),
@@ -17201,3 +17335,7 @@ mod cli_attach_daemon_tests;
 #[cfg(test)]
 #[path = "artifact_read_tests.rs"]
 mod artifact_read_tests;
+
+#[cfg(test)]
+#[path = "relay_connection_tests.rs"]
+mod relay_connection_tests;

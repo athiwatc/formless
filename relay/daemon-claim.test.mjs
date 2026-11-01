@@ -4,6 +4,7 @@ import { readFile } from "node:fs/promises";
 import vm from "node:vm";
 import { daemonClaim, claimRoom, claimAuthorization, verifyDaemonClaim } from "./daemon-claim.mjs";
 import { RelayRoom } from "./worker.js";
+import { roomFixture, controls, ackControls } from "./test-room-state.mjs";
 
 const vector = {
   key: Uint8Array.from({ length:32 }, (_,i)=>i),
@@ -25,16 +26,9 @@ test("Rust/Worker/browser room-v3 fixed vector and strict header proof", async()
   assert.equal(await verifyDaemonClaim("0".repeat(32),vector.authorization),false,"proof bound to room");
   assert.notEqual(Buffer.from(claim).toString("hex"),Buffer.from(vector.key).toString("hex"));
 });
-function fixture(){
-  const sockets=[];
-  const state={getWebSockets:(tag)=>sockets.filter(s=>!tag||s.tags.includes(tag)),acceptWebSocket:(s,tags)=>{s.tags=tags;sockets.push(s);}};
-  const room=new RelayRoom(state,{});
-  let pushes=0; room.pushAll=async()=>{pushes++;};
-  const socket=()=>({att:{},readyState:1,sent:[],closed:null,serializeAttachment(a){this.att=a;},deserializeAttachment(){return this.att;},send(frame){this.sent.push(JSON.parse(frame));},close(code,reason){this.closed={code,reason};this.readyState=3;}});
-  return{room,state,socket,pushes:()=>pushes};
-}
-test("unauthenticated daemon rejected before upgrade, admission and control authority",async()=>{
-  const f=fixture();
+function fixture(){const f=roomFixture();let pushes=0;f.room.pushAll=async()=>{pushes++;};return{...f,pushes:()=>pushes};}
+test("unauthenticated daemon rejected before upgrade, admission and control authority",async(t)=>{
+  const f=fixture();t.after(()=>f.close());
   const browser=f.socket();f.room.admit(browser,"client",false,"private-browser");
   for(const header of [null,"Bearer "+"00".repeat(32)]){
     const response=await f.room.fetch(new Request(`https://relay.test/relay/${vector.room}?role=daemon`,{headers:{Upgrade:"websocket",...(header?{Authorization:header}:{})}}));
@@ -49,24 +43,25 @@ test("unauthenticated daemon rejected before upgrade, admission and control auth
   assert.deepEqual(f.state.getWebSockets("daemon"),[]);
 });
 test("authenticated restart preempts, retires old controls and survives hibernation/late teardown",async()=>{
-  const f=fixture(); const browser=f.socket(); f.room.admit(browser,"client",false,"private-browser");
-  const first=f.socket(); f.room.admit(first,"daemon",true,"",true);
-  const second=f.socket(); f.room.admit(second,"daemon",true,"",true);
-  assert.equal(first.closed.code,4003);
-  assert.equal(first.att.role,"superseded");
-  assert.deepEqual(f.room.sockets("daemon"),[second]);
-  assert.deepEqual(browser.sent.slice(-2),[{relay:"daemon_offline"},{relay:"daemon_online"}],"new channel handshake is required");
-  assert.ok(second.sent.some(m=>m.relay==="client_open"&&m.cid===browser.att.cid&&m.ua==="private-browser"));
-  const resumed=new RelayRoom(f.state,{}); let pushes=0;resumed.pushAll=async()=>{pushes++;};
-  const before=browser.sent.length;
-  await resumed.webSocketMessage(first,'{"relay":"push"}');
-  await resumed.webSocketMessage(first,JSON.stringify({relay:"disconnect",cid:browser.att.cid}));
-  await resumed.webSocketMessage(first,JSON.stringify({cid:browser.att.cid,f:"stale"}));
-  await resumed.webSocketClose(first);await resumed.webSocketError(first);
-  assert.equal(pushes,0);assert.equal(browser.closed,null);assert.equal(browser.sent.length,before);
-  await resumed.webSocketMessage(second,'{"relay":"push"}');assert.equal(pushes,1);
-  await resumed.webSocketMessage(browser,'opaque browser ciphertext');
-  assert.deepEqual(second.sent.at(-1),{cid:browser.att.cid,f:"opaque browser ciphertext"});
+ const f=fixture();try{
+ const browser=f.socket();f.room.admit(browser,"client",true,"private-browser");
+ const first=f.socket();f.room.admit(first,"daemon",true,"",true);const oldIdentity=structuredClone(first.att);
+ const second=f.socket();f.room.admit(second,"daemon",true,"",true);
+ assert.equal(first.closed.code,4003);assert.deepEqual(first.att,oldIdentity,"supersession must preserve immutable socket identity");
+ assert.equal(browser.closed.code,4002,"a new daemon requires a fresh bounded channel");assert.deepEqual(f.room.sockets("daemon"),[second]);
+ const fresh=f.socket();f.room.admit(fresh,"client",true,"private-browser");
+ assert.ok(controls(second).some(m=>m.relay==="client_open"&&m.cid===fresh.att.cid&&m.ua==="private-browser"));
+ assert.ok(controls(fresh).some(m=>m.relay==="daemon_online"));
+ const resumed=new RelayRoom(f.state,{});let pushes=0;resumed.pushAll=async()=>{pushes++;};const before=fresh.sent.length;
+ await resumed.webSocketMessage(first,'{"relay":"push"}');await resumed.webSocketMessage(first,JSON.stringify({relay:"disconnect",cid:fresh.att.cid}));
+ await resumed.webSocketMessage(first,JSON.stringify({cid:fresh.att.cid,g:fresh.att.g,f:"stale"}));
+ first.finish();await resumed.webSocketClose(first);await resumed.webSocketError(first);
+ assert.equal(pushes,0);assert.equal(fresh.closed,null);assert.equal(fresh.sent.length,before);
+ await resumed.webSocketMessage(second,'{"relay":"push"}');assert.equal(pushes,1);
+ await ackControls(resumed,second);await ackControls(resumed,fresh);
+ const hello=JSON.stringify({v:2,hello:btoa("x".repeat(16))});await resumed.webSocketMessage(fresh,hello);
+ assert.ok(controls(second).some(m=>m.cid===fresh.att.cid&&m.f===hello),"only the new authenticated daemon receives current browser handshakes");
+ }finally{f.close();}
 });
 
 test("production fetch verifies before Upgrade and admits a restart through the same room policy",async()=>{
@@ -78,12 +73,12 @@ test("production fetch verifies before Upgrade and admits a restart through the 
   globalThis.WebSocketPair=class{constructor(){this[0]={client:true};this[1]=f.socket();pairs.push(this);}};
   globalThis.Response=class{constructor(body,init){this.status=init.status;this.webSocket=init.webSocket;this.body=body;}};
   try{
-    const request=()=>new Request(`https://relay.test/relay/${vector.room}?role=daemon&mux=1`,{headers:{Upgrade:"websocket",Authorization:vector.authorization}});
+    const request=()=>new Request(`https://relay.test/relay/${vector.room}?role=daemon&mux=1&transport=1`,{headers:{Upgrade:"websocket",Authorization:vector.authorization}});
     const first=await f.room.fetch(request());assert.equal(first.status,101);assert.equal(first.webSocket,pairs[0][0]);
     assert.equal(pairs[0][1].att.authenticated,3);
     const second=await f.room.fetch(request());assert.equal(second.status,101);
     assert.equal(pairs[0][1].closed.code,4003);
     assert.deepEqual(f.room.sockets("daemon"),[pairs[1][1]]);
     assert.ok(!JSON.stringify(pairs.map(p=>p[1].att)).includes(vector.authorization.slice(7)),"no claim in socket attachments");
-  }finally{globalThis.Response=savedResponse;if(savedPair===undefined)delete globalThis.WebSocketPair;else globalThis.WebSocketPair=savedPair;}
+  }finally{f.close();globalThis.Response=savedResponse;if(savedPair===undefined)delete globalThis.WebSocketPair;else globalThis.WebSocketPair=savedPair;}
 });

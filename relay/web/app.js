@@ -66,6 +66,12 @@
     channel: null, // { key, sent, received } once the handshake is done
     sendChain: Promise.resolve(),
     recvChain: Promise.resolve(),
+    relayModule: null,
+    relayMemory: null, // shared across reconnects; old async consumers stay charged
+    relayLink: null,
+    relayLocalProof: false,
+    relayRoomReady: false,
+    relayReady: false,
     secret: "",
     userClosed: false,
     backoff: 1000,
@@ -137,6 +143,9 @@
   const HANDSHAKE_TRIES = 3;
   function startHandshake(again) {
     S.channel = null;
+    S.relayLocalProof = false;
+    S.relayRoomReady = false;
+    S.relayReady = false;
     clearTimeout(S.handshakeTimer);
     S.handshakeTries = again ? (S.handshakeTries || 0) + 1 : 1;
     S.handshakeFailed = false;
@@ -168,13 +177,16 @@
       { name: "HKDF", hash: "SHA-256", salt, info: enc("formless-relay/2 confirm " + from) }, S.key, 256));
   }
   async function finishHandshake(daemonHello) {
+    const ws = S.ws, hello = S.hello, pairingKey = S.key;
     const salt = new Uint8Array(32);
-    salt.set(S.hello, 0);
+    salt.set(hello, 0);
     salt.set(daemonHello, 16);
     const key = await crypto.subtle.deriveKey(
       { name: "HKDF", hash: "SHA-256", salt, info: enc("formless-relay/2") },
-      S.key, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+      pairingKey, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+    if (S.ws !== ws || S.hello !== hello || S.key !== pairingKey) return false;
     S.channel = { key, sent: 0, received: 0 };
+    return true;
   }
   async function encrypt(text) {
     const ch = S.channel;
@@ -190,6 +202,7 @@
     if (!ch || v.v !== FRAME_VERSION || v.seq !== ch.received + 1) throw new Error("rejected frame");
     const pt = await crypto.subtle.decrypt(
       { name: "AES-GCM", iv: b64ToBytes(v.iv), additionalData: aad("d2b", v.seq) }, ch.key, b64ToBytes(v.ct));
+    if (pt.byteLength > (S.relayModule ? S.relayModule.LIMITS.plaintext : 32 * 1024 * 1024)) throw new Error("relay plaintext exceeds IPC limit");
     ch.received = v.seq;
     return new TextDecoder().decode(pt);
   }
@@ -199,8 +212,19 @@
   function request(req, timeoutMs) {
     return new Promise((resolve, reject) => {
       if (!S.ws || S.ws.readyState !== 1) return reject(new Error("not connected to the relay"));
-      if (!S.channel) return reject(new Error("still connecting to the daemon"));
+      if (!S.channel || (!S.local && !S.relayReady)) return reject(new Error("still connecting to the daemon"));
+      if (S.pending.size >= 64) return reject(new Error("too many pending requests; wait for an answer"));
       const id = S.nextId++;
+      let text, lease;
+      try {
+        text = JSON.stringify({ id, protocol: PROTOCOL, request: req });
+        if (!S.local) {
+          const bytes = S.relayModule.wireBytes(text, S.relayModule.LIMITS.plaintext);
+          // Known serialization/UTF8/GCM/base64/string copies and bounded
+          // fragment lookahead. This is not a DOM/application-state RSS cap.
+          lease = S.relayMemory.reserve(12 * bytes + 1024 * 1024);
+        }
+      } catch (error) { return reject(error); }
       const timer = setTimeout(() => {
         S.pending.delete(id);
         reject(new Error("the daemon did not answer (is it online?)"));
@@ -209,15 +233,26 @@
         resolve: (v) => { clearTimeout(timer); resolve(v); },
         reject: (e) => { clearTimeout(timer); reject(e); },
       });
-      // Serialised so frames leave in sequence-number order.
       const ws = S.ws;
-      S.sendChain = S.sendChain
-        .then(() => {
-          const text = JSON.stringify({ id, protocol: PROTOCOL, request: req });
-          return S.local ? text : encrypt(text);
-        })
-        .then((frame) => ws.send(frame))
-        .catch((e) => { S.pending.delete(id); clearTimeout(timer); reject(e); });
+      S.sendChain = S.sendChain.then(async () => {
+        // A timed-out queued intent must never be transmitted later.
+        if (S.ws !== ws || !S.pending.has(id)) return;
+        if (S.local) ws.send(text);
+        else {
+          const frame = await encrypt(text);
+          // Encryption's transient copies are gone. Retain only the actual
+          // encoded string plus bounded fragment/native-send lookahead; the
+          // discarded plaintext must not keep the peak reservation alive
+          // while a full-size response arrives before our final credit.
+          text = null;
+          lease.shrink(2 * frame.length + 4 * S.relayModule.LIMITS.windowFrames * S.relayModule.LIMITS.wire + 4096);
+          if (S.ws !== ws || !S.relayLink || S.relayLink.ws !== ws) throw new Error("relay connection changed");
+          await S.relayLink.endpoint.start(frame, lease);
+        }
+      }).catch((e) => {
+        S.pending.delete(id); clearTimeout(timer); reject(e);
+        if (!S.local && S.ws === ws && ws.readyState === 1) { try { ws.close(4002, "relay transport failed"); } catch (_) {} }
+      }).finally(() => { if (lease) lease.release(); });
     });
   }
   /** Request that reports failures as a toast; resolves null on error. */
@@ -5304,6 +5339,10 @@
     S.key = await crypto.subtle.importKey("raw", keyBytes, "HKDF", false, ["deriveKey", "deriveBits"]);
     S.room = await roomFor(keyBytes);
     keyBytes.fill(0);
+    S.relayModule = await import("./transport.mjs");
+    // This bound covers retained byte-backed transport copies; rendered
+    // application data/DOM and platform-native buffers are separate owners.
+    if (!S.relayMemory) S.relayMemory = new S.relayModule.MemoryBudget(512 * 1024 * 1024);
     try {
       if (prefs.get("remember_pairing", false)) sessionStorage.setItem("formless_secret", secret);
       else sessionStorage.removeItem("formless_secret");
@@ -5315,19 +5354,69 @@
     try { return prefs.get("remember_pairing", false) ? sessionStorage.getItem("formless_secret") || "" : ""; } catch (_) { return ""; }
   }
   /** Connect (or reconnect) to the room with the key already imported. */
+  function finishRelayReady(ws) {
+    if (S.ws !== ws || !S.relayLink || S.relayLink.ws !== ws || !S.relayLocalProof || !S.relayRoomReady || !S.channel) throw new Error("room readiness before E2E proof");
+    if (S.relayReady) return;
+    S.relayReady = true;
+    S.relayLink.endpoint.setReady();
+    restorePushSubscription(ws);
+    markStable();
+    note("daemon online");
+    loadAll();
+  }
   function openRelay() {
+    S.local = false;
+    if (S.relayLink) S.relayLink.endpoint.dispose();
+    S.relayLink = null;
+    S.relayLocalProof = false; S.relayRoomReady = false; S.relayReady = false;
     S.channel = null;
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
-    const ws = new WebSocket(proto + "//" + location.host + "/relay/" + S.room + "?role=client");
+    const ws = new WebSocket(proto + "//" + location.host + "/relay/" + S.room + "?role=client&transport=1");
     S.ws = ws;
     ws.onopen = () => {
       $("pair").classList.add("hidden");
       $("app").classList.remove("hidden");
       renderAll();
     };
-    // Frames are handled one at a time, in arrival order.
-    ws.onmessage = (e) => {
-      S.recvChain = S.recvChain.then(() => onFrame(ws, String(e.data))).catch(() => {});
+    // Wire data and credit controls are bounded before any async callback.
+    // Completed application frames retain their memory lease while decrypting.
+    ws.onmessage = (event) => {
+      if (S.ws !== ws) return;
+      try {
+        const frame = String(event.data);
+        S.relayModule.wireBytes(frame);
+        if (!S.relayLink) {
+          const packet = JSON.parse(frame);
+          const welcome = packet.relay === "control" && typeof packet.f === "string" && JSON.parse(packet.f);
+          if (!welcome || welcome.relay !== "transport" || welcome.v !== 1 || welcome.g !== packet.g || !/^[a-f0-9]{32}$/.test(packet.g)) throw new Error("bounded relay transport required");
+          const endpoint = new S.relayModule.WireEndpoint({
+            generation: packet.g,
+            memory: S.relayMemory,
+            send: (text) => ws.send(text),
+            close: (code, reason) => { try { ws.close(code, reason); } catch (_) {} },
+            consume: async (encrypted) => {
+              const estimated = Math.min(S.relayModule.LIMITS.plaintext, Math.ceil(encrypted.length * 3 / 4));
+              const lease = S.relayMemory.reserve(9 * estimated + 1024 * 1024);
+              try { await onFrame(ws, encrypted); } finally { lease.release(); }
+            },
+            control: async (text) => {
+              const value = JSON.parse(text);
+              if (value.relay === "transport") return;
+              if (value.relay === "push_subscribed" || value.relay === "push_unsubscribed") return;
+              if (value.relay === "ready") {
+                if (value.g !== packet.g) throw new Error("stale room readiness");
+                S.relayRoomReady = true;
+                finishRelayReady(ws);
+                return;
+              }
+              if (value.relay && value.relay !== "daemon_online" && value.relay !== "daemon_offline") throw new Error("unknown relay control");
+              await onFrame(ws, text);
+            },
+          });
+          S.relayLink = { ws, endpoint };
+        }
+        S.relayLink.endpoint.receive(frame);
+      } catch (_) { try { ws.close(1008, "relay transport failed"); } catch (_) {} }
     };
     async function onFrame(ws, frame) {
       if (S.ws !== ws) return;
@@ -5362,20 +5451,26 @@
         try { hello = hs && b64ToBytes(hs.hello); } catch (_) {}
         if (!hello || hello.length !== 16 || !S.hello || typeof hs.confirm !== "string") return;
         // The daemon must prove it holds the key before anything is trusted.
+        const clientHello = S.hello, pairingKey = S.key;
+        const current = () => S.ws === ws && S.hello === clientHello && S.key === pairingKey;
         const want = await confirmTag(hello, "d2b");
+        if (!current()) return;
         let got;
         try { got = b64ToBytes(hs.confirm); } catch (_) { return; }
         if (got.length !== want.length || got.some((b, i) => b !== want[i])) return;
-        S.ws.send(JSON.stringify({ v: FRAME_VERSION, confirm: bytesToB64(await confirmTag(hello, "b2d")) }));
+        const proof = await confirmTag(hello, "b2d");
+        if (!current()) return;
+        ws.send(JSON.stringify({ v: FRAME_VERSION, confirm: bytesToB64(proof) }));
         clearTimeout(S.handshakeTimer);
-        await finishHandshake(hello);
-        restorePushSubscription(ws);
-        markStable();
-        note("daemon online");
-        loadAll();
+        if (!await finishHandshake(hello) || !current()) return;
+        S.relayLocalProof = true;
+        // Room readiness follows the daemon's verification of our confirm.
+        // Bulk grants wait for this ready control's consumed receipt.
+        if (S.relayRoomReady) finishRelayReady(ws);
         return;
       }
       let msg;
+      const channel = S.channel;
       try { msg = JSON.parse(await decrypt(frame)); } catch (_) {
         // Replayed, missing or forged: the channel can't be trusted, so
         // start over (a new handshake reloads everything) (#905).
@@ -5383,6 +5478,7 @@
         try { ws.close(4002, "link integrity failure"); } catch (_) {}
         return;
       }
+      if (S.ws !== ws || S.channel !== channel) return;
       onMessage(msg);
     }
     ws.onclose = (ev) => {
@@ -5397,6 +5493,8 @@
       }
       S.daemonOnline = false;
       S.channel = null;
+      S.relayLocalProof = false; S.relayRoomReady = false; S.relayReady = false;
+      if (S.relayLink && S.relayLink.ws === ws) S.relayLink.endpoint.dispose();
       clearLiveState();
       for (const p of S.pending.values()) p.reject(new Error("relay connection closed"));
       S.pending.clear();
@@ -5426,6 +5524,8 @@
   // Local mode (SPEC §12): `formless web` serves this page on 127.0.0.1
   // and the protocol runs over a same-origin WebSocket, no relay crypto.
   async function connectLocal(token) {
+    if (S.relayLink) S.relayLink.endpoint.dispose();
+    S.relayLink = null; S.relayReady = false;
     S.local = true;
     S.userClosed = false;
     if (token) {

@@ -43,7 +43,7 @@ async fn internal_provider_factories_broadcast_unattributed_breaker_notes() {
     let (tx, mut rx) = mpsc::channel(8);
     daemon.subs.locked().push(Subscriber {
         conn: 1,
-        tx,
+        tx: tx.into(),
         filter: Arc::new(StdMutex::new(EventFilter::default())),
         kick: CancellationToken::new(),
         gaps: Default::default(),

@@ -152,7 +152,7 @@ async fn description_diff_is_visible_in_approval_and_reconnect_snapshot_without_
     let (events, mut received) = mpsc::channel(128);
     daemon.subs.locked().push(Subscriber {
         conn: 1,
-        tx: events,
+        tx: events.into(),
         filter: Arc::new(StdMutex::new(EventFilter::default())),
         kick: CancellationToken::new(),
         gaps: BTreeMap::new(),
@@ -604,7 +604,7 @@ async fn raw_legacy_skill_prefix_refuses_all_run_admission_writes_and_explicit_f
     let (events, mut received) = mpsc::channel(128);
     daemon.subs.locked().push(Subscriber {
         conn: 1,
-        tx: events,
+        tx: events.into(),
         filter: Arc::new(StdMutex::new(EventFilter::default())),
         kick: CancellationToken::new(),
         gaps: BTreeMap::new(),

@@ -4,6 +4,9 @@
 
 #[path = "support/env.rs"]
 mod credential_env;
+#[path = "support/relay_peer.rs"]
+mod relay_peer;
+use relay_peer::RoomPeer;
 
 use formless_core::config::{generate_relay_secret, RelayCfg};
 use formless_core::relay::{
@@ -102,7 +105,7 @@ fn relay_urls_use_room_and_fragment_secret() {
     assert_eq!(
         ws,
         format!(
-            "wss://formless.athiwat.xyz/relay/{}?role=daemon&mux=1",
+            "wss://formless.athiwat.xyz/relay/{}?role=daemon&mux=1&transport=1",
             room_id(&key)
         )
     );
@@ -168,7 +171,6 @@ fn temp_paths(tag: &str) -> formless_core::Paths {
 #[tokio::test]
 async fn relay_gives_each_browser_its_own_connection() {
     let _env = credential_env::EnvGuard::isolated();
-    use futures_util::{SinkExt, StreamExt};
     use std::sync::Arc;
     use std::time::Duration;
     use tokio_tungstenite::tungstenite::Message;
@@ -185,7 +187,7 @@ async fn relay_gives_each_browser_its_own_connection() {
         async move { formless_core::relay::connect_once(d, &base, &s, &t).await }
     });
     let (tcp, _) = listener.accept().await.unwrap();
-    let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+    let mut ws = RoomPeer::accept(tcp).await;
 
     async fn settle(daemon: &formless_core::daemon::Daemon, want: usize) {
         for _ in 0..50 {
@@ -209,9 +211,7 @@ async fn relay_gives_each_browser_its_own_connection() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(daemon.subscriber_count(), 0);
 
-    async fn recv(
-        ws: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
-    ) -> serde_json::Value {
+    async fn recv(ws: &mut RoomPeer) -> serde_json::Value {
         let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
             .await
             .unwrap()
@@ -287,7 +287,6 @@ async fn relay_gives_each_browser_its_own_connection() {
 #[tokio::test]
 async fn relay_link_is_silent_without_browsers() {
     let _env = credential_env::EnvGuard::isolated();
-    use futures_util::StreamExt;
     use std::sync::Arc;
     use std::time::Duration;
     use tokio_tungstenite::tungstenite::Message;
@@ -302,7 +301,7 @@ async fn relay_link_is_silent_without_browsers() {
         async move { formless_core::relay::connect_once(d, &base, &s, &t).await }
     });
     let (tcp, _) = listener.accept().await.unwrap();
-    let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+    let mut ws = RoomPeer::accept(tcp).await;
 
     // Daemon activity that would be broadcast to any attached client.
     daemon
@@ -497,7 +496,6 @@ async fn waiting_questions_ask_the_relay_for_a_push() {
 #[tokio::test]
 async fn relay_browsers_are_listed_and_can_be_disconnected() {
     let _env = credential_env::EnvGuard::isolated();
-    use futures_util::{SinkExt, StreamExt};
     use std::sync::Arc;
     use std::time::Duration;
     use tokio_tungstenite::tungstenite::Message;
@@ -512,7 +510,7 @@ async fn relay_browsers_are_listed_and_can_be_disconnected() {
         async move { formless_core::relay::connect_once(d, &base, &s, &t).await }
     });
     let (tcp, _) = listener.accept().await.unwrap();
-    let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+    let mut ws = RoomPeer::accept(tcp).await;
     ws.send(Message::Text(
         r#"{"relay":"client_open","cid":"c1","ua":"Mozilla/5.0 (iPhone) Safari/604.1"}"#.into(),
     ))
@@ -545,6 +543,9 @@ async fn relay_browsers_are_listed_and_can_be_disconnected() {
     ))
     .await
     .unwrap();
+    let mut fixture_channel = Channel::new(&key, &bh, &dh, Side::Browser);
+    ws.send(Message::Text(serde_json::json!({"cid":"c1","f":fixture_channel.seal(r#"{"id":99,"protocol":1,"request":{"type":"ping"}}"#).unwrap()}).to_string())).await.unwrap();
+    let _ = ws.next().await;
     let list = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
             let v = daemon
@@ -576,7 +577,11 @@ async fn relay_browsers_are_listed_and_can_be_disconnected() {
     })
     .await
     .unwrap();
-    assert_eq!(frame, r#"{"cid":"c1","relay":"disconnect"}"#);
+    let frame: serde_json::Value = serde_json::from_str(&frame).unwrap();
+    assert_eq!(
+        frame,
+        serde_json::json!({"cid":"c1","relay":"disconnect","code":4001})
+    );
     let list = daemon
         .handle(formless_protocol::Request::ListRelayClients)
         .await
@@ -669,7 +674,6 @@ fn relay_key_material_is_zeroized() {
 #[tokio::test(flavor = "multi_thread")]
 async fn relay_handshake_is_confirmed_and_idempotent() {
     let _env = credential_env::EnvGuard::isolated();
-    use futures_util::{SinkExt, StreamExt};
     use std::sync::Arc;
     use std::time::Duration;
     use tokio_tungstenite::tungstenite::Message;
@@ -685,10 +689,8 @@ async fn relay_handshake_is_confirmed_and_idempotent() {
         async move { formless_core::relay::connect_once(d, &base, &s, &t).await }
     });
     let (tcp, _) = listener.accept().await.unwrap();
-    let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
-    async fn recv(
-        ws: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
-    ) -> serde_json::Value {
+    let mut ws = RoomPeer::accept(tcp).await;
+    async fn recv(ws: &mut RoomPeer) -> serde_json::Value {
         loop {
             let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
                 .await
@@ -740,7 +742,7 @@ async fn relay_handshake_is_confirmed_and_idempotent() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(daemon.subscriber_count(), 0);
 
-    // The right one (after a fresh hello, since the wrong proof dropped it).
+    // The right proof can still finish the unchanged pending transcript.
     ws.send(send("a", hello_frame(&bh))).await.unwrap();
     let dh = parse_hello(recv(&mut ws).await["f"].as_str().unwrap()).unwrap();
     ws.send(send("a", confirm_frame(&key, &bh, &dh)))
@@ -754,25 +756,20 @@ async fn relay_handshake_is_confirmed_and_idempotent() {
     }
     assert_eq!(daemon.subscriber_count(), 1);
 
-    // A replayed old hello (from another handshake) starts only a pending
-    // one: the live channel still answers.
-    let old = new_hello();
-    ws.send(send("a", hello_frame(&old))).await.unwrap();
-    let _pending = recv(&mut ws).await;
+    // An established known hello is ignored, preserving the next seq1 frame.
+    ws.send(send("a", hello_frame(&bh))).await.unwrap();
     let req = serde_json::json!({"id": 1, "protocol": 1, "request": {"type": "ping"}});
     ws.send(send("a", chan.seal(&req.to_string()).unwrap()))
         .await
         .unwrap();
-    let reply = loop {
-        let frame = recv(&mut ws).await;
-        if let Ok(line) = chan.open(frame["f"].as_str().unwrap()) {
-            let v: serde_json::Value = serde_json::from_str(&line).unwrap();
-            if v["kind"] == "response" {
-                break v;
-            }
-        }
-    };
+    let frame = recv(&mut ws).await;
+    let reply: serde_json::Value =
+        serde_json::from_str(&chan.open(frame["f"].as_str().unwrap()).unwrap()).unwrap();
     assert_eq!(reply["id"], 1);
+    ws.send(send("a", hello_frame(&new_hello()))).await.unwrap();
+    let closed = recv(&mut ws).await;
+    assert_eq!(closed["relay"], "disconnect");
+    assert_eq!(closed["code"], 4002);
     shutdown.cancel();
     link.await.unwrap().unwrap();
 }
@@ -783,7 +780,6 @@ async fn relay_handshake_is_confirmed_and_idempotent() {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_largest_attachment_crosses_the_relay_in_pieces() {
     let _env = credential_env::EnvGuard::isolated();
-    use futures_util::{SinkExt, StreamExt};
     use std::sync::Arc;
     use std::time::Duration;
     use tokio_tungstenite::tungstenite::Message;
@@ -805,7 +801,7 @@ async fn the_largest_attachment_crosses_the_relay_in_pieces() {
         async move { formless_core::relay::connect_once(d, &base, &s, &t).await }
     });
     let (tcp, _) = listener.accept().await.unwrap();
-    let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+    let mut ws = RoomPeer::accept(tcp).await;
     let wrap = |f: String| Message::Text(serde_json::json!({"cid": "u", "f": f}).to_string());
     let bh = new_hello();
     ws.send(wrap(hello_frame(&bh))).await.unwrap();
@@ -824,11 +820,7 @@ async fn the_largest_attachment_crosses_the_relay_in_pieces() {
             serde_json::json!({"id": next_id, "protocol": 1, "request": request}).to_string();
         (next_id, chan.seal(&line).unwrap())
     };
-    async fn answer(
-        ws: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
-        chan: &mut Channel,
-        id: u64,
-    ) -> serde_json::Value {
+    async fn answer(ws: &mut RoomPeer, chan: &mut Channel, id: u64) -> serde_json::Value {
         loop {
             let msg = tokio::time::timeout(Duration::from_secs(10), ws.next())
                 .await
@@ -911,7 +903,7 @@ fn daemon_claim_matches_worker_browser_vector_without_exposing_pairing_key_in_ur
     assert!(!url.contains(&claim_hex) && !url.contains(&secret));
     assert_eq!(
         url,
-        "wss://relay.invalid/relay/c24c18b87313893139ea9647c754be6d?role=daemon&mux=1"
+        "wss://relay.invalid/relay/c24c18b87313893139ea9647c754be6d?role=daemon&mux=1&transport=1"
     );
 }
 
@@ -921,7 +913,6 @@ fn daemon_claim_matches_worker_browser_vector_without_exposing_pairing_key_in_ur
 #[tokio::test]
 async fn daemon_upgrade_proof_rejects_squat_and_wrong_claim_and_is_stable_on_restart() {
     use formless_core::relay::daemon_authorization;
-    use futures_util::SinkExt;
     use std::sync::Arc;
     use std::time::Duration;
     use tokio_tungstenite::tungstenite::{
@@ -1041,4 +1032,256 @@ async fn daemon_upgrade_proof_rejects_squat_and_wrong_claim_and_is_stable_on_res
     .expect("bounded claim and restart exchange");
     drop(daemon);
     std::fs::remove_dir_all(paths.data_dir.parent().unwrap()).unwrap();
+}
+
+/// A complete maximum-sized IPC request traverses the real TCP/WebSocket,
+/// fragments, authenticated E2E channel and daemon reader without truncation.
+#[tokio::test(flavor = "multi_thread")]
+async fn exact_32mib_ipc_request_crosses_the_native_relay_wire() {
+    let _env = credential_env::EnvGuard::isolated();
+    use std::sync::Arc;
+    use tokio_tungstenite::tungstenite::Message;
+    let daemon = Arc::new(formless_core::daemon::Daemon::new(temp_paths("relay32m")).unwrap());
+    let secret = generate_relay_secret();
+    let key = key_from_secret(&secret).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("ws://{}", listener.local_addr().unwrap());
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let link = tokio::spawn({
+        let (d, s, t) = (daemon.clone(), secret.clone(), shutdown.clone());
+        async move { formless_core::relay::connect_once(d, &base, &s, &t).await }
+    });
+    let (tcp, _) = listener.accept().await.unwrap();
+    let mut ws = RoomPeer::accept(tcp).await;
+    let bh = new_hello();
+    ws.send(Message::Text(
+        serde_json::json!({"cid":"max","f":hello_frame(&bh)}).to_string(),
+    ))
+    .await
+    .unwrap();
+    let first = ws.next().await.unwrap().unwrap();
+    let first: serde_json::Value = serde_json::from_str(first.to_text().unwrap()).unwrap();
+    let dh = parse_hello(first["f"].as_str().unwrap()).unwrap();
+    ws.send(Message::Text(
+        serde_json::json!({"cid":"max","f":confirm_frame(&key,&bh,&dh)}).to_string(),
+    ))
+    .await
+    .unwrap();
+    let mut channel = Channel::new(&key, &bh, &dh, Side::Browser);
+    // Unknown envelope metadata is ignored by the typed protocol decoder. Its
+    // exact byte count still exercises the complete 32MiB transport boundary.
+    let prefix = r#"{"id":701,"protocol":1,"request":{"type":"ping"},"private_padding":""#;
+    let mut line = String::with_capacity(formless_protocol::MAX_FRAME_BYTES);
+    line.push_str(prefix);
+    line.extend(std::iter::repeat_n(
+        'x',
+        formless_protocol::MAX_FRAME_BYTES - prefix.len() - 2,
+    ));
+    line.push_str("\"}");
+    assert_eq!(line.len(), formless_protocol::MAX_FRAME_BYTES);
+    let encrypted = channel.seal(&line).unwrap();
+    drop(line);
+    ws.send(Message::Text(
+        serde_json::json!({"cid":"max","f":encrypted}).to_string(),
+    ))
+    .await
+    .unwrap();
+    loop {
+        let frame = ws.next().await.unwrap().unwrap();
+        let frame: serde_json::Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+        let line = channel.open(frame["f"].as_str().unwrap()).unwrap();
+        let response: serde_json::Value = serde_json::from_str(&line).unwrap();
+        if response["kind"] == "response" && response["id"] == 701 {
+            assert_eq!(response["ok"], true, "{response}");
+            break;
+        }
+    }
+    assert!(ws.biggest <= 64 * 1024 + 1024);
+    assert!(ws.biggest > 64 * 1024);
+    shutdown.cancel();
+    tokio::time::timeout(std::time::Duration::from_secs(5), link)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(daemon.subscriber_count(), 0);
+}
+
+#[tokio::test]
+async fn native_relay_client_cap_rejects_unconfirmed_peers_without_core_subscribers() {
+    let _env = credential_env::EnvGuard::isolated();
+    use std::sync::Arc;
+    use tokio_tungstenite::tungstenite::Message;
+    let daemon = Arc::new(formless_core::daemon::Daemon::new(temp_paths("relaycap")).unwrap());
+    let secret = generate_relay_secret();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("ws://{}", listener.local_addr().unwrap());
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let link = tokio::spawn({
+        let (d, s, t) = (daemon.clone(), secret.clone(), shutdown.clone());
+        async move { formless_core::relay::connect_once(d, &base, &s, &t).await }
+    });
+    let (tcp, _) = listener.accept().await.unwrap();
+    let mut ws = RoomPeer::accept(tcp).await;
+    for n in 0..17 {
+        ws.send(Message::Text(
+            serde_json::json!({"relay":"client_open","cid":format!("c{n}")}).to_string(),
+        ))
+        .await
+        .unwrap();
+    }
+    let closed = ws.next().await.unwrap().unwrap();
+    let closed: serde_json::Value = serde_json::from_str(closed.to_text().unwrap()).unwrap();
+    assert_eq!(closed["relay"], "disconnect");
+    assert_eq!(closed["cid"], "c16");
+    assert_eq!(closed["code"], 1008);
+    assert_eq!(daemon.subscriber_count(), 0);
+    assert!(daemon
+        .handle(formless_protocol::Request::ListRelayClients)
+        .await
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .is_empty());
+    shutdown.cancel();
+    tokio::time::timeout(std::time::Duration::from_secs(5), link)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
+/// The output boundary is exercised separately from the maximum UP Ping:
+/// an owned stored message produces an exact32MiB actual GetSession response.
+#[tokio::test(flavor = "multi_thread")]
+async fn exact_32mib_session_reply_crosses_the_native_relay_wire_with_all_fragment_credits() {
+    let _env = credential_env::EnvGuard::isolated();
+    use sha2::{Digest, Sha256};
+    use std::sync::Arc;
+    use tokio_tungstenite::tungstenite::Message;
+    let paths = temp_paths("relay32down");
+    let mut cfg = formless_core::Config::default();
+    cfg.naming.enabled = false;
+    cfg.skills.auto_create = false;
+    cfg.save(&paths).unwrap();
+    // Both calibration states must have the same derived Session preview:
+    // its 80-character prefix plus ellipsis is part of the actual RPC envelope.
+    let seed = "d".repeat(128);
+    let (sid, mid) = {
+        let store = formless_core::Store::open(&paths.db_file()).unwrap();
+        let sid = store.create_session(None).unwrap().id;
+        let mid = store.append_message(&sid, "user", &seed).unwrap().id;
+        (sid, mid)
+    };
+    let daemon = Arc::new(formless_core::daemon::Daemon::new(paths.clone()).unwrap());
+    let snapshot = daemon
+        .handle(formless_protocol::Request::GetSession { id: sid.clone() })
+        .await
+        .unwrap();
+    let preview = snapshot["session"]["preview"].clone();
+    let base = formless_protocol::ServerMessage::ok(801, snapshot);
+    let overhead = serde_json::to_vec(&base).unwrap().len();
+    drop(base);
+    let content = "d".repeat(formless_protocol::MAX_FRAME_BYTES - overhead + seed.len());
+    // Fixture preparation touches only the owned message's content. Keeping
+    // timestamps fixed makes exact wire calibration independent of clock text.
+    {
+        let db = rusqlite::Connection::open(paths.db_file()).unwrap();
+        assert_eq!(
+            db.execute(
+                "UPDATE messages SET content=?1 WHERE id=?2",
+                rusqlite::params![&content, mid]
+            )
+            .unwrap(),
+            1
+        );
+    }
+    let expected_content_hash = Sha256::digest(content.as_bytes());
+    drop(content);
+    let snapshot = daemon
+        .handle(formless_protocol::Request::GetSession { id: sid.clone() })
+        .await
+        .unwrap();
+    assert_eq!(
+        snapshot["session"]["preview"], preview,
+        "derived preview is stable while only message bytes change"
+    );
+    let expected =
+        serde_json::to_vec(&formless_protocol::ServerMessage::ok(801, snapshot)).unwrap();
+    assert_eq!(
+        expected.len(),
+        formless_protocol::MAX_FRAME_BYTES,
+        "actual RPC calibration is exactly the documented boundary"
+    );
+    let expected_frame_hash = Sha256::digest(&expected);
+    drop(expected);
+    let secret = generate_relay_secret();
+    let key = key_from_secret(&secret).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("ws://{}", listener.local_addr().unwrap());
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let link = tokio::spawn({
+        let (d, s, t) = (daemon.clone(), secret.clone(), shutdown.clone());
+        async move { formless_core::relay::connect_once(d, &base, &s, &t).await }
+    });
+    let (tcp, _) = listener.accept().await.unwrap();
+    let mut peer = RoomPeer::accept(tcp).await;
+    let bh = new_hello();
+    peer.send(Message::Text(
+        serde_json::json!({"cid":"maxdown","f":hello_frame(&bh)}).to_string(),
+    ))
+    .await
+    .unwrap();
+    let reply = peer.next().await.unwrap().unwrap();
+    let reply: serde_json::Value = serde_json::from_str(reply.to_text().unwrap()).unwrap();
+    let dh = parse_hello(reply["f"].as_str().unwrap()).unwrap();
+    peer.send(Message::Text(
+        serde_json::json!({"cid":"maxdown","f":confirm_frame(&key,&bh,&dh)}).to_string(),
+    ))
+    .await
+    .unwrap();
+    let mut channel = Channel::new(&key, &bh, &dh, Side::Browser);
+    let request =
+        serde_json::json!({"id":801,"protocol":1,"request":{"type":"get_session","id":sid}})
+            .to_string();
+    let cipher = channel.seal(&request).unwrap();
+    peer.send(Message::Text(
+        serde_json::json!({"cid":"maxdown","f":cipher}).to_string(),
+    ))
+    .await
+    .unwrap();
+    let reply = peer.next().await.unwrap().unwrap();
+    let reply: serde_json::Value = serde_json::from_str(reply.to_text().unwrap()).unwrap();
+    assert_eq!(reply["cid"], "maxdown");
+    let line = channel.open(reply["f"].as_str().unwrap()).unwrap();
+    assert_eq!(line.len(), formless_protocol::MAX_FRAME_BYTES);
+    assert_eq!(
+        Sha256::digest(line.as_bytes()),
+        expected_frame_hash,
+        "entire actual RPC reply survives windowed native transport exactly"
+    );
+    let response: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(response["ok"], true);
+    assert_eq!(response["id"], 801);
+    assert_eq!(
+        Sha256::digest(
+            response["result"]["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .as_bytes()
+        ),
+        expected_content_hash
+    );
+    assert!(
+        peer.down_fragments > 8,
+        "actual output spans repeated credit windows"
+    );
+    assert!(peer.biggest <= 64 * 1024 + 1024);
+    shutdown.cancel();
+    tokio::time::timeout(std::time::Duration::from_secs(5), link)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(daemon.subscriber_count(), 0);
 }

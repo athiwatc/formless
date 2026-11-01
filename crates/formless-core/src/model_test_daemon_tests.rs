@@ -200,7 +200,7 @@ async fn background_save_failure_is_a_visible_note_and_preserves_existing_cache(
     let (tx, mut events) = mpsc::channel(64);
     f.daemon().subs.locked().push(Subscriber {
         conn: 1045,
-        tx,
+        tx: tx.into(),
         filter: Arc::new(StdMutex::new(EventFilter::default())),
         kick: CancellationToken::new(),
         gaps: BTreeMap::new(),

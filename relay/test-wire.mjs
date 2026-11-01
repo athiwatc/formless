@@ -1,5 +1,6 @@
 // Tiny dependency-free RFC6455 fixture peer. Authorization is sent only in
 // the Upgrade header; error messages intentionally contain no headers/URL.
+import { LIMITS } from "./web/transport.mjs";
 import http from "node:http";
 import https from "node:https";
 import { createHash, randomBytes } from "node:crypto";
@@ -19,14 +20,14 @@ export function wireOpen(url, authorization) {
       const listeners=new Set();
       const peer={got:[],closed:null,onmessage:null,onclose:null,
         subscribe(fn){listeners.add(fn);return()=>listeners.delete(fn);},
-        send(text){frame(1,Buffer.from(text));},close(){if(!closed)frame(8,Buffer.from([3,232]));},
+        send(text){frame(1,Buffer.from(text));},ping(){frame(9,Buffer.alloc(0));},declareTextBytes(n){const length=Buffer.alloc(8);length.writeBigUInt64BE(BigInt(n));socket.write(Buffer.concat([Buffer.from([129,255]),length,Buffer.alloc(4)]));},close(){if(!closed)frame(8,Buffer.from([3,232]));},
         terminate(){socket.destroy();}
       };
       function frame(op,payload){
         if(closed)throw new Error("fixture socket closed");
         const mask=randomBytes(4),n=payload.length;
-        const header=n<126?Buffer.from([128|op,128|n]):n<65536?Buffer.from([128|op,254,n>>8,n&255]):null;
-        if(!header)throw new Error("fixture frame too large");
+        if(n>LIMITS.wire)throw new Error("fixture frame too large");
+        const header=n<126?Buffer.from([128|op,128|n]):n<65536?Buffer.from([128|op,254,n>>8,n&255]):Buffer.concat([Buffer.from([128|op,255]),(()=>{const length=Buffer.alloc(8);length.writeBigUInt64BE(BigInt(n));return length;})()]);
         const bytes=Buffer.from(payload);for(let i=0;i<n;i++)bytes[i]^=mask[i%4];
         socket.write(Buffer.concat([header,mask,bytes]));
       }
@@ -36,7 +37,7 @@ export function wireOpen(url, authorization) {
         while(buffer.length>=2){
           const op=buffer[0]&15;let n=buffer[1]&127,offset=2;
           if(n===126){if(buffer.length<4)return;n=buffer.readUInt16BE(2);offset=4;}
-          if(n===127){socket.destroy();finish(1009);return;}
+          if(n===127){if(buffer.length<10)return;const declared=buffer.readBigUInt64BE(2);if(declared>BigInt(LIMITS.wire)){socket.destroy();finish(1009);return;}n=Number(declared);offset=10;}
           if(buffer.length<offset+n)return;
           const payload=buffer.subarray(offset,offset+n);buffer=buffer.subarray(offset+n);
           if(op===8){const code=payload.length>=2?payload.readUInt16BE(0):1000;if(!closed)frame(8,payload.subarray(0,2));finish(code);socket.end();return;}

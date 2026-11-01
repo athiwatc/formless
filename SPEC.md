@@ -4447,10 +4447,12 @@ during its snapshot fetch, deduplicated by message id.
   `confirm` = HKDF(key, salt = both nonces, info `formless-relay/2
   confirm d2b`), which the browser checks before answering with its own
   `{"v":2,"confirm":…}` (info `… b2d`). Only then does the browser count
-  as a subscriber or appear in the device list. The same hello again gets
-  the same answer (no one-sided rekey); a different hello starts a
-  pending handshake that replaces the live channel only once confirmed,
-  and is dropped after 30 s. The browser shows "securing the connection…"
+  as a subscriber or appear in the device list. While a handshake is pending,
+  the same hello gets the same answer without resetting its absolute 30 s
+  deadline. After readiness, a known hello or confirm is ignored without
+  rekeying, replying, or adding another subscriber. A different hello closes
+  only that client with 4002 so a fresh WebSocket generation can handshake;
+  an established channel is never replaced in place. The browser shows "securing the connection…"
   until confirmed, asks again up to three times 8 s apart, then says it
   couldn't secure the connection, and ignores any hello once its channel
   is up. Every frame carries a
@@ -4464,7 +4466,36 @@ during its snapshot fetch, deduplicated by message id.
   subscriber: with no browser attached, approvals fail closed and the
   daemon can idle-close. The browser URL carries
   the secret in the `#k=` fragment, which is never sent to a server.
-  `--rotate` invalidates old links. The hosted Web frontend is a full
+  `--rotate` invalidates old links. The matching bounded transport requires
+  `transport=1`: opaque 64 KiB fragments preserve the full 32 MiB plaintext
+  IPC ceiling without decrypting application payloads at the Relay.
+  Before daemon-authorized E2E readiness only 2048-byte handshake/control bodies
+  are accepted, with an absolute 30 s handshake deadline. The room admits at
+  most 16 CIDs including closing clients and sent-UP orphan receipts. Each
+  direction has eight pending permits/deliveries, a per-CID progress reserve,
+  and a shared 1 MiB excess-wire pool. Random receiver-only delivery receipts
+  are bound to the actual socket and generation; sender permits cannot serve
+  as pre-ACKs. Ready controls must be consumed and acknowledged before bulk
+  grants; the final fragment is acknowledged only after its consumer releases
+  the completed frame. Closing alone does not refund native buffering. The
+  compact SQLite metadata ledger and alarms preserve charges, deadlines and
+  lifecycle controls through hibernation; ciphertext is never persisted there.
+  A daemon `client_close` lifecycle control carries both `cid` and its exact
+  generation `g`; stale closes cannot retire a replacement connection. Logical
+  cancellation does not free a still-live native socket's slot or queued bytes.
+  Browser and daemon endpoint byte leases bound retained serialized producers,
+  reassembly and crypto work, with independent small lanes and bounded RPC
+  queues/control concurrency. Before allocating an incoming encrypted envelope
+  of `E` bytes, Rust reserves `3E + 2 min(32 MiB, 3 ceil(E/4)) + 16 KiB`:
+  this covers ciphertext and overlapping old/new escaped-JSON scratch buffers,
+  followed by decoding/plaintext handoff. Cipher-envelope validation constructs
+  constant errors without formatting attacker field names or wrong-type strings.
+  These are application-controlled transport bounds,
+  not OS RSS, arbitrary Store/business-query heaps, or undocumented platform
+  native-buffer guarantees. Exact limits and residual scope are recorded in
+  `relay/transport-design.md`; matching source versions and local end-to-end
+  validation are required, and no hosted deployment is implied.
+  The hosted Web frontend is a full
   client with TUI feature parity — Sessions (new, fork, rename, delete,
   search, import/export), streaming chat with thinking and Tool calls,
   send/steer/queue/stop and edit-and-rerun, approvals and promotions,

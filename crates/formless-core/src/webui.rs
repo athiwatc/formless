@@ -24,6 +24,7 @@ use crate::daemon::Daemon;
 
 const INDEX: &str = include_str!("../../../relay/web/index.html");
 const APP_JS: &str = include_str!("../../../relay/web/app.js");
+const TRANSPORT_JS: &str = include_str!("../../../relay/web/transport.mjs");
 const APP_CSS: &str = include_str!("../../../relay/web/app.css");
 const MERMAID: &str = include_str!("../../../relay/web/vendor/mermaid.min.js");
 // The installable app shell (SPEC §12).
@@ -129,6 +130,10 @@ pub async fn start(daemon: Arc<Daemon>, port: u16) -> Result<Arc<WebUi>> {
         .route(
             "/app.js",
             get(|s, h| asset(s, h, "text/javascript", APP_JS)),
+        )
+        .route(
+            "/transport.mjs",
+            get(|s, h| asset(s, h, "text/javascript", TRANSPORT_JS)),
         )
         .route("/app.css", get(|s, h| asset(s, h, "text/css", APP_CSS)))
         .route(
