@@ -289,6 +289,7 @@ pub(super) fn open_file(paths: &Paths, file: &Path) -> Result<Option<Store>> {
     // Only the private pager may rebuild SHM, replay WAL, migrate or optimize.
     // The source is still exclusively locked until its coherent copy is open.
     let mut store = Store::open(&copy)?;
+    store.artifact_root = Some(paths.data_dir.join("artifacts"));
     store.check_integrity(&copy)?;
     store.conn.execute_batch("PRAGMA query_only=ON;")?;
     // Keep configuration and data namespaces frozen until the caller finishes
