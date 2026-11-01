@@ -1129,4 +1129,31 @@ mod tests {
         assert_eq!(preview.fingerprint, uploaded.fingerprint);
         std::fs::remove_dir_all(root).unwrap();
     }
+    #[test]
+    fn owned_offline_quote_releases_source_freeze_before_any_output() {
+        let env = crate::credential_env::EnvGuard::isolated();
+        for key in ["FORMLESS_MODEL", "FORMLESS_BASE_URL", "FORMLESS_SECURE"] {
+            env.remove(key);
+        }
+        let root = std::env::temp_dir().join(format!("fl-forecast-owned-{}", uuid::Uuid::new_v4()));
+        let paths = Paths::from_dirs(root.join("data"), root.join("config")).unwrap();
+        config().save(&paths).unwrap();
+        let st = Store::open(&paths.db_file()).unwrap();
+        let sid = st.create_session(None).unwrap().id;
+        drop(st);
+        let quote = estimate(
+            &paths,
+            &ForecastInput {
+                session_id: Some(sid),
+                draft: "task".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let lease = crate::profile_lock::ProfileLock::hierarchy_shared(&paths)
+            .expect("owned quote cannot retain source maintenance during output");
+        assert!(!serde_json::to_string_pretty(&quote).unwrap().is_empty());
+        drop(lease);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

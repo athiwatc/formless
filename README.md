@@ -298,11 +298,26 @@ formless run "triage this" --output json                   # {session_id, status
 formless run "clean up the temp files" --yes               # auto-approve sensitive Tools
 formless run "classify these titles" --model small-model --effort low
 formless run "plan the migration" --role planner           # a configured Role's provider and model
+formless run --estimate "plan the migration" --json       # local preview; no Run or provider call
 formless run "fix the failing test" --cwd ~/src/app        # act on that folder (default: where you run it)
 formless run "what's wrong here?" --attach shot.png --attach app.log   # files and images
 git diff | formless run "review this"                      # piped input goes along as stdin.txt
 cat task.md | formless run -                               # `-` reads the task itself from stdin
 ```
+
+Before sending, the TUI and web composer show a local forecast for the current
+draft: prompt tokens, comparable model/role Runs, likely cost and steps, and
+compaction risk. No comparable history means prompt size only; unpriced models
+have no dollar range. `run --estimate` prints p50/p90 steps, tokens, cost and
+duration without creating a Session or Run, uploading files, refreshing credentials
+or calling a provider. It may read an already-running daemon over local IPC; it
+never starts one. Offline snapshots fail closed when the profile is busy.
+
+Set `limits.forecast_confirm_usd` to require confirmation when a priced p90 exceeds
+your threshold. Headless Runs need `--yes` for that confirmation. Forecasts add no
+step, token or time caps. Metrics records the immutable forecast beside actual
+usage, errors and coverage; interrupted or incomplete usage stays unknown.
+
 
 Piped stdin is read only when stdin isn't a terminal; from a script that leaves stdin open without writing to it, add `< /dev/null`.
 
