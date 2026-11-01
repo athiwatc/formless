@@ -3021,7 +3021,7 @@ fn doctor_report(paths: &Paths, quiet: bool) -> Result<Vec<Problem>> {
             }
         }
     }
-    for provider in oauth_provider_statuses(paths, &cfg) {
+    for provider in oauth_provider_statuses(&paths, &cfg) {
         let name = provider["name"].as_str().unwrap_or_default();
         say!(
             "OAuth {name}: {}",
