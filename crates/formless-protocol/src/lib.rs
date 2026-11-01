@@ -201,6 +201,80 @@ pub struct SessionBranchUsage {
     pub warnings: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BranchSummaryProjection {
+    pub total_messages: u64,
+    pub included_messages: u64,
+    pub omitted_messages: u64,
+    /// Source content bytes considered, before secret redaction.
+    pub total_bytes: u64,
+    pub included_bytes: u64,
+    pub omitted_bytes: u64,
+    pub truncated_messages: u64,
+    /// Policy: transcript metadata/attachment authorities are never projected.
+    pub metadata_omitted: bool,
+    pub attachment_bodies_omitted: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BranchSummaryBasis {
+    pub source_id: String,
+    pub target_id: String,
+    /// Bounded display labels; IDs and revision hashes remain authoritative.
+    pub source_name: String,
+    pub target_name: String,
+    pub source_revision: String,
+    pub target_revision: String,
+    pub provider: String,
+    /// Effective Session selector; role/auto is resolved only on generation.
+    pub requested_model: String,
+    pub projection: BranchSummaryProjection,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BranchSummaryUsage {
+    pub requests: u64,
+    pub reported_requests: u64,
+    pub reported_prompt_tokens: u64,
+    pub reported_completion_tokens: u64,
+    pub reported_cached_tokens: u64,
+    pub reported_cache_write_tokens: u64,
+    pub usage_complete: bool,
+    pub cost: Option<f64>,
+    pub priced_cost_subtotal: f64,
+    pub estimated_requests: u64,
+    pub unpriced: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BranchSummaryPreview {
+    pub preview_id: String,
+    pub source_id: String,
+    pub target_id: String,
+    pub source_revision: String,
+    pub target_revision: String,
+    /// Exact server-owned note content reviewed before a separate confirmation.
+    pub candidate: String,
+    pub candidate_hash: String,
+    pub provider: String,
+    /// Concrete selected model, after ordinary role/auto routing.
+    pub requested_model: String,
+    pub served_model: String,
+    pub usage: BranchSummaryUsage,
+    pub projection: BranchSummaryProjection,
+    pub expires_at: String,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BranchSummaryApplied {
+    pub preview_id: String,
+    pub source_id: String,
+    pub target_id: String,
+    pub message: MessageInfo,
+    pub already_applied: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SearchHit {
     pub session_id: String,
@@ -1530,6 +1604,26 @@ pub enum Request {
     CompareSessions {
         left: String,
         right: String,
+    },
+    /// Read-only durable revision basis before explicit paid summary generation.
+    InspectBranchSummary {
+        source_id: String,
+        target_id: String,
+    },
+    PrepareBranchSummary {
+        source_id: String,
+        target_id: String,
+        source_revision: String,
+        target_revision: String,
+    },
+    /// Confirm an exact server-owned candidate; never accepts client note text.
+    CommitBranchSummary {
+        preview_id: String,
+        source_id: String,
+        target_id: String,
+        source_revision: String,
+        target_revision: String,
+        candidate_hash: String,
     },
     SearchSessions {
         query: String,

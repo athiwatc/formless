@@ -525,6 +525,9 @@ pub fn run_with(paths: Paths, start: ChatStart, label: &str) -> Result<()> {
                     .collect();
                 say(&format!("Topics: {}.", topics.join(", ")));
             }
+            cmd if cmd == "/summarise-branch" || cmd.starts_with("/summarise-branch ") => {
+                say("Open the full TUI or web, switch to the target Session, then use /summarise-branch SOURCE_SESSION to generate and review a candidate before inserting one note.");
+            }
             "/stop" => {
                 client.send(Request::InterruptRun {
                     session_id: session.id.clone(),

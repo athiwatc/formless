@@ -1,3 +1,4 @@
+mod branch_summary;
 pub mod client;
 mod clipimg;
 mod commands;
@@ -174,6 +175,25 @@ enum Pending {
         revision: u64,
         left: String,
         right: String,
+    },
+    InspectBranchSummary {
+        generation: u64,
+        source_id: String,
+        target_id: String,
+    },
+    PrepareBranchSummary {
+        generation: u64,
+        source_id: String,
+        target_id: String,
+        source_revision: String,
+        target_revision: String,
+    },
+    CommitBranchSummary {
+        generation: u64,
+        preview_id: String,
+        source_id: String,
+        target_id: String,
+        candidate: String,
     },
     /// A step-mode decision (errors keep the step waiting).
     StepDecision,
@@ -1421,6 +1441,7 @@ struct App {
     session_idx: usize,
     session_filter: lists::ListFilter,
     session_comparison_revision: u64,
+    branch_summary: branch_summary::State,
     current: Option<String>,
     messages: Vec<MessageInfo>,
     streaming: String,
@@ -1788,6 +1809,7 @@ impl App {
             session_idx: 0,
             session_filter: lists::ListFilter::default(),
             session_comparison_revision: 0,
+            branch_summary: branch_summary::State::default(),
             current: None,
             messages: Vec::new(),
             streaming: String::new(),
@@ -1982,6 +2004,7 @@ impl App {
 
     /// Initial connection and reconnect both refresh connection-specific state.
     fn attach_daemon(&mut self, client: DaemonClient, inbox: mpsc::Receiver<ServerMessage>) {
+        self.cancel_branch_summary();
         self.clear_attention();
         self.description_save_preview = None;
         self.description_editor_observed = None;
@@ -2043,6 +2066,7 @@ impl App {
     /// The daemon went away (restart, crash): keep everything on screen,
     /// show "reconnecting…" and try again every 2 s (SPEC §10.5).
     fn daemon_lost(&mut self) {
+        self.cancel_branch_summary();
         self.forecast = ForecastUi::default();
         self.restore_unsent_draft();
         self.interrupt_attachment_send("Attachment upload was interrupted before sending; its text/files are kept for review, never sent automatically.");
@@ -2447,6 +2471,10 @@ impl App {
             if matches!(kind, Pending::ForecastHint { .. }) {
                 continue;
             }
+            if matches!(&kind, Pending::InspectBranchSummary { generation, .. } | Pending::PrepareBranchSummary { generation, .. } | Pending::CommitBranchSummary { generation, .. } if *generation == self.branch_summary.generation)
+            {
+                self.cancel_branch_summary();
+            }
             self.notes.push(format!(
                 "the daemon did not answer within {}s; try again",
                 REQUEST_DEADLINE.as_secs()
@@ -2626,7 +2654,19 @@ impl App {
                     let Some(kind) = self.pending.remove(&id) else {
                         continue;
                     };
+                    if matches!(&kind, Pending::InspectBranchSummary { generation, .. } | Pending::PrepareBranchSummary { generation, .. } | Pending::CommitBranchSummary { generation, .. } if *generation != self.branch_summary.generation)
+                    {
+                        continue;
+                    }
                     if !ok {
+                        if matches!(
+                            kind,
+                            Pending::InspectBranchSummary { .. }
+                                | Pending::PrepareBranchSummary { .. }
+                                | Pending::CommitBranchSummary { .. }
+                        ) {
+                            self.cancel_branch_summary();
+                        }
                         if matches!(kind, Pending::ForecastHint { .. }) {
                             continue;
                         }
@@ -2658,6 +2698,14 @@ impl App {
                         continue;
                     }
                     let Some(result) = result else {
+                        if matches!(
+                            kind,
+                            Pending::InspectBranchSummary { .. }
+                                | Pending::PrepareBranchSummary { .. }
+                                | Pending::CommitBranchSummary { .. }
+                        ) {
+                            self.cancel_branch_summary();
+                        }
                         if matches!(kind, Pending::ReconnectSession) {
                             self.reconnect_read_failed(id);
                         }
@@ -4156,6 +4204,115 @@ impl App {
                                 }
                             }
                         }
+                        Pending::InspectBranchSummary {
+                            generation,
+                            source_id,
+                            target_id,
+                        } => {
+                            if !self.branch_summary.current(
+                                generation,
+                                &source_id,
+                                &target_id,
+                                self.current.as_deref(),
+                            ) {
+                                continue;
+                            }
+                            match serde_json::from_value::<BranchSummaryBasis>(result) {
+                                Ok(basis)
+                                    if branch_summary::basis_matches(
+                                        &basis, &source_id, &target_id,
+                                    ) =>
+                                {
+                                    let pending = Pending::PrepareBranchSummary {
+                                        generation,
+                                        source_id: source_id.clone(),
+                                        target_id: target_id.clone(),
+                                        source_revision: basis.source_revision.clone(),
+                                        target_revision: basis.target_revision.clone(),
+                                    };
+                                    let request = Request::PrepareBranchSummary {
+                                        source_id,
+                                        target_id,
+                                        source_revision: basis.source_revision.clone(),
+                                        target_revision: basis.target_revision.clone(),
+                                    };
+                                    self.notes.push(format!(
+                                        "Generating {} → {} with {} / {}…",
+                                        basis.source_name,
+                                        basis.target_name,
+                                        basis.provider,
+                                        basis.requested_model
+                                    ));
+                                    self.branch_summary.basis = Some(basis);
+                                    self.request(pending, request);
+                                }
+                                _ => {
+                                    self.cancel_branch_summary();
+                                    self.notes.push("Branch summary basis did not match the requested source and target.".into());
+                                }
+                            }
+                        }
+                        Pending::PrepareBranchSummary {
+                            generation,
+                            source_id,
+                            target_id,
+                            source_revision,
+                            target_revision,
+                        } => {
+                            if !self.branch_summary.current(
+                                generation,
+                                &source_id,
+                                &target_id,
+                                self.current.as_deref(),
+                            ) {
+                                continue;
+                            }
+                            match serde_json::from_value::<BranchSummaryPreview>(result) {
+                                Ok(preview)
+                                    if preview.source_revision == source_revision
+                                        && preview.target_revision == target_revision
+                                        && self.branch_summary.basis.as_ref().is_some_and(
+                                            |basis| {
+                                                branch_summary::preview_matches(basis, &preview)
+                                            },
+                                        ) =>
+                                {
+                                    let lines = branch_summary::review_lines(
+                                        self.branch_summary.basis.as_ref().unwrap(),
+                                        &preview,
+                                    );
+                                    self.pager = Some(Pager {
+                                        title: "Branch summary · review exact note".into(),
+                                        lines,
+                                        top: 0,
+                                        left: 0,
+                                        styled: Vec::new(),
+                                    });
+                                    self.branch_summary.review = Some(preview);
+                                }
+                                _ => {
+                                    self.cancel_branch_summary();
+                                    self.notes.push("Branch summary candidate was stale or did not match its source, target, revisions and exact hash.".into());
+                                }
+                            }
+                        }
+                        Pending::CommitBranchSummary {
+                            generation: _,
+                            preview_id,
+                            source_id,
+                            target_id,
+                            candidate,
+                        } => {
+                            self.branch_summary.committing = false;
+                            match serde_json::from_value::<BranchSummaryApplied>(result) {
+                                Ok(applied) if applied.preview_id == preview_id && applied.source_id == source_id && applied.target_id == target_id
+                                    && applied.message.session_id == target_id && applied.message.content == candidate => {
+                                    self.on_event(Event::MessageAppended { session_id: target_id.clone(), message: applied.message });
+                                    self.notes.push(if applied.already_applied { "This summary note was already inserted; no duplicate was added.".into() } else { "Inserted one branch summary note; no Run was started.".into() });
+                                }
+                                _ => self.notes.push("Branch summary insertion reply did not match the reviewed candidate; inspect the target Session before retrying.".into()),
+                            }
+                        }
                         Pending::CompareSessions {
                             revision,
                             left,
@@ -4536,6 +4693,9 @@ impl App {
     /// Run state so it cannot bleed into this one.
     fn switch_session(&mut self, id: String) {
         self.vim_input.reset();
+        if self.current.as_deref() != Some(&id) {
+            self.cancel_branch_summary();
+        }
         // Live traffic only for the Session on screen (lists stay global).
         self.others.clear();
         self.request(
@@ -4589,6 +4749,17 @@ impl App {
     }
 
     fn on_event(&mut self, ev: Event) {
+        if self
+            .branch_summary
+            .intent
+            .as_ref()
+            .is_some_and(|(source, target)| branch_summary::affects(&ev, source, target))
+        {
+            self.cancel_branch_summary();
+            self.notes.push(
+                "A source or target Session changed; generate a fresh branch summary.".into(),
+            );
+        }
         if matches!(
             &ev,
             Event::SettingsChanged
@@ -7157,6 +7328,18 @@ impl App {
                     self.notes.push(format!("pulling {model} with Ollama…"));
                 }
             }
+            cmd if cmd == "summarise-branch" || cmd.starts_with("summarise-branch ") => {
+                self.cancel_branch_summary();
+                let source = cmd["summarise-branch".len()..].trim();
+                if source == "cancel" { return; }
+                let Some(target_id) = self.current.clone() else { self.notes.push("Open the target Session first.".into()); return; };
+                let source_id = match session_ui::resolve(&self.sessions,source) { Ok(id) => id, Err(error) => { self.notes.push(error); return; } };
+                if source_id == target_id { self.notes.push("Choose another source branch for this target Session.".into()); return; }
+                if self.offline.is_some() || self.client.is_none() { self.notes.push("Reconnect before generating a branch summary.".into()); return; }
+                self.branch_summary.intent = Some((source_id.clone(),target_id.clone()));
+                self.notes.push("Generating branch summary for review… Esc closes review. Started generation may finish and record usage.".into());
+                self.request(Pending::InspectBranchSummary { generation: self.branch_summary.generation, source_id: source_id.clone(), target_id: target_id.clone() }, Request::InspectBranchSummary { source_id,target_id });
+            }
             cmd if cmd == "compare" || cmd.starts_with("compare ") => {
                 self.session_comparison_revision = self.session_comparison_revision.wrapping_add(1);
                 let words: Vec<_> = cmd["compare".len()..].split_whitespace().collect();
@@ -8022,7 +8205,27 @@ impl App {
             return;
         }
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            if self.branch_summary.intent.is_some() {
+                self.cancel_branch_summary();
+                self.notes.push("Branch summary review dismissed.".into());
+                return;
+            }
             self.ctrl_c();
+            return;
+        }
+        if self.branch_summary.intent.is_some() && key.code == KeyCode::Esc {
+            self.cancel_branch_summary();
+            self.notes.push("Branch summary review dismissed.".into());
+            return;
+        }
+        if self.branch_summary.committing && key.code == KeyCode::Char('i') {
+            return;
+        }
+        if self.branch_summary.review.is_some()
+            && self.pager.is_some()
+            && key.code == KeyCode::Char('i')
+        {
+            self.insert_branch_summary();
             return;
         }
         // Reviewing a Proposal: decide from the same screen.
@@ -8059,7 +8262,10 @@ impl App {
             let page = 20;
             let last = p.lines.len().saturating_sub(1);
             match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => self.pager = None,
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    self.pager = None;
+                    self.branch_summary.clear();
+                }
                 KeyCode::Down | KeyCode::Char('j') => p.top = (p.top + 1).min(last),
                 KeyCode::Up | KeyCode::Char('k') => p.top = p.top.saturating_sub(1),
                 KeyCode::PageDown | KeyCode::Char(' ') => p.top = (p.top + page).min(last),
@@ -8873,6 +9079,74 @@ impl App {
         self.session_idx = selected
             .and_then(|id| visible.iter().position(|&i| self.sessions[i].id == id))
             .unwrap_or_else(|| self.session_idx.min(visible.len().saturating_sub(1)));
+    }
+
+    fn branch_summary_review_is_visible(&self) -> bool {
+        match (
+            &self.branch_summary.basis,
+            &self.branch_summary.review,
+            &self.pager,
+        ) {
+            (Some(basis), Some(preview), Some(pager)) => {
+                pager.title == "Branch summary · review exact note"
+                    && pager.lines == branch_summary::review_lines(basis, preview)
+            }
+            _ => false,
+        }
+    }
+
+    fn cancel_branch_summary(&mut self) {
+        if self.branch_summary_review_is_visible() {
+            self.pager = None;
+        }
+        self.branch_summary.clear();
+    }
+
+    fn insert_branch_summary(&mut self) {
+        if !self.branch_summary_review_is_visible() {
+            self.branch_summary.clear();
+            return;
+        }
+        self.pager = None;
+        let Some(preview) = self.branch_summary.review.take() else {
+            return;
+        };
+        let Some(basis) = self.branch_summary.basis.take() else {
+            self.cancel_branch_summary();
+            return;
+        };
+        if self.offline.is_some()
+            || self.client.is_none()
+            || self.current.as_deref() != Some(preview.target_id.as_str())
+            || !branch_summary::preview_matches(&basis, &preview)
+        {
+            self.cancel_branch_summary();
+            self.notes
+                .push("Branch summary review is stale; generate a fresh candidate.".into());
+            return;
+        }
+        self.pager = None;
+        self.branch_summary.intent = None;
+        self.branch_summary.committing = true;
+        let generation = self.branch_summary.generation;
+        let pending = Pending::CommitBranchSummary {
+            generation,
+            preview_id: preview.preview_id.clone(),
+            source_id: preview.source_id.clone(),
+            target_id: preview.target_id.clone(),
+            candidate: preview.candidate.clone(),
+        };
+        self.request(
+            pending,
+            Request::CommitBranchSummary {
+                preview_id: preview.preview_id,
+                source_id: preview.source_id,
+                target_id: preview.target_id,
+                source_revision: preview.source_revision,
+                target_revision: preview.target_revision,
+                candidate_hash: preview.candidate_hash,
+            },
+        );
     }
 
     fn visible_proposals(&self) -> Vec<usize> {
@@ -13254,6 +13528,7 @@ impl App {
     /// [`CTRL_C_WINDOW`] it detaches (Runs keep going in the daemon). The
     /// setup wizard still quits at once.
     fn ctrl_c(&mut self) {
+        self.cancel_branch_summary();
         if self.wizard.is_some() {
             self.flush_wizard_draft(true);
             self.should_quit = true;
@@ -16753,6 +17028,7 @@ mod tests {
             session_idx: 0,
             session_filter: lists::ListFilter::default(),
             session_comparison_revision: 0,
+            branch_summary: branch_summary::State::default(),
             current: Some("s1".into()),
             messages: Vec::new(),
             streaming: String::new(),
@@ -21362,6 +21638,238 @@ mod tests {
         assert_eq!(short_dir("/a/b"), "/a/b");
         #[cfg(unix)]
         assert_eq!(short_dir("/a/folder\\name/leaf"), "/a/folder\\name/leaf");
+    }
+
+    fn branch_summary_test_app() -> (
+        App,
+        mpsc::Sender<ServerMessage>,
+        mpsc::Receiver<String>,
+        BranchSummaryBasis,
+        BranchSummaryPreview,
+    ) {
+        let mut app = test_app();
+        let (basis, preview) = branch_summary::fixture();
+        app.sessions = vec![serde_json::from_value(serde_json::json!({"id":"source","name":"Source branch","created_at":"","updated_at":""})).unwrap(),serde_json::from_value(serde_json::json!({"id":"target","name":"Target Session","created_at":"","updated_at":""})).unwrap()];
+        app.current = Some("target".into());
+        app.input.set("Unsent original draft");
+        let (client, sent) = DaemonClient::recording();
+        let (tx, rx) = mpsc::channel();
+        app.client = Some(client);
+        app.inbox = Some(rx);
+        (app, tx, sent, basis, preview)
+    }
+
+    fn branch_summary_reply(tx: &mpsc::Sender<ServerMessage>, id: u64, value: serde_json::Value) {
+        tx.send(ServerMessage::Response {
+            id,
+            ok: true,
+            result: Some(value),
+            error: None,
+        })
+        .unwrap();
+    }
+
+    fn branch_summary_begin_prepare(
+        app: &mut App,
+        tx: &mpsc::Sender<ServerMessage>,
+        sent: &mpsc::Receiver<String>,
+        basis: &BranchSummaryBasis,
+    ) -> RequestEnvelope {
+        app.slash("summarise-branch source");
+        let inspect: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert!(
+            matches!(inspect.request,Request::InspectBranchSummary{ref source_id,ref target_id} if source_id=="source" && target_id=="target")
+        );
+        assert!(
+            sent.try_recv().is_err(),
+            "no generation before the read-only basis reply"
+        );
+        branch_summary_reply(tx, inspect.id, serde_json::to_value(basis).unwrap());
+        app.drain_daemon();
+        let prepare: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert!(
+            matches!(prepare.request,Request::PrepareBranchSummary{ref source_id,ref target_id,ref source_revision,ref target_revision} if source_id=="source" && target_id=="target" && source_revision==&basis.source_revision && target_revision==&basis.target_revision)
+        );
+        prepare
+    }
+
+    #[test]
+    fn branch_summary_review_requires_explicit_insert_and_preserves_draft_and_context() {
+        let _env = credential_env::EnvGuard::isolated();
+        let (mut app, tx, sent, basis, preview) = branch_summary_test_app();
+        let prepare = branch_summary_begin_prepare(&mut app, &tx, &sent, &basis);
+        branch_summary_reply(&tx, prepare.id, serde_json::to_value(&preview).unwrap());
+        app.drain_daemon();
+        assert!(sent.try_recv().is_err(), "a candidate cannot insert itself");
+        let screen = render(&mut app, 180, 70);
+        for shown in [
+            "Source branch (source)",
+            "Target Session (target)",
+            "served model: fallback-model",
+            "missing usage is not zero",
+            "Total cost: unknown",
+            "Exact candidate note",
+            "سلام",
+            "ไทย",
+            "⟨U+202E⟩",
+            "i Insert one note",
+        ] {
+            assert!(screen.contains(shown), "missing {shown}: {screen}");
+        }
+        assert!(!screen.contains('\u{202e}'));
+        assert_eq!(app.input.expanded(), "Unsent original draft");
+        app.key(key(KeyCode::Char('i')));
+        app.key(key(KeyCode::Char('i')));
+        let commit: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert!(
+            matches!(commit.request,Request::CommitBranchSummary{ref preview_id,ref source_id,ref target_id,ref source_revision,ref target_revision,ref candidate_hash} if preview_id==&preview.preview_id && source_id=="source" && target_id=="target" && source_revision==&basis.source_revision && target_revision==&basis.target_revision && candidate_hash==&preview.candidate_hash)
+        );
+        assert!(
+            sent.try_recv().is_err(),
+            "double insertion key cannot submit twice"
+        );
+        assert_eq!(app.input.expanded(), "Unsent original draft");
+        let message:MessageInfo=serde_json::from_value(serde_json::json!({"id":"summary-note","session_id":"target","seq":1,"role":"system","content":preview.candidate,"created_at":""})).unwrap();
+        app.on_event(Event::MessageAppended {
+            session_id: "target".into(),
+            message: message.clone(),
+        });
+        branch_summary_reply(
+            &tx,
+            commit.id,
+            serde_json::json!({"preview_id":preview.preview_id,"source_id":"source","target_id":"target","message":message,"already_applied":false}),
+        );
+        app.drain_daemon();
+        assert_eq!(
+            app.messages
+                .iter()
+                .filter(|m| m.id == "summary-note")
+                .count(),
+            1,
+            "broadcast plus response must not duplicate the note"
+        );
+        assert!(
+            sent.try_recv().is_err(),
+            "insertion never starts a Run or sends a user message"
+        );
+        assert!(app.branch_summary.review.is_none() && !app.branch_summary.committing);
+    }
+
+    #[test]
+    fn branch_summary_cancel_stale_metadata_and_reconnect_never_submit_later() {
+        let _env = credential_env::EnvGuard::isolated();
+        let (mut app, tx, sent, basis, preview) = branch_summary_test_app();
+        app.slash("summarise-branch source");
+        let inspect: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        app.key(key(KeyCode::Esc));
+        assert!(app.notes.last().unwrap().contains("review dismissed"));
+        branch_summary_reply(&tx, inspect.id, serde_json::to_value(&basis).unwrap());
+        app.drain_daemon();
+        assert!(
+            sent.try_recv().is_err(),
+            "cancel before basis reply must prevent paid generation"
+        );
+        let prepare = branch_summary_begin_prepare(&mut app, &tx, &sent, &basis);
+        app.on_event(Event::MessagesEdited {
+            session_id: "source".into(),
+        });
+        branch_summary_reply(&tx, prepare.id, serde_json::to_value(&preview).unwrap());
+        app.drain_daemon();
+        assert!(app.pager.is_none() && app.branch_summary.review.is_none());
+        assert!(
+            sent.try_recv().is_err(),
+            "metadata-only source edit must invalidate pending review"
+        );
+        let prepare = branch_summary_begin_prepare(&mut app, &tx, &sent, &basis);
+        let mut stale = preview.clone();
+        stale.target_revision = "target-meta-v2-same-count".into();
+        branch_summary_reply(&tx, prepare.id, serde_json::to_value(&stale).unwrap());
+        app.drain_daemon();
+        assert!(
+            app.pager.is_none() && sent.try_recv().is_err(),
+            "changed revision must reject even equal-count replies"
+        );
+        let prepare = branch_summary_begin_prepare(&mut app, &tx, &sent, &basis);
+        branch_summary_reply(&tx, prepare.id, serde_json::to_value(&preview).unwrap());
+        app.drain_daemon();
+        app.daemon_lost();
+        assert!(app.pager.is_none() && app.branch_summary.review.is_none());
+        app.key(key(KeyCode::Char('i')));
+        assert!(
+            sent.try_recv().is_err(),
+            "disconnected review must not submit"
+        );
+        assert!(!app.branch_summary.committing);
+    }
+
+    #[test]
+    fn ctrl_c_cancels_branch_review_without_clearing_the_unsent_draft() {
+        let _env = credential_env::EnvGuard::isolated();
+        let (mut app, tx, sent, basis, preview) = branch_summary_test_app();
+        let prepare = branch_summary_begin_prepare(&mut app, &tx, &sent, &basis);
+        branch_summary_reply(&tx, prepare.id, serde_json::to_value(&preview).unwrap());
+        app.drain_daemon();
+        app.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.pager.is_none() && app.branch_summary.review.is_none());
+        assert_eq!(app.input.expanded(), "Unsent original draft");
+        assert!(
+            sent.try_recv().is_err(),
+            "cancelling review cannot submit or send the draft"
+        );
+    }
+
+    #[test]
+    fn another_pager_cannot_confirm_a_hidden_branch_summary_candidate() {
+        let _env = credential_env::EnvGuard::isolated();
+        let (mut app, tx, sent, basis, preview) = branch_summary_test_app();
+        let prepare = branch_summary_begin_prepare(&mut app, &tx, &sent, &basis);
+        branch_summary_reply(&tx, prepare.id, serde_json::to_value(&preview).unwrap());
+        app.drain_daemon();
+        assert!(app.branch_summary_review_is_visible());
+        app.pager = Some(Pager {
+            title: "Unrelated late artifact".into(),
+            lines: vec!["Different content".into()],
+            top: 0,
+            left: 0,
+            styled: vec![],
+        });
+        app.key(key(KeyCode::Char('i')));
+        assert!(
+            sent.try_recv().is_err(),
+            "Insert cannot confirm a candidate hidden by another response"
+        );
+        assert!(app.branch_summary.review.is_none());
+        assert_eq!(app.pager.as_ref().unwrap().title, "Unrelated late artifact");
+        assert_eq!(app.input.expanded(), "Unsent original draft");
+    }
+
+    #[test]
+    fn branch_summary_rejects_wrong_basis_candidate_hash_and_ordered_pair() {
+        let _env = credential_env::EnvGuard::isolated();
+        let (mut app, tx, sent, basis, preview) = branch_summary_test_app();
+        app.slash("summarise-branch source");
+        let inspect: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        let mut wrong = basis.clone();
+        wrong.source_id = "other".into();
+        branch_summary_reply(&tx, inspect.id, serde_json::to_value(&wrong).unwrap());
+        app.drain_daemon();
+        assert!(
+            sent.try_recv().is_err(),
+            "wrong first basis cannot generate"
+        );
+        for wrong_kind in ["pair", "hash"] {
+            let prepare = branch_summary_begin_prepare(&mut app, &tx, &sent, &basis);
+            let mut bad = preview.clone();
+            if wrong_kind == "pair" {
+                std::mem::swap(&mut bad.source_id, &mut bad.target_id);
+            } else {
+                bad.candidate.push(' ');
+            }
+            branch_summary_reply(&tx, prepare.id, serde_json::to_value(&bad).unwrap());
+            app.drain_daemon();
+            assert!(app.pager.is_none() && app.branch_summary.review.is_none());
+            assert!(sent.try_recv().is_err());
+        }
     }
 
     #[test]
