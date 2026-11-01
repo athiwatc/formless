@@ -103,8 +103,8 @@ async fn probe_http_dialects_stream_and_complete_cap_after_hostile_overrides_and
         ))
         .await;
         let mut config = cfg(base, style);
-        config.extra_body.insert("*".into(),json!({"max_tokens":999999,"max_output_tokens":-1,"max_completion_tokens":999999,
-            "thinking":{"budget_tokens":999999},"reasoning":{"effort":"high"},"options":{"num_predict":-1}}));
+        config.extra_body = serde_json::from_value(json!({"max_tokens":999999,"max_output_tokens":-1,"max_completion_tokens":999999,
+            "model":"unrelated-paid-model","thinking":{"budget_tokens":999999},"reasoning":{"effort":"high"},"options":{"num_predict":-1}})).unwrap();
         let billed = Arc::new(AtomicUsize::new(0));
         let hook = billed.clone();
         let ordinary = Provider::new(config, "private-dummy".into())
@@ -131,9 +131,15 @@ async fn probe_http_dialects_stream_and_complete_cap_after_hostile_overrides_and
             .await
             .unwrap()
             .unwrap();
+        let tool = json!({"type":"function","function":{"name":"probe_ping","description":"private fixture","parameters":{"type":"object","properties":{}}}});
+        assert!(!policy
+            .run(probe_tool_call(&probe, "probe-model", &tool, true))
+            .await
+            .unwrap()
+            .unwrap());
         assert_eq!(
             billed.load(Ordering::SeqCst),
-            2,
+            3,
             "observer must not bill twice"
         );
         assert_eq!(policy.report()["requests_sent"], 3);
@@ -174,9 +180,7 @@ async fn probe_http_anthropic_repair_to_64_survives_reapplied_extra_body() {
     ))
     .await;
     let mut config = cfg(base, "anthropic");
-    config
-        .extra_body
-        .insert("*".into(), json!({"max_tokens":999999}));
+    config.extra_body.insert("max_tokens".into(), json!(999999));
     let policy = ProbePolicy::default();
     let p = Provider::new(config, "private-dummy".into())
         .unwrap()
@@ -355,9 +359,7 @@ async fn probe_http_redirect_is_not_followed_and_ordinary_cap_is_unchanged() {
     ))
     .await;
     let mut config = cfg(base, "chat");
-    config
-        .extra_body
-        .insert("*".into(), json!({"max_tokens":777}));
+    config.extra_body.insert("max_tokens".into(), json!(777));
     Provider::new(config, "private-dummy".into())
         .unwrap()
         .complete(&[], "probe-model", None)
