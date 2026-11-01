@@ -1039,21 +1039,20 @@ fn listed_tool_definitions_are_pinned_per_session() {
     let schema = |field: &str| {
         format!(r#"{{"type":"object","properties":{{"{field}":{{"type":"string"}}}}}}"#)
     };
-    let make = |field: &str| {
-        store
-            .create_tool_version(
-                "greeter",
-                "greets",
-                &schema(field),
-                "{}",
-                "function run(){ return 1; }",
-                &Capabilities::default(),
-                256,
-                "agent",
-            )
-            .unwrap()
+    let make = |field: &str, allow_breaking: bool| {
+        store.create_tool_version_with_schema_policy(
+            "greeter",
+            "greets",
+            &schema(field),
+            "{}",
+            "function run(){ return 1; }",
+            &Capabilities::default(),
+            256,
+            "agent",
+            formless_core::tool_compatibility::SchemaWritePolicy::Agent { allow_breaking },
+        )
     };
-    let (info, _) = make("name");
+    let (info, _) = make("name", false).unwrap();
     let session = store.create_session(None).unwrap().id;
     let params = |defs: &[Value]| {
         defs.iter()
@@ -1064,7 +1063,20 @@ fn listed_tool_definitions_are_pinned_per_session() {
     let first = toolreg::tool_definitions(&store, Some(&session), 40).unwrap();
     assert!(params(&first).get("name").is_some());
 
-    make("who"); // v2 with a different input schema
+    let error = make("who", false).unwrap_err();
+    assert!(error.is::<formless_core::tool_compatibility::SchemaChangeBlocked>());
+    assert_eq!(
+        store.get_tool_current(&info.id).unwrap().unwrap().1.version,
+        1,
+        "an unacknowledged schema change cannot persist a version"
+    );
+    assert_eq!(
+        toolreg::tool_definitions(&store, Some(&session), 40).unwrap(),
+        first,
+        "refusal preserves the original pinned definition"
+    );
+    let (_, version) = make("who", true).unwrap(); // explicitly acknowledged v2
+    assert_eq!(version, 2);
     let again = toolreg::tool_definitions(&store, Some(&session), 40).unwrap();
     assert_eq!(again, first, "the listed definition is pinned");
     let fresh = store.create_session(None).unwrap().id;
