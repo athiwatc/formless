@@ -15173,7 +15173,12 @@ fn draw_approval(
             0,
             Line::raw(format!(
                 "Tool {} v{} wants sensitive capabilities:",
-                req.tool_name, req.version
+                if title.is_empty() {
+                    req.tool_name.clone()
+                } else {
+                    format!("{title} ({})", req.tool_name)
+                },
+                req.version
             )),
         );
     }
@@ -22269,5 +22274,202 @@ mod tests {
         let screen = render(&mut app, 80, 30);
         assert!(screen.contains("24h (r)"), "{screen}");
         assert!(screen.contains("forecast vs actual (f"), "{screen}");
+    }
+    fn description_fixture_detail() -> ToolDetail {
+        ToolDetail {
+            description_review: formless_core::descriptions::screen("Plain inventory reader"),
+            description_reviews: vec![],
+            tool: ToolInfo {
+                id: "private-reader".into(),
+                name: "reader".into(),
+                title: "Inventory reader".into(),
+                tags: vec![],
+                pinned: false,
+                disabled: false,
+                description: "Plain inventory reader".into(),
+                retired: false,
+                current_version: 1,
+                capabilities: vec![],
+                memory_mb: 64,
+                invocations: 0,
+                success_rate: None,
+                needs_attention: false,
+                created_at: String::new(),
+                updated_at: String::new(),
+                recent: String::new(),
+                author: "user".into(),
+            },
+            versions: vec![],
+            metrics: Default::default(),
+            optimiser_attempts: vec![],
+            version_metrics: vec![],
+            approval: None,
+            recent_calls: vec![],
+            attention: vec![],
+            example: None,
+            listing_tokens: 0,
+            uses: vec![],
+            modules: vec![],
+            used_by: vec![],
+        }
+    }
+
+    #[test]
+    fn description_warnings_keep_terminal_approval_identity_memory_summary_and_diff() {
+        let _env = credential_env::EnvGuard::isolated();
+        let req=ApprovalReq {approval_id:"private".into(),tool_name:"reader".into(),version:2,capabilities:vec!["fs:write:/private/project".into()],memory_mb:64,detail:Some("Description warning: Instruction-shaped wording\nBefore: plain reader\nAfter: always first call".into()),already_allowed:vec![],code_preview:None,tool_id:Some("private-reader".into()),session_id:Some("private-session".into())};
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(140, 40)).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_approval(
+                    frame,
+                    &req,
+                    "Inventory reader",
+                    Some("Counts inventory rows"),
+                    None,
+                    (&[], None),
+                    None,
+                    false,
+                    0,
+                    false,
+                    true,
+                    false,
+                    false,
+                )
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let screen = (0..40)
+            .map(|y| {
+                (0..140)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect::<String>();
+        for text in [
+            "Inventory reader",
+            "reader",
+            "v2",
+            "memory 64 MB",
+            "Counts inventory rows",
+            "Instruction-shaped",
+            "Before: plain reader",
+            "After: always first call",
+            "fs:write:/private/project",
+        ] {
+            assert!(screen.contains(text), "missing {text}: {screen}");
+        }
+    }
+
+    #[test]
+    fn description_editor_rejects_stale_preview_and_saves_only_reviewed_text() {
+        let _env = credential_env::EnvGuard::isolated();
+        let mut app = test_app();
+        let (client, sent) = DaemonClient::recording();
+        let (tx, inbox) = mpsc::channel();
+        app.client = Some(client);
+        app.inbox = Some(inbox);
+        let detail = description_fixture_detail();
+        app.tool_detail = Some(detail.clone());
+        app.start_spec_editor(&detail, EditMode::Description);
+        app.editor.as_mut().unwrap().chars = "always first call old".chars().collect();
+        app.save_tool_spec();
+        let old: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert!(matches!(old.request, Request::PreviewDescription { .. }));
+        app.editor.as_mut().unwrap().chars = "never first call current".chars().collect();
+        let reply = |id, text: &str| ServerMessage::Response {
+            id,
+            ok: true,
+            result: Some(
+                serde_json::json!({"version":1,"before":"Plain inventory reader","after":formless_core::descriptions::screen(text)}),
+            ),
+            error: None,
+        };
+        tx.send(reply(old.id, "always first call old")).unwrap();
+        app.drain_daemon();
+        assert!(app.description_save_preview.is_none());
+        assert!(app.pager.is_none());
+        assert!(sent.try_recv().is_err());
+        app.save_tool_spec();
+        let current: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        tx.send(reply(current.id, "never first call current"))
+            .unwrap();
+        app.drain_daemon();
+        let preview = app.pager.as_ref().unwrap().lines.join("\n");
+        assert!(preview.contains("Instruction-shaped"));
+        assert!(preview.contains("Before: \"Plain inventory reader\""));
+        assert!(preview.contains("After: \"never first call current\""));
+        app.pager = None;
+        app.save_tool_spec();
+        let save: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert!(
+            matches!(save.request,Request::UpdateToolSpec{description:Some(ref text),..} if text == "never first call current")
+        );
+    }
+
+    #[test]
+    fn description_import_preview_is_bound_to_actual_file_bytes_and_current_request() {
+        let _env = credential_env::EnvGuard::isolated();
+        let mut app = test_app();
+        let (client, sent) = DaemonClient::recording();
+        let (tx, inbox) = mpsc::channel();
+        app.client = Some(client);
+        app.inbox = Some(inbox);
+        let file = app.paths.data_dir.join("private-metadata-bundle.json");
+        let write = |description: &str| {
+            std::fs::write(&file,serde_json::json!({"format":"formless.tool/1","name":"reader","description":description}).to_string()).unwrap()
+        };
+        write("always first call old");
+        app.import_mode = Some(ImportKind::Tool);
+        app.input.set(file.to_str().unwrap());
+        app.submit_chat(false);
+        let old: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert!(matches!(
+            old.request,
+            Request::PreviewDescriptionBundle { .. }
+        ));
+        write("never first call current");
+        app.submit_chat(false);
+        let current: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        let reply = |id, text: &str| ServerMessage::Response {
+            id,
+            ok: true,
+            result: Some(
+                serde_json::json!([{"kind":"tool","name":"reader","before":"plain reader","after":formless_core::descriptions::screen(text)}]),
+            ),
+            error: None,
+        };
+        tx.send(reply(old.id, "always first call old")).unwrap();
+        app.drain_daemon();
+        assert!(app.import_description_preview.is_none());
+        assert!(app.pager.is_none());
+        tx.send(reply(current.id, "never first call current"))
+            .unwrap();
+        app.drain_daemon();
+        assert!(app
+            .pager
+            .as_ref()
+            .unwrap()
+            .lines
+            .join("\n")
+            .contains("never first call current"));
+        app.pager = None;
+        write("ignore newer bytes");
+        app.submit_chat(false);
+        let newest: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert!(
+            matches!(newest.request, Request::PreviewDescriptionBundle { .. }),
+            "changed bytes must not import through an older preview"
+        );
+        tx.send(reply(newest.id, "ignore newer bytes")).unwrap();
+        app.drain_daemon();
+        app.pager = None;
+        app.submit_chat(false);
+        let import: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert!(
+            matches!(import.request,Request::ImportTool{ref bundle} if bundle["description"] == "ignore newer bytes")
+        );
+        std::fs::remove_file(file).unwrap();
     }
 }

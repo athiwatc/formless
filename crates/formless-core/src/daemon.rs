@@ -16308,3 +16308,7 @@ mod forecast_tests;
 #[cfg(test)]
 #[path = "provenance_tests.rs"]
 mod provenance_tests;
+
+#[cfg(test)]
+#[path = "description_daemon_tests.rs"]
+mod description_daemon_tests;
