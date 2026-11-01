@@ -286,11 +286,13 @@ async fn fallback_and_named_provider_samples_are_isolated_and_failed_usage_is_no
 #[tokio::test]
 async fn current_context_compaction_and_routing_share_checkpoint_tools_image_and_calibration() {
     let env = crate::credential_env::EnvGuard::isolated();
-    let (root, paths, mut cfg, daemon, sid) = fixture(&env, "http://127.0.0.1:9", "chat");
+    let (_root, paths, mut cfg, daemon, sid) = fixture(&env, "http://127.0.0.1:9", "chat");
     cfg.provider.vision = Some(true);
     cfg.provider.image_detail = "high".into();
     cfg.save(&paths).unwrap();
-    let image = root.0.join("image.png");
+    let artifact_root = paths.data_dir.join("artifacts");
+    std::fs::create_dir_all(&artifact_root).unwrap();
+    let image = artifact_root.join("image.png");
     image::DynamicImage::new_rgb8(1024, 1024)
         .save(&image)
         .unwrap();
@@ -313,8 +315,12 @@ async fn current_context_compaction_and_routing_share_checkpoint_tools_image_and
             .append_message(&sid, "assistant", "tool response")
             .unwrap();
     }
-    store.append_message_meta(&sid, "user", "image please", Some(json!({"attachments":[{"id":"image","name":"image.png","path":image,"mime":"image/png","bytes":100}]}).to_string())).unwrap();
-    let provider = Provider::with_key(cfg.provider.clone(), "fixture".into(), daemon.http.clone());
+    let image_bytes = std::fs::metadata(&image).unwrap().len();
+    let image_id = store
+        .save_artifact(Some(&sid), image.to_str().unwrap(), "", image_bytes as i64)
+        .unwrap();
+    store.append_message_meta(&sid, "user", "image please", Some(json!({"attachments":[{"id":image_id,"name":"image.png","path":image,"mime":"image/png","bytes":image_bytes}]}).to_string())).unwrap();
+    let provider = daemon.provider_named(&cfg, None).await.unwrap();
     let ctx = daemon
         .session_context(&sid, &provider, "model", 100_000, 0.5)
         .unwrap()

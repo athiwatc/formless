@@ -191,6 +191,7 @@ pub struct Provider {
     /// When set, credentials are re-resolved before each HTTP request so
     /// an OAuth token expiring during a long Run is refreshed in place.
     credential_paths: Option<Paths>,
+    attachment_access: Option<crate::attachment_access::AttachmentAccess>,
     http: reqwest::Client,
     /// Sent as `prompt_cache_key` so the endpoint routes one Session's
     /// requests to the same cache (see `provider.cache_key`).
@@ -1119,6 +1120,7 @@ impl Provider {
             cfg,
             api_key,
             credential_paths: None,
+            attachment_access: None,
             cache_key: None,
             on_retry: None,
             on_note: None,
@@ -1144,6 +1146,7 @@ impl Provider {
             cfg,
             api_key,
             credential_paths: None,
+            attachment_access: None,
             cache_key: None,
             on_retry: None,
             on_note: None,
@@ -1197,6 +1200,7 @@ impl Provider {
         Ok(Self {
             cfg,
             api_key,
+            attachment_access: Some(crate::attachment_access::AttachmentAccess::profile(&paths)),
             credential_paths: Some(paths),
             cache_key: None,
             on_retry: None,
@@ -1306,6 +1310,18 @@ impl Provider {
     pub fn with_usage_hook(mut self, hook: UsageHook) -> Self {
         self.on_usage = Some(hook);
         self
+    }
+
+    /// Forecasts/admission use their already-held Store, never a new connection
+    /// to the source database. No untrusted marker alone grants file access.
+    pub(crate) fn with_attachment_snapshot(
+        mut self,
+        store: &crate::Store,
+        messages: &[Value],
+    ) -> Result<Self> {
+        self.attachment_access =
+            crate::attachment_access::AttachmentAccess::snapshot(store, messages)?;
+        Ok(self)
     }
 
     /// Observe only bodies accepted by an actual successful provider response,
@@ -1657,47 +1673,86 @@ impl Provider {
     }
 
     pub fn prepare_attachments(&self, messages: &[Value], model: &str) -> Vec<Value> {
-        // Prompt-mode tools ride on Chat Completions text; the native
-        // Messages path keeps image blocks either way. The Responses API
-        // takes images as `input_image` parts (#616).
+        self.prepare_attachments_inner(messages, model, None)
+    }
+
+    /// Only the caller-created draft range may resolve metadata-only previews;
+    /// no persisted/imported marker can select this estimator-only capability.
+    pub(crate) fn prepare_forecast_attachments(
+        &self,
+        messages: &[Value],
+        model: &str,
+        previews: Option<(usize, usize, &[formless_protocol::ForecastAttachment])>,
+    ) -> Vec<Value> {
+        self.prepare_attachments_inner(messages, model, previews)
+    }
+
+    fn prepare_attachments_inner(
+        &self,
+        messages: &[Value],
+        model: &str,
+        previews: Option<(usize, usize, &[formless_protocol::ForecastAttachment])>,
+    ) -> Vec<Value> {
         let vision = self.sends_images(model);
-        messages
-            .iter()
-            .map(|m| {
-                let Some(atts) = m.get("_attachments").and_then(Value::as_array) else {
-                    return m.clone();
-                };
-                let mut m = m.clone();
-                m.as_object_mut().map(|o| o.remove("_attachments"));
-                if !vision {
-                    return m;
-                }
-                let mut parts = vec![json!({"type": "text", "text": m["content"]})];
-                for a in atts {
-                    let (Some(path), Some(mime)) = (a["path"].as_str(), a["mime"].as_str()) else {
-                        continue;
-                    };
-                    let name = a["name"].as_str().unwrap_or(path);
-                    match encoded_image(path, mime, self.cfg.image_max_px) {
-                        Ok(url) => {
-                            let mut image = json!({"url": url});
-                            if self.cfg.image_detail != "auto" && !self.cfg.image_detail.is_empty() {
-                                image["detail"] = json!(self.cfg.image_detail);
+        let mut budget = AttachmentBudget::default();
+        messages.iter().enumerate().map(|(message_index, original)| {
+            let Some(atts) = original.get("_attachments").and_then(Value::as_array) else {
+                return original.clone();
+            };
+            // Do not clone untrusted marker arrays just to remove them.
+            let mut m = Value::Object(original.as_object().unwrap().iter()
+                .filter(|(key,_)| key.as_str() != "_attachments")
+                .map(|(key,value)|(key.clone(),value.clone())).collect());
+            if !vision { return m; }
+            let mut parts = vec![json!({"type":"text","text":m["content"]})];
+            let mut omitted = 0usize;
+            let mut first_failure = None;
+            for (attachment_index,a) in atts.iter().enumerate() {
+                let name = crate::daemon::cap_name(&crate::daemon::attachment_name(
+                    a["name"].as_str().unwrap_or("attachment")),120);
+                let encoded = budget.attempt().and_then(|()| {
+                    if let Some((draft_index, first, descriptors)) = previews {
+                        if message_index == draft_index && attachment_index >= first {
+                            if let Some(descriptor) = descriptors.get(attachment_index-first) {
+                                return forecast_image(descriptor, self.cfg.image_max_px, &mut budget);
                             }
-                            parts.push(json!({"type": "image_url", "image_url": image}));
-                        }
-                        // Never silently: the model is told and so is the
-                        // user (#616).
-                        Err(why) => {
-                            parts.push(json!({"type": "text", "text": format!("[image {name} could not be attached: {why}]")}));
-                            self.note(format!("The image {name} wasn't sent to the model: {why}."));
                         }
                     }
+                    let (Some(path),Some(mime)) = (a["path"].as_str(),a["mime"].as_str()) else {
+                        return Err("no verified owned artifact reference".into());
+                    };
+                    self.attachment_access.as_ref()
+                        .ok_or_else(|| "no owned artifact authority is available".to_string())
+                        .and_then(|access| access.read_charged(a, crate::daemon::MAX_ATTACHMENT_BYTES, &mut budget.source_remaining))
+                        .and_then(|bytes| encoded_image(path,mime,self.cfg.image_max_px,bytes,&mut budget))
+                });
+                match encoded {
+                    Ok(url) => {
+                        let mut image = json!({"url":url});
+                        if self.cfg.image_detail != "auto" && !self.cfg.image_detail.is_empty() {
+                            image["detail"] = json!(self.cfg.image_detail);
+                        }
+                        parts.push(json!({"type":"image_url","image_url":image}));
+                    }
+                    Err(why) => {
+                        omitted += 1;
+                        first_failure.get_or_insert((name,why));
+                    }
                 }
-                m["content"] = json!(parts);
-                m
-            })
-            .collect()
+                if budget.attempts >= MAX_NATIVE_ATTACHMENTS && attachment_index+1 < atts.len() {
+                    omitted += atts.len()-attachment_index-1;
+                    first_failure.get_or_insert(("additional images".into(),"the request's 16 attempted native-attachment limit is reached".into()));
+                    break;
+                }
+            }
+            if let Some((name,why)) = first_failure {
+                let rest = if omitted > 1 {format!("; {} additional images were omitted",omitted-1)} else {String::new()};
+                parts.push(json!({"type":"text","text":format!("[image {name} could not be attached: {why}{rest}]")}));
+                self.note(format!("The image {name} wasn't sent to the model: {why}{rest}."));
+            }
+            m["content"] = json!(parts);
+            m
+        }).collect()
     }
 
     /// [`Provider::complete`] plus the reported token usage.
@@ -1732,6 +1787,7 @@ impl Provider {
         effort: Option<&str>,
     ) -> Result<CompletionResult> {
         let messages = crate::provenance::project(messages);
+        let messages = self.prepare_attachments(&messages, model);
         self.complete_with_usage_inner(&messages, model, effort)
             .await
     }
@@ -2864,18 +2920,138 @@ pub fn resized_image_dimensions(width: u32, height: u32, max_px: u32) -> (u32, u
     )
 }
 
-fn encoded_image(path: &str, mime: &str, max_px: u32) -> std::result::Result<String, String> {
+// Request-wide work limits, shared by ordinary projection and offline previews.
+pub(crate) const MAX_NATIVE_ATTACHMENTS: usize = 16;
+pub(crate) const MAX_NATIVE_SOURCE_BYTES: usize = 32 * 1024 * 1024;
+pub(crate) const MAX_NATIVE_ENCODED_BYTES: usize = 24 * 1024 * 1024;
+const MAX_NATIVE_DECODED_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_IMAGE_DIMENSION: u32 = 16_384;
+const MAX_IMAGE_CACHE_BYTES: usize = 24 * 1024 * 1024;
+
+struct AttachmentBudget {
+    attempts: usize,
+    source_remaining: usize,
+    decoded_remaining: u64,
+    encoded_remaining: usize,
+}
+impl Default for AttachmentBudget {
+    fn default() -> Self {
+        Self {
+            attempts: 0,
+            source_remaining: MAX_NATIVE_SOURCE_BYTES,
+            decoded_remaining: MAX_NATIVE_DECODED_BYTES,
+            encoded_remaining: MAX_NATIVE_ENCODED_BYTES,
+        }
+    }
+}
+impl AttachmentBudget {
+    fn attempt(&mut self) -> std::result::Result<(), String> {
+        if self.attempts >= MAX_NATIVE_ATTACHMENTS {
+            return Err("the request's 16 attempted native-attachment limit is reached".into());
+        }
+        self.attempts += 1;
+        Ok(())
+    }
+    fn decoded(&mut self, bytes: u64) -> std::result::Result<(), String> {
+        if bytes > self.decoded_remaining {
+            return Err("the request's 64 MiB decoded-image budget is exhausted".into());
+        }
+        self.decoded_remaining -= bytes;
+        Ok(())
+    }
+    fn encoded(&mut self, bytes: usize) -> std::result::Result<(), String> {
+        if bytes > self.encoded_remaining {
+            return Err("the request's 24 MiB encoded-image budget is exhausted".into());
+        }
+        self.encoded_remaining -= bytes;
+        Ok(())
+    }
+}
+
+fn forecast_image(
+    descriptor: &formless_protocol::ForecastAttachment,
+    max_px: u32,
+    budget: &mut AttachmentBudget,
+) -> std::result::Result<String, String> {
+    let bytes = usize::try_from(descriptor.bytes)
+        .map_err(|_| "the image source size is too large".to_string())?;
+    if bytes > crate::daemon::MAX_ATTACHMENT_BYTES || bytes > budget.source_remaining {
+        return Err("the request's attachment source-byte budget is exhausted".into());
+    }
+    budget.source_remaining -= bytes;
+    let dimensions = descriptor.width.zip(descriptor.height);
+    if dimensions.is_some_and(|(w, h)| w > MAX_IMAGE_DIMENSION || h > MAX_IMAGE_DIMENSION) {
+        return Err("the image dimensions exceed 16384 pixels".into());
+    }
+    // Pixel formats are unknown from metadata. Eight bytes per pixel covers
+    // supported 16-bit RGBA; resizing's encoded size is conservatively bounded.
+    let decoded = dimensions.map_or(MAX_NATIVE_DECODED_BYTES, |(w, h)| {
+        u64::from(w).saturating_mul(u64::from(h)).saturating_mul(8)
+    });
+    budget.decoded(decoded)?;
+    let resized = dimensions.is_some_and(|(w, h)| max_px > 0 && w.max(h) > max_px);
+    let encoded = if resized {
+        MAX_IMAGE_BYTES.div_ceil(3) * 4 + "data:image/jpeg;base64,".len()
+    } else {
+        bytes
+            .div_ceil(3)
+            .saturating_mul(4)
+            .saturating_add("data:;base64,".len() + descriptor.mime.len())
+    };
+    budget.encoded(encoded)?;
+    Ok(crate::forecast::dimension_image(
+        dimensions.map(|(w, h)| resized_image_dimensions(w, h, max_px)),
+    ))
+}
+
+fn encoded_image(
+    path: &str,
+    mime: &str,
+    max_px: u32,
+    bytes: Vec<u8>,
+    budget: &mut AttachmentBudget,
+) -> std::result::Result<String, String> {
     use base64::Engine;
+    use sha2::Digest;
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
-    static CACHE: OnceLock<Mutex<HashMap<(String, u32), String>>> = OnceLock::new();
+    static CACHE: OnceLock<Mutex<HashMap<(String, u32, [u8; 32]), String>>> = OnceLock::new();
     let cache = CACHE.get_or_init(Default::default);
-    let key = (path.to_string(), max_px);
+    let key = (
+        path.to_string(),
+        max_px,
+        sha2::Sha256::digest(&bytes).into(),
+    );
+    let actual = image::guess_format(&bytes)
+        .map_err(|_| "it is not a supported raster image".to_string())?;
+    if actual.to_mime_type() != mime {
+        return Err("the image type does not match its attachment metadata".into());
+    }
+    use image::ImageDecoder;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_IMAGE_DIMENSION);
+    limits.max_image_height = Some(MAX_IMAGE_DIMENSION);
+    limits.max_alloc = Some(MAX_NATIVE_DECODED_BYTES);
+    let mut reader = image::ImageReader::with_format(std::io::Cursor::new(&bytes), actual);
+    reader.limits(limits.clone());
+    let decoder = reader
+        .into_decoder()
+        .map_err(|_| "the image cannot be decoded within the image resource limits".to_string())?;
+    let (width, height) = decoder.dimensions();
+    limits
+        .check_dimensions(width, height)
+        .map_err(|_| "the image dimensions exceed 16384 pixels".to_string())?;
+    // Charge header-declared output before allocating/decompressing pixels.
+    // Failed decode attempts retain the charge; cache hits do not decode.
+    budget.decoded(decoder.total_bytes())?;
+    // Cached and cold preparation select the same bounded prefix. Charge the
+    // same declared decode work even though a cache hit avoids decompression.
     if let Some(url) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        budget.encoded(url.len())?;
         return Ok(url.clone());
     }
-    let bytes = std::fs::read(path).map_err(|_| "the file is gone".to_string())?;
-    let (bytes, mime) = match image::load_from_memory(&bytes) {
+
+    let (bytes, mime) = match image::DynamicImage::from_decoder(decoder) {
         Ok(img) if max_px > 0 && img.width().max(img.height()) > max_px => {
             let (width, height) = resized_image_dimensions(img.width(), img.height(), max_px);
             let small = img.thumbnail_exact(width, height);
@@ -2897,7 +3073,6 @@ fn encoded_image(path: &str, mime: &str, max_px: u32) -> std::result::Result<Str
             (out, mime.to_string())
         }
         Ok(_) => (bytes, mime.to_string()),
-        Err(_) if bytes.len() <= MAX_IMAGE_BYTES => (bytes, mime.to_string()),
         Err(_) => return Err("it isn't an image this build can read".into()),
     };
     if bytes.len() > MAX_IMAGE_BYTES {
@@ -2906,15 +3081,30 @@ fn encoded_image(path: &str, mime: &str, max_px: u32) -> std::result::Result<Str
             MAX_IMAGE_BYTES / 1024 / 1024
         ));
     }
+    // Reserve before allocating the base64 result, including the data prefix.
+    let encoded_len = bytes
+        .len()
+        .div_ceil(3)
+        .saturating_mul(4)
+        .saturating_add("data:;base64,".len() + mime.len());
+    budget.encoded(encoded_len)?;
     let url = format!(
         "data:{mime};base64,{}",
         base64::engine::general_purpose::STANDARD.encode(bytes)
     );
     let mut c = cache.lock().unwrap_or_else(|e| e.into_inner());
-    if c.len() >= 64 {
+    if c.len() >= 64
+        || c.values()
+            .map(String::len)
+            .sum::<usize>()
+            .saturating_add(url.len())
+            > MAX_IMAGE_CACHE_BYTES
+    {
         c.clear();
     }
-    c.insert(key, url.clone());
+    if url.len() <= MAX_IMAGE_CACHE_BYTES {
+        c.insert(key, url.clone());
+    }
     Ok(url)
 }
 
@@ -3563,6 +3753,65 @@ mod breaker_tests;
 
 #[cfg(test)]
 mod tests {
+
+    fn budget_png() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        image::DynamicImage::new_rgb8(8, 8)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        bytes
+    }
+    #[test]
+    fn native_encoded_and_decoded_work_limits_apply_before_large_allocations() {
+        let mut bytes = budget_png();
+        bytes.resize(6 * 1024 * 1024, 0); // Valid small raster, large original payload.
+        let mut budget = AttachmentBudget::default();
+        let first =
+            encoded_image("budget-large", "image/png", 0, bytes.clone(), &mut budget).unwrap();
+        let second =
+            encoded_image("budget-large", "image/png", 0, bytes.clone(), &mut budget).unwrap();
+        assert!(first.len() + second.len() <= MAX_NATIVE_ENCODED_BYTES);
+        assert!(
+            encoded_image("budget-large", "image/png", 0, bytes, &mut budget)
+                .unwrap_err()
+                .contains("encoded-image budget")
+        );
+        // Patch a valid PNG IHDR and its CRC. No giant pixel buffer is ever
+        // created: the declared dimensions/allocation must be rejected first.
+        let crc32 = |data: &[u8]| {
+            let mut crc = 0xffff_ffffu32;
+            for byte in data {
+                crc ^= u32::from(*byte);
+                for _ in 0..8 {
+                    crc = (crc >> 1) ^ if crc & 1 != 0 { 0xedb8_8320 } else { 0 };
+                }
+            }
+            !crc
+        };
+        for dimension in [MAX_IMAGE_DIMENSION + 1, 8192] {
+            let mut bomb = budget_png();
+            bomb[16..20].copy_from_slice(&dimension.to_be_bytes());
+            bomb[20..24].copy_from_slice(&dimension.to_be_bytes());
+            let crc = crc32(&bomb[12..29]);
+            bomb[29..33].copy_from_slice(&crc.to_be_bytes());
+            let mut budget = AttachmentBudget::default();
+            let error =
+                encoded_image("header-bomb", "image/png", 256, bomb, &mut budget).unwrap_err();
+            assert!(
+                error.contains("resource limits")
+                    || error.contains("decoded-image budget")
+                    || error.contains("dimensions"),
+                "{error}"
+            );
+            assert_eq!(
+                budget.encoded_remaining, MAX_NATIVE_ENCODED_BYTES,
+                "reject before base64 allocation"
+            );
+        }
+    }
 
     #[test]
     fn tool_name_and_arguments_choose_fragment_modes_independently() {

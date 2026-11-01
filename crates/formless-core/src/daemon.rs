@@ -4748,7 +4748,6 @@ impl Daemon {
                     .insert(forecast.basis.model.clone(), forecast.context_tokens);
             }
         }
-        let provider = Provider::with_key(pcfg, String::new(), self.http.clone()).with_name(name);
         let ctx = crate::storage::build_context(
             st,
             session_id,
@@ -4757,6 +4756,9 @@ impl Daemon {
             cfg.compaction.fraction(),
         )?
         .0;
+        let provider = Provider::with_key(pcfg, String::new(), self.http.clone())
+            .with_name(name)
+            .with_attachment_snapshot(st, &ctx)?;
         let ctx = provider.prepare_attachments(&ctx, &forecast.basis.model);
         let checkpoint = crate::forecast::hash(&st.latest_checkpoint_record(session_id)?);
         Ok(Arc::new(RunAdmission {
