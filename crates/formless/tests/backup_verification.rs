@@ -137,7 +137,22 @@ fn cli_plan_is_write_free_and_verify_list_restore_drill_read_known_session() {
         "{}",
         String::from_utf8_lossy(&backup.stderr)
     );
-    let list = invoke(&root.0, &["backup", "list"]);
+    let human = invoke(&root.0, &["backup", "list"]);
+    assert!(
+        human.status.success(),
+        "{}",
+        String::from_utf8_lossy(&human.stderr)
+    );
+    let human_text = String::from_utf8(human.stdout).unwrap();
+    for heading in ["FILE", "SIZE", "VERIFIED AT"] {
+        assert!(human_text.contains(heading), "{human_text}");
+    }
+    assert!(human_text.contains("formless-"), "{human_text}");
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&human_text).is_err(),
+        "default listing is human-readable"
+    );
+    let list = invoke(&root.0, &["backup", "list", "--json"]);
     assert!(list.status.success());
     let rows: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
     assert!(rows

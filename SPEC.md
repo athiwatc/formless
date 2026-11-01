@@ -2534,7 +2534,8 @@ daemon answers Status. Reopening an upgraded profile needs no new snapshot.
   and the database's free pages (VACUUM). Each row
   says how many items and bytes; a real run is audit-logged.
 - **Backup verification and drills.** `formless backup list` lists daily,
-  migration and pre-restore database snapshots with sizes and verification age.
+  migration and pre-restore database snapshots with sizes and verification age;
+  `backup list --json` returns stable machine-readable rows.
   `backup verify FILE` checks an immutable private copy: SQLite integrity,
   foreign keys, table/column inventory for its stamped schema, and row counts.
   A private atomic receipt binds verification to the exact source bytes; changed

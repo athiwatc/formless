@@ -337,7 +337,11 @@ enum Cmd {
 #[derive(clap::Subcommand)]
 enum BackupAction {
     /// List daily, migration and pre-restore copies with sizes and receipts
-    List,
+    List {
+        /// Machine-readable rows, including exact verification timestamps
+        #[arg(long)]
+        json: bool,
+    },
     /// Verify a standalone snapshot without changing its bytes
     Verify { file: std::path::PathBuf },
     /// Restore using exclusive ownership and seven bounded recovery copies
@@ -1503,13 +1507,23 @@ fn run_cli(cli: Cli) -> Result<()> {
         Some(Cmd::Gc { dry_run }) => gc_cmd(&paths, dry_run),
         Some(Cmd::Backup { action }) => match action {
             None => backup_cmd(&paths),
-            Some(BackupAction::List) => {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&formless_core::backup_verification::list(
-                        &paths
-                    ))?
-                );
+            Some(BackupAction::List { json }) => {
+                let rows = formless_core::backup_verification::list(&paths);
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&rows)?);
+                } else {
+                    let mut table = Table::new(&["FILE", "SIZE", "VERIFIED AT"]);
+                    for row in rows.as_array().into_iter().flatten() {
+                        table.row(vec![
+                            c(row["file"].as_str().unwrap_or_default()),
+                            c(formless_core::housekeeping::human_bytes(
+                                row["bytes"].as_u64().unwrap_or(0),
+                            )),
+                            c(row["verified_at"].as_str().unwrap_or("never verified")),
+                        ]);
+                    }
+                    table.print();
+                }
                 Ok(())
             }
             Some(BackupAction::Verify { file }) => {
