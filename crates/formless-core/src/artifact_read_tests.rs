@@ -3,7 +3,7 @@
 use super::*;
 
 struct Fixture {
-    daemon: Option<Daemon>,
+    daemon: Option<Arc<Daemon>>,
     root: std::path::PathBuf,
     paths: Paths,
     session: String,
@@ -22,13 +22,13 @@ impl Fixture {
         drop(st);
         std::fs::create_dir_all(paths.data_dir.join("artifacts/nested")).unwrap();
         Self {
-            daemon: Some(Daemon::new(paths.clone()).unwrap()),
+            daemon: Some(Arc::new(Daemon::new(paths.clone()).unwrap())),
             root,
             paths,
             session,
         }
     }
-    fn daemon(&self) -> &Daemon {
+    fn daemon(&self) -> &Arc<Daemon> {
         self.daemon.as_ref().unwrap()
     }
     fn record(&self, path: &std::path::Path, bytes: i64, owner: Option<&str>) -> String {
@@ -151,7 +151,7 @@ async fn restored_registry_cannot_authorize_outside_files_and_invalid_owned_targ
     f.daemon().with_store(|st| st.backup_into(&saved)).unwrap();
     drop(f.daemon.take());
     crate::housekeeping::restore(&f.paths, &saved).unwrap();
-    f.daemon = Some(Daemon::new(f.paths.clone()).unwrap());
+    f.daemon = Some(Arc::new(Daemon::new(f.paths.clone()).unwrap()));
     assert_eq!(
         f.daemon()
             .with_reader(|st| st.get_artifact(&id))
