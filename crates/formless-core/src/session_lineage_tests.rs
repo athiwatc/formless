@@ -267,3 +267,70 @@ fn prospective_snapshot_forks_use_same_lineage_without_mutating_the_source() {
     assert_eq!(st.list_sessions().unwrap().len(), 1);
     assert_eq!(preview.list_sessions().unwrap().len(), 2);
 }
+
+fn run_anchors(
+    st: &Store,
+    run: &str,
+) -> (Option<String>, Option<i64>, Option<String>, Option<i64>) {
+    st.conn.query_row("SELECT start_message_id,start_message_seq,end_message_id,end_message_seq FROM runs WHERE id=?1", params![run], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap()
+}
+
+#[test]
+fn run_boundaries_capture_real_message_ids_and_never_move_on_relabelling() {
+    let st = Store::open_in_memory().unwrap();
+    let session = st.create_session(None).unwrap();
+    let run = st.create_run(&session.id).unwrap();
+    assert_eq!(run_anchors(&st, &run), (None, Some(0), None, None));
+    let answer = st
+        .append_message(&session.id, "assistant", "first answer")
+        .unwrap();
+    st.set_run_status(&run, "paused").unwrap();
+    let expected = (None, Some(0), Some(answer.id.clone()), Some(1));
+    assert_eq!(run_anchors(&st, &run), expected);
+    let note = st
+        .append_message(&session.id, "system-note", "Resume the paused answer")
+        .unwrap();
+    st.set_run_status(&run, "resumed").unwrap();
+    let next = st.create_run(&session.id).unwrap();
+    assert_eq!(
+        run_anchors(&st, &next),
+        (Some(note.id), Some(2), None, None)
+    );
+    let completion = st
+        .append_message(&session.id, "assistant", "continued answer")
+        .unwrap();
+    st.set_run_status(&next, "completed").unwrap();
+    assert_eq!(run_anchors(&st, &next).2, Some(completion.id));
+    assert_eq!(
+        run_anchors(&st, &run),
+        expected,
+        "later resumed/abandoned labels cannot claim a newer closing message"
+    );
+    st.set_run_status(&run, "abandoned").unwrap();
+    assert_eq!(run_anchors(&st, &run), expected);
+
+    let fork = st.fork_session(&session.id, None, None).unwrap().unwrap();
+    let copied_tail = st.list_messages(&fork.id).unwrap().pop().unwrap();
+    let child_run = st.create_run(&fork.id).unwrap();
+    assert_eq!(run_anchors(&st, &child_run).0, Some(copied_tail.id));
+    assert_eq!(run_anchors(&st, &child_run).1, Some(3));
+}
+
+#[test]
+fn crash_orphaned_runs_keep_unknown_closing_boundaries_after_restart_actions() {
+    let st = Store::open_in_memory().unwrap();
+    let session = st.create_session(None).unwrap();
+    let message = st
+        .append_message(&session.id, "user", "interrupted work")
+        .unwrap();
+    let run = st.create_run(&session.id).unwrap();
+    st.mark_orphan_runs_interrupted().unwrap();
+    st.append_message(&session.id, "user", "later history")
+        .unwrap();
+    st.set_run_status(&run, "abandoned").unwrap();
+    assert_eq!(
+        run_anchors(&st, &run),
+        (Some(message.id), Some(1), None, None),
+        "startup cannot fabricate a historic closing point from today's transcript"
+    );
+}

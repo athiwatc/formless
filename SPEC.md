@@ -650,6 +650,12 @@ task, with quality as a gate**.
   have null lineage rather than guessed parents. Parent deletion never deletes
   children or erases their recorded parent ID. Forks copy transcript data and
   settings, not the parent's Runs or usage charges.
+  New Runs record the current transcript-tail message ID/sequence when their row is
+  created, and the closing message ID/sequence on their first transition out
+  of `running`. Resuming creates a new Run; relabelling an old Run never moves
+  its closing boundary. Historical and crash-orphan boundaries remain unknown.
+  These are whole-Run transcript anchors, not per-request billing boundaries;
+  a fork inside a Run cannot split that Run's usage exactly.
   **Deleting a Session can be undone for `daemon.delete_undo_secs` (30).**
   It is hidden at once from lists, search and `GetSession`
   (`sessions.deleted_at`, schema v27), and `RestoreSession` brings it
