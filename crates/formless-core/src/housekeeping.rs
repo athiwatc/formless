@@ -345,6 +345,15 @@ pub fn list_restore_backups(paths: &Paths) -> Vec<PathBuf> {
     copies
 }
 
+// New names have no extension, so require the *entire* generated stamp. A
+// prefix match alone would mistake a selected snapshot's WAL/SHM for backups.
+fn valid_recovery_stamp(stamp: &str) -> bool {
+    let Some((timestamp, id)) = stamp.split_once('-') else {
+        return false;
+    };
+    parse_backup_stamp(timestamp).is_some() && id.len() == 36 && uuid::Uuid::parse_str(id).is_ok()
+}
+
 fn list_copies(paths: &Paths, prefix: &str, suffix: &str) -> Vec<PathBuf> {
     let mut found: Vec<PathBuf> = std::fs::read_dir(backup_dir(paths))
         .into_iter()
@@ -353,9 +362,11 @@ fn list_copies(paths: &Paths, prefix: &str, suffix: &str) -> Vec<PathBuf> {
         .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
         .map(|e| e.path())
         .filter(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with(prefix) && n.ends_with(suffix))
+            p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                n.starts_with(prefix)
+                    && n.ends_with(suffix)
+                    && (suffix != "" || n.strip_prefix(prefix).is_some_and(valid_recovery_stamp))
+            })
         })
         .collect();
     found.sort_by_cached_key(|p| {

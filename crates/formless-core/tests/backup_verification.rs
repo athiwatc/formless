@@ -370,3 +370,70 @@ fn fresh_destination_preflight_failure_does_not_claim_a_nonexistent_recovery_cop
     assert!(!paths.db_file().exists());
     assert!(housekeeping::list_restore_backups(&paths).is_empty());
 }
+
+#[test]
+fn selected_new_format_recovery_wal_and_shm_are_not_retention_candidates() {
+    let (fixture, paths) = Fixture::new();
+    let canonical = Store::open(&paths.db_file()).unwrap();
+    canonical.create_session(Some("initial".into())).unwrap();
+    let original = fixture.0.join("original.db");
+    canonical.backup_into(&original).unwrap();
+    drop(canonical);
+    let selected = housekeeping::restore(&paths, &original).unwrap();
+    let source = Store::open(&selected).unwrap();
+    let later = source.create_session(Some("later-only".into())).unwrap();
+    let directory = housekeeping::backup_dir(&paths);
+    for day in 1..=8 {
+        source
+            .backup_into(&directory.join(format!("before-restore-9999010{day}T000000Z.db")))
+            .unwrap();
+    }
+    let bogus = PathBuf::from(format!("{}.arbitrary", selected.display()));
+    std::fs::write(&bogus, b"not a copy").unwrap();
+    let fake_dir = directory.join(format!(
+        "formless.db.pre-restore-99990101T000000Z-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir(&fake_dir).unwrap();
+    assert_eq!(
+        housekeeping::list_restore_backups(&paths).len(),
+        9,
+        "only database copies are inventoried"
+    );
+    let wal = PathBuf::from(format!("{}-wal", selected.display()));
+    let shm = PathBuf::from(format!("{}-shm", selected.display()));
+    let before: Vec<_> = [&selected, &wal, &shm]
+        .iter()
+        .map(|p| std::fs::read(p).unwrap())
+        .collect();
+    assert!(
+        !before[1].is_empty(),
+        "later-only Session is committed in the held source WAL"
+    );
+    let saved = housekeeping::restore(&paths, &selected).unwrap();
+    assert!(saved.is_file() && selected.is_file());
+    assert_eq!(
+        housekeeping::list_restore_backups(&paths).len(),
+        housekeeping::RESTORE_BACKUPS_KEEP
+    );
+    for (path, bytes) in [&selected, &wal, &shm].iter().zip(before) {
+        assert_eq!(
+            std::fs::read(path).unwrap(),
+            bytes,
+            "selected source/sidecars are preserved: {}",
+            path.display()
+        );
+    }
+    assert!(
+        bogus.exists() && fake_dir.exists(),
+        "unrecognized files/directories are never pruned"
+    );
+    let restored = Store::open(&paths.db_file()).unwrap();
+    assert!(restored
+        .list_sessions()
+        .unwrap()
+        .iter()
+        .any(|s| s.id == later.id));
+    drop(restored);
+    drop(source);
+}

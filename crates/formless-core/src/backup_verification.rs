@@ -223,7 +223,7 @@ pub fn copies(paths: &Paths) -> Vec<PathBuf> {
 }
 pub fn list(paths: &Paths) -> Value {
     json!(copies(paths).iter().map(|file| json!({"file":file,"bytes":housekeeping::path_bytes(file),
-        "modified_at":std::fs::metadata(file).and_then(|m|m.modified()).ok().map(chrono::DateTime::<chrono::Utc>::from),
+        "modified_at":std::fs::metadata(file).and_then(|m|m.modified()).ok().map(|at|chrono::DateTime::<chrono::Utc>::from(at).to_rfc3339()),
         "verified_at":verified(paths,file).map(|r|r.verified_at)})).collect::<Vec<_>>())
 }
 pub fn newest_status(paths: &Paths) -> Value {
@@ -260,7 +260,7 @@ pub async fn drill(paths: &Paths, file: &Path) -> Result<Value> {
         bail!("backup changed before drill");
     }
     housekeeping::restore(&trial, &saved)?;
-    let daemon = std::sync::Arc::new(crate::Daemon::for_restore_drill(trial.clone())?);
+    let daemon = std::sync::Arc::new(crate::daemon::Daemon::for_restore_drill(trial.clone())?);
     let sessions = daemon
         .handle(formless_protocol::Request::ListSessions)
         .await?;
