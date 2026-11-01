@@ -302,6 +302,28 @@ fn rehearse(checkpoint: i64) {
         "old histories do not invent parents"
     );
     assert_eq!(session.fork_point_seq, None);
+    let metadata_columns: i64 = upgraded
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('run_files') WHERE name='before_metadata'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        metadata_columns, 1,
+        "real historical DDL gains the nullable metadata column"
+    );
+    let invented_metadata: i64 = upgraded
+        .query_row(
+            "SELECT COUNT(*) FROM run_files WHERE before_metadata IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        invented_metadata, 0,
+        "an upgrade cannot invent prior file permissions"
+    );
     let anchors: (Option<String>, Option<i64>, Option<String>, Option<i64>) = upgraded.query_row("SELECT start_message_id,start_message_seq,end_message_id,end_message_seq FROM runs WHERE id='history-run-old'", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
     assert_eq!(
         anchors,

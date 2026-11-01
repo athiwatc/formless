@@ -648,6 +648,7 @@ pub struct Daemon {
     /// Comparisons in flight: id → (origin Session, [(fork, model)]).
     comparisons: StdMutex<HashMap<String, (String, Vec<(String, String)>)>>,
     branch_summary_state: Arc<StdMutex<branch_summary::BranchSummaryState>>,
+    hunk_reviews: StdMutex<review_daemon::ReviewState>,
     /// Sessions in step mode (`/step`), and the step decisions awaited.
     step_sessions: StdMutex<std::collections::HashSet<String>>,
     step_waiters: StdMutex<HashMap<String, tokio::sync::oneshot::Sender<(String, Option<String>)>>>,
@@ -858,6 +859,7 @@ impl Daemon {
             progress_sent: StdMutex::new(Default::default()),
             comparisons: StdMutex::new(Default::default()),
             branch_summary_state: Arc::new(StdMutex::new(Default::default())),
+            hunk_reviews: StdMutex::new(Default::default()),
             routing_log: StdMutex::new(Default::default()),
             model_test_cache,
             missing_models: StdMutex::new(Vec::new()),
@@ -2065,6 +2067,47 @@ impl Daemon {
                 let files = self.run_file_infos(&run_id, true)?;
                 Ok(json!({"run_id": run_id, "files": files}))
             }
+            Request::InspectRunReview { session_id, run_id } => Ok(serde_json::to_value(
+                self.inspect_run_review(&session_id, run_id.as_deref())
+                    .map_err(review_daemon::error)?,
+            )?),
+            Request::PrepareToolReview {
+                session_id,
+                tool_id,
+                base_version,
+                candidate_code,
+            } => Ok(serde_json::to_value(
+                self.prepare_tool_review(&session_id, &tool_id, base_version, &candidate_code)
+                    .map_err(review_daemon::error)?,
+            )?),
+            Request::DecideReviewHunk {
+                review_id,
+                file_id,
+                hunk_id,
+                expected_hash,
+                decision,
+            } => Ok(serde_json::to_value(
+                self.decide_review_hunk(&review_id, &file_id, &hunk_id, &expected_hash, &decision)
+                    .map_err(review_daemon::error)?,
+            )?),
+            Request::UndoReviewChange {
+                review_id,
+                change_id,
+                expected_hash,
+            } => Ok(serde_json::to_value(
+                self.undo_review_change(&review_id, &change_id, &expected_hash)
+                    .map_err(review_daemon::error)?,
+            )?),
+            Request::CommentReviewHunk {
+                review_id,
+                file_id,
+                hunk_id,
+                expected_hash,
+                comment,
+            } => Ok(serde_json::to_value(
+                self.comment_review_hunk(&review_id, &file_id, &hunk_id, &expected_hash, &comment)
+                    .map_err(review_daemon::error)?,
+            )?),
             Request::RewindRun {
                 session_id,
                 run_id,
@@ -10273,18 +10316,52 @@ impl Daemon {
     /// Before a Tool first changes `path` in a Run, keep what it held
     /// (SPEC §5.7): files up to 2 MB are kept, so they can be reverted.
     fn snapshot_before_change(&self, session_id: &str, run_id: &str, path: &std::path::Path) {
-        const MAX: u64 = 2 * 1024 * 1024;
         if run_id.is_empty() {
-            return; // a Tool run outside any Run (`formless tools run`)
+            return;
         }
-        let shown = path.to_string_lossy().into_owned();
-        let (existed, before) = match std::fs::symlink_metadata(path) {
-            Err(_) => (false, None),
-            Ok(m) if m.is_file() && m.len() <= MAX => (true, std::fs::read(path).ok()),
-            Ok(_) => (true, None),
+        // Lossy paths cannot name an exact recovery target. Snapshot capture
+        // never expands the live Tool's read authority to profile/credentials.
+        let Some(shown) = path.to_str() else {
+            return;
+        };
+        let capture = (|| -> Result<crate::review_file_io::ReviewImage> {
+            let cfg = self.config()?;
+            let policy =
+                crate::sensitive_reads::policy(&self.paths, &cfg.security, &self.sensitive_anchors)
+                    .map_err(anyhow::Error::msg)?;
+            // Parents can legitimately be absent before fs.write creates them.
+            // Only NotFound means absence; other errors remain unknown.
+            if !matches!(
+                policy.classify(path, path).map_err(anyhow::Error::msg)?,
+                formless_runtime::sensitive_paths::PathDecision::Ordinary
+            ) {
+                anyhow::bail!("Protected snapshot path");
+            }
+            match std::fs::symlink_metadata(path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    Ok(crate::review_file_io::ReviewImage::missing())
+                }
+                Err(error) => Err(error.into()),
+                Ok(_) => crate::review_file_io::ReviewPath::capture_snapshot(path, &policy),
+            }
+        })();
+        let (existed, before, metadata) = match capture {
+            Ok(image) => {
+                let metadata = crate::review_file_io::encode_before_metadata(&image).ok();
+                (image.bytes.is_some(), image.bytes, metadata)
+            }
+            // Unknown/unreadable is never presented as a known absent file.
+            Err(_) => (true, None, None),
         };
         let _ = self.with_store(|st| {
-            st.snapshot_run_file(session_id, run_id, &shown, existed, before.as_deref())
+            st.snapshot_run_file_with_metadata(
+                session_id,
+                run_id,
+                shown,
+                existed,
+                before.as_deref(),
+                metadata.as_deref(),
+            )
         });
     }
 
@@ -17113,6 +17190,9 @@ mod sensitive_read_daemon_tests;
 #[cfg(test)]
 #[path = "model_test_daemon_tests.rs"]
 mod model_test_daemon_tests;
+
+#[path = "review_daemon.rs"]
+mod review_daemon;
 
 #[cfg(test)]
 #[path = "cli_attach_daemon_tests.rs"]

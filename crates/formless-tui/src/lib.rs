@@ -3,6 +3,9 @@ pub mod client;
 mod clipimg;
 mod commands;
 mod highlight;
+mod hunk_controller;
+mod hunk_ui;
+mod hunk_view;
 mod i18n;
 mod images;
 mod input;
@@ -147,6 +150,10 @@ impl View {
 
 #[derive(Clone, PartialEq)]
 enum Pending {
+    HunkReview {
+        reply: hunk_ui::Reply,
+        action: hunk_ui::Action,
+    },
     ForecastHint {
         generation: String,
     },
@@ -225,7 +232,11 @@ enum Pending {
     /// `/revoke all [family]`: revoke what the list returns.
     RevokeAll,
     DryRunTool,
-    PreviewTool,
+    PreviewTool {
+        editor_generation: u64,
+        tool_id: String,
+        code_hash: String,
+    },
     UndoRegistry,
     GetModule,
     UpdateModule,
@@ -1105,6 +1116,7 @@ struct EditorReview {
 }
 
 struct EditorState {
+    review_base_version: Option<i64>,
     vim: vim::Vim,
     tool_id: String,
     name: String,
@@ -1442,6 +1454,8 @@ struct App {
     session_filter: lists::ListFilter,
     session_comparison_revision: u64,
     branch_summary: branch_summary::State,
+    hunk_review: hunk_ui::State,
+    editor_generation: u64,
     current: Option<String>,
     messages: Vec<MessageInfo>,
     streaming: String,
@@ -1810,6 +1824,8 @@ impl App {
             session_filter: lists::ListFilter::default(),
             session_comparison_revision: 0,
             branch_summary: branch_summary::State::default(),
+            hunk_review: hunk_ui::State::default(),
+            editor_generation: 0,
             current: None,
             messages: Vec::new(),
             streaming: String::new(),
@@ -2005,6 +2021,7 @@ impl App {
     /// Initial connection and reconnect both refresh connection-specific state.
     fn attach_daemon(&mut self, client: DaemonClient, inbox: mpsc::Receiver<ServerMessage>) {
         self.cancel_branch_summary();
+        self.hunk_review.clear();
         self.clear_attention();
         self.description_save_preview = None;
         self.description_editor_observed = None;
@@ -2067,6 +2084,7 @@ impl App {
     /// show "reconnecting…" and try again every 2 s (SPEC §10.5).
     fn daemon_lost(&mut self) {
         self.cancel_branch_summary();
+        self.hunk_review.clear();
         self.forecast = ForecastUi::default();
         self.restore_unsent_draft();
         self.interrupt_attachment_send("Attachment upload was interrupted before sending; its text/files are kept for review, never sent automatically.");
@@ -2468,6 +2486,17 @@ impl App {
             let Some(kind) = self.pending.remove(&id) else {
                 continue;
             };
+            if let Pending::HunkReview { reply, action } = &kind {
+                if self.hunk_reply_is_current(reply) {
+                    self.hunk_review.clear();
+                    self.notes.push(match action {
+                        hunk_ui::Action::Decision => "Review action timed out; it may still finish. Reopen review to inspect its result before another action.",
+                        hunk_ui::Action::Comment => "Review comment timed out; inspect the transcript before sending it again.",
+                        hunk_ui::Action::Inspect => "Review read timed out; reopen review when the daemon responds.",
+                    }.into());
+                }
+                continue;
+            }
             if matches!(kind, Pending::ForecastHint { .. }) {
                 continue;
             }
@@ -2654,6 +2683,20 @@ impl App {
                     let Some(kind) = self.pending.remove(&id) else {
                         continue;
                     };
+                    if let Pending::HunkReview { reply, .. } = &kind {
+                        if !self.hunk_reply_is_current(reply) {
+                            if self.hunk_review.generation == reply.generation {
+                                self.hunk_review.clear();
+                            }
+                            continue;
+                        }
+                        if !ok || result.is_none() {
+                            self.hunk_review.busy = false;
+                            self.hunk_review.error = Some(error.clone().unwrap_or_else(|| {
+                                "Review reply was empty; reopen to inspect.".into()
+                            }));
+                        }
+                    }
                     if matches!(&kind, Pending::InspectBranchSummary { generation, .. } | Pending::PrepareBranchSummary { generation, .. } | Pending::CommitBranchSummary { generation, .. } if *generation != self.branch_summary.generation)
                     {
                         continue;
@@ -2712,6 +2755,9 @@ impl App {
                         continue;
                     };
                     match kind {
+                        Pending::HunkReview { reply, action } => {
+                            self.hunk_review_result(reply, action, result)
+                        }
                         Pending::ForecastHint { generation } => {
                             if generation == self.forecast_generation() {
                                 self.forecast.hint = serde_json::from_value(result).ok();
@@ -2884,7 +2930,22 @@ impl App {
                                 self.modules = v;
                             }
                         }
-                        Pending::PreviewTool => {
+                        Pending::PreviewTool {
+                            editor_generation,
+                            tool_id,
+                            code_hash,
+                        } => {
+                            if self.editor_generation != editor_generation
+                                || !self.editor.as_ref().is_some_and(|editor| {
+                                    editor.mode == EditMode::Code
+                                        && editor.tool_id == tool_id
+                                        && formless_core::hunk_review::image_hash(Some(
+                                            editor.text().as_bytes(),
+                                        )) == code_hash
+                                })
+                            {
+                                continue;
+                            }
                             let ok = result["ok"] == true;
                             let mut verdict = if ok {
                                 match result["smoke_note"].as_str() {
@@ -4695,6 +4756,7 @@ impl App {
         self.vim_input.reset();
         if self.current.as_deref() != Some(&id) {
             self.cancel_branch_summary();
+            self.hunk_review.clear();
         }
         // Live traffic only for the Session on screen (lists stay global).
         self.others.clear();
@@ -4749,6 +4811,23 @@ impl App {
     }
 
     fn on_event(&mut self, ev: Event) {
+        if self
+            .hunk_review
+            .context
+            .as_ref()
+            .is_some_and(|context| match (context, &ev) {
+                (hunk_ui::Context::Tool { tool_id, .. }, Event::ToolUpdated { tool }) => {
+                    tool_id == &tool.id
+                }
+                (hunk_ui::Context::Tool { tool_id, .. }, Event::ToolDeleted { id }) => {
+                    tool_id == id
+                }
+                (context, Event::SessionDeleted { id }) => context.session_id() == id,
+                _ => false,
+            })
+        {
+            self.hunk_review.clear();
+        }
         if self
             .branch_summary
             .intent
@@ -6572,6 +6651,11 @@ impl App {
                 Some(_) => self.recap_open = !self.recap_open,
                 None => self.notes.push("no recap: it is made after Runs of 4 or more steps".into()),
             },
+            cmd if cmd == "review" || cmd.starts_with("review ") => {
+                let run = cmd.strip_prefix("review").unwrap().trim();
+                if run.split_whitespace().count() > 1 { self.notes.push("Usage: /review [RUN_ID]".into()); }
+                else { self.begin_run_review((!run.is_empty()).then(|| run.to_string())); }
+            }
             "files" => {
                 if let Some(session_id) = self.current.clone() {
                     self.request(
@@ -7339,6 +7423,7 @@ impl App {
                 let source_id = match session_ui::resolve(&self.sessions,source) { Ok(id) => id, Err(error) => { self.notes.push(error); return; } };
                 if source_id == target_id { self.notes.push("Choose another source branch for this target Session.".into()); return; }
                 if self.offline.is_some() || self.client.is_none() { self.notes.push("Reconnect before generating a branch summary.".into()); return; }
+                self.hunk_review.clear();
                 self.branch_summary.intent = Some((source_id.clone(),target_id.clone()));
                 self.notes.push("Generating branch summary for review… Esc closes review. Started generation may finish and record usage.".into());
                 self.request(Pending::InspectBranchSummary { generation: self.branch_summary.generation, source_id: source_id.clone(), target_id: target_id.clone() }, Request::InspectBranchSummary { source_id,target_id });
@@ -8031,6 +8116,18 @@ impl App {
 
     fn mouse(&mut self, m: crossterm::event::MouseEvent) {
         use crossterm::event::{MouseButton, MouseEventKind};
+        if self.hunk_review_is_visible() {
+            match m.kind {
+                MouseEventKind::ScrollUp => {
+                    self.hunk_review.scroll = self.hunk_review.scroll.saturating_sub(3)
+                }
+                MouseEventKind::ScrollDown => {
+                    self.hunk_review.scroll = self.hunk_review.scroll.saturating_add(3)
+                }
+                _ => {}
+            }
+            return;
+        }
         if self.wizard.is_some() {
             return;
         }
@@ -8066,6 +8163,7 @@ impl App {
     }
 
     fn editor_key(&mut self, key: KeyEvent) {
+        self.editor_generation = self.editor_generation.wrapping_add(1);
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if self.vim_help {
             if matches!(key.code, KeyCode::Esc | KeyCode::Char('?')) {
@@ -8087,6 +8185,17 @@ impl App {
             }
             return;
         }
+        if self.editor_review.is_some()
+            && key.code == KeyCode::Char('h')
+            && !ctrl
+            && self
+                .editor
+                .as_ref()
+                .is_some_and(|ed| ed.mode == EditMode::Code)
+        {
+            self.begin_tool_hunks();
+            return;
+        }
         // Reviewing: Ctrl+S saves, anything else goes back to editing.
         if self.editor_review.is_some() && !(ctrl && key.code == KeyCode::Char('s')) {
             self.editor_review = None;
@@ -8103,7 +8212,13 @@ impl App {
             }
             if let Some(ed) = self.editor.as_ref().filter(|e| e.mode == EditMode::Code) {
                 self.request(
-                    Pending::PreviewTool,
+                    Pending::PreviewTool {
+                        editor_generation: self.editor_generation,
+                        tool_id: ed.tool_id.clone(),
+                        code_hash: formless_core::hunk_review::image_hash(Some(
+                            ed.text().as_bytes(),
+                        )),
+                    },
                     Request::PreviewToolCode {
                         id: ed.tool_id.clone(),
                         code: ed.text(),
@@ -8205,6 +8320,10 @@ impl App {
         // Terminals that report key releases (the Windows console, kitty's
         // event types) would otherwise act on every key twice (#792).
         if key.kind == KeyEventKind::Release {
+            return;
+        }
+        if self.hunk_review_is_visible() {
+            self.hunk_review_key(key);
             return;
         }
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -8947,16 +9066,18 @@ impl App {
                     if let Some(tool) = self.selected_tool().cloned() {
                         match &self.tool_detail {
                             Some(d) if d.tool.id == tool.id => {
-                                let code = d
+                                let version = d
                                     .versions
                                     .iter()
                                     .find(|v| v.version == tool.current_version)
-                                    .or_else(|| d.versions.last())
-                                    .map(|v| v.code.clone())
-                                    .unwrap_or_default();
+                                    .or_else(|| d.versions.last());
+                                let review_base_version = version.map(|v| v.version);
+                                let code = version.map(|v| v.code.clone()).unwrap_or_default();
                                 let chars: Vec<char> = code.chars().collect();
                                 let cursor = chars.len();
+                                self.editor_generation = self.editor_generation.wrapping_add(1);
                                 self.editor = Some(EditorState {
+                                    review_base_version,
                                     vim: vim::Vim::default(),
                                     tool_id: tool.id.clone(),
                                     name: tool.name.clone(),
@@ -9227,7 +9348,9 @@ impl App {
                     .map(|v| v.code.clone())
                     .unwrap_or_default();
                 let chars: Vec<char> = code.chars().collect();
+                self.editor_generation = self.editor_generation.wrapping_add(1);
                 self.editor = Some(EditorState {
+                    review_base_version: None,
                     vim: vim::Vim::default(),
                     tool_id: m.id,
                     name: m.name,
@@ -10237,6 +10360,14 @@ impl App {
 
     /// A bracketed paste: one block, wherever text is being typed.
     fn paste(&mut self, text: &str) {
+        if self.hunk_review_is_visible() {
+            if !self.hunk_review.busy {
+                if let Some(comment) = &mut self.hunk_review.comment {
+                    comment.paste(text);
+                }
+            }
+            return;
+        }
         if self.wizard.is_some() || self.model_overlay.is_some() {
             for c in text.chars().filter(|c| !c.is_control()) {
                 self.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
@@ -10244,6 +10375,7 @@ impl App {
             return;
         }
         if let Some(ed) = &mut self.editor {
+            self.editor_generation = self.editor_generation.wrapping_add(1);
             if self.vim_mode {
                 let mut line = ed.modal_line();
                 ed.vim.paste(&mut line, text);
@@ -10286,6 +10418,10 @@ fn draw(f: &mut Frame, app: &mut App) {
     app.refresh_toasts();
     if let Some(w) = &app.wizard {
         draw_wizard(f, w, app.color);
+        return;
+    }
+    if app.hunk_review_is_visible() {
+        hunk_controller::draw(f, app);
         return;
     }
     if let Some(ed) = &app.editor {
@@ -12787,7 +12923,9 @@ impl App {
             .unwrap_or_else(|_| "{}".into())
             .chars()
             .collect();
+        self.editor_generation = self.editor_generation.wrapping_add(1);
         self.editor = Some(EditorState {
+            review_base_version: None,
             vim: vim::Vim::default(),
             tool_id: d.tool.id.clone(),
             name: d.tool.name.clone(),
@@ -12881,7 +13019,9 @@ impl App {
             _ => d.tool.description.clone(),
         };
         let chars: Vec<char> = text.chars().collect();
+        self.editor_generation = self.editor_generation.wrapping_add(1);
         self.editor = Some(EditorState {
+            review_base_version: None,
             vim: vim::Vim::default(),
             tool_id: d.tool.id.clone(),
             name: d.tool.name.clone(),
@@ -16490,9 +16630,9 @@ fn draw_editor_review(
     f.render_widget(
         Paragraph::new(Line::styled(
             if r.ok {
-                " Ctrl+S save as a new version · any other key: back to editing"
+                " Ctrl+S save as a new version · h interactive hunks · other key: edit"
             } else {
-                " Saving would fail · any key: back to editing"
+                " Saving would fail · h interactive hunks · other key: edit"
             },
             ui::dim(color),
         )),
@@ -17008,6 +17148,7 @@ mod credential_env;
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("hunk_tests.rs");
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -17032,6 +17173,8 @@ mod tests {
             session_filter: lists::ListFilter::default(),
             session_comparison_revision: 0,
             branch_summary: branch_summary::State::default(),
+            hunk_review: hunk_ui::State::default(),
+            editor_generation: 0,
             current: Some("s1".into()),
             messages: Vec::new(),
             streaming: String::new(),
@@ -19273,6 +19416,7 @@ mod tests {
     #[test]
     fn editor_works_in_grapheme_clusters() {
         let ed = |s: &str, cursor: usize| EditorState {
+            review_base_version: None,
             vim: vim::Vim::default(),
             tool_id: "t".into(),
             name: "n".into(),
@@ -19309,6 +19453,7 @@ mod tests {
     fn editor_edits_text_and_moves_cursor() {
         let mut app = test_app();
         app.editor = Some(EditorState {
+            review_base_version: None,
             vim: vim::Vim::default(),
             tool_id: "t1".into(),
             name: "writer".into(),
@@ -19835,6 +19980,7 @@ mod tests {
             session_id: None,
         });
         app.editor = Some(EditorState {
+            review_base_version: None,
             vim: vim::Vim::default(),
             tool_id: "t".into(),
             name: "t".into(),
@@ -20259,6 +20405,7 @@ mod tests {
     fn the_code_editor_reviews_before_saving() {
         let mut app = test_app();
         app.editor = Some(EditorState {
+            review_base_version: None,
             vim: vim::Vim::default(),
             tool_id: "t".into(),
             name: "echo_text".into(),
@@ -24698,6 +24845,7 @@ mod tests {
         let mut vim = vim::Vim::default();
         vim.mode = vim::Mode::Normal;
         app.editor = Some(EditorState {
+            review_base_version: None,
             vim,
             tool_id: "private".into(),
             name: "unicode editor".into(),
@@ -24774,6 +24922,7 @@ mod tests {
         let (client, sent) = DaemonClient::recording();
         app.client = Some(client);
         app.editor = Some(EditorState {
+            review_base_version: None,
             vim: vim::Vim::default(),
             tool_id: "private-tool".into(),
             name: "private_editor".into(),
@@ -24821,6 +24970,7 @@ mod tests {
             .any(|line| line.contains("Vim: d/c/y")));
         app.pager = None;
         app.editor = Some(EditorState {
+            review_base_version: None,
             vim: vim::Vim::default(),
             tool_id: "private".into(),
             name: "private_editor".into(),
@@ -24925,6 +25075,7 @@ mod tests {
         let mut app = test_app();
         app.vim_mode = true;
         app.editor = Some(EditorState {
+            review_base_version: None,
             vim: vim::Vim::default(),
             tool_id: "private".into(),
             name: "private".into(),

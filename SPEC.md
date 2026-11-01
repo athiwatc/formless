@@ -1179,6 +1179,90 @@ pasting paths.
   created it. Files whose content was not kept (too large, a folder) are
   reported as skipped. A system note tells the agent which files were
   reverted. Not while a Run is active.
+- **Run before-metadata (schema 63).** Before a live Tool first changes a
+  path, capture its bounded bytes (up to 2 MiB) and security metadata from one
+  anchored no-follow descriptor, subject to protected-profile/credential read
+  policy. Store both in the same immutable first snapshot; later mutations never
+  fill historical NULL metadata. Only NotFound records known absence; unsupported
+  or unreadable state remains unknown. Versioned before-metadata binds the exact
+  bytes and metadata with an integrity checksum (not a MAC). Newly captured
+  deleted ordinary files can be rejected back to their original bytes, mode and
+  ownership, then explicitly undone back to absence. Unsupported ACLs/xattrs,
+  unverifiable Windows security and legacy missing metadata remain read-only.
+  Whole-file byte-only snapshots remain available for authorized regular files
+  with hard links or unsupported metadata, including a legitimate symlink-parent
+  alias: both the requested name and canonical target must pass path policy,
+  the final entry cannot be a symlink, and one anchored no-follow descriptor
+  supplies bounded bytes and metadata. The original route's regular-file identity
+  and canonical destination are rechecked before and after the read (Unix device/
+  inode; Windows volume/file index through a metadata-only alias handle). Alias,
+  hard-link and unsupported-metadata captures are marked incomplete and confer no
+  hunk-write authority. Retargeting, unknown identity or read failure records
+  unknown state, never invented absence. This protects snapshot reads; it does
+  not claim atomicity with a subsequent Tool operation or strengthen legacy
+  whole-file restore semantics against an external alias retarget.
+- **Hunk review engine.** Interactive review uses content-bound hunk identities
+  and exact byte ranges, retaining original line endings and EOF newline state.
+  Inverse edits preserve every byte outside the selected hunk. Missing and empty
+  files have different identities; a rejected creation can restore absence.
+  Binary, generated and oversized files remain listed with explicit reasons,
+  without hunk edits. Text review is bounded to 256 KiB per image and one million
+  line-alignment pairs. Larger alignment workloads become one explicitly labelled
+  replacement hunk, rather than invented unchanged lines. Word spans preserve
+  Unicode and whitespace; excessively large word alignments are labelled and
+  shown as whole changed lines. This pure engine does not read or write paths;
+  filesystem authorization and stale checks belong to the owning review RPC.
+  `InspectRunReview` resolves the actual latest owned Run (or an explicit owned
+  Run ID); `PrepareToolReview` pins a Tool's current version and an uploaded
+  code draft. Decisions use only server review/file/hunk IDs and the expected
+  current image hash, never client paths or inverse text. Accept keeps the
+  current bytes; a rejected hunk must be undone before it can be accepted.
+  Rejections preserve exact line endings, EOF state, existence and supported
+  permission metadata. Source Sessions with active Runs or unfinished background
+  Invocations are refused. File decisions and Undo additionally refuse any
+  active Run or live pending/background Invocation anywhere in the same daemon
+  profile, including other Sessions. Read-only inspection and Tool draft review
+  do not gain this profile-wide exclusion. Completed results waiting for
+  await/push delivery in any Session are retained rather than consumed by
+  review. Run/Invocation admission and the final file commit share the Store
+  boundary, held through the final busy check and filesystem commit. This does
+  not claim a filesystem transaction against another daemon or a noncooperating
+  external writer; exact image checks still refuse observed external changes.
+  Before changing a Run file, a prepared private receipt retains both exact
+  images and permission metadata. Receipt and per-image checksums detect
+  accidental corruption, including valid-base64 corruption of the pre-image;
+  they are not authentication against a local profile owner. Receipt files are
+  owner-only (0600/0700 on Unix; protected owner/SYSTEM DACL on Windows), with
+  opaque UUID names, a 1 MiB per-record limit and a 32 MiB/128-entry journal
+  limit including staged updates. Capacity exhaustion retains old recovery
+  records and refuses new changes. Audit entries contain only identifiers,
+  hashes, status and path labels. Exact pre/post/existence/permission comparison
+  reconciles interrupted replies and status updates; an unknown state refuses
+  automatic overwrite. A replacement followed by a failed durability/status
+  update is reported as changed or uncertain, never falsely unchanged.
+  Reopening a Run review recovers durable undo receipts, ordered by a persistent
+  sequence rather than wall-clock time. Closing a pane does not cancel an
+  already-dispatched action and never automatically replays or undoes it.
+  Tool rejections and undo alter only the matching server-owned draft; they do
+  not publish a registry version or bypass the normal Ctrl+S save/smoke gate.
+  Draft reviews expire after 30 minutes; at most 16 reviews, 8 MiB per review,
+  and 32 MiB of retained review data are allowed.
+  Symlinks/reparse points, multiple hard links, protected profile/credential
+  paths, read-only/set-ID files, and permission metadata that cannot be preserved
+  remain noneditable. Legacy deleted-file snapshots have no original metadata and
+  are therefore read-only. Unix UID/GID and mode are preserved; extended
+  attributes/ACLs are refused rather than silently discarded. Windows special
+  attributes, nondefault streams and unsupported access-control entries are
+  refused. Full Windows audit/SACL and integrity-label state must be verifiable
+  using rights already available to the process: **ordinary unprivileged Windows
+  file hunk writes are currently read-only**, including existing-file replacement
+  and deletion/recreation. Review never enables privileges or changes OS policy.
+  Windows and macOS native metadata paths require separate platform evidence;
+  Linux tests do not establish their execution.
+  `CommentReviewHunk` accepts at most 4096 UTF-8 bytes and derives quoted
+  `path:line` context from the exact current decision set. It appends the user's
+  comment with a data-framed context and steers an existing Run. When idle it
+  saves the comment for a later explicit Run; it never starts a model request.
 - **What I did.** After a Run of 4 or more steps, `RunRecap {steps,
   duration_ms, used, built, files, steered}` sums up its trace with no
   model call: Tools and built-ins called (with counts and failures),

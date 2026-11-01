@@ -255,6 +255,7 @@ pub const COMMANDS: &[Command] = &[
         "expand or fold the last long Run's \"What I did\"",
         Run,
     ),
+    cmd("review", "[RUN_ID]", "review file hunks: keep, reject, undo or comment", Run),
     cmd(
         "files",
         "",
@@ -641,6 +642,14 @@ const KEYS: &[(&str, &str)] = &[
     (
         "Vim Tool editor: Ctrl+S / Ctrl+Q",
         "save / explicitly cancel; Esc keeps edited text",
+    ),
+    (
+        "Tool editor: Ctrl+D, then h",
+        "check the edit, then review draft hunks; Ctrl+S still saves normally",
+    ),
+    (
+        "Hunk review: n/p, a/r, u, c",
+        "next/previous, keep/reject, undo latest change, comment with server path:line",
     ),
     ("Ctrl+C", "clear the input; twice to detach"),
     ("Tab / Shift+Tab", "switch views"),
