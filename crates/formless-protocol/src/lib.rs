@@ -788,6 +788,12 @@ pub struct ForecastAttachment {
 pub struct ForecastInput {
     pub session_id: Option<String>,
     pub draft: String,
+    #[serde(default)]
+    pub edit_message_id: Option<String>,
+    #[serde(default)]
+    pub resume: bool,
+    #[serde(default)]
+    pub retry: bool,
     pub model: Option<String>,
     pub cwd: Option<String>,
     #[serde(default)]
@@ -817,6 +823,8 @@ pub struct RunForecast {
     pub tokens: Option<ForecastRange>,
     pub cost_usd: Option<ForecastRange>,
     pub duration_ms: Option<ForecastRange>,
+    pub context_tokens: u32,
+    pub context_source: String,
     pub will_compact: bool,
     pub compaction_probability: Option<f64>,
     pub cached_fraction: Option<ForecastRange>,
@@ -1345,6 +1353,8 @@ pub enum Request {
     /// Local-only preview; does not freeze Tools, upload files or start a Run.
     ForecastRun {
         input: ForecastInput,
+        #[serde(default)]
+        for_send: bool,
     },
     /// Explicit consent for an unexpired preview on this connection. Changed
     /// input/history/Tools/model/prices/threshold invalidates it before send.

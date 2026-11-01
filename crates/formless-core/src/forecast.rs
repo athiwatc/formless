@@ -146,6 +146,66 @@ fn range(mut values: Vec<f64>) -> Option<ForecastRange> {
 }
 
 pub fn estimate_store(st: &Store, cfg: &Config, input: &ForecastInput) -> Result<RunForecast> {
+    estimate_store_with_window(st, cfg, input, None, None)
+}
+
+pub(crate) fn estimate_store_with_window(
+    st: &Store,
+    cfg: &Config,
+    input: &ForecastInput,
+    cached: Option<&dyn Fn(&str, &ProviderCfg, &str) -> Option<u32>>,
+    selected: Option<&str>,
+) -> Result<RunForecast> {
+    if usize::from(input.edit_message_id.is_some())
+        + usize::from(input.resume)
+        + usize::from(input.retry)
+        > 1
+    {
+        anyhow::bail!("choose one forecast operation");
+    }
+    if input.edit_message_id.is_some() || input.resume || input.retry {
+        let session = input
+            .session_id
+            .as_deref()
+            .context("rerun forecast requires a Session")?;
+        let copy = st.preview_copy()?;
+        if let Some(edit) = &input.edit_message_id {
+            copy.edit_message(session, edit, &input.draft)?
+                .context("user message not found")?;
+        } else if input.retry {
+            let user = copy
+                .list_messages(session)?
+                .into_iter()
+                .rev()
+                .find(|m| m.role == "user")
+                .context("nothing to retry")?;
+            copy.edit_message(session, &user.id, &user.content)?
+                .context("user message not found")?;
+        } else {
+            let (id, status) = copy
+                .last_run(session)?
+                .filter(|(_, s)| s == "paused" || s == "interrupted")
+                .context("nothing to resume")?;
+            copy.set_run_status(&id, "resumed")?;
+            copy.append_message(session, "system-note", &resume_note(&status))?;
+        }
+        let projected = ForecastInput {
+            draft: String::new(),
+            edit_message_id: None,
+            resume: false,
+            retry: false,
+            attachments: Vec::new(),
+            ..input.clone()
+        };
+        let mut result = estimate_store_with_window(&copy, cfg, &projected, cached, selected)?;
+        result.fingerprint = hash(&(
+            result.fingerprint,
+            &input.edit_message_id,
+            input.resume,
+            input.retry,
+        ));
+        return Ok(result);
+    }
     let session = input
         .session_id
         .as_deref()
@@ -161,12 +221,11 @@ pub fn estimate_store(st: &Store, cfg: &Config, input: &ForecastInput) -> Result
         .or_else(|| session.as_ref().and_then(|s| s.model.clone()))
         .unwrap_or_else(|| cfg.provider.model.clone());
     let wanted = cfg.provider.resolve_alias(&wanted);
-    let role = wanted.strip_prefix("role:").unwrap_or("main").to_string();
-    let rcfg = if role != "main" {
-        Some(cfg.role(&role)?)
-    } else {
-        None
-    };
+    let selected_role = wanted.strip_prefix("role:");
+    let role = selected_role
+        .map(|r| format!("role:{r}"))
+        .unwrap_or_else(|| "main".into());
+    let rcfg = selected_role.map(|r| cfg.role(r)).transpose()?;
     let name = rcfg
         .and_then(|r| r.provider.as_deref())
         .unwrap_or(crate::config::DEFAULT_PROVIDER);
@@ -183,7 +242,7 @@ pub fn estimate_store(st: &Store, cfg: &Config, input: &ForecastInput) -> Result
             let candidates: Vec<_> = r.candidates.iter().map(|m| pcfg.resolve_alias(m)).collect();
             model = crate::routing::select_task_model(
                 &candidates,
-                &st.task_stats(&role)?,
+                &st.task_stats(selected_role.unwrap())?,
                 cfg.tools.task_min_samples,
                 cfg.tools.task_quality_bar,
                 false,
@@ -194,6 +253,16 @@ pub fn estimate_store(st: &Store, cfg: &Config, input: &ForecastInput) -> Result
                 .context("no model candidates")?;
         }
     }
+    if let Some(selected) = selected {
+        model = pcfg.resolve_alias(selected);
+    }
+    let (window, window_source) = if let Some(window) = pcfg.model_context_tokens.get(&model) {
+        (*window, "configured")
+    } else if let Some(window) = cached.and_then(|f| f(name, &pcfg, &model)) {
+        (window, "cached_endpoint")
+    } else {
+        (pcfg.context_tokens, "default")
+    };
     let cwd = input
         .cwd
         .as_deref()
@@ -214,14 +283,7 @@ pub fn estimate_store(st: &Store, cfg: &Config, input: &ForecastInput) -> Result
         None => fresh_prompt(st, cfg, session.as_ref(), &model, cwd)?,
     };
     let mut ctx = if let Some(id) = input.session_id.as_deref() {
-        crate::storage::build_context(
-            st,
-            id,
-            &prompt,
-            pcfg.context_for(&model),
-            cfg.compaction.fraction(),
-        )?
-        .0
+        crate::storage::build_context(st, id, &prompt, window, cfg.compaction.fraction())?.0
     } else {
         vec![json!({"role":"system","content":prompt})]
     };
@@ -291,11 +353,7 @@ pub fn estimate_store(st: &Store, cfg: &Config, input: &ForecastInput) -> Result
     let key = crate::tokens::provider_key(name, &pcfg);
     let ratio = st.token_ratio(&key, &model)?;
     let mut ctx = provider.prepare_attachments(&ctx, &model);
-    if !input.draft.is_empty()
-        && pcfg
-            .vision
-            .unwrap_or_else(|| crate::provider::is_vision_model(&model))
-    {
+    if !input.draft.is_empty() && provider.sends_images(&model) {
         if let Some(message) = ctx.last_mut() {
             let mut parts = message["content"]
                 .as_array()
@@ -306,7 +364,7 @@ pub fn estimate_store(st: &Store, cfg: &Config, input: &ForecastInput) -> Result
                 .iter()
                 .filter(|a| crate::daemon::is_raster_image(&a.mime))
             {
-                parts.push(json!({"type":"image_url","image_url":{"url":dimension_image(a.width.zip(a.height)),"detail":pcfg.image_detail}}));
+                parts.push(json!({"type":"image_url","image_url":{"url":dimension_image(a.width.zip(a.height).map(|(w,h)|crate::provider::resized_image_dimensions(w,h,pcfg.image_max_px))),"detail":pcfg.image_detail}}));
             }
             message["content"] = json!(parts);
         }
@@ -330,7 +388,7 @@ pub fn estimate_store(st: &Store, cfg: &Config, input: &ForecastInput) -> Result
     let mut durations = Vec::new();
     let mut caches = Vec::new();
     let mut crossings = 0;
-    let threshold = pcfg.context_for(&model) as f64 * cfg.compaction.fraction();
+    let threshold = window as f64 * cfg.compaction.fraction();
     for (id, old) in &recorded {
         let b = &old.basis;
         let same_location = b.session_id.is_some() && b.session_id == basis.session_id
@@ -360,7 +418,7 @@ pub fn estimate_store(st: &Store, cfg: &Config, input: &ForecastInput) -> Result
             continue;
         }
         let (cost, peak, cached) = st.forecast_usage(id, cfg)?;
-        if peak == 0 {
+        if peak == 0 || !st.forecast_usage_complete(id)? {
             continue;
         }
         steps.push(run.steps as f64);
@@ -394,8 +452,12 @@ pub fn estimate_store(st: &Store, cfg: &Config, input: &ForecastInput) -> Result
             .into(),
         "Legacy Runs without frozen inputs excluded; interrupted/unknown outcomes excluded".into(),
     ];
-    if !input.attachments.is_empty() {
-        warnings.push("Preview attachments are not uploaded; final artifact identifiers and unsupported media may change prompt size".into());
+    if window_source == "default" {
+        warnings.push("Endpoint context window is not cached; compaction risk uses configured/default window and may differ at dispatch".into());
+    }
+    warnings.push("Crossing the compaction trigger also requires a complete older turn; the flag is not a guarantee".into());
+    if !logical.is_empty() {
+        warnings.push("Attachment token counts use local dimensions/detail and reference metadata; unsupported media are uncertain".into());
     }
     if n == 0 {
         warnings.push(
@@ -421,6 +483,8 @@ pub fn estimate_store(st: &Store, cfg: &Config, input: &ForecastInput) -> Result
         tokens: range(tokens),
         cost_usd,
         duration_ms: range(durations),
+        context_tokens: window,
+        context_source: window_source.into(),
         will_compact,
         compaction_probability: if will_compact {
             Some(1.0)
@@ -436,22 +500,29 @@ pub fn estimate_store(st: &Store, cfg: &Config, input: &ForecastInput) -> Result
         confirmation_id: None,
         hint: String::new(),
     };
+    let history_revision: Vec<_> = runs
+        .iter()
+        .map(|r| {
+            (
+                &r.run_id,
+                &r.status,
+                if r.status == "completed" {
+                    Some((r.steps, r.prompt_tokens, r.completion_tokens, r.duration_ms))
+                } else {
+                    None
+                },
+            )
+        })
+        .collect();
     f.fingerprint = hash(&(
         context_hash,
         &input.draft,
         &logical,
         &cfg,
-        &pcfg.prices,
-        &pcfg.model_context_tokens,
-        pcfg.context_tokens,
-        pcfg.image_max_px,
-        &pcfg.image_detail,
-        &f.basis.provider_key,
-        &f.basis.model,
-        &f.basis.role,
-        &f.basis.cwd_hash,
-        &f.basis.tools_hash,
         &recorded,
+        &history_revision,
+        ratio,
+        &f,
     ));
     f.hint = format!(
         "{} prompt tokens · {}{}{}",
@@ -475,6 +546,10 @@ pub fn estimate_store(st: &Store, cfg: &Config, input: &ForecastInput) -> Result
     Ok(f)
 }
 
+pub fn resume_note(status: &str) -> String {
+    format!("The previous run was {status} before it finished. Continue the user's task from where it stopped; do not repeat work already done above.")
+}
+
 pub fn describe(f: &RunForecast) -> String {
     let show = |r: &Option<ForecastRange>, unit: &str| {
         r.as_ref()
@@ -492,8 +567,9 @@ pub fn metrics(st: &Store, cfg: &Config) -> Result<Value> {
             continue;
         };
         let (cost, _, _) = st.forecast_usage(&id, cfg)?;
+        let complete = st.forecast_usage_complete(&id)?;
         let actual = (run.prompt_tokens + run.completion_tokens) as f64;
-        let finished = run.status == "completed";
+        let finished = run.status == "completed" && complete;
         let error = f
             .tokens
             .as_ref()
@@ -504,7 +580,7 @@ pub fn metrics(st: &Store, cfg: &Config) -> Result<Value> {
             .as_ref()
             .filter(|_| finished)
             .map(|r| actual >= r.p50 && actual <= r.p90);
-        rows.push(json!({"run_id":id,"model":f.basis.model,"role":f.basis.role,"status":run.status,"comparable_runs":f.comparable_runs,"forecast":f,"actual":{"steps":run.steps,"tokens":actual,"cost_usd":cost,"duration_ms":run.duration_ms},"token_error":error,"token_covered_p50_p90":coverage,"calibration_eligible":finished}));
+        rows.push(json!({"run_id":id,"model":f.basis.model,"role":f.basis.role,"status":run.status,"comparable_runs":f.comparable_runs,"forecast":f,"actual":{"steps":run.steps,"tokens":complete.then_some(actual),"cost_usd":cost.filter(|_|complete),"usage_complete":complete,"duration_ms":run.duration_ms},"token_error":error,"token_covered_p50_p90":coverage,"calibration_eligible":finished}));
     }
     Ok(json!(rows))
 }
@@ -535,23 +611,25 @@ mod tests {
             .create_run(f.basis.session_id.as_deref().unwrap())
             .unwrap();
         st.record_forecast(&id, f).unwrap();
-        for _ in 0..steps {
+        for step in 0..steps {
             st.bump_run_steps(&id).unwrap();
+            st.record_forecast_request(&id, "run").unwrap();
+            st.record_usage_full(
+                f.basis.session_id.as_deref().unwrap(),
+                &id,
+                "default",
+                "model",
+                &crate::provider::Usage {
+                    prompt_tokens: 100,
+                    completion_tokens: if step == 0 { 20 } else { 0 },
+                    cached_tokens: 50,
+                    reported: 3,
+                    ..Default::default()
+                },
+                "run",
+            )
+            .unwrap();
         }
-        st.record_usage_full(
-            f.basis.session_id.as_deref().unwrap(),
-            &id,
-            "default",
-            "model",
-            &crate::provider::Usage {
-                prompt_tokens: (100 * steps) as u64,
-                completion_tokens: 20,
-                cached_tokens: 50,
-                ..Default::default()
-            },
-            "run",
-        )
-        .unwrap();
         st.set_run_status(&id, status).unwrap();
         assert!(st.forecast_usage(&id, cfg).unwrap().0.is_some());
         id

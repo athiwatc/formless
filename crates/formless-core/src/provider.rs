@@ -306,6 +306,7 @@ impl<'a> AttemptUsage<'a> {
             if let Some(previous) = self.usage {
                 // Usage events are cumulative, and partial updates may omit
                 // counters already reported by message_start/earlier events.
+                usage.reported |= previous.reported;
                 usage.prompt_tokens = usage.prompt_tokens.max(previous.prompt_tokens);
                 usage.completion_tokens = usage.completion_tokens.max(previous.completion_tokens);
                 usage.reasoning_tokens = usage.reasoning_tokens.max(previous.reasoning_tokens);
@@ -323,7 +324,7 @@ impl<'a> AttemptUsage<'a> {
     fn finish(&mut self) -> Result<()> {
         let usage = self.usage.take();
         self.provider.report_usage(&self.model, usage.as_ref())?;
-        if let Some(u) = usage {
+        if let Some(u) = usage.filter(|u| u.reported & 1 != 0) {
             self.provider
                 .observe_prompt(&self.model, self.prompt_estimate, u.prompt_tokens);
         }
@@ -381,7 +382,11 @@ impl BreakerPermit {
             if let Some(hook) = &accounting.hook {
                 hook(&accounting.provider, &accounting.model, &usage)?;
             }
-            if comparable && usage.prompt_tokens > 0 && accounting.prompt_estimate > 0 {
+            if comparable
+                && usage.reported & 1 != 0
+                && usage.prompt_tokens > 0
+                && accounting.prompt_estimate > 0
+            {
                 if let Some(hook) = &accounting.prompt_hook {
                     hook(
                         &accounting.prompt_key,
@@ -565,7 +570,7 @@ struct Recovered {
 }
 
 /// Provider-reported token counts for one request.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct Usage {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
@@ -579,6 +584,28 @@ pub struct Usage {
     /// USD the provider billed for the request (OpenRouter's
     /// `usage.cost`); preferred over `provider.prices` when present.
     pub cost: Option<f64>,
+    /// Coverage bits: 1=input explicitly reported, 2=output explicitly reported.
+    /// Cumulative stream snapshots combine these; counter equality ignores it.
+    pub reported: u8,
+}
+impl PartialEq for Usage {
+    fn eq(&self, other: &Self) -> bool {
+        (
+            self.prompt_tokens,
+            self.completion_tokens,
+            self.reasoning_tokens,
+            self.cached_tokens,
+            self.cache_write_tokens,
+            self.cost,
+        ) == (
+            other.prompt_tokens,
+            other.completion_tokens,
+            other.reasoning_tokens,
+            other.cached_tokens,
+            other.cache_write_tokens,
+            other.cost,
+        )
+    }
 }
 
 impl Usage {
@@ -612,6 +639,11 @@ impl Usage {
                 .max(n(&u["input_tokens_details"]["cache_write_tokens"]))
                 .max(n(&u["cache_creation_input_tokens"])),
             cost: u["cost"].as_f64().filter(|c| c.is_finite() && *c >= 0.0),
+            reported: u8::from(
+                u["prompt_tokens"].as_u64().is_some() || u["input_tokens"].as_u64().is_some(),
+            ) | (u8::from(
+                u["completion_tokens"].as_u64().is_some() || u["output_tokens"].as_u64().is_some(),
+            ) << 1),
         })
     }
 }
@@ -1605,12 +1637,16 @@ impl Provider {
     /// `storage::provider_message`): images become `image_url` parts for
     /// a vision model on Chat Completions; otherwise only the reference
     /// line in the text remains. The marker never reaches the endpoint.
+    pub fn sends_images(&self, model: &str) -> bool {
+        (!self.cfg.prompt_tools() || self.cfg.anthropic())
+            && self.cfg.vision.unwrap_or_else(|| is_vision_model(model))
+    }
+
     pub fn prepare_attachments(&self, messages: &[Value], model: &str) -> Vec<Value> {
         // Prompt-mode tools ride on Chat Completions text; the native
         // Messages path keeps image blocks either way. The Responses API
         // takes images as `input_image` parts (#616).
-        let vision = (!self.cfg.prompt_tools() || self.cfg.anthropic())
-            && self.cfg.vision.unwrap_or_else(|| is_vision_model(model));
+        let vision = self.sends_images(model);
         messages
             .iter()
             .map(|m| {
@@ -2783,6 +2819,17 @@ const MAX_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 /// `max_px` on its longest side, encoded once and kept, so later steps
 /// don't read, scale and encode it again (#616). The error says why it
 /// can't be sent.
+pub fn resized_image_dimensions(width: u32, height: u32, max_px: u32) -> (u32, u32) {
+    if max_px == 0 || width.max(height) <= max_px {
+        return (width, height);
+    }
+    let scale = max_px as f64 / width.max(height).max(1) as f64;
+    (
+        ((width as f64 * scale).round() as u32).max(1),
+        ((height as f64 * scale).round() as u32).max(1),
+    )
+}
+
 fn encoded_image(path: &str, mime: &str, max_px: u32) -> std::result::Result<String, String> {
     use base64::Engine;
     use std::collections::HashMap;
@@ -2796,7 +2843,8 @@ fn encoded_image(path: &str, mime: &str, max_px: u32) -> std::result::Result<Str
     let bytes = std::fs::read(path).map_err(|_| "the file is gone".to_string())?;
     let (bytes, mime) = match image::load_from_memory(&bytes) {
         Ok(img) if max_px > 0 && img.width().max(img.height()) > max_px => {
-            let small = img.thumbnail(max_px, max_px);
+            let (width, height) = resized_image_dimensions(img.width(), img.height(), max_px);
+            let small = img.thumbnail_exact(width, height);
             let mut out = Vec::new();
             // PNG keeps transparency; anything else becomes JPEG.
             let (format, mime) = if small.color().has_alpha() {

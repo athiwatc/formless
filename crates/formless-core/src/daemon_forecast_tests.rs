@@ -43,6 +43,7 @@ fn setup(env: &crate::credential_env::EnvGuard) -> (Fixture, Paths, Arc<Daemon>,
     let run = st.create_run(&sid).unwrap();
     st.record_forecast(&run, &f).unwrap();
     st.bump_run_steps(&run).unwrap();
+    st.record_forecast_request(&run, "run").unwrap();
     st.record_usage_full(
         &sid,
         &run,
@@ -51,6 +52,7 @@ fn setup(env: &crate::credential_env::EnvGuard) -> (Fixture, Paths, Arc<Daemon>,
         &crate::provider::Usage {
             prompt_tokens: 100,
             completion_tokens: 100,
+            reported: 3,
             ..Default::default()
         },
         "run",
@@ -91,6 +93,7 @@ async fn bypass_stale_forecast_wrong_connection_and_expired_consent_fail_before_
             .scope(
                 (1, "fixture".into()),
                 d.handle(Request::ForecastRun {
+                    for_send: false,
                     input: input.clone(),
                 }),
             )
@@ -147,7 +150,10 @@ async fn bypass_stale_forecast_wrong_connection_and_expired_consent_fail_before_
         CLIENT
             .scope(
                 (1, "fixture".into()),
-                d.handle(Request::ForecastRun { input }),
+                d.handle(Request::ForecastRun {
+                    for_send: false,
+                    input,
+                }),
             )
             .await
             .unwrap(),
@@ -189,6 +195,7 @@ async fn exact_consent_is_one_shot_and_cached_denial_is_never_replayed_as_approv
             .scope(
                 (9, "fixture".into()),
                 d.handle(Request::ForecastRun {
+                    for_send: false,
                     input: input.clone(),
                 }),
             )

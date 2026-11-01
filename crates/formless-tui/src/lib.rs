@@ -5110,6 +5110,7 @@ impl App {
         let input = ForecastInput {
             session_id: self.current.clone(),
             draft: text.trim().to_string(),
+            edit_message_id: self.editing_id.clone(),
             attachments,
             ..Default::default()
         };
@@ -5152,6 +5153,7 @@ impl App {
             self.request(
                 Pending::ForecastHint { generation },
                 Request::ForecastRun {
+                    for_send: false,
                     input: self.forecast_input(),
                 },
             );
@@ -5170,7 +5172,6 @@ impl App {
             && !text.starts_with('/')
             && !self.running()
             && self.current.is_some()
-            && self.editing_id.is_none()
             && self.editing_queued.is_none()
             && Config::load(&self.paths).is_ok_and(|c| c.limits.forecast_confirm_usd.is_some())
         {
@@ -5179,6 +5180,7 @@ impl App {
                 self.request(
                     Pending::ForecastSend { generation, queued },
                     Request::ForecastRun {
+                        for_send: true,
                         input: self.forecast_input(),
                     },
                 );
@@ -21572,7 +21574,13 @@ mod tests {
             app.forecast.changed = Some(Instant::now() - Duration::from_millis(301));
             app.forecast_tick();
             let read: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
-            assert!(matches!(read.request, Request::ForecastRun { .. }));
+            assert!(matches!(
+                read.request,
+                Request::ForecastRun {
+                    for_send: false,
+                    ..
+                }
+            ));
             match change {
                 0 => app.input.set("newer"),
                 1 => app.model_label = "new model".into(),
@@ -21627,7 +21635,10 @@ mod tests {
             app.input.set("task");
             app.submit_chat(false);
             let preview: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
-            assert!(matches!(preview.request, Request::ForecastRun { .. }));
+            assert!(matches!(
+                preview.request,
+                Request::ForecastRun { for_send: true, .. }
+            ));
             assert_eq!(app.input.expanded(), "task");
             tx.send(ServerMessage::Response {
                 id: preview.id,

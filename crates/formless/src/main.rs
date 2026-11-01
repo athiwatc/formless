@@ -1372,6 +1372,7 @@ fn run_cli(cli: Cli) -> Result<()> {
     }) = &cli.cmd
     {
         let paths = Paths::resolve_read_only(cli.profile.as_deref())?;
+        let live = formless_core::daemon::daemon_reachable(&paths);
         let session = if *continue_last || session.as_deref() == Some("last") {
             Some(
                 std::fs::read_to_string(paths.last_run_session_file())?
@@ -1382,9 +1383,15 @@ fn run_cli(cli: Cli) -> Result<()> {
             session.clone()
         };
         let session = if let Some(wanted) = session {
-            let store = formless_core::Store::open_forecast_reader(&paths.db_file())?;
-            let matches: Vec<_> = store
-                .list_sessions()?
+            let sessions: Vec<SessionInfo> = if live {
+                serde_json::from_value(formless_tui::client::request_once(
+                    &paths,
+                    Request::ListSessions,
+                )?)?
+            } else {
+                formless_core::Store::open_forecast_reader(&paths.db_file())?.list_sessions()?
+            };
+            let matches: Vec<_> = sessions
                 .into_iter()
                 .filter(|s| s.id == wanted || s.id.starts_with(&wanted) || s.name == wanted)
                 .collect();
@@ -1432,8 +1439,19 @@ fn run_cli(cli: Cli) -> Result<()> {
                 .or_else(|| model.clone()),
             cwd,
             attachments,
+            ..Default::default()
         };
-        let forecast = formless_core::forecast::estimate(&paths, &input)?;
+        let forecast: formless_protocol::RunForecast = if live {
+            serde_json::from_value(formless_tui::client::request_once(
+                &paths,
+                Request::ForecastRun {
+                    for_send: false,
+                    input,
+                },
+            )?)?
+        } else {
+            formless_core::forecast::estimate(&paths, &input)?
+        };
         if *json {
             println!("{}", serde_json::to_string_pretty(&forecast)?);
         } else {
@@ -3661,6 +3679,7 @@ fn run_headless(
                 &client,
                 &rx,
                 Request::ForecastRun {
+                    for_send: true,
                     input: formless_protocol::ForecastInput {
                         session_id: Some(session_id.clone()),
                         draft: task.clone(),

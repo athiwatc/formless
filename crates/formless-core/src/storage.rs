@@ -713,7 +713,8 @@ const MIGRATIONS: [(i64, MigrationStep); 59] = [
         )?)
     }),
     (59, |c| {
-        Ok(c.execute_batch("CREATE TABLE run_forecasts (run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE, forecast TEXT NOT NULL); CREATE TRIGGER immutable_run_forecast BEFORE UPDATE ON run_forecasts BEGIN SELECT RAISE(ABORT, 'Run forecast is immutable'); END;")?)
+        c.execute_batch("CREATE TABLE run_forecasts (run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE, forecast TEXT NOT NULL); CREATE TRIGGER immutable_run_forecast BEFORE UPDATE ON run_forecasts BEGIN SELECT RAISE(ABORT, 'Run forecast is immutable'); END; CREATE TABLE forecast_request_counts(run_id TEXT NOT NULL, source TEXT NOT NULL, expected INTEGER NOT NULL, PRIMARY KEY(run_id,source));")?;
+        add_column(c, "run_usage", "usage_complete INTEGER NOT NULL DEFAULT 0")
     }),
 ];
 
@@ -1442,6 +1443,76 @@ impl Store {
             > 0)
     }
 
+    pub(crate) fn read_transaction<T>(&self, action: impl FnOnce(&Self) -> Result<T>) -> Result<T> {
+        if !self.conn.is_autocommit() {
+            return action(self);
+        }
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Deferred,
+        )?;
+        let result = action(self)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    /// Validate and consume a Run's inputs under one SQLite write boundary.
+    pub(crate) fn transaction<T>(&self, action: impl FnOnce(&Self) -> Result<T>) -> Result<T> {
+        struct Guard<'a> {
+            conn: &'a Connection,
+            rollback: String,
+            commit: String,
+            done: bool,
+        }
+        impl Drop for Guard<'_> {
+            fn drop(&mut self) {
+                if !self.done {
+                    let _ = self.conn.execute_batch(&self.rollback);
+                }
+            }
+        }
+        let outer = self.conn.is_autocommit();
+        let name = format!("fl_{}", uuid::Uuid::new_v4().simple());
+        let (begin, commit, rollback) = if outer {
+            (
+                "BEGIN IMMEDIATE".to_string(),
+                "COMMIT".to_string(),
+                "ROLLBACK".to_string(),
+            )
+        } else {
+            (
+                format!("SAVEPOINT {name}"),
+                format!("RELEASE {name}"),
+                format!("ROLLBACK TO {name}; RELEASE {name}"),
+            )
+        };
+        self.conn.execute_batch(&begin)?;
+        let mut guard = Guard {
+            conn: &self.conn,
+            rollback,
+            commit,
+            done: false,
+        };
+        let result = action(self)?;
+        self.conn.execute_batch(&guard.commit)?;
+        guard.done = true;
+        Ok(result)
+    }
+    pub(crate) fn preview_copy(&self) -> Result<Self> {
+        let mut copy = Self::open_in_memory()?;
+        {
+            let backup = rusqlite::backup::Backup::new(&self.conn, &mut copy.conn)?;
+            backup.run_to_completion(128, std::time::Duration::ZERO, None)?;
+        }
+        Ok(copy)
+    }
+    pub(crate) fn preview_edit(&self, session: &str, id: &str, content: &str) -> Result<Self> {
+        let copy = self.preview_copy()?;
+        copy.edit_message(session, id, content)?
+            .context("user message not found")?;
+        Ok(copy)
+    }
+
     pub fn append_message(
         &self,
         session_id: &str,
@@ -1463,10 +1534,8 @@ impl Store {
         // One write transaction, taken up front (IMMEDIATE): the next seq is
         // computed inside the INSERT itself, so two writers can never pick
         // the same one, and the session's timestamp moves with the message.
-        let tx = rusqlite::Transaction::new_unchecked(
-            &self.conn,
-            rusqlite::TransactionBehavior::Immediate,
-        )?;
+        self.transaction(|st| {
+        let tx=&st.conn;
         let seq: i64 = tx
             .prepare_cached(
                 "INSERT INTO messages(id,session_id,seq,role,content,created_at,meta) \
@@ -1476,7 +1545,6 @@ impl Store {
             .query_row(params![id, session_id, role, content, t, meta], |r| r.get(0))?;
         tx.prepare_cached("UPDATE sessions SET updated_at=?2 WHERE id=?1")?
             .execute(params![session_id, t])?;
-        tx.commit()?;
         Ok(MessageInfo {
             id,
             session_id: session_id.into(),
@@ -1485,6 +1553,7 @@ impl Store {
             content: content.into(),
             created_at: t,
             meta,
+        })
         })
     }
 
@@ -1676,26 +1745,27 @@ impl Store {
         self.note_rewrite();
         // One edit is one commit: four separate ones cost four fsyncs (or
         // four WAL commits) for a single user action.
-        let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
-            "UPDATE messages SET content=?3 WHERE session_id=?1 AND id=?2",
-            params![session_id, message_id, content],
-        )?;
-        tx.execute(
-            "DELETE FROM messages WHERE session_id=?1 AND seq>?2",
-            params![session_id, msg.seq],
-        )?;
-        tx.execute(
-            "DELETE FROM checkpoints WHERE session_id=?1 AND up_to_seq>=?2",
-            params![session_id, msg.seq],
-        )?;
-        tx.execute(
-            "UPDATE sessions SET updated_at=?2 WHERE id=?1",
-            params![session_id, now()],
-        )?;
-        tx.commit()?;
-        msg.content = content.to_string();
-        Ok(Some(msg))
+        self.transaction(|st| {
+            let tx = &st.conn;
+            tx.execute(
+                "UPDATE messages SET content=?3 WHERE session_id=?1 AND id=?2",
+                params![session_id, message_id, content],
+            )?;
+            tx.execute(
+                "DELETE FROM messages WHERE session_id=?1 AND seq>?2",
+                params![session_id, msg.seq],
+            )?;
+            tx.execute(
+                "DELETE FROM checkpoints WHERE session_id=?1 AND up_to_seq>=?2",
+                params![session_id, msg.seq],
+            )?;
+            tx.execute(
+                "UPDATE sessions SET updated_at=?2 WHERE id=?1",
+                params![session_id, now()],
+            )?;
+            msg.content = content.to_string();
+            Ok(Some(msg))
+        })
     }
 
     pub fn create_run(&self, session_id: &str) -> Result<String> {
@@ -2622,6 +2692,25 @@ impl Store {
             Ok((id, serde_json::from_str(&json)?))
         })
         .collect()
+    }
+    pub fn record_forecast_request(&self, run_id: &str, source: &str) -> Result<()> {
+        if run_id.is_empty() {
+            return Ok(());
+        }
+        self.ex("INSERT INTO forecast_request_counts(run_id,source,expected) VALUES(?1,?2,1) ON CONFLICT(run_id,source) DO UPDATE SET expected=expected+1",params![run_id,source])?;
+        Ok(())
+    }
+    pub fn forecast_usage_complete(&self, run_id: &str) -> Result<bool> {
+        let (expected,main):(i64,i64)=self.conn.query_row("SELECT COALESCE(SUM(expected),0),COALESCE(SUM(CASE WHEN source='run' THEN expected ELSE 0 END),0) FROM forecast_request_counts WHERE run_id=?1",params![run_id],|r|Ok((r.get(0)?,r.get(1)?)))?;
+        let (rows, known): (i64, i64) = self.conn.query_row(
+            "SELECT COUNT(*),COALESCE(SUM(usage_complete),0) FROM run_usage WHERE run_id=?1",
+            params![run_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        Ok(expected > 0
+            && expected == rows
+            && expected == known
+            && main >= self.run_steps(run_id)?)
     }
     pub fn forecast_models(&self, run_id: &str) -> Result<Vec<(String, String)>> {
         let mut stmt = self
@@ -5185,7 +5274,7 @@ impl Store {
         source: &str,
     ) -> Result<()> {
         self.ex(
-            "INSERT INTO run_usage(session_id,run_id,model,prompt_tokens,completion_tokens,reasoning_tokens,cached_tokens,cache_write_tokens,cost,created_at,source,provider) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+            "INSERT INTO run_usage(session_id,run_id,model,prompt_tokens,completion_tokens,reasoning_tokens,cached_tokens,cache_write_tokens,cost,created_at,source,provider,usage_complete) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
             params![
                 session_id,
                 run_id,
@@ -5198,7 +5287,8 @@ impl Store {
                 usage.cost,
                 now(),
                 source,
-                provider
+                provider,
+                i64::from(usage.reported==3)
             ],
         )?;
         Ok(())

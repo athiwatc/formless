@@ -2059,7 +2059,7 @@
     // Use the same live transport for preview, consent and the later send.
     const stamp = forecastStamp();
     const sequence = forecastSequence;
-    const forecast = await request({type:"forecast_run",input:{session_id:sid,draft:text}});
+    const forecast = await request({type:"forecast_run",for_send:true,input:{session_id:sid,draft:text,edit_message_id:S.editMessageId || null}});
     if (sid !== S.current || stamp !== forecastStamp() || sequence !== forecastSequence || !S.daemonOnline) return false;
     if (forecast.confirmation_required) {
       if (!(await ask({title:"Forecast confirmation",text:forecast.hint,body:h("p",null,(forecast.warnings || []).join(" ")),ok:"Confirm send"}))) return false;

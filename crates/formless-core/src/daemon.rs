@@ -570,12 +570,21 @@ struct SentEntry {
     outcome: tokio::sync::watch::Receiver<Option<SendOutcome>>,
 }
 
+struct RunAdmission {
+    cfg: Config,
+    requested: String,
+    effort: Option<String>,
+    first: StdMutex<Option<(Vec<Value>, Vec<Value>, String)>>,
+}
+
 struct ForecastConsent {
     owner: Option<u64>,
     input: ForecastInput,
     fingerprint: String,
     at: std::time::Instant,
     approved: bool,
+    requires: bool,
+    selected: String,
 }
 
 pub struct Daemon {
@@ -609,6 +618,9 @@ pub struct Daemon {
     budget_admission: Arc<crate::budget::Admission>,
     forecast_admission: StdMutex<()>,
     forecast_consents: StdMutex<HashMap<String, ForecastConsent>>,
+    run_admissions: StdMutex<HashMap<String, Arc<RunAdmission>>>,
+    #[cfg(test)]
+    forecast_admission_test: StdMutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Per-Session step caps from `/limit` / `--max-steps`, for the active
     /// or next Run (cleared when it ends).
     step_limits: StdMutex<HashMap<String, u32>>,
@@ -795,6 +807,9 @@ impl Daemon {
             budget_admission: Arc::new(Default::default()),
             forecast_admission: StdMutex::new(()),
             forecast_consents: StdMutex::new(Default::default()),
+            run_admissions: StdMutex::new(Default::default()),
+            #[cfg(test)]
+            forecast_admission_test: StdMutex::new(None),
             step_limits: StdMutex::new(Default::default()),
             next_run_model: StdMutex::new(Default::default()),
             progress_sent: StdMutex::new(Default::default()),
@@ -1102,6 +1117,11 @@ impl Daemon {
                     .enter(&store, &paths, &owner.run_id, waived)
                     .await
                     .map_err(|e| anyhow::Error::new(RequestFailure::budget(e.to_string())))?;
+                store
+                    .lock()
+                    .map_err(|_| anyhow!("request coverage store unavailable"))?
+                    .record_forecast_request(&owner.run_id, owner.source)
+                    .context(crate::provider::UsageAccountingFailure)?;
                 Ok(Box::new(lease) as crate::provider::RequestLease)
             })
         })
@@ -1517,20 +1537,29 @@ impl Daemon {
                 message_id,
                 content,
             } => {
+                let _admission = self.forecast_admission.locked();
+                let _settings = self.config_edit.locked();
                 if self.runs.locked().contains_key(&session_id) {
                     return Err(anyhow::Error::new(RequestFailure::busy(
                         "session has an active run; interrupt it before editing",
                     )));
                 }
-                // Editing and re-running says the last Run missed (§8.7).
-                let _ = self.with_store(|st| st.mark_last_run_followup(&session_id, "edited"));
-                let msg = self
-                    .with_store(|st| st.edit_message(&session_id, &message_id, &content))?
-                    .context(RequestFailure::not_found("user message not found"))?;
+                let cfg = self.config()?;
+                let input = ForecastInput {
+                    session_id: Some(session_id.clone()),
+                    draft: content.clone(),
+                    edit_message_id: Some(message_id.clone()),
+                    ..Default::default()
+                };
+                let (msg, id, admission) = self.admit_action(&session_id, &cfg, &input, |st| {
+                    st.mark_last_run_followup(&session_id, "edited")?;
+                    st.edit_message(&session_id, &message_id, &content)?
+                        .context(RequestFailure::not_found("user message not found"))
+                })?;
                 self.broadcast(Event::MessagesEdited {
                     session_id: session_id.clone(),
                 });
-                self.start_run(session_id)?;
+                self.launch_prepared_run(session_id, id, admission)?;
                 Ok(serde_json::to_value(msg)?)
             }
             Request::SetSessionCwd { id, cwd } => {
@@ -1608,11 +1637,25 @@ impl Daemon {
                 self.broadcast(Event::SessionUpdated { session: s.clone() });
                 Ok(serde_json::to_value(s)?)
             }
-            Request::ForecastRun { input } => {
+            Request::ForecastRun { input, for_send } => {
                 let cfg = self.config()?;
-                let mut forecast =
-                    self.with_reader(|st| crate::forecast::estimate_store(st, &cfg, &input))?;
-                if forecast.confirmation_required {
+                let mut input = input;
+                if input.model.is_none() {
+                    input.model = self
+                        .next_run_model
+                        .locked()
+                        .get(input.session_id.as_deref().unwrap_or_default())
+                        .cloned();
+                }
+                let mut forecast = self.with_reader(|st| {
+                    let selected = if for_send {
+                        Some(self.action_model(st, &cfg, &input)?)
+                    } else {
+                        None
+                    };
+                    self.forecast_estimate_selected(st, &cfg, &input, selected.as_deref())
+                })?;
+                if forecast.confirmation_required || for_send {
                     let id = uuid::Uuid::new_v4().to_string();
                     let mut consents = self.forecast_consents.locked();
                     consents.retain(|_, c| c.at.elapsed().as_secs() < 300);
@@ -1627,6 +1670,8 @@ impl Daemon {
                             fingerprint: forecast.fingerprint.clone(),
                             at: std::time::Instant::now(),
                             approved: false,
+                            requires: forecast.confirmation_required,
+                            selected: forecast.basis.model.clone(),
                         },
                     );
                     forecast.confirmation_id = Some(id);
@@ -1635,7 +1680,7 @@ impl Daemon {
             }
             Request::ConfirmForecast { id } => {
                 let _admission = self.forecast_admission.locked();
-                let (input, fingerprint) = {
+                let (input, fingerprint, selected) = {
                     let consents = self.forecast_consents.locked();
                     let consent = consents
                         .get(&id)
@@ -1646,11 +1691,16 @@ impl Daemon {
                         .context(RequestFailure::invalid(
                             "forecast confirmation expired or belongs to another connection",
                         ))?;
-                    (consent.input.clone(), consent.fingerprint.clone())
+                    (
+                        consent.input.clone(),
+                        consent.fingerprint.clone(),
+                        consent.selected.clone(),
+                    )
                 };
                 let cfg = self.config()?;
-                let current =
-                    self.with_reader(|st| crate::forecast::estimate_store(st, &cfg, &input))?;
+                let current = self.with_reader(|st| {
+                    self.forecast_estimate_selected(st, &cfg, &input, Some(&selected))
+                })?;
                 if current.fingerprint != fingerprint {
                     return Err(anyhow::Error::new(RequestFailure::invalid(
                         "forecast inputs changed; preview and confirm again",
@@ -1834,59 +1884,62 @@ impl Daemon {
                 model,
                 keep_original,
             } => {
+                let _admission = self.forecast_admission.locked();
+                let _settings = self.config_edit.locked();
                 if self.runs.locked().contains_key(&session_id) {
-                    return Err(anyhow!(
-                        "session has an active run; interrupt it before retrying"
-                    ));
+                    return Err(anyhow::Error::new(RequestFailure::busy(
+                        "session has an active run; interrupt it before retrying",
+                    )));
                 }
-                let msgs = self.with_reader(|st| st.list_messages(&session_id))?;
-                let last_user = msgs
-                    .iter()
-                    .rposition(|m| m.role == "user")
-                    .context("nothing to retry: no message from you in this session")?;
-                let user = msgs[last_user].clone();
-                let answered = msgs[last_user + 1..]
-                    .iter()
-                    .any(|m| m.role == "assistant" || m.role == "tool");
-                let mut original = None;
-                if keep_original && answered {
-                    let name = self
-                        .with_reader(|st| st.get_session(&session_id))?
-                        .map(|s| s.name)
-                        .unwrap_or_default();
-                    let fork = self
-                        .with_store(|st| {
+                let cfg = self.config()?;
+                let model = model
+                    .map(|m| m.trim().to_string())
+                    .filter(|m| !m.is_empty());
+                let input = ForecastInput {
+                    session_id: Some(session_id.clone()),
+                    model: model.clone(),
+                    retry: true,
+                    ..Default::default()
+                };
+                let (original, id, admission) =
+                    self.admit_action(&session_id, &cfg, &input, |st| {
+                        let msgs = st.list_messages(&session_id)?;
+                        let last = msgs
+                            .iter()
+                            .rposition(|m| m.role == "user")
+                            .context("nothing to retry")?;
+                        let user = &msgs[last];
+                        let original = if keep_original
+                            && msgs[last + 1..]
+                                .iter()
+                                .any(|m| m.role == "assistant" || m.role == "tool")
+                        {
+                            let name = st
+                                .get_session(&session_id)?
+                                .map(|s| s.name)
+                                .unwrap_or_default();
                             st.fork_session(
                                 &session_id,
                                 Some(format!("{name} · original answer")),
                                 None,
-                            )
-                        })?
-                        .context(RequestFailure::not_found("session not found"))?;
+                            )?
+                        } else {
+                            None
+                        };
+                        st.edit_message(&session_id, &user.id, &user.content)?
+                            .context(RequestFailure::not_found("user message not found"))?;
+                        Ok(original)
+                    })?;
+                if let Some(fork) = &original {
                     self.broadcast(Event::SessionUpdated {
                         session: fork.clone(),
                     });
-                    original = Some(fork.id);
                 }
-                let model = model
-                    .map(|m| m.trim().to_string())
-                    .filter(|m| !m.is_empty());
-                if let Some(m) = &model {
-                    self.next_run_model
-                        .lock()
-                        .unwrap()
-                        .insert(session_id.clone(), m.clone());
-                }
-                self.with_store(|st| st.edit_message(&session_id, &user.id, &user.content))?
-                    .context(RequestFailure::not_found("user message not found"))?;
                 self.broadcast(Event::MessagesEdited {
                     session_id: session_id.clone(),
                 });
-                if let Err(e) = self.start_run(session_id.clone()) {
-                    self.next_run_model.locked().remove(&session_id);
-                    return Err(e);
-                }
-                Ok(json!({"model": model, "original_session": original}))
+                self.launch_prepared_run(session_id, id, admission)?;
+                Ok(json!({"model":model,"original_session":original.map(|s|s.id)}))
             }
             Request::RateRun {
                 session_id,
@@ -1923,40 +1976,47 @@ impl Daemon {
                 Ok(json!({"max_steps": max_steps.filter(|n| *n > 0), "active_run": active}))
             }
             Request::ResumeRun { session_id } => {
+                let _admission = self.forecast_admission.locked();
+                let _settings = self.config_edit.locked();
                 if self.runs.locked().contains_key(&session_id) {
                     return Err(anyhow::Error::new(RequestFailure::busy(
                         "a run is already active in this session",
                     )));
                 }
-                let (run_id, status) = self
-                    .with_store(|st| st.last_run(&session_id))?
-                    .filter(|(_, s)| s == "interrupted" || s == "paused")
-                    .context("nothing to resume: the last run was not interrupted or paused")?;
-                // Resuming from a spending pause goes past the limits once.
-                let budget = self
-                    .with_reader(|st| st.run_error(&run_id))
-                    .ok()
-                    .flatten()
-                    .is_some_and(|e| e.starts_with("budget:"));
+                let cfg = self.config()?;
+                let input = ForecastInput {
+                    session_id: Some(session_id.clone()),
+                    resume: true,
+                    ..Default::default()
+                };
+                let ((msg, budget), id, admission) =
+                    self.admit_action(&session_id, &cfg, &input, |st| {
+                        let (run, status) = st
+                            .last_run(&session_id)?
+                            .filter(|(_, s)| s == "paused" || s == "interrupted")
+                            .context(
+                                "nothing to resume: the last run was not interrupted or paused",
+                            )?;
+                        let budget = st
+                            .run_error(&run)?
+                            .is_some_and(|e| e.starts_with("budget:"));
+                        st.set_run_status(&run, "resumed")?;
+                        let msg = st.append_message(
+                            &session_id,
+                            "system-note",
+                            &crate::forecast::resume_note(&status),
+                        )?;
+                        Ok((msg, budget))
+                    })?;
                 if budget {
-                    self.budget_waived
-                        .lock()
-                        .unwrap()
-                        .insert(session_id.clone());
+                    self.budget_waived.locked().insert(session_id.clone());
                 }
-                self.with_store(|st| st.set_run_status(&run_id, "resumed"))?;
-                let note = format!(
-                    "The previous run was {status} before it finished. Continue the user's \
-                     task from where it stopped; do not repeat work already done above."
-                );
-                let msg =
-                    self.with_store(|st| st.append_message(&session_id, "system-note", &note))?;
                 self.broadcast(Event::MessageAppended {
                     session_id: session_id.clone(),
                     message: msg,
                 });
-                self.start_run(session_id)?;
-                Ok(json!({"started": true}))
+                self.launch_prepared_run(session_id, id, admission)?;
+                Ok(json!({"started":true}))
             }
             Request::AbandonRun { session_id } => {
                 let last = self
@@ -4263,20 +4323,6 @@ impl Daemon {
             .context(RequestFailure::not_found("session not found"))?;
         let _admission = self.forecast_admission.locked();
         let busy = self.runs.locked().contains_key(&session_id);
-        let forecast = if !busy {
-            let cfg = self.config()?;
-            let input = ForecastInput {
-                session_id: Some(session_id.clone()),
-                draft: content.clone(),
-                ..Default::default()
-            };
-            let forecast =
-                self.with_reader(|st| crate::forecast::estimate_store(st, &cfg, &input))?;
-            self.check_forecast_consent(&forecast)?;
-            Some(forecast)
-        } else {
-            None
-        };
         match (busy, mode) {
             (true, SendMode::Queue) => {
                 // Persisted, so a daemon restart does not lose it.
@@ -4312,30 +4358,37 @@ impl Daemon {
                 Ok(json!({"steered": true}))
             }
             (false, _) => {
-                if crate::runs::is_correction(&content) {
-                    let _ =
-                        self.with_store(|st| st.mark_last_run_followup(&session_id, "corrected"));
-                }
-                let msg = self.append_user_message(&session_id, &content)?;
+                let _settings = self.config_edit.locked();
+                let cfg = self.config()?;
+                let input = ForecastInput {
+                    session_id: Some(session_id.clone()),
+                    draft: content.clone(),
+                    ..Default::default()
+                };
+                let (msg, run_id, admission) = self.with_store(|st| {
+                    st.transaction(|st| {
+                        let forecast = self.consented_forecast(st, &cfg, &input)?;
+                        #[cfg(test)]
+                        if let Some(hook) = self.forecast_admission_test.locked().clone() {
+                            hook();
+                        }
+                        if crate::runs::is_correction(&content) {
+                            st.mark_last_run_followup(&session_id, "corrected")?;
+                        }
+                        let msg = Self::append_user_message_store(st, &session_id, &content, None)?;
+                        let admission =
+                            self.prepare_run_admission(st, &cfg, &session_id, &forecast)?;
+                        let run_id = st.create_run(&session_id)?;
+                        st.record_forecast(&run_id, &forecast)?;
+                        Ok((msg, run_id, admission))
+                    })
+                })?;
                 self.broadcast(Event::MessageAppended {
                     session_id: session_id.clone(),
                     message: msg,
                 });
-                match self.start_run_forecast(session_id.clone(), forecast) {
-                    Ok(()) => Ok(json!({"started": true})),
-                    // Another client's Run started first: the message (already
-                    // in the transcript) joins it at its next step (#726).
-                    Err(e)
-                        if e.downcast_ref::<RequestFailure>()
-                            .is_some_and(|f| f.code == codes::BUSY) =>
-                    {
-                        if let Some(ctl) = self.runs.locked().get(&session_id) {
-                            let _ = ctl.steer_tx.send(());
-                        }
-                        Ok(json!({"steered": true}))
-                    }
-                    Err(e) => Err(e),
-                }
+                self.launch_prepared_run(session_id, run_id, admission)?;
+                Ok(json!({"started":true}))
             }
         }
     }
@@ -4345,19 +4398,251 @@ impl Daemon {
     /// error naming the Run that won, and that Run's controls stay.
     fn start_run(self: &Arc<Self>, session_id: String) -> Result<()> {
         let _admission = self.forecast_admission.locked();
-        let cfg = self.config()?;
-        let forecast = self.with_reader(|st| {
-            crate::forecast::estimate_store(
+        let _settings = self.config_edit.locked();
+        self.start_run_forecast(session_id, None)
+    }
+
+    fn admit_action<T>(
+        &self,
+        session_id: &str,
+        cfg: &Config,
+        input: &ForecastInput,
+        mutation: impl FnOnce(&Store) -> Result<T>,
+    ) -> Result<(T, String, Arc<RunAdmission>)> {
+        self.with_store(|st| {
+            let forecast = self.consented_forecast(st, cfg, input)?;
+            st.transaction(|st| {
+                let output = mutation(st)?;
+                let admission = self.prepare_run_admission(st, cfg, session_id, &forecast)?;
+                let id = st.create_run(session_id)?;
+                st.record_forecast(&id, &forecast)?;
+                Ok((output, id, admission))
+            })
+        })
+    }
+
+    fn prepare_run_admission(
+        &self,
+        st: &Store,
+        cfg: &Config,
+        session_id: &str,
+        forecast: &RunForecast,
+    ) -> Result<Arc<RunAdmission>> {
+        let session = st
+            .get_session(session_id)?
+            .context("Session disappeared during admission")?;
+        let prompt = match st.session_system_prompt(session_id)? {
+            Some(p) => p,
+            None => {
+                let p = crate::forecast::fresh_prompt(
+                    st,
+                    cfg,
+                    Some(&session),
+                    &forecast.basis.model,
+                    session.cwd.as_deref(),
+                )?;
+                st.set_session_system_prompt(session_id, &p)?;
+                p
+            }
+        };
+        let defs = toolreg::tool_definitions(st, Some(session_id), cfg.tools.inline_limit)?;
+        if crate::forecast::hash(&defs) != forecast.basis.tools_hash {
+            return Err(anyhow!("Tool snapshot changed during forecast admission"));
+        }
+        let name = forecast
+            .basis
+            .provider_key
+            .rsplit_once(':')
+            .map(|(name, _)| name)
+            .unwrap_or(crate::config::DEFAULT_PROVIDER);
+        let mut fixed = cfg.clone();
+        let requested = if forecast.basis.role.starts_with("role:") {
+            let role = forecast.basis.role.trim_start_matches("role:");
+            let role = fixed
+                .roles
+                .get_mut(role)
+                .context("forecast Role disappeared")?;
+            role.model = forecast.basis.model.clone();
+            role.candidates.clear();
+            forecast.basis.role.clone()
+        } else {
+            forecast.basis.model.clone()
+        };
+        let pcfg = cfg.provider_cfg(Some(name))?;
+        let effort = if let Some(role) = forecast.basis.role.strip_prefix("role:") {
+            cfg.role(role)?
+                .reasoning_effort
+                .clone()
+                .or(pcfg.reasoning_effort.clone())
+        } else {
+            session
+                .reasoning_effort
+                .clone()
+                .or(pcfg.reasoning_effort.clone())
+        };
+        if forecast.context_source != "default" {
+            if name == crate::config::DEFAULT_PROVIDER {
+                fixed
+                    .provider
+                    .model_context_tokens
+                    .insert(forecast.basis.model.clone(), forecast.context_tokens);
+            } else if let Some(p) = fixed.providers.get_mut(name) {
+                p.model_context_tokens
+                    .insert(forecast.basis.model.clone(), forecast.context_tokens);
+            }
+        }
+        let provider = Provider::with_key(pcfg, String::new(), self.http.clone()).with_name(name);
+        let ctx = crate::storage::build_context(
+            st,
+            session_id,
+            &prompt,
+            forecast.context_tokens,
+            cfg.compaction.fraction(),
+        )?
+        .0;
+        let ctx = provider.prepare_attachments(&ctx, &forecast.basis.model);
+        let checkpoint = crate::forecast::hash(&st.latest_checkpoint(session_id)?);
+        Ok(Arc::new(RunAdmission {
+            cfg: fixed,
+            requested,
+            effort,
+            first: StdMutex::new(Some((ctx, defs, checkpoint))),
+        }))
+    }
+
+    fn forecast_estimate(
+        &self,
+        st: &Store,
+        cfg: &Config,
+        input: &ForecastInput,
+    ) -> Result<RunForecast> {
+        self.forecast_estimate_selected(st, cfg, input, None)
+    }
+    fn forecast_estimate_selected(
+        &self,
+        st: &Store,
+        cfg: &Config,
+        input: &ForecastInput,
+        selected: Option<&str>,
+    ) -> Result<RunForecast> {
+        st.read_transaction(|st| {
+            crate::forecast::estimate_store_with_window(
                 st,
-                &cfg,
-                &ForecastInput {
-                    session_id: Some(session_id.clone()),
-                    ..Default::default()
-                },
+                cfg,
+                input,
+                Some(&|name, provider, model| {
+                    self.model_windows
+                        .locked()
+                        .get(&format!("{name}\n{}", provider.base_url))
+                        .and_then(|entry| entry.as_ref().ok())
+                        .and_then(|windows| windows.get(model).copied())
+                }),
+                selected,
             )
-        })?;
-        self.check_forecast_consent(&forecast)?;
-        self.start_run_forecast(session_id, Some(forecast))
+        })
+    }
+    fn action_model(&self, st: &Store, cfg: &Config, input: &ForecastInput) -> Result<String> {
+        let session = input
+            .session_id
+            .as_deref()
+            .map(|id| st.get_session(id))
+            .transpose()?
+            .flatten();
+        let wanted = cfg.provider.resolve_alias(
+            &input
+                .model
+                .clone()
+                .or_else(|| session.and_then(|s| s.model))
+                .unwrap_or_else(|| cfg.provider.model.clone()),
+        );
+        let role_name = wanted.strip_prefix("role:");
+        let role = role_name.map(|r| cfg.role(r)).transpose()?;
+        let provider = cfg.provider_cfg(role.and_then(|r| r.provider.as_deref()))?;
+        let model = provider.resolve_alias(role.map_or(wanted.as_str(), |r| {
+            if r.model.is_empty() {
+                provider.model.as_str()
+            } else {
+                r.model.as_str()
+            }
+        }));
+        if !ProviderCfg::is_auto_model(&model) {
+            return Ok(model);
+        }
+        if let Some(role) = role.filter(|r| !r.candidates.is_empty()) {
+            let candidates: Vec<_> = role
+                .candidates
+                .iter()
+                .map(|m| provider.resolve_alias(m))
+                .collect();
+            return crate::routing::select_task_model(
+                &candidates,
+                &st.task_stats(role_name.unwrap())?,
+                cfg.tools.task_min_samples,
+                cfg.tools.task_quality_bar,
+                rand::random::<f64>() < cfg.tools.task_explore_rate,
+            )
+            .context("no role model candidates");
+        }
+        let mut max = 0;
+        for candidate in provider.routing_candidates() {
+            max = max.max(
+                self.forecast_estimate_selected(st, cfg, input, Some(&candidate))?
+                    .basis
+                    .prompt_tokens,
+            );
+        }
+        let tools = toolreg::preview_tool_definitions(
+            st,
+            input.session_id.as_deref(),
+            cfg.tools.inline_limit,
+        )?
+        .len();
+        crate::routing::select_model(
+            &provider,
+            &st.list_model_stats()?,
+            crate::routing::is_complex_tokens(max, tools, cfg.provider.routing_complex_chars),
+        )
+        .context("no model candidates")
+    }
+    fn consented_forecast(
+        &self,
+        st: &Store,
+        cfg: &Config,
+        input: &ForecastInput,
+    ) -> Result<RunForecast> {
+        let owner = current_client().map(|(id, _)| id);
+        let mut choices: Vec<_> = self
+            .forecast_consents
+            .locked()
+            .iter()
+            .filter(|(_, c)| {
+                c.owner == owner
+                    && c.at.elapsed().as_secs() < 300
+                    && (!c.requires || c.approved)
+                    && c.input.session_id == input.session_id
+                    && c.input.draft == input.draft
+                    && c.input.edit_message_id == input.edit_message_id
+                    && c.input.resume == input.resume
+                    && c.input.retry == input.retry
+            })
+            .map(|(id, c)| (id.clone(), c.selected.clone(), c.fingerprint.clone(), c.at))
+            .collect();
+        choices.sort_by_key(|(_, _, _, at)| std::cmp::Reverse(*at));
+        for (id, selected, fingerprint, _) in choices {
+            let f = self.forecast_estimate_selected(st, cfg, input, Some(&selected))?;
+            if f.fingerprint == fingerprint {
+                self.forecast_consents.locked().remove(&id);
+                return Ok(f);
+            }
+        }
+        let selected = self.action_model(st, cfg, input)?;
+        let f = self.forecast_estimate_selected(st, cfg, input, Some(&selected))?;
+        if f.confirmation_required {
+            return Err(anyhow::Error::new(RequestFailure::invalid(
+                "forecast confirmation required; preview and confirm current inputs before sending",
+            )));
+        }
+        Ok(f)
     }
 
     fn check_forecast_consent(&self, forecast: &RunForecast) -> Result<()> {
@@ -4396,27 +4681,36 @@ impl Daemon {
             ))));
         }
         self.close_dangling_tool_calls(&session_id)?;
-        let forecast = match forecast {
-            Some(f) => f,
-            None => self.with_reader(|st| {
-                crate::forecast::estimate_store(
-                    st,
-                    &self.config()?,
-                    &ForecastInput {
-                        session_id: Some(session_id.clone()),
-                        ..Default::default()
-                    },
-                )
-            })?,
-        };
-        let run_id = self.with_store(|st| {
-            let id = st.create_run(&session_id)?;
-            if let Err(error) = st.record_forecast(&id, &forecast) {
-                let _ = st.set_run_status(&id, "interrupted");
-                return Err(error);
-            }
-            Ok(id)
+        let cfg = self.config()?;
+        let (run_id, admission) = self.with_store(|st| {
+            st.transaction(|st| {
+                let forecast = match forecast {
+                    Some(f) => f,
+                    None => self.consented_forecast(
+                        st,
+                        &cfg,
+                        &ForecastInput {
+                            session_id: Some(session_id.clone()),
+                            model: self.next_run_model.locked().get(&session_id).cloned(),
+                            ..Default::default()
+                        },
+                    )?,
+                };
+                let admission = self.prepare_run_admission(st, &cfg, &session_id, &forecast)?;
+                let id = st.create_run(&session_id)?;
+                st.record_forecast(&id, &forecast)?;
+                Ok((id, admission))
+            })
         })?;
+        self.launch_prepared_run(session_id, run_id, admission)
+    }
+
+    fn launch_prepared_run(
+        self: &Arc<Self>,
+        session_id: String,
+        run_id: String,
+        admission: Arc<RunAdmission>,
+    ) -> Result<()> {
         let cancel = CancellationToken::new();
         let cancel_flag = Arc::new(AtomicBool::new(false));
         let (steer_tx, steer_rx) = mpsc::unbounded_channel::<()>();
@@ -4445,6 +4739,9 @@ impl Daemon {
                 },
             );
         }
+        self.run_admissions
+            .locked()
+            .insert(run_id.clone(), admission);
         self.broadcast(Event::RunStarted {
             session_id: session_id.clone(),
             run_id: run_id.clone(),
@@ -4556,6 +4853,7 @@ impl Daemon {
     /// free the Session, report what changed, resolve comparisons and jobs,
     /// run `run_end` hooks, and start the next queued message.
     async fn finish_run(self: &Arc<Self>, session_id: String, run_id: String, final_status: &str) {
+        self.run_admissions.locked().remove(&run_id);
         use futures_util::FutureExt;
         // run_panicked reaches this outside run_loop's unwind boundary too.
         // Whatever a tail step does, the queue drain remains reachable.
@@ -4675,47 +4973,46 @@ impl Daemon {
 
     fn start_next_queued_message(self: &Arc<Self>, session_id: String) {
         let _admission = self.forecast_admission.locked();
+        let _settings = self.config_edit.locked();
         if self.runs.locked().contains_key(&session_id) {
             return;
         }
-        let next = self
-            .with_reader(|st| Ok(st.queued_items(&session_id)?.into_iter().next()))
-            .ok()
-            .flatten();
-        let Some(next) = next else {
+        let Ok(cfg) = self.config() else {
             return;
         };
-        let forecast = self.with_reader(|st| {
-            crate::forecast::estimate_store(
-                st,
-                &self.config()?,
-                &ForecastInput {
+        let prepared = self.with_store(|st| {
+            st.transaction(|st| {
+                let Some(next) = st.queued_items(&session_id)?.into_iter().next() else {
+                    return Ok(None);
+                };
+                let input = ForecastInput {
                     session_id: Some(session_id.clone()),
-                    draft: next.content.clone(),
+                    draft: next.content,
                     ..Default::default()
-                },
-            )
+                };
+                let selected = self.action_model(st, &cfg, &input)?;
+                let forecast =
+                    self.forecast_estimate_selected(st, &cfg, &input, Some(&selected))?;
+                if forecast.confirmation_required {
+                    return Ok(None);
+                }
+                let Some(content) = st.pop_queued_message(&session_id)? else {
+                    return Ok(None);
+                };
+                let msg = Self::append_user_message_store(st, &session_id, &content, None)?;
+                let admission = self.prepare_run_admission(st, &cfg, &session_id, &forecast)?;
+                let id = st.create_run(&session_id)?;
+                st.record_forecast(&id, &forecast)?;
+                Ok(Some((msg, id, admission)))
+            })
         });
-        let Ok(forecast) = forecast else {
-            return;
-        };
-        if forecast.confirmation_required {
-            self.broadcast(Event::Note{session_id:Some(session_id),text:"Queued message kept: forecast confirmation is required. Preview and explicitly send it after confirming.".into()});
-            return;
-        }
-        let content = self
-            .with_store(|st| st.pop_queued_message(&session_id))
-            .ok()
-            .flatten();
-        if let Some(content) = content {
+        if let Ok(Some((msg, id, admission))) = prepared {
             self.queue_changed(&session_id);
-            if let Ok(msg) = self.append_user_message(&session_id, &content) {
-                self.broadcast(Event::MessageAppended {
-                    session_id: session_id.clone(),
-                    message: msg,
-                });
-                let _ = self.start_run_forecast(session_id, Some(forecast));
-            }
+            self.broadcast(Event::MessageAppended {
+                session_id: session_id.clone(),
+                message: msg,
+            });
+            let _ = self.launch_prepared_run(session_id, id, admission);
         }
     }
 
@@ -4995,7 +5292,12 @@ impl Daemon {
         cancel: &CancellationToken,
         cancel_flag: &Arc<AtomicBool>,
     ) -> Result<()> {
-        let cfg = self.config()?;
+        let admitted = self.run_admissions.locked().get(run_id).cloned();
+        let cfg = match &admitted {
+            Some(a) => a.cfg.clone(),
+            None => self.config()?,
+        };
+        let mut first = admitted.as_ref().and_then(|a| a.first.locked().take());
         if !cfg.provider.is_configured() {
             return Err(anyhow!(
                 "provider not configured; run the onboarding wizard"
@@ -5018,7 +5320,14 @@ impl Daemon {
         }
         // The Session's model, or its role's provider + model (SPEC §4.5).
         let once = self.next_run_model.locked().remove(session_id);
-        let target = self.target(&cfg, session_id, once.as_deref()).await?;
+        let requested = admitted
+            .as_ref()
+            .map(|a| a.requested.as_str())
+            .or(once.as_deref());
+        let mut target = self.target(&cfg, session_id, requested).await?;
+        if let Some(admitted) = &admitted {
+            target.effort = admitted.effort.clone();
+        }
         let provider = {
             let (sid, rid, subs) = (
                 session_id.to_string(),
@@ -5055,18 +5364,25 @@ impl Daemon {
                 })
         };
         let requested_model = target.model.clone();
-        let route_context = self
-            .session_context(
+        let route_context = if let Some((ctx, _, _)) = &first {
+            ctx.clone()
+        } else {
+            self.session_context(
                 session_id,
                 &provider,
                 &requested_model,
                 provider.settings().context_for(&requested_model),
                 cfg.compaction.fraction(),
             )?
-            .0;
-        let route_defs = self.with_store(|st| {
-            toolreg::tool_definitions(st, Some(session_id), cfg.tools.inline_limit)
-        })?;
+            .0
+        };
+        let route_defs = if let Some((_, defs, _)) = &first {
+            defs.clone()
+        } else {
+            self.with_store(|st| {
+                toolreg::tool_definitions(st, Some(session_id), cfg.tools.inline_limit)
+            })?
+        };
         let complex = self.routing_complex(
             &provider,
             &requested_model,
@@ -5114,6 +5430,14 @@ impl Daemon {
         )
         .await?;
 
+        if let Some((_, _, checkpoint)) = &first {
+            if self
+                .with_reader(|st| Ok(crate::forecast::hash(&st.latest_checkpoint(session_id)?)))?
+                != *checkpoint
+            {
+                first = None;
+            }
+        }
         // Agent loop: provider turn -> tool calls -> tool results -> repeat
         // until a final text answer (SPEC §5.2). Context is rebuilt from the
         // DB each iteration, so steered messages join at step boundaries.
@@ -5132,18 +5456,23 @@ impl Daemon {
             self.check_budget(session_id, run_id, &cfg)?;
             // Push delivery of completed Pending Invocations (§6.3).
             self.deliver_completed_pending(session_id);
-            let ctx = self
-                .session_context(
-                    session_id,
-                    &provider,
-                    &model,
-                    context_tokens,
-                    cfg.compaction.fraction(),
-                )?
-                .0;
-            let defs = self.with_store(|st| {
-                toolreg::tool_definitions(st, Some(session_id), cfg.tools.inline_limit)
-            })?;
+            let (ctx, defs) = if let Some((ctx, defs, _)) = first.take() {
+                (ctx, defs)
+            } else {
+                let ctx = self
+                    .session_context(
+                        session_id,
+                        &provider,
+                        &model,
+                        context_tokens,
+                        cfg.compaction.fraction(),
+                    )?
+                    .0;
+                let defs = self.with_store(|st| {
+                    toolreg::tool_definitions(st, Some(session_id), cfg.tools.inline_limit)
+                })?;
+                (ctx, defs)
+            };
             let retry = self
                 .runs
                 .lock()
@@ -9425,7 +9754,17 @@ impl Daemon {
         content: &str,
         extra: Option<(&str, serde_json::Value)>,
     ) -> Result<MessageInfo> {
-        let atts = self.with_store(|st| st.take_pending_attachments(session_id))?;
+        self.with_store(|st| {
+            st.transaction(|st| Self::append_user_message_store(st, session_id, content, extra))
+        })
+    }
+    fn append_user_message_store(
+        st: &Store,
+        session_id: &str,
+        content: &str,
+        extra: Option<(&str, Value)>,
+    ) -> Result<MessageInfo> {
+        let atts = st.take_pending_attachments(session_id)?;
         let mut meta = json!({});
         if !atts.is_empty() {
             meta["attachments"] = json!(atts);
@@ -9438,7 +9777,7 @@ impl Daemon {
             meta[k] = v;
         }
         let meta = (meta != json!({})).then(|| meta.to_string());
-        self.with_store(|st| st.append_message_meta(session_id, "user", content, meta))
+        st.append_message_meta(session_id, "user", content, meta)
     }
 
     /// `schedule_run` (SPEC §9.7): a one-shot job is scheduled at once; a
