@@ -814,6 +814,8 @@ pub struct ForecastBasis {
     pub provider_key: String,
     pub model: String,
     pub role: String,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
     pub session_id: Option<String>,
     pub cwd_hash: String,
     pub tools_hash: String,

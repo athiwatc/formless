@@ -397,6 +397,14 @@ pub(crate) fn estimate_store_with_window(
         provider_key: key,
         model: model.clone(),
         role: role.clone(),
+        reasoning_effort: if let Some(r) = rcfg {
+            r.reasoning_effort.clone().or(pcfg.reasoning_effort.clone())
+        } else {
+            session
+                .as_ref()
+                .and_then(|s| s.reasoning_effort.clone())
+                .or(pcfg.reasoning_effort.clone())
+        },
         session_id: input.session_id.clone(),
         cwd_hash: hash(&cwd),
         tools_hash: hash(&defs),
@@ -422,6 +430,7 @@ pub(crate) fn estimate_store_with_window(
         if b.provider_key != basis.provider_key
             || b.model != model
             || b.role != role
+            || b.reasoning_effort != basis.reasoning_effort
             || b.tools_hash != basis.tools_hash
             || !same_location
             || !(0.5..=2.0).contains(&scale)
@@ -560,6 +569,9 @@ pub(crate) fn estimate_store_with_window(
     f.fingerprint = hash(&(
         context_hash,
         &input.draft,
+        session
+            .as_ref()
+            .map(|s| (&s.model, &s.reasoning_effort, &s.cwd, &s.instructions)),
         &logical,
         &cfg,
         &recorded,
@@ -924,6 +936,12 @@ mod tests {
             first.fingerprint,
             estimate_store(&st, &c, &foreign).unwrap().fingerprint
         );
+        st.set_session_model(&sid, None, Some("high".into()))
+            .unwrap();
+        let effort = estimate_store(&st, &c, &input).unwrap();
+        assert_ne!(first.fingerprint, effort.fingerprint);
+        assert_eq!(effort.basis.reasoning_effort.as_deref(), Some("high"));
+        st.set_session_model(&sid, None, None).unwrap();
         st.observe_prompt_tokens(&first.basis.provider_key, "model", 100, 400)
             .unwrap();
         let calibrated = estimate_store(&st, &c, &input).unwrap();
