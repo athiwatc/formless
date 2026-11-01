@@ -29,7 +29,9 @@ grants and trusted folders do not cover this consent. The synthetic
 confers no filesystem, process or network access of its own.
 
 The active daemon's data and config directories, including its key fallback,
-are denied regardless of grants. Configured namespaces and resolved targets
+are denied regardless of grants. Files named by `FORMLESS_API_KEY_FILE` and
+`FORMLESS_API_KEY_<NAME>_FILE` are also denied, including ordinary filenames
+outside the profile. Configured namespaces and resolved targets
 are checked, including aliases and moves that could expose their contents.
 Smoke tests and optimiser replay cannot approve credential reads. Reads in a
 dry run still need consent. Explicit process operands (including a `cat`

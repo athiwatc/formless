@@ -1307,7 +1307,10 @@ pattern (§4.4).
   context and computed concrete path. Refusal/cancellation prevents access.
   The daemon's active data/config roots and key fallback are hard denied
   before grants, checking both configured namespaces and current/captured
-  canonical identities. Reads, chunks, metadata, detailed listings, implicit
+  canonical identities. Path-valued `FORMLESS_API_KEY_FILE` and
+  `FORMLESS_API_KEY_<NAME>_FILE` sources are also hard denied, including
+  ordinary filenames outside the profile. Their namespaces and startup
+  destinations are retained; policy construction inspects paths, not key bytes. Reads, chunks, metadata, detailed listings, implicit
   prior-content reads and source relocation use the same boundary. Moving or
   deleting a directory containing the profile is also denied. Renaming a
   configured sensitive subtree, its ancestor, or contents outside that subtree

@@ -752,17 +752,26 @@ impl Daemon {
         }
         let store = Store::open(&paths.db_file())?;
         let cwd = std::env::current_dir()?;
-        let sensitive_anchors = [&paths.data_dir, &paths.config_dir]
+        let mut sensitive_anchors = [&paths.data_dir, &paths.config_dir]
             .into_iter()
             .map(|root| {
-                let absolute =
-                    formless_runtime::caps::lexical_absolute(&cwd, root).map_err(|e| anyhow!(e))?;
+                formless_runtime::caps::lexical_absolute(&cwd, root).map_err(|e| anyhow!(e))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        sensitive_anchors
+            .extend(crate::sensitive_reads::credential_file_paths().map_err(|e| anyhow!(e))?);
+        // Keep configured namespaces as well as physical startup identities.
+        // A later env change or symlink retarget cannot unprotect an old key.
+        let canonical_anchors = sensitive_anchors
+            .iter()
+            .map(|root| {
                 formless_runtime::caps::canonical_path(
-                    absolute.to_str().context("profile path is not UTF-8")?,
+                    root.to_str().context("protected path is not UTF-8")?,
                 )
                 .map_err(|e| anyhow!(e))
             })
             .collect::<Result<Vec<_>>>()?;
+        sensitive_anchors.extend(canonical_anchors);
         // A damaged database stops the daemon with the backup to restore,
         // instead of failing wherever it first bites (SPEC §16).
         store.check_integrity(&paths.db_file())?;

@@ -9,7 +9,8 @@ struct Fixture {
     tool: ToolInfo,
 }
 impl Fixture {
-    fn new(_env: &crate::credential_env::EnvGuard, secure: bool) -> Self {
+    fn new(env: &crate::credential_env::EnvGuard, secure: bool) -> Self {
+        env.remove("FORMLESS_SECURE");
         let root =
             std::env::temp_dir().join(format!("fl-sensitive-registry-{}", uuid::Uuid::new_v4()));
         let paths = Paths::from_dirs(root.join("data"), root.join("config")).unwrap();
@@ -23,6 +24,7 @@ impl Fixture {
         cfg.skills.auto_create = false;
         cfg.save(&paths).unwrap();
         let daemon = Arc::new(Daemon::new(paths.clone()).unwrap());
+        assert_eq!(daemon.config().unwrap().security.secure, secure);
         let caps = Capabilities::parse(&[format!("fs:read:{}", project.display())]).unwrap();
         let (session, tool) = daemon
             .with_store(|st| {
@@ -331,4 +333,118 @@ fn typed_extensions_roundtrip_and_are_owner_file_only() {
         .set_key("security", json!({"sensitive_paths":[]}))
         .is_err());
     assert_eq!(cfg.security, before);
+}
+
+#[tokio::test]
+async fn default_and_named_external_key_files_are_hard_denied_by_path_without_reading_key_values() {
+    struct ExternalDir(std::path::PathBuf);
+    impl Drop for ExternalDir {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+    let env = crate::credential_env::EnvGuard::isolated();
+    let external = ExternalDir(
+        std::env::temp_dir().join(format!("fl-owned-external-key-{}", uuid::Uuid::new_v4())),
+    );
+    std::fs::create_dir(&external.0).unwrap();
+    let external_root = external.0.canonicalize().unwrap();
+    let default = external_root.join("creds.txt");
+    let named = external_root.join("named-source.txt");
+    let ordinary = external_root.join("notes.txt");
+    let replacement = external_root.join("replacement.txt");
+    for path in [&default, &named, &replacement] {
+        std::fs::write(path, "private-owned-key-fixture").unwrap();
+    }
+    std::fs::write(&ordinary, "ordinary-project-control").unwrap();
+    #[cfg(unix)]
+    let original = external_root.join("physical-original.txt");
+    #[cfg(unix)]
+    std::fs::write(&original, "private-owned-key-fixture").unwrap();
+    for secure in [false, true] {
+        #[cfg(unix)]
+        {
+            std::fs::remove_file(&default).unwrap();
+            std::os::unix::fs::symlink(&original, &default).unwrap();
+        }
+        env.set("FORMLESS_API_KEY_FILE", &default);
+        // provider_key("my-custom") uses exactly this normalized variable.
+        env.set("FORMLESS_API_KEY_MY_CUSTOM_FILE", &named);
+        let f = Fixture::new(&env, secure);
+        let mut cfg = f.daemon().config().unwrap();
+        cfg.security
+            .trusted_paths
+            .push(external_root.to_str().unwrap().into());
+        cfg.save(&f.paths).unwrap();
+        let paths = crate::sensitive_reads::credential_file_paths().unwrap();
+        assert!(paths.contains(&default) && paths.contains(&named));
+        f.daemon()
+            .with_store(|st| {
+                let caps =
+                    Capabilities::parse(&[format!("fs:read:{}", external_root.display())]).unwrap();
+                st.create_tool_version(
+                    "fixture_reader",
+                    "Read supplied file",
+                    "{\"type\":\"object\"}",
+                    "{}",
+                    "function run(i) { return fs.read(i.path); }",
+                    &caps,
+                    64,
+                    "user",
+                )?;
+                let mut legacy = caps;
+                legacy.sensitive_read = vec![
+                    default.to_str().unwrap().into(),
+                    named.to_str().unwrap().into(),
+                ];
+                st.set_approval(&f.tool.id, &legacy, 64)
+            })
+            .unwrap();
+        let mut events = f.events();
+        assert_eq!(
+            completed(f.launch(&ordinary, CancellationToken::new()))
+                .await
+                .unwrap()
+                .0,
+            json!("ordinary-project-control")
+        );
+        for path in [&default, &named] {
+            assert!(completed(f.launch(path, CancellationToken::new()))
+                .await
+                .is_err());
+            assert!(f.last_status().2.is_empty());
+        }
+        // Current environment-selected identities and startup anchors both
+        // remain protected, even after that selection changes or disappears.
+        env.set("FORMLESS_API_KEY_FILE", &replacement);
+        assert!(completed(f.launch(&replacement, CancellationToken::new()))
+            .await
+            .is_err());
+        env.remove("FORMLESS_API_KEY_FILE");
+        env.remove("FORMLESS_API_KEY_MY_CUSTOM_FILE");
+        #[cfg(unix)]
+        {
+            std::fs::remove_file(&default).unwrap();
+            std::os::unix::fs::symlink(&replacement, &default).unwrap();
+            // Retain the physical startup destination and the configured
+            // alias namespace after env removal and alias retargeting.
+            for path in [&original, &replacement] {
+                assert!(completed(f.launch(path, CancellationToken::new()))
+                    .await
+                    .is_err());
+            }
+        }
+        for path in [&default, &named] {
+            assert!(completed(f.launch(path, CancellationToken::new()))
+                .await
+                .is_err());
+        }
+        while let Ok(event) = events.try_recv() {
+            assert!(!matches!(
+                event,
+                ServerMessage::Event(Event::ApprovalRequested { .. })
+            ));
+        }
+        assert!(f.daemon().approvals.locked().is_empty());
+    }
 }
