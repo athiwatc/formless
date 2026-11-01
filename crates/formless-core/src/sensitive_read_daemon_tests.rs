@@ -475,3 +475,135 @@ async fn default_and_named_external_key_files_are_hard_denied_by_path_without_re
         assert!(f.daemon().approvals.locked().is_empty());
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancellation_serializes_with_inflight_answer_before_any_metadata_can_outlive_waiter() {
+    type Gate = Arc<(StdMutex<bool>, std::sync::Condvar)>;
+    struct ReleaseGate(Gate);
+    impl Drop for ReleaseGate {
+        fn drop(&mut self) {
+            let (released, ready) = &*self.0;
+            *released.locked() = true;
+            ready.notify_all();
+        }
+    }
+    let env = crate::credential_env::EnvGuard::isolated();
+    let f = Fixture::new(&env, false);
+    let key = f.root.join("project/.ssh/config");
+    std::fs::write(&key, "inflight-private-fixture").unwrap();
+    let cancel = CancellationToken::new();
+    let flag = Arc::new(AtomicBool::new(false));
+    let mut events = f.events();
+    let task = f.launch_controlled(&key, cancel.clone(), flag.clone());
+    let Event::ApprovalRequested { approval_id, .. } = next_approval(&mut events).await else {
+        unreachable!()
+    };
+    let (claimed_tx, claimed_rx) = oneshot::channel();
+    let (cleanup_tx, cleanup_rx) = oneshot::channel();
+    let claimed_tx = StdMutex::new(Some(claimed_tx));
+    let cleanup_tx = StdMutex::new(Some(cleanup_tx));
+    let gate: Gate = Arc::new((StdMutex::new(false), std::sync::Condvar::new()));
+    let release = ReleaseGate(gate.clone());
+    let wanted = approval_id.clone();
+    *f.daemon().approval_transition_test.locked() = Some(Arc::new(move |phase, id| {
+        if id != wanted {
+            return;
+        }
+        match phase {
+            "answer-claimed" => {
+                claimed_tx.locked().take().unwrap().send(()).unwrap();
+                let (open, ready) = &*gate;
+                let (released, timeout) = ready
+                    .wait_timeout_while(
+                        open.locked(),
+                        std::time::Duration::from_secs(5),
+                        |released| !*released,
+                    )
+                    .unwrap();
+                assert!(
+                    *released && !timeout.timed_out(),
+                    "private answer gate was not released"
+                );
+            }
+            "waiter-cleanup" => {
+                if let Some(tx) = cleanup_tx.locked().take() {
+                    let _ = tx.send(());
+                }
+            }
+            _ => panic!("unexpected private approval transition"),
+        }
+    }));
+    let daemon = f.daemon().clone();
+    let answer_id = approval_id.clone();
+    let requested_path = key.to_str().unwrap().to_string();
+    let root = f.root.to_str().unwrap().to_string();
+    let runtime = tokio::runtime::Handle::current();
+    // Actual request handler on a blocking worker: its private gate never
+    // blocks the async test's two-worker executor or another daemon's tests.
+    let answer = tokio::task::spawn_blocking(move || {
+        runtime.block_on(CLIENT.scope(
+            (708, "private answer fixture".into()),
+            daemon.handle(Request::ApprovalDecision {
+                approval_id: answer_id,
+                approved: false,
+                scope: ApprovalScope::Always,
+                paths: [(format!("fs:read-sensitive:{requested_path}"), root)].into(),
+                remember_denial: true,
+            }),
+        ))
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), claimed_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    flag.store(true, Ordering::SeqCst);
+    cancel.cancel();
+    tokio::time::timeout(std::time::Duration::from_secs(5), cleanup_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    // The waiter has selected cancellation and reached cleanup, but the
+    // answer holds its transaction lock before publishing any metadata.
+    assert!(matches!(
+        f.daemon().approvals.try_lock(),
+        Err(std::sync::TryLockError::WouldBlock)
+    ));
+    assert!(!task.is_finished());
+    assert!(f.daemon().approval_paths.locked().is_empty());
+    assert!(f.daemon().approval_by.locked().is_empty());
+    assert!(f.daemon().deny_always.locked().is_empty());
+    drop(release);
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), answer)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        result["resolved"], false,
+        "receiver was dropped when cancellation won"
+    );
+    assert!(completed(task).await.is_err());
+    assert_eq!(
+        f.last_status(),
+        ("cancelled".into(), "user-cancelled".into(), String::new())
+    );
+    assert!(f.daemon().approvals.locked().is_empty());
+    assert!(f.daemon().approval_paths.locked().is_empty());
+    assert!(f.daemon().approval_by.locked().is_empty());
+    assert!(f.daemon().deny_always.locked().is_empty());
+    assert!(
+        f.daemon()
+            .with_reader(|st| st.list_denials())
+            .unwrap()
+            .is_empty(),
+        "a failed answer must not remember a denial"
+    );
+    assert!(!f.daemon().pending_attention.locked().iter().any(
+        |event| matches!(event, Event::ApprovalRequested {approval_id:id, ..} if id == &approval_id)
+    ));
+    *f.daemon().approval_transition_test.locked() = None;
+    assert_eq!(
+        std::fs::read_to_string(key).unwrap(),
+        "inflight-private-fixture"
+    );
+}

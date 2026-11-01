@@ -626,6 +626,8 @@ pub struct Daemon {
     input_taint: crate::approval_preview::TaintIndex,
     #[cfg(test)]
     forecast_admission_test: StdMutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    approval_transition_test: StdMutex<Option<Arc<dyn Fn(&str, &str) + Send + Sync>>>,
     /// Per-Session step caps from `/limit` / `--max-steps`, for the active
     /// or next Run (cleared when it ends).
     step_limits: StdMutex<HashMap<String, u32>>,
@@ -837,6 +839,8 @@ impl Daemon {
             input_taint: Arc::new(StdMutex::new(Default::default())),
             #[cfg(test)]
             forecast_admission_test: StdMutex::new(None),
+            #[cfg(test)]
+            approval_transition_test: StdMutex::new(None),
             step_limits: StdMutex::new(Default::default()),
             next_run_model: StdMutex::new(Default::default()),
             progress_sent: StdMutex::new(Default::default()),
@@ -1339,6 +1343,14 @@ impl Daemon {
             tools.len(),
             cfg.provider.routing_complex_chars,
         ))
+    }
+
+    #[cfg(test)]
+    fn test_approval_transition(&self, phase: &str, id: &str) {
+        let hook = self.approval_transition_test.locked().clone();
+        if let Some(hook) = hook {
+            hook(phase, id);
+        }
     }
 
     fn remove_attention(&self, id: &str) {
@@ -4324,31 +4336,44 @@ impl Daemon {
                 paths,
                 remember_denial,
             } => {
-                // First answer wins (SPEC §10.4): removing the sender resolves
-                // it. A late or losing answer leaves nothing behind (#764).
-                let tx = self.approvals.locked().remove(&approval_id);
-                self.remove_attention(&approval_id);
-                if tx.is_some() {
-                    if remember_denial && !approved {
-                        self.deny_always.locked().insert(approval_id.clone());
+                // Serialize claiming the waiter and publishing answer metadata
+                // against cancellation cleanup. Lock order is approvals then
+                // one metadata map; no path holds metadata then approvals.
+                // No mutex is held across an await, attention or broadcast.
+                let resolved = {
+                    let mut waiters = self.approvals.locked();
+                    if waiters.contains_key(&approval_id) {
+                        #[cfg(test)]
+                        self.test_approval_transition("answer-claimed", &approval_id);
+                        if remember_denial && !approved {
+                            self.deny_always.locked().insert(approval_id.clone());
+                        }
+                        if !paths.is_empty() {
+                            self.approval_paths
+                                .locked()
+                                .insert(approval_id.clone(), paths);
+                        }
+                        if let Some((_, label)) = current_client() {
+                            self.approval_by.locked().insert(approval_id.clone(), label);
+                        }
+                        let sent = match waiters.remove(&approval_id) {
+                            Some(tx) => tx.send((approved, scope)).is_ok(),
+                            None => false,
+                        };
+                        if !sent {
+                            // Cancellation already dropped the receiver. Its
+                            // cleanup cannot run until this lock is released;
+                            // a losing answer must leave no metadata to apply.
+                            self.deny_always.locked().remove(&approval_id);
+                            self.approval_paths.locked().remove(&approval_id);
+                            self.approval_by.locked().remove(&approval_id);
+                        }
+                        sent
+                    } else {
+                        false
                     }
-                    if !paths.is_empty() {
-                        self.approval_paths
-                            .lock()
-                            .unwrap()
-                            .insert(approval_id.clone(), paths);
-                    }
-                    if let Some((_, label)) = current_client() {
-                        self.approval_by
-                            .lock()
-                            .unwrap()
-                            .insert(approval_id.clone(), label);
-                    }
-                }
-                let resolved = match tx {
-                    Some(tx) => tx.send((approved, scope)).is_ok(),
-                    None => false,
                 };
+                self.remove_attention(&approval_id);
                 if resolved {
                     self.broadcast(Event::ApprovalAnswered {
                         approval_id,
@@ -11779,6 +11804,8 @@ impl Daemon {
             _ = cancel.cancelled() => (false, ApprovalScope::Once),
             r = rx => r.unwrap_or((false, ApprovalScope::Once)),
         };
+        #[cfg(test)]
+        self.test_approval_transition("waiter-cleanup", &approval_id);
         self.approvals.locked().remove(&approval_id);
         self.remove_attention(&approval_id);
         let by = self
@@ -13304,6 +13331,8 @@ impl Daemon {
             _ = cancel.cancelled() => (false, ApprovalScope::Once),
             r = rx => r.unwrap_or((false, ApprovalScope::Once)),
         };
+        #[cfg(test)]
+        self.test_approval_transition("waiter-cleanup", &approval_id);
         self.approvals.locked().remove(&approval_id);
         self.remove_attention(&approval_id);
         // These prompts have no Tool to remember a denial or a folder for:
