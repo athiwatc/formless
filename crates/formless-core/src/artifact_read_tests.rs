@@ -11,7 +11,13 @@ struct Fixture {
 impl Fixture {
     fn new(env: &crate::credential_env::EnvGuard) -> Self {
         env.remove("FORMLESS_SECURE");
-        let root = std::env::temp_dir().join(format!("fl-artifact-reads-{}", uuid::Uuid::new_v4()));
+        // Unix socket fixtures must fit native sockaddr_un even when TMPDIR is
+        // a long validation path. Drop removes this entire private fixture.
+        #[cfg(unix)]
+        let base = std::path::PathBuf::from("/tmp");
+        #[cfg(not(unix))]
+        let base = std::env::temp_dir();
+        let root = base.join(format!("fl-ar-{}", uuid::Uuid::new_v4().simple()));
         let paths = Paths::from_dirs(root.join("data"), root.join("config")).unwrap();
         let mut cfg = Config::default();
         cfg.naming.enabled = false;

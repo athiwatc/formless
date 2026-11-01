@@ -286,7 +286,7 @@ pub(crate) fn read_artifact_record(
         })?;
     let root = std::path::absolute(paths.data_dir.join("artifacts"))?;
     let path = std::path::absolute(path)?;
-    let bytes = read_rooted_file(&root, &path, size).map_err(|_| {
+    let bytes = read_rooted_file_checked(&root, &path, size, Some(size as u64)).map_err(|_| {
         anyhow::anyhow!("artifact is missing, changed, nonregular, or outside its owned directory")
     })?;
     anyhow::ensure!(
