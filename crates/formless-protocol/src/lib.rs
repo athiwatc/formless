@@ -946,8 +946,37 @@ pub struct ForecastAttachment {
     pub width: Option<u32>,
     pub height: Option<u32>,
 }
+/// Immutable per-Run pipeline policy; omitted fields preserve ordinary Runs.
+/// These are never Session settings or persistent standing instructions.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct RunOptions {
+    /// Raw per-Run selector, resolved once by forecast/admission, never by a
+    /// Session model-selection request (which could start a paid probe).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<serde_json::Value>,
+    /// Explicit zero forbids model dispatch; None retains the profile Run cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_usd: Option<f64>,
+}
+impl RunOptions {
+    pub fn is_empty(&self) -> bool {
+        self.model.is_none()
+            && self.reasoning_effort.is_none()
+            && self.system.is_none()
+            && self.schema.is_none()
+            && self.max_usd.is_none()
+    }
+}
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ForecastInput {
+    #[serde(default, skip_serializing_if = "RunOptions::is_empty")]
+    pub options: RunOptions,
     pub session_id: Option<String>,
     pub draft: String,
     #[serde(default)]
@@ -1768,6 +1797,16 @@ pub enum Request {
         mode: SendMode,
         /// One per user action: a retry with the same key (after a lost
         /// reply) returns the first outcome instead of sending twice (#891).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_msg_id: Option<String>,
+    },
+    /// Start an idle Session with immutable Run-only pipeline options. Older
+    /// daemons must reject this request; clients never silently drop policy.
+    StartPipelineRun {
+        session_id: String,
+        content: String,
+        #[serde(default)]
+        options: RunOptions,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         client_msg_id: Option<String>,
     },

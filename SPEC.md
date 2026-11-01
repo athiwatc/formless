@@ -4366,6 +4366,56 @@ checks run through actual CLI child processes without test-stack overrides.
   - `json`: one `{session_id, status, answer, error}` object at the end;
   - `jsonl-events`: every event, one per line; `--json` is the same.
 
+  Pipeline options are per Run, never edits to the profile configuration or
+  Session's standing instructions. `--system TEXT` appends exact bounded
+  instructions to this Run's projected system prompt, including after context
+  rebuilds. `--max-usd N` accepts a finite nonnegative USD limit: it replaces
+  the global Run limit for this Run only (including an intentional increase),
+  while the daily limit remains in force. Zero authorizes no paid model
+  dispatch. Every physical model request, including retries, nested/background
+  calls, compaction and output repair, uses the same Run's spending ledger;
+  an in-flight request can exceed the remaining headroom before its actual
+  usage is reported. Run-initiated compaction, approval summaries and automatic
+  skill distillation retain the originating Run's policy through their physical
+  request/accounting lifetime, including after the main Run finishes. Spawned
+  maintenance also retains the existing routing Task as resource-only cost:
+  it cannot change the responsible model, quality result or logical response
+  clock, and final Task cost waits for those owners to settle. Ordinary Run
+  maintenance retains its existing usage-ledger attribution. An explicit limit
+  refuses unknown/unpriced work rather than silently claiming it was bounded. A budget stop exits 1 and reports
+  observed spend, with unknown usage/pricing distinguished, on stderr.
+
+  Existing `--model`/`--role` and `--effort` flags on a pipeline Run are
+  carried in the same immutable options. The raw selector resolves once during
+  admission; dispatch keeps that resolved model/Role and quoted effort. This
+  path never changes/restores the Session's model or triggers selection-time
+  background model tests, including when `provider.auto_test_models` is on.
+
+  `--schema FILE|-` reads a bounded JSON Schema and compiles it offline before
+  admission. With `-`, stdin is the schema rather than a task or stdin.txt;
+  combining it with task `-` is a usage error. The final answer is validated
+  before assistant storage or delivery. Candidate text is not streamed for a
+  schema Run. A JSON/schema mismatch allows exactly one paid, no-tools logical
+  repair attempt; its physical requests remain charged to this Run. A second
+  mismatch exits 3 and never prints the invalid candidate on stdout in final
+  or json mode. Refused, incomplete or oversized output is not accepted as a
+  valid JSON answer. These options are part of the immutable forecast input
+  and consent fingerprint, so a quote for different options cannot authorize
+  the Run.
+
+  `--output-file PATH` leaves stdout empty and writes the selected completed
+  output through a bounded private temporary file adjacent to PATH, followed
+  by an atomic replacement. Progress and errors remain on stderr. Invalid
+  schema output, a failed/paused/interrupted Run, timeout, output-size overflow
+  or a write failure never replaces an existing destination with partial
+  output. Selected output is limited to 8 MiB. No output destination is opened
+  or truncated before completion. Run-only instructions and schemas are retained
+  in memory by bounded execution policies and short-lived forecast previews;
+  durable policy markers contain only hashes and the numeric cap. Resume
+  refuses a stopped pipeline Run before status/message/waiver changes; submit a
+  new pipeline Run with its desired options instead of reconstructing them from
+  Session defaults.
+
   `--cwd DIR` sets the Run's working directory (§5.1). A new headless
   Session uses `--cwd`, or else the directory `formless run` was started
   in. With `--session` the Session keeps its own unless `--cwd` is given;

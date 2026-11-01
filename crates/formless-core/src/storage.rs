@@ -26,6 +26,9 @@ pub type GroupedUsage = (
 #[path = "forecast_snapshot.rs"]
 mod forecast_snapshot;
 
+#[path = "pipeline_storage.rs"]
+mod pipeline_storage;
+
 pub struct Store {
     conn: Connection,
     /// Bumped whenever stored messages change other than by appending

@@ -405,6 +405,7 @@ type ExecFuture = std::pin::Pin<
 >;
 
 pub(crate) struct PendingEntry {
+    _pipeline: StdMutex<Option<Arc<crate::pipeline_policy::RunPolicy>>>,
     routing_task: Option<Arc<crate::routing_task_observation::Task>>,
     taint_scope: Arc<crate::approval_preview::RunTaint>,
     tool_name: String,
@@ -544,6 +545,13 @@ type QuestionReply = (String, Vec<QuestionAnswer>);
 
 // The connection is part of the identity; a key from another client is a new
 // action. Direct internal handle() callers share the explicit None identity.
+#[path = "pipeline_daemon.rs"]
+mod pipeline_daemon;
+
+#[cfg(test)]
+#[path = "pipeline_daemon_tests.rs"]
+mod pipeline_daemon_tests;
+
 #[cfg(test)]
 #[path = "daemon_send_dedupe_tests.rs"]
 mod send_dedupe_tests;
@@ -575,6 +583,7 @@ struct SentEntry {
 }
 
 struct RunAdmission {
+    pipeline: Option<Arc<crate::pipeline_policy::RunPolicy>>,
     cfg: Config,
     requested: String,
     resolved_model: String,
@@ -634,6 +643,8 @@ pub struct Daemon {
     forecast_admission: StdMutex<()>,
     forecast_consents: StdMutex<HashMap<String, ForecastConsent>>,
     run_admissions: StdMutex<HashMap<String, Arc<RunAdmission>>>,
+    pipeline_policies: Arc<StdMutex<crate::pipeline_policy::Registry>>,
+    pipeline_keys: StdMutex<HashMap<SendKey, pipeline_daemon::CachedPipeline>>,
     input_taint: crate::approval_preview::TaintIndex,
     #[cfg(test)]
     forecast_admission_test: StdMutex<Option<Arc<dyn Fn() + Send + Sync>>>,
@@ -881,6 +892,8 @@ impl Daemon {
             forecast_admission: StdMutex::new(()),
             forecast_consents: StdMutex::new(Default::default()),
             run_admissions: StdMutex::new(Default::default()),
+            pipeline_policies: Arc::new(StdMutex::new(Default::default())),
+            pipeline_keys: StdMutex::new(Default::default()),
             input_taint: Arc::new(StdMutex::new(Default::default())),
             #[cfg(test)]
             forecast_admission_test: StdMutex::new(None),
@@ -1065,7 +1078,7 @@ impl Daemon {
                     .with_prompt_hook(self.prompt_hook())
                     .with_input_hook(self.input_hook())
                     .with_request_hook(self.request_hook())
-                    .with_request_policy(self.request_policy())
+                    .with_request_policy(self.request_policy(n))
                     .with_breaker_note_hook(self.provider_breaker_note_hook()),
                 )
             }
@@ -1173,7 +1186,7 @@ impl Daemon {
                 .with_prompt_hook(self.prompt_hook())
                 .with_input_hook(self.input_hook())
                 .with_request_hook(self.request_hook())
-                .with_request_policy(self.request_policy())
+                .with_request_policy(self.request_policy(crate::config::DEFAULT_PROVIDER))
                 .with_breaker_note_hook(self.provider_breaker_note_hook()),
         )
     }
@@ -1193,10 +1206,35 @@ impl Daemon {
 
     /// Admission applies to every request through either provider factory.
     /// Attribution is resolved in the active task, not at Provider construction.
-    fn request_policy(&self) -> crate::provider::RequestPolicy {
+    fn request_policy(&self, provider_name: &str) -> crate::provider::RequestPolicy {
+        let provider_name = provider_name.to_owned();
+        let policies = self.pipeline_policies.clone();
+        let store = self.store.clone();
         let paths = self.paths.clone();
         let waived = self.budget_waived.clone();
         Arc::new(move |body| {
+            let run = USAGE_FOR
+                .try_with(|owner| owner.run_id.clone())
+                .unwrap_or_default();
+            let pipeline = Self::policy_from_registry(&policies, &store, &run)
+                .map_err(|error| RequestFailure::budget(format!("budget: {error}")))?;
+            if let Some(max) = pipeline.as_ref().and_then(|p| p.options.options().max_usd) {
+                if max == 0.0 {
+                    return Err(RequestFailure::budget(
+                        "budget: explicit --max-usd 0 authorizes no model dispatch",
+                    )
+                    .into());
+                }
+                let cfg = Config::load(&paths)?;
+                let model = body["model"].as_str().unwrap_or_default();
+                if crate::tokens::has_native_media(body)
+                    || cfg
+                        .cost_of_known(&provider_name, model, 1, 1, 0, 0, None, false)
+                        .is_none()
+                {
+                    return Err(RequestFailure::budget("budget: actual physical model/media pricing is unknown under explicit --max-usd; request not sent").into());
+                }
+            }
             if !crate::tokens::has_native_media(body) {
                 return Ok(());
             }
@@ -1223,6 +1261,7 @@ impl Daemon {
         let store = self.store.clone();
         let waived = self.budget_waived.clone();
         let paths = self.paths.clone();
+        let policies = self.pipeline_policies.clone();
         Arc::new(move || {
             // Read task-local attribution when polled in the caller's scope,
             // never when the Provider is constructed or on a spawned task.
@@ -1233,24 +1272,34 @@ impl Daemon {
                     session_id: String::new(),
                     run_id: String::new(),
                 });
-            let (admission, store, paths, waived) = (
+            let (admission, store, paths, waived, policies) = (
                 admission.clone(),
                 store.clone(),
                 paths.clone(),
                 waived.clone(),
+                policies.clone(),
             );
             Box::pin(async move {
+                let policy = Self::policy_from_registry(&policies, &store, &owner.run_id)
+                    .map_err(|error| RequestFailure::budget(format!("budget: {error}")))?;
+                let limit = policy
+                    .as_ref()
+                    .and_then(|p| p.options.options().max_usd)
+                    .map(crate::pipeline_budget::RunLimit::Explicit)
+                    .unwrap_or(crate::pipeline_budget::RunLimit::Profile);
                 let waived = waived.locked().contains(&owner.session_id);
                 let lease = admission
-                    .enter(&store, &paths, &owner.run_id, waived)
+                    .enter(&store, &paths, &owner.run_id, waived, limit)
                     .await
                     .map_err(|e| anyhow::Error::new(RequestFailure::budget(e.to_string())))?;
+                // This counts admitted attempts, not proof of HTTP dispatch:
+                // the post-FIFO final-body policy can still refuse a send.
                 store
                     .lock()
                     .map_err(|_| anyhow!("request coverage store unavailable"))?
                     .record_forecast_request(&owner.run_id, owner.source)
                     .context(crate::provider::UsageAccountingFailure)?;
-                Ok(Box::new(lease) as crate::provider::RequestLease)
+                Ok(Box::new((lease, policy)) as crate::provider::RequestLease)
             })
         })
     }
@@ -1963,11 +2012,12 @@ impl Daemon {
                 let cfg = self.config()?;
                 let mut input = input;
                 if input.model.is_none() {
-                    input.model = self
-                        .next_run_model
-                        .locked()
-                        .get(input.session_id.as_deref().unwrap_or_default())
-                        .cloned();
+                    input.model = input.options.model.clone().or_else(|| {
+                        self.next_run_model
+                            .locked()
+                            .get(input.session_id.as_deref().unwrap_or_default())
+                            .cloned()
+                    });
                 }
                 let mut forecast = self.with_reader(|st| {
                     let selected = if for_send {
@@ -2034,6 +2084,15 @@ impl Daemon {
                     .context("forecast expired")?
                     .approved = true;
                 Ok(json!({"confirmed":true}))
+            }
+            Request::StartPipelineRun {
+                session_id,
+                content,
+                options,
+                client_msg_id,
+            } => {
+                Box::pin(self.start_pipeline_message(session_id, content, options, client_msg_id))
+                    .await
             }
             Request::SendMessage {
                 session_id,
@@ -2360,6 +2419,9 @@ impl Daemon {
                             .context(
                                 "nothing to resume: the last run was not interrupted or paused",
                             )?;
+                        if st.pipeline_policy_marker(&run)?.is_some() {
+                            return Err(RequestFailure::invalid("Run-only pipeline options cannot be recovered by Resume; submit a new pipeline Run with its options").into());
+                        }
                         let budget = st
                             .run_error(&run)?
                             .is_some_and(|e| e.starts_with("budget:"));
@@ -3938,9 +4000,14 @@ impl Daemon {
                 Ok(json!({"retrying": true}))
             }
             Request::GetRun { run_id } => {
-                let run = self
+                let mut run = self
                     .with_reader(|st| st.inspect_run(&run_id))?
                     .context(RequestFailure::not_found("Run not found"))?;
+                if let Ok(cfg) = Config::load(&self.paths) {
+                    if let Some(actual) = run["run_id"].as_str().map(str::to_owned) {
+                        run["spend"] = self.with_reader(|st| st.pipeline_spend(&actual, &cfg))?;
+                    }
+                }
                 Ok(run)
             }
             Request::CancelRunId { run_id } => {
@@ -4666,6 +4733,7 @@ impl Daemon {
         self: &Arc<Self>,
         cfg: &Config,
         session_id: &str,
+        run_id: &str,
         approval_id: &str,
         info: &ToolInfo,
         ver: &ToolVersionInfo,
@@ -4684,28 +4752,40 @@ impl Daemon {
             send(self, cached);
             return;
         }
-        let (this, cfg, session_id) = (self.clone(), cfg.clone(), session_id.to_string());
-        let (approval_id, info, ver) = (approval_id.to_string(), info.clone(), ver.clone());
-        tokio::spawn(async move {
-            let summary = tokio::time::timeout(
-                std::time::Duration::from_secs(45),
-                this.write_tool_summary(&cfg, &session_id, &info, &ver),
-            )
-            .await;
-            match summary {
-                Ok(Ok(text)) if !text.is_empty() => {
-                    let _ = this.with_store(|st| st.kv_set(SUMMARY_NS, &key, &json!(text)));
-                    this.broadcast(Event::ApprovalSummary {
-                        approval_id,
-                        tool_id: info.id,
-                        version: ver.version,
-                        summary: text,
-                    });
-                }
-                Ok(Err(e)) => tracing::warn!("approval summary for {}: {e:#}", info.name),
-                _ => {}
+        let pipeline = match self.pipeline_policy(run_id) {
+            Ok(policy) => policy,
+            Err(error) => {
+                tracing::warn!("approval summary refused unavailable pipeline policy: {error:#}");
+                return;
             }
-        });
+        };
+        let (this, cfg, session_id) = (self.clone(), cfg.clone(), session_id.to_string());
+        let run_id = run_id.to_string();
+        let routing_task = crate::routing_task_observation::current();
+        let (approval_id, info, ver) = (approval_id.to_string(), info.clone(), ver.clone());
+        tokio::spawn(crate::routing_task_observation::scope(
+            routing_task,
+            async move {
+                let summary = tokio::time::timeout(
+                    std::time::Duration::from_secs(45),
+                    this.write_tool_summary(&cfg, &session_id, &run_id, pipeline, &info, &ver),
+                )
+                .await;
+                match summary {
+                    Ok(Ok(text)) if !text.is_empty() => {
+                        let _ = this.with_store(|st| st.kv_set(SUMMARY_NS, &key, &json!(text)));
+                        this.broadcast(Event::ApprovalSummary {
+                            approval_id,
+                            tool_id: info.id,
+                            version: ver.version,
+                            summary: text,
+                        });
+                    }
+                    Ok(Err(e)) => tracing::warn!("approval summary for {}: {e:#}", info.name),
+                    _ => {}
+                }
+            },
+        ));
     }
 
     /// Ask the model what a Tool does, for someone who can't read code.
@@ -4713,6 +4793,8 @@ impl Daemon {
         self: &Arc<Self>,
         cfg: &Config,
         session_id: &str,
+        run_id: &str,
+        pipeline: Option<Arc<crate::pipeline_policy::RunPolicy>>,
         info: &ToolInfo,
         ver: &ToolVersionInfo,
     ) -> Result<String> {
@@ -4732,8 +4814,8 @@ impl Daemon {
         ];
         let (text, _) = counted(
             "approval-summary",
-            "",
-            "",
+            pipeline.as_ref().map_or("", |_| session_id),
+            pipeline.as_ref().map_or("", |_| run_id),
             target.provider.complete_with_usage(&messages, &model, None),
         )
         .await?;
@@ -5036,6 +5118,7 @@ impl Daemon {
         let sources = Arc::new(provider.freeze_attachments(&ctx, &forecast.basis.model, true));
         let checkpoint = crate::forecast::hash(&st.latest_checkpoint_record(session_id)?);
         Ok(Arc::new(RunAdmission {
+            pipeline: None,
             cfg: fixed,
             requested,
             resolved_model: forecast.basis.model.clone(),
@@ -5190,6 +5273,7 @@ impl Daemon {
                     && c.input.edit_message_id == input.edit_message_id
                     && c.input.resume == input.resume
                     && c.input.retry == input.retry
+                    && c.input.options == input.options
             })
             .map(|(id, c)| (id.clone(), c.selected.clone(), c.fingerprint.clone(), c.at))
             .collect();
@@ -5387,13 +5471,25 @@ impl Daemon {
                     final_status = "paused";
                     self.record_run_status(&session_id, &run_id, "paused");
                     let _ = self.with_store(|st| st.set_run_error(&run_id, &e.to_string()));
-                    let explained = self.config().ok().map(|cfg| {
+                    let mut explained = self.config().ok().map(|cfg| {
                         let (model, _) = self.session_model_effort(&session_id, &cfg);
                         crate::errors::explain(
                             &format!("{e:#}"),
                             &crate::errors::ErrorContext::from_config(&cfg, &model),
                         )
                     });
+                    if (e.to_string().starts_with("budget:")
+                        || e.to_string().starts_with("schema:"))
+                        && self
+                            .run_admissions
+                            .locked()
+                            .get(&run_id)
+                            .is_some_and(|admission| admission.pipeline.is_some())
+                    {
+                        if let Some(explained) = &mut explained {
+                            explained.action=Some("Submit a new pipeline Run with its desired options; Resume cannot recover Run-only instructions.".into());
+                        }
+                    }
                     self.broadcast(Event::RunPaused {
                         session_id: session_id.clone(),
                         run_id: run_id.clone(),
@@ -5424,14 +5520,22 @@ impl Daemon {
     /// free the Session, report what changed, resolve comparisons and jobs,
     /// run `run_end` hooks, and start the next queued message.
     async fn finish_run(self: &Arc<Self>, session_id: String, run_id: String, final_status: &str) {
-        self.run_admissions.locked().remove(&run_id);
+        let _policy_owner = self.run_admissions.locked().remove(&run_id);
         use futures_util::FutureExt;
         // run_panicked reaches this outside run_loop's unwind boundary too.
         // Whatever a tail step does, the queue drain remains reachable.
-        if let Err(p) =
-            std::panic::AssertUnwindSafe(self.finish_run_tail(&session_id, &run_id, final_status))
-                .catch_unwind()
-                .await
+        if let Err(p) = std::panic::AssertUnwindSafe(
+            self.finish_run_tail(
+                &session_id,
+                &run_id,
+                final_status,
+                _policy_owner
+                    .as_ref()
+                    .and_then(|admission| admission.pipeline.clone()),
+            ),
+        )
+        .catch_unwind()
+        .await
         {
             self.finish_tail_failed(&session_id, "Run finish", &p);
         }
@@ -5453,7 +5557,13 @@ impl Daemon {
         }
     }
 
-    async fn finish_run_tail(self: &Arc<Self>, session_id: &str, run_id: &str, final_status: &str) {
+    async fn finish_run_tail(
+        self: &Arc<Self>,
+        session_id: &str,
+        run_id: &str,
+        final_status: &str,
+        pipeline: Option<Arc<crate::pipeline_policy::RunPolicy>>,
+    ) {
         let session_id = session_id.to_string();
         let run_id = run_id.to_string();
         if final_status != "paused" {
@@ -5517,7 +5627,7 @@ impl Daemon {
             status: final_status.to_string(),
         });
         self.maybe_name_session(&session_id);
-        self.maybe_auto_skill(&session_id, &run_id, final_status);
+        self.maybe_auto_skill(&session_id, &run_id, final_status, pipeline);
         self.record_primary_task(&session_id, &run_id, final_status);
         // run_end hooks (SPEC §9.8): automation, results only logged.
         if let Ok(cfg) = self.config() {
@@ -5699,7 +5809,13 @@ impl Daemon {
     /// After a Run: retire unused or unhelpful auto skills, and distil a
     /// new one from a successful, non-trivial Run (SPEC §7.10). In the
     /// background; at most one distillation at a time, skipped when busy.
-    fn maybe_auto_skill(self: &Arc<Self>, session_id: &str, run_id: &str, status: &str) {
+    fn maybe_auto_skill(
+        self: &Arc<Self>,
+        session_id: &str,
+        run_id: &str,
+        status: &str,
+        pipeline: Option<Arc<crate::pipeline_policy::RunPolicy>>,
+    ) {
         let Ok(cfg) = self.config() else {
             return;
         };
@@ -5756,30 +5872,41 @@ impl Daemon {
         };
         let this = self.clone();
         let run_id = run_id.to_string();
-        tokio::spawn(async move {
-            let _permit = permit;
-            if let Err(e) = this
-                .distil_skill(
-                    &cfg,
-                    &run_id,
-                    &task,
-                    &calls,
-                    &outcome,
-                    &existing,
-                    session_model,
-                )
-                .await
-            {
-                tracing::warn!("auto skill from run {run_id}: {e:#}");
-            }
-        });
+        let session_id = session_id.to_string();
+        // Existing task ownership records maintenance resources only; it does
+        // not create a responsible model/role observation or extend its clock.
+        let routing_task = crate::routing_task_observation::current();
+        tokio::spawn(crate::routing_task_observation::scope(
+            routing_task,
+            async move {
+                let _permit = permit;
+                if let Err(e) = this
+                    .distil_skill(
+                        &cfg,
+                        &session_id,
+                        &run_id,
+                        pipeline,
+                        &task,
+                        &calls,
+                        &outcome,
+                        &existing,
+                        session_model,
+                    )
+                    .await
+                {
+                    tracing::warn!("auto skill from run {run_id}: {e:#}");
+                }
+            },
+        ));
     }
 
     #[allow(clippy::too_many_arguments)]
     async fn distil_skill(
         self: &Arc<Self>,
         cfg: &Config,
+        session_id: &str,
         run_id: &str,
+        pipeline: Option<Arc<crate::pipeline_policy::RunPolicy>>,
         task: &str,
         calls: &[(String, String, String)],
         outcome: &str,
@@ -5795,10 +5922,15 @@ impl Daemon {
         let model = self.resolve_model(&requested, cfg, false)?;
         let input = crate::skills::distil_input(task, calls, outcome, existing);
         let distiller = self.provider(cfg).await?.resolved_dispatch(&model);
+        // A pipeline's automatic background work retains the originating
+        // policy until the physical request and accounting finish. Ordinary
+        // profile maintenance keeps its existing internal attribution.
+        let usage_session = pipeline.as_ref().map_or("", |_| session_id);
+        let usage_run = pipeline.as_ref().map_or("", |_| run_id);
         let reply = counted(
             "skill-distil",
-            "",
-            "",
+            usage_session,
+            usage_run,
             distiller.complete(
                 &[
                     json!({"role": "system", "content": crate::skills::DISTIL_PROMPT}),
@@ -5884,6 +6016,16 @@ impl Daemon {
             None => self.config()?,
         };
         let mut first = admitted.as_ref().and_then(|a| a.first.locked().take());
+        let pipeline = admitted.as_ref().and_then(|a| a.pipeline.clone());
+        if pipeline
+            .as_ref()
+            .is_some_and(|p| p.options.options().max_usd == Some(0.0))
+        {
+            return Err(RequestFailure::budget(
+                "budget: explicit --max-usd 0 authorizes no model dispatch",
+            )
+            .into());
+        }
         if !cfg.provider.is_configured() {
             return Err(anyhow!(
                 "provider not configured; run the onboarding wizard"
@@ -5962,14 +6104,19 @@ impl Daemon {
         };
         let requested_model = target.model.clone();
         let route_context = if let Some((ctx, _, _, _)) = &first {
-            ctx.clone()
+            let mut ctx = ctx.clone();
+            if let Some(policy) = &pipeline {
+                policy.options.project_context(&mut ctx)?;
+            }
+            ctx
         } else {
-            self.session_context(
+            self.session_context_with_policy(
                 session_id,
                 &provider,
                 &requested_model,
                 provider.settings().context_for(&requested_model),
                 cfg.compaction.fraction(),
+                pipeline.as_ref().map(|p| &p.options),
             )?
             .0
         };
@@ -6021,9 +6168,11 @@ impl Daemon {
             &provider,
             &cfg,
             session_id,
+            run_id,
             &model,
             context_tokens,
             window_source,
+            pipeline.as_ref().map(|p| &p.options),
         )
         .await?;
 
@@ -6055,16 +6204,20 @@ impl Daemon {
             self.check_budget(session_id, run_id, &cfg)?;
             // Push delivery of completed Pending Invocations (§6.3).
             self.deliver_completed_pending(session_id);
-            let (ctx, defs, sources) = if let Some((ctx, defs, _, sources)) = first.take() {
+            let (ctx, defs, sources) = if let Some((mut ctx, defs, _, sources)) = first.take() {
+                if let Some(policy) = &pipeline {
+                    policy.options.project_context(&mut ctx)?;
+                }
                 (ctx, defs, Some(sources))
             } else {
                 let ctx = self
-                    .session_context(
+                    .session_context_with_policy(
                         session_id,
                         &provider,
                         &model,
                         context_tokens,
                         cfg.compaction.fraction(),
+                        pipeline.as_ref().map(|p| &p.options),
                     )?
                     .0;
                 let defs = self.with_store(|st| {
@@ -6096,6 +6249,7 @@ impl Daemon {
                 let (last_byte2, got_bytes2) = (last_byte.clone(), got_bytes.clone());
                 last_byte.store(epoch_ms(), Ordering::SeqCst);
                 got_bytes.store(false, Ordering::SeqCst);
+                let hide_candidate = pipeline.as_ref().is_some_and(|p| p.options.has_schema());
                 let chat_fut = counted(
                     "run",
                     session_id,
@@ -6109,6 +6263,9 @@ impl Daemon {
                         move |kind, delta| {
                             last_byte2.store(epoch_ms(), Ordering::SeqCst);
                             got_bytes2.store(true, Ordering::SeqCst);
+                            if hide_candidate {
+                                return;
+                            }
                             let ev = match kind {
                                 DeltaKind::Bytes => return,
                                 DeltaKind::Content => Event::MessageDelta {
@@ -6184,12 +6341,56 @@ impl Daemon {
                     }
                 }
             }}).await;
-            Self::finish_chat_observation(
-                &routing_call,
-                &provider,
-                &outcome,
-                cancel.is_cancelled(),
-            );
+            // A complete schema candidate is not a routing success until its
+            // compiled output contract passes. Do this before sealing the Call.
+            if let (Some(policy), Ok(answer)) = (pipeline.as_ref(), &outcome) {
+                if policy.options.has_schema()
+                    && answer.tool_calls.is_empty()
+                    && !answer.truncated
+                    && !cancel.is_cancelled()
+                    && !matches!(
+                        answer.stop_reason.as_deref(),
+                        Some(
+                            "model_context_window_exceeded"
+                                | "max_tokens"
+                                | "length"
+                                | "content_filter"
+                                | "refusal"
+                                | "pause_turn"
+                        )
+                    )
+                    && policy
+                        .options
+                        .validate_final(&answer.content)
+                        .is_err_and(|error| {
+                            matches!(
+                                error.downcast_ref::<crate::provider::StructuredOutputError>(),
+                                Some(
+                                    crate::provider::StructuredOutputError::InvalidJson
+                                        | crate::provider::StructuredOutputError::SchemaViolation
+                                )
+                            )
+                        })
+                {
+                    routing_call.claim_contract(crate::routing_observation::Identity::new(
+                        provider.name(),
+                        provider.settings(),
+                        &answer.model_used,
+                    ));
+                }
+            }
+            if let Some(identity) = routing_call.contract_identity() {
+                routing_call.finish(crate::routing_observation::Outcome::ContractFailure(
+                    identity,
+                ));
+            } else {
+                Self::finish_chat_observation(
+                    &routing_call,
+                    &provider,
+                    &outcome,
+                    cancel.is_cancelled(),
+                );
+            }
             // Keep the legacy request-health counters independently of the
             // correlated routing-quality receipt. HTTP availability faults are
             // neutral for routing, but remain real failures in Metrics. Local
@@ -6206,7 +6407,7 @@ impl Daemon {
             drop(routing_call);
             self.flush_routing()?;
 
-            let result = match outcome {
+            let mut result = match outcome {
                 Ok(r) => {
                     let _ = self.with_store(|st| st.bump_run_steps(run_id));
                     if let Ok(mut usage) = self.usage_info(None, Some(run_id), &cfg) {
@@ -6224,6 +6425,23 @@ impl Daemon {
                     return Err(e);
                 }
             };
+            if pipeline.as_ref().is_some_and(|p| p.options.has_schema())
+                && result.tool_calls.is_empty()
+                && (result.truncated
+                    || matches!(
+                        result.stop_reason.as_deref(),
+                        Some(
+                            "refusal"
+                                | "content_filter"
+                                | "pause_turn"
+                                | "model_context_window_exceeded"
+                        )
+                    ))
+            {
+                return Err(anyhow!(
+                    "schema: final answer was refused or incomplete; no repair was attempted"
+                ));
+            }
             if result.dropped_reasoning_effort {
                 self.broadcast(Event::Note {
                     session_id: Some(session_id.to_string()),
@@ -6255,10 +6473,11 @@ impl Daemon {
                             .into(),
                     });
                     match self
-                        .compact(
+                        .compact_for_run(
                             &provider,
                             &cfg,
                             session_id,
+                            run_id,
                             &model,
                             context_tokens,
                             up_to,
@@ -6322,6 +6541,7 @@ impl Daemon {
             // The resume limit is per paused turn, not per Run.
             paused_turns = 0;
             if result.tool_calls.is_empty()
+                && !pipeline.as_ref().is_some_and(|p| p.options.has_schema())
                 && cfg.provider.tool_use_nudge
                 && !used_tools
                 && !nudged_refusal
@@ -6365,6 +6585,21 @@ impl Daemon {
                             self.abandon_pending(handle, &entry);
                         }
                     }
+                }
+                if let Some(policy) = pipeline.as_ref().filter(|p| p.options.has_schema()) {
+                    self.validate_pipeline_answer(
+                        policy,
+                        &call_provider,
+                        &ctx,
+                        &model,
+                        effort.as_deref(),
+                        &mut result,
+                        session_id,
+                        run_id,
+                        &cfg,
+                        cancel,
+                    )
+                    .await?;
                 }
                 // Which model answered, when not the one asked for: a
                 // fallback, or auto routing's pick (SPEC §4.5).
@@ -7767,6 +8002,7 @@ impl Daemon {
         }
         let cancel_flag = Arc::new(AtomicBool::new(false));
         let ops = Arc::new(NestedOps {
+            _pipeline: self.pipeline_policies.locked().lookup(&run_id),
             routing_task: crate::routing_task_observation::current(),
             read_identity: Some((info.clone(), ver.clone())),
             read_input: input.clone(),
@@ -7956,6 +8192,10 @@ impl Daemon {
 
     fn complete_pending(&self, handle: &str, entry: &PendingEntry, ok: bool, text: String) {
         *entry.result.locked() = Some((ok, text));
+        // All physical work and its accounting have finished. Awaiting delivery
+        // keeps the result, but need not retain private Run-only instructions.
+        entry._pipeline.locked().take();
+        self.pipeline_policies.locked().prune();
         entry.notify.notify_waiters();
         self.broadcast(Event::InvocationCompleted {
             session_id: entry.session_id.clone(),
@@ -8037,6 +8277,7 @@ impl Daemon {
     ) -> String {
         let handle = uuid::Uuid::new_v4().to_string();
         let entry = Arc::new(PendingEntry {
+            _pipeline: StdMutex::new(self.pipeline_policies.locked().lookup(run_id)),
             routing_task: crate::routing_task_observation::current(),
             taint_scope: self.taint_scope(session_id, run_id),
             tool_name: name.to_string(),
@@ -9947,6 +10188,21 @@ impl Daemon {
     /// …"). A known spending floor still applies when the full total is unknown.
     fn check_budget(&self, session_id: &str, run_id: &str, cfg: &Config) -> Result<()> {
         let mut l = cfg.limits.clone();
+        let pipeline = self.pipeline_policy(run_id)?;
+        let explicit = pipeline.as_ref().and_then(|p| p.options.options().max_usd);
+        let live_cfg = explicit.map(|_| Config::load(&self.paths)).transpose()?;
+        let budget_cfg = live_cfg.as_ref().unwrap_or(cfg);
+        if let Some(max) = explicit {
+            let fresh = budget_cfg;
+            l.run_usd = Some(max);
+            l.daily_usd = fresh.limits.daily_usd;
+            if max == 0.0 {
+                return Err(RequestFailure::budget(
+                    "budget: explicit --max-usd 0 authorizes no model dispatch",
+                )
+                .into());
+            }
+        }
         // `/limit N` for this Run replaces `limits.run_steps`.
         let per_run = self.step_limits.locked().get(session_id).copied();
         if let Some(n) = per_run {
@@ -9955,7 +10211,7 @@ impl Daemon {
         if l.daily_usd.is_none() && l.run_usd.is_none() && l.run_steps.is_none() {
             return Ok(());
         }
-        if self.budget_waived.locked().contains(session_id) {
+        if explicit.is_none() && self.budget_waived.locked().contains(session_id) {
             return Ok(());
         }
         let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
@@ -9978,7 +10234,8 @@ impl Daemon {
             let spend: crate::budget::Spend = rows
                 .iter()
                 .map(|(provider, model, p, c, cached, cw, reported, unknown)| {
-                    cfg.cost_of_known(provider, model, *p, *c, *cached, *cw, *reported, *unknown)
+                    budget_cfg
+                        .cost_of_known(provider, model, *p, *c, *cached, *cw, *reported, *unknown)
                 })
                 .collect();
             let cost = spend.known;
@@ -9996,7 +10253,7 @@ impl Daemon {
                 .iter()
                 .map(
                     |(_, provider, model, p, c, cached, cw, reported, unknown)| {
-                        cfg.cost_of_known(
+                        budget_cfg.cost_of_known(
                             provider, model, *p, *c, *cached, *cw, *reported, *unknown,
                         )
                     },
@@ -11690,6 +11947,7 @@ impl Daemon {
         }
         let script_id = uuid::Uuid::new_v4().to_string();
         let ops = Arc::new(NestedOps {
+            _pipeline: self.pipeline_policies.locked().lookup(&run_id),
             routing_task: crate::routing_task_observation::current(),
             read_identity: None,
             read_input: Value::Null,
@@ -11930,6 +12188,7 @@ impl Daemon {
             );
         }
         let ops = Arc::new(NestedOps {
+            _pipeline: self.pipeline_policies.locked().lookup(&run_id),
             routing_task: crate::routing_task_observation::current(),
             read_identity: Some((info.clone(), ver.clone())),
             read_input: input.clone(),
@@ -12299,7 +12558,7 @@ impl Daemon {
             path_options,
         });
         if cfg.tools.approval_summaries && caps.mcp.is_empty() {
-            self.send_approval_summary(cfg, session_id, &approval_id, info, ver);
+            self.send_approval_summary(cfg, session_id, run_id, &approval_id, info, ver);
         }
         let (approved, scope) = tokio::select! {
             _ = cancel.cancelled() => (false, ApprovalScope::Once),
@@ -13153,6 +13412,7 @@ impl Daemon {
                 return outcome.map(|v| (v, inv_id));
             }
             let ops = Arc::new(NestedOps {
+                _pipeline: self.pipeline_policies.locked().lookup(&run_id),
                 routing_task: crate::routing_task_observation::current(),
                 read_identity: Some((info.clone(), ver.clone())),
                 read_input: input.clone(),
@@ -13300,6 +13560,25 @@ impl Daemon {
         context_tokens: u32,
         trigger_fraction: f64,
     ) -> Result<crate::storage::BuiltContext> {
+        self.session_context_with_policy(
+            session_id,
+            provider,
+            model,
+            context_tokens,
+            trigger_fraction,
+            None,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn session_context_with_policy(
+        &self,
+        session_id: &str,
+        provider: &Provider,
+        model: &str,
+        context_tokens: u32,
+        trigger_fraction: f64,
+        policy: Option<&crate::pipeline::CompiledRunOptions>,
+    ) -> Result<crate::storage::BuiltContext> {
         let prompt = self.session_prompt(session_id)?;
         let inline_limit = self.config()?.tools.inline_limit;
         let mut cache = self
@@ -13309,7 +13588,11 @@ impl Daemon {
             .remove(session_id)
             .unwrap_or_default();
         let built = self.with_store(|st| {
-            let built = cache.build(st, session_id, &prompt, context_tokens, trigger_fraction)?;
+            let mut built =
+                cache.build(st, session_id, &prompt, context_tokens, trigger_fraction)?;
+            if let Some(policy) = policy {
+                policy.project_context(&mut built.0)?;
+            }
             let defs = toolreg::tool_definitions(st, Some(session_id), inline_limit)?;
             let key = crate::tokens::provider_key(provider.name(), provider.settings());
             let estimated = crate::tokens::calibrated(
@@ -13327,21 +13610,25 @@ impl Daemon {
         built
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn maybe_compact(
         &self,
         provider: &Provider,
         cfg: &Config,
         session_id: &str,
+        run_id: &str,
         model: &str,
         context_tokens: u32,
         window_source: &str,
+        policy: Option<&crate::pipeline::CompiledRunOptions>,
     ) -> Result<()> {
-        let (_ctx, needs, compact_up_to) = self.session_context(
+        let (_ctx, needs, compact_up_to) = self.session_context_with_policy(
             session_id,
             &provider,
             &model,
             context_tokens,
             cfg.compaction.fraction(),
+            policy,
         )?;
         if !needs {
             return Ok(());
@@ -13354,10 +13641,11 @@ impl Daemon {
                 &format!("{session_id}: {model} {context_tokens} tokens ({window_source})"),
             )
         });
-        self.compact(
+        self.compact_for_run(
             provider,
             cfg,
             session_id,
+            run_id,
             model,
             context_tokens,
             compact_up_to,
@@ -13380,6 +13668,33 @@ impl Daemon {
         compact_up_to: i64,
         focus: Option<&str>,
     ) -> Result<()> {
+        self.compact_for_run(
+            provider,
+            cfg,
+            session_id,
+            "",
+            model,
+            context_tokens,
+            compact_up_to,
+            focus,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn compact_for_run(
+        &self,
+        provider: &Provider,
+        cfg: &Config,
+        session_id: &str,
+        run_id: &str,
+        model: &str,
+        context_tokens: u32,
+        compact_up_to: i64,
+        focus: Option<&str>,
+    ) -> Result<()> {
+        let pipeline = self.pipeline_policy(run_id)?;
+        let usage_run = pipeline.as_ref().map_or("", |_| run_id);
         self.with_reader(|st| Self::ensure_session_description_trust(st, session_id))?;
         let text = self.with_store(|st| {
             let (_s, prev_up_to) = st.latest_checkpoint(session_id)?.unwrap_or_default();
@@ -13422,7 +13737,7 @@ impl Daemon {
             match counted(
                 "compaction",
                 session_id,
-                "",
+                usage_run,
                 provider.compact_server(&input, &cmodel),
             )
             .await
@@ -13439,14 +13754,23 @@ impl Daemon {
                         &cmodel,
                         context_tokens,
                         session_id,
+                        usage_run,
                         ratio,
                     )
                     .await?
                 }
             }
         } else {
-            summarize_in_chunks(provider, &input, &cmodel, context_tokens, session_id, ratio)
-                .await?
+            summarize_in_chunks(
+                provider,
+                &input,
+                &cmodel,
+                context_tokens,
+                session_id,
+                usage_run,
+                ratio,
+            )
+            .await?
         };
         let summary = if previous.is_empty() || condense {
             summary
@@ -13604,7 +13928,8 @@ impl Daemon {
                         break;
                     }
                     let session = match &env.request {
-                        Request::SendMessage { session_id, .. } => Some(session_id.as_str()),
+                        Request::SendMessage { session_id, .. }
+                        | Request::StartPipelineRun { session_id, .. } => Some(session_id.as_str()),
                         _ => None,
                     };
                     let cut = crate::relay_buffers::interruption_cut(
@@ -13613,7 +13938,10 @@ impl Daemon {
                         arrived,
                         bounded_metadata,
                     );
-                    if matches!(&env.request, Request::SendMessage { .. }) {
+                    if matches!(
+                        &env.request,
+                        Request::SendMessage { .. } | Request::StartPipelineRun { .. }
+                    ) {
                         if cut.is_some_and(|at| at > arrived) {
                             let resp = ServerMessage::err(
                                 env.id,
@@ -15031,6 +15359,7 @@ fn mcp_state(s: &McpServerInfo) -> &'static str {
 /// blocking QuickJS thread (nested calls on threads of their own) and
 /// block_on the daemon executor.
 struct NestedOps {
+    _pipeline: Option<Arc<crate::pipeline_policy::RunPolicy>>,
     routing_task: Option<Arc<crate::routing_task_observation::Task>>,
     _taint_scope: Arc<crate::approval_preview::RunTaint>,
     read_identity: Option<(ToolInfo, ToolVersionInfo)>,
@@ -15115,15 +15444,18 @@ impl HostOps for NestedOps {
         // attention and decision metadata before returning. Wrapping it in
         // block_cancellable's outer select could drop that future at its
         // await point and let the Invocation finish before cleanup ran.
-        let allowed = self.handle.block_on(self.daemon.ensure_approval(
-            &cfg,
-            &self.session_id,
-            &self.run_id,
-            info,
-            ver,
-            &caps,
-            Some(&input),
-            &self.cancel,
+        let allowed = self.handle.block_on(crate::routing_task_observation::scope(
+            self.routing_task.clone(),
+            self.daemon.ensure_approval(
+                &cfg,
+                &self.session_id,
+                &self.run_id,
+                info,
+                ver,
+                &caps,
+                Some(&input),
+                &self.cancel,
+            ),
         ));
         if allowed {
             Ok(())
@@ -17174,6 +17506,7 @@ async fn summarize_in_chunks(
     model: &str,
     context_tokens: u32,
     session_id: &str,
+    run_id: &str,
     ratio: f64,
 ) -> Result<String> {
     let budget = (context_tokens as usize / 2).max(1000);
@@ -17182,7 +17515,7 @@ async fn summarize_in_chunks(
         return counted(
             "compaction",
             session_id,
-            "",
+            run_id,
             provider.summarize(input, model),
         )
         .await;
@@ -17215,7 +17548,7 @@ async fn summarize_in_chunks(
             counted(
                 "compaction",
                 session_id,
-                "",
+                run_id,
                 provider.summarize(&framed, model),
             )
             .await?,
@@ -17232,7 +17565,7 @@ async fn summarize_in_chunks(
     counted(
         "compaction",
         session_id,
-        "",
+        run_id,
         provider.summarize(&merged, model),
     )
     .await
