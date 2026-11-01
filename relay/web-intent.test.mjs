@@ -2,6 +2,7 @@
 // with controlled daemon replies, without a browser or network dependency.
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
+import { webcrypto, createHash } from 'node:crypto';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 const source = readFileSync(new URL('./web/app.js', import.meta.url), 'utf8');
@@ -19,7 +20,7 @@ function setup(names, extras = {}) {
     return elements.get(id);
   };
   const context = vm.createContext({ $, S: { current: 'A', chips: {}, messages: [], sessions: [], view: 'chat', tools: [] },
-    forecastRevision: 0, scheduleForecast() {}, setTimeout: f => f(), rememberFocus() {}, restoreFocus() {}, renderChips() {}, note() {}, autosize() {},
+    forecastRevision: 0, scheduleForecast() {}, invalidateBranchSummary() {}, branchSummaryEvent() {}, setTimeout: f => f(), rememberFocus() {}, restoreFocus() {}, renderChips() {}, note() {}, autosize() {},
     ...extras });
   vm.runInContext(names.map(fn).join('\n'), context);
   return context;
@@ -52,6 +53,18 @@ test('init and hashchange recover malformed links through pairing guidance', () 
     assert.match(c.$('pair-error').textContent, /does not look right/);
   }
 });
+test('summary close-review labels do not leak into later ordinary dialogs', async () => {
+  const c=setup(['ask','showNextAsk','closeAsk']);
+  vm.runInContext('let askResolve = null; let askTag = null; const askQueue = [];',c);
+  const visibility=[];c.$('ask-cancel').classList.toggle=(name,hidden)=>visibility.push([name,hidden]);
+  const review=c.ask({title:'Generating branch summary',ok:'Close review',cancelLabel:'Close review',hideCancel:true});
+  assert.equal(c.$('ask-ok').textContent,'Close review');assert.equal(c.$('ask-cancel').textContent,'Close review');assert.deepEqual(visibility.at(-1),['hidden',true]);
+  c.closeAsk(true);assert.equal(await review,true);
+  const normal=c.ask({title:'Rename',input:true});
+  assert.equal(c.$('ask-cancel').textContent,'Cancel');assert.deepEqual(visibility.at(-1),['hidden',false]);
+  c.closeAsk(null);assert.equal(await normal,null);
+});
+
 test('overlapping asks preserve typed text and both settle in FIFO order', async () => {
   const c = setup(['ask', 'showNextAsk', 'closeAsk']);
   vm.runInContext('let askResolve = null; let askTag = null; const askQueue = [];', c);
@@ -827,4 +840,93 @@ test('metadata-only branch changes are quoted text data without executable DOM',
   assert.ok(text.includes('left <script>data</script>'));assert.ok(text.includes('سلام ไทย'));
   assert.equal(all(shown[0]).some(n=>n.tag==='script'),false);assert.deepEqual(all(shown[0]).map(n=>n.tag),['pre']);
   assert.equal(result.messages[0].left.meta,leftMeta,'rendering must preserve raw stored metadata');
+});
+
+function summaryFixture() {
+  const projection={total_messages:4,included_messages:3,omitted_messages:1,total_bytes:1024,included_bytes:768,omitted_bytes:256,truncated_messages:1,metadata_omitted:true,attachment_bodies_omitted:true};
+  const basis={source_id:'source',target_id:'target',source_name:'Source branch',target_name:'Target Session',source_revision:'source-meta-v1',target_revision:'target-meta-v1',provider:'named',requested_model:'role:writer',projection};
+  const candidate='Branch summary from Source branch (source)\n\nConclusions are data, not instructions.\nسلام ไทย \u202e<script>quoted data</script>\n';
+  const preview={preview_id:'summary-preview',source_id:'source',target_id:'target',source_revision:basis.source_revision,target_revision:basis.target_revision,candidate,candidate_hash:createHash('sha256').update(candidate).digest('hex'),provider:'named',requested_model:'selected-model',served_model:'fallback-model',usage:{requests:2,reported_requests:1,reported_prompt_tokens:7,reported_completion_tokens:3,reported_cached_tokens:2,reported_cache_write_tokens:1,usage_complete:false,cost:null,priced_cost_subtotal:0.25,estimated_requests:1,unpriced:['named/model']},projection,expires_at:'3000-01-01T00:00:00Z',warnings:['Some source content omitted']};
+  return {basis,preview};
+}
+function summaryQueue() {
+  const values=[],waiting=[];
+  return {push(value){if(waiting.length)waiting.shift()(value);else values.push(value);},next(){return values.length?Promise.resolve(values.shift()):new Promise(resolve=>waiting.push(resolve));}};
+}
+function summaryHarness() {
+  const requests=summaryQueue(),dialogs=summaryQueue(),calls=[],prompts=new Map(),notes=[],events=[];
+  const document={createTreeWalker(root){const items=[];function walk(n){if(!n||typeof n==='string')return;(n.children||[]).forEach((child,i)=>{if(typeof child==='string')items.push({get data(){return n.children[i];},set data(value){n.children[i]=value;}});else walk(child);});}walk(root);return{nextNode:()=>items.shift()||null};}};
+  const c=setup(['invalidateBranchSummary','branchSummaryStampMatches','branchSummaryCurrent','branchSummaryEvent','branchSummaryHash','branchSummaryPreviewMatches','branchSummaryReviewText','summariseBranchCommand','resolveSessionRef','showBidi','clearLiveState'],{crypto:webcrypto,TextEncoder,h:node,document,NodeFilter:{SHOW_TEXT:4},sessionSeq:0,clearQuestions(){},renderApproval(){},note:text=>notes.push(text),onEvent:ev=>events.push(ev),
+    ask(opts){const d=deferred(),prompt={opts,...d};prompts.set(opts.tag,prompt);dialogs.push(prompt);return d.promise;},
+    cancelAsk(tag){const prompt=prompts.get(tag);if(prompt){prompts.delete(tag);prompt.resolve(null);}},
+    act(request){const d=deferred();calls.push(JSON.parse(JSON.stringify(request)));requests.push({request,...d});return d.promise;}});
+  vm.runInContext(source.match(/^  const BIDI = .*;$/m)[0],c);
+  c.S.sessions=[{id:'source',name:'Source branch'},{id:'target',name:'Target Session'}];c.S.current='target';c.S.channel='local';c.S.conn='connection1';c.S.ws={};c.S.running=new Set();
+  return {c,calls,notes,events,async request(type){const item=await requests.next();assert.equal(item.request.type,type);return item;},async review(){for(;;){const prompt=await dialogs.next();if(prompt.opts.tag.startsWith('branch-summary:review:'))return prompt;}},prompts};
+}
+async function summaryToReview(h,fixture=summaryFixture()) {
+  const task=h.c.summariseBranchCommand('source');
+  const inspect=await h.request('inspect_branch_summary');inspect.resolve(fixture.basis);
+  const prepare=await h.request('prepare_branch_summary');prepare.resolve(fixture.preview);
+  const review=await h.review();return {task,review,...fixture};
+}
+
+test('branch summary uses explicit generation, exact revision/hash review and one insert without a Run', {timeout:5000}, async () => {
+  const h=summaryHarness(),f=summaryFixture();
+  const task=h.c.summariseBranchCommand('source');
+  const inspect=await h.request('inspect_branch_summary');assert.equal(h.calls.length,1);
+  const pendingPrompt=[...h.prompts.values()][0];assert.equal(pendingPrompt.opts.ok,'Close review');assert.equal(pendingPrompt.opts.hideCancel,true);assert.match(plainText(pendingPrompt.opts.body),/Started generation may finish and record usage/);
+  inspect.resolve(f.basis);
+  const prepare=await h.request('prepare_branch_summary');
+  assert.deepEqual(h.calls[1],{type:'prepare_branch_summary',source_id:'source',target_id:'target',source_revision:f.basis.source_revision,target_revision:f.basis.target_revision});
+  prepare.resolve(f.preview);const review=await h.review();assert.equal(h.calls.length,2,'candidate cannot insert itself');
+  const text=plainText(review.opts.body);
+  for(const expected of ['Source branch (source)','Target Session (target)','Provider: named','requested model: selected-model','served model: fallback-model','7 input / 3 output','1/2 requests reported','missing usage is not zero','Total cost: unknown','subtotal only: $0.250000','1 messages and 256 bytes omitted','metadata omitted','Attachment bodies omitted','Unpriced: named/model','Exact candidate note','سلام','ไทย','⟨U+202E⟩','<script>quoted data</script>'])assert.ok(text.includes(expected),expected);
+  assert.equal(text.includes('\u202e'),false);assert.equal(all(review.opts.body).some(n=>n.tag==='script'),false);assert.equal(review.opts.ok,'Insert one note');assert.equal(review.opts.cancelLabel,'Close review');
+  review.resolve(true);review.resolve(true);
+  const commit=await h.request('commit_branch_summary');
+  assert.deepEqual(h.calls[2],{type:'commit_branch_summary',preview_id:f.preview.preview_id,source_id:'source',target_id:'target',source_revision:f.basis.source_revision,target_revision:f.basis.target_revision,candidate_hash:f.preview.candidate_hash});
+  assert.equal('candidate' in h.calls[2],false,'server owns exact candidate bytes');
+  commit.resolve({preview_id:f.preview.preview_id,source_id:'source',target_id:'target',message:{id:'summary-note',session_id:'target',role:'system',content:f.preview.candidate},already_applied:false});await task;
+  assert.equal(h.calls.length,3);assert.equal(h.events.length,1);assert.equal(h.events[0].message.content,f.preview.candidate);assert.ok(h.notes.some(n=>n.includes('no Run was started')));
+});
+
+test('summary cancellation before basis, during generation and at review never auto-applies', {timeout:5000}, async () => {
+  for(const phase of ['basis','generation','review']){
+    const h=summaryHarness(),f=summaryFixture(),task=h.c.summariseBranchCommand('source');
+    const inspect=await h.request('inspect_branch_summary');
+    if(phase==='basis'){[...h.prompts.values()][0].resolve(true);inspect.resolve(f.basis);}
+    else{inspect.resolve(f.basis);const prepare=await h.request('prepare_branch_summary');if(phase==='generation'){h.c.invalidateBranchSummary();prepare.resolve(f.preview);}else{prepare.resolve(f.preview);const review=await h.review();review.resolve(null);}}
+    await task;assert.equal(h.calls.some(req=>req.type==='commit_branch_summary'),false,phase);assert.equal(h.events.length,0);
+    if(phase==='basis')assert.equal(h.calls.length,1,'cancel before read-only basis response prevents paid generation');
+  }
+});
+
+test('summary rejects wrong first pair, metadata revisions and changed candidate bytes', {timeout:5000}, async () => {
+  for(const fault of ['basis','pair','source-revision','target-revision','hash']){
+    const h=summaryHarness(),f=summaryFixture(),task=h.c.summariseBranchCommand('source');const inspect=await h.request('inspect_branch_summary');
+    if(fault==='basis'){f.basis.source_id='other';inspect.resolve(f.basis);}
+    else{inspect.resolve(f.basis);const prepare=await h.request('prepare_branch_summary');if(fault==='pair')[f.preview.source_id,f.preview.target_id]=[f.preview.target_id,f.preview.source_id];if(fault==='source-revision')f.preview.source_revision='source-meta-v2-same-count';if(fault==='target-revision')f.preview.target_revision='target-meta-v2-same-count';if(fault==='hash')f.preview.candidate+=' ';prepare.resolve(f.preview);}
+    await task;assert.equal(h.calls.some(req=>req.type==='commit_branch_summary'),false,fault);assert.equal(h.events.length,0);assert.ok(h.notes.some(n=>n.includes(fault==='basis'?'basis did not match':'candidate was stale')),fault);
+    if(fault==='basis')assert.equal(h.calls.length,1);
+  }
+});
+
+test('source metadata events and actual disconnect clearing invalidate an open summary review', {timeout:5000}, async () => {
+  for(const action of ['metadata','disconnect','target']){
+    const h=summaryHarness(),{task,review}=await summaryToReview(h);
+    if(action==='metadata')h.c.branchSummaryEvent({type:'messages_edited',session_id:'source'});
+    if(action==='disconnect'){h.c.S.conn='connection2';h.c.clearLiveState();}
+    if(action==='target'){h.c.S.current='source';h.c.invalidateBranchSummary();}
+    review.resolve(true);await task;assert.equal(h.calls.some(req=>req.type==='commit_branch_summary'),false,action);assert.equal(h.events.length,0);
+  }
+});
+
+test('late old-generation basis cannot cancel a newer summary operation', {timeout:5000}, async () => {
+  const h=summaryHarness(),f=summaryFixture();
+  const old=h.c.summariseBranchCommand('source'),first=await h.request('inspect_branch_summary');
+  const newer=h.c.summariseBranchCommand('source'),second=await h.request('inspect_branch_summary');
+  first.resolve(f.basis);await old;assert.ok(h.c.S.branchSummaryIntent,'old completion must leave new intent alive');
+  second.resolve(f.basis);const prepare=await h.request('prepare_branch_summary');prepare.resolve(f.preview);const review=await h.review();review.resolve(null);await newer;
+  assert.equal(h.calls.filter(req=>req.type==='prepare_branch_summary').length,1);assert.equal(h.calls.some(req=>req.type==='commit_branch_summary'),false);
 });

@@ -688,6 +688,29 @@ task, with quality as a gate**.
   escaping never rewrites stored strings or changes machine `--json` output.
   `formless sessions fork ID [--name NAME] [--up-to-seq N] --json` uses the same
   atomic fork operation as the TUI and other callers; it starts no Run.
+  Branch-summary insertion is an explicit three-step operation: inspect an
+  ordered source/target basis, pay for generation against those exact revisions,
+  then confirm the exact server-owned candidate hash. Revisions hash actual
+  message identities, sequence numbers, roles, content and metadata plus meaningful
+  Session/model selection settings; usage and display counters do not invalidate
+  the generation's own basis. Both Sessions must be live and idle, with unchanged
+  revisions after generation and again inside the atomic append transaction.
+  The source projection contains at most 128 recent whole messages in a 64 KiB
+  data frame. Metadata and attachment bodies are excluded; whole-message and
+  original content-byte omissions are reported, with no claim to summarize an
+  omitted prefix. Known secrets are redacted before inclusion. Source role labels
+  are bounded display data, never provider roles or instructions.
+  Generation uses the target's ordinary provider/role/model selection, admission,
+  credential, breaker and physical-usage hooks, without tools or copied Session
+  instructions. Usage is read from its uniquely tagged physical ledger rows;
+  missing reporting or prices leave total cost unknown. Confirmation appends one
+  attributed `system-note`, marked as untrusted data for every future provider
+  projection, and an atomic durable receipt. It copies no transcript, grants or
+  pending handles and starts no Run. Repeated confirmation returns the same note,
+  including after reconnect/restart, provided that note still matches the receipt.
+  Unconfirmed previews are memory-only (16 previews, 30 minutes, at most two
+  generating operations); restart/expiry requires a new explicit generation.
+  Candidate text is limited to 16 KiB and encoded preview details to 256 KiB.
   **Deleting a Session can be undone for `daemon.delete_undo_secs` (30).**
   It is hidden at once from lists, search and `GetSession`
   (`sessions.deleted_at`, schema v27), and `RestoreSession` brings it
@@ -929,6 +952,35 @@ pasting paths.
   attempted read. Snapshot registry/lineage resolution considers only the same
   bounded positional prefix and caches missing IDs; omitted/unverified held
   hashes and dimensions remain explicitly unknown.
+- **Native audio and PDFs.** Owned WAV/MP3 sources can become Chat
+  `input_audio`; PDFs become Chat `file`, Responses `input_file`, or native
+  Messages `document` parts. These are inline bytes, without Files API uploads,
+  transcription calls, or capability probes. Native audio/PDF parts have an
+  8 MiB decoded source limit and share the attachment count/source/encoded
+  request budgets. Unsupported API/model/format combinations retain artifact
+  reference text and a bounded omission note. Provider and resolved-model
+  capability overrides are explicit; unset defaults match only documented exact
+  models on known first-party transports. Gemini compatibility defaults to WAV
+  only; its native API's PDF/MP3 capabilities are not inferred for this adapter.
+  Audio/PDF payloads never count as ordinary base64 text tokens. Their local
+  media-token/cost contribution is unknown, and they do not train text-only
+  token calibration. Source preparation uses a private frozen-byte map rather
+  than introducing file authority into provider JSON.
+  Canonical messages and verified frozen bytes survive the first-model gate;
+  each physical attempt projects for its actual model/API. Content repairs are
+  typed and persist across stream retries, touching only real API content parts,
+  never Tool schemas, defaults/examples, structured arguments or vendor data.
+  Final wire bodies reach input/accounting hooks after optional-body repairs.
+  Provider diagnostics that echo submitted attachment bytes or recognizable
+  encoded prefixes/data URLs are suppressed before display or truncation,
+  including later errors after a content repair. Only actual attempted content
+  parts supply these bounded patterns; schemas and untransmitted sources do not.
+  Raw protocol responses still drive usage parsing and recovery classification.
+  Strict dollar limits refuse unknown native input costs before HTTP; existing
+  explicit budget waivers retain their meaning. Schema 62 records unknown native
+  cost durably: generic text prices cannot replace an unreported media cost,
+  including after restart or pricing changes. Provider-reported USD wins;
+  reported and estimated rows remain separate cost bases before aggregation.
 - **Retention.** Attachments are artifacts, so `artifacts.*` retention
   removes them too. A removed one is marked expired where it was sent:
   clients show "name · expired" and the model's history says it is no
@@ -963,7 +1015,7 @@ pasting paths.
   step by step. Tab or Enter inserts `@path`. On send, each `@path`
   mention that names an existing file or directory goes through
   `AttachPath {session_id, path, root?}` before the message is sent:
-  - text files up to 256 KB and images up to 8 MB are attached as below;
+  - text files up to 256 KB and images, WAV/MP3 audio and PDFs up to 8 MB are attached as below;
   - larger files and directories go as a reference line,
     `[referenced: PATH (SIZE | directory); not attached, read it with
     your Tools]`, so the agent reads only what it needs.
@@ -3079,6 +3131,28 @@ run_tool = "network_policy"     # a registry Tool, or…
   (`ForkSession up_to_seq`) and puts the message in its input. An expanded call shows its input and its result or error,
   pretty-printed and highlighted when JSON (capped at a few hundred lines;
   `/open` shows stored outputs in full).
+- **Vim editing (TUI, #626).** `tui.vim_mode = true` (default false), or
+  `/vim [on|off]`, enables modal editing in the composer and internal Tool,
+  module, schema, description and run-input editors. The setting persists;
+  list-view keys and default readline editing are unchanged. Buffers start in
+  Insert, with `INSERT` / `NORMAL` shown in their border and `?` help in Normal.
+  Insert Esc only enters Normal, preserving text and any active Run. Normal
+  composer Esc retains Run-stop/cancel behavior; editor Esc always keeps text,
+  with Ctrl+S save and explicit Ctrl+Q cancel shown in the footer.
+  Supported Normal commands: h/j/k/l, w/b/e and W/B/E, 0/$, gg/G; d/c/y with
+  those motions, dd/cc/yy, iw/aw/iW/aW, single/double/backtick quotes and nested
+  ()/[]/{}/<> objects; i/a/I/A/o/O, x, p/P and dot repeat. Word/character and
+  operator counts are bounded to 999. Yank stays in an internal register;
+  no OS clipboard is read or written. Dot repeats the last editing command
+  and its unmodified Insert keys/paste; movement and yanks do not replace it.
+  Readline control shortcuts in Insert break the current repeat group.
+  Large collapsed pastes expand before modal editing to preserve their actual
+  contents. No Visual mode, Ex commands, macros, syntax-aware objects or full
+  Vim emulation is promised. Semantics follow the official
+  [motion](https://vimhelp.org/motion.txt.html),
+  [change](https://vimhelp.org/change.txt.html) and
+  [repeat](https://vimhelp.org/repeat.txt.html) help (including cw's trailing
+  whitespace exception and grapheme-safe editing).
 - **Input editor (TUI).** The message box is a multi-line editor with
   readline keys:
   - ←/→ move by character and Alt or Ctrl+←/→ by word. Home/End and
@@ -4340,6 +4414,8 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
 | `provider.routing_fast_models` / `routing_strong_models` | [] | Optional simple/complex subsets |
 | `provider.routing_complex_chars` | 20000 | Character-equivalent threshold (÷4 tokens) for calibrated prompt complexity |
 | `provider.vision` | (by model name) | Send attached images as image parts (§5.6) |
+| `provider.audio_input` / `provider.pdf_input` | known endpoint/model only | Permit native audio/PDF attachments (§5.6); unknown adapters/models retain references. API-style gates still apply. |
+| `provider.model_audio_input` / `provider.model_pdf_input` | {} | Boolean overrides by resolved model ID, before provider defaults. An explicit audio override asserts Chat WAV/MP3 support; Gemini's inferred default is WAV only. |
 | `provider.image_max_px` | 1568 | Longest side, in pixels, of an attached image sent to a vision model; bigger ones are scaled down once per Session and the encoded image kept for later steps (0: never scale). An image that can't be sent (gone, unreadable, over 8 MB) leaves a marker for the model and a note for the user (§4.2) |
 | `provider.image_detail` | auto | The `detail` asked of vision models for attached images: `auto`, `low` or `high`; images go to Chat Completions as `image_url` parts and to the Responses API as `input_image` parts (§4.2) |
 | `provider.prices` | {} | USD per million tokens per model (`input`, `output`, `cached_input`, `cache_write_input`; `retrieved_at` when imported with `formless prices import`) for cost estimates and dollar limits (§10.6) |
@@ -4402,6 +4478,7 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
 | `memory.confirm_writes` | `never` | Ask before keeping a note the agent writes: `never`, `sensitive` (personal details) or `always` (§7.11) |
 | `mcp.idle_secs` | 300 | Stop an MCP server process after this long without calls; it restarts on the next one (§7.9) |
 | `tui.queue_key` | Ctrl+Enter | Kept for compatibility; queueing is Ctrl+Enter (kitty protocol), Ctrl+J or Alt+Enter (§10.5) |
+| `tui.vim_mode` | false | Normal/Insert editing in composer and internal Tool editor; /vim toggles it persistently, Insert Esc enters Normal, Normal Esc stops a Run and editor Ctrl+Q explicitly cancels (§10.2) |
 | `tui.multi_pane` | false | Persistent multi-pane layout on wide terminals (§10.5) |
 | `tui.timestamps` | true | Message times (`now`, `2m`, `3h`, `Tue 14:02`) on chat headers and a separator when the date changes; `/timestamps` toggles it (§10.2) |
 | `tui.animations` | true | Spinners and other moving indicators in the TUI; false (or `REDUCED_MOTION` / `FORMLESS_REDUCED_MOTION` set to anything but empty, `0`, `false`, `no` or `off`) shows a static `●` and a steady cursor (§10.2) |

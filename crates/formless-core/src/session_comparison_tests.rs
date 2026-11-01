@@ -383,3 +383,134 @@ fn final_rpc_budget_also_covers_metadata_and_missing_sessions_stay_typed() {
         Some(SessionComparisonFailure::NotFound)
     ));
 }
+
+#[test]
+fn comparison_native_unknown_basis_is_durable_and_reported_usd_still_wins() {
+    let root =
+        std::env::temp_dir().join(format!("fl-compare-native-cost-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let file = root.join("formless.db");
+    let st = Store::open(&file).unwrap();
+    let parent = st.create_session(None).unwrap();
+    st.append_message(&parent.id, "user", "shared").unwrap();
+    let child = st.fork_session(&parent.id, None, None).unwrap().unwrap();
+    st.append_message(&parent.id, "user", "native request")
+        .unwrap();
+    let unknown = st.create_run(&parent.id).unwrap();
+    st.record_forecast_request(&unknown, "run").unwrap();
+    st.record_usage_full(
+        &parent.id,
+        &unknown,
+        "default",
+        "model",
+        &Usage {
+            prompt_tokens: 10,
+            completion_tokens: 1,
+            cost_unknown: true,
+            reported: 3,
+            ..Default::default()
+        },
+        "run",
+    )
+    .unwrap();
+    st.append_message(&parent.id, "assistant", "native reply")
+        .unwrap();
+    st.set_run_status(&unknown, "completed").unwrap();
+    st.append_message(&child.id, "user", "reported request")
+        .unwrap();
+    let reported = st.create_run(&child.id).unwrap();
+    st.record_forecast_request(&reported, "run").unwrap();
+    st.record_usage_full(
+        &child.id,
+        &reported,
+        "default",
+        "model",
+        &Usage {
+            prompt_tokens: 10,
+            completion_tokens: 1,
+            cost_unknown: true,
+            cost: Some(0.4),
+            reported: 3,
+            ..Default::default()
+        },
+        "run",
+    )
+    .unwrap();
+    st.append_message(&child.id, "assistant", "reported reply")
+        .unwrap();
+    st.set_run_status(&reported, "completed").unwrap();
+    drop(st);
+    let mut cfg = crate::Config::default();
+    cfg.provider.prices.insert(
+        "model".into(),
+        crate::config::ModelPrice {
+            input: 1_000_000.0,
+            output: 1_000_000.0,
+            ..Default::default()
+        },
+    );
+    for price in [1_000_000.0, 0.0] {
+        cfg.provider.prices.get_mut("model").unwrap().input = price;
+        let st = Store::open(&file).unwrap();
+        let result = st.compare_sessions(&parent.id, &child.id, &cfg).unwrap();
+        assert_eq!(
+            result.left.usage.cost, None,
+            "no generic price fallback for persisted native unknown"
+        );
+        assert_eq!(result.left.usage.estimated_requests, 0);
+        assert!(!result.left.usage.unpriced.is_empty());
+        assert_eq!(result.right.usage.cost, Some(0.4));
+        assert_eq!(result.right.usage.estimated_requests, 0);
+        drop(st);
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn internal_physical_work_without_run_is_owned_in_full_scope_but_not_guessed_after_cut() {
+    let st = Store::open_in_memory().unwrap();
+    let parent = st.create_session(None).unwrap();
+    st.append_message(&parent.id, "user", "shared").unwrap();
+    let child = st.fork_session(&parent.id, None, None).unwrap().unwrap();
+    usage(
+        &st,
+        &parent.id,
+        "summary-parent-no-Run",
+        "default",
+        "model",
+        "branch-summary",
+        11,
+        Some(0.4),
+    );
+    usage(
+        &st,
+        &child.id,
+        "summary-child-no-Run",
+        "default",
+        "model",
+        "branch-summary",
+        13,
+        Some(0.5),
+    );
+    let result = st
+        .compare_sessions(&parent.id, &child.id, &crate::Config::default())
+        .unwrap();
+    assert_eq!(result.right.usage.requests, 1);
+    assert_eq!(result.right.usage.recorded_prompt_tokens, 13);
+    assert_eq!(result.right.usage.unallocated_requests, 0);
+    assert_eq!(result.right.usage.priced_cost_subtotal, 0.5);
+    assert!(
+        !result.right.usage.usage_complete,
+        "physical row cannot prove no missing internal attempts"
+    );
+    assert_eq!(result.right.usage.cost, None);
+    assert_eq!(result.left.usage.requests, 0);
+    assert_eq!(result.left.usage.unallocated_requests, 1);
+    assert_eq!(result.left.usage.unallocated_prompt_tokens, 11);
+    let full = st
+        .compare_sessions(&parent.id, &parent.id, &crate::Config::default())
+        .unwrap();
+    assert_eq!(full.left.usage.requests, 1);
+    assert_eq!(full.left.usage.recorded_prompt_tokens, 11);
+    assert_eq!(full.left.usage.unallocated_requests, 0);
+}

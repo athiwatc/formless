@@ -11,7 +11,17 @@ use std::path::{Path, PathBuf};
 /// Token use for one key and model: (key, model, prompt, completion,
 /// cached, provider-reported USD when every request reported one).
 /// (key, provider, model, prompt, completion, cached, cache-write, reported cost).
-pub type GroupedUsage = (String, String, String, i64, i64, i64, i64, Option<f64>);
+pub type GroupedUsage = (
+    String,
+    String,
+    String,
+    i64,
+    i64,
+    i64,
+    i64,
+    Option<f64>,
+    bool,
+);
 
 #[path = "forecast_snapshot.rs"]
 mod forecast_snapshot;
@@ -299,8 +309,9 @@ pub const KV_MAX_NAMESPACE: i64 = 5 * 1024 * 1024;
 
 /// Token use of one model: (model, prompt, completion, cached,
 /// provider-reported USD when every request reported one).
-/// (provider, model, prompt, completion, cached, cache-write, reported cost).
-pub type ModelUsage = (String, String, i64, i64, i64, i64, Option<f64>);
+/// (provider, model, prompt, completion, cached, cache-write, reported cost, unknown native cost).
+/// Separate cost-basis groups preserve reported-cost precedence in mixed rows.
+pub type ModelUsage = (String, String, i64, i64, i64, i64, Option<f64>, bool);
 
 /// Scheduled jobs (SPEC §9.7).
 const SCHEMA_V22: &str = "
@@ -359,7 +370,7 @@ impl ModelStat {
 const SESSION_SUMMARY: &str = "s.*";
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 61;
+pub const SCHEMA_VERSION: i64 = 62;
 
 /// Add a column, tolerating only "it already exists" (a step that was
 /// partly applied by an older build); every other error is real.
@@ -444,7 +455,7 @@ fn migrate_v39(c: &Connection) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 61] = [
+const MIGRATIONS: [(i64, MigrationStep); 62] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -748,6 +759,13 @@ const MIGRATIONS: [(i64, MigrationStep); 61] = [
             c,
             "runs",
             "end_message_seq INTEGER CHECK(end_message_seq IS NULL OR end_message_seq>=0)",
+        )
+    }),
+    (62, |c| {
+        add_column(
+            c,
+            "run_usage",
+            "cost_unknown INTEGER NOT NULL DEFAULT 0 CHECK(cost_unknown IN (0,1))",
         )
     }),
 ];
@@ -2319,8 +2337,8 @@ impl Store {
     ) -> Result<(Vec<ModelUsage>, i64)> {
         let mut stmt = self.ps(
             "SELECT provider, model, SUM(prompt_tokens), SUM(completion_tokens), SUM(cached_tokens),
-               SUM(cache_write_tokens), CASE WHEN COUNT(cost)=COUNT(*) THEN SUM(cost) END FROM run_usage
-             WHERE (?1 IS NULL OR session_id=?1) AND (?2 IS NULL OR run_id=?2) GROUP BY provider, model",
+               SUM(cache_write_tokens), CASE WHEN COUNT(cost)=COUNT(*) THEN SUM(cost) END, MAX(cost_unknown) FROM run_usage
+             WHERE (?1 IS NULL OR session_id=?1) AND (?2 IS NULL OR run_id=?2) GROUP BY provider, model, (cost IS NULL), cost_unknown",
         )?;
         let rows = stmt
             .query_map(params![session_id, run_id], |r| {
@@ -2332,6 +2350,7 @@ impl Store {
                     r.get(4)?,
                     r.get(5)?,
                     r.get(6)?,
+                    r.get(7)?,
                 ))
             })?
             .collect::<rusqlite::Result<_>>()?;
@@ -2809,7 +2828,7 @@ impl Store {
         run_id: &str,
         cfg: &crate::Config,
     ) -> Result<(Option<f64>, u64, u64)> {
-        let mut stmt = self.ps("SELECT provider,model,prompt_tokens,completion_tokens,cached_tokens,cache_write_tokens,cost,source FROM run_usage WHERE run_id=?1")?;
+        let mut stmt = self.ps("SELECT provider,model,prompt_tokens,completion_tokens,cached_tokens,cache_write_tokens,cost,source,cost_unknown FROM run_usage WHERE run_id=?1")?;
         let rows = stmt.query_map(params![run_id], |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -2820,12 +2839,13 @@ impl Store {
                 r.get::<_, i64>(5)?,
                 r.get::<_, Option<f64>>(6)?,
                 r.get::<_, String>(7)?,
+                r.get::<_, bool>(8)?,
             ))
         })?;
         let (mut cost, mut peak, mut cached) = (Some(0.0), 0, 0);
         let mut any = false;
         for row in rows {
-            let (p, m, input, output, cache, write, reported, source) = row?;
+            let (p, m, input, output, cache, write, reported, source, unknown) = row?;
             any = true;
             // Only the main Session request drives its compaction threshold;
             // nested llm/sub-agent/summarizer contexts have separate windows.
@@ -2834,7 +2854,7 @@ impl Store {
             }
             cached += cache.max(0) as u64;
             cost = cost
-                .zip(cfg.cost_of(&p, &m, input, output, cache, write, reported))
+                .zip(cfg.cost_of_known(&p, &m, input, output, cache, write, reported, unknown))
                 .map(|(a, b)| a + b);
         }
         Ok((cost.filter(|_| any), peak, cached))
@@ -5521,7 +5541,7 @@ impl Store {
         source: &str,
     ) -> Result<()> {
         self.ex(
-            "INSERT INTO run_usage(session_id,run_id,model,prompt_tokens,completion_tokens,reasoning_tokens,cached_tokens,cache_write_tokens,cost,created_at,source,provider,usage_complete) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+            "INSERT INTO run_usage(session_id,run_id,model,prompt_tokens,completion_tokens,reasoning_tokens,cached_tokens,cache_write_tokens,cost,created_at,source,provider,usage_complete,cost_unknown) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
             params![
                 session_id,
                 run_id,
@@ -5535,7 +5555,8 @@ impl Store {
                 now(),
                 source,
                 provider,
-                i64::from(usage.reported==3)
+                i64::from(usage.reported==3),
+                i64::from(usage.cost_unknown && usage.cost.is_none())
             ],
         )?;
         Ok(())
@@ -5660,10 +5681,10 @@ impl Store {
         let mut stmt = self.ps(&format!(
             "SELECT {key}, u.provider, u.model, SUM(u.prompt_tokens), SUM(u.completion_tokens),
                SUM(u.cached_tokens), SUM(u.cache_write_tokens),
-               CASE WHEN COUNT(u.cost)=COUNT(*) THEN SUM(u.cost) END
+               CASE WHEN COUNT(u.cost)=COUNT(*) THEN SUM(u.cost) END, MAX(u.cost_unknown)
              FROM run_usage u LEFT JOIN sessions s ON s.id=u.session_id
              WHERE ?1 IS NULL OR u.created_at >= ?1
-             GROUP BY 1, 2, 3 ORDER BY 1"
+             GROUP BY 1, 2, 3, (u.cost IS NULL), u.cost_unknown ORDER BY 1"
         ))?;
         let rows = stmt
             .query_map(params![since], |r| {
@@ -5676,6 +5697,7 @@ impl Store {
                     r.get(5)?,
                     r.get(6)?,
                     r.get(7)?,
+                    r.get(8)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -5685,7 +5707,7 @@ impl Store {
     /// Summed usage of a Run's provider requests.
     pub fn run_usage(&self, run_id: &str) -> Result<crate::provider::Usage> {
         Ok(self.conn.query_row(
-            "SELECT COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0), COALESCE(SUM(reasoning_tokens),0), COALESCE(SUM(cached_tokens),0), COALESCE(SUM(cache_write_tokens),0) FROM run_usage WHERE run_id=?1",
+            "SELECT COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0), COALESCE(SUM(reasoning_tokens),0), COALESCE(SUM(cached_tokens),0), COALESCE(SUM(cache_write_tokens),0),COALESCE(MAX(cost_unknown),0) FROM run_usage WHERE run_id=?1",
             params![run_id],
             |r| {
                 Ok(crate::provider::Usage {
@@ -5694,6 +5716,7 @@ impl Store {
                     reasoning_tokens: r.get::<_, i64>(2)? as u64,
                     cached_tokens: r.get::<_, i64>(3)? as u64,
                     cache_write_tokens: r.get::<_, i64>(4)? as u64,
+                    cost_unknown:r.get(5)?,
                     ..Default::default()
                 })
             },
@@ -6608,10 +6631,11 @@ pub fn provider_message(m: &MessageInfo) -> Value {
                     a["id"].as_str().unwrap_or_default()
                 ));
                 // Only raster images go to a vision model (#855).
-                if a["mime"]
-                    .as_str()
-                    .is_some_and(crate::daemon::is_raster_image)
-                {
+                if a["mime"].as_str().is_some_and(|mime| {
+                    crate::daemon::is_raster_image(mime)
+                        || mime == "application/pdf"
+                        || mime.starts_with("audio/")
+                }) {
                     images.push(json!({"id": a.get("_artifact_id").unwrap_or(&a["id"]), "_source_session":m.session_id,"_source_seq":m.seq,"path": a["path"], "mime": a["mime"], "name": name, "bytes":a["bytes"], "sha256":a["sha256"]}));
                 }
             }
@@ -6955,6 +6979,132 @@ mod session_lineage_tests;
 mod session_comparison;
 pub(crate) use session_comparison::SessionComparisonFailure;
 
+#[path = "branch_summary_storage.rs"]
+mod branch_summary_storage;
+pub(crate) use branch_summary_storage::{
+    summary_hash, BranchSummaryConfirmation, BranchSummaryFailure, BranchSummarySnapshot,
+};
+
 #[cfg(test)]
 #[path = "session_comparison_tests.rs"]
 mod session_comparison_tests;
+
+#[cfg(test)]
+mod native_cost_basis_tests {
+    use super::*;
+    #[test]
+    fn schema62_keeps_legacy_prices_and_durable_unknown_native_cost_with_reported_precedence() {
+        let root = std::env::temp_dir().join(format!("fl-native-cost-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("formless.db");
+        let old = schema_at(61).unwrap();
+        // schema_at constructs historical DDL without promising a final
+        // user_version; the on-disk upgrade fixture must identify itself.
+        old.pragma_update(None, "user_version", 61).unwrap();
+        assert_eq!(
+            old.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            61
+        );
+        let native_cost_columns: i64 = old
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('run_usage') WHERE name='cost_unknown'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(native_cost_columns, 0, "fixture must predate schema 62");
+        // Schema 61 requires the physical token counters even for a legacy
+        // text-only row; it has no native-cost-basis column yet.
+        old.execute("INSERT INTO run_usage(session_id,run_id,model,prompt_tokens,completion_tokens,reasoning_tokens,cached_tokens,cache_write_tokens,created_at) VALUES('s','legacy','model',10,5,0,0,0,'2026-11-01')",[]).unwrap();
+        old.execute("VACUUM INTO ?1", [file.to_str().unwrap()])
+            .unwrap();
+        drop(old);
+        let mut cfg = crate::Config::default();
+        cfg.provider.prices.insert(
+            "model".into(),
+            crate::config::ModelPrice {
+                input: 1_000_000.0,
+                output: 2_000_000.0,
+                ..Default::default()
+            },
+        );
+        let store = Store::open(&file).unwrap();
+        let legacy = store.usage_rows(None, Some("legacy")).unwrap().0;
+        assert_eq!(legacy.len(), 1);
+        assert!(!legacy[0].7);
+        assert_eq!(store.forecast_usage("legacy", &cfg).unwrap().0, Some(20.0));
+        store
+            .record_usage_full(
+                "s",
+                "unknown",
+                "default",
+                "model",
+                &crate::provider::Usage {
+                    prompt_tokens: 10,
+                    completion_tokens: 5,
+                    cost_unknown: true,
+                    reported: 3,
+                    ..Default::default()
+                },
+                "run",
+            )
+            .unwrap();
+        store
+            .record_usage_full(
+                "s",
+                "reported",
+                "default",
+                "model",
+                &crate::provider::Usage {
+                    prompt_tokens: 10,
+                    completion_tokens: 5,
+                    cost: Some(0.25),
+                    cost_unknown: true,
+                    reported: 3,
+                    ..Default::default()
+                },
+                "run",
+            )
+            .unwrap();
+        store
+            .record_usage_full(
+                "s",
+                "reported",
+                "default",
+                "model",
+                &crate::provider::Usage {
+                    prompt_tokens: 10,
+                    completion_tokens: 5,
+                    reported: 3,
+                    ..Default::default()
+                },
+                "llm",
+            )
+            .unwrap();
+        assert_eq!(store.forecast_usage("unknown", &cfg).unwrap().0, None);
+        assert_eq!(
+            store.forecast_usage("reported", &cfg).unwrap().0,
+            Some(20.25)
+        );
+        let rows = store.usage_rows(None, Some("reported")).unwrap().0;
+        assert_eq!(
+            rows.iter()
+                .map(|(p, m, i, o, c, w, r, u)| cfg.cost_of_known(p, m, *i, *o, *c, *w, *r, *u))
+                .sum::<Option<f64>>(),
+            Some(20.25),
+            "mixed estimated/reported groups preserve actual USD"
+        );
+        drop(store);
+        cfg.provider.prices.get_mut("model").unwrap().input = 0.0;
+        let store = Store::open(&file).unwrap();
+        assert!(store.usage_rows(None, Some("unknown")).unwrap().0[0].7);
+        assert_eq!(store.forecast_usage("unknown", &cfg).unwrap().0, None);
+        assert_eq!(
+            store.forecast_usage("reported", &cfg).unwrap().0,
+            Some(10.25)
+        );
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}

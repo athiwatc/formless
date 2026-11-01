@@ -577,7 +577,14 @@ struct RunAdmission {
     requested: String,
     effort: Option<String>,
     recovery_messages: Vec<MessageInfo>,
-    first: StdMutex<Option<(Vec<Value>, Vec<Value>, String)>>,
+    first: StdMutex<
+        Option<(
+            Vec<Value>,
+            Vec<Value>,
+            String,
+            Arc<crate::provider::FrozenAttachments>,
+        )>,
+    >,
 }
 
 struct ForecastConsent {
@@ -640,6 +647,7 @@ pub struct Daemon {
     missing_models: StdMutex<Vec<String>>,
     /// Comparisons in flight: id → (origin Session, [(fork, model)]).
     comparisons: StdMutex<HashMap<String, (String, Vec<(String, String)>)>>,
+    branch_summary_state: Arc<StdMutex<branch_summary::BranchSummaryState>>,
     /// Sessions in step mode (`/step`), and the step decisions awaited.
     step_sessions: StdMutex<std::collections::HashSet<String>>,
     step_waiters: StdMutex<HashMap<String, tokio::sync::oneshot::Sender<(String, Option<String>)>>>,
@@ -849,6 +857,7 @@ impl Daemon {
             next_run_model: StdMutex::new(Default::default()),
             progress_sent: StdMutex::new(Default::default()),
             comparisons: StdMutex::new(Default::default()),
+            branch_summary_state: Arc::new(StdMutex::new(Default::default())),
             routing_log: StdMutex::new(Default::default()),
             model_test_cache,
             missing_models: StdMutex::new(Vec::new()),
@@ -1021,6 +1030,7 @@ impl Daemon {
                     .with_prompt_hook(self.prompt_hook())
                     .with_input_hook(self.input_hook())
                     .with_request_hook(self.request_hook())
+                    .with_request_policy(self.request_policy())
                     .with_breaker_note_hook(self.provider_breaker_note_hook()),
                 )
             }
@@ -1114,6 +1124,7 @@ impl Daemon {
                 .with_prompt_hook(self.prompt_hook())
                 .with_input_hook(self.input_hook())
                 .with_request_hook(self.request_hook())
+                .with_request_policy(self.request_policy())
                 .with_breaker_note_hook(self.provider_breaker_note_hook()),
         )
     }
@@ -1133,6 +1144,31 @@ impl Daemon {
 
     /// Admission applies to every request through either provider factory.
     /// Attribution is resolved in the active task, not at Provider construction.
+    fn request_policy(&self) -> crate::provider::RequestPolicy {
+        let paths = self.paths.clone();
+        let waived = self.budget_waived.clone();
+        Arc::new(move |body| {
+            if !crate::tokens::has_native_media(body) {
+                return Ok(());
+            }
+            let session = USAGE_FOR
+                .try_with(|owner| owner.session_id.clone())
+                .unwrap_or_default();
+            if waived.locked().contains(&session) {
+                return Ok(());
+            }
+            let cfg = Config::load(&paths)?;
+            if [cfg.limits.run_usd, cfg.limits.daily_usd]
+                .into_iter()
+                .flatten()
+                .any(|n| n > 0.0)
+            {
+                return Err(anyhow::Error::new(RequestFailure::budget("native audio/PDF input tokens and media cost cannot be bounded locally under a strict dollar limit; retain the artifact reference or use a model with native input disabled")));
+            }
+            Ok(())
+        })
+    }
+
     fn request_hook(&self) -> crate::provider::RequestHook {
         let admission = self.budget_admission.clone();
         let store = self.store.clone();
@@ -1707,6 +1743,49 @@ impl Daemon {
                         }
                     })?;
                 Ok(serde_json::to_value(comparison)?)
+            }
+            Request::InspectBranchSummary {
+                source_id,
+                target_id,
+            } => Ok(serde_json::to_value(
+                self.inspect_branch_summary(&source_id, &target_id)
+                    .map_err(branch_summary::summary_error)?,
+            )?),
+            Request::PrepareBranchSummary {
+                source_id,
+                target_id,
+                source_revision,
+                target_revision,
+            } => Ok(serde_json::to_value(
+                self.prepare_branch_summary(
+                    &source_id,
+                    &target_id,
+                    &source_revision,
+                    &target_revision,
+                )
+                .await
+                .map_err(branch_summary::summary_error)?,
+            )?),
+            Request::CommitBranchSummary {
+                preview_id,
+                source_id,
+                target_id,
+                source_revision,
+                target_revision,
+                candidate_hash,
+            } => {
+                let key = crate::storage::BranchSummaryConfirmation {
+                    preview_id,
+                    source_id,
+                    target_id,
+                    source_revision,
+                    target_revision,
+                    candidate_hash,
+                };
+                Ok(serde_json::to_value(
+                    self.commit_branch_summary(key)
+                        .map_err(branch_summary::summary_error)?,
+                )?)
             }
             Request::SearchSessions { query, limit } => {
                 Ok(serde_json::to_value(self.with_reader(|st| {
@@ -3215,8 +3294,9 @@ impl Daemon {
                 // Merge the per-model rows of each key, pricing as we go
                 // (no cost when a model in it has no price).
                 let mut out: Vec<(String, i64, i64, i64, Option<f64>)> = Vec::new();
-                for (key, provider, model, p, c, cached, cw, reported) in rows {
-                    let price = cfg.cost_of(&provider, &model, p, c, cached, cw, reported);
+                for (key, provider, model, p, c, cached, cw, reported, unknown) in rows {
+                    let price =
+                        cfg.cost_of_known(&provider, &model, p, c, cached, cw, reported, unknown);
                     match out.last_mut().filter(|o| o.0 == key) {
                         Some(o) => {
                             o.1 += p;
@@ -4784,14 +4864,14 @@ impl Daemon {
         let provider = Provider::with_key(pcfg, String::new(), self.http.clone())
             .with_name(name)
             .with_attachment_snapshot(st, &ctx)?;
-        let ctx = provider.prepare_attachments(&ctx, &forecast.basis.model);
+        let sources = Arc::new(provider.freeze_attachments(&ctx, &forecast.basis.model, true));
         let checkpoint = crate::forecast::hash(&st.latest_checkpoint_record(session_id)?);
         Ok(Arc::new(RunAdmission {
             cfg: fixed,
             requested,
             effort,
             recovery_messages,
-            first: StdMutex::new(Some((ctx, defs, checkpoint))),
+            first: StdMutex::new(Some((ctx, defs, checkpoint, sources))),
         }))
     }
 
@@ -5663,7 +5743,7 @@ impl Daemon {
                 })
         };
         let requested_model = target.model.clone();
-        let route_context = if let Some((ctx, _, _)) = &first {
+        let route_context = if let Some((ctx, _, _, _)) = &first {
             ctx.clone()
         } else {
             self.session_context(
@@ -5675,7 +5755,7 @@ impl Daemon {
             )?
             .0
         };
-        let route_defs = if let Some((_, defs, _)) = &first {
+        let route_defs = if let Some((_, defs, _, _)) = &first {
             defs.clone()
         } else {
             self.with_store(|st| {
@@ -5729,7 +5809,7 @@ impl Daemon {
         )
         .await?;
 
-        if let Some((_, _, checkpoint)) = &first {
+        if let Some((_, _, checkpoint, _)) = &first {
             if self.with_reader(|st| {
                 Ok(crate::forecast::hash(
                     &st.latest_checkpoint_record(session_id)?,
@@ -5757,8 +5837,8 @@ impl Daemon {
             self.check_budget(session_id, run_id, &cfg)?;
             // Push delivery of completed Pending Invocations (§6.3).
             self.deliver_completed_pending(session_id);
-            let (ctx, defs) = if let Some((ctx, defs, _)) = first.take() {
-                (ctx, defs)
+            let (ctx, defs, sources) = if let Some((ctx, defs, _, sources)) = first.take() {
+                (ctx, defs, Some(sources))
             } else {
                 let ctx = self
                     .session_context(
@@ -5772,7 +5852,11 @@ impl Daemon {
                 let defs = self.with_store(|st| {
                     toolreg::tool_definitions(st, Some(session_id), cfg.tools.inline_limit)
                 })?;
-                (ctx, defs)
+                (ctx, defs, None)
+            };
+            let call_provider = match sources {
+                Some(sources) => provider.clone().with_frozen_attachments(sources),
+                None => provider.clone(),
             };
             let retry = self
                 .runs
@@ -5795,7 +5879,7 @@ impl Daemon {
                     "run",
                     session_id,
                     run_id,
-                    provider.chat_stream(
+                    call_provider.chat_stream(
                         &ctx,
                         &defs,
                         &model,
@@ -8735,7 +8819,7 @@ impl Daemon {
                     if let Some(u) = &result.usage {
                         task_tokens += (u.prompt_tokens + u.completion_tokens) as i64;
                         task_cost = task_cost
-                            .zip(cfg.cost_of(
+                            .zip(cfg.cost_of_known(
                                 provider.name(),
                                 &result.model_used,
                                 u.prompt_tokens as i64,
@@ -8743,6 +8827,7 @@ impl Daemon {
                                 u.cached_tokens as i64,
                                 u.cache_write_tokens as i64,
                                 u.cost,
+                                u.cost_unknown,
                             ))
                             .map(|(sum, c)| sum + c);
                     }
@@ -9637,9 +9722,13 @@ impl Daemon {
             let rows = self.with_reader(|st| st.usage_grouped(Some(&today), "model"))?;
             let day: Option<f64> = rows
                 .iter()
-                .map(|(_, provider, model, p, c, cached, cw, reported)| {
-                    cfg.cost_of(provider, model, *p, *c, *cached, *cw, *reported)
-                })
+                .map(
+                    |(_, provider, model, p, c, cached, cw, reported, unknown)| {
+                        cfg.cost_of_known(
+                            provider, model, *p, *c, *cached, *cw, *reported, *unknown,
+                        )
+                    },
+                )
                 .sum();
             if let Some(cost) = day {
                 checks.push((
@@ -9694,12 +9783,12 @@ impl Daemon {
             ..Default::default()
         };
         let mut cost = Some(0.0);
-        for (provider, model, p, c, cached, cw, reported) in rows {
+        for (provider, model, p, c, cached, cw, reported, unknown) in rows {
             u.prompt_tokens += p;
             u.completion_tokens += c;
             u.cached_tokens += cached;
             u.cache_write_tokens += cw;
-            let one = cfg.cost_of(&provider, &model, p, c, cached, cw, reported);
+            let one = cfg.cost_of_known(&provider, &model, p, c, cached, cw, reported, unknown);
             if one.is_none() && !u.unpriced.contains(&model) {
                 u.unpriced.push(model.clone());
             }
@@ -10037,21 +10126,35 @@ impl Daemon {
     /// directories go as a reference the agent can read with its Tools.
     fn attach_path(&self, session_id: &str, path: &str, root: Option<&str>) -> Result<Value> {
         let session_root = self.session_cwd(session_id);
-        let root = mention_root(root.or(session_root.as_deref()))?;
+        let root_hint = root.or(session_root.as_deref());
+        let cwd = std::env::current_dir()?;
+        let raw_root = formless_runtime::caps::lexical_absolute(
+            &cwd,
+            &root_hint
+                .filter(|root| !root.trim().is_empty())
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| cwd.clone()),
+        )
+        .map_err(|error| anyhow!(error))?;
+        let root = mention_root(root_hint)?;
+        let home = directories::BaseDirs::new().map(|base| base.home_dir().to_path_buf());
+        let input_path = if let Some(rest) = path.strip_prefix("~/") {
+            home.as_ref()
+                .filter(|home| home.is_absolute())
+                .context("native home is unavailable for this mention")?
+                .join(rest)
+        } else {
+            std::path::PathBuf::from(path)
+        };
+        // Preserve the configured root spelling as well as its resolved
+        // destination: a credential/profile namespace can itself be an alias.
+        let requested = raw_root.join(&input_path);
         let full = root
-            .join(path.strip_prefix("~/").map_or_else(
-                || std::path::PathBuf::from(path),
-                |rest| {
-                    directories::BaseDirs::new()
-                        .map(|b| b.home_dir().join(rest))
-                        .unwrap_or_else(|| rest.into())
-                },
-            ))
+            .join(input_path)
             .canonicalize()
             .with_context(|| format!("no file '{path}'"))?;
         // A mention reaches only the working folder (or ~/ when written so),
         // and never a credential, whoever pasted it (#863).
-        let home = directories::BaseDirs::new().map(|b| b.home_dir().to_path_buf());
         let inside = full.starts_with(&root)
             || (path.starts_with("~/") && home.as_ref().is_some_and(|h| full.starts_with(h)));
         if !inside {
@@ -10065,19 +10168,40 @@ impl Daemon {
                 "@{path} looks like a credential ({why}); it is never attached from a mention, use /attach if you mean it"
             ));
         }
+        let policy = crate::sensitive_reads::policy(
+            &self.paths,
+            &self.config()?.security,
+            &self.sensitive_anchors,
+        )
+        .map_err(|error| anyhow!(error))?;
+        match policy.classify(&requested,&full).map_err(|error|anyhow!(error))? {
+            formless_runtime::sensitive_paths::PathDecision::Ordinary=>{},
+            _=>return Err(anyhow!("@{path} is a protected profile or credential path; it is never attached from a mention")),
+        }
         let meta = std::fs::metadata(&full)?;
         let name = full
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.to_string());
-        let inline_limit = if is_raster_image(guess_mime(&name)) {
-            MAX_INLINE_IMAGE_BYTES
-        } else {
-            MAX_MENTION_INLINE_BYTES
-        };
+        let mime = guess_mime(&name);
+        let inline_limit =
+            if is_raster_image(mime) || mime == "application/pdf" || audio_format_claim(mime) {
+                MAX_INLINE_IMAGE_BYTES
+            } else {
+                MAX_MENTION_INLINE_BYTES
+            };
         if meta.is_file() && meta.len() as usize <= inline_limit {
             use base64::Engine;
-            let data = base64::engine::general_purpose::STANDARD.encode(std::fs::read(&full)?);
+            let authority_root = if full.starts_with(&root) {
+                root.clone()
+            } else {
+                home.as_ref()
+                    .context("authorized home is unavailable")?
+                    .canonicalize()?
+            };
+            let bytes=crate::attachment_access::read_rooted_file(&authority_root,&full,inline_limit)
+                .context("inline attachment could not be read safely; the file may have changed or used a symbolic link")?;
+            let data = base64::engine::general_purpose::STANDARD.encode(bytes);
             let mut r = self.attach_file(session_id, &name, &data, None)?;
             r["reference"] = json!(false);
             return Ok(r);
@@ -14750,7 +14874,7 @@ impl HostOps for NestedOps {
         // as its model use (§10.4).
         if let (Some(u), Some(inv)) = (usage, &self.parent_inv) {
             let tokens = (u.prompt_tokens + u.completion_tokens) as i64;
-            let cost = self.cfg.cost_of(
+            let cost = self.cfg.cost_of_known(
                 provider.name(),
                 &result.model_used,
                 u.prompt_tokens as i64,
@@ -14758,6 +14882,7 @@ impl HostOps for NestedOps {
                 u.cached_tokens as i64,
                 u.cache_write_tokens as i64,
                 u.cost,
+                u.cost_unknown,
             );
             let _ = self.daemon.with_store(|st| {
                 st.add_invocation_tokens(inv, tokens)?;
@@ -14992,6 +15117,17 @@ pub fn sniff_mime(bytes: &[u8]) -> Option<&'static str> {
         Some("image/gif")
     } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
         Some("image/webp")
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WAVE" {
+        Some("audio/wav")
+    } else if bytes.len() >= 10 && bytes.starts_with(b"ID3")
+        || bytes.len() >= 4
+            && bytes[0] == 0xff
+            && bytes[1] & 0xe0 == 0xe0
+            && bytes[1] & 0x18 != 0x08
+            && bytes[2] & 0xf0 != 0xf0
+            && bytes[2] & 0x0c != 0x0c
+    {
+        Some("audio/mpeg")
     } else if bytes.starts_with(b"%PDF-") {
         Some("application/pdf")
     } else {
@@ -15011,12 +15147,19 @@ pub fn is_raster_image(mime: &str) -> bool {
 /// An attachment's type: what its bytes are when they say, else the claim
 /// or the name, except that a claimed image or PDF the bytes don't bear
 /// out becomes text or plain bytes (#855).
+fn audio_format_claim(mime: &str) -> bool {
+    matches!(
+        mime,
+        "audio/wav" | "audio/x-wav" | "audio/wave" | "audio/mpeg" | "audio/mp3"
+    )
+}
+
 pub fn resolve_mime(claimed: Option<&str>, name: &str, bytes: &[u8]) -> String {
     if let Some(real) = sniff_mime(bytes) {
         return real.to_string();
     }
     let said = claimed.unwrap_or_else(|| guess_mime(name));
-    if is_raster_image(said) || said == "application/pdf" {
+    if is_raster_image(said) || said == "application/pdf" || audio_format_claim(said) {
         return if std::str::from_utf8(bytes).is_ok() {
             "text/plain".into()
         } else {
@@ -15097,6 +15240,8 @@ pub fn guess_mime(name: &str) -> &'static str {
         "gif" => "image/gif",
         "webp" => "image/webp",
         "pdf" => "application/pdf",
+        "wav" => "audio/wav",
+        "mp3" => "audio/mpeg",
         "json" => "application/json",
         "csv" => "text/csv",
         "md" => "text/markdown",
@@ -16868,6 +17013,9 @@ mod description_daemon_tests;
 #[cfg(test)]
 #[path = "session_comparison_rpc_tests.rs"]
 mod session_comparison_rpc_tests;
+
+#[path = "branch_summary.rs"]
+mod branch_summary;
 
 #[cfg(test)]
 #[path = "approval_daemon_tests.rs"]
