@@ -4360,6 +4360,13 @@ Model-visible descriptions are quoted and labelled as third-party data.
 Description warnings appear in previews and approval details. A changed Tool or
 Skill description is shown with its before/after text and retained in Description
 reviews, including MCP sync changes and changes made while clients disconnect.
+The history is available through `ListDescriptionReviews`, web Settings →
+Description reviews, TUI `/descriptionreviews`, and `formless tools reviews`
+(`--kind tool|mcp|skill|module`, optional name, `--json`); `formless skills reviews
+[NAME]` narrows it to Skills. Connected clients display new committed changes;
+reconnection refreshes retained evidence. The description editor binds its preview
+to the Tool ID, version and exact text. Local imports bind confirmation to the
+same file content, and Skill bundle previews parse the actual bundled SKILL.md.
 This metadata review does not replace the separate code-hash approval binding.
 
 Tool data has no instruction authority: system instructions outrank user

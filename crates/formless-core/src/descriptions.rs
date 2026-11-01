@@ -1,6 +1,13 @@
 //! Third-party descriptions are bounded metadata, never instructions.
 use formless_protocol::{DescriptionMetadata, DescriptionReview};
 
+#[derive(Debug, thiserror::Error)]
+#[error("description review is stale (expected v{expected}, current {actual:?}); preview again")]
+pub(crate) struct DescriptionConflict {
+    pub expected: i64,
+    pub actual: Option<i64>,
+}
+
 pub const MAX_CHARS: usize = 1024;
 
 fn format_control(c: char) -> bool {
@@ -84,7 +91,7 @@ pub fn notice(review: &DescriptionReview) -> String {
         .as_ref()
         .map(|before| format!("\nBefore: {}", serde_json::to_string(&before.text).unwrap()))
         .unwrap_or_default();
-    format!("Description review — {} {} v{}: {flags}{before}\nAfter: {}\nReview history is retained in Description reviews.",review.kind,review.name,review.version,serde_json::to_string(&review.after.text).unwrap())
+    format!("Description review — {} {} v{}: {flags}{before}\nAfter: {}\nReview history: /descriptionreviews (TUI), Settings → Description reviews (web), or formless tools reviews (CLI).",review.kind,review.name,review.version,serde_json::to_string(&review.after.text).unwrap())
 }
 
 #[cfg(test)]

@@ -193,6 +193,7 @@ async fn description_diff_is_visible_in_approval_and_reconnect_snapshot_without_
         .any(|flag| flag.as_str().unwrap().contains("Instruction-shaped")));
     daemon
         .handle(Request::UpdateToolSpec {
+            expected_current_version: None,
             id: info.id.clone(),
             description: Some(hostile.into()),
             input_schema: None,
@@ -200,6 +201,28 @@ async fn description_diff_is_visible_in_approval_and_reconnect_snapshot_without_
         })
         .await
         .unwrap();
+    let refused = daemon
+        .handle(Request::UpdateToolSpec {
+            id: info.id.clone(),
+            expected_current_version: Some(original),
+            description: Some("stale reviewed text".into()),
+            input_schema: None,
+            output_schema: None,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        refused
+            .downcast_ref::<RequestFailure>()
+            .map(|failure| failure.code),
+        Some(codes::BUSY)
+    );
+    assert_eq!(
+        daemon
+            .with_store(|st| Ok(st.get_tool_current(&info.id)?.unwrap().0.description))
+            .unwrap(),
+        descriptions::screen(hostile).text
+    );
     let current = daemon
         .with_store(|st| Ok(st.get_tool_current(&info.id)?.unwrap().1))
         .unwrap();

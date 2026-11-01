@@ -156,3 +156,48 @@ fn description_evidence_and_versions_roll_back_together_and_legacy_reads_are_bou
         "legacy projection is cache-stable"
     );
 }
+
+#[test]
+fn reviewed_metadata_generation_is_compared_inside_its_replacement_write_boundary() {
+    let st = Store::open_in_memory().unwrap();
+    let (first, _) = tool(&st, "reader", "Initial description");
+    tool(&st, "reader", "Another client's description");
+    let ran = std::cell::Cell::new(false);
+    let refused = st
+        .with_current_tool(&first.id, 1, |st| {
+            ran.set(true);
+            Ok(tool(st, "reader", "stale reviewed text"))
+        })
+        .unwrap_err();
+    assert!(refused.is::<crate::descriptions::DescriptionConflict>());
+    assert!(
+        !ran.get(),
+        "a stale review cannot even enter the version writer"
+    );
+    assert_eq!(
+        st.get_tool_by_name("reader")
+            .unwrap()
+            .unwrap()
+            .0
+            .current_version,
+        2
+    );
+    assert_eq!(
+        st.description_reviews(Some("tool"), Some("reader"), 20)
+            .unwrap()
+            .len(),
+        1
+    );
+    st.with_current_tool(&first.id, 2, |st| {
+        Ok(tool(st, "reader", "Current reviewed text"))
+    })
+    .unwrap();
+    assert_eq!(
+        st.get_tool_by_name("reader")
+            .unwrap()
+            .unwrap()
+            .0
+            .current_version,
+        3
+    );
+}

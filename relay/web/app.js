@@ -2706,14 +2706,17 @@
         h("strong", null, "After · third-party metadata"), h("pre", { class: "diff" }, JSON.stringify(review.after.text)))));
   }
   async function showDescriptionReviews() {
+    const connection = [S.ws, S.conn, S.channel];
     const reviews = await act({ type: "list_description_reviews", limit: 100 });
-    if (!reviews) return;
+    if (!reviews || connection[0] !== S.ws || connection[1] !== S.conn || connection[2] !== S.channel) return;
     await ask({ title: "Description reviews", text: reviews.length ? "Retained warnings and exact before/after changes." : "No description reviews yet.",
       body: descriptionReviewCard(null, reviews), ok: "Close" });
   }
   async function refreshDescriptionReviews() {
+    const revision = S.descriptionReviewRevision = (S.descriptionReviewRevision || 0) + 1;
+    const connection = [S.ws, S.conn, S.channel];
     const reviews = await request({ type: "list_description_reviews", limit: 20 }).catch(() => null);
-    if (!reviews) return;
+    if (!reviews || revision !== S.descriptionReviewRevision || connection[0] !== S.ws || connection[1] !== S.conn || connection[2] !== S.channel) return;
     const seen = new Set((S.descriptionReviews || []).map((review) => review.id));
     S.descriptionReviews = reviews;
     for (const review of reviews) if (!seen.has(review.id)) {
@@ -2724,10 +2727,12 @@
     }
   }
   async function previewToolBundleDescriptions(bundle) {
+    const connection = [S.ws, S.conn, S.channel];
+    const current = () => connection[0] === S.ws && connection[1] === S.conn && connection[2] === S.channel;
     const grouped = Array.isArray(bundle.tools) || Array.isArray(bundle.modules) || Array.isArray(bundle.skills);
     const entries = grouped ? (bundle.tools || []).concat(bundle.modules || [], bundle.skills || []) : [bundle];
     const previews = await act({ type: "preview_description_bundle", bundle });
-    if (!previews) return null;
+    if (!previews || !current()) return null;
     const body = h("div", { class: "description-preview" });
     const metadata = new WeakMap();
     for (let index = 0; index < previews.length; index++) {
@@ -2736,7 +2741,8 @@
       const review = { kind: preview.kind, name: preview.name, version: "preview", source: "import", before: preview.before == null ? null : { text: preview.before }, after: preview.after };
       body.append(descriptionReviewCard(preview.after, [review]));
     }
-    return (await ask({ title: "Review imported descriptions", text: "Descriptions are third-party metadata. Skill metadata is parsed from the actual bundled SKILL.md. Warnings do not establish safety. Code and capability approval remain separate.", body, ok: "Continue" })) ? metadata : null;
+    const approved = await ask({ title: "Review imported descriptions", text: "Descriptions are third-party metadata. Skill metadata is parsed from the actual bundled SKILL.md. Warnings do not establish safety. Code and capability approval remain separate.", body, ok: "Continue" });
+    return approved && current() ? metadata : null;
   }
   function renderToolDetail(box, d) {
     const t = d.tool;
@@ -4802,7 +4808,9 @@
         if (here && ["create_tool", "create_module"].includes(ev.tool_name)) {
           try {
             const args = JSON.parse(ev.arguments);
+            const connection = [S.ws, S.conn, S.channel];
             request({ type: "preview_description", kind: ev.tool_name === "create_module" ? "module" : "tool", name: args.name || "", description: args.description || "" }).then((preview) => {
+              if (connection[0] !== S.ws || connection[1] !== S.conn || connection[2] !== S.channel || S.current !== ev.session_id) return;
               if (preview.after.flags.length) note("Description preview: " + preview.name + " · " + preview.after.flags.join("; ") + "\nThird-party metadata: " + JSON.stringify(preview.after.text));
             }).catch(() => {});
           } catch (_) {}

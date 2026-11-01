@@ -3348,6 +3348,27 @@ impl Store {
         }))
     }
 
+    /// Compare the reviewed generation while holding the very write boundary
+    /// that commits its replacement; smoke checks happen before this boundary.
+    pub(crate) fn with_current_tool<T>(
+        &self,
+        id: &str,
+        expected: i64,
+        action: impl FnOnce(&Self) -> Result<T>,
+    ) -> Result<T> {
+        self.transaction(|st| {
+            let actual = st
+                .get_tool_current(id)?
+                .map(|(info, _)| info.current_version);
+            if actual != Some(expected) {
+                return Err(anyhow::Error::new(
+                    crate::descriptions::DescriptionConflict { expected, actual },
+                ));
+            }
+            action(st)
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn create_tool_version(
         &self,

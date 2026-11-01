@@ -2119,6 +2119,10 @@ pub enum Request {
     /// `user` (SPEC §10.4).
     UpdateToolSpec {
         id: String,
+        /// Bind a reviewed metadata edit to its current version; older clients
+        /// omit this and retain their existing explicit-update behavior.
+        #[serde(default)]
+        expected_current_version: Option<i64>,
         #[serde(default)]
         description: Option<String>,
         #[serde(default)]

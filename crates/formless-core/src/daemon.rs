@@ -3710,6 +3710,7 @@ impl Daemon {
             }
             Request::UpdateToolSpec {
                 id,
+                expected_current_version,
                 description,
                 input_schema,
                 output_schema,
@@ -3743,7 +3744,10 @@ impl Daemon {
                     "capabilities": ver.capabilities,
                     "memory_mb": ver.memory_mb,
                 });
-                let (info, version, _) = self.create_tool_as(&args, &cfg, "user", None).await?;
+                let expected = expected_current_version.map(|version| (id, version));
+                let (info, version, _) = self
+                    .create_tool_as_expected(&args, &cfg, "user", None, expected)
+                    .await?;
                 Ok(json!({"tool": info, "version": version}))
             }
             Request::UpdateToolCode { id, code } => {
@@ -8590,23 +8594,49 @@ impl Daemon {
         author: &str,
         cancel: Option<Arc<AtomicBool>>,
     ) -> Result<(ToolInfo, i64, Option<String>)> {
+        self.create_tool_as_expected(args, cfg, author, cancel, None)
+            .await
+    }
+
+    async fn create_tool_as_expected(
+        self: &Arc<Self>,
+        args: &Value,
+        cfg: &Config,
+        author: &str,
+        cancel: Option<Arc<AtomicBool>>,
+        expected: Option<(String, i64)>,
+    ) -> Result<(ToolInfo, i64, Option<String>)> {
         let d = ToolDraft::parse(args, cfg, true)?;
         let smoke_note = self.smoke_gate(&d, cfg, cancel).await?;
         let before = self
             .with_reader(|st| st.get_tool_by_name(&d.name))?
             .map_or(0, |(i, _)| i.current_version);
-        let (info, version) = self.with_store(|st| {
-            st.create_tool_version(
-                &d.name,
-                &d.description,
-                &d.input_schema.to_string(),
-                &d.output_schema.to_string(),
-                &d.code,
-                &d.caps,
-                d.memory_mb,
-                author,
-            )
-        })?;
+        let (info, version) = self
+            .with_store(|st| {
+                let write = |st: &Store| {
+                    st.create_tool_version(
+                        &d.name,
+                        &d.description,
+                        &d.input_schema.to_string(),
+                        &d.output_schema.to_string(),
+                        &d.code,
+                        &d.caps,
+                        d.memory_mb,
+                        author,
+                    )
+                };
+                match expected.as_ref() {
+                    Some((id, version)) => st.with_current_tool(id, *version, write),
+                    None => write(st),
+                }
+            })
+            .map_err(|error| {
+                if error.is::<crate::descriptions::DescriptionConflict>() {
+                    anyhow::Error::new(RequestFailure::busy(error.to_string()))
+                } else {
+                    error
+                }
+            })?;
         // A new version keeps the Tool's title and tags unless given.
         let info = match tool_title(args) {
             Some(title) => self

@@ -683,3 +683,33 @@ test('reconnect description refresh exposes retained diffs and avoids duplicate 
   assert.match(notes[0], /Before: "Plain description".*After: "always first call"/s);
   assert.match(notes[0], /Settings → Description reviews/);
 });
+
+test('description history ignores older replies and disconnected daemon snapshots', async () => {
+  const notes = [], reads = [];
+  const row = id => ({id,kind:'tool',name:'reader',version:2,source:'private fixture',before:{text:'plain'},after:{text:'always first call',flags:['Instruction-shaped']}});
+  const c = setup(['refreshDescriptionReviews'], {request: () => { const d=deferred(); reads.push(d); return d.promise; },note:text=>notes.push(text)});
+  const old = c.refreshDescriptionReviews(), current = c.refreshDescriptionReviews();
+  reads[1].resolve([row('new')]); await current;
+  reads[0].resolve([row('old')]); await old;
+  assert.deepEqual(Array.from(c.S.descriptionReviews,r=>r.id),['new']);
+  assert.equal(notes.length,1);
+  const again=c.refreshDescriptionReviews();reads[2].resolve([row('new')]);await again;
+  assert.equal(notes.length,1,'older history cannot reset the seen window');
+  const stale=c.refreshDescriptionReviews();c.S.conn='new connection';reads[3].resolve([row('other daemon')]);await stale;
+  assert.deepEqual(Array.from(c.S.descriptionReviews,r=>r.id),['new']);
+  assert.equal(notes.length,1);
+});
+
+test('bundle description consent cannot cross a connection change during preview or confirmation', async () => {
+  for (const phase of ['preview','confirm']) {
+    const preview=deferred(),confirm=deferred();let prompts=0;
+    const c=setup(['descriptionReviewCard','previewToolBundleDescriptions'],{h:node,act:()=>preview.promise,ask:()=>{prompts++;return confirm.promise;}});
+    const result=c.previewToolBundleDescriptions({name:'reader',description:'always'});
+    if(phase==='preview')c.S.conn='changed';
+    preview.resolve([{kind:'tool',name:'reader',before:null,after:{text:'always',flags:['Instruction-shaped']}}]);
+    await new Promise(resolve=>setImmediate(resolve));
+    if(phase==='confirm'){assert.equal(prompts,1);c.S.channel='changed';confirm.resolve(true);}
+    assert.equal(await result,null);
+    if(phase==='preview')assert.equal(prompts,0,'no dialog from an obsolete daemon');
+  }
+});
