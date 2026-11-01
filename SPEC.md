@@ -3818,6 +3818,59 @@ run_tool = "network_policy"     # a registry Tool, or…
   is masked and goes to the keychain through `UpsertProvider`) and `d`
   twice to remove. "config.toml" opens the file in `$VISUAL`/`$EDITOR`.
 
+### External composition in the TUI
+
+Ctrl+G opens the current composer, Session `/instructions` buffer or built-in
+Tool/module editor in `$VISUAL`, then `$EDITOR` (default vi, or Notepad on
+Windows). `/editor` opens the current editing surface too. In history search,
+Ctrl+G retains its existing cancel-search meaning. Other modals keep their keys.
+Collapsed pastes expand in the editor copy without changing the original buffer.
+Code uses `.js`, structured Tool inputs/schemas `.json`, other drafts `.md`.
+
+Editor settings are argument vectors with quoted arguments, not implicit shell
+programs: Unix shell-style quoting, Windows double-quote/backslash command-line
+quoting. No variable, tilde, wildcard or pipeline expansion occurs. An explicit
+configured shell is the owner's command. Known GUI editors use a wait option for
+composition (Code-family --wait, Sublime/Mate/Zed/Gedit --wait, Kate --block,
+GVim/MacVim --nofork). Other GUI commands must themselves wait until this file
+closes; detaching file-open launchers are refused. Ordinary `/open path` keeps
+its existing nonblocking GUI behavior.
+
+The editor gets a private random temporary directory and a new file with Unix
+mode 0600 (directory 0700); Windows creates protected current-user/SYSTEM
+DACLs using the daemon's existing owner-only descriptor, also tightened on returned
+regular files only after checking the link count is one and the owner matches
+the originally created private file. Both are removed on success, cancellation and error,
+including editor backup files. Reads are bounded to 4 MiB and reject symlink,
+reparse-point, directory and other nonregular replacements; an editor's atomic
+regular-file replacement is supported. Only a successful editor exit can load
+UTF-8 text back (line endings normalize to the TUI newline convention). A nonzero exit, failed start/read or oversized result leaves the
+original buffer, cursor, collapsed pastes, Vim mode and attachments untouched,
+with a Note. An unchanged result preserves them too. A changed result replaces
+only that editing buffer and places its cursor at the end; it does not send a
+message, save a Tool, or submit instructions. Existing Enter/Ctrl+S validation
+and consent still apply. Stale Tool previews are invalidated; captured review
+base versions are retained.
+
+An empty result for a nonempty buffer shows a dedicated confirmation: y clears,
+n/Esc/Ctrl+C keep the original. Enter alone does not clear. Confirmation binds
+the edit generation, Session/Tool identity and exact original buffer/cursor;
+changed targets cannot be overwritten. Temporary files are already removed
+while confirmation waits. During a synchronous handoff only the parent catches
+INT/QUIT (Windows Ctrl+C/Break); child exec keeps its ordinary interrupt behavior.
+The exact prior parent signal policy is restored after terminal restoration,
+including failed spawn or unwind. Other signals retain their normal behavior.
+The handoff is synchronous: daemon messages queue while the editor owns the
+terminal. It invalidates pending forecast consent before waiting, so a queued
+reply cannot send the unchanged old draft on return. Superseded Tool-input
+opening replies are ignored. Changed Tool buffers remove pending old preview
+requests before the event pump resumes. Queued Session deletion stashes the
+edited draft with its original Session; an empty-confirmation target is checked
+again after queued events have been processed. No live-state freshness is
+claimed while the editor is open.
+Both config-file and temporary-buffer handoffs reuse
+the same terminal suspension/restoration and force-redraw-from-scratch path.
+
 ### 10.5 Input and keys
 
 - Enter: send / Steer while running. Queue: Ctrl+Enter where the

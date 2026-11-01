@@ -111,6 +111,7 @@ pub const COMMANDS: &[Command] = &[
     cmd("sessions", "", "list and switch Sessions (T toggles lineage tree)", Session),
     cmd("fork", "", "fork the current Session", Session),
     cmd("search", "", "search all Sessions", Session),
+    cmd("editor", "", "compose the current buffer in $VISUAL/$EDITOR (also Ctrl+G)", Session),
     cmd(
         "edit",
         "",
@@ -650,6 +651,10 @@ const KEYS: &[(&str, &str)] = &[
     (
         "Hunk review: n/p, a/r, u, c",
         "next/previous, keep/reject, undo latest change, comment with server path:line",
+    ),
+    (
+        "Ctrl+G",
+        "edit composer, instructions or Tool draft in $VISUAL/$EDITOR; normal send/save still applies",
     ),
     ("Ctrl+C", "clear the input; twice to detach"),
     ("Tab / Shift+Tab", "switch views"),
