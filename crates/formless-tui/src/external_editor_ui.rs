@@ -262,7 +262,9 @@ impl App {
         match origin.target {
             Target::Composer { .. } => {
                 let mode = self.vim_input.mode;
+                let literal = self.input.is_literal();
                 self.input.set(text);
+                self.input.set_literal(literal);
                 self.vim_input.reset();
                 self.vim_input.mode = mode;
                 self.palette_hidden = None;

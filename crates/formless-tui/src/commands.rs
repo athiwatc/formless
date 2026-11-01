@@ -63,6 +63,10 @@ const fn cmd(name: &'static str, args: &'static str, desc: &'static str, group: 
 
 use Group::*;
 
+/// Dispatcher aliases retained for compatibility, without duplicate palette
+/// rows. They reserve the same namespace against local prompt templates.
+pub const LEGACY_ALIASES: &[&str] = &["pending", "providers", "tags"];
+
 pub const COMMANDS: &[Command] = &[
     cmd(
         "new",

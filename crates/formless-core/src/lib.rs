@@ -64,6 +64,7 @@ pub mod storage;
 pub mod tokens;
 pub mod tools;
 pub mod transcript;
+pub mod user_commands;
 pub mod webui;
 #[cfg(windows)]
 pub mod win_pipe;
