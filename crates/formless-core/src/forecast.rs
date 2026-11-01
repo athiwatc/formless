@@ -1196,6 +1196,13 @@ mod tests {
         let st = Store::open(&paths.db_file()).unwrap();
         let sid = st.create_session(None).unwrap().id;
         drop(st);
+        let reader = Store::open_forecast_snapshot(&paths).unwrap().unwrap();
+        assert!(
+            crate::profile_lock::ProfileLock::hierarchy_shared(&paths).is_err(),
+            "configuration writer must not race a live snapshot quote"
+        );
+        Config::load_file_only(&paths).unwrap();
+        drop(reader);
         let quote = estimate(
             &paths,
             &ForecastInput {
