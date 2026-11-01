@@ -249,6 +249,11 @@ impl Store {
         if summary_hash(&message.content) != key.candidate_hash
             || meta["tool_data"] != true
             || meta["branch_summary"]["preview_id"] != key.preview_id
+            || meta["branch_summary"]["source_id"] != key.source_id
+            || meta["branch_summary"]["target_id"] != key.target_id
+            || meta["branch_summary"]["source_revision"] != key.source_revision
+            || meta["branch_summary"]["target_revision"] != key.target_revision
+            || meta["branch_summary"]["candidate_hash"] != key.candidate_hash
         {
             return Err(BranchSummaryFailure::Stale.into());
         }
@@ -549,5 +554,56 @@ mod tests {
         assert_eq!(p.truncated_messages, 0);
         assert!(p.metadata_omitted && p.attachment_bodies_omitted);
         assert!(!snapshot.frame.contains("never-open-this"));
+    }
+    #[test]
+    fn durable_receipt_survives_reopen_but_rejects_attribution_metadata_edit() {
+        struct Private(std::path::PathBuf);
+        impl Drop for Private {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let dir = Private(
+            std::env::temp_dir().join(format!("fl-summary-receipt-{}", uuid::Uuid::new_v4())),
+        );
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let file = dir.0.join("private.db");
+        let cfg = crate::Config::default();
+        let (key, message) = {
+            let st = Store::open(&file).unwrap();
+            let a = st.create_session(None).unwrap();
+            let b = st.create_session(None).unwrap();
+            st.append_message(&a.id, "user", "Durable evidence")
+                .unwrap();
+            let basis = st
+                .branch_summary_snapshot(&a.id, &b.id, &cfg)
+                .unwrap()
+                .basis;
+            let key = confirmation(&basis, "Reviewed data note");
+            let applied = st
+                .append_branch_summary(
+                    &key,
+                    "Reviewed data note",
+                    &cfg,
+                    "default",
+                    "served",
+                    &basis.projection,
+                )
+                .unwrap();
+            (key, applied.message)
+        };
+        let st = Store::open(&file).unwrap();
+        let replay = st.branch_summary_receipt(&key).unwrap().unwrap();
+        assert!(replay.already_applied);
+        assert_eq!(replay.message, message);
+        let mut meta: Value = serde_json::from_str(message.meta.as_deref().unwrap()).unwrap();
+        meta["branch_summary"]["source_id"] = json!("a-different-branch");
+        st.ex(
+            "UPDATE messages SET meta=?2 WHERE id=?1",
+            params![message.id, meta.to_string()],
+        )
+        .unwrap();
+        assert!(st.branch_summary_receipt(&key).is_err());
+        assert_eq!(st.list_messages(&key.target_id).unwrap().len(), 1);
     }
 }

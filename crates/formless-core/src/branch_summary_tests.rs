@@ -24,6 +24,7 @@ struct Mock {
     release: Semaphore,
     bodies: StdMutex<Vec<Value>>,
     fallback: bool,
+    output: AtomicUsize,
 }
 async fn setup(
     env: &crate::credential_env::EnvGuard,
@@ -37,6 +38,7 @@ async fn setup(
         release: Semaphore::new(0),
         bodies: StdMutex::new(Vec::new()),
         fallback,
+        output: AtomicUsize::new(0),
     });
     let handler = mock.clone();
     let app=axum::Router::new().route("/chat/completions",axum::routing::post(move |axum::Json(body):axum::Json<Value>| {
@@ -45,7 +47,9 @@ async fn setup(
             mock.calls.fetch_add(1,Ordering::SeqCst);mock.arrived.notify_one();
             mock.release.acquire().await.unwrap().forget();
             if mock.fallback && body["model"]=="primary" { return (axum::http::StatusCode::SERVICE_UNAVAILABLE,"private primary unavailable").into_response(); }
-            axum::Json(json!({"choices":[{"message":{"content":"Evidence supports the measured result; unresolved concerns remain."},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":4}})).into_response()
+            let mode=mock.output.load(Ordering::SeqCst);
+            let text=match mode {2=>"x".repeat(MAX_CANDIDATE_BYTES+1),3=>String::new(),_=>"Evidence supports the measured result; unresolved concerns remain.".into()};
+            axum::Json(json!({"choices":[{"message":{"content":text},"finish_reason":if mode==1 {"length"} else {"stop"}}],"usage":{"prompt_tokens":10,"completion_tokens":4}})).into_response()
         }
     }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -400,5 +404,106 @@ async fn summary_rechecks_target_at_confirmation_and_preserves_normal_budget_ref
         mock.calls.load(Ordering::SeqCst),
         1,
         "normal budget denial occurs before HTTP"
+    );
+}
+
+#[tokio::test]
+async fn busy_deleted_and_generation_capacity_refusals_make_no_provider_request() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let (_root, daemon, mock, _server, source, target) = setup(&env, false).await;
+    let slot1 = daemon.summary_generation_slot().unwrap();
+    let slot2 = daemon.summary_generation_slot().unwrap();
+    assert_eq!(
+        daemon
+            .summary_generation_slot()
+            .err()
+            .unwrap()
+            .downcast_ref::<RequestFailure>()
+            .unwrap()
+            .code,
+        codes::BUSY
+    );
+    drop(slot1);
+    let slot3 = daemon.summary_generation_slot().unwrap();
+    drop(slot2);
+    drop(slot3);
+    assert_eq!(daemon.branch_summary_state.locked().generating, 0);
+    let (steer_tx, _rx) = mpsc::unbounded_channel();
+    daemon.runs.locked().insert(
+        source.clone(),
+        RunCtl {
+            run_id: "owned-summary-test-busy".into(),
+            cancel: CancellationToken::new(),
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            steer_tx,
+            retry: Arc::new(Notify::new()),
+        },
+    );
+    let request = || Request::InspectBranchSummary {
+        source_id: source.clone(),
+        target_id: target.clone(),
+    };
+    assert_eq!(
+        daemon
+            .handle(request())
+            .await
+            .unwrap_err()
+            .downcast_ref::<RequestFailure>()
+            .unwrap()
+            .code,
+        codes::BUSY
+    );
+    daemon.runs.locked().remove(&source);
+    daemon.with_store(|st| st.delete_session(&source)).unwrap();
+    assert_eq!(
+        daemon
+            .handle(request())
+            .await
+            .unwrap_err()
+            .downcast_ref::<RequestFailure>()
+            .unwrap()
+            .code,
+        codes::NOT_FOUND
+    );
+    assert_eq!(mock.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn cut_off_oversized_or_empty_generation_keeps_charge_but_creates_no_preview_or_note() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let (_root, daemon, mock, _server, source, target) = setup(&env, false).await;
+    for mode in 1..=3 {
+        mock.output.store(mode, Ordering::SeqCst);
+        let b = basis(&daemon, &source, &target).await;
+        let clone = daemon.clone();
+        let request = prepare(&b);
+        let generation = tokio::spawn(async move { clone.handle(request).await });
+        arrived(&mock, mode).await;
+        mock.release.add_permits(1);
+        let err = tokio::time::timeout(Duration::from_secs(10), generation)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<RequestFailure>().unwrap().code,
+            codes::INVALID
+        );
+        assert!(daemon.branch_summary_state.locked().previews.is_empty());
+        assert_eq!(daemon.branch_summary_state.locked().generating, 0);
+        assert!(daemon
+            .with_reader(|st| st.list_messages(&target))
+            .unwrap()
+            .is_empty());
+    }
+    let db = rusqlite::Connection::open(daemon.paths.db_file()).unwrap();
+    assert_eq!(
+        db.query_row(
+            "SELECT COUNT(*) FROM run_usage WHERE source='branch-summary'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        3
     );
 }
