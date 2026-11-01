@@ -1518,8 +1518,41 @@ pattern (§4.4).
     — gated by `fs:read`; `fs.write/append/mkdir/remove/rename` — gated by
     `fs:write` (both paths for rename). Writes create missing parent dirs.
   - `env.get(key)` — gated by `env`. `process.run(cmd, args, {cwd, env,
-    stdin, stdinEncoding, encoding})` → `{code, signal, stdout, stderr}` —
-    gated by `process`, no shell, stdin closed unless given.
+    stdin, stdinEncoding, encoding, timeout_ms})` → `{code, signal, stdout,
+    stderr, timed_out, killed, truncated}` — gated by `process`, no shell,
+    stdin closed unless given. An optional integer `timeout_ms` from 0 to
+    86400000 terminates the owned process group/job on expiry and returns
+    `timed_out: true`; omission preserves cancellation-only execution.
+  - `process.spawn(cmd, args, opts)` takes the same options and checks as
+    `process.run`, returning an Invocation-local handle. `handle.read(size)`
+    blocks for the next available `{stream: "stdout"|"stderr", data, eof:
+    false}` chunk, or `{stream: null, data: "", eof: true}`. The size defaults
+    to 65536 and is clamped to 4–1048576 bytes; UTF-8 chunks do not split a
+    character. The stdout encoding follows `opts.encoding`; stderr is UTF-8,
+    as with `run`. Arrival order between streams is not guaranteed.
+    `handle.wait()` consumes/discards any unread output and returns
+    `{code, signal, timed_out, killed, truncated}`; discards are reported as
+    `truncated: true`, so waiting before reading cannot deadlock full pipes.
+    `handle.kill()` terminates the group/job and waits for cleanup;
+    `handle.close()` does the same without requiring a result. Finished JS
+    handles cache their status and subsequent reads return EOF.
+  - Streamed process output is backpressured: at most 256 KiB is queued per
+    stream, plus a 64 KiB pipe read and at most three UTF-8 carry bytes. There
+    are at most 16 open process handles per Invocation; waiting/closing frees
+    a slot. `run` still retains only `tools.max_process_output_bytes` from
+    each stream and drains the rest with `truncated: true`. Timeouts and
+    cancellation are supervised independently of JS reads or sleeps.
+    Processes cannot outlive their Invocation: normal return, thrown errors,
+    abandoned handles, and cancellation close all owned handles and reap
+    children/pipe workers. A direct child that exits cannot leave background
+    group members holding its pipes indefinitely. Unix uses a private process
+    group, retaining the waitable leader until group termination before
+    reaping it. A Unix parent policy that auto-reaps (`SIGCHLD` ignored or
+    `SA_NOCLDWAIT`) is rejected before spawn, without changing any handler;
+    application code must not independently reap runtime-owned children.
+    Windows assigns a suspended child to a private kill-on-close Job before
+    resuming it, failing closed if Job setup fails. This is process
+    ownership/cleanup, not an OS sandbox for arbitrary granted programs.
   - `progress(fraction, label)` — no Capability needed: `fraction` 0..1
     (or null when unknown) and a short label. The daemon broadcasts
     `ToolProgress {tool_name, depth, fraction, label}` (at most 5 a second
