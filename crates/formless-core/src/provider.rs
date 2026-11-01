@@ -204,13 +204,34 @@ pub struct Provider {
     /// Told of every request's reported usage (model, usage), so the
     /// daemon's own calls are counted too (#806).
     on_usage: Option<UsageHook>,
+    on_request: Option<RequestHook>,
     /// The configured provider's name (`default` or a `[providers.<name>]`
     /// key), for pricing usage from its own table (#810).
     name: String,
 }
 
 pub type NoteHook = Arc<dyn Fn(String) + Send + Sync>;
-pub type UsageHook = Arc<dyn Fn(&str, &str, &Usage) + Send + Sync>;
+pub type UsageHook = Arc<dyn Fn(&str, &str, &Usage) -> Result<()> + Send + Sync>;
+/// A local persistence failure is not evidence that the serving model failed.
+#[derive(Debug, thiserror::Error)]
+#[error("commit model usage before releasing budget admission")]
+pub(crate) struct UsageAccountingFailure;
+
+/// Lifetime lease acquired before a model request and dropped after accounting.
+pub type RequestLease = Box<dyn std::any::Any + Send>;
+pub type RequestHook = Arc<
+    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<RequestLease>> + Send>>
+        + Send
+        + Sync,
+>;
+
+#[derive(Debug, Clone)]
+pub struct CompletionResult {
+    pub text: String,
+    pub usage: Option<Usage>,
+    pub output_limited: bool,
+    pub model_used: String,
+}
 
 /// Shared, bounded per-provider/model circuit breakers. An acquired permit
 /// remains live through body parsing, so one half-open probe includes streaming.
@@ -246,7 +267,67 @@ struct BreakerPermit {
     probe: bool,
     label: String,
     note: Option<NoteHook>,
+    accounting: Option<RequestAccounting>,
 }
+
+/// The HTTP response owns admission until parsed usage is committed. Keeping
+/// this on the existing response permit preserves the post_provider contract.
+struct RequestAccounting {
+    _lease: Option<RequestLease>,
+    hook: Option<UsageHook>,
+    provider: String,
+    model: String,
+}
+
+/// A stream may end by error, cancellation, parser failure or future drop.
+/// Persist its latest reported cumulative counters once on every such path.
+struct AttemptUsage<'a> {
+    provider: &'a Provider,
+    model: String,
+    usage: Option<Usage>,
+}
+impl<'a> AttemptUsage<'a> {
+    fn new(provider: &'a Provider, model: &str) -> Self {
+        Self {
+            provider,
+            model: model.to_string(),
+            usage: None,
+        }
+    }
+    fn observe(&mut self, usage: Option<Usage>) {
+        if let Some(mut usage) = usage {
+            if let Some(previous) = self.usage {
+                // Usage events are cumulative, and partial updates may omit
+                // counters already reported by message_start/earlier events.
+                usage.prompt_tokens = usage.prompt_tokens.max(previous.prompt_tokens);
+                usage.completion_tokens = usage.completion_tokens.max(previous.completion_tokens);
+                usage.reasoning_tokens = usage.reasoning_tokens.max(previous.reasoning_tokens);
+                usage.cached_tokens = usage.cached_tokens.max(previous.cached_tokens);
+                usage.cache_write_tokens =
+                    usage.cache_write_tokens.max(previous.cache_write_tokens);
+                usage.cost = match (usage.cost, previous.cost) {
+                    (Some(a), Some(b)) => Some(a.max(b)),
+                    (a, b) => a.or(b),
+                };
+            }
+            self.usage = Some(usage);
+        }
+    }
+    fn finish(&mut self) -> Result<()> {
+        self.provider
+            .report_usage(&self.model, self.usage.take().as_ref())
+    }
+}
+impl Drop for AttemptUsage<'_> {
+    fn drop(&mut self) {
+        if let Err(error) = self.finish() {
+            // The daemon hook fails future admission closed after a failed
+            // commit. Preserve the original stream error/cancellation here.
+            tracing::warn!("could not commit failed stream usage: {error:#}");
+        }
+    }
+}
+
 impl BreakerPermit {
     fn acquire(key: String, label: String, note: Option<NoteHook>) -> Option<Self> {
         let now = std::time::Instant::now();
@@ -277,7 +358,16 @@ impl BreakerPermit {
             probe,
             label,
             note,
+            accounting: None,
         })
+    }
+    fn account_usage(&self, usage: Option<Usage>) -> Result<()> {
+        if let (Some(accounting), Some(usage)) = (&self.accounting, usage) {
+            if let Some(hook) = &accounting.hook {
+                hook(&accounting.provider, &accounting.model, &usage)?;
+            }
+        }
+        Ok(())
     }
     fn say(&self, text: String) {
         tracing::info!("{text}");
@@ -370,9 +460,10 @@ async fn completed_json(
     permit: BreakerPermit,
     context: &'static str,
 ) -> Result<Value> {
-    match resp.json().await {
+    match resp.json::<Value>().await {
         Ok(value) => {
             permit.success();
+            permit.account_usage(Usage::parse(&value["usage"]))?;
             Ok(value)
         }
         Err(error) => {
@@ -928,6 +1019,7 @@ impl Provider {
             on_note: None,
             on_breaker_note: None,
             on_usage: None,
+            on_request: None,
             name: crate::config::DEFAULT_PROVIDER.to_string(),
             http,
         })
@@ -950,6 +1042,7 @@ impl Provider {
             on_note: None,
             on_breaker_note: None,
             on_usage: None,
+            on_request: None,
             name: crate::config::DEFAULT_PROVIDER.to_string(),
             http,
         }
@@ -981,6 +1074,7 @@ impl Provider {
             on_note: None,
             on_breaker_note: None,
             on_usage: None,
+            on_request: None,
             name: crate::config::DEFAULT_PROVIDER.to_string(),
             http,
         })
@@ -1039,10 +1133,41 @@ impl Provider {
         &self.name
     }
 
-    fn report_usage(&self, model: &str, usage: Option<&Usage>) {
-        if let (Some(hook), Some(u)) = (&self.on_usage, usage) {
-            hook(&self.name, model, u);
+    pub fn with_request_hook(mut self, hook: RequestHook) -> Self {
+        self.on_request = Some(hook);
+        self
+    }
+
+    fn request_accounting(&self, model: &str, lease: Option<RequestLease>) -> RequestAccounting {
+        RequestAccounting {
+            _lease: lease,
+            hook: self.on_usage.clone(),
+            provider: self.name.clone(),
+            model: model.to_string(),
         }
+    }
+
+    fn report_error_usage(&self, text: &str, model: &str) -> Result<()> {
+        if let Ok(value) = serde_json::from_str::<Value>(text) {
+            let usage =
+                Usage::parse(&value["usage"]).or_else(|| Usage::parse(&value["response"]["usage"]));
+            self.report_usage(model, usage.as_ref())?;
+        }
+        Ok(())
+    }
+
+    async fn request_lease(&self) -> Result<Option<RequestLease>> {
+        match &self.on_request {
+            Some(hook) => hook().await.map(Some),
+            None => Ok(None),
+        }
+    }
+
+    fn report_usage(&self, model: &str, usage: Option<&Usage>) -> Result<()> {
+        if let (Some(hook), Some(u)) = (&self.on_usage, usage) {
+            hook(&self.name, model, u)?;
+        }
+        Ok(())
     }
 
     fn breaker_key(&self, model: &str, credential: &str) -> String {
@@ -1326,11 +1451,19 @@ impl Provider {
         model: &str,
         effort: Option<&str>,
     ) -> Result<(String, Option<Usage>, bool)> {
-        let out = self
-            .complete_with_usage_inner(messages, model, effort)
-            .await?;
-        self.report_usage(model, out.1.as_ref());
-        Ok(out)
+        let out = self.complete_result(messages, model, effort).await?;
+        Ok((out.text, out.usage, out.output_limited))
+    }
+
+    /// Completion including the final serving identity, for pricing and metrics.
+    pub async fn complete_result(
+        &self,
+        messages: &[Value],
+        model: &str,
+        effort: Option<&str>,
+    ) -> Result<CompletionResult> {
+        self.complete_with_usage_inner(messages, model, effort)
+            .await
     }
 
     async fn complete_with_usage_inner(
@@ -1338,47 +1471,64 @@ impl Provider {
         messages: &[Value],
         model: &str,
         effort: Option<&str>,
-    ) -> Result<(String, Option<Usage>, bool)> {
-        if self.cfg.anthropic() {
+    ) -> Result<CompletionResult> {
+        let (v, served) = if self.cfg.anthropic() {
             let mut body = crate::anthropic::body(model, messages, &[], false, effort, false);
-            let (resp, _, _, permit) = self.post_provider(&mut body, None, true).await?;
-            let v = completed_json(resp, permit, "parse Messages response").await?;
+            let (resp, _, served, permit) = self.post_provider(&mut body, None, true).await?;
+            (
+                completed_json(resp, permit, "parse Messages response").await?,
+                served,
+            )
+        } else {
+            let mut body = if self.cfg.responses() {
+                json!({"model": model, "input": responses_input(messages), "stream": false})
+            } else {
+                json!({"model": model, "messages": messages, "stream": false})
+            };
+            self.post_chat_served(&mut body, effort).await?
+        };
+        let usage = Usage::parse(&v["usage"]);
+        let (text, output_limited) = if self.cfg.anthropic() {
             if let Some(why) = crate::anthropic::unusable_stop(&v) {
                 return Err(anyhow!("provider error: {why}"));
             }
-            let usage = Usage::parse(&v["usage"]);
-            let cut = v["stop_reason"] == "max_tokens";
-            return Ok((crate::anthropic::response_parts(&v).0, usage, cut));
-        }
-        let mut body = if self.cfg.responses() {
-            json!({"model": model, "input": responses_input(messages), "stream": false})
+            (
+                crate::anthropic::response_parts(&v).0,
+                v["stop_reason"] == "max_tokens",
+            )
+        } else if self.cfg.responses() {
+            (responses_text(&v), v["status"] == "incomplete")
         } else {
-            json!({"model": model, "messages": messages, "stream": false})
+            (
+                v["choices"][0]["message"]["content"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+                v["choices"][0]["finish_reason"] == "length",
+            )
         };
-        let v = self.post_chat(&mut body, effort).await?;
-        let usage = Usage::parse(&v["usage"]);
-        if self.cfg.responses() {
-            let cut = v["status"] == "incomplete";
-            return Ok((responses_text(&v), usage, cut));
-        }
-        let cut = v["choices"][0]["finish_reason"] == "length";
-        Ok((
-            v["choices"][0]["message"]["content"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string(),
+        Ok(CompletionResult {
+            text,
             usage,
-            cut,
-        ))
+            output_limited,
+            model_used: served,
+        })
     }
 
     /// POST /chat/completions with bounded retries (SPEC §4.4). Returns the
     /// fully parsed JSON on success. If a 400 looks like an unknown-parameter
     /// rejection and reasoning_effort was set, retries once without it and
     /// flags `dropped` via the returned marker in ChatResult paths.
-    async fn post_chat(&self, body: &mut Value, effort: Option<&str>) -> Result<Value> {
-        let (resp, _, _, permit) = self.post_provider(body, effort, true).await?;
-        completed_json(resp, permit, "parse chat completion").await
+    async fn post_chat_served(
+        &self,
+        body: &mut Value,
+        effort: Option<&str>,
+    ) -> Result<(Value, String)> {
+        let (resp, _, served, permit) = self.post_provider(body, effort, true).await?;
+        Ok((
+            completed_json(resp, permit, "parse chat completion").await?,
+            served,
+        ))
     }
 
     async fn post_provider(
@@ -1423,6 +1573,7 @@ impl Provider {
             // (#1088), so `sends` just bounds the total.
             let (mut attempt, mut sends) = (0, 0);
             'attempts: while attempt <= self.cfg.max_retries && sends <= attempt + MAX_RESENDS {
+                let lease = self.request_lease().await?;
                 sends += 1;
                 let mut b = body.clone();
                 b["model"] = json!(model);
@@ -1466,10 +1617,12 @@ impl Provider {
                         let status = resp.status();
                         note_rate_limits(&self.cfg.base_url, resp.headers());
                         if status.is_success() {
+                            permit.accounting = Some(self.request_accounting(model, lease));
                             return Ok((resp, recovered, model.clone(), permit));
                         }
                         server_wait = retry_after(resp.headers());
                         let text = resp.text().await.unwrap_or_default();
+                        self.report_error_usage(&text, model)?;
                         // Save every rejected response before any recovery can
                         // continue, including the final send at the resend cap.
                         last_err = match server_wait {
@@ -1603,16 +1756,8 @@ impl Provider {
         cancel: &CancellationToken,
         on_delta: F,
     ) -> Result<ChatResult> {
-        let out = self
-            .chat_stream_inner(messages, tools, model, effort, cancel, on_delta)
-            .await?;
-        let served = if out.model_used.is_empty() {
-            model
-        } else {
-            &out.model_used
-        };
-        self.report_usage(served, out.usage.as_ref());
-        Ok(out)
+        self.chat_stream_inner(messages, tools, model, effort, cancel, on_delta)
+            .await
     }
 
     async fn chat_stream_inner<F: FnMut(DeltaKind, &str) + Send>(
@@ -1729,6 +1874,7 @@ impl Provider {
                 _ = cancel.cancelled() => return Err(anyhow!("interrupted")),
                 r = self.post_provider(&mut body, effort, true) => r?,
             };
+            let mut charged = AttemptUsage::new(self, &model_used);
             let mut stream = resp.bytes_stream();
             // Raw bytes: a chunk boundary can split a multibyte character, so
             // only complete lines are decoded.
@@ -1816,6 +1962,12 @@ impl Provider {
                                 }
                                 pending.clear();
                                 if let Ok(v) = parsed {
+                                    // Error/incomplete events can carry usage too. Observe
+                                    // before branches that retry or return, not just success.
+                                    usage = Usage::parse(&v["usage"])
+                                        .or_else(|| Usage::parse(&v["response"]["usage"]))
+                                        .or(usage);
+                                    charged.observe(usage);
                                     // Mid-stream failures: Responses `error` / `response.failed` /
                                     // `response.incomplete` events, or a Chat Completions `{"error": ...}`
                                     // chunk. Retry only before anything streamed, so the user never sees
@@ -2014,6 +2166,7 @@ impl Provider {
                     }
                 }
             }
+            charged.finish()?;
             permit.success();
             break (
                 StreamAttempt {
@@ -2116,8 +2269,12 @@ impl Provider {
             let mut stream = resp.bytes_stream();
             let mut buf: Vec<u8> = Vec::new();
             let mut f = crate::anthropic::Folded::default();
+            let mut charged = AttemptUsage::new(self, &model_used);
             let mut failed: Option<String> = None;
-            let fold = |f: &mut crate::anthropic::Folded, raw: &[u8], on_delta: &mut F| {
+            let fold = |f: &mut crate::anthropic::Folded,
+                        raw: &[u8],
+                        on_delta: &mut F,
+                        charged: &mut AttemptUsage<'_>| {
                 let line = String::from_utf8_lossy(raw);
                 let Some(data) = line.trim().strip_prefix("data:") else {
                     return;
@@ -2130,6 +2287,17 @@ impl Provider {
                     crate::anthropic::Delta::Thinking(t) => on_delta(DeltaKind::Reasoning, t),
                     crate::anthropic::Delta::None => {}
                 }
+                if let Some(mut usage) =
+                    Usage::parse(&v["usage"]).or_else(|| Usage::parse(&v["message"]["usage"]))
+                {
+                    usage.prompt_tokens = usage
+                        .prompt_tokens
+                        .max(f.input_tokens + f.cache_read + f.cache_write);
+                    usage.completion_tokens = usage.completion_tokens.max(f.output_tokens);
+                    usage.cached_tokens = usage.cached_tokens.max(f.cache_read);
+                    usage.cache_write_tokens = usage.cache_write_tokens.max(f.cache_write);
+                    charged.observe(Some(usage));
+                }
             };
             'read: loop {
                 tokio::select! {
@@ -2139,7 +2307,7 @@ impl Provider {
                             // A last event without its newline still counts.
                             if !buf.is_empty() {
                                 let rest = std::mem::take(&mut buf);
-                                fold(&mut f, &rest, &mut on_delta);
+                                fold(&mut f, &rest, &mut on_delta, &mut charged);
                             }
                             break 'read;
                         };
@@ -2154,7 +2322,7 @@ impl Provider {
                         buf.extend_from_slice(&chunk);
                         while let Some(pos) = buf.iter().position(|b| *b == b'\n') {
                             let raw: Vec<u8> = buf.drain(..=pos).collect();
-                            fold(&mut f, &raw, &mut on_delta);
+                            fold(&mut f, &raw, &mut on_delta, &mut charged);
                             if f.error.is_some() {
                                 break 'read;
                             }
@@ -2225,8 +2393,12 @@ impl Provider {
                 completion_tokens: f.output_tokens,
                 cached_tokens: f.cache_read,
                 cache_write_tokens: f.cache_write,
+                cost: charged.usage.and_then(|u| u.cost),
                 ..Default::default()
             };
+            charged.observe(Some(usage));
+            let usage = charged.usage.unwrap_or(usage);
+            charged.finish()?;
             return Ok(ChatResult {
                 content: f.text,
                 reasoning: f.thinking,
@@ -2252,13 +2424,15 @@ impl Provider {
     /// Server-side compaction (SPEC §11): POST {base_url}/compact with
     /// {model, input}; accepts {summary}|{output}|{content} responses.
     pub async fn compact_server(&self, text: &str, model: &str) -> Result<String> {
+        let lease = self.request_lease().await?;
         let body = json!({"model": model, "input": text});
         let credential = self.credential().await?;
-        let permit = self.breaker_permit(model, &credential).ok_or_else(|| {
+        let mut permit = self.breaker_permit(model, &credential).ok_or_else(|| {
             anyhow!(
                 "model {model}: circuit breaker is open, probing, or at active-identity capacity"
             )
         })?;
+        permit.accounting = Some(self.request_accounting(model, lease));
         let req = apply_headers(
             self.http.post(url(&self.cfg.base_url, "compact")),
             &self.cfg,
@@ -2277,12 +2451,12 @@ impl Provider {
             if status.as_u16() == 429 || status.is_server_error() {
                 permit.failure("compaction provider failed", false);
             }
-            return Err(anyhow!(
-                "POST /compact failed: {status}: {}",
-                resp.text().await.unwrap_or_default()
-            ));
+            let text = resp.text().await.unwrap_or_default();
+            self.report_error_usage(&text, model)?;
+            return Err(anyhow!("POST /compact failed: {status}: {text}"));
         }
         let v = completed_json(resp, permit, "parse /compact").await?;
+
         for key in ["summary", "output", "content"] {
             if let Some(s) = v[key].as_str() {
                 if !s.is_empty() {

@@ -1,6 +1,7 @@
 pub mod anthropic;
 pub mod artifacts;
 pub mod auth;
+mod budget;
 pub mod config;
 pub mod daemon;
 pub mod diff;

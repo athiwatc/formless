@@ -387,6 +387,28 @@ an empty listing just asks for one.
 
 ### 4.4 Provider failure handling
 
+Model requests made by a daemon share budget admission, including Run turns,
+sub-agents, nested `llm.complete` and internal model work. With a positive dollar
+limit configured, one request at a time reserves the available budget headroom;
+queued requests recheck committed usage and reload current effective limits and
+prices after acquiring admission, so live settings changes apply before dispatch. This conservative lane
+avoids guessing provider output costs: at most one in-flight request can cross a
+limit, even across concurrent Runs sharing the UTC daily limit. It is not a hard
+provider billing cap; an individual response, failed remote attempt or cancelled
+remote request can still incur charges. Reported usage is committed before the
+lane is released; errors and cancellation release it too. If committing usage
+fails, subsequent model requests fail closed until storage is repaired and the
+daemon restarted. The lane never spans Tool execution. Unpriced aggregate usage retains the existing opt-in limit
+semantics, and an explicit budget-resume waiver remains effective.
+Known reported usage counts even when a response is rejected as unusable or a
+stream fails, is cancelled, or is retried. Each attempt commits its latest known
+cumulative usage once before its admission lease is released; a retry/fallback
+must acquire fresh admission. A rejected answer remains an error. Unknown remote
+charges cannot be inferred from a transport failure.
+Nested completion and sub-agent usage, prices and parent Tool model-use costs
+use the final serving model, including fallback, consistently with Run turns.
+
+
 Circuit breakers are scoped to the normalized endpoint (host case, default
 port and trailing slash), configured provider name and a non-reversible
 credential digest, plus the model actually serving the request. Missing models
