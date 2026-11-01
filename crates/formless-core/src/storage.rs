@@ -6910,3 +6910,10 @@ mod description_store_tests;
 #[cfg(test)]
 #[path = "session_lineage_tests.rs"]
 mod session_lineage_tests;
+
+#[path = "session_comparison.rs"]
+mod session_comparison;
+
+#[cfg(test)]
+#[path = "session_comparison_tests.rs"]
+mod session_comparison_tests;

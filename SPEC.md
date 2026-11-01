@@ -656,6 +656,22 @@ task, with quality as a gate**.
   its closing boundary. Historical and crash-orphan boundaries remain unknown.
   These are whole-Run transcript anchors, not per-request billing boundaries;
   a fork inside a Run cannot split that Run's usage exactly.
+  `CompareSessions` and `formless sessions compare A B --json` compare stored
+  messages locally, without a model request or a Run. Related branches start
+  at their recorded common fork point; missing parents keep their identity.
+  If the common prefix has since changed, the diff includes full histories
+  with an explicit warning. Unknown ancestry also compares full histories.
+  Usage counts only physical rows owned by each Session, never copied
+  transcript charges. Whole Runs after the cut can be attributed using new
+  anchors; legacy, straddling or untracked work is shown separately as
+  unallocated, with incomplete totals left unknown. Each physical row uses
+  reported cost first, otherwise current configured provider/model prices.
+  Unpriced rows leave dollar totals unknown. A known-records allocation range
+  excludes missing provider usage and is never an upper bound on the bill.
+  Offline comparison reads a private snapshot and file-only prices; it never
+  starts a daemon, authenticates, runs jobs or writes the source SQLite files.
+  `formless sessions fork ID [--name NAME] [--up-to-seq N] --json` uses the same
+  atomic fork operation as the TUI and other callers; it starts no Run.
   **Deleting a Session can be undone for `daemon.delete_undo_secs` (30).**
   It is hidden at once from lists, search and `GetSession`
   (`sessions.deleted_at`, schema v27), and `RestoreSession` brings it

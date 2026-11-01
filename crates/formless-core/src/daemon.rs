@@ -1651,6 +1651,12 @@ impl Daemon {
                 self.broadcast(Event::SessionUpdated { session: s.clone() });
                 Ok(serde_json::to_value(s)?)
             }
+            Request::CompareSessions { left, right } => {
+                let cfg = Config::load_file_only(&self.paths)?;
+                Ok(serde_json::to_value(self.with_reader(|st| {
+                    st.compare_sessions(&left, &right, &cfg)
+                })?)?)
+            }
             Request::SearchSessions { query, limit } => {
                 Ok(serde_json::to_value(self.with_reader(|st| {
                     st.search_sessions(&query, limit.unwrap_or(50))

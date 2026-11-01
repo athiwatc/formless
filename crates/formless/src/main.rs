@@ -1372,6 +1372,13 @@ fn run_cli(cli: Cli) -> Result<()> {
         let paths = Paths::resolve_read_only(cli.profile.as_deref())?;
         return daemon_cmd(paths, DaemonAction::InstallService { dry_run: true });
     }
+    if let Some(Cmd::Sessions {
+        action: SessionsAction::Compare { left, right, json },
+    }) = &cli.cmd
+    {
+        let paths = Paths::resolve_read_only(cli.profile.as_deref())?;
+        return sessions_compare_cmd(&paths, left, right, *json);
+    }
     if let Some(Cmd::Run {
         estimate: true,
         task,
@@ -4356,6 +4363,23 @@ fn web_cmd(paths: Paths, port: Option<u16>, no_open: bool, stop: bool) -> Result
 
 #[derive(Subcommand)]
 enum SessionsAction {
+    /// Fork stored history without starting a Run
+    Fork {
+        id: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        up_to_seq: Option<i64>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Compare stored branch messages and recorded local usage (no model call)
+    Compare {
+        left: String,
+        right: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// List Sessions (archived ones only with --archived)
     List {
         #[arg(long)]
@@ -4405,9 +4429,40 @@ enum SessionsAction {
 }
 
 fn sessions_cmd(paths: Paths, action: SessionsAction) -> Result<()> {
+    let action = match action {
+        SessionsAction::Compare { left, right, json } => {
+            return sessions_compare_cmd(&paths, &left, &right, json)
+        }
+        other => other,
+    };
     formless_core::daemon::ensure_daemon(&paths)?;
     let daemon = |r| formless_tui::client::request_once(&paths, r);
     match action {
+        SessionsAction::Fork {
+            id,
+            name,
+            up_to_seq,
+            json,
+        } => {
+            let source = find_session(&paths, &id)?;
+            let fork: SessionInfo = serde_json::from_value(daemon(Request::ForkSession {
+                id: source.id,
+                name,
+                up_to_seq,
+            })?)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&fork)?);
+            } else {
+                println!(
+                    "forked {} ({}) from {} at seq {}",
+                    fork.name,
+                    fork.id,
+                    fork.forked_from.as_deref().unwrap_or("unknown"),
+                    fork.fork_point_seq.unwrap_or(0)
+                );
+            }
+        }
+        SessionsAction::Compare { .. } => unreachable!("handled before daemon startup"),
         SessionsAction::List { archived, json } => {
             let list: Vec<SessionInfo> = serde_json::from_value(daemon(Request::ListSessions)?)?;
             if json {
@@ -4668,6 +4723,10 @@ fn find_session(paths: &Paths, id: &str) -> Result<SessionInfo> {
         paths,
         Request::ListSessions,
     )?)?;
+    find_session_in(&list, id)
+}
+
+fn find_session_in(list: &[SessionInfo], id: &str) -> Result<SessionInfo> {
     // An exact id, else an id prefix, else a name (SPEC §10.7).
     if let Some(s) = list.iter().find(|s| s.id == id) {
         return Ok(s.clone());
@@ -4679,8 +4738,9 @@ fn find_session(paths: &Paths, id: &str) -> Result<SessionInfo> {
         .collect();
     if matches.is_empty() {
         matches = list
-            .into_iter()
+            .iter()
             .filter(|s| s.name.eq_ignore_ascii_case(id.trim()))
+            .cloned()
             .collect();
     }
     match matches.len() {
@@ -4690,6 +4750,84 @@ fn find_session(paths: &Paths, id: &str) -> Result<SessionInfo> {
             "'{id}' matches {n} Sessions; give more of the id"
         ))),
     }
+}
+
+fn sessions_compare_cmd(paths: &Paths, left: &str, right: &str, json: bool) -> Result<()> {
+    let comparison: formless_protocol::SessionComparison =
+        if formless_core::daemon::daemon_reachable(paths) {
+            let left = find_session(paths, left)?;
+            let right = find_session(paths, right)?;
+            serde_json::from_value(formless_tui::client::request_once(
+                paths,
+                Request::CompareSessions {
+                    left: left.id,
+                    right: right.id,
+                },
+            )?)?
+        } else {
+            let store = formless_core::Store::open_forecast_snapshot(paths)?
+                .context("No existing profile database to compare")?;
+            let list = store.list_sessions()?;
+            let left = find_session_in(&list, left)?;
+            let right = find_session_in(&list, right)?;
+            store.compare_sessions(&left.id, &right.id, &Config::load_file_only(paths)?)?
+        };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&comparison)?);
+        return Ok(());
+    }
+    println!(
+        "{} ({}) ↔ {} ({})",
+        comparison.left.session.name,
+        comparison.left.session.id,
+        comparison.right.session.name,
+        comparison.right.session.id
+    );
+    match (&comparison.common_ancestor, comparison.fork_point_seq) {
+        (Some(id), Some(seq)) => println!(
+            "Common parent {id}; fork point seq {seq}; diff after seq {}",
+            comparison.diff_from_seq
+        ),
+        _ => println!("Full stored-history comparison"),
+    }
+    for warning in &comparison.warnings {
+        println!("note: {warning}");
+    }
+    for (label, side) in [("left", &comparison.left), ("right", &comparison.right)] {
+        let usage = &side.usage;
+        println!("{label} usage scope: {}", usage.scope);
+        let cost = usage
+            .cost
+            .map(|cost| format!("${cost:.6}"))
+            .unwrap_or_else(|| "unknown (partial or unpriced)".into());
+        println!("{label}: recorded {} prompt / {} completion tokens; {} requests; cost {cost}; {} unallocated requests / {} unknown Runs",usage.recorded_prompt_tokens,usage.recorded_completion_tokens,usage.requests,usage.unallocated_requests,usage.unknown_runs);
+        if usage.unallocated_requests > 0 {
+            println!("  unallocated observed work: {} prompt / {} completion tokens; priced subtotal ${:.6}",usage.unallocated_prompt_tokens,usage.unallocated_completion_tokens,usage.unallocated_priced_cost_subtotal);
+        }
+        if let Some([low, high]) = usage.known_records_cost_range {
+            println!("  allocation range over observed priced records only: ${low:.6}–${high:.6} (excludes missing provider usage)");
+        }
+        for warning in &usage.warnings {
+            println!("  note: {warning}");
+        }
+    }
+    for row in comparison.messages {
+        let sign = match row.kind.as_str() {
+            "left_only" => "-",
+            "right_only" => "+",
+            _ => " ",
+        };
+        if let Some(message) = row.left.or(row.right) {
+            println!("{sign} {} [seq {}]:", message.role, message.seq);
+            for line in message.content.lines() {
+                println!("{sign} {line}");
+            }
+            if let Some(meta) = message.meta {
+                println!("{sign} metadata: {meta}");
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Archive or restore a Session given its id or an id prefix.

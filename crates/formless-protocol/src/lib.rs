@@ -146,6 +146,61 @@ pub struct SessionInfo {
     pub instructions: Option<String>,
 }
 
+/// Stored transcript comparison. This never creates a Run or calls a model.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SessionComparison {
+    pub left: SessionComparisonSide,
+    pub right: SessionComparisonSide,
+    pub common_ancestor: Option<String>,
+    pub fork_point_seq: Option<i64>,
+    pub diff_from_seq: i64,
+    pub prefix_changed: bool,
+    pub messages: Vec<SessionMessageDiff>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SessionComparisonSide {
+    pub session: SessionInfo,
+    pub usage: SessionBranchUsage,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SessionMessageDiff {
+    /// `unchanged`, `left_only` or `right_only`, at whole-message granularity.
+    pub kind: String,
+    pub left: Option<MessageInfo>,
+    pub right: Option<MessageInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SessionBranchUsage {
+    pub scope: String,
+    pub recorded_prompt_tokens: i64,
+    pub recorded_completion_tokens: i64,
+    pub recorded_cached_tokens: i64,
+    pub recorded_cache_write_tokens: i64,
+    pub requests: u64,
+    /// Entire recorded requests from legacy/straddling/unanchored Runs. Their
+    /// contents cannot be divided at a transcript boundary without guessing.
+    pub unallocated_requests: u64,
+    pub unallocated_prompt_tokens: i64,
+    pub unallocated_completion_tokens: i64,
+    pub unknown_runs: u64,
+    pub usage_complete: bool,
+    /// Total only when allocation/coverage and every request price are known.
+    pub cost: Option<f64>,
+    /// Priced allocated rows only; never represented as the complete bill.
+    pub priced_cost_subtotal: f64,
+    pub unallocated_priced_cost_subtotal: f64,
+    /// Possible allocation range over priced OBSERVED rows only. Missing
+    /// provider usage and unpriced rows are never bounded by this range.
+    pub known_records_cost_range: Option<[f64; 2]>,
+    pub estimated_requests: u64,
+    pub unpriced: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SearchHit {
     pub session_id: String,
@@ -1461,6 +1516,11 @@ pub enum Request {
         name: Option<String>,
         #[serde(default)]
         up_to_seq: Option<i64>,
+    },
+    /// Compare stored branches, their message diff and recorded local usage.
+    CompareSessions {
+        left: String,
+        right: String,
     },
     SearchSessions {
         query: String,
