@@ -2515,6 +2515,7 @@ impl Daemon {
                 )
             }
             Request::CompactSession { session_id, focus } => {
+                self.with_reader(|st| Self::ensure_session_description_trust(st, &session_id))?;
                 if self.runs.locked().contains_key(&session_id) {
                     return Err(anyhow!(
                         "a Run is active in this Session; compact when it ends"
@@ -4419,6 +4420,7 @@ impl Daemon {
         self.with_store(|st| st.get_session(&session_id))?
             .context(RequestFailure::not_found("session not found"))?;
         let _admission = self.forecast_admission.locked();
+        self.with_reader(|st| Self::ensure_session_description_trust(st, &session_id))?;
         let busy = self.runs.locked().contains_key(&session_id);
         match (busy, mode) {
             (true, SendMode::Queue) => {
@@ -4525,6 +4527,7 @@ impl Daemon {
         session_id: &str,
         forecast: &RunForecast,
     ) -> Result<Arc<RunAdmission>> {
+        Self::ensure_session_description_trust(st, session_id)?;
         let session = st
             .get_session(session_id)?
             .context("Session disappeared during admission")?;
@@ -4542,6 +4545,11 @@ impl Daemon {
                     &forecast.basis.model,
                     session.cwd.as_deref(),
                 )?;
+                if crate::descriptions::has_legacy_skill_index(&p) {
+                    return Err(anyhow::Error::new(RequestFailure::invalid(
+                        crate::descriptions::LEGACY_SKILL_INDEX_ERROR,
+                    )));
+                }
                 st.set_session_system_prompt(session_id, &p)?;
                 p
             }
@@ -4706,12 +4714,28 @@ impl Daemon {
         )
         .context("no model candidates")
     }
+    fn ensure_session_description_trust(st: &Store, session_id: &str) -> Result<()> {
+        if st
+            .session_system_prompt(session_id)?
+            .as_deref()
+            .is_some_and(crate::descriptions::has_legacy_skill_index)
+        {
+            return Err(anyhow::Error::new(RequestFailure::invalid(
+                crate::descriptions::LEGACY_SKILL_INDEX_ERROR,
+            )));
+        }
+        Ok(())
+    }
+
     fn consented_forecast(
         &self,
         st: &Store,
         cfg: &Config,
         input: &ForecastInput,
     ) -> Result<RunForecast> {
+        if let Some(session_id) = input.session_id.as_deref() {
+            Self::ensure_session_description_trust(st, session_id)?;
+        }
         let owner = current_client().map(|(id, _)| id);
         let mut choices: Vec<_> = self
             .forecast_consents
@@ -5063,6 +5087,15 @@ impl Daemon {
         let Ok(cfg) = self.config() else {
             return;
         };
+        if let Err(error) =
+            self.with_reader(|st| Self::ensure_session_description_trust(st, &session_id))
+        {
+            self.broadcast(Event::Note {
+                session_id: Some(session_id),
+                text: format!("Queued message kept: {error}"),
+            });
+            return;
+        }
         let mut held_for_confirmation = false;
         let prepared = self.with_store(|st| {
             st.transaction(|st| {
@@ -5380,6 +5413,7 @@ impl Daemon {
         cancel: &CancellationToken,
         cancel_flag: &Arc<AtomicBool>,
     ) -> Result<()> {
+        self.with_reader(|st| Self::ensure_session_description_trust(st, session_id))?;
         let admitted = self.run_admissions.locked().get(run_id).cloned();
         let cfg = match &admitted {
             Some(a) => a.cfg.clone(),
@@ -6117,6 +6151,7 @@ impl Daemon {
         let cfg = self.config()?;
         let comparison_id = uuid::Uuid::new_v4().to_string();
         let prepared=self.with_store(|st| {
+            Self::ensure_session_description_trust(st, session_id)?;
             let session=st.get_session(session_id)?.context(RequestFailure::not_found("session not found"))?;
             let (up_to,text)=match prompt.map(|p|p.trim().to_string()).filter(|p|!p.is_empty()) {
                 Some(p)=>(None,p),
@@ -8114,9 +8149,19 @@ impl Daemon {
     /// compaction, pick it up).
     fn session_prompt(&self, session_id: &str) -> Result<String> {
         if let Some(p) = self.with_store(|st| st.session_system_prompt(session_id))? {
+            if crate::descriptions::has_legacy_skill_index(&p) {
+                return Err(anyhow::Error::new(RequestFailure::invalid(
+                    crate::descriptions::LEGACY_SKILL_INDEX_ERROR,
+                )));
+            }
             return Ok(p);
         }
         let p = self.fresh_session_prompt(session_id);
+        if crate::descriptions::has_legacy_skill_index(&p) {
+            return Err(anyhow::Error::new(RequestFailure::invalid(
+                crate::descriptions::LEGACY_SKILL_INDEX_ERROR,
+            )));
+        }
         self.with_store(|st| st.set_session_system_prompt(session_id, &p))?;
         let _ = self.with_store(|st| st.touch_memories());
         Ok(p)
@@ -12477,6 +12522,7 @@ impl Daemon {
         compact_up_to: i64,
         focus: Option<&str>,
     ) -> Result<()> {
+        self.with_reader(|st| Self::ensure_session_description_trust(st, session_id))?;
         let text = self.with_store(|st| {
             let (_s, prev_up_to) = st.latest_checkpoint(session_id)?.unwrap_or_default();
             let msgs = st.list_messages(session_id)?;

@@ -4357,6 +4357,16 @@ and bidi/format characters to single-line metadata. Deterministic instruction-sh
 wording checks flag phrases such as “always”, “never”, “ignore” and “first call”
 for human review; these checks do not establish that unflagged text is safe.
 Model-visible descriptions are quoted and labelled as third-party data.
+A frozen Session containing the exact historical raw Skill-index boundary
+(`Skills (load one with load_skill before a task it covers):` followed by a
+literal newline and `- ` bullet) cannot start, resume, retry, edit-and-run,
+compare, compact, or consume queued work. Admission refuses before transcript,
+Run or forecast writes; it never parses or rewrites the trusted frozen text.
+Use the existing `/fork` workflow to retain the original history and start with
+the current framed metadata. Current JSON-framed indices escape embedded
+newlines and do not match the raw boundary; historical custom prompts without
+that boundary retain their original behavior. Local forecasts still make zero
+provider calls and report this blocked state explicitly.
 Description warnings appear in previews and approval details. A changed Tool or
 Skill description is shown with its before/after text and retained in Description
 reviews, including MCP sync changes and changes made while clients disconnect.
