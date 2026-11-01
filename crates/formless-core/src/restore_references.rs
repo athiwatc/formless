@@ -92,7 +92,12 @@ fn check(
     counts.total += 1;
     // Failed resolution never certifies a reference as local. It still gets
     // its independent missing/unreadable classification from the metadata probe.
-    let foreign = !resolve(path).is_ok_and(|resolved| resolved.starts_with(root));
+    let local =
+        |candidate: &Path| resolve(candidate).is_ok_and(|resolved| resolved.starts_with(root));
+    // A version directory can be local while SKILL.md is a link elsewhere.
+    // Both locations must be certified before opening the manifest for reading.
+    let foreign =
+        !local(path) || (matches!(kind, Kind::SkillVersion) && !local(&path.join("SKILL.md")));
     counts.foreign += usize::from(foreign);
     match probe(path, kind, !foreign) {
         Ok(true) => (),
@@ -110,6 +115,17 @@ fn check(
 }
 
 fn available(path: &Path, kind: Kind, check_readable: bool) -> std::io::Result<bool> {
+    available_with(path, kind, check_readable, |path| {
+        std::fs::File::open(path).map(drop)
+    })
+}
+
+fn available_with(
+    path: &Path,
+    kind: Kind,
+    check_readable: bool,
+    mut open_file: impl FnMut(&Path) -> std::io::Result<()>,
+) -> std::io::Result<bool> {
     let metadata = std::fs::metadata(path)?;
     match kind {
         Kind::Artifact => {
@@ -117,7 +133,7 @@ fn available(path: &Path, kind: Kind, check_readable: bool) -> std::io::Result<b
                 return Ok(false);
             }
             if check_readable {
-                drop(std::fs::File::open(path)?);
+                open_file(path)?;
             }
         }
         Kind::SkillVersion => {
@@ -130,7 +146,7 @@ fn available(path: &Path, kind: Kind, check_readable: bool) -> std::io::Result<b
             }
             if check_readable {
                 drop(std::fs::read_dir(path)?);
-                drop(std::fs::File::open(manifest)?);
+                open_file(&manifest)?;
             }
         }
     }
@@ -181,6 +197,74 @@ mod tests {
                 ..ReferenceCounts::default()
             }
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_skill_directory_with_escaping_manifest_is_one_foreign_reference_and_never_opened() {
+        let fixture =
+            Fixture(std::env::temp_dir().join(format!("fl-reference-{}", uuid::Uuid::new_v4())));
+        let paths = Paths::from_dirs(fixture.0.join("data"), fixture.0.join("config")).unwrap();
+        let directory = paths.data_dir.join("skills/example/v1");
+        std::fs::create_dir_all(&directory).unwrap();
+        let outside = fixture.0.join("outside-SKILL.md");
+        std::fs::write(&outside, "private fixture manifest").unwrap();
+        std::os::unix::fs::symlink(&outside, directory.join("SKILL.md")).unwrap();
+        let mut counts = ReferenceCounts::default();
+        let opened = std::cell::Cell::new(0);
+        check(
+            &mut counts,
+            &directory,
+            &paths.data_dir.join("skills").canonicalize().unwrap(),
+            Kind::SkillVersion,
+            |path, kind, check_readable| {
+                available_with(path, kind, check_readable, |_| {
+                    opened.set(opened.get() + 1);
+                    panic!("an escaped manifest must never be opened");
+                })
+            },
+        );
+        assert_eq!(opened.get(), 0);
+        assert_eq!(
+            counts,
+            ReferenceCounts {
+                total: 1,
+                foreign: 1,
+                ..ReferenceCounts::default()
+            }
+        );
+        let store = crate::Store::open(&paths.db_file()).unwrap();
+        store
+            .add_skill_version(
+                "example",
+                "fixture",
+                1,
+                directory.to_str().unwrap(),
+                "fixture",
+                "user",
+                false,
+            )
+            .unwrap();
+        drop(store);
+        let before = std::fs::read(paths.db_file()).unwrap();
+        let report = inspect(&paths.db_file(), &paths).unwrap();
+        assert_eq!(report.skill_versions, counts);
+        assert_eq!(report.warnings().len(), 1);
+        assert_eq!(std::fs::read(paths.db_file()).unwrap(), before);
+        let store = crate::Store::open(&paths.db_file()).unwrap();
+        assert_eq!(
+            store.skill_path("example").unwrap().as_deref(),
+            directory.to_str()
+        );
+        drop(store);
+        // A dangling escaped target remains missing as well as foreign; no
+        // independent missing/unreadable classification is hidden by containment.
+        std::fs::remove_file(outside).unwrap();
+        let report = inspect(&paths.db_file(), &paths).unwrap();
+        assert_eq!(report.skill_versions.total, 1);
+        assert_eq!(report.skill_versions.foreign, 1);
+        assert_eq!(report.skill_versions.missing, 1);
+        assert_eq!(report.skill_versions.unreadable, 0);
     }
 
     #[test]

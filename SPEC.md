@@ -2504,8 +2504,9 @@ daemon answers Status. Reopening an upgraded profile needs no new snapshot.
   and **all** skill versions (including old, disabled and retired versions).
   It reports missing/invalid files or skill directories/`SKILL.md`, unreadable
   local references, and foreign/unresolved paths outside the destination's
-  `artifacts/` or `skills/` roots separately; counts can overlap. Foreign file
-  contents are not opened. Nonzero counts produce explicit warnings; a failed
+  `artifacts/` or `skills/` roots separately; counts can overlap. A skill version's
+  directory and `SKILL.md` are resolved independently: either escape marks that
+  version foreign once. Foreign file contents are not opened. Nonzero counts produce explicit warnings; a failed
   diagnostic says recovery is unverified without misreporting a committed restore
   as rolled back. Rows are preserved: the check never runs deleting artifact GC,
   rewrites paths, copies files or certifies their contents/coherence.
