@@ -16590,3 +16590,7 @@ mod provenance_tests;
 #[cfg(test)]
 #[path = "description_daemon_tests.rs"]
 mod description_daemon_tests;
+
+#[cfg(test)]
+#[path = "approval_daemon_tests.rs"]
+mod approval_daemon_tests;
