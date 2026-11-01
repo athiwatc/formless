@@ -4,6 +4,7 @@
 
 pub mod caps;
 mod dns;
+mod processes;
 pub mod sensitive_paths;
 pub mod sync;
 pub use caps::Capabilities;
@@ -306,6 +307,8 @@ struct State {
     modules: Arc<Vec<(String, String)>>,
     streams: Mutex<HashMap<u64, Stream>>,
     next_stream: AtomicU64,
+    processes: Mutex<HashMap<u64, Arc<processes::Process>>>,
+    next_process: AtomicU64,
     stubbed: AtomicBool,
     /// The Invocation's cancel flag: blocking host calls (process, network)
     /// poll it so Esc stops them, not only the JS interpreter.
@@ -423,7 +426,20 @@ globalThis.process = {
     o = o || {};
     return __call("process_run", { cmd: String(cmd), args: (args || []).map(String), cwd: o.cwd || null,
       env: o.env || null, stdin: o.stdin == null ? null : String(o.stdin),
-      stdin_encoding: o.stdinEncoding || null, encoding: o.encoding || null });
+      stdin_encoding: o.stdinEncoding || null, encoding: o.encoding || null, timeout_ms: o.timeout_ms ?? o.timeoutMs ?? null });
+  },
+  spawn: (cmd, args, o) => {
+    o = o || {};
+    const h = __call("process_spawn", { cmd: String(cmd), args: (args || []).map(String), cwd: o.cwd || null,
+      env: o.env || null, stdin: o.stdin == null ? null : String(o.stdin),
+      stdin_encoding: o.stdinEncoding || null, encoding: o.encoding || null, timeout_ms: o.timeout_ms ?? o.timeoutMs ?? null });
+    let finished = null;
+    return {
+      read: (size) => finished ? {stream: null, data: "", eof: true} : __call("process_read", {id: h.id, size: size || 65536}),
+      wait: () => finished || (finished = __call("process_wait", {id: h.id})),
+      kill: () => finished || (finished = __call("process_kill", {id: h.id})),
+      close: () => { if (!finished) finished = __call("process_kill", {id: h.id}); },
+    };
   },
 };
 // tools.call returns a Promise settled from the event loop, so
@@ -960,16 +976,6 @@ fn send_request_with_dependencies(
     Err("too many redirects".into())
 }
 
-/// Kill a `process.run` child and everything it started.
-fn kill_tree(child: &mut std::process::Child) {
-    #[cfg(unix)]
-    // SAFETY: plain syscall; the child leads its own process group.
-    unsafe {
-        libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
-    }
-    let _ = child.kill();
-}
-
 /// Variables a `process.run` child inherits without an `env:` grant: what
 /// ordinary programs need to locate binaries, temp dirs and the locale.
 /// An environment variable that changes which program runs or what it
@@ -1406,6 +1412,10 @@ impl State {
                 Ok(Value::Null)
             }
             "process_run" => self.process_run(a),
+            "process_spawn" => self.process_spawn(a),
+            "process_read" => self.process_read(a),
+            "process_wait" => self.process_finish(a, false),
+            "process_kill" => self.process_finish(a, true),
             "fs_read" => {
                 let enc = enc_of(&a["encoding"])?;
                 let p = self.resolve(a["path"].as_str().unwrap_or_default(), false)?;
@@ -2031,7 +2041,7 @@ impl State {
         Ok(out)
     }
 
-    fn process_run(&self, a: &Value) -> Result<Value, String> {
+    fn process_start(&self, a: &Value) -> Result<Option<processes::Process>, String> {
         let cmd = a["cmd"].as_str().unwrap_or_default();
         let allowed = self
             .caps
@@ -2070,7 +2080,8 @@ impl State {
             return Err(denied("process denied in replay"));
         }
         if self.mode == HostMode::Smoke {
-            return Ok(self.stub(json!({"code": 0, "signal": null, "stdout": "", "stderr": ""})));
+            self.stub(Value::Null);
+            return Ok(None);
         }
         if self.mode == HostMode::DryRun {
             let args: Vec<&str> = a["args"]
@@ -2082,9 +2093,7 @@ impl State {
                     .trim_end()
                     .to_string(),
             );
-            return Ok(
-                json!({"code": 0, "signal": null, "stdout": "", "stderr": "", "dry_run": true}),
-            );
+            return Ok(None);
         }
         let enc = enc_of(&a["encoding"])?;
         let mut args: Vec<String> = a["args"]
@@ -2174,85 +2183,109 @@ impl State {
                 }
             }
         }
-        // Own process group, so cancelling kills the whole tree (a shell
-        // and its children), not just the direct child.
-        #[cfg(unix)]
-        std::os::unix::process::CommandExt::process_group(&mut command, 0);
         self.process_operand_paths(cmd, &args, &effective_cwd)?;
         if let Some(cwd) = &cwd {
             self.recheck_path(a["cwd"].as_str().unwrap(), cwd)?;
         }
-        let mut child = command.spawn().map_err(|e| format!("{cmd}: {e}"))?;
-        // Feed stdin and drain stdout/stderr on their own threads so a
-        // chatty child cannot deadlock against a full pipe, and the wait
-        // below can poll for cancellation.
-        let feeder = match (stdin, child.stdin.take()) {
-            (Some(data), Some(mut pipe)) => Some(std::thread::spawn(move || {
-                let _ = pipe.write_all(&data);
-            })),
-            _ => None,
-        };
-        // Keep up to the cap, but keep reading past it (and discard) so the
-        // child never blocks on a full pipe (#604).
-        let cap = MAX_PROCESS_OUTPUT.load(Ordering::Relaxed) as usize;
-        let drain = move |pipe: Option<Box<dyn Read + Send>>| {
-            std::thread::spawn(move || {
-                let (mut out, mut cut) = (Vec::new(), false);
-                if let Some(mut p) = pipe {
-                    let mut chunk = [0u8; 64 * 1024];
-                    while let Ok(n) = p.read(&mut chunk) {
-                        if n == 0 {
-                            break;
-                        }
-                        let room = cap.saturating_sub(out.len());
-                        out.extend_from_slice(&chunk[..n.min(room)]);
-                        cut |= n > room;
-                    }
-                }
-                (out, cut)
-            })
-        };
-        let stdout = drain(
-            child
-                .stdout
-                .take()
-                .map(|p| Box::new(p) as Box<dyn Read + Send>),
-        );
-        let stderr = drain(
-            child
-                .stderr
-                .take()
-                .map(|p| Box::new(p) as Box<dyn Read + Send>),
-        );
-        let status = loop {
-            if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
-                break status;
+        let timeout = match a.get("timeout_ms").filter(|v| !v.is_null()) {
+            None => None,
+            Some(value) => {
+                let ms = value
+                    .as_u64()
+                    .filter(|ms| *ms <= 86_400_000)
+                    .ok_or("process timeout_ms must be an integer from 0 to 86400000")?;
+                Some(std::time::Duration::from_millis(ms))
             }
-            if self.cancel.load(Ordering::SeqCst) {
-                kill_tree(&mut child);
-                let _ = child.wait();
-                return Err("interrupted".into());
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
         };
+        let process = processes::Process::start(command, stdin, timeout, self.cancel.clone(), enc)
+            .map_err(|error| format!("{cmd}: {error}"))?;
         self.ops.data_observed("process", cmd)?;
-        let (stdout, cut_out) = stdout.join().unwrap_or_default();
-        let (stderr, cut_err) = stderr.join().unwrap_or_default();
-        if let Some(f) = feeder {
-            let _ = f.join();
+        Ok(Some(process))
+    }
+
+    fn process_stub(&self) -> Value {
+        json!({"code": 0, "signal": null, "stdout": "", "stderr": "",
+            "timed_out": false, "killed": false, "truncated": false,
+            "dry_run": self.mode == HostMode::DryRun})
+    }
+
+    fn process_run(&self, a: &Value) -> Result<Value, String> {
+        let Some(process) = self.process_start(a)? else {
+            return Ok(self.process_stub());
+        };
+        let cap = MAX_PROCESS_OUTPUT.load(Ordering::Relaxed) as usize;
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut truncated = false;
+        while let Some((is_stdout, chunk)) = process.read_bytes(65536)? {
+            let out = if is_stdout { &mut stdout } else { &mut stderr };
+            let room = cap.saturating_sub(out.len());
+            out.extend_from_slice(&chunk[..chunk.len().min(room)]);
+            truncated |= chunk.len() > room;
         }
-        #[cfg(unix)]
-        let signal = std::os::unix::process::ExitStatusExt::signal(&status);
-        #[cfg(not(unix))]
-        let signal: Option<i32> = None;
-        Ok(json!({
-            "code": status.code().unwrap_or(-1),
-            "signal": signal,
-            "stdout": encode(&stdout, enc),
-            "stderr": encode(&stderr, Enc::Text),
-            // Output past tools.max_process_output_bytes was dropped.
-            "truncated": cut_out || cut_err,
-        }))
+        let mut result = process.wait()?;
+        result["stdout"] = encode(&stdout, enc_of(&a["encoding"])?);
+        result["stderr"] = encode(&stderr, Enc::Text);
+        result["truncated"] = json!(truncated || result["truncated"] == true);
+        Ok(result)
+    }
+
+    fn process_spawn(&self, a: &Value) -> Result<Value, String> {
+        if self.processes.locked().len() >= processes::MAX_HANDLES {
+            return Err(
+                "process.spawn resource limit: at most 16 open handles; wait or close one first"
+                    .into(),
+            );
+        }
+        let Some(process) = self.process_start(a)? else {
+            return Ok(json!({"id": 0}));
+        };
+        let id = self.next_process.fetch_add(1, Ordering::Relaxed) + 1;
+        self.processes.locked().insert(id, Arc::new(process));
+        Ok(json!({"id": id}))
+    }
+
+    fn process_read(&self, a: &Value) -> Result<Value, String> {
+        let id = a["id"].as_u64().unwrap_or(0);
+        if id == 0 && matches!(self.mode, HostMode::Smoke | HostMode::DryRun) {
+            return Ok(json!({"stream": null, "data": "", "eof": true}));
+        }
+        let process = self
+            .processes
+            .locked()
+            .get(&id)
+            .cloned()
+            .ok_or("process handle is closed or unknown to this Invocation")?;
+        let size = a["size"].as_u64().unwrap_or(65536).clamp(4, 1 << 20) as usize;
+        process.read(size)
+    }
+
+    fn process_finish(&self, a: &Value, kill: bool) -> Result<Value, String> {
+        let id = a["id"].as_u64().unwrap_or(0);
+        if id == 0 && matches!(self.mode, HostMode::Smoke | HostMode::DryRun) {
+            return Ok(self.process_stub());
+        }
+        let process = self
+            .processes
+            .locked()
+            .remove(&id)
+            .ok_or("process handle is closed or unknown to this Invocation")?;
+        if kill {
+            process.request_stop();
+        }
+        process.wait()
+    }
+
+    fn close_processes(&self) {
+        let processes: Vec<_> = std::mem::take(&mut *self.processes.locked())
+            .into_values()
+            .collect();
+        for process in &processes {
+            process.request_stop();
+        }
+        for process in processes {
+            let _ = process.wait();
+        }
     }
 
     /// Canonical containment check (SPEC §14): target must be inside a
@@ -2928,6 +2961,8 @@ pub fn execute(req: &ExecRequest, ops: Arc<dyn HostOps>) -> Result<ExecOutcome, 
         modules: req.modules.clone(),
         streams: Mutex::new(HashMap::new()),
         next_stream: AtomicU64::new(0),
+        processes: Mutex::new(HashMap::new()),
+        next_process: AtomicU64::new(0),
         stubbed: AtomicBool::new(false),
         cancel: req.cancel.clone(),
         kv_overlay: Mutex::new(Default::default()),
@@ -2935,6 +2970,15 @@ pub fn execute(req: &ExecRequest, ops: Arc<dyn HostOps>) -> Result<ExecOutcome, 
         settled_tx,
         settled_rx: Mutex::new(settled_rx),
     });
+    // State can outlive this call through nested async work. Native children
+    // cannot: every success, JS error, rejection and interruption closes them.
+    struct CloseProcesses(Arc<State>);
+    impl Drop for CloseProcesses {
+        fn drop(&mut self) {
+            self.0.close_processes();
+        }
+    }
+    let _processes = CloseProcesses(state.clone());
     let cancelled = req.cancel.clone();
     let err = |e: &dyn std::fmt::Display| {
         let mut x = classify(&e.to_string(), cancelled.load(Ordering::SeqCst));
