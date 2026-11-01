@@ -88,7 +88,7 @@ impl Drop for IsolatedSnapshot {
 fn isolated_snapshot(case: SnapshotCase) {
     let marker = format!("FORECAST_SNAPSHOT_CASE_PASSED:{}", case.name());
     let passed = Arc::new(AtomicBool::new(false));
-    let mut child = Command::new(std::env::current_exe().unwrap())
+    let child = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
             "storage::forecast_snapshot::tests::isolated_snapshot_child_fixture",
@@ -102,7 +102,12 @@ fn isolated_snapshot(case: SnapshotCase) {
         .stderr(Stdio::inherit())
         .spawn()
         .unwrap();
-    let stdout = child.stdout.take().unwrap();
+    // Own teardown before output extraction or thread creation can fail.
+    let mut isolated = IsolatedSnapshot {
+        child,
+        output: None,
+    };
+    let stdout = isolated.child.stdout.take().unwrap();
     let seen = passed.clone();
     let output = std::thread::spawn(move || {
         for line in BufReader::new(stdout).lines() {
@@ -113,10 +118,7 @@ fn isolated_snapshot(case: SnapshotCase) {
             eprintln!("{line}");
         }
     });
-    let mut isolated = IsolatedSnapshot {
-        child,
-        output: Some(output),
-    };
+    isolated.output = Some(output);
     // Harness containment only. Keep every original External readiness,
     // release and exit deadline (10 seconds each) unchanged; do not preempt
     // their combined bound. No lock acquisition or immediate assertion retries.
