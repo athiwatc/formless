@@ -2738,7 +2738,7 @@ impl Store {
         run_id: &str,
         cfg: &crate::Config,
     ) -> Result<(Option<f64>, u64, u64)> {
-        let mut stmt = self.ps("SELECT provider,model,prompt_tokens,completion_tokens,cached_tokens,cache_write_tokens,cost FROM run_usage WHERE run_id=?1")?;
+        let mut stmt = self.ps("SELECT provider,model,prompt_tokens,completion_tokens,cached_tokens,cache_write_tokens,cost,source FROM run_usage WHERE run_id=?1")?;
         let rows = stmt.query_map(params![run_id], |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -2748,14 +2748,19 @@ impl Store {
                 r.get::<_, i64>(4)?,
                 r.get::<_, i64>(5)?,
                 r.get::<_, Option<f64>>(6)?,
+                r.get::<_, String>(7)?,
             ))
         })?;
         let (mut cost, mut peak, mut cached) = (Some(0.0), 0, 0);
         let mut any = false;
         for row in rows {
-            let (p, m, input, output, cache, write, reported) = row?;
+            let (p, m, input, output, cache, write, reported, source) = row?;
             any = true;
-            peak = peak.max(input.max(0) as u64);
+            // Only the main Session request drives its compaction threshold;
+            // nested llm/sub-agent/summarizer contexts have separate windows.
+            if source == "run" {
+                peak = peak.max(input.max(0) as u64);
+            }
             cached += cache.max(0) as u64;
             cost = cost
                 .zip(cfg.cost_of(&p, &m, input, output, cache, write, reported))

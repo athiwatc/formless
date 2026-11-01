@@ -1173,4 +1173,42 @@ mod tests {
         drop(lease);
         std::fs::remove_dir_all(root).unwrap();
     }
+    #[test]
+    fn nested_request_costs_count_without_inventing_main_session_compaction_risk() {
+        let st = Store::open_in_memory().unwrap();
+        let c = config();
+        let sid = st.create_session(None).unwrap().id;
+        let input = ForecastInput {
+            session_id: Some(sid.clone()),
+            draft: "task".into(),
+            ..Default::default()
+        };
+        let initial = estimate_store(&st, &c, &input).unwrap();
+        assert!(!initial.will_compact);
+        let run = completed(&st, &c, &initial, 1, "completed");
+        st.record_forecast_request(&run, "llm").unwrap();
+        st.record_usage_full(
+            &sid,
+            &run,
+            "default",
+            "model",
+            &crate::provider::Usage {
+                prompt_tokens: 1_000_000,
+                completion_tokens: 1,
+                reported: 3,
+                ..Default::default()
+            },
+            "llm",
+        )
+        .unwrap();
+        let following = estimate_store(&st, &c, &input).unwrap();
+        assert_eq!(following.comparable_runs, 1);
+        assert_eq!(following.compaction_probability, Some(0.0));
+        assert_eq!(following.comparables[0].peak_prompt_tokens, 100);
+        assert_eq!(following.tokens.as_ref().unwrap().p50, 1_000_121.0);
+        assert!(
+            following.cost_usd.unwrap().p50 > 10.0,
+            "nested paid work remains in the total"
+        );
+    }
 }
