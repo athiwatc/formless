@@ -560,3 +560,38 @@ test('a definite gate rejection retries after consent with a fresh intent; uncer
     assert.equal(c.S.unsent,null);assert.equal(c.$('input').value,'');
   }
 });
+
+test('forecast generation invalidates history, Tool and settings revisions without draft edits', async () => {
+  for (const type of ['message_appended','messages_edited','compaction_notice','tool_updated','settings_changed']) {
+    const pending=deferred();
+    const c=forecastContext(['forecastStamp','scheduleForecast'], {request:()=>pending.promise});
+    c.$('input').value='task'; c.scheduleForecast(); const finishing=c.fire();
+    // Exercise the exact shipped discrete-event invalidation prefix without
+    // needing unrelated browser rendering for every event kind.
+    const start=fn('onEvent');
+    vm.runInContext(start.slice(0,start.indexOf('    if (S.sessionSnapshot'))+'\n  }',c);
+    c.onEvent({type,session_id:'A'});
+    pending.resolve({hint:'outdated'}); await finishing;
+    assert.equal(c.$('forecast-hint').textContent,'',type);
+  }
+});
+test('resume and retry require prospective consent before sending their commands', async () => {
+  for (const action of ['resume','retry']) {
+    for (const accepted of [false,true]) {
+      const calls=[];
+      const c=forecastContext(['forecastStamp','confirmForecast',action==='resume'?'resumeRun':'retryRun'], {
+        request:async r=>{calls.push(r);return r.type==='forecast_run'?{confirmation_required:true,confirmation_id:'quote',hint:'$2',warnings:[]}:{confirmed:true};},
+        ask:async()=>accepted,act:async r=>{calls.push(r);return {};},renderRunBanner(){},refreshSessions(){},
+      });
+      c.S.settings={limits:{forecast_confirm_usd:1}};c.$('input').value='another draft';
+      if(action==='resume')await c.resumeRun();else await c.retryRun('specific-model');
+      assert.equal(calls[0].type,'forecast_run');
+      assert.equal(calls[0].for_send,true);
+      assert.equal(calls[0].input[action],true);
+      assert.equal(calls[0].input.draft,'');
+      assert.equal(calls.at(-1).type,accepted?action+'_run':'forecast_run');
+      if(accepted)assert.equal(calls[1].type,'confirm_forecast');
+      assert.equal(c.$('input').value,'another draft');
+    }
+  }
+});

@@ -21827,4 +21827,93 @@ mod tests {
         assert_eq!(app.input.expanded(), "task");
         assert_eq!(app.attachments, vec![("held.txt".into(), vec![1, 2])]);
     }
+    #[test]
+    fn persisted_context_event_invalidates_pending_hint_even_with_unchanged_composer() {
+        let mut app = test_app();
+        let (client, sent) = DaemonClient::recording();
+        let (tx, inbox) = mpsc::channel();
+        app.client = Some(client);
+        app.inbox = Some(inbox);
+        app.input.set("task");
+        app.forecast_tick();
+        app.forecast.changed = Some(Instant::now() - Duration::from_millis(301));
+        app.forecast_tick();
+        let preview: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        let generation = app.forecast_generation();
+        app.on_event(Event::MessagesEdited {
+            session_id: "s1".into(),
+        });
+        assert_ne!(generation, app.forecast_generation());
+        tx.send(ServerMessage::Response {
+            id: preview.id,
+            ok: true,
+            result: Some(serde_json::to_value(forecast_reply("outdated context", false)).unwrap()),
+            error: None,
+        })
+        .unwrap();
+        app.drain_daemon();
+        assert!(app.forecast.hint.is_none());
+        assert_eq!(app.input.expanded(), "task");
+    }
+    #[test]
+    fn resume_and_retry_wait_for_current_prospective_confirmation() {
+        for retry in [false, true] {
+            let mut app = test_app();
+            let mut cfg = Config::default();
+            cfg.limits.forecast_confirm_usd = Some(0.0);
+            cfg.save(&app.paths).unwrap();
+            let (client, sent) = DaemonClient::recording();
+            let (tx, inbox) = mpsc::channel();
+            app.client = Some(client);
+            app.inbox = Some(inbox);
+            app.input.set("unrelated draft");
+            app.slash(if retry {
+                "retry --model chosen"
+            } else {
+                "resume"
+            });
+            let preview: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+            match preview.request {
+                Request::ForecastRun { input, for_send } => {
+                    assert!(for_send);
+                    assert_eq!(input.retry, retry);
+                    assert_eq!(input.resume, !retry);
+                    assert!(input.draft.is_empty() && input.attachments.is_empty());
+                    if retry {
+                        assert_eq!(input.model.as_deref(), Some("chosen"));
+                    }
+                }
+                _ => panic!("control command ran before forecast"),
+            }
+            assert!(sent.try_recv().is_err());
+            tx.send(ServerMessage::Response {
+                id: preview.id,
+                ok: true,
+                result: Some(serde_json::to_value(forecast_reply("$2 p90", true)).unwrap()),
+                error: None,
+            })
+            .unwrap();
+            app.drain_daemon();
+            assert!(app.forecast.modal.is_some());
+            app.key(key(KeyCode::Enter));
+            let consent: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+            assert!(matches!(consent.request, Request::ConfirmForecast { .. }));
+            assert!(sent.try_recv().is_err());
+            tx.send(ServerMessage::Response {
+                id: consent.id,
+                ok: true,
+                result: Some(serde_json::json!({"confirmed":true})),
+                error: None,
+            })
+            .unwrap();
+            app.drain_daemon();
+            let action: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+            assert!(if retry {
+                matches!(action.request, Request::RetryRun { .. })
+            } else {
+                matches!(action.request, Request::ResumeRun { .. })
+            });
+            assert_eq!(app.input.expanded(), "unrelated draft");
+        }
+    }
 }

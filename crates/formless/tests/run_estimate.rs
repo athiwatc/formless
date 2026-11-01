@@ -162,3 +162,151 @@ fn estimate_new_profile_does_not_create_profile_directories() {
     );
     assert!(!paths.data_dir.exists() && !paths.config_dir.exists());
 }
+
+#[cfg(unix)]
+#[test]
+fn headless_confirmation_uses_one_connection_and_refuses_without_yes() {
+    use formless_protocol::{Event, RequestEnvelope, ServerMessage};
+    use serde_json::{json, Value};
+    use std::{
+        io::{BufRead, BufReader},
+        os::unix::net::UnixListener,
+        sync::Mutex,
+    };
+    struct Server {
+        stop: Arc<AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+    impl Drop for Server {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            if let Some(t) = self.thread.take() {
+                t.join().unwrap();
+            }
+        }
+    }
+    for yes in [false, true] {
+        let root = Fixture(std::env::temp_dir().join(format!("fl-fc-{}", unique())));
+        let paths = formless_core::Paths::from_dirs(root.0.join("d"), root.0.join("c")).unwrap();
+        let mut cfg = formless_core::Config::default();
+        cfg.provider.base_url = "http://127.0.0.1:9".into();
+        cfg.provider.model = "model".into();
+        cfg.limits.forecast_confirm_usd = Some(1.0);
+        cfg.save(&paths).unwrap();
+        let st = formless_core::Store::open_in_memory().unwrap();
+        let session = st.create_session(Some("fixture".into())).unwrap();
+        let mut forecast = formless_core::forecast::estimate_store(
+            &st,
+            &cfg,
+            &formless_protocol::ForecastInput {
+                session_id: Some(session.id.clone()),
+                draft: "task".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        forecast.confirmation_required = true;
+        forecast.confirmation_id = Some("connection-bound".into());
+        forecast.hint = "$2 p90".into();
+        std::fs::create_dir_all(paths.socket_path().parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(paths.socket_path()).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = stop.clone();
+        let calls = Arc::new(Mutex::new(Vec::<(usize, String, Value)>::new()));
+        let observed = calls.clone();
+        let sid = session.id.clone();
+        let thread = std::thread::spawn(move || {
+            let mut peers = Vec::new();
+            let mut connection = 0;
+            while !stopped.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut socket, _)) => {
+                        connection += 1;
+                        let connection = connection;
+                        let stopped = stopped.clone();
+                        let observed = observed.clone();
+                        let forecast = forecast.clone();
+                        let session = session.clone();
+                        peers.push(std::thread::spawn(move||{
+                            socket.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+                            let mut reader=BufReader::new(socket.try_clone().unwrap());let mut approved=false;let mut previewed=false;
+                            while !stopped.load(Ordering::SeqCst) {
+                                let mut line=String::new();
+                                match reader.read_line(&mut line) {
+                                    Ok(0)=>break,
+                                    Ok(_)=>{},
+                                    Err(e)if matches!(e.kind(),std::io::ErrorKind::WouldBlock|std::io::ErrorKind::TimedOut)=>continue,
+                                    Err(_)=>break,
+                                }
+                                let envelope:RequestEnvelope=serde_json::from_str(&line).unwrap();
+                                let request=serde_json::to_value(envelope.request).unwrap();let kind=request["type"].as_str().unwrap().to_string();
+                                observed.lock().unwrap().push((connection,kind.clone(),request.clone()));
+                                let mut finish=false;
+                                let value=match kind.as_str(){
+                                    "status"=>json!({"version":env!("CARGO_PKG_VERSION"),"protocol":1,"secure":true}),
+                                    "list_sessions"=>json!([session]),
+                                    "forecast_run"=>{assert_eq!(request["for_send"],true);previewed=true;json!(forecast)},
+                                    "confirm_forecast"=>{assert!(previewed,"consent used a different connection");assert_eq!(request["id"],"connection-bound");approved=true;json!({"confirmed":true})},
+                                    "send_message"=>{assert!(approved,"headless send bypassed confirmation");finish=true;json!({"run_id":"fixture-run"})},
+                                    _=>json!({"ok":true}),
+                                };
+                                let reply=ServerMessage::Response{id:envelope.id,ok:true,result:Some(value),error:None};
+                                if writeln!(socket,"{}",serde_json::to_string(&reply).unwrap()).is_err(){break;}
+                                if finish {
+                                    let event=ServerMessage::Event(Event::RunFinished{session_id:session.id.clone(),run_id:"fixture-run".into(),status:"completed".into()});
+                                    let _=writeln!(socket,"{}",serde_json::to_string(&event).unwrap());
+                                }
+                            }
+                        }));
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(2))
+                    }
+                    Err(_) => break,
+                }
+            }
+            for peer in peers {
+                peer.join().unwrap();
+            }
+        });
+        let server = Server {
+            stop,
+            thread: Some(thread),
+        };
+        let mut cmd = command(&paths);
+        cmd.args(["run", "task", "--session", &sid, "--quiet"]);
+        if yes {
+            cmd.arg("--yes");
+        }
+        let result = output(cmd);
+        drop(server);
+        assert_eq!(
+            result.status.code(),
+            Some(if yes { 0 } else { 2 }),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let requests = calls.lock().unwrap();
+        let actions: Vec<_> = requests
+            .iter()
+            .filter(|(_, k, _)| {
+                matches!(
+                    k.as_str(),
+                    "forecast_run" | "confirm_forecast" | "send_message"
+                )
+            })
+            .collect();
+        assert_eq!(actions.len(), if yes { 3 } else { 1 });
+        assert!(actions.iter().all(|(c, _, _)| *c == actions[0].0));
+        if yes {
+            assert_eq!(actions[2].1, "send_message");
+            assert!(actions[2].2["client_msg_id"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty()));
+        }
+        assert!(!requests
+            .iter()
+            .any(|(_, k, _)| matches!(k.as_str(), "create_session" | "attach_file")));
+    }
+}

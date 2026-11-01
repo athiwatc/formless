@@ -451,3 +451,106 @@ async fn retry_override_is_the_immutable_forecast_and_dispatch_model() {
     );
     cancel_fixture_run(&d, &sid).await;
 }
+
+#[tokio::test]
+async fn racing_attachment_waits_for_admission_and_cannot_enter_the_confirmed_request() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let (_root, paths, d, sid, _cfg) = setup(&env);
+    let input = ForecastInput {
+        session_id: Some(sid.clone()),
+        draft: "task".into(),
+        ..Default::default()
+    };
+    let f: RunForecast = serde_json::from_value(
+        CLIENT
+            .scope(
+                (81, "fixture".into()),
+                d.handle(Request::ForecastRun {
+                    input,
+                    for_send: true,
+                }),
+            )
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    CLIENT
+        .scope(
+            (81, "fixture".into()),
+            d.handle(Request::ConfirmForecast {
+                id: f.confirmation_id.clone().unwrap(),
+            }),
+        )
+        .await
+        .unwrap();
+    let late = paths.data_dir.join("late.txt");
+    std::fs::write(&late, b"late").unwrap();
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(0);
+    let (attempt_tx, attempt_rx) = std::sync::mpsc::sync_channel(0);
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let done_rx = StdMutex::new(done_rx);
+    let attempt_rx = StdMutex::new(attempt_rx);
+    *d.forecast_admission_test.locked() = Some(Arc::new(move || {
+        entered_tx.send(()).unwrap();
+        attempt_rx
+            .locked()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        assert!(
+            matches!(
+                done_rx.locked().recv_timeout(Duration::from_millis(30)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "racing Store mutation passed the admission boundary"
+        );
+    }));
+    let other = d.clone();
+    let target = sid.clone();
+    let writer = std::thread::spawn(move || {
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        attempt_tx.send(()).unwrap();
+        other.with_store(|st|st.add_pending_attachment(&target,&json!({"id":"late","name":"late.txt","mime":"text/plain","path":late,"bytes":4}))).unwrap();
+        done_tx.send(()).unwrap();
+    });
+    CLIENT
+        .scope(
+            (81, "fixture".into()),
+            d.handle(Request::SendMessage {
+                session_id: sid.clone(),
+                content: "task".into(),
+                mode: SendMode::Send,
+                client_msg_id: Some("approved-race".into()),
+            }),
+        )
+        .await
+        .unwrap();
+    writer.join().unwrap();
+    *d.forecast_admission_test.locked() = None;
+    let run = d.runs.locked().get(&sid).unwrap().run_id.clone();
+    let first = d.run_admissions.locked().get(&run).unwrap().clone();
+    assert!(
+        !serde_json::to_string(&first.first.locked().as_ref().unwrap().0)
+            .unwrap()
+            .contains("late.txt")
+    );
+    let st = Store::open(&paths.db_file()).unwrap();
+    assert_eq!(st.pending_attachments(&sid).unwrap()[0]["name"], "late.txt");
+    let admitted = st
+        .recorded_forecasts()
+        .unwrap()
+        .into_iter()
+        .find(|(r, _)| r == &run)
+        .unwrap()
+        .1;
+    assert_eq!(admitted.fingerprint, f.fingerprint);
+    assert!(!st
+        .list_messages(&sid)
+        .unwrap()
+        .last()
+        .unwrap()
+        .meta
+        .as_deref()
+        .unwrap_or("")
+        .contains("late.txt"));
+    cancel_fixture_run(&d, &sid).await;
+}
