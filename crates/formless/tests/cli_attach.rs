@@ -451,6 +451,7 @@ fn follow_resynchronizes_lost_finish_without_switching_to_replacement_run() {
     drop(st);
     let listener = std::os::unix::net::UnixListener::bind(f.paths.socket_path()).unwrap();
     let sid = session.id.clone();
+    let query = sid.clone();
     let peer = std::thread::spawn(move || {
         let (mut socket, _) = listener.accept().unwrap();
         socket
@@ -519,7 +520,7 @@ fn follow_resynchronizes_lost_finish_without_switching_to_replacement_run() {
         assert!(seen_exact);
     });
     let out = finish(
-        f.command(&["sessions", "show", &session.id, "--follow", "--jsonl"])
+        f.command(&["sessions", "show", &query, "--follow", "--jsonl"])
             .spawn()
             .unwrap(),
     );
@@ -565,6 +566,7 @@ fn ctrl_c_detaches_while_snapshot_reply_is_pending() {
     drop(st);
     let listener = std::os::unix::net::UnixListener::bind(f.paths.socket_path()).unwrap();
     let sid = session.id.clone();
+    let query = sid.clone();
     let (tx, rx) = std::sync::mpsc::channel();
     let peer = std::thread::spawn(move || {
         let (mut socket, _) = listener.accept().unwrap();
@@ -603,7 +605,7 @@ fn ctrl_c_detaches_while_snapshot_reply_is_pending() {
         }
     });
     let child = f
-        .command(&["sessions", "show", &session.id, "--follow", "--jsonl"])
+        .command(&["sessions", "show", &query, "--follow", "--jsonl"])
         .spawn()
         .unwrap();
     rx.recv_timeout(Duration::from_secs(5)).unwrap();

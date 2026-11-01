@@ -1527,6 +1527,34 @@ fn run_cli(cli: Cli) -> Result<()> {
         }
         return Ok(());
     }
+    // Attach/control commands require an existing daemon and must not create a
+    // profile (or start scheduled work) merely to observe an absent endpoint.
+    let attach_existing = matches!(
+        &cli.cmd,
+        Some(Cmd::Runs {
+            action: Some(_),
+            ..
+        }) | Some(Cmd::Sessions {
+            action: SessionsAction::Show { follow: true, .. }
+        }) | Some(Cmd::Approvals {
+            action: ApprovalsAction::Pending { .. }
+                | ApprovalsAction::Approve { .. }
+                | ApprovalsAction::Deny { .. }
+        })
+    );
+    if attach_existing {
+        let paths = Paths::resolve_read_only(cli.profile.as_deref())?;
+        return match cli.cmd {
+            Some(Cmd::Runs {
+                action: Some(action),
+                json,
+                ..
+            }) => cli_attach::runs(&paths, action, json),
+            Some(Cmd::Sessions { action }) => sessions_cmd(paths, action),
+            Some(Cmd::Approvals { action }) => approvals_cmd(&paths, action),
+            _ => unreachable!("matched an attach command"),
+        };
+    }
     if cli.secure {
         // A daemon started from here inherits it (see `Config::apply_env`).
         std::env::set_var("FORMLESS_SECURE", "1");
