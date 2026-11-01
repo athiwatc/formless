@@ -280,6 +280,9 @@ enum Cmd {
     },
     /// Headless single Run (SPEC §12). Approvals fail closed unless --yes.
     Run {
+        /// Print a local forecast and exit without starting or changing anything
+        #[arg(long)]
+        estimate: bool,
         /// Task text; `-` reads it from stdin. With a task, piped stdin is
         /// attached as stdin.txt (`git diff | formless run "review this"`)
         task: String,
@@ -1355,6 +1358,111 @@ fn run_cli(cli: Cli) -> Result<()> {
         let paths = Paths::resolve_read_only(cli.profile.as_deref())?;
         return daemon_cmd(paths, DaemonAction::InstallService { dry_run: true });
     }
+    if let Some(Cmd::Run {
+        estimate: true,
+        task,
+        session,
+        continue_last,
+        model,
+        role,
+        attach,
+        cwd,
+        json,
+        ..
+    }) = &cli.cmd
+    {
+        let paths = Paths::resolve_read_only(cli.profile.as_deref())?;
+        let live = formless_core::daemon::daemon_reachable(&paths);
+        let session = if *continue_last || session.as_deref() == Some("last") {
+            Some(
+                std::fs::read_to_string(paths.last_run_session_file())?
+                    .trim()
+                    .to_string(),
+            )
+        } else {
+            session.clone()
+        };
+        let session = if let Some(wanted) = session {
+            let sessions: Vec<SessionInfo> = if live {
+                serde_json::from_value(formless_tui::client::request_once(
+                    &paths,
+                    Request::ListSessions,
+                )?)?
+            } else {
+                formless_core::Store::open_forecast_snapshot(&paths)?
+                    .context("forecast Session does not exist")?
+                    .list_sessions()?
+            };
+            let matches: Vec<_> = sessions
+                .into_iter()
+                .filter(|s| s.id == wanted || s.id.starts_with(&wanted) || s.name == wanted)
+                .collect();
+            if matches.len() != 1 {
+                return Err(usage("forecast Session is missing or ambiguous"));
+            }
+            Some(matches[0].id.clone())
+        } else {
+            None
+        };
+        use std::io::{IsTerminal, Read};
+        let piped = if std::io::stdin().is_terminal() {
+            None
+        } else {
+            let mut bytes = Vec::new();
+            std::io::stdin().read_to_end(&mut bytes)?;
+            Some(bytes)
+        };
+        let (task, stdin) = run_input(task.clone(), piped).map_err(usage)?;
+        let mut files = read_attachments(attach).map_err(usage)?;
+        if let Some(bytes) = stdin {
+            files.push(("stdin.txt".into(), bytes));
+        }
+        let attachments = files
+            .into_iter()
+            .map(|(name, bytes)| formless_core::forecast::attachment(name, &bytes))
+            .collect();
+        let cwd = cwd
+            .clone()
+            .or_else(|| {
+                session
+                    .is_none()
+                    .then(|| std::env::current_dir().ok())
+                    .flatten()
+            })
+            .map(|p| p.canonicalize())
+            .transpose()?
+            .map(|p| p.to_string_lossy().into_owned());
+        let input = formless_protocol::ForecastInput {
+            session_id: session,
+            draft: task,
+            model: role
+                .as_ref()
+                .map(|r| format!("role:{r}"))
+                .or_else(|| model.clone()),
+            cwd,
+            attachments,
+            ..Default::default()
+        };
+        let forecast: formless_protocol::RunForecast = if live {
+            serde_json::from_value(formless_tui::client::request_once(
+                &paths,
+                Request::ForecastRun {
+                    for_send: false,
+                    input,
+                },
+            )?)?
+        } else {
+            formless_core::forecast::estimate(&paths, &input)?
+        };
+        // Only an owned DTO reaches output: private readers and maintenance
+        // freezes have dropped, even if stdout is a backpressured pipe.
+        if *json {
+            println!("{}", serde_json::to_string_pretty(&forecast)?);
+        } else {
+            println!("{}", formless_core::forecast::describe(&forecast));
+        }
+        return Ok(());
+    }
     if cli.secure {
         // A daemon started from here inherits it (see `Config::apply_env`).
         std::env::set_var("FORMLESS_SECURE", "1");
@@ -1606,6 +1714,7 @@ fn run_cli(cli: Cli) -> Result<()> {
         }
         Some(Cmd::Restore { file }) => restore_cmd(&paths, &file),
         Some(Cmd::Run {
+            estimate: _,
             task,
             session,
             continue_last,
@@ -3568,6 +3677,34 @@ fn run_headless(
         });
     }
     let mut sends = formless_tui::client::SendTracker::default();
+    if cfg.limits.forecast_confirm_usd.is_some() {
+        let forecast: formless_protocol::RunForecast =
+            serde_json::from_value(headless_preview_request(
+                &client,
+                &rx,
+                Request::ForecastRun {
+                    for_send: true,
+                    input: formless_protocol::ForecastInput {
+                        session_id: Some(session_id.clone()),
+                        draft: task.clone(),
+                        ..Default::default()
+                    },
+                },
+            )?)?;
+        if forecast.confirmation_required {
+            if !yes {
+                eprintln!(
+                    "{}; confirmation required (pass --yes to accept this forecast)",
+                    forecast.hint
+                );
+                return Ok(2);
+            }
+            let id = forecast
+                .confirmation_id
+                .context("forecast confirmation token missing")?;
+            headless_preview_request(&client, &rx, Request::ConfirmForecast { id })?;
+        }
+    }
     critical.insert(sends.send(&client, session_id.clone(), task, SendMode::Send));
     let sigints = count_sigints();
     let mut interrupting = false;
@@ -3794,6 +3931,38 @@ fn run_headless(
         _ => {}
     }
     Ok(code)
+}
+
+/// Setup replies and the forecast use the same connection. No send intent is
+/// allocated until consent, so a cached failed send is never replayed as approval.
+fn headless_preview_request(
+    client: &formless_tui::client::DaemonClient,
+    rx: &std::sync::mpsc::Receiver<ServerMessage>,
+    request: Request,
+) -> Result<serde_json::Value> {
+    let wanted = client.send(request);
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        let message =
+            rx.recv_timeout(until.saturating_duration_since(std::time::Instant::now()))?;
+        if let ServerMessage::Response {
+            id,
+            ok,
+            result,
+            error,
+        } = message
+        {
+            if !ok {
+                return Err(anyhow::anyhow!(
+                    "{}",
+                    error.unwrap_or_else(|| "setup/forecast rejected".into())
+                ));
+            }
+            if id == wanted {
+                return Ok(result.unwrap_or_default());
+            }
+        }
+    }
 }
 
 /// What a headless Run did, for the line `formless run` ends with on stderr

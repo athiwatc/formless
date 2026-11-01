@@ -19,7 +19,7 @@ function setup(names, extras = {}) {
     return elements.get(id);
   };
   const context = vm.createContext({ $, S: { current: 'A', chips: {}, messages: [], sessions: [], view: 'chat', tools: [] },
-    setTimeout: f => f(), rememberFocus() {}, restoreFocus() {}, renderChips() {}, note() {}, autosize() {},
+    forecastRevision: 0, scheduleForecast() {}, setTimeout: f => f(), rememberFocus() {}, restoreFocus() {}, renderChips() {}, note() {}, autosize() {},
     ...extras });
   vm.runInContext(names.map(fn).join('\n'), context);
   return context;
@@ -141,7 +141,7 @@ test('slow mention attachment does not cross-post or overwrite new Session compo
 test('send completion clears only the original Session attachments', async () => {
   const wait = deferred(), calls = [];
   const c = setup(['submit'], { isRunning: () => false, askNotifyPermission() {}, closeMentions() {},
-    mentionsIn: () => [], crypto: { randomUUID: () => 'key' }, act: async x => { calls.push(x); await wait.promise; return {}; } });
+    mentionsIn: () => [], crypto: { randomUUID: () => 'key' }, request: async x => { calls.push(x); await wait.promise; return {}; } });
   vm.runInContext('const mentionAttached = {}; const attachmentDrafts = {};', c);
   c.$('input').value = 'hello'; c.S.chips.A = [{}]; c.S.chips.B = [{}];
   const pending = c.submit(false); c.S.current = 'B'; wait.resolve(); await pending;
@@ -490,4 +490,126 @@ test('dropped updates refresh durable usage and mark transient progress unavaila
   c.reconcileDropped({ session_id: '', run_id: '', kinds: ['model_pull_progress'], model: 'model' });
   assert.ok(notes.some(n => /download progress unavailable for model/.test(n)));
   assert.ok(notes.some(n => /live text, reasoning or progress updates were skipped/.test(n)));
+});
+
+function forecastContext(names, extras = {}) {
+  const timers = new Map(); let next = 1;
+  const c = setup(names, { isRunning: () => false, clearTimeout: id => timers.delete(id),
+    setTimeout: fn => { const id = next++; timers.set(id, fn); return id; }, h: () => ({}),
+    ...extras });
+  vm.runInContext('let forecastTimer = null; let forecastSequence = 0; let forecastStampLast = "";', c);
+  c.S.daemonOnline = true; c.S.hello = 'connection-one';
+  c.S.sessions = [{ id: 'A', model: 'model', cwd: '/project' }];
+  c.fire = async () => { const pending = [...timers.values()]; timers.clear(); for (const fn of pending) await fn(); };
+  return c;
+}
+test('forecast hints debounce and reject stale draft, model, Session and attachments', async () => {
+  for (const change of ['draft', 'model', 'session', 'files']) {
+    const wait = deferred(), reads = [];
+    const c = forecastContext(['forecastStamp', 'scheduleForecast'], { request: req => { reads.push(req); return wait.promise; } });
+    c.$('input').value = 'old'; c.scheduleForecast();
+    c.$('input').value = 'current'; c.scheduleForecast();
+    assert.equal(reads.length, 0, 'typing never immediately requests a forecast');
+    const fire = c.fire(); assert.equal(reads.length, 1); assert.equal(reads[0].input.draft, 'current');
+    if (change === 'draft') c.$('input').value = 'newer';
+    if (change === 'model') c.S.sessions[0].model = 'other';
+    if (change === 'session') c.S.current = 'B';
+    if (change === 'files') c.S.chips.A = [{id:'new-file'}];
+    wait.resolve({ hint: 'stale', warnings: [] }); await fire;
+    assert.notEqual(c.$('forecast-hint').textContent, 'stale');
+  }
+});
+test('current forecast hint shows compaction without changing the draft', async () => {
+  const c = forecastContext(['forecastStamp', 'scheduleForecast'], { request: async () => ({hint:'~$0.04–0.11 · ~6 steps · will compact', warnings:['N comparable Runs']}) });
+  c.$('input').value = 'keep my draft'; c.scheduleForecast(); await c.fire();
+  assert.match(c.$('forecast-hint').textContent, /will compact/); assert.equal(c.$('input').value, 'keep my draft');
+});
+test('forecast confirmation cannot cross a changed draft, Session, model or connection', async () => {
+  for (const change of ['draft','model','session','connection']) {
+    const dialog = deferred(), calls = [];
+    const c = forecastContext(['forecastStamp','confirmForecast'], { request: async req => {calls.push(req); return {confirmation_required:true,confirmation_id:'preview',hint:'estimate',warnings:[]};}, ask: () => dialog.promise });
+    c.$('input').value = 'task'; const result = c.confirmForecast('A','task'); await new Promise(resolve => setImmediate(resolve));
+    if (change === 'draft') c.$('input').value = 'newer';
+    if (change === 'model') c.S.sessions[0].model = 'other';
+    if (change === 'session') c.S.current = 'B';
+    if (change === 'connection') c.S.hello = 'connection-two';
+    dialog.resolve(true); assert.equal(await result, false); assert.deepEqual(calls.map(c => c.type), ['forecast_run']);
+  }
+});
+test('declined consent retains composer and allocates no send intent', async () => {
+  const calls = [];
+  const c = forecastContext(['forecastStamp','confirmForecast','submit'], { ask: async () => false, request: async req => {calls.push(req); return {confirmation_required:true,confirmation_id:'preview',hint:'estimate',warnings:[]};},
+    askNotifyPermission() {}, closeMentions() {}, mentionsIn:()=>[], crypto:{randomUUID:()=>{throw Error('intent must not be allocated');}} });
+  vm.runInContext('const mentionAttached = {}; const attachmentDrafts = {};', c);
+  c.S.settings={limits:{forecast_confirm_usd:0}};c.$('input').value='task';await c.submit(false);
+  assert.equal(c.$('input').value,'task');assert.deepEqual(calls.map(c=>c.type),['forecast_run']);
+});
+test('a definite gate rejection retries after consent with a fresh intent; uncertain sends keep their key', async () => {
+  for (const definite of [false,true]) {
+    const calls = [];let intent = 0, sends = 0;
+    const c = forecastContext(['forecastStamp','confirmForecast','submit'], { ask:async()=>true, request:async req=>{
+      calls.push(req);if(req.type==='forecast_run')return {confirmation_required:true,confirmation_id:'preview',hint:'estimate',warnings:[]};
+      if(req.type==='confirm_forecast')return {confirmed:true};
+      if(req.type==='send_message' && ++sends===1){const error=new Error(definite?'stale forecast':'lost response');error.daemonResponse=definite;throw error;}
+      return {started:true};
+    }, toast(){},askNotifyPermission(){},closeMentions(){},mentionsIn:()=>[],crypto:{randomUUID:()=>`intent-${++intent}`} });
+    vm.runInContext('const mentionAttached = {}; const attachmentDrafts = {};', c);
+    c.S.settings={limits:{forecast_confirm_usd:0}};c.$('input').value='task';await c.submit(false);assert.equal(c.$('input').value,'task');
+    await c.submit(false);const sent=calls.filter(c=>c.type==='send_message');assert.equal(sent.length,2);
+    assert.equal(sent[0].client_msg_id===sent[1].client_msg_id,!definite);
+    assert.equal(c.S.unsent,null);assert.equal(c.$('input').value,'');
+  }
+});
+
+test('forecast generation invalidates history, Tool and settings revisions without draft edits', async () => {
+  for (const type of ['message_appended','messages_edited','compaction_notice','tool_updated','settings_changed']) {
+    const pending=deferred();
+    const c=forecastContext(['forecastStamp','scheduleForecast'], {request:()=>pending.promise});
+    c.$('input').value='task'; c.scheduleForecast(); const finishing=c.fire();
+    // Exercise the exact shipped discrete-event invalidation prefix without
+    // needing unrelated browser rendering for every event kind.
+    const start=fn('onEvent');
+    vm.runInContext(start.slice(0,start.indexOf('    if (S.sessionSnapshot'))+'\n  }',c);
+    c.onEvent({type,session_id:'A'});
+    pending.resolve({hint:'outdated'}); await finishing;
+    assert.equal(c.$('forecast-hint').textContent,'',type);
+  }
+});
+test('resume and retry require prospective consent before sending their commands', async () => {
+  for (const action of ['resume','retry']) {
+    for (const accepted of [false,true]) {
+      const calls=[];
+      const c=forecastContext(['forecastStamp','confirmForecast',action==='resume'?'resumeRun':'retryRun'], {
+        request:async r=>{calls.push(r);return r.type==='forecast_run'?{confirmation_required:true,confirmation_id:'quote',hint:'$2',warnings:[]}:{confirmed:true};},
+        ask:async()=>accepted,act:async r=>{calls.push(r);return {};},renderRunBanner(){},refreshSessions(){},
+      });
+      c.S.settings={limits:{forecast_confirm_usd:1}};c.$('input').value='another draft';
+      if(action==='resume')await c.resumeRun();else await c.retryRun('specific-model');
+      assert.equal(calls[0].type,'forecast_run');
+      assert.equal(calls[0].for_send,true);
+      assert.equal(calls[0].input[action],true);
+      assert.equal(calls[0].input.draft,'');
+      assert.equal(calls.at(-1).type,accepted?action+'_run':'forecast_run');
+      if(accepted)assert.equal(calls[1].type,'confirm_forecast');
+      assert.equal(c.$('input').value,'another draft');
+    }
+  }
+});
+
+test('edit hints bind prospective truncation and identical-text mode changes invalidate replies', async () => {
+  const old=deferred();const requests=[];
+  const c=forecastContext(['forecastStamp','scheduleForecast'], {request:r=>{requests.push(r);return old.promise;}});
+  c.$('input').value='same text';c.S.editMessageId='old-user';c.scheduleForecast();const finishing=c.fire();
+  assert.equal(requests[0].input.edit_message_id,'old-user');
+  c.S.editMessageId=null;old.resolve({hint:'edited context'});await finishing;
+  assert.equal(c.$('forecast-hint').textContent,'');
+});
+test('a later control intent supersedes an older confirmation with an unchanged composer', async () => {
+  const older=deferred();const calls=[];
+  const c=forecastContext(['forecastStamp','confirmForecast'],{request:r=>{calls.push(r);return calls.length===1?older.promise:Promise.resolve({confirmation_required:false});}});
+  c.$('input').value='unchanged';
+  const first=c.confirmForecast('A','',{retry:true,model:'first'});
+  const second=c.confirmForecast('A','',{resume:true});
+  assert.equal(await second,true);older.resolve({confirmation_required:false});
+  assert.equal(await first,false);
 });

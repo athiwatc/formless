@@ -4229,6 +4229,7 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
 | `tui.on_start` | last | What the TUI opens on launch: `last`, `new` or `picker`; `formless -c` / `--new` override it (§10.1) |
 | `tui.notify` | desktop | `off`, `bell`, or `desktop` (terminal or browser notification plus the bell) while you are elsewhere (§10.6) |
 | `tui.notify_min_secs` | 20 | Runs shorter than this finish without a notification (§10.6) |
+| `limits.forecast_confirm_usd` | (none) | Ask before sending when a priced local forecast p90 exceeds this finite nonnegative USD amount; previews add no caps and unpriced/no-history forecasts have no invented dollar range (§5.2) |
 | `limits.daily_usd` / `run_usd` / `run_steps` | (none) | Opt-in spending limits: provider spend per UTC day across Sessions, spend of one Run, and model steps of one Run; a note at 80%, a pause at 100% (§5.2) |
 | `naming.enabled` | true | Rename "Untitled" Sessions after their first Run |
 | `naming.model` / `auto_download` / `timeout_secs` | qwen2.5-0.5b / true / 30 | Embedded naming model (empty: a heuristic title), fetched on first use, and how long one naming may take before the heuristic is used |
@@ -4349,6 +4350,22 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
   the family freeze, so an in-use child or a newly created profile cannot be
   erased through its default parent.
 - **Imports/exports** contain no secrets, metrics, or history (§7.8).
+
+Tool data has no instruction authority: system instructions outrank user
+instructions, and Tool/file/web/skill/module/sub-agent output is untrusted data.
+Conflicting instructions embedded in data are surfaced to the user, never obeyed.
+Every model-facing Tool result (including errors, deferred results and legacy
+transcripts) carries a stable source-Tool/provenance envelope. Raw Tool.run and
+direct-call values remain compatible. Actual data origins are bounded per Run
+and persisted without URL userinfo, paths, query values, fragments, headers or
+payload contents. HTTP/HTTPS sources identify only their canonical scheme, host
+and port (the `url` origin kind); file sources retain canonical file paths.
+Compacted history remains data; summaries do not become new system instructions.
+Tool-supplied `llm.complete` and `agents.run` requests and system hints are also
+framed as data from the calling Tool; they cannot create system authority.
+User-configured Role system instructions keep their existing authority.
+This boundary is defense in depth, not proof of real-model injection resistance
+or an operating-system process sandbox.
 
 ## 16. Error handling and edge cases (normative)
 
@@ -4538,3 +4555,63 @@ and fallback tests use the same lock as setters. Tests pin hostile inherited
 credentials, named-provider/file overrides, unwind restoration and contrasting
 parallel mock keys. A source check rejects bare environment mutation outside the
 shared helper.
+
+### Local pre-Run forecasts (§5.2, §10.6, §12)
+
+`ForecastRun` previews the current draft, held attachments, checkpoint and frozen
+Tool schemas without starting a Run or contacting a provider. The calibrated
+prompt count is approximate. Completed Runs with recorded, comparable provider,
+model/role, folder/Session, Tool snapshot and prompt size supply empirical p50/p90
+steps, tokens, USD and duration. Legacy Runs without those inputs are excluded.
+No history means prompt size only; missing prices mean no dollar range. Cache
+fractions and compaction probabilities describe comparable history, not guarantees.
+A draft already above the local compaction trigger is flagged immediately.
+
+TUI/web composer hints debounce and discard stale results after draft, Session,
+model, attachment, persisted context, Tool or settings changes. Retry, edit and
+resume use prospective inputs and preserve the existing transcript, paused status,
+held files and budget waiver when consent is refused. Quiet hints use stable
+local auto-selection; preparing a send selects exploration once and binds consent
+to that selected model. `formless run --estimate TASK [--session ID]
+[--model M] [--json]` uses the same Core engine locally, with no Session creation,
+Run, upload, last-Run marker, credential refresh or provider request. It may use
+read-only local IPC to an already-running daemon; it never starts one. Offline
+SQLite reads use a private coherent snapshot under maintenance/native locks,
+without opening the source with a SQLite pager or touching its WAL/SHM. Busy,
+unsupported locking or a possible hot rollback journal fails closed. A missing
+profile stays missing. Attachment previews carry client-supplied bytes-derived
+metadata or display-only references; the RPC never reads a client-supplied local
+path. Admissible uploaded attachments are rechecked at admission.
+
+`limits.forecast_confirm_usd` is optional, finite and nonnegative. A priced p90
+above it requires explicit confirmation. `ConfirmForecast` acknowledges a
+short-lived connection-bound preview; the daemon rechecks current inputs before
+appending or consuming attachments. The quote binds Session, history outcomes,
+calibration, prices, selected model and actual held file identity. Store/config
+admission serializes validation, append, held-file consumption, immutable ledger
+and Run creation, capturing the exact first context/Tool snapshot and selected
+configuration before later client changes. Edit/retry/resume mutations occur only
+after their prospective quote is accepted. Stale consent fails closed. Consent
+belongs to the live connection; reconnects require another review. A cached failed
+send intent remains failed, so a newly approved action allocates a fresh intent.
+Queued messages requiring confirmation stay queued and prompt for composer review.
+Model comparisons build prospective forks privately; if a priced forecast requires
+confirmation, the batch refuses before creating any real fork/message/Run. Batch
+forecast approval is not supported: review and confirm each model in an individual
+Session instead. Ordinary comparisons with no required forecast gate behave as before.
+Headless sends
+without `--yes` fail closed when confirmation is required. Forecasts add no step,
+token or time caps. Admission persists an immutable per-Run forecast and its
+non-text basis; Metrics shows the latest 200 recorded predictions beside actuals, errors and coverage, with
+unfinished/unknown outcomes distinguished from completed observations. Each
+snapshot retains at most 50 newest comparable Run ids (from the last 2000
+recorded Runs) and measured non-text observations,
+without duplicating prompts. A completed Run counts as a complete observation only
+when every admitted physical request has explicit input and output usage;
+missing/partial usage is unknown, never a fabricated zero-token success. Metrics
+also names the served main provider/models and marks a mismatch with the quoted
+basis; known actual-vs-quote errors remain visible, while fallback/mismatched or
+zero-main-prompt outcomes are excluded from per-model calibration. Small N
+ranges are observed quantiles, not confidence bounds. A cached endpoint context
+window is used locally when available; otherwise the window source and uncertainty
+are explicit.

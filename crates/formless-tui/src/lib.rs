@@ -144,6 +144,17 @@ impl View {
 
 #[derive(Clone, PartialEq)]
 enum Pending {
+    ForecastHint {
+        generation: String,
+    },
+    ForecastSend {
+        generation: String,
+        action: ForecastAction,
+    },
+    ForecastConfirm {
+        generation: String,
+        action: ForecastAction,
+    },
     /// Refresh the approvals mode of this connection without opening a pager.
     DaemonMode,
     SendMessage,
@@ -296,6 +307,10 @@ fn reconnect_state_event(event: &Event) -> bool {
                 | Event::QueueChanged { .. }
                 | Event::PlanUpdated { .. }
                 | Event::MessageAppended { .. }
+                | Event::MessagesEdited { .. }
+                | Event::CompactionNotice { .. }
+                | Event::ToolUpdated { .. }
+                | Event::ToolDeleted { .. }
                 | Event::MessageComplete { .. }
         )
 }
@@ -1284,8 +1299,37 @@ fn truncate_chars(s: &str, max: usize) -> String {
 /// How long the TUI waits for a request's answer before giving up on it.
 const REQUEST_DEADLINE: Duration = Duration::from_secs(120);
 
+#[derive(Clone, PartialEq)]
+enum ForecastAction {
+    Send {
+        queued: bool,
+    },
+    Resume {
+        session_id: String,
+    },
+    Retry {
+        session_id: String,
+        model: Option<String>,
+        keep_original: bool,
+    },
+}
+
+#[derive(Default)]
+struct ForecastUi {
+    generation: String,
+    revision: u64,
+    input_cache: std::cell::RefCell<Option<(String, ForecastInput)>>,
+    changed: Option<Instant>,
+    pending: bool,
+    hint: Option<RunForecast>,
+    modal: Option<(String, RunForecast, ForecastAction)>,
+    approved: Option<String>,
+    metrics: Vec<serde_json::Value>,
+}
+
 struct App {
     paths: Paths,
+    forecast: ForecastUi,
     view: View,
     wizard: Option<Wizard>,
     client: Option<DaemonClient>,
@@ -1642,6 +1686,7 @@ impl App {
                 None
             },
             paths,
+            forecast: Default::default(),
             view: View::Chat,
             client: None,
             inbox: None,
@@ -1889,6 +1934,7 @@ impl App {
     /// The daemon went away (restart, crash): keep everything on screen,
     /// show "reconnecting…" and try again every 2 s (SPEC §10.5).
     fn daemon_lost(&mut self) {
+        self.forecast = ForecastUi::default();
         self.restore_unsent_draft();
         self.interrupt_attachment_send("Attachment upload was interrupted before sending; its text/files are kept for review, never sent automatically.");
         self.sends.disconnected();
@@ -2238,6 +2284,9 @@ impl App {
             let Some(kind) = self.pending.remove(&id) else {
                 continue;
             };
+            if matches!(kind, Pending::ForecastHint { .. }) {
+                continue;
+            }
             self.notes.push(format!(
                 "the daemon did not answer within {}s; try again",
                 REQUEST_DEADLINE.as_secs()
@@ -2391,6 +2440,22 @@ impl App {
                             }
                         }
                     }
+                    if !ok {
+                        if let Some((session, text)) = self
+                            .sends
+                            .message(id)
+                            .map(|(s, t)| (s.to_string(), t.to_string()))
+                        {
+                            if self.current.as_deref() == Some(&session) && self.input.is_empty() {
+                                self.input.set(&text);
+                            } else if self.current.as_deref() != Some(&session) {
+                                let draft = self.drafts.entry(session).or_default();
+                                if draft.input.is_empty() {
+                                    draft.input.set(&text);
+                                }
+                            }
+                        }
+                    }
                     for answered in self.sends.answered(id) {
                         if answered != id {
                             self.pending.remove(&answered);
@@ -2402,6 +2467,9 @@ impl App {
                         continue;
                     };
                     if !ok {
+                        if matches!(kind, Pending::ForecastHint { .. }) {
+                            continue;
+                        }
                         if matches!(kind, Pending::ReconnectSession) {
                             if result.as_ref().and_then(|result| result["code"].as_str())
                                 == Some(codes::NOT_FOUND)
@@ -2436,6 +2504,27 @@ impl App {
                         continue;
                     };
                     match kind {
+                        Pending::ForecastHint { generation } => {
+                            if generation == self.forecast_generation() {
+                                self.forecast.hint = serde_json::from_value(result).ok();
+                            }
+                        }
+                        Pending::ForecastSend { generation, action } => {
+                            if generation == self.forecast_generation() && self.offline.is_none() {
+                                if let Ok(f) = serde_json::from_value::<RunForecast>(result) {
+                                    if f.confirmation_required {
+                                        self.forecast.modal = Some((generation, f, action));
+                                    } else {
+                                        self.complete_forecast_action(generation, action);
+                                    }
+                                }
+                            }
+                        }
+                        Pending::ForecastConfirm { generation, action } => {
+                            if generation == self.forecast_generation() && self.offline.is_none() {
+                                self.complete_forecast_action(generation, action);
+                            }
+                        }
                         Pending::SendMessage => {}
                         Pending::DaemonMode => self.daemon_secure = result["secure"].as_bool(),
                         Pending::ReconnectSession => self.apply_reconnect_snapshot(id, result),
@@ -2561,6 +2650,8 @@ impl App {
                             self.builtin_stats = serde_json::from_value(result).unwrap_or_default();
                         }
                         Pending::RunMetrics => {
+                            self.forecast.metrics =
+                                result["forecasts"].as_array().cloned().unwrap_or_default();
                             self.run_summary =
                                 serde_json::from_value(result["summary"].clone()).ok();
                         }
@@ -4159,6 +4250,25 @@ impl App {
     }
 
     fn on_event(&mut self, ev: Event) {
+        if matches!(
+            &ev,
+            Event::SettingsChanged
+                | Event::RegistryChanged { .. }
+                | Event::SessionUpdated { .. }
+                | Event::MessageAppended { .. }
+                | Event::MessagesEdited { .. }
+                | Event::CompactionNotice { .. }
+                | Event::ToolUpdated { .. }
+                | Event::ToolDeleted { .. }
+                | Event::MessageComplete { .. }
+                | Event::RunStarted { .. }
+                | Event::RunFinished { .. }
+                | Event::RunPaused { .. }
+        ) {
+            self.forecast.revision = self.forecast.revision.wrapping_add(1);
+            self.forecast.hint = None;
+            self.forecast.approved = None;
+        }
         if self.offline.is_some() && self.client.is_some() && reconnect_state_event(&ev) {
             self.reconnect_events.push(ev.clone());
             if attention_key(&ev).is_some() {
@@ -4490,6 +4600,7 @@ impl App {
             Event::RunFinished {
                 session_id, status, ..
             } => {
+                self.forecast.generation.clear();
                 self.running_sessions.remove(&session_id);
                 if self.is_current(&session_id) {
                     self.request_session_runs(&session_id);
@@ -4546,6 +4657,9 @@ impl App {
             | Event::MemoryUpdated
             | Event::JobsChanged => {}
             Event::SettingsChanged => {
+                self.forecast.generation.clear();
+                self.forecast.hint = None;
+                self.forecast.approved = None;
                 if let Ok(cfg) = Config::load(&self.paths) {
                     theme::set(theme::from_config(&cfg.tui.theme, &cfg.tui.colors));
                     markdown::set_line_numbers(cfg.tui.code_line_numbers);
@@ -4983,12 +5097,234 @@ impl App {
         }
     }
 
+    fn forecast_input(&self) -> ForecastInput {
+        let text = self.input.expanded();
+        let buffers: Vec<_> = self
+            .attachments
+            .iter()
+            .map(|(n, b)| (n, b.len(), b.as_ptr() as usize))
+            .collect();
+        let root = self.work_dir();
+        let paths: Vec<_> = formless_core::files::mentions(&text)
+            .iter()
+            .map(|p| {
+                let path = mention_path_in(&root, p).unwrap_or_else(|| root.join(p));
+                let stamp = path.metadata().ok().map(|m| (m.len(), m.modified().ok()));
+                (path, stamp)
+            })
+            .collect();
+        let key = formless_core::forecast::hash(&(
+            &self.current,
+            &self.editing_id,
+            &text,
+            &buffers,
+            &paths,
+        ));
+        if let Some((cached, input)) = &*self.forecast.input_cache.borrow() {
+            if cached == &key {
+                return input.clone();
+            }
+        }
+        let mut attachments: Vec<_> = self
+            .attachments
+            .iter()
+            .map(|(name, bytes)| formless_core::forecast::attachment(name.clone(), bytes))
+            .collect();
+        let root = self.work_dir();
+        for mention in formless_core::files::mentions(&self.input.expanded()) {
+            let Some(candidate) = mention_path_in(&root, &mention) else {
+                continue;
+            };
+            let Ok(path) = candidate.canonicalize() else {
+                continue;
+            };
+            let inside = path.starts_with(&root)
+                || (mention.starts_with("~/")
+                    && directories::BaseDirs::new()
+                        .is_some_and(|b| path.starts_with(b.home_dir())));
+            if !inside || formless_core::daemon::credential_path(&path).is_some() {
+                continue;
+            }
+            let Ok(meta) = path.metadata() else {
+                continue;
+            };
+            let name = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            let limit =
+                if formless_core::daemon::is_raster_image(formless_core::daemon::guess_mime(&name))
+                {
+                    formless_core::daemon::MAX_INLINE_IMAGE_BYTES
+                } else {
+                    formless_core::daemon::MAX_MENTION_INLINE_BYTES
+                };
+            if meta.is_file() && meta.len() <= limit as u64 {
+                if let Ok(bytes) = std::fs::read(&path) {
+                    attachments.push(formless_core::forecast::attachment(name, &bytes));
+                }
+            } else {
+                attachments.push(formless_core::forecast::reference(
+                    &path,
+                    meta.is_dir(),
+                    if meta.is_dir() { 0 } else { meta.len() },
+                ));
+            }
+        }
+        let input = ForecastInput {
+            session_id: self.current.clone(),
+            draft: text.trim().to_string(),
+            edit_message_id: self.editing_id.clone(),
+            attachments,
+            ..Default::default()
+        };
+        *self.forecast.input_cache.borrow_mut() = Some((key, input.clone()));
+        input
+    }
+    fn forecast_generation(&self) -> String {
+        let session = self
+            .current
+            .as_ref()
+            .and_then(|id| self.sessions.iter().find(|s| &s.id == id));
+        formless_core::forecast::hash(&(
+            self.forecast_input(),
+            session,
+            &self.model_label,
+            self.forecast.revision,
+        ))
+    }
+    fn forecast_tick(&mut self) {
+        if self.offline.is_some()
+            || self.client.is_none()
+            || self.current.is_none()
+            || self.running()
+            || self.input.is_empty()
+            || self.input.expanded().starts_with('/')
+        {
+            self.forecast.hint = None;
+            self.forecast.generation.clear();
+            return;
+        }
+        let generation = self.forecast_generation();
+        if generation != self.forecast.generation {
+            self.forecast.generation = generation.clone();
+            self.forecast.changed = Some(Instant::now());
+            self.forecast.pending = false;
+            self.forecast.hint = None;
+        }
+        if !self.forecast.pending
+            && self
+                .forecast
+                .changed
+                .is_some_and(|t| t.elapsed() >= Duration::from_millis(300))
+        {
+            self.forecast.pending = true;
+            self.request(
+                Pending::ForecastHint { generation },
+                Request::ForecastRun {
+                    for_send: false,
+                    input: self.forecast_input(),
+                },
+            );
+        }
+    }
+
+    fn complete_forecast_action(&mut self, generation: String, action: ForecastAction) {
+        match action {
+            ForecastAction::Send { queued } => {
+                self.forecast.approved = Some(generation);
+                self.submit_chat(queued);
+            }
+            ForecastAction::Resume { session_id } => {
+                self.request(Pending::RunControl, Request::ResumeRun { session_id });
+            }
+            ForecastAction::Retry {
+                session_id,
+                model,
+                keep_original,
+            } => {
+                self.request(
+                    Pending::RetryRun,
+                    Request::RetryRun {
+                        session_id,
+                        model,
+                        keep_original,
+                    },
+                );
+            }
+        }
+    }
+    fn forecast_control(&mut self, action: ForecastAction) {
+        self.forecast.revision = self.forecast.revision.wrapping_add(1);
+        if self.offline.is_some() {
+            return;
+        }
+        if !Config::load(&self.paths).is_ok_and(|c| c.limits.forecast_confirm_usd.is_some()) {
+            self.complete_forecast_action(self.forecast_generation(), action);
+            return;
+        }
+        let mut input = self.forecast_input();
+        input.draft.clear();
+        input.attachments.clear();
+        input.edit_message_id = None;
+        match &action {
+            ForecastAction::Resume { session_id } => {
+                input.session_id = Some(session_id.clone());
+                input.resume = true;
+            }
+            ForecastAction::Retry {
+                session_id, model, ..
+            } => {
+                input.session_id = Some(session_id.clone());
+                input.retry = true;
+                input.model = model.clone();
+            }
+            ForecastAction::Send { .. } => unreachable!(),
+        }
+        self.request(
+            Pending::ForecastSend {
+                generation: self.forecast_generation(),
+                action,
+            },
+            Request::ForecastRun {
+                for_send: true,
+                input,
+            },
+        );
+    }
+
     fn submit_chat(&mut self, queued: bool) {
         if self.offline.is_some() {
             // Nothing can be sent: keep the draft until the daemon is back.
             self.notes
                 .push("not sent — offline; your input is kept as a draft".into());
             return;
+        }
+        let text = self.input.expanded();
+        if !text.trim().is_empty()
+            && !text.starts_with('/')
+            && !self.running()
+            && self.current.is_some()
+            && self.editing_queued.is_none()
+            && Config::load(&self.paths).is_ok_and(|c| c.limits.forecast_confirm_usd.is_some())
+        {
+            let generation = self.forecast_generation();
+            if self.forecast.approved.take().as_deref() != Some(generation.as_str()) {
+                self.forecast.revision = self.forecast.revision.wrapping_add(1);
+                let generation = self.forecast_generation();
+                self.request(
+                    Pending::ForecastSend {
+                        generation,
+                        action: ForecastAction::Send { queued },
+                    },
+                    Request::ForecastRun {
+                        for_send: true,
+                        input: self.forecast_input(),
+                    },
+                );
+                return;
+            }
         }
         self.restored_send = None;
         let text = self.input.take();
@@ -5104,7 +5440,10 @@ impl App {
         let root = Some(self.work_dir());
         let found: Vec<String> = formless_core::files::mentions(&text)
             .into_iter()
-            .filter(|p| root.as_ref().is_some_and(|r| r.join(p).exists()))
+            .filter(|p| {
+                root.as_ref()
+                    .is_some_and(|r| mention_path_in(r, p).is_some_and(|p| p.exists()))
+            })
             .collect();
         let held = std::mem::take(&mut self.attachments);
         for (name, bytes) in &held {
@@ -5686,15 +6025,11 @@ impl App {
                 };
                 let arg = cmd.trim_start_matches("retry").trim();
                 let model = arg.strip_prefix("--model").unwrap_or(arg).trim();
-                self.run_banner = None;
-                self.request(
-                    Pending::RetryRun,
-                    Request::RetryRun {
-                        session_id,
-                        model: Some(model.to_string()).filter(|m| !m.is_empty()),
-                        keep_original: true,
-                    },
-                );
+                self.forecast_control(ForecastAction::Retry {
+                    session_id,
+                    model: Some(model.to_string()).filter(|m| !m.is_empty()),
+                    keep_original: true,
+                });
             }
             "metrics" => self.open_view(View::Metrics),
             "proposals" => self.open_view(View::Proposals),
@@ -6571,13 +6906,12 @@ impl App {
             }
             "resume" | "abandon" => {
                 if let Some(session_id) = self.current.clone() {
-                    let req = if cmd == "resume" {
-                        Request::ResumeRun { session_id }
+                    if cmd == "resume" {
+                        self.forecast_control(ForecastAction::Resume { session_id });
                     } else {
-                        Request::AbandonRun { session_id }
-                    };
-                    self.request(Pending::RunControl, req);
-                    self.run_banner = None;
+                        self.request(Pending::RunControl, Request::AbandonRun { session_id });
+                        self.run_banner = None;
+                    }
                 }
             }
             "help" => {
@@ -7303,6 +7637,29 @@ impl App {
         }
         if self.model_overlay.is_some() {
             self.model_key(key);
+            return;
+        }
+        if let Some((generation, forecast, action)) = self.forecast.modal.take() {
+            match key.code {
+                KeyCode::Enter | KeyCode::Char('y') if generation == self.forecast_generation() => {
+                    if let Some(id) = forecast.confirmation_id {
+                        self.request(
+                            Pending::ForecastConfirm { generation, action },
+                            Request::ConfirmForecast { id },
+                        );
+                    }
+                }
+                KeyCode::Esc | KeyCode::Char('n') => {}
+                _ => self.forecast.modal = Some((generation, forecast, action)),
+            }
+            return;
+        }
+        if self.view == View::Metrics && key.code == KeyCode::Char('f') {
+            self.pager = Some(code_pager(
+                "Forecast versus actual",
+                &serde_json::to_string_pretty(&self.forecast.metrics).unwrap_or_default(),
+                self.color,
+            ));
             return;
         }
         if self.quit_confirm {
@@ -9164,6 +9521,19 @@ fn draw(f: &mut Frame, app: &mut App) {
     if app.view == View::Chat || app.multi_pane {
         draw_toasts(f, toast_area, app);
     }
+    if let Some((_, forecast, _)) = &app.forecast.modal {
+        let area = f.area();
+        let width = area.width.saturating_sub(6);
+        let height = 7.min(area.height);
+        let rect = Rect::new(
+            area.x + 3,
+            area.y + area.height.saturating_sub(height) / 2,
+            width,
+            height,
+        );
+        f.render_widget(Clear, rect);
+        f.render_widget(Paragraph::new(format!("{}\n{} comparable Runs; local forecast, not a limit.\n\nEnter/y confirm · Esc/n keep draft",forecast.hint,forecast.comparable_runs)).wrap(Wrap{trim:false}).block(ui::panel(" Forecast confirmation ",app.color,Color::Yellow)),rect);
+    }
     if app.quit_confirm {
         draw_quit_confirm(f, app);
     }
@@ -9849,6 +10219,9 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App, show_cursor: bool) {
         } else {
             title.push_str(&format!("[@{label}] "));
         }
+    }
+    if let Some(forecast) = &app.forecast.hint {
+        title.push_str(&format!(" · {} ", truncate_chars(&forecast.hint, 100)));
     }
     let flashing = app.target_flash.is_some_and(|t| Instant::now() < t);
     let mut block = ui::panel(
@@ -10988,6 +11361,15 @@ fn short_dir(dir: &str) -> String {
     } else {
         d
     }
+}
+
+/// Resolve the same native-home spelling used by daemon AttachPath. Merely
+/// constructing this path grants no access; the daemon still validates intake.
+fn mention_path_in(base: &std::path::Path, path: &str) -> Option<std::path::PathBuf> {
+    Some(match path.strip_prefix("~/") {
+        Some(rest) => directories::BaseDirs::new()?.home_dir().join(rest),
+        None => base.join(path),
+    })
 }
 
 /// A file a chat mentions, resolved against `base` (the Session's working
@@ -13748,16 +14130,20 @@ fn draw_metrics(f: &mut Frame, area: Rect, app: &App) {
         })
         .collect();
     let range = METRIC_RANGES[app.metrics_range % METRIC_RANGES.len()].0;
+    let forecast = format!(
+        "forecast vs actual (f, {} records)",
+        app.forecast.metrics.len()
+    );
     let title = match app.run_summary.as_ref().filter(|s| s.runs > 0) {
         Some(s) => format!(
-            " Metrics · {range} (r) · {} · {} Runs: {:.0}% completed, {:.0}% edited/corrected, {:.1} steps avg ",
+            " Metrics · {range} (r) · {forecast} · {} · {} Runs: {:.0}% completed, {:.0}% edited/corrected, {:.1} steps avg ",
             metrics_summary(&tools),
             s.runs,
             s.completed * 100.0,
             (s.edited + s.corrected) * 100.0,
             s.avg_steps
         ),
-        None => format!(" Metrics · {range} (r) · {} ", metrics_summary(&tools)),
+        None => format!(" Metrics · {range} (r) · {forecast} · {} ", metrics_summary(&tools)),
     };
     let block = ui::panel(title, app.color, Color::Green);
     if rows.is_empty() {
@@ -15328,6 +15714,7 @@ pub fn run_with(paths: Paths, start: Option<&str>) -> Result<()> {
         while !app.should_quit {
             app.tick = app.tick.wrapping_add(1);
             app.drain_daemon();
+            app.forecast_tick();
             app.try_reconnect();
             app.wizard_poll();
             if std::mem::take(&mut app.force_redraw) {
@@ -15521,6 +15908,7 @@ mod tests {
         let paths = Paths::from_dirs(base.join("d"), base.join("c")).unwrap();
         App {
             paths,
+            forecast: Default::default(),
             view: View::Chat,
             wizard: None,
             client: None,
@@ -21299,5 +21687,319 @@ mod tests {
             vec!["b", "c", "d", "e"],
             "keeps the latest rows"
         );
+    }
+    fn forecast_reply(hint: &str, required: bool) -> RunForecast {
+        let st = formless_core::Store::open_in_memory().unwrap();
+        let mut cfg = Config::default();
+        cfg.provider.model = "model".into();
+        let mut f = formless_core::forecast::estimate_store(
+            &st,
+            &cfg,
+            &ForecastInput {
+                draft: "task".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        f.hint = hint.into();
+        f.confirmation_required = required;
+        f.confirmation_id = required.then(|| "preview-consent".into());
+        f
+    }
+    #[test]
+    fn forecast_hint_debounces_and_rejects_stale_draft_model_session_and_files() {
+        for change in 0..4 {
+            let mut app = test_app();
+            let (client, sent) = DaemonClient::recording();
+            let (tx, inbox) = mpsc::channel();
+            app.client = Some(client);
+            app.inbox = Some(inbox);
+            app.input.set("original");
+            app.forecast_tick();
+            assert!(sent.try_recv().is_err());
+            app.forecast.changed = Some(Instant::now() - Duration::from_millis(301));
+            app.forecast_tick();
+            let read: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+            assert!(matches!(
+                read.request,
+                Request::ForecastRun {
+                    for_send: false,
+                    ..
+                }
+            ));
+            match change {
+                0 => app.input.set("newer"),
+                1 => app.model_label = "new model".into(),
+                2 => app.current = Some("other".into()),
+                _ => app.attachments.push(("new.txt".into(), vec![1])),
+            }
+            tx.send(ServerMessage::Response {
+                id: read.id,
+                ok: true,
+                result: Some(serde_json::to_value(forecast_reply("stale", false)).unwrap()),
+                error: None,
+            })
+            .unwrap();
+            app.drain_daemon();
+            assert!(app.forecast.hint.is_none());
+            app.forecast_tick();
+            app.forecast.changed = Some(Instant::now() - Duration::from_millis(301));
+            app.forecast_tick();
+            let read: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+            tx.send(ServerMessage::Response {
+                id: read.id,
+                ok: true,
+                result: Some(
+                    serde_json::to_value(forecast_reply("42 prompt tokens · will compact", false))
+                        .unwrap(),
+                ),
+                error: None,
+            })
+            .unwrap();
+            app.drain_daemon();
+            assert_eq!(
+                app.forecast.hint.as_ref().unwrap().hint,
+                "42 prompt tokens · will compact"
+            );
+            let screen = render(&mut app, 140, 30);
+            assert!(screen.contains("will compact"), "{screen}");
+            app.forecast_tick();
+            assert!(sent.try_recv().is_err(), "unchanged draft has one preview");
+        }
+    }
+    #[test]
+    fn forecast_confirmation_keeps_composer_and_discards_stale_or_disconnected_ack() {
+        for disconnect in [false, true] {
+            let mut app = test_app();
+            let mut cfg = Config::default();
+            cfg.limits.forecast_confirm_usd = Some(0.0);
+            cfg.save(&app.paths).unwrap();
+            let (client, sent) = DaemonClient::recording();
+            let (tx, inbox) = mpsc::channel();
+            app.client = Some(client);
+            app.inbox = Some(inbox);
+            app.input.set("task");
+            app.submit_chat(false);
+            let preview: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+            assert!(matches!(
+                preview.request,
+                Request::ForecastRun { for_send: true, .. }
+            ));
+            assert_eq!(app.input.expanded(), "task");
+            tx.send(ServerMessage::Response {
+                id: preview.id,
+                ok: true,
+                result: Some(
+                    serde_json::to_value(forecast_reply("~$1–2 · will compact", true)).unwrap(),
+                ),
+                error: None,
+            })
+            .unwrap();
+            app.drain_daemon();
+            assert!(app.forecast.modal.is_some());
+            let screen = render(&mut app, 140, 30);
+            assert!(
+                screen.contains("Forecast confirmation") && screen.contains("Enter/y"),
+                "{screen}"
+            );
+            app.key(key(KeyCode::Enter));
+            let confirm: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+            assert!(matches!(confirm.request, Request::ConfirmForecast { .. }));
+            if disconnect {
+                app.daemon_lost();
+            } else {
+                app.input.set("newer draft");
+            }
+            let response = ServerMessage::Response {
+                id: confirm.id,
+                ok: true,
+                result: Some(serde_json::json!({"confirmed":true})),
+                error: None,
+            };
+            if disconnect {
+                assert!(tx.send(response).is_err(), "old socket inbox is closed");
+            } else {
+                tx.send(response).unwrap();
+            }
+            app.drain_daemon();
+            assert!(sent.try_recv().is_err(), "old acknowledgement never sends");
+            assert_eq!(
+                app.input.expanded(),
+                if disconnect { "task" } else { "newer draft" }
+            );
+        }
+    }
+    #[test]
+    fn declining_forecast_keeps_text_and_attachments_without_sending() {
+        let mut app = test_app();
+        app.input.set("task");
+        app.attachments.push(("held.txt".into(), vec![1, 2]));
+        app.forecast.modal = Some((
+            app.forecast_generation(),
+            forecast_reply("forecast", true),
+            ForecastAction::Send { queued: false },
+        ));
+        app.key(key(KeyCode::Esc));
+        assert!(app.forecast.modal.is_none());
+        assert_eq!(app.input.expanded(), "task");
+        assert_eq!(app.attachments, vec![("held.txt".into(), vec![1, 2])]);
+    }
+    #[test]
+    fn persisted_context_event_invalidates_pending_hint_even_with_unchanged_composer() {
+        let mut app = test_app();
+        let (client, sent) = DaemonClient::recording();
+        let (tx, inbox) = mpsc::channel();
+        app.client = Some(client);
+        app.inbox = Some(inbox);
+        app.input.set("task");
+        app.forecast_tick();
+        app.forecast.changed = Some(Instant::now() - Duration::from_millis(301));
+        app.forecast_tick();
+        let preview: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        let generation = app.forecast_generation();
+        app.on_event(Event::MessagesEdited {
+            session_id: "s1".into(),
+        });
+        assert_ne!(generation, app.forecast_generation());
+        tx.send(ServerMessage::Response {
+            id: preview.id,
+            ok: true,
+            result: Some(serde_json::to_value(forecast_reply("outdated context", false)).unwrap()),
+            error: None,
+        })
+        .unwrap();
+        app.drain_daemon();
+        assert!(app.forecast.hint.is_none());
+        assert_eq!(app.input.expanded(), "task");
+    }
+    #[test]
+    fn resume_and_retry_wait_for_current_prospective_confirmation() {
+        for retry in [false, true] {
+            let mut app = test_app();
+            let mut cfg = Config::default();
+            cfg.limits.forecast_confirm_usd = Some(0.0);
+            cfg.save(&app.paths).unwrap();
+            let (client, sent) = DaemonClient::recording();
+            let (tx, inbox) = mpsc::channel();
+            app.client = Some(client);
+            app.inbox = Some(inbox);
+            app.input.set("unrelated draft");
+            app.slash(if retry {
+                "retry --model chosen"
+            } else {
+                "resume"
+            });
+            let preview: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+            match preview.request {
+                Request::ForecastRun { input, for_send } => {
+                    assert!(for_send);
+                    assert_eq!(input.retry, retry);
+                    assert_eq!(input.resume, !retry);
+                    assert!(input.draft.is_empty() && input.attachments.is_empty());
+                    if retry {
+                        assert_eq!(input.model.as_deref(), Some("chosen"));
+                    }
+                }
+                _ => panic!("control command ran before forecast"),
+            }
+            assert!(sent.try_recv().is_err());
+            tx.send(ServerMessage::Response {
+                id: preview.id,
+                ok: true,
+                result: Some(serde_json::to_value(forecast_reply("$2 p90", true)).unwrap()),
+                error: None,
+            })
+            .unwrap();
+            app.drain_daemon();
+            assert!(app.forecast.modal.is_some());
+            app.key(key(KeyCode::Enter));
+            let consent: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+            assert!(matches!(consent.request, Request::ConfirmForecast { .. }));
+            assert!(sent.try_recv().is_err());
+            tx.send(ServerMessage::Response {
+                id: consent.id,
+                ok: true,
+                result: Some(serde_json::json!({"confirmed":true})),
+                error: None,
+            })
+            .unwrap();
+            app.drain_daemon();
+            let action: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+            assert!(if retry {
+                matches!(action.request, Request::RetryRun { .. })
+            } else {
+                matches!(action.request, Request::ResumeRun { .. })
+            });
+            assert_eq!(app.input.expanded(), "unrelated draft");
+        }
+    }
+    #[test]
+    fn identical_draft_edit_mode_changes_are_not_cached_as_append_forecasts() {
+        let mut app = test_app();
+        app.input.set("same text");
+        assert!(app.forecast_input().edit_message_id.is_none());
+        app.editing_id = Some("old-user".into());
+        assert_eq!(
+            app.forecast_input().edit_message_id.as_deref(),
+            Some("old-user")
+        );
+        app.editing_id = None;
+        assert!(app.forecast_input().edit_message_id.is_none());
+    }
+    #[test]
+    fn later_control_preparation_rejects_old_response_with_unchanged_composer() {
+        let mut app = test_app();
+        let mut cfg = Config::default();
+        cfg.limits.forecast_confirm_usd = Some(0.0);
+        cfg.save(&app.paths).unwrap();
+        let (client, sent) = DaemonClient::recording();
+        let (tx, inbox) = mpsc::channel();
+        app.client = Some(client);
+        app.inbox = Some(inbox);
+        app.input.set("unchanged");
+        app.forecast_control(ForecastAction::Retry {
+            session_id: "s1".into(),
+            model: Some("old".into()),
+            keep_original: true,
+        });
+        let older: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        app.forecast_control(ForecastAction::Resume {
+            session_id: "s1".into(),
+        });
+        let newer: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        tx.send(ServerMessage::Response {
+            id: older.id,
+            ok: true,
+            result: Some(serde_json::to_value(forecast_reply("old retry", true)).unwrap()),
+            error: None,
+        })
+        .unwrap();
+        app.drain_daemon();
+        assert!(app.forecast.modal.is_none());
+        tx.send(ServerMessage::Response {
+            id: newer.id,
+            ok: true,
+            result: Some(serde_json::to_value(forecast_reply("current resume", true)).unwrap()),
+            error: None,
+        })
+        .unwrap();
+        app.drain_daemon();
+        assert_eq!(
+            app.forecast.modal.as_ref().unwrap().1.hint,
+            "current resume"
+        );
+        assert!(sent.try_recv().is_err());
+    }
+    #[test]
+    fn metrics_shortcuts_keep_range_and_forecast_actions_visible_at_standard_width() {
+        let mut app = test_app();
+        app.view = View::Metrics;
+        let screen = render(&mut app, 80, 30);
+        assert!(screen.contains("all time (r)"), "{screen}");
+        assert!(screen.contains("forecast vs actual (f"), "{screen}");
+        app.key(key(KeyCode::Char('r')));
+        let screen = render(&mut app, 80, 30);
+        assert!(screen.contains("24h (r)"), "{screen}");
+        assert!(screen.contains("forecast vs actual (f"), "{screen}");
     }
 }

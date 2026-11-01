@@ -306,6 +306,24 @@ fn sse_text(text: &str) -> String {
     )
 }
 
+/// Scripted providers consume the model-facing data boundary, then reason
+/// about its semantic payload. Never accept a raw result as a framed result.
+fn tool_data(content: &str, source: &str) -> String {
+    let frame: Value = serde_json::from_str(content).expect("valid Tool data frame JSON");
+    assert_eq!(frame["formless_data"], 1, "{frame}");
+    assert_eq!(frame["source_tool"], source, "{frame}");
+    assert_eq!(
+        frame["note"],
+        formless_core::provenance::DATA_NOTE,
+        "{frame}"
+    );
+    let origins: Vec<formless_core::provenance::Origin> =
+        serde_json::from_value(frame["origins"].clone()).expect("typed frame origins");
+    assert!(origins.len() <= formless_core::provenance::MAX_ORIGINS);
+    assert!(origins.windows(2).all(|pair| pair[0] < pair[1]));
+    frame["content"].as_str().expect("text payload").to_owned()
+}
+
 // --- Pending: await path (with remind-once) ---
 
 #[cfg(unix)]
@@ -336,19 +354,26 @@ async fn pending_await_path_with_remind_once() {
                     sse_tool("c1", "sleeper", json!({"ms": 1800}))
                 } else if joined.contains("still have pending invocations") && tools.len() == 1 {
                     // Parse the pending handle out of the first tool result.
-                    let content = tools[0]["content"].as_str().unwrap_or_default();
-                    let handle = serde_json::from_str::<Value>(content)
-                        .map(|v| v["invocation_id"].as_str().unwrap_or_default().to_string())
-                        .unwrap_or_default();
+                    assert_eq!(joined.matches("still have pending invocations").count(), 1);
+                    let content = tool_data(tools[0]["content"].as_str().unwrap(), "sleeper");
+                    let pending: Value = serde_json::from_str(&content).unwrap();
+                    assert_eq!(pending["status"], "pending");
+                    assert_eq!(pending["tool"], "sleeper");
+                    let handle = pending["invocation_id"].as_str().unwrap();
+                    assert!(!handle.is_empty());
                     sse_tool("c2", "await_invocation", json!({"invocation_id": handle}))
                 } else if tools.len() == 1 {
                     // Attempt a final answer while still pending -> daemon must remind once.
                     sse_text("early final")
                 } else {
-                    let last = tools
-                        .last()
-                        .map(|m| m["content"].as_str().unwrap_or_default().to_string())
-                        .unwrap_or_default();
+                    let last = tool_data(
+                        tools.last().unwrap()["content"].as_str().unwrap(),
+                        "sleeper",
+                    );
+                    assert_eq!(
+                        serde_json::from_str::<Value>(&last).unwrap(),
+                        json!({"slept":1800})
+                    );
                     sse_text(&format!("awaited: {last}"))
                 };
                 (
@@ -1328,7 +1353,14 @@ async fn pending_handle_survives_restart_as_interrupted() {
                 let msgs = body["messages"].as_array().cloned().unwrap_or_default();
                 match msgs.iter().find(|m| m["role"] == "tool") {
                     None => sse_tool("c1", "check_invocation", json!({"invocation_id": "h-old"})),
-                    Some(t) => sse_text(t["content"].as_str().unwrap_or_default()),
+                    Some(t) => {
+                        let payload = tool_data(t["content"].as_str().unwrap(), "check_invocation");
+                        let interrupted: Value = serde_json::from_str(&payload).unwrap();
+                        assert_eq!(interrupted["status"], "interrupted");
+                        assert_eq!(interrupted["invocation_id"], "h-old");
+                        assert_eq!(interrupted["tool"], "sleeper");
+                        sse_text(&payload)
+                    }
                 }
             }),
         );
@@ -2085,7 +2117,7 @@ async fn pending_results_are_delivered_in_one_ordered_note() {
                             .iter()
                             .filter_map(|m| m["content"].as_str())
                             .filter(|c| c.contains("[Pending invocations completed]"))
-                            .map(str::to_string)
+                            .map(|c| tool_data(c, "deferred_tool_data"))
                             .collect();
                         if !pushed.is_empty() {
                             *notes.lock().unwrap() = pushed;
@@ -2128,12 +2160,31 @@ async fn pending_results_are_delivered_in_one_ordered_note() {
     assert_eq!(notes.len(), 1, "one note for both: {notes:?}");
     let lines: Vec<&str> = notes[0].lines().filter(|l| l.starts_with("- ")).collect();
     assert_eq!(lines.len(), 2, "{}", notes[0]);
-    // Started first, listed first.
-    assert!(
-        lines[0].contains("1300") && lines[1].contains("1400"),
-        "{}",
-        notes[0]
+    assert_eq!(
+        notes[0].lines().next(),
+        Some("[Pending invocations completed]")
     );
+    // Started first, listed first.
+    let mut handles = Vec::new();
+    for (line, ms) in lines.iter().zip([1300, 1400]) {
+        let (handle, framed) = line
+            .strip_prefix("- ")
+            .unwrap()
+            .split_once(" (tool sleeper): ")
+            .unwrap();
+        assert!(!handle.is_empty());
+        handles.push(handle);
+        let payload = tool_data(framed, "sleeper");
+        assert_eq!(
+            serde_json::from_str::<Value>(&payload).unwrap(),
+            json!({"slept":ms})
+        );
+    }
+    assert_ne!(handles[0], handles[1]);
+    let store = Store::open(&paths.db_file()).unwrap();
+    let (sleeper, _) = store.get_tool_by_name("sleeper").unwrap().unwrap();
+    let metrics = store.tool_metrics(&sleeper.id, None).unwrap();
+    assert_eq!((metrics.total, metrics.success, metrics.failure), (2, 2, 0));
     server.abort();
 }
 
@@ -2187,7 +2238,11 @@ async fn agent_adds_an_mcp_server_after_approval() {
                             "add_mcp_server",
                             json!({"name": "web", "transport": "http", "url": url, "reason": "to look things up"}),
                         ),
-                        Some(t) => sse_text(t["content"].as_str().unwrap_or_default()),
+                        Some(t) => {
+                            let payload = tool_data(t["content"].as_str().unwrap(), "add_mcp_server");
+                            assert_eq!(serde_json::from_str::<Value>(&payload).unwrap(), json!({"added":"web","error":null,"tools":1}));
+                            sse_text(&payload)
+                        }
                     }
                 }
             }),
@@ -2210,6 +2265,7 @@ async fn agent_adds_an_mcp_server_after_approval() {
     })
     .await;
     let mut answer = String::new();
+    let mut approvals = 0;
     loop {
         let line = tokio::time::timeout(std::time::Duration::from_secs(20), c.lines.next_line())
             .await
@@ -2227,6 +2283,7 @@ async fn agent_adds_an_mcp_server_after_approval() {
                 ..
             } => {
                 assert_eq!(tool_name, "add_mcp_server");
+                approvals += 1;
                 let detail = detail.expect("the modal says exactly what is added");
                 assert!(
                     detail.contains(&mcp_url) && detail.contains("to look things up"),
@@ -2246,7 +2303,14 @@ async fn agent_adds_an_mcp_server_after_approval() {
             _ => {}
         }
     }
-    assert!(answer.contains("\"added\":\"web\""), "{answer}");
+    assert_eq!(
+        approvals, 1,
+        "exactly one explicit approval before MCP setup"
+    );
+    assert_eq!(
+        serde_json::from_str::<Value>(&answer).unwrap(),
+        json!({"added":"web","error":null,"tools":1})
+    );
     let store = Store::open(&paths.db_file()).unwrap();
     assert!(store
         .get_tool_by_name("mcp__web__lookup")

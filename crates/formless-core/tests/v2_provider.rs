@@ -907,7 +907,7 @@ async fn native_anthropic_messages_stream_and_complete() {
             assert_eq!(headers.get("x-api-key").and_then(|v| v.to_str().ok()), Some("k"));
             assert_eq!(headers.get("anthropic-version").and_then(|v| v.to_str().ok()), Some("2023-06-01"));
             assert!(headers.get("authorization").is_none());
-            assert_eq!(body["system"][0]["text"], "sys");
+            assert_eq!(body["system"][0]["text"].as_str().unwrap().strip_prefix(&format!("{}\n\n",formless_core::provenance::HIERARCHY)),Some("sys"),"mandatory hierarchy precedes the exact trusted custom system prompt");
             if body["stream"] == false {
                 return Json(json!({
                     "content": [{"type": "text", "text": "summary"}],
@@ -1587,9 +1587,14 @@ async fn cache_breakpoints_follow_the_attempted_model() {
     );
     let other = bodies.iter().find(|b| b["model"] == "gpt-other").unwrap();
     assert!(!other.to_string().contains("cache_control"), "{other}");
+    assert_eq!(other["messages"][0]["role"], "system");
     assert_eq!(
-        other["messages"][0]["content"], "be brief",
-        "plain strings again"
+        other["messages"][0]["content"]
+            .as_str()
+            .expect("plain strings again")
+            .strip_prefix(&format!("{}\n\n", formless_core::provenance::HIERARCHY)),
+        Some("be brief"),
+        "fallback keeps the mandatory hierarchy and exact custom system text as a plain string"
     );
 
     seen.lock().unwrap().clear();
@@ -1599,6 +1604,29 @@ async fn cache_breakpoints_follow_the_attempted_model() {
         body.to_string().contains("cache_control"),
         "complete() marks Claude too: {body}"
     );
+}
+
+fn only_image_user(body: &Value, key: &str) -> Value {
+    let messages = body[key].as_array().expect("request message array");
+    let systems: Vec<_> = messages.iter().filter(|m| m["role"] == "system").collect();
+    assert_eq!(
+        systems.len(),
+        1,
+        "exactly one mandatory leading system message"
+    );
+    assert_eq!(messages[0]["role"], "system");
+    if key == "messages" {
+        assert_eq!(systems[0]["content"], formless_core::provenance::HIERARCHY);
+    } else {
+        assert_eq!(systems[0]["content"][0]["type"], "input_text");
+        assert_eq!(
+            systems[0]["content"][0]["text"],
+            formless_core::provenance::HIERARCHY
+        );
+    }
+    let users: Vec<_> = messages.iter().filter(|m| m["role"] == "user").collect();
+    assert_eq!(users.len(), 1, "exactly one image-bearing user message");
+    (*users[0]).clone()
 }
 
 /// Images reach vision models on both APIs, scaled down once, and an
@@ -1656,7 +1684,9 @@ async fn images_reach_both_apis_and_dropped_ones_are_marked() {
     .await
     .unwrap();
     let body = seen.lock().unwrap().last().unwrap().clone();
-    let image = &body["messages"][0]["content"][1]["image_url"];
+    let user = only_image_user(&body, "messages");
+    assert_eq!(user["content"][0], json!({"type":"text","text":"look"}));
+    let image = &user["content"][1]["image_url"];
     assert_eq!(image["detail"], "low");
     let url = image["url"].as_str().unwrap();
     assert!(
@@ -1686,7 +1716,8 @@ async fn images_reach_both_apis_and_dropped_ones_are_marked() {
     .await
     .unwrap();
     let body = seen.lock().unwrap().last().unwrap().clone();
-    let parts = body["input"][0]["content"].as_array().unwrap().clone();
+    let user = only_image_user(&body, "input");
+    let parts = user["content"].as_array().unwrap().clone();
     assert!(
         parts
             .iter()
@@ -1715,7 +1746,9 @@ async fn images_reach_both_apis_and_dropped_ones_are_marked() {
     .await
     .unwrap();
     let body = seen.lock().unwrap().last().unwrap().clone();
-    let text = body["messages"][0]["content"][1]["text"].as_str().unwrap();
+    let user = only_image_user(&body, "messages");
+    assert_eq!(user["content"][0], json!({"type":"text","text":"look"}));
+    let text = user["content"][1]["text"].as_str().unwrap();
     assert!(text.contains("big.png could not be attached"), "{text}");
     let _ = std::fs::remove_dir_all(dir);
 }

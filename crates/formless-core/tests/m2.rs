@@ -308,7 +308,14 @@ async fn mock_m2_server(workdir: String) -> String {
                 }
                 let msgs = body["messages"].as_array().cloned().unwrap_or_default();
                 // The approval prompt's plain-language summary (SPEC §10.3).
-                if msgs.first().and_then(|m| m["content"].as_str()).is_some_and(|c| c.starts_with("You explain small programs")) {
+                // Mandatory provenance instructions precede the trusted task
+                // prompt on every provider request. Classify the summary by
+                // that exact boundary, not text anywhere in Tool/user data.
+                if msgs.first().filter(|m| m["role"] == "system")
+                    .and_then(|m| m["content"].as_str())
+                    .and_then(|c| c.strip_prefix(formless_core::provenance::HIERARCHY))
+                    .and_then(|c| c.strip_prefix("\n\n"))
+                    .is_some_and(|c| c.starts_with("You explain small programs")) {
                     return Json(json!({"choices": [{"message": {"role": "assistant", "content": "Writes the text you give it to a file in the work folder and reads it back."}}]})).into_response();
                 }
                 let tool_msgs: Vec<&Value> = msgs.iter().filter(|m| m["role"] == "tool").collect();

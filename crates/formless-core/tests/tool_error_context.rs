@@ -219,18 +219,46 @@ async fn nested_errors_preserve_inner_detail_and_redact_recorded_and_returned_in
         [], |row| row.get(0),
     ).unwrap();
     let model_results = seen.lock().unwrap();
+    let payloads: Vec<String> = model_results
+        .iter()
+        .map(|text| {
+            let frame: Value = serde_json::from_str(text)
+                .expect("model-visible Tool error is a complete provenance frame");
+            assert_eq!(frame["formless_data"], 1);
+            assert_eq!(frame["source_tool"], "outer_diagnostic");
+            assert_eq!(frame["note"], formless_core::provenance::DATA_NOTE);
+            let origins: Vec<formless_core::provenance::Origin> =
+                serde_json::from_value(frame["origins"].clone()).expect("typed provenance origins");
+            assert!(origins.len() <= formless_core::provenance::MAX_ORIGINS);
+            assert!(
+                origins.windows(2).all(|w| w[0] < w[1]),
+                "origins sorted and unique"
+            );
+            frame["content"]
+                .as_str()
+                .expect("complete diagnostic text")
+                .to_string()
+        })
+        .collect();
+    let expected = format!("error: {persisted_for_run}");
     assert!(
-        model_results
-            .iter()
-            .any(|text| text.contains(&persisted_for_run)),
-        "provider-visible failure omitted or changed its complete persisted diagnostic"
+        payloads.iter().any(|text| text == &expected),
+        "provider-visible frame omitted or changed its complete persisted diagnostic"
     );
     assert!(
-        model_results
+        payloads
             .iter()
             .any(|text| text.contains("Tool call chain: outer_diagnostic → inner_diagnostic")),
         "mock provider saw no nested diagnostic result"
     );
+    for text in &payloads {
+        for secret in [secret, escaped, "fixture-secret-OPAQUE"] {
+            assert!(
+                !text.contains(secret),
+                "credential appeared in decoded model-visible diagnostic"
+            );
+        }
+    }
     for text in model_results.iter() {
         for secret in [secret, escaped, "fixture-secret-OPAQUE"] {
             assert!(
