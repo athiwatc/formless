@@ -40,7 +40,7 @@ Either way:
 |---|---|---|---|
 | `fs:read:<path>` | Read files under that path | `fs:read:~/notes` reads your notes | Low for a project folder; high for `~` or `/` (it could read keys and passwords) |
 | `fs:write:<path>` | Create, change, rename and delete files under that path | `fs:write:./build` writes build output | Medium: changes can be undone with `/rewind` (files up to 2 MB); high for your home folder |
-| `net:<host>` | HTTP(S) requests to that host (and its subdomains) | `net:api.github.com` | Low for a known API; bare `net` (any host) is flagged **broad**: it could send your data anywhere |
+| `net:<host>` | HTTP(S) requests to that exact host; explicit `*.` covers proper subdomains | `net:api.github.com` | Low for a known API; bare `net` (any host) is flagged **broad**: it could send your data anywhere |
 | `process:<command>` | Run that program (no shell) | `process:git` | Medium: the program can do anything you can; bare `process` (any program) is **broad** |
 | `env:<KEY>` | Read one environment variable | `env:GITHUB_TOKEN` | Depends on the variable: a token is as sensitive as a password |
 | `clipboard:read` / `clipboard:write` | Read or set the clipboard | | Low to medium: the clipboard may hold a password you just copied |
@@ -52,7 +52,11 @@ Either way:
 | `mcp:<server>` | Use an MCP server's tools | `mcp:github` | Whatever that server can do; each server is approved once |
 
 Static network scopes use a bare host, optionally with a port (for example
-`net:api.example.com:8443`). Hostnames are stored in lowercase; schemes,
+`net:api.example.com:8443`). Hostnames are stored in lowercase. `net:example.com` is exact;
+`net:*.example.com` explicitly includes proper subdomains and excludes the apex.
+Stored grants and configured trusted hosts follow the same rule. Public-suffix
+wildcards (including `github.io` and `workers.dev`) show a warning because they
+span independent tenants. Schemes,
 paths and empty `net:` or `process:` scopes are rejected when the Tool is
 created. Use an input-bound scope when the input contains a full URL.
 

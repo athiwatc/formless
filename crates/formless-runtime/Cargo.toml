@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+formless-protocol = { path = "../formless-protocol" }
 anyhow.workspace = true
 reqwest.workspace = true
 rquickjs.workspace = true

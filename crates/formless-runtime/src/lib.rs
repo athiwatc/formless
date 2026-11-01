@@ -592,7 +592,7 @@ fn host_in_scope(domains: &[String], host: &str, port: Option<u16>) -> bool {
     domains.iter().any(|d| {
         // `host:port` grants (input-bound URLs with a port) match that port only.
         let (dh, dp) = split_grant(d);
-        (host == dh || host.ends_with(&format!(".{dh}"))) && dp.is_none_or(|p| Some(p) == port)
+        formless_protocol::net_scope::host_covers(dh, host) && dp.is_none_or(|p| Some(p) == port)
     })
 }
 
@@ -3070,9 +3070,27 @@ mod tests {
             "not every port"
         );
         assert!(
-            host_in_scope(&g, "www.example.org", Some(8080)),
-            "portless grants keep any port"
+            host_in_scope(&g, "example.org", Some(8080)),
+            "portless grants keep any port on the exact host"
         );
+    }
+
+    #[test]
+    fn fetch_and_redirect_scope_require_explicit_child_authority() {
+        let exact = vec!["example.com".into()];
+        assert!(host_in_scope(&exact, "example.com", Some(443)));
+        assert!(!host_in_scope(&exact, "x.example.com", Some(443)));
+        let explicit = vec!["*.example.com:443".into()];
+        assert!(host_in_scope(&explicit, "x.example.com", Some(443)));
+        assert!(!host_in_scope(&explicit, "example.com", Some(443)));
+        assert!(!host_in_scope(&explicit, "x.example.com", Some(80)));
+        assert!(
+            !names_host_exactly(&explicit, "x.example.com", 443),
+            "a wildcard never enables the private-address exception"
+        );
+        let private = reqwest::Url::parse("http://127.0.0.1:8080/").unwrap();
+        assert!(checked_address(&private, &["*.0.0.1".into()]).is_err());
+        assert!(checked_address(&private, &["127.0.0.1:8080".into()]).is_ok());
     }
 
     #[test]

@@ -321,6 +321,16 @@ pub fn rows(
             ReadOnly("edit config.toml; /security lists them"),
         ),
     ];
+    let warnings = cfg.security.network_scope_warnings();
+    if !warnings.is_empty() {
+        out.push(Row::new(
+            "Security",
+            "security.network_scope_warnings",
+            "⚠ network scopes",
+            format!("{} warning(s); /security shows all", warnings.len()),
+            ReadOnly("/security shows public-suffix and wildcard scope warnings"),
+        ));
+    }
     for prov in providers["providers"].as_array().into_iter().flatten() {
         let name = prov["name"].as_str().unwrap_or_default();
         if name == formless_core::config::DEFAULT_PROVIDER {
