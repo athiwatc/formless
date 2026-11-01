@@ -19,9 +19,56 @@ use formless_core::{
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashMap,
     sync::{Arc, Mutex, Once},
     time::Duration,
 };
+
+// keyring::mock entries are entry-local. Share only private in-memory mock
+// credentials so lookup through a newly constructed Entry really exercises
+// keyring-only recovery; never delegate to an operating-system backend.
+#[derive(Default)]
+struct SharedMockBuilder(
+    Mutex<HashMap<(Option<String>, String, String), Arc<keyring::mock::MockCredential>>>,
+);
+struct SharedMockCredential(Arc<keyring::mock::MockCredential>);
+impl keyring::credential::CredentialApi for SharedMockCredential {
+    fn set_secret(&self, secret: &[u8]) -> keyring::Result<()> {
+        keyring::credential::CredentialApi::set_secret(self.0.as_ref(), secret)
+    }
+    fn get_secret(&self) -> keyring::Result<Vec<u8>> {
+        keyring::credential::CredentialApi::get_secret(self.0.as_ref())
+    }
+    fn delete_credential(&self) -> keyring::Result<()> {
+        keyring::credential::CredentialApi::delete_credential(self.0.as_ref())
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+impl keyring::credential::CredentialBuilderApi for SharedMockBuilder {
+    fn build(
+        &self,
+        target: Option<&str>,
+        service: &str,
+        user: &str,
+    ) -> keyring::Result<Box<keyring::credential::Credential>> {
+        let credential = self
+            .0
+            .lock()
+            .unwrap()
+            .entry((target.map(str::to_string), service.into(), user.into()))
+            .or_default()
+            .clone();
+        Ok(Box::new(SharedMockCredential(credential)))
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn persistence(&self) -> keyring::credential::CredentialPersistence {
+        keyring::credential::CredentialPersistence::UntilDelete
+    }
+}
 
 struct Fixture {
     paths: Paths,
@@ -31,7 +78,7 @@ impl Fixture {
     fn new(_guard: &credential_env::EnvGuard) -> Self {
         static MOCK: Once = Once::new();
         MOCK.call_once(|| {
-            keyring::set_default_credential_builder(keyring::mock::default_credential_builder())
+            keyring::set_default_credential_builder(Box::<SharedMockBuilder>::default())
         });
         let root = std::env::temp_dir().join(format!("fl-oauth-recovery-{}", uuid::Uuid::new_v4()));
         let paths = Paths {
@@ -101,7 +148,7 @@ fn endpoint_spelling_reuses_login_and_old_raw_slot_without_relabelling() {
         file.exists(),
         "diagnostics/compatibility lookup never rewrite or delete evidence"
     );
-    auth::save_oauth_tokens(&f.paths, &new.auth, &tokens()).unwrap();
+    auth::save_oauth_tokens(&f.paths, &old.auth, &tokens()).unwrap();
     assert_eq!(
         auth::oauth_tokens_file(&f.paths, &old.auth),
         auth::oauth_tokens_file(&f.paths, &new.auth)
@@ -151,7 +198,10 @@ fn legacy_without_issuer_and_wrong_issuer_are_never_adopted_by_new_default() {
     value["token_url"] = json!("https://NEW.example:443/token/");
     formless_core::config::write_secret_file(&f.paths.oauth_tokens_file(), &value.to_string())
         .unwrap();
-    assert_eq!(auth::load_oauth_tokens(&f.paths, &cfg.auth), Some(tokens()));
+    assert!(
+        auth::load_oauth_tokens(&f.paths, &cfg.auth).is_none(),
+        "profile-wide legacy records do not prove client/transport binding"
+    );
 }
 
 #[tokio::test]
@@ -186,6 +236,10 @@ struct Seen {
     drop_stream_once: bool,
     stream_delivered: bool,
     stream_drop_gate: Option<tokio::sync::oneshot::Receiver<()>>,
+    expected_token_path: Option<String>,
+    token_forms: Vec<String>,
+    allow_rotated_refresh: bool,
+    redirect_refresh: bool,
 }
 struct Server {
     base: String,
@@ -216,9 +270,30 @@ async fn endpoint(
     if path.trim_end_matches('/') == "/token" {
         seen.refreshes += 1;
         let body = String::from_utf8_lossy(&body);
+        seen.token_forms.push(body.to_string());
+        if seen
+            .expected_token_path
+            .as_deref()
+            .is_some_and(|expected| expected != path)
+        {
+            return (
+                StatusCode::FORBIDDEN,
+                "unproven alias must not receive credentials",
+            )
+                .into_response();
+        }
+        if seen.redirect_refresh {
+            return (
+                StatusCode::TEMPORARY_REDIRECT,
+                [(axum::http::header::LOCATION, "/trap")],
+                Json(json!({"error":"redirect_refused"})),
+            )
+                .into_response();
+        }
         assert!(
             body.contains("refresh_token=private-refresh")
-                || (seen.drop_stream_once && body.contains("refresh_token=rotated-refresh"))
+                || ((seen.drop_stream_once || seen.allow_rotated_refresh)
+                    && body.contains("refresh_token=rotated-refresh"))
         );
         return if seen.fail_refresh {
             let description = if seen.echo_credentials {
@@ -327,6 +402,7 @@ impl Server {
         let app = Router::new()
             .route("/token", post(endpoint))
             .route("/token/", post(endpoint))
+            .route("/trap", post(endpoint))
             .route("/v1/models", get(endpoint))
             .route("/v1/chat/completions", post(endpoint))
             .route("/v1/responses", post(endpoint))
@@ -627,11 +703,16 @@ async fn managed_operational_probe_recovers_revoked_token_in_models_stage() {
 async fn equivalent_old_endpoint_spellings_share_refresh_lock_and_canonical_save() {
     let env = credential_env::EnvGuard::isolated();
     let f = Fixture::new(&env);
-    let server = Server::new(Seen::default()).await;
+    let server = Server::new(Seen {
+        expected_token_path: Some("/token/".into()),
+        ..Default::default()
+    })
+    .await;
     let cfg = config(&server.base);
     let mut spelling = cfg.clone();
     spelling.auth.token_url.push('/');
-    write_old_slot(&f.paths, &spelling, Some(&spelling.auth.token_url));
+    let old_file = write_old_slot(&f.paths, &spelling, Some(&spelling.auth.token_url));
+    let old_bytes = std::fs::read(&old_file).unwrap();
     let one = Provider::for_named_profile_with(
         cfg.clone(),
         f.paths.clone(),
@@ -658,7 +739,277 @@ async fn equivalent_old_endpoint_spellings_share_refresh_lock_and_canonical_save
     );
     let stored = std::fs::read_to_string(auth::oauth_tokens_file(&f.paths, &cfg.auth)).unwrap();
     assert!(stored.contains("rotated-refresh"));
+    let record: Value = serde_json::from_str(&stored).unwrap();
+    assert_eq!(record["v"]["token_endpoint"], spelling.auth.token_url);
+    assert_eq!(
+        std::fs::read(&old_file).unwrap(),
+        old_bytes,
+        "refresh saves a verified new record without rewriting old evidence"
+    );
     server.close().await;
+}
+
+#[tokio::test]
+async fn exact_endpoint_survives_slash_edits_expiry_401_rotation_and_restart() {
+    let env = credential_env::EnvGuard::isolated();
+    for original_slash in [false, true] {
+        for expired in [false, true] {
+            let f = Fixture::new(&env);
+            let path = if original_slash { "/token/" } else { "/token" };
+            let alias = if original_slash { "/token" } else { "/token/" };
+            let server = Server::new(Seen {
+                expected_token_path: Some(path.into()),
+                allow_rotated_refresh: true,
+                ..Default::default()
+            })
+            .await;
+            let mut original = config(&server.base);
+            original.auth.token_url = format!("{}{path}?binding=private-fixture", server.base);
+            let mut changed = original.clone();
+            changed.auth.token_url = format!("{}{alias}?binding=private-fixture", server.base);
+            let mut saved = tokens();
+            if expired {
+                saved.expires_at = Some(auth::now_epoch() - 60);
+            }
+            auth::save_oauth_tokens(&f.paths, &original.auth, &saved).unwrap();
+            assert_eq!(
+                auth::oauth_tokens_file(&f.paths, &original.auth),
+                auth::oauth_tokens_file(&f.paths, &changed.auth)
+            );
+            if expired {
+                assert_eq!(
+                    tokio::time::timeout(
+                        Duration::from_secs(5),
+                        auth::resolve_provider_token(&f.paths, &changed)
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                    "new-access"
+                );
+            } else {
+                let p = Provider::for_named_profile_with(
+                    changed.clone(),
+                    f.paths.clone(),
+                    reqwest::Client::new(),
+                    "private",
+                )
+                .await
+                .unwrap();
+                assert_eq!(complete(&p).await.unwrap(), "fallback result");
+                assert!(
+                    server
+                        .seen
+                        .lock()
+                        .unwrap()
+                        .calls
+                        .iter()
+                        .any(|(url, credential, _)| url == "/v1/chat/completions"
+                            && credential == "Bearer old-access"),
+                    "real provider401 drives forced refresh"
+                );
+                drop(p);
+            }
+            let record_file = auth::oauth_tokens_file(&f.paths, &changed.auth);
+            let record: Value =
+                serde_json::from_slice(&std::fs::read(&record_file).unwrap()).unwrap();
+            assert_eq!(record["v"]["oauth_record_version"], 1);
+            assert_eq!(record["v"]["token_endpoint"], original.auth.token_url);
+            assert_eq!(
+                record["v"]["token_url"],
+                auth::canonical_token_url(&changed.auth.token_url).unwrap()
+            );
+            assert_eq!(record["v"]["client_id"], "client");
+            assert_eq!(record["v"]["refresh_token"], "rotated-refresh");
+            // Recreate the managed provider, rather than reuse its cached
+            // credential, then redeem the rotated token through the alias.
+            let restarted = Provider::for_named_profile_with(
+                changed.clone(),
+                f.paths.clone(),
+                reqwest::Client::new(),
+                "private",
+            )
+            .await
+            .unwrap();
+            assert_eq!(complete(&restarted).await.unwrap(), "fallback result");
+            assert_eq!(
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    auth::force_refresh_provider_token(&f.paths, &changed, "new-access")
+                )
+                .await
+                .unwrap()
+                .unwrap(),
+                "new-access"
+            );
+            let after: Value =
+                serde_json::from_slice(&std::fs::read(&record_file).unwrap()).unwrap();
+            assert_eq!(after["v"]["token_endpoint"], original.auth.token_url);
+            {
+                let seen = server.seen.lock().unwrap();
+                let token_calls: Vec<_> = seen
+                    .calls
+                    .iter()
+                    .filter(|(url, _, _)| url.starts_with("/token"))
+                    .collect();
+                assert_eq!(token_calls.len(), 2);
+                assert!(
+                    token_calls
+                        .iter()
+                        .all(|(url, _, _)| url == &format!("{path}?binding=private-fixture")),
+                    "no refresh credential reaches the unproven alias: {:?}",
+                    seen.calls
+                );
+                assert!(seen.token_forms[0].contains("refresh_token=private-refresh"));
+                assert!(seen.token_forms[1].contains("refresh_token=rotated-refresh"));
+            }
+            drop(restarted);
+            server.close().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn token_redirects_do_not_forward_credentials_or_replace_stored_evidence() {
+    let env = credential_env::EnvGuard::isolated();
+    let f = Fixture::new(&env);
+    let server = Server::new(Seen {
+        redirect_refresh: true,
+        ..Default::default()
+    })
+    .await;
+    let cfg = config(&server.base);
+    let mut saved = tokens();
+    saved.expires_at = Some(auth::now_epoch() - 60);
+    auth::save_oauth_tokens(&f.paths, &cfg.auth, &saved).unwrap();
+    let file = auth::oauth_tokens_file(&f.paths, &cfg.auth);
+    let before = std::fs::read(&file).unwrap();
+    let error = tokio::time::timeout(
+        Duration::from_secs(5),
+        auth::resolve_provider_token(&f.paths, &cfg),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    let error = format!("{error:#}");
+    assert!(
+        error.contains("307") && error.contains("redirect_refused"),
+        "{error}"
+    );
+    assert_eq!(std::fs::read(file).unwrap(), before);
+    assert_eq!(
+        server
+            .seen
+            .lock()
+            .unwrap()
+            .calls
+            .iter()
+            .map(|(url, _, _)| url.as_str())
+            .collect::<Vec<_>>(),
+        ["/token"],
+        "no request reaches the307 target"
+    );
+    server.close().await;
+}
+
+#[tokio::test]
+async fn ambiguous_canonical_legacy_and_invalid_evidence_require_relogin_without_network() {
+    let env = credential_env::EnvGuard::isolated();
+    for marker in [None, Some(1), Some(2)] {
+        let f = Fixture::new(&env);
+        let server = Server::new(Seen::default()).await;
+        let cfg = config(&server.base);
+        let mut value = serde_json::to_value(tokens()).unwrap();
+        value["token_url"] = json!(cfg.auth.token_url);
+        if let Some(marker) = marker {
+            value["oauth_record_version"] = json!(marker);
+            value["token_endpoint"] = json!(format!("{}/different-issuer", server.base));
+            value["client_id"] = json!("client");
+        }
+        let file = auth::oauth_tokens_file(&f.paths, &cfg.auth);
+        formless_core::config::write_secret_file(&file, &value.to_string()).unwrap();
+        let before = std::fs::read(&file).unwrap();
+        let error = auth::resolve_provider_token(&f.paths, &cfg)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("login required") && error.contains("exact token endpoint"),
+            "{error}"
+        );
+        assert!(
+            auth::force_refresh_provider_token(&f.paths, &cfg, "old-access")
+                .await
+                .is_err()
+        );
+        assert!(server.seen.lock().unwrap().calls.is_empty());
+        assert_eq!(std::fs::read(&file).unwrap(), before);
+        assert!(auth::peek_provider_token(&f.paths, &cfg).is_err());
+        server.close().await;
+    }
+}
+
+#[test]
+fn finite_raw_keyring_alias_recovery_uses_recorded_endpoint_and_leaves_evidence_intact() {
+    let env = credential_env::EnvGuard::isolated();
+    let f = Fixture::new(&env);
+    let mut old = config("https://example.com");
+    old.auth.token_url = "https://example.com/token/?binding=fixture".into();
+    let hash = Sha256::digest(format!("{}\n{}", old.auth.token_url, old.auth.client_id));
+    let slot: String = hash[..6].iter().map(|b| format!("{b:02x}")).collect();
+    let user = format!("oauth-tokens-{}-{slot}", f.paths.profile);
+    let entry = keyring::Entry::new("formless", &user).unwrap();
+    let mut value = serde_json::to_value(tokens()).unwrap();
+    value["token_url"] = json!(old.auth.token_url);
+    let before = value.to_string();
+    entry.set_password(&before).unwrap();
+    let mut changed = old.clone();
+    changed.auth.token_url = "https://example.com/token?binding=fixture".into();
+    assert_eq!(
+        auth::load_oauth_tokens(&f.paths, &changed.auth),
+        Some(tokens())
+    );
+    assert_eq!(entry.get_password().unwrap(), before);
+    assert!(
+        !auth::oauth_tokens_file(&f.paths, &changed.auth).exists(),
+        "read-only compatibility does not manufacture a new record"
+    );
+    entry.delete_credential().unwrap();
+}
+
+#[test]
+fn unknown_historical_raw_keyring_hash_is_not_guessed_or_relabelled() {
+    let env = credential_env::EnvGuard::isolated();
+    let f = Fixture::new(&env);
+    let mut original = config("https://example.com");
+    original.auth.token_url = "HTTPS://ExAmPlE.com:443/token/".into();
+    let hash = Sha256::digest(format!(
+        "{}\n{}",
+        original.auth.token_url, original.auth.client_id
+    ));
+    let slot: String = hash[..6].iter().map(|b| format!("{b:02x}")).collect();
+    let entry = keyring::Entry::new(
+        "formless",
+        &format!("oauth-tokens-{}-{slot}", f.paths.profile),
+    )
+    .unwrap();
+    let mut value = serde_json::to_value(tokens()).unwrap();
+    value["token_url"] = json!(original.auth.token_url);
+    let before = value.to_string();
+    entry.set_password(&before).unwrap();
+    let changed = config("https://example.com");
+    assert!(
+        auth::load_oauth_tokens(&f.paths, &changed.auth).is_none(),
+        "arbitrary old raw-hash keyring names are not discoverable from canonical identity"
+    );
+    assert_eq!(entry.get_password().unwrap(), before);
+    assert_eq!(
+        auth::load_oauth_tokens(&f.paths, &original.auth),
+        Some(tokens()),
+        "restoring known original spelling recovers its recorded endpoint evidence"
+    );
+    assert!(!auth::oauth_tokens_file(&f.paths, &changed.auth).exists());
+    entry.delete_credential().unwrap();
 }
 
 #[tokio::test]

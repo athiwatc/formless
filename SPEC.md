@@ -295,15 +295,21 @@ without redesign.
   never overwrite each other). Endpoint identity canonicalizes scheme/host
   case, default ports and trailing slashes, preserving path case and query.
   Slot derivation, recorded issuer checks and refresh locks share this identity.
-  Credentials are used only with a proven matching recorded issuer, including
-  unexpired access tokens. Older file-backed raw slots are found using the
-  recorded issuer and verified client-id slot hash. A profile-wide legacy set
-  is usable only if its recorded issuer matches; unlabelled or mismatched sets
-  remain untouched and produce a re-login warning, never a guessed issuer.
+  Credentials are used only with a proven matching recorded issuer and exact
+  token endpoint, including unexpired access tokens. Versioned credentials
+  retain the actual token endpoint separately from canonical lookup identity;
+  refresh uses that captured path/query, never a newly configured spelling,
+  and token requests refuse redirects. Rotation preserves this endpoint.
+  Older noncanonical raw slots are found using their recorded issuer and
+  verified client-id slot hash. Canonical-only records cannot prove whether
+  the original endpoint had a trailing slash. These ambiguous records and
+  profile-wide, unlabelled or mismatched legacy sets remain untouched and
+  produce a re-login warning, never a guessed transport destination.
   Read-only lookup does not rewrite stores; login/refresh saves the canonical
   slot, and logout removes matching evidenced aliases too. Arbitrary old
   keyring-only hashes cannot be enumerated after an endpoint spelling edit;
-  these require re-login (or restoring the original spelling first).
+  a finite lookup covers the configured raw spelling and its slash variant,
+  but arbitrary unknown historical spellings still require re-login.
   Both copies carry the time
   they were saved and the newer one wins; when only one write succeeds,
   the other store's older copy is removed (or the save fails). `formless

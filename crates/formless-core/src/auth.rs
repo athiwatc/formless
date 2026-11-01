@@ -88,14 +88,20 @@ pub struct AuthStatus {
 /// Stable issuer identity. Path case and query remain significant; endpoint
 /// spelling (including a trailing slash) does not create a new login.
 pub fn canonical_token_url(raw: &str) -> Result<String> {
-    validate_endpoint("token_url", raw)?;
-    let mut url = reqwest::Url::parse(raw.trim())?;
-    if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
-        bail!("OAuth token_url must not contain userinfo or a fragment");
-    }
+    let mut url = transport_token_url(raw)?;
     let path = url.path().trim_end_matches('/').to_string();
     url.set_path(if path.is_empty() { "/" } else { &path });
     Ok(url.to_string())
+}
+
+/// A transport destination preserves path/query spelling, unlike slot identity.
+fn transport_token_url(raw: &str) -> Result<reqwest::Url> {
+    validate_endpoint("token_url", raw)?;
+    let url = reqwest::Url::parse(raw.trim())?;
+    if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
+        bail!("OAuth token_url must not contain userinfo or a fragment");
+    }
+    Ok(url)
 }
 
 fn raw_token_slot(endpoint: &str, client_id: &str) -> String {
@@ -128,17 +134,43 @@ fn legacy_keyring_user(paths: &Paths) -> String {
 
 /// Stored form: the token set plus the endpoint it was issued by.
 fn encode_tokens(auth: &AuthCfg, tokens: &OAuthTokens) -> Result<String> {
+    validate_token_config(auth)?;
     let mut v = serde_json::to_value(tokens).context("encode OAuth tokens")?;
+    v["oauth_record_version"] = Value::from(1);
     v["token_url"] = Value::String(canonical_token_url(&auth.token_url)?);
+    v["token_endpoint"] = Value::String(transport_token_url(&auth.token_url)?.to_string());
+    v["client_id"] = Value::String(auth.client_id.trim().to_string());
     Ok(v.to_string())
 }
 
-/// (tokens, the token endpoint that issued them if recorded).
-fn decode_tokens(text: &str) -> Option<(OAuthTokens, Option<String>)> {
+struct StoredTokens {
+    tokens: OAuthTokens,
+    issuer: Option<String>,
+    endpoint: Option<String>,
+    client_id: Option<String>,
+    legacy: bool,
+}
+
+fn decode_tokens(text: &str) -> Option<StoredTokens> {
     let v: Value = serde_json::from_str(text).ok()?;
     let issuer = v["token_url"].as_str().map(str::to_string);
+    let endpoint = (v["oauth_record_version"] == 1)
+        .then(|| v["token_endpoint"].as_str())
+        .flatten()
+        .and_then(|endpoint| transport_token_url(endpoint).ok())
+        .map(|endpoint| endpoint.to_string());
+    let client_id = v["client_id"].as_str().map(str::to_string);
+    let legacy = v.get("oauth_record_version").is_none()
+        && v.get("token_endpoint").is_none()
+        && v.get("client_id").is_none();
     let tokens: OAuthTokens = serde_json::from_value(v).ok()?;
-    (!tokens.access_token.is_empty()).then_some((tokens, issuer))
+    (!tokens.access_token.is_empty()).then_some(StoredTokens {
+        tokens,
+        issuer,
+        endpoint,
+        client_id,
+        legacy,
+    })
 }
 
 /// A secret kept in the keychain and a `0600` file at once (#868). Each
@@ -248,7 +280,7 @@ pub fn save_oauth_tokens(paths: &Paths, auth: &AuthCfg, tokens: &OAuthTokens) ->
     token_store(paths, auth).save(&encode_tokens(auth, tokens)?)
 }
 
-fn read_stored(file: &std::path::Path, user: &str) -> Option<(OAuthTokens, Option<String>)> {
+fn read_stored(file: &std::path::Path, user: &str) -> Option<StoredTokens> {
     let store = DualStore {
         file: file.to_path_buf(),
         user: user.to_string(),
@@ -264,6 +296,21 @@ fn compatible_token_stores(paths: &Paths, auth: &AuthCfg) -> Vec<DualStore> {
         token_slot(auth),
         raw_token_slot(&auth.token_url, &auth.client_id),
     ]);
+    // A finite compatibility lookup for a slash-only edit to the old raw hash.
+    // This cannot enumerate arbitrary historical scheme/host/port spellings.
+    let raw = auth.token_url.trim();
+    let (path, query) = raw
+        .split_once('?')
+        .map_or((raw, String::new()), |(path, query)| {
+            (path, format!("?{query}"))
+        });
+    if let Some(without_slash) = path.strip_suffix('/') {
+        slots.insert(raw_token_slot(
+            &format!("{without_slash}{query}"),
+            &auth.client_id,
+        ));
+    }
+    slots.insert(raw_token_slot(&format!("{path}/{query}"), &auth.client_id));
     if let Ok(dir) = std::fs::read_dir(&paths.config_dir) {
         for e in dir.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
@@ -281,7 +328,7 @@ fn compatible_token_stores(paths: &Paths, auth: &AuthCfg) -> Vec<DualStore> {
             else {
                 continue;
             };
-            let Some((_, Some(issuer))) = decode_tokens(&text) else {
+            let Some(issuer) = decode_tokens(&text).and_then(|stored| stored.issuer) else {
                 continue;
             };
             // The old slot proves the client id as well as the recorded issuer.
@@ -302,6 +349,45 @@ fn compatible_token_stores(paths: &Paths, auth: &AuthCfg) -> Vec<DualStore> {
         .collect()
 }
 
+/// A recorded identity does not by itself prove a transport destination. Older
+/// raw slots provide evidence only when both their issuer and slot are distinct
+/// from the canonical-only encoding used before exact endpoints were retained.
+fn proven_stored_tokens(
+    auth: &AuthCfg,
+    store: &DualStore,
+    stored: StoredTokens,
+) -> Option<(OAuthTokens, Option<String>)> {
+    if !issuer_matches(auth, stored.issuer.as_deref()) {
+        return None;
+    }
+    let endpoint = if let Some(endpoint) = stored.endpoint {
+        if stored.client_id.as_deref() != Some(auth.client_id.trim())
+            || canonical_token_url(&endpoint).ok() != canonical_token_url(&auth.token_url).ok()
+        {
+            return None;
+        }
+        endpoint
+    } else if stored.legacy {
+        let issuer = stored.issuer.as_deref()?;
+        let slot = store
+            .file
+            .file_name()?
+            .to_str()?
+            .strip_prefix("oauth_tokens-")?
+            .strip_suffix(".json")?;
+        if issuer == canonical_token_url(issuer).ok()?
+            || slot != raw_token_slot(issuer, &auth.client_id)
+            || slot == token_slot(auth)
+        {
+            return None;
+        }
+        transport_token_url(issuer).ok()?.to_string()
+    } else {
+        return None;
+    };
+    Some((stored.tokens, Some(endpoint)))
+}
+
 fn issuer_matches(auth: &AuthCfg, issuer: Option<&str>) -> bool {
     match (
         canonical_token_url(&auth.token_url),
@@ -314,25 +400,24 @@ fn issuer_matches(auth: &AuthCfg, issuer: Option<&str>) -> bool {
 
 fn load_with_issuer(paths: &Paths, auth: &AuthCfg) -> Option<(OAuthTokens, Option<String>)> {
     // Prefer the current slot: a refreshed/rotated login supersedes old aliases.
-    if let Some(found) = token_store(paths, auth)
-        .load()
-        .and_then(|s| decode_tokens(&s))
-    {
-        return issuer_matches(auth, found.1.as_deref()).then_some(found);
+    let current = token_store(paths, auth);
+    if let Some(found) = current.load().and_then(|s| decode_tokens(&s)) {
+        return proven_stored_tokens(auth, &current, found);
     }
     let newest = compatible_token_stores(paths, auth)
         .iter()
-        .filter_map(|store| store.load_versioned())
-        .filter_map(|(at, value)| {
+        .filter_map(|store| {
+            let (at, value) = store.load_versioned()?;
             let found = decode_tokens(&value)?;
-            issuer_matches(auth, found.1.as_deref()).then_some((at, found))
+            proven_stored_tokens(auth, store, found).map(|found| (at, found))
         })
         .max_by_key(|(at, _)| *at);
     if let Some((_, found)) = newest {
         return Some(found);
     }
-    let found = read_stored(&paths.oauth_tokens_file(), &legacy_keyring_user(paths))?;
-    issuer_matches(auth, found.1.as_deref()).then_some(found)
+    // Profile-wide legacy copies do not bind a client or prove an exact
+    // endpoint. Keep them untouched for diagnostics and explicit re-login.
+    None
 }
 
 /// Unlabelled or mismatched legacy credentials are retained for explicit reset,
@@ -345,7 +430,7 @@ pub fn oauth_storage_warning(paths: &Paths, auth: &AuthCfg) -> Option<String> {
     let invalid = compatible_token_stores(paths, auth)
         .iter()
         .any(|s| s.load().is_some());
-    (legacy || invalid).then(|| "Stored OAuth credentials have no proven matching issuer; sign in again. Older keyring-only logins with an unknown endpoint spelling cannot be discovered automatically.".into())
+    (legacy || invalid).then(|| "Stored OAuth credentials have no proven matching issuer and exact token endpoint; sign in again. Canonical-only legacy records cannot prove the original endpoint path. Older keyring-only logins with an unknown endpoint spelling cannot be discovered automatically.".into())
 }
 
 /// The token set of the provider with `auth`, only with proven issuer identity.
@@ -419,7 +504,7 @@ pub fn delete_oauth_tokens(paths: &Paths, auth: &AuthCfg) -> Vec<String> {
         let _ = std::fs::remove_file(store.file.with_extension("json.tmp"));
     }
     if read_stored(&paths.oauth_tokens_file(), &legacy_keyring_user(paths))
-        .is_some_and(|(_, issuer)| issuer_matches(auth, issuer.as_deref()))
+        .is_some_and(|stored| issuer_matches(auth, stored.issuer.as_deref()))
     {
         left.extend(
             DualStore {
@@ -871,6 +956,7 @@ async fn token_request(
     params.insert("client_id".into(), cfg.client_id.trim().to_string());
 
     let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(30))
         .user_agent(concat!("formless/", env!("CARGO_PKG_VERSION")))
         .build()
@@ -1102,15 +1188,22 @@ async fn refresh_stored(
             provider_login_command(paths, cfg)
         );
     }
-    let refreshed = refresh_tokens(&cfg.auth, tokens).await.with_context(|| {
-        format!(
-            "OAuth token refresh failed; run `{}` if this persists",
-            provider_login_command(paths, cfg)
-        )
-    })?;
+    let mut captured_auth = cfg.auth.clone();
+    captured_auth.token_url = issuer
+        .context("missing proven OAuth token endpoint")?
+        .to_string();
+    let refreshed = refresh_tokens(&captured_auth, tokens)
+        .await
+        .with_context(|| {
+            format!(
+                "OAuth token refresh failed; run `{}` if this persists",
+                provider_login_command(paths, cfg)
+            )
+        })?;
     // Persist before use so a rotated refresh token cannot be lost after the
     // provider has already invalidated its predecessor.
-    save_oauth_tokens(paths, &cfg.auth, &refreshed).context("persist refreshed OAuth tokens")?;
+    save_oauth_tokens(paths, &captured_auth, &refreshed)
+        .context("persist refreshed OAuth tokens")?;
     Ok(refreshed.access_token)
 }
 
