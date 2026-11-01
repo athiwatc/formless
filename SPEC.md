@@ -1299,7 +1299,8 @@ pattern (§4.4).
 
 - **Credential reads (#708).** Ordinary project reads, including input-bound
   reads, stay quiet. Builtin credential directories (`.ssh`, `.aws`, `.gnupg`,
-  `.pki`), `.env*`, `*.pem`, `*.key`, shell histories and native/browser
+  `.pki`, `.kube`, `.docker`, `.password-store`), `.env*`, `*.pem`, `*.key`,
+  shell histories and native/browser
   credential stores require separate exact-path consent. This gate applies
   even with `security.secure = false`; broad read grants and trusted folders
   cannot cover it. Its synthetic Capability grants no file, network or process
@@ -1315,6 +1316,11 @@ pattern (§4.4).
   deleting a directory containing the profile is also denied. Renaming a
   configured sensitive subtree, its ancestor, or contents outside that subtree
   is refused: a read consent cannot erase the namespace classification.
+  Credential-sensitive directories cannot be renamed, including across
+  sensitive namespaces: exact directory consent does not cover descendant
+  contents. Ancestors forming a prefix of a native-store sequence (for
+  example `Library` in `Library/Keychains`) cannot be renamed either; this
+  conservative rule applies even if empty, without a recursive absence check.
   Default hosts
   without interactive consent, smoke tests and optimiser replay fail closed
   for credential reads; dry-run reads still require consent.

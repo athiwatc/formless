@@ -75,7 +75,22 @@ impl PathPolicy {
     /// ordinary files through a subsequent rename. Ancestors cannot move the
     /// namespace either; callers can read it with consent or edit the owner's
     /// configuration explicitly instead.
-    pub fn relocation_allowed(&self, from: &Path, to: &Path) -> Result<bool, String> {
+    pub fn relocation_allowed(
+        &self,
+        raw_from: &Path,
+        from: &Path,
+        to: &Path,
+    ) -> Result<bool, String> {
+        if from.is_dir()
+            && (self.classify(raw_from, from)? != PathDecision::Ordinary
+                || directory_namespace_prefix(raw_from)
+                || directory_namespace_prefix(from))
+        {
+            // A directory consent covers only that directory's listing or
+            // metadata. It cannot authorize declassifying its descendants.
+            // Reject cross-namespace moves conservatively as well.
+            return Ok(false);
+        }
         for rule in &self.rules {
             if let SensitivePathRule::Subtree(configured) = rule {
                 let root = crate::caps::canonical_path(configured)?;
@@ -195,6 +210,37 @@ fn credential_name(name: &std::ffi::OsStr) -> String {
     name
 }
 
+const DIRECTORY_SEQUENCES: &[&[&str]] = &[
+    &["library", "keychains"],
+    &[".local", "share", "keyrings"],
+    &["microsoft", "credentials"],
+    &["microsoft", "vault"],
+    &["etc", "ssl", "private"],
+];
+
+/// Removing a prefix of a recognized sequence also removes the descendants'
+/// classification: Library -> Ordinary would wash Library/Keychains/files.
+/// This deliberately rejects such directory names even if currently empty;
+/// no recursive, racy traversal is used to prove absence of secrets.
+fn directory_namespace_prefix(path: &Path) -> bool {
+    let parts: Vec<_> = path
+        .components()
+        .filter_map(|part| match part {
+            Component::Normal(name) => Some(credential_name(name)),
+            _ => None,
+        })
+        .collect();
+    DIRECTORY_SEQUENCES.iter().any(|sequence| {
+        (1..sequence.len()).any(|len| {
+            parts.len() >= len
+                && parts[parts.len() - len..]
+                    .iter()
+                    .map(String::as_str)
+                    .eq(sequence[..len].iter().copied())
+        })
+    })
+}
+
 fn builtin(path: &Path) -> Option<&'static str> {
     let parts: Vec<_> = path
         .components()
@@ -207,20 +253,17 @@ fn builtin(path: &Path) -> Option<&'static str> {
         })
         .collect();
     for name in &parts {
-        if matches!(name.as_str(), ".ssh" | ".aws" | ".gnupg" | ".pki") {
+        if matches!(
+            name.as_str(),
+            ".ssh" | ".aws" | ".gnupg" | ".pki" | ".kube" | ".docker" | ".password-store"
+        ) {
             return Some("credential directory");
         }
         if name.starts_with(".env") || name.ends_with(".pem") || name.ends_with(".key") {
             return Some("credential-shaped filename");
         }
     }
-    for sequence in [
-        &["library", "keychains"][..],
-        &[".local", "share", "keyrings"][..],
-        &["microsoft", "credentials"][..],
-        &["microsoft", "vault"][..],
-        &["etc", "ssl", "private"][..],
-    ] {
+    for sequence in DIRECTORY_SEQUENCES {
         if parts.windows(sequence.len()).any(|parts| {
             parts
                 .iter()
@@ -282,6 +325,9 @@ mod tests {
             ".ssh/config",
             ".aws/credentials",
             ".gnupg/private",
+            ".kube/config",
+            ".docker/config.json",
+            ".password-store/account.gpg",
             "Library/Keychains/login.keychain-db",
             ".local/share/keyrings/login.keyring",
             "Microsoft/Credentials/store",

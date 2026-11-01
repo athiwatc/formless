@@ -21,7 +21,8 @@ Capability is asked about:
 - Never asked as ordinary grants: `fs:read:~`, `store`, `harness:read`
 
 An ordinary project-file read stays quiet, including an input-bound read.
-Reading credential paths such as `.ssh/config`, `.aws/credentials`, `.env*`,
+Reading credential paths such as `.ssh/config`, `.aws/credentials`, `.kube`,
+`.docker`, `.password-store`, `.env*`,
 `*.pem`, `*.key`, shell histories and native credential stores asks with the
 computed concrete path, even when `security.secure = false`. Broad filesystem
 grants and trusted folders do not cover this consent. The synthetic
@@ -32,7 +33,9 @@ The active daemon's data and config directories, including its key fallback,
 are denied regardless of grants. Files named by `FORMLESS_API_KEY_FILE` and
 `FORMLESS_API_KEY_<NAME>_FILE` are also denied, including ordinary filenames
 outside the profile. Configured namespaces and resolved targets
-are checked, including aliases and moves that could expose their contents.
+are checked, including aliases and moves that could expose their contents. Credential
+directories and native-store namespace ancestors cannot be renamed; an exact
+directory consent cannot authorize descendant contents.
 Smoke tests and optimiser replay cannot approve credential reads. Reads in a
 dry run still need consent. Explicit process operands (including a `cat`
 filename relative to its `cwd`) receive the same checks; arbitrary approved

@@ -395,3 +395,105 @@ fn cat_relative_file_and_sensitive_cwd_cannot_bypass_via_process_write_scope_fal
         .contains("profile"));
     assert!(profile.paths.locked().is_empty());
 }
+
+#[test]
+fn accepted_directory_consent_cannot_launder_builtin_descendants_by_rename() {
+    let f = Fixture::new();
+    for (from_relative, sensitive_relative) in [
+        (".ssh", ".ssh"),
+        (".kube", ".kube"),
+        (".docker", ".docker"),
+        (".password-store", ".password-store"),
+        (".env-directory", ".env-directory"),
+        ("Library", "Library/Keychains"),
+        (".local/share", ".local/share/keyrings"),
+        ("Microsoft", "Microsoft/Credentials"),
+        ("etc/ssl", "etc/ssl/private"),
+    ] {
+        let from = f.0.join(from_relative);
+        let namespace = f.0.join(sensitive_relative);
+        std::fs::create_dir_all(&namespace).unwrap();
+        let sentinel = namespace.join("config");
+        std::fs::write(&sentinel, "unexposed-private-descendant").unwrap();
+        let ops = host(PathPolicy::default(), true);
+        let mut req = f.request("function run(i) { fs.list(i.namespace); fs.rename(i.path,i.to); return fs.read(i.exposed); }", &from);
+        req.caps.fs_read = vec![f.0.to_str().unwrap().into()];
+        req.input["namespace"] = json!(namespace);
+        let exposed =
+            f.0.join("ordinary")
+                .join(namespace.strip_prefix(&from).unwrap())
+                .join("config");
+        req.input["to"] = json!(f.0.join("ordinary"));
+        req.input["exposed"] = json!(exposed);
+        assert!(
+            execute(&req, ops.clone())
+                .unwrap_err()
+                .to_string()
+                .contains("credential-directory classification"),
+            "{from_relative}"
+        );
+        assert_eq!(
+            *ops.paths.locked(),
+            vec![namespace.canonicalize().unwrap()],
+            "the accepted directory consent must remain exact"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&sentinel).unwrap(),
+            "unexposed-private-descendant"
+        );
+        assert!(!exposed.exists());
+    }
+    // A destination that is sensitive too does not turn directory consent
+    // into a grant for all descendant contents.
+    let mut cross = f.request(
+        "function run(i) { fs.list(i.path); fs.rename(i.path,i.to); }",
+        &f.0.join(".ssh"),
+    );
+    cross.input["to"] = json!(f.0.join(".aws"));
+    cross.caps.fs_read = vec![f.0.to_str().unwrap().into()];
+    let ops = host(PathPolicy::default(), true);
+    assert!(execute(&cross, ops).is_err());
+    assert!(!f.0.join(".aws").exists());
+
+    #[cfg(unix)]
+    {
+        let physical = f.0.join("plain-physical-directory");
+        std::fs::create_dir(&physical).unwrap();
+        std::fs::write(physical.join("config"), "unexposed-alias-descendant").unwrap();
+        let parent = f.0.join("alias-parent");
+        std::fs::create_dir(&parent).unwrap();
+        let alias = parent.join(".ssh");
+        std::os::unix::fs::symlink(&physical, &alias).unwrap();
+        let mut req = f.request("function run(i) { fs.list(i.path); fs.rename(i.path,i.to); return fs.read(i.exposed); }", &alias);
+        req.caps.fs_read = vec![f.0.to_str().unwrap().into()];
+        req.input["to"] = json!(f.0.join("exposed-physical"));
+        req.input["exposed"] = json!(f.0.join("exposed-physical/config"));
+        let ops = host(PathPolicy::default(), true);
+        assert!(execute(&req, ops.clone()).is_err());
+        assert_eq!(*ops.paths.locked(), vec![physical.canonicalize().unwrap()]);
+        assert!(alias.exists());
+        assert_eq!(
+            std::fs::read_to_string(physical.join("config")).unwrap(),
+            "unexposed-alias-descendant"
+        );
+        assert!(!f.0.join("exposed-physical").exists());
+    }
+    // The fixture host has a no-op snapshot callback. Ordinary moves still
+    // work, and need neither credential consent nor snapshot configuration.
+    let ordinary = f.0.join("ordinary-project");
+    std::fs::create_dir(&ordinary).unwrap();
+    std::fs::write(ordinary.join("notes.txt"), "ordinary-control").unwrap();
+    let ops = host(PathPolicy::default(), false);
+    let mut req = f.request(
+        "function run(i) { fs.rename(i.path,i.to); return fs.read(i.exposed); }",
+        &ordinary,
+    );
+    req.input["to"] = json!(f.0.join("ordinary"));
+    req.input["exposed"] = json!(f.0.join("ordinary/notes.txt"));
+    req.caps.fs_read = vec![f.0.to_str().unwrap().into()];
+    assert_eq!(
+        execute(&req, ops.clone()).unwrap().output,
+        json!("ordinary-control")
+    );
+    assert!(ops.paths.locked().is_empty());
+}

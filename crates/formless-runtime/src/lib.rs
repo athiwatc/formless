@@ -1540,14 +1540,19 @@ impl State {
             "fs_rename" => {
                 let from = self.resolve(a["from"].as_str().unwrap_or_default(), true)?;
                 let to = self.resolve(a["to"].as_str().unwrap_or_default(), true)?;
+                let raw_from = caps::lexical_absolute(
+                    &std::env::current_dir().map_err(|e| denied(e.to_string()))?,
+                    Path::new(a["from"].as_str().unwrap_or_default()),
+                )
+                .map_err(denied)?;
                 if !self
                     .ops
                     .path_policy()
                     .map_err(denied)?
-                    .relocation_allowed(&from, &to)
+                    .relocation_allowed(&raw_from, &from, &to)
                     .map_err(denied)?
                 {
-                    return Err(denied("rename would remove a configured sensitive namespace; read consent does not authorize this relocation"));
+                    return Err(denied("rename would remove a configured sensitive namespace or credential-directory classification; exact read consent does not authorize this relocation"));
                 }
                 self.guard_read(
                     a["from"].as_str().unwrap_or_default(),
