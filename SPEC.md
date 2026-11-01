@@ -866,6 +866,8 @@ pasting paths.
     Wayland, `xclip` on X11, PowerShell on Windows.
   - A file dragged into the terminal (pasted as an absolute path, quoted,
     `\`-escaped or `file://`) is attached instead of typed.
+    File URLs preserve native drive/UNC paths and percent-encode reserved
+    characters; dropping the URL resolves back to the same local file.
   - Attaching an image when the current model doesn't look vision-capable
     (`provider.vision`, else a guess from the name) warns that it will get
     a reference instead.
@@ -2836,7 +2838,9 @@ run_tool = "network_policy"     # a registry Tool, or…
   answer with the system opener (`open`, `xdg-open`, `start`).
   File paths in the chat (`src/main.rs`, `./a/b.txt:42`, `Cargo.toml`)
   that exist under the TUI's working directory are linked the same way,
-  to `file://`. Existence checks are cached. `/open path FILE[:LINE]`
+  to `file://`. Existence checks are cached. Native Windows drive colons
+  are preserved when parsing a trailing `:LINE[:COLUMN]` suffix.
+  `/open path FILE[:LINE]`
   opens one in `$VISUAL`/`$EDITOR` at that line: `+LINE` for terminal
   editors (which get the terminal until they exit), `FILE:LINE` for
   Helix, and `-g` for VS Code and its forks.
@@ -4260,6 +4264,17 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
   each access; `..` and symlink escapes outside the granted roots are denied.
   A not-yet-existing path resolves through its deepest existing ancestor;
   a dangling symlink, or `..` in the missing part, is refused.
+  Parent traversal is checked before native path normalization, including on
+  Windows: each prefix traversed by `..` must resolve to an existing directory.
+  Existing-directory parent traversal still resolves normally and remains
+  subject to canonical containment.
+  Session-relative input localization and process-relative path resolution
+  preserve those literal traversal components before validation, even when
+  Windows supplies a verbatim canonical working directory. Ordinary relative
+  forward slashes are converted to native separators; rooted Windows paths
+  retain the working directory's drive or UNC share. Ambiguous drive-relative
+  paths (`C:notes.txt`) fail closed. A Session-relative path that cannot be
+  represented in UTF-8 JSON is an input error, never a lossy substitute path.
   If a missing path or ancestor becomes a regular file or directory during
   resolution, canonicalisation is retried once at that same path before
   appending any missing tail. Permission, symlink-loop and other resolution
@@ -4361,6 +4376,46 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
   the family freeze, so an in-use child or a newly created profile cannot be
   erased through its default parent.
 - **Imports/exports** contain no secrets, metrics, or history (§7.8).
+
+Third-party Tool, MCP, Skill and module descriptions share a 1,024-character
+Unicode limit. Intake and legacy projection normalize newlines, terminal/control
+and bidi/format characters to single-line metadata. Deterministic instruction-shaped
+wording checks flag phrases such as “always”, “never”, “ignore” and “first call”
+for human review; these checks do not establish that unflagged text is safe.
+Model-visible descriptions are quoted and labelled as third-party data.
+This projection also covers persisted active and inactive Session Tool definitions
+(`session_tools.pinned_def`) before either forecast or model dispatch. It changes
+only the model-visible top-level description: stored pinned bytes, selected
+version, validation schemas and code-hash inputs stay unchanged. Existing framed
+metadata is reused byte-for-byte only after validating its complete canonical,
+bounded envelope and known warning set; a string prefix alone never establishes
+that it has already been screened.
+A frozen Session containing the exact historical raw Skill-index boundary
+(`Skills (load one with load_skill before a task it covers):` followed by a
+literal newline and `- ` bullet) cannot start, resume, retry, edit-and-run,
+compare, compact, or consume queued work. Admission refuses before transcript,
+Run or forecast writes; it never parses or rewrites the trusted frozen text.
+Use the existing `/fork` workflow to retain the original history and start with
+the current framed metadata. Current JSON-framed indices escape embedded
+newlines and do not match the raw boundary; historical custom prompts without
+that boundary retain their original behavior. Local forecasts still make zero
+provider calls and report this blocked state explicitly.
+Description warnings appear in previews and approval details. A changed Tool or
+Skill description is shown with its before/after text and retained in Description
+reviews, including MCP sync changes and changes made while clients disconnect.
+The history is available through `ListDescriptionReviews`, web Settings →
+Description reviews, TUI `/descriptionreviews`, and `formless tools reviews`
+(`--kind tool|mcp|skill|module`, optional name, `--json`); `formless skills reviews
+[NAME]` narrows it to Skills. Connected clients display new committed changes;
+reconnection refreshes retained evidence. The description editor binds its preview
+to the Tool ID, version and exact text. Local imports bind confirmation to the
+same file content, and Skill bundle previews parse the actual bundled SKILL.md.
+Current-version checks commit atomically with a reviewed description edit, and
+client request generations preserve valid rollback edits while rejecting stale
+previews. This screen applies to the entity description fields, not arbitrary
+JSON Schema values; stored validation schemas and code-hash inputs retain their
+existing semantics. This metadata review does not replace the separate code-hash
+approval binding.
 
 Tool data has no instruction authority: system instructions outrank user
 instructions, and Tool/file/web/skill/module/sub-agent output is untrusted data.
@@ -4589,7 +4644,13 @@ Run, upload, last-Run marker, credential refresh or provider request. It may use
 read-only local IPC to an already-running daemon; it never starts one. Offline
 SQLite reads use a private coherent snapshot under maintenance/native locks,
 without opening the source with a SQLite pager or touching its WAL/SHM. Busy,
-unsupported locking or a possible hot rollback journal fails closed. A missing
+unsupported locking or a possible hot rollback journal fails closed. On macOS,
+offline reads require writable local APFS/HFS/UFS: filesystem metadata is checked
+before source open, preferred/forced proxy locking is refused, and the explicit
+POSIX VFS probes reserved locks before claiming the existing exclusive gate.
+The default auto-selecting VFS and its global flags are never changed. Network,
+read-only and unknown filesystems fail closed; ordinary default-VFS writer and
+checkpoint exclusion remain required. A missing
 profile stays missing. Attachment previews carry client-supplied bytes-derived
 metadata or display-only references; the RPC never reads a client-supplied local
 path. Admissible uploaded attachments are rechecked at admission.

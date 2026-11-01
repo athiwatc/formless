@@ -63,6 +63,7 @@ async fn a_tool_runs_by_hand_and_is_recorded() {
     // with the same code.
     let r = daemon
         .handle(Request::UpdateToolSpec {
+            expected_current_version: None,
             id: tool.id.clone(),
             description: Some("Shout text back in capitals".into()),
             input_schema: Some(serde_json::json!({
@@ -83,6 +84,7 @@ async fn a_tool_runs_by_hand_and_is_recorded() {
     assert_eq!(v2.code, d.versions[0].code);
     assert!(daemon
         .handle(Request::UpdateToolSpec {
+            expected_current_version: None,
             id: tool.id.clone(),
             description: Some("  ".into()),
             input_schema: None,

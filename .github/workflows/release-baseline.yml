@@ -83,7 +83,9 @@ jobs:
         run: bash scripts/ci-storage-budget.sh snapshot before-tests
       - name: Workspace tests (Cargo-cold)
         shell: bash
-        run: time -p cargo test --workspace --locked
+        # Inventory all native test targets after a fixture failure; Cargo
+        # still exits nonzero, so failed tests cannot reach release packaging.
+        run: time -p cargo test --workspace --locked --no-fail-fast
       - name: Reclaim completed workspace test artifacts
         run: bash scripts/ci-storage-budget.sh clean-debug
       - name: Release build

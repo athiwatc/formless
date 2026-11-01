@@ -2259,13 +2259,12 @@
             (c.new_capabilities.length ? c.new_capabilities : c.capabilities).map((cap) => h("span", { class: "tag" + (isBroad(cap) ? " broad" : "") }, cap)));
         }))) : null,
       // What it does in plain words: AI-written, so labelled (SPEC §10.3).
-      req.summary && !req.detail ? h("div", { class: "ai-summary" }, h("span", { class: "ai-label" }, "AI summary · may be wrong; the Capabilities are what counts"), h("p", null, req.summary)) : null,
-      req.detail
-        ? h("p", { class: "detail-text" }, req.detail)
-        : h("p", null, "Tool ", h("strong", null, toolTitleByName(req.tool_name) || req.tool_name),
+      req.summary && (!req.detail || req.tool_id) ? h("div", { class: "ai-summary" }, h("span", { class: "ai-label" }, "AI summary · may be wrong; the Capabilities are what counts"), h("p", null, req.summary)) : null,
+      req.detail ? h("p", { class: "detail-text" }, req.detail) : null,
+      !req.detail || req.tool_id ? h("p", null, "Tool ", h("strong", null, toolTitleByName(req.tool_name) || req.tool_name),
           toolTitleByName(req.tool_name) ? h("span", { class: "muted" }, " (" + req.tool_name + ")") : null,
           req.version ? " v" + req.version : "",
-          promo ? " is ready to be promoted." : " wants sensitive capabilities:"),
+          promo ? " is ready to be promoted." : " wants sensitive capabilities:") : null,
       promo && req.reason ? h("p", { class: "muted" }, req.reason) : null,
       h("ul", { "aria-label": promo ? "Capabilities" : "Capabilities requested" },
         (req.capabilities.length ? req.capabilities : ["(no capabilities)"]).map((c) =>
@@ -2274,7 +2273,7 @@
             : h("li", null, h("span", { class: "tag" + (isBroad(c) ? " broad" : "") }, c), isBroad(c) ? h("span", { class: "error" }, " broad access: " + broadWhy(c)) : (req.already || []).length ? h("span", null, " new") : null,
               ((n) => n ? h("div", { class: n[0] ? "error path-note" : "muted path-note" }, (n[0] ? "⚠ " : "") + n[1]) : null)(pathNote(c, ((S.sessions.find((s) => s.id === req.session_id) || {}).cwd) || null)),
               scopePicker(req, c))),
-        req.detail ? null : h("li", null, h("span", { class: "tag" }, "memory " + req.memory_mb + " MB"))),
+        req.detail && !req.tool_id ? null : h("li", null, h("span", { class: "tag" }, "memory " + req.memory_mb + " MB"))),
       req.code ? h("details", { class: "chip" }, h("summary", null, "Code (first lines)"), h("pre", { class: "diff" }, req.code)) : null,
       h("p", { class: "muted" }, promo
         ? "The new version replaces the current one; rollback stays available."
@@ -2597,7 +2596,7 @@
     const m = d.module;
     const cur = d.versions.find((v) => v.version === m.current_version) || d.versions[d.versions.length - 1] || { code: "" };
     const box = h("div", { class: "module-detail" },
-      h("h3", null, "Module " + m.name),
+      h("h3", null, "Module " + m.name), descriptionReviewCard(d.description_review, d.description_reviews),
       h("dl", { class: "kv" },
         h("dt", null, "Versions"), h("dd", null, h("div", { class: "versions" }, d.versions.map((v) =>
           v.version === m.current_version
@@ -2692,10 +2691,63 @@
     await ask({ title: t.name + " result", body: h("pre", { class: "try-result" }, text), ok: "Close" });
     selectTool(t.id, true);
   }
+  /** Description text is third-party data. Use text nodes, never HTML. */
+  function descriptionReviewCard(metadata, reviews) {
+    metadata = metadata || {};
+    return h("div", { class: "description-review" },
+      (metadata.flags || []).length ? h("div", { class: "attention" }, h("strong", null, "Description warning"),
+        h("ul", null, metadata.flags.map((flag) => h("li", null, flag))),
+        h("p", null, "Third-party metadata, not instructions"), h("pre", null, JSON.stringify(metadata.text || ""))) : null,
+      (reviews || []).map((review) => h("details", { class: "chip", open: !!review.before },
+        h("summary", null, review.kind + " " + review.name + " v" + review.version + " · description review"),
+        h("p", { class: "muted" }, "Source: " + review.source),
+        (review.after.flags || []).map((flag) => h("p", { class: "error" }, flag)),
+        review.before ? h("div", null, h("strong", null, "Before"), h("pre", { class: "diff" }, JSON.stringify(review.before.text))) : null,
+        h("strong", null, "After · third-party metadata"), h("pre", { class: "diff" }, JSON.stringify(review.after.text)))));
+  }
+  async function showDescriptionReviews() {
+    const connection = [S.ws, S.conn, S.channel];
+    const reviews = await act({ type: "list_description_reviews", limit: 100 });
+    if (!reviews || connection[0] !== S.ws || connection[1] !== S.conn || connection[2] !== S.channel) return;
+    await ask({ title: "Description reviews", text: reviews.length ? "Retained warnings and exact before/after changes." : "No description reviews yet.",
+      body: descriptionReviewCard(null, reviews), ok: "Close" });
+  }
+  async function refreshDescriptionReviews() {
+    const revision = S.descriptionReviewRevision = (S.descriptionReviewRevision || 0) + 1;
+    const connection = [S.ws, S.conn, S.channel];
+    const reviews = await request({ type: "list_description_reviews", limit: 20 }).catch(() => null);
+    if (!reviews || revision !== S.descriptionReviewRevision || connection[0] !== S.ws || connection[1] !== S.conn || connection[2] !== S.channel) return;
+    const seen = new Set((S.descriptionReviews || []).map((review) => review.id));
+    S.descriptionReviews = reviews;
+    for (const review of reviews) if (!seen.has(review.id)) {
+      note("Description review: " + review.kind + " " + review.name + " v" + review.version +
+        ((review.after.flags || []).length ? " · " + review.after.flags.join("; ") : "") +
+        (review.before ? "\nBefore: " + JSON.stringify(review.before.text) : "") +
+        "\nAfter: " + JSON.stringify(review.after.text) + "\nRetained in Settings → Description reviews.");
+    }
+  }
+  async function previewToolBundleDescriptions(bundle) {
+    const connection = [S.ws, S.conn, S.channel];
+    const current = () => connection[0] === S.ws && connection[1] === S.conn && connection[2] === S.channel;
+    const grouped = Array.isArray(bundle.tools) || Array.isArray(bundle.modules) || Array.isArray(bundle.skills);
+    const entries = grouped ? (bundle.tools || []).concat(bundle.modules || [], bundle.skills || []) : [bundle];
+    const previews = await act({ type: "preview_description_bundle", bundle });
+    if (!previews || !current()) return null;
+    const body = h("div", { class: "description-preview" });
+    const metadata = new WeakMap();
+    for (let index = 0; index < previews.length; index++) {
+      const preview = previews[index];
+      if (entries[index] && typeof entries[index] === "object") metadata.set(entries[index], preview.after);
+      const review = { kind: preview.kind, name: preview.name, version: "preview", source: "import", before: preview.before == null ? null : { text: preview.before }, after: preview.after };
+      body.append(descriptionReviewCard(preview.after, [review]));
+    }
+    const approved = await ask({ title: "Review imported descriptions", text: "Descriptions are third-party metadata. Skill metadata is parsed from the actual bundled SKILL.md. Warnings do not establish safety. Code and capability approval remain separate.", body, ok: "Continue" });
+    return approved && current() ? metadata : null;
+  }
   function renderToolDetail(box, d) {
     const t = d.tool;
     const current = d.versions.find((v) => v.version === t.current_version) || d.versions[d.versions.length - 1];
-    box.append(h("h3", null, toolLabel(t)), h("p", { class: "muted", style: "margin:0" }, t.description));
+    box.append(h("h3", null, toolLabel(t)), h("p", { class: "muted", style: "margin:0" }, t.description), descriptionReviewCard(d.description_review, d.description_reviews));
     box.append(h("dl", { class: "kv" },
       h("dt", null, "Status"), h("dd", null, h("span", { class: "status-pill " + (t.disabled ? "mid" : t.needs_attention ? "bad" : t.retired ? "" : "good") }, t.disabled ? "switched off" : t.needs_attention ? "needs attention" : t.retired ? "retired" : "active")),
       h("dt", null, "Versions"), h("dd", null, h("div", { class: "versions" }, d.versions.map((v) =>
@@ -3048,9 +3100,10 @@
         h("button", { class: "btn small", type: "button", onclick: () => act({ type: "backup" }).then((r) => r && note("backed up to " + r.file + " (" + humanBytes(r.bytes) + ")")) }, "Back up now"))));
     const skills = S.skills || [];
     grid.append(h("section", null, h("h3", null, "Skills"),
+      h("button", { class: "btn small", type: "button", onclick: showDescriptionReviews }, "Description reviews"),
       skills.length ? h("table", { class: "table" },
         h("tbody", null, skills.map((sk) => h("tr", null,
-          h("td", null, h("strong", null, sk.name + " v" + sk.version), h("div", { class: "muted" }, sk.description),
+          h("td", null, h("strong", null, sk.name + " v" + sk.version), h("div", { class: "muted" }, sk.description), descriptionReviewCard(sk.description_review, []),
             sk.has_scripts ? h("div", { class: "muted" }, "bundles scripts (never run on the host)") : null,
             sk.author === "auto" ? h("div", { class: "muted" }, sk.retired ? "auto-created · retired (enable to restore)" : "auto-created from a successful Run") : null,
             sk.retired && sk.retire_reason ? h("div", { class: "muted" }, "Retired: " + sk.retire_reason) : null),
@@ -3260,6 +3313,7 @@
   async function refreshTools() {
     const list = await act({ type: "list_tools" });
     if (list) S.tools = list;
+    await refreshDescriptionReviews();
     renderView();
   }
   async function refreshModules() {
@@ -3280,7 +3334,7 @@
   async function reviewSkill(name) {
     const r = await act({ type: "get_skill", name });
     if (!r) return;
-    await ask({ title: r.skill.name + " v" + r.skill.version, text: r.body + "\n\nFiles: " + r.files.join(", "), ok: "Close" });
+    await ask({ title: r.skill.name + " v" + r.skill.version, text: r.body + "\n\nFiles: " + r.files.join(", "), body: descriptionReviewCard(r.skill.description_review, r.skill.description_reviews), ok: "Close" });
   }
   async function editSetting(key, current, kind) {
     let value;
@@ -3474,7 +3528,7 @@
         if (!(await act({ type: "set_mcp_tool_enabled", name, tool: t.name, enabled: box.checked }))) box.checked = !box.checked;
         else refreshSettings();
       };
-      return h("tr", null, h("td", null, box), h("td", null, h("code", null, t.name), h("div", { class: "muted" }, (t.description || "").split("\n")[0])), h("td", { class: "num" }, "~" + t.tokens));
+      return h("tr", null, h("td", null, box), h("td", null, h("code", null, t.name), h("div", { class: "muted" }, t.description || ""), descriptionReviewCard(t.description_review, t.description_reviews)), h("td", { class: "num" }, "~" + t.tokens));
     });
     modal("MCP " + name + " tools", h("div", null, total, h("table", { class: "table" }, h("tbody", null, rows))));
   }
@@ -3577,14 +3631,16 @@
     if (!(await ask({ title: "Add skill", text: "Paths are on the daemon's machine.", body, ok: "Add" }))) return;
     if (!source.value.trim()) return toast("A source is needed.", true);
     const r = await act({ type: "add_skill", source: source.value.trim(), subdir: subdir.value.trim() || null, git_ref: ref.value.trim() || null }, null, 120000);
-    if (r) { note("Added skill " + (r.name || "")); refreshSettings(); }
+    if (r) { note("Added skill " + (r.name || "")); await reviewSkill(r.name); refreshSettings(); }
   }
   /** A `formless.skill/1` or `formless.skills/1` bundle from this browser
    * (installed disabled, for review). */
   async function importSkillBundle() {
     const bundle = await pickJson();
     if (!bundle) return;
-    if (await act({ type: "import_skill", bundle }, "Imported; review and enable it below")) refreshSettings();
+    if (!(await previewToolBundleDescriptions(bundle))) return;
+    const imported = await act({ type: "import_skill", bundle }, "Imported; review and enable it below");
+    if (imported) { for (const skill of imported) await reviewSkill(skill.name); refreshSettings(); }
   }
   const DAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
   /** A 5-field cron in words where it's a common shape, else as is. */
@@ -3691,6 +3747,7 @@
     S.harness = (await request({ type: "list_harness_changes" }).catch(() => null)) || [];
     S.relayClients = (await request({ type: "list_relay_clients" }).catch(() => null)) || [];
     S.skills = (await request({ type: "list_skills" }).catch(() => null)) || [];
+    await refreshDescriptionReviews();
     S.memories = (await request({ type: "list_memories" }).catch(() => null)) || [];
     S.jobs = (await request({ type: "list_jobs" }).catch(() => null)) || [];
     if (!S.auditPages || S.auditPages === 1) await loadAudit(false);
@@ -4748,6 +4805,16 @@
         }
         break;
       case "tool_call_started":
+        if (here && ["create_tool", "create_module"].includes(ev.tool_name)) {
+          try {
+            const args = JSON.parse(ev.arguments);
+            const connection = [S.ws, S.conn, S.channel];
+            request({ type: "preview_description", kind: ev.tool_name === "create_module" ? "module" : "tool", name: args.name || "", description: args.description || "" }).then((preview) => {
+              if (connection[0] !== S.ws || connection[1] !== S.conn || connection[2] !== S.channel || S.current !== ev.session_id) return;
+              if (preview.after.flags.length) note("Description preview: " + preview.name + " · " + preview.after.flags.join("; ") + "\nThird-party metadata: " + JSON.stringify(preview.after.text));
+            }).catch(() => {});
+          } catch (_) {}
+        }
         if (here) {
           S.liveTools.push({ name: ev.tool_name, version: ev.version, arguments: ev.arguments, status: "running", started: Date.now(), depth: ev.depth || 0 });
           setActivity("running " + ev.tool_name);
@@ -4838,6 +4905,7 @@
         if (here) openSession(S.current);
         break;
       case "tool_updated": {
+        refreshDescriptionReviews();
         const i = S.tools.findIndex((t) => t.id === ev.tool.id);
         if (i >= 0) S.tools[i] = ev.tool; else S.tools.push(ev.tool);
         if (ev.tool.id === S.selectedTool || ev.tool.id === S.metricTool) {
@@ -4853,6 +4921,7 @@
         renderView();
         break;
       case "module_updated": {
+        refreshDescriptionReviews();
         const i = S.modules.findIndex((m) => m.id === ev.module.id);
         if (i >= 0) S.modules[i] = ev.module; else S.modules.push(ev.module);
         if (S.moduleDetail && S.moduleDetail.module.id === ev.module.id && !S.moduleEditing) openModule(ev.module.id);
@@ -4860,6 +4929,7 @@
         break;
       }
       case "registry_changed": {
+        refreshDescriptionReviews();
         // Every registry change offers Undo for a few seconds (SPEC §7.2).
         const c = ev.change;
         toast(c.author + " " + (c.action === "rolled_back" ? "rolled " + c.name + " back to v" + c.to_version : c.action + " " + c.name + (c.action === "retired" || c.action === "restored" ? "" : " v" + c.to_version)), false,
@@ -5236,7 +5306,7 @@
   $("search").addEventListener("input", () => { if (!$("search").value) search(""); });
   $("import-tool").onclick = async () => {
     const bundle = await pickJson();
-    if (bundle && (await act({ type: "import_tool", bundle }, "Imported — the Tool needs first-run approval"))) refreshTools();
+    if (bundle && (await previewToolBundleDescriptions(bundle)) && (await act({ type: "import_tool", bundle }, "Imported — the Tool needs first-run approval"))) refreshTools();
   };
   // From an https URL or gist (SPEC §7.8): fetched by the daemon, shown in
   // full (source, Capabilities, code), imported only on a second yes.
@@ -5246,11 +5316,13 @@
     const fetched = await act({ type: "fetch_tool_bundle", url: url.trim() });
     if (!fetched) return;
     const b = fetched.bundle;
+    const descriptions = await previewToolBundleDescriptions(b);
+    if (!descriptions) return;
     const tools = Array.isArray(b.tools) ? b.tools : [b];
     const body = h("div", { class: "import-preview" },
       h("p", { class: "muted" }, "Source: " + fetched.source + (fetched.file ? " (" + fetched.file + ")" : "")),
       tools.map((t) => h("details", { class: "chip", open: tools.length === 1 },
-        h("summary", null, h("strong", null, t.name || "?"), " ", h("span", { class: "muted" }, t.description || "")),
+        h("summary", null, h("strong", null, t.name || "?"), " ", h("span", { class: "muted" }, (descriptions.get(t) || {}).text || "")),
         h("p", null, (t.capabilities && t.capabilities.length ? t.capabilities : ["(no capabilities)"]).map((c) =>
           h("span", { class: "tag" + (isBroad(c) ? " broad" : "") }, c)), h("span", { class: "tag" }, "memory " + (t.memory_mb || 256) + " MB")),
         h("pre", { class: "diff" }, t.implementation_js || ""))),

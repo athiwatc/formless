@@ -340,6 +340,7 @@ pub const COMMANDS: &[Command] = &[
         Tools,
     ),
     cmd("audit", "[FILTER]", "show the audit log", Tools),
+    cmd("descriptionreviews", "", "retained description warnings and before/after changes", Tools),
     cmd(
         "security",
         "",
@@ -678,7 +679,7 @@ mod tests {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let page = std::fs::read_to_string(root.join("docs/keys.md")).unwrap_or_default();
         assert!(
-            page == reference_markdown(),
+            page.replace("\r\n", "\n") == reference_markdown(),
             "docs/keys.md is stale: run `formless docs --keys > docs/keys.md`"
         );
         // Every web key listed here has a handler in the web UI (#1085):

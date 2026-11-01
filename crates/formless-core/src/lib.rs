@@ -5,6 +5,7 @@ pub mod backup_verification;
 mod budget;
 pub mod config;
 pub mod daemon;
+pub mod descriptions;
 pub mod diff;
 pub mod docs;
 pub mod dupes;

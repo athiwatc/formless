@@ -16,6 +16,10 @@ use std::{
     time::Duration,
 };
 
+#[cfg(any(target_os = "macos", test))]
+#[path = "forecast_snapshot_macos.rs"]
+mod macos;
+
 pub(super) struct SnapshotDir(PathBuf, Option<crate::profile_lock::MaintenanceGuard>);
 impl SnapshotDir {
     fn new() -> Result<Self> {
@@ -64,13 +68,22 @@ impl NativeLock {
             if !matches!(name, b"unix" | b"win32") {
                 bail!("forecast refuses unsupported/custom SQLite VFS");
             }
-            if name == b"unix"
-                && ffi::sqlite3_compileoption_used(c"ENABLE_LOCKING_STYLE=1".as_ptr()) != 0
-            {
-                bail!(
-                    "forecast cannot prove write-free locking with automatic Unix locking styles"
-                );
-            }
+            #[cfg(target_os = "macos")]
+            let (vfs, probe_posix) = {
+                if name != b"unix" {
+                    bail!("forecast refuses a non-native macOS VFS");
+                }
+                (macos::source_vfs(vfs, path.as_c_str())?, true)
+            };
+            #[cfg(not(target_os = "macos"))]
+            let (vfs, probe_posix) = {
+                if name == b"unix"
+                    && ffi::sqlite3_compileoption_used(c"ENABLE_LOCKING_STYLE=1".as_ptr()) != 0
+                {
+                    bail!("forecast cannot prove write-free locking with automatic Unix locking styles");
+                }
+                (vfs, false)
+            };
             if (*vfs).szOsFile < std::mem::size_of::<ffi::sqlite3_file>() as i32 {
                 bail!("invalid native SQLite VFS file size");
             }
@@ -114,6 +127,24 @@ impl NativeLock {
                 bail!("forecast cannot lock a read-only database without changing permissions");
             }
             let methods = guard.methods()?;
+            if probe_posix {
+                // Before taking SHARED, posix unixCheckReservedLock performs
+                // F_GETLK when no in-process reservation is cached. A writer
+                // reservation is refused. This is the same syscall support
+                // Apple's APFS auto-finder uses to choose posixIoMethods;
+                // HFS/UFS select POSIX directly. No pager/SHM is involved.
+                let probe = methods
+                    .xCheckReservedLock
+                    .context("POSIX VFS has no reserved-lock probe")?;
+                let mut reserved = 0;
+                check(
+                    probe(allocation, &mut reserved),
+                    "probe macOS source POSIX F_GETLK",
+                )?;
+                if reserved != 0 {
+                    bail!("forecast source is in use; cannot exclude SQLite writers");
+                }
+            }
             let lock = methods.xLock.context("native SQLite VFS has no locking")?;
             check(
                 lock(allocation, ffi::SQLITE_LOCK_SHARED),

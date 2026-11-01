@@ -4,10 +4,25 @@ use formless_core::{Config, Paths, Store};
 use formless_protocol::Request;
 use std::sync::Arc;
 
+struct Fixture(std::path::PathBuf);
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn sessions_have_a_working_directory_for_relative_paths() {
     let short = &uuid::Uuid::new_v4().to_string()[..8];
-    let dir = std::path::PathBuf::from(format!("/tmp/fl-cwd-{short}"));
+    let dir = std::env::temp_dir().join(format!("fl-cwd-{short}"));
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(&dir).unwrap();
+    let _fixture = Fixture(dir.clone());
     let paths = Paths {
         data_dir: dir.join("d"),
         config_dir: dir.join("c"),
@@ -44,7 +59,8 @@ async fn sessions_have_a_working_directory_for_relative_paths() {
         })
         .await
         .unwrap();
-    assert!(s["cwd"].as_str().unwrap().ends_with("project/sub"));
+    let sub = project.join("sub").canonicalize().unwrap();
+    assert_eq!(s["cwd"], sub.to_string_lossy().as_ref());
     assert!(daemon
         .handle(Request::SetSessionCwd {
             id: sid.clone(),
@@ -54,14 +70,14 @@ async fn sessions_have_a_working_directory_for_relative_paths() {
         .is_err());
     // The agent is told, in its prompt and the transcript.
     let prompt = store.session_system_prompt(&sid).unwrap().unwrap();
-    assert!(prompt.contains("Working directory: ") && prompt.contains("project/sub"));
+    assert!(prompt.contains("Working directory: ") && prompt.contains(sub.to_str().unwrap()));
     let notes = store.list_messages(&sid).unwrap();
     assert!(notes
         .iter()
-        .any(|m| m.role == "system-note" && m.content.contains("project/sub")));
+        .any(|m| m.role == "system-note" && m.content.contains(sub.to_str().unwrap())));
     // A fork keeps it.
     let fork = store.fork_session(&sid, None, None).unwrap().unwrap();
-    assert!(fork.cwd.unwrap().ends_with("project/sub"));
+    assert_eq!(fork.cwd.as_deref(), sub.to_str());
 
     // A Tool's input-bound path, given relative, reads from the Session's
     // directory (the grant binds to the absolute path).
@@ -84,9 +100,40 @@ async fn sessions_have_a_working_directory_for_relative_paths() {
     let r = daemon
         .call_tool_direct(&sid, "read_text", serde_json::json!({"path": "notes.txt"}))
         .await;
-    assert!(r.contains("hello from notes"), "{r}");
-    assert!(
-        r.contains("project/sub/notes.txt"),
-        "absolute path passed to the Tool: {r}"
+    let r: serde_json::Value = serde_json::from_str(&r).unwrap();
+    assert_eq!(r["text"], "hello from notes");
+    let file = sub.join("notes.txt").canonicalize().unwrap();
+    assert_eq!(r["path"], file.to_string_lossy().as_ref());
+
+    // Writes bind their relative target to the same Session directory too.
+    let out = daemon
+        .call_tool_direct(&sid, "create_tool", serde_json::json!({
+            "name": "write_text", "description": "writes a file",
+            "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "text": {"type": "string"}}, "required": ["path", "text"]},
+            "output_schema": {}, "implementation_js": "function run(i){ fs.write(i.path, i.text); return {path: i.path}; }",
+            "capabilities": ["fs:write:$input.path"]}))
+        .await;
+    assert!(out.contains("\"created\""), "{out}");
+    let (tool, ver) = store.get_tool_by_name("write_text").unwrap().unwrap();
+    store
+        .set_approval(
+            &tool.id,
+            &formless_runtime::Capabilities::parse(&ver.capabilities).unwrap(),
+            ver.memory_mb,
+        )
+        .unwrap();
+    let out = daemon
+        .call_tool_direct(
+            &sid,
+            "write_text",
+            serde_json::json!({"path": "written.txt", "text": "written in Session cwd"}),
+        )
+        .await;
+    let out: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let written = sub.join("written.txt").canonicalize().unwrap();
+    assert_eq!(out["path"], written.to_string_lossy().as_ref());
+    assert_eq!(
+        std::fs::read_to_string(written).unwrap(),
+        "written in Session cwd"
     );
 }

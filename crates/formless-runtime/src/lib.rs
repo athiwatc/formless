@@ -843,8 +843,31 @@ fn send_request(req: FetchRequest) -> Result<reqwest::blocking::Response, String
 }
 
 fn send_request_with_resolver(
+    req: FetchRequest,
+    resolve: &DnsResolver<'_>,
+) -> Result<reqwest::blocking::Response, String> {
+    send_request_with_dependencies(
+        req,
+        resolve,
+        &|url, pinned, timeouts| match url.host_str() {
+            Some(host) if !pinned.is_empty() => pinned_client(host, pinned, timeouts),
+            _ => http_client(timeouts),
+        },
+    )
+}
+
+// Keep client initialization injectable for deterministic HTTP deadline tests:
+// cold native TLS/runtime initialization must not consume the fixture's entire
+// short header/body budget before its server has received any HTTP request.
+// Production always supplies the checked, pooled client selector above.
+fn send_request_with_dependencies(
     mut req: FetchRequest,
     resolve: &DnsResolver<'_>,
+    client_for: &dyn Fn(
+        &reqwest::Url,
+        &[std::net::SocketAddr],
+        FetchTimeouts,
+    ) -> Result<reqwest::blocking::Client, String>,
 ) -> Result<reqwest::blocking::Response, String> {
     use reqwest::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, LOCATION};
     let deadline =
@@ -854,10 +877,7 @@ fn send_request_with_resolver(
             std::time::Instant::now() + std::time::Duration::from_millis(req.timeouts.connect_ms),
         );
         let pinned = checked_address(&req.url, &req.scope, dns_deadline, resolve)?;
-        let client = match req.url.host_str() {
-            Some(host) if !pinned.is_empty() => pinned_client(host, &pinned, req.timeouts)?,
-            _ => http_client(req.timeouts)?,
-        };
+        let client = client_for(&req.url, &pinned, req.timeouts)?;
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
             return Err("fetch timed out: tools.fetch_timeout_secs total deadline expired".into());
@@ -3415,14 +3435,16 @@ mod tests {
             for body in [false, true] {
                 let (addr, accepted, server) = stalled_http_peer(body, false);
                 let req = timeout_request(host, addr, 150);
+                let client = prepared_timeout_client(&req, addr);
                 let started = std::time::Instant::now();
-                let result = send_request(req).and_then(|mut response| {
-                    let mut bytes = Vec::new();
-                    response
-                        .read_to_end(&mut bytes)
-                        .map_err(|e| fetch_error(&e))?;
-                    Ok(())
-                });
+                let result =
+                    send_prepared_timeout_request(req, addr, &client).and_then(|mut response| {
+                        let mut bytes = Vec::new();
+                        response
+                            .read_to_end(&mut bytes)
+                            .map_err(|e| fetch_error(&e))?;
+                        Ok(())
+                    });
                 accepted
                     .recv_timeout(std::time::Duration::from_secs(2))
                     .unwrap();
@@ -3437,8 +3459,9 @@ mod tests {
         }
         let (addr, accepted, server) = stalled_http_peer(true, true);
         let req = timeout_request("127.0.0.1", addr, 150);
+        let client = prepared_timeout_client(&req, addr);
         let started = std::time::Instant::now();
-        let mut response = send_request(req).unwrap();
+        let mut response = send_prepared_timeout_request(req, addr, &client).unwrap();
         accepted
             .recv_timeout(std::time::Duration::from_secs(2))
             .unwrap();
@@ -3466,17 +3489,20 @@ mod tests {
         for body in [false, true] {
             let (addr, accepted, server) = stalled_http_peer(body, false);
             let req = timeout_request("127.0.0.1", addr, 200);
+            let client = prepared_timeout_client(&req, addr);
             let cancel = Arc::new(AtomicBool::new(false));
             let flag = cancel.clone();
             let (completed_tx, completed_rx) = std::sync::mpsc::channel();
             let caller = std::thread::spawn(move || {
                 cancellable_work(&flag, move || {
-                    let result = send_request(req).and_then(|mut response| {
-                        response
-                            .read_to_end(&mut Vec::new())
-                            .map_err(|e| fetch_error(&e))?;
-                        Ok(())
-                    });
+                    let result = send_prepared_timeout_request(req, addr, &client).and_then(
+                        |mut response| {
+                            response
+                                .read_to_end(&mut Vec::new())
+                                .map_err(|e| fetch_error(&e))?;
+                            Ok(())
+                        },
+                    );
                     // A completion signal from inside the abandoned worker, not
                     // merely the caller returning or a sleep that hopes it stopped.
                     completed_tx.send(result.clone()).unwrap();
@@ -3495,6 +3521,43 @@ mod tests {
             assert!(error.starts_with("fetch timed out:"), "{error}");
             server.join().unwrap();
         }
+    }
+
+    fn prepared_timeout_client(
+        req: &FetchRequest,
+        addr: std::net::SocketAddr,
+    ) -> reqwest::blocking::Client {
+        client_builder(req.timeouts)
+            .resolve_to_addrs("localhost", &[addr])
+            .build()
+            .unwrap()
+    }
+
+    fn send_prepared_timeout_request(
+        req: FetchRequest,
+        addr: std::net::SocketAddr,
+        client: &reqwest::blocking::Client,
+    ) -> Result<reqwest::blocking::Response, String> {
+        send_request_with_dependencies(
+            req,
+            &|host, port, _deadline| {
+                assert_eq!(host, "localhost");
+                assert_eq!(port, addr.port());
+                Ok(vec![addr])
+            },
+            &|url, pinned, _timeouts| {
+                if url.host_str() == Some("localhost") {
+                    assert_eq!(
+                        pinned,
+                        &[addr],
+                        "hostname still follows checked-address pinning"
+                    );
+                } else {
+                    assert!(pinned.is_empty(), "literal IP bypasses DNS");
+                }
+                Ok(client.clone())
+            },
+        )
     }
 
     fn timeout_request(host: &str, addr: std::net::SocketAddr, total_ms: u64) -> FetchRequest {
