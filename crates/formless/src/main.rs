@@ -6784,8 +6784,74 @@ mod tests {
         );
     }
 
+    // File locks inherited by another parallel test's fork survive until that
+    // child execs, even with CLOEXEC. Own manager children are fully awaited;
+    // isolate only the fixtures requiring immediate post-drop release from
+    // unrelated process creation, preserving their exact assertions below.
+    struct IsolatedMaintenanceProcess(std::process::Child);
+    impl Drop for IsolatedMaintenanceProcess {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn isolated_maintenance_assertions(mode: &str) {
+        assert!(matches!(mode, "release" | "refusal"));
+        let mut child = IsolatedMaintenanceProcess(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::maintenance_isolation_child_fixture",
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env("FORMLESS_TEST_MAINTENANCE_ISOLATION", mode)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::inherit())
+                .stderr(std::process::Stdio::inherit())
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                assert!(
+                    status.success(),
+                    "isolated maintenance {mode} fixture failed: {status}"
+                );
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "isolated maintenance {mode} fixture did not finish within ten seconds"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     #[test]
     fn destructive_maintenance_holds_cross_process_locks_and_orders_disable_stop_erase() {
+        isolated_maintenance_assertions("release");
+    }
+
+    #[test]
+    fn destructive_maintenance_preserves_data_when_service_or_owner_cannot_release() {
+        isolated_maintenance_assertions("refusal");
+    }
+
+    #[test]
+    #[ignore = "private subprocess fixture for immediate maintenance lock assertions"]
+    fn maintenance_isolation_child_fixture() {
+        match std::env::var("FORMLESS_TEST_MAINTENANCE_ISOLATION").as_deref() {
+            Ok("release") => maintenance_release_assertions(),
+            Ok("refusal") => maintenance_refusal_assertions(),
+            _ => panic!("invoke only through the isolated maintenance parent tests"),
+        }
+    }
+
+    fn maintenance_release_assertions() {
         let (_fixture, paths) = MaintenanceFixture::new();
         super::profile_maintenance(
             &paths,
@@ -6806,8 +6872,7 @@ mod tests {
         .is_ok());
     }
 
-    #[test]
-    fn destructive_maintenance_preserves_data_when_service_or_owner_cannot_release() {
+    fn maintenance_refusal_assertions() {
         let (_fixture, paths) = MaintenanceFixture::new();
         let sentinel = paths.db_file();
         std::fs::write(&sentinel, "untouched data").unwrap();
