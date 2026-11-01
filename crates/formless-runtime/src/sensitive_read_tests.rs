@@ -383,10 +383,28 @@ fn cat_relative_file_and_sensitive_cwd_cannot_bypass_via_process_write_scope_fal
         execute(&req, allowed.clone()).unwrap().output,
         json!("fixture-secret")
     );
+    let exact_identities = vec![ssh.canonicalize().unwrap(), key.canonicalize().unwrap()];
     assert_eq!(
-        allowed.paths.locked().len(),
-        2,
-        "cwd and file are distinct identities"
+        *allowed.paths.locked(),
+        exact_identities,
+        "only the actual cwd and file identities need consent; a bare PATH command is not cwd/cat"
+    );
+    req.code =
+        "function run(i) { return process.run(i.command,[i.operand],{cwd:i.cwd}).stdout; }".into();
+    req.input["command"] =
+        json!(which("cat").expect("private fixture requires the same cat executable used above"));
+    assert_eq!(
+        execute(&req, allowed.clone()).unwrap().output,
+        json!("fixture-secret")
+    );
+    assert_eq!(
+        *allowed.paths.locked(),
+        exact_identities
+            .iter()
+            .chain(&exact_identities)
+            .cloned()
+            .collect::<Vec<_>>(),
+        "an explicit executable path retains both actual scope checks"
     );
     let profile = host(PathPolicy::new(vec![ssh], vec![]).unwrap(), true);
     assert!(execute(&req, profile.clone())

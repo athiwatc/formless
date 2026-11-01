@@ -2301,12 +2301,14 @@ impl State {
         self.guard_read(cwd_text, cwd, "process working directory")?;
         let mut literal_arguments = false;
         let mut operands = Vec::new();
-        operands.push(cmd);
-        // Inspect a bare executable's current PATH resolution too. This
-        // does not confine code it subsequently loads or executes.
+        // A bare command is resolved through PATH, not as a filesystem
+        // operand under cwd. Inspect its resolved executable instead of
+        // inventing an unrelated <cwd>/<command> credential identity.
+        // Explicit executable paths still pass the ordinary operand checks.
         let executable = if !cmd.contains(['/', '\\']) {
             which(cmd)
         } else {
+            operands.push(cmd);
             None
         };
         if let Some(path) = &executable {
