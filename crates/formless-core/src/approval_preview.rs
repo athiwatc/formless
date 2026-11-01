@@ -276,7 +276,7 @@ pub fn input_sources(body: &Value) -> Vec<Origin> {
                 crate::provenance::mandatory_system(crate::provider::SUMMARIZE_PROMPT)
             )
         });
-        if let Some(tail) = text.strip_prefix(prefix) {
+        if let Some(tail) = text.strip_prefix(prefix.as_str()) {
             candidates.push(tail);
         }
         for candidate in candidates {
