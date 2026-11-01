@@ -2056,10 +2056,12 @@ impl State {
             .as_array()
             .and_then(|v| v.first())
             .and_then(|x| x.as_str());
-        if self.mode != HostMode::Live
-            && !allowed.is_empty()
-            && !process_allowed(allowed, cmd, first_arg)
-        {
+        let possible = if self.mode == HostMode::Live {
+            process_executable::possibly_allowed(allowed, cmd, first_arg)
+        } else {
+            allowed.is_empty() || process_allowed(allowed, cmd, first_arg)
+        };
+        if !possible {
             return Err(denied(format!(
                 "process:{cmd}{} not in scope",
                 first_arg.map(|f| format!(" {f}")).unwrap_or_default()
@@ -2119,7 +2121,16 @@ impl State {
             .clone()
             .unwrap_or(std::env::current_dir().map_err(|e| e.to_string())?);
         let child_env = process_executable::ChildEnv::capture(&self.caps.env, &a["env"]);
-        let executable = process_executable::resolve(cmd, &effective_cwd, &child_env)?;
+        let executable =
+            process_executable::resolve(cmd, &effective_cwd, &child_env).map_err(|error| {
+                if !allowed.is_empty() && !process_executable::names_request(allowed, cmd) {
+                    // An unresolved path cannot establish identity with a scoped
+                    // executable grant. Keep denial opaque, as before resolution.
+                    denied(format!("process:{cmd} not in scope"))
+                } else {
+                    error
+                }
+            })?;
         if !process_executable::allowed(
             allowed,
             cmd,

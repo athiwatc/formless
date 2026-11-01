@@ -263,3 +263,26 @@ pub(super) fn allowed(
             grant_program(name, cwd, env).is_ok_and(|grant| grant.canonical == actual.canonical)
         })
 }
+
+/// Reject impossible names/subcommands before probing executable paths. A path
+/// grant may need canonical identity comparison, but two different bare names
+/// never authorize one another.
+pub(super) fn possibly_allowed(
+    grants: &[String],
+    requested: &str,
+    first_arg: Option<&str>,
+) -> bool {
+    grants.is_empty()
+        || grants.iter().any(|grant| {
+            let (name, subs) = process_grant(grant);
+            if subs.is_some_and(|subs| !first_arg.is_some_and(|arg| subs.contains(&arg))) {
+                return false;
+            }
+            explicit(name) || explicit(requested) || name == requested
+        })
+}
+pub(super) fn names_request(grants: &[String], requested: &str) -> bool {
+    grants
+        .iter()
+        .any(|grant| process_grant(grant).0 == requested)
+}

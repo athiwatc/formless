@@ -331,3 +331,22 @@ fn path_scoped_grant_cannot_authorize_a_different_child_path_program() {
 fn removed_child_path_uses_native_default_instead_of_the_parent_path() {
     parent_path_probe("removed");
 }
+
+#[test]
+fn wrong_bare_name_and_subcommand_stay_denied_before_executable_lookup() {
+    let f = Fixture::new();
+    let mut req = f.request("run", false);
+    req.input["cmd"] = json!(format!("missing-{}", uuid::Uuid::new_v4()));
+    let error = execute(&req, Arc::new(formless_runtime::NoHostOps)).unwrap_err();
+    assert_eq!(error.kind, ExecErrorKind::Denied);
+    let mut req = f.request("spawn", false);
+    req.caps = Capabilities::parse(&[
+        format!("process:{}:allowed-subcommand", f.program),
+        "env:PATH".into(),
+        format!("fs:read:{}", f.root.display()),
+    ])
+    .unwrap();
+    let error = execute(&req, Arc::new(formless_runtime::NoHostOps)).unwrap_err();
+    assert_eq!(error.kind, ExecErrorKind::Denied);
+    assert!(!f.root.join("started").exists());
+}
