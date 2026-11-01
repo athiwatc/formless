@@ -330,9 +330,11 @@ async fn relay_link_is_silent_without_browsers() {
 #[tokio::test(flavor = "multi_thread")]
 async fn waiting_questions_ask_the_relay_for_a_push() {
     let _env = credential_env::EnvGuard::isolated();
+    use formless_protocol::{Event, Request, ServerMessage};
     use futures_util::StreamExt;
     use std::sync::Arc;
     use std::time::Duration;
+    use tokio::io::AsyncBufReadExt;
     use tokio_tungstenite::tungstenite::Message;
 
     let paths = temp_paths("relaypush");
@@ -343,38 +345,61 @@ async fn waiting_questions_ask_the_relay_for_a_push() {
         .create_session(None)
         .unwrap()
         .id;
-    tokio::spawn({
+    let server = tokio::spawn({
         let d = daemon.clone();
         async move { d.serve().await }
     });
-    for _ in 0..50 {
-        if formless_core::daemon::daemon_reachable(&paths) {
-            break;
+    // Keep the actual answer-capable IPC connection, rather than a readiness
+    // probe whose transient subscriber could disappear before ask_user.
+    let client = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match tokio::net::UnixStream::connect(paths.socket_path()).await {
+                Ok(client) => break client,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                    ) =>
+                {
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => panic!("connect private daemon: {error}"),
+            }
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    // Someone who could answer is connected.
-    let _client = tokio::net::UnixStream::connect(paths.socket_path())
-        .await
-        .unwrap();
+    })
+    .await
+    .expect("private daemon starts within 5s");
+    let mut events = tokio::io::BufReader::new(client).lines();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while daemon.subscriber_count() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("IPC answerer registered");
     let secret = generate_relay_secret();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("ws://{}", listener.local_addr().unwrap());
     let shutdown = tokio_util::sync::CancellationToken::new();
-    tokio::spawn({
+    let link = tokio::spawn({
         let (d, s, t) = (daemon.clone(), secret.clone(), shutdown.clone());
         async move { formless_core::relay::connect_once(d, &base, &s, &t).await }
     });
-    let (tcp, _) = listener.accept().await.unwrap();
-    let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
-    for _ in 0..50 {
-        if daemon.subscriber_count() > 0 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    tokio::spawn({
-        let d = daemon.clone();
+    let (tcp, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+        .await
+        .expect("relay TCP connection")
+        .unwrap();
+    // Hold the server's WebSocket handshake until the question has actually
+    // been broadcast. Peek leaves the real Upgrade request for accept_async.
+    let mut request = [0; 1];
+    let received = tokio::time::timeout(Duration::from_secs(5), tcp.peek(&mut request))
+        .await
+        .expect("relay starts its WebSocket handshake")
+        .unwrap();
+    assert_eq!(received, 1);
+    assert_eq!(request, [b'G']);
+    let question = tokio::spawn({
+        let (d, sid) = (daemon.clone(), sid.clone());
         async move {
             d.call_tool_direct(
                 &sid,
@@ -384,6 +409,44 @@ async fn waiting_questions_ask_the_relay_for_a_push() {
             .await
         }
     });
+    let question_id = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let line = events.next_line().await.unwrap().expect("IPC stays open");
+            if let Ok(ServerMessage::Event(Event::UserQuestion {
+                question_id,
+                session_id,
+                question,
+                ..
+            })) = serde_json::from_str(&line)
+            {
+                assert_eq!(session_id, sid);
+                assert_eq!(question, "Which file?");
+                // broadcast sends attention before delivering this event.
+                // Thus the old late subscription deterministically loses it.
+                break question_id;
+            }
+        }
+    })
+    .await
+    .expect("question registered while WebSocket handshake is held");
+    let snapshot = daemon
+        .handle(Request::GetSession { id: sid.clone() })
+        .await
+        .unwrap();
+    assert!(snapshot["pending_events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|ev| { ev["type"] == "user_question" && ev["question_id"] == question_id }));
+    assert!(
+        !question.is_finished(),
+        "question still waits for an answer"
+    );
+    assert!(!link.is_finished(), "relay still waits for the handshake");
+    let mut ws = tokio::time::timeout(Duration::from_secs(5), tokio_tungstenite::accept_async(tcp))
+        .await
+        .expect("release held WebSocket handshake")
+        .unwrap();
     let frame = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match ws.next().await {
@@ -396,7 +459,37 @@ async fn waiting_questions_ask_the_relay_for_a_push() {
     .await
     .expect("a push request");
     assert_eq!(frame, r#"{"relay":"push"}"#);
+    let answered = daemon
+        .handle(Request::AnswerQuestion {
+            question_id,
+            answer: "private-choice".into(),
+            answers: Vec::new(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(answered["answered"], true);
+    let reply = tokio::time::timeout(Duration::from_secs(5), question)
+        .await
+        .expect("question completes after explicit answer")
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&reply).unwrap(),
+        serde_json::json!({"answer":"private-choice"})
+    );
     shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(5), link)
+        .await
+        .expect("relay stops after cancellation")
+        .unwrap()
+        .unwrap();
+    drop(ws);
+    drop(events);
+    daemon.handle(Request::Shutdown).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("private daemon acknowledges shutdown")
+        .unwrap()
+        .unwrap();
 }
 
 /// The relay's browsers are listed with their User-Agent and can be
