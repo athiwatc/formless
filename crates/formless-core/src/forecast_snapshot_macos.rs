@@ -1,6 +1,8 @@
 //! Apple's default `unix` VFS auto-selects locking. Never open the source with
 //! that finder: a proxy/dotlock selection can create sidecars before xLock.
 //! On proven local APFS/HFS/UFS, use its explicit POSIX sibling instead.
+//! Do not infer Apple finder behavior from ENABLE_LOCKING_STYLE diagnostics:
+//! SQLite emits that array before applying its implicit Apple default.
 use anyhow::{bail, Result};
 use std::ffi::OsStr;
 

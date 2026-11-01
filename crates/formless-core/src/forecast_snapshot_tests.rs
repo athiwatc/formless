@@ -396,17 +396,14 @@ fn external_sqlite_fixture() {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn apple_default_autolocking_uses_explicit_posix_without_source_or_global_changes() {
+fn apple_default_vfs_uses_explicit_posix_without_source_or_global_changes() {
     let (fixture, paths) = Fixture::new();
     let expected = closed_wal(&paths);
     let before = tree(&fixture.0);
-    // This proof must exercise Apple's normal bundled automatic-locking build,
-    // not pass because a global compile flag disabled the feature under test.
+    // SQLite emits its diagnostic compile-option array before Apple's implicit
+    // locking-style default. Do not infer the actual finder from that report:
+    // exercise the real default VFS and the explicit POSIX sibling instead.
     let default_before = unsafe {
-        assert_eq!(
-            ffi::sqlite3_compileoption_used(c"ENABLE_LOCKING_STYLE=1".as_ptr()),
-            1
-        );
         let default = ffi::sqlite3_vfs_find(std::ptr::null());
         assert!(!default.is_null());
         assert_eq!(CStr::from_ptr((*default).zName).to_bytes(), b"unix");
@@ -419,6 +416,17 @@ fn apple_default_autolocking_uses_explicit_posix_without_source_or_global_change
         .unwrap();
         let selected = macos::source_vfs(default, source.as_c_str()).unwrap();
         assert_eq!(CStr::from_ptr((*selected).zName).to_bytes(), b"unix-posix");
+        assert_ne!(
+            default, selected,
+            "the source uses the explicit sibling, not the auto-selecting VFS"
+        );
+        // The bundled Apple registry binds these to different finder objects;
+        // comparing public VFS metadata does not open the automatic source VFS.
+        assert_ne!(
+            (*default).pAppData,
+            (*selected).pAppData,
+            "actual finder objects differ"
+        );
         assert_eq!(
             ffi::sqlite3_vfs_find(std::ptr::null()),
             default,
