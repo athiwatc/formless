@@ -129,7 +129,10 @@ without redesign.
   and latency per model, smoothed toward a neutral prior with a small
   exploration bonus for under-sampled models; optional
   `routing_fast_models` / `routing_strong_models` subsets constrain
-  simple vs complex tasks (`routing_complex_chars`). No vendor ranking
+  simple vs complex tasks (`routing_complex_chars`, converted to a token
+  threshold at four characters per token). Context size uses the shared,
+  model-calibrated prompt estimator, including Tool schemas and images; an
+  unresolved auto choice conservatively uses the largest candidate estimate. No vendor ranking
   is hard-coded. Stats are visible in the Metrics view and `doctor`.
   **Deprecated (§4.6):** a global `provider.model = "auto"` is migrated on
   daemon start. A `primary` role is created with `model = "auto"` and the
@@ -3522,6 +3525,17 @@ run_tool = "network_policy"     # a registry Tool, or…
   before any prompt is measured. `/context` (or clicking the segment on
   the web) adds an estimated breakdown: system prompt, Tool schemas,
   history, and the number of attachments.
+  All preflight counts share one Unicode/JSON estimator (including Tool-call
+  metadata). Images use their dimensions and detail, with a nonzero fallback
+  when dimensions are unknown; encoded image bytes are never counted as text.
+  Counts are approximate, not a tokenizer or a forecast. Each configured
+  provider/endpoint and serving model has a persisted calibration ratio:
+  observed prompt tokens divided by the estimate of that exact dispatched
+  request, exponentially smoothed at 0.2 and clamped to 0.25–8. Missing/zero
+  prompt usage and rejected requests do not train it. Repeated cumulative
+  stream snapshots train once per HTTP attempt, including fallback models.
+  Compaction, context reports and routing apply that same ratio; calibration
+  does not require a provider request or credential refresh.
 - **Notifications.** While the TUI's terminal isn't focused (focus
   events) or the web tab is hidden, Formless tells you when a Run
   finishes (if it took at least `tui.notify_min_secs`, default 20), is
