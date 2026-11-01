@@ -300,6 +300,9 @@ without redesign.
   retain the actual token endpoint separately from canonical lookup identity;
   refresh uses that captured path/query, never a newly configured spelling,
   and token requests refuse redirects. Rotation preserves this endpoint.
+  Token-request transport errors omit the URL, and remote error details mask
+  submitted query values in decoded/wire forms before truncation. Standard
+  OAuth failure categories are classified before masking diagnostic text.
   Every non-versioned legacy record requires re-login: historical migration
   could derive both its issuer label and raw slot from the current config,
   so even a matching noncanonical issuer/hash is not transport proof.

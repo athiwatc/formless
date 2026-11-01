@@ -810,24 +810,72 @@ pub fn parse_token_response(
 fn sanitized_oauth_error(body: &[u8], submitted_secrets: &[&str]) -> String {
     let parsed: Option<Value> = serde_json::from_slice(body).ok();
     let mut parts = Vec::new();
+    let mut classification: Option<&'static str> = None;
     if let Some(value) = parsed {
         if let Some(error) = value["error"].as_str() {
-            parts.push(error.to_string());
+            // Classify raw protocol values before masking free text. A short
+            // submitted value must not corrupt the standard failure category.
+            classification = [
+                "invalid_request",
+                "invalid_client",
+                "invalid_grant",
+                "unauthorized_client",
+                "unsupported_grant_type",
+                "invalid_scope",
+                "access_denied",
+                "temporarily_unavailable",
+                "server_error",
+            ]
+            .into_iter()
+            .find(|known| *known == error);
+            if classification.is_none() {
+                parts.push(error.to_string());
+            }
         }
         if let Some(description) = value["error_description"].as_str() {
             parts.push(description.to_string());
         }
     }
-    let text = if parts.is_empty() {
+    let text = if parts.is_empty() && classification.is_none() {
         String::from_utf8_lossy(body).trim().to_string()
     } else {
         parts.join(": ")
     };
-    crate::secrets::redact_known(&text, submitted_secrets)
+    let prefix = classification
+        .map(|kind| {
+            if text.is_empty() {
+                kind.to_string()
+            } else {
+                format!("{kind}: ")
+            }
+        })
+        .unwrap_or_default();
+    let detail: String = crate::secrets::redact_known(&text, submitted_secrets)
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
-        .take(300)
-        .collect()
+        .take(300 - prefix.chars().count())
+        .collect();
+    format!("{prefix}{detail}")
+}
+
+fn submitted_query_values(endpoint: &reqwest::Url) -> Vec<String> {
+    let mut values = std::collections::BTreeSet::new();
+    for (_, value) in endpoint
+        .query_pairs()
+        .filter(|(_, value)| !value.is_empty())
+    {
+        values.insert(value.to_string());
+        values.insert(percent_encode(&value));
+    }
+    // Retain the actual wire spelling too (including '+' and percent-hex case).
+    for part in endpoint.query().unwrap_or_default().split('&') {
+        if let Some((_, value)) = part.split_once('=') {
+            if !value.is_empty() {
+                values.insert(value.to_string());
+            }
+        }
+    }
+    values.into_iter().collect()
 }
 
 /// Revoke `token` at an RFC 7009 endpoint (blocking-safe async).
@@ -930,6 +978,8 @@ async fn token_request(
         params.insert(key.to_string(), value.to_string());
     }
     params.insert("client_id".into(), cfg.client_id.trim().to_string());
+    let endpoint = transport_token_url(&cfg.token_url)?;
+    let query_values = submitted_query_values(&endpoint);
 
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -937,7 +987,7 @@ async fn token_request(
         .user_agent(concat!("formless/", env!("CARGO_PKG_VERSION")))
         .build()
         .context("build OAuth HTTP client")?;
-    let mut request = client.post(cfg.token_url.trim()).form(&params);
+    let mut request = client.post(endpoint).form(&params);
     let client_secret = std::env::var("FORMLESS_OAUTH_CLIENT_SECRET")
         .ok()
         .filter(|s| !s.is_empty());
@@ -949,11 +999,16 @@ async fn token_request(
         // Confidential-client authentication stays out of config.toml.
         request = request.basic_auth(cfg.client_id.trim(), Some(secret));
     }
-    let response = request.send().await.context("send OAuth token request")?;
+    let response = request
+        .send()
+        .await
+        .map_err(reqwest::Error::without_url)
+        .context("send OAuth token request")?;
     let status = response.status();
     let body = response
         .bytes()
         .await
+        .map_err(reqwest::Error::without_url)
         .context("read OAuth token response")?;
     if !status.is_success() {
         let mut known: Vec<&str> = params
@@ -975,6 +1030,7 @@ async fn token_request(
             .collect();
         known.extend(client_secret.as_deref());
         known.extend(basic_credential.as_deref());
+        known.extend(query_values.iter().map(String::as_str));
         let detail = sanitized_oauth_error(&body, &known);
         if detail.is_empty() {
             bail!("OAuth token endpoint returned {status}");
@@ -1388,6 +1444,19 @@ where
 
 #[cfg(test)]
 mod error_redaction_tests {
+    #[test]
+    fn known_protocol_classification_is_not_derived_from_masked_free_text() {
+        let body=serde_json::json!({"error":"invalid_grant","error_description":"query value [grant] refused"}).to_string();
+        assert_eq!(
+            super::sanitized_oauth_error(body.as_bytes(), &["grant"]),
+            "invalid_grant: query value [[REDACTED]] refused"
+        );
+        let unknown = serde_json::json!({"error":"opaque-private-value"}).to_string();
+        assert_eq!(
+            super::sanitized_oauth_error(unknown.as_bytes(), &["opaque-private-value"]),
+            "[REDACTED]"
+        );
+    }
     #[test]
     fn echoed_opaque_credential_is_masked_before_error_truncation() {
         let secret = "opaque-credential-phrase";

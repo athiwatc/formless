@@ -76,6 +76,7 @@ struct Fixture {
 }
 impl Fixture {
     fn new(_guard: &credential_env::EnvGuard) -> Self {
+        _guard.set("NO_PROXY", "127.0.0.1,localhost");
         static MOCK: Once = Once::new();
         MOCK.call_once(|| {
             keyring::set_default_credential_builder(Box::<SharedMockBuilder>::default())
@@ -230,6 +231,7 @@ struct Seen {
     calls: Vec<(String, String, String)>,
     fail_refresh: bool,
     echo_credentials: bool,
+    echo_query: bool,
     accept_any_credential: bool,
     reject_forced_choice: bool,
     forced_rejections: usize,
@@ -300,7 +302,25 @@ async fn endpoint(
                     && body.contains("refresh_token=rotated-refresh"))
         );
         return if seen.fail_refresh {
-            let description = if seen.echo_credentials {
+            let description = if seen.echo_query {
+                let url = reqwest::Url::parse(&format!("http://private.fixture{uri}")).unwrap();
+                let value = url.query_pairs().next().unwrap().1;
+                let raw = uri.query().unwrap().split_once('=').unwrap().1;
+                let percent: String = value
+                    .bytes()
+                    .map(|byte| {
+                        if byte.is_ascii_alphanumeric() || b"-_.~".contains(&byte) {
+                            (byte as char).to_string()
+                        } else {
+                            format!("%{byte:02X}")
+                        }
+                    })
+                    .collect();
+                format!(
+                    "opaque query [{value}] [{raw}] [{percent}] {}",
+                    "X".repeat(350)
+                )
+            } else if seen.echo_credentials {
                 use base64::Engine;
                 let decoded = base64::engine::general_purpose::STANDARD
                     .decode(credential.trim_start_matches("Basic "))
@@ -917,6 +937,181 @@ async fn token_redirects_do_not_forward_credentials_or_replace_stored_evidence()
         "no request reaches the307 target"
     );
     server.close().await;
+}
+
+#[tokio::test]
+async fn token_query_echoes_are_masked_in_decoded_and_wire_forms_before_truncation() {
+    let env = credential_env::EnvGuard::isolated();
+    let f = Fixture::new(&env);
+    let server = Server::new(Seen {
+        fail_refresh: true,
+        echo_query: true,
+        ..Default::default()
+    })
+    .await;
+    let secret = "opaqueQueryQ7/with space+tail";
+    assert_eq!(
+        formless_core::secrets::redact(secret).0,
+        secret,
+        "fixture cannot rely on a token-pattern scanner"
+    );
+    let mut cfg = config(&server.base);
+    let mut endpoint = reqwest::Url::parse(&cfg.auth.token_url).unwrap();
+    endpoint.query_pairs_mut().append_pair("credential", secret);
+    cfg.auth.token_url = endpoint.to_string();
+    let mut expired = tokens();
+    expired.expires_at = Some(auth::now_epoch() - 60);
+    auth::save_oauth_tokens(&f.paths, &cfg.auth, &expired).unwrap();
+    let file = auth::oauth_tokens_file(&f.paths, &cfg.auth);
+    let before = std::fs::read(&file).unwrap();
+    let error = tokio::time::timeout(
+        Duration::from_secs(5),
+        auth::resolve_provider_token(&f.paths, &cfg),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    let detail = format!("{error:#}");
+    assert!(
+        detail.contains("400") && detail.contains("invalid_grant") && detail.contains("[REDACTED]"),
+        "{detail}"
+    );
+    assert!(
+        !detail.contains(secret) && !detail.contains("opaqueQueryQ7"),
+        "{detail}"
+    );
+    assert!(
+        !detail.contains(endpoint.query().unwrap().split_once('=').unwrap().1),
+        "wire form exposed: {detail}"
+    );
+    assert_eq!(
+        std::fs::read(&file).unwrap(),
+        before,
+        "rejected refresh cannot replace endpoint evidence"
+    );
+    assert_eq!(server.seen.lock().unwrap().refreshes, 1);
+    server.close().await;
+}
+
+#[tokio::test]
+async fn token_transport_and_parse_errors_retain_classification_without_query_credentials() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let env = credential_env::EnvGuard::isolated();
+    let _f = Fixture::new(&env);
+    let secret = "opaquePrivateQueryQ8";
+    // This port was owned by this fixture, and is closed before the request.
+    let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = closed.local_addr().unwrap();
+    drop(closed);
+    let mut cfg = config(&format!("http://{address}"));
+    cfg.auth
+        .token_url
+        .push_str(&format!("?credential={secret}"));
+    let error = tokio::time::timeout(
+        Duration::from_secs(5),
+        auth::refresh_tokens(&cfg.auth, &tokens()),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(error.downcast_ref::<reqwest::Error>().unwrap().is_connect());
+    assert!(error
+        .downcast_ref::<reqwest::Error>()
+        .unwrap()
+        .url()
+        .is_none());
+    let detail = format!("{error:#} {error:?}");
+    assert!(detail.contains("send OAuth token request"));
+    assert!(
+        !detail.contains(secret) && !detail.contains("credential="),
+        "{detail}"
+    );
+
+    // Fully consume the owned request, send valid headers with a truncated
+    // body, then close. This exercises response-body failure after send.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (sent, request) = tokio::sync::oneshot::channel();
+    let peer = tokio::spawn(async move {
+        tokio::time::timeout(Duration::from_secs(5), async move {
+            let (mut tcp, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            loop {
+                let mut buffer = [0; 1024];
+                let count = tcp.read(&mut buffer).await.unwrap();
+                assert!(count > 0);
+                bytes.extend_from_slice(&buffer[..count]);
+                assert!(bytes.len() < 16 * 1024);
+                if let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                    let headers = std::str::from_utf8(&bytes[..end]).unwrap();
+                    let size: usize = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.split_once(':')
+                                .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                                .map(|(_, size)| size.trim().parse().unwrap())
+                        })
+                        .unwrap();
+                    if bytes.len() >= end + 4 + size {
+                        sent.send(headers.lines().next().unwrap().to_string())
+                            .unwrap();
+                        break;
+                    }
+                }
+            }
+            tcp.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{")
+                .await
+                .unwrap();
+            tcp.shutdown().await.unwrap();
+        })
+        .await
+        .expect("owned truncated-response peer completes");
+    });
+    let mut cfg = config(&format!("http://{address}"));
+    cfg.auth
+        .token_url
+        .push_str(&format!("?credential={secret}"));
+    let error = tokio::time::timeout(
+        Duration::from_secs(5),
+        auth::refresh_tokens(&cfg.auth, &tokens()),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    let detail = format!("{error:#} {error:?}");
+    assert!(detail.contains("read OAuth token response"), "{detail}");
+    assert!(error
+        .downcast_ref::<reqwest::Error>()
+        .unwrap()
+        .url()
+        .is_none());
+    assert!(
+        !detail.contains(secret) && !detail.contains("credential="),
+        "{detail}"
+    );
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), request)
+            .await
+            .unwrap()
+            .unwrap(),
+        format!("POST /token?credential={secret} HTTP/1.1"),
+        "masking never alters the actual endpoint query"
+    );
+    tokio::time::timeout(Duration::from_secs(5), peer)
+        .await
+        .unwrap()
+        .unwrap();
+
+    cfg.auth.token_url = format!("http://127.0.0.1:invalid/token?credential={secret}");
+    let error = auth::refresh_tokens(&cfg.auth, &tokens())
+        .await
+        .unwrap_err();
+    let detail = format!("{error:#} {error:?}");
+    assert!(detail.contains("not a valid URL"), "{detail}");
+    assert!(
+        !detail.contains(secret) && !detail.contains("credential="),
+        "{detail}"
+    );
 }
 
 #[tokio::test]
