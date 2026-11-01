@@ -9950,7 +9950,12 @@ impl App {
             _ => return,
         }
         self.palette_sel = 0;
-        self.update_mention();
+        // Normal Escape may stop a Run without editing the composer. Do not
+        // rebuild a deliberately dismissed mention from the Normal cursor's
+        // shorter prefix. Escape paths that cleared text still clear mentions.
+        if !self.vim_mode || key.code != KeyCode::Esc || self.input.is_empty() {
+            self.update_mention();
+        }
     }
 
     /// A bracketed paste: one block, wherever text is being typed.
