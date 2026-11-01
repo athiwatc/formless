@@ -75,6 +75,7 @@ impl ProbePolicy {
     }
     fn check(&self) -> Result<()> {
         if tokio::time::Instant::now() >= self.0.deadline {
+            self.0.timed_out.store(true, Ordering::SeqCst);
             bail!("model probe logical deadline exceeded")
         }
         Ok(())
@@ -313,6 +314,20 @@ mod tests {
         let mut next = json!({"max_tokens":-1});
         policy.finalize(&mut next, &cfg, "claude-x").unwrap();
         assert_eq!(next["max_tokens"], 64);
+    }
+    #[test]
+    fn expired_pre_send_deadline_reports_partial_without_http() {
+        let policy = ProbePolicy::limited(Duration::ZERO, 8);
+        assert!(policy
+            .before_send()
+            .unwrap_err()
+            .to_string()
+            .contains("logical deadline"));
+        let report = policy.report();
+        assert_eq!(report["requests_sent"], 0);
+        assert_eq!(report["deadline_exceeded"], true);
+        assert_eq!(report["usage_partial"], true);
+        assert!(report["reported_usage"].is_null());
     }
     #[test]
     fn send_budget_and_usage_report_do_not_invent_unreported_zeroes() {
