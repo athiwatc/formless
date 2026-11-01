@@ -649,6 +649,10 @@ pub struct ModuleVersionInfo {
 /// A module with its history and the Tools that load it (SPEC §7.7).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ModuleDetail {
+    #[serde(default)]
+    pub description_review: DescriptionMetadata,
+    #[serde(default)]
+    pub description_reviews: Vec<DescriptionReview>,
     pub module: ModuleInfo,
     /// Oldest first.
     pub versions: Vec<ModuleVersionInfo>,
@@ -980,9 +984,34 @@ pub struct MemoryInfo {
     pub last_used: Option<String>,
 }
 
+/// A bounded single-line third-party description and its review warnings.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DescriptionMetadata {
+    pub text: String,
+    #[serde(default)]
+    pub flags: Vec<String>,
+}
+
+/// Durable evidence of screened metadata creation or a description change.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DescriptionReview {
+    pub id: String,
+    pub kind: String,
+    pub name: String,
+    pub version: i64,
+    pub source: String,
+    pub before: Option<DescriptionMetadata>,
+    pub after: DescriptionMetadata,
+    pub created_at: String,
+}
+
 /// An installed skill (SPEC §7.10).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SkillInfo {
+    #[serde(default)]
+    pub description_review: DescriptionMetadata,
+    #[serde(default)]
+    pub description_reviews: Vec<DescriptionReview>,
     pub name: String,
     pub description: String,
     pub version: i64,
@@ -1091,6 +1120,10 @@ pub struct ModelStatInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolDetail {
+    #[serde(default)]
+    pub description_review: DescriptionMetadata,
+    #[serde(default)]
+    pub description_reviews: Vec<DescriptionReview>,
     pub tool: ToolInfo,
     pub versions: Vec<ToolVersionInfo>,
     pub metrics: ToolMetricsInfo,
@@ -1607,6 +1640,25 @@ pub enum Request {
         #[serde(default)]
         cwd: Option<String>,
     },
+    /// Screen a description without saving or running anything.
+    PreviewDescription {
+        kind: String,
+        name: String,
+        description: String,
+    },
+    /// Inspect actual Tool/module/Skill bundle metadata without installing it.
+    PreviewDescriptionBundle {
+        bundle: serde_json::Value,
+    },
+    /// Durable description warnings and before/after changes, newest first.
+    ListDescriptionReviews {
+        #[serde(default)]
+        kind: Option<String>,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        limit: Option<u32>,
+    },
     ListSkills,
     /// Install a skill from a folder, a git URL (`git_ref`, `subdir`) or a
     /// `.zip`. New installs start disabled: review, then enable.
@@ -2067,6 +2119,10 @@ pub enum Request {
     /// `user` (SPEC §10.4).
     UpdateToolSpec {
         id: String,
+        /// Bind a reviewed metadata edit to its current version; older clients
+        /// omit this and retain their existing explicit-update behavior.
+        #[serde(default)]
+        expected_current_version: Option<i64>,
         #[serde(default)]
         description: Option<String>,
         #[serde(default)]

@@ -21,7 +21,13 @@ pub fn effective_prompt(st: &Store, cfg: &Config) -> Result<String> {
         .list_skills()?
         .into_iter()
         .filter(|s| s.enabled && !s.retired)
-        .map(|s| format!("- {}: {}", s.name, s.description))
+        .map(|s| {
+            format!(
+                "- {}: {}",
+                s.name,
+                crate::descriptions::model_text(&s.description)
+            )
+        })
         .collect();
     if !skills.is_empty() {
         prompt.push_str("\n\nSkills (load one with load_skill before a task it covers):\n");
@@ -315,6 +321,7 @@ pub(crate) fn estimate_store_with_window(
         Some(p) => p,
         None => fresh_prompt(st, cfg, session.as_ref(), &model, cwd)?,
     };
+    let legacy_skill_index = crate::descriptions::has_legacy_skill_index(&prompt);
     let mut ctx = if let Some(id) = input.session_id.as_deref() {
         crate::storage::build_context(st, id, &prompt, window, cfg.compaction.fraction())?.0
     } else {
@@ -526,6 +533,9 @@ pub(crate) fn estimate_store_with_window(
             .into(),
         "Legacy Runs without frozen inputs excluded; interrupted/unknown outcomes excluded; at most 50 newest comparable observations from the last 2000 recorded Runs".into(),
     ];
+    if legacy_skill_index {
+        warnings.push(crate::descriptions::LEGACY_SKILL_INDEX_ERROR.into());
+    }
     if window_source == "default" {
         warnings.push("Endpoint context window is not cached; compaction risk uses configured/default window and may differ at dispatch".into());
     }
@@ -624,6 +634,9 @@ pub(crate) fn estimate_store_with_window(
             ""
         }
     );
+    if legacy_skill_index {
+        f.hint = format!("Blocked: legacy Skill index; use /fork · {}", f.hint);
+    }
     Ok(f)
 }
 

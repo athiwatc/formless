@@ -926,7 +926,7 @@ pub fn registry_definition(info: &ToolInfo, v: &formless_protocol::ToolVersionIn
         serde_json::from_str(&v.input_schema).unwrap_or_else(|_| json!({"type": "object"}));
     json!({
         "type": "function",
-        "function": {"name": info.name, "description": info.description, "parameters": params}
+        "function": {"name": info.name, "description": crate::descriptions::model_text(&info.description), "parameters": params}
     })
 }
 
@@ -1209,6 +1209,7 @@ fn definitions(
         .map(|t| t.name.to_lowercase())
         .collect();
     let mut defs = builtin_definitions();
+    let trusted_builtins = defs.len();
     for info in shown {
         // A Session keeps the definition it first listed (a promotion or
         // rollback elsewhere must not rewrite its cached prefix); it picks
@@ -1247,6 +1248,20 @@ fn definitions(
             (!pinned_names.contains(&name), name)
         });
         defs.extend(registry);
+    }
+    // Persisted active/inactive definitions are immutable snapshots, but their
+    // old raw descriptions still need the current model-facing data boundary.
+    // Do not write the projection back or reinterpret any schema value.
+    for definition in defs.iter_mut().skip(trusted_builtins) {
+        if let Some(function) = definition
+            .get_mut("function")
+            .and_then(Value::as_object_mut)
+        {
+            if let Some(description) = function.get("description").and_then(Value::as_str) {
+                let description = crate::descriptions::project_model_text(description);
+                function.insert("description".into(), Value::String(description));
+            }
+        }
     }
     Ok(defs)
 }

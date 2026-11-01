@@ -213,7 +213,9 @@ enum Pending {
     ListModelStats,
     ListProposals,
     UpdateTool,
-    GetTool,
+    GetTool {
+        description_revision: u64,
+    },
     ExportTool,
     ExportSession,
     /// Resume/abandon: the answer is a note (errors already are).
@@ -232,6 +234,19 @@ enum Pending {
     SkillPreview,
     Forget,
     ListAudit,
+    DescriptionReviews {
+        show: bool,
+        revision: u64,
+    },
+    ImportDescriptions {
+        source: String,
+        fingerprint: String,
+    },
+    DescriptionSave {
+        id: String,
+        text: String,
+        version: i64,
+    },
     SessionUsage,
     GapUsage {
         session_id: String,
@@ -1414,6 +1429,13 @@ struct App {
     interrupted_attachment_sends: std::collections::VecDeque<PendingSend>,
     sends: client::SendTracker,
     restored_send: Option<(String, String)>,
+    description_review_seen: std::collections::HashSet<String>,
+    description_history_revision: [u64; 2],
+    description_save_preview: Option<(String, String, i64)>,
+    description_editor_observed: Option<(String, i64)>,
+    description_editor_revision: u64,
+    import_description_preview: Option<(String, String)>,
+    import_description_requested: Option<(String, String)>,
     /// Files and pasted images for the next message, shown as chips in
     /// the input and uploaded when it is sent (SPEC §5.6).
     attachments: Vec<(String, Vec<u8>)>,
@@ -1745,6 +1767,13 @@ impl App {
             interrupted_attachment_sends: Default::default(),
             sends: Default::default(),
             restored_send: None,
+            description_review_seen: Default::default(),
+            description_history_revision: Default::default(),
+            description_save_preview: None,
+            description_editor_observed: None,
+            description_editor_revision: 0,
+            import_description_preview: None,
+            import_description_requested: None,
             attachments: Vec::new(),
             palette_sel: 0,
             palette_hidden: None,
@@ -1878,6 +1907,9 @@ impl App {
     /// Initial connection and reconnect both refresh connection-specific state.
     fn attach_daemon(&mut self, client: DaemonClient, inbox: mpsc::Receiver<ServerMessage>) {
         self.clear_attention();
+        self.description_save_preview = None;
+        self.description_editor_observed = None;
+        self.description_editor_revision = self.description_editor_revision.wrapping_add(1);
         self.pending.clear();
         self.pending_since.clear();
         self.reconnect_request = None;
@@ -1888,6 +1920,7 @@ impl App {
         self.inbox = Some(inbox);
         self.send_request(Pending::DaemonMode, Request::Status);
         self.send_request(Pending::ListSessions, Request::ListSessions);
+        self.refresh_description_reviews(false);
         if self.offline.is_some() {
             self.begin_reconnect_snapshot();
         }
@@ -2241,6 +2274,54 @@ impl App {
         }
     }
 
+    fn description_editor_version(&self, id: &str) -> i64 {
+        // Versions can decrease on rollback. An observed current version is
+        // authoritative; request generations, not numeric MAX, order replies.
+        self.description_editor_observed
+            .as_ref()
+            .filter(|(tool, _)| tool == id)
+            .map(|(_, version)| *version)
+            .or_else(|| {
+                self.tool_detail
+                    .as_ref()
+                    .filter(|d| d.tool.id == id)
+                    .map(|d| d.tool.current_version)
+            })
+            .or_else(|| {
+                self.tools
+                    .iter()
+                    .find(|tool| tool.id == id)
+                    .map(|tool| tool.current_version)
+            })
+            .unwrap_or(0)
+    }
+
+    fn request_tool(&mut self, id: String) {
+        self.request(
+            Pending::GetTool {
+                description_revision: self.description_editor_revision,
+            },
+            Request::GetTool { id },
+        );
+    }
+
+    fn refresh_description_reviews(&mut self, show: bool) {
+        let index = usize::from(show);
+        self.description_history_revision[index] =
+            self.description_history_revision[index].wrapping_add(1);
+        self.request(
+            Pending::DescriptionReviews {
+                show,
+                revision: self.description_history_revision[index],
+            },
+            Request::ListDescriptionReviews {
+                kind: None,
+                name: None,
+                limit: Some(if show { 100 } else { 20 }),
+            },
+        );
+    }
+
     fn request(&mut self, kind: Pending, req: Request) {
         if self.offline.is_some()
             && !matches!(
@@ -2249,6 +2330,9 @@ impl App {
                     | Request::Status
                     | Request::ListTools
                     | Request::ListModules
+                    | Request::ListDescriptionReviews { .. }
+                    | Request::PreviewDescription { .. }
+                    | Request::PreviewDescriptionBundle { .. }
                     | Request::ContextUsage { .. }
                     | Request::RunMetrics { .. }
                     | Request::SessionUsage { .. }
@@ -2676,7 +2760,7 @@ impl App {
                         }
                         Pending::PreviewTool => {
                             let ok = result["ok"] == true;
-                            let verdict = if ok {
+                            let mut verdict = if ok {
                                 match result["smoke_note"].as_str() {
                                     Some(note) => {
                                         format!("Passes the syntax check; smoke test {note}")
@@ -2690,6 +2774,17 @@ impl App {
                                     result["error"].as_str().unwrap_or_default()
                                 )
                             };
+                            if let Ok(metadata) =
+                                serde_json::from_value::<formless_protocol::DescriptionMetadata>(
+                                    result["description_review"].clone(),
+                                )
+                            {
+                                let warning = description_review_text(&metadata, &[]);
+                                if !warning.is_empty() {
+                                    verdict.push_str("\n");
+                                    verdict.push_str(&warning.join("\n"));
+                                }
+                            }
                             if self.editor.is_some() {
                                 self.editor_review = Some(EditorReview {
                                     diff: result["diff"].as_str().unwrap_or_default().to_string(),
@@ -2729,7 +2824,7 @@ impl App {
                             self.editor = None;
                             self.request(Pending::ListTools, Request::ListTools);
                             if let Some(t) = self.selected_tool().cloned() {
-                                self.request(Pending::GetTool, Request::GetTool { id: t.id });
+                                self.request_tool(t.id);
                             }
                         }
                         Pending::ListTools => {
@@ -2841,8 +2936,21 @@ impl App {
                                 styled: Vec::new(),
                             });
                         }
-                        Pending::GetTool => {
+                        Pending::GetTool {
+                            description_revision,
+                        } => {
                             if let Ok(d) = serde_json::from_value::<ToolDetail>(result) {
+                                if self
+                                    .description_editor_observed
+                                    .as_ref()
+                                    .is_some_and(|(id, _)| *id == d.tool.id)
+                                {
+                                    if description_revision != self.description_editor_revision {
+                                        continue;
+                                    }
+                                    self.description_editor_observed =
+                                        Some((d.tool.id.clone(), d.tool.current_version));
+                                }
                                 if self.tool_detail.as_ref().map(|o| &o.tool.id) != Some(&d.tool.id)
                                 {
                                     self.call_idx = None;
@@ -3305,6 +3413,115 @@ impl App {
                                 ));
                             }
                         }
+                        Pending::ImportDescriptions {
+                            source,
+                            fingerprint,
+                        } => {
+                            if self.import_mode == Some(ImportKind::Tool)
+                                && self.input.expanded().trim() == source
+                                && self.import_description_requested.as_ref()
+                                    == Some(&(source.clone(), fingerprint.clone()))
+                            {
+                                let mut lines = Vec::new();
+                                for preview in result.as_array().into_iter().flatten() {
+                                    lines.push(format!(
+                                        "{} {} · import metadata",
+                                        preview["kind"].as_str().unwrap_or_default(),
+                                        preview["name"].as_str().unwrap_or_default()
+                                    ));
+                                    let metadata: formless_protocol::DescriptionMetadata =
+                                        serde_json::from_value(preview["after"].clone())
+                                            .unwrap_or_default();
+                                    lines.extend(description_review_text(&metadata, &[]));
+                                    if !preview["before"].is_null() {
+                                        lines.push(format!(
+                                            "Existing name (imports may rename): {}",
+                                            preview["before"]
+                                        ));
+                                    }
+                                    lines.push(format!(
+                                        "Imported metadata: {}",
+                                        serde_json::to_string(&metadata.text).unwrap()
+                                    ));
+                                }
+                                lines.push("Close preview, then Enter on the same file path to import. Changed file bytes require a new preview.".into());
+                                self.import_description_preview = Some((source, fingerprint));
+                                self.pager = Some(Pager {
+                                    title: "Import description preview".into(),
+                                    lines,
+                                    top: 0,
+                                    left: 0,
+                                    styled: Vec::new(),
+                                });
+                            }
+                        }
+                        Pending::DescriptionSave { id, text, version } => {
+                            let current = self.editor.as_ref().is_some_and(|editor| {
+                                editor.tool_id == id
+                                    && editor.mode == EditMode::Description
+                                    && editor.text().trim() == text
+                            });
+                            let latest = self.description_editor_version(&id);
+                            if current
+                                && latest == version
+                                && result["version"].as_i64() == Some(version)
+                            {
+                                let metadata: formless_protocol::DescriptionMetadata =
+                                    serde_json::from_value(result["after"].clone())
+                                        .unwrap_or_default();
+                                let mut lines = description_review_text(&metadata, &[]);
+                                lines.push(format!(
+                                    "Before: {}",
+                                    serde_json::to_string(&result["before"]).unwrap()
+                                ));
+                                lines.push(format!(
+                                    "After: {}",
+                                    serde_json::to_string(&metadata.text).unwrap()
+                                ));
+                                lines.push("Close this preview, then Ctrl+S again to save this exact text. Code/capability approval is unchanged.".into());
+                                self.description_save_preview = Some((id, text, version));
+                                self.pager = Some(Pager {
+                                    title: "Description preview".into(),
+                                    lines,
+                                    top: 0,
+                                    left: 0,
+                                    styled: Vec::new(),
+                                });
+                            } else if current {
+                                self.notes.push("Description changed while previewing; refresh the Tool and preview again.".into());
+                            }
+                        }
+                        Pending::DescriptionReviews { show, revision } => {
+                            if revision != self.description_history_revision[usize::from(show)] {
+                                continue;
+                            }
+                            let reviews: Vec<formless_protocol::DescriptionReview> =
+                                serde_json::from_value(result).unwrap_or_default();
+                            let mut lines = Vec::new();
+                            for review in &reviews {
+                                let notice = formless_core::descriptions::notice(review);
+                                lines.extend(notice.lines().map(str::to_string));
+                                lines.push(String::new());
+                                if !show && !self.description_review_seen.contains(&review.id) {
+                                    self.notes.extend(notice.lines().map(str::to_string));
+                                }
+                            }
+                            if show {
+                                if lines.is_empty() {
+                                    lines.push("No description reviews yet.".into());
+                                }
+                                self.pager = Some(Pager {
+                                    title: "Description reviews".into(),
+                                    lines,
+                                    top: 0,
+                                    left: 0,
+                                    styled: Vec::new(),
+                                });
+                            } else {
+                                self.description_review_seen =
+                                    reviews.into_iter().map(|review| review.id).collect();
+                            }
+                        }
                         Pending::ListAudit => {
                             let list: Vec<formless_protocol::AuditEntry> =
                                 serde_json::from_value(result).unwrap_or_default();
@@ -3378,6 +3595,17 @@ impl App {
                                 ),
                                 String::new(),
                             ];
+                            let metadata: formless_protocol::DescriptionMetadata =
+                                serde_json::from_value(
+                                    result["skill"]["description_review"].clone(),
+                                )
+                                .unwrap_or_default();
+                            let reviews: Vec<formless_protocol::DescriptionReview> =
+                                serde_json::from_value(
+                                    result["skill"]["description_reviews"].clone(),
+                                )
+                                .unwrap_or_default();
+                            lines.extend(description_review_text(&metadata, &reviews));
                             lines.extend(
                                 result["body"]
                                     .as_str()
@@ -3501,6 +3729,8 @@ impl App {
                                 );
                             }
                             for s in list {
+                                self.notes
+                                    .extend(description_review_text(&s.description_review, &[]));
                                 self.notes.push(format!(
                                     "skill {} v{} {} · {} loads{} · {}{}{}",
                                     s.name,
@@ -3629,6 +3859,12 @@ impl App {
                                     )
                                 })
                                 .collect();
+                            for tool in result["tools"].as_array().into_iter().flatten() {
+                                let metadata: formless_protocol::DescriptionMetadata =
+                                    serde_json::from_value(tool["description_review"].clone())
+                                        .unwrap_or_default();
+                                lines.extend(description_review_text(&metadata, &[]));
+                            }
                             lines.push(String::new());
                             lines.push(format!(
                                 "Enabled tools cost ~{} tokens per request. /mcp tool {name} TOOL on|off",
@@ -4687,6 +4923,14 @@ impl App {
                 if !self.is_current(&session_id) {
                     return;
                 }
+                if matches!(tool_name.as_str(), "create_tool" | "create_module") {
+                    if let Ok(args) = serde_json::from_str::<serde_json::Value>(&arguments) {
+                        let metadata = formless_core::descriptions::screen(
+                            args["description"].as_str().unwrap_or_default(),
+                        );
+                        self.notes.extend(description_review_text(&metadata, &[]));
+                    }
+                }
                 self.set_activity(format!("running {tool_name}"));
                 self.live_tools.push(LiveToolCall {
                     name: tool_name.clone(),
@@ -4852,6 +5096,31 @@ impl App {
                 });
             }
             Event::ToolUpdated { tool } => {
+                let editing = self.editor.as_ref().is_some_and(|editor| {
+                    editor.tool_id == tool.id && editor.mode == EditMode::Description
+                });
+                let tracking = editing
+                    || self
+                        .description_editor_observed
+                        .as_ref()
+                        .is_some_and(|(id, _)| *id == tool.id)
+                    || self
+                        .tool_detail
+                        .as_ref()
+                        .is_some_and(|detail| detail.tool.id == tool.id);
+                if tracking {
+                    self.description_editor_revision =
+                        self.description_editor_revision.wrapping_add(1);
+                    self.description_editor_observed =
+                        Some((tool.id.clone(), tool.current_version));
+                    self.description_save_preview = None;
+                    if editing {
+                        self.notes.push(
+                            "Tool changed; review its current description before saving.".into(),
+                        );
+                    }
+                    self.request_tool(tool.id.clone());
+                }
                 if let Some(existing) = self.tools.iter_mut().find(|x| x.id == tool.id) {
                     *existing = tool;
                 } else {
@@ -5341,9 +5610,29 @@ impl App {
             match std::fs::read_to_string(&text)
                 .map_err(|e| e.to_string())
                 .and_then(|s| {
-                    serde_json::from_str::<serde_json::Value>(&s).map_err(|e| e.to_string())
+                    let fingerprint = formless_core::descriptions::fingerprint(&s);
+                    serde_json::from_str::<serde_json::Value>(&s)
+                        .map(|bundle| (bundle, fingerprint))
+                        .map_err(|e| e.to_string())
                 }) {
-                Ok(bundle) => {
+                Ok((bundle, fingerprint)) => {
+                    if kind == ImportKind::Tool {
+                        let signature = (text.clone(), fingerprint);
+                        if self.import_description_preview.as_ref() != Some(&signature) {
+                            self.import_mode = Some(kind);
+                            self.import_description_requested = Some(signature.clone());
+                            self.input.set(&text);
+                            self.request(
+                                Pending::ImportDescriptions {
+                                    source: signature.0,
+                                    fingerprint: signature.1,
+                                },
+                                Request::PreviewDescriptionBundle { bundle },
+                            );
+                            return;
+                        }
+                        self.import_description_preview = None;
+                    }
                     self.fire(match kind {
                         ImportKind::Tool => Request::ImportTool { bundle },
                         ImportKind::Session => Request::ImportSession { bundle },
@@ -6352,6 +6641,7 @@ impl App {
                 }
                 None => self.notes.push("open a session first".into()),
             },
+            "descriptionreviews" => self.refresh_description_reviews(true),
             "audit" => self.request(
                 Pending::ListAudit,
                 Request::ListAudit {
@@ -8107,7 +8397,7 @@ impl App {
                     if let Some(call) = self.selected_call() {
                         self.open_call(&call);
                     } else if let Some(tool) = self.selected_tool().cloned() {
-                        self.request(Pending::GetTool, Request::GetTool { id: tool.id });
+                        self.request_tool(tool.id);
                     }
                 }
                 KeyCode::Char('c') => {
@@ -8206,7 +8496,7 @@ impl App {
                                 });
                             }
                             _ => {
-                                self.request(Pending::GetTool, Request::GetTool { id: tool.id });
+                                self.request_tool(tool.id);
                                 self.notes
                                     .push("loading Tool detail; press E again to edit".into());
                             }
@@ -8266,7 +8556,7 @@ impl App {
                                 .notes
                                 .push(format!("{} has only one version", tool.name)),
                             _ => {
-                                self.request(Pending::GetTool, Request::GetTool { id: tool.id });
+                                self.request_tool(tool.id);
                                 self.notes
                                     .push("loading versions… press b again to pick one".into());
                             }
@@ -8585,7 +8875,7 @@ impl App {
         {
             self.tool_idx = pos;
         }
-        self.request(Pending::GetTool, Request::GetTool { id });
+        self.request_tool(id);
     }
 
     fn selected_tool(&self) -> Option<&ToolInfo> {
@@ -11962,6 +12252,14 @@ impl App {
 
     /// Edit Tool `d`'s description (`D`) or schemas (`S`) in the editor.
     fn start_spec_editor(&mut self, d: &ToolDetail, mode: EditMode) {
+        self.description_save_preview = None;
+        self.description_editor_revision = self.description_editor_revision.wrapping_add(1);
+        let version = self
+            .description_editor_observed
+            .as_ref()
+            .filter(|(id, _)| *id == d.tool.id)
+            .map_or(d.tool.current_version, |(_, version)| *version);
+        self.description_editor_observed = Some((d.tool.id.clone(), version));
         let current = d
             .versions
             .iter()
@@ -12003,8 +12301,28 @@ impl App {
                 self.notes.push("the description can't be empty".into());
                 return;
             }
+            let version = self.description_editor_version(&id);
+            let signature = (id.clone(), text.clone(), version);
+            if self.description_save_preview.as_ref() != Some(&signature) {
+                let name = ed.name.clone();
+                self.request(
+                    Pending::DescriptionSave {
+                        id,
+                        text: text.clone(),
+                        version,
+                    },
+                    Request::PreviewDescription {
+                        kind: "tool".into(),
+                        name,
+                        description: text,
+                    },
+                );
+                return;
+            }
+            self.description_save_preview = None;
             Request::UpdateToolSpec {
                 id,
+                expected_current_version: Some(version),
                 description: Some(text),
                 input_schema: None,
                 output_schema: None,
@@ -12025,6 +12343,7 @@ impl App {
             }
             Request::UpdateToolSpec {
                 id,
+                expected_current_version: None,
                 description: None,
                 input_schema: Some(input),
                 output_schema: Some(output),
@@ -14481,6 +14800,11 @@ fn tool_detail_lines(app: &App) -> Vec<Line<'static>> {
                     ));
                 }
             }
+            lines.extend(
+                description_review_text(&d.description_review, &d.description_reviews)
+                    .into_iter()
+                    .map(Line::raw),
+            );
             if let Some(ex) = &d.example {
                 lines.push(Line::raw(""));
                 lines.push(Line::from(vec![
@@ -14661,6 +14985,31 @@ fn tool_detail_lines(app: &App) -> Vec<Line<'static>> {
     lines
 }
 
+fn description_review_text(
+    metadata: &formless_protocol::DescriptionMetadata,
+    reviews: &[formless_protocol::DescriptionReview],
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    if !metadata.flags.is_empty() {
+        lines.push(format!(
+            "Description warning: {}",
+            metadata.flags.join("; ")
+        ));
+        lines.push(format!(
+            "Third-party metadata: {}",
+            serde_json::to_string(&metadata.text).unwrap()
+        ));
+    }
+    for review in reviews {
+        lines.extend(
+            formless_core::descriptions::notice(review)
+                .lines()
+                .map(str::to_string),
+        );
+    }
+    lines
+}
+
 /// A module's detail: versions, who loads it, its current code.
 fn module_detail_lines(d: &ModuleDetail, color: bool) -> Vec<Line<'static>> {
     let m = &d.module;
@@ -14693,6 +15042,11 @@ fn module_detail_lines(d: &ModuleDetail, color: bool) -> Vec<Line<'static>> {
         ),
         Line::raw(""),
     ];
+    lines.extend(
+        description_review_text(&d.description_review, &d.description_reviews)
+            .into_iter()
+            .map(Line::raw),
+    );
     if let Some(cur) = d.versions.iter().find(|v| v.version == m.current_version) {
         for (i, l) in cur.code.lines().take(60).enumerate() {
             lines.push(Line::from(vec![
@@ -14919,6 +15273,20 @@ fn draw_approval(
             Line::raw(""),
         ],
     };
+    if req.detail.is_some() && req.tool_id.is_some() {
+        lines.insert(
+            0,
+            Line::raw(format!(
+                "Tool {} v{} wants sensitive capabilities:",
+                if title.is_empty() {
+                    req.tool_name.clone()
+                } else {
+                    format!("{title} ({})", req.tool_name)
+                },
+                req.version
+            )),
+        );
+    }
     // A parallel batch: every held call, each answered on its own (§5.2).
     if let Some((b, answers)) = batch {
         let mut head = vec![Line::styled(
@@ -14955,7 +15323,7 @@ fn draw_approval(
         lines.splice(0..0, head);
     }
     // What it does in plain words, AI-written and labelled so (SPEC §10.3).
-    if let Some(text) = summary.filter(|_| req.detail.is_none()) {
+    if let Some(text) = summary.filter(|_| req.detail.is_none() || req.tool_id.is_some()) {
         lines.insert(
             0,
             Line::from(vec![
@@ -15058,7 +15426,7 @@ fn draw_approval(
             ));
         }
     }
-    if req.detail.is_none() {
+    if req.detail.is_none() || req.tool_id.is_some() {
         lines.push(Line::raw(format!("  • memory {} MB", req.memory_mb)));
     }
     if let Some(code) = &req.code_preview {
@@ -15964,6 +16332,13 @@ mod tests {
             interrupted_attachment_sends: Default::default(),
             sends: Default::default(),
             restored_send: None,
+            description_review_seen: Default::default(),
+            description_history_revision: Default::default(),
+            description_save_preview: None,
+            description_editor_observed: None,
+            description_editor_revision: 0,
+            import_description_preview: None,
+            import_description_requested: None,
             attachments: Vec::new(),
             palette_sel: 0,
             palette_hidden: None,
@@ -19046,6 +19421,8 @@ mod tests {
             code: code.into(),
         };
         app.module_detail = Some(ModuleDetail {
+            description_review: Default::default(),
+            description_reviews: Vec::new(),
             module,
             versions: vec![
                 version(1, "module.exports = 1;"),
@@ -20919,6 +21296,8 @@ mod tests {
         };
         app.tools = vec![tool.clone()];
         app.tool_detail = Some(ToolDetail {
+            description_review: Default::default(),
+            description_reviews: Vec::new(),
             tool,
             versions: vec![ToolVersionInfo {
                 version: 1,
@@ -21247,6 +21626,8 @@ mod tests {
             created_at: at.into(),
         };
         app.tool_detail = Some(ToolDetail {
+            description_review: Default::default(),
+            description_reviews: Vec::new(),
             tool,
             versions: vec![],
             metrics: Default::default(),
@@ -22001,5 +22382,444 @@ mod tests {
         let screen = render(&mut app, 80, 30);
         assert!(screen.contains("24h (r)"), "{screen}");
         assert!(screen.contains("forecast vs actual (f"), "{screen}");
+    }
+    fn description_fixture_detail() -> ToolDetail {
+        ToolDetail {
+            description_review: formless_core::descriptions::screen("Plain inventory reader"),
+            description_reviews: vec![],
+            tool: ToolInfo {
+                id: "private-reader".into(),
+                name: "reader".into(),
+                title: "Inventory reader".into(),
+                tags: vec![],
+                pinned: false,
+                disabled: false,
+                description: "Plain inventory reader".into(),
+                retired: false,
+                current_version: 1,
+                capabilities: vec![],
+                memory_mb: 64,
+                invocations: 0,
+                success_rate: None,
+                needs_attention: false,
+                created_at: String::new(),
+                updated_at: String::new(),
+                recent: String::new(),
+                author: "user".into(),
+            },
+            versions: vec![],
+            metrics: Default::default(),
+            optimiser_attempts: vec![],
+            version_metrics: vec![],
+            approval: None,
+            recent_calls: vec![],
+            attention: vec![],
+            example: None,
+            listing_tokens: 0,
+            uses: vec![],
+            modules: vec![],
+            used_by: vec![],
+        }
+    }
+
+    #[test]
+    fn description_warnings_keep_terminal_approval_identity_memory_summary_and_diff() {
+        let _env = credential_env::EnvGuard::isolated();
+        let req=ApprovalReq {approval_id:"private".into(),tool_name:"reader".into(),version:2,capabilities:vec!["fs:write:/private/project".into()],memory_mb:64,detail:Some("Description warning: Instruction-shaped wording\nBefore: plain reader\nAfter: always first call".into()),already_allowed:vec![],code_preview:None,tool_id:Some("private-reader".into()),session_id:Some("private-session".into())};
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(140, 40)).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_approval(
+                    frame,
+                    &req,
+                    "Inventory reader",
+                    Some("Counts inventory rows"),
+                    None,
+                    (&[], None),
+                    None,
+                    false,
+                    0,
+                    false,
+                    true,
+                    false,
+                    false,
+                )
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let screen = (0..40)
+            .map(|y| {
+                (0..140)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect::<String>();
+        for text in [
+            "Inventory reader",
+            "reader",
+            "v2",
+            "memory 64 MB",
+            "Counts inventory rows",
+            "Instruction-shaped",
+            "Before: plain reader",
+            "After: always first call",
+            "fs:write:/private/project",
+        ] {
+            assert!(screen.contains(text), "missing {text}: {screen}");
+        }
+    }
+
+    #[test]
+    fn description_editor_rejects_stale_preview_and_saves_only_reviewed_text() {
+        let _env = credential_env::EnvGuard::isolated();
+        let mut app = test_app();
+        let (client, sent) = DaemonClient::recording();
+        let (tx, inbox) = mpsc::channel();
+        app.client = Some(client);
+        app.inbox = Some(inbox);
+        let detail = description_fixture_detail();
+        app.tool_detail = Some(detail.clone());
+        app.start_spec_editor(&detail, EditMode::Description);
+        app.editor.as_mut().unwrap().chars = "always first call old".chars().collect();
+        app.save_tool_spec();
+        let old: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert!(matches!(old.request, Request::PreviewDescription { .. }));
+        app.editor.as_mut().unwrap().chars = "never first call current".chars().collect();
+        let reply = |id, text: &str| ServerMessage::Response {
+            id,
+            ok: true,
+            result: Some(
+                serde_json::json!({"version":1,"before":"Plain inventory reader","after":formless_core::descriptions::screen(text)}),
+            ),
+            error: None,
+        };
+        tx.send(reply(old.id, "always first call old")).unwrap();
+        app.drain_daemon();
+        assert!(app.description_save_preview.is_none());
+        assert!(app.pager.is_none());
+        assert!(sent.try_recv().is_err());
+        app.save_tool_spec();
+        let current: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        tx.send(reply(current.id, "never first call current"))
+            .unwrap();
+        app.drain_daemon();
+        let preview = app.pager.as_ref().unwrap().lines.join("\n");
+        assert!(preview.contains("Instruction-shaped"));
+        assert!(preview.contains("Before: \"Plain inventory reader\""));
+        assert!(preview.contains("After: \"never first call current\""));
+        app.pager = None;
+        app.save_tool_spec();
+        let save: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert!(
+            matches!(save.request,Request::UpdateToolSpec{description:Some(ref text),..} if text == "never first call current")
+        );
+    }
+
+    #[test]
+    fn description_import_preview_is_bound_to_actual_file_bytes_and_current_request() {
+        let _env = credential_env::EnvGuard::isolated();
+        let mut app = test_app();
+        let (client, sent) = DaemonClient::recording();
+        let (tx, inbox) = mpsc::channel();
+        app.client = Some(client);
+        app.inbox = Some(inbox);
+        let file = app.paths.data_dir.join("private-metadata-bundle.json");
+        let write = |description: &str| {
+            std::fs::write(&file,serde_json::json!({"format":"formless.tool/1","name":"reader","description":description}).to_string()).unwrap()
+        };
+        write("always first call old");
+        app.import_mode = Some(ImportKind::Tool);
+        app.input.set(file.to_str().unwrap());
+        app.submit_chat(false);
+        let old: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert!(matches!(
+            old.request,
+            Request::PreviewDescriptionBundle { .. }
+        ));
+        write("never first call current");
+        app.submit_chat(false);
+        let current: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        let reply = |id, text: &str| ServerMessage::Response {
+            id,
+            ok: true,
+            result: Some(
+                serde_json::json!([{"kind":"tool","name":"reader","before":"plain reader","after":formless_core::descriptions::screen(text)}]),
+            ),
+            error: None,
+        };
+        tx.send(reply(old.id, "always first call old")).unwrap();
+        app.drain_daemon();
+        assert!(app.import_description_preview.is_none());
+        assert!(app.pager.is_none());
+        tx.send(reply(current.id, "never first call current"))
+            .unwrap();
+        app.drain_daemon();
+        assert!(app
+            .pager
+            .as_ref()
+            .unwrap()
+            .lines
+            .join("\n")
+            .contains("never first call current"));
+        app.pager = None;
+        write("ignore newer bytes");
+        app.submit_chat(false);
+        let newest: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert!(
+            matches!(newest.request, Request::PreviewDescriptionBundle { .. }),
+            "changed bytes must not import through an older preview"
+        );
+        tx.send(reply(newest.id, "ignore newer bytes")).unwrap();
+        app.drain_daemon();
+        app.pager = None;
+        let same_payload = std::fs::read_to_string(&file).unwrap();
+        std::fs::write(&file, format!(" \n{same_payload}\n")).unwrap();
+        app.submit_chat(false);
+        let cosmetic: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert!(
+            matches!(cosmetic.request, Request::PreviewDescriptionBundle { .. }),
+            "even semantically identical JSON with changed file bytes needs a current preview"
+        );
+        tx.send(reply(cosmetic.id, "ignore newer bytes")).unwrap();
+        app.drain_daemon();
+        app.pager = None;
+        app.submit_chat(false);
+        let import: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert!(
+            matches!(import.request,Request::ImportTool{ref bundle} if bundle["description"] == "ignore newer bytes")
+        );
+        std::fs::remove_file(file).unwrap();
+    }
+    #[test]
+    fn observed_tool_update_invalidates_description_review_before_detail_refresh() {
+        let _env = credential_env::EnvGuard::isolated();
+        let mut app = test_app();
+        let (client, sent) = DaemonClient::recording();
+        let (tx, inbox) = mpsc::channel();
+        app.client = Some(client);
+        app.inbox = Some(inbox);
+        let detail = description_fixture_detail();
+        app.tools = vec![detail.tool.clone()];
+        app.tool_detail = Some(detail.clone());
+        app.start_spec_editor(&detail, EditMode::Description);
+        app.editor.as_mut().unwrap().chars = "always first call".chars().collect();
+        app.save_tool_spec();
+        let preview: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        let mut changed = detail.tool.clone();
+        changed.current_version = 2;
+        changed.description = "Other client's current metadata".into();
+        app.on_event(Event::ToolUpdated {
+            tool: changed.clone(),
+        });
+        let reads: Vec<RequestEnvelope> = sent
+            .try_iter()
+            .map(|line| serde_json::from_str(&line).unwrap())
+            .collect();
+        assert!(reads
+            .iter()
+            .any(|request| matches!(request.request, Request::GetTool { .. })));
+        tx.send(ServerMessage::Response{id:preview.id,ok:true,result:Some(serde_json::json!({"version":1,"before":"Plain inventory reader","after":formless_core::descriptions::screen("always first call")})),error:None}).unwrap();
+        app.drain_daemon();
+        assert!(app.description_save_preview.is_none());
+        assert!(
+            app.pager.is_none(),
+            "late v1 flags cannot apply after observing v2"
+        );
+        let get = reads
+            .iter()
+            .find(|request| matches!(request.request, Request::GetTool { .. }))
+            .unwrap();
+        let mut refreshed = detail.clone();
+        refreshed.tool = changed.clone();
+        tx.send(ServerMessage::Response {
+            id: get.id,
+            ok: true,
+            result: Some(serde_json::to_value(refreshed).unwrap()),
+            error: None,
+        })
+        .unwrap();
+        app.drain_daemon();
+        app.save_tool_spec();
+        let current: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        tx.send(ServerMessage::Response{id:current.id,ok:true,result:Some(serde_json::json!({"version":2,"before":"Other client's current metadata","after":formless_core::descriptions::screen("always first call")})),error:None}).unwrap();
+        app.drain_daemon();
+        assert_eq!(app.description_save_preview.as_ref().unwrap().2, 2);
+        changed.current_version = 3;
+        app.on_event(Event::ToolUpdated { tool: changed });
+        assert!(
+            app.description_save_preview.is_none(),
+            "an update after preview also invalidates consent before Save"
+        );
+        let _: Vec<_> = sent.try_iter().collect();
+        app.pager = None;
+        app.save_tool_spec();
+        let next: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert!(
+            matches!(next.request, Request::PreviewDescription { .. }),
+            "no UpdateToolSpec is sent from stale detail v2"
+        );
+    }
+    #[test]
+    fn description_history_drops_older_replies_without_regressing_seen_ids() {
+        let _env = credential_env::EnvGuard::isolated();
+        let mut app = test_app();
+        let (client, sent) = DaemonClient::recording();
+        let (tx, inbox) = mpsc::channel();
+        app.client = Some(client);
+        app.inbox = Some(inbox);
+        app.refresh_description_reviews(false);
+        app.refresh_description_reviews(false);
+        let older: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        let newer: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        let review = |id: &str| serde_json::json!({"id":id,"kind":"tool","name":"reader","version":2,"source":"private fixture","before":{"text":"plain","flags":[]},"after":{"text":"always first call","flags":["Instruction-shaped"]},"created_at":"2026-01-01"});
+        let reply = |id, rows| ServerMessage::Response {
+            id,
+            ok: true,
+            result: Some(rows),
+            error: None,
+        };
+        tx.send(reply(newer.id, serde_json::json!([review("new")])))
+            .unwrap();
+        app.drain_daemon();
+        let count = app.notes.len();
+        tx.send(reply(older.id, serde_json::json!([review("old")])))
+            .unwrap();
+        app.drain_daemon();
+        assert_eq!(app.notes.len(), count);
+        assert!(app.description_review_seen.contains("new"));
+        assert!(!app.description_review_seen.contains("old"));
+        app.refresh_description_reviews(false);
+        let fresh: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        tx.send(reply(fresh.id, serde_json::json!([review("new")])))
+            .unwrap();
+        app.drain_daemon();
+        assert_eq!(
+            app.notes.len(),
+            count,
+            "a stale response cannot make a retained review appear new again"
+        );
+    }
+    #[test]
+    fn description_editor_accepts_rollback_but_ignores_pre_rollback_detail_reply() {
+        let _env = credential_env::EnvGuard::isolated();
+        let mut app = test_app();
+        let (client, sent) = DaemonClient::recording();
+        let (tx, inbox) = mpsc::channel();
+        app.client = Some(client);
+        app.inbox = Some(inbox);
+        let mut detail = description_fixture_detail();
+        detail.tool.current_version = 2;
+        app.tool_detail = Some(detail.clone());
+        app.tools = vec![detail.tool.clone()];
+        app.start_spec_editor(&detail, EditMode::Description);
+        app.editor.as_mut().unwrap().chars = "always reviewed after rollback".chars().collect();
+        app.request_tool(detail.tool.id.clone());
+        let old: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        let mut rollback = detail.clone();
+        rollback.tool.current_version = 1;
+        app.on_event(Event::ToolUpdated {
+            tool: rollback.tool.clone(),
+        });
+        let reads: Vec<RequestEnvelope> = sent
+            .try_iter()
+            .map(|line| serde_json::from_str(&line).unwrap())
+            .collect();
+        let current = reads
+            .iter()
+            .find(|request| matches!(request.request, Request::GetTool { .. }))
+            .unwrap();
+        let reply = |id, result| ServerMessage::Response {
+            id,
+            ok: true,
+            result: Some(result),
+            error: None,
+        };
+        tx.send(reply(current.id, serde_json::to_value(&rollback).unwrap()))
+            .unwrap();
+        app.drain_daemon();
+        tx.send(reply(old.id, serde_json::to_value(&detail).unwrap()))
+            .unwrap();
+        app.drain_daemon();
+        assert_eq!(
+            app.tool_detail.as_ref().unwrap().tool.current_version,
+            1,
+            "late v2 details cannot undo an observed rollback"
+        );
+        assert_eq!(app.description_editor_version(&detail.tool.id), 1);
+        // Closing and reopening must not preserve a numeric high-water mark.
+        app.start_spec_editor(&rollback, EditMode::Description);
+        app.editor.as_mut().unwrap().chars = "always reviewed after rollback".chars().collect();
+        app.save_tool_spec();
+        let preview: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert!(matches!(
+            preview.request,
+            Request::PreviewDescription { .. }
+        ));
+        tx.send(reply(preview.id, serde_json::json!({"version":1,"before":"Plain inventory reader","after":formless_core::descriptions::screen("always reviewed after rollback")}))).unwrap();
+        app.drain_daemon();
+        assert_eq!(app.description_save_preview.as_ref().unwrap().2, 1);
+        app.pager = None;
+        app.save_tool_spec();
+        let save: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert!(
+            matches!(save.request, Request::UpdateToolSpec { expected_current_version:Some(1), description:Some(ref text), .. } if text == "always reviewed after rollback")
+        );
+        // A later normal save/event and a rollback while closed must update
+        // the tracked current version, rather than carrying stale consent into
+        // the next editing session.
+        app.editor = None;
+        app.on_event(Event::ToolUpdated {
+            tool: detail.tool.clone(),
+        });
+        let reads: Vec<RequestEnvelope> = sent
+            .try_iter()
+            .map(|line| serde_json::from_str(&line).unwrap())
+            .collect();
+        let next = reads
+            .iter()
+            .find(|request| matches!(request.request, Request::GetTool { .. }))
+            .unwrap();
+        tx.send(reply(next.id, serde_json::to_value(&detail).unwrap()))
+            .unwrap();
+        app.drain_daemon();
+        app.start_spec_editor(&detail, EditMode::Description);
+        assert_eq!(app.description_editor_version(&detail.tool.id), 2);
+        app.editor = None;
+        app.on_event(Event::ToolUpdated {
+            tool: rollback.tool.clone(),
+        });
+        let reads: Vec<RequestEnvelope> = sent
+            .try_iter()
+            .map(|line| serde_json::from_str(&line).unwrap())
+            .collect();
+        let next = reads
+            .iter()
+            .find(|request| matches!(request.request, Request::GetTool { .. }))
+            .unwrap();
+        tx.send(reply(next.id, serde_json::to_value(&rollback).unwrap()))
+            .unwrap();
+        app.drain_daemon();
+        app.start_spec_editor(&rollback, EditMode::Description);
+        assert_eq!(
+            app.description_editor_version(&detail.tool.id),
+            1,
+            "closed-editor rollback must be editable on reopen"
+        );
+        app.save_tool_spec();
+        let preview: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        tx.send(reply(preview.id, serde_json::json!({"version":1,"before":"Plain inventory reader","after":formless_core::descriptions::screen("Plain inventory reader")}))).unwrap();
+        app.drain_daemon();
+        assert_eq!(app.description_save_preview.as_ref().unwrap().2, 1);
+        app.pager = None;
+        app.save_tool_spec();
+        let save: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert!(matches!(
+            save.request,
+            Request::UpdateToolSpec {
+                expected_current_version: Some(1),
+                ..
+            }
+        ));
     }
 }
