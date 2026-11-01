@@ -1322,7 +1322,9 @@ async fn agent_reads_its_own_artifacts_by_id() {
     let store = Store::open(&paths.db_file()).unwrap();
     let mine = store.create_session(None).unwrap().id;
     let theirs = store.create_session(None).unwrap().id;
-    let file = paths.data_dir.join("big.txt");
+    let artifact_dir = paths.data_dir.join("artifacts");
+    std::fs::create_dir_all(&artifact_dir).unwrap();
+    let file = artifact_dir.join("big.txt");
     let body: String = (1..=500).map(|i| format!("line {i}\n")).collect();
     std::fs::write(&file, &body).unwrap();
     let id = store
