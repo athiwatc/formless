@@ -427,6 +427,8 @@ async fn nested_and_script_returns_stay_raw_and_record_actual_private_file_origi
 async fn skill_artifact_and_error_results_keep_payloads_and_actual_origins() {
     let env = credential_env::EnvGuard::isolated();
     env.set("FORMLESS_API_KEY", "private-provenance-key");
+    env.remove("FORMLESS_BASE_URL");
+    env.remove("FORMLESS_MODEL");
     env.set("NO_PROXY", "127.0.0.1,localhost");
     let f = Fixture::new();
     let paths = Paths::from_dirs(f.0.join("data"), f.0.join("config")).unwrap();
