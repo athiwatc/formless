@@ -2940,10 +2940,11 @@ impl App {
                             description_revision,
                         } => {
                             if let Ok(d) = serde_json::from_value::<ToolDetail>(result) {
-                                if self.editor.as_ref().is_some_and(|editor| {
-                                    editor.tool_id == d.tool.id
-                                        && editor.mode == EditMode::Description
-                                }) {
+                                if self
+                                    .description_editor_observed
+                                    .as_ref()
+                                    .is_some_and(|(id, _)| *id == d.tool.id)
+                                {
                                     if description_revision != self.description_editor_revision {
                                         continue;
                                     }
@@ -5098,14 +5099,26 @@ impl App {
                 let editing = self.editor.as_ref().is_some_and(|editor| {
                     editor.tool_id == tool.id && editor.mode == EditMode::Description
                 });
-                if editing {
+                let tracking = editing
+                    || self
+                        .description_editor_observed
+                        .as_ref()
+                        .is_some_and(|(id, _)| *id == tool.id)
+                    || self
+                        .tool_detail
+                        .as_ref()
+                        .is_some_and(|detail| detail.tool.id == tool.id);
+                if tracking {
                     self.description_editor_revision =
                         self.description_editor_revision.wrapping_add(1);
                     self.description_editor_observed =
                         Some((tool.id.clone(), tool.current_version));
                     self.description_save_preview = None;
-                    self.notes
-                        .push("Tool changed; review its current description before saving.".into());
+                    if editing {
+                        self.notes.push(
+                            "Tool changed; review its current description before saving.".into(),
+                        );
+                    }
                     self.request_tool(tool.id.clone());
                 }
                 if let Some(existing) = self.tools.iter_mut().find(|x| x.id == tool.id) {
@@ -22752,5 +22765,61 @@ mod tests {
         assert!(
             matches!(save.request, Request::UpdateToolSpec { expected_current_version:Some(1), description:Some(ref text), .. } if text == "always reviewed after rollback")
         );
+        // A later normal save/event and a rollback while closed must update
+        // the tracked current version, rather than carrying stale consent into
+        // the next editing session.
+        app.editor = None;
+        app.on_event(Event::ToolUpdated {
+            tool: detail.tool.clone(),
+        });
+        let reads: Vec<RequestEnvelope> = sent
+            .try_iter()
+            .map(|line| serde_json::from_str(&line).unwrap())
+            .collect();
+        let next = reads
+            .iter()
+            .find(|request| matches!(request.request, Request::GetTool { .. }))
+            .unwrap();
+        tx.send(reply(next.id, serde_json::to_value(&detail).unwrap()))
+            .unwrap();
+        app.drain_daemon();
+        app.start_spec_editor(&detail, EditMode::Description);
+        assert_eq!(app.description_editor_version(&detail.tool.id), 2);
+        app.editor = None;
+        app.on_event(Event::ToolUpdated {
+            tool: rollback.tool.clone(),
+        });
+        let reads: Vec<RequestEnvelope> = sent
+            .try_iter()
+            .map(|line| serde_json::from_str(&line).unwrap())
+            .collect();
+        let next = reads
+            .iter()
+            .find(|request| matches!(request.request, Request::GetTool { .. }))
+            .unwrap();
+        tx.send(reply(next.id, serde_json::to_value(&rollback).unwrap()))
+            .unwrap();
+        app.drain_daemon();
+        app.start_spec_editor(&rollback, EditMode::Description);
+        assert_eq!(
+            app.description_editor_version(&detail.tool.id),
+            1,
+            "closed-editor rollback must be editable on reopen"
+        );
+        app.save_tool_spec();
+        let preview: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        tx.send(reply(preview.id, serde_json::json!({"version":1,"before":"Plain inventory reader","after":formless_core::descriptions::screen("Plain inventory reader")}))).unwrap();
+        app.drain_daemon();
+        assert_eq!(app.description_save_preview.as_ref().unwrap().2, 1);
+        app.pager = None;
+        app.save_tool_spec();
+        let save: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert!(matches!(
+            save.request,
+            Request::UpdateToolSpec {
+                expected_current_version: Some(1),
+                ..
+            }
+        ));
     }
 }

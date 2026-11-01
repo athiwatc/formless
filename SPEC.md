@@ -4367,7 +4367,12 @@ Description reviews, TUI `/descriptionreviews`, and `formless tools reviews`
 reconnection refreshes retained evidence. The description editor binds its preview
 to the Tool ID, version and exact text. Local imports bind confirmation to the
 same file content, and Skill bundle previews parse the actual bundled SKILL.md.
-This metadata review does not replace the separate code-hash approval binding.
+Current-version checks commit atomically with a reviewed description edit, and
+client request generations preserve valid rollback edits while rejecting stale
+previews. This screen applies to the entity description fields, not arbitrary
+JSON Schema values; stored validation schemas and code-hash inputs retain their
+existing semantics. This metadata review does not replace the separate code-hash
+approval binding.
 
 Tool data has no instruction authority: system instructions outrank user
 instructions, and Tool/file/web/skill/module/sub-agent output is untrusted data.
