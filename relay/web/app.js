@@ -679,6 +679,90 @@
   }
   setInterval(() => { if (S.channel && S.invocations && S.invocations.length) refreshRunning(); }, 2000);
 
+  function sessionRows(sessions, visible, tree) {
+    if (!tree) return visible.map(session => ({ session, depth: 0, note: "" }));
+    const shown = new Set(visible.map(session => session.id)), allIds = new Set(sessions.map(session => session.id));
+    const children = new Map(), roots = [];
+    for (const session of visible) {
+      if (session.forked_from && shown.has(session.forked_from)) {
+        if (!children.has(session.forked_from)) children.set(session.forked_from, []);
+        children.get(session.forked_from).push(session);
+      } else roots.push(session);
+    }
+    const seen = new Set(), rows = [];
+    for (const [candidates, detached] of [[roots, false], [visible, true]]) {
+      for (const root of candidates) {
+        if (seen.has(root.id)) continue;
+        const stack = [[root, 0]];
+        while (stack.length) {
+          const [session, depth] = stack.pop();
+          if (seen.has(session.id)) continue;
+          seen.add(session.id);
+          let note = session.fork_point_seq != null ? "fork at seq " + session.fork_point_seq : "";
+          if (session.forked_from) {
+            const why = detached && depth === 0 ? "lineage cycle" : !allIds.has(session.forked_from) ? "parent unavailable" : !shown.has(session.forked_from) ? "parent filtered" : null;
+            if (why) note += " · " + why + ": " + session.forked_from;
+          }
+          if (depth > 12) note += " · deep lineage (indent capped)";
+          rows.push({ session, depth: Math.min(depth, 12), note });
+          for (const child of [...(children.get(session.id) || [])].reverse()) stack.push([child, depth + 1]);
+        }
+      }
+    }
+    return rows;
+  }
+  function resolveSessionRef(query) {
+    const exact = S.sessions.find(session => session.id === query);
+    if (exact) return exact.id;
+    const matches = S.sessions.filter(session => query && (session.id.startsWith(query) || session.name === query));
+    if (matches.length !== 1) throw new Error(matches.length ? "Ambiguous Session; use its full ID." : "No matching Session; refresh the Sessions list and use an ID. Paid model comparison is /compare-models.");
+    return matches[0].id;
+  }
+  function sessionComparisonText(comparison) {
+    const lines = ["Stored Session comparison — no model request", "Common ancestor: " + (comparison.common_ancestor || "unknown") + " · fork point: " + (comparison.fork_point_seq ?? "unknown") + " · diff after seq " + comparison.diff_from_seq];
+    if (comparison.prefix_changed) lines.push("Copied prefix changed: showing full histories.");
+    lines.push(...(comparison.warnings || []).map(warning => "Warning: " + warning));
+    for (const [label, side] of [["LEFT", comparison.left], ["RIGHT", comparison.right]]) {
+      const usage = side.usage;
+      lines.push(label + ": " + side.session.name + " (" + side.session.id + ")", "  " + usage.scope,
+        "  Recorded: " + usage.recorded_prompt_tokens + " input / " + usage.recorded_completion_tokens + " output tokens · " + usage.recorded_cached_tokens + " cached / " + usage.recorded_cache_write_tokens + " cache-write · " + usage.requests + " requests",
+        "  Usage coverage: " + (usage.usage_complete ? "complete" : "incomplete; missing usage is not zero") + " · " + usage.unallocated_requests + " unallocated requests (" + usage.unallocated_prompt_tokens + " input / " + usage.unallocated_completion_tokens + " output) · " + usage.unknown_runs + " unknown Runs",
+        usage.cost != null ? "  Recorded branch cost: $" + usage.cost.toFixed(6) : "  Total cost: unknown · priced allocated subtotal only: $" + usage.priced_cost_subtotal.toFixed(6));
+      if (usage.known_records_cost_range) lines.push("  Observed priced rows allocation range only: $" + usage.known_records_cost_range.map(value => value.toFixed(6)).join("–$") + "; excludes missing usage and unpriced rows");
+      if (usage.unallocated_requests) lines.push("  Unallocated priced subtotal only: $" + usage.unallocated_priced_cost_subtotal.toFixed(6));
+      if (usage.estimated_requests) lines.push("  " + usage.estimated_requests + " request prices estimated from local prices");
+      if ((usage.unpriced || []).length) lines.push("  Unpriced: " + usage.unpriced.join(", "));
+      lines.push(...(usage.warnings || []).map(warning => "  Warning: " + warning));
+    }
+    for (const diff of comparison.messages) {
+      for (const [label, message] of [[diff.kind === "unchanged" ? "=" : "< LEFT", diff.left], ["> RIGHT", diff.kind === "unchanged" ? null : diff.right]]) {
+        if (message) lines.push("", label + " " + message.role + " seq " + message.seq + " (" + message.id + ")", message.content);
+      }
+    }
+    return lines.join("\n");
+  }
+  async function compareModelsCommand(arg) {
+    S.sessionCompareGeneration = (S.sessionCompareGeneration || 0) + 1;
+    const [a, b, ...rest] = (arg || "").trim().split(/\s+/);
+    if (!a || !b) return note("usage: /compare-models MODEL_A MODEL_B [prompt] (no prompt: your last message again)", true);
+    const r = await act({ type: "compare_models", session_id: S.current, models: [a, b], prompt: rest.join(" ") || null });
+    if (r) { note("comparing " + a + " vs " + b + " in forked Sessions; the answers show here when both finish"); refreshSessions(); }
+  }
+  async function compareSessionsCommand(arg) {
+    const generation = S.sessionCompareGeneration = (S.sessionCompareGeneration || 0) + 1;
+    const words = (arg || "").trim().split(/\s+/);
+    if (words.length !== 2 || !words[0]) return note("usage: /compare SESSION_A SESSION_B (stored history only); /compare-models starts paid model comparisons", true);
+    let left, right;
+    try { left = resolveSessionRef(words[0]); right = resolveSessionRef(words[1]); }
+    catch (error) { return note(error.message, true); }
+    const channel = S.channel, conn = S.conn;
+    const result = await act({ type: "compare_sessions", left, right });
+    if (!result || generation !== S.sessionCompareGeneration || channel !== S.channel || conn !== S.conn) return;
+    const body = h("pre", { class: "session-comparison" }, sessionComparisonText(result));
+    showBidi(body);
+    modal("Stored Session comparison", body);
+  }
+
   function renderSessions() {
     const list = $("sessions");
     list.replaceChildren();
@@ -686,6 +770,7 @@
       list.append(h("li", { class: "muted", style: "padding:8px" }, "No sessions yet."));
       return;
     }
+    list.append(h("li", null, h("button", { type: "button", class: "btn small", "aria-pressed": String(!!S.sessionTree), onclick: () => { S.sessionTree = !S.sessionTree; renderSessions(); } }, S.sessionTree ? "Tree on" : "Tree off")));
     // Tag chips filter the list (SPEC §10.4).
     const tags = [...new Set(S.sessions.flatMap((s) => s.tags || []))].sort();
     if (S.tagFilter && !tags.includes(S.tagFilter)) S.tagFilter = null;
@@ -712,7 +797,8 @@
     // Archived Sessions sit in their own collapsible group at the end.
     const archived = S.sessions.filter((s) => s.archived && tagged(s));
     const shown = S.sessions.filter((s) => tagged(s) && (!s.archived || S.showArchived));
-    for (const s of shown) {
+    for (const row of sessionRows(S.sessions, shown, !!S.sessionTree)) {
+      const s = row.session;
       const menu = h("button", {
         class: "icon-btn menu", type: "button", "aria-label": "Session actions",
         onclick: (e) => { e.stopPropagation(); sessionMenu(menu, s); },
@@ -727,7 +813,8 @@
         onclick: (e) => { e.stopPropagation(); if (e.target.checked) S.marked.add(s.id); else S.marked.delete(s.id); renderSessions(); } }),
       S.running.has(s.id) ? h("span", { class: "running", title: "running" })
         : s.last_run_status === "paused" ? h("span", { class: "state", title: "paused" }, "⏸") : null,
-      h("span", { class: "name", title: s.name }, s.pinned ? "★ " : null, s.name,
+      h("span", { class: "name", title: s.name, style: "padding-inline-start:" + (row.depth * 12) + "px" }, s.pinned ? "★ " : null, row.depth ? "↳ " : null, s.name,
+        row.note ? h("span", { class: "muted lineage", title: row.note }, " · " + row.note) : null,
         s.preview ? h("span", { class: "preview", title: s.preview }, s.preview) : null),
       h("span", { class: "when", title: (s.message_count || 0) + " messages" + (s.model ? " · " + s.model : "") }, relTime(s.updated_at)),
       menu));
@@ -4335,12 +4422,8 @@
     { name: "status", group: "Settings", desc: "the daemon: memory, CPU, database, running work", run: () => showStatus() },
     { name: "storage", group: "Settings", desc: "disk used by Sessions, artifacts, logs, backups", run: () => showStorage() },
     { name: "gc", group: "Settings", desc: "clean up: shows what it frees first", run: () => showGc() },
-    { name: "compare", args: "MODEL_A MODEL_B [PROMPT]", group: "Run control", desc: "the same prompt on two models, side by side with time and cost", run: async (arg) => {
-      const [a, b, ...rest] = (arg || "").trim().split(/\s+/);
-      if (!a || !b) return note("usage: /compare MODEL_A MODEL_B [prompt] (no prompt: your last message again)", true);
-      const r = await act({ type: "compare_models", session_id: S.current, models: [a, b], prompt: rest.join(" ") || null });
-      if (r) { note("comparing " + a + " vs " + b + " in forked Sessions; the answers show here when both finish"); refreshSessions(); }
-    } },
+    { name: "compare", args: "SESSION_A SESSION_B", group: "Session", desc: "compare stored branch messages and recorded usage (no model call)", run: compareSessionsCommand },
+    { name: "compare-models", args: "MODEL_A MODEL_B [PROMPT]", group: "Run control", desc: "the same prompt on two models, side by side with time and cost", run: compareModelsCommand },
     { name: "step", group: "Run control", desc: "step mode: pause before each Tool call", run: async () => {
       S.stepMode = !S.stepMode;
       if (await act({ type: "set_step_mode", session_id: S.current, on: S.stepMode })) note(S.stepMode ? "step mode on: the agent stops before each Tool call" : "step mode off");
