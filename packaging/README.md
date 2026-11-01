@@ -21,7 +21,11 @@ platform app-dirs (SPEC §9.4).
      `cargo-generate-rpm`, metadata in `crates/formless/Cargo.toml`) on
      Debian bullseye, so they need **glibc 2.31 or newer** (Debian 11+,
      Ubuntu 20.04+, RHEL/Rocky 9+); the packages record the shared
-     libraries the binary links (libc, libdbus) and ship the license;
+     libraries the binary links (libc, libdbus) and ship the license. The RPM
+     output directory is created before `cargo generate-rpm --output`: the tool
+     recognizes an existing directory and appends its metadata-derived package
+     name, version, release and architecture filename; a missing directory path
+     would instead be treated as a filename;
    - installs the packages in clean Debian, Ubuntu and Rocky containers
      and runs `formless --version`;
    - builds the Docker image, runs it and checks the daemon answers, then
