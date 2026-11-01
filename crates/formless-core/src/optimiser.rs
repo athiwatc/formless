@@ -25,7 +25,7 @@ const OPTIMISER_PROMPT: &str = concat!(
 Reply with ONLY a JSON object: {\"description\": string, \"input_schema\": object, \"output_schema\": object, \
 \"implementation_js\": string defining `function run(input)`, \"capabilities\": string[], \"memory_mb\": integer}. \
 Keep capabilities and memory no wider than the current Tool unless the failures prove it necessary. \
-If failures are resource/out-of-memory, fix with streaming (fs.readChunks / fetchChunks / emit) first. \
+If failures are resource/out-of-memory, fix with streaming (fs.readChunks / fetchChunks / process.spawn plus handle.read / emit) first. \
 Fix the actual failures without breaking the recorded successes. ",
     crate::provider::host_api_doc!()
 );
@@ -1413,7 +1413,7 @@ pub fn fix_plan(replay: &[ReplayItem]) -> FixPlan {
     for (tag, _) in &tags {
         out.push_str(match tag.as_str() {
             "validation" => "- validation: callers send input the schema rejects (or the output breaks the output schema). Fix the description and input_schema first: clearer field names and descriptions, optional fields with defaults, accept common variants. Change the code only as needed to match.\n",
-            "resource" => "- resource (out of memory/time): stream with fs.readChunks / fetchChunks / emit instead of loading whole.\n",
+            "resource" => "- resource (out of memory/time): stream with fs.readChunks / fetchChunks / process.spawn plus handle.read / emit instead of loading whole.\n",
             "denied-capability" => "- denied-capability: do not widen Capabilities; handle the denial with a clear thrown error. Grants are the user's decision.\n",
             "js" => "- js (exceptions): fix the failing code paths shown in the errors, keeping recorded successes working.\n",
             "user-cancelled" => "- user-cancelled: often too slow; make it faster or report progress with emit.\n",
