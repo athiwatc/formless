@@ -52,7 +52,7 @@ Type `/` in the TUI or the web composer; the same commands work in both (a few a
 | `/tag [NAME…]` | tag this Session, or list tags (filter Sessions with /#tag) |
 | `/untag NAME…` | remove tags from this Session |
 | `/cd [PATH]` | show or change this Session's working directory |
-| `/sessions` | list and switch Sessions |
+| `/sessions` | list and switch Sessions (T toggles lineage tree) |
 | `/fork` | fork the current Session |
 | `/search` | search all Sessions |
 | `/edit` | edit your last message and retry from there |
@@ -73,6 +73,7 @@ Type `/` in the TUI or the web composer; the same commands work in both (a few a
 | `/instructions [TEXT\|clear]` | standing instructions for this Session's agent |
 | `/context` | how full the context window is, and what fills it |
 | `/undo [tool]` | undo the last Session delete; `tool`: the last Tool registry change |
+| `/compare SESSION_A SESSION_B` | compare stored branches and recorded usage (no model call) |
 
 ### Run control
 
@@ -81,7 +82,7 @@ Type `/` in the TUI or the web composer; the same commands work in both (a few a
 | `/stop` | stop the current Run (Esc) |
 | `/cancel` | cancel the stalled or pending Tool call |
 | `/resend` | re-send a stalled provider request |
-| `/compare A B [prompt]` | the same prompt on two models, side by side with time and cost |
+| `/compare-models A B [prompt]` | the same prompt on two models, side by side with time and cost |
 | `/step` | step mode: pause before each Tool call (Enter run, e edit, s skip) |
 | `/good [comment]` | rate the last answer 👍 (feeds Run metrics and routing) |
 | `/bad [comment]` | rate the last answer 👎 (feeds Run metrics and routing) |
