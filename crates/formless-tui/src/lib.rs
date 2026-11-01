@@ -19167,7 +19167,44 @@ mod tests {
                 "{h} rows: {screen}"
             );
             assert!(screen.contains("v full code"), "{h} rows: {screen}");
-            assert!(screen.contains("v to see all"), "{h} rows: {screen}");
+            assert!(screen.contains("i full approval"), "{h} rows: {screen}");
+            let (client, sent) = DaemonClient::recording();
+            app.client = Some(client);
+            app.input_focus = false;
+            app.key(key(KeyCode::Char('i')));
+            let inspector = app
+                .pager
+                .as_ref()
+                .expect("full approval inspector stays reachable on a short terminal");
+            let full = inspector.lines.join("\n");
+            assert!(
+                full.contains(req.detail.as_deref().unwrap()),
+                "all MCP input/detail must remain inspectable at {h} rows"
+            );
+            assert!(
+                full.contains(req.code_preview.as_deref().unwrap()),
+                "the complete held code preview must remain inspectable"
+            );
+            assert!(
+                full.contains("MCP tool COMPOSIO_REMOTE_WORKBENCH")
+                    && full.contains("mcp:composio")
+            );
+            assert!(
+                sent.try_recv().is_err(),
+                "reading full approval evidence must not approve or execute anything"
+            );
+            app.key(key(KeyCode::Esc));
+            app.key(key(KeyCode::Char('v')));
+            assert!(
+                app.pager
+                    .as_ref()
+                    .unwrap()
+                    .lines
+                    .join("\n")
+                    .contains(&payload),
+                "the existing MCP v detail view remains accessible"
+            );
+            assert!(sent.try_recv().is_err());
         }
     }
 
