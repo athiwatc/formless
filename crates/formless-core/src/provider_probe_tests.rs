@@ -763,3 +763,73 @@ async fn probe_http_schema_mode_and_caps_compose_without_echo_driven_repairs() {
         }
     }
 }
+
+#[tokio::test]
+async fn probe_http_choice_multipliers_cannot_expand_the_output_budget() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    env.set("NO_PROXY", "127.0.0.1,localhost");
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let captured = seen.clone();
+    let (base, _server) = server(Router::new().route("/chat/completions", post(move |Json(body): Json<Value>| {
+        let count = body["n"].as_u64().unwrap_or(1);
+        assert!((1..=7).contains(&count));
+        captured.locked().push(body);
+        async move {
+            let choices: Vec<Value> = (0..count).map(|index| json!({"index":index,"message":{"content":"ok"},"finish_reason":"stop"})).collect();
+            Json(json!({"model":"probe-model","choices":choices,"usage":{"prompt_tokens":3,"completion_tokens":2*count}}))
+        }
+    }))).await;
+    let mut config = cfg(base, "chat");
+    config.extra_body.insert("n".into(), json!(7));
+    config.extra_body.insert("best_of".into(), json!(7));
+    config
+        .extra_body
+        .insert("num_return_sequences".into(), json!(7));
+    config
+        .extra_body
+        .insert("options".into(), json!({"num_outputs":7}));
+    let billed = Arc::new(AtomicUsize::new(0));
+    let hook = billed.clone();
+    let ordinary = Provider::new(config, "private-dummy".into())
+        .unwrap()
+        .with_usage_hook(Arc::new(move |_, _, usage| {
+            hook.fetch_add(usage.completion_tokens as usize, Ordering::SeqCst);
+            Ok(())
+        }));
+    assert_eq!(
+        ordinary.complete(&[], "probe-model", None).await.unwrap(),
+        "ok"
+    );
+    assert_eq!(
+        billed.load(Ordering::SeqCst),
+        14,
+        "ordinary owner-configured multiplicity is unchanged"
+    );
+    let policy = ProbePolicy::default();
+    let probe = ordinary.scoped_probe(policy.clone()).unwrap();
+    assert_eq!(
+        policy
+            .run(probe.complete(&[], "probe-model", None))
+            .await
+            .unwrap()
+            .unwrap(),
+        "ok"
+    );
+    let rows = seen.locked();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["n"], 7);
+    assert_eq!(
+        rows[1]["n"], 1,
+        "probe must request only one billable output choice"
+    );
+    for key in ["best_of", "num_return_sequences"] {
+        assert!(rows[1].get(key).is_none(), "{rows:?}");
+    }
+    assert!(rows[1]["options"].get("num_outputs").is_none());
+    assert_eq!(
+        billed.load(Ordering::SeqCst),
+        16,
+        "only two probe output tokens are charged"
+    );
+    assert_eq!(policy.report()["reported_usage"]["completion_tokens"], 2);
+}
