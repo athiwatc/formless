@@ -583,7 +583,11 @@ fn operator_range(
     if linewise {
         let start = line_start(s, at.min(target));
         let end = line_end(s, at.max(target));
-        return Some(start..if end < s.len() { end + 1 } else { end });
+        let mut exclusive = if end < s.len() { end + 1 } else { end };
+        if op == 'c' && exclusive > start && s[..exclusive].ends_with('\n') {
+            exclusive -= 1;
+        }
+        return Some(start..exclusive);
     }
     let start = at.min(target);
     let mut end = at.max(target);
@@ -828,6 +832,8 @@ mod tests {
             ("one two three", "d2aw", "three"),
             ("alpha-beta tail", "diW", " tail"),
             ("a\nb\nc", "2dd", "c"),
+            ("one\ntwo\nthree", "cjX", "X\nthree"),
+            ("one\ntwo", "jcggX", "X"),
             ("\"one\" tail", "da\"", "tail"),
             ("'one' tail", "da'", "tail"),
             ("`one` tail", "da`", "tail"),
