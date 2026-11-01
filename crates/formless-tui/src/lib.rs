@@ -2264,6 +2264,9 @@ impl App {
             let Some(kind) = self.pending.remove(&id) else {
                 continue;
             };
+            if matches!(kind, Pending::ForecastHint { .. }) {
+                continue;
+            }
             self.notes.push(format!(
                 "the daemon did not answer within {}s; try again",
                 REQUEST_DEADLINE.as_secs()
@@ -2444,6 +2447,9 @@ impl App {
                         continue;
                     };
                     if !ok {
+                        if matches!(kind, Pending::ForecastHint { .. }) {
+                            continue;
+                        }
                         if matches!(kind, Pending::ReconnectSession) {
                             if result.as_ref().and_then(|result| result["code"].as_str())
                                 == Some(codes::NOT_FOUND)
@@ -4557,6 +4563,7 @@ impl App {
             Event::RunFinished {
                 session_id, status, ..
             } => {
+                self.forecast.generation.clear();
                 self.running_sessions.remove(&session_id);
                 if self.is_current(&session_id) {
                     self.request_session_runs(&session_id);
@@ -4613,6 +4620,9 @@ impl App {
             | Event::MemoryUpdated
             | Event::JobsChanged => {}
             Event::SettingsChanged => {
+                self.forecast.generation.clear();
+                self.forecast.hint = None;
+                self.forecast.approved = None;
                 if let Ok(cfg) = Config::load(&self.paths) {
                     theme::set(theme::from_config(&cfg.tui.theme, &cfg.tui.colors));
                     markdown::set_line_numbers(cfg.tui.code_line_numbers);
@@ -21529,5 +21539,152 @@ mod tests {
             vec!["b", "c", "d", "e"],
             "keeps the latest rows"
         );
+    }
+    fn forecast_reply(hint: &str, required: bool) -> RunForecast {
+        let st = formless_core::Store::open_in_memory().unwrap();
+        let mut cfg = Config::default();
+        cfg.provider.model = "model".into();
+        let mut f = formless_core::forecast::estimate_store(
+            &st,
+            &cfg,
+            &ForecastInput {
+                draft: "task".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        f.hint = hint.into();
+        f.confirmation_required = required;
+        f.confirmation_id = required.then(|| "preview-consent".into());
+        f
+    }
+    #[test]
+    fn forecast_hint_debounces_and_rejects_stale_draft_model_session_and_files() {
+        for change in 0..4 {
+            let mut app = test_app();
+            let (client, sent) = DaemonClient::recording();
+            let (tx, inbox) = mpsc::channel();
+            app.client = Some(client);
+            app.inbox = Some(inbox);
+            app.input.set("original");
+            app.forecast_tick();
+            assert!(sent.try_recv().is_err());
+            app.forecast.changed = Some(Instant::now() - Duration::from_millis(301));
+            app.forecast_tick();
+            let read: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+            assert!(matches!(read.request, Request::ForecastRun { .. }));
+            match change {
+                0 => app.input.set("newer"),
+                1 => app.model_label = "new model".into(),
+                2 => app.current = Some("other".into()),
+                _ => app.attachments.push(("new.txt".into(), vec![1])),
+            }
+            tx.send(ServerMessage::Response {
+                id: read.id,
+                ok: true,
+                result: Some(serde_json::to_value(forecast_reply("stale", false)).unwrap()),
+                error: None,
+            })
+            .unwrap();
+            app.drain_daemon();
+            assert!(app.forecast.hint.is_none());
+            app.forecast_tick();
+            app.forecast.changed = Some(Instant::now() - Duration::from_millis(301));
+            app.forecast_tick();
+            let read: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+            tx.send(ServerMessage::Response {
+                id: read.id,
+                ok: true,
+                result: Some(
+                    serde_json::to_value(forecast_reply("42 prompt tokens · will compact", false))
+                        .unwrap(),
+                ),
+                error: None,
+            })
+            .unwrap();
+            app.drain_daemon();
+            assert_eq!(
+                app.forecast.hint.as_ref().unwrap().hint,
+                "42 prompt tokens · will compact"
+            );
+            let screen = render(&mut app, 140, 30);
+            assert!(screen.contains("will compact"), "{screen}");
+            app.forecast_tick();
+            assert!(sent.try_recv().is_err(), "unchanged draft has one preview");
+        }
+    }
+    #[test]
+    fn forecast_confirmation_keeps_composer_and_discards_stale_or_disconnected_ack() {
+        for disconnect in [false, true] {
+            let mut app = test_app();
+            let mut cfg = Config::default();
+            cfg.limits.forecast_confirm_usd = Some(0.0);
+            cfg.save(&app.paths).unwrap();
+            let (client, sent) = DaemonClient::recording();
+            let (tx, inbox) = mpsc::channel();
+            app.client = Some(client);
+            app.inbox = Some(inbox);
+            app.input.set("task");
+            app.submit_chat(false);
+            let preview: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+            assert!(matches!(preview.request, Request::ForecastRun { .. }));
+            assert_eq!(app.input.expanded(), "task");
+            tx.send(ServerMessage::Response {
+                id: preview.id,
+                ok: true,
+                result: Some(
+                    serde_json::to_value(forecast_reply("~$1–2 · will compact", true)).unwrap(),
+                ),
+                error: None,
+            })
+            .unwrap();
+            app.drain_daemon();
+            assert!(app.forecast.modal.is_some());
+            let screen = render(&mut app, 140, 30);
+            assert!(
+                screen.contains("Forecast confirmation") && screen.contains("Enter/y"),
+                "{screen}"
+            );
+            app.key(key(KeyCode::Enter));
+            let confirm: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+            assert!(matches!(confirm.request, Request::ConfirmForecast { .. }));
+            if disconnect {
+                app.daemon_lost();
+            } else {
+                app.input.set("newer draft");
+            }
+            let response = ServerMessage::Response {
+                id: confirm.id,
+                ok: true,
+                result: Some(serde_json::json!({"confirmed":true})),
+                error: None,
+            };
+            if disconnect {
+                assert!(tx.send(response).is_err(), "old socket inbox is closed");
+            } else {
+                tx.send(response).unwrap();
+            }
+            app.drain_daemon();
+            assert!(sent.try_recv().is_err(), "old acknowledgement never sends");
+            assert_eq!(
+                app.input.expanded(),
+                if disconnect { "task" } else { "newer draft" }
+            );
+        }
+    }
+    #[test]
+    fn declining_forecast_keeps_text_and_attachments_without_sending() {
+        let mut app = test_app();
+        app.input.set("task");
+        app.attachments.push(("held.txt".into(), vec![1, 2]));
+        app.forecast.modal = Some((
+            app.forecast_generation(),
+            forecast_reply("forecast", true),
+            false,
+        ));
+        app.key(key(KeyCode::Esc));
+        assert!(app.forecast.modal.is_none());
+        assert_eq!(app.input.expanded(), "task");
+        assert_eq!(app.attachments, vec![("held.txt".into(), vec![1, 2])]);
     }
 }

@@ -141,7 +141,7 @@ test('slow mention attachment does not cross-post or overwrite new Session compo
 test('send completion clears only the original Session attachments', async () => {
   const wait = deferred(), calls = [];
   const c = setup(['submit'], { isRunning: () => false, askNotifyPermission() {}, closeMentions() {},
-    mentionsIn: () => [], crypto: { randomUUID: () => 'key' }, act: async x => { calls.push(x); await wait.promise; return {}; } });
+    mentionsIn: () => [], crypto: { randomUUID: () => 'key' }, request: async x => { calls.push(x); await wait.promise; return {}; } });
   vm.runInContext('const mentionAttached = {}; const attachmentDrafts = {};', c);
   c.$('input').value = 'hello'; c.S.chips.A = [{}]; c.S.chips.B = [{}];
   const pending = c.submit(false); c.S.current = 'B'; wait.resolve(); await pending;
@@ -490,4 +490,73 @@ test('dropped updates refresh durable usage and mark transient progress unavaila
   c.reconcileDropped({ session_id: '', run_id: '', kinds: ['model_pull_progress'], model: 'model' });
   assert.ok(notes.some(n => /download progress unavailable for model/.test(n)));
   assert.ok(notes.some(n => /live text, reasoning or progress updates were skipped/.test(n)));
+});
+
+function forecastContext(names, extras = {}) {
+  const timers = new Map(); let next = 1;
+  const c = setup(names, { isRunning: () => false, clearTimeout: id => timers.delete(id),
+    setTimeout: fn => { const id = next++; timers.set(id, fn); return id; }, h: () => ({}),
+    ...extras });
+  vm.runInContext('let forecastTimer = null; let forecastSequence = 0; let forecastStampLast = "";', c);
+  c.S.daemonOnline = true; c.S.hello = 'connection-one';
+  c.S.sessions = [{ id: 'A', model: 'model', cwd: '/project' }];
+  c.fire = async () => { const pending = [...timers.values()]; timers.clear(); for (const fn of pending) await fn(); };
+  return c;
+}
+test('forecast hints debounce and reject stale draft, model, Session and attachments', async () => {
+  for (const change of ['draft', 'model', 'session', 'files']) {
+    const wait = deferred(), reads = [];
+    const c = forecastContext(['forecastStamp', 'scheduleForecast'], { request: req => { reads.push(req); return wait.promise; } });
+    c.$('input').value = 'old'; c.scheduleForecast();
+    c.$('input').value = 'current'; c.scheduleForecast();
+    assert.equal(reads.length, 0, 'typing never immediately requests a forecast');
+    const fire = c.fire(); assert.equal(reads.length, 1); assert.equal(reads[0].input.draft, 'current');
+    if (change === 'draft') c.$('input').value = 'newer';
+    if (change === 'model') c.S.sessions[0].model = 'other';
+    if (change === 'session') c.S.current = 'B';
+    if (change === 'files') c.S.chips.A = [{id:'new-file'}];
+    wait.resolve({ hint: 'stale', warnings: [] }); await fire;
+    assert.notEqual(c.$('forecast-hint').textContent, 'stale');
+  }
+});
+test('current forecast hint shows compaction without changing the draft', async () => {
+  const c = forecastContext(['forecastStamp', 'scheduleForecast'], { request: async () => ({hint:'~$0.04–0.11 · ~6 steps · will compact', warnings:['N comparable Runs']}) });
+  c.$('input').value = 'keep my draft'; c.scheduleForecast(); await c.fire();
+  assert.match(c.$('forecast-hint').textContent, /will compact/); assert.equal(c.$('input').value, 'keep my draft');
+});
+test('forecast confirmation cannot cross a changed draft, Session, model or connection', async () => {
+  for (const change of ['draft','model','session','connection']) {
+    const dialog = deferred(), calls = [];
+    const c = forecastContext(['forecastStamp','confirmForecast'], { request: async req => {calls.push(req); return {confirmation_required:true,confirmation_id:'preview',hint:'estimate',warnings:[]};}, ask: () => dialog.promise });
+    c.$('input').value = 'task'; const result = c.confirmForecast('A','task'); await new Promise(resolve => setImmediate(resolve));
+    if (change === 'draft') c.$('input').value = 'newer';
+    if (change === 'model') c.S.sessions[0].model = 'other';
+    if (change === 'session') c.S.current = 'B';
+    if (change === 'connection') c.S.hello = 'connection-two';
+    dialog.resolve(true); assert.equal(await result, false); assert.deepEqual(calls.map(c => c.type), ['forecast_run']);
+  }
+});
+test('declined consent retains composer and allocates no send intent', async () => {
+  const calls = [];
+  const c = forecastContext(['forecastStamp','confirmForecast','submit'], { ask: async () => false, request: async req => {calls.push(req); return {confirmation_required:true,confirmation_id:'preview',hint:'estimate',warnings:[]};},
+    askNotifyPermission() {}, closeMentions() {}, mentionsIn:()=>[], crypto:{randomUUID:()=>{throw Error('intent must not be allocated');}} });
+  vm.runInContext('const mentionAttached = {}; const attachmentDrafts = {};', c);
+  c.S.settings={limits:{forecast_confirm_usd:0}};c.$('input').value='task';await c.submit(false);
+  assert.equal(c.$('input').value,'task');assert.deepEqual(calls.map(c=>c.type),['forecast_run']);
+});
+test('a definite gate rejection retries after consent with a fresh intent; uncertain sends keep their key', async () => {
+  for (const definite of [false,true]) {
+    const calls = [];let intent = 0, sends = 0;
+    const c = forecastContext(['forecastStamp','confirmForecast','submit'], { ask:async()=>true, request:async req=>{
+      calls.push(req);if(req.type==='forecast_run')return {confirmation_required:true,confirmation_id:'preview',hint:'estimate',warnings:[]};
+      if(req.type==='confirm_forecast')return {confirmed:true};
+      if(req.type==='send_message' && ++sends===1){const error=new Error(definite?'stale forecast':'lost response');error.daemonResponse=definite;throw error;}
+      return {started:true};
+    }, toast(){},askNotifyPermission(){},closeMentions(){},mentionsIn:()=>[],crypto:{randomUUID:()=>`intent-${++intent}`} });
+    vm.runInContext('const mentionAttached = {}; const attachmentDrafts = {};', c);
+    c.S.settings={limits:{forecast_confirm_usd:0}};c.$('input').value='task';await c.submit(false);assert.equal(c.$('input').value,'task');
+    await c.submit(false);const sent=calls.filter(c=>c.type==='send_message');assert.equal(sent.length,2);
+    assert.equal(sent[0].client_msg_id===sent[1].client_msg_id,!definite);
+    assert.equal(c.S.unsent,null);assert.equal(c.$('input').value,'');
+  }
 });

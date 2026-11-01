@@ -508,3 +508,219 @@ pub fn metrics(st: &Store, cfg: &Config) -> Result<Value> {
     }
     Ok(json!(rows))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn config() -> Config {
+        let mut c = Config::default();
+        c.provider.model = "model".into();
+        c.provider.base_url = "http://127.0.0.1:9".into();
+        c.provider
+            .model_context_tokens
+            .insert("model".into(), 100_000);
+        c.provider.prices.insert(
+            "model".into(),
+            crate::config::ModelPrice {
+                input: 10.0,
+                output: 20.0,
+                ..Default::default()
+            },
+        );
+        c.naming.enabled = false;
+        c
+    }
+    fn completed(st: &Store, cfg: &Config, f: &RunForecast, steps: i64, status: &str) -> String {
+        let id = st
+            .create_run(f.basis.session_id.as_deref().unwrap())
+            .unwrap();
+        st.record_forecast(&id, f).unwrap();
+        for _ in 0..steps {
+            st.bump_run_steps(&id).unwrap();
+        }
+        st.record_usage_full(
+            f.basis.session_id.as_deref().unwrap(),
+            &id,
+            "default",
+            "model",
+            &crate::provider::Usage {
+                prompt_tokens: (100 * steps) as u64,
+                completion_tokens: 20,
+                cached_tokens: 50,
+                ..Default::default()
+            },
+            "run",
+        )
+        .unwrap();
+        st.set_run_status(&id, status).unwrap();
+        assert!(st.forecast_usage(&id, cfg).unwrap().0.is_some());
+        id
+    }
+    #[test]
+    fn previews_are_read_only_and_without_history_invent_no_ranges() {
+        let st = Store::open_in_memory().unwrap();
+        let c = config();
+        let sid = st.create_session(None).unwrap().id;
+        let input = ForecastInput {
+            session_id: Some(sid.clone()),
+            draft: "你好 inspect JSON".into(),
+            ..Default::default()
+        };
+        let f = estimate_store(&st, &c, &input).unwrap();
+        assert!(f.basis.prompt_tokens > 0);
+        assert_eq!(f.comparable_runs, 0);
+        assert!(
+            f.steps.is_none()
+                && f.tokens.is_none()
+                && f.cost_usd.is_none()
+                && f.duration_ms.is_none()
+        );
+        assert!(!st.session_has_filler(&sid).unwrap());
+        assert!(st.session_system_prompt(&sid).unwrap().is_none());
+        assert!(st.list_messages(&sid).unwrap().is_empty());
+        assert!(st.run_metrics(10).unwrap().is_empty());
+        assert!(st.pending_attachments(&sid).unwrap().is_empty());
+        assert_eq!(f, estimate_store(&st, &c, &input).unwrap());
+        let legacy = st.create_run(&sid).unwrap();
+        st.set_run_status(&legacy, "completed").unwrap();
+        assert_eq!(estimate_store(&st, &c, &input).unwrap().comparable_runs, 0);
+    }
+    #[test]
+    fn comparable_quantiles_unknown_prices_outcomes_and_metrics_are_truthful() {
+        let st = Store::open_in_memory().unwrap();
+        let mut c = config();
+        let sid = st.create_session(None).unwrap().id;
+        let input = ForecastInput {
+            session_id: Some(sid),
+            draft: "a task".into(),
+            ..Default::default()
+        };
+        let first = estimate_store(&st, &c, &input).unwrap();
+        for steps in [1, 2, 8, 10] {
+            completed(&st, &c, &first, steps, "completed");
+        }
+        completed(&st, &c, &first, 100, "paused");
+        let f = estimate_store(&st, &c, &input).unwrap();
+        assert_eq!(f.comparable_runs, 4);
+        assert_eq!(f.steps.as_ref().unwrap().p50, 2.0);
+        assert_eq!(f.steps.as_ref().unwrap().p90, 10.0);
+        assert_eq!(f.tokens.as_ref().unwrap().p50, 220.0);
+        assert_eq!(f.tokens.as_ref().unwrap().p90, 1020.0);
+        assert!(f.cost_usd.as_ref().unwrap().p90 > 0.0);
+        assert!(f.cached_fraction.is_some());
+        let id = completed(&st, &c, &f, 3, "completed");
+        assert!(
+            st.record_forecast(&id, &first).is_err(),
+            "admission snapshots are immutable"
+        );
+        let rows = metrics(&st, &c).unwrap();
+        let row = rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["run_id"] == id)
+            .unwrap();
+        assert_eq!(row["token_error"], 100.0);
+        assert_eq!(row["token_covered_p50_p90"], true);
+        let paused = rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["status"] == "paused")
+            .unwrap();
+        assert_eq!(paused["token_error"], Value::Null);
+        assert_eq!(paused["calibration_eligible"], false);
+        c.provider.prices.clear();
+        let f = estimate_store(&st, &c, &input).unwrap();
+        assert!(f.unpriced && f.cost_usd.is_none() && f.steps.is_some());
+    }
+    #[test]
+    fn unrelated_model_tools_location_and_compaction_are_not_hidden() {
+        let st = Store::open_in_memory().unwrap();
+        let mut c = config();
+        let sid = st.create_session(None).unwrap().id;
+        let input = ForecastInput {
+            session_id: Some(sid.clone()),
+            draft: "task".into(),
+            ..Default::default()
+        };
+        let f = estimate_store(&st, &c, &input).unwrap();
+        let mut foreign = f.clone();
+        foreign.basis.tools_hash = "other snapshot".into();
+        completed(&st, &c, &foreign, 2, "completed");
+        assert_eq!(estimate_store(&st, &c, &input).unwrap().comparable_runs, 0);
+        completed(&st, &c, &f, 2, "completed");
+        let other = st.create_session(None).unwrap().id;
+        let other = ForecastInput {
+            session_id: Some(other),
+            draft: "task".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            estimate_store(&st, &c, &other).unwrap().comparable_runs,
+            0,
+            "unknown cwd does not make other Sessions comparable"
+        );
+        c.provider.model_context_tokens.insert("model".into(), 1);
+        let f = estimate_store(&st, &c, &input).unwrap();
+        assert!(f.will_compact);
+        assert_eq!(f.compaction_probability, Some(1.0));
+    }
+    #[test]
+    fn byte_bound_attachment_previews_equal_uploaded_input_and_do_not_read_rpc_paths() {
+        let root = std::env::temp_dir().join(format!("fl-forecast-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let st = Store::open_in_memory().unwrap();
+        let mut c = config();
+        c.provider.vision = Some(true);
+        let sid = st.create_session(None).unwrap().id;
+        let path = root.join("real.png");
+        image::DynamicImage::new_rgb8(512, 512).save(&path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let descriptor = attachment("[real].png".into(), &bytes);
+        let input = ForecastInput {
+            session_id: Some(sid.clone()),
+            draft: "inspect this".into(),
+            attachments: vec![descriptor.clone()],
+            ..Default::default()
+        };
+        let preview = estimate_store(&st, &c, &input).unwrap();
+        st.add_pending_attachment(&sid,&json!({"id":uuid::Uuid::new_v4().to_string(),"name":descriptor.name,"mime":descriptor.mime,"path":path,"bytes":bytes.len()})).unwrap();
+        let uploaded = estimate_store(
+            &st,
+            &c,
+            &ForecastInput {
+                attachments: vec![],
+                ..input.clone()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            preview.fingerprint, uploaded.fingerprint,
+            "upload nonce does not change confirmed semantic inputs"
+        );
+        assert_eq!(preview.basis.prompt_tokens, uploaded.basis.prompt_tokens);
+        let forged:ForecastAttachment=serde_json::from_value(json!({"name":"rpc","mime":"image/png","bytes":10,"width":null,"height":null,"path":"/private/not/a/preview/file"})).unwrap();
+        assert!(forged.sha256.is_empty());
+        assert!(estimate_store(
+            &st,
+            &c,
+            &ForecastInput {
+                attachments: vec![forged],
+                ..input.clone()
+            }
+        )
+        .is_ok());
+        let changed = ForecastInput {
+            draft: "changed".into(),
+            attachments: vec![],
+            ..input
+        };
+        assert_ne!(
+            uploaded.fingerprint,
+            estimate_store(&st, &c, &changed).unwrap().fingerprint
+        );
+        drop(st);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}

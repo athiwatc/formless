@@ -1584,6 +1584,7 @@ impl Config {
             "on_tui_start": ON_TUI_START,
             // What each key means and its default (SPEC §13).
             "docs": setting_docs_json(),
+            "limits": self.limits,
             "relay": { "enabled": self.relay.enabled, "url": self.relay.url },
             // The approval posture, read-only here (config.toml or --secure).
             "security": {

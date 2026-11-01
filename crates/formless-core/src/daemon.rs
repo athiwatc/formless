@@ -15541,3 +15541,7 @@ mod budget_admission_tests;
 #[cfg(test)]
 #[path = "daemon_token_tests.rs"]
 mod token_estimator_tests;
+
+#[cfg(test)]
+#[path = "daemon_forecast_tests.rs"]
+mod forecast_tests;
