@@ -655,6 +655,7 @@ pub const SETTABLE: &[&str] = &[
     "daemon.idle_grace_secs",
     "daemon.stall_warning_secs",
     "daemon.keep_alive_for_jobs",
+    "daemon.backup_restore_drill",
     "daemon.delete_undo_secs",
     "tui.",
     "tools.",
@@ -751,6 +752,8 @@ pub struct DaemonCfg {
     pub delete_undo_secs: u64,
     /// Daily database backups kept in `<data>/backups`; 0 turns them off.
     pub backups_keep: usize,
+    /// Offline restore rehearsal after each daily backup (opt-in).
+    pub backup_restore_drill: bool,
 }
 impl Default for DaemonCfg {
     fn default() -> Self {
@@ -763,6 +766,7 @@ impl Default for DaemonCfg {
             keep_alive_for_jobs: false,
             delete_undo_secs: 30,
             backups_keep: 7,
+            backup_restore_drill: false,
         }
     }
 }

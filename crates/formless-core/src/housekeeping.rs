@@ -43,7 +43,7 @@ pub fn backup_dir(paths: &Paths) -> PathBuf {
 }
 
 /// Copies made before schema migrations, newest first.
-fn migration_backups(paths: &Paths) -> Vec<PathBuf> {
+pub(crate) fn migration_backups(paths: &Paths) -> Vec<PathBuf> {
     let db = paths.db_file();
     let (Some(dir), Some(name)) = (db.parent(), db.file_name().and_then(|n| n.to_str())) else {
         return Vec::new();
@@ -151,21 +151,64 @@ pub fn gc(paths: &Paths, store: &Store, cfg: &Config, dry_run: bool) -> Result<V
     }
     rows.push(json!({"kind": "MCP logs", "items": n, "bytes": bytes,
         "detail": "cut to their last 1 MB"}));
-    // Old pre-migration copies.
-    let old: Vec<PathBuf> = migration_backups(paths)
-        .into_iter()
+    // Recovery copies are removed only after a newer one has actually passed
+    // structural verification. An active failed-migration receipt pins its copy.
+    let migrations = migration_backups(paths);
+    let pin = std::fs::read(paths.db_file().with_extension("migration-backup.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|v| v["backup_name"].as_str().map(str::to_string));
+    let candidates: Vec<_> = migrations
+        .iter()
         .skip(MIGRATION_BACKUPS_KEEP)
+        .filter(|p| p.file_name().and_then(|n| n.to_str()) != pin.as_deref())
+        .cloned()
         .collect();
-    let bytes: u64 = old.iter().map(|p| path_bytes(p)).sum();
-    if !dry_run {
-        for p in &old {
-            let _ = std::fs::remove_file(p);
+    let mut removed = Vec::new();
+    let mut bytes = 0;
+    let mut verification_error = None;
+    if !candidates.is_empty() {
+        let newest = migrations
+            .first()
+            .expect("candidates require a newest copy");
+        if dry_run {
+            // A preview never writes verification receipts or guesses that an
+            // unverified snapshot will pass. Show the gate instead.
+            if crate::backup_verification::verified(paths, newest).is_some() {
+                removed = candidates;
+                bytes = removed.iter().map(|p| path_bytes(p)).sum();
+            } else {
+                verification_error = Some("newest copy needs verification".to_string());
+            }
+        } else {
+            match crate::backup_verification::verify(paths, newest) {
+                Ok(_) => {
+                    for path in candidates {
+                        let size = path_bytes(&path);
+                        crate::backup_verification::remove_copy(paths, &path)?;
+                        bytes += size;
+                        tracing::info!("pruned verified migration backup {}", path.display());
+                        store.audit(
+                            "daemon",
+                            "backup.prune",
+                            &format!(
+                                "{} ({size} bytes); newest {} verified",
+                                path.display(),
+                                newest.display()
+                            ),
+                        )?;
+                        removed.push(path);
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!("migration backup retention skipped: {error:#}");
+                    verification_error = Some(format!("{error:#}"));
+                }
+            }
         }
     }
-    rows.push(
-        json!({"kind": "migration backups", "items": old.len(), "bytes": bytes,
-        "detail": format!("all but the newest {MIGRATION_BACKUPS_KEEP}")}),
-    );
+    rows.push(json!({"kind":"migration backups","items":removed.len(),"bytes":bytes,
+        "detail":format!("keep newest {MIGRATION_BACKUPS_KEEP} and receipt-pinned recovery; verify newest before pruning"),"verification_error":verification_error}));
     // Free pages left behind in the database.
     let free = store.free_bytes()?;
     if !dry_run && free > 0 {
@@ -213,10 +256,22 @@ pub fn backup(paths: &Paths, store: &Store, keep: usize) -> Result<PathBuf> {
     let stamp = backup_stamp();
     let dest = dir.join(format!("formless-{stamp}.db"));
     store.backup_into(&dest)?;
+    crate::backup_verification::verify(paths, &dest)
+        .context("verify new backup before retention")?;
     let mut all = list_backups(paths);
     all.reverse(); // newest first
     for old in all.iter().skip(keep.max(1)) {
-        let _ = std::fs::remove_file(old);
+        crate::backup_verification::remove_copy(paths, old)?;
+        tracing::info!("pruned daily backup {}", old.display());
+        store.audit(
+            "daemon",
+            "backup.prune",
+            &format!(
+                "daily {}; newest {} verified",
+                old.display(),
+                dest.display()
+            ),
+        )?;
     }
     Ok(dest)
 }
