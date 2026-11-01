@@ -930,3 +930,26 @@ test('late old-generation basis cannot cancel a newer summary operation', {timeo
   second.resolve(f.basis);const prepare=await h.request('prepare_branch_summary');prepare.resolve(f.preview);const review=await h.review();review.resolve(null);await newer;
   assert.equal(h.calls.filter(req=>req.type==='prepare_branch_summary').length,1);assert.equal(h.calls.some(req=>req.type==='commit_branch_summary'),false);
 });
+
+test('relay reconnect registers only existing push opt-in on the current authenticated room', async () => {
+  const subscription={toJSON:()=>({endpoint:'https://push.example/private'})};
+  const registration=deferred();
+  const c=setup(['restorePushSubscription'],{navigator:{serviceWorker:{getRegistration:()=>registration.promise}}});
+  const frames=[];const ws={readyState:1,send:frame=>frames.push(JSON.parse(frame))};
+  Object.assign(c.S,{ws,room:'new-v3-room',channel:{},daemonOnline:true});
+  const current=c.restorePushSubscription(ws);
+  registration.resolve({pushManager:{getSubscription:async()=>subscription}});
+  await current;
+  assert.deepEqual(frames,[{relay:'push_subscribe',sub:{endpoint:'https://push.example/private'}}]);
+  for(const change of ['socket','room','channel']){
+    const held=deferred();c.navigator.serviceWorker.getRegistration=()=>held.promise;
+    Object.assign(c.S,{ws,room:'new-v3-room',channel:{},daemonOnline:true});
+    const stale=c.restorePushSubscription(ws);
+    if(change==='socket')c.S.ws={};else if(change==='room')c.S.room='another-room';else c.S.channel=null;
+    held.resolve({pushManager:{getSubscription:async()=>subscription}});await stale;
+    assert.equal(frames.length,1,'stale registration cannot cross connection or room');
+  }
+  c.navigator.serviceWorker.getRegistration=async()=>({pushManager:{getSubscription:async()=>null}});
+  Object.assign(c.S,{ws,room:'new-v3-room',channel:{},daemonOnline:true});
+  await c.restorePushSubscription(ws);assert.equal(frames.length,1,'no existing opt-in creates no subscription');
+});

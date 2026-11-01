@@ -4,8 +4,9 @@
 // this worker only forwards opaque text and can never read session data.
 // The Web frontend lives in web/ and is served as static assets with the
 // headers below (the page URL carries the key, so no inline script runs).
-// The room id is a truncated SHA-256 of the pairing key, so knowing a
-// room does not reveal the key. Deployed at formless.athiwat.xyz.
+// Room v3 is a truncated SHA-256 of a domain-separated HKDF daemon claim.
+// A daemon proves that claim in an Authorization header before upgrade;
+// knowing the room does not reveal the claim or pairing/E2E key. Deployed at formless.athiwat.xyz.
 //
 // A daemon that connects with ?mux=1 gets one logical connection per
 // browser: each client socket has an id (cid), the daemon is told
@@ -19,6 +20,7 @@
 // when an approval or question waits, and the room sends each subscription
 // a payload-free VAPID push (push.mjs).
 
+import { verifyDaemonClaim } from "./daemon-claim.mjs";
 import { isConfigFailure, loadVapid, sendPush, validSubscription } from "./push.mjs";
 
 const MAX_SUBSCRIPTIONS = 10;
@@ -44,7 +46,7 @@ export class RelayRoom {
   }
 
   sockets(role) {
-    return this.state.getWebSockets(role).filter((ws) => ws.readyState === 1);
+    return this.state.getWebSockets(role).filter((ws) => ws.readyState === 1 && (role !== "daemon" || (this.attachment(ws).role === "daemon" && this.attachment(ws).authenticated === 3)));
   }
 
   attachment(ws) {
@@ -75,27 +77,30 @@ export class RelayRoom {
     }
     const url = new URL(request.url);
     const role = url.searchParams.get("role") === "daemon" ? "daemon" : "client";
-    const refused = this.refuse(role);
-    if (refused) return new Response(refused[1], { status: refused[0] });
-    const pair = new WebSocketPair();
-    this.admit(pair[1], role, url.searchParams.get("mux") === "1", request.headers.get("User-Agent") || "");
-    return new Response(null, { status: 101, webSocket: pair[0] });
-  }
-
-  /** Why `role` can't join right now, as [status, text], or null. */
-  refuse(role) {
-    if (role === "daemon" && this.sockets("daemon").length > 0) {
-      return [409, "a daemon is already connected to this room"];
+    const room = url.pathname.match(/^\/relay\/([a-f0-9]{32})$/)?.[1];
+    if (role === "daemon" && !await verifyDaemonClaim(room || "", request.headers.get("Authorization"))) {
+      return new Response("daemon authentication required", { status: 401 });
     }
-    return null;
+    const pair = new WebSocketPair();
+    this.admit(pair[1], role, url.searchParams.get("mux") === "1", request.headers.get("User-Agent") || "", role === "daemon");
+    return new Response(null, { status: 101, webSocket: pair[0] });
   }
 
   /** Admit an accepted server-side socket: the Worker's own, or the one
    * relay/dev.mjs wraps around a Node socket, so both run this code (#836). */
-  admit(server, role, mux, userAgent) {
+  admit(server, role, mux, userAgent, authenticated = false) {
     if (role === "daemon") {
+      if (!authenticated) throw new Error("daemon authentication required");
+      const replacing = this.sockets("daemon").length > 0;
+      // Retire attachments synchronously before closing: queued old frames,
+      // delayed close/error events and hibernation must not regain authority.
+      for (const old of this.state.getWebSockets("daemon")) {
+        old.serializeAttachment({ role: "superseded" });
+        try { old.close(4003, "daemon connection replaced"); } catch (_) {}
+      }
+      if (replacing) this.notifyClients("daemon_offline");
       this.state.acceptWebSocket(server, [role]);
-      server.serializeAttachment({ role: role, mux: mux });
+      server.serializeAttachment({ role: role, mux: mux, authenticated: 3 });
       if (mux) {
         for (const ws of this.sockets("client")) { const a = this.attachment(ws); this.notifyDaemon(server, "client_open", a.cid, a.ua); }
       }
@@ -145,6 +150,7 @@ export class RelayRoom {
   async webSocketMessage(ws, message) {
     if (typeof message !== "string") return;
     const att = this.attachment(ws);
+    if (att.role !== "client" && !(att.role === "daemon" && att.authenticated === 3)) return;
     const ctl = this.control(message);
     if (ctl && att.role === "daemon" && ctl.relay === "push") return this.pushAll();
     // The daemon closes one browser: 4001 when kicked (it may reconnect;
@@ -194,10 +200,11 @@ export class RelayRoom {
     if (this.gone.has(ws)) return;
     this.gone.add(ws);
     const att = this.attachment(ws);
-    if (att.role === "daemon") {
-      this.notifyClients("daemon_offline");
+    if (att.role === "daemon" && att.authenticated === 3) {
+      if (this.sockets("daemon").length === 0) this.notifyClients("daemon_offline");
       return;
     }
+    if (att.role !== "client") return;
     const daemon = this.muxDaemon();
     if (daemon && att.cid) this.notifyDaemon(daemon, "client_close", att.cid);
   }
