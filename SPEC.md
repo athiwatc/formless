@@ -4578,7 +4578,13 @@ Run, upload, last-Run marker, credential refresh or provider request. It may use
 read-only local IPC to an already-running daemon; it never starts one. Offline
 SQLite reads use a private coherent snapshot under maintenance/native locks,
 without opening the source with a SQLite pager or touching its WAL/SHM. Busy,
-unsupported locking or a possible hot rollback journal fails closed. A missing
+unsupported locking or a possible hot rollback journal fails closed. On macOS,
+offline reads require writable local APFS/HFS/UFS: filesystem metadata is checked
+before source open, preferred/forced proxy locking is refused, and the explicit
+POSIX VFS probes reserved locks before claiming the existing exclusive gate.
+The default auto-selecting VFS and its global flags are never changed. Network,
+read-only and unknown filesystems fail closed; ordinary default-VFS writer and
+checkpoint exclusion remain required. A missing
 profile stays missing. Attachment previews carry client-supplied bytes-derived
 metadata or display-only references; the RPC never reads a client-supplied local
 path. Admissible uploaded attachments are rechecked at admission.

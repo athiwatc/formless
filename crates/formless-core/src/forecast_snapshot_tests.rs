@@ -169,7 +169,11 @@ struct External {
 }
 impl External {
     fn spawn(file: &Path, mode: &str) -> Self {
-        let mut child = Command::new(std::env::current_exe().unwrap())
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        if mode == "forced-proxy" {
+            command.env("SQLITE_FORCE_PROXY_LOCKING", "1");
+        }
+        let mut child = command
             .args([
                 "--ignored",
                 "--exact",
@@ -317,6 +321,24 @@ fn native_exclusive_lock_excludes_independent_wal_append_checkpoint_and_reset() 
 fn external_sqlite_fixture() {
     let file = std::env::var_os("FORMLESS_FORECAST_FIXTURE_DB").expect("private fixture path");
     let mode = std::env::var("FORMLESS_FORECAST_FIXTURE_MODE").unwrap();
+    #[cfg(target_os = "macos")]
+    if mode == "forced-proxy" {
+        let error = match NativeLock::acquire(Path::new(&file)) {
+            Ok(_) => panic!("forced proxy admitted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("proxy locking"), "{error}");
+        println!("FORECAST_FIXTURE_READY");
+        std::io::stdout().flush().unwrap();
+        let mut command = String::new();
+        BufReader::new(std::io::stdin())
+            .read_line(&mut command)
+            .unwrap();
+        assert_eq!(command, "release\n");
+        println!("FORECAST_FIXTURE_DONE");
+        std::io::stdout().flush().unwrap();
+        return;
+    }
     if mode == "unproven-vfs" {
         // Private subprocess only: register an unproven VFS name without
         // opening any source SQLite connection, then restore registration.
@@ -370,4 +392,65 @@ fn external_sqlite_fixture() {
     drop(conn);
     println!("FORECAST_FIXTURE_DONE");
     std::io::stdout().flush().unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn apple_default_autolocking_uses_explicit_posix_without_source_or_global_changes() {
+    let (fixture, paths) = Fixture::new();
+    let expected = closed_wal(&paths);
+    let before = tree(&fixture.0);
+    // This proof must exercise Apple's normal bundled automatic-locking build,
+    // not pass because a global compile flag disabled the feature under test.
+    let default_before = unsafe {
+        assert_eq!(
+            ffi::sqlite3_compileoption_used(c"ENABLE_LOCKING_STYLE=1".as_ptr()),
+            1
+        );
+        let default = ffi::sqlite3_vfs_find(std::ptr::null());
+        assert!(!default.is_null());
+        assert_eq!(CStr::from_ptr((*default).zName).to_bytes(), b"unix");
+        let source = CString::new(
+            std::fs::canonicalize(paths.db_file())
+                .unwrap()
+                .to_str()
+                .unwrap(),
+        )
+        .unwrap();
+        let selected = macos::source_vfs(default, source.as_c_str()).unwrap();
+        assert_eq!(CStr::from_ptr((*selected).zName).to_bytes(), b"unix-posix");
+        assert_eq!(
+            ffi::sqlite3_vfs_find(std::ptr::null()),
+            default,
+            "selection never changes the process default"
+        );
+        default
+    };
+    let reader = open(&paths).unwrap().unwrap();
+    assert!(reader
+        .list_sessions()
+        .unwrap()
+        .iter()
+        .any(|s| s.id == expected));
+    drop(reader);
+    unsafe {
+        assert_eq!(
+            ffi::sqlite3_vfs_find(std::ptr::null()),
+            default_before,
+            "snapshot never changes the process default"
+        );
+    }
+    assert_eq!(tree(&fixture.0), before);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn forced_proxy_preference_refuses_before_source_open_in_an_owned_process() {
+    let (fixture, paths) = Fixture::new();
+    closed_wal(&paths);
+    let before = tree(&fixture.0);
+    let mut external = External::spawn(&paths.db_file(), "forced-proxy");
+    external.marker("FORECAST_FIXTURE_READY");
+    external.release_and_finish();
+    assert_eq!(tree(&fixture.0), before);
 }

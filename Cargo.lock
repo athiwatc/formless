@@ -1352,6 +1352,7 @@ dependencies = [
  "image",
  "jsonschema",
  "keyring",
+ "libc",
  "pulldown-cmark",
  "rand 0.8.8",
  "regex",
