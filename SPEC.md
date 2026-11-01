@@ -642,6 +642,14 @@ task, with quality as a gate**.
 - v2: Sessions can be forked (full copy, or a prefix up to a message),
   searched across all Sessions, and a past user message can be edited —
   everything after it is dropped and the Run retries from there.
+  Fork creation atomically records `forked_from` (the direct parent ID) and
+  `fork_point_seq` (the last source message actually copied, or 0 for an empty
+  prefix). Copied message sequence numbers remain unchanged, including gaps,
+  so checkpoint and fork-point boundaries retain their source meaning.
+  New and imported Sessions are roots; profiles upgraded from before lineage
+  have null lineage rather than guessed parents. Parent deletion never deletes
+  children or erases their recorded parent ID. Forks copy transcript data and
+  settings, not the parent's Runs or usage charges.
   **Deleting a Session can be undone for `daemon.delete_undo_secs` (30).**
   It is hidden at once from lists, search and `GetSession`
   (`sessions.deleted_at`, schema v27), and `RestoreSession` brings it

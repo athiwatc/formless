@@ -359,7 +359,7 @@ impl ModelStat {
 const SESSION_SUMMARY: &str = "s.*";
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 59;
+pub const SCHEMA_VERSION: i64 = 60;
 
 /// Add a column, tolerating only "it already exists" (a step that was
 /// partly applied by an older build); every other error is real.
@@ -444,7 +444,7 @@ fn migrate_v39(c: &Connection) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 59] = [
+const MIGRATIONS: [(i64, MigrationStep); 60] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -723,6 +723,16 @@ const MIGRATIONS: [(i64, MigrationStep); 59] = [
     (59, |c| {
         c.execute_batch("CREATE TABLE run_forecasts (run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE, forecast TEXT NOT NULL); CREATE TRIGGER immutable_run_forecast BEFORE UPDATE ON run_forecasts BEGIN SELECT RAISE(ABORT, 'Run forecast is immutable'); END; CREATE TABLE forecast_request_counts(run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE, source TEXT NOT NULL, expected INTEGER NOT NULL, PRIMARY KEY(run_id,source));")?;
         add_column(c, "run_usage", "usage_complete INTEGER NOT NULL DEFAULT 0")
+    }),
+    (60, |c| {
+        // Deliberately no parent foreign key: deleting a parent must preserve
+        // both children and their historical parent identity.
+        add_column(c, "sessions", "forked_from TEXT")?;
+        add_column(c, "sessions", "fork_point_seq INTEGER CHECK((forked_from IS NULL AND fork_point_seq IS NULL) OR (forked_from IS NOT NULL AND fork_point_seq IS NOT NULL AND fork_point_seq>=0))")?;
+        c.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_sessions_forked_from ON sessions(forked_from);",
+        )?;
+        Ok(())
     }),
 ];
 
@@ -1172,6 +1182,8 @@ impl Store {
     fn row_session(r: &rusqlite::Row) -> rusqlite::Result<SessionInfo> {
         Ok(SessionInfo {
             id: r.get("id")?,
+            forked_from: r.get("forked_from")?,
+            fork_point_seq: r.get("fork_point_seq")?,
             name: r.get("name")?,
             model: r.get("model")?,
             reasoning_effort: r.get("reasoning_effort")?,
@@ -1658,30 +1670,49 @@ impl Store {
         name: Option<String>,
         up_to_seq: Option<i64>,
     ) -> Result<Option<SessionInfo>> {
+        self.transaction(|st| st.fork_session_locked(id, name, up_to_seq))
+    }
+
+    fn fork_session_locked(
+        &self,
+        id: &str,
+        name: Option<String>,
+        up_to_seq: Option<i64>,
+    ) -> Result<Option<SessionInfo>> {
         let Some(orig) = self.get_session(id)? else {
             return Ok(None);
         };
         let limit = up_to_seq.unwrap_or(i64::MAX);
-        let messages: Vec<(String, String, Option<String>)> = self
+        let messages: Vec<MessageInfo> = self
             .list_messages(id)?
             .into_iter()
             .filter(|m| m.seq <= limit)
-            .map(|m| (m.role, m.content, m.meta))
             .collect();
-        let checkpoints: Vec<(String, i64)> = self
-            .list_checkpoints(id)?
-            .into_iter()
-            .filter(|(_, up_to)| *up_to <= limit)
-            .collect();
+        let point = messages.last().map(|message| message.seq).unwrap_or(0);
+        let checkpoints: Vec<(String, String, i64)> = self.ps(
+            "SELECT id,summary,up_to_seq FROM checkpoints WHERE session_id=?1 AND up_to_seq<=?2 ORDER BY up_to_seq,rowid"
+        )?.query_map(params![id,point], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?;
         let name = name
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| format!("{} (fork)", orig.name));
-        let fork = self.import_session(
-            &name,
-            orig.model,
-            orig.reasoning_effort,
-            &messages,
-            &checkpoints,
+        let fork = self.create_session(Some(name))?;
+        self.set_session_model(&fork.id, orig.model, orig.reasoning_effort)?;
+        for message in messages {
+            self.ex("INSERT INTO messages(id,session_id,seq,role,content,created_at,meta) VALUES(?1,?2,?3,?4,?5,?6,?7)", params![uuid::Uuid::new_v4().to_string(),fork.id,message.seq,message.role,message.content,message.created_at,message.meta])?;
+        }
+        for (source_id, summary, up_to) in checkpoints {
+            let copied_id = self.save_checkpoint(&fork.id, &summary, up_to)?;
+            // The summary's evidence can outlive the original message rows.
+            // Rebind it to this independent checkpoint ID, not the parent's
+            // session/run key, and never pull evidence from a later cut.
+            for origin in self.data_origins(id, &format!("checkpoint:{source_id}"))? {
+                self.record_data_origin(&fork.id, &format!("checkpoint:{copied_id}"), &origin)?;
+            }
+        }
+        self.ex(
+            "UPDATE sessions SET forked_from=?2,fork_point_seq=?3,updated_at=?4 WHERE id=?1",
+            params![fork.id, id, point, now()],
         )?;
         // The fork works in the same directory, to the same instructions.
         if orig.instructions.is_some() {
@@ -6862,3 +6893,7 @@ mod forecast_retention_tests {
 #[cfg(test)]
 #[path = "description_store_tests.rs"]
 mod description_store_tests;
+
+#[cfg(test)]
+#[path = "session_lineage_tests.rs"]
+mod session_lineage_tests;
