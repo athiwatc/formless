@@ -2,6 +2,13 @@
 name: release-baseline
 on:
   workflow_dispatch:
+    inputs:
+      job_family:
+        description: Cold job family to measure (skipped families are not timing evidence)
+        type: choice
+        required: true
+        default: all
+        options: [all, native, linux, docker, pipe]
 
 # Same-run artifact actions use the workflow's scoped artifact-service token.
 # No repository/package write, OIDC, publishing credentials or inherited secrets.
@@ -13,13 +20,14 @@ defaults:
     shell: bash
 
 concurrency:
-  group: release-baseline-${{ github.ref }}
+  group: release-baseline-${{ github.ref }}-${{ inputs.job_family }}
   cancel-in-progress: false
 
 jobs:
   # Limits remain provisional until the first green Cargo-cold run per runner.
   # Compare job started_at/completed_at (not queue time), then ceil(2x seconds/60).
   build:
+    if: ${{ inputs.job_family == 'all' || inputs.job_family == 'native' }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -120,6 +128,7 @@ jobs:
       # is no distribution upload; local extracted smoke is included in timing.
 
   linux:
+    if: ${{ inputs.job_family == 'all' || inputs.job_family == 'linux' }}
     timeout-minutes: 60
     runs-on: ubuntu-latest
     container: rust:1-bullseye
@@ -130,7 +139,9 @@ jobs:
       - name: Record source, image and cold state
         shell: bash
         run: |
-          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          # Container UID can differ from checkout owner: trust this exact read
+          # only, without writing global/system Git configuration.
+          test "$(git -c safe.directory="$GITHUB_WORKSPACE" rev-parse HEAD)" = "$GITHUB_SHA"
           ci_cargo_home="$RUNNER_TEMP/baseline-cargo"
           ci_target="$GITHUB_WORKSPACE/target"
           test ! -e "$ci_cargo_home"
@@ -195,6 +206,7 @@ jobs:
             dist/*.sha256
 
   linux-install-test:
+    if: ${{ inputs.job_family == 'all' || inputs.job_family == 'linux' }}
     timeout-minutes: 30
     needs: linux
     strategy:
@@ -246,6 +258,7 @@ jobs:
           }
 
   docker:
+    if: ${{ inputs.job_family == 'all' || inputs.job_family == 'docker' }}
     timeout-minutes: 30
     runs-on: ubuntu-latest
     env:
@@ -320,6 +333,7 @@ jobs:
   # Matches windows.yml's targeted test job, independently Cargo-cold. The
   # pending inventory UTF-8 fix must be merged before dispatching this baseline.
   pipe:
+    if: ${{ inputs.job_family == 'all' || inputs.job_family == 'pipe' }}
     timeout-minutes: 22
     runs-on: windows-latest
     steps:

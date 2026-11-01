@@ -45,6 +45,11 @@ platform app-dirs (SPEC §9.4).
 `release-baseline.yml` is a separate, manual-only workflow for measuring the
 nonpublishing work before sizing job timeouts (#1164). After it is merged,
 run it on a reviewed commit through **Actions → release-baseline → Run workflow**.
+Choose `job_family`: `all` (default), `native` (three macOS/Windows build rows),
+`linux` (bullseye build and all three install containers), `docker`, or `pipe`.
+Family-specific concurrency does not cancel other in-progress runs. Rerun an
+unaffected family only when new evidence is needed; a Linux-only retry need not
+repeat expensive native/Docker work.
 Do not use the existing `release` dispatch for this: that workflow has publishing
 permissions, and selecting a version tag can reach its publishing jobs.
 
@@ -74,7 +79,12 @@ following the whole workspace suite would be warm and cannot serve as its cold
 baseline.
 
 Use each green job's `completed_at - started_at` (excluding queue time) and retain
-its run/job URL, SHA, runner image and cache state. Set the corresponding timeout
+its run/job URL, SHA, selected family, runner image and cache state. A skipped
+or failed job supplies no green measurement for that row. To combine rows from
+workflow-only retries, verify that their Rust source, manifests/lockfile and
+relevant build/test/container/package inputs have the same content; retain each
+row's actual SHA and scope. Code/dependency/image/build-recipe changes require
+new measurements of affected rows. Set the corresponding timeout
 to `ceil(2 * seconds / 60)` minutes; for a common matrix timeout, use the slowest
 green matrix row. Current 60/30-minute release caps stay explicitly provisional
 until that evidence exists. Failed, timed-out, unavailable-runner or warm jobs
