@@ -14,7 +14,9 @@ pub fn hash(value: &impl serde::Serialize) -> String {
 
 /// Shared with live Session snapshots; callers decide whether to persist it.
 pub fn effective_prompt(st: &Store, cfg: &Config) -> Result<String> {
-    let mut prompt = st.effective_system_prompt(crate::provider::SYSTEM_PROMPT)?;
+    let mut prompt = crate::provenance::mandatory_system(
+        &st.effective_system_prompt(crate::provider::SYSTEM_PROMPT)?,
+    );
     let skills: Vec<_> = st
         .list_skills()?
         .into_iter()
@@ -23,7 +25,11 @@ pub fn effective_prompt(st: &Store, cfg: &Config) -> Result<String> {
         .collect();
     if !skills.is_empty() {
         prompt.push_str("\n\nSkills (load one with load_skill before a task it covers):\n");
-        prompt.push_str(&skills.join("\n"));
+        prompt.push_str(&crate::provenance::frame(
+            "skill_index",
+            &[],
+            &skills.join("\n"),
+        ));
     }
     if !cfg.roles.is_empty() {
         prompt.push_str("\n\nRoles (pass {role: name} to agents.run or llm.complete from a Tool with the agent/llm Capability):");

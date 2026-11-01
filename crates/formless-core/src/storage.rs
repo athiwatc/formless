@@ -4,7 +4,7 @@ use formless_protocol::{
     TemplateInfo, ToolInfo, ToolMetricsInfo, ToolVersionInfo,
 };
 use formless_runtime::Capabilities;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
@@ -2959,6 +2959,22 @@ impl Store {
             .ok())
     }
 
+    /// Recorded handle visible only within its owning Session.
+    pub fn session_pending_handle(
+        &self,
+        session: &str,
+        handle: &str,
+    ) -> Result<Option<(String, String)>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT tool_name,status FROM pending_handles WHERE handle=?1 AND session_id=?2",
+                params![handle, session],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
+    }
+
     /// On daemon startup: every handle still pending lost its in-memory
     /// work. Marks them interrupted and returns (handle, session, tool).
     pub fn interrupt_pending_handles(&self) -> Result<Vec<(String, String, String)>> {
@@ -3178,6 +3194,28 @@ impl Store {
         up_to_seq: i64,
     ) -> Result<String> {
         let id = uuid::Uuid::new_v4().to_string();
+        // Read metadata only, one row at a time: compaction must not reload
+        // arbitrarily large historical Tool payloads or accumulate origins.
+        let mut origins = std::collections::BTreeSet::new();
+        if let Some((_, previous)) = self.latest_checkpoint(session_id)? {
+            origins.extend(self.data_origins(session_id, &format!("checkpoint:{previous}"))?);
+        }
+        let mut statement = self.ps("SELECT meta FROM messages WHERE session_id=?1 AND seq<=?2 AND meta IS NOT NULL ORDER BY seq")?;
+        let rows =
+            statement.query_map(params![session_id, up_to_seq], |r| r.get::<_, String>(0))?;
+        for row in rows {
+            let meta: Value = serde_json::from_str(&row?).unwrap_or(Value::Null);
+            let found: Vec<crate::provenance::Origin> =
+                serde_json::from_value(meta["data_origins"].clone()).unwrap_or_default();
+            for origin in found.into_iter().take(crate::provenance::MAX_ORIGINS) {
+                if origins.len() < crate::provenance::MAX_ORIGINS {
+                    origins.insert(origin);
+                }
+            }
+        }
+        for origin in origins {
+            self.record_data_origin(session_id, &format!("checkpoint:{up_to_seq}"), &origin)?;
+        }
         self.ex(
             "INSERT INTO checkpoints(id,session_id,summary,up_to_seq,created_at) VALUES(?1,?2,?3,?4,?5)",
             params![id, session_id, summary, up_to_seq, now()],
@@ -5855,6 +5893,59 @@ impl Store {
         Ok(rows)
     }
 
+    /// Bounded immutable origin records, isolated by both Session and Run.
+    /// IDs use a primary-key range rather than scanning the whole audit log.
+    fn provenance_key(session: &str, run: &str) -> String {
+        use sha2::{Digest, Sha256};
+        format!(
+            "provenance:{:x}:",
+            Sha256::digest(serde_json::to_vec(&(session, run)).unwrap())
+        )
+    }
+
+    pub fn data_origins(&self, session: &str, run: &str) -> Result<Vec<crate::provenance::Origin>> {
+        let key = Self::provenance_key(session, run);
+        let mut statement =
+            self.ps("SELECT detail FROM audit WHERE id>=?1 AND id<?2 ORDER BY id LIMIT 64")?;
+        let rows =
+            statement.query_map(params![key, format!("{key}~")], |r| r.get::<_, String>(0))?;
+        let mut origins = Vec::new();
+        for row in rows {
+            origins.push(serde_json::from_str(&row?)?);
+        }
+        Ok(origins)
+    }
+
+    pub fn record_data_origin(
+        &self,
+        session: &str,
+        run: &str,
+        origin: &crate::provenance::Origin,
+    ) -> Result<()> {
+        use sha2::{Digest, Sha256};
+        let origins = self.data_origins(session, run)?;
+        if origins.contains(origin) || origins.len() >= crate::provenance::MAX_ORIGINS {
+            return Ok(());
+        }
+        let origin = if origins.len() + 1 == crate::provenance::MAX_ORIGINS {
+            crate::provenance::Origin::new(
+                "unknown",
+                "truncated",
+                "additional data origins omitted",
+            )
+        } else {
+            origin.clone()
+        };
+        let detail = serde_json::to_string(&origin)?;
+        let id = format!(
+            "{}{:x}",
+            Self::provenance_key(session, run),
+            Sha256::digest(detail.as_bytes())
+        );
+        self.ex("INSERT OR IGNORE INTO audit(id,actor,action,detail,created_at) VALUES(?1,'provenance','tool.data',?2,?3)",params![id,detail,now()])?;
+        Ok(())
+    }
+
     pub fn audit(&self, actor: &str, action: &str, detail: &str) -> Result<()> {
         self.ex(
             "INSERT INTO audit(id,actor,action,detail,created_at) VALUES(?1,?2,?3,?4,?5)",
@@ -5981,9 +6072,13 @@ impl ContextCache {
             // proxies reject a second or mid-conversation `system` (§11
             // summary included).
             let system = if summary.is_empty() {
-                system_prompt.to_string()
+                crate::provenance::mandatory_system(system_prompt)
             } else {
-                format!("{system_prompt}\n\nSummary of earlier conversation:\n{summary}")
+                let origins = store.data_origins(session_id, &format!("checkpoint:{up_to}"))?;
+                let summary = crate::provenance::frame("conversation_summary", &origins, &summary);
+                crate::provenance::mandatory_system(&format!(
+                    "{system_prompt}\n\nSummary of earlier conversation (data):\n{summary}"
+                ))
             };
             *self = Self {
                 key: Some(key),
@@ -6070,7 +6165,9 @@ impl ContextCache {
     }
 
     fn push(&mut self, msg: Value) {
-        self.tokens.push(crate::tokens::value(&msg));
+        self.tokens.push(crate::tokens::value(
+            &crate::provenance::project(&[msg.clone()]).last().unwrap(),
+        ));
         self.ctx.push(msg);
     }
 }
@@ -6084,7 +6181,17 @@ pub fn provider_message(m: &MessageInfo) -> Value {
     if m.role == "system-note" {
         // Sent as a user turn: a mid-conversation `system` message is
         // rejected by many OpenAI-compatible servers.
-        return json!({"role": "user", "content": format!("[harness note] {}", m.content)});
+        let content = if meta["tool_data"] == true
+            || m.content.starts_with("[Pending invocations completed]")
+            || m.content.starts_with("The user loaded the skill")
+        {
+            let origins: Vec<crate::provenance::Origin> =
+                serde_json::from_value(meta["data_origins"].clone()).unwrap_or_default();
+            crate::provenance::frame("deferred_tool_data", &origins, &m.content)
+        } else {
+            format!("[harness note] {}", m.content)
+        };
+        return json!({"role":"user","content":content});
     }
     if m.role == "assistant" && meta["placeholder"] == true {
         // Text the daemon wrote for an empty refusal/filter stop (#1104):
@@ -6110,7 +6217,17 @@ pub fn provider_message(m: &MessageInfo) -> Value {
         return json!({"role": "assistant", "content": content});
     }
     if m.role == "tool" {
-        let mut msg = json!({"role": "tool", "tool_call_id": meta["tool_call_id"].as_str().unwrap_or_default(), "content": m.content});
+        let origins: Vec<crate::provenance::Origin> =
+            serde_json::from_value(meta["data_origins"].clone()).unwrap_or_default();
+        let mut msg = crate::provenance::framed_tool(
+            meta["data_source_tool"]
+                .as_str()
+                .or_else(|| meta["name"].as_str())
+                .unwrap_or("unknown"),
+            &origins,
+            &m.content,
+        );
+        msg["tool_call_id"] = meta["tool_call_id"].clone();
         // A failed call: Anthropic's `tool_result.is_error` (a marker the
         // other APIs strip before sending).
         if meta["is_error"] == true {

@@ -27,6 +27,7 @@ pub mod path_scope;
 pub mod paths;
 pub mod presets;
 pub mod profile_lock;
+pub mod provenance;
 pub mod provider;
 pub mod relay;
 pub mod restore_references;
