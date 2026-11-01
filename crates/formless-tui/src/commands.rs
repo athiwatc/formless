@@ -652,6 +652,10 @@ const KEYS: &[(&str, &str)] = &[
         "Hunk review: n/p, a/r, u, c",
         "next/previous, keep/reject, undo latest change, comment with server path:line",
     ),
+    (
+        "Ctrl+G",
+        "edit composer, instructions or Tool draft in $VISUAL/$EDITOR; normal send/save still applies",
+    ),
     ("Ctrl+C", "clear the input; twice to detach"),
     ("Tab / Shift+Tab", "switch views"),
     ("PgUp / PgDn, ↑ / ↓", "scroll the chat"),
