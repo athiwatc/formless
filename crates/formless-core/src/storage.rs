@@ -4,7 +4,7 @@ use formless_protocol::{
     TemplateInfo, ToolInfo, ToolMetricsInfo, ToolVersionInfo,
 };
 use formless_runtime::Capabilities;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
@@ -13,11 +13,17 @@ use std::path::{Path, PathBuf};
 /// (key, provider, model, prompt, completion, cached, cache-write, reported cost).
 pub type GroupedUsage = (String, String, String, i64, i64, i64, i64, Option<f64>);
 
+#[path = "forecast_snapshot.rs"]
+mod forecast_snapshot;
+
 pub struct Store {
     conn: Connection,
     /// Bumped whenever stored messages change other than by appending
     /// (edit/truncate, delete), so [`ContextCache`]s know to rebuild.
     rewrites: std::sync::atomic::AtomicU64,
+    // Connection drops before this private directory; source files are never
+    // held by a forecast reader or touched by close-time optimize.
+    _forecast_snapshot: Option<forecast_snapshot::SnapshotDir>,
 }
 
 #[derive(Debug, Clone)]
@@ -351,7 +357,7 @@ impl ModelStat {
 const SESSION_SUMMARY: &str = "s.*";
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 58;
+pub const SCHEMA_VERSION: i64 = 59;
 
 /// Add a column, tolerating only "it already exists" (a step that was
 /// partly applied by an older build); every other error is real.
@@ -436,7 +442,7 @@ fn migrate_v39(c: &Connection) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 58] = [
+const MIGRATIONS: [(i64, MigrationStep); 59] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -711,6 +717,10 @@ const MIGRATIONS: [(i64, MigrationStep); 58] = [
                 ratio REAL NOT NULL, samples INTEGER NOT NULL,
                 PRIMARY KEY(provider_key, model));",
         )?)
+    }),
+    (59, |c| {
+        c.execute_batch("CREATE TABLE run_forecasts (run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE, forecast TEXT NOT NULL); CREATE TRIGGER immutable_run_forecast BEFORE UPDATE ON run_forecasts BEGIN SELECT RAISE(ABORT, 'Run forecast is immutable'); END; CREATE TABLE forecast_request_counts(run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE, source TEXT NOT NULL, expected INTEGER NOT NULL, PRIMARY KEY(run_id,source));")?;
+        add_column(c, "run_usage", "usage_complete INTEGER NOT NULL DEFAULT 0")
     }),
 ];
 
@@ -1072,6 +1082,7 @@ impl Store {
         Ok(Self {
             conn,
             rewrites: Default::default(),
+            _forecast_snapshot: None,
         })
     }
 
@@ -1092,6 +1103,29 @@ impl Store {
         Err(damaged(file, &detail.join("; ")))
     }
 
+    /// Private snapshot reader; no SQLite connection ever opens the source.
+    /// Busy/unsupported native locking fails closed instead of changing WAL/SHM.
+    pub fn open_forecast_reader(file: &Path) -> Result<Self> {
+        let absolute = std::path::absolute(file)?;
+        let directory = absolute
+            .parent()
+            .context("forecast database has no parent")?
+            .to_path_buf();
+        let paths = crate::Paths {
+            data_dir: directory.clone(),
+            config_dir: directory,
+            profile: "forecast-snapshot".into(),
+        };
+        // This compatibility wrapper protects the data tree. Callers with real
+        // profile Paths can additionally freeze its separate configuration tree.
+        forecast_snapshot::open_file(&paths, &absolute)?.context("forecast database does not exist")
+    }
+
+    /// None means genuinely absent: no profile/lock/directory is created.
+    pub fn open_forecast_snapshot(paths: &crate::Paths) -> Result<Option<Self>> {
+        forecast_snapshot::open(paths)
+    }
+
     /// An extra connection for reads only (the database must already be
     /// migrated). WAL lets it read while the main connection writes.
     pub fn open_reader(file: &Path) -> Result<Self> {
@@ -1101,6 +1135,7 @@ impl Store {
         Ok(Self {
             conn,
             rewrites: Default::default(),
+            _forecast_snapshot: None,
         })
     }
 
@@ -1112,6 +1147,7 @@ impl Store {
         Ok(Self {
             conn,
             rewrites: Default::default(),
+            _forecast_snapshot: None,
         })
     }
 
@@ -1431,6 +1467,69 @@ impl Store {
             > 0)
     }
 
+    pub(crate) fn read_transaction<T>(&self, action: impl FnOnce(&Self) -> Result<T>) -> Result<T> {
+        if !self.conn.is_autocommit() {
+            return action(self);
+        }
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Deferred,
+        )?;
+        let result = action(self)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    /// Validate and consume a Run's inputs under one SQLite write boundary.
+    pub(crate) fn transaction<T>(&self, action: impl FnOnce(&Self) -> Result<T>) -> Result<T> {
+        struct Guard<'a> {
+            conn: &'a Connection,
+            rollback: String,
+            commit: String,
+            done: bool,
+        }
+        impl Drop for Guard<'_> {
+            fn drop(&mut self) {
+                if !self.done {
+                    let _ = self.conn.execute_batch(&self.rollback);
+                }
+            }
+        }
+        let outer = self.conn.is_autocommit();
+        let name = format!("fl_{}", uuid::Uuid::new_v4().simple());
+        let (begin, commit, rollback) = if outer {
+            (
+                "BEGIN IMMEDIATE".to_string(),
+                "COMMIT".to_string(),
+                "ROLLBACK".to_string(),
+            )
+        } else {
+            (
+                format!("SAVEPOINT {name}"),
+                format!("RELEASE {name}"),
+                format!("ROLLBACK TO {name}; RELEASE {name}"),
+            )
+        };
+        self.conn.execute_batch(&begin)?;
+        let mut guard = Guard {
+            conn: &self.conn,
+            rollback,
+            commit,
+            done: false,
+        };
+        let result = action(self)?;
+        self.conn.execute_batch(&guard.commit)?;
+        guard.done = true;
+        Ok(result)
+    }
+    pub(crate) fn preview_copy(&self) -> Result<Self> {
+        let mut copy = Self::open_in_memory()?;
+        {
+            let backup = rusqlite::backup::Backup::new(&self.conn, &mut copy.conn)?;
+            backup.run_to_completion(128, std::time::Duration::ZERO, None)?;
+        }
+        Ok(copy)
+    }
     pub fn append_message(
         &self,
         session_id: &str,
@@ -1452,10 +1551,8 @@ impl Store {
         // One write transaction, taken up front (IMMEDIATE): the next seq is
         // computed inside the INSERT itself, so two writers can never pick
         // the same one, and the session's timestamp moves with the message.
-        let tx = rusqlite::Transaction::new_unchecked(
-            &self.conn,
-            rusqlite::TransactionBehavior::Immediate,
-        )?;
+        self.transaction(|st| {
+        let tx=&st.conn;
         let seq: i64 = tx
             .prepare_cached(
                 "INSERT INTO messages(id,session_id,seq,role,content,created_at,meta) \
@@ -1465,7 +1562,6 @@ impl Store {
             .query_row(params![id, session_id, role, content, t, meta], |r| r.get(0))?;
         tx.prepare_cached("UPDATE sessions SET updated_at=?2 WHERE id=?1")?
             .execute(params![session_id, t])?;
-        tx.commit()?;
         Ok(MessageInfo {
             id,
             session_id: session_id.into(),
@@ -1474,6 +1570,7 @@ impl Store {
             content: content.into(),
             created_at: t,
             meta,
+        })
         })
     }
 
@@ -1665,26 +1762,27 @@ impl Store {
         self.note_rewrite();
         // One edit is one commit: four separate ones cost four fsyncs (or
         // four WAL commits) for a single user action.
-        let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
-            "UPDATE messages SET content=?3 WHERE session_id=?1 AND id=?2",
-            params![session_id, message_id, content],
-        )?;
-        tx.execute(
-            "DELETE FROM messages WHERE session_id=?1 AND seq>?2",
-            params![session_id, msg.seq],
-        )?;
-        tx.execute(
-            "DELETE FROM checkpoints WHERE session_id=?1 AND up_to_seq>=?2",
-            params![session_id, msg.seq],
-        )?;
-        tx.execute(
-            "UPDATE sessions SET updated_at=?2 WHERE id=?1",
-            params![session_id, now()],
-        )?;
-        tx.commit()?;
-        msg.content = content.to_string();
-        Ok(Some(msg))
+        self.transaction(|st| {
+            let tx = &st.conn;
+            tx.execute(
+                "UPDATE messages SET content=?3 WHERE session_id=?1 AND id=?2",
+                params![session_id, message_id, content],
+            )?;
+            tx.execute(
+                "DELETE FROM messages WHERE session_id=?1 AND seq>?2",
+                params![session_id, msg.seq],
+            )?;
+            tx.execute(
+                "DELETE FROM checkpoints WHERE session_id=?1 AND up_to_seq>=?2",
+                params![session_id, msg.seq],
+            )?;
+            tx.execute(
+                "UPDATE sessions SET updated_at=?2 WHERE id=?1",
+                params![session_id, now()],
+            )?;
+            msg.content = content.to_string();
+            Ok(Some(msg))
+        })
     }
 
     pub fn create_run(&self, session_id: &str) -> Result<String> {
@@ -2587,6 +2685,100 @@ impl Store {
     }
 
     /// Per-Run metrics, newest first.
+    pub fn record_forecast(
+        &self,
+        run_id: &str,
+        forecast: &formless_protocol::RunForecast,
+    ) -> Result<()> {
+        self.ex(
+            "INSERT INTO run_forecasts(run_id,forecast) VALUES(?1,?2)",
+            params![run_id, serde_json::to_string(forecast)?],
+        )?;
+        Ok(())
+    }
+    pub fn recorded_forecasts(&self) -> Result<Vec<(String, formless_protocol::RunForecast)>> {
+        self.recorded_forecasts_limited(2000)
+    }
+    pub(crate) fn recorded_forecasts_limited(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(String, formless_protocol::RunForecast)>> {
+        let exists: bool = self.conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='run_forecasts')", [], |r| r.get(0))?;
+        if !exists {
+            return Ok(Vec::new());
+        }
+        let mut stmt =
+            self.ps("SELECT run_id,forecast FROM run_forecasts ORDER BY rowid DESC LIMIT ?1")?;
+        let rows = stmt.query_map(params![limit.min(2000) as i64], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        rows.map(|r| {
+            let (id, json) = r?;
+            Ok((id, serde_json::from_str(&json)?))
+        })
+        .collect()
+    }
+    pub fn record_forecast_request(&self, run_id: &str, source: &str) -> Result<()> {
+        if run_id.is_empty() {
+            return Ok(());
+        }
+        self.ex("INSERT INTO forecast_request_counts(run_id,source,expected) SELECT ?1,?2,1 WHERE EXISTS(SELECT 1 FROM runs WHERE id=?1) ON CONFLICT(run_id,source) DO UPDATE SET expected=expected+1",params![run_id,source])?;
+        Ok(())
+    }
+    pub fn forecast_usage_complete(&self, run_id: &str) -> Result<bool> {
+        let (expected,main):(i64,i64)=self.conn.query_row("SELECT COALESCE(SUM(expected),0),COALESCE(SUM(CASE WHEN source='run' THEN expected ELSE 0 END),0) FROM forecast_request_counts WHERE run_id=?1",params![run_id],|r|Ok((r.get(0)?,r.get(1)?)))?;
+        let (rows, known): (i64, i64) = self.conn.query_row(
+            "SELECT COUNT(*),COALESCE(SUM(usage_complete),0) FROM run_usage WHERE run_id=?1",
+            params![run_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        Ok(expected > 0
+            && expected == rows
+            && expected == known
+            && main >= self.run_steps(run_id)?)
+    }
+    pub fn forecast_models(&self, run_id: &str) -> Result<Vec<(String, String)>> {
+        let mut stmt = self
+            .ps("SELECT DISTINCT provider,model FROM run_usage WHERE run_id=?1 AND source='run'")?;
+        let rows = stmt.query_map(params![run_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+    pub fn forecast_usage(
+        &self,
+        run_id: &str,
+        cfg: &crate::Config,
+    ) -> Result<(Option<f64>, u64, u64)> {
+        let mut stmt = self.ps("SELECT provider,model,prompt_tokens,completion_tokens,cached_tokens,cache_write_tokens,cost,source FROM run_usage WHERE run_id=?1")?;
+        let rows = stmt.query_map(params![run_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, i64>(5)?,
+                r.get::<_, Option<f64>>(6)?,
+                r.get::<_, String>(7)?,
+            ))
+        })?;
+        let (mut cost, mut peak, mut cached) = (Some(0.0), 0, 0);
+        let mut any = false;
+        for row in rows {
+            let (p, m, input, output, cache, write, reported, source) = row?;
+            any = true;
+            // Only the main Session request drives its compaction threshold;
+            // nested llm/sub-agent/summarizer contexts have separate windows.
+            if source == "run" {
+                peak = peak.max(input.max(0) as u64);
+            }
+            cached += cache.max(0) as u64;
+            cost = cost
+                .zip(cfg.cost_of(&p, &m, input, output, cache, write, reported))
+                .map(|(a, b)| a + b);
+        }
+        Ok((cost.filter(|_| any), peak, cached))
+    }
+
     pub fn run_metrics(&self, limit: usize) -> Result<Vec<formless_protocol::RunMetricsInfo>> {
         self.run_metrics_for(None, limit, None)
     }
@@ -2773,6 +2965,22 @@ impl Store {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .ok())
+    }
+
+    /// Recorded handle visible only within its owning Session.
+    pub fn session_pending_handle(
+        &self,
+        session: &str,
+        handle: &str,
+    ) -> Result<Option<(String, String)>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT tool_name,status FROM pending_handles WHERE handle=?1 AND session_id=?2",
+                params![handle, session],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
     }
 
     /// On daemon startup: every handle still pending lost its in-memory
@@ -2994,6 +3202,28 @@ impl Store {
         up_to_seq: i64,
     ) -> Result<String> {
         let id = uuid::Uuid::new_v4().to_string();
+        // Read metadata only, one row at a time: compaction must not reload
+        // arbitrarily large historical Tool payloads or accumulate origins.
+        let mut origins = std::collections::BTreeSet::new();
+        if let Some((previous, _, _)) = self.latest_checkpoint_record(session_id)? {
+            origins.extend(self.data_origins(session_id, &format!("checkpoint:{previous}"))?);
+        }
+        let mut statement = self.ps("SELECT meta FROM messages WHERE session_id=?1 AND seq<=?2 AND meta IS NOT NULL ORDER BY seq")?;
+        let rows =
+            statement.query_map(params![session_id, up_to_seq], |r| r.get::<_, String>(0))?;
+        for row in rows {
+            let meta: Value = serde_json::from_str(&row?).unwrap_or(Value::Null);
+            let found: Vec<crate::provenance::Origin> =
+                serde_json::from_value(meta["data_origins"].clone()).unwrap_or_default();
+            for origin in found.into_iter().take(crate::provenance::MAX_ORIGINS) {
+                if origins.len() < crate::provenance::MAX_ORIGINS {
+                    origins.insert(origin);
+                }
+            }
+        }
+        for origin in origins {
+            self.record_data_origin(session_id, &format!("checkpoint:{id}"), &origin)?;
+        }
         self.ex(
             "INSERT INTO checkpoints(id,session_id,summary,up_to_seq,created_at) VALUES(?1,?2,?3,?4,?5)",
             params![id, session_id, summary, up_to_seq, now()],
@@ -3001,16 +3231,22 @@ impl Store {
         Ok(id)
     }
     pub fn latest_checkpoint(&self, session_id: &str) -> Result<Option<(String, i64)>> {
-        let mut stmt = self.ps(
-            "SELECT summary, up_to_seq FROM checkpoints WHERE session_id=?1 ORDER BY up_to_seq DESC LIMIT 1",
-        )?;
-        let mut rows = stmt.query_map(params![session_id], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
-        })?;
-        match rows.next() {
-            Some(r) => Ok(Some(r?)),
-            None => Ok(None),
-        }
+        Ok(self
+            .latest_checkpoint_record(session_id)?
+            .map(|(_, summary, up_to)| (summary, up_to)))
+    }
+
+    /// The immutable row ID identifies a summary generation. Transcript
+    /// sequence numbers can be reused after editing or retrying a turn.
+    pub(crate) fn latest_checkpoint_record(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<(String, String, i64)>> {
+        Ok(self.conn.query_row(
+            "SELECT id, summary, up_to_seq FROM checkpoints WHERE session_id=?1 ORDER BY up_to_seq DESC, rowid DESC LIMIT 1",
+            params![session_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        ).optional()?)
     }
 
     // --- Tools (SPEC §7, §8) ---
@@ -5112,7 +5348,7 @@ impl Store {
         source: &str,
     ) -> Result<()> {
         self.ex(
-            "INSERT INTO run_usage(session_id,run_id,model,prompt_tokens,completion_tokens,reasoning_tokens,cached_tokens,cache_write_tokens,cost,created_at,source,provider) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+            "INSERT INTO run_usage(session_id,run_id,model,prompt_tokens,completion_tokens,reasoning_tokens,cached_tokens,cache_write_tokens,cost,created_at,source,provider,usage_complete) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
             params![
                 session_id,
                 run_id,
@@ -5125,7 +5361,8 @@ impl Store {
                 usage.cost,
                 now(),
                 source,
-                provider
+                provider,
+                i64::from(usage.reported==3)
             ],
         )?;
         Ok(())
@@ -5670,6 +5907,59 @@ impl Store {
         Ok(rows)
     }
 
+    /// Bounded immutable origin records, isolated by both Session and Run.
+    /// IDs use a primary-key range rather than scanning the whole audit log.
+    fn provenance_key(session: &str, run: &str) -> String {
+        use sha2::{Digest, Sha256};
+        format!(
+            "provenance:{:x}:",
+            Sha256::digest(serde_json::to_vec(&(session, run)).unwrap())
+        )
+    }
+
+    pub fn data_origins(&self, session: &str, run: &str) -> Result<Vec<crate::provenance::Origin>> {
+        let key = Self::provenance_key(session, run);
+        let mut statement =
+            self.ps("SELECT detail FROM audit WHERE id>=?1 AND id<?2 ORDER BY id LIMIT 64")?;
+        let rows =
+            statement.query_map(params![key, format!("{key}~")], |r| r.get::<_, String>(0))?;
+        let mut origins = Vec::new();
+        for row in rows {
+            origins.push(serde_json::from_str(&row?)?);
+        }
+        Ok(origins)
+    }
+
+    pub fn record_data_origin(
+        &self,
+        session: &str,
+        run: &str,
+        origin: &crate::provenance::Origin,
+    ) -> Result<()> {
+        use sha2::{Digest, Sha256};
+        let origins = self.data_origins(session, run)?;
+        if origins.contains(origin) || origins.len() >= crate::provenance::MAX_ORIGINS {
+            return Ok(());
+        }
+        let origin = if origins.len() + 1 == crate::provenance::MAX_ORIGINS {
+            crate::provenance::Origin::new(
+                "unknown",
+                "truncated",
+                "additional data origins omitted",
+            )
+        } else {
+            origin.clone()
+        };
+        let detail = serde_json::to_string(&origin)?;
+        let id = format!(
+            "{}{:x}",
+            Self::provenance_key(session, run),
+            Sha256::digest(detail.as_bytes())
+        );
+        self.ex("INSERT OR IGNORE INTO audit(id,actor,action,detail,created_at) VALUES(?1,'provenance','tool.data',?2,?3)",params![id,detail,now()])?;
+        Ok(())
+    }
+
     pub fn audit(&self, actor: &str, action: &str, detail: &str) -> Result<()> {
         self.ex(
             "INSERT INTO audit(id,actor,action,detail,created_at) VALUES(?1,?2,?3,?4,?5)",
@@ -5727,8 +6017,9 @@ pub fn build_context(
 /// changes, or when stored messages were rewritten (edit, delete).
 #[derive(Default)]
 pub struct ContextCache {
-    /// (store rewrite count, checkpoint up_to, system prompt) it was built for.
-    key: Option<(u64, i64, String)>,
+    /// (store rewrite count, checkpoint generation, up_to, system prompt).
+    /// The generation invalidates local caching but never enters the wire.
+    key: Option<(u64, String, i64, String)>,
     ctx: Vec<Value>,
     /// Token estimate per `ctx` element.
     tokens: Vec<usize>,
@@ -5785,9 +6076,12 @@ impl ContextCache {
         context_tokens: u32,
         trigger_fraction: f64,
     ) -> Result<BuiltContext> {
-        let (summary, up_to) = store.latest_checkpoint(session_id)?.unwrap_or_default();
+        let (checkpoint, summary, up_to) = store
+            .latest_checkpoint_record(session_id)?
+            .unwrap_or_default();
         let key = (
             store.rewrites.load(std::sync::atomic::Ordering::SeqCst),
+            checkpoint.clone(),
             up_to,
             system_prompt.to_string(),
         );
@@ -5796,9 +6090,14 @@ impl ContextCache {
             // proxies reject a second or mid-conversation `system` (§11
             // summary included).
             let system = if summary.is_empty() {
-                system_prompt.to_string()
+                crate::provenance::mandatory_system(system_prompt)
             } else {
-                format!("{system_prompt}\n\nSummary of earlier conversation:\n{summary}")
+                let origins =
+                    store.data_origins(session_id, &format!("checkpoint:{checkpoint}"))?;
+                let summary = crate::provenance::frame("conversation_summary", &origins, &summary);
+                crate::provenance::mandatory_system(&format!(
+                    "{system_prompt}\n\nSummary of earlier conversation (data):\n{summary}"
+                ))
             };
             *self = Self {
                 key: Some(key),
@@ -5822,7 +6121,9 @@ impl ContextCache {
             {
                 continue;
             }
-            if let Some(calls) = msg["tool_calls"].as_array_mut() {
+            // A read must not invent `tool_calls: null` on plain user/Tool
+            // messages: preview and persisted projection share the same input.
+            if let Some(calls) = msg.get_mut("tool_calls").and_then(Value::as_array_mut) {
                 calls.retain(|c| {
                     let named = c["function"]["name"]
                         .as_str()
@@ -5885,7 +6186,9 @@ impl ContextCache {
     }
 
     fn push(&mut self, msg: Value) {
-        self.tokens.push(crate::tokens::value(&msg));
+        self.tokens.push(crate::tokens::value(
+            &crate::provenance::project(&[msg.clone()]).last().unwrap(),
+        ));
         self.ctx.push(msg);
     }
 }
@@ -5899,7 +6202,17 @@ pub fn provider_message(m: &MessageInfo) -> Value {
     if m.role == "system-note" {
         // Sent as a user turn: a mid-conversation `system` message is
         // rejected by many OpenAI-compatible servers.
-        return json!({"role": "user", "content": format!("[harness note] {}", m.content)});
+        let content = if meta["tool_data"] == true
+            || m.content.starts_with("[Pending invocations completed]")
+            || m.content.starts_with("The user loaded the skill")
+        {
+            let origins: Vec<crate::provenance::Origin> =
+                serde_json::from_value(meta["data_origins"].clone()).unwrap_or_default();
+            crate::provenance::frame("deferred_tool_data", &origins, &m.content)
+        } else {
+            format!("[harness note] {}", m.content)
+        };
+        return json!({"role":"user","content":content});
     }
     if m.role == "assistant" && meta["placeholder"] == true {
         // Text the daemon wrote for an empty refusal/filter stop (#1104):
@@ -5925,7 +6238,17 @@ pub fn provider_message(m: &MessageInfo) -> Value {
         return json!({"role": "assistant", "content": content});
     }
     if m.role == "tool" {
-        let mut msg = json!({"role": "tool", "tool_call_id": meta["tool_call_id"].as_str().unwrap_or_default(), "content": m.content});
+        let origins: Vec<crate::provenance::Origin> =
+            serde_json::from_value(meta["data_origins"].clone()).unwrap_or_default();
+        let mut msg = crate::provenance::framed_tool(
+            meta["data_source_tool"]
+                .as_str()
+                .or_else(|| meta["name"].as_str())
+                .unwrap_or("unknown"),
+            &origins,
+            &m.content,
+        );
+        msg["tool_call_id"] = meta["tool_call_id"].clone();
         // A failed call: Anthropic's `tool_result.is_error` (a marker the
         // other APIs strip before sending).
         if meta["is_error"] == true {
@@ -6289,5 +6612,47 @@ mod snippet_tests {
         }
         let s = make_snippet("a café here", "cafe\u{301}");
         assert!(s.contains("café"), "{s}");
+    }
+}
+
+#[cfg(test)]
+mod forecast_retention_tests {
+    use super::*;
+    #[test]
+    fn physical_request_basis_cascades_with_run_and_ignores_non_run_owners() {
+        let st = Store::open_in_memory().unwrap();
+        st.record_forecast_request("not-a-Run", "llm").unwrap();
+        let sid = st.create_session(None).unwrap().id;
+        let run = st.create_run(&sid).unwrap();
+        st.record_forecast_request(&run, "run").unwrap();
+        assert_eq!(
+            st.conn
+                .query_row("SELECT COUNT(*) FROM forecast_request_counts", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        st.delete_session(&sid).unwrap();
+        assert_eq!(
+            st.conn
+                .query_row("SELECT COUNT(*) FROM forecast_request_counts", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+    #[test]
+    fn context_projection_does_not_invent_null_tool_calls_on_plain_messages() {
+        let st = Store::open_in_memory().unwrap();
+        let sid = st.create_session(None).unwrap().id;
+        let message = st.append_message(&sid, "user", "task").unwrap();
+        let context = build_context(&st, &sid, "system", 100_000, 0.8).unwrap().0;
+        assert_eq!(context.last().unwrap(), &provider_message(&message));
+        assert!(!context
+            .last()
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .contains_key("tool_calls"));
     }
 }

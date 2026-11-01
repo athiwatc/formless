@@ -152,7 +152,25 @@ fn context_has_one_leading_system_message() {
     let roles: Vec<&str> = ctx.iter().map(|m| m["role"].as_str().unwrap()).collect();
     assert_eq!(roles, ["system", "user", "assistant", "user"]);
     let system = ctx[0]["content"].as_str().unwrap();
-    assert!(system.starts_with("sys") && system.contains("earlier summary"));
+    let trusted_and_summary = system
+        .strip_prefix(formless_core::provenance::HIERARCHY)
+        .and_then(|rest| rest.strip_prefix("\n\n"))
+        .expect("mandatory hierarchy leads the sole system message");
+    let (trusted, summary) = trusted_and_summary
+        .split_once("\n\nSummary of earlier conversation (data):\n")
+        .expect("earlier summary is explicitly separated as data");
+    assert_eq!(trusted, "sys", "custom system instructions remain exact");
+    let summary: serde_json::Value = serde_json::from_str(summary).unwrap();
+    assert_eq!(
+        summary,
+        json!({
+            "formless_data":1,
+            "source_tool":"conversation_summary",
+            "origins":[],
+            "note":formless_core::provenance::DATA_NOTE,
+            "content":"earlier summary"
+        })
+    );
     assert_eq!(
         ctx[1]["content"],
         "question\n\n[harness note] joins the user turn"

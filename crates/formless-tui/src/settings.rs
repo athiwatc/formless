@@ -255,6 +255,13 @@ pub fn rows(
         ),
         Row::new(
             "Limits",
+            "limits.forecast_confirm_usd",
+            "forecast_confirm_usd",
+            limit(cfg.limits.forecast_confirm_usd),
+            Number,
+        ),
+        Row::new(
+            "Limits",
             "limits.run_steps",
             "run_steps",
             cfg.limits.run_steps.map_or("off".into(), |n| n.to_string()),
