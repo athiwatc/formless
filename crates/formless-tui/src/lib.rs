@@ -23991,4 +23991,30 @@ mod tests {
         assert_eq!(app.input, "dw private pasted text");
         assert_eq!(app.vim_input.mode, vim::Mode::Insert);
     }
+    #[test]
+    fn vim_tool_editor_dot_requires_its_text_object_before_replaying_insert() {
+        let mut app = test_app();
+        app.vim_mode = true;
+        app.editor = Some(EditorState {
+            vim: vim::Vim::default(),
+            tool_id: "private".into(),
+            name: "private".into(),
+            chars: "\"secret\" plain".chars().collect(),
+            cursor: 0,
+            mode: EditMode::Code,
+        });
+        app.key(key(KeyCode::Esc));
+        for c in "ci\"X".chars() {
+            app.key(key(KeyCode::Char(c)))
+        }
+        app.key(key(KeyCode::Esc));
+        app.key(key(KeyCode::Char('$')));
+        let before = app.editor.as_ref().unwrap().text();
+        let cursor = app.editor.as_ref().unwrap().cursor;
+        app.key(key(KeyCode::Char('.')));
+        let ed = app.editor.as_ref().unwrap();
+        assert_eq!(ed.text(), before);
+        assert_eq!(ed.cursor, cursor);
+        assert_eq!(ed.vim.mode, vim::Mode::Normal);
+    }
 }

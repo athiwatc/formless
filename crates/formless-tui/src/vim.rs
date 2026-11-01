@@ -147,7 +147,9 @@ impl Vim {
         }
         if c == '.' && self.pending.is_empty() {
             if let Some(change) = self.last.clone() {
-                self.apply(line, change.command.clone());
+                if !self.apply(line, change.command.clone()) {
+                    return Outcome::Handled;
+                }
                 for key in &change.edits {
                     insert_key(line, *key, surface);
                 }
@@ -175,11 +177,12 @@ impl Vim {
             }
             if c == 'p' || c == 'P' {
                 let cmd = Command::Put(c == 'p', self.register.clone(), self.register_linewise);
-                self.apply(line, cmd.clone());
-                self.last = Some(Change {
-                    command: cmd,
-                    edits: vec![],
-                });
+                if self.apply(line, cmd.clone()) {
+                    self.last = Some(Change {
+                        command: cmd,
+                        edits: vec![],
+                    });
+                }
                 return Outcome::Handled;
             }
         }
@@ -215,11 +218,12 @@ impl Vim {
         if rest == "x" {
             let cmd = Command::Delete(count);
             self.pending.clear();
-            self.apply(line, cmd.clone());
-            self.last = Some(Change {
-                command: cmd,
-                edits: vec![],
-            });
+            if self.apply(line, cmd.clone()) {
+                self.last = Some(Change {
+                    command: cmd,
+                    edits: vec![],
+                });
+            }
             return Outcome::Handled;
         }
         let motion = rest.to_string();
@@ -276,12 +280,18 @@ impl Vim {
                     }
                     end = next(line, end)
                 }
+                if start == end {
+                    return false;
+                }
                 self.register = line[start..end].into();
                 self.register_linewise = false;
                 line.modal_replace(start..end, "");
                 normal_cursor(line);
             }
             Command::Put(after, text, linewise) => {
+                if text.is_empty() {
+                    return false;
+                }
                 if *linewise {
                     let mut text = text.clone();
                     let at = if *after {
@@ -319,6 +329,9 @@ impl Vim {
                 else {
                     return false;
                 };
+                if range.is_empty() && *op != 'c' {
+                    return false;
+                }
                 self.register = line[range.clone()].into();
                 self.register_linewise =
                     motion == &op.to_string() || matches!(motion.as_str(), "gg" | "G" | "j" | "k");
@@ -883,5 +896,51 @@ mod tests {
         commands(&mut v, &mut l, "G$.");
         assert_eq!(&*l, "dw\n👩‍💻taidw\n👩‍💻l");
         assert_eq!(v.mode, Mode::Normal);
+    }
+    #[test]
+    fn dot_with_missing_text_object_never_inserts_a_ghost_replacement() {
+        let (mut v, mut l) = normal("\"secret\" plain");
+        commands(&mut v, &mut l, "ci\"X");
+        v.key(
+            &mut l,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            Surface::Composer,
+        );
+        commands(&mut v, &mut l, "$");
+        let before = l.to_string();
+        let cursor = l.cursor_byte();
+        commands(&mut v, &mut l, ".");
+        assert_eq!(&*l, before);
+        assert_eq!(l.cursor_byte(), cursor);
+        assert_eq!(v.mode, Mode::Normal);
+        l.set_modal_cursor(1);
+        commands(&mut v, &mut l, ".");
+        assert_eq!(
+            &*l, "\"X\" plain",
+            "the prior valid change is still repeatable at an actual object"
+        );
+    }
+    #[test]
+    fn no_op_put_and_delete_do_not_replace_the_last_successful_change() {
+        let (mut v, mut l) = normal("tail");
+        commands(&mut v, &mut l, "iX");
+        v.key(
+            &mut l,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            Surface::Composer,
+        );
+        commands(&mut v, &mut l, "p$.");
+        assert_eq!(
+            &*l, "XtaiXl",
+            "empty private register must not overwrite the last insert"
+        );
+        let (mut v, mut l) = normal("one two");
+        commands(&mut v, &mut l, "dw");
+        l.clear();
+        commands(&mut v, &mut l, "x");
+        l.set("next word");
+        l.set_modal_cursor(0);
+        commands(&mut v, &mut l, ".");
+        assert_eq!(&*l, "word");
     }
 }
