@@ -4351,6 +4351,17 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
   erased through its default parent.
 - **Imports/exports** contain no secrets, metrics, or history (§7.8).
 
+Third-party Tool, MCP, Skill and module descriptions share a 1,024-character
+Unicode limit. Intake and legacy projection normalize newlines, terminal/control
+and bidi/format characters to single-line metadata. Deterministic instruction-shaped
+wording checks flag phrases such as “always”, “never”, “ignore” and “first call”
+for human review; these checks do not establish that unflagged text is safe.
+Model-visible descriptions are quoted and labelled as third-party data.
+Description warnings appear in previews and approval details. A changed Tool or
+Skill description is shown with its before/after text and retained in Description
+reviews, including MCP sync changes and changes made while clients disconnect.
+This metadata review does not replace the separate code-hash approval binding.
+
 Tool data has no instruction authority: system instructions outrank user
 instructions, and Tool/file/web/skill/module/sub-agent output is untrusted data.
 Conflicting instructions embedded in data are surfaced to the user, never obeyed.

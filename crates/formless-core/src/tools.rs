@@ -926,7 +926,7 @@ pub fn registry_definition(info: &ToolInfo, v: &formless_protocol::ToolVersionIn
         serde_json::from_str(&v.input_schema).unwrap_or_else(|_| json!({"type": "object"}));
     json!({
         "type": "function",
-        "function": {"name": info.name, "description": info.description, "parameters": params}
+        "function": {"name": info.name, "description": crate::descriptions::model_text(&info.description), "parameters": params}
     })
 }
 

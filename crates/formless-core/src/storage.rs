@@ -24,6 +24,7 @@ pub struct Store {
     // Connection drops before this private directory; source files are never
     // held by a forecast reader or touched by close-time optimize.
     _forecast_snapshot: Option<forecast_snapshot::SnapshotDir>,
+    description_notifications: std::sync::Mutex<(Vec<formless_protocol::DescriptionReview>, bool)>,
 }
 
 #[derive(Debug, Clone)]
@@ -1083,6 +1084,7 @@ impl Store {
             conn,
             rewrites: Default::default(),
             _forecast_snapshot: None,
+            description_notifications: Default::default(),
         })
     }
 
@@ -1136,6 +1138,7 @@ impl Store {
             conn,
             rewrites: Default::default(),
             _forecast_snapshot: None,
+            description_notifications: Default::default(),
         })
     }
 
@@ -1148,6 +1151,7 @@ impl Store {
             conn,
             rewrites: Default::default(),
             _forecast_snapshot: None,
+            description_notifications: Default::default(),
         })
     }
 
@@ -3329,7 +3333,7 @@ impl Store {
             tags: serde_json::from_str(&tags).unwrap_or_default(),
             pinned: pinned != 0,
             disabled: disabled != 0,
-            description,
+            description: crate::descriptions::screen(&description).text,
             retired: retired != 0,
             current_version,
             capabilities,
@@ -3403,6 +3407,12 @@ impl Store {
         memory_mb: u32,
         author: &str,
     ) -> Result<(ToolInfo, i64)> {
+        let before = self
+            .get_tool_by_name(name)?
+            .map(|(info, _)| info.description);
+        let screened = crate::descriptions::screen(description);
+        let raw_description = description;
+        let description = screened.text.as_str();
         let lower = name.to_lowercase();
         let existing: Option<(String, i64)> = self
             .conn
@@ -3444,6 +3454,16 @@ impl Store {
             "UPDATE tools SET description=?2, current_version=?3, updated_at=?4 WHERE id=?1",
             params![tool_id, description, version, t],
         )?;
+        if author != "builtin" {
+            self.record_description_review(
+                if author == "mcp" { "mcp" } else { "tool" },
+                name,
+                version,
+                caps.mcp.first().map(String::as_str).unwrap_or(author),
+                before.as_deref(),
+                raw_description,
+            )?;
+        }
         Ok((self.tool_info(&tool_id)?.context("tool vanished")?, version))
     }
 
@@ -3517,7 +3537,7 @@ impl Store {
                     Ok(ModuleInfo {
                         id: r.get(0)?,
                         name: r.get(1)?,
-                        description: r.get(2)?,
+                        description: crate::descriptions::screen(&r.get::<_,String>(2)?).text,
                         current_version: r.get(3)?,
                         retired: r.get::<_, i64>(4)? != 0,
                         created_at: r.get(5)?,
@@ -3535,6 +3555,22 @@ impl Store {
         code: &str,
         author: &str,
     ) -> Result<(ModuleInfo, i64)> {
+        self.transaction(|st| st.create_module_version_locked(name, description, code, author))
+    }
+
+    fn create_module_version_locked(
+        &self,
+        name: &str,
+        description: &str,
+        code: &str,
+        author: &str,
+    ) -> Result<(ModuleInfo, i64)> {
+        let before = self
+            .get_module_by_name(name)?
+            .map(|(info, _)| info.description);
+        let screened = crate::descriptions::screen(description);
+        let raw_description = description;
+        let description = screened.text.as_str();
         let lower = name.to_lowercase();
         let existing: Option<(String, i64)> = self
             .conn
@@ -3575,6 +3611,14 @@ impl Store {
         self.ex(
             "UPDATE modules SET description=?2, current_version=?3, updated_at=?4 WHERE id=?1",
             params![module_id, description, version, t],
+        )?;
+        self.record_description_review(
+            "module",
+            name,
+            version,
+            author,
+            before.as_deref(),
+            raw_description,
         )?;
         Ok((
             self.module_info(&module_id)?.context("module vanished")?,
@@ -3988,6 +4032,8 @@ impl Store {
             self.attention_reasons(&tool, &metrics, &optimiser_attempts, &recent_calls)?;
         let example = self.tool_example(id)?;
         Ok(Some(formless_protocol::ToolDetail {
+            description_review: crate::descriptions::screen(&tool.description),
+            description_reviews: self.description_reviews(None, Some(&tool.name), 20)?,
             tool,
             versions,
             metrics,
@@ -4789,6 +4835,34 @@ impl Store {
         author: &str,
         has_scripts: bool,
     ) -> Result<formless_protocol::SkillInfo> {
+        self.transaction(|st| {
+            st.add_skill_version_locked(
+                name,
+                description,
+                version,
+                path,
+                source,
+                author,
+                has_scripts,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_skill_version_locked(
+        &self,
+        name: &str,
+        description: &str,
+        version: i64,
+        path: &str,
+        source: &str,
+        author: &str,
+        has_scripts: bool,
+    ) -> Result<formless_protocol::SkillInfo> {
+        let before = self.get_skill(name)?.map(|info| info.description);
+        let screened = crate::descriptions::screen(description);
+        let raw_description = description;
+        let description = screened.text.as_str();
         let t = now();
         self.ex(
             "INSERT INTO skills(id,name,description,current_version,enabled,source,author,has_scripts,created_at,updated_at)
@@ -4802,13 +4876,23 @@ impl Store {
             "INSERT OR REPLACE INTO skill_versions(skill_id,version,path,created_at) SELECT id,?2,?3,?4 FROM skills WHERE name=?1",
             params![name, version, path, t],
         )?;
+        self.record_description_review(
+            "skill",
+            name,
+            version,
+            source,
+            before.as_deref(),
+            raw_description,
+        )?;
         self.get_skill(name)?.context("skill vanished")
     }
 
     fn row_skill(r: &rusqlite::Row) -> rusqlite::Result<formless_protocol::SkillInfo> {
         Ok(formless_protocol::SkillInfo {
+            description_review: crate::descriptions::screen(&r.get::<_, String>("description")?),
+            description_reviews: Vec::new(),
             name: r.get("name")?,
-            description: r.get("description")?,
+            description: crate::descriptions::screen(&r.get::<_, String>("description")?).text,
             version: r.get("current_version")?,
             enabled: r.get::<_, i64>("enabled")? != 0,
             source: r.get("source")?,
@@ -4835,14 +4919,23 @@ impl Store {
     }
 
     pub fn get_skill(&self, name: &str) -> Result<Option<formless_protocol::SkillInfo>> {
-        Ok(self
+        let mut info = self
             .conn
             .query_row(
                 &format!("SELECT {SKILL_COLS} FROM skills s WHERE s.name=?1"),
                 params![name],
                 Self::row_skill,
             )
-            .ok())
+            .optional()?;
+        if let Some(info) = &mut info {
+            info.description_reviews = self.description_reviews(Some("skill"), Some(name), 20)?;
+            if let Some(review) = info.description_reviews.iter().find(|review| {
+                review.version == info.version && review.after.text == info.description
+            }) {
+                info.description_review = review.after.clone();
+            }
+        }
+        Ok(info)
     }
 
     /// Installed folder of the skill's current version.
@@ -5960,6 +6053,89 @@ impl Store {
         Ok(())
     }
 
+    /// Durable metadata evidence. The audit primary-key range avoids scanning
+    /// unrelated invocation/provenance history; no schema upgrade is needed.
+    #[allow(clippy::too_many_arguments)]
+    fn record_description_review(
+        &self,
+        kind: &str,
+        name: &str,
+        version: i64,
+        source: &str,
+        before: Option<&str>,
+        after: &str,
+    ) -> Result<()> {
+        let before = before.map(crate::descriptions::screen);
+        let after = crate::descriptions::screen(after);
+        if before.as_ref().is_some_and(|old| old.text == after.text)
+            || (before.is_none() && after.flags.is_empty())
+        {
+            return Ok(());
+        }
+        let at = now();
+        let id = format!("description:{at}:{}", uuid::Uuid::new_v4());
+        let review = formless_protocol::DescriptionReview {
+            id: id.clone(),
+            kind: kind.into(),
+            name: name.into(),
+            version,
+            source: crate::provenance::Origin::new(name, kind, source).origin,
+            before,
+            after,
+            created_at: at.clone(),
+        };
+        self.ex("INSERT INTO audit(id,actor,action,detail,created_at) VALUES(?1,'metadata','description.review',?2,?3)",params![id,serde_json::to_string(&review)?,at])?;
+        let mut pending = self
+            .description_notifications
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if pending.0.len() < 128 {
+            pending.0.push(review);
+        } else {
+            pending.1 = true;
+        }
+        Ok(())
+    }
+
+    pub fn description_reviews(
+        &self,
+        kind: Option<&str>,
+        name: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<formless_protocol::DescriptionReview>> {
+        let mut statement=self.ps("SELECT detail FROM audit WHERE id>='description:' AND id<'description:~' AND (?1 IS NULL OR json_extract(detail,'$.kind')=?1) AND (?2 IS NULL OR json_extract(detail,'$.name')=?2) ORDER BY created_at DESC,rowid DESC LIMIT ?3")?;
+        let rows = statement.query_map(params![kind, name, limit.clamp(1, 200)], |r| {
+            r.get::<_, String>(0)
+        })?;
+        rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+    }
+
+    pub(crate) fn take_description_notifications(
+        &self,
+    ) -> Result<(Vec<formless_protocol::DescriptionReview>, bool)> {
+        if !self.conn.is_autocommit() {
+            return Ok((Vec::new(), false));
+        }
+        let (pending, overflow) = std::mem::take(
+            &mut *self
+                .description_notifications
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
+        let mut committed = Vec::new();
+        for review in pending {
+            let exists: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM audit WHERE id=?1)",
+                params![review.id],
+                |r| r.get(0),
+            )?;
+            if exists {
+                committed.push(review);
+            }
+        }
+        Ok((committed, overflow))
+    }
+
     pub fn audit(&self, actor: &str, action: &str, detail: &str) -> Result<()> {
         self.ex(
             "INSERT INTO audit(id,actor,action,detail,created_at) VALUES(?1,?2,?3,?4,?5)",
@@ -6629,3 +6805,7 @@ mod forecast_retention_tests {
             .contains_key("tool_calls"));
     }
 }
+
+#[cfg(test)]
+#[path = "description_store_tests.rs"]
+mod description_store_tests;

@@ -21,7 +21,13 @@ pub fn effective_prompt(st: &Store, cfg: &Config) -> Result<String> {
         .list_skills()?
         .into_iter()
         .filter(|s| s.enabled && !s.retired)
-        .map(|s| format!("- {}: {}", s.name, s.description))
+        .map(|s| {
+            format!(
+                "- {}: {}",
+                s.name,
+                crate::descriptions::model_text(&s.description)
+            )
+        })
         .collect();
     if !skills.is_empty() {
         prompt.push_str("\n\nSkills (load one with load_skill before a task it covers):\n");

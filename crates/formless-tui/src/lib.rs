@@ -19046,6 +19046,8 @@ mod tests {
             code: code.into(),
         };
         app.module_detail = Some(ModuleDetail {
+            description_review: Default::default(),
+            description_reviews: Vec::new(),
             module,
             versions: vec![
                 version(1, "module.exports = 1;"),
@@ -20919,6 +20921,8 @@ mod tests {
         };
         app.tools = vec![tool.clone()];
         app.tool_detail = Some(ToolDetail {
+            description_review: Default::default(),
+            description_reviews: Vec::new(),
             tool,
             versions: vec![ToolVersionInfo {
                 version: 1,
@@ -21247,6 +21251,8 @@ mod tests {
             created_at: at.into(),
         };
         app.tool_detail = Some(ToolDetail {
+            description_review: Default::default(),
+            description_reviews: Vec::new(),
             tool,
             versions: vec![],
             metrics: Default::default(),

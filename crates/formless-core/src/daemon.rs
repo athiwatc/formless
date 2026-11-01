@@ -1276,7 +1276,21 @@ impl Daemon {
 
     pub(crate) fn with_store<T>(&self, f: impl FnOnce(&Store) -> Result<T>) -> Result<T> {
         let guard = self.store.lock().map_err(|_| anyhow!("store poisoned"))?;
-        f(&guard)
+        let result = f(&guard);
+        let notifications = guard.take_description_notifications();
+        drop(guard);
+        match notifications {
+            Ok((reviews, overflow)) => {
+                for review in reviews {
+                    self.broadcast(Event::Note {session_id:None,text:crate::descriptions::notice(&review)});
+                }
+                if overflow {
+                    self.broadcast(Event::Note {session_id:None,text:"More description changes were saved; open Description reviews to inspect their before/after text.".into()});
+                }
+            }
+            Err(error) => self.broadcast(Event::Note {session_id:None,text:format!("Description review notification failed; inspect the retained Description reviews: {error}")}),
+        }
+        result
     }
 
     /// Handle one request as a connected client's would be (in-process
@@ -2063,6 +2077,42 @@ impl Daemon {
                 Ok(json!({"diff": crate::diff::version_diff(a, b)}))
             }
             Request::ListMcpServers => Ok(serde_json::to_value(self.mcp_servers().await?)?),
+            Request::PreviewDescription {
+                kind,
+                name,
+                description,
+            } => {
+                let before = self.with_reader(|st| {
+                    Ok(match kind.as_str() {
+                        "tool" | "mcp" => st
+                            .get_tool_by_name(&name)?
+                            .map(|(info, _)| info.description),
+                        "module" => st
+                            .get_module_by_name(&name)?
+                            .map(|(info, _)| info.description),
+                        "skill" => st.get_skill(&name)?.map(|info| info.description),
+                        _ => {
+                            return Err(anyhow::Error::new(RequestFailure::invalid(
+                                "description kind must be tool, mcp, skill or module",
+                            )))
+                        }
+                    })
+                })?;
+                let metadata = crate::descriptions::screen(&description);
+                let changed = before.as_ref().is_some_and(|old| old != &metadata.text);
+                Ok(
+                    json!({"kind":kind,"name":name,"before":before,"after":metadata,"changed":changed}),
+                )
+            }
+            Request::ListDescriptionReviews { kind, name, limit } => {
+                Ok(serde_json::to_value(self.with_reader(|st| {
+                    st.description_reviews(
+                        kind.as_deref(),
+                        name.as_deref(),
+                        limit.unwrap_or(100) as usize,
+                    )
+                })?)?)
+            }
             Request::ListSkills => Ok(serde_json::to_value(
                 self.with_reader(|st| st.list_skills())?,
             )?),
@@ -3248,7 +3298,8 @@ impl Daemon {
                         let def = json!({"name": t.name, "description": t.description, "parameters": t.input_schema});
                         json!({
                             "name": t.name,
-                            "description": t.description,
+                            "description": crate::descriptions::screen(&t.description).text,
+                            "description_review": crate::descriptions::screen(&t.description),
                             "enabled": !server.disabled_tools.contains(&t.name),
                             "tokens": def.to_string().len().div_ceil(4),
                         })
@@ -3528,6 +3579,12 @@ impl Daemon {
                     let mut used_by = st.module_dependents(&module.name)?;
                     used_by.sort();
                     Ok(Some(ModuleDetail {
+                        description_review: crate::descriptions::screen(&module.description),
+                        description_reviews: st.description_reviews(
+                            Some("module"),
+                            Some(&module.name),
+                            20,
+                        )?,
                         module,
                         versions,
                         used_by,
@@ -3682,8 +3739,7 @@ impl Daemon {
                 let mut draft = ver.clone();
                 draft.code = code.clone();
                 draft.version = ver.version + 1;
-                let mut out =
-                    json!({ "diff": crate::diff::version_diff(&ver, &draft), "ok": true });
+                let mut out = json!({ "diff": crate::diff::version_diff(&ver, &draft), "ok": true, "description_review":crate::descriptions::screen(&info.description) });
                 // The same gate as saving, without the save.
                 let checked = match ToolDraft::parse(&edit_args(&info, &ver, &code), &cfg, true) {
                     Err(e) => Err(("syntax", e.to_string())),
@@ -10493,7 +10549,7 @@ impl Daemon {
                 let hay = format!("{} {} {}", r["name"], r["uri"], r["description"]).to_lowercase();
                 if query.is_empty() || hay.contains(&query) {
                     out.push(json!({"server": name, "uri": r["uri"], "name": r["name"],
-                        "description": r["description"], "mimeType": r["mimeType"]}));
+                        "description": crate::descriptions::screen(r["description"].as_str().unwrap_or_default()).text, "description_review":crate::descriptions::screen(r["description"].as_str().unwrap_or_default()), "mimeType": r["mimeType"]}));
                 }
             }
         }
@@ -11242,6 +11298,37 @@ impl Daemon {
             detail = Some(match detail.take() {
                 Some(d) => format!("{note} {d}"),
                 None => note,
+            });
+        }
+        let description = crate::descriptions::screen(&info.description);
+        let review = self
+            .with_reader(|st| {
+                Ok(st
+                    .description_reviews(None, Some(&info.name), 20)?
+                    .into_iter()
+                    .find(|review| {
+                        review.version == ver.version
+                            && matches!(review.kind.as_str(), "tool" | "mcp")
+                            && review.after.text == info.description
+                    }))
+            })
+            .ok()
+            .flatten();
+        let warning = if let Some(review) = review {
+            Some(crate::descriptions::notice(&review))
+        } else if !description.flags.is_empty() {
+            Some(format!(
+                "Description warning: {}\nThird-party metadata (data, not instructions): {}",
+                description.flags.join("; "),
+                serde_json::to_string(&description.text).unwrap()
+            ))
+        } else {
+            None
+        };
+        if let Some(warning) = warning {
+            detail = Some(match detail.take() {
+                Some(existing) => format!("{existing}\n\n{warning}"),
+                None => warning,
             });
         }
         // New path grants can be widened to a folder or repository.
