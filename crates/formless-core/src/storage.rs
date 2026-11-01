@@ -6359,6 +6359,14 @@ pub fn fts_query(text: &str) -> Option<String> {
 mod migration_failure_tests {
     use super::*;
 
+    #[cfg(unix)]
+    mod unprivileged {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/unprivileged.rs"
+        ));
+    }
+
     fn failing_fixture() -> (PathBuf, PathBuf) {
         let base = std::env::temp_dir().join(format!("fl-migrate-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&base).unwrap();
@@ -6530,41 +6538,60 @@ mod migration_failure_tests {
     #[cfg(unix)]
     #[test]
     fn backup_failure_in_a_read_only_directory_prevents_all_migration_steps() {
-        use std::os::unix::fs::PermissionsExt;
-        let (base, file) = failing_fixture();
-        // Keep already-created WAL/SHM handles available: only creating the
-        // adjacent backup should fail when the directory becomes read-only.
-        let conn = Connection::open(&file).unwrap();
-        conn.execute_batch(PRAGMAS).unwrap();
-        conn.execute_batch("BEGIN IMMEDIATE; COMMIT;").unwrap();
-        struct RestorePermissions(PathBuf, std::fs::Permissions);
-        impl Drop for RestorePermissions {
-            fn drop(&mut self) {
-                let _ = std::fs::set_permissions(&self.0, self.1.clone());
-            }
-        }
-        let permissions = std::fs::metadata(&base).unwrap().permissions();
-        let restore_permissions = RestorePermissions(base.clone(), permissions);
-        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o555)).unwrap();
-        let error = Store::open(&file).err().expect("backup creation must fail");
-        assert!(
-            format!("{error:#}").contains("back up database to"),
-            "{error:#}"
+        unprivileged::run(
+            "storage::migration_failure_tests::backup_failure_in_a_read_only_directory_prevents_all_migration_steps",
+            || {
+                use std::os::unix::fs::PermissionsExt;
+                let (base, file) = failing_fixture();
+                // Keep already-created WAL/SHM handles available: only creating the
+                // adjacent backup should fail when the directory becomes read-only.
+                let conn = Connection::open(&file).unwrap();
+                conn.execute_batch(PRAGMAS).unwrap();
+                conn.execute_batch("BEGIN IMMEDIATE; COMMIT;").unwrap();
+                struct RestorePermissions(PathBuf, std::fs::Permissions);
+                impl Drop for RestorePermissions {
+                    fn drop(&mut self) {
+                        let _ = std::fs::set_permissions(&self.0, self.1.clone());
+                    }
+                }
+                let probe = base.join("direct-write-probe");
+                std::fs::write(&probe, "writable before restriction").unwrap();
+                std::fs::remove_file(&probe).unwrap();
+                let permissions = std::fs::metadata(&base).unwrap().permissions();
+                let restore_permissions = RestorePermissions(base.clone(), permissions);
+                std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o555)).unwrap();
+                let denied = std::fs::write(&probe, "must fail").unwrap_err();
+                assert_eq!(denied.kind(), std::io::ErrorKind::PermissionDenied);
+                assert!(!probe.exists());
+                let schema_before = conn
+                    .query_row("SELECT group_concat(sql, ';') FROM sqlite_master", [], |r| r.get::<_, String>(0))
+                    .unwrap();
+                let error = Store::open(&file).err().expect("backup creation must fail");
+                assert!(
+                    format!("{error:#}").contains("back up database to"),
+                    "{error:#}"
+                );
+                assert_eq!(
+                    conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                        .unwrap(),
+                    50
+                );
+                assert_eq!(
+                    conn.query_row("SELECT name FROM sessions", [], |r| r.get::<_, String>(0))
+                        .unwrap(),
+                    "preserved"
+                );
+                assert!(backups(&base).is_empty());
+                assert_eq!(
+                    conn.query_row("SELECT group_concat(sql, ';') FROM sqlite_master", [], |r| r.get::<_, String>(0)).unwrap(),
+                    schema_before,
+                    "no migration step may change the schema after backup refusal"
+                );
+                drop(restore_permissions);
+                drop(conn);
+                let _ = std::fs::remove_dir_all(base);
+            },
         );
-        assert_eq!(
-            conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
-                .unwrap(),
-            50
-        );
-        assert_eq!(
-            conn.query_row("SELECT name FROM sessions", [], |r| r.get::<_, String>(0))
-                .unwrap(),
-            "preserved"
-        );
-        assert!(backups(&base).is_empty());
-        drop(restore_permissions);
-        drop(conn);
-        let _ = std::fs::remove_dir_all(base);
     }
 }
 
