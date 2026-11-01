@@ -1951,6 +1951,16 @@ pub enum Request {
     },
     /// Recent Runs' metrics and their summary (SPEC §8.7):
     /// `{"runs": [RunMetricsInfo], "summary": RunSummary}`.
+    /// Inspect a stored Run (full id or unambiguous prefix).
+    GetRun {
+        run_id: String,
+    },
+    /// Interrupt only the matching active Run, never a replacement.
+    CancelRunId {
+        run_id: String,
+    },
+    /// Outstanding Tool capability approval requests.
+    PendingApprovals,
     RunMetrics {
         #[serde(default)]
         limit: Option<usize>,
