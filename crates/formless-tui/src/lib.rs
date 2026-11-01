@@ -8395,6 +8395,16 @@ impl App {
         }
         if self.vim_mode
             && self.view == View::Chat
+            && self.vim_input.mode == vim::Mode::Normal
+            && self.current_question().is_none()
+            && self.find.is_none()
+            && (self.approvals.is_empty() || self.input_focus)
+            && self.call_focus_key(&key)
+        {
+            return;
+        }
+        if self.vim_mode
+            && self.view == View::Chat
             && self.find.is_none()
             && self.current_question().is_none()
             && (self.approvals.is_empty() || self.input_focus)
@@ -9767,12 +9777,16 @@ impl App {
             }
             return;
         }
-        if self.find_key(&key) || self.call_focus_key(&key) {
+        if self.find_key(&key) || (!self.vim_mode && self.call_focus_key(&key)) {
             return;
         }
         // On the empty-Session screen, 1–4 put an example in the input.
         if let KeyCode::Char(d @ '1'..='4') = key.code {
-            if self.input.is_empty() && self.messages.is_empty() && !self.running() {
+            if !self.vim_mode
+                && self.input.is_empty()
+                && self.messages.is_empty()
+                && !self.running()
+            {
                 self.input.set(EXAMPLES[d as usize - '1' as usize]);
                 return;
             }
@@ -9804,6 +9818,7 @@ impl App {
             }
         }
         if self.vim_mode && self.vim_input.mode == vim::Mode::Insert {
+            self.call_focus = None;
             if self
                 .vim_input
                 .key(&mut self.input, key, vim::Surface::Composer)
