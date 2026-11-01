@@ -9683,7 +9683,7 @@ impl Daemon {
 
     /// Opt-in spending limits (SPEC §5.2), checked before each model step:
     /// a note at 80%, and at 100% an error that pauses the Run ("budget:
-    /// …"). Dollar limits apply only while every model used has a price.
+    /// …"). A known spending floor still applies when the full total is unknown.
     fn check_budget(&self, session_id: &str, run_id: &str, cfg: &Config) -> Result<()> {
         let mut l = cfg.limits.clone();
         // `/limit N` for this Run replaces `limits.run_steps`.
@@ -9697,7 +9697,6 @@ impl Daemon {
         if self.budget_waived.locked().contains(session_id) {
             return Ok(());
         }
-        let run = self.usage_info(None, Some(run_id), cfg)?;
         let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let mut checks: Vec<(String, f64, f64, String)> = Vec::new();
         if let Some(max) = l.run_steps {
@@ -9713,17 +9712,26 @@ impl Daemon {
                 },
             ));
         }
-        if let (Some(max), Some(cost)) = (l.run_usd, run.cost) {
+        if let Some(max) = l.run_usd.filter(|max| *max > 0.0) {
+            let (rows, _) = self.with_reader(|st| st.usage_rows(None, Some(run_id)))?;
+            let spend: crate::budget::Spend = rows
+                .iter()
+                .map(|(provider, model, p, c, cached, cw, reported, unknown)| {
+                    cfg.cost_of_known(provider, model, *p, *c, *cached, *cw, *reported, *unknown)
+                })
+                .collect();
+            let cost = spend.known;
+            let qualifier = if spend.complete { "" } else { "at least " };
             checks.push((
                 "run_usd".into(),
                 cost,
                 max,
-                format!("this Run spent ${cost:.2} of ${max:.2}"),
+                format!("this Run spent {qualifier}${cost:.2} of ${max:.2}"),
             ));
         }
-        if let Some(max) = l.daily_usd {
+        if let Some(max) = l.daily_usd.filter(|max| *max > 0.0) {
             let rows = self.with_reader(|st| st.usage_grouped(Some(&today), "model"))?;
-            let day: Option<f64> = rows
+            let day: crate::budget::Spend = rows
                 .iter()
                 .map(
                     |(_, provider, model, p, c, cached, cw, reported, unknown)| {
@@ -9732,15 +9740,15 @@ impl Daemon {
                         )
                     },
                 )
-                .sum();
-            if let Some(cost) = day {
-                checks.push((
-                    "daily_usd".into(),
-                    cost,
-                    max,
-                    format!("today's spend is ${cost:.2} of ${max:.2}"),
-                ));
-            }
+                .collect();
+            let cost = day.known;
+            let qualifier = if day.complete { "" } else { "at least " };
+            checks.push((
+                "daily_usd".into(),
+                cost,
+                max,
+                format!("today's spend is {qualifier}${cost:.2} of ${max:.2}"),
+            ));
         }
         for (name, used, max, what) in checks {
             let source = if per_run.is_some() && name == "run_steps" {
