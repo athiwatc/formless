@@ -294,3 +294,7 @@ impl Daemon {
         Ok(applied)
     }
 }
+
+#[cfg(test)]
+#[path = "branch_summary_tests.rs"]
+mod tests;
