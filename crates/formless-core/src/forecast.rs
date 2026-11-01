@@ -195,6 +195,16 @@ pub(crate) fn estimate_store_with_window(
     cached: Option<&dyn Fn(&str, &ProviderCfg, &str) -> Option<u32>>,
     selected: Option<&str>,
 ) -> Result<RunForecast> {
+    let mut canonical = input.clone();
+    if let Some(model) = &input.options.model {
+        anyhow::ensure!(
+            input.model.as_ref().is_none_or(|outer| outer == model),
+            "forecast model conflicts with Run-only model selector"
+        );
+        canonical.model = Some(model.clone());
+    }
+    let input = &canonical;
+    let pipeline = crate::pipeline::CompiledRunOptions::compile(input.options.clone())?;
     if usize::from(input.edit_message_id.is_some())
         + usize::from(input.resume)
         + usize::from(input.retry)
@@ -330,6 +340,7 @@ pub(crate) fn estimate_store_with_window(
     } else {
         vec![json!({"role":"system","content":prompt})]
     };
+    pipeline.project_context(&mut ctx)?;
     let context_hash = hash(&ctx);
     let held = input
         .session_id
@@ -486,14 +497,16 @@ pub(crate) fn estimate_store_with_window(
         provider_key: key,
         model: model.clone(),
         role: role.clone(),
-        reasoning_effort: if let Some(r) = rcfg {
-            r.reasoning_effort.clone().or(pcfg.reasoning_effort.clone())
-        } else {
-            session
-                .as_ref()
-                .and_then(|s| s.reasoning_effort.clone())
-                .or(pcfg.reasoning_effort.clone())
-        },
+        reasoning_effort: input.options.reasoning_effort.clone().or_else(|| {
+            if let Some(r) = rcfg {
+                r.reasoning_effort.clone().or(pcfg.reasoning_effort.clone())
+            } else {
+                session
+                    .as_ref()
+                    .and_then(|s| s.reasoning_effort.clone())
+                    .or(pcfg.reasoning_effort.clone())
+            }
+        }),
         session_id: input.session_id.clone(),
         cwd_hash: hash(&cwd),
         tools_hash: hash(&defs),
@@ -589,6 +602,9 @@ pub(crate) fn estimate_store_with_window(
             .into(),
         "Legacy Runs without frozen inputs excluded; interrupted/unknown outcomes excluded; at most 50 newest comparable observations from the last 2000 recorded Runs".into(),
     ];
+    if pipeline.has_schema() {
+        warnings.push("A schema mismatch can add one paid repair request; this is not a guaranteed cost ceiling".into());
+    }
     if legacy_skill_index {
         warnings.push(crate::descriptions::LEGACY_SKILL_INDEX_ERROR.into());
     }
@@ -676,6 +692,7 @@ pub(crate) fn estimate_store_with_window(
     f.fingerprint = hash(&(
         context_hash,
         &input.draft,
+        &input.options,
         session
             .as_ref()
             .map(|s| (&s.model, &s.reasoning_effort, &s.cwd, &s.instructions)),

@@ -1,4 +1,5 @@
 mod cli_attach;
+mod cli_pipeline;
 mod table;
 
 use anyhow::{bail, Context, Result};
@@ -337,6 +338,8 @@ enum Cmd {
         /// limits.run_steps for this Run)
         #[arg(long, value_name = "N")]
         max_steps: Option<u32>,
+        #[command(flatten)]
+        pipeline: cli_pipeline::Args,
     },
 }
 
@@ -1428,10 +1431,12 @@ fn run_cli(cli: Cli) -> Result<()> {
         session,
         continue_last,
         model,
+        effort,
         role,
         attach,
         cwd,
         json,
+        pipeline,
         ..
     }) = &cli.cmd
     {
@@ -1469,14 +1474,41 @@ fn run_cli(cli: Cli) -> Result<()> {
             None
         };
         use std::io::{IsTerminal, Read};
-        let piped = if std::io::stdin().is_terminal() {
+        if task.as_str() == "-" && pipeline.schema.as_deref() == Some(std::path::Path::new("-")) {
+            return Err(usage("--schema - and task '-' cannot both consume stdin"));
+        }
+        let piped = if std::io::stdin().is_terminal()
+            && pipeline.schema.as_deref() != Some(std::path::Path::new("-"))
+        {
             None
         } else {
             let mut bytes = Vec::new();
-            std::io::stdin().read_to_end(&mut bytes)?;
+            let limit = if pipeline.schema.as_deref() == Some(std::path::Path::new("-")) {
+                formless_core::pipeline::MAX_SCHEMA_BYTES
+            } else {
+                formless_core::daemon::MAX_ATTACHMENT_BYTES
+            };
+            std::io::stdin()
+                .take((limit + 1) as u64)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() > limit {
+                return Err(usage("piped Run input exceeds its byte limit"));
+            }
             Some(bytes)
         };
-        let (task, stdin) = run_input(task.clone(), piped).map_err(usage)?;
+        let mut prepared = pipeline
+            .prepare(task.clone(), piped)
+            .map_err(|e| usage(e.to_string()))?;
+        if pipeline.enabled() {
+            prepared.options.model = role
+                .as_ref()
+                .map(|r| format!("role:{r}"))
+                .or_else(|| model.clone());
+            prepared.options.reasoning_effort = effort.clone();
+            formless_core::pipeline::CompiledRunOptions::compile(prepared.options.clone())?;
+        }
+        let task = prepared.task;
+        let stdin = prepared.attachment;
         let mut files = read_attachments(attach).map_err(usage)?;
         if let Some(bytes) = stdin {
             files.push(("stdin.txt".into(), bytes));
@@ -1497,6 +1529,7 @@ fn run_cli(cli: Cli) -> Result<()> {
             .transpose()?
             .map(|p| p.to_string_lossy().into_owned());
         let input = formless_protocol::ForecastInput {
+            options: prepared.options,
             session_id: session,
             draft: task,
             model: role
@@ -1831,35 +1864,43 @@ fn run_cli(cli: Cli) -> Result<()> {
             role,
             attach,
             max_steps,
+            pipeline,
         }) => {
             let output = if json { RunOutput::JsonlEvents } else { output };
-            let session = if continue_last || session.as_deref() == Some("last") {
-                match last_run_session(&paths) {
-                    Ok(id) => Some(id),
-                    Err(e) => {
-                        eprintln!("{e}");
-                        std::process::exit(2);
-                    }
-                }
-            } else {
-                session
-            };
             // Piped input: the task itself (`-`) or an attachment.
             use std::io::{IsTerminal, Read};
-            let piped = if std::io::stdin().is_terminal() {
+            if task.as_str() == "-" && pipeline.schema.as_deref() == Some(std::path::Path::new("-"))
+            {
+                return Err(usage("--schema - and task '-' cannot both consume stdin"));
+            }
+            let piped = if std::io::stdin().is_terminal()
+                && pipeline.schema.as_deref() != Some(std::path::Path::new("-"))
+            {
                 None
             } else {
                 let mut buf = Vec::new();
-                std::io::stdin().read_to_end(&mut buf)?;
+                let limit = if pipeline.schema.as_deref() == Some(std::path::Path::new("-")) {
+                    formless_core::pipeline::MAX_SCHEMA_BYTES
+                } else {
+                    formless_core::daemon::MAX_ATTACHMENT_BYTES
+                };
+                std::io::stdin()
+                    .take((limit + 1) as u64)
+                    .read_to_end(&mut buf)?;
+                if buf.len() > limit {
+                    return Err(usage("piped Run input exceeds its byte limit"));
+                }
                 Some(buf)
             };
-            let (task, attachment) = match run_input(task, piped) {
+            let mut prepared = match pipeline.prepare(task, piped) {
                 Ok(v) => v,
                 Err(e) => {
                     eprintln!("{e}");
                     std::process::exit(2);
                 }
             };
+            let task = prepared.task;
+            let attachment = prepared.attachment;
             // `--attach` files, read and checked before anything starts.
             let mut files = match read_attachments(&attach) {
                 Ok(f) => f,
@@ -1871,6 +1912,17 @@ fn run_cli(cli: Cli) -> Result<()> {
             if let Some(bytes) = attachment {
                 files.push(("stdin.txt".into(), bytes));
             }
+            let session = if continue_last || session.as_deref() == Some("last") {
+                match last_run_session(&paths) {
+                    Ok(id) => Some(id),
+                    Err(e) => {
+                        eprintln!("{e}");
+                        std::process::exit(2);
+                    }
+                }
+            } else {
+                session
+            };
             let pick = match run_model(&paths, model, effort, role) {
                 Ok(p) => p,
                 Err(e) => {
@@ -1878,6 +1930,16 @@ fn run_cli(cli: Cli) -> Result<()> {
                     std::process::exit(2);
                 }
             };
+            let pipeline_mode = pipeline.enabled();
+            if pipeline_mode {
+                if let Some((model, effort)) = &pick {
+                    prepared.options.model = model.clone();
+                    prepared.options.reasoning_effort = effort.clone();
+                }
+                formless_core::pipeline::CompiledRunOptions::compile(prepared.options.clone())
+                    .map_err(|e| usage(e.to_string()))?;
+            }
+            let pick_was_set = !pipeline_mode && pick.is_some();
             // An existing Session gets its own model back after this Run.
             // The folder the Run acts in: --cwd, else where it was started
             // (a continued Session keeps its own unless --cwd is given).
@@ -1892,7 +1954,7 @@ fn run_cli(cli: Cli) -> Result<()> {
                 None if session.is_none() => std::env::current_dir().ok(),
                 None => None,
             };
-            let restore = match (&session, pick.is_some() || cwd.is_some()) {
+            let restore = match (&session, pick_was_set || cwd.is_some()) {
                 (Some(id), true) => {
                     formless_core::daemon::ensure_daemon(&paths)?;
                     let list: Vec<SessionInfo> = serde_json::from_value(
@@ -1903,13 +1965,12 @@ fn run_cli(cli: Cli) -> Result<()> {
                 _ => None,
             };
             // `--effort` alone keeps the Session's model.
-            let pick = pick.map(|(model, effort)| {
+            let pick = if pipeline_mode { None } else { pick }.map(|(model, effort)| {
                 (
                     model.or_else(|| restore.as_ref().and_then(|s| s.model.clone())),
                     effort,
                 )
             });
-            let pick_was_set = pick.is_some();
             let code = run_headless(
                 paths.clone(),
                 task,
@@ -1923,6 +1984,8 @@ fn run_cli(cli: Cli) -> Result<()> {
                 quiet,
                 timeout,
                 max_steps,
+                prepared.options,
+                pipeline.output_file,
             );
             if let Some(s) = restore {
                 if pick_was_set {
@@ -3671,12 +3734,17 @@ fn run_headless(
     quiet: bool,
     timeout: Option<std::time::Duration>,
     max_steps: Option<u32>,
+    options: formless_protocol::RunOptions,
+    output_file: Option<std::path::PathBuf>,
 ) -> Result<i32> {
     use std::io::IsTerminal;
     let json_out = output == RunOutput::JsonlEvents;
     // The answer streams only in text mode; progress goes to stderr in
     // text mode, and in final mode when someone is watching.
-    let stream = output == RunOutput::Text;
+    let policy = formless_core::pipeline::CompiledRunOptions::compile(options.clone())?;
+    let stream = output == RunOutput::Text && !policy.has_schema() && output_file.is_none();
+    let mut event_output = Vec::new();
+    let mut actual_run_id: Option<String> = None;
     let progress = !quiet
         && match output {
             RunOutput::Text => true,
@@ -3686,6 +3754,7 @@ fn run_headless(
     let interactive = matches!(output, RunOutput::Text | RunOutput::Final);
     let mut final_answer: Option<String> = None;
     let mut run_error: Option<String> = None;
+    let mut budget_stopped = false;
     let mut summary = RunSummary::default();
     let cfg = Config::load(&paths)?;
     if !cfg.provider.is_configured() {
@@ -3788,6 +3857,8 @@ fn run_headless(
                     input: formless_protocol::ForecastInput {
                         session_id: Some(session_id.clone()),
                         draft: task.clone(),
+                        options: options.clone(),
+                        model: options.model.clone(),
                         ..Default::default()
                     },
                 },
@@ -3806,7 +3877,16 @@ fn run_headless(
             headless_preview_request(&client, &rx, Request::ConfirmForecast { id })?;
         }
     }
-    critical.insert(sends.send(&client, session_id.clone(), task, SendMode::Send));
+    if options.is_empty() {
+        critical.insert(sends.send(&client, session_id.clone(), task, SendMode::Send));
+    } else {
+        critical.insert(client.send(Request::StartPipelineRun {
+            session_id: session_id.clone(),
+            content: task,
+            options: options.clone(),
+            client_msg_id: Some(format!("pipeline-{}", std::process::id())),
+        }));
+    }
     let sigints = count_sigints();
     let mut interrupting = false;
     let mut code = 1;
@@ -3859,9 +3939,25 @@ fn run_headless(
                     continue;
                 }
                 if json_out {
-                    println!("{}", serde_json::to_string(&ev).unwrap_or_default());
+                    let line = format!("{}\n", serde_json::to_string(&ev)?);
+                    if output_file.is_some() {
+                        if event_output.len().saturating_add(line.len())
+                            > formless_core::pipeline::MAX_RESULT_FILE_BYTES
+                        {
+                            if let Some(run_id) = &actual_run_id {
+                                client.send(Request::CancelRunId {
+                                    run_id: run_id.clone(),
+                                });
+                            }
+                            return Err(anyhow::anyhow!("Run event output exceeded the 8 MiB result-file limit; output file unchanged"));
+                        }
+                        event_output.extend_from_slice(line.as_bytes());
+                    } else {
+                        print!("{line}");
+                    }
                 }
                 match ev {
+                    Event::RunStarted { run_id, .. } => actual_run_id = Some(run_id),
                     Event::MessageDelta { delta, .. } => {
                         if stream {
                             print!("{delta}");
@@ -3874,6 +3970,15 @@ fn run_headless(
                         }
                         // The last answer the agent gave is the final one.
                         if message.role == "assistant" && !message.content.trim().is_empty() {
+                            if policy.has_schema()
+                                && policy.validate_final(&message.content).is_err()
+                            {
+                                final_answer = None;
+                                run_error =
+                                    Some("schema: daemon delivered an invalid final answer".into());
+                                code = 3;
+                                break;
+                            }
                             final_answer = Some(message.content);
                         }
                     }
@@ -3962,8 +4067,14 @@ fn run_headless(
                         });
                     }
                     Event::RunPaused {
-                        error, explained, ..
+                        run_id,
+                        error,
+                        explained,
+                        ..
                     } => {
+                        actual_run_id = Some(run_id);
+                        let schema_mismatch = error.starts_with("schema:");
+                        budget_stopped = error.starts_with("budget:");
                         run_error = Some(
                             explained
                                 .as_ref()
@@ -3979,10 +4090,11 @@ fn run_headless(
                             }
                             None => eprintln!("run paused: {error}"),
                         }
-                        code = 1;
+                        code = if schema_mismatch { 3 } else { 1 };
                         break;
                     }
-                    Event::RunFinished { status, .. } => {
+                    Event::RunFinished { run_id, status, .. } => {
+                        actual_run_id = Some(run_id);
                         code = match status.as_str() {
                             "completed" => 0,
                             "interrupted" => 130,
@@ -4007,6 +4119,16 @@ fn run_headless(
                 code = 2;
                 break;
             }
+            Ok(ServerMessage::Response {
+                id,
+                ok: true,
+                result: Some(result),
+                ..
+            }) if critical.contains(&id) => {
+                if let Some(run) = result["run_id"].as_str() {
+                    actual_run_id = Some(run.to_owned());
+                }
+            }
             Ok(_) => {}
             Err(_) => break,
         }
@@ -4019,6 +4141,7 @@ fn run_headless(
         0 => "completed",
         124 => "timed_out",
         130 => "interrupted",
+        3 => "schema_mismatch",
         _ if run_error.is_some() => "paused",
         _ => "failed",
     };
@@ -4028,22 +4151,89 @@ fn run_headless(
             summary.line(&status.replace('_', " "), started.elapsed())
         );
     }
-    match output {
-        RunOutput::Final => {
-            if let Some(a) = &final_answer {
-                println!("{}", a.trim_end());
+    if policy.has_schema() && code != 0 {
+        final_answer = None;
+    }
+    if budget_stopped {
+        let spend = actual_run_id
+            .as_ref()
+            .and_then(|run_id| {
+                formless_tui::client::request_once(
+                    &paths,
+                    Request::GetRun {
+                        run_id: run_id.clone(),
+                    },
+                )
+                .ok()
+            })
+            .map(|run| run["spend"].clone());
+        if let Some(spend) = spend {
+            if let Some(known) = spend["known_usd"].as_f64() {
+                let qualifier = if spend["total_usd"].is_number() {
+                    ""
+                } else {
+                    "at least "
+                };
+                let basis = if spend["usage_records"] == 0 && spend["admitted_attempts"] == 0 {
+                    " (no model dispatch admitted)"
+                } else if spend["uses_local_prices"] == true {
+                    " (from reported usage and local prices)"
+                } else if spend["usage_records"] == 0 {
+                    " (no provider usage reported)"
+                } else {
+                    " (provider-reported charges)"
+                };
+                eprintln!(
+                    "observed spend: {qualifier}${known:.6}{basis}{}",
+                    if spend["total_usd"].is_null() {
+                        "; total unknown/incomplete"
+                    } else {
+                        ""
+                    }
+                );
+            } else {
+                eprintln!("observed spend: unknown (usage unavailable)");
+            }
+        } else {
+            eprintln!("observed spend: unknown (Run usage unavailable)");
+        }
+    }
+    if let Some(path) = output_file {
+        if code == 0 {
+            anyhow::ensure!(
+                final_answer.is_some() || output == RunOutput::JsonlEvents,
+                "Run completed without a final answer; output file unchanged"
+            );
+            let bytes = if output == RunOutput::JsonlEvents {
+                event_output
+            } else {
+                cli_pipeline::render_result(
+                    output,
+                    &session_id,
+                    status,
+                    final_answer.as_deref(),
+                    run_error.as_deref(),
+                )?
+            };
+            let receipt = formless_core::pipeline::write_result_file(&path, &bytes)?;
+            if let Some(warning) = receipt.durability_warning {
+                eprintln!("{warning}");
             }
         }
-        RunOutput::Json => println!(
-            "{}",
-            serde_json::json!({
-                "session_id": session_id,
-                "status": status,
-                "answer": final_answer,
-                "error": run_error,
-            })
-        ),
-        _ => {}
+    } else if output == RunOutput::Json
+        || output == RunOutput::Final
+        || (output == RunOutput::Text && policy.has_schema())
+    {
+        if output == RunOutput::Json || final_answer.is_some() {
+            let bytes = cli_pipeline::render_result(
+                output,
+                &session_id,
+                status,
+                final_answer.as_deref(),
+                run_error.as_deref(),
+            )?;
+            std::io::stdout().write_all(&bytes)?;
+        }
     }
     Ok(code)
 }

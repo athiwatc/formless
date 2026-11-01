@@ -390,6 +390,7 @@ async fn selection_keeps_one_pass_aliases_and_admitted_role_identity_without_htt
     f.daemon().run_admissions.locked().insert(
         "admitted-private-run".into(),
         Arc::new(RunAdmission {
+            pipeline: None,
             cfg: cfg.clone(),
             requested: "role:worker".into(),
             resolved_model: "served".into(),
@@ -520,6 +521,7 @@ async fn completed_pending_map_alone_retains_exact_role_task_after_real_late_htt
         .unwrap();
     let handle = uuid::Uuid::new_v4().to_string();
     let entry = Arc::new(PendingEntry {
+        _pipeline: StdMutex::new(None),
         routing_task: Some(task.clone()),
         taint_scope: daemon.taint_scope(&f.sid, &run),
         tool_name: "controlled-private-resource".into(),

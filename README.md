@@ -303,7 +303,21 @@ formless run "fix the failing test" --cwd ~/src/app        # act on that folder 
 formless run "what's wrong here?" --attach shot.png --attach app.log   # files and images
 git diff | formless run "review this"                      # piped input goes along as stdin.txt
 cat task.md | formless run -                               # `-` reads the task itself from stdin
+formless run "classify these titles" --schema result.schema.json --system "Use concise labels" --max-usd 0.10 --output final --output-file result.json
 ```
+
+`--schema` validates the final answer and allows one paid repair; a second
+mismatch exits 3 without emitting invalid JSON in final/json mode. `--schema -`
+uses stdin for the schema instead of a task or attachment. `--system` applies
+only to this Run. `--max-usd` replaces its Run cap, including an intentional
+increase, while the profile's daily cap still applies; zero admits no model
+request. Limits are checked before each physical call, so an in-flight response
+can exceed the remaining amount. Unknown spend or pricing pauses further calls.
+A budget stop exits 1 and reports observed usage cost on stderr. Stopped pipeline
+Runs must be resubmitted with their options; `/resume` cannot recover ephemeral
+instructions. `--output-file` leaves stdout empty and atomically replaces the
+file only after successful output (at most 8 MiB); failure leaves the previous
+file intact.
 
 Before sending, the TUI and web composer show a local forecast for the current
 draft: prompt tokens, comparable model/role Runs, likely cost and steps, and

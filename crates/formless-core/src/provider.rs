@@ -2744,6 +2744,12 @@ impl Provider {
                     .await
                     .map_err(|error| auth.annotate(error))?;
                 let lease = ObservedLease::new(lease, routing.clone());
+                // Settings/prices may change while waiting for the profile
+                // budget FIFO. Recheck the same final body before any send;
+                // this pure guard never bills or creates another attempt.
+                if let Some(policy) = &self.request_policy {
+                    policy(&b).map_err(|error| auth.annotate(error))?;
+                }
                 let credential = self
                     .credential()
                     .await

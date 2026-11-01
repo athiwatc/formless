@@ -57,6 +57,7 @@ impl Admission {
         paths: &Paths,
         run: &str,
         waived: bool,
+        limit: crate::pipeline_budget::RunLimit,
     ) -> Result<Option<tokio::sync::OwnedMutexGuard<()>>> {
         if self.accounting_failed.load(Ordering::SeqCst) {
             return Err(anyhow!("budget: usage accounting failed; repair storage and restart before sending more model requests"));
@@ -64,11 +65,18 @@ impl Admission {
         // Read-only effective configuration: no daemon/config mutex is held
         // while waiting, and no store lock is held while reading settings.
         let cfg = Config::load(paths)?;
-        let capped = [cfg.limits.run_usd, cfg.limits.daily_usd]
-            .into_iter()
-            .flatten()
-            .any(|n| n > 0.0);
-        if !capped || waived {
+        let limits = crate::pipeline_budget::resolve_limits(
+            limit,
+            cfg.limits.run_usd,
+            cfg.limits.daily_usd,
+            waived,
+        )?;
+        if limits.explicit_zero() {
+            return Err(anyhow!(
+                "budget: explicit --max-usd 0 authorizes no model dispatch"
+            ));
+        }
+        if !limits.capped() {
             return Ok(None);
         }
         #[cfg(test)]
@@ -83,10 +91,25 @@ impl Admission {
         // A queued request must not retain the pre-wait limit or price table.
         // SetSetting reports applies=now, including while another call is held.
         let cfg = Config::load(paths)?;
+        let limits = crate::pipeline_budget::resolve_limits(
+            limit,
+            cfg.limits.run_usd,
+            cfg.limits.daily_usd,
+            waived,
+        )?;
         let st = store
             .lock()
             .map_err(|_| anyhow!("budget: usage store is unavailable"))?;
-        if let Some(max) = cfg.limits.run_usd.filter(|n| *n > 0.0 && !run.is_empty()) {
+        // The previous holder settled usage before releasing this FIFO. Check
+        // only prior attempts: request_hook increments the current attempt
+        // AFTER this function returns, never while we are waiting above.
+        if limits.explicit
+            && !run.is_empty()
+            && st.pipeline_spend(run, &cfg)?["spend_complete"] != true
+        {
+            return Err(anyhow!("budget: prior model request spend is incomplete or unknown under explicit --max-usd; no further request was sent"));
+        }
+        if let Some(max) = limits.run_usd.filter(|_| !run.is_empty()) {
             let (rows, _) = st.usage_rows(None, Some(run))?;
             if rows.iter().any(|row| row.7) {
                 return Err(anyhow!("budget: native media cost is unknown for this Run; strict run_usd cannot authorize more spending"));
@@ -97,9 +120,12 @@ impl Admission {
                     cfg.cost_of_known(provider, model, *p, *c, *cache, *write, *reported, *unknown)
                 })
                 .collect();
+            if limits.explicit && !cost.complete {
+                return Err(anyhow!("budget: actual Run spend is incomplete or unpriced under explicit --max-usd; cannot authorize another request"));
+            }
             refuse("run_usd", cost, max)?;
         }
-        if let Some(max) = cfg.limits.daily_usd.filter(|n| *n > 0.0) {
+        if let Some(max) = limits.daily_usd {
             let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
             let rows = st.usage_grouped(Some(&day), "model")?;
             if rows.iter().any(|row| row.8) {
