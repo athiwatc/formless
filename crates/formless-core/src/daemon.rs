@@ -13998,9 +13998,9 @@ struct Upload {
 }
 /// `@`-mentioned text files up to this size are attached; larger ones and
 /// directories go as a reference (SPEC §5.6).
-const MAX_MENTION_INLINE_BYTES: usize = 256 * 1024;
+pub const MAX_MENTION_INLINE_BYTES: usize = 256 * 1024;
 /// Images sent inline to vision models (SPEC §5.6).
-const MAX_INLINE_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_INLINE_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 const FILE_INDEX_SECS: u64 = 30;
 
 type FileIndex = (

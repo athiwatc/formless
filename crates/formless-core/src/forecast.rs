@@ -89,8 +89,25 @@ pub fn attachment(name: String, bytes: &[u8]) -> ForecastAttachment {
         name,
         bytes: bytes.len() as u64,
         sha256: format!("{:x}", Sha256::digest(bytes)),
+        reference: None,
+        directory: false,
         width: dims.map(|d| d.0),
         height: dims.map(|d| d.1),
+    }
+}
+
+/// A display-only reference, never resolved or read by the forecast RPC.
+pub fn reference(path: &std::path::Path, directory: bool, bytes: u64) -> ForecastAttachment {
+    let value = path.to_string_lossy().into_owned();
+    ForecastAttachment {
+        name: crate::daemon::attachment_name(
+            &path.file_name().unwrap_or_default().to_string_lossy(),
+        ),
+        bytes,
+        sha256: hash(&(json!(value), json!(directory), json!(bytes))),
+        reference: Some(value),
+        directory,
+        ..Default::default()
     }
 }
 
@@ -119,12 +136,9 @@ fn dimension_image(dims: Option<(u32, u32)>) -> String {
 }
 
 pub fn estimate(paths: &Paths, input: &ForecastInput) -> Result<RunForecast> {
+    let st = Store::open_forecast_snapshot(paths)?.unwrap_or(Store::open_in_memory()?);
+    // Source SQLite files are never opened by a pager; only the private copy is.
     let cfg = Config::load(paths)?; // Configuration only, never provider_key/auth.
-    let st = if paths.db_file().exists() {
-        Store::open_forecast_reader(&paths.db_file())?
-    } else {
-        Store::open_in_memory()?
-    };
     estimate_store(&st, &cfg, input)
 }
 
@@ -297,7 +311,9 @@ pub(crate) fn estimate_store_with_window(
     let mut logical = Vec::new();
     let mut normalized = held.clone();
     for a in &held {
-        let bytes = a["path"].as_str().and_then(|p| std::fs::read(p).ok());
+        let bytes = (a["reference"] != true)
+            .then(|| a["path"].as_str().and_then(|p| std::fs::read(p).ok()))
+            .flatten();
         let mut descriptor = if let Some(bytes) = bytes {
             attachment(
                 a["full_name"]
@@ -320,6 +336,8 @@ pub(crate) fn estimate_store_with_window(
         }
         if a["reference"] == true {
             descriptor.sha256 = hash(&(a["path"].clone(), a["dir"].clone(), a["bytes"].clone()));
+            descriptor.reference = a["path"].as_str().map(str::to_string);
+            descriptor.directory = a["dir"] == true;
         }
         logical.push(descriptor);
     }
@@ -328,7 +346,11 @@ pub(crate) fn estimate_store_with_window(
         a["id"] = json!("00000000-0000-0000-0000-000000000000");
     }
     for a in &input.attachments {
-        normalized.push(json!({"id":"00000000-0000-0000-0000-000000000000","name":a.name,"mime":a.mime,"bytes":a.bytes}));
+        if let Some(path) = &a.reference {
+            normalized.push(json!({"reference":true,"name":a.name,"path":path,"dir":a.directory,"bytes":a.bytes}));
+        } else {
+            normalized.push(json!({"id":"00000000-0000-0000-0000-000000000000","name":a.name,"mime":a.mime,"bytes":a.bytes}));
+        }
     }
     if !input.draft.is_empty() {
         let message = MessageInfo {
@@ -362,7 +384,7 @@ pub(crate) fn estimate_store_with_window(
             for a in input
                 .attachments
                 .iter()
-                .filter(|a| crate::daemon::is_raster_image(&a.mime))
+                .filter(|a| a.reference.is_none() && crate::daemon::is_raster_image(&a.mime))
             {
                 parts.push(json!({"type":"image_url","image_url":{"url":dimension_image(a.width.zip(a.height).map(|(w,h)|crate::provider::resized_image_dimensions(w,h,pcfg.image_max_px))),"detail":pcfg.image_detail}}));
             }
@@ -800,5 +822,181 @@ mod tests {
         );
         drop(st);
         std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn missing_or_partial_usage_is_unknown_in_metrics_and_never_a_comparable() {
+        let st = Store::open_in_memory().unwrap();
+        let c = config();
+        let sid = st.create_session(None).unwrap().id;
+        let input = ForecastInput {
+            session_id: Some(sid.clone()),
+            draft: "task".into(),
+            ..Default::default()
+        };
+        let f = estimate_store(&st, &c, &input).unwrap();
+        for reported in [0, 1, 2] {
+            let run = st.create_run(&sid).unwrap();
+            st.record_forecast(&run, &f).unwrap();
+            st.bump_run_steps(&run).unwrap();
+            st.record_forecast_request(&run, "run").unwrap();
+            if reported != 0 {
+                st.record_usage_full(
+                    &sid,
+                    &run,
+                    "default",
+                    "model",
+                    &crate::provider::Usage {
+                        prompt_tokens: 100,
+                        completion_tokens: 20,
+                        reported,
+                        ..Default::default()
+                    },
+                    "run",
+                )
+                .unwrap();
+            }
+            st.set_run_status(&run, "completed").unwrap();
+            let rows = metrics(&st, &c).unwrap();
+            let row = rows
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["run_id"] == run)
+                .unwrap();
+            assert_eq!(row["actual"]["tokens"], Value::Null);
+            assert_eq!(row["actual"]["cost_usd"], Value::Null);
+            assert_eq!(row["calibration_eligible"], false);
+            assert_eq!(row["token_error"], Value::Null);
+            assert_eq!(estimate_store(&st, &c, &input).unwrap().comparable_runs, 0);
+        }
+    }
+
+    #[test]
+    fn quote_binds_session_calibration_and_newly_completed_history() {
+        let st = Store::open_in_memory().unwrap();
+        let c = config();
+        let sid = st.create_session(None).unwrap().id;
+        let input = ForecastInput {
+            session_id: Some(sid.clone()),
+            draft: "task".into(),
+            ..Default::default()
+        };
+        let first = estimate_store(&st, &c, &input).unwrap();
+        let foreign = ForecastInput {
+            session_id: Some(st.create_session(None).unwrap().id),
+            ..input.clone()
+        };
+        assert_ne!(
+            first.fingerprint,
+            estimate_store(&st, &c, &foreign).unwrap().fingerprint
+        );
+        st.observe_prompt_tokens(&first.basis.provider_key, "model", 100, 400)
+            .unwrap();
+        let calibrated = estimate_store(&st, &c, &input).unwrap();
+        assert!(calibrated.basis.prompt_tokens > first.basis.prompt_tokens);
+        assert_ne!(first.fingerprint, calibrated.fingerprint);
+        let id = completed(&st, &c, &calibrated, 2, "running");
+        let running = estimate_store(&st, &c, &input).unwrap();
+        st.set_run_status(&id, "completed").unwrap();
+        let done = estimate_store(&st, &c, &input).unwrap();
+        assert_ne!(running.fingerprint, done.fingerprint);
+        assert_eq!(done.comparable_runs, 1);
+    }
+
+    #[test]
+    fn role_named_main_and_local_cached_windows_match_actual_selection() {
+        let st = Store::open_in_memory().unwrap();
+        let mut c = config();
+        let mut named = c.provider.clone();
+        named.base_url = "http://127.0.0.1:8".into();
+        named.model = "named-model".into();
+        named.model_context_tokens.clear();
+        c.providers.insert("named".into(), named.clone());
+        c.roles.insert(
+            "main".into(),
+            crate::config::RoleCfg {
+                provider: Some("named".into()),
+                model: "named-model".into(),
+                ..Default::default()
+            },
+        );
+        let input = ForecastInput {
+            model: Some("role:main".into()),
+            draft: "task".into(),
+            ..Default::default()
+        };
+        let f = estimate_store_with_window(
+            &st,
+            &c,
+            &input,
+            Some(&|name, _, model| {
+                assert_eq!((name, model), ("named", "named-model"));
+                Some(1)
+            }),
+            None,
+        )
+        .unwrap();
+        assert_eq!(f.basis.role, "role:main");
+        assert_eq!(f.basis.model, "named-model");
+        assert_eq!(
+            f.basis.provider_key,
+            crate::tokens::provider_key("named", &named)
+        );
+        assert_eq!(f.context_source, "cached_endpoint");
+        assert!(f.will_compact);
+        let offline = estimate_store(&st, &c, &input).unwrap();
+        assert_eq!(offline.context_source, "default");
+        assert!(offline.warnings.iter().any(|w| w.contains("window")));
+        c.providers
+            .get_mut("named")
+            .unwrap()
+            .model_context_tokens
+            .insert("named-model".into(), 100_000);
+        let configured = estimate_store_with_window(
+            &st,
+            &c,
+            &input,
+            Some(&|_, _, _| panic!("explicit configured window wins")),
+            None,
+        )
+        .unwrap();
+        assert_eq!(configured.context_source, "configured");
+    }
+
+    #[test]
+    fn prospective_resume_edit_and_retry_never_mutate_source_and_are_stable() {
+        let st = Store::open_in_memory().unwrap();
+        let c = config();
+        let sid = st.create_session(None).unwrap().id;
+        let user = st.append_message(&sid, "user", "original").unwrap();
+        st.append_message(&sid, "assistant", "answer").unwrap();
+        let run = st.create_run(&sid).unwrap();
+        st.set_run_status(&run, "paused").unwrap();
+        let before = st.list_messages(&sid).unwrap();
+        for operation in 0..3 {
+            let input = ForecastInput {
+                session_id: Some(sid.clone()),
+                draft: if operation == 0 {
+                    "edited".into()
+                } else {
+                    String::new()
+                },
+                edit_message_id: (operation == 0).then(|| user.id.clone()),
+                retry: operation == 1,
+                resume: operation == 2,
+                ..Default::default()
+            };
+            let first = estimate_store(&st, &c, &input).unwrap();
+            let second = estimate_store(&st, &c, &input).unwrap();
+            assert_eq!(
+                first.fingerprint, second.fingerprint,
+                "prospective operation {operation}"
+            );
+            assert_eq!(
+                serde_json::to_value(st.list_messages(&sid).unwrap()).unwrap(),
+                serde_json::to_value(&before).unwrap()
+            );
+            assert_eq!(st.last_run(&sid).unwrap().unwrap().1, "paused");
+        }
     }
 }

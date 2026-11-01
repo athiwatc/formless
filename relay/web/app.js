@@ -1792,10 +1792,25 @@
   }
   // Re-run the last user message, on `model` for that Run when given.
   async function retryRun(model) {
-    const r = await act({ type: "retry_run", session_id: S.current, model: model || null });
+    const sid = S.current;
+    if (S.settings && S.settings.limits && S.settings.limits.forecast_confirm_usd != null) {
+      try { if (!(await confirmForecast(sid, "", {retry:true,model:model || null,edit_message_id:null}))) return; }
+      catch (e) { note("forecast: " + e.message, true); return; }
+    }
+    const r = await act({ type: "retry_run", session_id: sid, model: model || null });
     if (!r) return;
     note("retrying" + (r.model ? " on " + r.model : "") + (r.original_session ? "; the previous answer is kept in \"… · original answer\"" : ""));
     if (r.original_session) refreshSessions();
+  }
+
+  async function resumeRun() {
+    const sid = S.current;
+    if (!sid) return;
+    if (S.settings && S.settings.limits && S.settings.limits.forecast_confirm_usd != null) {
+      try { if (!(await confirmForecast(sid, "", {resume:true,edit_message_id:null}))) return; }
+      catch (e) { note("forecast: " + e.message, true); return; }
+    }
+    if (await act({type:"resume_run",session_id:sid})) { S.unfinished = null; renderRunBanner(); }
   }
 
   function welcome() {
@@ -1952,7 +1967,7 @@
     box.replaceChildren(
       text,
       h("button", { class: "btn small primary", type: "button", onclick: async () => {
-        if (await act({ type: "resume_run", session_id: S.current })) { S.unfinished = null; renderRunBanner(); }
+        await resumeRun();
       } }, tr("Resume")),
       h("button", { class: "btn small", type: "button", onclick: async () => {
         if (await act({ type: "abandon_run", session_id: S.current }, "Abandoned")) { S.unfinished = null; renderRunBanner(); }
@@ -2032,9 +2047,10 @@
   let forecastTimer = null;
   let forecastSequence = 0;
   let forecastStampLast = "";
+  let forecastRevision = 0;
   function forecastStamp(draft = $("input").value) {
     const session = S.sessions.find((s) => s.id === S.current);
-    return JSON.stringify([S.current, draft, session && session.model, session && session.cwd, S.chips[S.current] || [], S.daemonOnline, S.hello]);
+    return JSON.stringify([S.current, draft, session && session.model, session && session.cwd, S.chips[S.current] || [], S.daemonOnline, S.hello, forecastRevision]);
   }
   function scheduleForecast() {
     const stamp = forecastStamp();
@@ -2055,11 +2071,11 @@
       } catch (_) { /* A failed preview never executes or clears a draft. */ }
     }, 300);
   }
-  async function confirmForecast(sid, text) {
+  async function confirmForecast(sid, text, operation = {}) {
     // Use the same live transport for preview, consent and the later send.
     const stamp = forecastStamp();
     const sequence = forecastSequence;
-    const forecast = await request({type:"forecast_run",for_send:true,input:{session_id:sid,draft:text,edit_message_id:S.editMessageId || null}});
+    const forecast = await request({type:"forecast_run",for_send:true,input:{session_id:sid,draft:text,edit_message_id:S.editMessageId || null,...operation}});
     if (sid !== S.current || stamp !== forecastStamp() || sequence !== forecastSequence || !S.daemonOnline) return false;
     if (forecast.confirmation_required) {
       if (!(await ask({title:"Forecast confirmation",text:forecast.hint,body:h("p",null,(forecast.warnings || []).join(" ")),ok:"Confirm send"}))) return false;
@@ -2084,7 +2100,7 @@
         groups.set(key,group);
       }
       for (const [key,g] of groups) box.append(h("p",null,key+": "+g.n+" completed comparisons · mean token error "+(g.n ? Math.round(g.error/g.n) : "unknown")+" · p50–p90 coverage "+(g.n ? Math.round(100*g.covered/g.n)+"%" : "unknown")+" · "+g.unknown+" interrupted/unknown/no-history"));
-      for (const row of rows) box.append(h("details",null,h("summary",null,row.model+" · "+row.status+" · "+row.comparable_runs+" comparable Runs · actual "+row.actual.tokens+" tokens · error "+(row.token_error == null ? "unknown" : Math.round(row.token_error))),h("pre",null,JSON.stringify({forecast:row.forecast,actual:row.actual},null,2))));
+      for (const row of rows) box.append(h("details",null,h("summary",null,row.model+" · "+row.status+" · "+row.comparable_runs+" comparable Runs · actual "+(row.actual.tokens == null ? "unknown" : row.actual.tokens)+" tokens · error "+(row.token_error == null ? "unknown" : Math.round(row.token_error))),h("pre",null,JSON.stringify({forecast:row.forecast,actual:row.actual},null,2))));
     } catch (_) { /* Metrics are read-only and optional on older daemons. */ }
   }
 
@@ -4267,7 +4283,7 @@
       if (r) note(r.max_steps ? (r.active_run ? "this Run" : "the next Run") + " stops after " + r.max_steps + " steps (pauses: /resume continues)" : "no step limit");
     } },
     { name: "resume", group: "Run control", desc: "continue an interrupted or paused Run", run: async () => {
-      if (S.current) await act({ type: "resume_run", session_id: S.current });
+      await resumeRun();
     } },
     { name: "abandon", group: "Run control", desc: "drop an interrupted or paused Run", run: async () => {
       if (!S.current) return;
@@ -4455,6 +4471,10 @@
     if (!S.current) await newSession();
     if (!S.current) return;
     const sid = S.current;
+    if (S.editMessageId && S.settings && S.settings.limits && S.settings.limits.forecast_confirm_usd != null) {
+      try { if (!(await confirmForecast(sid, text))) return; }
+      catch (e) { note("forecast: " + e.message, true); return; }
+    }
     const mode = queued ? "queue" : isRunning() ? "steer" : "send";
     input.value = "";
     autosize();
@@ -4624,6 +4644,10 @@
   }
 
   function onEvent(ev) {
+    if (["settings_changed", "registry_changed", "session_updated", "messages_edited", "compaction_notice", "tool_updated", "tool_deleted", "message_appended", "message_complete", "run_started", "run_finished", "run_paused"].includes(ev.type)) {
+      forecastRevision++;
+      scheduleForecast();
+    }
     if (S.sessionSnapshot && ["run_started", "run_finished", "run_paused", "approval_requested", "approval_answered", "approval_summary", "promotion_approval_requested", "promotion_approval_resolved", "user_question", "user_question_closed"].includes(ev.type)) {
       S.sessionSnapshot.events.push(ev);
     }

@@ -149,11 +149,11 @@ enum Pending {
     },
     ForecastSend {
         generation: String,
-        queued: bool,
+        action: ForecastAction,
     },
     ForecastConfirm {
         generation: String,
-        queued: bool,
+        action: ForecastAction,
     },
     /// Refresh the approvals mode of this connection without opening a pager.
     DaemonMode,
@@ -307,6 +307,10 @@ fn reconnect_state_event(event: &Event) -> bool {
                 | Event::QueueChanged { .. }
                 | Event::PlanUpdated { .. }
                 | Event::MessageAppended { .. }
+                | Event::MessagesEdited { .. }
+                | Event::CompactionNotice { .. }
+                | Event::ToolUpdated { .. }
+                | Event::ToolDeleted { .. }
                 | Event::MessageComplete { .. }
         )
 }
@@ -1295,14 +1299,30 @@ fn truncate_chars(s: &str, max: usize) -> String {
 /// How long the TUI waits for a request's answer before giving up on it.
 const REQUEST_DEADLINE: Duration = Duration::from_secs(120);
 
+#[derive(Clone, PartialEq)]
+enum ForecastAction {
+    Send {
+        queued: bool,
+    },
+    Resume {
+        session_id: String,
+    },
+    Retry {
+        session_id: String,
+        model: Option<String>,
+        keep_original: bool,
+    },
+}
+
 #[derive(Default)]
 struct ForecastUi {
     generation: String,
+    revision: u64,
     input_cache: std::cell::RefCell<Option<(String, ForecastInput)>>,
     changed: Option<Instant>,
     pending: bool,
     hint: Option<RunForecast>,
-    modal: Option<(String, RunForecast, bool)>,
+    modal: Option<(String, RunForecast, ForecastAction)>,
     approved: Option<String>,
     metrics: Vec<serde_json::Value>,
 }
@@ -2489,22 +2509,20 @@ impl App {
                                 self.forecast.hint = serde_json::from_value(result).ok();
                             }
                         }
-                        Pending::ForecastSend { generation, queued } => {
+                        Pending::ForecastSend { generation, action } => {
                             if generation == self.forecast_generation() && self.offline.is_none() {
                                 if let Ok(f) = serde_json::from_value::<RunForecast>(result) {
                                     if f.confirmation_required {
-                                        self.forecast.modal = Some((generation, f, queued));
+                                        self.forecast.modal = Some((generation, f, action));
                                     } else {
-                                        self.forecast.approved = Some(generation);
-                                        self.submit_chat(queued);
+                                        self.complete_forecast_action(generation, action);
                                     }
                                 }
                             }
                         }
-                        Pending::ForecastConfirm { generation, queued } => {
+                        Pending::ForecastConfirm { generation, action } => {
                             if generation == self.forecast_generation() && self.offline.is_none() {
-                                self.forecast.approved = Some(generation);
-                                self.submit_chat(queued);
+                                self.complete_forecast_action(generation, action);
                             }
                         }
                         Pending::SendMessage => {}
@@ -4232,6 +4250,25 @@ impl App {
     }
 
     fn on_event(&mut self, ev: Event) {
+        if matches!(
+            &ev,
+            Event::SettingsChanged
+                | Event::RegistryChanged { .. }
+                | Event::SessionUpdated { .. }
+                | Event::MessageAppended { .. }
+                | Event::MessagesEdited { .. }
+                | Event::CompactionNotice { .. }
+                | Event::ToolUpdated { .. }
+                | Event::ToolDeleted { .. }
+                | Event::MessageComplete { .. }
+                | Event::RunStarted { .. }
+                | Event::RunFinished { .. }
+                | Event::RunPaused { .. }
+        ) {
+            self.forecast.revision = self.forecast.revision.wrapping_add(1);
+            self.forecast.hint = None;
+            self.forecast.approved = None;
+        }
         if self.offline.is_some() && self.client.is_some() && reconnect_state_event(&ev) {
             self.reconnect_events.push(ev.clone());
             if attention_key(&ev).is_some() {
@@ -5071,7 +5108,10 @@ impl App {
         let paths: Vec<_> = formless_core::files::mentions(&text)
             .iter()
             .map(|p| {
-                let path = root.join(p);
+                let path = p
+                    .strip_prefix("~/")
+                    .and_then(|rest| directories::BaseDirs::new().map(|b| b.home_dir().join(rest)))
+                    .unwrap_or_else(|| root.join(p));
                 let stamp = path.metadata().ok().map(|m| (m.len(), m.modified().ok()));
                 (path, stamp)
             })
@@ -5089,22 +5129,45 @@ impl App {
             .collect();
         let root = self.work_dir();
         for mention in formless_core::files::mentions(&self.input.expanded()) {
-            let Ok(path) = root.join(&mention).canonicalize() else {
+            let candidate = mention
+                .strip_prefix("~/")
+                .and_then(|rest| directories::BaseDirs::new().map(|b| b.home_dir().join(rest)))
+                .unwrap_or_else(|| root.join(&mention));
+            let Ok(path) = candidate.canonicalize() else {
                 continue;
             };
-            if path.is_file()
-                && formless_core::daemon::credential_path(&path).is_none()
-                && path.metadata().is_ok_and(|m| m.len() <= 20 * 1024 * 1024)
-            {
+            let inside = path.starts_with(&root)
+                || (mention.starts_with("~/")
+                    && directories::BaseDirs::new()
+                        .is_some_and(|b| path.starts_with(b.home_dir())));
+            if !inside || formless_core::daemon::credential_path(&path).is_some() {
+                continue;
+            }
+            let Ok(meta) = path.metadata() else {
+                continue;
+            };
+            let name = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            let limit =
+                if formless_core::daemon::is_raster_image(formless_core::daemon::guess_mime(&name))
+                {
+                    formless_core::daemon::MAX_INLINE_IMAGE_BYTES
+                } else {
+                    formless_core::daemon::MAX_MENTION_INLINE_BYTES
+                };
+            if meta.is_file() && meta.len() <= limit as u64 {
                 if let Ok(bytes) = std::fs::read(&path) {
-                    attachments.push(formless_core::forecast::attachment(
-                        path.file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy()
-                            .into_owned(),
-                        &bytes,
-                    ));
+                    attachments.push(formless_core::forecast::attachment(name, &bytes));
                 }
+            } else {
+                attachments.push(formless_core::forecast::reference(
+                    &path,
+                    meta.is_dir(),
+                    if meta.is_dir() { 0 } else { meta.len() },
+                ));
             }
         }
         let input = ForecastInput {
@@ -5122,7 +5185,12 @@ impl App {
             .current
             .as_ref()
             .and_then(|id| self.sessions.iter().find(|s| &s.id == id));
-        formless_core::forecast::hash(&(self.forecast_input(), session, &self.model_label))
+        formless_core::forecast::hash(&(
+            self.forecast_input(),
+            session,
+            &self.model_label,
+            self.forecast.revision,
+        ))
     }
     fn forecast_tick(&mut self) {
         if self.offline.is_some()
@@ -5160,6 +5228,69 @@ impl App {
         }
     }
 
+    fn complete_forecast_action(&mut self, generation: String, action: ForecastAction) {
+        match action {
+            ForecastAction::Send { queued } => {
+                self.forecast.approved = Some(generation);
+                self.submit_chat(queued);
+            }
+            ForecastAction::Resume { session_id } => {
+                self.request(Pending::RunControl, Request::ResumeRun { session_id });
+            }
+            ForecastAction::Retry {
+                session_id,
+                model,
+                keep_original,
+            } => {
+                self.request(
+                    Pending::RetryRun,
+                    Request::RetryRun {
+                        session_id,
+                        model,
+                        keep_original,
+                    },
+                );
+            }
+        }
+    }
+    fn forecast_control(&mut self, action: ForecastAction) {
+        if self.offline.is_some() {
+            return;
+        }
+        if !Config::load(&self.paths).is_ok_and(|c| c.limits.forecast_confirm_usd.is_some()) {
+            self.complete_forecast_action(self.forecast_generation(), action);
+            return;
+        }
+        let mut input = self.forecast_input();
+        input.draft.clear();
+        input.attachments.clear();
+        input.edit_message_id = None;
+        match &action {
+            ForecastAction::Resume { session_id } => {
+                input.session_id = Some(session_id.clone());
+                input.resume = true;
+            }
+            ForecastAction::Retry {
+                session_id, model, ..
+            } => {
+                input.session_id = Some(session_id.clone());
+                input.retry = true;
+                input.model = model.clone();
+            }
+            ForecastAction::Send { .. } => unreachable!(),
+        }
+        self.request(
+            Pending::ForecastSend {
+                generation: self.forecast_generation(),
+                action,
+            },
+            Request::ForecastRun {
+                for_send: true,
+                input,
+            },
+        );
+    }
+
     fn submit_chat(&mut self, queued: bool) {
         if self.offline.is_some() {
             // Nothing can be sent: keep the draft until the daemon is back.
@@ -5178,7 +5309,10 @@ impl App {
             let generation = self.forecast_generation();
             if self.forecast.approved.take().as_deref() != Some(generation.as_str()) {
                 self.request(
-                    Pending::ForecastSend { generation, queued },
+                    Pending::ForecastSend {
+                        generation,
+                        action: ForecastAction::Send { queued },
+                    },
                     Request::ForecastRun {
                         for_send: true,
                         input: self.forecast_input(),
@@ -5883,15 +6017,11 @@ impl App {
                 };
                 let arg = cmd.trim_start_matches("retry").trim();
                 let model = arg.strip_prefix("--model").unwrap_or(arg).trim();
-                self.run_banner = None;
-                self.request(
-                    Pending::RetryRun,
-                    Request::RetryRun {
-                        session_id,
-                        model: Some(model.to_string()).filter(|m| !m.is_empty()),
-                        keep_original: true,
-                    },
-                );
+                self.forecast_control(ForecastAction::Retry {
+                    session_id,
+                    model: Some(model.to_string()).filter(|m| !m.is_empty()),
+                    keep_original: true,
+                });
             }
             "metrics" => self.open_view(View::Metrics),
             "proposals" => self.open_view(View::Proposals),
@@ -6768,13 +6898,12 @@ impl App {
             }
             "resume" | "abandon" => {
                 if let Some(session_id) = self.current.clone() {
-                    let req = if cmd == "resume" {
-                        Request::ResumeRun { session_id }
+                    if cmd == "resume" {
+                        self.forecast_control(ForecastAction::Resume { session_id });
                     } else {
-                        Request::AbandonRun { session_id }
-                    };
-                    self.request(Pending::RunControl, req);
-                    self.run_banner = None;
+                        self.request(Pending::RunControl, Request::AbandonRun { session_id });
+                        self.run_banner = None;
+                    }
                 }
             }
             "help" => {
@@ -7502,18 +7631,18 @@ impl App {
             self.model_key(key);
             return;
         }
-        if let Some((generation, forecast, queued)) = self.forecast.modal.take() {
+        if let Some((generation, forecast, action)) = self.forecast.modal.take() {
             match key.code {
                 KeyCode::Enter | KeyCode::Char('y') if generation == self.forecast_generation() => {
                     if let Some(id) = forecast.confirmation_id {
                         self.request(
-                            Pending::ForecastConfirm { generation, queued },
+                            Pending::ForecastConfirm { generation, action },
                             Request::ConfirmForecast { id },
                         );
                     }
                 }
                 KeyCode::Esc | KeyCode::Char('n') => {}
-                _ => self.forecast.modal = Some((generation, forecast, queued)),
+                _ => self.forecast.modal = Some((generation, forecast, action)),
             }
             return;
         }
@@ -21691,7 +21820,7 @@ mod tests {
         app.forecast.modal = Some((
             app.forecast_generation(),
             forecast_reply("forecast", true),
-            false,
+            ForecastAction::Send { queued: false },
         ));
         app.key(key(KeyCode::Esc));
         assert!(app.forecast.modal.is_none());

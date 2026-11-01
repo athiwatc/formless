@@ -19,7 +19,7 @@ function setup(names, extras = {}) {
     return elements.get(id);
   };
   const context = vm.createContext({ $, S: { current: 'A', chips: {}, messages: [], sessions: [], view: 'chat', tools: [] },
-    setTimeout: f => f(), rememberFocus() {}, restoreFocus() {}, renderChips() {}, note() {}, autosize() {},
+    forecastRevision: 0, scheduleForecast() {}, setTimeout: f => f(), rememberFocus() {}, restoreFocus() {}, renderChips() {}, note() {}, autosize() {},
     ...extras });
   vm.runInContext(names.map(fn).join('\n'), context);
   return context;

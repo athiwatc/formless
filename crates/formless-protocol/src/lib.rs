@@ -781,6 +781,11 @@ pub struct ForecastAttachment {
     pub bytes: u64,
     #[serde(default)]
     pub sha256: String,
+    /// Display-only reference metadata; never a daemon-local read capability.
+    #[serde(default)]
+    pub reference: Option<String>,
+    #[serde(default)]
+    pub directory: bool,
     pub width: Option<u32>,
     pub height: Option<u32>,
 }

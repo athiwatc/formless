@@ -1389,7 +1389,9 @@ fn run_cli(cli: Cli) -> Result<()> {
                     Request::ListSessions,
                 )?)?
             } else {
-                formless_core::Store::open_forecast_reader(&paths.db_file())?.list_sessions()?
+                formless_core::Store::open_forecast_snapshot(&paths)?
+                    .context("forecast Session does not exist")?
+                    .list_sessions()?
             };
             let matches: Vec<_> = sessions
                 .into_iter()
