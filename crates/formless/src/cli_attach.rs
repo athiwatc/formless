@@ -30,15 +30,23 @@ struct Connection {
     rx: mpsc::Receiver<ServerMessage>,
     events: VecDeque<Event>,
     event_bytes: usize,
+    cancel: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 impl Connection {
     fn connect(paths: &Paths) -> Result<Self> {
+        Self::connect_with_cancel(paths, None)
+    }
+    fn connect_with_cancel(
+        paths: &Paths,
+        cancel: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    ) -> Result<Self> {
         let (client, rx) = DaemonClient::connect(paths).context("connect to the running daemon")?;
         let mut this = Self {
             client,
             rx,
             events: VecDeque::new(),
             event_bytes: 0,
+            cancel,
         };
         this.subscribe(Vec::new(), false)?;
         Ok(this)
@@ -55,10 +63,20 @@ impl Connection {
         let id = self.client.send(request);
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
-            let msg = self
-                .rx
-                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                .context("daemon disconnected or did not answer within 30s")?;
+            if self
+                .cancel
+                .as_ref()
+                .is_some_and(|count| count.load(std::sync::atomic::Ordering::SeqCst) > 0)
+            {
+                return Err(Detached.into());
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            anyhow::ensure!(!left.is_zero(), "daemon did not answer within 30s");
+            let msg = match self.rx.recv_timeout(left.min(Duration::from_millis(100))) {
+                Ok(msg) => msg,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(_) => bail!("daemon disconnected while awaiting response"),
+            };
             match msg {
                 msg @ ServerMessage::Response { id: rid, .. } if rid == id => {
                     let code = msg.error_code().map(str::to_owned);
@@ -182,7 +200,7 @@ fn confirm_broad(
         write!(output, "{prompt}")?;
         output.flush()?;
         let mut line = String::new();
-        input.take(1024).read_line(&mut line)?;
+        (&mut *input).take(1024).read_line(&mut line)?;
         anyhow::ensure!(
             matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes"),
             "approval left pending"
@@ -328,9 +346,23 @@ impl Observer {
         Ok(())
     }
 }
+#[derive(Debug)]
+struct Detached;
+impl std::fmt::Display for Detached {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "observer detached")
+    }
+}
+impl std::error::Error for Detached {}
 pub(super) fn follow(paths: &Paths, query: &str, json: bool) -> Result<i32> {
+    match follow_inner(paths, query, json) {
+        Err(e) if e.downcast_ref::<Detached>().is_some() => Ok(130),
+        other => other,
+    }
+}
+fn follow_inner(paths: &Paths, query: &str, json: bool) -> Result<i32> {
     let sigints = super::count_sigints();
-    let mut conn = Connection::connect(paths)?;
+    let mut conn = Connection::connect_with_cancel(paths, Some(sigints.clone()))?;
     let sessions: Vec<SessionInfo> = serde_json::from_value(conn.request(Request::ListSessions)?)?;
     let session = super::find_session_in(&sessions, query)?;
     conn.subscribe(vec![session.id.clone()], true)?;
@@ -389,10 +421,15 @@ pub(super) fn follow(paths: &Paths, query: &str, json: bool) -> Result<i32> {
             })?;
         }
         if resync {
+            if let Some(run_id) = run["run_id"].as_str() {
+                run = conn.request(Request::GetRun {
+                    run_id: run_id.into(),
+                })?;
+            }
             let snap = conn.request(Request::GetSession {
                 id: session.id.clone(),
             })?;
-            observer.snapshot(&snap, None)?;
+            observer.snapshot(&snap, run["end_message_seq"].as_i64())?;
         }
     }
 }
