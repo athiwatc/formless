@@ -792,8 +792,34 @@ impl Daemon {
         // A damaged database stops the daemon with the backup to restore,
         // instead of failing wherever it first bites (SPEC §16).
         store.check_integrity(&paths.db_file())?;
-        // Uploads don't survive a restart: their pieces are never attached.
-        let _ = std::fs::remove_dir_all(paths.data_dir.join("artifacts").join(".uploads"));
+        // Reject unsafe artifact namespaces before future writers can follow
+        // them. Never recurse through a path during stale-upload cleanup.
+        let artifact_dir = paths.data_dir.join("artifacts");
+        match std::fs::create_dir(&artifact_dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e).context("create profile artifact directory"),
+        }
+        let artifact_root = crate::artifact_delete::Root::open(&artifact_dir)
+            .context("artifact directory must be ordinary and non-symlinked")?;
+        if !offline {
+            match artifact_root.entries(std::path::Path::new(".uploads")) {
+                Ok(parts) => {
+                    for part in parts {
+                        artifact_root
+                            .remove(&part)
+                            .context("unsafe or undeletable stale upload entry")?;
+                    }
+                }
+                Err(e)
+                    if crate::artifact_delete::rejection(&e)
+                        == Some(crate::artifact_delete::Rejection::Missing) => {}
+                Err(e) => {
+                    return Err(e)
+                        .context("stale upload directory must be ordinary and non-symlinked")
+                }
+            }
+        }
         // Deprecated global auto (SPEC §4.6): rewrite the file once and
         // tell every client that connects this lifetime.
         let mut startup_warnings = Vec::new();
@@ -1700,7 +1726,9 @@ impl Daemon {
                             .with_store(|st| st.session_deleted(&sid))
                             .unwrap_or(false)
                         {
-                            let _ = this.purge_session(&sid);
+                            if let Err(error) = this.purge_session(&sid) {
+                                this.broadcast(Event::Note{session_id:Some(sid.clone()),text:format!("Session cleanup incomplete; artifact records retained: {error:#}")});
+                            }
                         }
                     });
                     let _ = self.with_store(|st| st.audit("user", "session.delete", &id));
@@ -2590,11 +2618,15 @@ impl Daemon {
                 Ok(json!({ "disconnected": true }))
             }
             Request::DetachFile { session_id, id } => {
-                let gone = self.with_store(|st| st.remove_pending_attachment(&session_id, &id))?;
-                // A detached copy is deleted, not left behind (#857).
-                if let Some(att) = &gone {
-                    self.discard_attachment(att);
-                }
+                let gone = self.with_store(|st| {
+                    st.transaction(|st| {
+                        let gone = st.remove_pending_attachment(&session_id, &id)?;
+                        if let Some(att) = &gone {
+                            Self::discard_attachment_store(st, att)?;
+                        }
+                        Ok(gone)
+                    })
+                })?;
                 Ok(json!({ "removed": gone.is_some() }))
             }
             Request::AttachFile {
@@ -2621,7 +2653,7 @@ impl Daemon {
             Request::AttachAbort { upload_id } => {
                 let gone = self.uploads.locked().remove(&upload_id);
                 if let Some(u) = &gone {
-                    let _ = std::fs::remove_file(&u.part);
+                    self.discard_artifact_path(&u.part);
                 }
                 Ok(json!({"aborted": gone.is_some()}))
             }
@@ -10178,7 +10210,7 @@ impl Daemon {
         if u.received + piece.len() as u64 > u.expected {
             let part = u.part.clone();
             uploads.remove(upload_id);
-            let _ = std::fs::remove_file(part);
+            self.discard_artifact_path(&part);
             bail!("the pieces add up to more than the size the upload declared");
         }
         std::fs::OpenOptions::new()
@@ -10200,7 +10232,7 @@ impl Daemon {
                 "no such upload (finished, aborted or expired)",
             ))?;
         if u.received != u.expected {
-            let _ = std::fs::remove_file(&u.part);
+            self.discard_artifact_path(&u.part);
             bail!(
                 "the upload is incomplete ({} of {} bytes); nothing was attached",
                 u.received,
@@ -10229,7 +10261,7 @@ impl Daemon {
         uploads.retain(|_, u| {
             let live = u.touched.elapsed() < UPLOAD_TTL;
             if !live {
-                let _ = std::fs::remove_file(&u.part);
+                self.discard_artifact_path(&u.part);
             }
             live
         });
@@ -10311,18 +10343,36 @@ impl Daemon {
         Ok(json!({"id": id, "name": name, "mime": mime, "bytes": len}))
     }
 
+    /// Even process-created upload paths are removed through the same pinned
+    /// artifact directory, so replacing .uploads with a link cannot redirect cleanup.
+    fn discard_artifact_path(&self, path: &std::path::Path) {
+        let result = crate::artifact_delete::Root::open(&self.paths.data_dir.join("artifacts"))
+            .and_then(|root| root.remove(path));
+        if let Err(error) = result {
+            if crate::artifact_delete::rejection(&error).is_none() {
+                self.broadcast(Event::Note {
+                    session_id: None,
+                    text: format!(
+                        "Upload cleanup incomplete; file deletion was not verified: {error}"
+                    ),
+                });
+            }
+        }
+    }
+
     /// Delete a held attachment's stored copy (its file and artifact row);
     /// a referenced file is the user's own and stays.
-    fn discard_attachment(&self, att: &Value) {
+    fn discard_attachment_store(st: &Store, att: &Value) -> Result<()> {
         if att["reference"] == true {
-            return;
-        }
-        if let Some(path) = att["path"].as_str() {
-            let _ = std::fs::remove_file(path);
+            return Ok(());
         }
         if let Some(id) = att["id"].as_str() {
-            let _ = self.with_store(|st| st.delete_artifact_rows(&[id.to_string()]));
+            crate::artifacts::remove_record(st, id)?;
         }
+        Ok(())
+    }
+    fn discard_attachment(&self, att: &Value) -> Result<()> {
+        self.with_store(|st| Self::discard_attachment_store(st, att))
     }
 
     /// Attachments held for a day and never sent are deleted (#857).
@@ -10332,7 +10382,9 @@ impl Daemon {
             .with_store(|st| st.expire_pending_attachments(&before))
             .unwrap_or_default();
         for att in &gone {
-            self.discard_attachment(att);
+            if let Err(error) = self.discard_attachment(att) {
+                self.broadcast(Event::Note{session_id:None,text:format!("Held attachment cleanup could not verify or delete its file; artifact record retained: {error:#}")});
+            }
         }
         gone.len()
     }
@@ -14282,7 +14334,14 @@ impl Daemon {
             .with_store(|st| st.sessions_deleted_before(&cutoff))
             .unwrap_or_default()
         {
-            let _ = self.purge_session(&id);
+            if let Err(error) = self.purge_session(&id) {
+                self.broadcast(Event::Note {
+                    session_id: Some(id.clone()),
+                    text: format!(
+                        "Session cleanup incomplete; artifact records retained: {error:#}"
+                    ),
+                });
+            }
         }
         let watcher = {
             let this = self.clone();
@@ -17536,3 +17595,7 @@ mod routing_daemon;
 #[cfg(test)]
 #[path = "routing_daemon_tests.rs"]
 mod routing_daemon_tests;
+
+#[cfg(test)]
+#[path = "artifact_cleanup_daemon_tests.rs"]
+mod artifact_cleanup_tests;

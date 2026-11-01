@@ -116,11 +116,11 @@ pub fn gc(paths: &Paths, store: &Store, cfg: &Config, dry_run: bool) -> Result<V
     };
     // Files the database lost track of (#609).
     if !dry_run {
-        let _ = crate::artifacts::reconcile(
+        crate::artifacts::reconcile(
             store,
             &paths.data_dir.join("artifacts"),
             std::time::Duration::from_secs(3600),
-        );
+        )?;
     }
     rows.push(json!({"kind": "artifacts", "items": n, "bytes": bytes,
         "detail": format!("older than {} days or over {} MB (artifacts.*)", cfg.artifacts.max_age_days, cfg.artifacts.max_total_mb)}));

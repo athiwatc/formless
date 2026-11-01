@@ -5339,3 +5339,39 @@ request fails rather than reporting a grant. The decision receipt reports
 warns explicitly without suggesting a retry. New broad Session grants require
 two explicit confirmations on a TTY, and --yes off-TTY. Declining confirmation
 leaves the request pending. These commands connect only to an existing daemon.
+
+
+Artifact cleanup treats every SQLite or held-attachment path as untrusted data
+(#1262). Retention, Session deletion, detach/expiry and orphan reconciliation
+can unlink only with authority from a pinned profile artifacts directory and
+ordinary relative components, using the platform boundaries below. Foreign, missing, symlinked or unverifiable
+artifact references confirmed foreign, missing or nonregular lose only their
+database rows; they never authorize an outside file operation or contribute
+forged sizes to the retention budget. Permission, unsupported-volume, handle
+verification and other uncertain I/O failures preserve rows and attachment
+expiry state and return an error; preview does not invent a zero-byte estimate.
+A final-path query's NotFound result is verification uncertainty, not proof
+that a file is missing. Windows named lookup failures before a verified final
+handle likewise retain records unless complete enumeration of the pinned parent
+HANDLE proves the child absent, considering long names, short aliases and case
+ambiguity. Directory enumeration uses the handle rather than reopening its name. Public detach rolls back its held entry if cleanup is
+uncertain; background expiry retains the artifact row and surfaces a warning.
+Owned retention uses observed regular-file sizes. Unix unlinks relative to
+pinned parent descriptors (a final symlink swap never follows its target);
+Windows captures the original pinned root's physical GUID-volume path once,
+then validates every opened leaf's normalized final-handle path with exact
+case-sensitive component containment before size accounting or handle deletion.
+Each positive open must also have the exact physical parent captured before
+opening its name. Registered files are protected during reconciliation by the
+validated handle's volume/file identity, including case, short-name and hardlink
+aliases, rather than solely by the registry's lexical path. Delete sharing is
+denied so the validated leaf cannot be renamed afterward.
+Attribute-only reparse changes can transiently expose names/attributes during
+named opens; enumeration itself stays on pinned directory handles. No file
+payload is read, and no outside leaf is authorized.
+This is a final-handle containment boundary, not strict Windows no-follow
+traversal. Unknown namespaces, volumes, casing or path-query errors fail closed.
+Configured profile-directory aliases resolve before pinning. Unix traversal
+never follows the artifacts entry or descendants through symlinks; Windows
+static reparse entries are rejected and physical handle containment protects
+deletion when an attribute-only reparse mutation races enumeration.
