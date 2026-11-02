@@ -665,9 +665,20 @@ pub struct Daemon {
     comparisons: StdMutex<HashMap<String, (String, Vec<(String, String)>)>>,
     branch_summary_state: Arc<StdMutex<branch_summary::BranchSummaryState>>,
     hunk_reviews: StdMutex<review_daemon::ReviewState>,
+    run_file_post_images: StdMutex<HashMap<(String, String), String>>,
+    #[cfg(windows)]
+    windows_run_directory_proofs:
+        StdMutex<HashMap<(String, String), crate::review_file_io::WindowsDirectoryProof>>,
+    #[cfg(windows)]
+    windows_run_file_witnesses: StdMutex<
+        HashMap<(String, String), (crate::review_file_io::ReviewImage, std::time::Instant)>,
+    >,
     #[cfg(windows)]
     retained_capture_leases: StdMutex<
-        std::collections::BTreeMap<(String, String, String), crate::review_retained::RetainedToken>,
+        std::collections::BTreeMap<
+            (String, String, String),
+            (crate::review_retained::RetainedToken, std::time::Instant),
+        >,
     >,
 
     /// Sessions in step mode (`/step`), and the step decisions awaited.
@@ -910,6 +921,11 @@ impl Daemon {
             comparisons: StdMutex::new(Default::default()),
             branch_summary_state: Arc::new(StdMutex::new(Default::default())),
             hunk_reviews: StdMutex::new(Default::default()),
+            run_file_post_images: StdMutex::new(Default::default()),
+            #[cfg(windows)]
+            windows_run_directory_proofs: StdMutex::new(Default::default()),
+            #[cfg(windows)]
+            windows_run_file_witnesses: StdMutex::new(Default::default()),
             #[cfg(windows)]
             retained_capture_leases: StdMutex::new(Default::default()),
             routing_log: StdMutex::new(Default::default()),
@@ -2182,8 +2198,10 @@ impl Daemon {
 
             Request::RunFiles { session_id, run_id } => {
                 let run_id = self.files_run(&session_id, run_id)?;
-                let files = self.run_file_infos(&run_id, true)?;
-                Ok(json!({"run_id": run_id, "files": files}))
+                let files = self.run_file_infos(&session_id, &run_id, true)?;
+                let untracked =
+                    self.with_reader(|st| st.run_untracked_writes_possible(&session_id, &run_id))?;
+                Ok(json!({"run_id": run_id, "files": files, "untracked_writes_possible":untracked}))
             }
             Request::InspectRunReview { session_id, run_id } => Ok(serde_json::to_value(
                 self.inspect_run_review(&session_id, run_id.as_deref())
@@ -2231,41 +2249,9 @@ impl Daemon {
                 run_id,
                 path,
             } => {
-                if self.runs.locked().contains_key(&session_id) {
-                    return Err(anyhow!(
-                        "session has an active run; stop it before rewinding"
-                    ));
-                }
                 let run_id = self.files_run(&session_id, run_id)?;
-                let rows = self.with_reader(|st| st.run_files(&run_id))?;
-                let picked: Vec<_> = match &path {
-                    Some(p) => {
-                        let found: Vec<_> = rows
-                            .into_iter()
-                            .filter(|(f, ..)| {
-                                f == p
-                                    || f.ends_with(&format!("/{p}"))
-                                    || f.ends_with(&format!("\\{p}"))
-                            })
-                            .collect();
-                        if found.is_empty() {
-                            return Err(anyhow!("that Run did not change {p}"));
-                        }
-                        found
-                    }
-                    None => rows,
-                };
-                let (mut restored, mut skipped) = (Vec::new(), Vec::new());
-                // Newest first, so a file created then renamed unwinds.
-                for (f, existed, _kept, before) in picked.into_iter().rev() {
-                    match self.revert_run_file(&f, existed, before.as_deref()) {
-                        Ok(()) => {
-                            let _ = self.with_store(|st| st.forget_run_file(&run_id, &f));
-                            restored.push(f);
-                        }
-                        Err(e) => skipped.push(json!({"path": f, "reason": e.to_string()})),
-                    }
-                }
+                let (restored, skipped) =
+                    self.rewind_run_files(&session_id, &run_id, path.as_deref())?;
                 if !restored.is_empty() {
                     let note = format!(
                         "The user reverted these files to how they were before an earlier Run: {}.",
@@ -5606,6 +5592,7 @@ impl Daemon {
     ) {
         let session_id = session_id.to_string();
         let run_id = run_id.to_string();
+        self.finish_run_file_capture(&session_id, &run_id);
         if final_status != "paused" {
             self.record_run_status(&session_id, &run_id, final_status);
         }
@@ -5639,7 +5626,17 @@ impl Daemon {
         self.finish_tail_step(&session_id, "job completion", || {
             self.job_run_ended(&session_id, &run_id, final_status);
         });
-        let files = self.run_file_infos(&run_id, false).unwrap_or_default();
+        let files = match self.run_file_infos(&session_id, &run_id, false) {
+            Ok(files) => files,
+            Err(error) => {
+                self.mark_run_untracked_writes(&session_id, &run_id);
+                self.broadcast(Event::Note {session_id:Some(session_id.clone()),text:format!("The tracked path summary is unavailable: {error}. Use /files for the explicit error; the Run's change list may be incomplete.")});
+                Vec::new()
+            }
+        };
+        let untracked_writes_possible = self
+            .with_reader(|st| st.run_untracked_writes_possible(&session_id, &run_id))
+            .unwrap_or(true);
         if let Some(recap) = self.run_recap(&session_id, &run_id, changes.as_deref(), &files) {
             self.broadcast(Event::RunRecap {
                 session_id: session_id.clone(),
@@ -5654,11 +5651,12 @@ impl Daemon {
                 changes,
             });
         }
-        if !files.is_empty() {
+        if !files.is_empty() || untracked_writes_possible {
             self.broadcast(Event::RunFilesChanged {
                 session_id: session_id.clone(),
                 run_id: run_id.clone(),
                 files,
+                untracked_writes_possible,
             });
         }
         self.broadcast(Event::RunFinished {
@@ -10922,7 +10920,8 @@ impl Daemon {
                                 let actual = path.canonicalize()?;
                                 let access =
                                     crate::review_file_io::ReviewPath::open(&actual, &policy)?;
-                                let source = access.namespace_source(&image, &policy, store)?;
+                                let source =
+                                    access.namespace_source_whole(&image, &policy, store)?;
                                 store.capture(&owner, &source, &image)
                             })()
                             .ok();
@@ -10936,26 +10935,32 @@ impl Daemon {
                 }
             }
         })();
-        let (existed, before, metadata) = match capture {
+        let before_kind = run_files_daemon::entry_kind(path);
+        let (existed, before, metadata, reason) = match capture {
             Ok(image) => {
                 let metadata = crate::review_file_io::encode_before_metadata(&image).ok();
-                (image.bytes.is_some(), image.bytes, metadata)
+                (image.bytes.is_some(), image.bytes, metadata, None)
             }
-            // Unknown/unreadable is never presented as a known absent file.
-            Err(_) => (true, None, None),
+            Err(error) => (true, None, None, Some(error.to_string())),
+        };
+        let Ok(cfg) = self.config() else {
+            return;
         };
         #[cfg(windows)]
         {
             if snapshot_store
-                .snapshot_run_file_with_metadata(
+                .snapshot_run_file_capped(
                     session_id,
                     run_id,
                     shown,
                     existed,
                     before.as_deref(),
                     metadata.as_deref(),
+                    before_kind,
+                    reason.as_deref(),
+                    &cfg.run_files,
                 )
-                .is_ok()
+                .is_ok_and(|admission| admission.inserted && admission.kept)
             {
                 let mut leases = self.retained_capture_leases.locked();
                 if let Some(token) = retained_token {
@@ -10966,60 +10971,38 @@ impl Daemon {
                     if leases.contains_key(&key)
                         || leases.len() < crate::review_retained::MAX_RECORDS
                     {
-                        leases.insert(key, token);
+                        leases.insert(
+                            key,
+                            (
+                                token,
+                                std::time::Instant::now()
+                                    + std::time::Duration::from_secs(
+                                        crate::review_retained::RETENTION_SECONDS,
+                                    ),
+                            ),
+                        );
                     }
                 }
             }
         }
         #[cfg(not(windows))]
         let _ = self.with_store(|st| {
-            st.snapshot_run_file_with_metadata(
+            st.snapshot_run_file_capped(
                 session_id,
                 run_id,
                 shown,
                 existed,
                 before.as_deref(),
                 metadata.as_deref(),
+                before_kind,
+                reason.as_deref(),
+                &cfg.run_files,
             )
+            .map(|_| ())
         });
     }
 
     /// A Run's changed files compared with now, optionally with diffs.
-    fn run_file_infos(&self, run_id: &str, diffs: bool) -> Result<Vec<RunFileInfo>> {
-        let rows = self.with_reader(|st| st.run_files(run_id))?;
-        Ok(rows
-            .into_iter()
-            .map(|(path, existed, kept, before)| {
-                let now = std::fs::read(&path).ok();
-                let exists = std::path::Path::new(&path).exists();
-                let status = match (existed, exists) {
-                    (false, true) => "created",
-                    (true, false) => "removed",
-                    (false, false) => "unchanged",
-                    (true, true) if kept && before.as_deref() == now.as_deref() => "unchanged",
-                    (true, true) => "modified",
-                };
-                let text = |b: &Option<Vec<u8>>| {
-                    b.as_ref()
-                        .map(|b| std::str::from_utf8(b).ok().map(str::to_string))
-                        .unwrap_or(Some(String::new()))
-                };
-                let diff = (diffs && kept && status != "unchanged")
-                    .then(|| match (text(&before), text(&now)) {
-                        (Some(a), Some(b)) => Some(crate::diff::context_diff(&a, &b).join("\n")),
-                        _ => Some("(binary file)".to_string()),
-                    })
-                    .flatten();
-                RunFileInfo {
-                    path,
-                    status: status.to_string(),
-                    revertible: kept,
-                    diff,
-                }
-            })
-            .collect())
-    }
-
     /// "What I did" for a Run of 4+ steps, from its trace (SPEC §5.7).
     fn run_recap(
         &self,
@@ -11083,40 +11066,25 @@ impl Daemon {
             built,
             files,
             steered,
+            untracked_writes_possible: self
+                .with_reader(|st| st.run_untracked_writes_possible(session_id, run_id))
+                .unwrap_or(true),
         })
     }
 
     /// The Run `/files` and `/rewind` act on: the given one, else the
     /// Session's latest that changed files.
     fn files_run(&self, session_id: &str, run_id: Option<String>) -> Result<String> {
-        match run_id {
-            Some(r) => Ok(r),
+        let run = match run_id {
+            Some(run) => run,
             None => self
                 .with_reader(|st| st.last_run_with_files(session_id))?
-                .context("no Run in this session changed files"),
-        }
-    }
-
-    /// Put one recorded file back as it was before the Run.
-    fn revert_run_file(&self, path: &str, existed: bool, before: Option<&[u8]>) -> Result<()> {
-        let p = std::path::Path::new(path);
-        match (existed, before) {
-            (true, Some(bytes)) => {
-                if let Some(parent) = p.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                std::fs::write(p, bytes)?;
-            }
-            (false, _) => {
-                if p.is_dir() {
-                    std::fs::remove_dir_all(p)?;
-                } else if p.exists() {
-                    std::fs::remove_file(p)?;
-                }
-            }
-            (true, None) => return Err(anyhow!("its earlier content was not kept")),
-        }
-        Ok(())
+                .context(
+                    "no Run in this session changed tracked paths or invoked an untracked writer",
+                )?,
+        };
+        self.with_reader(|st| st.validate_run_file_owner(session_id, &run))?;
+        Ok(run)
     }
 
     /// `update_plan` (SPEC §5.8): replace the Session's checklist.
@@ -13553,6 +13521,9 @@ impl Daemon {
                 Ok(id) => id,
                 Err(e) => return Err(e.to_string()),
             };
+            if caps.process.is_some() || !caps.mcp.is_empty() {
+                self.mark_run_untracked_writes(&session_id, &run_id);
+            }
             if let Some(server) = caps.mcp.first().cloned() {
                 // An MCP tool: the server runs it ((SPEC §7.9)). Cancelling
                 // the Invocation drops the request, which tells the server.
@@ -14610,7 +14581,18 @@ impl Daemon {
     /// Apply artifact retention at start and then hourly.
     async fn artifact_gc_loop(self: Arc<Self>) {
         loop {
+            #[cfg(windows)]
+            self.sweep_retained_before_action();
             if let Ok(cfg) = self.config() {
+                match self.with_store(|st| st.retain_run_files(&cfg.run_files, false)) {
+                    Ok(report) if report.files > 0 => tracing::info!(
+                        "expired {} Run recovery snapshots ({} bytes)",
+                        report.files,
+                        report.bytes
+                    ),
+                    Ok(_) => (),
+                    Err(error) => tracing::warn!("Run snapshot retention: {error:#}"),
+                }
                 match self.with_store(|st| crate::artifacts::gc(st, &cfg.artifacts)) {
                     Ok(c) if c.files > 0 => {
                         tracing::info!("removed {} artifact(s), {} bytes", c.files, c.bytes)
@@ -15697,6 +15679,43 @@ impl HostOps for NestedOps {
     fn file_changing(&self, path: &std::path::Path) {
         self.daemon
             .snapshot_before_change(&self.session_id, &self.run_id, path);
+    }
+    fn file_changing_resolved(
+        &self,
+        requested: &std::path::Path,
+        resolved: &std::path::Path,
+        _operation: &str,
+    ) {
+        self.daemon.snapshot_before_change_resolved(
+            &self.session_id,
+            &self.run_id,
+            requested,
+            resolved,
+        );
+    }
+    fn file_changed(
+        &self,
+        requested: &std::path::Path,
+        resolved: &std::path::Path,
+        _operation: &str,
+    ) {
+        // Match the pre-change key even when native canonicalization only adds
+        // Windows' verbatim prefix. Genuine alias routes retain their raw key.
+        let path = if formless_runtime::caps::same_path_spelling(requested, resolved) {
+            resolved
+        } else {
+            requested
+        };
+        self.daemon
+            .record_run_file_post_image(&self.session_id, &self.run_id, path);
+    }
+    fn directory_created(&self, path: &std::path::Path) {
+        self.daemon
+            .snapshot_created_directory(&self.session_id, &self.run_id, path);
+    }
+    fn untracked_writes_possible(&self) {
+        self.daemon
+            .mark_run_untracked_writes(&self.session_id, &self.run_id);
     }
     fn harness(&self, op: &str, args: &Value, reason: &str) -> std::result::Result<Value, String> {
         let tool = self
@@ -18092,6 +18111,13 @@ mod model_test_daemon_tests;
 
 #[path = "review_daemon.rs"]
 mod review_daemon;
+
+#[path = "run_files_daemon.rs"]
+mod run_files_daemon;
+
+#[cfg(windows)]
+#[path = "run_files_windows.rs"]
+mod run_files_windows;
 
 #[cfg(test)]
 #[path = "cli_attach_daemon_tests.rs"]

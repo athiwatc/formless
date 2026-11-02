@@ -315,6 +315,9 @@ impl ReviewPath {
             bail!("Anchored review is unsupported on this platform");
         }
     }
+    pub(crate) fn read_whole_file(&self, policy: &PathPolicy) -> Result<ReviewImage> {
+        self.read_bounded(policy, 2 * 1024 * 1024, false, None)
+    }
     pub(crate) fn read(&self, policy: &PathPolicy) -> Result<ReviewImage> {
         self.read_bounded(policy, MAX_REVIEW_BYTES, false, None)
     }
@@ -378,6 +381,68 @@ impl ReviewPath {
             .restore_retained(&self.path, object, desired, policy, store)
     }
     #[cfg(windows)]
+    pub(crate) fn replace_whole_file_tracked(
+        &self,
+        expected: &ReviewImage,
+        desired: &ReviewImage,
+        policy: &PathPolicy,
+        store: &crate::review_retained::RetainedStore,
+    ) -> Result<Vec<String>> {
+        if self.read_whole_file_tracked(policy, store)? != *expected {
+            bail!("Changed since the Run");
+        }
+        self.native.replace_existing_bounded(
+            &self.path,
+            expected,
+            desired,
+            policy,
+            Some(store),
+            2 * 1024 * 1024,
+        )
+    }
+    #[cfg(windows)]
+    pub(crate) fn namespace_source_whole(
+        &self,
+        expected: &ReviewImage,
+        policy: &PathPolicy,
+        store: &crate::review_retained::RetainedStore,
+    ) -> Result<std::fs::File> {
+        self.native
+            .namespace_source_bounded(&self.path, expected, policy, store, 2 * 1024 * 1024)
+    }
+    #[cfg(windows)]
+    pub(crate) fn restore_retained_whole(
+        &self,
+        object: &crate::review_retained::RetainedObject,
+        desired: &ReviewImage,
+        policy: &PathPolicy,
+        store: &crate::review_retained::RetainedStore,
+    ) -> Result<Vec<String>> {
+        self.native.restore_retained_bounded(
+            &self.path,
+            object,
+            desired,
+            policy,
+            store,
+            2 * 1024 * 1024,
+        )
+    }
+    #[cfg(windows)]
+    pub(crate) fn read_whole_file_tracked(
+        &self,
+        policy: &PathPolicy,
+        store: &crate::review_retained::RetainedStore,
+    ) -> Result<ReviewImage> {
+        self.native.read_bounded(
+            &self.path,
+            policy,
+            2 * 1024 * 1024,
+            false,
+            None,
+            Some(store),
+        )
+    }
+    #[cfg(windows)]
     pub(crate) fn remove_retained(
         &self,
         expected: &ReviewImage,
@@ -426,7 +491,14 @@ impl ReviewPath {
         }
         let access = Self::open(&actual, policy)?;
         let mut image = access.read_bounded(policy, 2 * 1024 * 1024, true, Some(path))?;
-        if path != actual {
+        // Windows canonicalization changes an ordinary drive/UNC spelling
+        // into a verbatim prefix. Preserve metadata completeness when the
+        // original route itself passes no-reparse ancestor anchoring.
+        #[cfg(windows)]
+        let direct = Self::open(path, policy).is_ok();
+        #[cfg(not(windows))]
+        let direct = path == actual;
+        if !direct {
             image.security_complete = false;
         }
         Ok(image)
@@ -456,7 +528,14 @@ impl ReviewPath {
             Some(path),
             Some(store),
         )?;
-        if path != actual {
+        // Windows canonicalization changes an ordinary drive/UNC spelling
+        // into a verbatim prefix. Preserve metadata completeness when the
+        // original route itself passes no-reparse ancestor anchoring.
+        #[cfg(windows)]
+        let direct = Self::open(path, policy).is_ok();
+        #[cfg(not(windows))]
+        let direct = path == actual;
+        if !direct {
             image.security_complete = false;
         }
         Ok(image)
@@ -573,6 +652,87 @@ impl ReviewPath {
         }
         Ok(())
     }
+    #[cfg(windows)]
+    pub(crate) fn capture_windows_directory(
+        &self,
+        policy: &PathPolicy,
+    ) -> Result<WindowsDirectoryProof> {
+        self.native.capture_directory(&self.path, policy)
+    }
+    #[cfg(windows)]
+    pub(crate) fn verify_windows_directory(
+        &self,
+        proof: &WindowsDirectoryProof,
+        policy: &PathPolicy,
+        remove: bool,
+    ) -> Result<()> {
+        self.native
+            .verify_directory(&self.path, proof, policy, remove)
+    }
+    /// Identity of an ordinary directory, with no symlink traversal at the leaf.
+    pub(crate) fn directory_identity(&self, policy: &PathPolicy) -> Result<(u64, u64)> {
+        self.recheck_policy(policy)?;
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let mut info = std::mem::MaybeUninit::<libc::stat>::uninit();
+            if unsafe {
+                libc::fstatat(
+                    self.parent.as_raw_fd(),
+                    self.leaf.as_ptr(),
+                    info.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            } != 0
+            {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            let info = unsafe { info.assume_init() };
+            if info.st_mode & libc::S_IFMT != libc::S_IFDIR {
+                bail!("Directory changed type since the Run");
+            }
+            Ok((info.st_dev as u64, info.st_ino as u64))
+        }
+        #[cfg(windows)]
+        {
+            self.native.directory_identity(&self.path, policy)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            bail!("Anchored directory rewind is unavailable on this platform")
+        }
+    }
+    pub(crate) fn remove_created_directory(
+        &self,
+        expected: (u64, u64),
+        policy: &PathPolicy,
+    ) -> Result<()> {
+        if self.directory_identity(policy)? != expected {
+            bail!("Directory changed since the Run");
+        }
+        self.recheck_policy(policy)?;
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            // AT_REMOVEDIR fails for a nonempty directory; unknown children are never deleted.
+            if unsafe {
+                libc::unlinkat(
+                    self.parent.as_raw_fd(),
+                    self.leaf.as_ptr(),
+                    libc::AT_REMOVEDIR,
+                )
+            } != 0
+            {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            self.parent.sync_all()?;
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            bail!("Anchored directory rewind is unavailable on this platform")
+        }
+    }
     /// A durable pending receipt must exist BEFORE calling this function. Errors
     /// before rename leave the target untouched. Once the atomic namespace change
     /// succeeds, later fsync failure is a warning, never a false unchanged claim.
@@ -582,15 +742,28 @@ impl ReviewPath {
         desired: &ReviewImage,
         policy: &PathPolicy,
     ) -> Result<Vec<String>> {
+        self.replace_bounded(expected, desired, policy, MAX_REVIEW_BYTES)
+    }
+    pub(crate) fn replace_whole_file(
+        &self,
+        expected: &ReviewImage,
+        desired: &ReviewImage,
+        policy: &PathPolicy,
+    ) -> Result<Vec<String>> {
+        self.replace_bounded(expected, desired, policy, 2 * 1024 * 1024)
+    }
+    fn replace_bounded(
+        &self,
+        expected: &ReviewImage,
+        desired: &ReviewImage,
+        policy: &PathPolicy,
+        limit: usize,
+    ) -> Result<Vec<String>> {
         self.recheck_policy(policy)?;
-        if desired
-            .bytes
-            .as_ref()
-            .is_some_and(|b| b.len() > MAX_REVIEW_BYTES)
-        {
+        if desired.bytes.as_ref().is_some_and(|b| b.len() > limit) {
             bail!("Review replacement exceeds its byte limit");
         }
-        let current = self.read(policy)?;
+        let current = self.read_bounded(policy, limit, false, None)?;
         if current != *expected {
             bail!("File content, existence or mode changed; inspect again");
         }
@@ -600,9 +773,13 @@ impl ReviewPath {
         }
         #[cfg(windows)]
         if expected.bytes.is_some() && desired.bytes.is_some() {
-            return self
-                .native
-                .replace_existing(&self.path, expected, desired, policy);
+            return if limit == MAX_REVIEW_BYTES {
+                self.native
+                    .replace_existing(&self.path, expected, desired, policy)
+            } else {
+                self.native
+                    .replace_existing_bounded(&self.path, expected, desired, policy, None, limit)
+            };
         }
         if let Some(reason) = current
             .write_restriction()
@@ -675,7 +852,7 @@ impl ReviewPath {
                 file.sync_all()?;
             }
             self.recheck_policy(policy)?;
-            if self.read(policy)? != *expected {
+            if self.read_bounded(policy, limit, false, None)? != *expected {
                 bail!("File changed before the review commit; inspect again");
             }
             if expected.mode.is_some_and(|mode| mode & 0o6000 != 0) {
@@ -1111,6 +1288,8 @@ mod metadata_tests {
 #[cfg(windows)]
 #[path = "review_file_windows.rs"]
 mod windows;
+#[cfg(windows)]
+pub(crate) use windows::WindowsDirectoryProof;
 
 #[cfg(all(test, unix))]
 mod snapshot_tests {

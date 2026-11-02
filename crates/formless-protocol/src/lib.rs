@@ -1115,6 +1115,9 @@ pub struct PlanItem {
 /// (SPEC §5.7).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct RunRecap {
+    /// Programs and MCP tools may have changed paths outside file tracking.
+    #[serde(default)]
+    pub untracked_writes_possible: bool,
     pub steps: i64,
     pub duration_ms: i64,
     /// "read_file ×3", "fetch_page ×2 (1 failed)".
@@ -1130,6 +1133,12 @@ pub struct RunRecap {
 /// A file a Run's Tools changed (SPEC §5.7).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RunFileInfo {
+    /// File-system kind; empty means unknown for legacy records.
+    #[serde(default)]
+    pub kind: String,
+    /// Why the recorded path cannot be restored.
+    #[serde(default)]
+    pub revert_reason: Option<String>,
     pub path: String,
     /// "created", "modified", "removed" or "unchanged" (changed back),
     /// comparing the snapshot with the file now.
@@ -2804,6 +2813,8 @@ pub enum Event {
         session_id: String,
         run_id: String,
         files: Vec<RunFileInfo>,
+        #[serde(default)]
+        untracked_writes_possible: bool,
     },
     /// Ollama download progress for `model` (status text, bytes so far
     /// and in total when known); `done` ends it.
@@ -3280,6 +3291,44 @@ pub fn artifact_refs(text: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_run_file_coverage_defaults_and_new_fields_round_trip() {
+        let raw = serde_json::json!({"type":"run_files_changed","session_id":"s","run_id":"r","files":[{"path":"x","status":"created","revertible":true}]});
+        let event: super::Event = serde_json::from_value(raw).unwrap();
+        let super::Event::RunFilesChanged {
+            mut files,
+            untracked_writes_possible,
+            ..
+        } = event
+        else {
+            panic!("wrong event")
+        };
+        assert!(!untracked_writes_possible);
+        assert_eq!(files[0].kind, "");
+        assert_eq!(files[0].revert_reason, None);
+        files[0].kind = "symlink".into();
+        files[0].revert_reason = Some("symlink target is not tracked".into());
+        let new = super::Event::RunFilesChanged {
+            session_id: "s".into(),
+            run_id: "r".into(),
+            files,
+            untracked_writes_possible: true,
+        };
+        let encoded = serde_json::to_value(&new).unwrap();
+        let decoded: super::Event = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), encoded);
+        let recap: super::RunRecap = serde_json::from_value(serde_json::json!({"steps":4,"duration_ms":1,"used":[],"built":[],"files":[],"steered":0})).unwrap();
+        assert!(!recap.untracked_writes_possible);
+        let new = super::RunRecap {
+            untracked_writes_possible: true,
+            ..recap
+        };
+        assert_eq!(
+            serde_json::from_value::<super::RunRecap>(serde_json::to_value(&new).unwrap()).unwrap(),
+            new
+        );
+    }
+
     #[test]
     fn legacy_session_payloads_have_unknown_lineage_and_new_records_round_trip() {
         let raw = serde_json::json!({"id":"legacy","name":"Imported or old", "model":null,"reasoning_effort":null,"created_at":"2020-01-01T00:00:00Z","updated_at":"2020-01-01T00:00:00Z"});

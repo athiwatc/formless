@@ -115,14 +115,14 @@ impl Store {
             let (count,foreign):(i64,i64)=st.conn.query_row("SELECT COUNT(*),COALESCE(SUM(session_id<>?2),0) FROM run_files WHERE run_id=?1",params![run_id,session],|r|Ok((r.get(0)?,r.get(1)?)))?;
             if foreign>0 {return Err(ReviewFailure::Invalid("The Run contains file snapshots with mismatched Session ownership".into()).into());}
             if count>MAX_REVIEW_FILES {return Err(ReviewFailure::Invalid("This Run exceeds the 128-file interactive review limit; use the whole-file listing instead".into()).into());}
-            let mut query=st.ps("SELECT path,existed,kept,COALESCE(length(before),0),CASE WHEN length(before)<=?2 THEN before ELSE NULL END,CASE WHEN length(before_metadata)<=131072 THEN before_metadata ELSE NULL END FROM run_files WHERE run_id=?1 ORDER BY rowid")?;
-            let records=query.query_map(params![run_id,MAX_REVIEW_BYTES],|r|Ok((r.get::<_,String>(0)?,r.get::<_,bool>(1)?,r.get::<_,bool>(2)?,r.get::<_,u64>(3)?,r.get::<_,Option<Vec<u8>>>(4)?,r.get::<_,Option<String>>(5)?)))?;
+            let mut query=st.ps("SELECT path,existed,kept,COALESCE(length(before),0),CASE WHEN length(before)<=?2 THEN before ELSE NULL END,CASE WHEN length(before_metadata)<=131072 THEN before_metadata ELSE NULL END,substr(not_kept_reason,1,2048) FROM run_files WHERE run_id=?1 ORDER BY rowid")?;
+            let records=query.query_map(params![run_id,MAX_REVIEW_BYTES],|r|Ok((r.get::<_,String>(0)?,r.get::<_,bool>(1)?,r.get::<_,bool>(2)?,r.get::<_,u64>(3)?,r.get::<_,Option<Vec<u8>>>(4)?,r.get::<_,Option<String>>(5)?,r.get::<_,Option<String>>(6)?)))?;
             let mut files=Vec::new();
             let mut bytes=0usize;
             for record in records {
-                let (path,existed,kept,size,mut before,before_metadata)=record?;
+                let (path,existed,kept,size,mut before,before_metadata,not_kept_reason)=record?;
                 let exclusion_reason=if !existed && before.is_some() {Some("Recorded existence contradicts the retained original bytes")}
-                    else if !kept {Some("The pre-Run regular-file content was not kept")}
+                    else if !kept {Some(not_kept_reason.as_deref().unwrap_or("The pre-Run regular-file content was not kept"))}
                     else if size>MAX_REVIEW_BYTES as u64 {Some("The pre-Run image exceeds the 256 KiB interactive review limit")}
                     else if existed && before.is_none() {Some("The pre-Run image is unavailable")}
                     else if bytes.saturating_add(before.as_ref().map_or(0,Vec::len))>2*1024*1024 {Some("The Run exceeds the 2 MiB retained pre-image review budget")}

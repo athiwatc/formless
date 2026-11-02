@@ -203,7 +203,7 @@ impl Daemon {
         }
         Ok(())
     }
-    fn review_policy(&self) -> Result<formless_runtime::sensitive_paths::PathPolicy> {
+    pub(super) fn review_policy(&self) -> Result<formless_runtime::sensitive_paths::PathPolicy> {
         let cfg = Config::load(&self.paths)?;
         crate::sensitive_reads::policy(&self.paths, &cfg.security, &self.sensitive_anchors)
             .map_err(invalid)
@@ -246,9 +246,47 @@ impl Daemon {
         if self.review_pending_status(None).0 {
             return;
         }
-        self.retained_capture_leases
-            .locked()
-            .retain(|(_, run, _), _| store.review_retained_run_active(run).unwrap_or(true));
+        use sha2::{Digest, Sha256};
+        let now = std::time::Instant::now();
+        let mut leases = self.retained_capture_leases.locked();
+        let mut owned = BTreeMap::new();
+        for (session, run, _) in leases.keys() {
+            let owner = (session.clone(), run.clone());
+            if owned.contains_key(&owner) {
+                continue;
+            }
+            let paths = store
+                .run_file_records(session, run)
+                .map(|rows| {
+                    rows.into_iter()
+                        .filter(|row| {
+                            row.kept
+                                && row
+                                    .after_state
+                                    .as_deref()
+                                    .and_then(|token| serde_json::from_str::<Value>(token).ok())
+                                    .is_some_and(|state| {
+                                        state["version"] == 1
+                                            && state["reason"].is_null()
+                                            && matches!(
+                                                state["kind"].as_str(),
+                                                Some("file" | "missing")
+                                            )
+                                    })
+                        })
+                        .map(|row| format!("{:x}", Sha256::digest(row.path.as_bytes())))
+                        .collect::<BTreeSet<_>>()
+                })
+                .unwrap_or_default();
+            owned.insert(owner, paths);
+        }
+        leases.retain(|(session, run, path), (_, deadline)| {
+            *deadline > now
+                && (store.review_retained_run_active(run).unwrap_or(true)
+                    || owned
+                        .get(&(session.clone(), run.clone()))
+                        .is_some_and(|paths| paths.contains(path)))
+        });
     }
     #[cfg(windows)]
     pub(super) fn expire_retained_now(
@@ -263,6 +301,13 @@ impl Daemon {
     }
     #[cfg(windows)]
     pub(super) fn sweep_retained_before_action(&self) {
+        let now = std::time::Instant::now();
+        self.windows_run_file_witnesses
+            .locked()
+            .retain(|_, (_, deadline)| *deadline > now);
+        self.windows_run_directory_proofs
+            .locked()
+            .retain(|_, proof| proof.fresh());
         // A dismissed review must not pin objects forever merely because no
         // review RPC runs again. Never wait here: apply/Undo already own this
         // mutex and their entrypoints prune before obtaining the live entry.
@@ -768,7 +813,7 @@ impl Daemon {
         let detail = json!({"change_id":receipt.id,"session_id":receipt.session_id,"run_id":receipt.run_id,"file_id":receipt.file_id,"hunk_id":receipt.hunk_id,"path":receipt.path,"before_hash":before.hash(),"after_hash":after.hash(),"status":status});
         st.audit("user", "review.file", &detail.to_string())
     }
-    fn review_pending_status(&self, session: Option<&str>) -> (bool, BTreeSet<String>) {
+    pub(super) fn review_pending_status(&self, session: Option<&str>) -> (bool, BTreeSet<String>) {
         let mut complete = BTreeSet::new();
         let mut live = false;
         for (handle, pending) in self
@@ -792,7 +837,7 @@ impl Daemon {
         }
         Ok(())
     }
-    fn review_profile_commit_idle(&self, st: &Store) -> Result<()> {
+    pub(super) fn review_profile_commit_idle(&self, st: &Store) -> Result<()> {
         let (live, complete) = self.review_pending_status(None);
         // Do not acquire `runs` here: Run admission can hold that mutex before
         // acquiring Store. Committed Run statuses cover the entire profile.

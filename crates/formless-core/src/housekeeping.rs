@@ -8,8 +8,6 @@ use std::path::{Path, PathBuf};
 use crate::config::Config;
 use crate::{Paths, Store};
 
-/// File snapshots (`/rewind`) older than this are dropped by `gc`.
-const SNAPSHOT_DAYS: i64 = 30;
 /// MCP server logs larger than this are cut to their last part by `gc`.
 const MCP_LOG_KEEP: u64 = 1_000_000;
 /// Pre-migration database copies kept by `gc` (newest first).
@@ -81,6 +79,7 @@ pub(crate) fn migration_backups(paths: &Paths) -> Vec<PathBuf> {
 pub fn usage(paths: &Paths, store: &Store) -> Result<Value> {
     let (artifact_count, artifact_bytes) = crate::artifacts::usage(store)?;
     let inside = store.content_bytes()?;
+    let snapshots = store.run_file_usage()?;
     let mcp_logs = path_bytes(&paths.data_dir.join("mcp"));
     let backups = path_bytes(&backup_dir(paths))
         + migration_backups(paths)
@@ -92,7 +91,7 @@ pub fn usage(paths: &Paths, store: &Store) -> Result<Value> {
         json!({"kind": "sessions", "bytes": inside["messages"], "detail": "messages, inside the database", "inside_db": true}),
         json!({"kind": "invocation logs", "bytes": inside["invocations"], "detail": "Tool inputs and outputs, inside the database", "inside_db": true}),
         json!({"kind": "tool versions", "bytes": inside["tool_versions"], "detail": "every version's code, inside the database", "inside_db": true}),
-        json!({"kind": "file snapshots", "bytes": inside["run_files"], "detail": "for /rewind, inside the database", "inside_db": true}),
+        json!({"kind": "file snapshots", "bytes": snapshots.retained_bytes.saturating_add(snapshots.after_state_bytes), "rows": snapshots.rows, "retained_files": snapshots.retained_files, "before_bytes": snapshots.before_bytes, "metadata_bytes": snapshots.metadata_bytes, "after_state_bytes": snapshots.after_state_bytes, "detail": format!("{} recorded paths, {} retained snapshots, inside the database", snapshots.rows, snapshots.retained_files), "inside_db": true}),
         json!({"kind": "artifacts", "bytes": artifact_bytes, "detail": format!("{artifact_count} stored outputs")}),
         json!({"kind": "logs", "bytes": crate::logs::log_usage(paths) + mcp_logs, "detail": "daemon and MCP server logs"}),
         json!({"kind": "skills", "bytes": path_bytes(&paths.data_dir.join("skills")), "detail": "installed skill files"}),
@@ -124,14 +123,12 @@ pub fn gc(paths: &Paths, store: &Store, cfg: &Config, dry_run: bool) -> Result<V
     }
     rows.push(json!({"kind": "artifacts", "items": n, "bytes": bytes,
         "detail": format!("older than {} days or over {} MB (artifacts.*)", cfg.artifacts.max_age_days, cfg.artifacts.max_total_mb)}));
-    // Old /rewind snapshots.
-    let cutoff = (chrono::Utc::now() - chrono::Duration::days(SNAPSHOT_DAYS)).to_rfc3339();
-    let (n, bytes) = store.old_run_files(&cutoff)?;
-    if !dry_run {
-        store.delete_run_files_before(&cutoff)?;
-    }
-    rows.push(json!({"kind": "file snapshots", "items": n, "bytes": bytes,
-        "detail": format!("older than {SNAPSHOT_DAYS} days (no /rewind past them)")}));
+    // Expiry releases recovery payload while preserving the latest path history.
+    let snapshots = store.retain_run_files(&cfg.run_files, dry_run)?;
+    rows.push(json!({"kind": "file snapshots", "items": snapshots.files, "runs": snapshots.runs,
+        "bytes": snapshots.bytes, "pinned_bytes": snapshots.pinned_bytes,
+        "remaining_bytes": snapshots.remaining_bytes, "over_budget_bytes": snapshots.over_budget_bytes,
+        "detail": format!("keep {} Runs per Session, {} days, {} MiB (run_files.*); active/latest Runs protected; expired paths remain listed", cfg.run_files.keep_runs_per_session, cfg.run_files.max_age_days, cfg.run_files.max_total_mb)}));
     // MCP logs cut to their last part.
     let (mut n, mut bytes) = (0, 0u64);
     for e in std::fs::read_dir(paths.data_dir.join("mcp"))

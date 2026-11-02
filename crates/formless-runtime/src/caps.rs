@@ -468,6 +468,40 @@ pub fn canonical_path(raw: &str) -> Result<std::path::PathBuf, String> {
     canonical_path_with(raw, |p| p.canonicalize(), |p| p.symlink_metadata())
 }
 
+/// Compare native spellings without resolving aliases. Windows canonicalization
+/// adds a verbatim prefix to ordinary disk/UNC paths; that prefix alone does not
+/// make the original route a symlink. Remaining components must match exactly.
+pub fn same_path_spelling(left: &std::path::Path, right: &std::path::Path) -> bool {
+    if left == right {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+        let (mut left, mut right) = (left.components(), right.components());
+        let (Some(Component::Prefix(a)), Some(Component::Prefix(b))) = (left.next(), right.next())
+        else {
+            return false;
+        };
+        let prefix_matches = match (a.kind(), b.kind()) {
+            (
+                Prefix::Disk(a) | Prefix::VerbatimDisk(a),
+                Prefix::Disk(b) | Prefix::VerbatimDisk(b),
+            ) => a.eq_ignore_ascii_case(&b),
+            (
+                Prefix::UNC(a, b) | Prefix::VerbatimUNC(a, b),
+                Prefix::UNC(c, d) | Prefix::VerbatimUNC(c, d),
+            ) => a == c && b == d,
+            _ => false,
+        };
+        prefix_matches && left.eq(right)
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 /// Join without PathBuf::push's Windows verbatim `.`/`..` normalization.
 /// Relative separators are reconstructed natively, so ordinary JS `sub/file`
 /// also works under a canonical Windows Session cwd. OS names stay OsString;
@@ -772,6 +806,47 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn capture_spelling_accepts_only_equivalent_native_verbatim_prefixes() {
+        use std::path::Path;
+        for (ordinary, verbatim) in [
+            (r"C:\work\file.txt", r"\\?\C:\work\file.txt"),
+            (r"c:\work\file.txt", r"\\?\C:\work\file.txt"),
+            (r"C:/work/file.txt", r"\\?\C:\work\file.txt"),
+            (r"\\server\share\file.txt", r"\\?\UNC\server\share\file.txt"),
+        ] {
+            assert!(same_path_spelling(Path::new(ordinary), Path::new(verbatim)));
+            assert!(same_path_spelling(Path::new(verbatim), Path::new(ordinary)));
+        }
+        for (requested, resolved) in [
+            (r"C:\work\alias.txt", r"\\?\C:\work\target.txt"),
+            (r"C:\work\file.txt", r"\\?\D:\work\file.txt"),
+            (r"C:\work\File.txt", r"\\?\C:\work\file.txt"),
+            (r"\\server\share\file.txt", r"\\?\UNC\server\other\file.txt"),
+            (r"C:\work\file.txt", r"\\?\GLOBALROOT\work\file.txt"),
+        ] {
+            assert!(!same_path_spelling(
+                Path::new(requested),
+                Path::new(resolved)
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capture_spelling_does_not_resolve_a_real_symlink_route() {
+        let root = PathFixture::new();
+        let target = root.0.join("target.txt");
+        let alias = root.0.join("alias.txt");
+        std::fs::write(&target, b"owned fixture").unwrap();
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+        let resolved = canonical_path(alias.to_str().unwrap()).unwrap();
+        assert_eq!(resolved, target);
+        assert!(!same_path_spelling(&alias, &resolved));
+        assert!(same_path_spelling(&target, &resolved));
     }
 
     #[test]

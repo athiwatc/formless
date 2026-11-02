@@ -16,6 +16,15 @@ use std::io::Write;
 use std::sync::Arc;
 use table::{c, t, Table, Tone};
 
+/// File coverage is diagnostic output; stdout remains the requested Run result.
+fn write_run_file_notice(
+    out: &mut impl Write,
+    files: &[formless_protocol::RunFileInfo],
+    untracked: bool,
+) {
+    let _ = writeln!(out, "{}", formless_tui::run_files_text(files, untracked));
+}
+
 #[derive(Parser)]
 #[command(
     name = "formless",
@@ -2967,6 +2976,19 @@ fn daemon_secure(paths: &Paths) -> Option<bool> {
         .as_bool()
 }
 
+/// Database-only facts: no provider, keyring, service or daemon calls.
+fn run_file_doctor_facts(paths: &Paths) -> serde_json::Value {
+    if !paths.db_file().exists() {
+        return serde_json::Value::Null;
+    }
+    match formless_core::Store::open_reader(&paths.db_file())
+        .and_then(|store| store.run_file_usage())
+    {
+        Ok(usage) => serde_json::json!(usage),
+        Err(error) => serde_json::json!({"error": error.to_string()}),
+    }
+}
+
 fn doctor_json(paths: &Paths) -> Result<serde_json::Value> {
     let cfg = Config::load(paths)?;
     let problems = doctor_report(paths, true)?;
@@ -2981,6 +3003,7 @@ fn doctor_json(paths: &Paths) -> Result<serde_json::Value> {
         "backup": formless_core::backup_verification::newest_status(paths),
         "profile_backups": paths.list_profiles().iter().map(|p|serde_json::json!({"profile":p.profile,"newest":formless_core::backup_verification::newest_status(p)})).collect::<Vec<_>>(),
         "db_present": paths.db_file().exists(),
+        "run_files": run_file_doctor_facts(paths),
         "log_bytes": formless_core::logs::log_usage(paths),
         "daemon_running": daemon_reachable(paths),
         "provider": {
@@ -3230,6 +3253,16 @@ fn doctor_report(paths: &Paths, quiet: bool) -> Result<Vec<Problem>> {
             cfg.artifacts.max_total_mb,
             cfg.artifacts.max_age_days
         );
+    }
+    let snapshots = run_file_doctor_facts(&paths);
+    if let Some(rows) = snapshots["rows"].as_u64() {
+        say!(
+            "snapshots:  {rows} paths, {} retained ({:.1} MiB including metadata; run_files.* retention)",
+            snapshots["retained_files"].as_u64().unwrap_or(0),
+            snapshots["retained_bytes"].as_u64().unwrap_or(0) as f64 / (1024.0 * 1024.0)
+        );
+    } else if let Some(error) = snapshots["error"].as_str() {
+        say!("snapshots:  unavailable ({error})");
     }
     match formless_core::provider::proxy_in_use(&cfg.provider) {
         Some(p) => say!("proxy:      {p} (provider.proxy or HTTPS_PROXY; NO_PROXY is honoured)"),
@@ -3975,6 +4008,17 @@ fn run_headless(
                 }
                 match ev {
                     Event::RunStarted { run_id, .. } => actual_run_id = Some(run_id),
+                    Event::RunFilesChanged {
+                        files,
+                        untracked_writes_possible,
+                        ..
+                    } => {
+                        write_run_file_notice(
+                            &mut std::io::stderr().lock(),
+                            &files,
+                            untracked_writes_possible,
+                        );
+                    }
                     Event::MessageDelta { delta, .. } => {
                         if stream {
                             print!("{delta}");
@@ -7510,6 +7554,78 @@ mod oauth_credential_env;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn doctor_run_file_facts_use_only_private_database_and_count_paths_and_payload() {
+        let root = std::env::temp_dir().join(format!(
+            "fl-doctor-runfiles-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let paths = formless_core::Paths::from_dirs(root.join("d"), root.join("c")).unwrap();
+        assert!(super::run_file_doctor_facts(&paths).is_null());
+        assert!(!paths.db_file().exists());
+        let store = formless_core::Store::open(&paths.db_file()).unwrap();
+        let session = store.create_session(None).unwrap().id;
+        let run = store.create_run(&session).unwrap();
+        store
+            .snapshot_run_file_capped(
+                &session,
+                &run,
+                "private.txt",
+                true,
+                Some(b"abc"),
+                Some("日"),
+                "file",
+                None,
+                &formless_core::config::RunFilesCfg::default(),
+            )
+            .unwrap();
+        let facts = super::run_file_doctor_facts(&paths);
+        assert_eq!(facts["rows"], 1);
+        assert_eq!(facts["retained_files"], 1);
+        assert_eq!(facts["before_bytes"], 3);
+        assert_eq!(facts["metadata_bytes"], 3);
+        assert_eq!(facts["retained_bytes"], 6);
+        store.forget_run_file(&run, "private.txt").unwrap();
+        let facts = super::run_file_doctor_facts(&paths);
+        assert_eq!(facts["rows"], 1);
+        assert_eq!(facts["retained_files"], 0);
+        assert_eq!(facts["retained_bytes"], 0);
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn run_file_coverage_stays_on_stderr_in_shipped_cli_fixture() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::run_file_coverage_child_fixture",
+                "--ignored",
+                "--nocapture",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stdout.contains("{\"result\":\"machine-readable\"}"));
+        assert!(!stdout.contains("Untracked writes"));
+        assert!(stderr.contains("No tracked path changes."));
+        assert!(stderr.contains("Untracked writes are possible"));
+        assert!(stderr.contains("MCP tools"));
+    }
+
+    #[test]
+    #[ignore = "private subprocess fixture for CLI output separation"]
+    fn run_file_coverage_child_fixture() {
+        super::write_run_file_notice(&mut std::io::stderr().lock(), &[], true);
+        println!("{{\"result\":\"machine-readable\"}}");
+    }
+
     #[test]
     fn auth_selectors_parse_for_every_action_and_resolve_named_config() {
         use clap::Parser;

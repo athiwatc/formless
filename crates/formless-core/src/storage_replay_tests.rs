@@ -192,7 +192,7 @@ fn legacy_schema_64_upgrade_has_backup_and_never_invents_replay_provenance() {
             .conn
             .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        65
+        super::super::SCHEMA_VERSION
     );
     assert!(upgraded
         .attempt_replay_snapshot("old-attempt")

@@ -59,6 +59,18 @@ fn identity(file: &File) -> Result<WindowsIdentity> {
         file: info.FileId.Identifier,
     })
 }
+/// Live-only authority from the successful mkdir callback; never decoded from a token.
+pub(crate) struct WindowsDirectoryProof {
+    file: File,
+    security: Vec<u8>,
+    attributes: u32,
+    captured: std::time::Instant,
+}
+impl WindowsDirectoryProof {
+    pub(crate) fn fresh(&self) -> bool {
+        self.captured.elapsed().as_secs() < crate::review_retained::RETENTION_SECONDS
+    }
+}
 pub(super) struct Access {
     path: PathBuf,
     guards: Vec<File>,
@@ -344,6 +356,78 @@ impl Access {
         }
         Ok(())
     }
+    fn run_directory(&self, raw: &Path, policy: &PathPolicy) -> Result<File> {
+        self.recheck(raw, policy)?;
+        let parent = self.guards.last().context("No pinned directory parent")?;
+        let file = crate::review_windows_namespace::open_directory_for_removal(
+            parent,
+            self.path.file_name().context("No directory leaf")?,
+        )?;
+        if physical_path(&file)?.parent() != Some(physical_path(parent)?.as_path()) {
+            bail!("Directory escaped pinned parent");
+        }
+        Ok(file)
+    }
+    pub(super) fn capture_directory(
+        &self,
+        raw: &Path,
+        policy: &PathPolicy,
+    ) -> Result<WindowsDirectoryProof> {
+        let file = self.run_directory(raw, policy)?;
+        let (security, _) = snapshot_security(&file)?;
+        let attributes = file.metadata()?.file_attributes();
+        Ok(WindowsDirectoryProof {
+            file,
+            security,
+            attributes,
+            captured: std::time::Instant::now(),
+        })
+    }
+    pub(super) fn directory_identity(&self, raw: &Path, policy: &PathPolicy) -> Result<(u64, u64)> {
+        let file = self.run_directory(raw, policy)?;
+        let id = identity(&file)?;
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(id.file);
+        Ok((id.volume, u64::from_le_bytes(digest[..8].try_into()?)))
+    }
+    pub(super) fn verify_directory(
+        &self,
+        raw: &Path,
+        proof: &WindowsDirectoryProof,
+        policy: &PathPolicy,
+        remove: bool,
+    ) -> Result<()> {
+        if !proof.fresh() {
+            bail!("Live created-directory proof expired");
+        }
+        let current = self.run_directory(raw, policy)?;
+        if identity(&current)? != identity(&proof.file)?
+            || current.metadata()?.file_attributes() != proof.attributes
+            || snapshot_security(&current)?.0 != proof.security
+        {
+            bail!("Created directory object or security changed since the Run");
+        }
+        self.recheck(raw, policy)?;
+        if remove {
+            // Windows rejects a nonempty directory. The same checked HANDLE is
+            // used, so no replaced pathname can acquire removal authority.
+            let disposition = FILE_DISPOSITION_INFO_EX {
+                Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+            };
+            if unsafe {
+                SetFileInformationByHandle(
+                    current.as_raw_handle(),
+                    FileDispositionInfoEx,
+                    (&disposition as *const FILE_DISPOSITION_INFO_EX).cast(),
+                    std::mem::size_of::<FILE_DISPOSITION_INFO_EX>() as u32,
+                )
+            } == 0
+            {
+                return Err(std::io::Error::last_os_error().into());
+            }
+        }
+        Ok(())
+    }
     pub(super) fn namespace_target_matches(
         &self,
         raw: &Path,
@@ -365,6 +449,16 @@ impl Access {
         policy: &PathPolicy,
         store: &crate::review_retained::RetainedStore,
     ) -> Result<File> {
+        self.namespace_source_bounded(raw, expected, policy, store, MAX_REVIEW_BYTES)
+    }
+    pub(super) fn namespace_source_bounded(
+        &self,
+        raw: &Path,
+        expected: &ReviewImage,
+        policy: &PathPolicy,
+        store: &crate::review_retained::RetainedStore,
+        limit: usize,
+    ) -> Result<File> {
         use crate::review_windows_namespace as namespace;
         self.recheck(raw, policy)?;
         if let Some(reason) = expected.ordinary_write_restriction() {
@@ -374,7 +468,7 @@ impl Access {
             .bytes
             .as_deref()
             .context("Existing namespace source required")?;
-        if before.len() > MAX_REVIEW_BYTES {
+        if before.len() > limit {
             bail!("Namespace source exceeds review byte limit");
         }
         let parent = self.guards.last().context("No parent")?;
@@ -415,9 +509,7 @@ impl Access {
             bail!("Namespace source security metadata changed");
         }
         let mut actual = Vec::with_capacity(before.len());
-        (&file)
-            .take(MAX_REVIEW_BYTES as u64 + 1)
-            .read_to_end(&mut actual)?;
+        (&file).take(limit as u64 + 1).read_to_end(&mut actual)?;
         if actual != before {
             bail!("Namespace source bytes changed");
         }
@@ -433,10 +525,21 @@ impl Access {
         policy: &PathPolicy,
         store: &crate::review_retained::RetainedStore,
     ) -> Result<Vec<String>> {
+        self.restore_retained_bounded(raw, object, desired, policy, store, MAX_REVIEW_BYTES)
+    }
+    pub(super) fn restore_retained_bounded(
+        &self,
+        raw: &Path,
+        object: &crate::review_retained::RetainedObject,
+        desired: &ReviewImage,
+        policy: &PathPolicy,
+        store: &crate::review_retained::RetainedStore,
+        limit: usize,
+    ) -> Result<Vec<String>> {
         use crate::review_windows_namespace as namespace;
         self.recheck(raw, policy)?;
         if self
-            .read_bounded(raw, policy, MAX_REVIEW_BYTES, false, None, Some(store))?
+            .read_bounded(raw, policy, limit, false, None, Some(store))?
             .bytes
             .is_some()
         {
@@ -452,7 +555,7 @@ impl Access {
             .bytes
             .as_deref()
             .context("Missing desired restoration image")?;
-        if bytes.len() > MAX_REVIEW_BYTES {
+        if bytes.len() > limit {
             bail!("Restoration image exceeds review limit");
         }
         // No mutable public alias may exist before ANY retained-body rewrite.
@@ -492,9 +595,7 @@ impl Access {
         file.sync_all()?;
         file.seek(SeekFrom::Start(0))?;
         let mut actual = Vec::with_capacity(bytes.len());
-        (&file)
-            .take(MAX_REVIEW_BYTES as u64 + 1)
-            .read_to_end(&mut actual)?;
+        (&file).take(limit as u64 + 1).read_to_end(&mut actual)?;
         if actual != bytes {
             bail!("Retained restoration readback differs");
         }
@@ -571,13 +672,24 @@ impl Access {
         policy: &PathPolicy,
         tracked: Option<&crate::review_retained::RetainedStore>,
     ) -> Result<Vec<String>> {
+        self.replace_existing_bounded(raw, expected, desired, policy, tracked, MAX_REVIEW_BYTES)
+    }
+    pub(super) fn replace_existing_bounded(
+        &self,
+        raw: &Path,
+        expected: &ReviewImage,
+        desired: &ReviewImage,
+        policy: &PathPolicy,
+        tracked: Option<&crate::review_retained::RetainedStore>,
+        limit: usize,
+    ) -> Result<Vec<String>> {
         self.recheck(raw, policy)?;
         let before = expected
             .bytes
             .as_deref()
             .context("Existing file required")?;
         let after = desired.bytes.as_deref().context("Existing file required")?;
-        if before.len() > MAX_REVIEW_BYTES || after.len() > MAX_REVIEW_BYTES {
+        if before.len() > limit || after.len() > limit {
             bail!("Review byte limit exceeded");
         }
         if let Some(reason) = expected
@@ -662,9 +774,7 @@ impl Access {
         };
         verify(&file, before)?;
         let mut observed = Vec::with_capacity(before.len());
-        (&file)
-            .take(MAX_REVIEW_BYTES as u64 + 1)
-            .read_to_end(&mut observed)?;
+        (&file).take(limit as u64 + 1).read_to_end(&mut observed)?;
         if observed != before {
             bail!("Review bytes changed before commit");
         }
@@ -702,9 +812,7 @@ impl Access {
         }
         file.seek(SeekFrom::Start(0))?;
         observed.clear();
-        (&file)
-            .take(MAX_REVIEW_BYTES as u64 + 1)
-            .read_to_end(&mut observed)?;
+        (&file).take(limit as u64 + 1).read_to_end(&mut observed)?;
         if observed != after {
             bail!("In-place readback differs; retain prepared recovery receipt");
         }

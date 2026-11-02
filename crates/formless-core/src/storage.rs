@@ -36,6 +36,12 @@ mod optimiser_attempt_schema;
 mod replay_storage;
 pub use replay_storage::ReplaySnapshot;
 
+#[path = "runfile_storage.rs"]
+mod runfile_storage;
+pub use runfile_storage::{
+    RunFileAdmission, RunFileRecord, RunFileRetention, RunFileUsage, StoredRunFile,
+};
+
 pub struct Store {
     conn: Connection,
     /// Bumped whenever stored messages change other than by appending
@@ -380,7 +386,7 @@ impl ModelStat {
 const SESSION_SUMMARY: &str = "s.*";
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 65;
+pub const SCHEMA_VERSION: i64 = 66;
 
 /// Add a column, tolerating only "it already exists" (a step that was
 /// partly applied by an older build); every other error is real.
@@ -465,7 +471,7 @@ fn migrate_v39(c: &Connection) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 65] = [
+const MIGRATIONS: [(i64, MigrationStep); 66] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -781,6 +787,12 @@ const MIGRATIONS: [(i64, MigrationStep); 65] = [
     (63, |c| add_column(c, "run_files", "before_metadata TEXT")),
     (64, |c| Ok(c.execute_batch(routing_storage::SCHEMA)?)),
     (65, |c| Ok(c.execute_batch(replay_storage::SCHEMA)?)),
+    (66, |c| {
+        add_column(c, "run_files", "before_kind TEXT")?;
+        add_column(c, "run_files", "after_state TEXT")?;
+        add_column(c, "run_files", "not_kept_reason TEXT")?;
+        add_column(c, "runs", "untracked_writes_possible INTEGER NOT NULL DEFAULT 0 CHECK(untracked_writes_possible IN (0,1))")
+    }),
 ];
 
 /// Empty schema at a stamped historical version, for offline backup inspection.
@@ -1528,10 +1540,10 @@ impl Store {
 
     pub fn delete_session(&self, id: &str) -> Result<bool> {
         self.note_rewrite();
-        Ok(self
-            .conn
-            .execute("DELETE FROM sessions WHERE id=?1", params![id])?
-            > 0)
+        self.transaction(|st| {
+            st.ex("DELETE FROM run_files WHERE session_id=?1 OR run_id IN (SELECT id FROM runs WHERE session_id=?1)", params![id])?;
+            Ok(st.ex("DELETE FROM sessions WHERE id=?1", params![id])? > 0)
+        })
     }
 
     pub(crate) fn read_transaction<T>(&self, action: impl FnOnce(&Self) -> Result<T>) -> Result<T> {
@@ -2638,18 +2650,16 @@ impl Store {
         Ok(rows)
     }
 
-    /// The Session's latest Run that changed files.
+    /// The latest Run with recorded paths or a durable untracked-write caveat.
+    /// Paths survive expiry and rewind, so this never falls back to older edits.
     pub fn last_run_with_files(&self, session_id: &str) -> Result<Option<String>> {
-        use rusqlite::OptionalExtension;
-        Ok(self
-            .conn
-            .query_row(
-                "SELECT run_id FROM run_files WHERE session_id=?1
-                 ORDER BY created_at DESC, rowid DESC LIMIT 1",
-                params![session_id],
-                |r| r.get(0),
-            )
-            .optional()?)
+        Ok(self.conn.query_row(
+            "SELECT r.id FROM runs r JOIN sessions s ON s.id=r.session_id
+             WHERE r.session_id=?1 AND s.deleted_at IS NULL AND
+             (r.untracked_writes_possible=1 OR EXISTS(SELECT 1 FROM run_files f WHERE f.run_id=r.id))
+             ORDER BY r.created_at DESC,r.rowid DESC LIMIT 1",
+            params![session_id], |r| r.get(0),
+        ).optional()?)
     }
 
     /// What a Run called: (name, calls, failed), registry Tools and
@@ -2720,24 +2730,6 @@ impl Store {
         }))
     }
 
-    /// File snapshots older than `cutoff`: (count, bytes).
-    pub fn old_run_files(&self, cutoff: &str) -> Result<(usize, u64)> {
-        let (n, b): (i64, Option<i64>) = self.conn.query_row(
-            "SELECT count(*), SUM(COALESCE(length(before),0)) FROM run_files WHERE created_at < ?1",
-            params![cutoff],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
-        Ok((n as usize, b.unwrap_or(0) as u64))
-    }
-
-    pub fn delete_run_files_before(&self, cutoff: &str) -> Result<()> {
-        self.ex(
-            "DELETE FROM run_files WHERE created_at < ?1",
-            params![cutoff],
-        )?;
-        Ok(())
-    }
-
     /// Unused pages VACUUM would give back.
     pub fn free_bytes(&self) -> Result<u64> {
         let free: i64 = self
@@ -2767,10 +2759,11 @@ impl Store {
         Ok(())
     }
 
-    /// Forget one recorded file (after it was reverted).
+    /// Drop restoration authority after rewind, retaining the path as a tombstone.
+    /// Internal compatibility wrapper; live routes validate ownership first.
     pub fn forget_run_file(&self, run_id: &str, path: &str) -> Result<()> {
         self.ex(
-            "DELETE FROM run_files WHERE run_id=?1 AND path=?2",
+            "UPDATE run_files SET kept=0,before=NULL,before_metadata=NULL,not_kept_reason='Already rewound' WHERE run_id=?1 AND path=?2",
             params![run_id, path],
         )?;
         Ok(())

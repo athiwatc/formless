@@ -147,6 +147,31 @@ pub(crate) fn format_event(ev: &Event, streaming: &mut bool) -> Option<String> {
             format!("{}Run paused: {msg}{next}", end_stream(streaming))
         }
         Event::Note { text, .. } => format!("Note: {text}"),
+        Event::RunFilesChanged {
+            files,
+            untracked_writes_possible,
+            ..
+        } => format!(
+            "{}{}",
+            end_stream(streaming),
+            super::run_files_text(files, *untracked_writes_possible)
+        ),
+        Event::RunRecap { recap, .. } => {
+            let mut text = format!(
+                "{}What I did: {} steps; {} tracked path(s).",
+                end_stream(streaming),
+                recap.steps,
+                recap.files.len()
+            );
+            for path in &recap.files {
+                text.push_str(&format!("\n  {}", super::run_file_safe_text(path)));
+            }
+            if recap.untracked_writes_possible {
+                text.push(' ');
+                text.push_str(super::RUN_FILES_CAVEAT);
+            }
+            text
+        }
         Event::RunToolChanges { changes, .. } => format!("{}.", super::tool_changes_text(changes)),
         Event::CompactionNotice { .. } => "Note: the conversation was compacted.".into(),
         Event::ApprovalRequested {
