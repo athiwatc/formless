@@ -2258,15 +2258,20 @@
   }
 
   /** The agent's checklist (`update_plan`, SPEC §5.8), above the composer. */
+  function planStateLabel(state) {
+    if (!state) return "";
+    return [state.previous_task ? "previous task" : "", state.run_status || "", state.origin && state.origin !== "live" ? state.origin : "", state.updated_at ? "updated " + state.updated_at : ""].filter(Boolean).join(" · ");
+  }
   function renderPlan() {
     const box = $("plan");
     const items = S.plan || [];
     box.classList.toggle("hidden", !items.length);
     if (!items.length) return box.replaceChildren();
     const done = items.filter((i) => i.status === "completed").length;
-    if (done === items.length && !isRunning()) return box.replaceChildren(h("span", { class: "muted" }, "✓ " + tr("Plan done") + " (" + done + "/" + items.length + ")"));
+    const lifecycle = planStateLabel(S.planState);
+    if (done === items.length && !isRunning() && !lifecycle) return box.replaceChildren(h("span", { class: "muted" }, "✓ " + tr("Plan done") + " (" + done + "/" + items.length + ")"));
     const mark = { completed: "✓", in_progress: "▸" };
-    box.replaceChildren(h("span", { class: "muted" }, tr("Plan") + " (" + done + "/" + items.length + ")"),
+    box.replaceChildren(h("span", { class: "muted" }, tr("Plan") + " (" + done + "/" + items.length + ")" + (lifecycle ? " · " + lifecycle : "")),
       h("ul", null, items.map((i) => h("li", { class: i.status }, (mark[i.status] || "○") + " " + i.content))));
   }
 
@@ -4118,12 +4123,35 @@
     S.liveTools = []; S.liveRun = null;
     renderApproval();
   }
+  function restoreSessionRunState(id, result, events) {
+    let latest = result.latest_run && result.latest_run.run_id;
+    let recorded = result.last_recap || null;
+    if (recorded && latest && recorded.run_id !== latest) recorded = null;
+    let plan = result.plan || [], state = result.plan_state || null;
+    for (const ev of events) {
+      if (ev.session_id !== id) continue;
+      if (ev.type === "run_started") { latest = ev.run_id; recorded = null; }
+      if (ev.type === "run_recap" && (!latest || latest === ev.run_id)) recorded = { run_id: ev.run_id, recap: ev.recap };
+      if (ev.type === "plan_updated") {
+        const metadata = ev.plan_state || null;
+        const older = state && state.updated_at && metadata && metadata.updated_at && metadata.updated_at < state.updated_at;
+        const wrongRun = metadata && !metadata.previous_task && ["live", "resumed"].includes(metadata.origin) && metadata.run_id && latest && metadata.run_id !== latest;
+        if (!older && !wrongRun) { plan = ev.items || []; state = metadata; }
+      }
+      if (["run_finished", "run_paused"].includes(ev.type) && state && state.run_id === ev.run_id && (!latest || latest === ev.run_id)) state = { ...state, run_status: ev.type === "run_paused" ? "paused" : ev.status };
+    }
+    S.plan = plan; S.planState = state;
+    S.recap = recorded && recorded.recap;
+    S.recapRunId = recorded && recorded.run_id;
+    if (latest) S.liveRun = { id: latest, ended: !S.running.has(id) };
+  }
   function applySessionLiveState(id, result, liveEvents) {
     if (typeof result.running !== "boolean" || !Array.isArray(result.pending_events)) return;
     if (result.running) S.running.add(id); else S.running.delete(id);
     // Reduce authoritative global attention plus racing events as data. Replaying
     // onEvent would notify twice and erase already-received streaming text.
     const pending = new Map();
+    let latestRun = result.latest_run && result.latest_run.run_id;
     for (const ev of result.pending_events.concat(liveEvents)) {
       switch (ev.type) {
         case "approval_requested": pending.set("tool:" + ev.approval_id, ev); break;
@@ -4137,8 +4165,8 @@
           if (req) pending.set("tool:" + ev.approval_id, { ...req, summary: ev.summary });
           break;
         }
-        case "run_started": S.running.add(ev.session_id); break;
-        case "run_finished": case "run_paused": S.running.delete(ev.session_id); break;
+        case "run_started": if (ev.session_id === id) latestRun = ev.run_id; S.running.add(ev.session_id); break;
+        case "run_finished": case "run_paused": if (ev.session_id !== id || !latestRun || latestRun === ev.run_id) S.running.delete(ev.session_id); break;
       }
     }
     S.approvals = S.approvals.filter((a) => pending.has(a.kind + ":" + a.id));
@@ -4197,9 +4225,9 @@
     S.liveTools = []; S.liveRun = null;
     S.editMessageId = null;
     S.queued = []; renderQueue();
-    S.plan = []; renderPlan();
+    S.plan = []; S.planState = null; renderPlan();
     S.step = null; renderStep();
-    S.recap = null;
+    S.recap = null; S.recapRunId = null;
     S.follow = true;
     const r = await act({ type: "get_session", id });
     if (seq !== sessionSeq || S.current !== id) return;
@@ -4215,7 +4243,7 @@
       renderRunBanner();
       S.queued = r.queued_items || [];
       renderQueue();
-      S.plan = r.plan || [];
+      restoreSessionRunState(id, r, snapshot.events);
       renderPlan();
       S.stepMode = !!r.step_mode;
       const i = S.sessions.findIndex((s) => s.id === id);
@@ -4775,7 +4803,7 @@
     const n = (k, what) => (k ? " · " + k + " " + what : "");
     const list = (title, items) => (items.length ? [h("div", { class: "muted" }, title), h("ul", null, items.map((i) => h("li", null, i)))] : []);
     return h("details", { class: "recap" },
-      h("summary", null, tr("What I did") + " · " + r.steps + " steps · " + Math.round(r.duration_ms / 1000) + "s" + n(r.used.length, "calls") + n(r.built.length, "Tools changed") + n(r.files.length, "tracked paths") + (r.untracked_writes_possible ? " · " + runFilesCaveat() : "")),
+      h("summary", null, tr("What I did") + " · " + r.steps + " steps · " + Math.round(r.duration_ms / 1000) + "s" + (r.status ? " · " + r.status : "") + (r.total_calls != null ? " · " + r.total_calls + " calls" : "") + n(r.unfinished_calls || 0, "unfinished calls") + n(r.built.length, "Tools changed") + n(r.files.length, "tracked paths") + (r.untracked_writes_possible ? " · " + runFilesCaveat() : "")),
       ...list("Used", r.used), ...list("Built", r.built), ...list("Tracked paths", r.files),
       r.untracked_writes_possible ? h("p", { class: "muted" }, runFilesCaveat()) : null,
       r.steered ? h("div", { class: "muted" }, "You steered it " + r.steered + " time(s).") : null);
@@ -5009,7 +5037,7 @@
       forecastRevision++;
       scheduleForecast();
     }
-    if (S.sessionSnapshot && ["run_started", "run_finished", "run_paused", "approval_requested", "approval_answered", "approval_summary", "promotion_approval_requested", "promotion_approval_resolved", "user_question", "user_question_closed"].includes(ev.type)) {
+    if (S.sessionSnapshot && ["run_started", "run_finished", "run_paused", "run_recap", "plan_updated", "approval_requested", "approval_answered", "approval_summary", "promotion_approval_requested", "promotion_approval_resolved", "user_question", "user_question_closed"].includes(ev.type)) {
       S.sessionSnapshot.events.push(ev);
     }
     notifyFor(ev);
@@ -5020,11 +5048,13 @@
         break;
       case "run_started":
         S.running.add(ev.session_id);
-        if (here) { S.unfinished = null; renderRunBanner(); S.runTools = null; renderRunTools(); S.rated = null; S.recap = null; }
+        if (here) { S.unfinished = null; renderRunBanner(); S.runTools = null; renderRunTools(); S.rated = null; S.recap = null; S.recapRunId = null; }
         if (here) { S.streaming = ""; S.thinking = ""; S.liveTools = (S.liveTools || []).filter(t => t.status === "running" && t.handle); S.liveRun = { id: ev.run_id, ended: false }; setActivity("waiting for model"); }
         break;
       case "run_recap":
-        if (here) { S.recap = ev.recap; renderHistory(); }
+        if (here && (!S.liveRun || S.liveRun.id === ev.run_id)) {
+          if (S.recapRunId !== ev.run_id || JSON.stringify(S.recap) !== JSON.stringify(ev.recap)) { S.recap = ev.recap; S.recapRunId = ev.run_id; renderHistory(); }
+        }
         break;
       case "run_files_changed":
         if (here) {
@@ -5068,7 +5098,12 @@
         if (here && S.step && S.step.step_id === ev.step_id) { S.step = null; renderStep(); }
         break;
       case "plan_updated":
-        if (here) { S.plan = ev.items || []; renderPlan(); }
+        if (here) {
+          const state = ev.plan_state || null;
+          const older = S.planState && S.planState.updated_at && state && state.updated_at && state.updated_at < S.planState.updated_at;
+          const wrongRun = state && !state.previous_task && ["live", "resumed"].includes(state.origin) && state.run_id && S.liveRun && state.run_id !== S.liveRun.id;
+          if (!older && !wrongRun) { S.plan = ev.items || []; S.planState = state; renderPlan(); }
+        }
         break;
       case "queue_changed":
         if (here) { S.queued = ev.queued || []; renderQueue(); }
@@ -5090,6 +5125,7 @@
         if (here && S.liveRun && S.liveRun.id !== ev.run_id) break;
         S.running.delete(ev.session_id);
         if (here) {
+          if (S.planState && S.planState.run_id === ev.run_id) S.planState = { ...S.planState, run_status: ev.type === "run_paused" ? "paused" : ev.status };
           renderPlan();
           // run_paused carries the error (and its explanation); the
           // run_finished that follows must not wipe it.

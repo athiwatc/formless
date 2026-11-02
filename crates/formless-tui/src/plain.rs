@@ -10,10 +10,18 @@ use formless_protocol::*;
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, Write};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+fn display_text(text: &str) -> String {
+    text.chars().flat_map(|c| {
+        if c.is_control() || matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}') {
+            c.escape_default().collect::<Vec<_>>()
+        } else { vec![c] }
+    }).collect()
+}
 
 fn invocation_label(id: Option<&str>) -> String {
-    id.map(|id| format!(" [{}]", super::run_file_safe_text(id)))
+    id.map(|id| format!(" [{}]", display_text(id)))
         .unwrap_or_default()
 }
 
@@ -27,9 +35,351 @@ pub(super) fn progress_diagnostic(fraction: Option<f64>, label: Option<&str>) ->
             .map(|f| format!("{}%", (f * 100.0).round()))
             .unwrap_or_else(|| "unknown".into()),
         label
-            .map(|l| format!(" ({})", super::run_file_safe_text(l)))
+            .map(|l| format!(" ({})", display_text(l)))
             .unwrap_or_default()
     )
+}
+
+/// Stateful, bounded feedback shared with headless stderr. Legacy progress
+/// without an invocation ID cannot safely distinguish concurrent calls.
+#[derive(Default)]
+pub struct LiveFeedback {
+    progress: HashMap<(String, String), (Instant, Option<u8>, String)>,
+}
+impl LiveFeedback {
+    pub fn event(&mut self, ev: &Event) -> Option<String> {
+        match ev {
+            Event::ToolCallFinished {
+                run_id,
+                invocation_id: Some(id),
+                ..
+            } => {
+                self.progress.remove(&(run_id.clone(), id.clone()));
+                None
+            }
+            Event::InvocationCompleted {
+                invocation_id: Some(id),
+                ..
+            } => {
+                self.progress.retain(|(_, invocation), _| invocation != id);
+                None
+            }
+            Event::ToolProgress {
+                run_id,
+                invocation_id: Some(id),
+                tool_name,
+                fraction,
+                label,
+                depth,
+                ..
+            } if *depth == 0 => {
+                let key = (run_id.clone(), id.clone());
+                let percent = fraction
+                    .filter(|f| f.is_finite())
+                    .map(|f| (f.clamp(0.0, 1.0) * 100.0).round() as u8);
+                let label = display_text(&label.chars().take(160).collect::<String>());
+                let now = Instant::now();
+                if let Some((at, old, old_label)) = self.progress.get(&key) {
+                    let milestone = percent.is_some_and(|p| {
+                        p == 100 && *old != Some(100) || old.is_some_and(|o| p / 25 > o / 25)
+                    });
+                    if (*old == percent && *old_label == label)
+                        || (!milestone && now.duration_since(*at) < Duration::from_secs(2))
+                    {
+                        return None;
+                    }
+                } else if self.progress.len() >= 1024 {
+                    // Keep existing identities intact; never attribute an unknown
+                    // invocation's progress to another invocation with the same name.
+                    return None;
+                }
+                self.progress.insert(key, (now, percent, label.clone()));
+                Some(format!(
+                    "Tool progress: {}{}: {}{}.",
+                    display_text(tool_name),
+                    invocation_label(Some(id)),
+                    percent.map_or_else(|| "working".into(), |p| format!("{p}%")),
+                    if label.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({label})")
+                    }
+                ))
+            }
+            Event::PlanUpdated {
+                items, plan_state, ..
+            } => Some(plan_text(items, plan_state.as_ref())),
+            Event::RunRecap { recap, .. } => Some(recap_text(recap)),
+            _ => None,
+        }
+    }
+}
+
+pub fn plan_text(items: &[PlanItem], state: Option<&PlanState>) -> String {
+    let done = items.iter().filter(|i| i.status == "completed").count();
+    let current = items
+        .iter()
+        .find(|i| i.status == "in_progress")
+        .map(|i| format!(" Current: {}.", display_text(&i.content)))
+        .unwrap_or_default();
+    let lifecycle = state
+        .map(|s| {
+            format!(
+                "{}{}{}",
+                s.run_status
+                    .as_deref()
+                    .map(|v| format!("; {}", display_text(v)))
+                    .unwrap_or_default(),
+                if s.previous_task {
+                    "; previous task"
+                } else {
+                    ""
+                },
+                if s.origin.is_empty() {
+                    String::new()
+                } else {
+                    format!("; {}", display_text(&s.origin))
+                }
+            )
+        })
+        .unwrap_or_default();
+    format!("Plan: {done}/{} done{lifecycle}.{current}", items.len())
+}
+
+pub fn recap_text(recap: &RunRecap) -> String {
+    let finished = recap
+        .total_calls
+        .and_then(|total| total.checked_sub(recap.unfinished_calls))
+        .filter(|count| *count >= 0)
+        .map_or_else(|| "unknown".into(), |count| count.to_string());
+    let mut text = format!("What I did: status {}; {} steps; {} ms; {} total calls; {finished} finished calls; {} unfinished calls; {} steering message(s).", if recap.status.is_empty() { "unknown (legacy)".into() } else { display_text(&recap.status) }, recap.steps, recap.duration_ms, recap.total_calls.map_or_else(|| "unknown".into(), |n| n.to_string()), recap.unfinished_calls, recap.steered);
+    for (title, values) in [
+        ("Used", &recap.used),
+        ("Built", &recap.built),
+        ("Files", &recap.files),
+    ] {
+        text.push_str(&format!(
+            "\n{title}: {}",
+            if values.is_empty() {
+                "none recorded".into()
+            } else {
+                values
+                    .iter()
+                    .map(|v| display_text(v))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            }
+        ));
+    }
+    text.push_str("\nCoverage: tracked paths only.");
+    if recap.untracked_writes_possible {
+        text.push(' ');
+        text.push_str(super::RUN_FILES_CAVEAT);
+    }
+    text
+}
+
+/// Full path identities and diffs, rather than the abbreviated live notice.
+pub fn files_result_text(result: &serde_json::Value) -> Result<String> {
+    let files: Vec<RunFileInfo> = serde_json::from_value(result["files"].clone())?;
+    let mut text = format!(
+        "Run {}. Tracked paths only.",
+        display_text(result["run_id"].as_str().unwrap_or("unknown"))
+    );
+    for file in files {
+        text.push_str(&format!(
+            "\n{}: {} (restorable: {})",
+            display_text(&file.path),
+            display_text(&file.status),
+            file.revertible
+        ));
+        if let Some(reason) = file.revert_reason {
+            text.push_str(&format!("; {}", display_text(&reason)));
+        }
+        if let Some(diff) = file.diff {
+            text.push_str(&format!(
+                "\n{}",
+                diff.lines()
+                    .map(display_text)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ));
+        }
+    }
+    if result["untracked_writes_possible"]
+        .as_bool()
+        .unwrap_or(false)
+    {
+        text.push(' ');
+        text.push_str(super::RUN_FILES_CAVEAT);
+    }
+    Ok(text)
+}
+
+pub fn rewind_result_text(result: &serde_json::Value) -> String {
+    let mut text = String::from("Rewind result:");
+    for path in result["restored"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|p| p.as_str())
+    {
+        text.push_str(&format!("\nRestored: {}", display_text(path)));
+    }
+    for item in result["skipped"].as_array().into_iter().flatten() {
+        text.push_str(&format!(
+            "\nNot restored: {} ({})",
+            display_text(item["path"].as_str().unwrap_or("unknown")),
+            display_text(item["reason"].as_str().unwrap_or("unknown"))
+        ));
+    }
+    text
+}
+
+#[derive(Default)]
+struct EventBacklog {
+    messages: VecDeque<ServerMessage>,
+    bytes: usize,
+}
+impl EventBacklog {
+    fn push(&mut self, message: ServerMessage) -> Result<()> {
+        let bytes = serde_json::to_vec(&message)?.len();
+        anyhow::ensure!(self.messages.len() < 4096 && self.bytes.saturating_add(bytes) <= 4 * 1024 * 1024, "plain event backlog exceeded 4096 messages or 4 MiB; reconnect to resynchronize (events were not silently discarded)");
+        self.bytes += bytes;
+        self.messages.push_back(message);
+        Ok(())
+    }
+    fn pop(&mut self) -> Option<ServerMessage> {
+        let message = self.messages.pop_front()?;
+        self.bytes = self
+            .bytes
+            .saturating_sub(serde_json::to_vec(&message).map_or(0, |v| v.len()));
+        Some(message)
+    }
+}
+
+/// Snapshot replies are accepted only if no live Run/plan event has arrived
+/// since the request. An older terminal event cannot replace a newer Run.
+#[derive(Default)]
+struct RunState {
+    generation: u64,
+    run_id: Option<String>,
+    recap: Option<RecordedRunRecap>,
+    plan: Vec<PlanItem>,
+    plan_state: Option<PlanState>,
+}
+impl RunState {
+    fn accept(&mut self, event: &Event) -> bool {
+        match event {
+            Event::RunStarted { run_id, .. } => {
+                self.generation = self.generation.wrapping_add(1);
+                self.run_id = Some(run_id.clone());
+                self.recap = None;
+            }
+            Event::RunRecap { run_id, recap, .. } => {
+                if self.run_id.as_ref().is_some_and(|id| id != run_id)
+                    || self.recap.as_ref().is_some_and(|r| r.run_id == *run_id)
+                {
+                    return false;
+                }
+                self.generation = self.generation.wrapping_add(1);
+                self.recap = Some(RecordedRunRecap {
+                    run_id: run_id.clone(),
+                    recap: recap.clone(),
+                });
+            }
+            Event::PlanUpdated {
+                items, plan_state, ..
+            } => {
+                if plan_state.as_ref().is_some_and(|s| {
+                    !s.previous_task
+                        && s.run_id
+                            .as_ref()
+                            .zip(self.run_id.as_ref())
+                            .is_some_and(|(a, b)| a != b)
+                }) {
+                    return false;
+                }
+                self.generation = self.generation.wrapping_add(1);
+                self.plan = items.clone();
+                self.plan_state = plan_state.clone();
+            }
+            Event::RunFinished { run_id, .. } | Event::RunPaused { run_id, .. } => {
+                if self.run_id.as_ref().is_some_and(|id| id != run_id) {
+                    return false;
+                }
+                self.generation = self.generation.wrapping_add(1);
+            }
+            _ => {}
+        }
+        true
+    }
+    fn snapshot(
+        &mut self,
+        generation: u64,
+        value: &serde_json::Value,
+        explicit: bool,
+    ) -> Vec<String> {
+        if self.generation != generation {
+            return if explicit {
+                self.recap
+                    .as_ref()
+                    .map(|r| vec![recap_text(&r.recap)])
+                    .unwrap_or_else(|| vec!["No recorded recap for the latest Run.".into()])
+            } else {
+                Vec::new()
+            };
+        }
+        let mut lines = Vec::new();
+        self.run_id = value["latest_run"]["run_id"].as_str().map(str::to_owned);
+        if let Ok(items) = serde_json::from_value::<Vec<PlanItem>>(value["plan"].clone()) {
+            let state = serde_json::from_value::<PlanState>(value["plan_state"].clone()).ok();
+            if !explicit && !items.is_empty() && (self.plan != items || self.plan_state != state) {
+                lines.push(plan_text(&items, state.as_ref()));
+            }
+            self.plan = items;
+            self.plan_state = state;
+        }
+        let recap = serde_json::from_value::<RecordedRunRecap>(value["last_recap"].clone()).ok();
+        if let Some(recorded) = &recap {
+            if explicit || self.recap.as_ref() != Some(recorded) {
+                lines.push(recap_text(&recorded.recap));
+            }
+        } else if explicit {
+            lines.push("No recorded recap for the latest Run.".into());
+        }
+        self.recap = recap;
+        lines
+    }
+}
+
+fn wait_response(
+    rx: &mpsc::Receiver<ServerMessage>,
+    sends: &std::cell::RefCell<crate::client::SendTracker>,
+    backlog: &std::cell::RefCell<EventBacklog>,
+    id: u64,
+) -> Result<serde_json::Value> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let message = rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))?;
+        if let ServerMessage::Response {
+            id: rid,
+            ok,
+            result,
+            error,
+        } = &message
+        {
+            sends.borrow_mut().answered(*rid);
+            if *rid == id {
+                return if *ok {
+                    Ok(result.clone().unwrap_or_default())
+                } else {
+                    Err(anyhow::anyhow!(error.clone().unwrap_or_default()))
+                };
+            }
+        }
+        backlog.borrow_mut().push(message)?;
+    }
 }
 
 /// Something waiting for the user's next line.
@@ -176,22 +526,8 @@ pub(crate) fn format_event(ev: &Event, streaming: &mut bool) -> Option<String> {
             end_stream(streaming),
             super::run_files_text(files, *untracked_writes_possible)
         ),
-        Event::RunRecap { recap, .. } => {
-            let mut text = format!(
-                "{}What I did: {} steps; {} tracked path(s).",
-                end_stream(streaming),
-                recap.steps,
-                recap.files.len()
-            );
-            for path in &recap.files {
-                text.push_str(&format!("\n  {}", super::run_file_safe_text(path)));
-            }
-            if recap.untracked_writes_possible {
-                text.push(' ');
-                text.push_str(super::RUN_FILES_CAVEAT);
-            }
-            text
-        }
+        Event::RunRecap { recap, .. } => format!("{}{}", end_stream(streaming), recap_text(recap)),
+        Event::PlanUpdated { items, plan_state, .. } => format!("{}{}", end_stream(streaming), plan_text(items, plan_state.as_ref())),
         Event::RunToolChanges { changes, .. } => format!("{}.", super::tool_changes_text(changes)),
         Event::CompactionNotice { .. } => "Note: the conversation was compacted.".into(),
         Event::ApprovalRequested {
@@ -271,12 +607,9 @@ pub(crate) fn format_event(ev: &Event, streaming: &mut bool) -> Option<String> {
             end_stream(streaming), invocation_label(invocation_id.as_deref()),
             if *ok { "finished" } else { "failed" }
         ),
-        Event::InvocationPending { tool_name, invocation_id, handle, .. } => format!("{}Tool {tool_name}{} continues in the background ({}).", end_stream(streaming), invocation_label(invocation_id.as_deref()), super::run_file_safe_text(handle)),
-        // Left out on purpose: live detail a screen reader would drown in
-        // (reasoning, usage, progress, activity), state the plain client
-        // doesn't show (lists, plans, settings, subscriptions), and
-        // events already told another way (MessageAppended for our own
-        // input, RunStarted's "Working…", RunRecap after "Run completed").
+        Event::InvocationPending { tool_name, invocation_id, handle, .. } => format!("{}Tool {tool_name}{} continues in the background ({}).", end_stream(streaming), invocation_label(invocation_id.as_deref()), display_text(handle)),
+        // Stateful progress is printed by LiveFeedback. Reasoning, activity,
+        // usage, settings and subscription chatter stay out of line mode.
         // A new event lands here by default: decide whether it belongs.
         _ => return None,
     })
@@ -333,27 +666,8 @@ pub fn run_with(paths: Paths, start: ChatStart, label: &str) -> Result<()> {
     }
     let (client, rx) = DaemonClient::connect(&paths)?;
     let sends = std::cell::RefCell::new(crate::client::SendTracker::default());
-    let wait = |id: u64| -> Result<serde_json::Value> {
-        loop {
-            if let ServerMessage::Response {
-                id: rid,
-                ok,
-                result,
-                error,
-            } = rx.recv()?
-            {
-                sends.borrow_mut().answered(rid);
-                if rid != id {
-                    continue;
-                }
-                return if ok {
-                    Ok(result.unwrap_or_default())
-                } else {
-                    Err(anyhow::anyhow!(error.unwrap_or_default()))
-                };
-            }
-        }
-    };
+    let backlog = std::cell::RefCell::new(EventBacklog::default());
+    let wait = |id: u64| wait_response(&rx, &sends, &backlog, id);
     let create = || -> Result<SessionInfo> {
         Ok(serde_json::from_value(wait(
             client.send(Request::CreateSession { name: None }),
@@ -403,9 +717,20 @@ pub fn run_with(paths: Paths, start: ChatStart, label: &str) -> Result<()> {
     let mut prompts: VecDeque<Prompt> = VecDeque::new();
     let mut streaming = false;
     let mut running = false;
+    let mut feedback = LiveFeedback::default();
+    let mut run_state = RunState::default();
+    let mut snapshots = HashMap::new();
+    snapshots.insert(
+        client.send(Request::GetSession {
+            id: session.id.clone(),
+        }),
+        (session.id.clone(), run_state.generation, false),
+    );
     let mut gap_refreshes: HashMap<u64, GapRefresh> = HashMap::new();
     loop {
-        while let Ok(msg) = rx.try_recv() {
+        loop {
+            let msg = backlog.borrow_mut().pop().or_else(|| rx.try_recv().ok());
+            let Some(msg) = msg else { break };
             if let ServerMessage::Response {
                 id,
                 ok,
@@ -415,6 +740,18 @@ pub fn run_with(paths: Paths, start: ChatStart, label: &str) -> Result<()> {
             } = &msg
             {
                 sends.borrow_mut().answered(*id);
+                if let Some((snapshot_session, generation, explicit)) = snapshots.remove(id) {
+                    if *ok && snapshot_session == session.id {
+                        if let Some(result) = result {
+                            for text in run_state.snapshot(generation, result, explicit) {
+                                if std::mem::take(&mut streaming) {
+                                    println!();
+                                }
+                                say(&text);
+                            }
+                        }
+                    }
+                }
                 if let Some(kind) = gap_refreshes.remove(id) {
                     if *ok {
                         if streaming {
@@ -441,6 +778,9 @@ pub fn run_with(paths: Paths, start: ChatStart, label: &str) -> Result<()> {
             if !mine && !matches!(ev, Event::ApprovalRequested { .. }) {
                 continue;
             }
+            if !run_state.accept(&ev) {
+                continue;
+            }
             for (kind, request) in gap_requests(&ev) {
                 if !gap_refreshes.values().any(|pending| *pending == kind) {
                     gap_refreshes.insert(client.send(request), kind);
@@ -451,7 +791,19 @@ pub fn run_with(paths: Paths, start: ChatStart, label: &str) -> Result<()> {
                 Event::RunFinished { .. } | Event::RunPaused { .. } => running = false,
                 _ => {}
             }
-            if let Some(text) = format_event(&ev, &mut streaming) {
+            let live = feedback.event(&ev);
+            let text = if matches!(ev, Event::ToolProgress { .. }) {
+                live.map(|t| {
+                    if std::mem::take(&mut streaming) {
+                        format!("\n{t}")
+                    } else {
+                        t
+                    }
+                })
+            } else {
+                format_event(&ev, &mut streaming)
+            };
+            if let Some(text) = text {
                 if matches!(ev, Event::MessageDelta { .. }) || text == "\n" {
                     print!("{text}");
                     let _ = std::io::stdout().flush();
@@ -561,7 +913,7 @@ pub fn run_with(paths: Paths, start: ChatStart, label: &str) -> Result<()> {
         match text.as_str() {
             "" => {}
             "/quit" | "/exit" => break,
-            "/help" => say("Commands: /new starts a Session, /sessions lists them, /switch N opens one, /stop stops the Run, /docs [topic] gives the guides' addresses, /quit exits (Runs keep going in the daemon). Anything else is sent as a message; to send text that starts with /, begin it with //."),
+            "/help" => say("Commands: /new starts a Session, /sessions lists them, /switch N opens one, /stop stops the Run, /files [RUN] shows tracked changes, /rewind [PATH] attempts safe restoration, /recap shows the recorded recap, /docs [topic] gives the guides' addresses, /quit exits (Runs keep going in the daemon). Anything else is sent as a message; to send text that starts with /, begin it with //."),
             cmd if cmd == "/docs" || cmd.starts_with("/docs ") => {
                 let topic = cmd["/docs".len()..].trim();
                 match formless_core::docs::url(Some(topic).filter(|t| !t.is_empty())) {
@@ -577,6 +929,17 @@ pub fn run_with(paths: Paths, start: ChatStart, label: &str) -> Result<()> {
             cmd if cmd == "/summarise-branch" || cmd.starts_with("/summarise-branch ") => {
                 say("Open the full TUI or web, switch to the target Session, then use /summarise-branch SOURCE_SESSION to generate and review a candidate before inserting one note.");
             }
+            cmd if cmd == "/files" || cmd.starts_with("/files ") => {
+                let run_id = cmd.strip_prefix("/files").unwrap().trim();
+                match wait(client.send(Request::RunFiles { session_id: session.id.clone(), run_id: (!run_id.is_empty()).then(|| run_id.to_string()) })).and_then(|v| files_result_text(&v)) { Ok(text) => say(&text), Err(e) => say(&format!("Files: {e}")) }
+            }
+            cmd if cmd == "/rewind" || cmd.starts_with("/rewind ") => {
+                let path = cmd.strip_prefix("/rewind").unwrap().trim();
+                match wait(client.send(Request::RewindRun { session_id: session.id.clone(), run_id: None, path: (!path.is_empty()).then(|| path.to_string()) })) { Ok(v) => say(&rewind_result_text(&v)), Err(e) => say(&format!("Rewind: {e}")) }
+            }
+            "/recap" => {
+                snapshots.insert(client.send(Request::GetSession { id: session.id.clone() }), (session.id.clone(), run_state.generation, true));
+            }
             "/stop" => {
                 client.send(Request::InterruptRun {
                     session_id: session.id.clone(),
@@ -587,11 +950,14 @@ pub fn run_with(paths: Paths, start: ChatStart, label: &str) -> Result<()> {
                     wait(client.send(Request::CreateSession { name: None }))?,
                 )?;
                 session = s;
+                run_state = RunState::default();
+                feedback = LiveFeedback::default();
                 client.send(Request::Subscribe {
                     sessions: Some(vec![session.id.clone()]),
                     deltas: true,
                     client: Some("TUI (plain)".into()),
                 });
+                snapshots.insert(client.send(Request::GetSession { id: session.id.clone() }), (session.id.clone(), run_state.generation, false));
                 say(&format!("New Session: {}.", session.name));
             }
             "/sessions" => {
@@ -608,11 +974,14 @@ pub fn run_with(paths: Paths, start: ChatStart, label: &str) -> Result<()> {
                 match cmd["/switch ".len()..].trim().parse::<usize>().ok().and_then(|n| list.get(n.wrapping_sub(1))) {
                     Some(s) => {
                         session = s.clone();
+                        run_state = RunState::default();
+                        feedback = LiveFeedback::default();
                         client.send(Request::Subscribe {
                             sessions: Some(vec![session.id.clone()]),
                             deltas: true,
                             client: Some("TUI (plain)".into()),
                         });
+                        snapshots.insert(client.send(Request::GetSession { id: session.id.clone() }), (session.id.clone(), run_state.generation, false));
                         say(&format!("Switched to {}.", session.name));
                     }
                     None => say("No Session with that number; /sessions lists them."),
@@ -639,6 +1008,172 @@ pub fn run_with(paths: Paths, start: ChatStart, label: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn progress(id: Option<&str>, fraction: f64) -> Event {
+        Event::ToolProgress {
+            invocation_id: id.map(str::to_owned),
+            session_id: "s".into(),
+            run_id: "r".into(),
+            tool_name: "same".into(),
+            depth: 0,
+            fraction: Some(fraction),
+            label: "line\n\u{1b}[31m\u{202e}".into(),
+        }
+    }
+
+    #[test]
+    fn progress_throttles_exact_ids_and_keeps_background_identity() {
+        let mut feedback = LiveFeedback::default();
+        let first = feedback.event(&progress(Some("one"), 0.01)).unwrap();
+        assert!(first.contains("[one]"));
+        assert!(!first.contains('\u{1b}'));
+        assert!(!first.contains('\u{202e}'));
+        assert!(feedback.event(&progress(Some("one"), 0.02)).is_none());
+        assert!(feedback.event(&progress(Some("two"), 0.02)).is_some());
+        assert!(feedback.event(&progress(Some("one"), 0.25)).is_some());
+        assert!(feedback.event(&progress(Some("one"), 1.0)).is_some());
+        assert!(feedback.event(&progress(Some("one"), 1.0)).is_none());
+        assert!(feedback.event(&progress(None, 1.0)).is_none());
+        feedback.event(&Event::RunFinished {
+            session_id: "s".into(),
+            run_id: "r".into(),
+            status: "completed".into(),
+        });
+        assert!(feedback.progress.keys().any(|(_, id)| id == "two"));
+        feedback.event(&Event::InvocationCompleted {
+            session_id: "s".into(),
+            invocation_id: Some("two".into()),
+            handle: "h".into(),
+            tool_name: "same".into(),
+            ok: true,
+        });
+        assert!(!feedback.progress.keys().any(|(_, id)| id == "two"));
+    }
+
+    #[test]
+    fn rpc_wait_preserves_interleaved_critical_events_and_responses_in_order() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(ServerMessage::Event(Event::RunStarted {
+            session_id: "s".into(),
+            run_id: "r".into(),
+        }))
+        .unwrap();
+        tx.send(ServerMessage::Response {
+            id: 8,
+            ok: false,
+            result: None,
+            error: Some("other request".into()),
+        })
+        .unwrap();
+        tx.send(ServerMessage::Event(Event::PlanUpdated {
+            session_id: "s".into(),
+            items: vec![],
+            plan_state: None,
+        }))
+        .unwrap();
+        tx.send(ServerMessage::Response {
+            id: 9,
+            ok: true,
+            result: Some(serde_json::json!({"files": []})),
+            error: None,
+        })
+        .unwrap();
+        let backlog = std::cell::RefCell::new(EventBacklog::default());
+        let sends = std::cell::RefCell::new(crate::client::SendTracker::default());
+        assert_eq!(
+            wait_response(&rx, &sends, &backlog, 9).unwrap()["files"],
+            serde_json::json!([])
+        );
+        let mut backlog = backlog.borrow_mut();
+        assert!(matches!(
+            backlog.pop(),
+            Some(ServerMessage::Event(Event::RunStarted { .. }))
+        ));
+        assert!(matches!(
+            backlog.pop(),
+            Some(ServerMessage::Response { id: 8, .. })
+        ));
+        assert!(matches!(
+            backlog.pop(),
+            Some(ServerMessage::Event(Event::PlanUpdated { .. }))
+        ));
+        assert!(backlog.pop().is_none());
+        assert_eq!(backlog.bytes, 0);
+        backlog.bytes = 4 * 1024 * 1024;
+        assert!(backlog
+            .push(ServerMessage::Event(Event::Note {
+                session_id: None,
+                text: "overflow".into()
+            }))
+            .unwrap_err()
+            .to_string()
+            .contains("reconnect"));
+    }
+
+    #[test]
+    fn unfinished_calls_are_not_reported_as_finished() {
+        let text = recap_text(&RunRecap {
+            total_calls: Some(5),
+            unfinished_calls: 5,
+            ..Default::default()
+        });
+        assert!(
+            text.contains("5 total calls; 0 finished calls; 5 unfinished calls"),
+            "{text}"
+        );
+        assert!(text.contains("Used: none recorded"));
+        let legacy = recap_text(&RunRecap::default());
+        assert!(legacy.contains("unknown total calls; unknown finished calls"));
+    }
+
+    #[test]
+    fn snapshot_restores_once_and_live_new_run_rejects_old_recap() {
+        let recap = RunRecap {
+            status: "paused".into(),
+            total_calls: Some(5),
+            unfinished_calls: 1,
+            used: vec!["read ×4".into()],
+            built: vec!["created helper v1".into()],
+            files: vec!["modified a.rs".into()],
+            steered: 2,
+            untracked_writes_possible: true,
+            ..Default::default()
+        };
+        let snapshot = serde_json::json!({"latest_run": {"run_id":"old"}, "last_recap": RecordedRunRecap { run_id: "old".into(), recap: recap.clone() }, "plan": [{"content":"finish","status":"in_progress"}], "plan_state": {"run_id":"old","run_status":"paused","origin":"live"}});
+        let mut state = RunState::default();
+        let lines = state.snapshot(0, &snapshot, false);
+        assert_eq!(lines.len(), 2);
+        for required in [
+            "status paused",
+            "5 total calls",
+            "1 unfinished",
+            "2 steering",
+            "Used: read",
+            "Built: created helper",
+            "Files: modified",
+            "Untracked writes",
+        ] {
+            assert!(lines[1].contains(required), "{}", lines[1]);
+        }
+        assert!(lines[0].contains("0/1 done; paused; live. Current: finish."));
+        assert!(state.snapshot(0, &snapshot, false).is_empty());
+        assert!(!state.accept(&Event::RunRecap {
+            session_id: "s".into(),
+            run_id: "old".into(),
+            recap: recap.clone()
+        }));
+        assert!(state.accept(&Event::RunStarted {
+            session_id: "s".into(),
+            run_id: "new".into()
+        }));
+        assert!(state.snapshot(0, &snapshot, false).is_empty());
+        assert!(!state.accept(&Event::RunRecap {
+            session_id: "s".into(),
+            run_id: "old".into(),
+            recap
+        }));
+        assert!(state.recap.is_none());
+    }
 
     #[test]
     fn gap_recovery_requests_and_prints_recorded_usage_and_activity() {

@@ -1117,16 +1117,50 @@ pub struct PlanItem {
     pub status: String,
 }
 
+/// Ownership and lifecycle of the legacy plan item list. Missing fields are
+/// unknown; foreign/copied Run IDs never grant local write authority.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlanState {
+    #[serde(default)]
+    pub run_id: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+    #[serde(default)]
+    pub run_status: Option<String>,
+    #[serde(default)]
+    pub previous_task: bool,
+    /// "live", "resumed", "copied", "imported", or "legacy"; empty is unknown.
+    #[serde(default)]
+    pub origin: String,
+}
+
+/// The immutable terminal recap recorded for this exact owned Run.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RecordedRunRecap {
+    pub run_id: String,
+    pub recap: RunRecap,
+}
+
 /// "What I did": a long Run's recap from its trace, no model call
 /// (SPEC §5.7).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct RunRecap {
+    /// Empty means the terminal status was not recorded by a legacy producer.
+    #[serde(default)]
+    pub status: String,
+    /// All actual calls, including the unfinished subset. None is legacy unknown.
+    #[serde(default)]
+    pub total_calls: Option<i64>,
+    /// The subset still running at this snapshot; excluded from terminal outcomes.
+    #[serde(default)]
+    pub unfinished_calls: i64,
     /// Programs and MCP tools may have changed paths outside file tracking.
     #[serde(default)]
     pub untracked_writes_possible: bool,
     pub steps: i64,
     pub duration_ms: i64,
-    /// "read_file ×3", "fetch_page ×2 (1 failed)".
+    /// Terminal calls only, including nested calls: "read_file ×3",
+    /// "fetch_page ×2 (1 failed)". Unfinished calls are excluded.
     pub used: Vec<String>,
     /// "created csv_stats v1", "updated git_log v3".
     pub built: Vec<String>,
@@ -2805,6 +2839,8 @@ pub enum Event {
     PlanUpdated {
         session_id: String,
         items: Vec<PlanItem>,
+        #[serde(default)]
+        plan_state: Option<PlanState>,
     },
     /// At the end of a long Run (4+ steps): what it did, for a
     /// collapsible "What I did" block under the answer.
@@ -3315,6 +3351,52 @@ pub fn artifact_refs(text: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_plan_and_recap_lifecycle_fields_are_unknown_and_new_records_round_trip() {
+        let legacy: super::Event = serde_json::from_value(
+            serde_json::json!({"type":"plan_updated","session_id":"s","items":[]}),
+        )
+        .unwrap();
+        let super::Event::PlanUpdated { plan_state, .. } = legacy else {
+            panic!("wrong event")
+        };
+        assert_eq!(plan_state, None);
+        let metadata: super::PlanState = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(metadata, super::PlanState::default());
+        let recap: super::RunRecap = serde_json::from_value(serde_json::json!({"steps":4,"duration_ms":1,"used":["tool ×7"],"built":[],"files":[],"steered":0})).unwrap();
+        assert_eq!(recap.status, "");
+        assert_eq!(recap.total_calls, None);
+        assert_eq!(recap.unfinished_calls, 0);
+        let record = super::RecordedRunRecap {
+            run_id: "owned".into(),
+            recap: super::RunRecap {
+                status: "paused".into(),
+                total_calls: Some(7),
+                unfinished_calls: 2,
+                ..recap
+            },
+        };
+        assert_eq!(
+            serde_json::from_value::<super::RecordedRunRecap>(
+                serde_json::to_value(&record).unwrap()
+            )
+            .unwrap(),
+            record
+        );
+        let metadata = super::PlanState {
+            run_id: None,
+            updated_at: Some("2026-11-02T00:00:00Z".into()),
+            run_status: Some("interrupted".into()),
+            previous_task: true,
+            origin: "imported".into(),
+        };
+        assert_eq!(
+            serde_json::from_value::<super::PlanState>(serde_json::to_value(&metadata).unwrap())
+                .unwrap(),
+            metadata
+        );
+    }
+
     #[test]
     fn legacy_invocation_identity_and_progress_diagnostics_default_and_round_trip() {
         for kind in [

@@ -42,6 +42,13 @@ pub use runfile_storage::{
     RunFileAdmission, RunFileRecord, RunFileRetention, RunFileUsage, StoredRunFile,
 };
 
+#[path = "run_state_storage.rs"]
+mod run_state_storage;
+
+#[path = "recap_storage.rs"]
+mod recap_storage;
+pub(crate) use recap_storage::RecapRunFacts;
+
 pub struct Store {
     conn: Connection,
     /// Bumped whenever stored messages change other than by appending
@@ -386,7 +393,7 @@ impl ModelStat {
 const SESSION_SUMMARY: &str = "s.*";
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 66;
+pub const SCHEMA_VERSION: i64 = 67;
 
 /// Add a column, tolerating only "it already exists" (a step that was
 /// partly applied by an older build); every other error is real.
@@ -471,7 +478,7 @@ fn migrate_v39(c: &Connection) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 66] = [
+const MIGRATIONS: [(i64, MigrationStep); 67] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -792,6 +799,10 @@ const MIGRATIONS: [(i64, MigrationStep); 66] = [
         add_column(c, "run_files", "after_state TEXT")?;
         add_column(c, "run_files", "not_kept_reason TEXT")?;
         add_column(c, "runs", "untracked_writes_possible INTEGER NOT NULL DEFAULT 0 CHECK(untracked_writes_possible IN (0,1))")
+    }),
+    (67, |c| {
+        add_column(c, "sessions", "plan_state TEXT")?;
+        Ok(c.execute_batch(run_state_storage::SCHEMA)?)
     }),
 ];
 
@@ -1542,6 +1553,8 @@ impl Store {
         self.note_rewrite();
         self.transaction(|st| {
             st.ex("DELETE FROM run_files WHERE session_id=?1 OR run_id IN (SELECT id FROM runs WHERE session_id=?1)", params![id])?;
+            st.ex("DELETE FROM run_recaps WHERE session_id=?1 OR run_id IN (SELECT id FROM runs WHERE session_id=?1)",params![id])?;
+            st.ex("DELETE FROM session_plan_revisions WHERE session_id=?1",params![id])?;
             Ok(st.ex("DELETE FROM sessions WHERE id=?1", params![id])? > 0)
         })
     }
@@ -1746,6 +1759,9 @@ impl Store {
         let Some(orig) = self.get_session(id)? else {
             return Ok(None);
         };
+        if self.session_deleted(id)? {
+            return Ok(None);
+        }
         let limit = up_to_seq.unwrap_or(i64::MAX);
         let messages: Vec<MessageInfo> = self
             .list_messages(id)?
@@ -1765,6 +1781,13 @@ impl Store {
         for message in messages {
             self.ex("INSERT INTO messages(id,session_id,seq,role,content,created_at,meta) VALUES(?1,?2,?3,?4,?5,?6,?7)", params![uuid::Uuid::new_v4().to_string(),fork.id,message.seq,message.role,message.content,message.created_at,message.meta])?;
         }
+        let complete = up_to_seq.is_none()
+            || !self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM messages WHERE session_id=?1 AND seq>?2)",
+                params![id, point],
+                |r| r.get::<_, bool>(0),
+            )?;
+        self.copy_plan_at(id, &fork.id, point, complete)?;
         for (source_id, summary, up_to) in checkpoints {
             let copied_id = self.save_checkpoint(&fork.id, &summary, up_to)?;
             // The summary's evidence can outlive the original message rows.
@@ -1884,6 +1907,7 @@ impl Store {
                 "UPDATE sessions SET updated_at=?2 WHERE id=?1",
                 params![session_id, now()],
             )?;
+            st.truncate_plan_revisions(session_id, msg.seq)?;
             msg.content = content.to_string();
             Ok(Some(msg))
         })
@@ -2662,13 +2686,13 @@ impl Store {
         ).optional()?)
     }
 
-    /// What a Run called: (name, calls, failed), registry Tools and
-    /// built-ins together, most-used first (the "What I did" recap).
+    /// Finished calls in a Run: (name, count, failed), including nested
+    /// Invocations and built-ins. Unfinished calls are counted separately.
     pub fn run_calls(&self, run_id: &str) -> Result<Vec<(String, i64, i64)>> {
         let mut stmt = self.ps("SELECT name, COUNT(*), SUM(failed) FROM (
-               SELECT t.name AS name, (i.status NOT IN ('success','running','pending')) AS failed
+               SELECT t.name AS name, (i.status <> 'success') AS failed
                  FROM invocations i JOIN tools t ON t.id=i.tool_id
-                WHERE i.run_id=?1 AND i.parent_id IS NULL
+                WHERE i.run_id=?1 AND i.status NOT IN ('running','pending')
                UNION ALL
                SELECT name, (ok=0) FROM builtin_calls WHERE run_id=?1)
              GROUP BY name ORDER BY COUNT(*) DESC, name")?;
@@ -2684,34 +2708,19 @@ impl Store {
         Ok(rows)
     }
 
-    /// The agent's plan for a Session (`update_plan`); empty when none.
+    /// The authoritative item list, with legacy metadata kept separately.
     pub fn session_plan(&self, session_id: &str) -> Result<Vec<formless_protocol::PlanItem>> {
-        use rusqlite::OptionalExtension;
-        let raw: Option<Option<String>> = self
-            .conn
-            .query_row(
-                "SELECT plan FROM sessions WHERE id=?1",
-                params![session_id],
-                |r| r.get(0),
-            )
-            .optional()?;
-        Ok(raw
-            .flatten()
-            .and_then(|p| serde_json::from_str(&p).ok())
-            .unwrap_or_default())
+        self.session_plan_snapshot(session_id)
+            .map(|(items, _)| items)
     }
 
+    /// Legacy fixture/import compatibility. Live agents must supply their Run.
     pub fn set_session_plan(
         &self,
         session_id: &str,
         items: &[formless_protocol::PlanItem],
     ) -> Result<()> {
-        let plan = (!items.is_empty()).then(|| serde_json::to_string(items).unwrap_or_default());
-        self.ex(
-            "UPDATE sessions SET plan=?2 WHERE id=?1",
-            params![session_id, plan],
-        )?;
-        Ok(())
+        self.set_legacy_plan(session_id, items)
     }
 
     /// Roughly what fills the database, in bytes of stored text/blobs.
@@ -6502,6 +6511,9 @@ pub fn build_context(
     )
 }
 
+#[path = "plan_context.rs"]
+mod plan_context;
+
 /// [`build_context`] for one Session, kept between agent steps: each build
 /// reads only messages newer than the last one seen and keeps a running
 /// token estimate. It starts over when the system prompt or checkpoint
@@ -6648,13 +6660,22 @@ impl ContextCache {
             }
             self.push(msg);
         }
-        let tokens: usize = self.tokens.iter().sum();
+        // Plan state is read on every projection, outside the cached base and
+        // persisted prompt. Forecasts, compaction and dispatch share this path.
+        let mut context = self.ctx.clone();
+        let mut tokens: usize = self.tokens.iter().sum();
+        if plan_context::append(store, session_id, &mut context)? {
+            let projected = crate::provenance::project(&context[..1]);
+            tokens = tokens
+                .saturating_sub(self.tokens.first().copied().unwrap_or(0))
+                .saturating_add(crate::tokens::value(&projected[0]));
+        }
         let over = (tokens as f64) > (context_tokens as f64 * trigger_fraction);
         let (needs, compact_up_to) = match self.turn_cut() {
             Some(cut) if over => (true, cut),
             _ => (false, up_to),
         };
-        Ok((self.ctx.clone(), needs, compact_up_to))
+        Ok((context, needs, compact_up_to))
     }
 
     /// Where to compact: the end of a whole turn (just before a user

@@ -1,6 +1,7 @@
 mod cli_attach;
 mod cli_commands;
 mod cli_pipeline;
+mod cli_run_identity;
 mod table;
 
 use anyhow::{bail, Context, Result};
@@ -3811,8 +3812,9 @@ fn run_headless(
     // text mode, and in final mode when someone is watching.
     let policy = formless_core::pipeline::CompiledRunOptions::compile(options.clone())?;
     let stream = output == RunOutput::Text && !policy.has_schema() && output_file.is_none();
+    let mut live_feedback = formless_tui::plain::LiveFeedback::default();
     let mut event_output = Vec::new();
-    let mut actual_run_id: Option<String> = None;
+    let mut target = cli_run_identity::Target::default();
     let progress = !quiet
         && match output {
             RunOutput::Text => true,
@@ -3822,6 +3824,7 @@ fn run_headless(
     let interactive = matches!(output, RunOutput::Text | RunOutput::Final);
     let mut final_answer: Option<String> = None;
     let mut run_error: Option<String> = None;
+    let mut paused_exit_code = None;
     let mut budget_stopped = false;
     let mut summary = RunSummary::default();
     let cfg = Config::load(&paths)?;
@@ -3945,16 +3948,17 @@ fn run_headless(
             headless_preview_request(&client, &rx, Request::ConfirmForecast { id })?;
         }
     }
-    if options.is_empty() {
-        critical.insert(sends.send(&client, session_id.clone(), task, SendMode::Send));
+    let send_request = if options.is_empty() {
+        sends.send(&client, session_id.clone(), task, SendMode::Send)
     } else {
-        critical.insert(client.send(Request::StartPipelineRun {
+        client.send(Request::StartPipelineRun {
             session_id: session_id.clone(),
             content: task,
             options: options.clone(),
             client_msg_id: Some(format!("pipeline-{}", std::process::id())),
-        }));
-    }
+        })
+    };
+    critical.insert(send_request);
     let sigints = count_sigints();
     let mut interrupting = false;
     let mut code = 1;
@@ -3969,9 +3973,11 @@ fn run_headless(
                         "timed out after {}; interrupting the run",
                         format_duration(limit)
                     );
-                    client.send(Request::InterruptRun {
-                        session_id: session_id.clone(),
-                    });
+                    if let Some(run_id) = &target.run_id {
+                        client.send(Request::CancelRunId {
+                            run_id: run_id.clone(),
+                        });
+                    }
                     timed_out = Some(std::time::Instant::now());
                 }
                 Some(at) if at.elapsed() >= std::time::Duration::from_secs(10) => break,
@@ -3985,17 +3991,23 @@ fn run_headless(
             1 if !interrupting => {
                 interrupting = true;
                 eprintln!("interrupting the run… (Ctrl+C again to quit now)");
-                client.send(Request::InterruptRun {
-                    session_id: session_id.clone(),
-                });
+                if let Some(run_id) = &target.run_id {
+                    client.send(Request::CancelRunId {
+                        run_id: run_id.clone(),
+                    });
+                }
             }
             1 => {}
             _ => return Ok(130),
         }
-        let msg = match rx.recv_timeout(std::time::Duration::from_millis(100)) {
-            Ok(msg) => Ok(msg),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(e) => Err(e),
+        let msg = if let Some(event) = target.next() {
+            Ok(ServerMessage::Event(event))
+        } else {
+            match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok(msg) => Ok(msg),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(e) => Err(e),
+            }
         };
         if let Ok(ServerMessage::Response { id, .. }) = &msg {
             sends.answered(*id);
@@ -4006,13 +4018,25 @@ fn run_headless(
                 if ev.session_id() != Some(session_id.as_str()) {
                     continue;
                 }
+                if target.waiting() {
+                    target.buffer(ev)?;
+                    continue;
+                }
+                if !target.accepts(&ev)? {
+                    continue;
+                }
+                if progress {
+                    if let Some(text) = live_feedback.event(&ev) {
+                        eprintln!("{text}");
+                    }
+                }
                 if json_out {
                     let line = format!("{}\n", serde_json::to_string(&ev)?);
                     if output_file.is_some() {
                         if event_output.len().saturating_add(line.len())
                             > formless_core::pipeline::MAX_RESULT_FILE_BYTES
                         {
-                            if let Some(run_id) = &actual_run_id {
+                            if let Some(run_id) = &target.run_id {
                                 client.send(Request::CancelRunId {
                                     run_id: run_id.clone(),
                                 });
@@ -4025,17 +4049,19 @@ fn run_headless(
                     }
                 }
                 match ev {
-                    Event::RunStarted { run_id, .. } => actual_run_id = Some(run_id),
+                    Event::RunStarted { .. } => {}
                     Event::RunFilesChanged {
                         files,
                         untracked_writes_possible,
                         ..
                     } => {
-                        write_run_file_notice(
-                            &mut std::io::stderr().lock(),
-                            &files,
-                            untracked_writes_possible,
-                        );
+                        if progress {
+                            write_run_file_notice(
+                                &mut std::io::stderr().lock(),
+                                &files,
+                                untracked_writes_possible,
+                            );
+                        }
                     }
                     Event::MessageDelta { delta, .. } => {
                         if stream {
@@ -4146,12 +4172,8 @@ fn run_headless(
                         });
                     }
                     Event::RunPaused {
-                        run_id,
-                        error,
-                        explained,
-                        ..
+                        error, explained, ..
                     } => {
-                        actual_run_id = Some(run_id);
                         let schema_mismatch = error.starts_with("schema:");
                         budget_stopped = error.starts_with("budget:");
                         run_error = Some(
@@ -4170,11 +4192,14 @@ fn run_headless(
                             None => eprintln!("run paused: {error}"),
                         }
                         code = if schema_mismatch { 3 } else { 1 };
-                        break;
+                        paused_exit_code = Some(code);
+                        // The terminal tail persists and emits the recap before
+                        // RunFinished. Keep receiving it after the early pause
+                        // notice, including in JSONL event output.
                     }
-                    Event::RunFinished { run_id, status, .. } => {
-                        actual_run_id = Some(run_id);
+                    Event::RunFinished { status, .. } => {
                         code = match status.as_str() {
+                            "paused" => paused_exit_code.unwrap_or(1),
                             "completed" => 0,
                             "interrupted" => 130,
                             _ => 1,
@@ -4204,8 +4229,15 @@ fn run_headless(
                 result: Some(result),
                 ..
             }) if critical.contains(&id) => {
-                if let Some(run) = result["run_id"].as_str() {
-                    actual_run_id = Some(run.to_owned());
+                if id == send_request {
+                    target.acknowledge(&result)?;
+                    if interrupting || timed_out.is_some() {
+                        if let Some(run_id) = &target.run_id {
+                            client.send(Request::CancelRunId {
+                                run_id: run_id.clone(),
+                            });
+                        }
+                    }
                 }
             }
             Ok(_) => {}
@@ -4234,7 +4266,8 @@ fn run_headless(
         final_answer = None;
     }
     if budget_stopped {
-        let spend = actual_run_id
+        let spend = target
+            .run_id
             .as_ref()
             .and_then(|run_id| {
                 formless_tui::client::request_once(
@@ -4756,6 +4789,23 @@ enum SessionsAction {
         #[arg(long)]
         json: bool,
     },
+    /// Show a Run's tracked files and diffs
+    Files {
+        id: String,
+        #[arg(long)]
+        run: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Attempt safe restoration of one path or all tracked files
+    Rewind {
+        id: String,
+        path: Option<String>,
+        #[arg(long)]
+        run: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Rename a Session
     Rename { id: String, name: String },
     /// Delete a Session (restorable for daemon.delete_undo_secs)
@@ -4895,6 +4945,36 @@ fn sessions_cmd(paths: Paths, action: SessionsAction) -> Result<()> {
                 } else if !m.content.trim().is_empty() {
                     println!("\n{who}:\n{}", m.content.trim_end());
                 }
+            }
+        }
+        SessionsAction::Files { id, run, json } => {
+            let session = find_session(&paths, &id)?;
+            let result = daemon(Request::RunFiles {
+                session_id: session.id,
+                run_id: run,
+            })?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!("{}", formless_tui::plain::files_result_text(&result)?);
+            }
+        }
+        SessionsAction::Rewind {
+            id,
+            path,
+            run,
+            json,
+        } => {
+            let session = find_session(&paths, &id)?;
+            let result = daemon(Request::RewindRun {
+                session_id: session.id,
+                run_id: run,
+                path,
+            })?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!("{}", formless_tui::plain::rewind_result_text(&result));
             }
         }
         SessionsAction::Rename { id, name } => {

@@ -2946,7 +2946,9 @@ async fn update_plan_is_stored_and_broadcast() {
             .unwrap()
             .unwrap();
         match serde_json::from_str::<ServerMessage>(&line) {
-            Ok(ServerMessage::Event(Event::PlanUpdated { items, .. })) => updates.push(items),
+            Ok(ServerMessage::Event(Event::PlanUpdated {
+                items, plan_state, ..
+            })) => updates.push((items, plan_state)),
             Ok(ServerMessage::Event(Event::RunFinished { status, .. })) => {
                 assert_eq!(status, "completed");
                 break;
@@ -2955,8 +2957,20 @@ async fn update_plan_is_stored_and_broadcast() {
             _ => {}
         }
     }
-    assert_eq!(updates.len(), 1, "the invalid plan is not broadcast");
-    assert_eq!(updates[0][1].status, "in_progress");
+    assert_eq!(updates.len(), 2, "only the valid plan and its terminal lifecycle are broadcast; the invalid enum is not broadcast");
+    assert_eq!(
+        updates[0].0, updates[1].0,
+        "lifecycle does not replace the checklist with invalid items"
+    );
+    assert_eq!(updates[0].0[1].status, "in_progress");
+    assert_eq!(
+        updates[0].1.as_ref().unwrap().run_status.as_deref(),
+        Some("running")
+    );
+    assert_eq!(
+        updates[1].1.as_ref().unwrap().run_status.as_deref(),
+        Some("completed")
+    );
     let plan = c.rpc(Request::GetSession { id: id.clone() }).await["plan"].clone();
     assert_eq!(plan.as_array().unwrap().len(), 3, "{plan}");
     server.abort();

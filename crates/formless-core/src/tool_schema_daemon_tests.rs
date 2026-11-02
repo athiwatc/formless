@@ -101,7 +101,8 @@ async fn schema_save_flag_is_required_despite_forged_author_and_reports_reach_re
         .to_string()
         .contains("must be a boolean"));
     args["allow_breaking"] = json!(true);
-    let (saved, id) = daemon.create_tool_impl(&args, &cfg, &cancel).await.unwrap();
+    let (saved, change) = daemon.create_tool_impl(&args, &cfg, &cancel).await.unwrap();
+    let id = change.tool_id;
     assert_eq!(id, tool.id);
     let saved: Value = serde_json::from_str(&saved).unwrap();
     assert_eq!(saved["version"], 2);

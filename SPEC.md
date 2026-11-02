@@ -1425,26 +1425,81 @@ pasting paths.
   `path:line` context from the exact current decision set. It appends the user's
   comment with a data-framed context and steers an existing Run. When idle it
   saves the comment for a later explicit Run; it never starts a model request.
-- **What I did.** After a Run of 4 or more steps, `RunRecap {steps,
-  duration_ms, used, built, files, steered, untracked_writes_possible}` sums up
-  its trace with no model call: Tools and built-ins called (with counts and failures),
-  Tools created or updated, tracked paths changed, and how often the user steered.
-  Both folded and expanded recaps show the possible-untracked-writes caveat,
-  even when their tracked-path list is empty.
-  The TUI shows a folded "▸ What I did" line under the answer (`/recap`
-  expands it); the web shows it as a collapsible block.
+- **What I did.** After an eligible terminal Run of 4 or more steps,
+  `RunRecap {status, steps, duration_ms, total_calls?, unfinished_calls, used,
+  built, files, steered, untracked_writes_possible}` summarizes its own trace
+  without a model call. Read the exact owned terminal `runs` row, including its
+  valid stored start/end timestamps; a missing, foreign, nonterminal or invalid
+  row produces no fabricated recap. Never look up a Run through a recent-results
+  page or substitute an empty timestamp. Count steering from parsed steering
+  metadata within that Run's timestamp window and its recorded message-sequence
+  bounds when available, without loading all Session message bodies.
+- `used` includes nested and top-level terminal Invocations plus built-in calls,
+  with counts and failures. `total_calls` counts all actual calls, including the
+  `unfinished_calls` subset; it is not the number of distinct Tool names. Running
+  and pending Invocations do not appear in `used` or in successful/failed outcome
+  totals. Their separate unfinished count describes the terminal snapshot time. Status is explicit: paused, interrupted and failed recaps describe
+  partial work rather than implying that the Run completed successfully. Legacy
+  empty status and absent totals mean unknown, not an invented outcome.
+- Capture the actual Tool changes and tracked path descriptions from that
+  execution, and save the bounded exact terminal recap before broadcasting it.
+  Save failures are reported; no event pretends that an unsaved recap is durable.
+  The snapshot survives restart/reconnect and is never reconstructed from current
+  file contents or a later mutable Run row. Resume creates a **new Run ID**:
+  its metrics, steering and builds do not implicitly inherit the old Run's work.
+  The old paused recap remains its original historical snapshot even after that
+  row is marked resumed. Legacy/crash gaps remain unavailable; timestamp guesses
+  never attribute unrelated Tool versions to a Run. A latest ineligible or legacy
+  Run with no snapshot does not silently select an older recap.
+- Folded and expanded recaps include the possible-untracked-writes caveat even
+  when their tracked-path list is empty. The TUI shows a folded "▸ What I did"
+  line under the answer (`/recap` expands it); the web shows a collapsible block.
 
 ### 5.8 The agent's plan
 
 - `update_plan(items)` is a built-in for tasks of 3 or more steps: a
   checklist of up to 20 `{content, status}` items (`pending`,
   `in_progress`, `completed`; at most 200 characters each). Each call
-  replaces the whole list; an empty list clears it. It is stored on the
-  Session (`sessions.plan`, schema v51), returned by `GetSession` as
-  `plan`, and broadcast as `PlanUpdated {session_id, items}`.
+  replaces the whole list; an empty list clears it. At most one step may
+  be `in_progress`. Only the Session's current, owned, active main-agent Run
+  may write it; sub-agents return suggested steps to the main agent, and
+  stale or background calls cannot replace the checklist.
+- Schema 67 binds new plan revisions to their Run, update time and actual
+  message boundary. Legacy rows retain their items without invented ownership
+  or timestamps. `GetSession` retains legacy `plan` and adds typed `plan_state`;
+  `PlanUpdated` retains `items` and includes the same metadata. The owning
+  Run's durable status exposes paused, interrupted and failed work without
+  silently changing item statuses. A new unrelated Run preserves the old plan
+  as a previous task; explicit Resume creates a new Run and hands its plan
+  forward without losing the steps.
+- Every nonempty plan is bounded and framed as data at a fixed position in
+  the single leading system message. This modifies only a projected context
+  clone, preserving the stored prompt and cache base. Context budgeting,
+  compaction and forecasts include these bytes. The first request remains the
+  frozen admission snapshot described by its quote; its source Run metadata
+  describes that recorded checklist, and subsequent turns read current state.
+- Historical forks copy the latest known revision at the actual copied
+  message boundary, including clear revisions; later plans never leak into an
+  earlier fork. Portable Session/ExportAll bundles include plan data and known
+  history. Copied/imported plans retain honest detached provenance rather than
+  acquiring authority from a foreign Run ID. Editing/retrying a message removes
+  plan revisions derived from the rewritten branch.
+- Each stored plan/revision and metadata image is bounded to 64 KiB.
+  Updates at the same committed message boundary coalesce; unchanged owned
+  items do not add revisions. Explicit clears are revisions too. History stays
+  linear in retained message boundaries and is not silently expired. Message
+  deletion removes anchored revisions; Session purge removes plan revisions and
+  recorded recaps. Portable bundles include `plan`, `plan_state`, `plan_history`
+  and explicit message sequences. Import maps boundaries to the new transcript,
+  strips foreign Run ownership and timestamps, and marks the state imported;
+  it cannot overwrite an existing local plan or Run. A full legacy fork can
+  retain its current checklist as copied and unowned, while an earlier cut
+  never guesses where an unversioned legacy plan belonged.
 - The TUI pins it at the end of the chat, just above the input (`✓` done,
-  `▸` in progress, `○` pending) and the web above the composer. Once every
-  step is done and no Run is active it folds to "✓ Plan done (n/n)".
+  `▸` in progress, `○` pending) and the web above the composer. Lifecycle and
+  previous-task labels distinguish stopped or older checklists from active
+  work. Once every step is done and no Run is active it folds to
+  "✓ Plan done (n/n)".
 
 ### 5.9 Step mode
 

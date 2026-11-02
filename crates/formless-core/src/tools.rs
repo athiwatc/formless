@@ -405,7 +405,7 @@ fn update_plan_definition() -> Value {
         "type": "function",
         "function": {
             "name": UPDATE_PLAN,
-            "description": "For a task of 3 or more distinct steps, keep a short checklist the user sees pinned above the input. Send the whole list each time (it replaces the last one): set a step in_progress when you start it and completed when it is done, with exactly one in_progress while working. Skip it for simple tasks; send an empty list to clear it.",
+            "description": "For a task of 3 or more distinct steps, keep a short checklist the user sees pinned above the input. Send the whole list each time (it replaces the last one): set a step in_progress when you start it and completed when it is done, with at most one in_progress. Only the main agent of the current Run may replace this Session checklist; sub-agents should return suggested steps instead. The saved checklist is provided as context data, including its source Run and lifecycle. Skip it for simple tasks; send an empty list to clear it.",
             "parameters": {
                 "type": "object",
                 "properties": {

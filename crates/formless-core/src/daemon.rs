@@ -620,6 +620,8 @@ pub struct Daemon {
     /// so a slow read never holds up writes behind the main store lock.
     readers: Vec<StdMutex<Store>>,
     pub(crate) runs: Arc<StdMutex<HashMap<String, RunCtl>>>,
+    /// Runs whose terminal snapshot/event publication has not finished yet.
+    run_publications: StdMutex<HashMap<(String, String), usize>>,
     approvals: Arc<StdMutex<HashMap<String, ApprovalReply>>>,
     /// Outstanding interactive prompts, replayable after a client reconnects.
     pending_attention: StdMutex<Vec<Event>>,
@@ -651,6 +653,8 @@ pub struct Daemon {
     input_taint: crate::approval_preview::TaintIndex,
     #[cfg(test)]
     forecast_admission_test: StdMutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    session_snapshot_test: StdMutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
     approval_transition_test: StdMutex<Option<Arc<dyn Fn(&str, &str) + Send + Sync>>>,
     /// Per-Session step caps from `/limit` / `--max-steps`, for the active
@@ -893,6 +897,7 @@ impl Daemon {
             store: Arc::new(StdMutex::new(store)),
             readers,
             runs: Arc::new(StdMutex::new(HashMap::new())),
+            run_publications: StdMutex::new(Default::default()),
             approvals: Arc::new(StdMutex::new(HashMap::new())),
             pending_attention: StdMutex::new(Vec::new()),
             next_conn: AtomicU64::new(1),
@@ -914,6 +919,8 @@ impl Daemon {
             input_taint: Arc::new(StdMutex::new(Default::default())),
             #[cfg(test)]
             forecast_admission_test: StdMutex::new(None),
+            #[cfg(test)]
+            session_snapshot_test: StdMutex::new(None),
             #[cfg(test)]
             approval_transition_test: StdMutex::new(None),
             step_limits: StdMutex::new(Default::default()),
@@ -1817,33 +1824,44 @@ impl Daemon {
                 Ok(serde_json::to_value(s)?)
             }
             Request::GetSession { id } => {
-                let (session, messages, queued, last, latest_run) = self.with_reader(|st| {
-                    let s = st
-                        .get_session(&id)?
-                        .filter(|_| !st.session_deleted(&id).unwrap_or(false))
-                        .context(RequestFailure::not_found("session not found"))?;
-                    let m = st.list_messages(&id)?;
-                    let q = (st.queued_items(&id)?, st.session_plan(&id)?);
-                    let l = st.unfinished_last_run(&id)?;
-                    let latest = st
-                        .last_run(&id)?
-                        .map(|(rid, _)| st.inspect_run(&rid))
-                        .transpose()?
-                        .flatten();
-                    Ok((s, m, q, l, latest))
-                })?;
+                let (session, messages, queued, last, latest_run, last_recap, running) = self
+                    .with_store(|st| {
+                        st.read_transaction(|st| {
+                            let s = st
+                                .get_session(&id)?
+                                .filter(|_| !st.session_deleted(&id).unwrap_or(false))
+                                .context(RequestFailure::not_found("session not found"))?;
+                            let m = st.list_messages(&id)?;
+                            let q = (st.queued_items(&id)?, st.session_plan_snapshot(&id)?);
+                            let l = st.unfinished_last_run(&id)?;
+                            let latest = st
+                                .last_run(&id)?
+                                .map(|(rid, _)| st.inspect_run(&rid))
+                                .transpose()?
+                                .flatten();
+                            let last_recap = st.latest_recorded_run_recap(&id)?;
+                            // Hold the writer mutex through this sample: terminal
+                            // capture commits its recap before releasing controls.
+                            #[cfg(test)]
+                            if let Some(hook) = self.session_snapshot_test.locked().clone() {
+                                hook();
+                            }
+                            let running = self.runs.locked().contains_key(&id)
+                                || self.session_is_publishing(&id);
+                            Ok((s, m, q, l, latest, last_recap, running))
+                        })
+                    })?;
                 // An unfinished last Run (interrupted/paused) gets a banner
                 // with Resume / Abandon in clients (SPEC §5.4).
-                let running = self.runs.locked().contains_key(&id);
                 let last_run = last.filter(|_| !running).map(|(run_id, status, error)| {
                     json!({"run_id": run_id, "status": status, "error": error})
                 });
                 // `queued`: the texts (as before); `queued_items` adds ids
                 // for editing.
-                let (queued, plan) = queued;
+                let (queued, (plan, plan_state)) = queued;
                 let texts: Vec<&str> = queued.iter().map(|q| q.content.as_str()).collect();
                 Ok(
-                    json!({"session": session, "messages": messages, "queued": texts, "queued_items": queued, "plan": plan, "step_mode": self.step_sessions.locked().contains(&id), "unfinished_run": last_run, "running": running,
+                    json!({"session": session, "messages": messages, "queued": texts, "queued_items": queued, "plan": plan, "plan_state": plan_state, "last_recap": last_recap, "step_mode": self.step_sessions.locked().contains(&id), "unfinished_run": last_run, "running": running,
                         "latest_run": latest_run, "pending_events": self.pending_attention.locked().clone() }),
                 )
             }
@@ -2437,21 +2455,24 @@ impl Daemon {
                 Ok(json!({"started":true}))
             }
             Request::AbandonRun { session_id } => {
-                let last = self
-                    .with_store(|st| st.last_run(&session_id))?
-                    .filter(|(_, s)| s == "interrupted" || s == "paused");
-                let abandoned = match last {
-                    Some((run_id, _)) => {
-                        self.with_store(|st| {
-                            st.set_run_status(&run_id, "abandoned")?;
-                            #[cfg(windows)]
-                            self.prune_retained_capture_leases_in(st);
-                            Ok(())
-                        })?;
-                        true
+                let _admission = self.forecast_admission.locked();
+                let abandoned = self.with_store(|st| {
+                    if self.runs.locked().contains_key(&session_id)
+                        || self.session_is_publishing(&session_id) {
+                        return Err(RequestFailure::busy("The Run is active or still finishing; wait until it finishes before abandoning it").into());
                     }
-                    None => false,
-                };
+                    let Some((run_id, _)) = st.last_run(&session_id)?
+                        .filter(|(_, status)| status == "interrupted" || status == "paused") else {
+                        return Ok(false);
+                    };
+                    st.set_run_status(&run_id, "abandoned")?;
+                    #[cfg(windows)]
+                    self.prune_retained_capture_leases_in(st);
+                    Ok(true)
+                })?;
+                if abandoned {
+                    self.publish_session_plan(&session_id);
+                }
                 Ok(json!({"abandoned": abandoned}))
             }
             // Only meaningful per connection (see `handle_conn`).
@@ -4864,33 +4885,26 @@ impl Daemon {
         self.broadcast(Event::RegistryChanged { change });
     }
 
-    /// Remember that this Run changed a Tool, for its `RunToolChanges`.
-    /// `change` defaults to created (version 1) or updated; one entry per
-    /// Tool, keeping what the Run first did and the version it ended on.
-    fn note_tool_change(&self, run_id: &str, tool_id: &str, change: Option<&str>) {
-        let Ok(Some((info, _))) = self.with_reader(|st| st.get_tool_current(tool_id)) else {
-            return;
-        };
-        let change = change.unwrap_or(if info.current_version == 1 {
-            "created"
-        } else {
-            "updated"
-        });
+    /// Attribute only the exact operation result owned by this Run. Reading
+    /// the current registry here could claim a later version from another Run.
+    fn note_tool_change(&self, run_id: &str, change: ToolChange) {
         let mut all = self.run_tool_changes.locked();
         let list = all.entry(run_id.to_string()).or_default();
-        match list.iter_mut().find(|c| c.tool_id == tool_id) {
-            Some(c) => {
-                c.version = info.current_version;
-                if change == "retired" {
-                    c.change = change.into();
+        match list
+            .iter_mut()
+            .find(|record| record.tool_id == change.tool_id)
+        {
+            Some(record) => {
+                // Concurrent operations of this Run can notify out of order;
+                // only their own captured versions may advance its high water.
+                record.version = record.version.max(change.version);
+                if change.change == "retired"
+                    || (change.change == "created" && record.change != "retired")
+                {
+                    record.change = change.change;
                 }
             }
-            None => list.push(ToolChange {
-                tool_id: tool_id.to_string(),
-                name: info.name,
-                version: info.current_version,
-                change: change.into(),
-            }),
+            None => list.push(change),
         }
     }
 
@@ -4961,7 +4975,8 @@ impl Daemon {
                     .get(&session_id)
                     .map(|c| c.run_id.clone());
                 let step = run_id
-                    .and_then(|r| self.with_reader(|st| st.run_steps(&r)).ok())
+                    .as_deref()
+                    .and_then(|r| self.with_reader(|st| st.run_steps(r)).ok())
                     .unwrap_or(0);
                 let msg = self.append_user_message_meta(
                     &session_id,
@@ -4975,7 +4990,7 @@ impl Daemon {
                 if let Some(ctl) = self.runs.locked().get(&session_id) {
                     let _ = ctl.steer_tx.send(());
                 }
-                Ok(json!({"steered": true}))
+                Ok(json!({"steered": true,"run_id":run_id}))
             }
             (false, _) => {
                 let _settings = self.config_guard();
@@ -5007,8 +5022,8 @@ impl Daemon {
                     session_id: session_id.clone(),
                     message: msg,
                 });
-                self.launch_prepared_run(session_id, run_id, admission)?;
-                Ok(json!({"started":true}))
+                self.launch_prepared_run(session_id, run_id.clone(), admission)?;
+                Ok(json!({"started":true,"run_id":run_id}))
             }
         }
     }
@@ -5032,10 +5047,19 @@ impl Daemon {
         self.with_store(|st| {
             let forecast = self.consented_forecast(st, cfg, input)?;
             st.transaction(|st| {
+                let resumed_from = if input.resume {
+                    st.last_run(session_id)?.map(|(run, _)| run)
+                } else {
+                    None
+                };
                 let output = mutation(st)?;
+                // Freeze the same pre-Run request the forecast described.
                 let admission = self.prepare_run_admission(st, cfg, session_id, &forecast)?;
                 let id = st.create_run(session_id)?;
                 st.record_forecast(&id, &forecast)?;
+                if let Some(previous) = resumed_from {
+                    st.resume_session_plan(session_id, &previous, &id)?;
+                }
                 Ok((output, id, admission))
             })
         })
@@ -5395,6 +5419,7 @@ impl Daemon {
             session_id: session_id.clone(),
             run_id: run_id.clone(),
         });
+        self.publish_session_plan(&session_id);
         let this = self.clone();
         tokio::spawn(async move {
             use futures_util::FutureExt;
@@ -5537,6 +5562,9 @@ impl Daemon {
         if recorded.is_ok() {
             self.sweep_retained_before_action();
         }
+        if recorded.is_ok() {
+            self.publish_session_plan(session_id);
+        }
         if let Err(e) = recorded {
             tracing::error!("could not record run {run_id} as {status}: {e:#}");
             self.broadcast(Event::Note {
@@ -5568,6 +5596,15 @@ impl Daemon {
         .await
         {
             self.finish_tail_failed(&session_id, "Run finish", &p);
+            // An unwind before normal control release must not strand the
+            // Session. A newer Run's controls remain independently owned.
+            let mut runs = self.runs.locked();
+            if runs
+                .get(&session_id)
+                .is_some_and(|run| run.run_id == run_id)
+            {
+                runs.remove(&session_id);
+            }
         }
         self.start_next_queued_message(session_id);
     }
@@ -5596,10 +5633,42 @@ impl Daemon {
     ) {
         let session_id = session_id.to_string();
         let run_id = run_id.to_string();
+        let publication = self.begin_run_publication(&session_id, &run_id);
         self.finish_run_file_capture(&session_id, &run_id);
         if final_status != "paused" {
             self.record_run_status(&session_id, &run_id, final_status);
         }
+        // Persist the exact terminal snapshot before a new Run or Resume can
+        // acquire this Session, and before any recap event advertises it.
+        let changes = self
+            .run_tool_changes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&run_id);
+        let files = match self.run_file_infos(&session_id, &run_id, false) {
+            Ok(files) => files,
+            Err(error) => {
+                self.mark_run_untracked_writes(&session_id, &run_id);
+                self.broadcast(Event::Note {session_id:Some(session_id.clone()),text:format!("The tracked path summary is unavailable: {error}. Use /files for the explicit error; the Run's change list may be incomplete.")});
+                Vec::new()
+            }
+        };
+        let untracked_writes_possible = self
+            .with_reader(|st| st.run_untracked_writes_possible(&session_id, &run_id))
+            .unwrap_or(true);
+        let recap = match self.capture_terminal_recap(
+            &session_id,
+            &run_id,
+            changes.as_deref(),
+            &files,
+        ) {
+            Ok(recap) => recap,
+            Err(error) => {
+                tracing::warn!("terminal recap unavailable for Run {run_id}: {error:#}");
+                self.broadcast(Event::Note {session_id:Some(session_id.clone()),text:format!("This Run's recap could not be saved; no persisted recap was announced: {error}")});
+                None
+            }
+        };
         // Locks a panicking Run may have poisoned are still taken. Only this
         // Run's own entry goes: a newer Run of the Session keeps its
         // controls (#726).
@@ -5617,11 +5686,6 @@ impl Daemon {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&session_id);
-        let changes = self
-            .run_tool_changes
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&run_id);
         // Resolve these independently before optional effects, so a naming or
         // hook panic cannot leave comparisons/jobs waiting on a finished Run.
         self.finish_tail_step(&session_id, "comparison completion", || {
@@ -5630,18 +5694,7 @@ impl Daemon {
         self.finish_tail_step(&session_id, "job completion", || {
             self.job_run_ended(&session_id, &run_id, final_status);
         });
-        let files = match self.run_file_infos(&session_id, &run_id, false) {
-            Ok(files) => files,
-            Err(error) => {
-                self.mark_run_untracked_writes(&session_id, &run_id);
-                self.broadcast(Event::Note {session_id:Some(session_id.clone()),text:format!("The tracked path summary is unavailable: {error}. Use /files for the explicit error; the Run's change list may be incomplete.")});
-                Vec::new()
-            }
-        };
-        let untracked_writes_possible = self
-            .with_reader(|st| st.run_untracked_writes_possible(&session_id, &run_id))
-            .unwrap_or(true);
-        if let Some(recap) = self.run_recap(&session_id, &run_id, changes.as_deref(), &files) {
+        if let Some(recap) = recap {
             self.broadcast(Event::RunRecap {
                 session_id: session_id.clone(),
                 run_id: run_id.clone(),
@@ -5668,6 +5721,7 @@ impl Daemon {
             run_id: run_id.clone(),
             status: final_status.to_string(),
         });
+        drop(publication);
         self.maybe_name_session(&session_id);
         self.maybe_auto_skill(&session_id, &run_id, final_status, pipeline);
         self.record_primary_task(&session_id, &run_id, final_status);
@@ -7537,11 +7591,12 @@ impl Daemon {
         }
         let text = match tc.name.as_str() {
             toolreg::CREATE_TOOL => match self.create_tool_impl(&args, cfg, cancel_flag).await {
-                Ok((text, tool_id)) => {
+                Ok((text, change)) => {
+                    let tool_id = change.tool_id.clone();
                     let _ = self.with_store(|st| {
                         st.load_session_tools(session_id, std::slice::from_ref(&tool_id), "created")
                     });
-                    self.note_tool_change(run_id, &tool_id, None);
+                    self.note_tool_change(run_id, change);
                     // The search missed a Tool this one duplicates (§8.8).
                     if self.near_duplicate_after_empty_find(run_id, &tool_id, &args) {
                         created_kind = "near-duplicate";
@@ -7586,10 +7641,12 @@ impl Daemon {
                 Ok(text) => text,
                 Err(e) => call_failed(format!("error: remember failed: {e}")),
             },
-            toolreg::UPDATE_PLAN => match self.update_plan_impl(session_id, &args) {
-                Ok(text) => text,
-                Err(e) => call_failed(format!("error: update_plan failed: {e}")),
-            },
+            toolreg::UPDATE_PLAN => {
+                match self.update_plan_impl(session_id, run_id, agent_depth, &args) {
+                    Ok(text) => text,
+                    Err(e) => call_failed(format!("error: update_plan failed: {e}")),
+                }
+            }
             toolreg::FORGET => match self.forget_impl(session_id, &args) {
                 Ok(text) => text,
                 Err(e) => call_failed(format!("error: forget failed: {e}")),
@@ -7722,8 +7779,16 @@ impl Daemon {
                             self.with_store(|st| st.set_tool_retired(&info.id, true))
                         {
                             self.note_registry_change(&t, "retired", t.current_version, "agent");
+                            self.note_tool_change(
+                                run_id,
+                                ToolChange {
+                                    tool_id: t.id,
+                                    name: t.name,
+                                    version: t.current_version,
+                                    change: "retired".into(),
+                                },
+                            );
                         }
-                        self.note_tool_change(run_id, &info.id, Some("retired"));
                         let _ = self.with_store(|st| {
                             st.audit("agent", "tool.retire", &format!("{name}: {reason}"))
                         });
@@ -8581,17 +8646,19 @@ impl Daemon {
 
     /// A Session as a `formless.session/1` bundle.
     fn session_bundle(&self, id: &str) -> Result<Value> {
-        self.with_reader(|st| {
-            let s = st.get_session(id)?.context(RequestFailure::not_found( "session not found"))?;
+        self.with_reader(|st| st.read_transaction(|st| {
+            let s = st.get_session(id)?.context(RequestFailure::not_found("session not found"))?;
             let msgs = st.list_messages(id)?;
             let cps = st.list_checkpoints(id)?;
+            let plan = st.session_plan_bundle(id)?;
             Ok(json!({
                 "format": "formless.session/1",
                 "name": s.name, "model": s.model, "reasoning_effort": s.reasoning_effort,
-                "messages": msgs.iter().map(|m| json!({"role": m.role, "content": m.content, "meta": m.meta})).collect::<Vec<_>>(),
+                "messages": msgs.iter().map(|m| json!({"seq":m.seq,"role": m.role, "content": m.content, "meta": m.meta})).collect::<Vec<_>>(),
                 "checkpoints": cps.iter().map(|(s2, u)| json!({"summary": s2, "up_to_seq": u})).collect::<Vec<_>>(),
+                "plan":plan["plan"],"plan_state":plan["plan_state"],"plan_history":plan["plan_history"],
             }))
-        })
+        }))
     }
 
     /// Load a `formless.session/1` bundle as a new Session.
@@ -8624,14 +8691,25 @@ impl Daemon {
                 )
             })
             .collect();
+        let source_seqs: Vec<i64> = bundle["messages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .enumerate()
+            .map(|(index, message)| message["seq"].as_i64().unwrap_or(index as i64 + 1))
+            .collect();
         let s = self.with_store(|st| {
-            st.import_session(
-                bundle["name"].as_str().unwrap_or("Imported"),
-                bundle["model"].as_str().map(str::to_string),
-                bundle["reasoning_effort"].as_str().map(str::to_string),
-                &messages,
-                &checkpoints,
-            )
+            st.transaction(|st| {
+                let s = st.import_session(
+                    bundle["name"].as_str().unwrap_or("Imported"),
+                    bundle["model"].as_str().map(str::to_string),
+                    bundle["reasoning_effort"].as_str().map(str::to_string),
+                    &messages,
+                    &checkpoints,
+                )?;
+                st.import_session_plan_bundle(&s.id, bundle, &source_seqs)?;
+                Ok(s)
+            })
         })?;
         Ok(s)
     }
@@ -9509,7 +9587,7 @@ impl Daemon {
         args: &Value,
         cfg: &Config,
         cancel: &Arc<AtomicBool>,
-    ) -> Result<(String, String)> {
+    ) -> Result<(String, ToolChange)> {
         let (info, version, smoke_note, compatibility) = self
             .create_tool_as(args, cfg, "agent", Some(cancel.clone()))
             .await?;
@@ -9517,7 +9595,15 @@ impl Daemon {
         if let Some(note) = smoke_note {
             out["smoke_test"] = json!(note);
         }
-        Ok((out.to_string(), info.id))
+        Ok((
+            out.to_string(),
+            ToolChange {
+                tool_id: info.id,
+                name: info.name,
+                version,
+                change: if version == 1 { "created" } else { "updated" }.into(),
+            },
+        ))
     }
 
     /// The smoke test of the save gate (SPEC §7.1): the draft runs in the
@@ -11024,76 +11110,6 @@ impl Daemon {
         });
     }
 
-    /// A Run's changed files compared with now, optionally with diffs.
-    /// "What I did" for a Run of 4+ steps, from its trace (SPEC §5.7).
-    fn run_recap(
-        &self,
-        session_id: &str,
-        run_id: &str,
-        changes: Option<&[ToolChange]>,
-        files: &[RunFileInfo],
-    ) -> Option<RunRecap> {
-        let steps = self.with_reader(|st| st.run_steps(run_id)).ok()?;
-        if steps < 4 {
-            return None;
-        }
-        let (duration_ms, started) = self
-            .with_reader(|st| st.run_metrics_for(Some(session_id), 5, None))
-            .ok()?
-            .into_iter()
-            .find(|r| r.run_id == run_id)
-            .map_or((0, String::new()), |r| (r.duration_ms, r.created_at));
-        let used = self
-            .with_reader(|st| st.run_calls(run_id))
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(name, n, failed)| {
-                let times = if n > 1 {
-                    format!(" ×{n}")
-                } else {
-                    String::new()
-                };
-                let fails = if failed > 0 {
-                    format!(" ({failed} failed)")
-                } else {
-                    String::new()
-                };
-                format!("{name}{times}{fails}")
-            })
-            .collect();
-        let built = changes
-            .unwrap_or_default()
-            .iter()
-            .map(|c| format!("{} {} v{}", c.change, c.name, c.version))
-            .collect();
-        let files = files
-            .iter()
-            .filter(|f| f.status != "unchanged")
-            .map(|f| format!("{} {}", f.status, f.path))
-            .collect();
-        let steered = self
-            .with_reader(|st| st.list_messages(session_id))
-            .unwrap_or_default()
-            .iter()
-            .filter(|m| {
-                m.role == "user"
-                    && m.created_at >= started
-                    && m.meta.as_deref().is_some_and(|x| x.contains("\"steer\""))
-            })
-            .count() as i64;
-        Some(RunRecap {
-            steps,
-            duration_ms,
-            used,
-            built,
-            files,
-            steered,
-            untracked_writes_possible: self
-                .with_reader(|st| st.run_untracked_writes_possible(session_id, run_id))
-                .unwrap_or(true),
-        })
-    }
-
     /// The Run `/files` and `/rewind` act on: the given one, else the
     /// Session's latest that changed files.
     fn files_run(&self, session_id: &str, run_id: Option<String>) -> Result<String> {
@@ -11107,44 +11123,6 @@ impl Daemon {
         };
         self.with_reader(|st| st.validate_run_file_owner(session_id, &run))?;
         Ok(run)
-    }
-
-    /// `update_plan` (SPEC §5.8): replace the Session's checklist.
-    fn update_plan_impl(&self, session_id: &str, args: &Value) -> Result<String> {
-        let items: Vec<PlanItem> = serde_json::from_value(args["items"].clone())
-            .context("items must be a list of {content, status}")?;
-        if items.len() > toolreg::MAX_PLAN_ITEMS {
-            return Err(anyhow!("at most {} steps", toolreg::MAX_PLAN_ITEMS));
-        }
-        let mut items = items;
-        for i in &mut items {
-            if !matches!(i.status.as_str(), "pending" | "in_progress" | "completed") {
-                return Err(anyhow!(
-                    "status must be pending, in_progress or completed, not {:?}",
-                    i.status
-                ));
-            }
-            i.content = i
-                .content
-                .trim()
-                .chars()
-                .take(toolreg::MAX_PLAN_TEXT)
-                .collect();
-            if i.content.is_empty() {
-                return Err(anyhow!("a step needs content"));
-            }
-        }
-        self.with_store(|st| st.set_session_plan(session_id, &items))?;
-        self.broadcast(Event::PlanUpdated {
-            session_id: session_id.to_string(),
-            items: items.clone(),
-        });
-        let done = items.iter().filter(|i| i.status == "completed").count();
-        Ok(if items.is_empty() {
-            "plan cleared".into()
-        } else {
-            format!("plan updated ({done}/{} done)", items.len())
-        })
     }
 
     /// Tell clients the Session's queue changed.
@@ -12232,11 +12210,12 @@ impl Daemon {
             tool["capabilities"] = json!([]);
             let cancel_flag = Arc::new(AtomicBool::new(false));
             match self.create_tool_impl(&tool, cfg, &cancel_flag).await {
-                Ok((text, tool_id)) => {
+                Ok((text, change)) => {
+                    let tool_id = change.tool_id.clone();
                     let _ = self.with_store(|st| {
                         st.load_session_tools(session_id, std::slice::from_ref(&tool_id), "created")
                     });
-                    self.note_tool_change(run_id, &tool_id, None);
+                    self.note_tool_change(run_id, change);
                     saved = save["name"].as_str().unwrap_or_default().to_string();
                     res["saved"] = serde_json::from_str(&text).unwrap_or(json!(text));
                 }
@@ -18109,8 +18088,14 @@ mod model_test_daemon_tests;
 #[path = "review_daemon.rs"]
 mod review_daemon;
 
+#[path = "plan_daemon.rs"]
+mod plan_daemon;
+
 #[path = "progress_daemon.rs"]
 mod progress_daemon;
+
+#[path = "recap_daemon.rs"]
+mod recap_daemon;
 
 #[path = "run_files_daemon.rs"]
 mod run_files_daemon;

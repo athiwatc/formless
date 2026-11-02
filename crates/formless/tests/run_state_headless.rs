@@ -1,0 +1,428 @@
+//! Shipped headless output contracts with interleaved plan/recap/progress IPC.
+//! A private fake daemon owns the only socket; no provider or service is used.
+#![cfg(unix)]
+use formless_core::{Config, Paths, Store};
+use formless_protocol::{Event, Request, RequestEnvelope, ServerMessage};
+use serde_json::{json, Value};
+use std::{
+    io::{Read, Write},
+    os::unix::net::{UnixListener, UnixStream},
+    process::{Command, Output, Stdio},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
+};
+struct Fixture {
+    root: std::path::PathBuf,
+    paths: Paths,
+    session: formless_protocol::SessionInfo,
+    events: Vec<Event>,
+    stop: Arc<AtomicBool>,
+    server: Option<std::thread::JoinHandle<()>>,
+}
+impl Fixture {
+    fn new() -> Self {
+        Self::with_paused(false)
+    }
+    fn with_paused(paused: bool) -> Self {
+        Self::with_history(paused, false)
+    }
+    fn with_history(paused: bool, obsolete: bool) -> Self {
+        let root = std::path::PathBuf::from("/tmp").join(format!(
+            "fl-ho-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let paths = Paths::from_dirs(root.join("d"), root.join("c")).unwrap();
+        let mut config = Config::default();
+        config.provider.base_url = "http://127.0.0.1:9".into();
+        config.provider.model = "unused-private-fixture".into();
+        config.naming.enabled = false;
+        config.save(&paths).unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let session = store
+            .create_session(Some("headless acceptance".into()))
+            .unwrap();
+        let answer = store
+            .append_message(&session.id, "assistant", "ONLY_FINAL_ANSWER_761")
+            .unwrap();
+        let sid = &session.id;
+        let decode = |value| serde_json::from_value::<Event>(value).unwrap();
+        let status = if paused { "paused" } else { "completed" };
+        let mut events = vec![
+            decode(json!({"type":"run_started","session_id":sid,"run_id":"headless-761"})),
+            decode(
+                json!({"type":"plan_updated","session_id":sid,"items":[{"content":"PLAN_MARKER_761","status":"in_progress"}],"plan_state":{"run_id":"headless-761","origin":"live","run_status":"running"}}),
+            ),
+            decode(
+                json!({"type":"tool_progress","session_id":sid,"run_id":"headless-761","invocation_id":"invoke-761","tool_name":"fixture_tool","fraction":0.5,"label":"PROGRESS_MARKER_761"}),
+            ),
+            decode(
+                json!({"type":"message_delta","session_id":sid,"run_id":"headless-761","delta":"ONLY_FINAL_ANSWER_761"}),
+            ),
+            decode(
+                json!({"type":"message_complete","session_id":sid,"run_id":"headless-761","message":answer}),
+            ),
+            decode(
+                json!({"type":"run_recap","session_id":sid,"run_id":"headless-761","recap":{"steps":4,"duration_ms":40,"used":["RECAP_MARKER_761"],"built":[],"files":[],"steered":0,"status":status,"total_calls":1,"unfinished_calls":0}}),
+            ),
+            decode(
+                json!({"type":"run_finished","session_id":sid,"run_id":"headless-761","status":status}),
+            ),
+        ];
+        if paused {
+            events.insert(5,decode(json!({"type":"run_paused","session_id":sid,"run_id":"headless-761","error":"private acceptance pause","explained":null})));
+        }
+        let listener = UnixListener::bind(paths.socket_path()).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = stop.clone();
+        let exported = session.clone();
+        let emitted = events.clone();
+        let server = std::thread::spawn(move || {
+            let mut peers = Vec::new();
+            while !stopped.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        let stopped = stopped.clone();
+                        let session = exported.clone();
+                        let events = emitted.clone();
+                        peers.push(std::thread::spawn(move || {
+                            serve_peer(stream, stopped, session, events, obsolete)
+                        }));
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::park_timeout(Duration::from_millis(2))
+                    }
+                    Err(e) => panic!("private listener: {e}"),
+                }
+            }
+            for peer in peers {
+                peer.join().unwrap();
+            }
+        });
+        Self {
+            root,
+            paths,
+            session,
+            events,
+            stop,
+            server: Some(server),
+        }
+    }
+    fn run(&self, mode: &str, quiet: bool, file: bool) -> Output {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_formless"));
+        command.env_clear();
+        for key in ["PATH", "SystemRoot", "WINDIR", "TEMP", "TMP"] {
+            if let Some(value) = std::env::var_os(key) {
+                command.env(key, value);
+            }
+        }
+        command
+            .env("FORMLESS_DATA_DIR", &self.paths.data_dir)
+            .env("FORMLESS_CONFIG_DIR", &self.paths.config_dir)
+            .env("FORMLESS_API_KEY", "private-headless-dummy")
+            .env("NO_COLOR", "1")
+            .env("RUST_LOG", "error")
+            .args([
+                "run",
+                "private headless task",
+                "--session",
+                &self.session.id,
+                "--output",
+                mode,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if quiet {
+            command.arg("--quiet");
+        }
+        if file {
+            command
+                .arg("--output-file")
+                .arg(self.root.join("answer.txt"));
+        }
+        let mut child = command.spawn().unwrap();
+        let mut stdout = child.stdout.take().unwrap();
+        let mut stderr = child.stderr.take().unwrap();
+        let out = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            stdout.read_to_end(&mut bytes).unwrap();
+            bytes
+        });
+        let err = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            stderr.read_to_end(&mut bytes).unwrap();
+            bytes
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!(
+                    "headless output fixture exceeded its deadline; stdout={:?}; stderr={:?}",
+                    out.join().unwrap(),
+                    err.join().unwrap()
+                );
+            }
+            std::thread::park_timeout(Duration::from_millis(2));
+        };
+        Output {
+            status,
+            stdout: out.join().unwrap(),
+            stderr: err.join().unwrap(),
+        }
+    }
+}
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(server) = self.server.take() {
+            server.join().unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+fn frame(stream: &mut UnixStream, message: ServerMessage) {
+    writeln!(stream, "{}", serde_json::to_string(&message).unwrap()).unwrap();
+}
+fn serve_peer(
+    mut stream: UnixStream,
+    stop: Arc<AtomicBool>,
+    session: formless_protocol::SessionInfo,
+    events: Vec<Event>,
+    obsolete: bool,
+) {
+    stream
+        .set_read_timeout(Some(Duration::from_millis(50)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut pending = Vec::new();
+    let mut chunk = [0u8; 4096];
+    while !stop.load(Ordering::SeqCst) && Instant::now() < deadline {
+        let count = match stream.read(&mut chunk) {
+            Ok(0) => return,
+            Ok(count) => count,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                continue
+            }
+            Err(e) => panic!("private IPC read: {e}"),
+        };
+        pending.extend_from_slice(&chunk[..count]);
+        assert!(pending.len() < 64 * 1024, "bounded fixture NDJSON input");
+        while let Some(end) = pending.iter().position(|byte| *byte == b'\n') {
+            let line: Vec<u8> = pending.drain(..=end).collect();
+            let request: RequestEnvelope = serde_json::from_slice(&line).unwrap();
+            let send = matches!(request.request, Request::SendMessage { .. });
+            let result = match request.request {
+                Request::Status | Request::Ping => {
+                    json!({"version":env!("CARGO_PKG_VERSION"),"protocol":1,"secure":true})
+                }
+                Request::ListSessions => json!([session]),
+                Request::Subscribe { .. } => json!({}),
+                Request::SendMessage { session_id, .. } => {
+                    assert_eq!(session_id, session.id);
+                    json!({"run_id":"headless-761"})
+                }
+                other => panic!("unexpected private headless request: {other:?}"),
+            };
+            if send {
+                if obsolete {
+                    // The ack, rather than an unsolicited RunStarted, owns
+                    // this command. Delay the ack across both old and target
+                    // events to exercise the pre-ack deferred queue.
+                    for event in obsolete_events(&session.id) {
+                        frame(&mut stream, ServerMessage::Event(event));
+                    }
+                    frame(&mut stream, ServerMessage::Event(events[0].clone()));
+                    for event in obsolete_events(&session.id).into_iter().skip(1) {
+                        frame(&mut stream, ServerMessage::Event(event));
+                    }
+                } else {
+                    // Deliver live metadata while its RPC is outstanding.
+                    for event in &events[..events.len() - 1] {
+                        frame(&mut stream, ServerMessage::Event(event.clone()));
+                    }
+                }
+            }
+            frame(
+                &mut stream,
+                ServerMessage::Response {
+                    id: request.id,
+                    ok: true,
+                    result: Some(result),
+                    error: None,
+                },
+            );
+            if send {
+                if obsolete {
+                    // An old terminal tail can also arrive after binding.
+                    for event in obsolete_events(&session.id).into_iter().skip(1) {
+                        frame(&mut stream, ServerMessage::Event(event));
+                    }
+                    for event in events.iter().skip(1) {
+                        frame(&mut stream, ServerMessage::Event(event.clone()));
+                    }
+                } else {
+                    frame(
+                        &mut stream,
+                        ServerMessage::Event(events.last().unwrap().clone()),
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn interleaved_run_metadata_preserves_every_headless_stdout_mode() {
+    for mode in ["text", "final", "json", "jsonl-events"] {
+        for quiet in [false, true] {
+            for file in [false, true] {
+                let fixture = Fixture::new();
+                let output = fixture.run(mode, quiet, file);
+                assert!(
+                    output.status.success(),
+                    "{mode} quiet={quiet} file={file}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let bytes = if file {
+                    assert!(
+                        output.stdout.is_empty(),
+                        "output-file must keep stdout empty"
+                    );
+                    std::fs::read(fixture.root.join("answer.txt")).unwrap()
+                } else {
+                    output.stdout
+                };
+                match mode {
+                    "text" | "final" => assert_eq!(
+                        bytes, b"ONLY_FINAL_ANSWER_761\n",
+                        "live plan/recap/progress must not enter answer stdout"
+                    ),
+                    "json" => {
+                        let value: Value = serde_json::from_slice(&bytes).unwrap();
+                        assert_eq!(value["answer"], "ONLY_FINAL_ANSWER_761");
+                        assert_eq!(value["status"], "completed");
+                        assert_eq!(value["session_id"], fixture.session.id);
+                        assert_eq!(value.as_object().unwrap().len(), 4);
+                    }
+                    "jsonl-events" => {
+                        let actual: Vec<Value> = String::from_utf8(bytes)
+                            .unwrap()
+                            .lines()
+                            .map(|line| serde_json::from_str(line).unwrap())
+                            .collect();
+                        let expected: Vec<Value> = fixture
+                            .events
+                            .iter()
+                            .map(|event| serde_json::to_value(event).unwrap())
+                            .collect();
+                        assert_eq!(actual,expected,"RPC interleaving must preserve event order without loss or duplication");
+                    }
+                    _ => unreachable!(),
+                }
+                if quiet {
+                    assert!(
+                        output.stderr.is_empty(),
+                        "quiet successful Run must have no human feedback: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn paused_headless_jsonl_retains_terminal_recap_after_pause_notice() {
+    let fixture = Fixture::with_paused(true);
+    let output = fixture.run("jsonl-events", true, false);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let actual: Vec<Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let expected: Vec<Value> = fixture
+        .events
+        .iter()
+        .map(|event| serde_json::to_value(event).unwrap())
+        .collect();
+    assert_eq!(actual,expected,"RunPaused is followed by terminal recap and RunFinished; consume the complete terminal tail exactly once");
+}
+
+fn obsolete_events(session: &str) -> Vec<Event> {
+    [
+        json!({"type":"run_started","session_id":session,"run_id":"obsolete-headless-761"}),
+        json!({"type":"run_paused","session_id":session,"run_id":"obsolete-headless-761","error":"OBSOLETE_PAUSE_MUST_STAY_OUT","explained":null}),
+        json!({"type":"run_recap","session_id":session,"run_id":"obsolete-headless-761","recap":{"steps":4,"duration_ms":99,"used":["OBSOLETE_RECAP_MUST_STAY_OUT"],"built":[],"files":[],"steered":0,"status":"paused","total_calls":1,"unfinished_calls":0}}),
+        json!({"type":"run_finished","session_id":session,"run_id":"obsolete-headless-761","status":"paused"}),
+    ].into_iter().map(|value|serde_json::from_value(value).unwrap()).collect()
+}
+
+#[test]
+fn headless_target_binds_to_ack_and_ignores_same_session_older_terminal_events() {
+    for mode in ["text", "final", "json", "jsonl-events"] {
+        let fixture = Fixture::with_history(false, true);
+        let output = fixture.run(mode, true, false);
+        assert!(
+            output.status.success(),
+            "{mode}: old terminal tail must not end requested Run: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.stderr.is_empty(),
+            "obsolete pause/recap must not produce feedback: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        match mode {
+            "text" | "final" => assert_eq!(output.stdout, b"ONLY_FINAL_ANSWER_761\n"),
+            "json" => {
+                let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(value["status"], "completed");
+                assert_eq!(value["answer"], "ONLY_FINAL_ANSWER_761");
+            }
+            "jsonl-events" => {
+                let actual: Vec<Value> = String::from_utf8(output.stdout)
+                    .unwrap()
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+                let expected: Vec<Value> = fixture
+                    .events
+                    .iter()
+                    .map(|event| serde_json::to_value(event).unwrap())
+                    .collect();
+                assert_eq!(actual,expected,"only ack-owned events reach stdout, retaining target pre-ack RunStarted exactly once");
+            }
+            _ => unreachable!(),
+        }
+    }
+}

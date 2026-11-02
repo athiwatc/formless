@@ -363,6 +363,7 @@ fn reconnect_state_event(event: &Event) -> bool {
                 | Event::RunPaused { .. }
                 | Event::QueueChanged { .. }
                 | Event::PlanUpdated { .. }
+                | Event::RunRecap { .. }
                 | Event::MessageAppended { .. }
                 | Event::MessagesEdited { .. }
                 | Event::CompactionNotice { .. }
@@ -1754,8 +1755,12 @@ struct App {
     /// expanded it.
     recap: Option<formless_protocol::RunRecap>,
     recap_open: bool,
+    recap_run_id: Option<String>,
+    run_state_revision: u64,
+    run_state_reads: HashMap<u64, (String, u64)>,
     /// The agent's checklist (`update_plan`), pinned under the chat.
     plan: Vec<formless_protocol::PlanItem>,
+    plan_state: Option<formless_protocol::PlanState>,
     /// `/mcp import NAME`: the server to add once the candidates arrive.
     mcp_import_pick: Option<String>,
     /// An Ollama download in progress (`/pull`), for the status bar.
@@ -2019,7 +2024,11 @@ impl App {
             editing_queued: None,
             recap: None,
             recap_open: false,
+            recap_run_id: None,
+            run_state_revision: 0,
+            run_state_reads: HashMap::new(),
             plan: Vec::new(),
+            plan_state: None,
             mcp_import_pick: None,
             offline: None,
             reconnect_request: None,
@@ -2071,6 +2080,7 @@ impl App {
         self.description_editor_observed = None;
         self.description_editor_revision = self.description_editor_revision.wrapping_add(1);
         self.pending.clear();
+        self.run_state_reads.clear();
         self.pending_since.clear();
         self.reconnect_request = None;
         self.reconnect_events.clear();
@@ -2318,6 +2328,12 @@ impl App {
             return;
         };
         let events = std::mem::take(&mut self.reconnect_events);
+        let mut plan_state: Option<formless_protocol::PlanState> =
+            serde_json::from_value(result["plan_state"].clone()).ok();
+        let mut latest_run = result["latest_run"]["run_id"].as_str().map(str::to_string);
+        let mut recorded: Option<formless_protocol::RecordedRunRecap> =
+            serde_json::from_value(result["last_recap"].clone()).ok();
+        recorded = recorded.filter(|r| latest_run.as_ref().is_none_or(|id| id == &r.run_id));
         let mut run_banner = result["unfinished_run"].as_object().map(|run| {
             (
                 run["status"].as_str().unwrap_or_default().to_string(),
@@ -2341,17 +2357,26 @@ impl App {
         for event in &events {
             match event {
                 Event::RunStarted {
-                    session_id: sid, ..
+                    session_id: sid,
+                    run_id,
                 } if sid == &session_id => {
+                    latest_run = Some(run_id.clone());
+                    recorded = None;
                     running = true;
                     run_banner = None;
                 }
                 Event::RunFinished {
                     session_id: sid,
                     status,
-                    ..
-                } if sid == &session_id => {
+                    run_id,
+                } if sid == &session_id && latest_run.as_ref().is_none_or(|id| id == run_id) => {
                     running = false;
+                    if let Some(state) = plan_state
+                        .as_mut()
+                        .filter(|s| s.run_id.as_ref() == Some(run_id))
+                    {
+                        state.run_status = Some(status.clone());
+                    }
                     if status == "completed" {
                         run_banner = None;
                     } else if run_banner.is_none() {
@@ -2362,9 +2387,15 @@ impl App {
                     session_id: sid,
                     error,
                     explained,
-                    ..
-                } if sid == &session_id => {
+                    run_id,
+                } if sid == &session_id && latest_run.as_ref().is_none_or(|id| id == run_id) => {
                     running = false;
+                    if let Some(state) = plan_state
+                        .as_mut()
+                        .filter(|s| s.run_id.as_ref() == Some(run_id))
+                    {
+                        state.run_status = Some("paused".into());
+                    }
                     run_banner = Some((
                         "paused".into(),
                         explained
@@ -2379,7 +2410,35 @@ impl App {
                 Event::PlanUpdated {
                     session_id: sid,
                     items,
-                } if sid == &session_id => plan = items.clone(),
+                    plan_state: metadata,
+                } if sid == &session_id => {
+                    let older = plan_state
+                        .as_ref()
+                        .and_then(|s| s.updated_at.as_ref())
+                        .zip(metadata.as_ref().and_then(|s| s.updated_at.as_ref()))
+                        .is_some_and(|(old, new)| new < old);
+                    let wrong_run = metadata.as_ref().is_some_and(|s| {
+                        !s.previous_task
+                            && matches!(s.origin.as_str(), "live" | "resumed")
+                            && s.run_id.as_ref().is_some_and(|owner| {
+                                latest_run.as_ref().is_some_and(|run| run != owner)
+                            })
+                    });
+                    if !older && !wrong_run {
+                        plan = items.clone();
+                        plan_state = metadata.clone();
+                    }
+                }
+                Event::RunRecap {
+                    session_id: sid,
+                    run_id,
+                    recap,
+                } if sid == &session_id && latest_run.as_ref().is_none_or(|id| id == run_id) => {
+                    recorded = Some(formless_protocol::RecordedRunRecap {
+                        run_id: run_id.clone(),
+                        recap: recap.clone(),
+                    });
+                }
                 Event::MessageAppended {
                     session_id: sid,
                     message,
@@ -2403,6 +2462,15 @@ impl App {
         self.md_cache.borrow_mut().clear();
         self.queued = queued;
         self.plan = plan;
+        self.plan_state = plan_state;
+        let same_recap =
+            self.recap_run_id.as_deref() == recorded.as_ref().map(|r| r.run_id.as_str());
+        self.recap_run_id = recorded.as_ref().map(|r| r.run_id.clone());
+        self.recap = recorded.map(|r| r.recap);
+        if !same_recap {
+            self.recap_open = false;
+        }
+        self.live_run = latest_run.map(|id| (id, !running));
         self.step_mode = result["step_mode"] == true;
         if running {
             self.running_sessions.insert(session_id);
@@ -2512,7 +2580,16 @@ impl App {
 
     fn send_request(&mut self, kind: Pending, req: Request) {
         if let Some(c) = &self.client {
+            let state_read = match &req {
+                Request::GetSession { id } if matches!(kind, Pending::GetSession) => {
+                    Some((id.clone(), self.run_state_revision))
+                }
+                _ => None,
+            };
             let id = c.send(req);
+            if let Some(read) = state_read {
+                self.run_state_reads.insert(id, read);
+            }
             self.pending.insert(id, kind);
             self.pending_since.insert(id, Instant::now());
         }
@@ -2528,6 +2605,7 @@ impl App {
             .collect();
         for id in late {
             self.pending_since.remove(&id);
+            self.run_state_reads.remove(&id);
             let Some(kind) = self.pending.remove(&id) else {
                 continue;
             };
@@ -2730,6 +2808,7 @@ impl App {
                         }
                     }
                     self.pending_since.remove(&id);
+                    let state_read = self.run_state_reads.remove(&id);
                     let Some(kind) = self.pending.remove(&id) else {
                         continue;
                     };
@@ -4570,6 +4649,17 @@ impl App {
                             }
                         }
                         Pending::GetSession => {
+                            if state_read.as_ref().is_some_and(|(session, _)| {
+                                self.current.as_deref() != Some(session.as_str())
+                            }) {
+                                continue;
+                            }
+                            let restore_state = state_read
+                                .as_ref()
+                                .is_none_or(|(_, revision)| *revision == self.run_state_revision);
+                            if restore_state {
+                                self.restore_run_state(&result);
+                            }
                             if let Some(msgs) = result.get("messages").cloned() {
                                 if let Ok(v) = serde_json::from_value::<Vec<MessageInfo>>(msgs) {
                                     self.messages = v;
@@ -4578,7 +4668,11 @@ impl App {
                                     }
                                     // Edits arrive as reloads: drop renders of old content.
                                     self.md_cache.borrow_mut().clear();
-                                    self.live_tools.clear();
+                                    if restore_state {
+                                        self.live_tools.retain(|call| {
+                                            call.status == "running" && call.handle.is_some()
+                                        });
+                                    }
                                     self.follow_chat_bottom();
                                 }
                             }
@@ -4590,8 +4684,10 @@ impl App {
                             });
                             self.queued = serde_json::from_value(result["queued_items"].clone())
                                 .unwrap_or_default();
-                            self.plan =
-                                serde_json::from_value(result["plan"].clone()).unwrap_or_default();
+                            if restore_state {
+                                self.plan = serde_json::from_value(result["plan"].clone())
+                                    .unwrap_or_default();
+                            }
                             self.step_mode = result["step_mode"] == true;
                         }
                     }
@@ -4715,6 +4811,48 @@ impl App {
             }
         };
         self.rollback_pick = next;
+    }
+
+    fn plan_state_is_current(&self, state: Option<&formless_protocol::PlanState>) -> bool {
+        let Some(state) = state else {
+            return true;
+        };
+        if let (Some(old), Some(new)) = (
+            self.plan_state.as_ref().and_then(|s| s.updated_at.as_ref()),
+            state.updated_at.as_ref(),
+        ) {
+            if new < old {
+                return false;
+            }
+        }
+        state.previous_task
+            || !matches!(state.origin.as_str(), "live" | "resumed")
+            || state
+                .run_id
+                .as_ref()
+                .is_none_or(|owner| self.live_run.as_ref().is_none_or(|(run, _)| run == owner))
+    }
+
+    fn restore_run_state(&mut self, result: &serde_json::Value) {
+        self.plan_state = serde_json::from_value(result["plan_state"].clone()).ok();
+        let record = serde_json::from_value::<Option<formless_protocol::RecordedRunRecap>>(
+            result["last_recap"].clone(),
+        )
+        .ok()
+        .flatten();
+        let latest = result["latest_run"]["run_id"].as_str();
+        let record = record.filter(|record| latest.is_none_or(|id| id == record.run_id));
+        let same = self.recap_run_id.as_deref() == record.as_ref().map(|r| r.run_id.as_str());
+        self.recap_run_id = record.as_ref().map(|r| r.run_id.clone());
+        self.recap = record.map(|r| r.recap);
+        if !same {
+            self.recap_open = false;
+        }
+        if self.live_run.is_none() {
+            if let Some(run) = latest {
+                self.live_run = Some((run.into(), result["running"] != true));
+            }
+        }
     }
 
     fn accept_live_run(&self, run_id: &str, invocation_id: Option<&str>) -> bool {
@@ -5024,6 +5162,9 @@ impl App {
         self.editing_queued = None;
         self.queued.clear();
         self.recap = None;
+        self.recap_run_id = None;
+        self.plan_state = None;
+        self.run_state_revision = self.run_state_revision.wrapping_add(1);
         self.plan.clear();
         self.step = None;
         self.editing_step = false;
@@ -5035,6 +5176,23 @@ impl App {
     }
 
     fn on_event(&mut self, ev: Event) {
+        if let Event::RunFinished {
+            session_id,
+            run_id,
+            status,
+        } = &ev
+        {
+            if self.is_current(session_id)
+                && self.live_run.as_ref().is_none_or(|(id, _)| id == run_id)
+                && self.plan_state.as_ref().and_then(|s| s.run_id.as_ref()) == Some(run_id)
+            {
+                if let Some(state) = &mut self.plan_state {
+                    state.run_status = Some(status.clone());
+                }
+                self.run_state_revision = self.run_state_revision.wrapping_add(1);
+            }
+        }
+
         if self
             .hunk_review
             .context
@@ -5251,17 +5409,31 @@ impl App {
                     }
                 }
             }
-            Event::PlanUpdated { session_id, items } => {
-                if self.is_current(&session_id) {
+            Event::PlanUpdated {
+                session_id,
+                items,
+                plan_state,
+            } => {
+                if self.is_current(&session_id) && self.plan_state_is_current(plan_state.as_ref()) {
+                    self.run_state_revision = self.run_state_revision.wrapping_add(1);
                     self.plan = items;
+                    self.plan_state = plan_state;
                 }
             }
             Event::RunRecap {
-                session_id, recap, ..
+                session_id,
+                run_id,
+                recap,
             } => {
-                if self.is_current(&session_id) {
+                if self.is_current(&session_id)
+                    && self.live_run.as_ref().is_none_or(|(id, _)| id == &run_id)
+                {
+                    self.run_state_revision = self.run_state_revision.wrapping_add(1);
+                    if self.recap_run_id.as_deref() != Some(run_id.as_str()) {
+                        self.recap_open = false;
+                    }
+                    self.recap_run_id = Some(run_id);
                     self.recap = Some(recap);
-                    self.recap_open = false;
                 }
             }
             Event::RunFilesChanged {
@@ -5395,7 +5567,9 @@ impl App {
                     return;
                 }
                 self.run_banner = None;
+                self.run_state_revision = self.run_state_revision.wrapping_add(1);
                 self.recap = None;
+                self.recap_run_id = None;
                 self.thinking.clear();
                 self.streaming.clear();
                 self.live_tools
@@ -6972,7 +7146,7 @@ impl App {
             cmd if cmd == "queue" || cmd.starts_with("queue ") => self.queue_command(cmd),
             "recap" => match self.recap {
                 Some(_) => self.recap_open = !self.recap_open,
-                None => self.notes.push("no recap: it is made after Runs of 4 or more steps".into()),
+                None => self.notes.push("no recorded recap for the latest Run: short, legacy or unfinished Runs may have none".into()),
             },
             cmd if cmd == "review" || cmd.starts_with("review ") => {
                 let run = cmd.strip_prefix("review").unwrap().trim();
@@ -12358,15 +12532,37 @@ fn sent_elsewhere(app: &App, m: &MessageInfo) -> Option<String> {
 
 /// The agent's plan (SPEC §5.8): every step while it works; one line once
 /// all are done and nothing is running.
+fn plan_state_label(state: Option<&formless_protocol::PlanState>) -> String {
+    let Some(state) = state else {
+        return String::new();
+    };
+    let mut labels = Vec::new();
+    if state.previous_task {
+        labels.push("previous task".into());
+    }
+    if let Some(status) = state.run_status.as_deref().filter(|s| !s.is_empty()) {
+        labels.push(run_file_safe_text(status));
+    }
+    if !state.origin.is_empty() && state.origin != "live" {
+        labels.push(run_file_safe_text(&state.origin));
+    }
+    if let Some(at) = &state.updated_at {
+        labels.push(format!("updated {}", run_file_safe_text(at)));
+    }
+    labels.join(" · ")
+}
+
 fn plan_lines(
     plan: &[formless_protocol::PlanItem],
+    state: Option<&formless_protocol::PlanState>,
     running: bool,
     width: usize,
     color: bool,
 ) -> Vec<Line<'static>> {
     let done = plan.iter().filter(|i| i.status == "completed").count();
     let mut out = vec![Line::raw("")];
-    if done == plan.len() && !running {
+    let lifecycle = plan_state_label(state);
+    if done == plan.len() && !running && lifecycle.is_empty() {
         out.push(Line::styled(
             format!("  ✓ {} ({done}/{})", i18n::tr("Plan done"), plan.len()),
             ui::dim(color),
@@ -12374,7 +12570,16 @@ fn plan_lines(
         return out;
     }
     out.push(Line::styled(
-        format!("  {} ({done}/{})", i18n::tr("Plan"), plan.len()),
+        format!(
+            "  {} ({done}/{}){}",
+            i18n::tr("Plan"),
+            plan.len(),
+            if lifecycle.is_empty() {
+                String::new()
+            } else {
+                format!(" · {lifecycle}")
+            }
+        ),
         bold_fg(color, Color::Cyan),
     ));
     for i in plan {
@@ -12424,13 +12629,21 @@ fn recap_lines(r: &formless_protocol::RunRecap, open: bool, color: bool) -> Vec<
         format_elapsed(Duration::from_millis(r.duration_ms.max(0) as u64))
     );
     for (n, what) in [
-        (r.used.len(), "calls"),
         (r.built.len(), "Tools changed"),
         (r.files.len(), "tracked paths"),
     ] {
         if n > 0 {
             head.push_str(&format!(" · {n} {what}"));
         }
+    }
+    if !r.status.is_empty() {
+        head.push_str(&format!(" · {}", run_file_safe_text(&r.status)));
+    }
+    if let Some(count) = r.total_calls {
+        head.push_str(&format!(" · {count} calls"));
+    }
+    if r.unfinished_calls > 0 {
+        head.push_str(&format!(" · {} unfinished calls", r.unfinished_calls));
     }
     if r.untracked_writes_possible {
         head.push_str(" · ");
@@ -14998,7 +15211,13 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
         }
     }
     if !app.plan.is_empty() {
-        lines.extend(plan_lines(&app.plan, app.running(), width, app.color));
+        lines.extend(plan_lines(
+            &app.plan,
+            app.plan_state.as_ref(),
+            app.running(),
+            width,
+            app.color,
+        ));
     }
     if let Some(step) = &app.step {
         lines.push(Line::raw(""));
@@ -17985,6 +18204,7 @@ mod tests {
     include!("hunk_tests.rs");
     include!("run_file_coverage_tests.rs");
     include!("invocation_progress_tests.rs");
+    include!("run_state_tests.rs");
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -18162,7 +18382,11 @@ mod tests {
             editing_queued: None,
             recap: None,
             recap_open: false,
+            recap_run_id: None,
+            run_state_revision: 0,
+            run_state_reads: HashMap::new(),
             plan: Vec::new(),
+            plan_state: None,
             mcp_import_pick: None,
             offline: None,
             reconnect_request: None,
@@ -18630,12 +18854,12 @@ mod tests {
             item("Test", "pending"),
         ];
         assert_eq!(
-            text(plan_lines(&plan, true, 80, false)),
+            text(plan_lines(&plan, None, true, 80, false)),
             ["", "  Plan (1/3)", "    ✓ Read", "    ▸ Fix", "    ○ Test"]
         );
         let done = vec![item("Read", "completed")];
         assert_eq!(
-            text(plan_lines(&done, false, 80, false)),
+            text(plan_lines(&done, None, false, 80, false)),
             ["", "  ✓ Plan done (1/1)"]
         );
     }
@@ -18854,6 +19078,7 @@ mod tests {
                 }],
             },
             Event::PlanUpdated {
+                plan_state: None,
                 session_id: "s1".into(),
                 items: vec![PlanItem {
                     content: "new plan".into(),
