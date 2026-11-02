@@ -1210,12 +1210,22 @@ pasting paths.
   - keep Tab inside the dialog, and give focus back to where it was when
     they close.
 - **Reading controls (web).** Settings → This browser:
-  - text size A− / A+ (85–150% in 10% steps) scales the transcript and
-    composer;
+  - text size A− / A+ (85–200% in 10% steps, clamped at the endpoints)
+    scales the root font relative to the browser's default font size;
+    typography and layout use relative units, without CSS zoom;
   - density is comfortable or compact (tighter turns, line height and
     bubbles).
 
   Both are remembered per device.
+- **Device display and printing (web).** Auto theme follows OS changes;
+  the browser theme/status-bar color follows the effective Auto, Light or Dark
+  theme, with media-specific initial colors before JavaScript loads. Shell
+  controls, drawers, overlays, notifications and the jump-to-output button
+  respect all four safe-area insets in portrait and landscape. Printing or
+  saving a PDF renders the current Session on light pages with its title,
+  without app chrome or the composer. Tool chips retain a readable summary;
+  code wraps, diagrams fit the page, and long transcripts paginate between
+  turns without clipping long turns.
 - **Reduced motion (web).** Under `prefers-reduced-motion: reduce` nothing
   animates or transitions: spinners become a still "⋯", the running dot
   stops pulsing, toasts appear without sliding, the mobile sidebar opens

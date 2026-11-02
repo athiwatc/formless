@@ -131,6 +131,15 @@ The `#k=` fragment is never sent to any server.
 
 ## Local development
 
+Run the relay/web regression suite with `node --test relay/*.test.mjs` from
+the repository root. Display regressions also have a browser check:
+`python relay/web-display.browser-test.py /tmp/formless-display-check`.
+It requires Python Playwright, `/usr/bin/chromium`, and Poppler's `pdftotext`
+and `pdftoppm`. It serves the actual web assets locally with a test-only
+transcript fixture, checks browser default font preferences, manual reading
+size, theme changes, menus and simulated safe areas, and saves screenshots
+and a multipage PDF. Simulated insets do not replace physical phone testing.
+
 `dev.mjs` runs the Worker's own code: each room is `worker.js`'s
 `RelayRoom` over a real SQLite ledger through Node's built-in `node:sqlite`
 (Node 22.13+), and every

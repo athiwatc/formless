@@ -635,6 +635,31 @@
     if (popover) { popover.remove(); popover = null; }
     document.querySelectorAll(".menu[aria-expanded]").forEach((m) => m.removeAttribute("aria-expanded"));
   }
+  /** Measure after insertion: rem-based menus can be taller than the viewport. */
+  function placePopover(btn, alignRight = false) {
+    document.body.append(popover);
+    const css = getComputedStyle(document.documentElement);
+    const inset = (edge) => parseFloat(css.getPropertyValue("--safe-" + edge)) || 0;
+    const gap = (parseFloat(css.fontSize) || 16) * 0.5;
+    const viewport = window.visualViewport;
+    const left = (viewport?.offsetLeft || 0) + inset("left") + gap;
+    const top = (viewport?.offsetTop || 0) + inset("top") + gap;
+    const right = (viewport?.offsetLeft || 0) + (viewport?.width || innerWidth) - inset("right") - gap;
+    const bottom = (viewport?.offsetTop || 0) + (viewport?.height || innerHeight) - inset("bottom") - gap;
+    popover.style.minWidth = "0";
+    popover.style.maxWidth = Math.max(0, right - left) + "px";
+    popover.style.maxHeight = Math.max(0, bottom - top) + "px";
+    const r = btn.getBoundingClientRect();
+    const width = popover.offsetWidth, height = popover.offsetHeight;
+    const x = alignRight ? r.right - width : r.left;
+    const y = r.bottom + gap + height <= bottom ? r.bottom + gap : r.top - gap - height;
+    popover.style.left = Math.max(left, Math.min(x, right - width)) + "px";
+    popover.style.top = Math.max(top, Math.min(y, bottom - height)) + "px";
+    popover.querySelector("button").focus({ preventScroll: true });
+  }
+  window.addEventListener("resize", closePopover);
+  window.visualViewport?.addEventListener("resize", closePopover);
+  window.visualViewport?.addEventListener("scroll", closePopover);
   /** The URL fragment as `#k=…&s=…` pairs. Not URLSearchParams: it turns
    * "+" (in a base64 key) into a space. */
   function hashParams() {
@@ -685,7 +710,6 @@
   function sessionMenu(btn, s) {
     closePopover();
     btn.setAttribute("aria-expanded", "true");
-    const r = btn.getBoundingClientRect();
     popover = h("div", { class: "popover", role: "menu" },
       h("button", { type: "button", onclick: () => { closePopover(); pinSession(s); } }, s.pinned ? "Unpin" : "Pin"),
       h("button", { type: "button", onclick: () => { closePopover(); archiveSession(s); } }, s.archived ? "Unarchive" : "Archive"),
@@ -697,10 +721,7 @@
       h("button", { type: "button", title: S.local ? "" : "The link includes the pairing key", onclick: () => { closePopover(); copySessionLink(s); } }, S.local ? "Copy link" : "Copy link (has the key)"),
       h("button", { type: "button", onclick: () => { closePopover(); pickExport(s.id); } }, "Export…"),
       h("button", { type: "button", class: "danger", onclick: () => { closePopover(); deleteSession(s); } }, "Delete"));
-    popover.style.top = Math.min(r.bottom + 4, innerHeight - 170) + "px";
-    popover.style.left = Math.min(r.left, innerWidth - 170) + "px";
-    document.body.append(popover);
-    popover.querySelector("button").focus();
+    placePopover(btn);
   }
 
   // Running Invocations across Sessions (SPEC §6.3): cancel or abandon.
@@ -917,7 +938,7 @@
     const list = $("sessions");
     list.replaceChildren();
     if (!S.sessions.length) {
-      list.append(h("li", { class: "muted", style: "padding:8px" }, "No sessions yet."));
+      list.append(h("li", { class: "muted", style: "padding:0.5rem" }, "No sessions yet."));
       return;
     }
     list.append(h("li", null, h("button", { type: "button", class: "btn small", "aria-pressed": String(!!S.sessionTree), onclick: () => { S.sessionTree = !S.sessionTree; renderSessions(); } }, S.sessionTree ? "Tree on" : "Tree off")));
@@ -963,7 +984,7 @@
         onclick: (e) => { e.stopPropagation(); if (e.target.checked) S.marked.add(s.id); else S.marked.delete(s.id); renderSessions(); } }),
       S.running.has(s.id) ? h("span", { class: "running", title: "running" })
         : s.last_run_status === "paused" ? h("span", { class: "state", title: "paused" }, "⏸") : null,
-      h("span", { class: "name", title: s.name, style: "padding-inline-start:" + (row.depth * 12) + "px" }, s.pinned ? "★ " : null, row.depth ? "↳ " : null, s.name,
+      h("span", { class: "name", title: s.name, style: "padding-inline-start:" + (row.depth * 0.75) + "rem" }, s.pinned ? "★ " : null, row.depth ? "↳ " : null, s.name,
         row.note ? h("span", { class: "muted lineage", title: row.note }, " · " + row.note) : null,
         s.preview ? h("span", { class: "preview", title: s.preview }, s.preview) : null),
       h("span", { class: "when", title: (s.message_count || 0) + " messages" + (s.model ? " · " + s.model : "") }, relTime(s.updated_at)),
@@ -982,7 +1003,7 @@
     box.replaceChildren();
     if (hits == null) { box.classList.add("hidden"); return; }
     box.classList.remove("hidden");
-    box.append(h("div", { class: "muted", style: "padding:4px 8px;font-size:12px" },
+    box.append(h("div", { class: "muted", style: "padding:0.25rem 0.5rem;font-size:0.75rem" },
       hits.length + " hit" + (hits.length === 1 ? "" : "s") + " for “" + query + "”"));
     const lower = query.toLowerCase();
     for (const hit of hits) {
@@ -1182,9 +1203,12 @@
   let mermaidQueue = Promise.resolve();
   let mermaidSeq = 0;
   const darkScheme = window.matchMedia("(prefers-color-scheme: dark)");
-  /** Text size (85–150%) and density for the transcript, per device. */
+  /** Scale the browser's default root size (85–200%), per device. */
+  function readingScale(scale) {
+    return Number.isFinite(scale) ? Math.round(Math.min(2, Math.max(0.85, scale)) * 100) / 100 : 1;
+  }
   function setReading(scale, density) {
-    if (scale != null) S.readScale = Math.round(Math.min(1.5, Math.max(0.85, scale)) * 100) / 100;
+    if (scale != null) S.readScale = readingScale(scale);
     if (density) S.density = density;
     prefs.set("readScale", S.readScale);
     prefs.set("density", S.density);
@@ -1192,7 +1216,9 @@
     if (S.view === "settings") renderView();
   }
   function applyReading() {
+    S.readScale = readingScale(S.readScale);
     document.documentElement.style.setProperty("--read-scale", String(S.readScale));
+    closePopover();
     if (S.density === "compact") document.documentElement.dataset.density = "compact";
     else delete document.documentElement.dataset.density;
   }
@@ -1209,11 +1235,19 @@
     if (t === "light" || t === "dark") document.documentElement.dataset.theme = t;
     else delete document.documentElement.dataset.theme;
     $("theme").value = t === "light" || t === "dark" ? t : "auto";
+    const color = getComputedStyle(document.documentElement).getPropertyValue("--bg").trim();
+    document.querySelectorAll('meta[name="theme-color"]').forEach((meta) => meta.setAttribute("content", color));
   }
   applyTheme(prefs.get("theme", "auto"));
   $("theme").addEventListener("change", (e) => {
     prefs.set("theme", e.target.value);
     applyTheme(e.target.value);
+    mermaidCache.clear();
+    renderAll();
+  });
+  darkScheme.addEventListener("change", () => {
+    if (document.documentElement.dataset.theme) return;
+    applyTheme("auto");
     mermaidCache.clear();
     renderAll();
   });
@@ -1257,7 +1291,7 @@
         try {
           const { svg } = await mermaid.render(id, src, measure);
           const vb = svg.match(/viewBox="[-\d.]+ [-\d.]+ ([\d.]+) ([\d.]+)"/);
-          return { url: "data:image/svg+xml;charset=utf-8," + encodeURIComponent(svg), svg, width: vb ? Math.ceil(+vb[1]) : 0 };
+          return { url: "data:image/svg+xml;charset=utf-8," + encodeURIComponent(svg), svg, theme, width: vb ? Math.ceil(+vb[1]) : 0 };
         } finally {
           measure.replaceChildren();
         }
@@ -1278,7 +1312,7 @@
     box.append(h("div", { class: "lang" }, h("span", null, "mermaid"), h("span", { class: "spacer" }), toggle, save, copyButton(src)), view, code);
     if (!closed) { setSource(true); return box; }
     renderMermaid(src).then((d) => {
-      const img = h("img", { src: d.url, alt: "Mermaid diagram", class: "diagram-img", title: "Click to zoom" });
+      const img = h("img", { src: d.url, alt: "Mermaid diagram", class: "diagram-img", "data-theme": d.theme, title: "Click to zoom" });
       if (d.width) img.style.width = d.width + "px";
       img.addEventListener("click", () => box.classList.toggle("zoom"));
       img.addEventListener("load", () => scrollToBottom(), { once: true });
@@ -1918,12 +1952,8 @@
     }));
     btn.setAttribute("aria-expanded", "true");
     btn.classList.add("menu");
-    const r = btn.getBoundingClientRect();
     popover = h("div", { class: "popover", role: "menu" }, items);
-    document.body.append(popover);
-    popover.style.top = Math.min(r.bottom + 4, innerHeight - popover.offsetHeight - 8) + "px";
-    popover.style.left = Math.max(8, Math.min(r.right - popover.offsetWidth, innerWidth - popover.offsetWidth - 8)) + "px";
-    popover.querySelector("button").focus();
+    placePopover(btn, true);
   }
 
   function assistantStopNote(message) {
@@ -2189,7 +2219,7 @@
       const mark = running ? h("span", { class: "spinner", style: "color:var(--warn)" })
         : h("span", { class: t.status === "ok" ? "tree-ok" : "tree-fail" }, t.status === "ok" ? "✓" : "✗");
       const time = t.elapsedMs != null ? (t.elapsedMs / 1000).toFixed(1) + "s" : elapsed(t.started);
-      live.append(h("details", { class: "chip live tree-node" + (running ? "" : " done"), style: "margin-left:" + (t.depth || 0) * 18 + "px" },
+      live.append(h("details", { class: "chip live tree-node" + (running ? "" : " done"), style: "margin-left:" + (t.depth || 0) * 1.125 + "rem" },
         h("summary", null,
           t.depth ? h("span", { class: "muted" }, "└") : null,
           mark,
@@ -3136,7 +3166,7 @@
       box.append(ed, h("div", { class: "detail-actions" },
         h("button", { class: "btn primary small", type: "button", onclick: () => saveCode(t) }, "Save new version"),
         h("button", { class: "btn ghost small", type: "button", onclick: () => { S.editingCode = null; renderTools(); } }, "Cancel"),
-        h("span", { class: "muted", style: "font-size:12px" }, "Ctrl/⌘+S save · Esc cancel")));
+        h("span", { class: "muted", style: "font-size:0.75rem" }, "Ctrl/⌘+S save · Esc cancel")));
       setTimeout(() => area.focus(), 0);
     } else if (current) {
       box.append(h("h3", null, "Code v" + current.version));
@@ -3302,7 +3332,7 @@
           h("span", { class: "spacer" }),
           h("span", { class: "muted score" }, "~" + p.est_tokens + " tokens · " + relTime(p.created_at))),
         h("div", { class: "content" }, p.content),
-        p.rationale ? h("p", { class: "muted", style: "margin:8px 0 0" }, p.rationale) : null,
+        p.rationale ? h("p", { class: "muted", style: "margin:0.5rem 0 0" }, p.rationale) : null,
         actions.length ? h("div", { class: "actions" }, actions) : null));
     }
   }
@@ -4956,7 +4986,8 @@
   function autosize() {
     const t = $("input");
     t.style.height = "auto";
-    t.style.height = Math.min(t.scrollHeight, 220) + "px";
+    const maxHeight = parseFloat(getComputedStyle(t).maxHeight);
+    t.style.height = Math.min(t.scrollHeight, Number.isFinite(maxHeight) ? maxHeight : t.scrollHeight) + "px";
   }
 
   function openSidebar() { $("sidebar").classList.add("open"); }
