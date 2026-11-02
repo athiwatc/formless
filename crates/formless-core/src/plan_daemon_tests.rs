@@ -50,6 +50,7 @@ impl Fixture {
                 cancel: CancellationToken::new(),
                 cancel_flag: Arc::new(AtomicBool::new(false)),
                 steer_tx,
+                steering: Arc::new(Default::default()),
                 retry: Arc::new(tokio::sync::Notify::new()),
             },
         );

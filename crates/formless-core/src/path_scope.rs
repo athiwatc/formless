@@ -24,8 +24,14 @@ const PROJECT: &[&str] = &["Cargo.toml", "package.json", "pyproject.toml", "go.m
 /// the kind of repository; else the nearest project root, labelled by its
 /// marker file.
 pub fn enclosing_root(start: &Path) -> Option<(PathBuf, String)> {
+    enclosing_root_from_dirs(start.ancestors())
+}
+
+fn enclosing_root_from_dirs<'a>(
+    directories: impl IntoIterator<Item = &'a Path>,
+) -> Option<(PathBuf, String)> {
     let mut project = None;
-    for dir in start.ancestors() {
+    for dir in directories {
         if let Some((_, kind)) = VCS.iter().find(|(m, _)| dir.join(m).exists()) {
             return Some((dir.to_path_buf(), kind.to_string()));
         }
@@ -94,6 +100,15 @@ fn choices_with(
     home: Option<&Path>,
     canonicalize: impl Fn(&Path) -> Result<PathBuf, String>,
 ) -> Vec<PathChoice> {
+    choices_with_root(path, home, canonicalize, enclosing_root)
+}
+
+fn choices_with_root(
+    path: &str,
+    home: Option<&Path>,
+    canonicalize: impl Fn(&Path) -> Result<PathBuf, String>,
+    root_finder: impl Fn(&Path) -> Option<(PathBuf, String)>,
+) -> Vec<PathChoice> {
     let p = Path::new(path);
     let mut out = vec![PathChoice {
         path: path.to_string(),
@@ -108,7 +123,7 @@ fn choices_with(
             label: String::new(),
         });
     }
-    if let Some((root, label)) = folder.and_then(enclosing_root) {
+    if let Some((root, label)) = folder.and_then(root_finder) {
         let known = out.iter().any(|c| Path::new(&c.path) == root);
         if !known && !too_broad(&root, home, &canonicalize) {
             out.push(PathChoice {
@@ -225,10 +240,41 @@ mod tests {
         let root = tmp("proj");
         std::fs::write(root.join("Cargo.toml"), "").unwrap();
         let file = root.join("src/main.rs");
-        let c = choices(file.to_str().unwrap());
+        // Probe real markers only in this fixture. Writable-root mount metadata
+        // (or a developer's parent repository) must not redefine this oracle.
+        let c = choices_with_root(
+            file.to_str().unwrap(),
+            home_dir().as_deref(),
+            canonical_scope,
+            |start| {
+                enclosing_root_from_dirs(start.ancestors().take_while(|dir| dir.starts_with(&root)))
+            },
+        );
         assert_eq!(c.last().unwrap().kind, "project");
         assert_eq!(c.last().unwrap().label, "Cargo.toml");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn ancestor_repository_is_stronger_than_a_nearer_project_marker() {
+        let root = tmp("ancestor-repo");
+        let project = root.join("nested");
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        std::fs::create_dir(root.join(".git")).unwrap();
+        std::fs::write(project.join("Cargo.toml"), "").unwrap();
+        let file = project.join("src/main.rs");
+        let c = choices_with_root(
+            file.to_str().unwrap(),
+            home_dir().as_deref(),
+            canonical_scope,
+            |start| {
+                enclosing_root_from_dirs(start.ancestors().take_while(|dir| dir.starts_with(&root)))
+            },
+        );
+        assert_eq!(c.last().unwrap().kind, "repo");
+        assert_eq!(c.last().unwrap().label, "git");
+        assert_eq!(Path::new(&c.last().unwrap().path), root);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

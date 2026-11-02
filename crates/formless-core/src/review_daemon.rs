@@ -1405,18 +1405,24 @@ impl Daemon {
                 "Review comment context exceeds its bounded transcript size",
             ));
         }
-        let active = self
-            .runs
-            .locked()
-            .get(&entry.view.session_id)
-            .map(|run| run.run_id.clone());
+        let active = self.runs.locked().get(&entry.view.session_id).cloned();
+        if active.as_ref().is_some_and(|run| {
+            !run.steering.accepts()
+                || run.cancel.is_cancelled()
+                || run.cancel_flag.load(Ordering::SeqCst)
+        }) || (active.is_none() && self.session_is_publishing(&entry.view.session_id))
+        {
+            return Err(anyhow::Error::new(RequestFailure::busy(
+                "This Run is finishing. Your comment was not saved; retry after it finishes.",
+            )));
+        }
         let step = active
-            .as_deref()
-            .and_then(|id| self.with_reader(|st| st.run_steps(id)).ok())
+            .as_ref()
+            .and_then(|run| self.with_reader(|st| st.run_steps(&run.run_id)).ok())
             .unwrap_or(0);
         let mut meta = json!({"review_context":context});
-        if active.is_some() {
-            meta["steer"] = json!({"step":step});
+        if let Some(run) = &active {
+            meta["steer"] = json!({"step":step,"run_id":run.run_id});
         }
         let message = self.with_store(|st| {
             st.append_message_meta(
@@ -1430,8 +1436,9 @@ impl Daemon {
             session_id: entry.view.session_id.clone(),
             message: message.clone(),
         });
-        if let Some(control) = self.runs.locked().get(&entry.view.session_id) {
-            let _ = control.steer_tx.send(());
+        if let Some(control) = &active {
+            control.steering.accepted(message.seq);
+            let _ = control.steer_tx.send(message.seq);
         }
         Ok(ReviewCommentResult {
             message,

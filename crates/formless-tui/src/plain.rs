@@ -395,6 +395,54 @@ enum Prompt {
     },
 }
 
+/// Submission and application are distinct: an open prompt may have been
+/// cancelled or answered by another client before this request is processed.
+#[derive(Clone, Copy)]
+enum PendingReply {
+    Approval(bool),
+    Promotion,
+    Question,
+}
+#[derive(Default)]
+struct ReplyAcks(HashMap<u64, PendingReply>);
+impl ReplyAcks {
+    fn has_room(&self) -> bool {
+        self.0.len() < 128
+    }
+    fn insert(&mut self, request: u64, reply: PendingReply) {
+        self.0.insert(request, reply);
+    }
+    fn response(
+        &mut self,
+        request: u64,
+        ok: bool,
+        result: Option<&serde_json::Value>,
+        error: Option<&str>,
+    ) -> Option<String> {
+        let reply = self.0.remove(&request)?;
+        let (kind, field) = match reply {
+            PendingReply::Approval(_) => ("Approval decision", "resolved"),
+            PendingReply::Promotion => ("Promotion decision", "resolved"),
+            PendingReply::Question => ("Answer", "answered"),
+        };
+        Some(if !ok {
+            format!(
+                "{kind} was not applied: {}",
+                display_text(error.unwrap_or("request failed"))
+            )
+        } else if result.and_then(|v| v[field].as_bool()) == Some(true) {
+            match reply {
+                PendingReply::Approval(true) => "Approved.".into(),
+                PendingReply::Approval(false) => "Denied.".into(),
+                PendingReply::Promotion => "Promotion decision accepted.".into(),
+                PendingReply::Question => "Answered.".into(),
+            }
+        } else {
+            format!("{kind} was not applied: the prompt was already closed, cancelled, or resolved elsewhere.")
+        })
+    }
+}
+
 fn remove_resolved_prompt(prompts: &mut VecDeque<Prompt>, ev: &Event) {
     prompts.retain(|prompt| !match (prompt, ev) {
         (
@@ -410,6 +458,13 @@ fn remove_resolved_prompt(prompts: &mut VecDeque<Prompt>, ev: &Event) {
                 promotion: false,
             },
             Event::ApprovalAnswered { approval_id, .. },
+        ) => id == approval_id,
+        (
+            Prompt::Approval {
+                id,
+                promotion: false,
+            },
+            Event::ApprovalClosed { approval_id },
         ) => id == approval_id,
         (Prompt::Question { id, .. }, Event::UserQuestionClosed { question_id }) => {
             id == question_id
@@ -578,6 +633,7 @@ pub(crate) fn format_event(ev: &Event, streaming: &mut bool) -> Option<String> {
             "{}Promotion of {tool_name} needs approval: {reason}. Type y to approve or n to deny.",
             end_stream(streaming)
         ),
+        Event::ApprovalClosed { .. } => format!("{}Approval prompt closed.", end_stream(streaming)),
         Event::PromotionApprovalResolved { .. } => {
             "The promotion approval prompt was resolved.".into()
         }
@@ -715,6 +771,7 @@ pub fn run_with(paths: Paths, start: ChatStart, label: &str) -> Result<()> {
     });
 
     let mut prompts: VecDeque<Prompt> = VecDeque::new();
+    let mut reply_acks = ReplyAcks::default();
     let mut streaming = false;
     let mut running = false;
     let mut feedback = LiveFeedback::default();
@@ -740,6 +797,14 @@ pub fn run_with(paths: Paths, start: ChatStart, label: &str) -> Result<()> {
             } = &msg
             {
                 sends.borrow_mut().answered(*id);
+                let reply_notice = reply_acks.response(*id, *ok, result.as_ref(), error.as_deref());
+                let handled_reply = reply_notice.is_some();
+                if let Some(notice) = reply_notice {
+                    if std::mem::take(&mut streaming) {
+                        println!();
+                    }
+                    say(&notice);
+                }
                 if let Some((snapshot_session, generation, explicit)) = snapshots.remove(id) {
                     if *ok && snapshot_session == session.id {
                         if let Some(result) = result {
@@ -763,7 +828,7 @@ pub fn run_with(paths: Paths, start: ChatStart, label: &str) -> Result<()> {
                         }
                     }
                 }
-                if !ok {
+                if !ok && !handled_reply {
                     say(&format!(
                         "Daemon: {}",
                         error.as_deref().unwrap_or("request failed")
@@ -867,11 +932,15 @@ pub fn run_with(paths: Paths, start: ChatStart, label: &str) -> Result<()> {
                             continue;
                         }
                     };
-                    if *promotion {
+                    if !reply_acks.has_room() {
+                        say("Too many prompt replies await confirmation; wait before replying again.");
+                        continue;
+                    }
+                    let request = if *promotion {
                         client.send(Request::PromotionDecision {
                             promotion_id: id.clone(),
                             approved,
-                        });
+                        })
                     } else {
                         client.send(Request::ApprovalDecision {
                             remember_denial: Default::default(),
@@ -879,9 +948,17 @@ pub fn run_with(paths: Paths, start: ChatStart, label: &str) -> Result<()> {
                             approval_id: id.clone(),
                             approved,
                             scope,
-                        });
-                    }
-                    say(if approved { "Approved." } else { "Denied." });
+                        })
+                    };
+                    reply_acks.insert(
+                        request,
+                        if *promotion {
+                            PendingReply::Promotion
+                        } else {
+                            PendingReply::Approval(approved)
+                        },
+                    );
+                    say("Decision sent; awaiting daemon confirmation.");
                     prompts.pop_front();
                 }
                 Prompt::Question {
@@ -889,8 +966,11 @@ pub fn run_with(paths: Paths, start: ChatStart, label: &str) -> Result<()> {
                     questions,
                     answers,
                 } => {
+                    if answers.len() + 1 == questions.len() && !reply_acks.has_room() {
+                        say("Too many prompt replies await confirmation; wait before replying again.");
+                        continue;
+                    }
                     let answer = questions[answers.len()].parse_reply(&text);
-                    say(&format!("Answered: {}.", answer.summary()));
                     answers.push(answer);
                     if answers.len() < questions.len() {
                         say(&question_text(
@@ -899,11 +979,13 @@ pub fn run_with(paths: Paths, start: ChatStart, label: &str) -> Result<()> {
                             questions.len(),
                         ));
                     } else {
-                        client.send(Request::AnswerQuestion {
+                        let request = client.send(Request::AnswerQuestion {
                             question_id: id.clone(),
                             answer: QuestionAnswer::summary_of(answers),
                             answers: std::mem::take(answers),
                         });
+                        reply_acks.insert(request, PendingReply::Question);
+                        say("Answer sent; awaiting daemon confirmation.");
                         prompts.pop_front();
                     }
                 }
@@ -1342,3 +1424,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "plain_reply_ack_tests.rs"]
+mod reply_ack_tests;

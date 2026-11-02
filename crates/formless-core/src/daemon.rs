@@ -534,11 +534,13 @@ enum McpApproval {
 /// Answers a waiting approval: (approved, scope).
 type ApprovalReply = oneshot::Sender<(bool, ApprovalScope)>;
 
+#[derive(Clone)]
 pub(crate) struct RunCtl {
     pub(crate) run_id: String,
     cancel: CancellationToken,
     cancel_flag: Arc<AtomicBool>,
-    steer_tx: mpsc::UnboundedSender<()>,
+    steer_tx: mpsc::UnboundedSender<i64>,
+    steering: Arc<steering_daemon::RunSteering>,
     /// User-requested re-send of the in-flight provider request.
     retry: Arc<tokio::sync::Notify>,
 }
@@ -592,6 +594,7 @@ struct RunAdmission {
     resolved_model: String,
     effort: Option<String>,
     recovery_messages: Vec<MessageInfo>,
+    first_message_seq: i64,
     first: StdMutex<
         Option<(
             Vec<Value>,
@@ -629,6 +632,10 @@ pub struct Daemon {
     next_conn: AtomicU64,
     #[cfg(test)]
     panic_in_finish_tail: AtomicBool,
+    #[cfg(test)]
+    run_publication_test: StdMutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    run_final_decision_test: StdMutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Fires when an approval or question starts waiting on the user (the
     /// relay turns it into a Web Push, SPEC §12).
     pub(crate) attention: tokio::sync::broadcast::Sender<()>,
@@ -903,6 +910,10 @@ impl Daemon {
             next_conn: AtomicU64::new(1),
             #[cfg(test)]
             panic_in_finish_tail: AtomicBool::new(false),
+            #[cfg(test)]
+            run_publication_test: StdMutex::new(None),
+            #[cfg(test)]
+            run_final_decision_test: StdMutex::new(None),
             attention: tokio::sync::broadcast::channel(16).0,
             relay_clients: StdMutex::new(Default::default()),
             uploads: StdMutex::new(HashMap::new()),
@@ -1538,7 +1549,9 @@ impl Daemon {
             | Event::PromotionApprovalRequested { .. } => {
                 self.pending_attention.locked().push(ev.clone())
             }
-            Event::ApprovalAnswered { approval_id, .. } => self.remove_attention(approval_id),
+            Event::ApprovalAnswered { approval_id, .. } | Event::ApprovalClosed { approval_id } => {
+                self.remove_attention(approval_id)
+            }
             Event::UserQuestionClosed { question_id } => self.remove_attention(question_id),
             Event::PromotionApprovalResolved { promotion_id } => {
                 self.remove_attention(promotion_id)
@@ -3499,9 +3512,13 @@ impl Daemon {
                 answers,
             } => {
                 // First answer wins; the others find it gone.
-                let tx = self.questions.locked().remove(&question_id);
+                let answered = {
+                    let mut waiters = self.questions.locked();
+                    waiters
+                        .remove(&question_id)
+                        .is_some_and(|tx| tx.send((answer, answers)).is_ok())
+                };
                 self.remove_attention(&question_id);
-                let answered = tx.is_some_and(|tx| tx.send((answer, answers)).is_ok());
                 Ok(json!({"answered": answered}))
             }
             Request::ListBuiltinStats { since } => Ok(serde_json::to_value(
@@ -4048,9 +4065,9 @@ impl Daemon {
                     .with_reader(|st| st.inspect_run(&run_id))?
                     .context(RequestFailure::not_found("Run not found"))?;
                 let runs = self.runs.locked();
-                let ctl = runs
-                    .values()
-                    .find(|ctl| Some(ctl.run_id.as_str()) == run["run_id"].as_str());
+                let ctl = runs.values().find(|ctl| {
+                    Some(ctl.run_id.as_str()) == run["run_id"].as_str() && ctl.steering.accepts()
+                });
                 if let Some(ctl) = ctl {
                     ctl.cancel_flag.store(true, Ordering::SeqCst);
                     ctl.cancel.cancel();
@@ -4069,7 +4086,7 @@ impl Daemon {
             }
             Request::InterruptRun { session_id } => {
                 let runs = self.runs.locked();
-                if let Some(ctl) = runs.get(&session_id) {
+                if let Some(ctl) = runs.get(&session_id).filter(|ctl| ctl.steering.accepts()) {
                     ctl.cancel_flag.store(true, Ordering::SeqCst);
                     ctl.cancel.cancel();
                     Ok(json!({"interrupted": true}))
@@ -4956,43 +4973,38 @@ impl Daemon {
             .context(RequestFailure::not_found("session not found"))?;
         let _admission = self.forecast_admission.locked();
         self.with_reader(|st| Self::ensure_session_description_trust(st, &session_id))?;
-        let busy = self.runs.locked().contains_key(&session_id);
-        match (busy, mode) {
-            (true, SendMode::Queue) => {
-                // Persisted, so a daemon restart does not lose it.
-                self.with_store(|st| st.enqueue_message(&session_id, &content))?;
-                self.queue_changed(&session_id);
-                Ok(json!({"queued": true}))
-            }
-            (true, _) => {
-                // Steer (Enter) or Send-while-busy: persist + notify run (SPEC §5.3).
-                // Marked with the step it arrived at, so the transcript
-                // shows where the agent was redirected.
-                let run_id = self
-                    .runs
-                    .lock()
-                    .unwrap()
-                    .get(&session_id)
-                    .map(|c| c.run_id.clone());
-                let step = run_id
-                    .as_deref()
-                    .and_then(|r| self.with_reader(|st| st.run_steps(r)).ok())
+        let control = self.runs.locked().get(&session_id).cloned();
+        let queue = mode == SendMode::Queue && control.is_some()
+            || control.as_ref().is_some_and(|control| {
+                !control.steering.accepts()
+                    || control.cancel.is_cancelled()
+                    || control.cancel_flag.load(Ordering::SeqCst)
+            })
+            || (control.is_none() && self.session_is_publishing(&session_id));
+        if queue {
+            self.with_store(|st| st.enqueue_message(&session_id, &content))?;
+            self.queue_changed(&session_id);
+            return Ok(json!({"queued":true}));
+        }
+        match control {
+            Some(control) => {
+                let step = self
+                    .with_reader(|st| st.run_steps(&control.run_id))
                     .unwrap_or(0);
                 let msg = self.append_user_message_meta(
                     &session_id,
                     &content,
-                    Some(("steer", json!({"step": step}))),
+                    Some(("steer", json!({"step":step,"run_id":control.run_id}))),
                 )?;
+                control.steering.accepted(msg.seq);
+                let _ = control.steer_tx.send(msg.seq);
                 self.broadcast(Event::MessageAppended {
                     session_id: session_id.clone(),
                     message: msg,
                 });
-                if let Some(ctl) = self.runs.locked().get(&session_id) {
-                    let _ = ctl.steer_tx.send(());
-                }
-                Ok(json!({"steered": true,"run_id":run_id}))
+                Ok(json!({"steered":true,"run_id":control.run_id}))
             }
-            (false, _) => {
+            None => {
                 let _settings = self.config_guard();
                 let cfg = self.config()?;
                 let input = ForecastInput {
@@ -5145,14 +5157,17 @@ impl Daemon {
                     .insert(forecast.basis.model.clone(), forecast.context_tokens);
             }
         }
-        let ctx = crate::storage::build_context(
-            st,
-            session_id,
-            &prompt,
-            forecast.context_tokens,
-            cfg.compaction.fraction(),
-        )?
-        .0;
+        let mut cache = ContextCache::default();
+        let ctx = cache
+            .build(
+                st,
+                session_id,
+                &prompt,
+                forecast.context_tokens,
+                cfg.compaction.fraction(),
+            )?
+            .0;
+        let first_message_seq = cache.last_included_seq();
         let provider = Provider::with_key(pcfg, String::new(), self.http.clone())
             .with_name(name)
             .resolved_dispatch(&forecast.basis.model)
@@ -5166,6 +5181,7 @@ impl Daemon {
             resolved_model: forecast.basis.model.clone(),
             effort,
             recovery_messages,
+            first_message_seq,
             first: StdMutex::new(Some((ctx, defs, checkpoint, sources))),
         }))
     }
@@ -5380,7 +5396,7 @@ impl Daemon {
     ) -> Result<()> {
         let cancel = CancellationToken::new();
         let cancel_flag = Arc::new(AtomicBool::new(false));
-        let (steer_tx, steer_rx) = mpsc::unbounded_channel::<()>();
+        let (steer_tx, steer_rx) = mpsc::unbounded_channel::<i64>();
         {
             let mut runs = self.runs.locked();
             if let Some(ctl) = runs.get(&session_id) {
@@ -5402,6 +5418,7 @@ impl Daemon {
                     cancel: cancel.clone(),
                     cancel_flag: cancel_flag.clone(),
                     steer_tx,
+                    steering: Arc::new(Default::default()),
                     retry: Arc::new(tokio::sync::Notify::new()),
                 },
             );
@@ -5443,6 +5460,7 @@ impl Daemon {
     /// message works without a restart. Locks a panic may have poisoned
     /// are still taken.
     async fn run_panicked(self: &Arc<Self>, session_id: &str, run_id: &str, why: &str) {
+        self.close_run_steering(session_id, run_id);
         tracing::error!("run {run_id} in session {session_id} panicked: {why}");
         let error = format!("internal error: {why}");
         self.record_run_status(session_id, run_id, "paused");
@@ -5463,7 +5481,7 @@ impl Daemon {
         run_id: String,
         cancel: CancellationToken,
         cancel_flag: Arc<AtomicBool>,
-        steer_rx: mpsc::UnboundedReceiver<()>,
+        steer_rx: mpsc::UnboundedReceiver<i64>,
     ) {
         let task = self.routing_task_for_run(&session_id, &run_id);
         let producer = crate::routing_task_observation::Producer(task.clone());
@@ -5485,7 +5503,7 @@ impl Daemon {
         run_id: String,
         cancel: CancellationToken,
         cancel_flag: Arc<AtomicBool>,
-        mut steer_rx: mpsc::UnboundedReceiver<()>,
+        mut steer_rx: mpsc::UnboundedReceiver<i64>,
     ) {
         let taint_scope = self.taint_scope(&session_id, &run_id);
         let mut final_status = "completed";
@@ -5495,23 +5513,33 @@ impl Daemon {
                 .await
             {
                 Ok(()) => {
-                    // Steered messages continue the same Run (next step boundary).
-                    let mut steered = false;
-                    while steer_rx.try_recv().is_ok() {
-                        steered = true;
+                    #[cfg(test)]
+                    if let Some(hook) = self.run_final_decision_test.locked().take() {
+                        hook();
                     }
-                    if steered && !cancel.is_cancelled() {
-                        continue;
+                    // Steered messages continue the same Run (next step boundary).
+                    while steer_rx.try_recv().is_ok() {}
+                    match self.extend_or_close_steering(&session_id, &run_id, cancel.is_cancelled())
+                    {
+                        steering_daemon::SteeringOutcome::Extend => continue,
+                        steering_daemon::SteeringOutcome::Completed => {}
+                        steering_daemon::SteeringOutcome::Interrupted => {
+                            final_status = "interrupted";
+                            let _ = self
+                                .with_store(|st| st.set_run_error(&run_id, "interrupted by you"));
+                        }
                     }
                     break;
                 }
                 Err(e) if e.to_string().contains("interrupted") || cancel.is_cancelled() => {
                     final_status = "interrupted";
+                    self.close_run_steering(&session_id, &run_id);
                     let _ = self.with_store(|st| st.set_run_error(&run_id, "interrupted by you"));
                     break;
                 }
                 Err(e) => {
                     final_status = "paused";
+                    self.close_run_steering(&session_id, &run_id);
                     self.record_run_status(&session_id, &run_id, "paused");
                     let _ = self.with_store(|st| st.set_run_error(&run_id, &e.to_string()));
                     let mut explained = self.config().ok().map(|cfg| {
@@ -5578,6 +5606,7 @@ impl Daemon {
     /// free the Session, report what changed, resolve comparisons and jobs,
     /// run `run_end` hooks, and start the next queued message.
     async fn finish_run(self: &Arc<Self>, session_id: String, run_id: String, final_status: &str) {
+        self.close_run_steering(&session_id, &run_id);
         let _policy_owner = self.run_admissions.locked().remove(&run_id);
         use futures_util::FutureExt;
         // run_panicked reaches this outside run_loop's unwind boundary too.
@@ -5678,6 +5707,10 @@ impl Daemon {
                 runs.remove(&session_id);
             }
         }
+        #[cfg(test)]
+        if let Some(hook) = self.run_publication_test.locked().take() {
+            hook();
+        }
         self.budget_waived
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -5751,7 +5784,7 @@ impl Daemon {
     fn start_next_queued_message(self: &Arc<Self>, session_id: String) {
         let _admission = self.forecast_admission.locked();
         let _settings = self.config_guard();
-        if self.runs.locked().contains_key(&session_id) {
+        if self.runs.locked().contains_key(&session_id) || self.session_is_publishing(&session_id) {
             return;
         }
         let Ok(cfg) = self.config() else {
@@ -6112,6 +6145,9 @@ impl Daemon {
             None => self.config()?,
         };
         let mut first = admitted.as_ref().and_then(|a| a.first.locked().take());
+        let first_message_seq = admitted
+            .as_ref()
+            .map_or(0, |admission| admission.first_message_seq);
         let pipeline = admitted.as_ref().and_then(|a| a.pipeline.clone());
         if pipeline
             .as_ref()
@@ -6300,27 +6336,27 @@ impl Daemon {
             self.check_budget(session_id, run_id, &cfg)?;
             // Push delivery of completed Pending Invocations (§6.3).
             self.deliver_completed_pending(session_id);
-            let (ctx, defs, sources) = if let Some((mut ctx, defs, _, sources)) = first.take() {
-                if let Some(policy) = &pipeline {
-                    policy.options.project_context(&mut ctx)?;
-                }
-                (ctx, defs, Some(sources))
-            } else {
-                let ctx = self
-                    .session_context_with_policy(
+            let (ctx, defs, sources, consumed_seq) =
+                if let Some((mut ctx, defs, _, sources)) = first.take() {
+                    if let Some(policy) = &pipeline {
+                        policy.options.project_context(&mut ctx)?;
+                    }
+                    (ctx, defs, Some(sources), first_message_seq)
+                } else {
+                    let (built, consumed_seq) = self.session_context_with_policy_tracked(
                         session_id,
                         &provider,
                         &model,
                         context_tokens,
                         cfg.compaction.fraction(),
                         pipeline.as_ref().map(|p| &p.options),
-                    )?
-                    .0;
-                let defs = self.with_store(|st| {
-                    toolreg::tool_definitions(st, Some(session_id), cfg.tools.inline_limit)
-                })?;
-                (ctx, defs, None)
-            };
+                    )?;
+                    let ctx = built.0;
+                    let defs = self.with_store(|st| {
+                        toolreg::tool_definitions(st, Some(session_id), cfg.tools.inline_limit)
+                    })?;
+                    (ctx, defs, None, consumed_seq)
+                };
             let call_provider = match sources {
                 Some(sources) => provider.clone().with_frozen_attachments(sources),
                 None => provider.clone(),
@@ -6346,6 +6382,7 @@ impl Daemon {
                 last_byte.store(epoch_ms(), Ordering::SeqCst);
                 got_bytes.store(false, Ordering::SeqCst);
                 let hide_candidate = pipeline.as_ref().is_some_and(|p| p.options.has_schema());
+                self.mark_context_consumed(session_id,run_id,consumed_seq);
                 let chat_fut = counted(
                     "run",
                     session_id,
@@ -6816,9 +6853,15 @@ impl Daemon {
                 }
                 continue;
             }
+            if cancel.is_cancelled() || cancel_flag.load(Ordering::SeqCst) {
+                bail!("interrupted");
+            }
             let denied = self
                 .approve_calls(&cfg, session_id, run_id, &result.tool_calls, cancel)
                 .await?;
+            if cancel.is_cancelled() || cancel_flag.load(Ordering::SeqCst) {
+                bail!("interrupted");
+            }
             // Execute the batch in parallel (isolated sandboxes).
             let step_started = chrono::Utc::now().to_rfc3339();
             let mut futs = Vec::new();
@@ -7193,6 +7236,9 @@ impl Daemon {
         calls: &[ToolCall],
         cancel: &CancellationToken,
     ) -> Result<HashMap<String, bool>> {
+        if cancel.is_cancelled() {
+            bail!("interrupted");
+        }
         let mut denied: HashMap<String, bool> = HashMap::new();
         // Several held calls in one batch: each prompt lists them all
         // (SPEC §5.2), and each is still answered on its own.
@@ -7433,6 +7479,9 @@ impl Daemon {
         denied: &mut HashMap<String, bool>,
     ) -> Result<()> {
         for tc in calls {
+            if cancel.is_cancelled() {
+                bail!("interrupted");
+            }
             if toolreg::is_builtin(&tc.name) {
                 continue;
             }
@@ -7447,7 +7496,7 @@ impl Daemon {
                 let Ok(caps) = bound_caps(&ver, &input) else {
                     continue;
                 };
-                if !self
+                let approved = self
                     .ensure_approval(
                         cfg,
                         session_id,
@@ -7458,8 +7507,11 @@ impl Daemon {
                         Some(&input),
                         cancel,
                     )
-                    .await
-                {
+                    .await;
+                if cancel.is_cancelled() {
+                    bail!("interrupted");
+                }
+                if !approved {
                     denied.insert(tc.id.clone(), true);
                     self.record_inv(
                         &info,
@@ -7477,6 +7529,9 @@ impl Daemon {
                     );
                 }
             }
+        }
+        if cancel.is_cancelled() {
+            bail!("interrupted");
         }
         Ok(())
     }
@@ -7541,6 +7596,9 @@ impl Daemon {
         denied: &HashMap<String, bool>,
         agent_depth: usize,
     ) -> String {
+        if cancel.is_cancelled() || cancel_flag.load(Ordering::SeqCst) {
+            return call_failed("error: interrupted".into());
+        }
         let mut args: Value = match serde_json::from_str(&tc.arguments) {
             Ok(v) => v,
             Err(e) => {
@@ -7569,7 +7627,14 @@ impl Daemon {
             )
             .await
         {
-            return call_failed(format!("error: denied by a pre_tool hook: {reason}"));
+            return call_failed(if cancel.is_cancelled() {
+                "error: interrupted".into()
+            } else {
+                format!("error: denied by a pre_tool hook: {reason}")
+            });
+        }
+        if cancel.is_cancelled() || cancel_flag.load(Ordering::SeqCst) {
+            return call_failed("error: interrupted".into());
         }
         // Bootstrap/meta tools don't pass through execute_tool_value, so
         // broadcast their lifecycle here (registry Tools broadcast there).
@@ -7688,6 +7753,9 @@ impl Daemon {
                         cancel,
                     )
                     .await;
+                if cancel.is_cancelled() {
+                    return call_failed("error: interrupted".into());
+                }
                 if !approved {
                     let _ = self.with_store(|st| st.audit("agent", "mcp.remove.denied", &name));
                     call_failed(
@@ -7911,7 +7979,7 @@ impl Daemon {
                 elapsed_ms,
             });
         }
-        if cfg.hooks.iter().any(|h| h.event == "post_tool") {
+        if !cancel.is_cancelled() && cfg.hooks.iter().any(|h| h.event == "post_tool") {
             let result: String = text.chars().take(4000).collect();
             self.run_tool_hooks(
                 "post_tool",
@@ -7962,6 +8030,9 @@ impl Daemon {
             payload["ok"] = json!(!r.starts_with("error:"));
         }
         for h in hooks {
+            if cancel.is_cancelled() {
+                return Some("interrupted".into());
+            }
             if !crate::hooks::matches(h, tool, &caps) {
                 continue;
             }
@@ -7992,6 +8063,8 @@ impl Daemon {
     ) -> (bool, String) {
         let timeout = std::time::Duration::from_secs(h.timeout_secs.unwrap_or(30).max(1));
         if let Some(name) = &h.run_tool {
+            let hook_cancel = cancel.child_token();
+            let hook_flag = Arc::new(AtomicBool::new(false));
             let fut = self.clone().execute_tool_value(
                 session_id.to_string(),
                 run_id.to_string(),
@@ -7999,16 +8072,30 @@ impl Daemon {
                 payload.clone(),
                 1,
                 None,
-                Arc::new(AtomicBool::new(false)),
+                hook_flag.clone(),
                 None,
-                cancel.clone(),
+                hook_cancel.clone(),
                 cfg.clone(),
                 false,
             );
-            return match tokio::time::timeout(timeout, fut).await {
-                Ok(Ok((v, _))) => crate::hooks::tool_verdict(&v),
-                Ok(Err(e)) => (false, format!("hook tool {name} failed: {e}")),
-                Err(_) => (false, format!("hook tool {name} timed out")),
+            tokio::pin!(fut);
+            let timed_out = tokio::select! {
+                result = &mut fut => return match result {
+                    Ok((v, _)) => crate::hooks::tool_verdict(&v),
+                    Err(e) => (false, format!("hook tool {name} failed: {e}")),
+                },
+                _ = cancel.cancelled() => false,
+                _ = tokio::time::sleep(timeout) => true,
+            };
+            // Drive consent bookkeeping to completion instead of dropping a
+            // waiter that may already have acknowledged a reply.
+            hook_flag.store(true, Ordering::SeqCst);
+            hook_cancel.cancel();
+            let _ = fut.await;
+            return if timed_out {
+                (false, format!("hook tool {name} timed out"))
+            } else {
+                (false, "interrupted".into())
             };
         }
         let Some((cmd, args)) = h.command.split_first() else {
@@ -8035,10 +8122,16 @@ impl Daemon {
                 )
                 .await;
             if !ok {
+                if cancel.is_cancelled() {
+                    return (false, "interrupted".into());
+                }
                 // Fail closed: an unapproved policy hook blocks its call.
                 return (false, format!("hook command not approved: {key}"));
             }
             self.hook_approvals.locked().insert(key.clone());
+        }
+        if cancel.is_cancelled() {
+            return (false, "interrupted".into());
         }
         crate::hooks::run_command(cmd, args, payload, timeout).await
     }
@@ -9330,7 +9423,10 @@ impl Daemon {
             }
             // The Session's model/effort, or a role's provider + model
             // (`role:<name>`), never the daemon default (SPEC §4.5, §7.6).
-            let target = self.target(cfg, session_id, model).await?;
+            let target = tokio::select! {
+                _ = cancel.cancelled() => bail!("interrupted"),
+                result = self.target(cfg, session_id, model) => result?,
+            };
             let provider = target.provider;
             let session_effort = target.effort;
             let requested = target.model;
@@ -10043,6 +10139,9 @@ impl Daemon {
                 cancel,
             )
             .await;
+        if cancel.is_cancelled() {
+            bail!("interrupted");
+        }
         if !approved {
             return Err(anyhow!(
                 "the user did not approve this harness change (or nobody is connected to ask)"
@@ -11213,6 +11312,9 @@ impl Daemon {
                 ok
             }
         };
+        if cancel.is_cancelled() {
+            bail!("interrupted");
+        }
         let job = self.with_store(|st| {
             st.create_job(
                 prompt,
@@ -11574,11 +11676,7 @@ impl Daemon {
             options,
             questions: questions.clone(),
         });
-        let reply = tokio::select! {
-            _ = cancel.cancelled() => None,
-            r = rx => r.ok(),
-        };
-        self.questions.locked().remove(&question_id);
+        let reply = prompt_reply::wait(&self.questions, &question_id, rx, cancel, || {}).await;
         self.broadcast(Event::UserQuestionClosed { question_id });
         let (answer, answers) = reply.context("interrupted before the user answered")?;
         if answers.is_empty() {
@@ -11649,7 +11747,7 @@ impl Daemon {
         };
         if ask {
             let (keep, _) = self
-                .ask_user_approval(
+                .ask_user_approval_decision(
                     session_id,
                     run_id,
                     "memory",
@@ -11659,7 +11757,10 @@ impl Daemon {
                     ),
                     cancel,
                 )
-                .await;
+                .await.context("interrupted before the memory decision")?;
+            // A delivered Approve-to-keep decision owns this bounded atomic
+            // memory commit. Run cancellation stops subsequent batch work,
+            // rather than discarding the acknowledged decision itself.
             if !keep {
                 let _ = self.with_store(|st| st.audit("user", "memory.discard", &cleaned));
                 return Ok(json!({
@@ -11746,6 +11847,9 @@ impl Daemon {
         server: &str,
         cancel: &CancellationToken,
     ) -> bool {
+        if cancel.is_cancelled() {
+            return false;
+        }
         if self
             .with_store(|st| st.mcp_server_approved(server))
             .unwrap_or(false)
@@ -11765,7 +11869,7 @@ impl Daemon {
         if ok && scope == ApprovalScope::Always {
             let _ = self.with_store(|st| st.approve_mcp_server(server));
         }
-        ok
+        ok && !cancel.is_cancelled()
     }
 
     async fn list_mcp_resources(
@@ -11879,6 +11983,9 @@ impl Daemon {
                 cancel,
             )
             .await;
+        if cancel.is_cancelled() {
+            return call_failed("error: interrupted".into());
+        }
         if !approved {
             let _ = self.with_store(|st| st.audit("agent", "mcp.add.denied", &name));
             return call_failed("error: the user did not approve adding this MCP server".into());
@@ -12087,11 +12194,20 @@ impl Daemon {
                 )
                 .await
             {
+                if cancel.is_cancelled() {
+                    bail!("interrupted");
+                }
                 bail!("{}", self.denied_text(&name));
+            }
+            if cancel.is_cancelled() {
+                bail!("interrupted");
             }
             if !caps.has_bindings() {
                 preapproved.insert(name.clone());
             }
+        }
+        if cancel.is_cancelled() {
+            bail!("interrupted");
         }
         let script_id = uuid::Uuid::new_v4().to_string();
         let hash = crate::scripts::recurrence_key(source, &uses);
@@ -12338,10 +12454,16 @@ impl Daemon {
             )
             .await
         {
+            if cancel.is_cancelled() {
+                bail!("interrupted");
+            }
             return Ok(
                 json!({"ok": false, "stage": "approval", "error": "user denied approval"})
                     .to_string(),
             );
+        }
+        if cancel.is_cancelled() {
+            bail!("interrupted");
         }
         let ops = Arc::new(NestedOps {
             _pipeline: self.pipeline_policies.locked().lookup(&run_id),
@@ -12439,6 +12561,9 @@ impl Daemon {
         input: Option<&Value>,
         cancel: &CancellationToken,
     ) -> bool {
+        if cancel.is_cancelled() {
+            return false;
+        }
         // Concrete protected targets are never offered for consent. Broad
         // scopes remain usable for ordinary files; the runtime excludes the
         // protected subtree at each actual operation regardless of that grant.
@@ -12642,6 +12767,10 @@ impl Daemon {
             });
             return true;
         }
+        // Cancellation is not a refusal and cannot open the next prompt.
+        if cancel.is_cancelled() {
+            return false;
+        }
         // Fail closed when nobody can answer (SPEC §12 headless rule).
         if self.subscriber_count() == 0 {
             return false;
@@ -12717,13 +12846,18 @@ impl Daemon {
         if cfg.tools.approval_summaries && caps.mcp.is_empty() {
             self.send_approval_summary(cfg, session_id, run_id, &approval_id, info, ver);
         }
-        let (approved, scope) = tokio::select! {
-            _ = cancel.cancelled() => (false, ApprovalScope::Once),
-            r = rx => r.unwrap_or((false, ApprovalScope::Once)),
+        let answer = prompt_reply::wait(&self.approvals, &approval_id, rx, cancel, || {
+            #[cfg(test)]
+            self.test_approval_transition("waiter-cleanup", &approval_id);
+        })
+        .await;
+        let Some((approved, scope)) = answer else {
+            self.deny_always.locked().remove(&approval_id);
+            self.approval_paths.locked().remove(&approval_id);
+            self.approval_by.locked().remove(&approval_id);
+            self.broadcast(Event::ApprovalClosed { approval_id });
+            return false;
         };
-        #[cfg(test)]
-        self.test_approval_transition("waiter-cleanup", &approval_id);
-        self.approvals.locked().remove(&approval_id);
         self.remove_attention(&approval_id);
         let by = self
             .approval_by
@@ -13403,6 +13537,9 @@ impl Daemon {
     ) -> ExecFuture {
         let progress = progress.unwrap_or_else(|| Arc::new(Default::default()));
         Box::pin(async move {
+            if cancel.is_cancelled() || cancel_flag.load(Ordering::SeqCst) {
+                return Err("interrupted".into());
+            }
             if depth > cfg.tools.max_tool_depth {
                 return Err(format!(
                     "tool nesting deeper than tools.max_tool_depth ({}): a cycle?",
@@ -13475,8 +13612,8 @@ impl Daemon {
                     return Err(e);
                 }
             };
-            if !preapproved
-                && !self
+            let approved = preapproved
+                || self
                     .ensure_approval(
                         &cfg,
                         &session_id,
@@ -13487,8 +13624,11 @@ impl Daemon {
                         Some(&input),
                         &cancel,
                     )
-                    .await
-            {
+                    .await;
+            if cancel.is_cancelled() || cancel_flag.load(Ordering::SeqCst) {
+                return Err("interrupted".into());
+            }
+            if !approved {
                 self.record_inv(
                     &info,
                     ver.version,
@@ -13746,6 +13886,26 @@ impl Daemon {
         trigger_fraction: f64,
         policy: Option<&crate::pipeline::CompiledRunOptions>,
     ) -> Result<crate::storage::BuiltContext> {
+        self.session_context_with_policy_tracked(
+            session_id,
+            provider,
+            model,
+            context_tokens,
+            trigger_fraction,
+            policy,
+        )
+        .map(|(built, _)| built)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn session_context_with_policy_tracked(
+        &self,
+        session_id: &str,
+        provider: &Provider,
+        model: &str,
+        context_tokens: u32,
+        trigger_fraction: f64,
+        policy: Option<&crate::pipeline::CompiledRunOptions>,
+    ) -> Result<(crate::storage::BuiltContext, i64)> {
         let prompt = self.session_prompt(session_id)?;
         let inline_limit = self.config()?.tools.inline_limit;
         let mut cache = self
@@ -13766,7 +13926,11 @@ impl Daemon {
                 provider.prompt_tokens(&built.0, &defs, model),
                 st.token_ratio(&key, model)?,
             );
-            Ok(cache.with_prompt_tokens(built, estimated, context_tokens, trigger_fraction))
+            let included_seq = cache.last_included_seq();
+            Ok((
+                cache.with_prompt_tokens(built, estimated, context_tokens, trigger_fraction),
+                included_seq,
+            ))
         });
         if built.is_ok() {
             self.contexts
@@ -14414,8 +14578,25 @@ impl Daemon {
         detail: String,
         cancel: &CancellationToken,
     ) -> (bool, ApprovalScope) {
+        self.ask_user_approval_decision(session_id, run_id, what, items, detail, cancel)
+            .await
+            .unwrap_or((false, ApprovalScope::Once))
+    }
+
+    async fn ask_user_approval_decision(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        what: &str,
+        items: Vec<String>,
+        detail: String,
+        cancel: &CancellationToken,
+    ) -> Option<(bool, ApprovalScope)> {
+        if cancel.is_cancelled() {
+            return None;
+        }
         if self.subscriber_count() == 0 {
-            return (false, ApprovalScope::Once);
+            return Some((false, ApprovalScope::Once));
         }
         let approval_id = uuid::Uuid::new_v4().to_string();
         let (tx, rx) = oneshot::channel::<(bool, ApprovalScope)>();
@@ -14444,20 +14625,24 @@ impl Daemon {
             tool_id: None,
             batch: None,
         });
-        let answer = tokio::select! {
-            _ = cancel.cancelled() => (false, ApprovalScope::Once),
-            r = rx => r.unwrap_or((false, ApprovalScope::Once)),
-        };
-        #[cfg(test)]
-        self.test_approval_transition("waiter-cleanup", &approval_id);
-        self.approvals.locked().remove(&approval_id);
+        let answer = prompt_reply::wait(&self.approvals, &approval_id, rx, cancel, || {
+            #[cfg(test)]
+            self.test_approval_transition("waiter-cleanup", &approval_id);
+        })
+        .await;
         self.remove_attention(&approval_id);
         // These prompts have no Tool to remember a denial or a folder for:
         // drop what an answer may have left (clients don't offer them, #764).
         self.deny_always.locked().remove(&approval_id);
         self.approval_paths.locked().remove(&approval_id);
         self.approval_by.locked().remove(&approval_id);
-        answer
+        match answer {
+            Some(answer) => Some(answer),
+            None => {
+                self.broadcast(Event::ApprovalClosed { approval_id });
+                None
+            }
+        }
     }
 
     /// The MCP part of an approval (SPEC §7.9): the server is approved
@@ -14502,13 +14687,16 @@ impl Daemon {
                     cancel,
                 )
                 .await;
+            if ok && scope == ApprovalScope::Always {
+                let _ = self.with_store(|st| st.approve_mcp_server(server));
+                let _ = self.with_store(|st| st.audit("user", "mcp.server.approve", server));
+            }
+            if cancel.is_cancelled() {
+                return McpApproval::Denied;
+            }
             if !ok {
                 let _ = self.with_store(|st| st.audit("user", "mcp.server.deny", server));
                 return McpApproval::Denied;
-            }
-            if scope == ApprovalScope::Always {
-                let _ = self.with_store(|st| st.approve_mcp_server(server));
-                let _ = self.with_store(|st| st.audit("user", "mcp.server.approve", server));
             }
         }
         let ann = crate::mcp::annotations(&ver.code);
@@ -15609,6 +15797,9 @@ impl HostOps for NestedOps {
                 &self.cancel,
             ),
         ));
+        if self.cancel.is_cancelled() {
+            return Err("interrupted".into());
+        }
         if allowed {
             Ok(())
         } else {
@@ -15702,15 +15893,20 @@ impl HostOps for NestedOps {
             })
             .map(|(t, _)| t.name)
             .unwrap_or_else(|| self.kv_scope.clone());
-        self.block_cancellable(self.daemon.harness_call(
-            &self.session_id,
-            &self.run_id,
-            &tool,
-            op,
-            args,
-            reason,
-            &self.cancel,
-        ))
+        self.handle
+            .block_on(crate::routing_task_observation::scope(
+                self.routing_task.clone(),
+                self.daemon.harness_call(
+                    &self.session_id,
+                    &self.run_id,
+                    &tool,
+                    op,
+                    args,
+                    reason,
+                    &self.cancel,
+                ),
+            ))
+            .map_err(|error| error.to_string())
     }
 
     fn kv(
@@ -15771,23 +15967,28 @@ impl HostOps for NestedOps {
         );
         let parent_inv = self.parent_inv.clone();
         let caller_tool = self.tool_name.clone();
-        self.block_cancellable(async move {
-            daemon
-                .run_subagent_text(
-                    &session_id,
-                    &run_id,
-                    &caller_tool,
-                    &task,
-                    system.as_deref(),
-                    model.as_deref(),
-                    &cfg,
-                    &cancel_flag,
-                    &cancel,
-                    agent_depth,
-                    parent_inv.as_deref(),
-                )
-                .await
-        })
+        self.handle
+            .block_on(crate::routing_task_observation::scope(
+                self.routing_task.clone(),
+                async move {
+                    daemon
+                        .run_subagent_text(
+                            &session_id,
+                            &run_id,
+                            &caller_tool,
+                            &task,
+                            system.as_deref(),
+                            model.as_deref(),
+                            &cfg,
+                            &cancel_flag,
+                            &cancel,
+                            agent_depth,
+                            parent_inv.as_deref(),
+                        )
+                        .await
+                },
+            ))
+            .map_err(|error| error.to_string())
     }
 
     fn llm_complete(
@@ -17560,7 +17761,7 @@ mod run_start_tests {
         let daemon = Arc::new(Daemon::new(paths).unwrap());
         let sid = daemon.with_store(|st| st.create_session(None)).unwrap().id;
         // A Run holds the Session (inserted as start_run would).
-        let (steer_tx, mut steer_rx) = mpsc::unbounded_channel::<()>();
+        let (steer_tx, mut steer_rx) = mpsc::unbounded_channel::<i64>();
         daemon.runs.locked().insert(
             sid.clone(),
             RunCtl {
@@ -17568,6 +17769,7 @@ mod run_start_tests {
                 cancel: CancellationToken::new(),
                 cancel_flag: Arc::new(AtomicBool::new(false)),
                 steer_tx,
+                steering: Arc::new(Default::default()),
                 retry: Arc::new(tokio::sync::Notify::new()),
             },
         );
@@ -17925,6 +18127,7 @@ mod live_snapshot_tests {
                 cancel: CancellationToken::new(),
                 cancel_flag: Arc::new(AtomicBool::new(false)),
                 steer_tx,
+                steering: Arc::new(Default::default()),
                 retry: Arc::new(tokio::sync::Notify::new()),
             },
         );
@@ -18088,6 +18291,9 @@ mod model_test_daemon_tests;
 #[path = "review_daemon.rs"]
 mod review_daemon;
 
+#[path = "prompt_reply.rs"]
+mod prompt_reply;
+
 #[path = "plan_daemon.rs"]
 mod plan_daemon;
 
@@ -18096,6 +18302,9 @@ mod progress_daemon;
 
 #[path = "recap_daemon.rs"]
 mod recap_daemon;
+
+#[path = "steering_daemon.rs"]
+mod steering_daemon;
 
 #[path = "run_files_daemon.rs"]
 mod run_files_daemon;

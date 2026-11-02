@@ -477,7 +477,7 @@ async fn default_and_named_external_key_files_are_hard_denied_by_path_without_re
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cancellation_serializes_with_inflight_answer_before_any_metadata_can_outlive_waiter() {
+async fn answer_claimed_before_cancel_cleanup_is_acknowledged_and_applied_once() {
     type Gate = Arc<(StdMutex<bool>, std::sync::Condvar)>;
     struct ReleaseGate(Gate);
     impl Drop for ReleaseGate {
@@ -579,8 +579,8 @@ async fn cancellation_serializes_with_inflight_answer_before_any_metadata_can_ou
         .unwrap()
         .unwrap();
     assert_eq!(
-        result["resolved"], false,
-        "receiver was dropped when cancellation won"
+        result["resolved"], true,
+        "the handler claimed the registry before cancellation cleanup"
     );
     assert!(completed(task).await.is_err());
     assert_eq!(
@@ -591,13 +591,17 @@ async fn cancellation_serializes_with_inflight_answer_before_any_metadata_can_ou
     assert!(f.daemon().approval_paths.locked().is_empty());
     assert!(f.daemon().approval_by.locked().is_empty());
     assert!(f.daemon().deny_always.locked().is_empty());
-    assert!(
-        f.daemon()
-            .with_reader(|st| st.list_denials())
-            .unwrap()
-            .is_empty(),
-        "a failed answer must not remember a denial"
+    let denials = f.daemon().with_reader(|st| st.list_denials()).unwrap();
+    assert_eq!(
+        denials.len(),
+        1,
+        "the acknowledged explicit denial is applied once"
     );
+    assert_eq!(
+        denials[0].capability,
+        format!("fs:read-sensitive:{}", key.display())
+    );
+    assert_eq!(denials[0].denied_by, "private answer fixture");
     assert!(!f.daemon().pending_attention.locked().iter().any(
         |event| matches!(event, Event::ApprovalRequested {approval_id:id, ..} if id == &approval_id)
     ));
@@ -606,4 +610,218 @@ async fn cancellation_serializes_with_inflight_answer_before_any_metadata_can_ou
         std::fs::read_to_string(key).unwrap(),
         "inflight-private-fixture"
     );
+}
+
+#[tokio::test]
+async fn acknowledged_question_survives_both_ready_cancel_exactly_once() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let f = Fixture::new(&env, true);
+    let mut events = f.events();
+    let cancel = CancellationToken::new();
+    let args = json!({"question":"Which fixture?", "options":["one", "two"]});
+    let reply = f.daemon().ask_user_impl(&f.session, &args, &cancel);
+    tokio::pin!(reply);
+    assert!(futures_util::poll!(&mut reply).is_pending());
+    let question_id = loop {
+        if let ServerMessage::Event(Event::UserQuestion { question_id, .. }) =
+            events.try_recv().unwrap()
+        {
+            break question_id;
+        }
+    };
+    let answer = || Request::AnswerQuestion {
+        question_id: question_id.clone(),
+        answer: "one".into(),
+        answers: Vec::new(),
+    };
+    assert_eq!(f.daemon().handle(answer()).await.unwrap()["answered"], true);
+    cancel.cancel();
+    let value: Value = serde_json::from_str(&reply.await.unwrap()).unwrap();
+    assert_eq!(value, json!({"answer":"one"}));
+    assert_eq!(
+        f.daemon().handle(answer()).await.unwrap()["answered"],
+        false
+    );
+    let mut closed = 0;
+    while let Ok(message) = events.try_recv() {
+        if matches!(message, ServerMessage::Event(Event::UserQuestionClosed {question_id:id}) if id == question_id)
+        {
+            closed += 1;
+        }
+    }
+    assert_eq!(closed, 1);
+    assert!(f.daemon().questions.locked().is_empty());
+}
+
+#[tokio::test]
+async fn acknowledged_always_grant_survives_both_ready_cancel_without_dispatch() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let f = Fixture::new(&env, true);
+    let mut events = f.events();
+    let cancel = CancellationToken::new();
+    let (info, ver) = f
+        .daemon()
+        .with_store(|st| st.get_tool_by_name(&f.tool.name))
+        .unwrap()
+        .unwrap();
+    let caps = Capabilities::parse(&["process:fixture-no-execution".into()]).unwrap();
+    let cfg = f.daemon().config().unwrap();
+    let approval = f.daemon().ensure_approval(
+        &cfg, &f.session, "fixture", &info, &ver, &caps, None, &cancel,
+    );
+    tokio::pin!(approval);
+    assert!(futures_util::poll!(&mut approval).is_pending());
+    let Event::ApprovalRequested { approval_id, .. } = next_approval(&mut events).await else {
+        unreachable!()
+    };
+    let answer = || Request::ApprovalDecision {
+        approval_id: approval_id.clone(),
+        approved: true,
+        scope: ApprovalScope::Always,
+        paths: Default::default(),
+        remember_denial: false,
+    };
+    assert_eq!(f.daemon().handle(answer()).await.unwrap()["resolved"], true);
+    cancel.cancel();
+    assert!(
+        approval.await,
+        "a delivered grant must be applied before caller interruption"
+    );
+    assert_eq!(
+        f.daemon().handle(answer()).await.unwrap()["resolved"],
+        false
+    );
+    let grant = f
+        .daemon()
+        .with_store(|st| st.get_approval(&info.id))
+        .unwrap()
+        .unwrap();
+    assert!(grant.0.covers(&caps));
+    assert!(f.daemon().approvals.locked().is_empty());
+    assert!(f.daemon().approval_paths.locked().is_empty());
+    assert!(f.daemon().approval_by.locked().is_empty());
+    assert!(f.daemon().deny_always.locked().is_empty());
+    let conn = rusqlite::Connection::open(f.paths.db_file()).unwrap();
+    let grants: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM audit WHERE action='tool.approve'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(grants, 1);
+    let decisions: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM audit WHERE action='approval.decision'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(decisions, 1);
+    let mut answered = 0;
+    while let Ok(message) = events.try_recv() {
+        match message {
+            ServerMessage::Event(Event::ApprovalAnswered {
+                approval_id: id,
+                approved,
+                ..
+            }) if id == approval_id => {
+                assert!(approved);
+                answered += 1;
+            }
+            ServerMessage::Event(Event::ApprovalClosed { approval_id: id })
+                if id == approval_id =>
+            {
+                panic!("acknowledged grant cannot be cancelled closed")
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(answered, 1);
+    let invocations: i64 = conn
+        .query_row("SELECT count(*) FROM invocations", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(invocations, 0);
+}
+
+#[tokio::test]
+async fn hook_timeout_closes_unanswered_consent_without_denial_or_orphan() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let f = Fixture::new(&env, true);
+    let mut events = f.events();
+    let caps = Capabilities::parse(&["process:fixture-no-execution".into()]).unwrap();
+    let name = "fixture_hook_consent";
+    f.daemon()
+        .with_store(|st| {
+            st.create_tool_version(
+                name,
+                "Never execute without consent",
+                "{\"type\":\"object\"}",
+                "{}",
+                "function run(i) { return true; }",
+                &caps,
+                64,
+                "user",
+            )
+        })
+        .unwrap();
+    let hook = crate::config::HookCfg {
+        run_tool: Some(name.into()),
+        timeout_secs: Some(1),
+        ..Default::default()
+    };
+    let cfg = f.daemon().config().unwrap();
+    let payload = json!({"event":"pre_tool"});
+    let cancel = CancellationToken::new();
+    let result = f
+        .daemon()
+        .run_hook(&hook, &payload, &f.session, "fixture", &cfg, &cancel);
+    tokio::pin!(result);
+    assert!(futures_util::poll!(&mut result).is_pending());
+    let Event::ApprovalRequested { approval_id, .. } = next_approval(&mut events).await else {
+        unreachable!()
+    };
+    // This is the product's configured deadline, not a scheduling sleep.
+    let verdict = tokio::time::timeout(std::time::Duration::from_secs(5), result)
+        .await
+        .unwrap();
+    assert_eq!(verdict, (false, format!("hook tool {name} timed out")));
+    assert!(f.daemon().approvals.locked().is_empty());
+    assert!(f.daemon().approval_paths.locked().is_empty());
+    assert!(f.daemon().approval_by.locked().is_empty());
+    assert!(f.daemon().deny_always.locked().is_empty());
+    let late = f
+        .daemon()
+        .handle(Request::ApprovalDecision {
+            approval_id: approval_id.clone(),
+            approved: false,
+            scope: ApprovalScope::Always,
+            paths: Default::default(),
+            remember_denial: true,
+        })
+        .await
+        .unwrap();
+    assert_eq!(late["resolved"], false);
+    let mut closed = 0;
+    while let Ok(message) = events.try_recv() {
+        match message {
+            ServerMessage::Event(Event::ApprovalClosed { approval_id: id })
+                if id == approval_id =>
+            {
+                closed += 1
+            }
+            ServerMessage::Event(Event::ApprovalAnswered {
+                approval_id: id, ..
+            }) if id == approval_id => panic!("timeout is not a denial"),
+            _ => {}
+        }
+    }
+    assert_eq!(closed, 1);
+    let conn = rusqlite::Connection::open(f.paths.db_file()).unwrap();
+    let denied: i64 = conn.query_row("SELECT count(*) FROM audit WHERE action IN ('approval.decision','tool.deny','tool.deny_always')", [], |r| r.get(0)).unwrap();
+    assert_eq!(denied, 0);
+    let invocations: i64 = conn
+        .query_row("SELECT count(*) FROM invocations", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(invocations, 0);
 }

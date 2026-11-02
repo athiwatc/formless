@@ -2,6 +2,12 @@
 use super::*;
 use std::collections::VecDeque;
 
+#[derive(Debug, PartialEq)]
+pub(super) enum Acknowledged {
+    Run,
+    Queued,
+}
+
 #[derive(Default)]
 pub(super) struct Target {
     pub(super) run_id: Option<String>,
@@ -21,7 +27,15 @@ impl Target {
     pub(super) fn waiting(&self) -> bool {
         !self.acknowledged
     }
-    pub(super) fn acknowledge(&mut self, result: &Value) -> Result<()> {
+    pub(super) fn acknowledge(&mut self, result: &Value) -> Result<Acknowledged> {
+        if result["queued"] == true {
+            // A queue entry has no Run yet. Buffered activity belongs to
+            // earlier work and must not manufacture an execution identity.
+            self.pending.clear();
+            self.bytes = 0;
+            self.acknowledged = true;
+            return Ok(Acknowledged::Queued);
+        }
         if let Some(run) = result["run_id"].as_str().filter(|id| !id.is_empty()) {
             self.run_id = Some(run.into());
         } else {
@@ -37,7 +51,7 @@ impl Target {
             self.run_id = first.map(str::to_owned);
         }
         self.acknowledged = true;
-        Ok(())
+        Ok(Acknowledged::Run)
     }
     pub(super) fn next(&mut self) -> Option<Event> {
         if !self.acknowledged {
@@ -54,7 +68,8 @@ impl Target {
         let event_run = identity["run_id"]
             .as_str()
             .filter(|id| !id.is_empty())
-            .or_else(|| identity["plan_state"]["run_id"].as_str());
+            .or_else(|| identity["plan_state"]["run_id"].as_str())
+            .or_else(|| identity["context"]["run_id"].as_str());
         Ok(event_run.is_none_or(|id| self.run_id.as_deref() == Some(id)))
     }
 }
@@ -129,3 +144,7 @@ mod tests {
         assert!(target.buffer(started("overflow")).is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "cli_control_reply_tests.rs"]
+mod control_reply_tests;

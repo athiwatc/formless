@@ -210,7 +210,7 @@ test('approval decisions stay pending until confirmed; failures remain retryable
   assert.equal(calls, 1); assert.equal(c.S.approvals.length, 1); assert.equal(notes.length, 0);
   waits[0].reject(new Error('offline')); await first;
   assert.equal(c.S.approvals.length, 1); assert.equal(c.S.approvals[0].deciding, false);
-  assert.match(errors[0], /not delivered/); assert.equal(c.S.batchAnswers, undefined);
+  assert.match(errors[0], /not confirmed.*Inspect current approvals or grants/); assert.equal(c.S.batchAnswers, undefined);
   const retry = c.decide(true, 'once'); waits[1].resolve({ resolved: true }); await retry;
   assert.equal(c.S.approvals.length, 0); assert.equal(c.S.batchAnswers.b[1], 'once');
   assert.equal(notes.filter(x => x.startsWith('approved ')).length, 1);
