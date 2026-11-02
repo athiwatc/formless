@@ -17,11 +17,10 @@ fn temp_paths(tag: &str) -> Paths {
     // Unique profile per test dir: keychain users derive from the profile,
     // so tests must never touch the developer's real "default" entries
     // (which can also block on a macOS Keychain access prompt).
-    let paths = Paths {
-        data_dir: base.join("d"),
-        config_dir: base.join("c"),
-        profile: format!("test-{tag}-{short}"),
-    };
+    let paths = Paths::from_dirs(base.join("d"), base.join("c"))
+        .unwrap()
+        .named(&format!("test-{tag}-{short}"))
+        .unwrap();
     std::fs::create_dir_all(&paths.data_dir).unwrap();
     std::fs::create_dir_all(&paths.config_dir).unwrap();
     paths

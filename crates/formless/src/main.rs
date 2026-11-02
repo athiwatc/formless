@@ -25,6 +25,11 @@ fn write_run_file_notice(
     let _ = writeln!(out, "{}", formless_tui::run_files_text(files, untracked));
 }
 
+fn parse_profile_name(value: &str) -> std::result::Result<String, String> {
+    formless_core::paths::validate_profile_name(value).map_err(|error| error.to_string())?;
+    Ok(value.to_owned())
+}
+
 #[derive(Parser)]
 #[command(
     name = "formless",
@@ -33,7 +38,7 @@ fn write_run_file_notice(
 )]
 struct Cli {
     /// Isolated profile (separate daemon + data dir)
-    #[arg(long, global = true)]
+    #[arg(long, global = true, value_parser = parse_profile_name)]
     profile: Option<String>,
     /// Plain, line-oriented mode for screen readers (no redraws,
     /// spinners or borders); also `tui.screen_reader = true`
@@ -1211,6 +1216,7 @@ enum ProfilesAction {
     },
     /// Delete a profile's data, config and stored secrets
     Rm {
+        #[arg(value_parser = parse_profile_name)]
         name: String,
         /// Don't ask for confirmation (required when not on a terminal)
         #[arg(long, visible_alias = "yes")]
@@ -1218,11 +1224,33 @@ enum ProfilesAction {
     },
 }
 
+/// Pure preflight: no daemon, service, keychain or destructive callbacks.
+fn profile_removal_target(paths: &Paths, name: &str) -> Result<Paths> {
+    let target = paths.named(name)?;
+    if name == "default" {
+        anyhow::bail!("the default profile can't be removed; `formless reset` wipes it");
+    }
+    target.validate_cleanup_namespace()?;
+    if !paths
+        .list_profiles()
+        .iter()
+        .any(|profile| profile.profile == name)
+    {
+        return Err(usage(format!(
+            "no profile named {name:?} (see `formless profiles list`)"
+        )));
+    }
+    Ok(target)
+}
+
 fn profiles_cmd(paths: &Paths, action: ProfilesAction) -> Result<()> {
     match action {
         ProfilesAction::List { json } => {
-            let rows: Vec<Value> = paths
-                .list_profiles()
+            let inventory = paths.profile_inventory();
+            for diagnostic in &inventory.diagnostics {
+                eprintln!("warning: {diagnostic}");
+            }
+            let rows: Vec<Value> = inventory.profiles
                 .iter()
                 .map(|p| {
                     let running = daemon_reachable(p);
@@ -1273,18 +1301,8 @@ fn profiles_cmd(paths: &Paths, action: ProfilesAction) -> Result<()> {
             Ok(())
         }
         ProfilesAction::Rm { name, force } => {
-            if name == "default" {
-                anyhow::bail!("the default profile can't be removed; `formless reset` wipes it");
-            }
-            let Some(target) = paths
-                .list_profiles()
-                .into_iter()
-                .find(|p| p.profile == name)
-            else {
-                return Err(usage(format!(
-                    "no profile named '{name}' (see `formless profiles list`)"
-                )));
-            };
+            // Programmatic callers receive the same preflight as clap callers.
+            let target = profile_removal_target(paths, &name)?;
             if !force {
                 confirm_typed(
                     &format!(
@@ -7233,6 +7251,7 @@ fn tool_run_exit(v: &serde_json::Value, text: &str) -> i32 {
 /// and secrets, then its folders (unless --keep-data), then the binary
 /// (unless --keep-binary or a package manager owns it).
 fn uninstall_cmd(paths: &Paths, keep_data: bool, keep_binary: bool, yes: bool) -> Result<()> {
+    paths.validate_cleanup_namespace()?;
     let profiles = paths.list_profiles();
     let exe = std::env::current_exe().ok();
     // A package manager's binary is removed with the package manager.
@@ -7278,7 +7297,7 @@ fn uninstall_cmd(paths: &Paths, keep_data: bool, keep_binary: bool, yes: bool) -
     }
     // What could not be removed; any of it makes the exit non-zero.
     let mut failed: Vec<String> = Vec::new();
-    let base = paths.named("default");
+    let base = paths.named("default")?;
     let changed = profile_maintenance(
         &base,
         || {
@@ -7414,6 +7433,7 @@ fn erase_profiles(
             .map(|p| p.profile.clone())
             .collect::<std::collections::BTreeSet<_>>()
     };
+    base.validate_cleanup_namespace()?;
     if names(&base.list_profiles()) != names(expected) {
         anyhow::bail!(
             "profile inventory changed during preparation; nothing was deleted; retry uninstall"
@@ -7445,6 +7465,7 @@ fn profile_maintenance<T>(
     stop: impl FnOnce() -> Result<()>,
     change: impl FnOnce(&formless_core::profile_lock::MaintenanceGuard) -> Result<T>,
 ) -> Result<T> {
+    paths.validate_cleanup_namespace()?;
     let gate = formless_core::profile_lock::ProfileLock::maintenance(
         paths,
         std::time::Duration::from_secs(30),
@@ -7554,6 +7575,96 @@ mod oauth_credential_env;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn profile_namespace_parser_refuses_reserved_names_before_running_cli_actions() {
+        use clap::Parser;
+        for name in [
+            "commands",
+            "COMMANDS",
+            "api_key",
+            "artifacts",
+            "Default",
+            "../outside",
+            "a/b",
+            "a\\b",
+            ".hidden",
+            "CON",
+        ] {
+            let error =
+                super::Cli::try_parse_from(["formless", "--profile", name, "profiles", "list"])
+                    .err()
+                    .unwrap();
+            assert!(
+                error.to_string().contains("profile name"),
+                "{name}: {error}"
+            );
+            assert!(
+                super::Cli::try_parse_from(["formless", "profiles", "rm", name, "--force"])
+                    .is_err()
+            );
+        }
+        assert!(super::Cli::try_parse_from([
+            "formless",
+            "--profile",
+            "work-2",
+            "profiles",
+            "list"
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn reserved_profile_removal_and_maintenance_never_reach_service_or_secret_hooks() {
+        let root = std::env::temp_dir().join(format!(
+            "fl-profile-preflight-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let base = formless_core::Paths::from_dirs(root.join("d"), root.join("c")).unwrap();
+        let commands = base.config_dir.join("commands");
+        std::fs::create_dir(&commands).unwrap();
+        std::fs::write(commands.join("config.toml"), "private legacy marker").unwrap();
+        std::fs::write(commands.join("review.md"), "private default template").unwrap();
+        assert!(super::profile_removal_target(&base, "commands").is_err());
+        let forged = formless_core::Paths {
+            data_dir: base.data_dir.join("commands"),
+            config_dir: commands.clone(),
+            profile: "commands".into(),
+        };
+        for target in [&forged, &base] {
+            let calls = std::cell::Cell::new(0);
+            let result = super::profile_maintenance(
+                target,
+                || {
+                    calls.set(calls.get() + 1);
+                    Ok(())
+                },
+                || {
+                    calls.set(calls.get() + 1);
+                    Ok(())
+                },
+                |_| {
+                    calls.set(calls.get() + 1);
+                    Ok(())
+                },
+            );
+            assert!(result.is_err());
+            assert_eq!(
+                calls.get(),
+                0,
+                "namespace errors must precede service/secret preparation"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(commands.join("review.md")).unwrap(),
+            "private default template"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn doctor_run_file_facts_use_only_private_database_and_count_paths_and_payload() {
         let root = std::env::temp_dir().join(format!(
@@ -7794,7 +7905,7 @@ mod tests {
         let (_fixture, base) = MaintenanceFixture::new();
         std::fs::write(base.db_file(), "default sentinel").unwrap();
         let initial = base.list_profiles();
-        let named = base.named("new-child");
+        let named = base.named("new-child").unwrap();
         let erased = std::cell::Cell::new(false);
         let result = super::profile_maintenance(
             &base,
@@ -7829,7 +7940,7 @@ mod tests {
     #[test]
     fn uninstall_never_erases_parent_after_child_failure_and_preparation_failure_erases_nothing() {
         let (_fixture, base) = MaintenanceFixture::new();
-        let named = base.named("child");
+        let named = base.named("child").unwrap();
         super::Paths::from_dirs(named.data_dir.clone(), named.config_dir.clone()).unwrap();
         std::fs::write(base.db_file(), "default sentinel").unwrap();
         std::fs::write(named.db_file(), "child sentinel").unwrap();

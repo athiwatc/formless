@@ -474,6 +474,16 @@ Tokens are kept in the keychain (plus a `0600` fallback file) and refreshed auto
 
 `--profile <name>` is a global flag: it gives an isolated daemon, data dir and config dir, which is the safe way to try dangerous Tools.
 
+Names use 1–64 ASCII letters, digits, `-` or `_`, starting with a letter or digit.
+Default-owned names such as `commands`, `artifacts`, `backups`, `mcp`, `models`,
+`skills`, `api_key` and `relay_secret` are reserved regardless of case; the full
+list is in SPEC §9.4. Case collisions and linked or overlapping profile paths are
+refused before setup or removal. `profiles list` warns about unsafe legacy
+folders and preserves them. Back up the reported paths outside the Formless
+roots and recover them manually before reset/uninstall; no legacy folder is
+automatically moved or deleted. Your ordinary `commands/*.md` templates remain
+part of the default profile, never a removable profile named `commands`.
+
 ```bash
 formless --profile sandbox
 formless profiles list           # every profile, whether its daemon runs, where its data is
