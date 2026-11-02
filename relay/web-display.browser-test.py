@@ -147,6 +147,7 @@ def run():
                             page.locator('#menu-btn').click()
                             page.wait_for_timeout(220)
                             check(not page.locator('#sidebar').evaluate('(e)=>e.classList.contains("open")'), 'session drawer closes through menu button')
+                        check(page.locator('#sidebar').evaluate('(e)=>getComputedStyle(e).visibility')=='hidden','closed drawer descendants are hidden')
                         check(rect(page,'#sidebar')['right']<=1, f'closed sidebar clears safe area at 200% in {width}x{height}')
                         page.screenshot(path=str(OUT/f'screen-200-closed-{width}x{height}.png'),full_page=True)
                         page.locator('#toasts').evaluate('e=>e.replaceChildren()')
