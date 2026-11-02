@@ -4704,6 +4704,14 @@
     document.body.append(dialog);
     close.focus();
   }
+  function runFilesCaveat() {
+    return "Untracked writes are possible: changes by programs the Run launched or MCP tools are not tracked.";
+  }
+  function runFilesText(files, untracked) {
+    const changed = files.filter((f) => f.status !== "unchanged");
+    let text = changed.length ? changed.length + " tracked path(s) changed: " + changed.slice(0, 5).map((f) => f.path.split(/[\\/]/).pop() + " (" + f.status + ")").join(", ") + (changed.length > 5 ? ", +" + (changed.length - 5) + " more" : "") + " · /files shows tracked changes; /rewind attempts safe restoration." : files.length ? "No current changes among tracked paths." : "No tracked path changes.";
+    return text + (untracked ? " " + runFilesCaveat() : "");
+  }
   // The files the last Run changed, with diffs and revert buttons (SPEC §5.7).
   async function showRunFiles() {
     if (!S.current) return note("open a session first", true);
@@ -4722,11 +4730,11 @@
     const body = h("div", { class: "files-body" }, r.files.map((f) => h("div", { class: "run-file" },
       h("div", { class: "run-file-head" }, h("code", null, (mark[f.status] || "M") + " " + f.path),
         h("span", { class: "spacer" }),
-        f.revertible && f.status !== "unchanged" ? h("button", { class: "btn small", type: "button", onclick: () => rewind(f.path) }, "Revert") : h("span", { class: "muted" }, f.revertible ? "" : "not revertible")),
+        f.revertible && f.status !== "unchanged" ? h("button", { class: "btn small", type: "button", onclick: () => rewind(f.path) }, "Revert") : h("span", { class: "muted" }, f.revertible ? "" : "not revertible: " + (f.revert_reason || "snapshot unavailable"))),
       f.diff ? h("pre", { class: "diff" }, f.diff.split("\n").map((l) => h("span", { class: l[0] === "+" ? "add" : l[0] === "-" ? "del" : "" }, l + "\n"))) : null)));
-    const all = h("button", { class: "btn small", type: "button", onclick: () => { if (confirm("Revert every file this Run changed?")) rewind(""); } }, "Revert all");
+    const all = h("button", { class: "btn small", type: "button", onclick: () => { if (confirm("Attempt safe restoration of every tracked path? Paths changed since the Run may be skipped.")) rewind(""); } }, "Revert all");
     const dialog = h("div", { class: "backdrop", role: "dialog", "aria-modal": "true", "aria-label": "Files changed" },
-      h("div", { class: "modal help" }, h("h2", null, "Files changed by the Run (" + r.files.length + ")"), body,
+      h("div", { class: "modal help" }, h("h2", null, "Paths tracked by the Run (" + r.files.length + ")"), r.untracked_writes_possible ? h("p", { class: "muted" }, runFilesCaveat()) : null, body,
         h("div", { class: "modal-actions" }, all, h("span", { class: "spacer" }), close)));
     const done = () => { dialog.remove(); $("input").focus(); };
     close.onclick = done;
@@ -4739,8 +4747,9 @@
     const n = (k, what) => (k ? " · " + k + " " + what : "");
     const list = (title, items) => (items.length ? [h("div", { class: "muted" }, title), h("ul", null, items.map((i) => h("li", null, i)))] : []);
     return h("details", { class: "recap" },
-      h("summary", null, tr("What I did") + " · " + r.steps + " steps · " + Math.round(r.duration_ms / 1000) + "s" + n(r.used.length, "calls") + n(r.built.length, "Tools changed") + n(r.files.length, "files")),
-      ...list("Used", r.used), ...list("Built", r.built), ...list("Files", r.files),
+      h("summary", null, tr("What I did") + " · " + r.steps + " steps · " + Math.round(r.duration_ms / 1000) + "s" + n(r.used.length, "calls") + n(r.built.length, "Tools changed") + n(r.files.length, "tracked paths") + (r.untracked_writes_possible ? " · " + runFilesCaveat() : "")),
+      ...list("Used", r.used), ...list("Built", r.built), ...list("Tracked paths", r.files),
+      r.untracked_writes_possible ? h("p", { class: "muted" }, runFilesCaveat()) : null,
       r.steered ? h("div", { class: "muted" }, "You steered it " + r.steered + " time(s).") : null);
   }
   async function showContext() {
@@ -4991,8 +5000,7 @@
         break;
       case "run_files_changed":
         if (here) {
-          const changed = ev.files.filter((f) => f.status !== "unchanged");
-          if (changed.length) note(changed.length + " file(s) changed: " + changed.slice(0, 5).map((f) => f.path.split(/[\\/]/).pop() + " (" + f.status + ")").join(", ") + " · /files shows them, /rewind reverts");
+          note(runFilesText(ev.files, ev.untracked_writes_possible));
         }
         break;
       case "run_tool_changes":

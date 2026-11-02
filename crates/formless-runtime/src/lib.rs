@@ -102,6 +102,17 @@ pub trait HostOps: Send + Sync {
     /// to change `path` (each side of a rename): the daemon snapshots the
     /// file first so the Run's changes can be listed and reverted.
     fn file_changing(&self, _path: &std::path::Path) {}
+    /// Requested spelling and resolved target of a tracked live mutation.
+    fn file_changing_resolved(&self, _requested: &Path, resolved: &Path, _operation: &str) {
+        self.file_changing(resolved);
+    }
+    /// A tracked mutation succeeded; captures an attributable post-image.
+    fn file_changed(&self, _requested: &Path, _resolved: &Path, _operation: &str) {}
+    /// create_dir succeeded for this exact new directory (not AlreadyExists).
+    fn directory_created(&self, _path: &Path) {}
+    /// A live program or other opaque writer may mutate paths outside capture.
+    fn untracked_writes_possible(&self) {}
+
     /// Actual external data source, recorded by the daemon without payloads.
     fn data_observed(&self, _kind: &str, _origin: &str) -> Result<(), String> {
         Ok(())
@@ -1508,9 +1519,9 @@ impl State {
                     self.overlay_put(&p, Some(full));
                     return Ok(json!(data.len()));
                 }
-                self.ops.file_changing(&p);
+                self.changing(a["path"].as_str().unwrap_or_default(), &p, "write");
                 if let Some(parent) = p.parent() {
-                    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                    self.create_tracked_directories(parent)?;
                 }
                 if append {
                     std::fs::OpenOptions::new()
@@ -1522,6 +1533,7 @@ impl State {
                     std::fs::write(&p, &data)
                 }
                 .map_err(|e| format!("{}: {e}", p.display()))?;
+                self.changed(a["path"].as_str().unwrap_or_default(), &p, "write");
                 Ok(json!(data.len()))
             }
             "fs_exists" => {
@@ -1555,7 +1567,7 @@ impl State {
             "fs_mkdir" => {
                 let p = self.resolve(a["path"].as_str().unwrap_or_default(), true)?;
                 if !self.mode.is_overlay() {
-                    std::fs::create_dir_all(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+                    self.create_tracked_directories(&p)?;
                 } else if self.mode == HostMode::DryRun {
                     self.would(format!("create the folder {}", p.display()));
                 }
@@ -1575,7 +1587,7 @@ impl State {
                 }
                 let m =
                     std::fs::symlink_metadata(&p).map_err(|e| format!("{}: {e}", p.display()))?;
-                self.ops.file_changing(&p);
+                self.changing(a["path"].as_str().unwrap_or_default(), &p, "remove");
                 if m.is_dir() {
                     if a["recursive"].as_bool().unwrap_or(false) {
                         std::fs::remove_dir_all(&p)
@@ -1586,6 +1598,7 @@ impl State {
                     std::fs::remove_file(&p)
                 }
                 .map_err(|e| format!("{}: {e}", p.display()))?;
+                self.changed(a["path"].as_str().unwrap_or_default(), &p, "remove");
                 Ok(Value::Null)
             }
             "fs_rename" => {
@@ -1633,12 +1646,14 @@ impl State {
                     self.overlay_put(&from, None);
                     return Ok(Value::Null);
                 }
-                self.ops.file_changing(&from);
-                self.ops.file_changing(&to);
+                self.changing(a["from"].as_str().unwrap_or_default(), &from, "rename");
+                self.changing(a["to"].as_str().unwrap_or_default(), &to, "rename");
                 if let Some(parent) = to.parent() {
-                    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                    self.create_tracked_directories(parent)?;
                 }
                 std::fs::rename(&from, &to).map_err(|e| e.to_string())?;
+                self.changed(a["from"].as_str().unwrap_or_default(), &from, "rename");
+                self.changed(a["to"].as_str().unwrap_or_default(), &to, "rename");
                 Ok(Value::Null)
             }
             "fs_chunk" => {
@@ -2249,6 +2264,7 @@ impl State {
                 Some(std::time::Duration::from_millis(ms))
             }
         };
+        self.ops.untracked_writes_possible();
         let process = processes::Process::start(command, stdin, timeout, self.cancel.clone(), enc)
             .map_err(|error| format!("{cmd}: {error}"))?;
         self.ops.data_observed("process", cmd)?;
@@ -2526,6 +2542,50 @@ impl State {
         self.recheck_path(raw, canonical)
     }
 
+    fn requested_path(raw: &str) -> Option<PathBuf> {
+        caps::lexical_absolute(&std::env::current_dir().ok()?, Path::new(raw)).ok()
+    }
+    fn changing(&self, raw: &str, resolved: &Path, operation: &str) {
+        if let Some(requested) = Self::requested_path(raw) {
+            self.ops
+                .file_changing_resolved(&requested, resolved, operation);
+        }
+    }
+    fn changed(&self, raw: &str, resolved: &Path, operation: &str) {
+        if let Some(requested) = Self::requested_path(raw) {
+            self.ops.file_changed(&requested, resolved, operation);
+        }
+    }
+    fn create_tracked_directories(&self, path: &Path) -> Result<(), String> {
+        let mut missing = Vec::new();
+        let mut next = Some(path);
+        while let Some(dir) = next {
+            match std::fs::symlink_metadata(dir) {
+                Ok(metadata) if metadata.is_dir() => break,
+                Ok(_) => {
+                    return Err(format!(
+                        "{}: an existing path is not a directory",
+                        dir.display()
+                    ))
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    missing.push(dir.to_owned())
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+            next = dir.parent();
+        }
+        for dir in missing.into_iter().rev() {
+            match std::fs::create_dir(&dir) {
+                Ok(()) => self.ops.directory_created(&dir),
+                // A racing creator owns this directory; do not claim creation.
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && dir.is_dir() => {
+                }
+                Err(error) => return Err(format!("{}: {error}", dir.display())),
+            }
+        }
+        Ok(())
+    }
     fn resolve(&self, raw: &str, write: bool) -> Result<PathBuf, String> {
         let roots = if write {
             &self.caps.fs_write
@@ -4111,3 +4171,6 @@ mod tests {
 
 #[cfg(test)]
 mod sensitive_read_tests;
+
+#[cfg(test)]
+mod run_file_capture_tests;

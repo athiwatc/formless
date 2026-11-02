@@ -1227,23 +1227,77 @@ pasting paths.
 ### 5.7 What a Run changed
 
 - **Files.** Before a Tool's live `fs.write` / `fs.append` / `fs.remove` /
-  `fs.rename` first touches a path in a Run, the daemon keeps what it held
-  (`run_files`, schema v51: whether it existed, and its bytes when it is a
-  regular file of at most 2 MB). Later changes in the same Run keep that
-  first snapshot. Files changed by `process.run` or other programs are not
-  tracked, and neither are Tools run outside a Run.
-- At the end of a Run that changed files, `RunFilesChanged {files}` lists
-  them (`created`, `modified`, `removed`, or `unchanged` when changed
-  back); clients note "3 files changed … · /files · /rewind".
-  `RunFiles {session_id, run_id?}` adds a context diff for text files.
-  The TUI's `/files` opens them in the pager; the web shows a dialog with
-  diffs and Revert buttons.
+  `fs.rename` / `fs.mkdir` first touches a path in a Run, the daemon records
+  its original kind and bounded recovery image (`run_files`, schema v51 with
+  schema-66 kind and final-state fields). Later changes keep the first image.
+  A newly created directory is tracked as an original missing path with a
+  directory final state. Final-entry symlinks, aliases without verifiable
+  restoration authority, recursive directory removal and unknown state remain
+  paths-only with specific reasons. Files changed by launched programs and MCP
+  tools are not captured. A durable `untracked_writes_possible` marker is set
+  for process-capable Tools, `process.run` and MCP calls, even if no paths were
+  captured; the same caveat appears in the recap and file views.
+- At the end of a Run with tracked paths or possible untracked writes,
+  `RunFilesChanged` reports tracked paths (`created`, `modified`, `removed`, or
+  `unchanged` when changed back) and the coverage caveat. Clients qualify the
+  count as tracked paths and warn that untracked writes are possible from
+  launched programs or MCP tools when appropriate, including an empty tracked
+  list. The marker is conservative: a process-capable Tool need not actually
+  launch a program or write anything. `RunFiles {session_id, run_id?}` adds a
+  bounded context diff for text files. The TUI's `/files` opens them in the pager; the
+  web shows a dialog with diffs and Revert buttons. Explicit Run IDs must belong
+  to the requested live Session, including every recorded path row.
 - **Rewind.** `RewindRun {session_id, run_id?, path?}` (`/rewind [PATH]`)
-  puts one file, or all of the Run's revertible files, back as they were
-  before the Run: rewritten from the snapshot, or deleted when the Run
-  created it. Files whose content was not kept (too large, a folder) are
-  reported as skipped. A system note tells the agent which files were
-  reverted. Not while a Run is active.
+  restores one or all eligible tracked paths from the original image. A
+  schema-66 after-state token binds the successful tracked operation's kind,
+  content hash, size and available security/identity metadata; the immediate
+  postimage must remain unchanged at Run completion before it can become proof.
+  Missing legacy tokens, pending/background mutations and unverifiable states
+  remain read-only. Changed content is skipped with "changed since the Run";
+  type changes are skipped. Rewind offers no conflict override. A positively
+  recorded directory creation can be removed only with matching identity and
+  an empty-directory removal; rewind never recursively removes a directory.
+  Active or pending work anywhere in the profile blocks rewind, including
+  background work, under the existing admission and Store lock. A system note
+  names successfully restored paths. On Windows, fresh whole-file namespace
+  restoration reuses the anchored retained-object protocol: restoring a deleted
+  file requires its retained original object; removing a created file requires
+  its private first-absence marker and the live post-operation object witness.
+  Existing-file rewind likewise requires that live witness. Positively created
+  directories require a live creation proof and must still be empty. Serialized
+  hashes, FileIDs and database flags cannot recreate these process-local proofs
+  after a restart. Missing, lost or expired proof, unsupported namespace operations
+  and changed objects remain read-only with a specific skip reason. No recovery
+  path repairs ACLs or enables privileges to make an operation succeed. Owned
+  interactive review remains available only where its own authority checks pass.
+  Files are loaded one bounded image at a time (2 MiB); text diff work is capped
+  at 256 KiB per image and 1 MiB aggregate, with omissions stated explicitly.
+  These checks do not provide a filesystem transaction against an unrelated
+  external writer racing the final comparison and write.
+- **Recovery storage (schema 66).** Every live capture is admitted atomically
+  against `run_files.max_files_per_run` (128) and `max_bytes_per_run`
+  (16 MiB, original bytes plus descriptor metadata). A kept creation counts as
+  one file even when it has no original bytes. Zero keeps no new recovery
+  payload. Overflow still records the path, with an explicit file-count or
+  byte-limit reason; repeated changes never replace the first capture.
+  Original kind, final after-state and a paths-only reason are separate fields;
+  historical missing kind/after-state remains unverifiable, never backfilled
+  from the current filesystem. Owned reads require a live Session, its Run,
+  and matching ownership on every snapshot row.
+  Existing GC applies `run_files.keep_runs_per_session` (10), `max_age_days`
+  (30) and `max_total_mb` (256 MiB) to recovery payload, oldest first. Zero
+  expires eligible payload immediately; it never disables a limit. Active Runs
+  and the latest Run with recorded paths per Session remain protected. Their
+  bytes count toward the total, and GC reports any excess it cannot free.
+  Expiry clears original bytes and security metadata, keeps the paths and final
+  tokens, and reports "Snapshot expired by retention policy". Successful rewind
+  likewise leaves an "Already rewound" path tombstone, so later `/files` or
+  `/rewind` never silently falls back to an older Run. Coverage-only Runs remain
+  selectable even with no tracked paths. This path history establishes the
+  tombstone needed before any future policy can expire the latest recovery
+  payload safely. Hard Session deletion, including expiry of its soft-delete
+  undo window, removes its snapshot rows. Storage and doctor report the path
+  row count, retained file count, original bytes, metadata and final-token bytes.
 - **Run before-metadata (schema 63).** Before a live Tool first changes a
   path, capture its bounded bytes (up to 2 MiB) and security metadata from one
   anchored no-follow descriptor, subject to protected-profile/credential read
@@ -1372,9 +1426,11 @@ pasting paths.
   comment with a data-framed context and steers an existing Run. When idle it
   saves the comment for a later explicit Run; it never starts a model request.
 - **What I did.** After a Run of 4 or more steps, `RunRecap {steps,
-  duration_ms, used, built, files, steered}` sums up its trace with no
-  model call: Tools and built-ins called (with counts and failures),
-  Tools created or updated, files changed, and how often the user steered.
+  duration_ms, used, built, files, steered, untracked_writes_possible}` sums up
+  its trace with no model call: Tools and built-ins called (with counts and failures),
+  Tools created or updated, tracked paths changed, and how often the user steered.
+  Both folded and expanded recaps show the possible-untracked-writes caveat,
+  even when their tracked-path list is empty.
   The TUI shows a folded "▸ What I did" line under the answer (`/recap`
   expands it); the web shows it as a collapsible block.
 
@@ -3102,8 +3158,8 @@ daemon answers Status. Reopening an upgraded profile needs no new snapshot.
   data folder's total.
 - **Clean-up.** `Gc {dry_run}` (`formless gc [--dry-run]`, TUI `/gc` then
   `/gc run`, web Clean up… which shows the dry run before "Free"):
-  artifacts past their retention, `/rewind` snapshots older than 30
-  days, MCP logs cut to their last 1 MB, all but the two newest
+  artifacts past their retention, `/rewind` payload beyond `run_files.*`
+  limits (paths remain listed; active/latest Runs are protected), MCP logs cut to their last 1 MB, all but the two newest
   pre-migration copies by their recorded timestamp (not schema version),
   and the database's free pages (VACUUM). Each row
   says how many items and bytes; a real run is audit-logged.
@@ -4939,6 +4995,8 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
 | `daemon.backups_keep` | 7 | Daily database backups kept in `<data>/backups` (`formless backup` / `restore`); 0 = no automatic backups (§9.6) |
 | `daemon.backup_restore_drill` | false | After a daily backup, rehearse restoration in a private throwaway profile and read its Sessions with an offline daemon; never start providers, MCP, hooks or jobs (§9.6) |
 | `artifacts.max_total_mb` / `max_age_days` | 1024 / 30 | Artifact retention (§9.6); 0 disables a limit. Attachments count too: a removed one shows as expired in its message (§5.6) |
+| `run_files.max_files_per_run` / `max_bytes_per_run` | 128 / 16777216 | Recovery admission caps per Run, counting original bytes plus descriptor metadata; overflow keeps paths with a reason; 0 keeps no new recovery payload (§5.7) |
+| `run_files.keep_runs_per_session` / `max_age_days` / `max_total_mb` | 10 / 30 / 256 | Recovery retention per Session, age and profile MiB; 0 expires eligible payload, active/latest Runs remain protected, expired paths stay listed (§5.7) |
 | `provider.base_url` | — (wizard) | Verbatim endpoint base (§4.1) |
 | `relay.enabled` | `false` | Dial out to the hosted Relay on daemon start (§12) |
 | `relay.url` | `wss://formless.athiwat.xyz` | Relay websocket base URL |

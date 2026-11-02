@@ -9,7 +9,7 @@ use anyhow::{bail, Context, Result};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 
-pub(crate) const MAX_RECORD_BYTES: usize = 768 * 1024;
+pub(crate) const MAX_RECORD_BYTES: usize = 3 * 1024 * 1024;
 pub(crate) const MAX_RECORDS: usize = 64;
 pub(crate) const MAX_STORE_BYTES: u64 = 32 * 1024 * 1024;
 pub(crate) const RETENTION_SECONDS: u64 = 7 * 24 * 60 * 60;
@@ -156,7 +156,7 @@ impl Manifest {
             .bytes
             .as_ref()
             .context("Cannot retain a missing file object")?;
-        if bytes.len() > crate::hunk_review::MAX_REVIEW_BYTES {
+        if bytes.len() > (2 * 1024 * 1024usize) {
             bail!("Retained before-image exceeds its byte limit");
         }
         let mut record = Self {
@@ -192,11 +192,11 @@ impl Manifest {
         }
         RetainedToken::parse(self.token.id())?;
         self.owner.validate()?;
-        if self.before_base64.len() > crate::hunk_review::MAX_REVIEW_BYTES.div_ceil(3) * 4 {
+        if self.before_base64.len() > (2 * 1024 * 1024usize).div_ceil(3) * 4 {
             bail!("Retained before-image exceeds its encoded limit");
         }
         let bytes = base64::engine::general_purpose::STANDARD.decode(&self.before_base64)?;
-        if bytes.len() > crate::hunk_review::MAX_REVIEW_BYTES {
+        if bytes.len() > (2 * 1024 * 1024usize) {
             bail!("Retained before-image exceeds its decoded limit");
         }
         let image = decode_before_metadata(&self.before_metadata, Some(&bytes))?;
@@ -236,7 +236,7 @@ impl Manifest {
     /// Reserve a full bounded mutable object, plus the immutable JSON bytes.
     /// Hard-link writes by external actors cannot themselves be quota-enforced.
     fn charge(&self) -> Result<u64> {
-        Ok(self.encode()?.len() as u64 + crate::hunk_review::MAX_REVIEW_BYTES as u64)
+        Ok(self.encode()?.len() as u64 + (2 * 1024 * 1024usize) as u64)
     }
 }
 
@@ -322,7 +322,7 @@ impl MissingMarker {
     /// Reserve the eventual created-image receipt/object BEFORE the Tool runs.
     /// Upgrading this exact token never needs a second logical store slot.
     fn charge(&self) -> u64 {
-        MAX_RECORD_BYTES as u64 + crate::hunk_review::MAX_REVIEW_BYTES as u64 + 4096
+        MAX_RECORD_BYTES as u64 + (2 * 1024 * 1024usize) as u64 + 4096
     }
 }
 
@@ -396,7 +396,7 @@ mod tests {
     fn manifests_bound_expiry_size_unknown_fields_and_reserved_live_bytes() {
         let record = record();
         assert_eq!(record.expires_at - record.created_at, RETENTION_SECONDS);
-        assert!(record.charge().unwrap() > crate::hunk_review::MAX_REVIEW_BYTES as u64);
+        assert!(record.charge().unwrap() > (2 * 1024 * 1024usize) as u64);
         assert!(record.charge().unwrap() < MAX_STORE_BYTES);
         let mut bad = record.clone();
         bad.expires_at += 1;
@@ -447,10 +447,7 @@ mod tests {
         let marker =
             MissingMarker::new(token.clone(), owner(), &ReviewImage::missing(), 123).unwrap();
         assert!(MissingMarker::decode(&marker.encode().unwrap(), &token, Some(&owner())).is_ok());
-        assert!(
-            marker.charge()
-                >= MAX_RECORD_BYTES as u64 + crate::hunk_review::MAX_REVIEW_BYTES as u64
-        );
+        assert!(marker.charge() >= MAX_RECORD_BYTES as u64 + (2 * 1024 * 1024usize) as u64);
         assert!(MissingMarker::new(token.clone(), owner(), &image(), 123).is_err());
         let mut other = owner();
         other.path_digest = "c".repeat(64);

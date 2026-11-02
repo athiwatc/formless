@@ -4463,8 +4463,13 @@ impl App {
                             let files: Vec<formless_protocol::RunFileInfo> =
                                 serde_json::from_value(result["files"].clone()).unwrap_or_default();
                             self.pager = Some(Pager {
-                                title: format!("Files changed by the Run ({})", files.len()),
-                                lines: files_pager_lines(&files),
+                                title: format!("Paths tracked by the Run ({})", files.len()),
+                                lines: files_pager_lines(
+                                    &files,
+                                    result["untracked_writes_possible"]
+                                        .as_bool()
+                                        .unwrap_or(false),
+                                ),
                                 top: 0,
                                 left: 0,
                                 styled: Vec::new(),
@@ -5085,10 +5090,14 @@ impl App {
                 }
             }
             Event::RunFilesChanged {
-                session_id, files, ..
+                session_id,
+                files,
+                untracked_writes_possible,
+                ..
             } => {
                 if self.is_current(&session_id) {
-                    self.notes.push(files_note(&files));
+                    self.notes
+                        .push(run_files_text(&files, untracked_writes_possible));
                 }
             }
             Event::QueueChanged { session_id, queued } => {
@@ -12162,11 +12171,15 @@ fn recap_lines(r: &formless_protocol::RunRecap, open: bool, color: bool) -> Vec<
     for (n, what) in [
         (r.used.len(), "calls"),
         (r.built.len(), "Tools changed"),
-        (r.files.len(), "files"),
+        (r.files.len(), "tracked paths"),
     ] {
         if n > 0 {
             head.push_str(&format!(" · {n} {what}"));
         }
+    }
+    if r.untracked_writes_possible {
+        head.push_str(" · ");
+        head.push_str(RUN_FILES_CAVEAT);
     }
     if !open {
         head.push_str(" · /recap expands");
@@ -12177,13 +12190,22 @@ fn recap_lines(r: &formless_protocol::RunRecap, open: bool, color: bool) -> Vec<
             if !items.is_empty() {
                 out.push(Line::styled(format!("    {title}"), ui::dim(color)));
                 for i in items {
-                    out.push(Line::styled(format!("      · {i}"), ui::dim(color)));
+                    out.push(Line::styled(
+                        format!("      · {}", run_file_safe_text(i)),
+                        ui::dim(color),
+                    ));
                 }
             }
         };
         section("Used", &r.used);
         section("Built", &r.built);
-        section("Files", &r.files);
+        section("Tracked paths", &r.files);
+        if r.untracked_writes_possible {
+            out.push(Line::styled(
+                format!("    {RUN_FILES_CAVEAT}"),
+                ui::dim(color),
+            ));
+        }
         if r.steered > 0 {
             out.push(Line::styled(
                 format!("    You steered it {} time(s).", r.steered),
@@ -12194,8 +12216,23 @@ fn recap_lines(r: &formless_protocol::RunRecap, open: bool, color: bool) -> Vec<
     out
 }
 
-/// "3 files changed: a.rs (modified), b.md (created) · /files · /rewind".
-fn files_note(files: &[formless_protocol::RunFileInfo]) -> String {
+/// Tracking covers host filesystem operations, not external programs or MCP.
+pub const RUN_FILES_CAVEAT: &str = "Untracked writes are possible: changes by programs the Run launched or MCP tools are not tracked.";
+
+fn run_file_safe_text(text: &str) -> String {
+    text.chars()
+        .flat_map(|c| {
+            if c.is_control() {
+                c.escape_default().collect::<Vec<_>>()
+            } else {
+                vec![c]
+            }
+        })
+        .collect()
+}
+
+/// Shared by the TUI, plain mode and CLI stderr; counts only tracked paths.
+pub fn run_files_text(files: &[formless_protocol::RunFileInfo], untracked: bool) -> String {
     let changed: Vec<String> = files
         .iter()
         .filter(|f| f.status != "unchanged")
@@ -12203,34 +12240,42 @@ fn files_note(files: &[formless_protocol::RunFileInfo]) -> String {
             let name = std::path::Path::new(&f.path)
                 .file_name()
                 .map_or(f.path.clone(), |n| n.to_string_lossy().into_owned());
-            format!("{name} ({})", f.status)
+            format!(
+                "{} ({})",
+                run_file_safe_text(&name),
+                run_file_safe_text(&f.status)
+            )
         })
         .collect();
-    if changed.is_empty() {
-        return "the Run's file changes were all undone".into();
-    }
-    let shown = changed
-        .iter()
-        .take(5)
-        .cloned()
-        .collect::<Vec<_>>()
-        .join(", ");
-    let more = changed.len().saturating_sub(5);
-    format!(
-        "{} file{} changed: {shown}{} · /files shows the changes, /rewind reverts them",
-        changed.len(),
-        if changed.len() == 1 { "" } else { "s" },
-        if more > 0 {
-            format!(", +{more} more")
+    let mut text: String = if changed.is_empty() {
+        if files.is_empty() {
+            "No tracked path changes.".into()
         } else {
-            String::new()
+            "No current changes among tracked paths.".into()
         }
-    )
+    } else {
+        let shown = changed
+            .iter()
+            .take(5)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        let more = changed.len().saturating_sub(5);
+        format!("{} tracked path(s) changed: {shown}{} · /files shows tracked changes; /rewind attempts safe restoration.", changed.len(), if more > 0 { format!(", +{more} more") } else { String::new() })
+    };
+    if untracked {
+        text.push(' ');
+        text.push_str(RUN_FILES_CAVEAT);
+    }
+    text
 }
 
 /// The `/files` pager: each file's status, then its diff.
-fn files_pager_lines(files: &[formless_protocol::RunFileInfo]) -> Vec<String> {
-    let mut out = Vec::new();
+fn files_pager_lines(files: &[formless_protocol::RunFileInfo], untracked: bool) -> Vec<String> {
+    let mut out = vec!["Tracked paths only.".into()];
+    if untracked {
+        out.push(RUN_FILES_CAVEAT.into());
+    }
     for f in files {
         out.push(format!(
             "{} {}{}",
@@ -12240,19 +12285,24 @@ fn files_pager_lines(files: &[formless_protocol::RunFileInfo]) -> Vec<String> {
                 "unchanged" => "=",
                 _ => "M",
             },
-            f.path,
+            run_file_safe_text(&f.path),
             if f.revertible {
-                ""
+                String::new()
             } else {
-                "  (not revertible: too large or a folder)"
+                format!(
+                    "  (not revertible: {})",
+                    run_file_safe_text(
+                        f.revert_reason.as_deref().unwrap_or("snapshot unavailable")
+                    )
+                )
             }
         ));
         if let Some(d) = &f.diff {
-            out.extend(d.lines().map(|l| format!("    {l}")));
+            out.extend(d.lines().map(|l| format!("    {}", run_file_safe_text(l))));
         }
         out.push(String::new());
     }
-    out.push("/rewind PATH reverts one file, /rewind all of them.".into());
+    out.push("/rewind PATH attempts safe restoration of one tracked path; /rewind attempts all tracked paths.".into());
     out
 }
 
@@ -14708,7 +14758,10 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
             bold_fg(app.color, Color::Magenta),
         ));
         for l in pretty_json(&step.arguments).lines().take(12) {
-            lines.push(Line::styled(format!("    {l}"), ui::dim(app.color)));
+            lines.push(Line::styled(
+                format!("    {}", run_file_safe_text(l)),
+                ui::dim(app.color),
+            ));
         }
         lines.push(Line::styled(
             format!(
@@ -17675,6 +17728,7 @@ mod credential_env;
 mod tests {
     use super::*;
     include!("hunk_tests.rs");
+    include!("run_file_coverage_tests.rs");
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)

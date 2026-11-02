@@ -1312,14 +1312,28 @@ async fn windows_retention_capacity_failure_preserves_whole_run_before_bytes_and
     let source = access
         .namespace_source(&quota_image, &policy, &retained)
         .unwrap();
+    let mut admitted = 0;
     for i in 0..crate::review_retained::MAX_RECORDS {
         let owner = crate::review_retained::RetainedOwner {
             session_id: "private-capacity".into(),
             run_id: format!("run-{i}"),
             path_digest: format!("{i:064x}"),
         };
-        retained.capture(&owner, &source, &quota_image).unwrap();
+        match retained.capture(&owner, &source, &quota_image) {
+            Ok(_) => admitted += 1,
+            Err(error) => {
+                assert!(
+                    error.to_string().to_lowercase().contains("capacity"),
+                    "unexpected capacity-fill error: {error:#}"
+                );
+                break;
+            }
+        }
     }
+    assert!(
+        admitted > 0 && admitted <= crate::review_retained::MAX_RECORDS,
+        "byte reservations and entry count must bound retained capacity"
+    );
     let extra = crate::review_retained::RetainedOwner {
         session_id: "private-capacity".into(),
         run_id: "one-too-many".into(),

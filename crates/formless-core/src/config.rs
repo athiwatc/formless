@@ -19,6 +19,7 @@ pub struct Config {
     pub tui: TuiCfg,
     pub naming: NamingCfg,
     pub artifacts: ArtifactsCfg,
+    pub run_files: RunFilesCfg,
     pub mcp: McpCfg,
     pub skills: SkillsCfg,
     pub limits: LimitsCfg,
@@ -749,6 +750,7 @@ pub const SETTABLE: &[&str] = &[
     "naming.",
     "skills.",
     "artifacts.",
+    "run_files.",
     "limits.",
 ];
 
@@ -801,6 +803,29 @@ pub struct McpServerCfg {
 }
 
 /// Retention for stored Tool outputs (SPEC §9.6). 0 disables a limit.
+/// Run recovery payload budgets. Zero keeps no new recovery payload; limits
+/// never become unbounded. Retention preserves active and latest recorded Runs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RunFilesCfg {
+    pub max_files_per_run: usize,
+    pub max_bytes_per_run: u64,
+    pub keep_runs_per_session: usize,
+    pub max_age_days: u64,
+    pub max_total_mb: u64,
+}
+impl Default for RunFilesCfg {
+    fn default() -> Self {
+        Self {
+            max_files_per_run: 128,
+            max_bytes_per_run: 16 * 1024 * 1024,
+            keep_runs_per_session: 10,
+            max_age_days: 30,
+            max_total_mb: 256,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ArtifactsCfg {

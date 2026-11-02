@@ -51,7 +51,7 @@ impl Inventory {
                 .get(token)
                 .copied()
                 .unwrap_or(0)
-                .saturating_sub(crate::hunk_review::MAX_REVIEW_BYTES as u64)
+                .saturating_sub((2 * 1024 * 1024u64))
         };
         let missing = self.missing.values().try_fold(0u64, |sum, marker| {
             sum.checked_add(marker.charge())
@@ -882,7 +882,7 @@ impl RetainedStore {
             let oversized = inventory
                 .actual_bytes
                 .get(&token)
-                .is_some_and(|size| *size > crate::hunk_review::MAX_REVIEW_BYTES as u64);
+                .is_some_and(|size| *size > (2 * 1024 * 1024u64));
             if (!oversized && deadline > timestamp)
                 || live.get(&token).and_then(Weak::upgrade).is_some()
             {
@@ -1469,13 +1469,13 @@ mod tests {
         let mut leases = vec![marker.clone()];
         for index in 1..MAX_RECORDS {
             let (_path, source, image) = f.source(&format!("occupied-{index}.txt"), b"small");
-            leases.push(
-                store
-                    .capture(&owner(&format!("occupied-{index}")), &source, &image)
-                    .unwrap(),
-            );
+            match store.capture(&owner(&format!("occupied-{index}")), &source, &image) {
+                Ok(token) => leases.push(token),
+                Err(_) => break,
+            }
         }
-        assert_eq!(store.inventory().unwrap().len(), MAX_RECORDS);
+        assert!(store.inventory().unwrap().len() <= MAX_RECORDS);
+        let admitted = store.inventory().unwrap().len();
         assert!(!store.0.namespace_capable.load(Ordering::Acquire));
         store.ensure_namespace_capability().unwrap();
         let (path, source, image) = f.source("last-created.txt", b"created");
@@ -1486,7 +1486,7 @@ mod tests {
         let token = store.commit_move(prepared, &source).unwrap();
         drop(source);
         assert!(!path.exists());
-        assert_eq!(store.inventory().unwrap().len(), MAX_RECORDS);
+        assert_eq!(store.inventory().unwrap().len(), admitted);
         let object = store.open_verified(&token, &reserved_owner).unwrap();
         object.require_retained_only().unwrap();
     }

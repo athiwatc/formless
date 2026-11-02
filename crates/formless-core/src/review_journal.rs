@@ -9,7 +9,8 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
 };
-const MAX_RECEIPT_BYTES: usize = 1024 * 1024;
+const MAX_RECEIPT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_WHOLE_FILE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_JOURNAL_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_RECEIPTS: usize = 128;
 
@@ -36,11 +37,10 @@ struct Image {
 }
 impl Image {
     fn capture(image: &ReviewImage) -> Result<Self> {
-        if image
-            .bytes
-            .as_ref()
-            .is_some_and(|b| b.len() > MAX_REVIEW_BYTES)
-        {
+        Self::capture_bounded(image, MAX_REVIEW_BYTES)
+    }
+    fn capture_bounded(image: &ReviewImage, limit: usize) -> Result<Self> {
+        if image.bytes.as_ref().is_some_and(|b| b.len() > limit) {
             bail!("Review image exceeds journal byte limit");
         }
         if image
@@ -68,16 +68,16 @@ impl Image {
                 .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes)),
         })
     }
-    fn decode(&self) -> Result<ReviewImage> {
+    fn decode_bounded(&self, limit: usize) -> Result<ReviewImage> {
         let bytes = self
             .base64
             .as_ref()
             .map(|encoded| {
-                if encoded.len() > MAX_REVIEW_BYTES.div_ceil(3) * 4 {
+                if encoded.len() > limit.div_ceil(3) * 4 {
                     bail!("Review journal image exceeds byte limit");
                 }
                 let bytes = base64::engine::general_purpose::STANDARD.decode(encoded)?;
-                if bytes.len() > MAX_REVIEW_BYTES {
+                if bytes.len() > limit {
                     bail!("Review journal decoded image exceeds byte limit");
                 }
                 Ok(bytes)
@@ -180,6 +180,31 @@ impl Receipt {
         receipt.refresh_integrity()?;
         Ok(receipt)
     }
+    /// Whole-file rewind keeps the existing two-MiB snapshot limit without
+    /// widening the interactive constructor's 256-KiB image allowance.
+    pub fn new_whole_file(
+        session: &str,
+        run: &str,
+        path: &str,
+        before: &ReviewImage,
+        after: &ReviewImage,
+    ) -> Result<Self> {
+        let mut receipt = Self::new(
+            session,
+            run,
+            "whole-file",
+            "whole-file",
+            path,
+            "pending",
+            &ReviewImage::missing(),
+            &ReviewImage::missing(),
+        )?;
+        receipt.format_version = 2;
+        receipt.before = Image::capture_bounded(before, MAX_WHOLE_FILE_BYTES)?;
+        receipt.after = Image::capture_bounded(after, MAX_WHOLE_FILE_BYTES)?;
+        receipt.refresh_integrity()?;
+        Ok(receipt)
+    }
     /// Bind trusted newly-created action metadata before callers inspect its
     /// images. The initial checksum is verified first; disk corruption is never
     /// repaired by this builder, and committed receipts cannot be rebound.
@@ -213,7 +238,7 @@ impl Receipt {
     }
     pub fn images(&self) -> Result<(ReviewImage, ReviewImage)> {
         validate_id(&self.id)?;
-        if self.format_version != 1
+        if !matches!(self.format_version, 1 | 2)
             || self.integrity.len() != 64
             || self.checksum()? != self.integrity
         {
@@ -233,7 +258,15 @@ impl Receipt {
         if !matches!(self.previous_decision.as_str(), "pending" | "accepted") {
             bail!("Review receipt decision is invalid");
         }
-        Ok((self.before.decode()?, self.after.decode()?))
+        let limit = if self.format_version == 2 {
+            MAX_WHOLE_FILE_BYTES
+        } else {
+            MAX_REVIEW_BYTES
+        };
+        Ok((
+            self.before.decode_bounded(limit)?,
+            self.after.decode_bounded(limit)?,
+        ))
     }
     /// Read-only reconciliation. Even a prepared record can already correspond
     /// to the after-image if a reply or final phase update failed. Ambiguous
@@ -808,6 +841,41 @@ mod tests {
             after,
         )
         .unwrap()
+    }
+    #[test]
+    fn whole_file_receipts_preserve_large_images_without_widening_interactive_limits() {
+        let (_dir, paths) = fixture();
+        std::fs::create_dir(&paths.data_dir).unwrap();
+        let journal = Journal::open(&paths, true).unwrap().unwrap();
+        let before = image(&vec![b'a'; 300 * 1024]);
+        let after = image(&vec![b'b'; 300 * 1024]);
+        assert!(Receipt::new(
+            "s",
+            "r",
+            "f",
+            "h",
+            "/not-opened",
+            "pending",
+            &before,
+            &after
+        )
+        .is_err());
+        let mut whole = Receipt::new_whole_file("s", "r", "/not-opened", &before, &after).unwrap();
+        journal.prepare(&mut whole).unwrap();
+        let loaded = journal.read(&whole.id).unwrap();
+        assert_eq!(loaded.images().unwrap(), (before.clone(), after.clone()));
+        assert_eq!(loaded.observed_phase(&before).unwrap(), Phase::Prepared);
+        assert_eq!(loaded.observed_phase(&after).unwrap(), Phase::Applied);
+        let applied = journal.set_phase(&loaded, Phase::Applied).unwrap();
+        assert_eq!(journal.read(&applied.id).unwrap().phase, Phase::Applied);
+        assert!(Receipt::new_whole_file(
+            "s",
+            "r",
+            "/not-opened",
+            &image(&vec![0; 2 * 1024 * 1024 + 1]),
+            &after
+        )
+        .is_err());
     }
     #[test]
     fn binding_new_action_preserves_valid_images_and_never_reseals_a_corrupt_receipt() {

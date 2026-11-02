@@ -576,6 +576,18 @@ pub(super) fn open_directory(parent: &File, leaf: &OsStr) -> io::Result<File> {
     )
 }
 
+/// Open a directory for exact-handle empty removal, without security setter rights.
+pub(super) fn open_directory_for_removal(parent: &File, leaf: &OsStr) -> io::Result<File> {
+    open_relative(
+        parent,
+        leaf,
+        FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL | DELETE | SYNCHRONIZE,
+        false,
+        true,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
