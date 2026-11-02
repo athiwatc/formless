@@ -20,7 +20,11 @@ function setup(names, extras = {}) {
     return elements.get(id);
   };
   const context = vm.createContext({ $, S: { current: 'A', chips: {}, messages: [], sessions: [], view: 'chat', tools: [] },
-    forecastRevision: 0, scheduleForecast() {}, invalidateBranchSummary() {}, branchSummaryEvent() {}, setTimeout: f => f(), rememberFocus() {}, restoreFocus() {}, renderChips() {}, note() {}, autosize() {},
+    forecastRevision: 0, scheduleForecast() {}, invalidateBranchSummary() {}, branchSummaryEvent() {}, setTimeout: f => f(), rememberFocus() {}, restoreFocus() {},
+    // These tests isolate intent/data behavior; real focus/inert behavior runs
+    // against the complete shipped UI in web-focus.browser-test.py.
+    document: { activeElement: null }, focusBefore: {}, openDialog() {}, closeDialog() {}, activeDialog: () => null,
+    renderChips() {}, note() {}, autosize() {},
     ...extras });
   const dependencies = names.includes('openSession') ? ['restoreSessionRunState'] : [];
   vm.runInContext([...new Set([...dependencies, ...names])].map(fn).join('\n'), context);
