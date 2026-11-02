@@ -1,3 +1,4 @@
+import { installEventRenderFixture, installHistoryFixture } from './test-web-render.mjs';
 // Run with node --test relay/web-intent.test.mjs. Exercise the shipped handlers
 // with controlled daemon replies, without a browser or network dependency.
 import { readFileSync } from 'node:fs';
@@ -26,6 +27,8 @@ function setup(names, extras = {}) {
     document: { activeElement: null }, focusBefore: {}, openDialog() {}, closeDialog() {}, activeDialog: () => null,
     renderChips() {}, note() {}, autosize() {},
     ...extras });
+  installEventRenderFixture(context, fn);
+  if (names.includes('renderHistory')) installHistoryFixture(context, fn);
   const dependencies = names.includes('openSession') ? ['restoreSessionRunState'] : [];
   vm.runInContext([...new Set([...dependencies, ...names])].map(fn).join('\n'), context);
   return context;
@@ -228,9 +231,34 @@ test('a stale approval response cannot be reported as an accepted denial', async
   assert.equal(c.S.approvals.length, 0); assert.equal(notes.some(x => x.startsWith('denied ')), false);
 });
 function node(tag, attrs, ...children) {
-  return { tag, attrs: attrs || {}, children: children.flat(Infinity), classList: { add() {} },
-    append(...kids) { this.children.push(...kids.flat(Infinity)); }, replaceChildren(...kids) { this.children = kids.flat(Infinity); },
+  const element = { tag, attrs: attrs || {}, children: [], parentNode: null, classList: { add() {} },
+    get firstChild() { return this.children[0] || null; },
+    get nextSibling() {
+      if (!this.parentNode) return null;
+      return this.parentNode.children[this.parentNode.children.indexOf(this) + 1] || null;
+    },
+    append(...kids) { for (const child of kids.flat(Infinity)) this.insertBefore(child, null); },
+    insertBefore(child, before) {
+      if (child && typeof child === 'object') child.remove();
+      const index = before == null ? this.children.length : this.children.indexOf(before);
+      assert.ok(index >= 0, 'reconciliation reference must belong to parent');
+      this.children.splice(index, 0, child);
+      if (child && typeof child === 'object') child.parentNode = this;
+      return child;
+    },
+    remove() {
+      if (!this.parentNode) return;
+      this.parentNode.children.splice(this.parentNode.children.indexOf(this), 1);
+      this.parentNode = null;
+    },
+    replaceChildren(...kids) {
+      for (const child of this.children) if (child && typeof child === 'object') child.parentNode = null;
+      this.children = [];
+      this.append(...kids);
+    },
     setAttribute(k, v) { this.attrs[k] = v; } };
+  element.append(...children);
+  return element;
 }
 const all = (n) => typeof n === 'object' && n ? [n, ...n.children.flatMap(all)] : [];
 const plainText = n => typeof n === 'string' ? n : (n?.children || []).map(plainText).join('');
@@ -270,10 +298,12 @@ test('live MessageComplete → RunRecap → RunFinished updates recap/rating out
   c.rendered = cached;
   vm.runInContext('const rendered = globalThis.rendered; const WHO = { assistant: "Formless" };', c);
   c.onEvent({ type: 'message_complete', session_id: 'A', message: { id: 'answer', role: 'assistant', content: 'answer' } });
+  c.flushEventRender();
   const originalBody = cached.get('answer');
   assert.equal(all(transcript).filter(n => n.attrs.class === 'rate').length, 0);
   c.onEvent({ type: 'run_recap', session_id: 'A', recap: { label: 'summary' } });
   c.onEvent({ type: 'run_finished', session_id: 'A', status: 'completed' });
+  c.flushEventRender();
   assert.equal(cached.get('answer'), originalBody);
   assert.equal(all(transcript).filter(n => n.tag === 'recap').length, 1);
   const rate = all(transcript).find(n => n.attrs.class === 'rate');

@@ -146,6 +146,14 @@ Playwright and `/usr/bin/chromium`). This check uses the shipped frontend with
 controlled replies, exercises modal focus containment and background inertness,
 return focus, nested dialogs and menu keyboard navigation, and saves screenshots.
 
+Streaming and reading-position checks run with
+`python relay/web-streaming.browser-test.py /tmp/formless-streaming-check`.
+The complete check requires both Chromium and a supported Playwright WebKit
+installation with its native dependencies. `--browser chromium` is explicitly
+partial validation. It checks animation-frame batching, retained DOM/text nodes,
+pixel-stable anchors without native scroll anchoring, delayed layout and
+Session/view transitions. WebKit engine evidence is not physical Safari testing.
+
 `dev.mjs` runs the Worker's own code: each room is `worker.js`'s
 `RelayRoom` over a real SQLite ledger through Node's built-in `node:sqlite`
 (Node 22.13+), and every

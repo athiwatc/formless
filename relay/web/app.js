@@ -546,22 +546,52 @@
   function setActivity(label) {
     if (!label) S.activity = null;
     else if (!S.activity || S.activity.label !== label) S.activity = { label, since: Date.now() };
-    renderStatus();
-    renderLive();
+    scheduleEventRender({ status: true, live: true });
   }
   const isRunning = () => S.current != null && S.running.has(S.current);
 
+  // UI work from a burst of protocol events is coalesced, while event state
+  // itself is reduced immediately. Navigation invalidates rather than replays
+  // a queued paint from an earlier Session/view generation.
+  let eventPaint = null, eventPaintEpoch = 0;
+  function cancelEventRender() {
+    eventPaintEpoch++;
+    if (eventPaint) cancelAnimationFrame(eventPaint.frame);
+    eventPaint = null;
+  }
+  function scheduleEventRender(flags) {
+    if (!Object.values(flags).some(Boolean)) return;
+    if (eventPaint && (eventPaint.session !== S.current || eventPaint.view !== S.view || eventPaint.sequence !== sessionSeq)) cancelEventRender();
+    if (!eventPaint) {
+      const batch = { session: S.current, view: S.view, sequence: sessionSeq, epoch: eventPaintEpoch };
+      eventPaint = batch;
+      batch.frame = requestAnimationFrame(() => {
+        if (eventPaint !== batch) return;
+        eventPaint = null;
+        if (batch.epoch !== eventPaintEpoch || batch.session !== S.current || batch.view !== S.view || batch.sequence !== sessionSeq) return;
+        withTranscriptLayout(() => {
+          if (batch.history) renderHistory();
+          else if (batch.live) renderLive();
+          if (batch.status) renderStatus();
+          if (batch.composer) renderComposer();
+        }, { newContent: !!batch.newContent });
+      });
+    }
+    for (const [key, value] of Object.entries(flags)) if (value) eventPaint[key] = true;
+  }
+
   // ============================================================ rendering
   function renderAll() {
-    renderChrome();
-    renderSessions();
-    renderHistory();
-    renderLive();
-    renderComposer();
-    renderView();
-    renderStatus();
-    renderApproval();
-    renderNotes();
+    withTranscriptLayout(() => {
+      renderChrome();
+      renderSessions();
+      renderHistory();
+      renderComposer();
+      renderView();
+      renderStatus();
+      renderApproval();
+      renderNotes();
+    });
   }
 
   function renderChrome() {
@@ -619,6 +649,11 @@
   }
 
   function setView(view) {
+    if (S.view !== view) {
+      if (S.view === "chat") reading.anchor = captureReadingAnchor() || reading.anchor;
+      if (eventPaint?.newContent) reading.pendingContent = true;
+      cancelEventRender();
+    }
     S.view = view;
     prefs.set("view", view);
     if (view === "tools") { refreshTools(); refreshModules(); }
@@ -628,7 +663,7 @@
     if (view === "settings") refreshSettings();
     renderChrome();
     renderView();
-    if (view === "chat") scrollToBottom(true);
+    if (view === "chat") { withTranscriptLayout(() => renderHistory()); scrollToBottom(); }
   }
 
   // ------------------------------------------------------------- sidebar
@@ -1377,9 +1412,10 @@
       const img = h("img", { src: d.url, alt: "Mermaid diagram", class: "diagram-img", "data-theme": d.theme, title: "Click to zoom" });
       if (d.width) img.style.width = d.width + "px";
       img.addEventListener("click", () => box.classList.toggle("zoom"));
-      img.addEventListener("load", () => scrollToBottom(), { once: true });
-      view.replaceChildren(img);
-      save.hidden = false;
+      img.addEventListener("load", () => { if ($("transcript").contains(img)) scrollToBottom(); }, { once: true });
+      const update = () => { view.replaceChildren(img); save.hidden = false; };
+      if ($("transcript").contains(view)) withTranscriptLayout(update);
+      else update();
       save.onclick = () => downloadBlob("diagram.svg", new Blob([d.svg], { type: "image/svg+xml" }));
     }, (e) => {
       view.replaceChildren(h("span", { class: "error" }, "Diagram not rendered: " + (e && e.message ? e.message : e)));
@@ -1966,21 +2002,40 @@
     draw();
   }
 
-  // Rendered message bodies by message id: the turn layout is rebuilt on
-  // every change, but Markdown, highlighting, Mermaid and tool chips are
-  // built once per message (and keep their state, e.g. open <details>).
+  // Stable keyed wrappers retain selection, focus and disclosure state while
+  // later messages arrive. Only an edited message's own body is rebuilt.
   const rendered = new Map();
+  const historyRender = { session: undefined, turns: new Map(), live: null, welcome: null, banner: null };
+  function reconcileChildren(parent, wanted) {
+    let cursor = parent.firstChild;
+    for (const node of wanted) {
+      if (node === cursor) cursor = cursor.nextSibling;
+      else parent.insertBefore(node, cursor);
+    }
+    while (cursor) { const next = cursor.nextSibling; cursor.remove(); cursor = next; }
+  }
+  function updateText(node, value) {
+    const text = String(value == null ? "" : value);
+    if (node.data !== text) node.data = text;
+  }
   function messageBody(m, build) {
     let node = rendered.get(m.id);
     if (!node) {
-      node = h("div", { class: "msg" });
+      node = h("div", { class: "msg", "data-message-id": m.id });
+      rendered.set(m.id, node);
+    }
+    const signature = [m.role, m.content, m.meta, m.seq, m.role === "user" ? sentElsewhere(m) : null];
+    const changed = !node.messageSignature || signature.some((part, i) => part !== node.messageSignature[i]);
+    node.currentMessage = m;
+    if (changed) {
+      node.replaceChildren();
       build(node);
       if (m.role !== "system-note") {
         node.append(h("button", { class: "msg-menu", type: "button", title: "Message actions", "aria-label": "Message actions", "aria-haspopup": "menu",
-          onkeydown: (e) => menuTriggerKey(e, (last) => messageMenu(e.currentTarget, m, node, last)),
-          onclick: (e) => { e.stopPropagation(); messageMenu(e.currentTarget, m, node); } }, "⋯"));
+          onkeydown: (e) => menuTriggerKey(e, (last) => messageMenu(e.currentTarget, node.currentMessage, node, last)),
+          onclick: (e) => { e.stopPropagation(); messageMenu(e.currentTarget, node.currentMessage, node); } }, "⋯"));
       }
-      rendered.set(m.id, node);
+      node.messageSignature = signature;
     }
     return node;
   }
@@ -2036,73 +2091,126 @@
     };
     return notes[reason] || "The answer ended early (" + reason + ").";
   }
-  function renderHistory() {
+  function renderHistory({ newContent = false } = {}) {
     const box = $("transcript");
-    box.replaceChildren();
-    if (!S.current) {
-      box.append(welcome());
-      return;
-    }
-    if (!S.daemonOnline) box.append(h("div", { class: "banner" }, "The daemon is offline. Start formless on your machine; this page reconnects automatically."));
-    if (!S.messages.length && !isRunning()) { box.append(welcome()); box.append(h("div", { id: "live" })); return; }
-    const lastUser = [...S.messages].reverse().find((m) => m.role === "user");
-    const lastAnswer = [...S.messages].reverse().find((m) => m.role === "assistant" && m.content);
-    let turn = null;
-    let group = null;
-    const open = (role, when, msg) => {
-      const g = speaker(role);
-      if (g === group && turn) return turn.body;
-      group = g;
-      const who = h("div", { class: "who " + g }, WHO[g], when ? h("time", null, clock(when)) : null);
-      if (msg && msg === lastUser && !isRunning()) {
-        who.append(h("button", { class: "btn ghost small edit", type: "button", title: "Edit and re-run (/edit)", onclick: () => beginEdit(msg) }, "Edit"));
+    withTranscriptLayout(() => {
+      if (historyRender.session !== S.current) {
+        historyRender.session = S.current;
+        historyRender.turns.clear();
+        historyRender.live = null;
+        historyRender.welcome = null;
+        historyRender.banner = null;
+        rendered.clear();
       }
-      const body = h("div");
-      turn = { el: h("div", { class: "turn " + g }, who, body), body };
-      box.append(turn.el);
-      return body;
-    };
-    for (const m of S.messages) {
-      if (m.role === "user") {
-        // Each user message starts a fresh turn so its Edit button is exact.
-        group = null;
-        const from = sentElsewhere(m);
-        open("user", m.created_at, m).append(messageBody(m, (n) => n.append(h("div", { class: "bubble" }, withMentions(m.content)),
-          ...attachmentTags(m),
-          ...(from ? [h("div", { class: "muted sent-from" }, "sent from " + from)] : []),
-          ...(steerStep(m) != null ? [h("div", { class: "steer-mark", title: "Sent while the Run was working; it joined at this step" }, "↳ steer at step " + steerStep(m))] : []))));
-      } else if (m.role === "tool") {
-        open("assistant", m.created_at).append(messageBody(m, (n) => n.append(toolResultChip(m.content || ""))));
-      } else if (m.role === "system-note") {
-        open("system-note", m.created_at).append(messageBody(m, (n) => n.append(h("div", { class: "bubble" }, m.content))));
-      } else {
-        open("assistant", m.created_at).append(messageBody(m, (n) => {
-          let served = null;
-          try { served = JSON.parse(m.meta || "{}").model; } catch (_) {}
-          if (served && served.name) n.append(h("div", { class: "muted sent-from", title: "The Session asked for " + (served.requested || "another model") }, "via " + served.name + " (" + (served.via || "fallback") + ")"));
-          let placeholder = false;
-          try { placeholder = JSON.parse(m.meta || "{}").placeholder === true; } catch (_) {}
-          // An empty refusal/filter stop: the daemon's note, not the model's words.
-          if (placeholder) n.append(h("div", { class: "muted stop-note" }, m.content));
-          else if (m.content) n.append(markdown(m.content));
-          const stopNote = assistantStopNote(m);
-          if (stopNote) n.append(h("div", { class: "muted stop-note" }, stopNote));
-          let calls = [];
-          try { calls = (JSON.parse(m.meta || "{}").tool_calls) || []; } catch (_) {}
-          calls.forEach((c) => n.append(toolCallChip(c)));
-        }));
-        // Run state changes after MessageComplete. Keep its controls outside
-        // the cached body so recap/rating and the last-answer target stay live.
-        if (m === lastAnswer && !isRunning()) {
-          const body = turn.body;
-          if (S.recap) body.append(recapBlock(S.recap));
-          body.append(rateButtons());
+      const wanted = [];
+      if (!S.current || (!S.messages.length && !isRunning())) {
+        historyRender.turns.clear();
+        rendered.clear();
+        if (!historyRender.welcome) historyRender.welcome = welcome();
+        if (S.current && !S.daemonOnline) {
+          if (!historyRender.banner) historyRender.banner = h("div", { class: "banner" }, "The daemon is offline. Start formless on your machine; this page reconnects automatically.");
+          wanted.push(historyRender.banner);
+        }
+        wanted.push(historyRender.welcome);
+        if (S.current) {
+          if (!historyRender.live) historyRender.live = h("div", { id: "live", class: "turn", "data-live-root": S.current });
+          wanted.push(historyRender.live);
+        }
+        reconcileChildren(box, wanted);
+        return;
+      }
+      if (!S.daemonOnline) {
+        if (!historyRender.banner) historyRender.banner = h("div", { class: "banner" }, "The daemon is offline. Start formless on your machine; this page reconnects automatically.");
+        wanted.push(historyRender.banner);
+      }
+      const lastUser = [...S.messages].reverse().find((m) => m.role === "user");
+      const lastAnswer = [...S.messages].reverse().find((m) => m.role === "assistant" && m.content);
+      const active = new Set(), messageIds = new Set();
+      let turn = null, group = null;
+      const open = (role, when, msg) => {
+        const g = speaker(role);
+        if (g === group && turn) return turn.items;
+        group = g;
+        // A turn's first message is its stable key. Users always start a turn.
+        const key = g + ":" + currentMessage.id;
+        turn = historyRender.turns.get(key);
+        if (!turn) {
+          const who = h("div", { class: "who " + g }, WHO[g]);
+          const time = h("time");
+          who.append(time);
+          const body = h("div");
+          turn = { el: h("div", { class: "turn " + g, "data-turn-id": currentMessage.id }, who, body), who, time, body, edit: null, decorations: null, decorationKey: null };
+          historyRender.turns.set(key, turn);
+        }
+        turn.items = [];
+        turn.message = currentMessage;
+        const stamp = when ? clock(when) : "";
+        if (turn.time.textContent !== stamp) turn.time.textContent = stamp;
+        turn.time.hidden = !when;
+        const editable = msg && msg === lastUser && !isRunning();
+        if (editable && !turn.edit) {
+          const entry = turn;
+          turn.edit = h("button", { class: "btn ghost small edit", type: "button", title: "Edit and re-run (/edit)", onclick: () => beginEdit(entry.message) }, "Edit");
+          turn.who.append(turn.edit);
+        } else if (!editable && turn.edit) { turn.edit.remove(); turn.edit = null; }
+        active.add(key);
+        wanted.push(turn.el);
+        return turn.items;
+      };
+      let currentMessage;
+      for (const m of S.messages) {
+        currentMessage = m;
+        messageIds.add(m.id);
+        if (m.role === "user") {
+          // Each user message starts a fresh turn so its Edit button is exact.
+          group = null;
+          const from = sentElsewhere(m);
+          open("user", m.created_at, m).push(messageBody(m, (n) => n.append(h("div", { class: "bubble" }, withMentions(m.content)),
+            ...attachmentTags(m),
+            ...(from ? [h("div", { class: "muted sent-from" }, "sent from " + from)] : []),
+            ...(steerStep(m) != null ? [h("div", { class: "steer-mark", title: "Sent while the Run was working; it joined at this step" }, "↳ steer at step " + steerStep(m))] : []))));
+        } else if (m.role === "tool") {
+          open("assistant", m.created_at).push(messageBody(m, (n) => n.append(toolResultChip(m.content || ""))));
+        } else if (m.role === "system-note") {
+          open("system-note", m.created_at).push(messageBody(m, (n) => n.append(h("div", { class: "bubble" }, m.content))));
+        } else {
+          open("assistant", m.created_at).push(messageBody(m, (n) => {
+            let served = null;
+            try { served = JSON.parse(m.meta || "{}").model; } catch (_) {}
+            if (served && served.name) n.append(h("div", { class: "muted sent-from", title: "The Session asked for " + (served.requested || "another model") }, "via " + served.name + " (" + (served.via || "fallback") + ")"));
+            let placeholder = false;
+            try { placeholder = JSON.parse(m.meta || "{}").placeholder === true; } catch (_) {}
+            // An empty refusal/filter stop: the daemon's note, not the model's words.
+            if (placeholder) n.append(h("div", { class: "muted stop-note" }, m.content));
+            else if (m.content) n.append(markdown(m.content));
+            const stopNote = assistantStopNote(m);
+            if (stopNote) n.append(h("div", { class: "muted stop-note" }, stopNote));
+            let calls = [];
+            try { calls = (JSON.parse(m.meta || "{}").tool_calls) || []; } catch (_) {}
+            calls.forEach((c) => n.append(toolCallChip(c)));
+          }));
         }
       }
-    }
-    box.append(h("div", { id: "live", class: "turn" }));
+      for (const [key, entry] of historyRender.turns) {
+        if (!active.has(key)) { entry.el.remove(); historyRender.turns.delete(key); continue; }
+        const answerHere = lastAnswer && entry.items.includes(rendered.get(lastAnswer.id)) && !isRunning();
+        if (answerHere) {
+          const decorationKey = JSON.stringify([S.recap, S.rated, lastAnswer.id]);
+          if (!entry.decorations) entry.decorations = h("div", { class: "turn-actions" });
+          if (entry.decorationKey !== decorationKey) {
+            entry.decorations.replaceChildren(...(S.recap ? [recapBlock(S.recap)] : []), rateButtons());
+            entry.decorationKey = decorationKey;
+          }
+          entry.items.push(entry.decorations);
+        }
+        reconcileChildren(entry.body, entry.items);
+      }
+      for (const id of rendered.keys()) if (!messageIds.has(id)) rendered.delete(id);
+      if (!historyRender.live) historyRender.live = h("div", { id: "live", class: "turn", "data-live-root": S.current });
+      wanted.push(historyRender.live);
+      reconcileChildren(box, wanted);
+    }, { newContent });
     renderLive();
-    scrollToBottom();
   }
 
   // 👍/👎 on the last answer (SPEC §8.7), with an optional comment for 👎.
@@ -2255,68 +2363,455 @@
     }
     return [text.slice(0, cut), text.slice(cut)];
   }
-  // The rendered finished part, reused while it doesn't change.
-  const liveDone = { src: null, node: null };
+  // Completed Markdown chunks and the unfinished tail keep their DOM identity.
+  const liveDone = { session: undefined, text: "", src: "", node: null, done: null, tail: null, tailText: null, plainText: null };
+  const liveRender = { session: undefined, root: null, who: null, thinking: null, thinkingText: null, rows: new Map(), activity: null, activityText: null };
+  const statusRender = { root: null, spinner: null, text: null };
   function streamingNode(text) {
+    if (!liveDone.node || liveDone.session !== S.current) {
+      liveDone.session = S.current;
+      liveDone.text = liveDone.src = "";
+      liveDone.done = h("div", { class: "md bubble" });
+      liveDone.tailText = document.createTextNode("");
+      liveDone.tail = h("div", { class: "stream-tail" }, liveDone.tailText);
+      liveDone.node = h("div", { class: "streaming" }, liveDone.done, liveDone.tail);
+      liveDone.plainText = null;
+    }
     const [done, tail] = splitStreaming(text);
     if (liveDone.src !== done) {
+      const extra = done.startsWith(liveDone.src) ? done.slice(liveDone.src.length) : null;
+      const continuation = extra && /^\s+\S/.test(extra) && /^(UL|OL)$/.test(liveDone.done.lastElementChild?.tagName || "");
+      if (done.length > MD_FORMAT_CHARS) {
+        if (!liveDone.plainText) {
+          liveDone.plainText = document.createTextNode(done);
+          liveDone.done.replaceChildren(h("pre", { class: "md-plain" }, liveDone.plainText));
+        } else updateText(liveDone.plainText, done);
+      } else if (extra !== null && !continuation && !liveDone.plainText) {
+        if (extra) liveDone.done.append(...markdown(extra).childNodes);
+      } else {
+        // A restarted stream or an indented continuation can change the last
+        // Markdown block's meaning. Retain identical earlier blocks in place.
+        const next = markdown(done);
+        const previous = [...liveDone.done.childNodes];
+        const nodes = [...next.childNodes].map((node, index) => previous[index]?.isEqualNode(node) ? previous[index] : node);
+        reconcileChildren(liveDone.done, nodes);
+        liveDone.plainText = null;
+      }
       liveDone.src = done;
-      liveDone.node = done ? markdown(done) : null;
     }
-    return h("div", { class: "streaming" }, liveDone.node, tail ? h("div", { class: "stream-tail" }, tail) : null);
+    liveDone.text = text;
+    liveDone.done.hidden = !done;
+    liveDone.tail.hidden = !tail;
+    updateText(liveDone.tailText, tail);
+    return liveDone.node;
   }
-  function renderLive() {
+  function liveToolRow(tool) {
+    let row = liveRender.rows.get(tool);
+    if (row) return row;
+    // Reconciled snapshots may replace the record while retaining the same
+    // invocation identity. Keep its disclosure/focused controls in that case.
+    row = [...liveRender.rows.values()].find((candidate) =>
+      tool.invocationId != null && candidate.tool.invocationId === tool.invocationId
+      || tool.handle && candidate.tool.handle === tool.handle
+      || tool.subagent && candidate.tool.subagent === tool.subagent);
+    if (row) {
+      liveRender.rows.delete(row.tool);
+      row.tool = tool;
+      liveRender.rows.set(tool, row);
+      return row;
+    }
+    const mark = h("span");
+    const name = document.createTextNode("");
+    const args = document.createTextNode("");
+    const folded = h("span", { class: "tag" });
+    const progress = h("progress", { max: "1", "aria-label": "Progress" });
+    const progressText = document.createTextNode("");
+    const progressBox = h("span", { class: "tprogress" }, progress, progressText);
+    const stalled = h("span", { class: "tag broad" });
+    const cancel = h("button", { type: "button", class: "btn danger small", onclick: (e) => { e.preventDefault(); cancelTool(row.tool.handle); } }, "Cancel");
+    const transcript = h("button", { type: "button", class: "btn ghost small", onclick: (e) => { e.preventDefault(); showSubagent(row.tool.subagent); } }, "Transcript");
+    const timer = document.createTextNode("");
+    const summary = h("summary", null, h("span", { class: "muted", "data-live-depth": "" }, "└"), mark,
+      h("span", { class: "tname" }, name), h("span", { class: "targs" }, args), folded, progressBox, stalled, cancel, transcript,
+      h("span", { class: "tstat", "data-live-timer": "" }, timer));
+    row = { tool, node: h("details", { class: "chip live tree-node" }, summary), summary, mark, name, args, folded, progress, progressText, progressBox, stalled, cancel, transcript, timer, payload: null, payloadInitialized: false, payloadArgs: undefined, payloadSubagent: undefined };
+    liveRender.rows.set(tool, row);
+    return row;
+  }
+  function updateLiveTool(row, folded) {
+    const t = row.tool, running = t.status === "running";
+    const rowClass = "chip live tree-node" + (running ? "" : " done");
+    if (row.node.className !== rowClass) row.node.className = rowClass;
+    const indent = (t.depth || 0) * 1.125 + "rem";
+    if (row.node.style.marginLeft !== indent) row.node.style.marginLeft = indent;
+    const identity = t.invocationId || t.handle || t.subagent || t.name || "tool";
+    if (row.node.dataset.liveTool !== identity) row.node.dataset.liveTool = identity;
+    if (row.summary.firstChild.hidden !== !t.depth) row.summary.firstChild.hidden = !t.depth;
+    const markClass = running ? "spinner" : t.status === "ok" ? "tree-ok" : "tree-fail";
+    if (row.mark.className !== markClass) {
+      row.mark.className = markClass;
+      row.mark.style.color = running ? "var(--warn)" : "";
+      row.mark.textContent = running ? "" : t.status === "ok" ? "✓" : "✗";
+    }
+    updateText(row.name, t.name + (t.version > 0 ? " v" + t.version : ""));
+    updateText(row.args, t.subagent ? t.step || "" : summarizeArgs(t.arguments || ""));
+    if (row.folded.hidden !== !folded) row.folded.hidden = !folded;
+    if (row.folded.textContent !== "+" + folded + " nested") row.folded.textContent = "+" + folded + " nested";
+    const hideProgress = !running || !t.progress;
+    if (row.progressBox.hidden !== hideProgress) row.progressBox.hidden = hideProgress;
+    if (row.progress.hidden !== (t.progress?.fraction == null)) row.progress.hidden = t.progress?.fraction == null;
+    if (t.progress?.fraction != null) row.progress.value = t.progress.fraction;
+    updateText(row.progressText, t.progress ? (t.progress.fraction != null ? " " + Math.round(t.progress.fraction * 100) + "%" : "") + (t.progress.label ? " " + t.progress.label : "") : "");
+    if (row.stalled.hidden !== (t.stalledSecs == null)) row.stalled.hidden = t.stalledSecs == null;
+    if (row.stalled.textContent !== "stalled " + t.stalledSecs + "s") row.stalled.textContent = "stalled " + t.stalledSecs + "s";
+    const hideCancel = !t.handle || !running;
+    if (row.cancel.hidden !== hideCancel) row.cancel.hidden = hideCancel;
+    if (row.transcript.hidden !== !t.subagent) row.transcript.hidden = !t.subagent;
+    updateText(row.timer, t.elapsedMs != null ? (t.elapsedMs / 1000).toFixed(1) + "s" : elapsed(t.started));
+    if (!row.payloadInitialized || row.payloadArgs !== t.arguments || row.payloadSubagent !== t.subagent) {
+      row.payloadInitialized = true;
+      row.payloadArgs = t.arguments;
+      row.payloadSubagent = t.subagent;
+      row.payload = t.subagent ? null : payload(t.arguments || "");
+      reconcileChildren(row.node, [row.summary, ...(row.payload ? [row.payload] : [])]);
+    }
+  }
+  function renderLive({ newContent = false } = {}) {
     const live = $("live");
     if (!live) return;
-    live.replaceChildren();
-    const running = isRunning();
-    const tools = S.liveTools.filter((t) => t.status === "running");
-    if (!running && !S.streaming && !tools.length) return;
-    live.append(h("div", { class: "who assistant" }, "Formless"));
-    if (S.showThinking && S.thinking) {
-      // Latest lines only, like the TUI: reasoning never floods the view.
-      const lines = S.thinking.split("\n");
-      live.append(h("div", { class: "thinking" }, lines.length > 6 ? "… " + lines.slice(-6).join("\n") : S.thinking));
-    }
-    for (const [t, folded] of liveTree(S.liveTools)) {
-      const running = t.status === "running";
-      const mark = running ? h("span", { class: "spinner", style: "color:var(--warn)" })
-        : h("span", { class: t.status === "ok" ? "tree-ok" : "tree-fail" }, t.status === "ok" ? "✓" : "✗");
-      const time = t.elapsedMs != null ? (t.elapsedMs / 1000).toFixed(1) + "s" : elapsed(t.started);
-      live.append(h("details", { class: "chip live tree-node" + (running ? "" : " done"), style: "margin-left:" + (t.depth || 0) * 1.125 + "rem" },
-        h("summary", null,
-          t.depth ? h("span", { class: "muted" }, "└") : null,
-          mark,
-          h("span", { class: "tname" }, t.name + (t.version > 0 ? " v" + t.version : "")),
-          h("span", { class: "targs" }, t.subagent ? (t.step || "") : summarizeArgs(t.arguments || "")),
-          folded ? h("span", { class: "tag" }, "+" + folded + " nested") : null,
-          running && t.progress ? h("span", { class: "tprogress" },
-            t.progress.fraction != null ? h("progress", { max: "1", value: String(t.progress.fraction), "aria-label": "Progress" }) : null,
-            (t.progress.fraction != null ? " " + Math.round(t.progress.fraction * 100) + "%" : "") + (t.progress.label ? " " + t.progress.label : "")) : null,
-          t.stalledSecs != null ? h("span", { class: "tag broad" }, "stalled " + t.stalledSecs + "s") : null,
-          t.handle && running ? h("button", { type: "button", class: "btn danger small", onclick: (e) => { e.preventDefault(); cancelTool(t.handle); } }, "Cancel") : null,
-          t.subagent ? h("button", { type: "button", class: "btn ghost small", onclick: (e) => { e.preventDefault(); showSubagent(t.subagent); } }, "Transcript") : null,
-          h("span", { class: "tstat" }, time)),
-        t.subagent ? null : payload(t.arguments || "")));
-    }
-    if (S.streaming) live.append(streamingNode(S.streaming));
-    else if (running && S.activity) live.append(h("div", { class: "activity" }, h("span", { class: "spinner" }), activityText(S.activity)));
-    scrollToBottom();
+    withTranscriptLayout(() => {
+      if (liveRender.session !== S.current || liveRender.root !== live) {
+        liveRender.session = S.current;
+        liveRender.root = live;
+        liveRender.who = h("div", { class: "who assistant" }, "Formless");
+        liveRender.thinkingText = document.createTextNode("");
+        liveRender.thinking = h("div", { class: "thinking" }, liveRender.thinkingText);
+        liveRender.activityText = document.createTextNode("");
+        liveRender.activity = h("div", { class: "activity" }, h("span", { class: "spinner" }), h("span", { "data-live-activity": "" }, liveRender.activityText));
+        liveRender.rows.clear();
+      }
+      const running = isRunning();
+      const tools = S.liveTools.filter((t) => t.status === "running");
+      const children = [];
+      if (running || S.streaming || tools.length) {
+        children.push(liveRender.who);
+        if (S.showThinking && S.thinking) {
+          const lines = S.thinking.split("\n");
+          updateText(liveRender.thinkingText, lines.length > 6 ? "… " + lines.slice(-6).join("\n") : S.thinking);
+          children.push(liveRender.thinking);
+        }
+        for (const [tool, folded] of liveTree(S.liveTools)) {
+          const row = liveToolRow(tool);
+          updateLiveTool(row, folded);
+          children.push(row.node);
+        }
+        if (S.streaming) children.push(streamingNode(S.streaming));
+        else if (running && S.activity) {
+          updateText(liveRender.activityText, activityText(S.activity));
+          children.push(liveRender.activity);
+        }
+      }
+      const retained = new Set(S.liveTools);
+      for (const [tool] of liveRender.rows) if (!retained.has(tool)) liveRender.rows.delete(tool);
+      reconcileChildren(live, children);
+    }, { newContent });
+  }
+  function updateElapsedTimers() {
+    withTranscriptLayout(() => {
+      if (statusRender.text) updateText(statusRender.text, isRunning() ? S.activity ? activityText(S.activity) : "running" : "● ready");
+      if (liveRender.session !== S.current || liveRender.root !== $("live")) return;
+      if (liveRender.activity.isConnected && S.activity) updateText(liveRender.activityText, activityText(S.activity));
+      for (const row of liveRender.rows.values()) {
+        if (row.node.isConnected && row.tool.elapsedMs == null) updateText(row.timer, elapsed(row.tool.started));
+      }
+    }, { newContent: false });
   }
 
-  function scrollToBottom(force) {
+  // Explicit anchoring also works in engines without native overflow-anchor.
+  // Keep the last committed reading block, not geometry captured after reflow.
+  const reading = { session: null, saved: new Map(), anchor: null, unseen: new Map(), unseenIds: new Set(), deferred: new Map(), pendingContent: false, pendingLive: false, afterSeq: -1,
+    depth: 0, changed: false, adjustment: 0, intentUntil: 0, direction: 0, writeTop: null,
+    writeUntil: 0, inputFrame: 0, pointer: null, observed: new Set() };
+  const printMedia = window.matchMedia("print");
+  const anchorBlocks = "p, pre, summary, li, h1, h2, h3, h4, .bubble, .diagram-view, .stream-tail";
+  function readingVisible() {
     const box = $("transcript");
-    if (force) S.follow = true;
-    if (S.follow) {
-      box.scrollTop = box.scrollHeight;
-      $("jump").classList.add("hidden");
-    } else if (isRunning() || S.streaming) $("jump").classList.remove("hidden");
+    return !printMedia.matches && S.view === "chat" && box.clientHeight > 0 && box.getClientRects().length > 0;
   }
-  $("transcript").addEventListener("scroll", () => {
+  function captureReadingAnchor() {
+    if (!readingVisible()) return null;
+    const box = $("transcript"), bounds = box.getBoundingClientRect();
+    const messages = [...box.querySelectorAll("[data-message-id], [data-live-root]")];
+    const visible = messages.filter(node => { const r = node.getBoundingClientRect(); return r.height && r.bottom > bounds.top + 1; });
+    const candidates = [];
+    for (const message of visible.slice(0, 4)) {
+      const blocks = [...message.querySelectorAll(anchorBlocks)];
+      const visibleBlocks = blocks.filter(node => { const r = node.getBoundingClientRect(); return r.height && r.bottom > bounds.top + 1; });
+      let block = visibleBlocks[0] || message;
+      for (const child of visibleBlocks.slice(1)) {
+        if (!block.contains(child)) break;
+        block = child;
+      }
+      candidates.push({ node: block, id: message.dataset.messageId || null, live: message.hasAttribute("data-live-root"),
+        block: blocks.indexOf(block), offset: block.getBoundingClientRect().top - bounds.top });
+    }
+    return { candidates, top: box.scrollTop };
+  }
+  function resolveReadingBlock(candidate) {
     const box = $("transcript");
-    S.follow = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
-    if (S.follow) $("jump").classList.add("hidden");
+    if (candidate.node?.isConnected && box.contains(candidate.node)) return candidate.node;
+    const message = candidate.live ? box.querySelector("[data-live-root]")
+      : [...box.querySelectorAll("[data-message-id]")].find(node => node.dataset.messageId === candidate.id);
+    const node = message && (candidate.block < 0 ? message : message.querySelectorAll(anchorBlocks)[candidate.block] || message);
+    if (node) candidate.node = node;
+    return node;
+  }
+  function writeReadingTop(top) {
+    const box = $("transcript");
+    box.scrollTop = top;
+    reading.writeTop = box.scrollTop;
+    reading.writeUntil = performance.now() + 150;
+  }
+  function setReadingAdjustment(value) {
+    if (Math.abs(reading.adjustment - value) < .001) return;
+    reading.adjustment = value;
+    $("transcript").style.setProperty("--reading-offset", value + "px");
+  }
+  function restoreReadingAnchor() {
+    if (!readingVisible()) return false;
+    const box = $("transcript");
+    if (S.follow) { setReadingAdjustment(0); writeReadingTop(box.scrollHeight); return true; }
+    const anchor = reading.anchor;
+    if (!anchor) return false;
+    for (const candidate of anchor.candidates) {
+      const node = resolveReadingBlock(candidate);
+      if (!node || !node.getClientRects().length) continue;
+      const delta = node.getBoundingClientRect().top - box.getBoundingClientRect().top - candidate.offset;
+      if (Math.abs(delta) > .01) writeReadingTop(box.scrollTop + delta);
+      // WebKit quantizes scrollTop to whole CSS pixels. Retain its fractional
+      // remainder in layout, rather than accepting a visible subpixel drift.
+      const residual = node.getBoundingClientRect().top - box.getBoundingClientRect().top - candidate.offset;
+      if (Math.abs(residual) > .01 && Math.abs(residual) < 1) {
+        const adjustment = reading.adjustment - residual;
+        const whole = Math.trunc(adjustment);
+        setReadingAdjustment(adjustment - whole);
+        if (whole) writeReadingTop(box.scrollTop - whole);
+      } else if (Math.abs(residual) >= 1) reading.anchor = captureReadingAnchor();
+      return true;
+    }
+    // During a Session snapshot load, retain the anchor until its message exists.
+    if (S.messages.length) writeReadingTop(anchor.top);
+    return false;
+  }
+  function resetReadingSession(id) {
+    if (reading.session === id) return;
+    if (reading.session != null) {
+      const anchor = reading.anchor || (!S.follow && captureReadingAnchor());
+      const unseenIds = [...reading.unseenIds, ...[...reading.unseen.keys(), ...reading.deferred.keys()].map(node =>
+        (node.nodeType === Node.TEXT_NODE ? node.parentElement : node)?.closest("[data-message-id]")?.dataset.messageId).filter(Boolean)];
+      const unseenLive = reading.pendingLive || [...reading.unseen.keys(), ...reading.deferred.keys()].some(node =>
+        (node.nodeType === Node.TEXT_NODE ? node.parentElement : node)?.closest("[data-live-root]"));
+      reading.saved.delete(reading.session);
+      reading.saved.set(reading.session, { follow: S.follow,
+        anchor: anchor && { top: anchor.top, candidates: anchor.candidates.map(candidate => ({ ...candidate, node: null })) }, unseenIds,
+        pendingContent: reading.pendingContent, unseenLive,
+        afterSeq: reading.pendingLive ? reading.afterSeq : S.messages.reduce((seq, message) => Math.max(seq, message.seq || 0), -1) });
+      // Reading bookmarks retain IDs/offsets rather than detached transcript DOM.
+      if (reading.saved.size > 32) reading.saved.delete(reading.saved.keys().next().value);
+    }
+    const saved = reading.saved.get(id);
+    reading.session = id;
+    reading.anchor = saved?.anchor || null;
+    reading.unseen = new Map();
+    reading.unseenIds = new Set(saved?.unseenIds || []);
+    reading.deferred = new Map();
+    reading.pendingContent = saved?.pendingContent || false;
+    reading.pendingLive = saved?.unseenLive || false;
+    reading.afterSeq = saved?.afterSeq ?? -1;
+    setReadingAdjustment(0);
+    S.follow = saved ? saved.follow : true;
+    reading.intentUntil = 0;
+    reading.writeTop = null;
+    reading.pointer = null;
+    if (reading.inputFrame) cancelAnimationFrame(reading.inputFrame);
+    reading.inputFrame = 0;
+    $("jump").classList.add("hidden");
+  }
+  function outputBottom(node, start) {
+    if (node.nodeType !== Node.TEXT_NODE) return node.getBoundingClientRect().bottom;
+    const range = document.createRange();
+    range.setStart(node, Math.min(start || 0, node.length));
+    range.setEnd(node, node.length);
+    const rects = [...range.getClientRects()];
+    return rects.length ? Math.max(...rects.map(rect => rect.bottom)) : -Infinity;
+  }
+  function markNewOutput(records) {
+    if (S.follow) return;
+    const box = $("transcript"), visible = readingVisible(), bottom = box.getBoundingClientRect().bottom;
+    const semantic = "[data-message-id], .streaming, .thinking, .tree-node, .recap";
+    const mark = (node, start) => {
+      if (!visible) reading.deferred.set(node, start);
+      else if (outputBottom(node, start) > bottom + 1) reading.unseen.set(node, start);
+    };
+    for (const record of records) {
+      if (record.type === "characterData") {
+        const node = record.target, parent = node.parentElement;
+        if (!parent?.closest(semantic) || parent.closest(".tstat, .activity")) continue;
+        const before = record.oldValue || "", after = node.data;
+        let start = 0;
+        while (start < before.length && start < after.length && before[start] === after[start]) start++;
+        if (start < after.length) mark(node, start);
+      } else for (const node of record.addedNodes) {
+        if (!(node instanceof Element) || !box.contains(node)) continue;
+        if (node.matches("button, .who, .rate, .tstat")) continue;
+        const content = node.matches(semantic) || node.closest(semantic) ? [node] : [...node.querySelectorAll(semantic)];
+        for (const item of content) mark(item, null);
+      }
+    }
+  }
+  function updateReadingPill() {
+    const box = $("transcript");
+    for (const markers of [reading.unseen, reading.deferred]) for (const node of markers.keys()) {
+      if (!node.isConnected || !box.contains(node)) markers.delete(node);
+    }
+    if (!readingVisible()) return;
+    const bottom = box.getBoundingClientRect().bottom;
+    if (reading.pendingLive) {
+      const newIds = new Set(S.messages.filter(message => message.seq > reading.afterSeq).map(message => message.id));
+      const content = [...box.querySelectorAll("[data-message-id]")].filter(node => newIds.has(node.dataset.messageId));
+      const live = [...box.querySelectorAll("[data-live-root] .streaming, [data-live-root] .thinking, [data-live-root] .tree-node")];
+      content.push(...live.filter(node => node.textContent));
+      if (content.length) {
+        for (const node of content) if (node.getBoundingClientRect().bottom > bottom + 1) reading.unseen.set(node, null);
+        reading.pendingLive = false;
+      } else if (!S.sessionSnapshot && !isRunning()) reading.pendingLive = false;
+    }
+    for (const [node, start] of reading.deferred) {
+      if (node.isConnected && box.contains(node) && outputBottom(node, start) > bottom + 1) reading.unseen.set(node, start);
+    }
+    reading.deferred.clear();
+    if (reading.unseenIds.size) for (const node of box.querySelectorAll("[data-message-id]")) {
+      if (reading.unseenIds.delete(node.dataset.messageId) && node.getBoundingClientRect().bottom > bottom + 1) reading.unseen.set(node, null);
+    }
+    for (const [node, start] of reading.unseen) {
+      if (!node.isConnected || !box.contains(node) || outputBottom(node, start) <= bottom + 1) reading.unseen.delete(node);
+    }
+    $("jump").classList.toggle("hidden", S.follow || !reading.unseen.size);
+  }
+  function observeReadingNodes(records) {
+    for (const record of records) if (record.type === "childList") {
+      for (const root of record.addedNodes) if (root instanceof Element) {
+        const nodes = root.matches("[data-message-id], [data-live-root]") ? [root] : [...root.querySelectorAll("[data-message-id], [data-live-root]")];
+        for (const node of nodes) if (!reading.observed.has(node)) { reading.observed.add(node); readingResize.observe(node); }
+      }
+      for (const root of record.removedNodes) if (root instanceof Element) {
+        const nodes = root.matches("[data-message-id], [data-live-root]") ? [root] : [...root.querySelectorAll("[data-message-id], [data-live-root]")];
+        for (const node of nodes) if (!$("transcript").contains(node)) { reading.observed.delete(node); readingResize.unobserve(node); }
+      }
+    }
+  }
+  function settleReadingLayout() {
+    if (!readingVisible() || reading.depth || reading.inputFrame) return;
+    restoreReadingAnchor();
+    if (S.follow) reading.anchor = null;
+    else if (!reading.anchor) reading.anchor = captureReadingAnchor();
+    updateReadingPill();
+  }
+  function withTranscriptLayout(update, { newContent = false } = {}) {
+    resetReadingSession(S.current);
+    const outer = !reading.depth++;
+    if (outer) {
+      reading.changed = reading.pendingContent && readingVisible();
+      if (reading.changed) reading.pendingContent = false;
+      if (!S.follow && (!reading.anchor || reading.inputFrame || performance.now() < reading.intentUntil)) reading.anchor = captureReadingAnchor() || reading.anchor;
+    }
+    reading.changed ||= newContent;
+    try { return update(); }
+    finally {
+      reading.depth--;
+      if (outer) {
+        const records = readingChanges.takeRecords();
+        observeReadingNodes(records);
+        restoreReadingAnchor();
+        if (reading.changed) markNewOutput(records);
+        if (S.follow) reading.anchor = null;
+        else if (!reading.anchor) reading.anchor = captureReadingAnchor();
+        updateReadingPill();
+      }
+    }
+  }
+  const readingChanges = new MutationObserver(records => {
+    observeReadingNodes(records);
+    settleReadingLayout();
   });
+  readingChanges.observe($("transcript"), { childList: true, subtree: true,
+    characterData: true, characterDataOldValue: true, attributes: true, attributeFilter: ["open", "class"] });
+  const readingResize = new ResizeObserver(settleReadingLayout);
+  readingResize.observe($("transcript"));
+  function resumeReadingFollow() {
+    S.follow = true;
+    reading.unseen.clear(); reading.unseenIds.clear(); reading.deferred.clear();
+    reading.pendingContent = false; reading.pendingLive = false;
+    setReadingAdjustment(0);
+    writeReadingTop($("transcript").scrollHeight);
+  }
+  function scrollToBottom(force) {
+    if (force) resumeReadingFollow();
+    settleReadingLayout();
+  }
+  function readingInput(direction, duration = 1200) {
+    reading.writeTop = null;
+    reading.intentUntil = performance.now() + duration;
+    reading.direction = direction;
+    if (direction < 0) S.follow = false;
+    if (reading.inputFrame) cancelAnimationFrame(reading.inputFrame);
+    const session = S.current;
+    reading.inputFrame = requestAnimationFrame(() => {
+      reading.inputFrame = 0;
+      if (S.current !== session || !readingVisible()) return;
+      const box = $("transcript"), bottom = box.scrollHeight - box.clientHeight - box.scrollTop <= 1;
+      if (direction > 0 && bottom) resumeReadingFollow();
+      reading.anchor = captureReadingAnchor();
+      updateReadingPill();
+    });
+  }
+  $("transcript").addEventListener("wheel", e => readingInput(Math.sign(e.deltaY)), { passive: true });
+  $("transcript").addEventListener("touchstart", () => readingInput(0, 2500), { passive: true });
+  $("transcript").addEventListener("touchmove", () => readingInput(0, 2500), { passive: true });
+  $("transcript").addEventListener("pointerdown", e => {
+    const box = $("transcript"), rect = box.getBoundingClientRect();
+    reading.pointer = { y: e.clientY, top: box.scrollTop };
+    if (e.target === box && (e.clientX >= rect.left + box.clientWidth || e.clientY >= rect.top + box.clientHeight)) readingInput(0, 1500);
+  });
+  window.addEventListener("pointermove", e => {
+    const pointer = reading.pointer;
+    if (pointer && e.buttons && Math.abs(e.clientY - pointer.y) > 3) readingInput(Math.sign($("transcript").scrollTop - pointer.top), 1500);
+  });
+  window.addEventListener("pointerup", () => { reading.pointer = null; });
+  $("transcript").addEventListener("keydown", e => {
+    if (e.target.matches("input, textarea, select, [contenteditable='true']")) return;
+    if (e.defaultPrevented || (e.key === " " && e.target.closest("button, summary, a[href], [role='button']"))) return;
+    const down = ["End", "PageDown", "ArrowDown", " "].includes(e.key) && !e.shiftKey;
+    const up = ["Home", "PageUp", "ArrowUp"].includes(e.key) || (e.key === " " && e.shiftKey);
+    if (down || up) readingInput(down ? 1 : -1);
+  });
+  $("transcript").addEventListener("scroll", () => {
+    if (!readingVisible()) return;
+    const box = $("transcript"), now = performance.now();
+    const ownWrite = reading.writeTop != null && Math.abs(box.scrollTop - reading.writeTop) <= 1 && now < reading.writeUntil;
+    if (ownWrite) { updateReadingPill(); return; }
+    const bottom = box.scrollHeight - box.scrollTop - box.clientHeight <= 1;
+    if (now < reading.intentUntil) {
+      if (!bottom) S.follow = false;
+      else if (reading.direction >= 0) resumeReadingFollow();
+      reading.anchor = captureReadingAnchor();
+      updateReadingPill();
+    } else if (S.follow && !bottom) {
+      S.follow = false;
+      reading.anchor = captureReadingAnchor();
+    } else settleReadingLayout();
+  });
+  printMedia.addEventListener("change", () => { if (!printMedia.matches) requestAnimationFrame(settleReadingLayout); });
   $("jump").onclick = () => scrollToBottom(true);
 
   // An interrupted/paused last Run (SPEC §5.4): why, and what to do.
@@ -2500,14 +2995,17 @@
 
   function renderStatus() {
     const state = $("state");
-    state.replaceChildren();
-    if (isRunning()) {
-      state.className = "state busy";
-      state.append(h("span", { class: "spinner" }), S.activity ? activityText(S.activity) : "running");
-    } else {
-      state.className = "state";
-      state.append("● ready");
+    if (statusRender.root !== state) {
+      statusRender.root = state;
+      statusRender.spinner = h("span", { class: "spinner" });
+      statusRender.text = document.createTextNode("");
+      state.replaceChildren(statusRender.spinner, h("span", { "data-status-activity": "" }, statusRender.text));
     }
+    const running = isRunning();
+    const stateClass = running ? "state busy" : "state";
+    if (state.className !== stateClass) state.className = stateClass;
+    if (statusRender.spinner.hidden !== !running) statusRender.spinner.hidden = !running;
+    updateText(statusRender.text, running ? S.activity ? activityText(S.activity) : "running" : "● ready");
     const s = S.sessions.find((x) => x.id === S.current);
     $("status-session").textContent = s ? s.name : "no session";
     $("status-session").title = s && s.cwd ? "Working directory: " + s.cwd : "";
@@ -4455,12 +4953,17 @@
   let sessionSeq = 0;
   async function openSession(id, stay) {
     if (S.current !== id) invalidateBranchSummary();
+    cancelEventRender();
+    resetReadingSession(id);
     const seq = ++sessionSeq;
     closeSidebar();
     if (!stay && S.view !== "chat") setView("chat");
     S.current = id;
     const snapshot = S.sessionSnapshot = { events: [] };
     S.messages = [];
+    S.streaming = "";
+    S.thinking = "";
+    S.liveTools = []; S.liveRun = null;
     renderHistory();
     S.runTools = null;
     renderRunTools();
@@ -4487,15 +4990,11 @@
         renderStatus();
       }).catch(() => {});
     prefs.set("session", id);
-    S.streaming = "";
-    S.thinking = "";
-    S.liveTools = []; S.liveRun = null;
     S.editMessageId = null;
     S.queued = []; renderQueue();
     S.plan = []; S.planState = null; renderPlan();
     S.step = null; renderStep();
     S.recap = null; S.recapRunId = null;
-    S.follow = true;
     const r = await act({ type: "get_session", id });
     if (seq !== sessionSeq || S.current !== id) return;
     S.sessionSnapshot = null;
@@ -5126,7 +5625,6 @@
     const mode = queued ? "queue" : isRunning() ? "steer" : "send";
     input.value = "";
     autosize();
-    S.follow = true;
     if (S.editMessageId) {
       const id = S.editMessageId;
       S.editMessageId = null;
@@ -5319,7 +5817,7 @@
         break;
       case "run_recap":
         if (here && (!S.liveRun || S.liveRun.id === ev.run_id)) {
-          if (S.recapRunId !== ev.run_id || JSON.stringify(S.recap) !== JSON.stringify(ev.recap)) { S.recap = ev.recap; S.recapRunId = ev.run_id; renderHistory(); }
+          if (S.recapRunId !== ev.run_id || JSON.stringify(S.recap) !== JSON.stringify(ev.recap)) { S.recap = ev.recap; S.recapRunId = ev.run_id; scheduleEventRender({ history: true, newContent: true }); }
         }
         break;
       case "run_files_changed":
@@ -5335,10 +5833,15 @@
         // A persisted assistant step (e.g. text before a Tool call) replaces
         // the live stream, so the next step starts fresh.
         if (here && (ev.type === "message_complete" || ev.message.role === "assistant")) { S.streaming = ""; S.thinking = ""; }
-        if (here && !S.messages.some((m) => m.id === ev.message.id)) { S.messages.push(ev.message); renderHistory(); }
+        if (here) {
+          const index = S.messages.findIndex((m) => m.id === ev.message.id);
+          if (index < 0) S.messages.push(ev.message);
+          else if (ev.type === "message_complete") S.messages[index] = ev.message;
+          if (index < 0 || ev.type === "message_complete") scheduleEventRender({ history: true, newContent: true });
+        }
         break;
       case "message_delta":
-        if (here) { S.streaming += ev.delta; if (!S.activity || S.activity.label !== "responding") setActivity("responding"); else renderLive(); }
+        if (here) { S.streaming += ev.delta; if (!S.activity || S.activity.label !== "responding") setActivity("responding"); else scheduleEventRender({ live: true }); }
         break;
       case "provider_stalled":
         if (here) { setActivity("provider stalled"); note("no data from the provider for " + ev.idle_secs + "s; /resend re-sends the request", true); }
@@ -5377,14 +5880,14 @@
       case "provider_retrying":
         if (here) {
           S.activity = { label: ev.reason, since: Date.now(), retryAt: Date.now() + ev.wait_secs * 1000, count: "(" + ev.attempt + "/" + ev.max_attempts + ")" };
-          renderLive();
+          scheduleEventRender({ live: true });
         }
         break;
       case "stream_restarted":
-        if (here) { S.streaming = ""; S.thinking = ""; note("provider stream dropped; retrying"); renderLive(); }
+        if (here) { S.streaming = ""; S.thinking = ""; note("provider stream dropped; retrying"); scheduleEventRender({ live: true }); }
         break;
       case "reasoning_delta":
-        if (here) { S.thinking += ev.delta; if (!S.activity || S.activity.label !== "thinking") setActivity("thinking"); else renderLive(); }
+        if (here) { S.thinking += ev.delta; if (!S.activity || S.activity.label !== "thinking") setActivity("thinking"); else scheduleEventRender({ live: true }); }
         break;
       case "run_finished":
       case "run_paused":
@@ -5407,7 +5910,7 @@
           setActivity(null);
           if (ev.type === "run_paused") note("run paused: " + ((ev.explained && ev.explained.message) || ev.error), true);
           else if (ev.status !== "completed") note("run " + ev.status, ev.status !== "interrupted");
-          renderHistory();
+          scheduleEventRender({ history: true });
         }
         break;
       case "tool_call_started":
@@ -5433,7 +5936,7 @@
       case "tool_progress":
         if (here && (!S.liveRun || S.liveRun.id === ev.run_id && !S.liveRun.ended || ev.invocation_id != null && runningTool(null, ev.invocation_id))) {
           const t = runningTool(ev.tool_name, ev.invocation_id, ev.depth || 0);
-          if (t) { t.progress = { fraction: ev.fraction, label: ev.label }; renderLive(); }
+          if (t) { t.progress = { fraction: ev.fraction, label: ev.label }; scheduleEventRender({ live: true }); }
         }
         break;
       case "tool_call_finished":
@@ -5452,18 +5955,18 @@
       case "run_usage":
         (S.usage = S.usage || {})[ev.session_id] = ev.usage;
         if (ev.usage.context_tokens > 0) (S.contextFill = S.contextFill || {})[ev.session_id] = { used: ev.usage.context_used, size: ev.usage.context_tokens };
-        if (here) renderStatus();
+        if (here) scheduleEventRender({ status: true });
         break;
       case "session_clients":
         if (ev.session_id === S.current) {
           S.others = (ev.clients || []).filter((c) => c.conn !== S.conn);
-          renderStatus();
+          scheduleEventRender({ status: true });
         }
         break;
       case "approval_closed": {
         const before = S.approvals.length;
         S.approvals = S.approvals.filter(a => !(a.kind === "tool" && a.id === ev.approval_id));
-        if (S.approvals.length < before) { note("Approval closed without a user decision."); renderApproval(); renderStatus(); }
+        if (S.approvals.length < before) { note("Approval closed without a user decision."); renderApproval(); scheduleEventRender({ status: true }); }
         break;
       }
       case "approval_answered": {
@@ -5473,7 +5976,7 @@
         if (S.approvals.length < before) {
           note("approval " + (ev.approved ? "granted" : "denied") + " in " + (ev.by || "another client"));
           renderApproval();
-          renderStatus();
+          scheduleEventRender({ status: true });
         }
         break;
       }
@@ -5498,14 +6001,14 @@
       case "promotion_approval_resolved":
         S.approvals = S.approvals.filter((a) => a.kind !== "promotion" || a.id !== ev.promotion_id);
         renderApproval();
-        renderStatus();
+        scheduleEventRender({ status: true });
         break;
       case "session_updated": {
         const i = S.sessions.findIndex((s) => s.id === ev.session.id);
         if (i >= 0) S.sessions[i] = ev.session; else S.sessions.unshift(ev.session);
         S.sessions.sort((a, b) => String(b.updated_at).localeCompare(String(a.updated_at)));
         renderSessions();
-        renderComposer();
+        scheduleEventRender({ composer: true });
         break;
       }
       case "session_deleted":
@@ -5589,7 +6092,7 @@
           t.stalledSecs = ev.silent_secs;
           if (ev.last_fraction != null || ev.last_label != null) t.progress = { fraction: ev.last_fraction, label: ev.last_label || "" };
           note(ev.tool_name + ": no advancing progress or activity for " + ev.silent_secs + "s" + progressDiagnostic(ev) + "; /cancel stops just this tool", true);
-          renderLive();
+          scheduleEventRender({ live: true });
         }
         break;
       }
@@ -5607,7 +6110,7 @@
           const parent = [...S.liveTools].reverse().find((t) => t.status === "running");
           S.liveTools.push({ name: "sub-agent" + (ev.subagent.model ? " (" + ev.subagent.model + ")" : "") + ": " + truncate(ev.subagent.task, 60),
             subagent: ev.subagent.id, arguments: "", status: "running", started: Date.now(), depth: parent ? (parent.depth || 0) + 1 : 0 });
-          renderLive();
+          scheduleEventRender({ live: true });
         }
         break;
       case "subagent_step":
@@ -5615,7 +6118,7 @@
           const node = S.liveTools.find((t) => t.subagent === ev.subagent_id);
           if (node) node.step = "step " + ev.step + ": " + (ev.tool_calls.length ? ev.tool_calls.join(", ") : "answering");
           if (isRunning()) setActivity("sub-agent " + (node ? node.step : "step " + ev.step));
-          renderLive();
+          scheduleEventRender({ live: true });
         }
         break;
       case "subagent_finished":
@@ -5623,13 +6126,13 @@
           note("sub-agent " + ev.subagent.status + " after " + ev.subagent.steps + " step(s) · click it to read its transcript", ev.subagent.status !== "completed");
           const node = S.liveTools.find((t) => t.subagent === ev.subagent.id);
           if (node) { node.status = ev.subagent.status === "completed" ? "ok" : "failed"; node.elapsedMs = Date.now() - node.started; }
-          renderLive();
+          scheduleEventRender({ live: true });
         }
         break;
       case "invocation_activity": {
         const t = here && runningTool(null, ev.invocation_id, null, ev.handle);
         if (t) t.stalledSecs = null;
-        if (here) renderLive();
+        if (here) scheduleEventRender({ live: true });
         break;
       }
       case "invocation_completed": {
@@ -5642,8 +6145,11 @@
         note("optimiser · " + ev.tool_name + ": " + ev.text);
         break;
     }
-    renderStatus();
-    renderComposer();
+    const output = here && (["message_delta", "tool_call_started", "tool_call_finished", "subagent_started", "subagent_finished", "invocation_completed"].includes(ev.type)
+      || ev.type === "reasoning_delta" && S.showThinking);
+    const deltaOnly = ["message_delta", "reasoning_delta", "tool_progress", "subagent_step", "invocation_activity"].includes(ev.type);
+    const composerUnchanged = deltaOnly || ["run_usage", "session_clients", "approval_summary"].includes(ev.type);
+    scheduleEventRender({ status: !deltaOnly, composer: !composerUnchanged, live: output, newContent: output });
   }
 
   // =========================================================== connection
@@ -6213,7 +6719,7 @@
   });
   // Tick elapsed timers (activity + running Tools) once a second.
   setInterval(() => {
-    if (isRunning() || S.liveTools.some((t) => t.status === "running")) { renderStatus(); renderLive(); }
+    if (isRunning() || S.liveTools.some((t) => t.status === "running")) updateElapsedTimers();
   }, 1000);
   // Relative times drift; refresh the sidebar each minute.
   setInterval(renderSessions, 60000);
