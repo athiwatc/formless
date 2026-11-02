@@ -437,7 +437,7 @@ async fn busy_deleted_and_generation_capacity_refusals_make_no_provider_request(
             cancel_flag: Arc::new(AtomicBool::new(false)),
             steer_tx,
             steering: Arc::new(Default::default()),
-            retry: Arc::new(Notify::new()),
+            retry: Arc::new(provider_retry_daemon::ProviderRetry::default()),
         },
     );
     let request = || Request::InspectBranchSummary {

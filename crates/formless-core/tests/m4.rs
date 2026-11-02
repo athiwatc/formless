@@ -2439,7 +2439,13 @@ async fn a_step_limit_warns_then_pauses_and_resume_goes_past_it() {
                     let n = calls.fetch_add(1, Ordering::SeqCst);
                     async move {
                         if n < 8 {
-                            sse_tool(&format!("c{n}"), "no_such_tool", json!({}))
+                            // Exercise budget progress, rather than repeated daemon
+                            // corrections that correctly pause after three attempts.
+                            sse_tool(
+                                &format!("c{n}"),
+                                "read_metrics",
+                                json!({"kind":"tools","limit":1}),
+                            )
                         } else {
                             sse_text("done")
                         }
@@ -2533,7 +2539,13 @@ async fn a_per_run_step_limit_pauses_and_is_cleared_after() {
                     let n = calls.fetch_add(1, Ordering::SeqCst);
                     async move {
                         if n < 6 {
-                            sse_tool(&format!("c{n}"), "no_such_tool", json!({}))
+                            // Exercise budget progress, rather than repeated daemon
+                            // corrections that correctly pause after three attempts.
+                            sse_tool(
+                                &format!("c{n}"),
+                                "read_metrics",
+                                json!({"kind":"tools","limit":1}),
+                            )
                         } else {
                             sse_text("done")
                         }

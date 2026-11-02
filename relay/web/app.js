@@ -2093,6 +2093,19 @@
     if (ev.last_fraction == null && ev.last_label == null) return "";
     return " · last progress " + (ev.last_fraction == null ? "unknown" : Math.round(ev.last_fraction * 100) + "%") + (ev.last_label ? " (" + ev.last_label + ")" : "");
   }
+  async function retryProviderRequest() {
+    const sid = S.current;
+    if (!sid) return;
+    const label = text => note((S.current === sid ? "" : "Session " + sid.slice(0, 8) + ": ") + text);
+    try {
+      const result = await request({ type: "retry_provider_request", session_id: sid });
+      if (result && result.retrying === true) label("Retry requested for the in-flight provider request.");
+      else if (result && result.retrying === false) label("Nothing was retried; no provider request is available for retry.");
+      else label("The daemon did not confirm whether a provider retry was requested.");
+    } catch (_) {
+      label("Provider retry was not confirmed; the request may already have been re-sent.");
+    }
+  }
   function cancelTool(handle) {
     if (handle) act({ type: "cancel_invocation", handle }, "Cancelling the tool");
     else note("no pending or stalled tool to cancel (Esc stops the whole run)", true);
@@ -4599,9 +4612,7 @@
       const t = [...S.liveTools].reverse().find((x) => x.status === "running" && x.handle);
       return cancelTool(t && t.handle);
     } },
-    { name: "resend", group: "Run control", desc: "re-send a stalled provider request", run: async () => {
-      if (S.current) await act({ type: "retry_provider_request", session_id: S.current }, "Re-sending the request");
-    } },
+    { name: "resend", group: "Run control", desc: "re-send a stalled provider request", run: retryProviderRequest },
     { name: "retry", args: "[--model MODEL]", group: "Run control", desc: "re-run your last message, optionally on another model (the old answer stays in a fork)", run: (arg) => retryRun((arg || "").replace(/^--model\s*/, "").trim()) },
     { name: "test", args: "[MODEL]", group: "Settings", desc: "test a model: latency, streaming, reasoning, tool calls", run: async (arg) => {
       const s = S.sessions.find((x) => x.id === S.current);

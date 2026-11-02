@@ -4930,6 +4930,9 @@ fn sessions_cmd(paths: Paths, action: SessionsAction) -> Result<()> {
                 return Ok(());
             }
             println!("{}  ({})", s.name, s.id);
+            if let Some(notice) = formless_tui::plain::unfinished_run_text(&r["unfinished_run"]) {
+                println!("{notice}");
+            }
             println!(
                 "{} messages · updated {}{}{}",
                 s.message_count,

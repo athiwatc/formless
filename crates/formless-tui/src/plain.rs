@@ -258,6 +258,48 @@ impl EventBacklog {
     }
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct UnfinishedRun {
+    run_id: String,
+    status: String,
+    error: String,
+}
+impl UnfinishedRun {
+    fn from_value(value: &serde_json::Value) -> Option<Self> {
+        let status = value["status"].as_str()?;
+        if !matches!(status, "paused" | "interrupted") {
+            return None;
+        }
+        let raw = value["error"].as_str().unwrap_or_default();
+        let mut error = display_text(&raw.chars().take(2048).collect::<String>());
+        if raw.chars().count() > 2048 {
+            error.push_str("… [reason truncated]");
+        }
+        Some(Self {
+            run_id: value["run_id"].as_str().unwrap_or_default().into(),
+            status: status.into(),
+            error,
+        })
+    }
+    fn text(&self) -> String {
+        let reason = if self.error.is_empty() {
+            String::new()
+        } else {
+            format!(": {}", self.error)
+        };
+        format!(
+            "Run {}{reason}\nResume this Session in the TUI or web after reviewing the cause.",
+            self.status
+        )
+    }
+}
+
+/// Persisted pause reason for human attach views. It does not invent a live
+/// event, a current provider request or an explanation missing from storage.
+pub fn unfinished_run_text(value: &serde_json::Value) -> Option<String> {
+    UnfinishedRun::from_value(value).map(|run| run.text())
+}
+
 /// Snapshot replies are accepted only if no live Run/plan event has arrived
 /// since the request. An older terminal event cannot replace a newer Run.
 #[derive(Default)]
@@ -267,6 +309,7 @@ struct RunState {
     recap: Option<RecordedRunRecap>,
     plan: Vec<PlanItem>,
     plan_state: Option<PlanState>,
+    unfinished: Option<UnfinishedRun>,
 }
 impl RunState {
     fn accept(&mut self, event: &Event) -> bool {
@@ -275,6 +318,7 @@ impl RunState {
                 self.generation = self.generation.wrapping_add(1);
                 self.run_id = Some(run_id.clone());
                 self.recap = None;
+                self.unfinished = None;
             }
             Event::RunRecap { run_id, recap, .. } => {
                 if self.run_id.as_ref().is_some_and(|id| id != run_id)
@@ -304,7 +348,16 @@ impl RunState {
                 self.plan = items.clone();
                 self.plan_state = plan_state.clone();
             }
-            Event::RunFinished { run_id, .. } | Event::RunPaused { run_id, .. } => {
+            Event::RunPaused { run_id, error, .. } => {
+                if self.run_id.as_ref().is_some_and(|id| id != run_id) {
+                    return false;
+                }
+                self.generation = self.generation.wrapping_add(1);
+                self.unfinished = UnfinishedRun::from_value(
+                    &serde_json::json!({"run_id":run_id,"status":"paused","error":error}),
+                );
+            }
+            Event::RunFinished { run_id, .. } => {
                 if self.run_id.as_ref().is_some_and(|id| id != run_id) {
                     return false;
                 }
@@ -332,6 +385,19 @@ impl RunState {
         }
         let mut lines = Vec::new();
         self.run_id = value["latest_run"]["run_id"].as_str().map(str::to_owned);
+        if !explicit {
+            let unfinished = if value["running"] == true {
+                None
+            } else {
+                UnfinishedRun::from_value(&value["unfinished_run"])
+            };
+            if unfinished != self.unfinished {
+                if let Some(run) = &unfinished {
+                    lines.push(run.text());
+                }
+            }
+            self.unfinished = unfinished;
+        }
         if let Ok(items) = serde_json::from_value::<Vec<PlanItem>>(value["plan"].clone()) {
             let state = serde_json::from_value::<PlanState>(value["plan_state"].clone()).ok();
             if !explicit && !items.is_empty() && (self.plan != items || self.plan_state != state) {
@@ -1428,3 +1494,7 @@ mod tests {
 #[cfg(test)]
 #[path = "plain_reply_ack_tests.rs"]
 mod reply_ack_tests;
+
+#[cfg(test)]
+#[path = "plain_pause_restore_tests.rs"]
+mod pause_restore_tests;

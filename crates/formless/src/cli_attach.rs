@@ -309,6 +309,15 @@ pub(super) fn decide(
     Ok(())
 }
 
+fn print_terminal_reason(run: &Value) {
+    if let Some(notice) = formless_tui::plain::unfinished_run_text(run) {
+        eprintln!("{notice}");
+    } else if let Some(error) = run["error"].as_str().filter(|error| !error.is_empty()) {
+        let bounded = error.chars().take(2048).collect::<String>();
+        eprintln!("{}", super::comparison_terminal_text(&bounded));
+    }
+}
+
 fn terminal(status: &str) -> Option<i32> {
     match status {
         "completed" => Some(0),
@@ -325,9 +334,13 @@ struct Observer {
 }
 impl Observer {
     fn emit(&mut self, event: Event) -> Result<()> {
+        self.emit_to(event, &mut std::io::stdout().lock())
+    }
+    fn emit_to(&mut self, event: Event, output: &mut impl Write) -> Result<()> {
         let relevant = match &event {
             Event::ApprovalAnswered { approval_id, .. }
-            | Event::ApprovalSummary { approval_id, .. } => self.approvals.contains(approval_id),
+            | Event::ApprovalSummary { approval_id, .. }
+            | Event::ApprovalClosed { approval_id } => self.approvals.contains(approval_id),
             _ => event.session_id() == Some(self.session.as_str()),
         };
         if !relevant {
@@ -344,29 +357,34 @@ impl Observer {
             {
                 return Ok(())
             }
+            Event::ApprovalClosed { approval_id } => {
+                self.approvals.remove(approval_id);
+            }
             _ => {}
         }
         if self.json {
-            println!("{}", serde_json::to_string(&event)?);
+            writeln!(output, "{}", serde_json::to_string(&event)?)?;
         } else {
             match &event {
                 Event::MessageDelta { delta, .. } => {
-                    print!("{}", super::comparison_terminal_text(delta))
+                    write!(output, "{}", super::comparison_terminal_text(delta))?
                 }
                 Event::MessageAppended { message, .. } | Event::MessageComplete { message, .. } => {
-                    println!(
+                    writeln!(
+                        output,
                         "\n{}: {}",
                         super::comparison_terminal_text(&message.role),
                         super::comparison_terminal_text(&message.content)
-                    )
+                    )?
                 }
-                _ => println!(
+                _ => writeln!(
+                    output,
                     "{}",
                     super::comparison_terminal_text(&serde_json::to_string(&event)?)
-                ),
+                )?,
             }
         }
-        std::io::stdout().flush()?;
+        output.flush()?;
         Ok(())
     }
     fn snapshot(&mut self, value: &Value, end: Option<i64>, attention: bool) -> Result<()> {
@@ -440,6 +458,7 @@ fn follow_inner(paths: &Paths, query: &str, json: bool) -> Result<i32> {
         // Historical Runs predate stored message anchors. The initial Session
         // snapshot is honest; a later unbounded refresh could include a new Run.
         observer.emit(Event::Note {session_id:Some(session.id.clone()),text:"Historical Run has no stored message boundary; displayed the initial Session snapshot only.".into()})?;
+        print_terminal_reason(&run);
         return Ok(code);
     }
     loop {
@@ -452,9 +471,7 @@ fn follow_inner(paths: &Paths, query: &str, json: bool) -> Result<i32> {
                 id: session.id.clone(),
             })?;
             observer.snapshot(&snapshot, Some(end), false)?;
-            if let Some(error) = run["error"].as_str() {
-                eprintln!("{}", super::comparison_terminal_text(error));
-            }
+            print_terminal_reason(&run);
             return Ok(code);
         }
         let Some(ev) = conn.next()? else { continue };
@@ -571,3 +588,7 @@ mod tests {
         assert_eq!(String::from_utf8(out).unwrap().matches("[y/N]").count(), 2);
     }
 }
+
+#[cfg(test)]
+#[path = "cli_observer_close_tests.rs"]
+mod observer_close_tests;

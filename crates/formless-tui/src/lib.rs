@@ -154,6 +154,9 @@ impl View {
 
 #[derive(Clone, PartialEq)]
 enum Pending {
+    ProviderRetry {
+        session_id: String,
+    },
     ApprovalDecision {
         note: String,
         batch: Option<ApprovalBatch>,
@@ -2615,6 +2618,13 @@ impl App {
             let Some(kind) = self.pending.remove(&id) else {
                 continue;
             };
+            if matches!(kind, Pending::ProviderRetry { .. }) {
+                self.notes.push(
+                    "Provider retry was not confirmed; the request may already have been re-sent."
+                        .into(),
+                );
+                continue;
+            }
             if matches!(kind, Pending::ApprovalDecision { .. }) {
                 self.notes.push("Approval decision timed out and is not confirmed; inspect current approvals or grants before retrying.".into());
                 continue;
@@ -2840,6 +2850,23 @@ impl App {
                     let Some(kind) = self.pending.remove(&id) else {
                         continue;
                     };
+                    if let Pending::ProviderRetry { session_id } = &kind {
+                        let text = if ok {
+                            match result.as_ref().and_then(|r| r["retrying"].as_bool()) {
+                            Some(true) => "Retry requested for the in-flight provider request.",
+                            Some(false) => "Nothing was retried; no provider request is available for retry.",
+                            None => "The daemon did not confirm whether a provider retry was requested.",
+                        }
+                        } else {
+                            "Provider retry was not confirmed; the request may already have been re-sent."
+                        };
+                        self.notes.push(if self.is_current(session_id) {
+                            text.into()
+                        } else {
+                            format!("Session {}: {text}", truncate_chars(session_id, 8))
+                        });
+                        continue;
+                    }
                     if let Pending::ApprovalDecision { note, batch, word } = &kind {
                         if ok && result.as_ref().is_some_and(|r| r["resolved"] == true) {
                             if let Some(batch) = batch {
@@ -2941,6 +2968,9 @@ impl App {
                         continue;
                     };
                     match kind {
+                        Pending::ProviderRetry { .. } => {
+                            unreachable!("retry acknowledgements handled above")
+                        }
                         Pending::ApprovalDecision { .. } => {
                             unreachable!("approval acknowledgements handled above")
                         }
@@ -8128,7 +8158,7 @@ impl App {
             "resend" => {
                 if let Some(session_id) = self.current.clone() {
                     self.request(
-                        Pending::RunControl,
+                        Pending::ProviderRetry { session_id: session_id.clone() },
                         Request::RetryProviderRequest { session_id },
                     );
                 }
@@ -15208,7 +15238,7 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
             lines.push(Line::from(spans));
         }
     }
-    if app.messages.is_empty() && !app.running() {
+    if app.messages.is_empty() && !app.running() && app.run_banner.is_none() {
         return ChatRender {
             lines: welcome_lines(app.color, height),
             ..Default::default()
@@ -18264,6 +18294,7 @@ mod tests {
     include!("invocation_progress_tests.rs");
     include!("run_state_tests.rs");
     include!("approval_resolution_tests.rs");
+    include!("provider_retry_ui_tests.rs");
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)

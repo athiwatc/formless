@@ -51,7 +51,7 @@ impl Fixture {
                 cancel_flag: Arc::new(AtomicBool::new(false)),
                 steer_tx,
                 steering: Arc::new(Default::default()),
-                retry: Arc::new(tokio::sync::Notify::new()),
+                retry: Arc::new(provider_retry_daemon::ProviderRetry::default()),
             },
         );
     }
