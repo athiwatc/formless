@@ -520,7 +520,7 @@ fn genuine_schema65_upgrade_and_backup_preserve_originals_and_immutable_replay_p
             st.conn
                 .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
                 .unwrap(),
-            66
+            SCHEMA_VERSION
         );
         let rows = vec![st.run_file_record("session", "run", "private.txt").unwrap()];
         assert_eq!(rows[0].before.as_deref(), Some(original.as_slice()));
@@ -564,7 +564,7 @@ fn genuine_schema65_upgrade_and_backup_preserve_originals_and_immutable_replay_p
         let upgraded = root.join("upgraded66.db");
         st.backup_into(&upgraded).unwrap();
         let verified = crate::backup_verification::inspect(&upgraded).unwrap();
-        assert_eq!(verified.schema_version, 66);
+        assert_eq!(verified.schema_version, SCHEMA_VERSION);
         assert_eq!(verified.tables["run_files"], 1);
         assert_eq!(verified.tables["optimiser_replay_snapshots"], 1);
     }

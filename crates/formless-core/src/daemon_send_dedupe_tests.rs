@@ -79,7 +79,7 @@ async fn concurrent_same_identity_waits_for_claim_and_survives_lost_first_waiter
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(result, json!({"steered": true}));
+    assert_eq!(result, json!({"steered": true, "run_id": "test-run"}));
     let replay = CLIENT
         .scope(
             (42, "test".into()),

@@ -22,7 +22,8 @@ function setup(names, extras = {}) {
   const context = vm.createContext({ $, S: { current: 'A', chips: {}, messages: [], sessions: [], view: 'chat', tools: [] },
     forecastRevision: 0, scheduleForecast() {}, invalidateBranchSummary() {}, branchSummaryEvent() {}, setTimeout: f => f(), rememberFocus() {}, restoreFocus() {}, renderChips() {}, note() {}, autosize() {},
     ...extras });
-  vm.runInContext(names.map(fn).join('\n'), context);
+  const dependencies = names.includes('openSession') ? ['restoreSessionRunState'] : [];
+  vm.runInContext([...new Set([...dependencies, ...names])].map(fn).join('\n'), context);
   return context;
 }
 test('malformed fragment pairs preserve independently valid pairs and plus signs', () => {
