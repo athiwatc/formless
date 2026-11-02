@@ -564,7 +564,7 @@ mod tests {
     fn parent_cleanup_assertions() {
         let _env = crate::credential_env::EnvGuard::isolated();
         let (_fixture, base) = Fixture::new();
-        let named = base.named("child");
+        let named = base.named("child").unwrap();
         let child = Paths::from_dirs(named.data_dir.clone(), named.config_dir.clone()).unwrap();
         std::fs::write(base.db_file(), "default sentinel").unwrap();
         std::fs::write(child.db_file(), "child data sentinel").unwrap();
@@ -605,7 +605,7 @@ mod tests {
             .unwrap()
             .freeze()
             .unwrap();
-        let named = base.named("new-child");
+        let named = base.named("new-child").unwrap();
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
         let child_paths = named.clone();
         let child_barrier = barrier.clone();
@@ -657,7 +657,7 @@ mod tests {
             .unwrap()
             .freeze()
             .unwrap();
-        let child = base.named("child");
+        let child = base.named("child").unwrap();
         std::os::unix::fs::symlink(&outside, &child.data_dir).unwrap();
         assert!(!frozen.covers(&child).unwrap());
         assert!(crate::config::reset_all_guarded(&child, &frozen).is_err());
@@ -676,7 +676,7 @@ mod tests {
     #[cfg(unix)]
     fn aliased_parent_assertions() {
         let (fixture, base) = Fixture::new();
-        let child = base.named("child");
+        let child = base.named("child").unwrap();
         Paths::from_dirs(child.data_dir.clone(), child.config_dir.clone()).unwrap();
         let owner = ProfileLock::owner(&child).unwrap();
         let data_alias = fixture.0.join("data-alias");
@@ -698,7 +698,7 @@ mod tests {
             .freeze()
             .unwrap();
         assert!(ProfileLock::try_owner(&child).unwrap().is_none());
-        assert!(frozen.covers(&alias.named("child")).unwrap());
+        assert!(frozen.covers(&alias.named("child").unwrap()).unwrap());
     }
 
     #[test]

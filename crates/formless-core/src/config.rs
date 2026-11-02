@@ -2268,6 +2268,7 @@ pub fn delete_provider_key(paths: &Paths, name: &str) {
 /// Full reset (SPEC §15): keychain entry, config, and the entire data dir.
 /// Caller must stop the daemon first.
 pub fn reset_all(paths: &Paths) -> Result<Vec<String>> {
+    paths.validate_cleanup_namespace()?;
     let gate = crate::profile_lock::ProfileLock::maintenance(paths, std::time::Duration::ZERO)?;
     let guard = gate.freeze()?;
     reset_all_guarded(paths, &guard)
@@ -2278,6 +2279,7 @@ pub fn reset_all_guarded(
     paths: &Paths,
     guard: &crate::profile_lock::MaintenanceGuard,
 ) -> Result<Vec<String>> {
+    paths.validate_cleanup_namespace()?;
     if !guard.covers(paths)? {
         anyhow::bail!("profile is outside the frozen cleanup namespace");
     }

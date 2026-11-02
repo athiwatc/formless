@@ -23,15 +23,8 @@ pub struct Plan {
 /// The per-profile name: `formless`, or `formless-<profile>`.
 fn unit_name(paths: &Paths) -> Result<String> {
     let profile = &paths.profile;
-    if profile.is_empty()
-        || profile.len() > 64
-        || !profile.as_bytes()[0].is_ascii_alphanumeric()
-        || !profile
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-    {
-        return Err(anyhow!("invalid service profile {profile:?}: use 1–64 ASCII letters, digits, '-' or '_', starting with a letter or digit"));
-    }
+    crate::paths::validate_profile_name(profile)
+        .map_err(|error| anyhow!("invalid service profile {profile:?}: {error}"))?;
     Ok(if profile == "default" {
         "formless".into()
     } else {

@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Longest unix socket path, NUL included (`sun_path`: 104 bytes on
 /// macOS and the BSDs, 108 on Linux).
@@ -8,6 +8,112 @@ use std::path::PathBuf;
 const SUN_PATH_MAX: usize = 108;
 #[cfg(all(unix, not(target_os = "linux")))]
 const SUN_PATH_MAX: usize = 104;
+
+/// Default-profile entries share the parent namespace with named profiles.
+/// Keep this list beside profile resolution whenever a new owned root is added.
+pub const RESERVED_PROFILE_NAMES: &[&str] = &[
+    "api_key",
+    "artifacts",
+    "backups",
+    "commands",
+    "exports",
+    "last_run_session",
+    "mcp",
+    "models",
+    "profiles",
+    "relay_secret",
+    "review-objects",
+    "review-receipts",
+    "skills",
+];
+
+/// Validate before joining paths or touching locks, services or credentials.
+pub fn validate_profile_name(name: &str) -> Result<()> {
+    let charset = "use 1–64 ASCII letters, digits, '-' or '_', starting with a letter or digit";
+    if name.is_empty()
+        || name.len() > 64
+        || !name.as_bytes()[0].is_ascii_alphanumeric()
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        anyhow::bail!("invalid profile name {name:?}: {charset}");
+    }
+    let upper = name.to_ascii_uppercase();
+    let device = matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (upper.len() == 4
+            && (upper.starts_with("COM") || upper.starts_with("LPT"))
+            && matches!(upper.as_bytes()[3], b'1'..=b'9'));
+    if device
+        || (name != "default" && name.eq_ignore_ascii_case("default"))
+        || RESERVED_PROFILE_NAMES
+            .iter()
+            .any(|reserved| name.eq_ignore_ascii_case(reserved))
+    {
+        anyhow::bail!("reserved profile name {name:?}: choose another name ({charset}); existing directories are preserved, not migrated or removed");
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+pub struct ProfileInventory {
+    pub profiles: Vec<Paths>,
+    /// Ambiguous legacy entries are preserved and must block parent cleanup.
+    pub diagnostics: Vec<String>,
+}
+
+fn linked(metadata: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & 0x400 != 0 {
+            return true;
+        }
+    }
+    metadata.file_type().is_symlink()
+}
+
+fn profile_marker_with(
+    directory: &Path,
+    mut inspect: impl FnMut(&Path) -> std::io::Result<std::fs::Metadata>,
+) -> Result<bool> {
+    for marker in ["formless.db", "config.toml"] {
+        let path = directory.join(marker);
+        match inspect(&path) {
+            Ok(_) => return Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("cannot inspect profile marker {path:?}"))
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn absolute_identity(path: &Path) -> Result<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for component in std::path::absolute(path)?.components() {
+        match component {
+            std::path::Component::CurDir => (),
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            component => normalized.push(component.as_os_str()),
+        }
+    }
+    #[cfg(windows)]
+    {
+        normalized = PathBuf::from(normalized.to_string_lossy().to_lowercase());
+    }
+    Ok(normalized)
+}
+fn canonical_identity(path: &Path) -> Result<PathBuf> {
+    let path = path
+        .to_str()
+        .context("profile namespace requires UTF-8 paths")?;
+    absolute_identity(&formless_runtime::caps::canonical_path(path).map_err(anyhow::Error::msg)?)
+}
 
 #[derive(Debug, Clone)]
 pub struct Paths {
@@ -30,8 +136,9 @@ impl Paths {
     /// Resolve the same profile paths without creating directories or
     /// opening profile state, for previews that must not change anything.
     pub fn resolve_read_only(profile: Option<&str>) -> Result<Self> {
-        let profile = profile.unwrap_or("default").to_string();
-        let (mut data, mut config) = match (
+        let profile = profile.unwrap_or("default");
+        validate_profile_name(profile)?;
+        let (data, config) = match (
             std::env::var("FORMLESS_DATA_DIR"),
             std::env::var("FORMLESS_CONFIG_DIR"),
         ) {
@@ -47,43 +154,128 @@ impl Paths {
                 )
             }
         };
-        if profile != "default" {
-            data = data.join(&profile);
-            config = config.join(&profile);
-        }
-        Ok(Self {
+        Self {
             data_dir: data,
             config_dir: config,
-            profile,
-        })
+            profile: "default".into(),
+        }
+        .named(profile)
     }
 
-    /// Every profile that exists: `default` first, then each named one
-    /// (a sub-directory with a database or config), sorted. Named
-    /// profiles live inside the default profile's directories.
+    /// Existing valid profiles only. Use `profile_inventory` when displaying
+    /// diagnostics or preparing cleanup; skipped legacy entries are not disposable.
     pub fn list_profiles(&self) -> Vec<Paths> {
+        self.profile_inventory().profiles
+    }
+
+    pub fn profile_inventory(&self) -> ProfileInventory {
         let base = self.base();
+        let identities = match [&base.data_dir, &base.config_dir]
+            .into_iter().map(|root| absolute_identity(root)).collect::<Result<Vec<_>>>() {
+            Ok(identities)=>identities,
+            Err(error)=>return ProfileInventory {profiles:vec![base],diagnostics:vec![format!("Cannot identify profile roots: {error:#}; files are preserved; restore access before cleanup.")]},
+        };
         let mut names = std::collections::BTreeSet::new();
+        let mut diagnostics = std::collections::BTreeSet::new();
         for dir in [&base.data_dir, &base.config_dir] {
-            for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                let p = base.named(&name);
-                if entry.path().is_dir() && (p.db_file().exists() || p.config_file().exists()) {
-                    names.insert(name);
+            let entries = match std::fs::read_dir(dir) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    diagnostics.insert(format!("Cannot inspect profile directory {dir:?}: {error}; files are preserved. Restore access and retry `formless profiles list` before cleanup."));
+                    continue;
+                }
+            };
+            for entry in entries {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        diagnostics.insert(format!("Cannot inspect an entry in {dir:?}: {error}; restore access before cleanup."));
+                        continue;
+                    }
+                };
+                let metadata = match std::fs::symlink_metadata(entry.path()) {
+                    Ok(metadata) => metadata,
+                    Err(error) => {
+                        diagnostics.insert(format!("Cannot inspect {:?}: {error}; files are preserved; restore access before cleanup.",entry.path()));
+                        continue;
+                    }
+                };
+                if linked(&metadata) {
+                    diagnostics.insert(format!("Skipped linked profile entry {:?}; its files are preserved. Back up and inspect this link manually before cleanup.",entry.path()));
+                    continue;
+                }
+                if !metadata.is_dir() {
+                    continue;
+                }
+                // A configured nested default root is not a named profile.
+                // The named resolver still rejects any attempt to select it.
+                let entry_identity = match absolute_identity(&entry.path()) {
+                    Ok(identity) => identity,
+                    Err(error) => {
+                        diagnostics.insert(format!("Cannot identify {:?}: {error:#}; files are preserved; inspect this directory before cleanup.",entry.path()));
+                        continue;
+                    }
+                };
+                if identities.contains(&entry_identity) {
+                    continue;
+                }
+                // Probe markers only inside a real entry, never through a link.
+                let marked = match profile_marker_with(&entry.path(), |path| {
+                    path.symlink_metadata()
+                }) {
+                    Ok(marked) => marked,
+                    Err(error) => {
+                        diagnostics.insert(format!("Skipped directory {:?}: {error:#}; files are preserved. Restore access and retry `formless profiles list` before cleanup.",entry.path()));
+                        continue;
+                    }
+                };
+                if !marked {
+                    continue;
+                }
+                let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                    diagnostics.insert(format!("Skipped non-UTF-8 profile directory {:?}; back it up and recover it manually before cleanup.",entry.path()));
+                    continue;
+                };
+                if name == "default" {
+                    diagnostics.insert(format!("Skipped legacy profile directory {:?}: default is the parent profile; back up and recover this directory manually before cleanup.",entry.path()));
+                    continue;
+                }
+                match base.named(&name) {
+                    Ok(_) => {
+                        names.insert(name);
+                    }
+                    Err(error) => {
+                        diagnostics.insert(format!("Skipped profile directory {:?}: {error}. Its files are preserved. Back up this directory outside the Formless roots and recover it manually before cleanup; no automatic migration is performed.",entry.path()));
+                    }
                 }
             }
         }
-        std::iter::once(base.clone())
-            .chain(names.into_iter().map(|n| base.named(&n)))
-            .collect()
+        let mut profiles = vec![base.clone()];
+        for name in names {
+            match base.named(&name) {
+                Ok(profile) => profiles.push(profile),
+                Err(error) => {
+                    diagnostics.insert(format!("Profile {name:?} changed during discovery: {error}; files are preserved; inspect it before cleanup."));
+                }
+            }
+        }
+        ProfileInventory {
+            profiles,
+            diagnostics: diagnostics.into_iter().collect(),
+        }
     }
 
-    /// The default profile's paths.
+    /// The default profile's configured parent paths.
     fn base(&self) -> Paths {
         if self.profile == "default" {
             return self.clone();
         }
-        let up = |p: &PathBuf| p.parent().map(PathBuf::from).unwrap_or_else(|| p.clone());
+        let up = |path: &PathBuf| {
+            path.parent()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| path.clone())
+        };
         Paths {
             data_dir: up(&self.data_dir),
             config_dir: up(&self.config_dir),
@@ -91,17 +283,91 @@ impl Paths {
         }
     }
 
-    /// Another profile's paths, without creating anything.
-    pub fn named(&self, profile: &str) -> Paths {
+    /// Another profile's paths, without creating anything or accepting aliases.
+    pub fn named(&self, profile: &str) -> Result<Paths> {
+        validate_profile_name(profile)?;
         let base = self.base();
         if profile == "default" {
-            return base;
+            return Ok(base);
         }
-        Paths {
+        let paths = Paths {
             data_dir: base.data_dir.join(profile),
             config_dir: base.config_dir.join(profile),
-            profile: profile.to_string(),
+            profile: profile.to_owned(),
+        };
+        paths.validate_profile_namespace()?;
+        Ok(paths)
+    }
+
+    /// Independent validation for public/constructed Paths at mutation boundaries.
+    pub fn validate_profile_namespace(&self) -> Result<()> {
+        validate_profile_name(&self.profile)?;
+        if self.profile == "default" {
+            return Ok(());
         }
+        let base = self.base();
+        for path in [&self.data_dir, &self.config_dir] {
+            if path.file_name() != Some(std::ffi::OsStr::new(&self.profile)) {
+                anyhow::bail!("profile {:?} does not match its configured directory {path:?}; files are preserved",self.profile);
+            }
+            match path.symlink_metadata() {
+                Ok(metadata) if linked(&metadata) || !metadata.is_dir()=>anyhow::bail!("profile path {path:?} is linked or is not a real directory; files are preserved"),
+                Err(error) if error.kind()!=std::io::ErrorKind::NotFound=>return Err(error).context("inspect profile namespace before mutation"),
+                _=>(),
+            }
+        }
+        for root in [&base.data_dir, &base.config_dir] {
+            match std::fs::read_dir(root) {
+                Ok(entries) => {
+                    for entry in entries {
+                        let entry = entry?;
+                        if let Some(name) = entry.file_name().to_str() {
+                            if name != self.profile && name.eq_ignore_ascii_case(&self.profile) {
+                                anyhow::bail!("profile {:?} collides case-insensitively with {name:?} in {root:?}; existing directories are preserved; choose a distinct name",self.profile);
+                            }
+                        }
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+                Err(error) => {
+                    return Err(error).context("inspect profile name collisions before mutation")
+                }
+            }
+        }
+        let roots = [
+            absolute_identity(&base.data_dir)?,
+            absolute_identity(&base.config_dir)?,
+            canonical_identity(&base.data_dir)?,
+            canonical_identity(&base.config_dir)?,
+        ];
+        for path in [&self.data_dir, &self.config_dir] {
+            for candidate in [absolute_identity(path)?, canonical_identity(path)?] {
+                if roots.iter().any(|root| root.starts_with(&candidate)) {
+                    anyhow::bail!("profile {:?} path {path:?} overlaps a default-profile root; choose a different name or nonoverlapping roots; files are preserved",self.profile);
+                }
+            }
+            let expected =
+                canonical_identity(path.parent().context("profile directory has no parent")?)?
+                    .join(&self.profile);
+            if canonical_identity(path)? != absolute_identity(&expected)? {
+                anyhow::bail!(
+                    "profile path {path:?} aliases another namespace; files are preserved"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Preflight before any service/secret preparation, then recheck under freeze.
+    pub fn validate_cleanup_namespace(&self) -> Result<()> {
+        self.validate_profile_namespace()?;
+        if self.profile == "default" {
+            let diagnostics = self.profile_inventory().diagnostics;
+            if !diagnostics.is_empty() {
+                anyhow::bail!("profile cleanup refused: {}", diagnostics.join("; "));
+            }
+        }
+        Ok(())
     }
 
     pub fn from_dirs(data_dir: PathBuf, config_dir: PathBuf) -> Result<Self> {
@@ -279,3 +545,7 @@ mod tests {
         assert_ne!(sock, other.socket_path(), "one socket per data dir");
     }
 }
+
+#[cfg(test)]
+#[path = "profile_namespace_tests.rs"]
+mod profile_namespace_tests;

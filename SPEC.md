@@ -3040,6 +3040,29 @@ such as `read_file`, `read_text_file` and `file_read`.
   gives an isolated daemon + data/config dirs (intended for testing
   dangerous Tools). Named profiles live in sub-directories of the default
   profile's data and config dirs.
+  Profile names use 1–64 ASCII letters, digits, `-` or `_`, beginning with a
+  letter or digit. The lowercase `default` names the parent profile; other
+  spellings of it and Windows device names are refused on every platform.
+  Names reserved by the default-profile namespace are refused case-insensitively:
+  `api_key`, `artifacts`, `backups`, `commands`, `exports`, `last_run_session`,
+  `mcp`, `models`, `profiles`, `relay_secret`, `review-objects`, `review-receipts`
+  and `skills`. Add new owned top-level entries to the shared reserved list.
+  CLI parsing and direct path resolution reject unsafe names before creating
+  directories; checked named paths also reject case-insensitive sibling
+  collisions, linked/reparse profile directories and paths that equal or contain
+  another configured default root, including canonical aliases. Configured
+  parent-root aliases and legitimate noncolliding profiles remain supported.
+  Profile discovery returns `default` once and lists only valid profiles. It
+  reports ambiguous legacy directories and marker/namespace inspection errors
+  without modifying them. A normal `commands/*.md` folder is never a profile;
+  a legacy `commands` directory containing profile config/data is preserved
+  with an actionable warning. `profiles rm` and lower-level reset independently
+  validate the namespace before service or credential effects. Parent reset or
+  uninstall refuses while ambiguous/unreadable legacy entries remain, rather
+  than recursively erasing hidden profile state. Back up the reported paths
+  outside Formless roots and recover them manually into a valid profile before
+  retrying cleanup. No automatic migration, rename or legacy cleanup occurs;
+  clone/rename features are separate work.
   Ownership is acquired before opening/migrating the store or performing startup
   recovery. It holds private per-user locks for both the configured absolute
   lexical path (without resolving symlinks) and the current canonical data
@@ -5240,6 +5263,10 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
   use full uninstall to coordinate every profile. The refusal is checked under
   the family freeze, so an in-use child or a newly created profile cannot be
   erased through its default parent.
+  The same freeze rechecks discovery diagnostics: reserved, invalid, linked,
+  case-ambiguous or unreadable legacy profile state is preserved for manual
+  recovery (§9.4), including a former profile named `commands` mixed with
+  default prompt templates.
 - **Imports/exports** contain no secrets, metrics, or history (§7.8).
 
 Network grants name an exact host unless their spec explicitly begins `*.`.
