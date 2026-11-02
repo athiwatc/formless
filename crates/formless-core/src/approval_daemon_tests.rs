@@ -671,6 +671,7 @@ fn retained_pending_fixture(
     let handle = uuid::Uuid::new_v4().to_string();
     let run = uuid::Uuid::new_v4().to_string();
     let entry = Arc::new(PendingEntry {
+        progress: Arc::new(Default::default()),
         _pipeline: StdMutex::new(None),
         routing_task: None,
         taint_scope: daemon.taint_scope(session, &run),

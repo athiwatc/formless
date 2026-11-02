@@ -1289,6 +1289,8 @@ struct Pager {
 }
 
 struct LiveToolCall {
+    metadata_pending: bool,
+    invocation_id: Option<String>,
     name: String,
     /// Tree depth: nested `tools.call`, or a sub-agent under its Tool.
     depth: usize,
@@ -1507,6 +1509,7 @@ struct App {
     tick: u64,
     activity: Option<Activity>,
     live_tools: Vec<LiveToolCall>,
+    live_run: Option<(String, bool)>,
     /// Absolute chat scroll top; `None` means follow the live bottom.
     chat_scroll_top: Option<usize>,
     chat_view_height: usize,
@@ -1882,6 +1885,7 @@ impl App {
             tick: 0,
             activity: None,
             live_tools: Vec::new(),
+            live_run: None,
             chat_scroll_top: None,
             chat_view_height: 10,
             chat_line_count: 0,
@@ -2140,6 +2144,7 @@ impl App {
         self.streaming.clear();
         self.thinking.clear();
         self.live_tools.clear();
+        self.live_run = None;
         self.queued.clear();
         self.plan.clear();
         self.step = None;
@@ -3257,6 +3262,7 @@ impl App {
                         }
                         Pending::ListInvocations => {
                             self.invocations = serde_json::from_value(result).unwrap_or_default();
+                            self.reconcile_invocation_progress(&self.invocations.clone());
                             if self.invocations.is_empty() {
                                 self.notes.push("no running invocations".into());
                             }
@@ -3268,7 +3274,7 @@ impl App {
                                     .map(|s| s.name.clone())
                                     .unwrap_or_else(|| truncate_chars(&i.session_id, 8));
                                 self.notes.push(format!(
-                                    "{} {} · {}s · {}{}{} · /kill or /drop {}",
+                                    "{} {} · {}s · {}{}{}{} · /kill or /drop {}",
                                     if i.stalled { "⚠" } else { "•" },
                                     i.tool_name,
                                     i.elapsed_ms / 1000,
@@ -3279,6 +3285,10 @@ impl App {
                                         String::new()
                                     },
                                     if i.abandoned { " · abandoned" } else { "" },
+                                    plain::progress_diagnostic(
+                                        i.last_fraction,
+                                        i.last_label.as_deref()
+                                    ),
                                     truncate_chars(&i.handle, 8)
                                 ));
                             }
@@ -3628,6 +3638,7 @@ impl App {
                         }
                         Pending::GapInvocations => {
                             self.invocations = serde_json::from_value(result).unwrap_or_default();
+                            self.reconcile_invocation_progress(&self.invocations.clone());
                         }
                         Pending::SessionUsage => {
                             let get = |k: &str| {
@@ -4706,15 +4717,173 @@ impl App {
         self.rollback_pick = next;
     }
 
-    /// The current Session's newest running call of `tool_name`.
-    fn running_call(&mut self, session_id: &str, tool_name: &str) -> Option<&mut LiveToolCall> {
+    fn accept_live_run(&self, run_id: &str, invocation_id: Option<&str>) -> bool {
+        invocation_id.is_some_and(|id| {
+            self.live_tools
+                .iter()
+                .any(|call| call.invocation_id.as_deref() == Some(id) && call.status == "running")
+        }) || self
+            .live_run
+            .as_ref()
+            .is_none_or(|(id, ended)| id == run_id && !ended)
+    }
+
+    fn retain_pending_call(
+        &mut self,
+        session: &str,
+        run: &str,
+        id: Option<&str>,
+        name: &str,
+        handle: &str,
+    ) {
+        if handle.is_empty() || !self.is_current(session) || !self.accept_live_run(run, id) {
+            return;
+        }
+        if let Some(id) = id.filter(|id| !id.is_empty()) {
+            if !self
+                .live_tools
+                .iter()
+                .any(|c| c.invocation_id.as_deref() == Some(id))
+                && self
+                    .live_tools
+                    .iter()
+                    .filter(|c| c.metadata_pending)
+                    .count()
+                    < 128
+            {
+                self.live_tools.push(LiveToolCall {
+                    metadata_pending: true,
+                    invocation_id: Some(id.into()),
+                    name: name.into(),
+                    depth: 0,
+                    subagent: None,
+                    version: 0,
+                    arguments: String::new(),
+                    status: "running".into(),
+                    started: Instant::now(),
+                    elapsed_ms: None,
+                    handle: Some(handle.into()),
+                    stalled_secs: None,
+                    progress: None,
+                });
+            }
+        }
+        if let Some(call) = self.running_call(session, id, Some(name), None, Some(handle)) {
+            call.handle = Some(handle.into());
+        }
+    }
+
+    /// An exact ID never falls back to a same-name sibling. Legacy events need
+    /// exactly one candidate, or an already associated pending handle.
+    fn running_call(
+        &mut self,
+        session_id: &str,
+        invocation_id: Option<&str>,
+        name: Option<&str>,
+        depth: Option<usize>,
+        handle: Option<&str>,
+    ) -> Option<&mut LiveToolCall> {
         if !self.is_current(session_id) {
             return None;
         }
-        self.live_tools
-            .iter_mut()
-            .rev()
-            .find(|c| c.name == tool_name && c.status == "running")
+        let known_handle = handle.is_some_and(|h| {
+            self.live_tools
+                .iter()
+                .any(|c| c.status == "running" && c.handle.as_deref() == Some(h))
+        });
+        let candidates: Vec<usize> = self
+            .live_tools
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| {
+                c.status == "running"
+                    && c.subagent.is_none()
+                    && match invocation_id {
+                        Some(id) => c.invocation_id.as_deref() == Some(id),
+                        None => {
+                            name.is_none_or(|n| c.name == n)
+                                && depth.is_none_or(|d| c.depth == d)
+                                && if let Some(h) = handle {
+                                    if known_handle {
+                                        c.handle.as_deref() == Some(h)
+                                    } else {
+                                        name.is_some() && c.handle.is_none()
+                                    }
+                                } else {
+                                    name.is_some()
+                                }
+                        }
+                    }
+            })
+            .map(|(i, _)| i)
+            .collect();
+        if candidates.len() == 1 {
+            self.live_tools.get_mut(candidates[0])
+        } else {
+            None
+        }
+    }
+
+    fn reconcile_invocation_progress(&mut self, invocations: &[formless_protocol::InvocationInfo]) {
+        for i in invocations {
+            if !self.is_current(&i.session_id) {
+                continue;
+            }
+            if i.invocation_id.as_ref().is_some_and(|id| {
+                self.live_tools
+                    .iter()
+                    .any(|c| c.invocation_id.as_ref() == Some(id) && c.status != "running")
+            }) {
+                continue;
+            }
+            // Reconnect snapshots carry authoritative handles; avoid name-only
+            // rebinding when two identical calls are present.
+            let index = self.live_tools.iter().position(|c| {
+                c.status == "running"
+                    && match i.invocation_id.as_deref() {
+                        Some(id) => c.invocation_id.as_deref() == Some(id),
+                        None => c.handle.as_deref() == Some(i.handle.as_str()),
+                    }
+            });
+            let index = match index {
+                Some(index) => index,
+                None => {
+                    if self
+                        .live_tools
+                        .iter()
+                        .filter(|c| c.metadata_pending)
+                        .count()
+                        >= 128
+                    {
+                        continue;
+                    }
+                    self.live_tools.push(LiveToolCall {
+                        metadata_pending: true,
+                        invocation_id: i.invocation_id.clone(),
+                        name: i.tool_name.clone(),
+                        depth: 0,
+                        subagent: None,
+                        version: 0,
+                        arguments: String::new(),
+                        status: "running".into(),
+                        started: Instant::now()
+                            .checked_sub(Duration::from_millis(i.elapsed_ms))
+                            .unwrap_or_else(Instant::now),
+                        elapsed_ms: None,
+                        handle: Some(i.handle.clone()),
+                        stalled_secs: None,
+                        progress: None,
+                    });
+                    self.live_tools.len() - 1
+                }
+            };
+            let call = &mut self.live_tools[index];
+            call.handle = Some(i.handle.clone());
+            call.stalled_secs = i.stalled.then_some(i.silent_ms / 1000);
+            if i.last_fraction.is_some() || i.last_label.is_some() {
+                call.progress = Some((i.last_fraction, i.last_label.clone().unwrap_or_default()));
+            }
+        }
     }
 
     fn set_activity(&mut self, label: impl Into<String>) {
@@ -4850,6 +5019,7 @@ impl App {
         self.streaming.clear();
         self.thinking.clear();
         self.live_tools.clear();
+        self.live_run = None;
         self.editing_id = None;
         self.editing_queued = None;
         self.queued.clear();
@@ -4977,6 +5147,8 @@ impl App {
                 }
             }
             Event::ToolProgress {
+                run_id,
+                invocation_id,
                 session_id,
                 tool_name,
                 depth,
@@ -4984,15 +5156,18 @@ impl App {
                 label,
                 ..
             } => {
-                if !self.is_current(&session_id) {
+                if !self.is_current(&session_id)
+                    || !self.accept_live_run(&run_id, invocation_id.as_deref())
+                {
                     return;
                 }
-                if let Some(call) = self
-                    .live_tools
-                    .iter_mut()
-                    .rev()
-                    .find(|c| c.status == "running" && c.name == tool_name && c.depth == depth)
-                {
+                if let Some(call) = self.running_call(
+                    &session_id,
+                    invocation_id.as_deref(),
+                    Some(&tool_name),
+                    Some(depth),
+                    None,
+                ) {
                     call.progress = Some((fraction, label));
                 }
             }
@@ -5214,7 +5389,7 @@ impl App {
                     self.messages.push(message);
                 }
             }
-            Event::RunStarted { session_id, .. } => {
+            Event::RunStarted { session_id, run_id } => {
                 self.running_sessions.insert(session_id.clone());
                 if !self.is_current(&session_id) {
                     return;
@@ -5223,7 +5398,9 @@ impl App {
                 self.recap = None;
                 self.thinking.clear();
                 self.streaming.clear();
-                self.live_tools.clear();
+                self.live_tools
+                    .retain(|call| call.status == "running" && call.handle.is_some());
+                self.live_run = Some((run_id, false));
                 self.set_activity("waiting for model");
             }
             Event::RunFinished {
@@ -5245,8 +5422,15 @@ impl App {
                 });
             }
             Event::RunFinished {
-                session_id, status, ..
+                session_id,
+                run_id,
+                status,
             } => {
+                if self.is_current(&session_id)
+                    && self.live_run.as_ref().is_some_and(|(id, _)| id != &run_id)
+                {
+                    return;
+                }
                 self.forecast.generation.clear();
                 self.running_sessions.remove(&session_id);
                 if self.is_current(&session_id) {
@@ -5260,8 +5444,11 @@ impl App {
                 self.activity = None;
                 self.streaming.clear();
                 self.thinking.clear();
-                // Nothing can still be running once the run is over.
-                self.live_tools.clear();
+                // Pending invocations may outlive the Run and continue while a
+                // newer Run is active. Their exact IDs and handles remain live.
+                self.live_tools
+                    .retain(|call| call.status == "running" && call.handle.is_some());
+                self.live_run = Some((run_id, true));
                 if status != "completed" {
                     self.notes.push(format!("run {status}"));
                 }
@@ -5331,6 +5518,8 @@ impl App {
                 }
             }
             Event::ToolCallStarted {
+                run_id,
+                invocation_id,
                 session_id,
                 tool_name,
                 version,
@@ -5338,7 +5527,9 @@ impl App {
                 depth,
                 ..
             } => {
-                if !self.is_current(&session_id) {
+                if !self.is_current(&session_id)
+                    || !self.accept_live_run(&run_id, invocation_id.as_deref())
+                {
                     return;
                 }
                 if matches!(tool_name.as_str(), "create_tool" | "create_module") {
@@ -5349,8 +5540,26 @@ impl App {
                         self.notes.extend(description_review_text(&metadata, &[]));
                     }
                 }
+                if let Some(id) = invocation_id.as_deref() {
+                    if let Some(call) = self
+                        .live_tools
+                        .iter_mut()
+                        .find(|c| c.invocation_id.as_deref() == Some(id))
+                    {
+                        if call.status == "running" && call.metadata_pending {
+                            call.name = tool_name;
+                            call.version = version;
+                            call.arguments = arguments;
+                            call.depth = depth;
+                            call.metadata_pending = false;
+                        }
+                        return;
+                    }
+                }
                 self.set_activity(format!("running {tool_name}"));
                 self.live_tools.push(LiveToolCall {
+                    metadata_pending: false,
+                    invocation_id,
                     name: tool_name.clone(),
                     depth,
                     subagent: None,
@@ -5366,6 +5575,7 @@ impl App {
                 self.notes.push(format!("running {tool_name}…"));
             }
             Event::ToolCallFinished {
+                invocation_id,
                 session_id,
                 tool_name,
                 ok,
@@ -5382,12 +5592,13 @@ impl App {
                             .into(),
                     );
                 }
-                if let Some(call) = self
-                    .live_tools
-                    .iter_mut()
-                    .rev()
-                    .find(|c| c.name == tool_name && c.status == "running")
-                {
+                if let Some(call) = self.running_call(
+                    &session_id,
+                    invocation_id.as_deref(),
+                    Some(&tool_name),
+                    None,
+                    None,
+                ) {
                     call.status = if ok { "ok".into() } else { "failed".into() };
                     call.elapsed_ms = Some(if elapsed_ms > 0 {
                         elapsed_ms
@@ -5626,28 +5837,45 @@ impl App {
                 });
             }
             Event::InvocationPending {
+                invocation_id,
                 session_id,
+                run_id,
                 tool_name,
                 handle,
-                ..
             } => {
-                if let Some(call) = self.running_call(&session_id, &tool_name) {
-                    call.handle = Some(handle);
-                }
+                self.retain_pending_call(
+                    &session_id,
+                    &run_id,
+                    invocation_id.as_deref(),
+                    &tool_name,
+                    &handle,
+                );
                 self.notes
                     .push(format!("{tool_name} still running (pending)"));
             }
             Event::InvocationStalled {
+                invocation_id,
+                last_fraction,
+                last_label,
                 session_id,
                 handle,
                 tool_name,
                 silent_secs,
             } => {
-                if let Some(call) = self.running_call(&session_id, &tool_name) {
+                if let Some(call) = self.running_call(
+                    &session_id,
+                    invocation_id.as_deref(),
+                    Some(&tool_name),
+                    None,
+                    Some(&handle),
+                ) {
                     call.handle = Some(handle);
                     call.stalled_secs = Some(silent_secs);
+                    if last_fraction.is_some() || last_label.is_some() {
+                        call.progress = Some((last_fraction, last_label.unwrap_or_default()));
+                    }
                     self.notes.push(format!(
-                        "{tool_name}: no activity for {silent_secs}s; /cancel stops just this tool"
+                        "{tool_name}: no advancing progress or activity for {silent_secs}s; /cancel stops just this tool"
                     ));
                 }
             }
@@ -5669,6 +5897,8 @@ impl App {
                         .find(|c| c.status == "running")
                         .map_or(0, |c| c.depth + 1);
                     self.live_tools.push(LiveToolCall {
+                        metadata_pending: false,
+                        invocation_id: None,
                         name: format!(
                             "sub-agent{}: {}",
                             if subagent.model.is_empty() {
@@ -5739,14 +5969,38 @@ impl App {
                     }
                 }
             }
-            Event::InvocationActivity { handle, .. } => {
-                for call in &mut self.live_tools {
-                    if call.handle.as_deref() == Some(&handle) {
-                        call.stalled_secs = None;
-                    }
+            Event::InvocationActivity {
+                session_id,
+                invocation_id,
+                handle,
+            } => {
+                if let Some(call) = self.running_call(
+                    &session_id,
+                    invocation_id.as_deref(),
+                    None,
+                    None,
+                    Some(&handle),
+                ) {
+                    call.stalled_secs = None;
                 }
             }
-            Event::InvocationCompleted { tool_name, ok, .. } => {
+            Event::InvocationCompleted {
+                session_id,
+                invocation_id,
+                handle,
+                tool_name,
+                ok,
+            } => {
+                if let Some(call) = self.running_call(
+                    &session_id,
+                    invocation_id.as_deref(),
+                    Some(&tool_name),
+                    None,
+                    Some(&handle),
+                ) {
+                    call.status = if ok { "ok".into() } else { "failed".into() };
+                    call.stalled_secs = None;
+                }
                 self.notes.push(format!(
                     "pending {tool_name} {}",
                     if ok { "completed" } else { "failed" }
@@ -5778,6 +6032,7 @@ impl App {
                     self.streaming.clear();
                     self.thinking.clear();
                     self.live_tools.clear();
+                    self.live_run = None;
                     self.activity = None;
                     self.notes
                         .push("Session deleted; its draft is kept with that Session.".into());
@@ -17729,6 +17984,7 @@ mod tests {
     use super::*;
     include!("hunk_tests.rs");
     include!("run_file_coverage_tests.rs");
+    include!("invocation_progress_tests.rs");
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -17771,6 +18027,7 @@ mod tests {
             tick: 0,
             activity: None,
             live_tools: Vec::new(),
+            live_run: None,
             chat_scroll_top: None,
             chat_view_height: 10,
             chat_line_count: 100,
@@ -18101,6 +18358,7 @@ mod tests {
             delta: "more".into(),
         });
         app.on_event(Event::ToolCallStarted {
+            invocation_id: None,
             session_id: "s1".into(),
             run_id: "r1".into(),
             tool_name: "t".into(),
@@ -18220,6 +18478,7 @@ mod tests {
         app.inbox = Some(inbox);
         app.run_usage.insert("s1".into(), UsageInfo::default());
         app.on_event(Event::ToolCallStarted {
+            invocation_id: None,
             session_id: "s1".into(),
             run_id: "r1".into(),
             tool_name: "import".into(),
@@ -18327,6 +18586,7 @@ mod tests {
         assert_eq!(progress_text(None, "waiting"), "waiting");
         let mut app = test_app();
         app.on_event(Event::ToolCallStarted {
+            invocation_id: None,
             session_id: "s1".into(),
             run_id: "r1".into(),
             tool_name: "import".into(),
@@ -18335,6 +18595,7 @@ mod tests {
             depth: 0,
         });
         app.on_event(Event::ToolProgress {
+            invocation_id: None,
             session_id: "s1".into(),
             run_id: "r1".into(),
             tool_name: "import".into(),
@@ -19495,6 +19756,7 @@ mod tests {
         assert!(app.activity_text().unwrap().contains("thinking"));
 
         app.on_event(Event::ToolCallStarted {
+            invocation_id: None,
             session_id: "s1".into(),
             run_id: "r1".into(),
             tool_name: "create_tool".into(),
@@ -19506,6 +19768,7 @@ mod tests {
         assert_eq!(app.live_tools.len(), 1);
         assert_eq!(app.live_tools[0].status, "running");
         app.on_event(Event::ToolCallFinished {
+            invocation_id: None,
             session_id: "s1".into(),
             run_id: "r1".into(),
             tool_name: "create_tool".into(),
@@ -24186,6 +24449,8 @@ mod tests {
     #[test]
     fn live_calls_render_as_a_tree_and_fold_finished_subtrees() {
         let node = |name: &str, depth: usize, status: &str| LiveToolCall {
+            metadata_pending: false,
+            invocation_id: None,
             name: name.into(),
             depth,
             subagent: None,

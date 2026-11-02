@@ -1483,15 +1483,24 @@ pasting paths.
 - Every Invocation runs on its own sandbox thread with isolated memory
   (per-Tool `memory_mb`, §7.5). One hung or spinning Tool never blocks the
   daemon or other Sessions.
-- The daemon tracks elapsed time and a **last-activity heartbeat** (any host
-  call/output counts as activity). After a configurable silence period
-  (default 5 min) an Invocation is visually flagged `possibly stalled` in
-  the TUI. The flag is advisory only — **nothing is ever auto-killed**.
-  Protocol: `InvocationStalled {handle, tool_name, silent_secs}` sets the
-  flag on that Tool call, `InvocationActivity {handle}` clears it, and the
-  user may stop just that Invocation with `CancelInvocation {handle}`
-  (`/cancel`, or the chip's Cancel button): it is recorded user-cancelled
-  and the agent gets the error result while the Run carries on.
+- The daemon tracks elapsed time and a **last-work heartbeat**. Ordinary host
+  calls/output retain their activity behavior. `progress()` bypasses the runtime's
+  generic heartbeat: only a finite fractional value above that execution's prior
+  high-water mark refreshes work activity, in the daemon. Repeated fractions,
+  regressions, unknown fractions, label changes, and repeated 0→1 cycles cannot
+  indefinitely suppress a stall warning. Genuine nested Tool work retains the
+  parent's existing activity propagation.
+- After a configurable silence period (default 5 min), an unfinished Invocation
+  is visually flagged `possibly stalled`, including when idle-close is disabled.
+  The flag is advisory only — **nothing is ever auto-killed**. The public Invocation
+  list and stall events use the same heartbeat and bounded last-progress snapshot.
+  `InvocationStalled {handle, invocation_id?, tool_name, silent_secs,
+  last_fraction?, last_label?}` sets the flag; `InvocationActivity {handle,
+  invocation_id?}` clears it after actual activity resumes. The user may stop just
+  that Invocation with `CancelInvocation {handle}` (`/cancel`, or the chip's Cancel
+  button): it is recorded user-cancelled and the Run carries on. Cancellation
+  handles retain their established meaning; the additive execution ID does not
+  replace them.
 
 ### 6.2 Soft threshold → Pending Invocation
 
@@ -1943,12 +1952,23 @@ pattern (§4.4).
     PATHEXT spelling for explicit batch-file grants and native Windows argument
     quoting are preserved; the runtime introduces no shell command parsing.
   - `progress(fraction, label)` — no Capability needed: `fraction` 0..1
-    (or null when unknown) and a short label. The daemon broadcasts
-    `ToolProgress {tool_name, depth, fraction, label}` (at most 5 a second
-    per Invocation, plus every label change and completion), the TUI and
-    web draw a bar on the running call, and like any host call it counts
-    as activity for stall detection (§6.1). Ignored in smoke tests and
-    replays.
+    (or null when unknown) and a short label. The daemon independently clamps
+    finite fractions to 0..1, treats nonfinite values as unknown, strips control
+    characters from labels, and keeps at most 120 Unicode scalar values, even
+    for direct host-bridge calls that bypass the JS shim. Its invocation-local
+    state records the latest sanitized tuple independently of emission.
+    `ToolProgress {invocation_id?, tool_name, depth, fraction, label}` is emitted
+    at most once per 200 ms per execution, with no label-change or completion
+    exception; unchanged emitted tuples are suppressed. Only strict fractional
+    advancement counts as work for stall detection (§6.1).
+    Tool start/progress/finish and pending/completed/stalled/activity events share
+    one additive execution ID. Registry IDs are allocated before pending handoff
+    and match the stored Invocation, even with a zero-second pending threshold.
+    Built-in scripts and draft tests share their outer lifecycle ID and have
+    independent progress state. State is owned by the execution, not an unbounded
+    global throttle table. Clients match IDs exactly; legacy ID-less updates may
+    match only one unambiguous running call. Progress is ignored in smoke tests,
+    replays and dry runs.
   - `tools.call(name, input)` — composition (§7.6). Returns a Promise of
     the nested Tool's output, so several run in parallel under
     `Promise.all` (§7.12). Every call must settle before `run` is done: a

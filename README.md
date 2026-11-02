@@ -757,6 +757,7 @@ formless memory rm m1a2b3c4
 * Past a soft threshold (default 300 s) the Invocation becomes a **Pending Invocation** — still running, with a handle the agent holds (`check_invocation`, `await_invocation`, `abandon_invocation`) instead of a timeout killing it.
 * Outcomes are tagged distinctly: success, error, `resource` (JS heap cap hit), `user-cancelled`, `abandoned`. User-cancelled and malformed model tool-calls never masquerade as Tool bugs, so the optimiser cannot fix what the user interrupted.
 * Stalled provider requests follow the same pending pattern.
+* Progress bars follow invocation IDs, so parallel calls to the same Tool keep independent progress and completion states. A stalled call retains its last reported fraction and label; repeating a fraction or changing only the label does not prove forward progress. Older daemon events without IDs update a bar only when the match is unambiguous.
 
 ---
 

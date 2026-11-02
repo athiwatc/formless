@@ -12,6 +12,26 @@ use std::io::{BufRead, Write};
 use std::sync::mpsc;
 use std::time::Duration;
 
+fn invocation_label(id: Option<&str>) -> String {
+    id.map(|id| format!(" [{}]", super::run_file_safe_text(id)))
+        .unwrap_or_default()
+}
+
+pub(super) fn progress_diagnostic(fraction: Option<f64>, label: Option<&str>) -> String {
+    if fraction.is_none() && label.is_none() {
+        return String::new();
+    }
+    format!(
+        " Last progress: {}{}.",
+        fraction
+            .map(|f| format!("{}%", (f * 100.0).round()))
+            .unwrap_or_else(|| "unknown".into()),
+        label
+            .map(|l| format!(" ({})", super::run_file_safe_text(l)))
+            .unwrap_or_default()
+    )
+}
+
 /// Something waiting for the user's next line.
 enum Prompt {
     Approval {
@@ -122,11 +142,11 @@ pub(crate) fn format_event(ev: &Event, streaming: &mut bool) -> Option<String> {
             return None;
         }
         Event::ToolCallStarted {
-            tool_name, depth, ..
-        } if *depth == 0 => format!("{}Tool started: {tool_name}.", end_stream(streaming)),
-        Event::ToolCallFinished { tool_name, ok, .. } => format!(
-            "Tool {}: {tool_name}.",
-            if *ok { "finished" } else { "failed" }
+            tool_name, depth, invocation_id, ..
+        } if *depth == 0 => format!("{}Tool started: {tool_name}{}.", end_stream(streaming), invocation_label(invocation_id.as_deref())),
+        Event::ToolCallFinished { tool_name, invocation_id, ok, .. } => format!(
+            "Tool {}: {tool_name}{}.",
+            if *ok { "finished" } else { "failed" }, invocation_label(invocation_id.as_deref())
         ),
         // A paused Run was already reported by RunPaused.
         Event::RunFinished { status, .. } if status == "paused" => return None,
@@ -237,17 +257,21 @@ pub(crate) fn format_event(ev: &Event, streaming: &mut bool) -> Option<String> {
         ),
         Event::InvocationStalled {
             tool_name,
+            invocation_id,
+            last_fraction,
+            last_label,
             silent_secs,
             ..
         } => format!(
-            "{}Note: Tool {tool_name} has shown no activity for {silent_secs} s; it keeps running.",
-            end_stream(streaming)
+            "{}Note: Tool {tool_name}{} has shown no advancing progress or activity for {silent_secs} s; it keeps running.{}",
+            end_stream(streaming), invocation_label(invocation_id.as_deref()), progress_diagnostic(*last_fraction, last_label.as_deref())
         ),
-        Event::InvocationCompleted { tool_name, ok, .. } => format!(
-            "{}Background Tool {tool_name} {}.",
-            end_stream(streaming),
+        Event::InvocationCompleted { tool_name, invocation_id, ok, .. } => format!(
+            "{}Background Tool {tool_name}{} {}.",
+            end_stream(streaming), invocation_label(invocation_id.as_deref()),
             if *ok { "finished" } else { "failed" }
         ),
+        Event::InvocationPending { tool_name, invocation_id, handle, .. } => format!("{}Tool {tool_name}{} continues in the background ({}).", end_stream(streaming), invocation_label(invocation_id.as_deref()), super::run_file_safe_text(handle)),
         // Left out on purpose: live detail a screen reader would drown in
         // (reasoning, usage, progress, activity), state the plain client
         // doesn't show (lists, plans, settings, subscriptions), and
@@ -717,6 +741,7 @@ mod tests {
         );
         assert_eq!(format_event(&delta("lo"), &mut streaming).unwrap(), "lo");
         let started = Event::ToolCallStarted {
+            invocation_id: None,
             session_id: "s".into(),
             run_id: "r".into(),
             tool_name: "fetch".into(),

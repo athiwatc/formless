@@ -521,6 +521,7 @@ async fn completed_pending_map_alone_retains_exact_role_task_after_real_late_htt
         .unwrap();
     let handle = uuid::Uuid::new_v4().to_string();
     let entry = Arc::new(PendingEntry {
+        progress: Arc::new(Default::default()),
         _pipeline: StdMutex::new(None),
         routing_task: Some(task.clone()),
         taint_scope: daemon.taint_scope(&f.sid, &run),
