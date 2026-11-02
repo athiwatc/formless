@@ -43,7 +43,7 @@ def expose_script(route):
     source = (ROOT / 'web/app.js').read_text()
     end = source.rfind('\n})();')
     assert end > 0
-    source = source[:end] + '\nwindow.__display = {S,setReading,applyTheme,sessionMenu,messageMenu,closePopover,renderHistory,toast};' + source[end:]
+    source = source[:end] + '\nwindow.__display = {S,setReading,applyTheme,sessionMenu,messageMenu,closePopover,renderHistory,toast,pauseWithNewOutput(){S.follow=false;const box=$("transcript");box.scrollTop=0;reading.anchor=captureReadingAnchor();reading.unseen.set([...box.querySelectorAll("[data-message-id]")].at(-1),null);updateReadingPill();}};' + source[end:]
     route.fulfill(status=200, content_type='text/javascript', body=source)
 
 
@@ -121,7 +121,8 @@ def run():
                         check(contained(rect(page,'.popover'),width,height,46,24,38,22),f'message menu bounded at 200% in {width}x{height}')
                         page.evaluate("__display.closePopover();document.querySelector('#menu-btn').removeAttribute('style');document.querySelector('.msg-menu').removeAttribute('style');__display.setReading(1)")
                         page.wait_for_timeout(250)
-                        page.evaluate("__display.toast('Safe area toast');document.querySelector('#jump').classList.remove('hidden')")
+                        # The pill represents paused reading with output below the viewport.
+                        page.evaluate("__display.toast('Safe area toast');__display.pauseWithNewOutput()")
                         check(contained(rect(page,'.toasts'),width,height,46,24,38,22),f'toasts honor four simulated insets in {width}x{height}')
                         check(contained(rect(page,'#jump'),width,height,46,24,38,22),f'jump pill honors simulated insets in {width}x{height}: {rect(page, chr(35)+"jump")}')
                         check(rect(page,'.topbar')['y']>=0 and page.locator('.topbar').evaluate('(e)=>parseFloat(getComputedStyle(e).paddingTop)')>=24,'topbar respects top inset')
