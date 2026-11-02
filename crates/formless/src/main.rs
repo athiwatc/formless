@@ -304,6 +304,9 @@ enum Cmd {
         force: bool,
     },
     /// Headless single Run (SPEC §12). Approvals fail closed unless --yes.
+    /// A message queued while an earlier Run closes exits 2 without a
+    /// foreground answer. JSON reports status queued; JSONL emits only
+    /// actual events, and result output files remain unchanged.
     Run {
         /// Print a local forecast and exit without starting or changing anything
         #[arg(long)]
@@ -3825,6 +3828,7 @@ fn run_headless(
     let mut final_answer: Option<String> = None;
     let mut run_error: Option<String> = None;
     let mut paused_exit_code = None;
+    let mut queued_delivery = false;
     let mut budget_stopped = false;
     let mut summary = RunSummary::default();
     let cfg = Config::load(&paths)?;
@@ -4156,9 +4160,9 @@ fn run_headless(
                                 "[approval] {} -> {}",
                                 tool_name,
                                 if yes {
-                                    "approved once (--yes)"
+                                    "sending approval for this call (--yes)"
                                 } else {
-                                    "DENIED (fail closed; pass --yes or approve in the TUI)"
+                                    "sending denial (pass --yes or approve in the TUI)"
                                 }
                             );
                         }
@@ -4230,7 +4234,12 @@ fn run_headless(
                 ..
             }) if critical.contains(&id) => {
                 if id == send_request {
-                    target.acknowledge(&result)?;
+                    if target.acknowledge(&result)? == cli_run_identity::Acknowledged::Queued {
+                        queued_delivery = true;
+                        code = if interrupting { 130 } else { 2 };
+                        eprintln!("Message queued and persisted in Session {session_id}; no Run ID or foreground result is available for this message. Inspect delivery with `formless sessions show {session_id}`; add `--follow` once a Run is active. Result output files are unchanged.");
+                        break;
+                    }
                     if interrupting || timed_out.is_some() {
                         if let Some(run_id) = &target.run_id {
                             client.send(Request::CancelRunId {
@@ -4248,13 +4257,17 @@ fn run_headless(
         code = 124;
         run_error.get_or_insert_with(|| "timed out".into());
     }
-    let status = match code {
-        0 => "completed",
-        124 => "timed_out",
-        130 => "interrupted",
-        3 => "schema_mismatch",
-        _ if run_error.is_some() => "paused",
-        _ => "failed",
+    let status = if queued_delivery && code == 2 {
+        "queued"
+    } else {
+        match code {
+            0 => "completed",
+            124 => "timed_out",
+            130 => "interrupted",
+            3 => "schema_mismatch",
+            _ if run_error.is_some() => "paused",
+            _ => "failed",
+        }
     };
     if progress {
         eprintln!(
@@ -7197,9 +7210,9 @@ fn tool_run(
                     "[approval] {tool_name} wants {} -> {}",
                     capabilities.join(", "),
                     if yes {
-                        "approved once (--yes)"
+                        "sending approval for this call (--yes)"
                     } else {
-                        "DENIED (fail closed; pass --yes)"
+                        "sending denial (pass --yes)"
                     }
                 );
                 client.send(Request::ApprovalDecision {

@@ -3010,6 +3010,11 @@ pub enum Event {
         session_id: String,
         clients: Vec<AttachedClient>,
     },
+    /// An unanswered approval was closed, for example when its Run was
+    /// interrupted. This is neither an approval nor a user denial.
+    ApprovalClosed {
+        approval_id: String,
+    },
     /// An approval was answered, by the client named `by`; the others
     /// close their prompt ("answered in web").
     ApprovalAnswered {
@@ -3232,7 +3237,8 @@ impl Event {
             | Event::OptimiserActivity { .. }
             | Event::PromotionApprovalRequested { .. }
             | Event::PromotionApprovalResolved { .. }
-            | Event::ApprovalAnswered { .. } => None,
+            | Event::ApprovalAnswered { .. }
+            | Event::ApprovalClosed { .. } => None,
         }
     }
 }
@@ -3351,6 +3357,18 @@ pub fn artifact_refs(text: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unanswered_approval_close_is_global_and_has_no_decision_value() {
+        let event: super::Event = serde_json::from_value(
+            serde_json::json!({"type":"approval_closed","approval_id":"held"}),
+        )
+        .unwrap();
+        assert_eq!(event.session_id(), None);
+        let encoded = serde_json::to_value(event).unwrap();
+        assert_eq!(encoded["approval_id"], "held");
+        assert!(encoded.get("approved").is_none());
+    }
+
     #[test]
     fn legacy_plan_and_recap_lifecycle_fields_are_unknown_and_new_records_round_trip() {
         let legacy: super::Event = serde_json::from_value(

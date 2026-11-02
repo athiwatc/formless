@@ -127,6 +127,87 @@ fn no_network(s: &Setup) {
 }
 
 #[tokio::test]
+async fn review_comment_steering_uses_context_sequence_and_refuses_closing_run() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let s = setup(&env);
+    let view = inspect(&s).await;
+    let active = s.daemon.with_store(|st| st.create_run(&s.session)).unwrap();
+    let (steer_tx, mut wakeups) = mpsc::unbounded_channel();
+    s.daemon.runs.locked().insert(
+        s.session.clone(),
+        RunCtl {
+            run_id: active.clone(),
+            cancel: CancellationToken::new(),
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            steer_tx,
+            steering: Arc::new(Default::default()),
+            retry: Arc::new(tokio::sync::Notify::new()),
+        },
+    );
+    let request = |text: &str| Request::CommentReviewHunk {
+        review_id: view.review_id.clone(),
+        file_id: view.files[0].id.clone(),
+        hunk_id: view.files[0].hunks[0].id.clone(),
+        expected_hash: view.files[0].after_hash.clone(),
+        comment: text.into(),
+    };
+    let comment: ReviewCommentResult =
+        serde_json::from_value(s.daemon.handle(request("active redirect")).await.unwrap()).unwrap();
+    assert!(comment.steered);
+    assert_eq!(wakeups.try_recv().unwrap(), comment.message.seq);
+    assert!(
+        s.daemon
+            .extend_or_close_steering(&s.session, &active, false)
+            == super::super::steering_daemon::SteeringOutcome::Extend,
+        "review steer must extend an older provider context"
+    );
+    s.daemon
+        .mark_context_consumed(&s.session, &active, comment.message.seq);
+    assert!(
+        s.daemon
+            .extend_or_close_steering(&s.session, &active, false)
+            == super::super::steering_daemon::SteeringOutcome::Completed,
+        "included review steer must not repeat final work"
+    );
+    let before = s
+        .daemon
+        .with_reader(|st| st.list_messages(&s.session))
+        .unwrap();
+    let error = s.daemon.handle(request("late comment")).await.unwrap_err();
+    assert!(error.to_string().contains("Your comment was not saved"));
+    let publication = s.daemon.begin_run_publication(&s.session, &active);
+    s.daemon.runs.locked().remove(&s.session);
+    let error = s
+        .daemon
+        .handle(request("publication gap comment"))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("retry after it finishes"));
+    assert_eq!(
+        s.daemon
+            .with_reader(|st| st.list_messages(&s.session))
+            .unwrap(),
+        before
+    );
+    assert_eq!(
+        s.daemon
+            .with_reader(|st| st.queued_count(&s.session))
+            .unwrap(),
+        0
+    );
+    drop(publication);
+    let idle: ReviewCommentResult = serde_json::from_value(
+        s.daemon
+            .handle(request("saved for explicit next Run"))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(!idle.steered);
+    no_network(&s);
+}
+
+#[tokio::test]
 async fn run_hunk_reject_undo_accept_and_server_comment_are_exact_without_provider_or_run() {
     let env = crate::credential_env::EnvGuard::isolated();
     let s = setup(&env);

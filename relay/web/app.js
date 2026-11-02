@@ -2670,8 +2670,8 @@
         ? { type: "promotion_decision", promotion_id: req.id, approved }
         : { type: "approval_decision", approval_id: req.id, approved, scope: scope || "always", paths: scope === "once" ? {} : pickedPaths(req), remember_denial: !!rememberDenial });
     } catch (e) {
-      toast("Decision was not delivered: " + e.message + ". Try again.", true);
-      note("Decision was not delivered: " + e.message, true);
+      toast("Decision was not confirmed: " + e.message + ". Inspect current approvals or grants before retrying.", true);
+      note("Decision was not confirmed: " + e.message + ". Inspect current approvals or grants before retrying.", true);
       return;
     } finally {
       req.deciding = false;
@@ -4157,7 +4157,7 @@
         case "approval_requested": pending.set("tool:" + ev.approval_id, ev); break;
         case "user_question": pending.set("question:" + ev.question_id, ev); break;
         case "promotion_approval_requested": pending.set("promotion:" + ev.promotion_id, ev); break;
-        case "approval_answered": pending.delete("tool:" + ev.approval_id); break;
+        case "approval_closed": case "approval_answered": pending.delete("tool:" + ev.approval_id); break;
         case "user_question_closed": pending.delete("question:" + ev.question_id); break;
         case "promotion_approval_resolved": pending.delete("promotion:" + ev.promotion_id); break;
         case "approval_summary": {
@@ -5037,7 +5037,7 @@
       forecastRevision++;
       scheduleForecast();
     }
-    if (S.sessionSnapshot && ["run_started", "run_finished", "run_paused", "run_recap", "plan_updated", "approval_requested", "approval_answered", "approval_summary", "promotion_approval_requested", "promotion_approval_resolved", "user_question", "user_question_closed"].includes(ev.type)) {
+    if (S.sessionSnapshot && ["run_started", "run_finished", "run_paused", "run_recap", "plan_updated", "approval_requested", "approval_answered", "approval_closed", "approval_summary", "promotion_approval_requested", "promotion_approval_resolved", "user_question", "user_question_closed"].includes(ev.type)) {
       S.sessionSnapshot.events.push(ev);
     }
     notifyFor(ev);
@@ -5194,6 +5194,12 @@
           renderStatus();
         }
         break;
+      case "approval_closed": {
+        const before = S.approvals.length;
+        S.approvals = S.approvals.filter(a => !(a.kind === "tool" && a.id === ev.approval_id));
+        if (S.approvals.length < before) { note("Approval closed without a user decision."); renderApproval(); renderStatus(); }
+        break;
+      }
       case "approval_answered": {
         // Answered in another client: close ours and say where.
         const before = S.approvals.length;

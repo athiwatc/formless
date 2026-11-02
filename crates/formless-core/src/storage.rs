@@ -6536,6 +6536,18 @@ pub struct ContextCache {
 }
 
 impl ContextCache {
+    /// Transcript boundary read by the most recent successful context build.
+    /// Filtered legacy Tool/assistant rows can advance this boundary, but user
+    /// rows are retained; it never credits user messages appended afterward.
+    /// Capture it together with the returned context under the same Store lock.
+    pub(crate) fn last_included_seq(&self) -> i64 {
+        self.live_seqs
+            .last()
+            .copied()
+            .or_else(|| self.key.as_ref().map(|key| key.2))
+            .unwrap_or(0)
+    }
+
     /// Use the provider's last real prompt size (when known) for the
     /// compaction decision instead of the chars/4 estimate, whichever is
     /// larger: code, JSON and CJK text are far off four chars per token.
@@ -7367,3 +7379,68 @@ mod routing_storage;
 
 #[path = "storage_tool_compatibility.rs"]
 mod tool_compatibility_store;
+
+#[cfg(test)]
+mod context_watermark_tests {
+    use super::*;
+
+    #[test]
+    fn context_boundary_credits_only_built_rows_and_retains_checkpoint_boundary() {
+        let store = Store::open_in_memory().unwrap();
+        let session = store.create_session(None).unwrap().id;
+        let mut cache = ContextCache::default();
+        assert_eq!(cache.last_included_seq(), 0);
+        let first = store
+            .append_message(&session, "user", "first request")
+            .unwrap();
+        let filtered = store
+            .append_message_meta(
+                &session,
+                "assistant",
+                "",
+                Some(
+                    json!({"tool_calls":[{"id":"invalid-call","function":{"arguments":"{}"}}]})
+                        .to_string(),
+                ),
+            )
+            .unwrap();
+        let built = cache
+            .build(&store, &session, "private prompt", 100_000, 0.8)
+            .unwrap();
+        assert_eq!(cache.last_included_seq(), filtered.seq);
+        assert!(!serde_json::to_string(&built.0)
+            .unwrap()
+            .contains("invalid-call"));
+        assert!(serde_json::to_string(&built.0)
+            .unwrap()
+            .contains(&first.content));
+        let unseen = store
+            .append_message(&session, "user", "not in the frozen request")
+            .unwrap();
+        assert_eq!(
+            cache.last_included_seq(),
+            filtered.seq,
+            "new DB rows cannot retroactively advance a built context watermark"
+        );
+        cache
+            .build(&store, &session, "private prompt", 100_000, 0.8)
+            .unwrap();
+        assert_eq!(cache.last_included_seq(), unseen.seq);
+        store
+            .save_checkpoint(&session, "private compacted data", unseen.seq)
+            .unwrap();
+        cache
+            .build(&store, &session, "private prompt", 100_000, 0.8)
+            .unwrap();
+        assert!(cache.live_seqs.is_empty());
+        assert_eq!(
+            cache.last_included_seq(),
+            unseen.seq,
+            "an empty live tail still includes the recorded checkpoint boundary"
+        );
+        store
+            .append_message(&session, "user", "after checkpoint")
+            .unwrap();
+        assert_eq!(cache.last_included_seq(), unseen.seq);
+    }
+}

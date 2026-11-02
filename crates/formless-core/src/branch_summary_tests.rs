@@ -436,6 +436,7 @@ async fn busy_deleted_and_generation_capacity_refusals_make_no_provider_request(
             cancel: CancellationToken::new(),
             cancel_flag: Arc::new(AtomicBool::new(false)),
             steer_tx,
+            steering: Arc::new(Default::default()),
             retry: Arc::new(Notify::new()),
         },
     );

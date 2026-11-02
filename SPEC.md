@@ -955,7 +955,15 @@ task, with quality as a gate**.
   queue** for after the Run ends (Ctrl+J or Alt+Enter in any terminal, §10.5); queued messages
   are stored in the database, so a daemon restart does not lose them, and
   `GetSession` lists them (`queued` texts, and `queued_items` with ids).
-  When idle, Enter simply starts a new Run.
+  When idle, Enter simply starts a new Run. Steering extends the Run only
+  when its message sequence is newer than the transcript boundary included
+  in the actual provider request. A steer already included after a Tool
+  result does not trigger another final-answer request. Closing the Run and
+  accepting steering are serialized: messages arriving after it closes or
+  during terminal publication are queued before transcript append, with an
+  honest queued acknowledgement and no invented future Run ID. Explicit
+  interruption or a paused/failed Run retains accepted steering in the
+  transcript for Resume; it does not automatically replay it.
 - **The queue is visible and editable.** `QueueChanged {session_id,
   queued}` is broadcast whenever it changes (queued, sent, edited,
   removed, reordered). The TUI lists queued messages at the end of the
@@ -990,8 +998,8 @@ task, with quality as a gate**.
   ends. Reaching it pauses the Run with the budget banner: `/resume`
   continues past it, `/abandon` stops. `/limit off` removes it.
 - **Steering is marked.** A message sent while a Run is active is stored
-  with `meta.steer = {step}` (the Run's step count when it arrived), and
-  clients show it as `↳ steer at step N` under the message.
+  with `meta.steer = {step, run_id}` (the Run's step count when it arrived),
+  and clients show it as `↳ steer at step N` under the message.
 
 ### 5.5 Asking the user mid-Run
 
@@ -1005,7 +1013,9 @@ accepted as a label. The user may always answer in their own words.
 - The daemon broadcasts `UserQuestion` (global, like approvals) and waits
   for the first `AnswerQuestion`. `UserQuestionClosed` tells the other
   clients to close their prompt. Interrupting the Run abandons the
-  question.
+  question. An acknowledged answer wins over a later interruption and is
+  returned exactly once; an answer that loses resolution to interruption
+  receives `answered: false`.
 - **Compatibility:** `UserQuestion` carries the structured `questions` and
   also `question`/`options` (one question: its text and labels; several: a
   numbered list and no options) for older clients. `AnswerQuestion` takes
@@ -3733,6 +3743,17 @@ run_tool = "network_policy"     # a registry Tool, or…
   (§8.4) use the same modal. In parallel batches, the modal lists all held
   calls and asks for each in turn (§5.2). Modals are keyboard-driven,
   never lose scrollback.
+- Interrupting an approval pre-pass closes its open prompt and stops the
+  batch before any call or pre-tool hook is dispatched. It neither denies
+  the remaining calls nor remembers a denial. Answer resolution and
+  interruption have one winner: an acknowledged answer is applied exactly
+  once (including lasting grants), while a losing answer receives
+  `resolved: false` and emits no answered event. `ApprovalClosed {approval_id}`
+  dismisses a cancelled prompt without attributing a denial to the user.
+  An already-dispatched memory confirmation's acknowledged approve-to-keep
+  decision completes its bounded atomic memory write; interruption stops
+  subsequent batch work. Clients distinguish submission from confirmation
+  and do not claim that an unacknowledged decision was applied.
 - The answer has a scope (`ApprovalDecision.scope`): **always** (`y`, the
   default for clients that omit it) stores the grant as above; **once**
   (`o`) allows only the waiting call and stores nothing, so the next call
@@ -4732,6 +4753,13 @@ checks run through actual CLI child processes without test-stack overrides.
   refuses a stopped pipeline Run before status/message/waiver changes; submit a
   new pipeline Run with its desired options instead of reconstructing them from
   Session defaults.
+
+  A send queued while the previous Run finishes has no future Run identity
+  or foreground answer. The CLI reports that it was queued on stderr even
+  with `--quiet`, exits 2, and leaves result output files unchanged. JSON
+  reports `status: "queued"` with null answer and error; text/final output
+  stays empty and JSONL emits no invented Run events. Inspect the Session
+  queue or follow its next active Run to observe delivery.
 
   `--cwd DIR` sets the Run's working directory (§5.1). A new headless
   Session uses `--cwd`, or else the directory `formless run` was started

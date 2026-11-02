@@ -154,6 +154,11 @@ impl View {
 
 #[derive(Clone, PartialEq)]
 enum Pending {
+    ApprovalDecision {
+        note: String,
+        batch: Option<ApprovalBatch>,
+        word: String,
+    },
     HunkReview {
         reply: hunk_ui::Reply,
         action: hunk_ui::Action,
@@ -335,6 +340,7 @@ fn attention_key(event: &Event) -> Option<(u8, &str)> {
     match event {
         Event::ApprovalRequested { approval_id, .. }
         | Event::ApprovalAnswered { approval_id, .. }
+        | Event::ApprovalClosed { approval_id }
         | Event::ApprovalSummary { approval_id, .. } => Some((0, approval_id)),
         Event::UserQuestion { question_id, .. } | Event::UserQuestionClosed { question_id } => {
             Some((1, question_id))
@@ -2609,6 +2615,10 @@ impl App {
             let Some(kind) = self.pending.remove(&id) else {
                 continue;
             };
+            if matches!(kind, Pending::ApprovalDecision { .. }) {
+                self.notes.push("Approval decision timed out and is not confirmed; inspect current approvals or grants before retrying.".into());
+                continue;
+            }
             if let Pending::HunkReview { reply, action } = &kind {
                 if self.hunk_reply_is_current(reply) {
                     self.hunk_review.clear();
@@ -2728,6 +2738,24 @@ impl App {
         }
     }
 
+    fn send_approval_reply(
+        &mut self,
+        approval_id: &str,
+        decision: Request,
+        note: String,
+        word: &str,
+    ) {
+        let batch = self.approval_batches.remove(approval_id);
+        self.request(
+            Pending::ApprovalDecision {
+                note,
+                batch,
+                word: word.into(),
+            },
+            decision,
+        );
+    }
+
     fn fire(&mut self, req: Request) {
         if self.offline.is_some() {
             self.notes
@@ -2812,6 +2840,35 @@ impl App {
                     let Some(kind) = self.pending.remove(&id) else {
                         continue;
                     };
+                    if let Pending::ApprovalDecision { note, batch, word } = &kind {
+                        if ok && result.as_ref().is_some_and(|r| r["resolved"] == true) {
+                            if let Some(batch) = batch {
+                                self.batch_answers
+                                    .entry(batch.batch_id.clone())
+                                    .or_default()
+                                    .push((batch.index, word.clone()));
+                            }
+                            if !self.seen.approval_help {
+                                self.seen.approval_help = true;
+                                self.save_seen();
+                            }
+                            self.notes.push(note.clone());
+                            if result
+                                .as_ref()
+                                .is_some_and(|r| r["audit_recorded"] == false)
+                            {
+                                self.notes.push("Decision applied, but its audit record could not be saved; do not retry it.".into());
+                            }
+                        } else if ok && result.as_ref().is_some_and(|r| r["resolved"] == false) {
+                            self.notes.push(
+                                "That approval is no longer pending; no decision was applied."
+                                    .into(),
+                            );
+                        } else {
+                            self.notes.push(format!("Approval decision was not confirmed: {}. Inspect current approvals or grants before retrying.", error.as_deref().unwrap_or("empty daemon reply")));
+                        }
+                        continue;
+                    }
                     if let Pending::HunkReview { reply, .. } = &kind {
                         if !self.hunk_reply_is_current(reply) {
                             if self.hunk_review.generation == reply.generation {
@@ -2884,6 +2941,9 @@ impl App {
                         continue;
                     };
                     match kind {
+                        Pending::ApprovalDecision { .. } => {
+                            unreachable!("approval acknowledgements handled above")
+                        }
                         Pending::HunkReview { reply, action } => {
                             self.hunk_review_result(reply, action, result)
                         }
@@ -5840,6 +5900,25 @@ impl App {
                         .into_iter()
                         .filter(|c| Some(c.conn) != self.conn)
                         .collect();
+                }
+            }
+            Event::ApprovalClosed { approval_id } => {
+                let before = self.approvals.len();
+                self.approvals.retain(|a| a.approval_id != approval_id);
+                self.approval_summaries.remove(&approval_id);
+                self.approval_batches.remove(&approval_id);
+                self.approval_scopes.remove(&approval_id);
+                self.scope_focus.remove(&approval_id);
+                if self
+                    .broad_arm
+                    .as_ref()
+                    .is_some_and(|(id, _)| id == &approval_id)
+                {
+                    self.broad_arm = None;
+                }
+                if self.approvals.len() < before {
+                    self.notes
+                        .push("Approval closed without a user decision.".into());
                 }
             }
             Event::ApprovalAnswered {
@@ -9148,61 +9227,57 @@ impl App {
                 }
                 return;
             }
-            // Always-deny remembers a Tool's Capabilities; other prompts
-            // (an MCP server, a harness change) are denied once (#764).
-            if c == 'N' && self.approvals.front().is_some_and(|r| r.tool_id.is_none()) {
-                let req = self.approvals.pop_front().unwrap();
-                self.fire(Request::ApprovalDecision {
-                    approval_id: req.approval_id,
-                    approved: false,
-                    scope: ApprovalScope::Once,
-                    paths: Default::default(),
-                    remember_denial: false,
-                });
-                self.notes.push(format!(
-                    "denied {} (always-deny is for Tool approvals; this asks again next time)",
-                    req.tool_name
-                ));
-                return;
-            }
+            // A decision is reported as applied only after the daemon acknowledges it.
             if c == 'N' && !self.approvals.is_empty() {
                 let req = self.approvals.pop_front().unwrap();
-                self.note_batch_answer(&req.approval_id, "always denied");
+                let remember = req.tool_id.is_some();
                 let _ = self.take_paths(&req.approval_id);
-                self.fire(Request::ApprovalDecision {
-                    approval_id: req.approval_id,
-                    approved: false,
-                    scope: ApprovalScope::Always,
-                    paths: Default::default(),
-                    remember_denial: true,
-                });
-                self.notes.push(format!(
-                    "denied {} and will always deny its new access (formless approvals denials to undo)",
-                    req.tool_name
-                ));
+                let note = if remember {
+                    format!("denied {} and will always deny its new access (formless approvals denials to undo)", req.tool_name)
+                } else {
+                    format!(
+                        "denied {} (always-deny is for Tool approvals; this asks again next time)",
+                        req.tool_name
+                    )
+                };
+                self.send_approval_reply(
+                    &req.approval_id,
+                    Request::ApprovalDecision {
+                        approval_id: req.approval_id.clone(),
+                        approved: false,
+                        scope: if remember {
+                            ApprovalScope::Always
+                        } else {
+                            ApprovalScope::Once
+                        },
+                        paths: Default::default(),
+                        remember_denial: remember,
+                    },
+                    note,
+                    if remember { "always denied" } else { "denied" },
+                );
                 return;
             }
             if c == 'o' && !self.approvals.is_empty() {
                 let req = self.approvals.pop_front().unwrap();
-                self.note_batch_answer(&req.approval_id, "once");
-                // A wider folder is a lasting grant's; once allows only this
-                // call (#765).
                 let widened = !self.take_paths(&req.approval_id).is_empty();
-                self.fire(Request::ApprovalDecision {
-                    remember_denial: Default::default(),
-                    paths: Default::default(),
-                    approval_id: req.approval_id,
-                    approved: true,
-                    scope: ApprovalScope::Once,
-                });
-                self.notes.push(if widened {
-                    format!(
-                        "approved {} once, for this call's paths only (a wider folder needs y, s or h)",
-                        req.tool_name
-                    )
+                let note = if widened {
+                    format!("approved {} once, for this call's paths only (a wider folder needs y, s or h)", req.tool_name)
                 } else {
                     format!("approved {} once", req.tool_name)
-                });
+                };
+                self.send_approval_reply(
+                    &req.approval_id,
+                    Request::ApprovalDecision {
+                        approval_id: req.approval_id.clone(),
+                        approved: true,
+                        scope: ApprovalScope::Once,
+                        paths: Default::default(),
+                        remember_denial: false,
+                    },
+                    note,
+                    "once",
+                );
                 return;
             }
             // Granting broad access beyond this call takes a second press.
@@ -9231,56 +9306,50 @@ impl App {
                 }
                 self.broad_arm = None;
             }
-            if c == '1' && !self.approvals.is_empty() {
+            if matches!(c, '1' | 's') && !self.approvals.is_empty() {
                 let req = self.approvals.pop_front().unwrap();
-                self.note_batch_answer(&req.approval_id, "for 1 hour");
                 let paths = self.take_paths(&req.approval_id);
-                self.fire(Request::ApprovalDecision {
-                    remember_denial: Default::default(),
-                    paths,
-                    approval_id: req.approval_id,
-                    approved: true,
-                    scope: ApprovalScope::Hour,
-                });
-                self.notes
-                    .push(format!("approved {} for an hour", req.tool_name));
-                return;
-            }
-            if c == 's' && !self.approvals.is_empty() {
-                let req = self.approvals.pop_front().unwrap();
-                self.note_batch_answer(&req.approval_id, "this Session");
-                let paths = self.take_paths(&req.approval_id);
-                self.fire(Request::ApprovalDecision {
-                    remember_denial: Default::default(),
-                    paths,
-                    approval_id: req.approval_id,
-                    approved: true,
-                    scope: ApprovalScope::Session,
-                });
-                self.notes
-                    .push(format!("approved {} for this Session", req.tool_name));
+                let (scope, word, suffix) = if c == '1' {
+                    (ApprovalScope::Hour, "for 1 hour", "for an hour")
+                } else {
+                    (ApprovalScope::Session, "this Session", "for this Session")
+                };
+                let note = format!("approved {} {suffix}", req.tool_name);
+                self.send_approval_reply(
+                    &req.approval_id,
+                    Request::ApprovalDecision {
+                        approval_id: req.approval_id.clone(),
+                        approved: true,
+                        scope,
+                        paths,
+                        remember_denial: false,
+                    },
+                    note,
+                    word,
+                );
                 return;
             }
             if c == 'y' || c == 'n' {
                 if !self.approvals.is_empty() {
                     let req = self.approvals.pop_front().unwrap();
-                    self.note_batch_answer(
-                        &req.approval_id,
-                        if c == 'y' { "always" } else { "denied" },
-                    );
                     let paths = self.take_paths(&req.approval_id);
-                    self.fire(Request::ApprovalDecision {
-                        remember_denial: Default::default(),
-                        paths,
-                        approval_id: req.approval_id,
-                        approved: c == 'y',
-                        scope: ApprovalScope::Always,
-                    });
-                    self.notes.push(format!(
+                    let note = format!(
                         "{} {}",
                         if c == 'y' { "approved" } else { "denied" },
                         req.tool_name
-                    ));
+                    );
+                    self.send_approval_reply(
+                        &req.approval_id,
+                        Request::ApprovalDecision {
+                            approval_id: req.approval_id.clone(),
+                            approved: c == 'y',
+                            scope: ApprovalScope::Always,
+                            paths,
+                            remember_denial: false,
+                        },
+                        note,
+                        if c == 'y' { "always" } else { "denied" },
+                    );
                     return;
                 }
                 if !self.promotions.is_empty() {
@@ -10120,17 +10189,6 @@ impl App {
             })
             .to_string(),
         );
-    }
-
-    fn note_batch_answer(&mut self, approval_id: &str, word: &str) {
-        if !self.seen.approval_help {
-            self.seen.approval_help = true;
-            self.save_seen();
-        }
-        if let Some(b) = self.approval_batches.remove(approval_id) {
-            let answers = self.batch_answers.entry(b.batch_id).or_default();
-            answers.push((b.index, word.to_string()));
-        }
     }
 
     /// Tools whose code calls this one, from its loaded detail.
@@ -18205,6 +18263,7 @@ mod tests {
     include!("run_file_coverage_tests.rs");
     include!("invocation_progress_tests.rs");
     include!("run_state_tests.rs");
+    include!("approval_resolution_tests.rs");
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -20990,6 +21049,8 @@ mod tests {
     #[test]
     fn always_deny_is_only_for_tool_approvals() {
         let mut app = test_app();
+        let (client, sent) = DaemonClient::recording();
+        app.client = Some(client);
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
         app.on_event(Event::ApprovalRequested {
             context: None,
@@ -21008,6 +21069,17 @@ mod tests {
         });
         app.key(key(KeyCode::Char('N')));
         assert!(app.approvals.is_empty());
+        let decision: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert!(matches!(
+            decision.request,
+            Request::ApprovalDecision {
+                approved: false,
+                scope: ApprovalScope::Once,
+                remember_denial: false,
+                ..
+            }
+        ));
+        approval_ack_test_reply(&mut app, true);
         assert!(
             app.notes
                 .iter()
@@ -21707,6 +21779,8 @@ mod tests {
     #[test]
     fn a_batch_lists_each_held_call_with_its_answer() {
         let mut app = test_app();
+        let (client, _sent) = DaemonClient::recording();
+        app.client = Some(client);
         let calls = vec![
             HeldCall {
                 tool_name: "fetch_page".into(),
@@ -21756,6 +21830,8 @@ mod tests {
         // Approve the first once; the second's prompt shows that answer.
         app.input_focus = false;
         app.key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
+        assert!(app.batch_answers.is_empty());
+        approval_ack_test_reply(&mut app, true);
         let screen = render(&mut app, 120, 30);
         assert!(screen.contains("Call 2 of 2"), "{screen}");
         assert!(screen.contains("once  1. fetch_page"), "{screen}");
@@ -21765,6 +21841,8 @@ mod tests {
     #[test]
     fn approvals_show_the_ai_summary_when_it_arrives() {
         let mut app = test_app();
+        let (client, _sent) = DaemonClient::recording();
+        app.client = Some(client);
         app.on_event(Event::ApprovalRequested {
             context: None,
             path_options: Default::default(),
@@ -21800,6 +21878,7 @@ mod tests {
         app.input_focus = false;
         app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
         assert!(app.approvals.is_empty());
+        approval_ack_test_reply(&mut app, true);
         assert_eq!(
             app.notes.last().unwrap(),
             "approved echo_write for this Session"
@@ -21823,6 +21902,7 @@ mod tests {
         app.input_focus = false;
         app.key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
         assert!(app.approvals.is_empty());
+        approval_ack_test_reply(&mut app, true);
         assert_eq!(app.notes.last().unwrap(), "approved echo_write for an hour");
     }
 
@@ -21873,6 +21953,8 @@ mod tests {
     #[test]
     fn broad_grants_take_a_second_press() {
         let mut app = test_app();
+        let (client, _sent) = DaemonClient::recording();
+        app.client = Some(client);
         app.on_event(Event::ApprovalRequested {
             context: None,
             path_options: Default::default(),
@@ -21902,6 +21984,7 @@ mod tests {
         assert_eq!(app.approvals.len(), 1);
         app.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
         assert!(app.approvals.is_empty());
+        approval_ack_test_reply(&mut app, true);
         assert_eq!(
             app.notes.last().unwrap(),
             "approved sweeper for this Session"
@@ -22670,6 +22753,8 @@ mod tests {
     fn typing_continues_while_an_approval_is_open() {
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
         let mut app = test_app();
+        let (client, _sent) = DaemonClient::recording();
+        app.client = Some(client);
         app.approvals.push_back(ApprovalReq {
             context: None,
             approval_id: "a".into(),
@@ -22700,6 +22785,8 @@ mod tests {
         app.key(key(KeyCode::Tab));
         app.key(key(KeyCode::Char('n')));
         assert!(app.approvals.is_empty());
+        assert_eq!(app.input, "hey no");
+        approval_ack_test_reply(&mut app, true);
         assert_eq!(app.input, "hey no");
         assert!(app.notes.last().unwrap().contains("denied fetch_page"));
     }
