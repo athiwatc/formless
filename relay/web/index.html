@@ -24,7 +24,7 @@
     <p class="muted">Open the link printed by <code>formless relay enable</code>, or paste its pairing secret (the part after <code>#k=</code>). Traffic is end-to-end encrypted in this browser; the relay only forwards ciphertext.</p>
     <form id="pair-form" autocomplete="off">
       <label for="secret" class="sr-only">Pairing secret</label>
-      <input id="secret" type="password" placeholder="Pairing secret" spellcheck="false">
+      <input id="secret" type="password" placeholder="Pairing secret" spellcheck="false" autocapitalize="none" autocorrect="off" inputmode="text">
       <button class="btn primary" type="submit">Connect</button>
       <label class="remember"><input id="remember" type="checkbox"> Stay paired after reloading this tab</label>
     </form>
@@ -64,7 +64,7 @@
         <button class="icon-btn" id="import-session" type="button" title="Import session bundle" aria-label="Import session">⇪</button>
       </div>
       <form id="search-form" class="search" role="search">
-        <input id="search" type="search" placeholder="Search all sessions" aria-label="Search all sessions">
+        <input id="search" type="search" placeholder="Search all sessions" aria-label="Search all sessions" autocapitalize="none" autocorrect="off" inputmode="search">
       </form>
       <div id="search-results" class="search-results hidden"></div>
       <ul id="sessions" class="session-list"></ul>
@@ -96,11 +96,11 @@
           <div id="attach-chips" class="attach-chips hidden" aria-label="Attachments for your next message"></div>
           <div class="compose-row">
             <label class="btn ghost" id="attach-btn" title="Attach a file (or paste an image)">📎<input id="attach-input" type="file" multiple hidden></label>
-            <textarea id="input" rows="1" placeholder="Message Formless…" aria-label="Message"></textarea>
+            <textarea id="input" rows="1" placeholder="Message Formless…" aria-label="Message" aria-describedby="compose-hint" enterkeyhint="send" inputmode="text"></textarea>
             <button class="btn danger" id="stop-btn" type="button" hidden>Stop</button>
             <button class="btn primary" id="send-btn" type="submit">Send</button>
           </div>
-          <div class="compose-hint muted">Enter send · Shift+Enter newline · Ctrl/⌘+Enter queue · /help · ? shortcuts</div>
+          <div id="compose-hint" class="compose-hint muted">Enter send · Shift+Enter newline · Ctrl/⌘+Enter queue · /help · ? shortcuts</div>
         </form>
       </section>
 
@@ -109,7 +109,7 @@
         <div class="view-head">
           <h2>Tools <span id="tools-count" class="muted"></span></h2>
           <div class="list-filter">
-            <input id="tools-filter" type="search" placeholder="Filter Tools…" aria-label="Filter Tools" autocomplete="off">
+            <input id="tools-filter" type="search" placeholder="Filter Tools…" aria-label="Filter Tools" autocomplete="off" autocapitalize="none" autocorrect="off" inputmode="search">
             <select id="tools-sort" aria-label="Sort Tools"><option value="name">Name</option><option value="rate">Success rate</option><option value="used">Last used</option><option value="calls">Calls</option></select>
             <select id="tools-quick" aria-label="Show Tools"><option value="all">All</option><option value="active">Active</option><option value="retired">Retired</option><option value="failing">Failing (&lt;80%)</option><option value="attention">Needs attention</option></select>
           </div>
@@ -142,7 +142,7 @@
         <div class="view-head">
           <h2>Prompt proposals <span id="proposals-count" class="muted"></span></h2>
           <div class="list-filter">
-            <input id="proposals-filter" type="search" placeholder="Filter proposals…" aria-label="Filter proposals" autocomplete="off">
+            <input id="proposals-filter" type="search" placeholder="Filter proposals…" aria-label="Filter proposals" autocomplete="off" autocapitalize="none" autocorrect="off" inputmode="search">
             <select id="proposals-quick" aria-label="Show proposals"><option value="all">All</option><option value="pending">Pending</option><option value="applied">Applied</option><option value="rejected">Rejected</option></select>
           </div>
           <div class="actions"><button class="btn primary small" id="generate-proposal" type="button">Generate measured proposal</button></div>
@@ -170,7 +170,7 @@
       <!-- Settings -->
       <section id="view-settings" class="view hidden" aria-label="Settings">
         <div class="view-head"><h2>Settings</h2></div>
-        <input id="settings-filter" class="settings-filter" type="search" placeholder="Filter settings: a key, a word from a description…" aria-label="Filter settings" autocomplete="off" spellcheck="false">
+        <input id="settings-filter" class="settings-filter" type="search" placeholder="Filter settings: a key, a word from a description…" aria-label="Filter settings" autocomplete="off" spellcheck="false" autocapitalize="none" autocorrect="off" inputmode="search">
         <div id="settings"></div>
       </section>
     </main>
@@ -218,7 +218,7 @@
     <h2 id="ask-title"></h2>
     <p id="ask-text" class="muted"></p>
     <div id="ask-body"></div>
-    <input id="ask-input" type="text" spellcheck="false" aria-labelledby="ask-title">
+    <input id="ask-input" type="text" spellcheck="false" aria-labelledby="ask-title" autocapitalize="none" autocorrect="off" inputmode="text">
     <div class="modal-actions">
       <span class="spacer"></span>
       <button class="btn ghost" id="ask-cancel" type="button">Cancel</button>

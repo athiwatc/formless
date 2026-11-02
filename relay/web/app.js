@@ -29,11 +29,24 @@
       else if (k.startsWith("on")) node.addEventListener(k.slice(2), v);
       else node.setAttribute(k, v === true ? "" : String(v));
     }
+    configureTextInput(node);
     for (const kid of kids.flat(Infinity)) {
       if (kid == null || kid === false) continue;
       node.append(kid instanceof Node ? kid : String(kid));
     }
     return node;
+  }
+
+  /** Machine-readable fields must retain exactly what the user types. */
+  function configureTextInput(node) {
+    if (node.tagName !== "INPUT" && node.tagName !== "TEXTAREA") return;
+    const machine = ["password", "search", "url", "email"].includes(node.type)
+      || node.getAttribute("spellcheck") === "false" || node.classList.contains("editor");
+    if (!machine) return;
+    if (!node.hasAttribute("autocapitalize")) node.setAttribute("autocapitalize", "none");
+    if (!node.hasAttribute("autocorrect")) node.setAttribute("autocorrect", "off");
+    if (!node.hasAttribute("inputmode")) node.setAttribute("inputmode", ["url", "email", "search"].includes(node.type) ? node.type : "text");
+    if (node.tagName === "TEXTAREA" && !node.hasAttribute("enterkeyhint")) node.setAttribute("enterkeyhint", "enter");
   }
 
   const prefs = {
@@ -549,6 +562,8 @@
     scheduleEventRender({ status: true, live: true });
   }
   const isRunning = () => S.current != null && S.running.has(S.current);
+  const coarsePointer = window.matchMedia("(pointer: coarse)");
+  function inputTouchMode() { return coarsePointer.matches; }
 
   // UI work from a burst of protocol events is coalesced, while event state
   // itself is reduced immediately. Navigation invalidates rather than replays
@@ -669,6 +684,7 @@
   // ------------------------------------------------------------- sidebar
   let popover = null;
   let popoverTrigger = null;
+  let popoverAlignment = false;
   function closePopover({ restore = !!popover && (popover.contains(document.activeElement) || document.activeElement === document.body) } = {}) {
     const trigger = popoverTrigger;
     if (popover) { popover.remove(); popover = null; }
@@ -732,29 +748,182 @@
       if (next != null) { e.preventDefault(); focus(enabled[next]); }
     });
     (activeDialog()?.node || document.body).append(popover);
-    const css = getComputedStyle(document.documentElement);
-    const inset = (edge) => parseFloat(css.getPropertyValue("--safe-" + edge)) || 0;
-    const gap = (parseFloat(css.fontSize) || 16) * 0.5;
-    const viewport = window.visualViewport;
-    const left = (viewport?.offsetLeft || 0) + inset("left") + gap;
-    const top = (viewport?.offsetTop || 0) + inset("top") + gap;
-    const right = (viewport?.offsetLeft || 0) + (viewport?.width || innerWidth) - inset("right") - gap;
-    const bottom = (viewport?.offsetTop || 0) + (viewport?.height || innerHeight) - inset("bottom") - gap;
-    popover.style.minWidth = "0";
-    popover.style.maxWidth = Math.max(0, right - left) + "px";
-    popover.style.maxHeight = Math.max(0, bottom - top) + "px";
-    const r = btn.getBoundingClientRect();
-    const width = popover.offsetWidth, height = popover.offsetHeight;
-    const x = alignRight ? r.right - width : r.left;
-    const y = r.bottom + gap + height <= bottom ? r.bottom + gap : r.top - gap - height;
-    popover.style.left = Math.max(left, Math.min(x, right - width)) + "px";
-    popover.style.top = Math.max(top, Math.min(y, bottom - height)) + "px";
+    popoverAlignment = alignRight;
+    positionPopover();
     const enabled = available();
     focus(focusLast ? enabled[enabled.length - 1] : enabled[0]);
   }
-  window.addEventListener("resize", closePopover);
-  window.visualViewport?.addEventListener("resize", closePopover);
-  window.visualViewport?.addEventListener("scroll", closePopover);
+  /** Visual viewport coordinates are CSS pixels, including during pinch zoom.
+   * Keep typography and the main layout width native; only the keyboard's
+   * available height and floating controls follow the visible rectangle. */
+  let viewportFrame = 0;
+  let viewportPrinting = false;
+  function viewportBounds() {
+    const viewport = window.visualViewport;
+    const finite = (value, fallback) => Number.isFinite(value) ? value : fallback;
+    const left = Math.max(0, finite(viewport?.offsetLeft, 0));
+    const top = Math.max(0, finite(viewport?.offsetTop, 0));
+    const width = Math.max(1, finite(viewport?.width, innerWidth));
+    const height = Math.max(1, finite(viewport?.height, innerHeight));
+    return { left, top, width, height, right: left + width, bottom: top + height,
+      scale: Math.max(.1, finite(viewport?.scale, 1)) };
+  }
+  function safeViewportBounds(gap = 0) {
+    const viewport = viewportBounds(), css = getComputedStyle(document.documentElement);
+    const inset = edge => parseFloat(css.getPropertyValue("--safe-" + edge)) || 0;
+    return { ...viewport, left: viewport.left + inset("left") + gap,
+      top: viewport.top + inset("top") + gap, right: viewport.right - inset("right") - gap,
+      bottom: viewport.bottom - inset("bottom") - gap };
+  }
+  function viewportVariable(name, value) {
+    const style = document.documentElement.style, text = Math.max(0, value).toFixed(3) + "px";
+    if (style.getPropertyValue(name) === text) return false;
+    style.setProperty(name, text);
+    return true;
+  }
+  // inline-size containment on .app creates a fixed-position containing block.
+  // Measure that origin instead of treating layout and visual coordinates alike.
+  function positionFixedBox(node, left, top) {
+    node.style.right = node.style.bottom = "auto";
+    node.style.left = node.style.top = "0px";
+    const origin = node.getBoundingClientRect();
+    node.style.left = left - origin.left + "px";
+    node.style.top = top - origin.top + "px";
+  }
+  function withMeasurableBox(node, measure) {
+    const hidden = getComputedStyle(node).display === "none";
+    const display = node.style.getPropertyValue("display"), priority = node.style.getPropertyPriority("display"), visibility = node.style.visibility;
+    if (hidden) { node.style.setProperty("display", "block", "important"); node.style.visibility = "hidden"; }
+    try { return measure(); }
+    finally { if (hidden) { if (display) node.style.setProperty("display", display, priority); else node.style.removeProperty("display"); node.style.visibility = visibility; } }
+  }
+  function revealViewportControl(node, container, bounds) {
+    if (!node || !container || !container.contains(node)) return;
+    const rect = node.getBoundingClientRect(), box = container.getBoundingClientRect();
+    const top = Math.max(bounds.top, box.top) + 1, bottom = Math.min(bounds.bottom, box.bottom) - 1;
+    if (rect.height <= bottom - top) {
+      if (rect.top < top) container.scrollTop -= top - rect.top;
+      else if (rect.bottom > bottom) container.scrollTop += rect.bottom - bottom;
+    }
+  }
+  function positionPopover() {
+    if (!popover) return;
+    if (!popoverTrigger?.isConnected || !popoverTrigger.getClientRects().length) return closePopover();
+    const gap = (parseFloat(getComputedStyle(document.documentElement).fontSize) || 16) * .5;
+    const bounds = safeViewportBounds(gap);
+    popover.style.minWidth = "0";
+    popover.style.maxWidth = Math.max(0, bounds.right - bounds.left) + "px";
+    popover.style.maxHeight = Math.max(0, bounds.bottom - bounds.top) + "px";
+    // Reset the previous anchor before measuring shrink-to-fit width. An old
+    // right-edge position must not squeeze a retained menu after resize.
+    popover.style.right = popover.style.bottom = "auto";
+    popover.style.left = popover.style.top = "0px";
+    const rect = popoverTrigger.getBoundingClientRect(), width = popover.offsetWidth, height = popover.offsetHeight;
+    const left = popoverAlignment ? rect.right - width : rect.left;
+    const top = rect.bottom + gap + height <= bounds.bottom ? rect.bottom + gap : rect.top - gap - height;
+    positionFixedBox(popover, Math.max(bounds.left, Math.min(left, bounds.right - width)), Math.max(bounds.top, Math.min(top, bounds.bottom - height)));
+    revealViewportControl(document.activeElement, popover, bounds);
+  }
+  function positionComposePopups(bounds, fontSize) {
+    const input = $("input"), anchor = input.getBoundingClientRect();
+    for (const popup of document.querySelectorAll(".compose-popup")) {
+      if (!popup.getClientRects().length) continue;
+      const width = Math.min(35 * fontSize, Math.max(0, bounds.right - bounds.left), Math.max(anchor.width, 12 * fontSize));
+      popup.style.width = width + "px";
+      const above = Math.max(0, anchor.top - bounds.top - fontSize * .25), below = Math.max(0, bounds.bottom - anchor.bottom - fontSize * .25);
+      const preferAbove = above >= below;
+      popup.style.maxHeight = Math.min(20 * fontSize, preferAbove ? above : below) + "px";
+      const rect = popup.getBoundingClientRect();
+      const top = preferAbove ? anchor.top - fontSize * .25 - rect.height : anchor.bottom + fontSize * .25;
+      positionFixedBox(popup, Math.max(bounds.left, Math.min(anchor.left, bounds.right - rect.width)), Math.max(bounds.top, Math.min(top, bounds.bottom - rect.height)));
+      const selected = popup.querySelector(".sel");
+      if (selected) revealViewportControl(selected, popup, bounds);
+    }
+  }
+  function positionJump(bounds, fontSize) {
+    const jump = $("jump"), composer = $("composer").getBoundingClientRect();
+    withMeasurableBox(jump, () => {
+      jump.style.maxWidth = Math.max(0, bounds.right - bounds.left) + "px";
+      jump.style.maxHeight = Math.max(0, Math.min(bounds.bottom, composer.top) - bounds.top - fontSize * .5) + "px";
+      const rect = jump.getBoundingClientRect();
+      const top = Math.max(bounds.top, Math.min(bounds.bottom - rect.height, composer.top - rect.height - fontSize * .5));
+      positionFixedBox(jump, bounds.left + Math.max(0, bounds.right - bounds.left - rect.width) / 2, top);
+    });
+  }
+  function syncViewport() {
+    viewportFrame = 0;
+    if (viewportPrinting || document.hidden || matchMedia("print").matches) return;
+    const viewport = viewportBounds(), root = document.documentElement;
+    const fontSize = parseFloat(getComputedStyle(root).fontSize) || 16;
+    const zoomed = Math.abs(viewport.scale - 1) > .01;
+    const composing = $("composer").contains(document.activeElement);
+    withTranscriptLayout(() => {
+      root.setAttribute("data-visual-viewport", "");
+      root.toggleAttribute("data-viewport-zoomed", zoomed);
+      root.toggleAttribute("data-viewport-short", viewport.height < fontSize * 24);
+      root.toggleAttribute("data-viewport-composing", composing);
+      viewportVariable("--visual-left", viewport.left);
+      viewportVariable("--visual-top", viewport.top);
+      viewportVariable("--visual-width", viewport.width);
+      viewportVariable("--visual-height", viewport.height);
+      viewportVariable("--visual-right", viewport.right);
+      viewportVariable("--visual-bottom", viewport.bottom);
+      viewportVariable("--app-viewport-left", zoomed ? 0 : viewport.left);
+      viewportVariable("--app-viewport-top", zoomed ? 0 : viewport.top);
+      viewportVariable("--app-viewport-width", zoomed ? root.clientWidth : viewport.width);
+      viewportVariable("--app-viewport-height", zoomed ? viewport.bottom : viewport.height);
+      const bounds = safeViewportBounds(fontSize * .5);
+      const chat = $("view-chat"), composer = $("composer"), input = $("input");
+      if (chat.getClientRects().length) {
+        const rect = chat.getBoundingClientRect();
+        const available = Math.max(1, Math.min(bounds.bottom, rect.bottom) - Math.max(bounds.top, rect.top));
+        viewportVariable("--chat-visible-height", available);
+        viewportVariable("--composer-limit", available * .65);
+        const inputStyle = getComputedStyle(input);
+        const oneLine = (parseFloat(inputStyle.lineHeight) || parseFloat(inputStyle.fontSize) * 1.45)
+          + parseFloat(inputStyle.paddingTop) + parseFloat(inputStyle.paddingBottom) + parseFloat(inputStyle.borderTopWidth) + parseFloat(inputStyle.borderBottomWidth);
+        if (viewportVariable("--composer-input-limit", Math.max(oneLine, Math.min(viewport.height * .35, available * .45)))) autosize();
+        if (zoomed) {
+          composer.style.width = Math.max(0, bounds.right - bounds.left) + "px";
+          const height = composer.getBoundingClientRect().height;
+          const bottom = Math.min(bounds.bottom, rect.bottom);
+          positionFixedBox(composer, bounds.left, Math.max(bounds.top, bottom - height));
+          viewportVariable("--floating-composer-height", height + fontSize * .5);
+        } else {
+          for (const property of ["left", "top", "right", "bottom", "width"]) composer.style.removeProperty(property);
+          viewportVariable("--floating-composer-height", 0);
+        }
+        if (composing) revealViewportControl(document.activeElement, composer, bounds);
+        positionComposePopups(bounds, fontSize);
+        positionJump(bounds, fontSize);
+      }
+      positionPopover();
+      const modal = activeDialog()?.node.querySelector(".modal") || document.activeElement?.closest(".pair-card");
+      if (modal) revealViewportControl(document.activeElement, modal, bounds);
+    }, { newContent: false });
+    // A viewport pan changes which block the user is looking at. Adopt that
+    // new visible block rather than compensating away the user's pinch/pan.
+    if (!S.follow && readingVisible()) reading.anchor = captureReadingAnchor();
+  }
+  function scheduleViewportSync() {
+    if (!viewportFrame) viewportFrame = requestAnimationFrame(syncViewport);
+  }
+  window.addEventListener("resize", scheduleViewportSync);
+  window.visualViewport?.addEventListener("resize", scheduleViewportSync);
+  window.visualViewport?.addEventListener("scroll", scheduleViewportSync);
+  document.addEventListener("focusin", scheduleViewportSync);
+  document.addEventListener("focusout", scheduleViewportSync);
+  document.addEventListener("visibilitychange", scheduleViewportSync);
+  window.addEventListener("beforeprint", () => { viewportPrinting = true; });
+  window.addEventListener("afterprint", () => { viewportPrinting = false; scheduleViewportSync(); });
+  $("view-chat").addEventListener("scroll", scheduleViewportSync, { passive: true });
+  const viewportResize = new ResizeObserver(scheduleViewportSync);
+  for (const node of [$("composer"), $("input"), $("app"), document.querySelector(".topbar"), document.querySelector(".statusbar")]) viewportResize.observe(node);
+  new MutationObserver(records => {
+    if (records.some(record => record.target === $("app") || record.target === $("jump") || record.target instanceof Element && record.target.closest("#composer")
+      || [...record.addedNodes].some(node => node instanceof Element && node.matches(".backdrop, .compose-popup")))) scheduleViewportSync();
+  }).observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ["class", "hidden"] });
+  scheduleViewportSync();
   /** The URL fragment as `#k=…&s=…` pairs. Not URLSearchParams: it turns
    * "+" (in a base64 key) into a space. */
   function hashParams() {
@@ -2534,13 +2703,28 @@
     writeUntil: 0, inputFrame: 0, pointer: null, observed: new Set() };
   const printMedia = window.matchMedia("print");
   const anchorBlocks = "p, pre, summary, li, h1, h2, h3, h4, .bubble, .diagram-view, .stream-tail";
+  function visibleReadingBounds() {
+    const box = $("transcript").getBoundingClientRect();
+    const chat = $("view-chat").getBoundingClientRect();
+    const viewport = window.visualViewport;
+    const left = Math.max(box.left, chat.left, viewport?.offsetLeft || 0);
+    const right = Math.min(box.right, chat.right, (viewport?.offsetLeft || 0) + (viewport?.width || innerWidth));
+    const top = Math.max(box.top, chat.top, viewport?.offsetTop || 0);
+    let bottom = Math.min(box.bottom, chat.bottom, (viewport?.offsetTop || 0) + (viewport?.height || innerHeight));
+    const composer = $("composer").getBoundingClientRect();
+    if (composer.height && composer.top > top) bottom = Math.min(bottom, composer.top);
+    return { left, right, top, bottom, width: Math.max(0, right - left), height: Math.max(0, bottom - top) };
+  }
   function readingVisible() {
     const box = $("transcript");
-    return !printMedia.matches && S.view === "chat" && box.clientHeight > 0 && box.getClientRects().length > 0;
+    if (printMedia.matches || S.view !== "chat" || !box.clientHeight || !box.getClientRects().length) return false;
+    const bounds = visibleReadingBounds();
+    return bounds.height > 0 && bounds.width > 0;
   }
   function captureReadingAnchor() {
     if (!readingVisible()) return null;
-    const box = $("transcript"), bounds = box.getBoundingClientRect();
+    const box = $("transcript"), bounds = visibleReadingBounds();
+    const origin = box.getBoundingClientRect().top;
     const messages = [...box.querySelectorAll("[data-message-id], [data-live-root]")];
     const visible = messages.filter(node => { const r = node.getBoundingClientRect(); return r.height && r.bottom > bounds.top + 1; });
     const candidates = [];
@@ -2553,7 +2737,7 @@
         block = child;
       }
       candidates.push({ node: block, id: message.dataset.messageId || null, live: message.hasAttribute("data-live-root"),
-        block: blocks.indexOf(block), offset: block.getBoundingClientRect().top - bounds.top });
+        block: blocks.indexOf(block), offset: block.getBoundingClientRect().top - origin });
     }
     return { candidates, top: box.scrollTop };
   }
@@ -2647,7 +2831,7 @@
   }
   function markNewOutput(records) {
     if (S.follow) return;
-    const box = $("transcript"), visible = readingVisible(), bottom = box.getBoundingClientRect().bottom;
+    const box = $("transcript"), visible = readingVisible(), bottom = visibleReadingBounds().bottom;
     const semantic = "[data-message-id], .streaming, .thinking, .tree-node, .recap";
     const mark = (node, start) => {
       if (!visible) reading.deferred.set(node, start);
@@ -2675,7 +2859,7 @@
       if (!node.isConnected || !box.contains(node)) markers.delete(node);
     }
     if (!readingVisible()) return;
-    const bottom = box.getBoundingClientRect().bottom;
+    const bottom = visibleReadingBounds().bottom;
     if (reading.pendingLive) {
       const newIds = new Set(S.messages.filter(message => message.seq > reading.afterSeq).map(message => message.id));
       const content = [...box.querySelectorAll("[data-message-id]")].filter(node => newIds.has(node.dataset.messageId));
@@ -2981,6 +3165,9 @@
     $("send-btn").textContent = tr(S.editMessageId ? "Re-run" : running ? "Steer" : "Send");
     $("stop-btn").textContent = tr("Stop");
     $("input").placeholder = tr(running ? "Steer, or Ctrl/⌘+Enter to queue…" : "Message Formless…");
+    $("compose-hint").textContent = inputTouchMode()
+      ? "Enter newline · Send button sends · Ctrl/⌘+Enter queue · /help"
+      : "Enter send · Shift+Enter newline · Ctrl/⌘+Enter queue · /help · ? shortcuts";
     const mode = $("compose-mode");
     mode.replaceChildren();
     if (S.editMessageId) {
@@ -6634,6 +6821,10 @@
   $("input").addEventListener("input", () => { palette.sel = 0; autosize(); updatePalette(); updateMentions(); scheduleForecast(); });
   $("input").addEventListener("blur", () => setTimeout(() => { closeMentions(); closePalette(); }, 100));
   $("input").addEventListener("keydown", (e) => {
+    if (e.isComposing || e.keyCode === 229) return;
+    // Let the textarea perform its native newline insertion, including when
+    // suggestions are open. Fine-pointer desktop shortcuts remain unchanged.
+    if (e.key === "Enter" && inputTouchMode() && !e.ctrlKey && !e.metaKey) return;
     if (paletteKey(e) || mentionKey(e)) return;
     if (e.key === "?" && !$("input").value && !e.ctrlKey && !e.metaKey) { e.preventDefault(); return showHelp(); }
     if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); submit(true); }
@@ -6643,6 +6834,7 @@
       else stop();
     }
   });
+  coarsePointer.addEventListener("change", () => renderComposer());
   document.addEventListener("click", (e) => {
     if (popover && !popover.contains(e.target)) closePopover();
     // A modal click belongs to that layer, including a button that removed

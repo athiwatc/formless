@@ -154,6 +154,12 @@ partial validation. It checks animation-frame batching, retained DOM/text nodes,
 pixel-stable anchors without native scroll anchoring, delayed layout and
 Session/view transitions. WebKit engine evidence is not physical Safari testing.
 
+Mobile keyboard/viewport and input regressions run with
+`python relay/web-mobile.browser-test.py /tmp/formless-mobile-check` using
+Chromium and the same supported Playwright WebKit runtime. The check separates
+native browser resizing and touch input from simulated visual-viewport/keyboard
+geometry. Simulations are not physical iOS/Android keyboard or device evidence.
+
 `dev.mjs` runs the Worker's own code: each room is `worker.js`'s
 `RelayRoom` over a real SQLite ledger through Node's built-in `node:sqlite`
 (Node 22.13+), and every

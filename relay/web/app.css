@@ -638,6 +638,14 @@ mark.find { background: var(--accent-soft); color: inherit; border-radius: 0.187
 .ed-err { background: var(--err-soft); }
 .ed-status { font-size: 0.75rem; margin-top: 0.25rem; font-family: var(--mono); }
 
+/* A touch-capable browser may focus even a small secondary/code field. Keep
+   the CSS-pixel floor at 16 when the manual root reading size is 85%. The
+   editor's painted layers must use the same metrics as its native textarea. */
+@media (any-pointer: coarse) {
+  input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="button"]):not([type="submit"]):not([type="reset"]):not([type="color"]):not([type="file"]):not([type="hidden"]),
+  textarea, select, .ed-layer { font-size: max(1rem, 16px) !important; }
+}
+
 /* Right-to-left text (#791): each paragraph of a message takes its
    direction from its own first strong letter, so an Arabic or Hebrew
    answer is right-aligned and an English one beside it stays left; names
@@ -742,6 +750,60 @@ mark.find { background: var(--accent-soft); color: inherit; border-radius: 0.187
 @container app (max-width: 25rem) {
   .compose-row { flex-wrap: wrap; }
   .composer textarea { flex-basis: 100%; order: -1; }
+}
+
+/* Keyboard geometry uses visual-viewport CSS pixels. Main layout width is
+   preserved during pinch zoom; only the composer and floating controls adapt. */
+@media screen {
+  :root[data-visual-viewport] .app {
+    position: fixed;
+    left: var(--app-viewport-left, 0px); top: var(--app-viewport-top, 0px);
+    width: var(--app-viewport-width, 100%); height: var(--app-viewport-height, 100dvh);
+  }
+  :root[data-visual-viewport] #composer {
+    position: relative;
+    max-height: var(--composer-limit, 65dvh);
+    overflow: auto;
+    overscroll-behavior: contain;
+  }
+  :root[data-visual-viewport] #composer textarea {
+    max-height: min(13.75rem, var(--composer-input-limit, 13.75rem));
+  }
+  :root[data-visual-viewport] .compose-popup {
+    position: fixed; inset: auto; left: 0; top: 0;
+    width: 35rem; min-height: 0; max-height: var(--visual-height, 40dvh);
+  }
+  :root[data-visual-viewport] .jump {
+    position: fixed; inset: auto; left: 0; top: 0;
+    transform: none; width: max-content; min-height: 0;
+  }
+  :root[data-visual-viewport] .backdrop {
+    inset: auto; left: var(--visual-left, 0px); top: var(--visual-top, 0px);
+    width: var(--visual-width, 100%); height: var(--visual-height, 100dvh);
+  }
+  :root[data-visual-viewport] .modal {
+    max-height: calc(var(--visual-height, 100dvh) - var(--safe-top) - var(--safe-bottom) - 2rem);
+  }
+  :root[data-visual-viewport] .pair {
+    position: fixed; left: var(--visual-left, 0px); top: var(--visual-top, 0px);
+    width: var(--visual-width, 100%); min-height: var(--visual-height, 100dvh);
+    height: var(--visual-height, 100dvh);
+  }
+  :root[data-visual-viewport] .pair-card {
+    max-height: calc(var(--visual-height, 100dvh) - var(--safe-top) - var(--safe-bottom) - 2rem);
+    overflow: auto;
+  }
+  :root[data-viewport-zoomed] #composer { position: fixed; z-index: 15; }
+  :root[data-viewport-zoomed] #view-chat { padding-bottom: var(--floating-composer-height, 0px); }
+  /* On a short focused keyboard viewport, use the space for the draft and
+     transcript. Chrome returns as soon as focus leaves the composer. */
+  :root[data-viewport-short][data-viewport-composing] .topbar,
+  :root[data-viewport-short][data-viewport-composing] .chat-head { display: none; }
+  :root[data-viewport-short][data-viewport-composing] .statusbar {
+    max-height: min(3rem, calc(var(--app-viewport-height, 100dvh) * .2));
+    overflow: auto;
+  }
+  :root[data-viewport-short] #transcript { min-height: 0; }
 }
 
 /* Print the current Session, including content below the viewport. Tool payloads

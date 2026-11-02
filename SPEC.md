@@ -1241,6 +1241,18 @@ pasting paths.
   do not create it. Following resumes on an explicit user scroll to the bottom
   or pill action, rather than an approximate distance threshold or a
   programmatic scroll.
+- **Mobile input and viewport (web).** Visual-viewport resize and offset changes
+  keep the composer and its slash/@ suggestions, menus and new-output control
+  within the visible screen. Following keeps the transcript tail above the
+  composer; paused reading retains its anchor. Pinch zoom remains enabled and
+  does not inverse-scale text or reflow the main transcript to the zoomed width.
+  Touch-capable text fields and editor layers have a 16 CSS-pixel font floor,
+  including at an 85% manual reading size. On a primary coarse pointer, plain
+  Enter inserts a native newline and Send is explicit; fine-pointer desktop
+  shortcuts and Ctrl/Command+Enter queue behavior are retained. IME composition
+  keys never trigger palette, mention or send actions. The composer advertises
+  `enterkeyhint="send"`; secret, code and filter fields disable capitalization
+  and autocorrection.
 - **Device display and printing (web).** Auto theme follows OS changes;
   the browser theme/status-bar color follows the effective Auto, Light or Dark
   theme, with media-specific initial colors before JavaScript loads. Shell
