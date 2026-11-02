@@ -147,7 +147,9 @@ fn droppable_scope(ev: &Event) -> Option<(GapScope, DroppedEventKind)> {
             None,
             K::RunUsage,
         ),
-        Event::InvocationActivity { session_id, handle } => (
+        Event::InvocationActivity {
+            session_id, handle, ..
+        } => (
             session_id.as_str(),
             "",
             Some(handle.clone()),
@@ -405,6 +407,7 @@ type ExecFuture = std::pin::Pin<
 >;
 
 pub(crate) struct PendingEntry {
+    progress: Arc<crate::invocation_progress::InvocationProgress>,
     _pipeline: StdMutex<Option<Arc<crate::pipeline_policy::RunPolicy>>>,
     routing_task: Option<Arc<crate::routing_task_observation::Task>>,
     taint_scope: Arc<crate::approval_preview::RunTaint>,
@@ -684,8 +687,6 @@ pub struct Daemon {
     /// Sessions in step mode (`/step`), and the step decisions awaited.
     step_sessions: StdMutex<std::collections::HashSet<String>>,
     step_waiters: StdMutex<HashMap<String, tokio::sync::oneshot::Sender<(String, Option<String>)>>>,
-    /// When each running Invocation last sent ToolProgress (throttle).
-    progress_sent: StdMutex<HashMap<String, (std::time::Instant, String)>>,
     /// Registry changes made by each running Run, by run id.
     run_tool_changes: StdMutex<HashMap<String, Vec<ToolChange>>>,
     /// Approvals for one Session only, by (session id, tool id): the
@@ -917,7 +918,6 @@ impl Daemon {
             approval_transition_test: StdMutex::new(None),
             step_limits: StdMutex::new(Default::default()),
             next_run_model: StdMutex::new(Default::default()),
-            progress_sent: StdMutex::new(Default::default()),
             comparisons: StdMutex::new(Default::default()),
             branch_summary_state: Arc::new(StdMutex::new(Default::default())),
             hunk_reviews: StdMutex::new(Default::default()),
@@ -3960,9 +3960,13 @@ impl Daemon {
                     .filter(|(_, e)| e.result.locked().is_none())
                     .map(|(h, e)| {
                         let silent = now.saturating_sub(e.activity.load(Ordering::SeqCst));
+                        let progress = e.progress.snapshot();
                         (
                             e.order,
                             formless_protocol::InvocationInfo {
+                                invocation_id: Some(e.progress.id.clone()),
+                                last_fraction: progress.as_ref().and_then(|value| value.fraction),
+                                last_label: progress.map(|value| value.label),
                                 handle: h.clone(),
                                 tool_name: e.tool_name.clone(),
                                 session_id: e.session_id.clone(),
@@ -7516,10 +7520,13 @@ impl Daemon {
         // Bootstrap/meta tools don't pass through execute_tool_value, so
         // broadcast their lifecycle here (registry Tools broadcast there).
         let bootstrap = toolreg::is_builtin(&tc.name);
+        let builtin_progress = Arc::new(crate::invocation_progress::InvocationProgress::default());
+        let builtin_call_id = builtin_progress.id.clone();
         let started = std::time::Instant::now();
         let mut created_kind = "";
         if bootstrap {
             self.broadcast(Event::ToolCallStarted {
+                invocation_id: Some(builtin_call_id.clone()),
                 session_id: session_id.to_string(),
                 run_id: run_id.to_string(),
                 tool_name: tc.name.clone(),
@@ -7675,6 +7682,7 @@ impl Daemon {
                     cancel_flag,
                     cancel,
                     agent_depth,
+                    builtin_progress.clone(),
                 )
                 .await
             {
@@ -7682,7 +7690,15 @@ impl Daemon {
                 Err(e) => call_failed(format!("error: test_tool failed: {e}")),
             },
             toolreg::RUN_SCRIPT => match self
-                .run_script_impl(session_id, run_id, &args, cfg, cancel, agent_depth)
+                .run_script_impl(
+                    session_id,
+                    run_id,
+                    &args,
+                    cfg,
+                    cancel,
+                    agent_depth,
+                    builtin_progress.clone(),
+                )
                 .await
             {
                 Ok(text) => text,
@@ -7822,6 +7838,7 @@ impl Daemon {
                 st.record_builtin_call(&tc.name, session_id, run_id, ok, kind, elapsed_ms)
             });
             self.broadcast(Event::ToolCallFinished {
+                invocation_id: Some(builtin_call_id),
                 session_id: session_id.to_string(),
                 run_id: run_id.to_string(),
                 tool_name: tc.name.clone(),
@@ -8051,6 +8068,7 @@ impl Daemon {
             session_id: session_id.to_string(),
             run_id: run_id.clone(),
             parent_inv: None,
+            progress: Arc::new(Default::default()),
             activity: None,
             depth: 1,
             agent_depth: 0,
@@ -8238,6 +8256,7 @@ impl Daemon {
         self.sweep_retained_before_action();
         entry.notify.notify_waiters();
         self.broadcast(Event::InvocationCompleted {
+            invocation_id: Some(entry.progress.id.clone()),
             session_id: entry.session_id.clone(),
             handle: handle.to_string(),
             tool_name: entry.tool_name.clone(),
@@ -8317,6 +8336,7 @@ impl Daemon {
     ) -> String {
         let handle = uuid::Uuid::new_v4().to_string();
         let entry = Arc::new(PendingEntry {
+            progress: Arc::new(Default::default()),
             _pipeline: StdMutex::new(self.pipeline_policies.locked().lookup(run_id)),
             routing_task: crate::routing_task_observation::current(),
             taint_scope: self.taint_scope(session_id, run_id),
@@ -8380,6 +8400,7 @@ impl Daemon {
                             cfg2.clone(),
                             true,
                             agent_depth,
+                            Some(entry2.progress.clone()),
                         )
                         .await;
                     let (ok, text) = match res {
@@ -8410,6 +8431,7 @@ impl Daemon {
             None => {
                 let _ = self.with_store(|st| st.add_pending_handle(&handle, session_id, name));
                 self.broadcast(Event::InvocationPending {
+                    invocation_id: Some(entry.progress.id.clone()),
                     session_id: session_id.to_string(),
                     run_id: run_id.to_string(),
                     handle: handle.clone(),
@@ -12016,6 +12038,7 @@ impl Daemon {
     /// `run_script` (SPEC §7.12): a Capability-free script that calls the
     /// registry Tools in its `uses` list, approved before it runs. Its
     /// nested Invocations link to it through `parent_id` "script:<id>".
+    #[allow(clippy::too_many_arguments)]
     async fn run_script_impl(
         self: &Arc<Self>,
         session_id: &str,
@@ -12024,6 +12047,7 @@ impl Daemon {
         cfg: &Config,
         cancel: &CancellationToken,
         agent_depth: usize,
+        progress: Arc<crate::invocation_progress::InvocationProgress>,
     ) -> Result<String> {
         let source = args["code"].as_str().context("code is required")?;
         if source.len() > cfg.scripts.max_source_kb * 1024 {
@@ -12110,6 +12134,7 @@ impl Daemon {
             session_id: session_id.to_string(),
             run_id: run_id.to_string(),
             parent_inv: Some(format!("script:{script_id}")),
+            progress,
             activity: None,
             depth: 1,
             agent_depth,
@@ -12240,6 +12265,7 @@ impl Daemon {
         cancel_flag: &Arc<AtomicBool>,
         cancel: &CancellationToken,
         agent_depth: usize,
+        progress: Arc<crate::invocation_progress::InvocationProgress>,
     ) -> Result<String> {
         let input = args.get("input").cloned().unwrap_or(json!({}));
         let existing = match args["name"].as_str() {
@@ -12350,6 +12376,7 @@ impl Daemon {
             session_id: session_id.to_string(),
             run_id: run_id.to_string(),
             parent_inv: None,
+            progress,
             activity: None,
             depth: 1,
             agent_depth,
@@ -13372,6 +13399,7 @@ impl Daemon {
             cfg,
             preapproved,
             0,
+            None,
         )
     }
 
@@ -13392,7 +13420,9 @@ impl Daemon {
         cfg: Config,
         preapproved: bool,
         agent_depth: usize,
+        progress: Option<Arc<crate::invocation_progress::InvocationProgress>>,
     ) -> ExecFuture {
+        let progress = progress.unwrap_or_else(|| Arc::new(Default::default()));
         Box::pin(async move {
             if depth > cfg.tools.max_tool_depth {
                 return Err(format!(
@@ -13496,20 +13526,13 @@ impl Daemon {
                 );
                 return Err(self.denied_text(&name));
             }
-            self.broadcast(Event::ToolCallStarted {
-                session_id: session_id.clone(),
-                run_id: run_id.clone(),
-                tool_name: name.clone(),
-                version: ver.version,
-                arguments: input_text.clone(),
-                depth,
-            });
             if let Some(server) = caps.mcp.first() {
                 self.record_data_origin(&session_id, &run_id, &name, "mcp", server)
                     .map_err(|e| e.to_string())?;
             }
             let inv_id = match self.with_store(|st| {
-                st.start_invocation(
+                st.start_invocation_with_id(
+                    &progress.id,
                     &info.id,
                     ver.version,
                     Some(&session_id),
@@ -13521,6 +13544,15 @@ impl Daemon {
                 Ok(id) => id,
                 Err(e) => return Err(e.to_string()),
             };
+            self.broadcast(Event::ToolCallStarted {
+                invocation_id: Some(inv_id.clone()),
+                session_id: session_id.clone(),
+                run_id: run_id.clone(),
+                tool_name: name.clone(),
+                version: ver.version,
+                arguments: input_text.clone(),
+                depth,
+            });
             if caps.process.is_some() || !caps.mcp.is_empty() {
                 self.mark_run_untracked_writes(&session_id, &run_id);
             }
@@ -13557,6 +13589,7 @@ impl Daemon {
                 let outcome = outcome.map_err(|(_, e)| e);
                 self.finish_inv(&inv_id, &info, status, tag, &out, &err, elapsed, &cfg);
                 self.broadcast(Event::ToolCallFinished {
+                    invocation_id: Some(inv_id.clone()),
                     session_id: session_id.clone(),
                     run_id: run_id.clone(),
                     tool_name: name.clone(),
@@ -13577,6 +13610,7 @@ impl Daemon {
                 session_id: session_id.clone(),
                 run_id: run_id.clone(),
                 parent_inv: Some(inv_id.clone()),
+                progress: progress.clone(),
                 activity: activity.clone(),
                 depth: depth + 1,
                 agent_depth,
@@ -13606,8 +13640,8 @@ impl Daemon {
                 tokio::task::spawn_blocking(move || formless_runtime::execute(&req, ops_dyn)).await;
             let elapsed = dur(&started);
             let finish = |ok: bool, this: &Daemon| {
-                this.progress_sent.locked().remove(&inv_id);
                 this.broadcast(Event::ToolCallFinished {
+                    invocation_id: Some(inv_id.clone()),
                     session_id: session_id.clone(),
                     run_id: run_id.clone(),
                     tool_name: name.clone(),
@@ -14739,6 +14773,12 @@ impl Daemon {
                 .config()
                 .map(|c| c.daemon.idle_grace_secs)
                 .unwrap_or(60);
+            if let Ok(cfg) = self.config() {
+                self.scan_invocation_stalls(
+                    epoch_ms(),
+                    cfg.daemon.stall_warning_secs.saturating_mul(1000),
+                );
+            }
             if grace == u64::MAX {
                 continue; // idle-close disabled (used by explicit foreground serve in tests)
             }
@@ -14748,39 +14788,6 @@ impl Daemon {
                 .unwrap()
                 .values()
                 .any(|e| e.result.locked().is_none());
-            // Stall warnings (SPEC §6.1): advisory only, never auto-kill.
-            if let Ok(cfg) = self.config() {
-                let stall_ms = cfg.daemon.stall_warning_secs.saturating_mul(1000);
-                let now = epoch_ms();
-                let entries: Vec<(String, Arc<PendingEntry>)> = self
-                    .pending
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .map(|(h, e)| (h.clone(), e.clone()))
-                    .collect();
-                for (handle, e) in entries {
-                    if e.result.locked().is_some() {
-                        continue;
-                    }
-                    let silent_ms = now.saturating_sub(e.activity.load(Ordering::SeqCst));
-                    if silent_ms >= stall_ms {
-                        if !e.stalled_noted.swap(true, Ordering::SeqCst) {
-                            self.broadcast(Event::InvocationStalled {
-                                session_id: e.session_id.clone(),
-                                handle,
-                                tool_name: e.tool_name.clone(),
-                                silent_secs: silent_ms / 1000,
-                            });
-                        }
-                    } else if e.stalled_noted.swap(false, Ordering::SeqCst) {
-                        self.broadcast(Event::InvocationActivity {
-                            session_id: e.session_id.clone(),
-                            handle,
-                        });
-                    }
-                }
-            }
             let jobs_waiting = self.config().is_ok_and(|c| c.daemon.keep_alive_for_jobs)
                 && self.with_store(|st| st.has_active_jobs()).unwrap_or(false);
             // `daemon serve --stay` (the login service) never idles out.
@@ -15536,6 +15543,7 @@ struct NestedOps {
     session_id: String,
     run_id: String,
     parent_inv: Option<String>,
+    progress: Arc<crate::invocation_progress::InvocationProgress>,
     activity: Option<Arc<std::sync::atomic::AtomicU64>>,
     depth: usize,
     /// Sub-agent nesting of the Run this Tool serves (0 = the main agent).
@@ -15642,39 +15650,25 @@ impl HostOps for NestedOps {
     }
 
     fn progress(&self, fraction: Option<f64>, label: &str) {
-        // At most 5 updates a second per Invocation, unless the label
-        // changes or the work is done.
-        let key = self.parent_inv.clone().unwrap_or_default();
-        {
-            let mut sent = self.daemon.progress_sent.locked();
-            let now = std::time::Instant::now();
-            if let Some((at, last)) = sent.get(&key) {
-                let soon = now.duration_since(*at) < std::time::Duration::from_millis(200);
-                if soon && last == label && fraction != Some(1.0) {
-                    return;
-                }
+        let update = self
+            .progress
+            .report(fraction, label, std::time::Instant::now());
+        if update.advanced {
+            if let Some(activity) = &self.activity {
+                activity.store(epoch_ms(), Ordering::SeqCst);
             }
-            sent.insert(key, (now, label.to_string()));
         }
-        let tool_name = self
-            .kv_scope
-            .strip_prefix("tool:")
-            .and_then(|id| {
-                self.daemon
-                    .with_reader(|st| st.get_tool_current(id))
-                    .ok()
-                    .flatten()
-            })
-            .map(|(t, _)| t.name)
-            .unwrap_or_default();
-        self.daemon.broadcast(Event::ToolProgress {
-            session_id: self.session_id.clone(),
-            run_id: self.run_id.clone(),
-            tool_name,
-            depth: self.depth.saturating_sub(1),
-            fraction,
-            label: label.to_string(),
-        });
+        if let Some(value) = update.emit {
+            self.daemon.broadcast(Event::ToolProgress {
+                invocation_id: Some(self.progress.id.clone()),
+                session_id: self.session_id.clone(),
+                run_id: self.run_id.clone(),
+                tool_name: self.tool_name.clone(),
+                depth: self.depth.saturating_sub(1),
+                fraction: value.fraction,
+                label: value.label,
+            });
+        }
     }
     fn file_changing(&self, path: &std::path::Path) {
         self.daemon
@@ -16007,6 +16001,7 @@ impl HostOps for NestedOps {
                         cfg,
                         preapproved,
                         agent_depth,
+                        None,
                     )
                     .await
                     .map(|(v, _inv)| v)
@@ -16898,6 +16893,7 @@ mod backpressure_tests {
                 delta: "reasoning".into(),
             },
             Event::ToolProgress {
+                invocation_id: None,
                 session_id: "s".into(),
                 run_id: "r".into(),
                 tool_name: "tool".into(),
@@ -16911,6 +16907,7 @@ mod backpressure_tests {
                 usage: UsageInfo::default(),
             },
             Event::InvocationActivity {
+                invocation_id: None,
                 session_id: "s".into(),
                 handle: "invocation".into(),
             },
@@ -18111,6 +18108,9 @@ mod model_test_daemon_tests;
 
 #[path = "review_daemon.rs"]
 mod review_daemon;
+
+#[path = "progress_daemon.rs"]
+mod progress_daemon;
 
 #[path = "run_files_daemon.rs"]
 mod run_files_daemon;

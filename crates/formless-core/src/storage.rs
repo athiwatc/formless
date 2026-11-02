@@ -4786,6 +4786,31 @@ impl Store {
         parent_id: Option<&str>,
         input: &str,
     ) -> Result<String> {
+        self.start_invocation_with_id(
+            &uuid::Uuid::new_v4().to_string(),
+            tool_id,
+            version,
+            session_id,
+            run_id,
+            parent_id,
+            input,
+        )
+    }
+
+    /// The daemon allocates identity before a threshold-zero pending handoff, so
+    /// lifecycle events and the eventual running row use the same unique ID.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn start_invocation_with_id(
+        &self,
+        id: &str,
+        tool_id: &str,
+        version: i64,
+        session_id: Option<&str>,
+        run_id: Option<&str>,
+        parent_id: Option<&str>,
+        input: &str,
+    ) -> Result<String> {
+        uuid::Uuid::parse_str(id)?;
         let tx = self.conn.unchecked_transaction()?;
         if let Some(run) = run_id {
             let _ = tx.execute(
@@ -4793,13 +4818,12 @@ impl Store {
                 params![tool_id, run],
             );
         }
-        let id = uuid::Uuid::new_v4().to_string();
         tx.execute(
             "INSERT INTO invocations(id,tool_id,version,session_id,run_id,parent_id,status,tag,input,output,error,duration_ms,created_at) VALUES(?1,?2,?3,?4,?5,?6,'running','',?7,'','',0,?8)",
             params![id, tool_id, version, session_id, run_id, parent_id, input, now()],
         )?;
         tx.commit()?;
-        Ok(id)
+        Ok(id.to_owned())
     }
 
     #[allow(clippy::too_many_arguments)]

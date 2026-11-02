@@ -495,6 +495,7 @@ async fn other_session_completed_awaiting_delivery_allows_file_changes_without_c
         .unwrap();
     let handle = uuid::Uuid::new_v4().to_string();
     let pending = Arc::new(PendingEntry {
+        progress: Arc::new(Default::default()),
         _pipeline: StdMutex::new(None),
         routing_task: None,
         taint_scope: s.daemon.taint_scope(&other, &run),
@@ -647,6 +648,7 @@ async fn unresolved_pending_memory_blocks_but_completed_awaiting_delivery_is_pre
     let initial = inspect(&s).await;
     let handle = uuid::Uuid::new_v4().to_string();
     let pending = Arc::new(PendingEntry {
+        progress: Arc::new(Default::default()),
         _pipeline: StdMutex::new(None),
         routing_task: None,
         taint_scope: s.daemon.taint_scope(&s.session, &s.run),
@@ -1475,6 +1477,7 @@ async fn windows_last_background_completion_releases_completed_run_capture_witho
     s.daemon.snapshot_before_change(&s.session, &s.run, &s.path);
     let handle = uuid::Uuid::new_v4().to_string();
     let pending = Arc::new(PendingEntry {
+        progress: Arc::new(Default::default()),
         _pipeline: StdMutex::new(None),
         routing_task: None,
         taint_scope: s.daemon.taint_scope(&s.session, &s.run),

@@ -705,8 +705,12 @@
 
   // Running Invocations across Sessions (SPEC §6.3): cancel or abandon.
   async function refreshRunning() {
-    const list = (await request({ type: "list_invocations" }).catch(() => null)) || [];
+    const revision = S.invocationRefresh = (S.invocationRefresh || 0) + 1;
+    const connection = [S.ws, S.conn, S.channel];
+    const list = await request({ type: "list_invocations" }).catch(() => null);
+    if (!list || revision !== S.invocationRefresh || connection[0] !== S.ws || connection[1] !== S.conn || connection[2] !== S.channel) return;
     S.invocations = list;
+    reconcileInvocationProgress(list);
     const box = $("running");
     box.classList.toggle("hidden", !list.length);
     box.replaceChildren(...(list.length ? [h("h4", null, "Running tools")] : []), ...list.map((i) => {
@@ -714,7 +718,7 @@
       return h("div", { class: "running-item" + (i.stalled ? " stalled" : "") },
         h("button", { class: "linklike", type: "button", title: "Open its session", onclick: () => openSession(i.session_id) },
           h("strong", null, i.tool_name), " · " + Math.round(i.elapsed_ms / 1000) + "s" + (s ? " · " + s.name : "") +
-          (i.stalled ? " · silent " + Math.round(i.silent_ms / 1000) + "s" : "") + (i.abandoned ? " · abandoned" : "")),
+          (i.stalled ? " · silent " + Math.round(i.silent_ms / 1000) + "s" : "") + progressDiagnostic(i) + (i.abandoned ? " · abandoned" : "")),
         h("button", { class: "btn ghost small", type: "button", title: "Cancel (user-cancelled)", onclick: () => act({ type: "cancel_invocation", handle: i.handle }, "Cancelled " + i.tool_name).then(refreshRunning) }, "Cancel"),
         i.abandoned ? null : h("button", { class: "btn ghost small", type: "button", title: "Stop waiting for it", onclick: () => act({ type: "abandon_invocation", handle: i.handle }, "Abandoned " + i.tool_name).then(refreshRunning) }, "Abandon"));
     }));
@@ -2062,8 +2066,32 @@
       h("p", { class: "muted" }, "Enter sends · /help commands · /model switch model · @ reference a file"));
   }
 
-  function runningTool(name) {
-    return [...S.liveTools].reverse().find((x) => x.name === name && x.status === "running");
+  function runningTool(name, invocationId = null, depth = null, handle = null) {
+    const calls = S.liveTools.filter(x => x.status === "running" && !x.subagent);
+    const knownHandle = handle != null && calls.some(x => x.handle === handle);
+    const candidates = calls.filter(x => invocationId != null ? x.invocationId === invocationId :
+      (name == null || x.name === name) && (depth == null || (x.depth || 0) === depth) &&
+      (handle != null ? knownHandle ? x.handle === handle : name != null && !x.handle : name != null));
+    return candidates.length === 1 ? candidates[0] : null;
+  }
+  function reconcileInvocationProgress(list) {
+    for (const i of list) {
+      if (i.session_id !== S.current) continue;
+      if (i.invocation_id != null && S.liveTools.some(t => t.invocationId === i.invocation_id && t.status !== "running")) continue;
+      let t = runningTool(i.tool_name, i.invocation_id, null, i.handle);
+      if (!t) {
+        if (S.liveTools.filter(t => t.metadataPending).length >= 128) continue;
+        t = { metadataPending: true, invocationId: i.invocation_id ?? null, name: i.tool_name, status: "running", depth: 0, started: Date.now() - i.elapsed_ms };
+        S.liveTools.push(t);
+      }
+      t.handle = i.handle;
+      t.stalledSecs = i.stalled ? Math.floor(i.silent_ms / 1000) : null;
+      if (i.last_fraction != null || i.last_label != null) t.progress = { fraction: i.last_fraction, label: i.last_label || "" };
+    }
+  }
+  function progressDiagnostic(ev) {
+    if (ev.last_fraction == null && ev.last_label == null) return "";
+    return " · last progress " + (ev.last_fraction == null ? "unknown" : Math.round(ev.last_fraction * 100) + "%") + (ev.last_label ? " (" + ev.last_label + ")" : "");
   }
   function cancelTool(handle) {
     if (handle) act({ type: "cancel_invocation", handle }, "Cancelling the tool");
@@ -4087,7 +4115,7 @@
     S.activity = null;
     S.streaming = "";
     S.thinking = "";
-    S.liveTools = [];
+    S.liveTools = []; S.liveRun = null;
     renderApproval();
   }
   function applySessionLiveState(id, result, liveEvents) {
@@ -4166,7 +4194,7 @@
     prefs.set("session", id);
     S.streaming = "";
     S.thinking = "";
-    S.liveTools = [];
+    S.liveTools = []; S.liveRun = null;
     S.editMessageId = null;
     S.queued = []; renderQueue();
     S.plan = []; renderPlan();
@@ -4993,7 +5021,7 @@
       case "run_started":
         S.running.add(ev.session_id);
         if (here) { S.unfinished = null; renderRunBanner(); S.runTools = null; renderRunTools(); S.rated = null; S.recap = null; }
-        if (here) { S.streaming = ""; S.thinking = ""; S.liveTools = []; setActivity("waiting for model"); }
+        if (here) { S.streaming = ""; S.thinking = ""; S.liveTools = (S.liveTools || []).filter(t => t.status === "running" && t.handle); S.liveRun = { id: ev.run_id, ended: false }; setActivity("waiting for model"); }
         break;
       case "run_recap":
         if (here) { S.recap = ev.recap; renderHistory(); }
@@ -5059,6 +5087,7 @@
         break;
       case "run_finished":
       case "run_paused":
+        if (here && S.liveRun && S.liveRun.id !== ev.run_id) break;
         S.running.delete(ev.session_id);
         if (here) {
           renderPlan();
@@ -5072,7 +5101,7 @@
         if (here) {
           S.streaming = "";
           S.thinking = "";
-          S.liveTools = [];
+          S.liveTools = (S.liveTools || []).filter(t => t.status === "running" && t.handle); S.liveRun = { id: ev.run_id, ended: true };
           setActivity(null);
           if (ev.type === "run_paused") note("run paused: " + ((ev.explained && ev.explained.message) || ev.error), true);
           else if (ev.status !== "completed") note("run " + ev.status, ev.status !== "interrupted");
@@ -5080,6 +5109,7 @@
         }
         break;
       case "tool_call_started":
+        if (here && S.liveRun && (S.liveRun.id !== ev.run_id || S.liveRun.ended) && !(ev.invocation_id != null && runningTool(null, ev.invocation_id))) break;
         if (here && ["create_tool", "create_module"].includes(ev.tool_name)) {
           try {
             const args = JSON.parse(ev.arguments);
@@ -5091,20 +5121,23 @@
           } catch (_) {}
         }
         if (here) {
-          S.liveTools.push({ name: ev.tool_name, version: ev.version, arguments: ev.arguments, status: "running", started: Date.now(), depth: ev.depth || 0 });
+          const existing = ev.invocation_id != null && S.liveTools.find(t => t.invocationId === ev.invocation_id);
+          if (existing) {
+            if (existing.status === "running" && existing.metadataPending) Object.assign(existing, { metadataPending: false, name: ev.tool_name, version: ev.version, arguments: ev.arguments, depth: ev.depth || 0 });
+          } else S.liveTools.push({ metadataPending: false, invocationId: ev.invocation_id ?? null, name: ev.tool_name, version: ev.version, arguments: ev.arguments, status: "running", started: Date.now(), depth: ev.depth || 0 });
           setActivity("running " + ev.tool_name);
         }
         break;
       case "tool_progress":
-        if (here) {
-          const t = [...S.liveTools].reverse().find((x) => x.name === ev.tool_name && x.status === "running" && (x.depth || 0) === (ev.depth || 0));
+        if (here && (!S.liveRun || S.liveRun.id === ev.run_id && !S.liveRun.ended || ev.invocation_id != null && runningTool(null, ev.invocation_id))) {
+          const t = runningTool(ev.tool_name, ev.invocation_id, ev.depth || 0);
           if (t) { t.progress = { fraction: ev.fraction, label: ev.label }; renderLive(); }
         }
         break;
       case "tool_call_finished":
         if (S.invocations && S.invocations.length) refreshRunning();
         if (here) {
-          const t = S.liveTools.find((x) => x.name === ev.tool_name && x.status === "running");
+          const t = runningTool(ev.tool_name, ev.invocation_id);
           if (t) { t.status = ev.ok ? "ok" : "failed"; t.elapsedMs = ev.elapsed_ms; }
           if (!ev.ok) note(ev.tool_name + " failed after " + ev.elapsed_ms + "ms", true);
           setActivity(isRunning() ? "waiting for model" : null);
@@ -5231,18 +5264,23 @@
         break;
       case "invocation_pending": {
         refreshRunning();
-        const t = here && runningTool(ev.tool_name);
+        if (here && S.liveRun && (S.liveRun.id !== ev.run_id || S.liveRun.ended) && !(ev.invocation_id != null && runningTool(null, ev.invocation_id))) break;
+        if (here && typeof ev.handle === "string" && ev.handle && typeof ev.invocation_id === "string" && ev.invocation_id && !S.liveTools.some(t => t.invocationId === ev.invocation_id) && S.liveTools.filter(t => t.metadataPending).length < 128) {
+          S.liveTools.push({ metadataPending: true, invocationId: ev.invocation_id, name: ev.tool_name, version: 0, arguments: "", depth: 0, status: "running", started: Date.now(), handle: ev.handle });
+        }
+        const t = here && runningTool(ev.tool_name, ev.invocation_id, null, ev.handle);
         if (t) t.handle = ev.handle;
         note(ev.tool_name + " continues in the background (" + ev.handle + ")");
         break;
       }
       case "invocation_stalled": {
         refreshRunning();
-        const t = here && runningTool(ev.tool_name);
+        const t = here && runningTool(ev.tool_name, ev.invocation_id, null, ev.handle);
         if (t) {
           t.handle = ev.handle;
           t.stalledSecs = ev.silent_secs;
-          note(ev.tool_name + ": no activity for " + ev.silent_secs + "s; /cancel stops just this tool", true);
+          if (ev.last_fraction != null || ev.last_label != null) t.progress = { fraction: ev.last_fraction, label: ev.last_label || "" };
+          note(ev.tool_name + ": no advancing progress or activity for " + ev.silent_secs + "s" + progressDiagnostic(ev) + "; /cancel stops just this tool", true);
           renderLive();
         }
         break;
@@ -5280,13 +5318,18 @@
           renderLive();
         }
         break;
-      case "invocation_activity":
-        for (const t of S.liveTools) if (t.handle === ev.handle) t.stalledSecs = null;
+      case "invocation_activity": {
+        const t = here && runningTool(null, ev.invocation_id, null, ev.handle);
+        if (t) t.stalledSecs = null;
         if (here) renderLive();
         break;
-      case "invocation_completed":
+      }
+      case "invocation_completed": {
+        const t = here && runningTool(ev.tool_name, ev.invocation_id, null, ev.handle);
+        if (t) { t.status = ev.ok ? "ok" : "failed"; t.stalledSecs = null; }
         note(ev.tool_name + " background invocation " + (ev.ok ? "finished" : "failed"), !ev.ok);
         break;
+      }
       case "optimiser_activity":
         note("optimiser · " + ev.tool_name + ": " + ev.text);
         break;

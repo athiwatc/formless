@@ -543,7 +543,7 @@ globalThis.requireModule = (name) => {
 globalThis.modules = { load: globalThis.requireModule, list: () => __call("module_list", {}) };
 globalThis.emit = (chunk) => __call("emit", { chunk: String(chunk) });
 // Progress for long work: a fraction 0..1 (or null when unknown) and a
-// short label; shown on the running call and counted as activity.
+// short label; the daemon decides whether it represents advancing work.
 globalThis.progress = (fraction, label) => __call("progress", {
   fraction: typeof fraction === "number" && isFinite(fraction) ? Math.min(1, Math.max(0, fraction)) : null,
   label: label == null ? "" : String(label).slice(0, 120),
@@ -3152,7 +3152,7 @@ pub fn execute(req: &ExecRequest, ops: Arc<dyn HostOps>) -> Result<ExecOutcome, 
         let host = Function::new(
             ctx.clone(),
             move |op: String, args_json: String| -> String {
-                if let Some(a) = &activity {
+                if let Some(a) = activity.as_ref().filter(|_| op != "progress") {
                     let ms = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_millis() as u64)
@@ -3358,6 +3358,27 @@ mod tests {
                 (Some(1.0), String::new()),
                 (None, String::new())
             ]
+        );
+    }
+
+    #[test]
+    fn progress_does_not_refresh_the_generic_activity_heartbeat() {
+        let ops = Arc::new(ProgressOps(Mutex::new(Vec::new())));
+        let heartbeat = Arc::new(AtomicU64::new(1));
+        let mut req = live("function run(){ for(let i=0;i<50;i++){ progress(0.5,'working'); __call('progress',{fraction:0.5,label:'raw'}); } return 1; }");
+        req.activity = Some(heartbeat.clone());
+        execute(&req, ops.clone()).unwrap();
+        assert_eq!(ops.0.locked().len(), 100);
+        assert_eq!(
+            heartbeat.load(Ordering::SeqCst),
+            1,
+            "only the daemon may credit actual progress advancement"
+        );
+        req.code = "function run(){ emit('ordinary work'); return 1; }".into();
+        execute(&req, ops).unwrap();
+        assert!(
+            heartbeat.load(Ordering::SeqCst) > 1,
+            "other host activity keeps its established heartbeat behavior"
         );
     }
 

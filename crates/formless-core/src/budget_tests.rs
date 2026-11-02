@@ -527,6 +527,7 @@ async fn nested_and_agent_fallback_usage_and_parent_cost_use_serving_model() {
                 cfg.clone(),
                 true,
                 0,
+                None,
             )
             .await
             .unwrap();

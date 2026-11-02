@@ -892,6 +892,12 @@ pub struct BuiltinStatInfo {
 /// A running Invocation, for the Invocations panel (SPEC §6.3).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct InvocationInfo {
+    #[serde(default)]
+    pub invocation_id: Option<String>,
+    #[serde(default)]
+    pub last_fraction: Option<f64>,
+    #[serde(default)]
+    pub last_label: Option<String>,
     pub handle: String,
     pub tool_name: String,
     pub session_id: String,
@@ -2908,6 +2914,8 @@ pub enum Event {
         session_id: String,
     },
     ToolCallStarted {
+        #[serde(default)]
+        invocation_id: Option<String>,
         session_id: String,
         run_id: String,
         tool_name: String,
@@ -2923,6 +2931,8 @@ pub enum Event {
     /// A running Tool reported `progress(fraction, label)`: `fraction`
     /// 0..1 or None when unknown; `depth` as in ToolCallStarted.
     ToolProgress {
+        #[serde(default)]
+        invocation_id: Option<String>,
         session_id: String,
         run_id: String,
         tool_name: String,
@@ -2932,6 +2942,8 @@ pub enum Event {
         label: String,
     },
     ToolCallFinished {
+        #[serde(default)]
+        invocation_id: Option<String>,
         session_id: String,
         run_id: String,
         tool_name: String,
@@ -3031,12 +3043,16 @@ pub enum Event {
         change: RegistryChange,
     },
     InvocationPending {
+        #[serde(default)]
+        invocation_id: Option<String>,
         session_id: String,
         run_id: String,
         handle: String,
         tool_name: String,
     },
     InvocationCompleted {
+        #[serde(default)]
+        invocation_id: Option<String>,
         session_id: String,
         handle: String,
         tool_name: String,
@@ -3045,6 +3061,12 @@ pub enum Event {
     /// A running Invocation has shown no activity for `silent_secs`
     /// (SPEC §6.1: advisory, never auto-killed).
     InvocationStalled {
+        #[serde(default)]
+        last_fraction: Option<f64>,
+        #[serde(default)]
+        last_label: Option<String>,
+        #[serde(default)]
+        invocation_id: Option<String>,
         session_id: String,
         handle: String,
         tool_name: String,
@@ -3091,6 +3113,8 @@ pub enum Event {
     JobsChanged,
     /// A stalled Invocation is active again (clears the stall flag).
     InvocationActivity {
+        #[serde(default)]
+        invocation_id: Option<String>,
         session_id: String,
         handle: String,
     },
@@ -3291,6 +3315,43 @@ pub fn artifact_refs(text: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_invocation_identity_and_progress_diagnostics_default_and_round_trip() {
+        for kind in [
+            "tool_call_started",
+            "tool_progress",
+            "tool_call_finished",
+            "invocation_pending",
+            "invocation_completed",
+            "invocation_stalled",
+            "invocation_activity",
+        ] {
+            let raw = serde_json::json!({"type":kind,"session_id":"s","run_id":"r","tool_name":"same","version":1,"fraction":0.5,"label":"work","ok":true,"handle":"h","silent_secs":5});
+            let event: super::Event = serde_json::from_value(raw).unwrap();
+            let mut encoded = serde_json::to_value(event).unwrap();
+            assert!(encoded["invocation_id"].is_null());
+            encoded["invocation_id"] = serde_json::json!("inv-1");
+            if kind == "invocation_stalled" {
+                encoded["last_fraction"] = serde_json::json!(0.5);
+                encoded["last_label"] = serde_json::json!("work");
+            }
+            let decoded: super::Event = serde_json::from_value(encoded.clone()).unwrap();
+            assert_eq!(serde_json::to_value(decoded).unwrap(), encoded);
+        }
+        let mut info: super::InvocationInfo = serde_json::from_value(serde_json::json!({"handle":"h","tool_name":"same","session_id":"s","elapsed_ms":1,"silent_ms":2,"stalled":false,"abandoned":false})).unwrap();
+        assert_eq!(info.invocation_id, None);
+        assert_eq!(info.last_fraction, None);
+        assert_eq!(info.last_label, None);
+        info.invocation_id = Some("inv-1".into());
+        info.last_fraction = Some(0.5);
+        info.last_label = Some("work".into());
+        assert_eq!(
+            serde_json::from_value::<super::InvocationInfo>(serde_json::to_value(&info).unwrap())
+                .unwrap(),
+            info
+        );
+    }
+
     #[test]
     fn legacy_run_file_coverage_defaults_and_new_fields_round_trip() {
         let raw = serde_json::json!({"type":"run_files_changed","session_id":"s","run_id":"r","files":[{"path":"x","status":"created","revertible":true}]});
