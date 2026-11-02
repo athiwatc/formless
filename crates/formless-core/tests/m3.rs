@@ -150,11 +150,56 @@ fn trigger_window_and_replay_set_sampling() {
     // Window of last 10 is all successes (recorded last).
     let (sample, rate) = store.windowed_success(&info.id, 10).unwrap();
     assert_eq!((sample, rate), (10, Some(1.0)));
-    // Replay set: all failures + equal-sized success sample.
+    // Repeated invocations retain their window weight but share replay context.
     let set = store.replay_set(&info.id).unwrap();
-    assert_eq!(set.len(), 24);
-    assert_eq!(set.iter().filter(|r| r.recorded_success).count(), 12);
-    assert_eq!(set.iter().filter(|r| !r.recorded_success).count(), 12);
+    assert_eq!(set.len(), 2);
+    assert_eq!(set.iter().filter(|r| r.recorded_success).count(), 1);
+    assert_eq!(set.iter().filter(|r| !r.recorded_success).count(), 1);
+    assert!(set.iter().any(|r| {
+        let input: Value = serde_json::from_str(&r.input).unwrap();
+        input.as_object().is_some_and(|object| object.len() == 1)
+            && input["x"].as_f64() == Some(-1.0)
+            && !r.recorded_success
+            && r.error == "neg"
+    }));
+    assert!(set.iter().any(|r| {
+        let input: Value = serde_json::from_str(&r.input).unwrap();
+        input.as_object().is_some_and(|object| object.len() == 1)
+            && input["x"].as_f64() == Some(1.0)
+            && r.recorded_success
+    }));
+
+    // Freeze disjoint generation/holdout evidence without inflating sample size.
+    let snapshot = store.create_replay_snapshot(&info.id, 1, 100, 50).unwrap();
+    assert_eq!(snapshot.source_count, 24);
+    assert_eq!(snapshot.excluded_count, 0);
+    assert_eq!(snapshot.generation.len(), 1);
+    assert_eq!(snapshot.holdout.len(), 1);
+    assert_ne!(snapshot.generation[0].input, snapshot.holdout[0].input);
+    for item in snapshot.generation.iter().chain(&snapshot.holdout) {
+        assert!(set.iter().any(|context| {
+            context.input == item.input && context.recorded_success == item.recorded_success
+        }));
+    }
+    let groups = snapshot.provenance["groups"].as_array().unwrap();
+    assert_eq!(groups.len(), 2);
+    assert!(groups
+        .iter()
+        .all(|group| group["source_invocations"].as_array().unwrap().len() == 12));
+    assert_eq!(
+        groups
+            .iter()
+            .filter(|group| group["latest_recorded_success"] == true)
+            .count(),
+        1
+    );
+    assert_eq!(
+        groups
+            .iter()
+            .filter(|group| group["latest_recorded_success"] == false)
+            .count(),
+        1
+    );
 }
 
 // --- Daemon optimiser end-to-end with a scripted candidate provider. ---
@@ -187,7 +232,10 @@ fn seed_broken(paths: &Paths, name: &str, workdir: &str) -> String {
             "agent",
         )
         .unwrap();
-    for _ in 0..12 {
+    // Sixty distinct inputs give the default 50% split 30 held-out cases.
+    // With only 20 successes in the whole pool, every split has at least ten
+    // negative-input wins for Math.abs, independent of the Tool UUID hash.
+    for x in -40..0 {
         store
             .record_invocation(
                 &info.id,
@@ -197,7 +245,7 @@ fn seed_broken(paths: &Paths, name: &str, workdir: &str) -> String {
                 None,
                 "failure",
                 "",
-                r#"{"x":-3}"#,
+                &json!({"x": x}).to_string(),
                 "",
                 "negative",
                 1,
@@ -205,7 +253,7 @@ fn seed_broken(paths: &Paths, name: &str, workdir: &str) -> String {
             )
             .unwrap();
     }
-    for _ in 0..12 {
+    for x in 0..20 {
         store
             .record_invocation(
                 &info.id,
@@ -215,8 +263,8 @@ fn seed_broken(paths: &Paths, name: &str, workdir: &str) -> String {
                 None,
                 "success",
                 "",
-                r#"{"x":4}"#,
-                r#"{"result":4}"#,
+                &json!({"x": x}).to_string(),
+                &json!({"result": x}).to_string(),
                 "",
                 1,
                 200,
@@ -419,7 +467,42 @@ async fn optimiser_promotes_only_on_replay_win_and_rollback_restores() {
     let attempts = store.list_attempts(&tool_id, 10).unwrap();
     assert_eq!(attempts[0].status, "promoted");
     assert_eq!(attempts[0].candidate_score, Some(1.0));
-    assert_eq!(attempts[0].baseline_score, Some(0.5));
+    let snapshot = store
+        .attempt_replay_snapshot(&attempts[0].id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshot.generation.len(), 30);
+    assert_eq!(snapshot.holdout.len(), 30);
+    // BROKEN succeeds exactly on nonnegative inputs. Derive its expected score
+    // from the persisted frozen inputs, independently of replay's score report.
+    let baseline_passes = snapshot
+        .holdout
+        .iter()
+        .filter(|item| {
+            let input: Value = serde_json::from_str(&item.input).unwrap();
+            input["x"].as_f64().unwrap() >= 0.0
+        })
+        .count();
+    let wins = snapshot.holdout.len() - baseline_passes;
+    assert!(wins >= 10, "every split must retain at least ten wins");
+    let expected_baseline = baseline_passes as f64 / snapshot.holdout.len() as f64;
+    assert_eq!(attempts[0].baseline_score, Some(expected_baseline));
+    assert_eq!(attempts[0].replay_total, snapshot.holdout.len() as i64);
+    let detail: Value = serde_json::from_str(&attempts[0].detail).unwrap();
+    let paired = &detail["holdout"]["paired"];
+    assert_eq!(paired["criteria"]["minimum_n"], 20);
+    assert_eq!(paired["criteria"]["alpha"], 0.05);
+    assert_eq!(paired["criteria"]["minimum_improvement"], 0.1);
+    assert_eq!(paired["n"], snapshot.holdout.len());
+    assert!(snapshot.holdout.len() >= 20);
+    assert_eq!(paired["candidate_only"], wins);
+    assert_eq!(paired["baseline_only"], 0);
+    // With no losses, the two-sided exact paired p-value is 2 * (1/2)^wins.
+    let expected_p = 2.0_f64.powi(1 - wins as i32);
+    assert_eq!(paired["p_value"], expected_p);
+    assert!(expected_p <= 0.05);
+    assert!(1.0 - expected_baseline >= 0.1);
+    assert_eq!(paired["eligible_auto"], true);
     assert_eq!(attempts[0].regressions, 0);
     // Candidate wrote a file during replay only -> real fs proof absent.
     assert!(!std::path::Path::new(&format!("{workdir}/replay-proof.txt")).exists());

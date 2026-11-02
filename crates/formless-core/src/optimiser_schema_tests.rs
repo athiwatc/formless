@@ -19,11 +19,11 @@ impl Fixture {
         let daemon = Arc::new(Daemon::new(paths).unwrap());
         let session = daemon.with_store(|st| st.create_session(None)).unwrap().id;
         let (tool, _) = daemon.with_store(|st| st.create_tool_version(
-            "schema_target", "test", r#"{"type":"object","properties":{"legacy":{"type":"string"}},"additionalProperties":false}"#,
+            "schema_target", "test", r#"{"type":"object","properties":{"legacy":{"type":"string"},"new_required":{"type":"string"}},"additionalProperties":false}"#,
             r#"{"type":"object"}"#, "function run(){throw new Error('old implementation');}", &Capabilities::default(), 64, "agent",
         )).unwrap();
         let candidate = CandidateData { code: "function run(){return {}; }".into(), description: "fix validation".into(),
-            input_schema: r#"{"type":"object","properties":{"legacy":{"type":"string"},"new_required":{"type":"string"}},"required":["new_required"],"additionalProperties":false}"#.into(),
+            input_schema: r#"{"type":"object","properties":{"legacy":{"type":["string","number"]},"new_required":{"type":"string"}},"required":["new_required"],"additionalProperties":false}"#.into(),
             output_schema: r#"{"type":"object"}"#.into(), capabilities: vec![], memory_mb: 64 };
         Self {
             daemon,
@@ -52,7 +52,16 @@ impl Fixture {
     }
     fn attempt(&self) -> String {
         self.daemon
-            .with_store(|st| st.create_attempt(&self.tool.id, 1, &self.candidate, 0))
+            .with_store(|st| {
+                let snapshot = st.create_replay_snapshot(&self.tool.id, 1, 200, 50)?;
+                st.create_attempt_with_replay_snapshot(
+                    &self.tool.id,
+                    1,
+                    &self.candidate,
+                    0,
+                    &snapshot.id,
+                )
+            })
             .unwrap()
     }
     fn info(&self) -> (ToolInfo, ToolVersionInfo) {
@@ -72,17 +81,21 @@ impl Fixture {
         tickets.remove(&id).unwrap()
     }
     async fn validation_failure(&self) {
-        let (_, ok) = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            self.daemon.call_tool_direct_outcome(
-                &self.session,
-                "schema_target",
-                json!({"legacy":7}),
-            ),
-        )
-        .await
-        .unwrap();
-        assert!(!ok);
+        // Schema tests exercise the schema gate AFTER a genuinely significant
+        // held-out win; small-sample approval is tested separately by #650.
+        for index in 0..42 {
+            let (_, ok) = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                self.daemon.call_tool_direct_outcome(
+                    &self.session,
+                    "schema_target",
+                    json!({"legacy":index,"new_required":"heldout-compatible"}),
+                ),
+            )
+            .await
+            .unwrap();
+            assert!(!ok);
+        }
         assert!(self
             .daemon
             .with_store(|st| st.replay_set(&self.tool.id))
@@ -138,7 +151,7 @@ async fn real_validation_replay_cannot_hide_breaking_schema_or_auto_promote_live
     assert!(scored["summary"]
         .as_str()
         .unwrap()
-        .contains("candidate 1/1 baseline 0/1"));
+        .contains("candidate 21/21 baseline 0/21"));
     assert!(scored["validation_schema_warning"].is_string());
     let ticket = f.take_ticket();
     assert!(matches!(ticket.gate, PromotionGate::Schema(_)));
@@ -167,14 +180,20 @@ async fn real_validation_replay_cannot_hide_breaking_schema_or_auto_promote_live
     );
 }
 
-#[test]
-fn changed_dependent_set_or_candidate_invalidates_an_earlier_typed_schema_approval() {
+#[tokio::test]
+async fn changed_dependent_set_or_candidate_invalidates_an_earlier_typed_schema_approval() {
     let env = crate::credential_env::EnvGuard::isolated();
     let f = Fixture::new(&env);
     f.dependent("caller_one");
+    f.validation_failure().await;
     let id = f.attempt();
     f.daemon
-        .promote_attempt_with(&f.tool, &id, &f.candidate, &Config::default());
+        .replay_and_maybe_promote(
+            id.clone(),
+            &Config::default(),
+            PromotionApprovals::default(),
+        )
+        .await;
     assert_eq!(f.info().1.version, 1);
     let ticket = f.take_ticket();
     let PromotionGate::Schema(old_context) = ticket.gate else {
@@ -189,6 +208,7 @@ fn changed_dependent_set_or_candidate_invalidates_an_earlier_typed_schema_approv
         PromotionApprovals {
             schema_context: Some(old_context),
             replay_limited: true,
+            ..ticket.approvals
         },
     );
     assert_eq!(f.info().1.version, 1);
@@ -251,7 +271,9 @@ async fn compatible_fix_keeps_live_callers_and_auto_promotion_after_the_existing
     let mut f = Fixture::new(&env);
     f.dependent("compatible_caller");
     f.validation_failure().await;
-    f.candidate.input_schema = f.info().1.input_schema;
+    let mut schema: Value = serde_json::from_str(&f.info().1.input_schema).unwrap();
+    schema["properties"]["legacy"]["type"] = json!(["string", "number"]);
+    f.candidate.input_schema = schema.to_string();
     let id = f.attempt();
     assert_eq!(
         f.detail(&id)["schema_compatibility"]["compatibility"]["verdict"],
@@ -277,11 +299,12 @@ async fn compatible_fix_keeps_live_callers_and_auto_promotion_after_the_existing
     assert!(f.detail(&id)["validation_schema_warning"].is_null());
 }
 
-#[test]
-fn audit_or_attempt_detail_text_never_mints_a_schema_promotion_acknowledgement() {
+#[tokio::test]
+async fn audit_or_attempt_detail_text_never_mints_a_schema_promotion_acknowledgement() {
     let env = crate::credential_env::EnvGuard::isolated();
     let f = Fixture::new(&env);
     f.dependent("caller");
+    f.validation_failure().await;
     let id = f.attempt();
     let report = f
         .daemon
@@ -307,7 +330,12 @@ fn audit_or_attempt_detail_text_never_mints_a_schema_promotion_acknowledgement()
         })
         .unwrap();
     f.daemon
-        .promote_attempt_with(&f.tool, &id, &f.candidate, &Config::default());
+        .replay_and_maybe_promote(
+            id.clone(),
+            &Config::default(),
+            PromotionApprovals::default(),
+        )
+        .await;
     assert_eq!(f.info().1.version, 1);
     assert_eq!(f.daemon.promotions.locked().len(), 1);
 }

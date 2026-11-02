@@ -32,6 +32,10 @@ mod pipeline_storage;
 #[path = "optimiser_attempt_schema.rs"]
 mod optimiser_attempt_schema;
 
+#[path = "storage_replay.rs"]
+mod replay_storage;
+pub use replay_storage::ReplaySnapshot;
+
 pub struct Store {
     conn: Connection,
     /// Bumped whenever stored messages change other than by appending
@@ -44,7 +48,7 @@ pub struct Store {
     description_notifications: std::sync::Mutex<(Vec<formless_protocol::DescriptionReview>, bool)>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct ReplayItem {
     pub input: String,
     pub error: String,
@@ -376,7 +380,7 @@ impl ModelStat {
 const SESSION_SUMMARY: &str = "s.*";
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 64;
+pub const SCHEMA_VERSION: i64 = 65;
 
 /// Add a column, tolerating only "it already exists" (a step that was
 /// partly applied by an older build); every other error is real.
@@ -461,7 +465,7 @@ fn migrate_v39(c: &Connection) -> Result<()> {
 type MigrationStep = fn(&Connection) -> Result<()>;
 
 /// Migration steps by the version they produce.
-const MIGRATIONS: [(i64, MigrationStep); 64] = [
+const MIGRATIONS: [(i64, MigrationStep); 65] = [
     (1, |c| Ok(c.execute_batch(SCHEMA_V1)?)),
     (2, |c| {
         add_column(c, "messages", "meta TEXT")?;
@@ -776,6 +780,7 @@ const MIGRATIONS: [(i64, MigrationStep); 64] = [
     }),
     (63, |c| add_column(c, "run_files", "before_metadata TEXT")),
     (64, |c| Ok(c.execute_batch(routing_storage::SCHEMA)?)),
+    (65, |c| Ok(c.execute_batch(replay_storage::SCHEMA)?)),
 ];
 
 /// Empty schema at a stamped historical version, for offline backup inspection.
@@ -6045,28 +6050,20 @@ impl Store {
         ))
     }
 
+    /// Bounded recent terminal inputs, selected without balancing outcomes.
     pub fn replay_set(&self, tool_id: &str) -> Result<Vec<ReplayItem>> {
-        let query = |status: &str, limit: i64| -> Result<Vec<ReplayItem>> {
-            let mut stmt = self.ps(
-                "SELECT input, error, tag FROM invocations WHERE tool_id=?1 AND status=?2 ORDER BY rowid DESC LIMIT ?3",
-            )?;
-            let rows = stmt
-                .query_map(params![tool_id, status, limit], |r| {
-                    Ok(ReplayItem {
-                        input: r.get::<_, String>(0)?,
-                        error: r.get::<_, String>(1)?,
-                        tag: r.get::<_, String>(2)?,
-                        recorded_success: status == "success",
-                    })
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows)
-        };
-        let failures = query("failure", i64::MAX)?;
-        let successes = query("success", failures.len() as i64)?;
-        let mut out = failures;
-        out.extend(successes);
-        Ok(out)
+        Ok(self
+            .replay_pool(tool_id, 200)?
+            .0
+            .into_iter()
+            .map(|group| {
+                // This legacy view supplies current failure context, not the
+                // frozen holdout's any-known-success regression policy.
+                let mut item = group.item;
+                item.recorded_success = group.latest_success;
+                item
+            })
+            .collect())
     }
 
     pub fn create_attempt(

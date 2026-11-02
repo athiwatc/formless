@@ -29,6 +29,7 @@ pub mod memory;
 mod model_test_cache;
 pub mod namer;
 pub mod optimiser;
+mod optimiser_statistics;
 pub mod path_scope;
 pub mod paths;
 pub mod pipeline;

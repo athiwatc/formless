@@ -2582,8 +2582,44 @@ All thresholds in this section are **configurable** (§13); defaults stated.
 
 ### 8.4 Sandboxed replay (the promotion gate)
 
-- Replay set: **all recorded failed Invocations + an equal-sized sample of
-  recorded successes** (regression guard).
+- Before contacting the candidate-generation provider, freeze a **server-owned
+  replay manifest** from recent terminal success/failure Invocations. Selection
+  is independent of outcome: there is no balancing or oversampling of failures.
+  `optimiser.replay_pool_limit` defaults to 200 unique inputs (2–512). Scan at
+  most four times that many recent records, at most 2,048, with at most 256 KiB
+  per raw input and an 8 MiB manifest. Invalid/oversized inputs and samples
+  outside the bounded pool are counted as exclusions, never silently claimed
+  as tested. The snapshot records source Invocation IDs, canonical input
+  digests, selection bounds and partitions.
+- Group semantically identical JSON inputs before splitting, ignoring object
+  key order and normalizing numbers as JavaScript receives them. Repeated
+  inputs, even with conflicting recorded outcomes, count as **one** statistical
+  sample and can occur in only one partition. A group retains the known-success
+  regression guard if **any** represented source Invocation succeeded, even
+  when its newest representative failed. Frozen provenance separately records
+  that representative's latest outcome: current failure examples, validation
+  warnings and capability-only generation refusal use the latest context, while
+  regression checks retain the any-known-success guard. Rank groups deterministically by
+  a digest of Tool identity, base version and canonical input, independently of
+  recorded outcomes. `optimiser.replay_holdout_percent` defaults to 50 (10–90).
+  Only the generation partition may appear in the candidate prompt; held-out
+  inputs, their errors and source contents are never included. Generation and
+  promotion do not resample the snapshot.
+- Schema v65 stores the immutable manifest and an immutable one-to-one attempt
+  binding separately from candidate JSON and attempt presentation. A binding
+  verifies the exact Tool and base version; arbitrary detail/provenance fields
+  cannot mint proof. Raw held-out inputs stay in the private database; attempt
+  detail exposes hashes/counts/scores, not those inputs. Replay and approval
+  retries, including after restart, use this same frozen evidence. Legacy or
+  missing/unverifiable evidence cannot auto-promote and requires explicit
+  manual approval, with its lack of holdout proof clearly shown.
+- Replay evidence storage is bounded to 64 manifests and 64 MiB total. Evidence
+  older than seven days is reclaimed only when unbound or its attempt is
+  terminal (promoted/rejected/discarded/failed/cancelled); generated/replaying/approval-
+  pending evidence is preserved. Full capacity refuses new generation rather
+  than discarding active evidence. Missing expired proof never becomes a
+  fresh purported holdout. Each database upgrade backs up the old schema and
+  preserves legacy attempts without inventing evidence.
 - Environment: throwaway **copy-on-write overlay sandbox** — filesystem
   writes go to a discarded overlay; **network denied by default**
   (recorded responses served where available); `process` denied; **no real
@@ -2601,10 +2637,18 @@ All thresholds in this section are **configurable** (§13); defaults stated.
 
 ### 8.5 Promotion
 
-- **Bar:** Candidate replay success ≥ **10 points** above the current
-  version's replay score on the full replay set, **and zero regressions** on
-  previously-successful replays. Otherwise the Candidate is discarded and
-  logged in the Tool's history.
+- **Automatic bar:** evaluate Candidate and baseline on the **same held-out
+  unique inputs**. Require at least `optimiser.replay_min_holdout` samples
+  (default 20, range 2–512), Candidate success ≥ `promotion_margin_points`
+  (default 10 points) above baseline, zero regressions on previously-successful
+  replays, and a two-sided exact paired McNemar test with p ≤
+  `optimiser.replay_significance` (default .05, finite range (0, .05]). Invalid
+  statistical settings fail closed. Attempt detail records held-out sample and
+  pass counts, discordant-pair counts, effect size, confidence intervals and
+  paired significance. A positive small-sample or statistically inconclusive
+  win goes to `awaiting_approval`, never automatic promotion. Existing
+  capability-widening, schema-breaking and replay-limited approval gates still
+  compose with this decision; no evidence label grants approval authority.
 - Promotion is atomic: running Invocations finish on their starting version;
   subsequent Invocations use the promoted version. Every version is retained
   with **one-action rollback** in the Tool browser. Promotions, rollbacks,
@@ -4972,7 +5016,11 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
 | `optimiser.cooldown_secs` | 3600 | Per-Tool attempt cooldown (§8.3) |
 | `optimiser.max_attempts_per_day` | 3 | Per-Tool daily cap (§8.3) |
 | `optimiser.give_up_after_failures` | 3 | Consecutive failures → `needs attention` (§8.3) |
-| `optimiser.promotion_margin_points` | 10 | Replay win required (§8.5) |
+| `optimiser.promotion_margin_points` | 10 | Held-out replay win required (§8.5) |
+| `optimiser.replay_pool_limit` | 200 | Unique input pool, 2–512 (§8.4) |
+| `optimiser.replay_holdout_percent` | 50 | Held-out share, 10–90 percent (§8.4) |
+| `optimiser.replay_min_holdout` | 20 | Minimum unique held-out inputs for automatic promotion (§8.5) |
+| `optimiser.replay_significance` | 0.05 | Maximum exact paired-test p value, (0, .05] (§8.5) |
 | `optimiser.model` / `reasoning_effort` | (session) | Optional separate optimiser model (§8.3) |
 | `optimiser.token_budget` | (none) | Optional daemon optimisation budget (§8.3) |
 | `optimiser.eval_repeats` | 3 | Runs per prompt-eval scenario per arm (§8.6) |
@@ -5316,7 +5364,7 @@ metrics match recorded Invocations exactly.
 Metrics aggregation, trigger, background optimiser, sandboxed replay,
 promotion/rollback, guardrails, audit surfacing in Tools view.
 **Accept when:** a Tool driven below trigger yields a Candidate that is
-promoted only on a ≥10-point zero-regression replay win (demonstrated with
+promoted only on a sufficiently sampled, paired-significant ≥10-point zero-regression held-out replay win (demonstrated with
 an intentionally broken Tool); replay provably touches no real files/network/
 secrets; capability-widening Candidates route to human approval; three
 failed Candidates flag `needs attention` and stop; rollback restores the

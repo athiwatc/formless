@@ -11,8 +11,9 @@ use std::sync::Arc;
 
 use crate::config::Config;
 use crate::daemon::Daemon;
+use crate::optimiser_statistics::{self as statistics, GateCriteria, PairedCounts, PairedReport};
 use crate::provider::{CompletionOptions, Provider, ToolCall};
-use crate::storage::{CandidateData, ReplayItem};
+use crate::storage::{CandidateData, ReplayItem, ReplaySnapshot};
 use crate::tools as toolreg;
 
 const PROPOSAL_PROMPT: &str = "You improve the Formless agent's learned guidance. \
@@ -34,12 +35,123 @@ Fix the actual failures without breaking the recorded successes. ",
 struct PromotionApprovals {
     schema_context: Option<String>,
     replay_limited: bool,
+    holdout_context: Option<String>,
+    evaluation: Option<Arc<TrustedReplay>>,
 }
 #[derive(Clone)]
 enum PromotionGate {
     Widening,
     Schema(String),
     ReplayLimited,
+    Holdout(String),
+}
+/// Constructed only from actual paired replay. Presentation JSON cannot mint it.
+#[derive(Clone)]
+struct TrustedReplay {
+    identity: String,
+    snapshot_id: String,
+    snapshot_digest: String,
+    counts: PairedCounts,
+    report: PairedReport,
+    regressions: i64,
+    context: String,
+}
+fn replay_criteria(cfg: &Config) -> Result<GateCriteria> {
+    cfg.optimiser.validate_replay()?;
+    Ok(GateCriteria {
+        minimum_n: cfg.optimiser.replay_min_holdout as u64,
+        alpha: cfg.optimiser.replay_significance,
+        minimum_improvement: cfg.optimiser.promotion_margin_points as f64 / 100.0,
+    })
+}
+fn replay_identity(
+    attempt_id: &str,
+    candidate: &CandidateData,
+    base: &ToolVersionInfo,
+    snapshot: &ReplaySnapshot,
+) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(
+            &json!({"domain":"optimiser-heldout-identity-v1","attempt_id":attempt_id,
+        "snapshot_id":snapshot.id,"snapshot_digest":snapshot.digest,"base":{"version":base.version,"code":base.code,"input_schema":base.input_schema,
+        "output_schema":base.output_schema,"capabilities":base.capabilities,"memory_mb":base.memory_mb},
+        "candidate":{"code":candidate.code,"description":candidate.description,"input_schema":candidate.input_schema,"output_schema":candidate.output_schema,
+        "capabilities":candidate.capabilities,"memory_mb":candidate.memory_mb}})
+        )?)
+    ))
+}
+fn replay_context(
+    identity: &str,
+    report: &PairedReport,
+    counts: PairedCounts,
+    regressions: i64,
+) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(
+            &json!({"domain":"optimiser-heldout-approval-v1","identity":identity,"paired":report,"counts":counts,"recorded_success_regressions":regressions})
+        )?)
+    ))
+}
+fn replay_detail(snapshot: &ReplaySnapshot, evaluation: &TrustedReplay) -> Value {
+    json!({"provenance":"frozen_before_generation","snapshot_id":snapshot.id,"snapshot_digest":snapshot.digest,
+        "source_count":snapshot.source_count,"excluded_count":snapshot.excluded_count,"created_at":snapshot.created_at,
+        "generation_count":snapshot.generation.len(),"holdout_count":snapshot.holdout.len(),"manifest":snapshot.provenance,
+        "paired_counts":evaluation.counts,"paired":evaluation.report,"recorded_success_regressions":evaluation.regressions})
+}
+/// Generation failures use the newest observation, independently of the
+/// historical-success OR used by the held-out regression guard. Never infer a
+/// newest status from that aggregate flag.
+pub(crate) fn generation_context(snapshot: &ReplaySnapshot) -> Result<Vec<ReplayItem>> {
+    use sha2::{Digest, Sha256};
+    let groups = snapshot
+        .provenance
+        .get("groups")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("Generation provenance is unavailable; regenerate"))?;
+    snapshot
+        .generation
+        .iter()
+        .map(|item| {
+            let digest = format!("{:x}", Sha256::digest(item.input.as_bytes()));
+            let group = groups
+                .iter()
+                .find(|group| {
+                    group.get("input_digest").and_then(Value::as_str) == Some(digest.as_str())
+                        && group.get("partition").and_then(Value::as_str) == Some("generation")
+                })
+                .ok_or_else(|| {
+                    anyhow!("Generation input has no matching private partition metadata")
+                })?;
+            let latest = group
+                .get("latest_recorded_success")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Generation provenance does not identify the latest outcome; regenerate"
+                    )
+                })?;
+            let mut context = item.clone();
+            context.recorded_success = latest;
+            Ok(context)
+        })
+        .collect()
+}
+fn replay_input_accepts(
+    schema: &formless_runtime::structured_output::JsonOutputSchema,
+    input: &str,
+) -> Result<bool> {
+    use formless_runtime::structured_output::StructuredOutputError;
+    match schema.parse_and_validate(input) {
+        Ok(_) => Ok(true),
+        Err(StructuredOutputError::SchemaViolation) => Ok(false),
+        Err(error) => Err(anyhow!(
+            "Held-out input cannot be validated within the offline replay bounds: {error}"
+        )),
+    }
 }
 /// Private, one-use server state. Candidate JSON, attempt text and audit text
 /// cannot supply an approval. Restart intentionally requires a new approval.
@@ -75,6 +187,7 @@ enum PromotionCommit {
     Applied(ToolInfo, i64),
     SchemaApproval(crate::tool_compatibility::ToolSchemaReport, String),
     Discarded(String),
+    HoldoutApproval(String),
 }
 
 impl Daemon {
@@ -487,10 +600,41 @@ impl Daemon {
         }
         // Failures that are only denied Capabilities are a grant decision
         // for the user, not a code problem (§8.3): surface, don't rewrite.
-        let replay = self
-            .with_store(|st| st.replay_set(tool_id))
-            .unwrap_or_default();
-        if let FixPlan::NeedsCapability(n) = fix_plan(&replay) {
+        if let Err(error) = cfg.optimiser.validate_replay() {
+            self.activity(&info.name, format!("candidate generation refused: {error}"));
+            return;
+        }
+        let snapshot = match self.with_store(|st| {
+            st.create_replay_snapshot(
+                tool_id,
+                ver.version,
+                cfg.optimiser.replay_pool_limit,
+                cfg.optimiser.replay_holdout_percent,
+            )
+        }) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.activity(
+                    &info.name,
+                    format!("could not freeze holdout before generation: {error}"),
+                );
+                return;
+            }
+        };
+        if snapshot.holdout.is_empty() {
+            let _ = self.with_store(|st| st.discard_unbound_replay_snapshot(&snapshot.id));
+            self.activity(&info.name,"Not enough distinct recorded inputs for a held-out comparison; collect more real invocations before regenerating".into());
+            return;
+        }
+        let generation = match generation_context(&snapshot) {
+            Ok(generation) => generation,
+            Err(error) => {
+                let _ = self.with_store(|st| st.discard_unbound_replay_snapshot(&snapshot.id));
+                self.activity(&info.name, error.to_string());
+                return;
+            }
+        };
+        if let FixPlan::NeedsCapability(n) = fix_plan(&generation) {
             let text = format!(
                 "needs a capability: {n} recent calls of {} were denied a Capability; widen its grant or create a new version with the Capability it needs (your decision)",
                 info.name
@@ -503,6 +647,7 @@ impl Daemon {
             let _ =
                 self.with_store(|st| st.audit("optimiser", "tool.needs_capability", &info.name));
             self.set_cooldown_now(tool_id, cfg);
+            let _ = self.with_store(|st| st.discard_unbound_replay_snapshot(&snapshot.id));
             return;
         }
         self.activity(&info.name, "generating candidate…".into());
@@ -510,20 +655,28 @@ impl Daemon {
             "optimiser-generate",
             "",
             "",
-            self.generate_candidate(&info, &ver, cfg),
+            self.generate_candidate(&info, &ver, cfg, &snapshot),
         )
         .await
         {
             Ok((cand, est_tokens, validation_context)) => {
                 let attempt_id = match self.with_store(|st| {
-                    let id = st.create_attempt(tool_id, ver.version, &cand, est_tokens)?;
-                    if validation_context {
-                        st.mark_attempt_validation_context(&id)?;
-                    }
+                    let id = st.create_attempt_with_replay_snapshot(
+                        tool_id,
+                        ver.version,
+                        &cand,
+                        est_tokens,
+                        &snapshot.id,
+                    )?;
+                    st.set_attempt_generation_validation_context(&id, validation_context)?;
                     Ok(id)
                 }) {
                     Ok(id) => id,
-                    Err(_) => return,
+                    Err(_) => {
+                        let _ =
+                            self.with_store(|st| st.discard_unbound_replay_snapshot(&snapshot.id));
+                        return;
+                    }
                 };
                 // Widening gate (§8.3): never auto-widen capabilities/memory.
                 let cur_caps = Capabilities::parse(&ver.capabilities).unwrap_or_default();
@@ -560,9 +713,15 @@ impl Daemon {
                     capabilities: Vec::new(),
                     memory_mb: ver.memory_mb,
                 };
-                if let Ok(attempt_id) =
-                    self.with_store(|st| st.create_attempt(tool_id, ver.version, &empty, 0))
-                {
+                if let Ok(attempt_id) = self.with_store(|st| {
+                    st.create_attempt_with_replay_snapshot(
+                        tool_id,
+                        ver.version,
+                        &empty,
+                        0,
+                        &snapshot.id,
+                    )
+                }) {
                     self.fail_attempt(
                         &info,
                         &attempt_id,
@@ -584,8 +743,9 @@ impl Daemon {
         info: &ToolInfo,
         ver: &ToolVersionInfo,
         cfg: &Config,
+        snapshot: &ReplaySnapshot,
     ) -> Result<(CandidateData, i64, bool)> {
-        let replay = self.with_store(|st| st.replay_set(&info.id))?;
+        let replay = generation_context(snapshot)?;
         let validation_context = replay
             .iter()
             .any(|item| !item.recorded_success && item.tag == "validation");
@@ -594,7 +754,8 @@ impl Daemon {
             .filter(|r| !r.recorded_success)
             .take(10)
             .collect();
-        let successes: Vec<&ReplayItem> = replay
+        let successes: Vec<&ReplayItem> = snapshot
+            .generation
             .iter()
             .filter(|r| r.recorded_success)
             .take(5)
@@ -667,6 +828,7 @@ impl Daemon {
                 })
                 .unwrap_or_else(|_| "Schema compatibility could not be verified; inspect the attempt detail".into()),
             PromotionGate::ReplayLimited => "replay_limited".to_owned(),
+            PromotionGate::Holdout(_) => "Held-out improvement is not yet statistically established (small sample or insignificant paired result). Review the attempt's held-out scores, 95% Wilson intervals, discordant pairs, exact p-value and frozen provenance before manually approving.".into(),
         };
         let promotion_id = uuid::Uuid::new_v4().to_string();
         self.promotions
@@ -729,6 +891,11 @@ impl Daemon {
                 approvals.replay_limited = true;
                 self.promote_attempt(&info, &attempt_id, &cfg, approvals);
             }
+            PromotionGate::Holdout(context) => {
+                approvals.holdout_context = Some(context);
+                self.replay_and_maybe_promote(attempt_id, &cfg, approvals)
+                    .await;
+            }
         }
     }
 
@@ -736,7 +903,7 @@ impl Daemon {
         self: &Arc<Self>,
         attempt_id: String,
         cfg: &Config,
-        approvals: PromotionApprovals,
+        mut approvals: PromotionApprovals,
     ) {
         let Ok(Some(attempt)) = self.with_store(|st| st.get_attempt(&attempt_id)) else {
             return;
@@ -763,80 +930,210 @@ impl Daemon {
             return;
         }
         let cand = &attempt.candidate;
-        let replay = match self.with_store(|st| st.replay_set(&info.id)) {
-            Ok(r) if !r.is_empty() => r,
+        let snapshot = match self.with_store(|st| st.attempt_replay_snapshot(&attempt_id)) {
+            Ok(Some(snapshot))
+                if !snapshot.holdout.is_empty()
+                    && snapshot.tool_id == info.id
+                    && snapshot.base_version == attempt.base_version =>
+            {
+                snapshot
+            }
             _ => {
-                self.fail_attempt(
-                    &info,
-                    &attempt_id,
-                    "discarded",
-                    "no replay data",
-                    None,
-                    None,
-                    0,
-                    0,
-                    cfg,
+                // Never resample current calls after seeing the candidate.
+                // Legacy scores remain readable; they cannot mint holdout proof.
+                let _ = self.with_store(|st| {
+                    st.set_attempt_holdout_detail(&attempt_id,&json!({"provenance":"unverified","action":"regenerate","reason":"No verified pre-generation held-out snapshot is available; regenerate the candidate after collecting distinct recorded inputs"}))
+                });
+                self.activity(&info.name,"No trusted pre-generation holdout: regenerate this candidate; historical attempt status and scores were preserved".into());
+                return;
+            }
+        };
+        let identity = match replay_identity(&attempt_id, cand, &ver, &snapshot) {
+            Ok(identity) => identity,
+            Err(_) => return,
+        };
+        let criteria = match replay_criteria(cfg) {
+            Ok(criteria) => criteria,
+            Err(error) => {
+                self.activity(
+                    &info.name,
+                    format!("held-out gate refused invalid configuration: {error}"),
                 );
                 return;
             }
         };
-        self.activity(
-            &info.name,
-            format!("replaying {} recorded invocations…", replay.len()),
-        );
         let cand_caps = Capabilities::parse(&cand.capabilities).unwrap_or_default();
         let cur_caps = Capabilities::parse(&ver.capabilities).unwrap_or_default();
-        let total = replay.len() as i64;
-        let mut cand_pass = 0i64;
-        let mut base_pass = 0i64;
-        let mut regressions = 0i64;
-        for item in &replay {
-            let input: Value = serde_json::from_str(&item.input).unwrap_or(json!({}));
-            let cand_ok = self
-                .replay_one(
-                    &info.name,
-                    &cand.code,
-                    &cand_caps,
-                    cand.memory_mb,
-                    &cand.output_schema,
-                    input.clone(),
-                    Some(cand),
-                    0,
-                    new_overlay(),
-                )
-                .await;
-            let base_ok = self
-                .replay_one(
-                    &info.name,
-                    &ver.code,
-                    &cur_caps,
-                    ver.memory_mb,
-                    &ver.output_schema,
-                    input,
-                    None,
-                    0,
-                    new_overlay(),
-                )
-                .await;
-            if cand_ok {
-                cand_pass += 1;
-            } else if item.recorded_success {
-                regressions += 1;
+        let input_schemas = (|| -> Result<_> {
+            use formless_runtime::structured_output::JsonOutputSchema;
+            Ok((
+                JsonOutputSchema::compile(serde_json::from_str(&cand.input_schema)?)?,
+                JsonOutputSchema::compile(serde_json::from_str(&ver.input_schema)?)?,
+            ))
+        })();
+        let (candidate_input, baseline_input) = match input_schemas {
+            Ok(schemas) => schemas,
+            Err(error) => {
+                self.activity(&info.name,format!("Offline held-out input-schema validation unavailable; no promotion: {error}"));
+                return;
             }
-            if base_ok {
-                base_pass += 1;
+        };
+        let (counts, regressions) = if let Some(previous) = &approvals.evaluation {
+            if previous.identity != identity {
+                self.activity(&info.name,"Candidate, baseline or frozen evidence changed after replay; regenerate instead of reusing approval".into());
+                return;
             }
+            (previous.counts, previous.regressions)
+        } else {
+            self.activity(
+                &info.name,
+                format!(
+                    "replaying {} frozen held-out inputs…",
+                    snapshot.holdout.len()
+                ),
+            );
+            let mut counts = PairedCounts::default();
+            let mut regressions = 0;
+            for item in &snapshot.holdout {
+                let input: Value = match serde_json::from_str(&item.input) {
+                    Ok(input) => input,
+                    Err(_) => {
+                        self.activity(
+                            &info.name,
+                            "Frozen replay input could not be decoded; no promotion".into(),
+                        );
+                        return;
+                    }
+                };
+                let candidate_accepts = match replay_input_accepts(&candidate_input, &item.input) {
+                    Ok(accepts) => accepts,
+                    Err(error) => {
+                        self.activity(&info.name, error.to_string());
+                        return;
+                    }
+                };
+                let baseline_accepts = match replay_input_accepts(&baseline_input, &item.input) {
+                    Ok(accepts) => accepts,
+                    Err(error) => {
+                        self.activity(&info.name, error.to_string());
+                        return;
+                    }
+                };
+                let cand_ok = candidate_accepts
+                    && self
+                        .replay_one(
+                            &info.name,
+                            &cand.code,
+                            &cand_caps,
+                            cand.memory_mb,
+                            &cand.output_schema,
+                            input.clone(),
+                            Some(cand),
+                            0,
+                            new_overlay(),
+                        )
+                        .await;
+                let base_ok = baseline_accepts
+                    && self
+                        .replay_one(
+                            &info.name,
+                            &ver.code,
+                            &cur_caps,
+                            ver.memory_mb,
+                            &ver.output_schema,
+                            input,
+                            None,
+                            0,
+                            new_overlay(),
+                        )
+                        .await;
+                match (cand_ok, base_ok) {
+                    (true, true) => counts.both_pass += 1,
+                    (true, false) => counts.candidate_only += 1,
+                    (false, true) => counts.baseline_only += 1,
+                    (false, false) => counts.both_fail += 1,
+                }
+                if !cand_ok && item.recorded_success {
+                    regressions += 1;
+                }
+            }
+            (counts, regressions)
+        };
+        let report = match statistics::evaluate(counts, criteria) {
+            Ok(report) => report,
+            Err(error) => {
+                self.activity(
+                    &info.name,
+                    format!("Held-out statistics could not be verified: {error}"),
+                );
+                return;
+            }
+        };
+        let context = match replay_context(&identity, &report, counts, regressions) {
+            Ok(context) => context,
+            Err(_) => return,
+        };
+        let evaluation = Arc::new(TrustedReplay {
+            identity,
+            snapshot_id: snapshot.id.clone(),
+            snapshot_digest: snapshot.digest.clone(),
+            counts,
+            report,
+            regressions,
+            context,
+        });
+        if self
+            .with_store(|st| {
+                st.set_attempt_holdout_detail(&attempt_id, &replay_detail(&snapshot, &evaluation))
+            })
+            .is_err()
+        {
+            self.activity(
+                &info.name,
+                "Held-out evidence detail could not be committed; no promotion".into(),
+            );
+            return;
         }
-        let cand_score = cand_pass as f64 / total as f64;
-        let base_score = base_pass as f64 / total as f64;
+        let total = evaluation.report.n as i64;
+        let cand_pass = evaluation.report.candidate_passes as i64;
+        let base_pass = evaluation.report.baseline_passes as i64;
+        let cand_score = evaluation.report.candidate_rate;
+        let base_score = evaluation.report.baseline_rate;
+        approvals.evaluation = Some(evaluation.clone());
         // Exact integer form of `cand_score - base_score >= margin` so a
         // win of exactly the margin is not lost to float rounding.
         let wins_by_margin =
             (cand_pass - base_pass) * 100 >= cfg.optimiser.promotion_margin_points as i64 * total;
         let detail = format!(
-            "candidate {cand_pass}/{total} baseline {base_pass}/{total} regressions {regressions}"
+            "held-out candidate {cand_pass}/{total} baseline {base_pass}/{total} regressions {regressions}; paired p={:.6}, candidate 95% CI [{:.4},{:.4}], baseline 95% CI [{:.4},{:.4}]",
+            evaluation.report.p_value,evaluation.report.candidate_ci.0,evaluation.report.candidate_ci.1,evaluation.report.baseline_ci.0,evaluation.report.baseline_ci.1
         );
-        if wins_by_margin && regressions == 0 {
+        if wins_by_margin && cand_pass > base_pass && regressions == 0 {
+            if !evaluation.report.eligible_auto
+                && approvals.holdout_context.as_ref() != Some(&evaluation.context)
+            {
+                let _ = self.with_store(|st| {
+                    st.update_attempt(
+                        &attempt_id,
+                        "awaiting_approval",
+                        &detail,
+                        Some(cand_score),
+                        Some(base_score),
+                        total,
+                        regressions,
+                    )
+                });
+                self.request_promotion_ticket(
+                    &info,
+                    PromotionTicket {
+                        attempt_id,
+                        gate: PromotionGate::Holdout(evaluation.context.clone()),
+                        approvals,
+                    },
+                    cand,
+                );
+                return;
+            }
             if (cand_caps.net.is_some() || !cand_caps.mcp.is_empty()) && !approvals.replay_limited {
                 // Replay-limited (§8.4): net and MCP tools can only promote
                 // by hand (what a Candidate sends a server isn't checked).
@@ -996,6 +1293,29 @@ impl Daemon {
                         "Tool changed after replay".into(),
                     ));
                 }
+                let snapshot = st.attempt_replay_snapshot(attempt_id)?.ok_or_else(||anyhow!("No trusted pre-generation holdout; regenerate this legacy candidate"))?;
+                let evaluated = approvals.evaluation.as_ref().ok_or_else(||anyhow!("No actual paired held-out evaluation; promotion refused"))?;
+                let (_, base) = st.get_tool_current(&info.id)?.ok_or_else(||anyhow!("Tool disappeared"))?;
+                let identity = replay_identity(attempt_id,cand,&base,&snapshot)?;
+                if identity != evaluated.identity || snapshot.id != evaluated.snapshot_id || snapshot.digest != evaluated.snapshot_digest {
+                    return Err(anyhow!("Candidate, baseline or frozen replay proof changed after evaluation; regenerate"));
+                }
+                let latest_cfg = self.config()?;
+                let fresh = statistics::evaluate(evaluated.counts,replay_criteria(&latest_cfg)?)?;
+                let fresh_context = replay_context(&identity,&fresh,evaluated.counts,evaluated.regressions)?;
+                if fresh.candidate_passes <= fresh.baseline_passes || evaluated.regressions != 0
+                    || (fresh.candidate_passes-fresh.baseline_passes)*100 < latest_cfg.optimiser.promotion_margin_points as u64 * fresh.n {
+                    return Err(anyhow!("Fresh held-out margin or regression gate refused promotion"));
+                }
+                let fresh_eval = TrustedReplay { report:fresh.clone(), context:fresh_context.clone(), ..(**evaluated).clone() };
+                let mut evidence = replay_detail(&snapshot,&fresh_eval);
+                evidence["manual_acknowledged"] = json!(approvals.holdout_context.as_ref() == Some(&fresh_context));
+                st.set_attempt_holdout_detail(attempt_id,&evidence)?;
+                if !fresh.eligible_auto && approvals.holdout_context.as_ref() != Some(&fresh_context) {
+                    let(detail,cs,bs,total,regressions)=st.attempt_scores(attempt_id)?;
+                    st.update_attempt(attempt_id,"awaiting_approval",&detail,cs,bs,total,regressions)?;
+                    return Ok(PromotionCommit::HoldoutApproval(fresh_context));
+                }
                 let report = st.attempt_schema_report(attempt_id)?;
                 let context = schema_context(attempt_id, cand, &report)?;
                 if schema_context(attempt_id, &attempt.candidate, &report)? != context {
@@ -1061,6 +1381,7 @@ impl Daemon {
             Ok(PromotionCommit::Discarded(reason)) => {
                 self.activity(&info.name, format!("candidate discarded: {reason}"))
             }
+            Ok(PromotionCommit::HoldoutApproval(context)) => self.request_promotion_ticket(info,PromotionTicket {attempt_id:attempt_id.into(),gate:PromotionGate::Holdout(context),approvals},cand),
             Err(e) => self.activity(&info.name, format!("promotion failed: {e}")),
         }
     }
@@ -1213,6 +1534,15 @@ impl Daemon {
         let caps = caps.clone();
         let override_cand = override_cand.cloned();
         Box::pin(async move {
+            let validator =
+                match serde_json::from_str::<Value>(&output_schema)
+                    .ok()
+                    .and_then(|schema| {
+                        formless_runtime::structured_output::JsonOutputSchema::compile(schema).ok()
+                    }) {
+                    Some(validator) => validator,
+                    None => return false,
+                };
             match this
                 .replay_exec(
                     &tool_name,
@@ -1228,13 +1558,8 @@ impl Daemon {
                 )
                 .await
             {
-                Ok(output) => {
-                    let schema: Value = serde_json::from_str(&output_schema).unwrap_or(json!({}));
-                    match toolreg::compile_schema(&schema) {
-                        Ok(v) => toolreg::validate_against(&v, &output).is_ok(),
-                        Err(_) => false,
-                    }
-                }
+                Ok(output) => serde_json::to_string(&output)
+                    .is_ok_and(|output| validator.parse_and_validate(&output).is_ok()),
                 Err(_) => false,
             }
         })
@@ -1538,14 +1863,7 @@ pub fn scenario_cases() -> Vec<ScenarioCase> {
 
 /// 95% Wilson score interval for `passes` out of `n`.
 pub fn wilson_interval(passes: i64, n: i64) -> (f64, f64) {
-    if n <= 0 {
-        return (0.0, 1.0);
-    }
-    let (n, p, z) = (n as f64, passes as f64 / n as f64, 1.96f64);
-    let denom = 1.0 + z * z / n;
-    let centre = (p + z * z / (2.0 * n)) / denom;
-    let half = z * (p * (1.0 - p) / n + z * z / (4.0 * n * n)).sqrt() / denom;
-    ((centre - half).max(0.0), (centre + half).min(1.0))
+    statistics::wilson_interval(passes, n).unwrap_or((0.0, 1.0))
 }
 
 /// One-sided two-proportion z-test at 5%: is the candidate's pass rate
@@ -1739,6 +2057,14 @@ fn parse_proposal(v: &Value) -> Result<(String, String, String)> {
         .to_string();
     Ok((kind, content, rationale))
 }
+
+#[cfg(test)]
+#[path = "optimiser_holdout_tests.rs"]
+mod holdout_tests;
+
+#[cfg(test)]
+#[path = "optimiser_holdout_provider_tests.rs"]
+mod holdout_provider_tests;
 
 #[cfg(test)]
 #[path = "optimiser_schema_tests.rs"]
