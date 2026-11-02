@@ -667,7 +667,7 @@ async fn acknowledged_always_grant_survives_both_ready_cancel_without_dispatch()
     let caps = Capabilities::parse(&["process:fixture-no-execution".into()]).unwrap();
     let cfg = f.daemon().config().unwrap();
     let approval = f.daemon().ensure_approval(
-        &cfg, &f.session, "fixture", &info, &ver, &caps, None, &cancel,
+        &cfg, &f.session, "fixture", &info, &ver, &caps, None, &cancel, None,
     );
     tokio::pin!(approval);
     assert!(futures_util::poll!(&mut approval).is_pending());

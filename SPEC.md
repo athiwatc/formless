@@ -554,7 +554,22 @@ than growing the map or losing an in-flight probe.
   (same philosophy as Pending Invocations, §6.4); nothing is killed.
 - Malformed tool-calls from the model are fed back to the model as a
   correction prompt and counted in a **separate** malformed-call counter —
-  they never pollute Tool Success Rate.
+  they never pollute Tool Success Rate. The daemon pauses a Run resumably
+  after **three consecutive identical corrections**, keyed by Tool name, raw
+  arguments and the typed daemon correction class (invalid JSON, truncated
+  arguments or unknown Tool). Changed names, arguments or classes reset the
+  streak. An ordered batch containing only daemon corrections is also hashed
+  and paused after three identical turns; changed arguments, order or classes
+  reset that batch streak. Successful calls and ordinary Tool errors reset both
+  guards, and any such outcome makes a batch ineligible. Repeated
+  successful pending polls remain unrestricted. This is not a global step
+  limit. Each sub-agent model loop has the same independent guard and returns
+  a stuck error to its caller. All call results in an already-returned batch
+  are saved before the guard stops further provider requests, preserving
+  complete call/result pairs for Resume. The stored pause reason and attached
+  `RunPaused` explanation describe the repetition and suggest revising the
+  request or switching model before Resume. The guards retain only hashes and
+  counters, never raw argument history, and direct Tool calls do not pause Runs.
 
 - **Stream parsing (#614).** A last event without its trailing newline
   is still parsed (often the usage / finish chunk); a JSON field split

@@ -77,7 +77,13 @@ pub fn explain(raw: &str, ctx: &ErrorContext) -> ErrorExplained {
         .next()
         .unwrap_or_default();
     let local = host.starts_with("localhost") || host.starts_with("127.0.0.1");
-    let (category, message, action) = if t.starts_with("budget:") {
+    let (category, message, action) = if t.starts_with("stuck: repeated daemon correction:") {
+        (
+            "stuck",
+            "The model repeated the same invalid Tool call or all-correction batch three times without fixing it. The Run is paused to avoid repeating paid requests.".into(),
+            Some("Revise your request or switch model, then Resume to try again".into()),
+        )
+    } else if t.starts_with("budget:") {
         (
             "budget",
             raw.trim_start_matches("budget:").trim().to_string(),

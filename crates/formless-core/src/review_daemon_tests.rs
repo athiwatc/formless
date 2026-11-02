@@ -141,7 +141,7 @@ async fn review_comment_steering_uses_context_sequence_and_refuses_closing_run()
             cancel_flag: Arc::new(AtomicBool::new(false)),
             steer_tx,
             steering: Arc::new(Default::default()),
-            retry: Arc::new(tokio::sync::Notify::new()),
+            retry: Arc::new(provider_retry_daemon::ProviderRetry::default()),
         },
     );
     let request = |text: &str| Request::CommentReviewHunk {

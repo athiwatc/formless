@@ -16,6 +16,7 @@ use crate::provider::{DeltaKind, Provider, ToolCall, SYSTEM_PROMPT};
 use crate::storage::{ContextCache, Store};
 use crate::tools as toolreg;
 use crate::Paths;
+use correction_loop::{CorrectionBatch, CorrectionClass, CorrectionStreak};
 
 // A std mutex (never held across .await) so broadcast() sends synchronously
 // and every subscriber sees events in emission order.
@@ -542,7 +543,7 @@ pub(crate) struct RunCtl {
     steer_tx: mpsc::UnboundedSender<i64>,
     steering: Arc<steering_daemon::RunSteering>,
     /// User-requested re-send of the in-flight provider request.
-    retry: Arc<tokio::sync::Notify>,
+    retry: Arc<provider_retry_daemon::ProviderRetry>,
 }
 
 /// A client's reply to an `ask_user` call: free text, structured answers.
@@ -710,7 +711,6 @@ pub struct Daemon {
     grant_code: StdMutex<HashMap<String, String>>,
     /// The parallel batch a Session's approvals belong to while
     /// `approve_calls` asks: (batch id, held calls, next call to match).
-    approval_batches: StdMutex<HashMap<String, (String, Vec<HeldCall>, usize)>>,
     /// Which client answered each approval, by approval id, until
     /// `ensure_approval` records it with the grant.
     approval_by: StdMutex<HashMap<String, String>>,
@@ -956,7 +956,6 @@ impl Daemon {
             session_grants: StdMutex::new(Default::default()),
             timed_grants: StdMutex::new(Default::default()),
             grant_code: StdMutex::new(Default::default()),
-            approval_batches: StdMutex::new(Default::default()),
             approval_by: StdMutex::new(Default::default()),
             approval_paths: StdMutex::new(Default::default()),
             deny_always: StdMutex::new(Default::default()),
@@ -4043,11 +4042,13 @@ impl Daemon {
             }
             Request::RetryProviderRequest { session_id } => {
                 let runs = self.runs.locked();
-                let ctl = runs
-                    .get(&session_id)
-                    .context(RequestFailure::not_found("no active run in this session"))?;
-                ctl.retry.notify_one();
-                Ok(json!({"retrying": true}))
+                let retrying = runs.get(&session_id).is_some_and(|ctl| {
+                    !ctl.cancel.is_cancelled()
+                        && !ctl.cancel_flag.load(Ordering::SeqCst)
+                        && ctl.steering.accepts()
+                        && ctl.retry.request()
+                });
+                Ok(json!({"retrying": retrying}))
             }
             Request::GetRun { run_id } => {
                 let mut run = self
@@ -5419,7 +5420,7 @@ impl Daemon {
                     cancel_flag: cancel_flag.clone(),
                     steer_tx,
                     steering: Arc::new(Default::default()),
-                    retry: Arc::new(tokio::sync::Notify::new()),
+                    retry: Arc::new(provider_retry_daemon::ProviderRetry::default()),
                 },
             );
         }
@@ -6328,6 +6329,7 @@ impl Daemon {
         let mut used_tools = false;
         let mut context_retried = false;
         let mut paused_turns = 0;
+        let mut corrections = CorrectionStreak::default();
         loop {
             if cancel.is_cancelled() {
                 return Err(anyhow!("interrupted"));
@@ -6366,6 +6368,7 @@ impl Daemon {
                 .lock()
                 .unwrap()
                 .get(session_id)
+                .filter(|c| c.run_id == run_id)
                 .map(|c| c.retry.clone())
                 .unwrap_or_default();
             let last_byte = Arc::new(std::sync::atomic::AtomicU64::new(epoch_ms()));
@@ -6383,6 +6386,7 @@ impl Daemon {
                 got_bytes.store(false, Ordering::SeqCst);
                 let hide_candidate = pipeline.as_ref().is_some_and(|p| p.options.has_schema());
                 self.mark_context_consumed(session_id,run_id,consumed_seq);
+                let (mut request_attempt, mut retry_signal) = retry.begin();
                 let chat_fut = counted(
                     "run",
                     session_id,
@@ -6427,8 +6431,18 @@ impl Daemon {
                 let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
                 loop {
                     tokio::select! {
-                        r = &mut chat_fut => break 'request r,
-                        _ = retry.notified() => {
+                        r = &mut chat_fut => {
+                            if !request_attempt.finish() || cancel.is_cancelled() {
+                                break 'request r;
+                            }
+                            self.broadcast(Event::StreamRestarted {
+                                session_id: session_id.to_string(),
+                                run_id: run_id.to_string(),
+                            });
+                            continue 'request;
+                        }
+                        Ok(()) = &mut retry_signal => {
+                            request_attempt.finish();
                             self.broadcast(Event::StreamRestarted {
                                 session_id: session_id.to_string(),
                                 run_id: run_id.to_string(),
@@ -6837,6 +6851,8 @@ impl Daemon {
             if result.truncated {
                 // The arguments are cut off: running them (or treating them as
                 // a malformed call) would only repeat the failure. Say why.
+                let mut stuck = None;
+                let mut correction_batch = CorrectionBatch::default();
                 for tc in &result.tool_calls {
                     let msg = self.with_store(|st| {
                         st.append_message_meta(
@@ -6850,13 +6866,22 @@ impl Daemon {
                         session_id: session_id.to_string(),
                         message: msg,
                     });
+                    correction_batch.observe(tc, Some(CorrectionClass::TruncatedArguments));
+                    let repeated =
+                        corrections.observe(tc, Some(CorrectionClass::TruncatedArguments));
+                    if stuck.is_none() {
+                        stuck = repeated;
+                    }
+                }
+                if let Some(error) = stuck.or(corrections.observe_batch(correction_batch)) {
+                    return Err(error);
                 }
                 continue;
             }
             if cancel.is_cancelled() || cancel_flag.load(Ordering::SeqCst) {
                 bail!("interrupted");
             }
-            let denied = self
+            let (denied, approved_calls) = self
                 .approve_calls(&cfg, session_id, run_id, &result.tool_calls, cancel)
                 .await?;
             if cancel.is_cancelled() || cancel_flag.load(Ordering::SeqCst) {
@@ -6865,7 +6890,7 @@ impl Daemon {
             // Execute the batch in parallel (isolated sandboxes).
             let step_started = chrono::Utc::now().to_rfc3339();
             let mut futs = Vec::new();
-            for tc in &result.tool_calls {
+            for tc in &approved_calls {
                 let this = self.clone();
                 let (sid, rid) = (session_id.to_string(), run_id.to_string());
                 let tc = tc.clone();
@@ -6875,18 +6900,21 @@ impl Daemon {
                 let denied = denied.clone();
                 let skip = skipped.contains(&tc.id);
                 futs.push(async move {
-                    let (text, is_error) = if skip {
+                    let (text, is_error, correction) = if skip {
                         (
                             "skipped: the user chose not to run this call (step mode). \
                              Continue without its result, or ask them."
                                 .to_string(),
                             true,
+                            None,
                         )
                     } else {
-                        this.dispatch_call(&sid, &rid, &tc, &cfg2, &flag, &tok, &denied)
-                            .await
+                        this.dispatch_call_correction(
+                            &sid, &rid, &tc, &cfg2, &flag, &tok, &denied, 0,
+                        )
+                        .await
                     };
-                    (tc, text, is_error)
+                    (tc, text, is_error, correction)
                 });
             }
             let results = futures_util::future::join_all(futs).await;
@@ -6898,7 +6926,9 @@ impl Daemon {
                 });
             }
             let mut warned = std::collections::HashSet::new();
-            for (tc, text, is_error) in results {
+            let mut stuck = None;
+            let mut correction_batch = CorrectionBatch::default();
+            for (tc, text, is_error, correction) in results {
                 // A result that holds a secret is still sent (blocking would
                 // break the task), but the user hears about it once per Tool
                 // and kind in this Run (#709).
@@ -6927,6 +6957,14 @@ impl Daemon {
                     session_id: session_id.to_string(),
                     message: msg,
                 });
+                correction_batch.observe(&tc, correction);
+                let repeated = corrections.observe(&tc, correction);
+                if stuck.is_none() {
+                    stuck = repeated;
+                }
+            }
+            if let Some(error) = stuck.or(corrections.observe_batch(correction_batch)) {
+                return Err(error);
             }
         }
     }
@@ -7235,39 +7273,57 @@ impl Daemon {
         run_id: &str,
         calls: &[ToolCall],
         cancel: &CancellationToken,
-    ) -> Result<HashMap<String, bool>> {
+    ) -> Result<(HashMap<String, bool>, Vec<ToolCall>)> {
         if cancel.is_cancelled() {
             bail!("interrupted");
         }
+        // Resolve every input-bound filesystem path before the first await.
+        // Dispatch must use this same prepared input: its registry path is
+        // preapproved and must not resolve relative input against a later cwd.
+        let cwd = self
+            .session_cwd(session_id)
+            .map(std::path::PathBuf::from)
+            .map(Ok)
+            .unwrap_or_else(std::env::current_dir)?;
+        let mut prepared = calls.to_vec();
+        for call in &mut prepared {
+            if toolreg::is_builtin(&call.name) {
+                continue;
+            }
+            let Some((_, ver)) = self.with_store(|st| st.get_tool_by_name(&call.name))? else {
+                continue;
+            };
+            let Ok(mut input) = serde_json::from_str::<Value>(&call.arguments) else {
+                continue;
+            };
+            // Match execution's nested-JSON coercion before resolving bound
+            // paths, so those paths cannot appear only after preapproval.
+            let schema: Value =
+                serde_json::from_str(&ver.input_schema).unwrap_or(json!({"type": "object"}));
+            toolreg::coerce_json_strings(&schema, &mut input);
+            let caps = Capabilities::parse(&ver.capabilities).map_err(|e| anyhow!(e))?;
+            // Invalid bindings retain their existing execution-time validation
+            // failure, rather than receiving a preapproved partial rewrite.
+            if caps.absolutize_inputs(&mut input, &cwd).is_ok() {
+                call.arguments = input.to_string();
+            }
+        }
+        let calls = prepared.as_slice();
         let mut denied: HashMap<String, bool> = HashMap::new();
         // Several held calls in one batch: each prompt lists them all
         // (SPEC §5.2), and each is still answered on its own.
-        let held = self.held_calls(cfg, session_id, calls)?;
-        if held.len() > 1 {
-            self.approval_batches.locked().insert(
-                session_id.to_string(),
-                (uuid::Uuid::new_v4().to_string(), held, 0),
-            );
-        }
-        let result = self
-            .approve_each(cfg, session_id, run_id, calls, cancel, &mut denied)
-            .await;
-        self.approval_batches.locked().remove(session_id);
-        result.map(|()| denied)
-    }
-
-    /// This prompt's place in the Session's batch, if one is being asked:
-    /// the next held call of this Tool.
-    fn batch_position(&self, session_id: &str, tool_name: &str) -> Option<ApprovalBatch> {
-        let mut batches = self.approval_batches.locked();
-        let (batch_id, calls, next) = batches.get_mut(session_id)?;
-        let at = (*next..calls.len()).find(|&i| calls[i].tool_name == tool_name)?;
-        *next = at + 1;
-        Some(ApprovalBatch {
-            batch_id: batch_id.clone(),
-            index: at + 1,
-            calls: calls.clone(),
-        })
+        let batch = approval_batch::Batch::new(self.held_calls(cfg, session_id, calls)?);
+        self.approve_each(
+            cfg,
+            session_id,
+            run_id,
+            calls,
+            cancel,
+            &mut denied,
+            batch.as_ref(),
+        )
+        .await?;
+        Ok((denied, prepared))
     }
 
     /// Every grant, one row per Capability (SPEC §10.3): stored grants
@@ -7381,9 +7437,9 @@ impl Daemon {
         cfg: &Config,
         session_id: &str,
         calls: &[ToolCall],
-    ) -> Result<Vec<HeldCall>> {
+    ) -> Result<Vec<(usize, String, HeldCall)>> {
         let mut held = Vec::new();
-        for tc in calls {
+        for (ordinal, tc) in calls.iter().enumerate() {
             if toolreg::is_builtin(&tc.name) {
                 continue;
             }
@@ -7400,11 +7456,15 @@ impl Daemon {
                 continue;
             };
             if let Some(new) = self.uncovered(cfg, session_id, &info, &ver, &caps) {
-                held.push(HeldCall {
-                    tool_name: info.name.clone(),
-                    capabilities: caps.to_specs(),
-                    new_capabilities: new,
-                });
+                held.push((
+                    ordinal,
+                    tc.id.clone(),
+                    HeldCall {
+                        tool_name: info.name.clone(),
+                        capabilities: caps.to_specs(),
+                        new_capabilities: new,
+                    },
+                ));
             }
         }
         Ok(held)
@@ -7477,8 +7537,9 @@ impl Daemon {
         calls: &[ToolCall],
         cancel: &CancellationToken,
         denied: &mut HashMap<String, bool>,
+        batch: Option<&approval_batch::Batch>,
     ) -> Result<()> {
-        for tc in calls {
+        for (ordinal, tc) in calls.iter().enumerate() {
             if cancel.is_cancelled() {
                 bail!("interrupted");
             }
@@ -7506,6 +7567,7 @@ impl Daemon {
                         &caps,
                         Some(&input),
                         cancel,
+                        batch.and_then(|batch| batch.for_call(ordinal, &tc.id)),
                     )
                     .await;
                 if cancel.is_cancelled() {
@@ -7537,6 +7599,7 @@ impl Daemon {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     async fn dispatch_call(
         self: &Arc<Self>,
         session_id: &str,
@@ -7555,6 +7618,7 @@ impl Daemon {
     /// recorded by [`call_failed`] where the failure was produced (never
     /// guessed from the text, which a Tool's own output may resemble).
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     async fn dispatch_call_checked(
         self: &Arc<Self>,
         session_id: &str,
@@ -7566,20 +7630,55 @@ impl Daemon {
         denied: &HashMap<String, bool>,
         agent_depth: usize,
     ) -> (String, bool) {
-        CALL_FAILED
-            .scope(std::cell::Cell::new(false), async {
-                let text = Box::pin(self.dispatch_call_inner(
-                    session_id,
-                    run_id,
-                    tc,
-                    cfg,
-                    cancel_flag,
-                    cancel,
-                    denied,
-                    agent_depth,
-                ))
-                .await;
-                (text, CALL_FAILED.with(std::cell::Cell::get))
+        let (text, failed, _) = self
+            .dispatch_call_correction(
+                session_id,
+                run_id,
+                tc,
+                cfg,
+                cancel_flag,
+                cancel,
+                denied,
+                agent_depth,
+            )
+            .await;
+        (text, failed)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn dispatch_call_correction(
+        self: &Arc<Self>,
+        session_id: &str,
+        run_id: &str,
+        tc: &ToolCall,
+        cfg: &Config,
+        cancel_flag: &Arc<AtomicBool>,
+        cancel: &CancellationToken,
+        denied: &HashMap<String, bool>,
+        agent_depth: usize,
+    ) -> (String, bool, Option<CorrectionClass>) {
+        CALL_CORRECTION
+            .scope(std::cell::Cell::new(None), async {
+                CALL_FAILED
+                    .scope(std::cell::Cell::new(false), async {
+                        let text = Box::pin(self.dispatch_call_inner(
+                            session_id,
+                            run_id,
+                            tc,
+                            cfg,
+                            cancel_flag,
+                            cancel,
+                            denied,
+                            agent_depth,
+                        ))
+                        .await;
+                        (
+                            text,
+                            CALL_FAILED.with(std::cell::Cell::get),
+                            CALL_CORRECTION.with(std::cell::Cell::get),
+                        )
+                    })
+                    .await
             })
             .await
     }
@@ -7604,10 +7703,13 @@ impl Daemon {
             Err(e) => {
                 // Malformed model tool-call: feed back for correction, never
                 // counted against any Tool (SPEC §4.4).
-                return call_failed(format!(
-                    "error: invalid JSON arguments for {}: {e}. Retry with valid JSON.",
-                    tc.name
-                ));
+                return call_correction(
+                    format!(
+                        "error: invalid JSON arguments for {}: {e}. Retry with valid JSON.",
+                        tc.name
+                    ),
+                    CorrectionClass::InvalidJson,
+                );
             }
         };
         // Nested objects sent as JSON strings (some models do this) are
@@ -8208,6 +8310,7 @@ impl Daemon {
                 &caps,
                 Some(&input),
                 &cancel,
+                None,
             )
             .await
         {
@@ -8322,7 +8425,7 @@ impl Daemon {
             arguments: args.to_string(),
         };
         let cancel = CancellationToken::new();
-        let denied = match self
+        let (denied, approved_calls) = match self
             .approve_calls(
                 &cfg,
                 session_id,
@@ -8338,7 +8441,7 @@ impl Daemon {
         self.dispatch_call_inner(
             session_id,
             "direct",
-            &tc,
+            &approved_calls[0],
             &cfg,
             &Arc::new(AtomicBool::new(false)),
             &cancel,
@@ -8492,6 +8595,16 @@ impl Daemon {
         cancel: &CancellationToken,
         agent_depth: usize,
     ) -> String {
+        match self.with_reader(|st| st.get_tool_by_name(name)) {
+            Ok(None) => {
+                return call_correction(
+                    format!("error: no tool named '{name}'"),
+                    CorrectionClass::UnknownTool,
+                )
+            }
+            Err(error) => return call_failed(format!("error: {error}")),
+            Ok(Some(_)) => {}
+        }
         let handle = uuid::Uuid::new_v4().to_string();
         let entry = Arc::new(PendingEntry {
             progress: Arc::new(Default::default()),
@@ -9494,6 +9607,7 @@ impl Daemon {
                 let _ = self.with_store(|st| st.append_subagent_message(&sub_id, m));
             };
             let mut step = 0i64;
+            let mut corrections = CorrectionStreak::default();
             // No step limit (SPEC principle 3): it ends on a final answer,
             // a fault, or cancellation.
             let routing_task = crate::routing_task_observation::Task::with_recorder(
@@ -9587,12 +9701,28 @@ impl Daemon {
                     }
                     record(&assistant);
                     messages.push(assistant);
-                    let denied = self
+                    if result.truncated {
+                        let mut stuck = None;
+                        let mut correction_batch = CorrectionBatch::default();
+                        for tc in &result.tool_calls {
+                            let message = json!({"role":"tool", "tool_call_id":tc.id,"content":truncated_call_message(&tc.name),"_is_error":true});
+                            record(&message);
+                            messages.push(message);
+                            correction_batch.observe(tc, Some(CorrectionClass::TruncatedArguments));
+                            let repeated = corrections.observe(tc, Some(CorrectionClass::TruncatedArguments));
+                            if stuck.is_none() { stuck = repeated; }
+                        }
+                        if let Some(error) = stuck.or(corrections.observe_batch(correction_batch)) { return Err(error); }
+                        continue;
+                    }
+                    let (denied, approved_calls) = self
                         .approve_calls(cfg, session_id, run_id, &result.tool_calls, cancel)
                         .await?;
-                    for tc in &result.tool_calls {
-                        let (text, is_error) = self
-                            .dispatch_call_checked(
+                    let mut stuck = None;
+                        let mut correction_batch = CorrectionBatch::default();
+                    for tc in &approved_calls {
+                        let (text, is_error, correction) = self
+                            .dispatch_call_correction(
                                 session_id,
                                 run_id,
                                 tc,
@@ -9613,7 +9743,11 @@ impl Daemon {
                         }
                         record(&msg);
                         messages.push(msg);
+                        correction_batch.observe(tc, correction);
+                        let repeated = corrections.observe(tc, correction);
+                        if stuck.is_none() { stuck = repeated; }
                     }
+                    if let Some(error) = stuck.or(corrections.observe_batch(correction_batch)) { return Err(error); }
                 }
             }).await;
             if let Some(task) = &routing_task {
@@ -12191,6 +12325,7 @@ impl Daemon {
                     &caps.unbound(),
                     None,
                     cancel,
+                    None,
                 )
                 .await
             {
@@ -12451,6 +12586,7 @@ impl Daemon {
                 &caps,
                 Some(&input),
                 cancel,
+                None,
             )
             .await
         {
@@ -12560,6 +12696,7 @@ impl Daemon {
         caps: &Capabilities,
         input: Option<&Value>,
         cancel: &CancellationToken,
+        batch: Option<ApprovalBatch>,
     ) -> bool {
         if cancel.is_cancelled() {
             return false;
@@ -12840,7 +12977,7 @@ impl Daemon {
                 .unwrap_or_default(),
             code_preview: (!preview.is_empty()).then_some(preview),
             tool_id: Some(info.id.clone()),
-            batch: self.batch_position(session_id, &info.name),
+            batch,
             path_options,
         });
         if cfg.tools.approval_summaries && caps.mcp.is_empty() {
@@ -13623,6 +13760,7 @@ impl Daemon {
                         &caps,
                         Some(&input),
                         &cancel,
+                        None,
                     )
                     .await;
             if cancel.is_cancelled() || cancel_flag.load(Ordering::SeqCst) {
@@ -15795,6 +15933,7 @@ impl HostOps for NestedOps {
                 &caps,
                 Some(&input),
                 &self.cancel,
+                None,
             ),
         ));
         if self.cancel.is_cancelled() {
@@ -16222,10 +16361,16 @@ impl HostOps for NestedOps {
 tokio::task_local! {
     /// Set by [`call_failed`] while one tool call is dispatched.
     static CALL_FAILED: std::cell::Cell<bool>;
+    static CALL_CORRECTION: std::cell::Cell<Option<CorrectionClass>>;
 }
 
 /// Mark the tool call being dispatched as failed (`is_error` on its
 /// result) and pass its text through.
+fn call_correction(text: String, class: CorrectionClass) -> String {
+    let _ = CALL_CORRECTION.try_with(|correction| correction.set(Some(class)));
+    call_failed(text)
+}
+
 fn call_failed(text: String) -> String {
     let _ = CALL_FAILED.try_with(|f| f.set(true));
     text
@@ -16827,6 +16972,7 @@ mod trust_precedence_tests {
                 &caps,
                 None,
                 &CancellationToken::new(),
+                None,
             )
             .await;
         assert!(ok);
@@ -17497,7 +17643,7 @@ mod grant_code_tests {
         let cancel = CancellationToken::new();
         assert!(
             daemon
-                .ensure_approval(&cfg, &sid, "", &info1, &v1, &caps, None, &cancel)
+                .ensure_approval(&cfg, &sid, "", &info1, &v1, &caps, None, &cancel, None)
                 .await,
             "v1 runs on its grant"
         );
@@ -17520,7 +17666,7 @@ mod grant_code_tests {
         assert_ne!(code_hash(&v1), code_hash(&v2));
         assert!(
             !daemon
-                .ensure_approval(&cfg, &sid, "", &info2, &v2, &caps, None, &cancel)
+                .ensure_approval(&cfg, &sid, "", &info2, &v2, &caps, None, &cancel, None)
                 .await,
             "v2 needs a new answer (and nobody is here to give it)"
         );
@@ -17607,6 +17753,7 @@ mod widen_scope_tests {
                         &caps,
                         None,
                         &CancellationToken::new(),
+                        None,
                     )
                     .await
                 })
@@ -17770,7 +17917,7 @@ mod run_start_tests {
                 cancel_flag: Arc::new(AtomicBool::new(false)),
                 steer_tx,
                 steering: Arc::new(Default::default()),
-                retry: Arc::new(tokio::sync::Notify::new()),
+                retry: Arc::new(provider_retry_daemon::ProviderRetry::default()),
             },
         );
         let e = daemon.start_run(sid.clone()).unwrap_err().to_string();
@@ -18128,7 +18275,7 @@ mod live_snapshot_tests {
                 cancel_flag: Arc::new(AtomicBool::new(false)),
                 steer_tx,
                 steering: Arc::new(Default::default()),
-                retry: Arc::new(tokio::sync::Notify::new()),
+                retry: Arc::new(provider_retry_daemon::ProviderRetry::default()),
             },
         );
         let (tx, rx) = oneshot::channel();
@@ -18303,8 +18450,18 @@ mod progress_daemon;
 #[path = "recap_daemon.rs"]
 mod recap_daemon;
 
+#[cfg(test)]
+#[path = "correction_daemon_tests.rs"]
+mod correction_daemon_tests;
+
+#[path = "correction_loop.rs"]
+mod correction_loop;
+
 #[path = "steering_daemon.rs"]
 mod steering_daemon;
+
+#[path = "provider_retry_daemon.rs"]
+mod provider_retry_daemon;
 
 #[path = "run_files_daemon.rs"]
 mod run_files_daemon;
@@ -18339,3 +18496,10 @@ mod artifact_cleanup_tests;
 #[cfg(test)]
 #[path = "tool_schema_daemon_tests.rs"]
 mod tool_schema_tests;
+
+#[path = "approval_batch.rs"]
+mod approval_batch;
+
+#[cfg(test)]
+#[path = "approval_batch_tests.rs"]
+mod approval_batch_tests;
