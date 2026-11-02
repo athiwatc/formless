@@ -1,3 +1,4 @@
+import { installEventRenderFixture } from './test-web-render.mjs';
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 import test from 'node:test';
@@ -14,6 +15,7 @@ function setup(actualRefresh = false) {
   const c = vm.createContext({S:{current:'s',running:new Set(),sessions:[],liveTools:[],invocations:[],ws:{},conn:1,channel:{}}, h, $:() => box,
     forecastRevision:0, scheduleForecast() {}, note: text => notes.push(text), branchSummaryEvent() {}, notifyFor() {}, renderLive() {}, renderStatus() {}, renderComposer() {}, renderRunBanner() {}, renderRunTools() {}, renderPlan() {}, renderHistory() {}, setActivity() {}, isRunning:() => true,
     request: async () => [], Date});
+  installEventRenderFixture(c, fn);
   vm.runInContext(['runningTool','reconcileInvocationProgress','progressDiagnostic','refreshRunning','onEvent'].map(fn).join('\n'),c);
   if (!actualRefresh) c.refreshRunning = () => {};
   return {c, notes, box};

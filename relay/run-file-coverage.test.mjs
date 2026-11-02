@@ -1,3 +1,4 @@
+import { installEventRenderFixture } from './test-web-render.mjs';
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 import test from 'node:test';
@@ -17,6 +18,7 @@ function setup() {
     // focus and inertness use the browser regression suite's real DOM.
     openDialog: node => appended.push(node), closeDialog: node => node.remove(),
     $: () => ({focus(){}}), act: async () => context.reply });
+  installEventRenderFixture(context, fn);
   vm.runInContext(['runFilesCaveat','runFilesText','showRunFiles','recapBlock','onEvent'].map(fn).join('\n'), context);
   return { context, notes, appended };
 }

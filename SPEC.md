@@ -1230,6 +1230,17 @@ pasting paths.
     bubbles).
 
   Both are remembered per device.
+- **Stable transcript reading (web).** Incoming live display updates are batched
+  to animation frames. Streaming tails and elapsed timers retain their text
+  nodes; unchanged message wrappers, turns and Tool disclosures stay mounted.
+  Reading history pauses following. Explicit block/message anchors preserve
+  pixel offsets across persisted output, disclosure changes and delayed diagram
+  layout without native scroll anchoring. View and Session navigation retain
+  paused reading state and discard stale paint callbacks. The new-output pill
+  tracks new content below the viewport; timer ticks and layout changes alone
+  do not create it. Following resumes on an explicit user scroll to the bottom
+  or pill action, rather than an approximate distance threshold or a
+  programmatic scroll.
 - **Device display and printing (web).** Auto theme follows OS changes;
   the browser theme/status-bar color follows the effective Auto, Light or Dark
   theme, with media-specific initial colors before JavaScript loads. Shell
