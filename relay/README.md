@@ -140,6 +140,12 @@ transcript fixture, checks browser default font preferences, manual reading
 size, theme changes, menus and simulated safe areas, and saves screenshots
 and a multipage PDF. Simulated insets do not replace physical phone testing.
 
+Keyboard and overlay regressions run with
+`python relay/web-focus.browser-test.py /tmp/formless-focus-check` (Python
+Playwright and `/usr/bin/chromium`). This check uses the shipped frontend with
+controlled replies, exercises modal focus containment and background inertness,
+return focus, nested dialogs and menu keyboard navigation, and saves screenshots.
+
 `dev.mjs` runs the Worker's own code: each room is `worker.js`'s
 `RelayRoom` over a real SQLite ledger through Node's built-in `node:sqlite`
 (Node 22.13+), and every

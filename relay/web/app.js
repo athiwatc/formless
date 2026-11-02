@@ -483,7 +483,9 @@
     ok.className = "btn " + (opts.danger ? "danger" : "primary");
     $("ask-backdrop").classList.remove("hidden");
     const first = opts.body && opts.body.querySelector("input");
-    setTimeout(() => { if (askResolve === resolve) { if (opts.input) input.select(); else (first || ok).focus(); } }, 0);
+    openDialog($("ask-backdrop"), { trigger: focusBefore["ask-backdrop"],
+      initialFocus: opts.input ? input : first || ok, onDismiss: () => closeAsk(null) });
+    if (opts.input && activeDialog()?.node === $("ask-backdrop")) input.select();
   }
   function closeAsk(value) {
     $("ask-backdrop").classList.add("hidden");
@@ -631,13 +633,70 @@
 
   // ------------------------------------------------------------- sidebar
   let popover = null;
-  function closePopover() {
+  let popoverTrigger = null;
+  function closePopover({ restore = !!popover && (popover.contains(document.activeElement) || document.activeElement === document.body) } = {}) {
+    const trigger = popoverTrigger;
     if (popover) { popover.remove(); popover = null; }
-    document.querySelectorAll(".menu[aria-expanded]").forEach((m) => m.removeAttribute("aria-expanded"));
+    popoverTrigger = null;
+    // Keep the expanded trigger visible until focus-within takes over.
+    if (restore) focusReturn(trigger);
+    if (trigger) {
+      trigger.removeAttribute("aria-expanded");
+      trigger.removeAttribute("aria-controls");
+    }
+  }
+  function menuTriggerKey(e, open) {
+    if (["Enter", " ", "ArrowDown", "ArrowUp"].includes(e.key)) e.stopPropagation();
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      open(e.key === "ArrowUp");
+    }
   }
   /** Measure after insertion: rem-based menus can be taller than the viewport. */
-  function placePopover(btn, alignRight = false) {
-    document.body.append(popover);
+  function placePopover(btn, alignRight = false, focusLast = false) {
+    popoverTrigger = btn;
+    btn.setAttribute("aria-haspopup", "menu");
+    btn.setAttribute("aria-expanded", "true");
+    btn.setAttribute("aria-controls", "action-menu");
+    popover.id = "action-menu";
+    const items = [...popover.querySelectorAll("button")];
+    for (const item of items) { item.setAttribute("role", "menuitem"); item.tabIndex = -1; }
+    const available = () => items.filter((item) => !item.disabled && !item.hidden);
+    const focus = (item) => {
+      if (!item) return;
+      for (const other of items) other.tabIndex = other === item ? 0 : -1;
+      item.focus({ preventScroll: true });
+      item.scrollIntoView({ block: "nearest" });
+    };
+    popover.addEventListener("focusin", (e) => {
+      if (items.includes(e.target)) for (const item of items) item.tabIndex = item === e.target ? 0 : -1;
+    });
+    // A menu action is not an outside click on its drawer or parent dialog.
+    popover.addEventListener("click", (e) => e.stopPropagation());
+    popover.addEventListener("keydown", (e) => {
+      // A menu owns its keys: page shortcuts must not run behind it.
+      e.stopPropagation();
+      if (e.key === "Escape" || e.key === "Tab") {
+        e.preventDefault();
+        closePopover({ restore: true });
+        return;
+      }
+      const enabled = available();
+      if (!enabled.length) return;
+      const current = enabled.indexOf(document.activeElement);
+      let next;
+      if (e.key === "ArrowDown") next = (current + 1) % enabled.length;
+      else if (e.key === "ArrowUp") next = (current - 1 + enabled.length) % enabled.length;
+      else if (e.key === "Home") next = 0;
+      else if (e.key === "End") next = enabled.length - 1;
+      else if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey && e.key !== " ") {
+        const ordered = enabled.slice(current + 1).concat(enabled.slice(0, current + 1));
+        const match = ordered.find((item) => item.textContent.trim().toLocaleLowerCase().startsWith(e.key.toLocaleLowerCase()));
+        if (match) next = enabled.indexOf(match);
+      }
+      if (next != null) { e.preventDefault(); focus(enabled[next]); }
+    });
+    (activeDialog()?.node || document.body).append(popover);
     const css = getComputedStyle(document.documentElement);
     const inset = (edge) => parseFloat(css.getPropertyValue("--safe-" + edge)) || 0;
     const gap = (parseFloat(css.fontSize) || 16) * 0.5;
@@ -655,7 +714,8 @@
     const y = r.bottom + gap + height <= bottom ? r.bottom + gap : r.top - gap - height;
     popover.style.left = Math.max(left, Math.min(x, right - width)) + "px";
     popover.style.top = Math.max(top, Math.min(y, bottom - height)) + "px";
-    popover.querySelector("button").focus({ preventScroll: true });
+    const enabled = available();
+    focus(focusLast ? enabled[enabled.length - 1] : enabled[0]);
   }
   window.addEventListener("resize", closePopover);
   window.visualViewport?.addEventListener("resize", closePopover);
@@ -707,10 +767,10 @@
     S.sessions.sort((a, b) => (b.pinned - a.pinned) || b.updated_at.localeCompare(a.updated_at));
     renderSessions();
   }
-  function sessionMenu(btn, s) {
+  function sessionMenu(btn, s, focusLast = false) {
     closePopover();
     btn.setAttribute("aria-expanded", "true");
-    popover = h("div", { class: "popover", role: "menu" },
+    popover = h("div", { class: "popover", role: "menu", "aria-label": "Session actions" },
       h("button", { type: "button", onclick: () => { closePopover(); pinSession(s); } }, s.pinned ? "Unpin" : "Pin"),
       h("button", { type: "button", onclick: () => { closePopover(); archiveSession(s); } }, s.archived ? "Unarchive" : "Archive"),
       h("button", { type: "button", onclick: () => { closePopover(); renameSession(s); } }, "Rename"),
@@ -721,7 +781,7 @@
       h("button", { type: "button", title: S.local ? "" : "The link includes the pairing key", onclick: () => { closePopover(); copySessionLink(s); } }, S.local ? "Copy link" : "Copy link (has the key)"),
       h("button", { type: "button", onclick: () => { closePopover(); pickExport(s.id); } }, "Export…"),
       h("button", { type: "button", class: "danger", onclick: () => { closePopover(); deleteSession(s); } }, "Delete"));
-    placePopover(btn);
+    placePopover(btn, false, focusLast);
   }
 
   // Running Invocations across Sessions (SPEC §6.3): cancel or abandon.
@@ -819,6 +879,7 @@
     if (r) { note("comparing " + a + " vs " + b + " in forked Sessions; the answers show here when both finish"); refreshSessions(); }
   }
   async function compareSessionsCommand(arg) {
+    const trigger = document.activeElement;
     const generation = S.sessionCompareGeneration = (S.sessionCompareGeneration || 0) + 1;
     const words = (arg || "").trim().split(/\s+/);
     if (words.length !== 2 || !words[0]) return note("usage: /compare SESSION_A SESSION_B (stored history only); /compare-models starts paid model comparisons", true);
@@ -831,7 +892,7 @@
     if (result.left?.session?.id !== left || result.right?.session?.id !== right) return note("Session comparison reply does not match the requested ordered pair; retry /compare.", true);
     const body = h("pre", { class: "session-comparison" }, sessionComparisonText(result));
     showBidi(body);
-    modal("Stored Session comparison", body);
+    modal("Stored Session comparison", body, { trigger });
   }
 
   function invalidateBranchSummary() {
@@ -971,7 +1032,8 @@
     for (const row of sessionRows(S.sessions, shown, !!S.sessionTree)) {
       const s = row.session;
       const menu = h("button", {
-        class: "icon-btn menu", type: "button", "aria-label": "Session actions",
+        class: "icon-btn menu", type: "button", "aria-label": "Session actions", "aria-haspopup": "menu",
+        onkeydown: (e) => menuTriggerKey(e, (last) => sessionMenu(menu, s, last)),
         onclick: (e) => { e.stopPropagation(); sessionMenu(menu, s); },
       }, "⋯");
       list.append(h("li", {
@@ -1500,6 +1562,7 @@
   }
   // Stored outputs open over the protocol (GetArtifact), never by path.
   async function openArtifact(id) {
+    const trigger = document.activeElement;
     const first = await act({ type: "get_artifact", id, offset: 0 });
     if (!first) return;
     let text = first.text;
@@ -1533,16 +1596,15 @@
       setTimeout(() => URL.revokeObjectURL(a.href), 1000);
     } }, "Download");
     const close = h("button", { class: "btn small primary", type: "button" }, "Close");
-    const viewer = h("div", { class: "backdrop", role: "dialog", "aria-modal": "true" },
+    const viewer = h("div", { class: "backdrop", role: "dialog", "aria-modal": "true", "aria-label": "Full output" },
       h("div", { class: "modal viewer" },
         h("h2", null, "Output " + id.slice(0, 8) + " · " + first.bytes + " bytes"),
         pre,
         h("div", { class: "modal-actions" }, status, h("span", { class: "spacer" }), more, download, close)));
-    close.onclick = () => viewer.remove();
-    viewer.addEventListener("keydown", (e) => { if (e.key === "Escape") { e.stopPropagation(); viewer.remove(); } });
-    document.body.append(viewer);
+    const done = () => closeDialog(viewer);
+    close.onclick = done;
+    openDialog(viewer, { trigger, initialFocus: close, onDismiss: done });
     sync();
-    close.focus();
   }
 
   // ------------------------------------------------------- @ mentions
@@ -1809,7 +1871,7 @@
         h("label", { class: "picker-effort" }, "Reasoning effort ", effort),
         h("div", { class: "modal-actions" }, status, h("span", { class: "spacer" }), test, cancel, asDefault, apply)));
     let items = [], matches = [], sel = 0;
-    const close = () => { dialog.remove(); $("input").focus(); };
+    const close = () => closeDialog(dialog);
     const choice = () => (matches[sel] && matches[sel].item.id) || input.value.trim();
     const multiSource = () => new Set(items.map((i) => i.source)).size > 1;
     function draw() {
@@ -1862,8 +1924,10 @@
     }
     input.oninput = () => { sel = 0; draw(); };
     dialog.addEventListener("keydown", (e) => {
-      if (e.key === "Escape") { e.stopPropagation(); close(); }
-      else if (e.key === "ArrowDown") { e.preventDefault(); sel = Math.min(sel + 1, matches.length - 1); draw(); }
+      // The model filter owns list navigation; native selects/buttons keep
+      // their Arrow and Enter behavior instead of unexpectedly applying a model.
+      if (e.target !== input) return;
+      if (e.key === "ArrowDown") { e.preventDefault(); sel = Math.min(sel + 1, matches.length - 1); draw(); }
       else if (e.key === "ArrowUp") { e.preventDefault(); sel = Math.max(sel - 1, 0); draw(); }
       else if (e.key === "Enter" && e.target.tagName !== "BUTTON") { e.preventDefault(); finish(e.ctrlKey || e.metaKey); }
     });
@@ -1880,8 +1944,7 @@
       status.textContent = modelTestText(t);
       draw();
     };
-    document.body.append(dialog);
-    input.focus();
+    openDialog(dialog, { initialFocus: input, onDismiss: close });
     const r = await act({ type: "list_models" }, null, 30000);
     if (!r || !dialog.isConnected) return;
     const recent = r.recent || [];
@@ -1914,6 +1977,7 @@
       build(node);
       if (m.role !== "system-note") {
         node.append(h("button", { class: "msg-menu", type: "button", title: "Message actions", "aria-label": "Message actions", "aria-haspopup": "menu",
+          onkeydown: (e) => menuTriggerKey(e, (last) => messageMenu(e.currentTarget, m, node, last)),
           onclick: (e) => { e.stopPropagation(); messageMenu(e.currentTarget, m, node); } }, "⋯"));
       }
       rendered.set(m.id, node);
@@ -1926,7 +1990,7 @@
   /** Actions on one message (SPEC §10.2): copy it (as text or Markdown),
    * edit and re-run a user message, fork the Session from it, and copy a
    * Tool call's input or a result. */
-  function messageMenu(btn, m, node) {
+  function messageMenu(btn, m, node, focusLast = false) {
     closePopover();
     let calls = [];
     try { calls = JSON.parse(m.meta || "{}").tool_calls || []; } catch (_) {}
@@ -1952,8 +2016,8 @@
     }));
     btn.setAttribute("aria-expanded", "true");
     btn.classList.add("menu");
-    popover = h("div", { class: "popover", role: "menu" }, items);
-    placePopover(btn, true);
+    popover = h("div", { class: "popover", role: "menu", "aria-label": "Message actions" }, items);
+    placePopover(btn, true, focusLast);
   }
 
   function assistantStopNote(message) {
@@ -2560,7 +2624,7 @@
   function renderApproval() {
     const req = S.approvals[0];
     if (!req) S.approvalLater = false;
-    $("modal-backdrop").classList.toggle("hidden", !req || S.approvalLater);
+    $("modal-backdrop").classList.toggle("hidden", !req || !!S.approvalLater);
     if (!req || S.approvalLater) return restoreFocus("modal-backdrop");
     const promo = req.kind === "promotion";
     for (const id of ["modal-approve", "modal-once", "modal-session", "modal-hour", "modal-deny", "modal-deny-always"]) {
@@ -2616,7 +2680,10 @@
     $("modal-approve").replaceChildren(h("kbd", { "aria-hidden": "true" }, "y"), promo ? " Approve" : " Always");
     rememberFocus("modal-backdrop");
     $("modal-more").textContent = S.approvals.length > 1 ? "+" + (S.approvals.length - 1) + " more waiting" : "";
-    setTimeout(() => $("modal-approve").focus(), 0);
+    openDialog($("modal-backdrop"), { trigger: focusBefore["modal-backdrop"],
+      initialFocus: $("modal-approve"), background: true,
+      canDismiss: () => !S.approvals[0]?.deciding,
+      onDismiss: () => { S.approvalLater = true; renderApproval(); } });
   }
   /** The agent's open question in a dialog; Cancel keeps it pending (the
    * status bar and `a` bring it back). */
@@ -2667,30 +2734,182 @@
   }
   $("status-approvals").onclick = focusPending;
   $("modal-later").onclick = () => { S.approvalLater = true; renderApproval(); };
-  /** Dialogs give focus back to where it was when they close. */
+  // Every modal shares the same stack, focus boundary and inert background.
+  // Re-rendering an existing dialog does not raise it or replace its invoker.
+  const dialogStack = [];
+  const dialogInert = new Map();
   const focusBefore = {};
+  let syncingDialogs = false;
+  let lastFocusTarget = null;
+  function activeDialog() {
+    return dialogStack[dialogStack.length - 1] || null;
+  }
+  function focusVisible(el) {
+    return !!(el && el !== document.body && el.isConnected && typeof el.focus === "function"
+      && !el.disabled && !el.closest("[inert], .hidden, [hidden]") && el.getClientRects().length
+      && getComputedStyle(el).visibility !== "hidden");
+  }
+  function dialogItems(node) {
+    return [...node.querySelectorAll("button, a[href], input, select, textarea, summary, [tabindex]")]
+      .filter((el) => el.tabIndex >= 0 && focusVisible(el));
+  }
+  function focusReturn(el) {
+    const top = activeDialog();
+    if (focusVisible(el) && (!top || top.node.contains(el))) {
+      el.focus({ preventScroll: true });
+      if (document.activeElement === el) return;
+    }
+    if (top) return focusDialog(top);
+    // A re-render or view change can remove/hide the original control.
+    const candidates = [document.querySelector('#tabs button[aria-current="page"]'),
+      $("view-" + S.view)?.querySelector("button, input, select, textarea, [tabindex]"), $("input"), $("secret")];
+    const fallback = candidates.find(focusVisible);
+    if (fallback) return fallback.focus({ preventScroll: true });
+    const root = !$("app").classList.contains("hidden") ? $("app") : $("pair");
+    root.tabIndex = -1;
+    root.focus({ preventScroll: true });
+  }
+  function focusDialog(entry, preferred) {
+    if (activeDialog() !== entry) return;
+    const initial = preferred || (typeof entry.initialFocus === "function" ? entry.initialFocus() : entry.initialFocus);
+    const target = focusVisible(initial) && entry.node.contains(initial) ? initial : dialogItems(entry.node)[0];
+    const surface = entry.node.querySelector(".modal") || entry.node;
+    if (!target) surface.tabIndex = -1;
+    (target || surface).focus({ preventScroll: true });
+  }
+  function syncDialogs() {
+    if (syncingDialogs) return;
+    syncingDialogs = true;
+    const removed = dialogStack.filter((entry) => !entry.node.isConnected || entry.node.classList.contains("hidden") || entry.node.hidden);
+    const previousTop = activeDialog();
+    for (const entry of removed) {
+      if (popover && entry.node.contains(popover)) closePopover({ restore: false });
+      dialogStack.splice(dialogStack.indexOf(entry), 1);
+      releaseDialog(entry);
+    }
+    const top = activeDialog();
+    if (top) {
+      for (const node of document.body.children) {
+        if (!dialogInert.has(node)) dialogInert.set(node, node.inert);
+        const inert = node !== top.node;
+        if (node.inert !== inert) node.inert = inert;
+      }
+      dialogStack.forEach((entry, index) => { entry.node.style.zIndex = String(100 + index); });
+    } else {
+      for (const [node, inert] of dialogInert) if (node.inert !== inert) node.inert = inert;
+      dialogInert.clear();
+    }
+    syncingDialogs = false;
+    if (previousTop && removed.includes(previousTop)) focusReturn(previousTop.trigger);
+    else if (top && !top.node.contains(document.activeElement)) focusDialog(top);
+  }
+  function openDialog(node, options = {}) {
+    const existing = dialogStack.find((entry) => entry.node === node);
+    if (existing) {
+      for (const key of ["onDismiss", "canDismiss"]) if (key in options) existing[key] = options[key];
+      syncDialogs();
+      return existing;
+    }
+    const trigger = options.trigger || popoverTrigger || document.activeElement;
+    closePopover({ restore: false });
+    if (!node.isConnected) document.body.append(node);
+    node.classList.remove("hidden");
+    node.hidden = false;
+    const entry = { node, trigger, initialFocus: options.initialFocus, onDismiss: options.onDismiss,
+      canDismiss: options.canDismiss, zIndex: node.style.zIndex };
+    // An arriving approval waits behind the user's current modal. An explicit
+    // nested prompt/viewer instead becomes the active layer.
+    if (options.background && dialogStack.length) dialogStack.unshift(entry);
+    else dialogStack.push(entry);
+    let pointerStartedOutside = false, pointerEndedOutside = false;
+    entry.pointerdown = (e) => {
+      pointerStartedOutside = e.target === node;
+      pointerEndedOutside = false;
+      if (pointerStartedOutside) e.preventDefault();
+    };
+    entry.pointerup = (e) => {
+      pointerEndedOutside = e.target === node;
+      // Selecting/dragging non-focusable text can blur a control to body.
+      // Do not cancel that gesture; restore modal focus after it finishes.
+      if (activeDialog() === entry && !node.contains(document.activeElement)) focusDialog(entry, entry.lastFocus);
+    };
+    entry.click = (e) => {
+      if (e.target === node && pointerStartedOutside && pointerEndedOutside) dismissDialog(entry);
+      else if (activeDialog() === entry && !node.contains(document.activeElement)) focusDialog(entry, entry.lastFocus);
+      pointerStartedOutside = pointerEndedOutside = false;
+    };
+    node.addEventListener("pointerdown", entry.pointerdown);
+    node.addEventListener("pointerup", entry.pointerup);
+    node.addEventListener("click", entry.click);
+    syncDialogs();
+    if (activeDialog() === entry) focusDialog(entry);
+    return entry;
+  }
+  function releaseDialog(entry) {
+    entry.node.removeEventListener("pointerdown", entry.pointerdown);
+    entry.node.removeEventListener("pointerup", entry.pointerup);
+    entry.node.removeEventListener("click", entry.click);
+    entry.node.style.zIndex = entry.zIndex;
+  }
+  function dismissDialog(entry) {
+    if (activeDialog() !== entry) return;
+    const allowed = typeof entry.canDismiss === "function" ? entry.canDismiss() : entry.canDismiss !== false;
+    if (!entry.onDismiss || !allowed) return focusDialog(entry, entry.lastFocus);
+    entry.onDismiss();
+    if (activeDialog() === entry) focusDialog(entry, entry.lastFocus);
+  }
+  function closeDialog(node, { remove = true } = {}) {
+    const index = dialogStack.findIndex((entry) => entry.node === node);
+    const entry = dialogStack[index];
+    const wasTop = entry && activeDialog() === entry;
+    if (entry) {
+      if (popover && node.contains(popover)) closePopover({ restore: false });
+      dialogStack.splice(index, 1);
+      releaseDialog(entry);
+    }
+    if (remove) node.remove();
+    else node.classList.add("hidden");
+    syncDialogs();
+    if (wasTop) focusReturn(entry.trigger);
+  }
   function rememberFocus(id) {
-    const el = document.activeElement;
-    if (el && !$(id).contains(el) && focusBefore[id] === undefined) focusBefore[id] = el;
+    if (focusBefore[id] === undefined && !$(id).contains(document.activeElement))
+      focusBefore[id] = popoverTrigger || document.activeElement;
   }
   function restoreFocus(id) {
-    const el = focusBefore[id];
+    closeDialog($(id), { remove: false });
     delete focusBefore[id];
-    if (el && el.isConnected && typeof el.focus === "function") el.focus();
   }
-  // Tab stays inside an open dialog (it is modal).
   document.addEventListener("keydown", (e) => {
-    if (e.key !== "Tab") return;
-    const open = ["ask-backdrop", "modal-backdrop"].map($).find((b) => !b.classList.contains("hidden"));
-    if (!open) return;
-    const items = [...open.querySelectorAll("button, [href], input, select, textarea, summary, [tabindex]:not([tabindex='-1'])")]
-      .filter((el) => !el.disabled && !el.closest(".hidden") && el.offsetParent !== null);
-    if (!items.length) return;
-    const first = items[0], last = items[items.length - 1];
-    if (!open.contains(document.activeElement)) { e.preventDefault(); first.focus(); }
-    else if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
-    else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+    const top = activeDialog();
+    if (!top || (popover && popover.contains(e.target))) return;
+    if (e.key === "Escape") {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      dismissDialog(top);
+    } else if (e.key === "Tab") {
+      const items = dialogItems(top.node);
+      const first = items[0], last = items[items.length - 1];
+      if (!items.length) { e.preventDefault(); focusDialog(top); }
+      else if (!top.node.contains(document.activeElement)) { e.preventDefault(); (e.shiftKey ? last : first).focus(); }
+      else if (e.shiftKey && (document.activeElement === first || !items.includes(document.activeElement))) { e.preventDefault(); last.focus(); }
+      else if (!e.shiftKey && (document.activeElement === last || !items.includes(document.activeElement))) { e.preventDefault(); first.focus(); }
+    }
+  }, true);
+  document.addEventListener("focusin", (e) => {
+    if (e.target !== document.body && e.target !== document.documentElement) lastFocusTarget = e.target;
+    const top = activeDialog();
+    if (top && !top.node.contains(e.target)) focusDialog(top);
+    else if (top) top.lastFocus = e.target;
   });
+  new MutationObserver(() => {
+    if (dialogStack.length || dialogInert.size) syncDialogs();
+    // A menu action, view transition or streamed re-render can remove the
+    // restored control after a dialog has already closed. Retain visible user
+    // focus; recover only when its previous target itself disappeared/was hidden.
+    if (lastFocusTarget && !focusVisible(lastFocusTarget) && !focusVisible(document.activeElement)) focusReturn(lastFocusTarget);
+  })
+    .observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ["class", "hidden"] });
   async function decide(approved, scope, rememberDenial) {
     // Granting broad access beyond this call takes a second press (§10.3).
     const head = S.approvals[0];
@@ -3810,11 +4029,13 @@
   }
   // Disk use by kind (SPEC §9.6).
   async function showStorage() {
+    const trigger = document.activeElement;
     const r = await act({ type: "storage_usage" });
-    if (r) modal("Disk use", h("div", null, kindsTable(r, false), h("p", { class: "muted" }, "Total " + humanBytes(r.total_bytes) + " in " + r.data_dir + (r.last_backup ? " · last backup " + r.last_backup : ""))));
+    if (r) modal("Disk use", h("div", null, kindsTable(r, false), h("p", { class: "muted" }, "Total " + humanBytes(r.total_bytes) + " in " + r.data_dir + (r.last_backup ? " · last backup " + r.last_backup : ""))), { trigger });
   }
   // Clean-up: the dry run first, then free it on request.
   async function showGc() {
+    const trigger = document.activeElement;
     const r = await act({ type: "gc", dry_run: true });
     if (!r) return;
     let close = null;
@@ -3824,10 +4045,11 @@
       if (close) close();
       note("freed about " + humanBytes(done.total_bytes));
     } }, "Free " + humanBytes(r.total_bytes));
-    close = modal("Clean up", h("div", null, kindsTable(r, true), h("div", { class: "detail-actions" }, run)));
+    close = modal("Clean up", h("div", null, kindsTable(r, true), h("div", { class: "detail-actions" }, run)), { trigger });
   }
   // The daemon and what it is using (SPEC §9.3).
   async function showStatus() {
+    const trigger = document.activeElement;
     const v = await act({ type: "status" });
     if (!v) return;
     const r = v.resources || {};
@@ -3838,29 +4060,29 @@
       ["database", humanBytes(r.db_bytes) + " · artifacts " + humanBytes(r.artifacts_bytes)],
       ["work", v.sessions + " Sessions · " + (v.running_sessions || []).length + " running Runs · " + r.running_invocations + " pending Invocations"],
     ];
-    modal("Daemon", h("table", { class: "table" }, h("tbody", null, rows.map(([k, val]) => h("tr", null, h("td", null, k), h("td", null, val))))));
+    modal("Daemon", h("table", { class: "table" }, h("tbody", null, rows.map(([k, val]) => h("tr", null, h("td", null, k), h("td", null, val))))), { trigger });
   }
 
   // A modal with a title, body and Close (Esc closes it).
-  function modal(title, body) {
+  function modal(title, body, options = {}) {
     const close = h("button", { class: "btn small primary", type: "button" }, "Close");
     const dialog = h("div", { class: "backdrop", role: "dialog", "aria-modal": "true", "aria-label": title },
       h("div", { class: "modal help" }, h("h2", null, title), h("div", { class: "files-body" }, body),
         h("div", { class: "modal-actions" }, h("span", { class: "spacer" }), close)));
-    const done = () => dialog.remove();
+    const done = () => closeDialog(dialog);
     close.onclick = done;
-    dialog.addEventListener("keydown", (e) => { if (e.key === "Escape") { e.stopPropagation(); done(); } });
-    document.body.append(dialog);
-    close.focus();
+    openDialog(dialog, { ...options, initialFocus: close, onDismiss: done });
     return done;
   }
   // An MCP server's stderr tail (SPEC §7.9).
   async function showMcpLog(name) {
+    const trigger = document.activeElement;
     const r = await act({ type: "mcp_server_log", name, lines: 200 });
-    if (r) modal("MCP " + name + " log", h("pre", { class: "diff" }, r.lines.length ? r.lines.join("\n") : "(no output yet)"));
+    if (r) modal("MCP " + name + " log", h("pre", { class: "diff" }, r.lines.length ? r.lines.join("\n") : "(no output yet)"), { trigger });
   }
   // Turn an MCP server's tools on or off, with each one's token cost.
   async function showMcpTools(name) {
+    const trigger = document.activeElement;
     const r = await act({ type: "list_mcp_tools", name }, null, 60000);
     if (!r) return;
     const total = h("p", { class: "muted" }, "Enabled tools cost ~" + r.enabled_tokens + " tokens per request.");
@@ -3873,10 +4095,11 @@
       };
       return h("tr", null, h("td", null, box), h("td", null, h("code", null, t.name), h("div", { class: "muted" }, t.description || ""), descriptionReviewCard(t.description_review, t.description_reviews)), h("td", { class: "num" }, "~" + t.tokens));
     });
-    modal("MCP " + name + " tools", h("div", null, total, h("table", { class: "table" }, h("tbody", null, rows))));
+    modal("MCP " + name + " tools", h("div", null, total, h("table", { class: "table" }, h("tbody", null, rows))), { trigger });
   }
   // The curated catalog of popular servers (SPEC §7.9).
   async function showMcpCatalog() {
+    const trigger = document.activeElement;
     const list = await act({ type: "mcp_catalog" });
     if (!list) return;
     let close = null;
@@ -3905,10 +4128,11 @@
         if (close) close();
         refreshSettings();
       } }, "Add"))));
-    close = modal("MCP server catalog", h("table", { class: "table" }, h("tbody", null, rows)));
+    close = modal("MCP server catalog", h("table", { class: "table" }, h("tbody", null, rows)), { trigger });
   }
   // Servers configured in Claude Desktop, Cursor or VS Code (SPEC §7.9).
   async function showMcpImport() {
+    const trigger = document.activeElement;
     const list = await act({ type: "mcp_import_candidates", cwd: null });
     if (!list) return;
     if (!list.length) return note("no MCP servers found in Claude Desktop, Cursor or VS Code configs");
@@ -3926,7 +4150,7 @@
         ev.target.replaceWith(h("span", { class: "muted" }, "imported disabled and untrusted"));
         refreshSettings();
       } }, "Add"))));
-    modal("Import MCP servers", h("div", null, h("p", { class: "muted" }, "Check each command before adding it: it runs on the daemon's machine."), h("table", { class: "table" }, h("tbody", null, rows))));
+    modal("Import MCP servers", h("div", null, h("p", { class: "muted" }, "Check each command before adding it: it runs on the daemon's machine."), h("table", { class: "table" }, h("tbody", null, rows))), { trigger });
   }
 
   /** Settings → Add MCP server: a stdio command or an HTTP URL. Adding
@@ -4335,7 +4559,7 @@
       h("div", { class: "modal picker" }, h("h2", null, "Switch Session"), input, list,
         h("div", { class: "modal-actions" }, status)));
     let matches = [], sel = 0;
-    const close = () => { dialog.remove(); $("input").focus(); };
+    const close = () => closeDialog(dialog);
     function draw() {
       const q = input.value;
       matches = S.sessions.filter((s) => !s.archived).map((s) => {
@@ -4373,15 +4597,12 @@
     }
     input.oninput = () => { sel = 0; draw(); };
     dialog.addEventListener("keydown", (e) => {
-      if (e.key === "Escape") { e.stopPropagation(); close(); }
-      else if (e.key === "ArrowDown") { e.preventDefault(); sel = Math.min(sel + 1, matches.length - 1); draw(); }
+      if (e.key === "ArrowDown") { e.preventDefault(); sel = Math.min(sel + 1, matches.length - 1); draw(); }
       else if (e.key === "ArrowUp") { e.preventDefault(); sel = Math.max(sel - 1, 0); draw(); }
       else if (e.key === "Enter") { e.preventDefault(); finish(e.ctrlKey || e.metaKey); }
     });
-    dialog.addEventListener("click", (e) => { if (e.target === dialog) close(); });
-    document.body.append(dialog);
+    openDialog(dialog, { initialFocus: input, onDismiss: close });
     draw();
-    input.focus();
   }
   /** "+ New session": with templates saved, pick one (or blank) first. */
   async function pickNewSession() {
@@ -4653,6 +4874,7 @@
       if (t) note(modelTestText(t), !t.ok);
     } },
     { name: "routing", group: "Settings", desc: "why routing picked each model lately", run: async () => {
+      const trigger = document.activeElement;
       const list = await act({ type: "routing_decisions" });
       if (!list) return;
       if (!list.length) return note("no routing decisions yet (provider.model = \"auto\" or Roles with candidates)");
@@ -4662,7 +4884,7 @@
           h("td", null, (c.model === d.picked ? "▸ " : "") + c.model), h("td", { class: "num" }, c.samples + " samples"),
           h("td", { class: "num" }, c.good_rate != null ? Math.round(c.good_rate * 100) + "% good" : c.score != null ? "score " + c.score.toFixed(2) : ""),
           h("td", { class: "num" }, c.avg_ms != null ? (c.avg_ms / 1000).toFixed(1) + "s" : ""),
-          h("td", null, c.qualified === false ? "below the quality gate" : "")))))))));
+          h("td", null, c.qualified === false ? "below the quality gate" : "")))))))), { trigger });
     } },
     { name: "pull", args: "MODEL", group: "Settings", desc: "Ollama: download a model", run: async (arg) => {
       const model = (arg || "").trim();
@@ -4795,11 +5017,9 @@
     const dialog = h("div", { class: "backdrop", role: "dialog", "aria-modal": "true", "aria-label": "Help" },
       h("div", { class: "modal help" }, h("h2", null, "Help"), h("div", { class: "help-body" }, sections),
         h("div", { class: "modal-actions" }, h("span", { class: "spacer" }), close)));
-    const done = () => { dialog.remove(); $("input").focus(); };
+    const done = () => closeDialog(dialog);
     close.onclick = done;
-    dialog.addEventListener("keydown", (e) => { if (e.key === "Escape") { e.stopPropagation(); done(); } });
-    document.body.append(dialog);
-    close.focus();
+    openDialog(dialog, { initialFocus: close, onDismiss: done });
   }
   function runFilesCaveat() {
     return "Untracked writes are possible: changes by programs the Run launched or MCP tools are not tracked.";
@@ -4811,6 +5031,7 @@
   }
   // The files the last Run changed, with diffs and revert buttons (SPEC §5.7).
   async function showRunFiles() {
+    const trigger = document.activeElement;
     if (!S.current) return note("open a session first", true);
     const sid = S.current;
     const r = await act({ type: "run_files", session_id: sid });
@@ -4833,11 +5054,9 @@
     const dialog = h("div", { class: "backdrop", role: "dialog", "aria-modal": "true", "aria-label": "Files changed" },
       h("div", { class: "modal help" }, h("h2", null, "Paths tracked by the Run (" + r.files.length + ")"), r.untracked_writes_possible ? h("p", { class: "muted" }, runFilesCaveat()) : null, body,
         h("div", { class: "modal-actions" }, all, h("span", { class: "spacer" }), close)));
-    const done = () => { dialog.remove(); $("input").focus(); };
+    const done = () => closeDialog(dialog);
     close.onclick = done;
-    dialog.addEventListener("keydown", (e) => { if (e.key === "Escape") { e.stopPropagation(); done(); } });
-    document.body.append(dialog);
-    close.focus();
+    openDialog(dialog, { trigger, initialFocus: close, onDismiss: done });
   }
   // "What I did" under the last answer of a long Run (SPEC §5.7).
   function recapBlock(r) {
@@ -4991,7 +5210,12 @@
   }
 
   function openSidebar() { $("sidebar").classList.add("open"); }
-  function closeSidebar() { $("sidebar").classList.remove("open"); }
+  function closeSidebar() {
+    const sidebar = $("sidebar");
+    const returnFocus = sidebar.contains(document.activeElement);
+    sidebar.classList.remove("open");
+    if (returnFocus && getComputedStyle(sidebar).visibility === "hidden") focusReturn($("menu-btn"));
+  }
 
   // ============================================================== events
   let toolRefresh = null;
@@ -5129,7 +5353,7 @@
             h("h3", null, r.model),
             h("div", { class: "muted" }, r.status + " · " + (r.duration_ms / 1000).toFixed(1) + "s · " + r.tokens + " tokens · " + r.steps + " steps" + (r.cost != null ? " · $" + r.cost.toFixed(4) : "")),
             h("div", { class: "compare-answer" }, markdown(r.answer || "(no answer)")),
-            h("button", { class: "btn small", type: "button", onclick: () => { document.querySelector(".backdrop") && document.querySelector(".backdrop").remove(); openSession(r.session_id); } }, "Continue in this Session")));
+            h("button", { class: "btn small", type: "button", onclick: (e) => { closeDialog(e.currentTarget.closest(".backdrop")); openSession(r.session_id); } }, "Continue in this Session")));
           modal("Compare: " + ev.results.map((r) => r.model).join(" vs "), h("div", { class: "compare" }, cols));
         }
         break;
@@ -5915,6 +6139,9 @@
   });
   document.addEventListener("click", (e) => {
     if (popover && !popover.contains(e.target)) closePopover();
+    // A modal click belongs to that layer, including a button that removed
+    // its dialog before this event bubbled. Do not dismiss background drawers.
+    if (e.composedPath().some((node) => node instanceof Element && node.classList.contains("backdrop"))) return;
     const sb = $("sidebar");
     if (sb.classList.contains("open") && !sb.contains(e.target) && e.target !== $("menu-btn")) closeSidebar();
   });
@@ -5954,12 +6181,15 @@
   const typingIn = (el) => el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.tagName === "SELECT" || el.isContentEditable);
 
   document.addEventListener("keydown", (e) => {
-    if ((e.ctrlKey || e.metaKey) && !e.altKey && e.key.toLowerCase() === "k" && S.channel) {
+    if (e.defaultPrevented) return;
+    const layer = activeDialog();
+    if (layer && layer.node !== $("modal-backdrop")) return;
+    if ((e.ctrlKey || e.metaKey) && !e.altKey && e.key.toLowerCase() === "k" && S.channel && !layer) {
       e.preventDefault();
       openSwitcher();
       return;
     }
-    const modalOpen = !$("modal-backdrop").classList.contains("hidden");
+    const modalOpen = layer?.node === $("modal-backdrop");
     if (modalOpen && !e.ctrlKey && !e.metaKey && !e.altKey) {
       if (e.key === "y") { e.preventDefault(); decide(true); return; }
       if (e.key === "o" && S.approvals[0] && S.approvals[0].kind !== "promotion") { e.preventDefault(); decide(true, "once"); return; }
@@ -5968,7 +6198,7 @@
       if (e.key === "n") { e.preventDefault(); decide(false); return; }
       if (e.key === "N" && S.approvals[0] && S.approvals[0].kind !== "promotion" && S.approvals[0].tool_id) { e.preventDefault(); decide(false, "always", true); return; }
     }
-    const dialogOpen = modalOpen || !$("ask-backdrop").classList.contains("hidden");
+    const dialogOpen = !!layer;
     if (!dialogOpen && !e.ctrlKey && !e.metaKey && !e.altKey && !typingIn(document.activeElement) && S.channel) {
       const sc = SHORTCUTS.find((s) => s.keys.includes(e.key) && (!s.view || s.view === S.view));
       if (sc) { e.preventDefault(); sc.run(e.key); return; }

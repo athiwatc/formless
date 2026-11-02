@@ -1201,14 +1201,27 @@ pasting paths.
   messages (an earlier one drops the turns after it, and says so), Fork
   from here (`ForkSession` up to that message), and copying a Tool call's
   input or a result's output.
-- **Accessible dialogs (web).** The approval and question dialogs:
+- **Accessible dialogs (web).** Every modal (including output viewers,
+  model pickers, Session switchers, help and detail dialogs) uses shared
+  focus management: Tab and Shift+Tab stay in the top dialog, background
+  content is inert, and closing restores its invoking element or a visible
+  control in the active view if the original element disappeared. Nested
+  dialogs restore the dialog underneath before returning to the page.
+  Escape and backdrop clicks use the dialog's existing cancellation or
+  deferral action where dismissal is safe; they never choose a decision.
+  The approval and question dialogs additionally:
   - are modal (`aria-modal`), labelled by their title and described by
     their body;
   - list the requested Capabilities under their own label;
   - expose key shortcuts as `aria-keyshortcuts` (the visible key hints
     are hidden from screen readers);
-  - keep Tab inside the dialog, and give focus back to where it was when
-    they close.
+  - keep their existing approval and answer semantics.
+- **Accessible menus (web).** Session and message popovers expose menuitems;
+  ArrowUp/ArrowDown, Home and End move focus within them. Escape and Tab
+  close the menu and restore its trigger (or the active view's fallback),
+  clearing `aria-expanded`. Closing on an outside click keeps pointer
+  navigation usable. Menus inside a dialog stay within that dialog's focus
+  boundary.
 - **Reading controls (web).** Settings → This browser:
   - text size A− / A+ (85–200% in 10% steps, clamped at the endpoints)
     scales the root font relative to the browser's default font size;
