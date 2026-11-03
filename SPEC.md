@@ -3747,7 +3747,15 @@ run_tool = "network_policy"     # a registry Tool, or…
     newline. The box grows to 8 rows.
   - ↑/↓ move between lines. On the first or last line they walk the
     current Session's earlier messages, and Down past the newest returns
-    the draft. Ctrl+R searches that history.
+    the draft. Ctrl+R searches that history. History entries are borrowed from
+    the selected Session; typing/searching does not copy every message's text
+    or allocate a lowercased copy of each entry. The search preview reads one
+    matched entry and bounds its text before flattening and measuring it.
+    Reloads, reconnects and stashed-draft restoration invalidate old history
+    indices while preserving the draft, cursor and search query. An invalidated
+    match is blank until another explicit search step; Enter cancels that search
+    without submitting the draft or recalling a different shifted message.
+    Out-of-range Up/Down/search indices cancel safely instead of indexing blindly.
   - Bracketed paste is on, so a paste is one block and its newlines
     never send. Pastes over 8 lines or 1,500 characters show as
     `[pasted N lines #k]` and are sent in full; Backspace removes one as

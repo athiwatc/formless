@@ -714,7 +714,7 @@ mod tests {
         assert_eq!(app.input.expanded(), "slash result");
         assert_clean(&path);
         app.input.set("history query");
-        app.input.search_older(&[]);
+        app.input.search_older(&[] as &[&str]);
         let calls = Arc::new(Mutex::new(0));
         let counted = calls.clone();
         app.external_edit.runner = Some(Box::new(move |_, _| {

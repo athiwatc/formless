@@ -69,6 +69,9 @@ impl From<&str> for InputLine {
 use crate::text;
 use unicode_segmentation::UnicodeSegmentation;
 
+#[path = "history_match.rs"]
+mod history_match;
+
 /// A cluster that is part of a word. Clusters of scripts written without
 /// spaces (Thai, CJK) are words of their own, so a word step moves one
 /// cluster there instead of across the whole sentence (#786).
@@ -658,27 +661,35 @@ impl InputLine {
     }
 
     /// Up through `history` (oldest first), keeping the draft.
-    pub fn history_prev(&mut self, history: &[String]) {
+    pub fn history_prev(&mut self, history: &[impl AsRef<str>]) {
         if history.is_empty() {
+            self.browsing = None;
             return;
         }
         let (idx, draft, literal) = match self.browsing.take() {
+            Some((i, _, _)) if history.get(i).is_none() => return,
             Some((0, d, literal)) => (0, d, literal),
             Some((i, d, literal)) => (i - 1, d, literal),
             None => (history.len() - 1, self.expanded(), self.literal),
         };
-        self.set(&history[idx]);
+        let Some(entry) = history.get(idx) else {
+            return;
+        };
+        self.set(entry.as_ref());
         self.literal = true;
         self.browsing = Some((idx, draft, literal));
     }
 
     /// Down back towards the draft.
-    pub fn history_next(&mut self, history: &[String]) {
+    pub fn history_next(&mut self, history: &[impl AsRef<str>]) {
         let Some((idx, draft, literal)) = self.browsing.take() else {
             return;
         };
-        if idx + 1 < history.len() {
-            self.set(&history[idx + 1]);
+        if history.get(idx).is_none() {
+            return;
+        }
+        if let Some(next) = idx.checked_add(1).and_then(|i| history.get(i)) {
+            self.set(next.as_ref());
             self.literal = true;
             self.browsing = Some((idx + 1, draft, literal));
         } else {
@@ -694,7 +705,7 @@ impl InputLine {
     }
 
     /// Start a search, or (when one is open) look further back.
-    pub fn search_older(&mut self, history: &[String]) {
+    pub fn search_older(&mut self, history: &[impl AsRef<str>]) {
         match &mut self.search {
             None => self.search = Some((String::new(), None)),
             Some((q, m)) => {
@@ -706,7 +717,7 @@ impl InputLine {
         }
     }
 
-    pub fn search_type(&mut self, c: Option<char>, history: &[String]) {
+    pub fn search_type(&mut self, c: Option<char>, history: &[impl AsRef<str>]) {
         if let Some((q, m)) = &mut self.search {
             match c {
                 Some(c) => q.push(c),
@@ -719,15 +730,27 @@ impl InputLine {
     }
 
     /// Enter: take the match into the input.
-    pub fn search_accept(&mut self, history: &[String]) {
+    pub fn search_accept(&mut self, history: &[impl AsRef<str>]) {
         if let Some((_, Some(i))) = self.search.take() {
-            self.set(&history[i]);
-            self.literal = true;
+            if let Some(entry) = history.get(i) {
+                self.set(entry.as_ref());
+                self.literal = true;
+            }
         }
     }
 
     pub fn search_cancel(&mut self) {
         self.search = None;
+    }
+
+    /// The history bank changed. Keep the draft/query, but never accept an
+    /// index from its previous ordering. Enter cancels this invalidated search
+    /// instead of accidentally submitting the draft as a new message.
+    pub(crate) fn invalidate_history(&mut self) {
+        self.browsing = None;
+        if let Some((_, found)) = &mut self.search {
+            *found = None;
+        }
     }
 
     /// The rows to draw for `width` columns, and the cursor's (row, col),
@@ -789,16 +812,49 @@ pub(crate) fn selection_spans(
     spans
 }
 
-fn find_back(history: &[String], query: &str, before: usize) -> Option<usize> {
-    let q = query.to_lowercase();
+fn find_back(history: &[impl AsRef<str>], query: &str, before: usize) -> Option<usize> {
+    let matcher = history_match::Matcher::new(query);
     history[..before.min(history.len())]
         .iter()
-        .rposition(|h| h.to_lowercase().contains(&q))
+        .rposition(|h| matcher.contains(h.as_ref()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_search_accept_after_shrink_preserves_the_draft() {
+        let mut line = InputLine::from("private unsent draft");
+        let old = vec!["first".to_string(), "last match".to_string()];
+        line.search_older(&old);
+        line.search_type(Some('m'), &old);
+        assert_eq!(line.searching(), Some(("m", Some(1))));
+        line.search_accept(&["shorter".to_string()]);
+        assert_eq!(line.expanded(), "private unsent draft");
+    }
+    #[test]
+    fn history_browse_after_shrink_never_indexes_a_stale_entry() {
+        let mut line = InputLine::from("draft");
+        let old = vec![
+            "first".to_string(),
+            "second".to_string(),
+            "third".to_string(),
+        ];
+        line.history_prev(&old);
+        assert_eq!(line.expanded(), "third");
+        line.history_prev(&["shorter".to_string()]);
+        assert_eq!(line.expanded(), "third");
+    }
+    #[test]
+    fn history_next_after_shrink_cancels_the_stale_browse_without_replacing_text() {
+        let mut line = InputLine::from("draft");
+        let old = ["first", "second", "third"];
+        line.history_prev(&old);
+        line.history_next(&["shorter"]);
+        assert_eq!(line.expanded(), "third");
+        assert!(line.browsing.is_none());
+    }
 
     #[test]
     fn undo_restores_collapsed_paste_backing_and_cursor() {
@@ -842,7 +898,7 @@ mod tests {
         let mut i = InputLine::from("draft");
         i.left();
         let cursor = i.cursor;
-        i.history_prev(&["old".into()]);
+        i.history_prev(&["old"]);
         assert!(i.undo());
         assert_eq!(i.expanded(), "draft");
         assert_eq!(i.cursor, cursor);
