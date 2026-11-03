@@ -300,11 +300,18 @@ description: Review the proposed change
 Review $ARGUMENTS. Focus first on $1, and include @notes/review-checklist.md.
 ```
 
-New files and edits appear without restarting the TUI. `/help` lists them under
+New files and edits appear without restarting the TUI or plain client. `/help` lists them under
 **Yours**; project files override global files with the same name. Builtin
 commands always win, and shadowed files and malformed templates are reported.
-Expansion substitutes arguments into prompt text and uses the existing `@path`
-attachment flow; template text does not execute shell commands or Tools by itself.
+Expansion substitutes arguments into prompt text; the full TUI then uses its
+existing `@path` attachment flow. Template text does not execute shell commands
+or Tools by itself.
+Plain mode (`--plain` or `formless chat`) loads the current Session's templates
+and sends expanded bodies as literal messages, including bodies beginning with
+`/`. Its `//` escape still sends raw slash text. Invalid-template invocations
+name the file and reason; typo suggestions include local and shadowed templates.
+Diagnostics are announced once while present and can be announced again after
+a repaired file becomes invalid again.
 
 `formless commands list` shows the available metadata, diagnostics and shadowed
 files; `formless commands list --json` returns the same shared metadata projection

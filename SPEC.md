@@ -4377,13 +4377,21 @@ undo, redo and replacements invalidate prior asynchronous editor previews.
   executed. Valid project templates override global templates. Built-in slash
   roots always win, including their subcommands; `/help` groups custom commands
   under **Yours** and identifies shadowed files.
-  The shared Core loader supplies the TUI palette/help and
+  The shared Core loader supplies the TUI palette/help, plain-client expansion/help and
   `formless commands list [--json]`. JSON contains command metadata, diagnostics
   and shadowed-file metadata, never template bodies or expanded arguments.
   CLI discovery resolves paths read-only before profile/daemon setup and never
   creates a profile, starts a daemon, invokes a provider or reads `@path` targets.
   Human-readable file labels escape terminal controls and directional formatting;
   JSON retains the original metadata path strings.
+  Plain mode uses the current Session working directory and preserves built-in
+  precedence, including its `/exit` and `/switch` aliases. Expanded bodies are
+  sent as literal message text and never redispatched as slash commands; `//`
+  remains the raw slash-text escape. Invalid-template invocations report the
+  current filename and reason even after a diagnostic note was dismissed.
+  Suggestions include loaded and shadowed template names, with shadowing reasons.
+  A diagnostic key is forgotten when absent from a refreshed snapshot, allowing
+  a newly broken file to be announced again after repair.
   TUI discovery refreshes at most every 250 ms while idle and forces a fresh
   snapshot for help and explicit expansion; its cache binds the profile path,
   selected Session and working directory. Diagnostic notes are deduplicated by

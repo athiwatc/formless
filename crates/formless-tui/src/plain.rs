@@ -12,6 +12,9 @@ use std::io::{BufRead, Write};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+#[path = "plain_commands.rs"]
+mod templates;
+
 fn docs_lines(topic: &str) -> Vec<String> {
     let result = match formless_core::docs::resolve(Some(topic)) {
         Ok(url) => format!("The guide is at {url}"),
@@ -853,6 +856,7 @@ pub fn run_with(paths: Paths, start: ChatStart, label: &str) -> Result<()> {
     let mut streaming = false;
     let mut running = false;
     let mut feedback = LiveFeedback::default();
+    let mut template_diagnostics = VecDeque::new();
     let mut run_state = RunState::default();
     let mut snapshots = HashMap::new();
     snapshots.insert(
@@ -932,6 +936,7 @@ pub fn run_with(paths: Paths, start: ChatStart, label: &str) -> Result<()> {
             match &ev {
                 Event::RunStarted { .. } => running = true,
                 Event::RunFinished { .. } | Event::RunPaused { .. } => running = false,
+                Event::SessionUpdated { session: updated } => session = updated.clone(),
                 _ => {}
             }
             let live = feedback.event(&ev);
@@ -1070,13 +1075,49 @@ pub fn run_with(paths: Paths, start: ChatStart, label: &str) -> Result<()> {
             }
             continue;
         }
+        let templates = templates::load(&paths, &session);
+        for note in crate::user_commands_ui::diagnostic_notes(&templates, &mut template_diagnostics)
+        {
+            if std::mem::take(&mut streaming) {
+                println!();
+            }
+            say(&note);
+        }
+        match templates::expand(&templates, &text) {
+            Ok(Some(expanded)) => {
+                // Do not redispatch a body beginning with slash or shell syntax.
+                sends.borrow_mut().send(
+                    &client,
+                    session.id.clone(),
+                    expanded,
+                    if running {
+                        SendMode::Steer
+                    } else {
+                        SendMode::Send
+                    },
+                );
+                continue;
+            }
+            Err(error) => {
+                say(&error);
+                continue;
+            }
+            Ok(None) => {}
+        }
         match text.as_str() {
             "" => {}
             "/quit" | "/exit" => break,
-            "/help" => say("Commands: /new starts a Session, /sessions lists them, /switch N opens one, /stop stops the Run, /files [RUN] shows tracked changes, /rewind [PATH] attempts safe restoration, /recap shows the recorded recap, /docs [topic] gives the guides' addresses, /quit exits (Runs keep going in the daemon). Anything else is sent as a message; to send text that starts with /, begin it with //."),
+            "/help" => {
+                say("Commands: /new starts a Session, /sessions lists them, /switch N opens one, /stop stops the Run, /files [RUN] shows tracked changes, /rewind [PATH] attempts safe restoration, /recap shows the recorded recap, /docs [topic] gives the guides' addresses, /quit exits (Runs keep going in the daemon). Anything else is sent as a message; to send text that starts with /, begin it with //.");
+                for line in crate::user_commands_ui::help_lines(&templates) {
+                    say(&line);
+                }
+            }
             cmd if cmd == "/docs" || cmd.starts_with("/docs ") => {
                 let topic = cmd["/docs".len()..].trim();
-                for line in docs_lines(topic) { say(&line); }
+                for line in docs_lines(topic) {
+                    say(&line);
+                }
             }
 
             cmd if cmd == "/summarise-branch" || cmd.starts_with("/summarise-branch ") => {
@@ -1084,14 +1125,34 @@ pub fn run_with(paths: Paths, start: ChatStart, label: &str) -> Result<()> {
             }
             cmd if cmd == "/files" || cmd.starts_with("/files ") => {
                 let run_id = cmd.strip_prefix("/files").unwrap().trim();
-                match wait(client.send(Request::RunFiles { session_id: session.id.clone(), run_id: (!run_id.is_empty()).then(|| run_id.to_string()) })).and_then(|v| files_result_text(&v)) { Ok(text) => say(&text), Err(e) => say(&format!("Files: {e}")) }
+                match wait(client.send(Request::RunFiles {
+                    session_id: session.id.clone(),
+                    run_id: (!run_id.is_empty()).then(|| run_id.to_string()),
+                }))
+                .and_then(|v| files_result_text(&v))
+                {
+                    Ok(text) => say(&text),
+                    Err(e) => say(&format!("Files: {e}")),
+                }
             }
             cmd if cmd == "/rewind" || cmd.starts_with("/rewind ") => {
                 let path = cmd.strip_prefix("/rewind").unwrap().trim();
-                match wait(client.send(Request::RewindRun { session_id: session.id.clone(), run_id: None, path: (!path.is_empty()).then(|| path.to_string()) })) { Ok(v) => say(&rewind_result_text(&v)), Err(e) => say(&format!("Rewind: {e}")) }
+                match wait(client.send(Request::RewindRun {
+                    session_id: session.id.clone(),
+                    run_id: None,
+                    path: (!path.is_empty()).then(|| path.to_string()),
+                })) {
+                    Ok(v) => say(&rewind_result_text(&v)),
+                    Err(e) => say(&format!("Rewind: {e}")),
+                }
             }
             "/recap" => {
-                snapshots.insert(client.send(Request::GetSession { id: session.id.clone() }), (session.id.clone(), run_state.generation, true));
+                snapshots.insert(
+                    client.send(Request::GetSession {
+                        id: session.id.clone(),
+                    }),
+                    (session.id.clone(), run_state.generation, true),
+                );
             }
             "/stop" => {
                 client.send(Request::InterruptRun {
@@ -1099,9 +1160,9 @@ pub fn run_with(paths: Paths, start: ChatStart, label: &str) -> Result<()> {
                 });
             }
             "/new" => {
-                let s: SessionInfo = serde_json::from_value(
-                    wait(client.send(Request::CreateSession { name: None }))?,
-                )?;
+                let s: SessionInfo = serde_json::from_value(wait(
+                    client.send(Request::CreateSession { name: None }),
+                )?)?;
                 session = s;
                 run_state = RunState::default();
                 feedback = LiveFeedback::default();
@@ -1110,12 +1171,18 @@ pub fn run_with(paths: Paths, start: ChatStart, label: &str) -> Result<()> {
                     deltas: true,
                     client: Some("TUI (plain)".into()),
                 });
-                snapshots.insert(client.send(Request::GetSession { id: session.id.clone() }), (session.id.clone(), run_state.generation, false));
+                snapshots.insert(
+                    client.send(Request::GetSession {
+                        id: session.id.clone(),
+                    }),
+                    (session.id.clone(), run_state.generation, false),
+                );
                 say(&format!("New Session: {}.", session.name));
             }
             "/sessions" => {
                 let list: Vec<SessionInfo> =
-                    serde_json::from_value(wait(client.send(Request::ListSessions))?).unwrap_or_default();
+                    serde_json::from_value(wait(client.send(Request::ListSessions))?)
+                        .unwrap_or_default();
                 for (i, s) in list.iter().enumerate().take(20) {
                     say(&format!("{}. {}", i + 1, s.name));
                 }
@@ -1123,8 +1190,14 @@ pub fn run_with(paths: Paths, start: ChatStart, label: &str) -> Result<()> {
             }
             cmd if cmd.starts_with("/switch ") => {
                 let list: Vec<SessionInfo> =
-                    serde_json::from_value(wait(client.send(Request::ListSessions))?).unwrap_or_default();
-                match cmd["/switch ".len()..].trim().parse::<usize>().ok().and_then(|n| list.get(n.wrapping_sub(1))) {
+                    serde_json::from_value(wait(client.send(Request::ListSessions))?)
+                        .unwrap_or_default();
+                match cmd["/switch ".len()..]
+                    .trim()
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|n| list.get(n.wrapping_sub(1)))
+                {
                     Some(s) => {
                         session = s.clone();
                         run_state = RunState::default();
@@ -1134,7 +1207,12 @@ pub fn run_with(paths: Paths, start: ChatStart, label: &str) -> Result<()> {
                             deltas: true,
                             client: Some("TUI (plain)".into()),
                         });
-                        snapshots.insert(client.send(Request::GetSession { id: session.id.clone() }), (session.id.clone(), run_state.generation, false));
+                        snapshots.insert(
+                            client.send(Request::GetSession {
+                                id: session.id.clone(),
+                            }),
+                            (session.id.clone(), run_state.generation, false),
+                        );
                         say(&format!("Switched to {}.", session.name));
                     }
                     None => say("No Session with that number; /sessions lists them."),
@@ -1143,12 +1221,27 @@ pub fn run_with(paths: Paths, start: ChatStart, label: &str) -> Result<()> {
             // An unknown command is never sent to the model by mistake.
             cmd if cmd.starts_with('/') && !cmd.starts_with("//") => {
                 let name = cmd.split_whitespace().next().unwrap_or(cmd);
-                say(&format!("{name} is not a command here; /help lists them. To send it as a message, begin it with //."));
+                let suggestion =
+                    crate::user_commands_ui::suggestion(&templates, name.trim_start_matches('/'))
+                        .map(|text| format!(" {text}"))
+                        .unwrap_or_default();
+                say(&format!("{name} is not a command here; /help lists them.{suggestion} To send it as a message, begin it with //."));
             }
             msg => {
-                let msg = msg.strip_prefix('/').filter(|m| m.starts_with('/')).unwrap_or(msg);
-                sends.borrow_mut().send(&client, session.id.clone(), msg.to_string(),
-                    if running { SendMode::Steer } else { SendMode::Send });
+                let msg = msg
+                    .strip_prefix('/')
+                    .filter(|m| m.starts_with('/'))
+                    .unwrap_or(msg);
+                sends.borrow_mut().send(
+                    &client,
+                    session.id.clone(),
+                    msg.to_string(),
+                    if running {
+                        SendMode::Steer
+                    } else {
+                        SendMode::Send
+                    },
+                );
             }
         }
     }
