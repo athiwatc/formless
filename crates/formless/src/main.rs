@@ -3461,6 +3461,7 @@ fn doctor_report(paths: &Paths, quiet: bool) -> Result<Vec<Problem>> {
     );
     say!("data dir:   {}", paths.data_dir.display());
     say!("config dir: {}", paths.config_dir.display());
+    say!("profile:    {}", paths.profile);
     say!(
         "db:         {} ({})",
         paths.db_file().display(),
@@ -3855,10 +3856,11 @@ fn doctor_report(paths: &Paths, quiet: bool) -> Result<Vec<Problem>> {
             }
         }
     } else {
-        say!("probe:      skipped (not configured; run `formless` for the wizard)");
+        let setup = formless_core::profile_setup::missing_setup_message(&paths);
+        say!("probe:      skipped ({setup})");
         problems.push(Problem {
-            what: "no provider is configured".into(),
-            next: Some("formless (the setup wizard)".into()),
+            what: format!("no provider is configured for profile '{}'", paths.profile),
+            next: Some(setup),
             fix: None,
         });
     }
@@ -4051,7 +4053,10 @@ fn run_headless(
     let mut summary = RunSummary::default();
     let cfg = Config::load(&paths)?;
     if !cfg.provider.is_configured() {
-        eprintln!("not configured; run `formless` for the wizard");
+        eprintln!(
+            "{}",
+            formless_core::profile_setup::missing_setup_message(&paths)
+        );
         return Ok(2);
     }
     formless_core::daemon::ensure_daemon(&paths)?;

@@ -39,6 +39,7 @@ mod pipeline_policy;
 pub mod presets;
 mod probe_policy;
 pub mod profile_lock;
+pub mod profile_setup;
 pub mod provenance;
 pub mod provider;
 pub mod relay;

@@ -268,6 +268,11 @@ With no arguments `formless` launches the **TUI**, which auto-starts the daemon 
 
 The result is written to `config.toml` in the config dir ([§4](#4-data-config-and-profiles)); you never need to edit it by hand. Re-run the wizard at any time with `formless doctor` for a diagnosis, or delete the config to go through it again.
 
+Setup names the active profile, and the TUI status line identifies a non-default
+profile. If this profile needs setup while another profile has saved provider
+configuration, the wizard, `formless run`, and `formless doctor` show the exact
+command to open it. `formless profiles list` lists the available profiles.
+
 ### 3.4 Using the TUI
 
 Type a task at the bottom and press **Enter**. Formless starts with the built-in Tools ([§5.1](#51-the-built-in-tools)) and builds whatever else the task needs with `create_tool`.

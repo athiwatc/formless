@@ -274,6 +274,9 @@ impl Fixture {
         }
     }
     fn command(&self, args: &[&str]) -> Command {
+        self.command_profile("p", args)
+    }
+    fn command_profile(&self, profile: &str, args: &[&str]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_formless"));
         for (key, _) in std::env::vars_os() {
             let value = key.to_string_lossy().to_ascii_uppercase();
@@ -285,7 +288,7 @@ impl Fixture {
             }
         }
         command
-            .args(["--profile", "p"])
+            .args(["--profile", profile])
             .args(args)
             .current_dir(&self.root)
             .env("FORMLESS_DATA_DIR", self.root.join("d"))
@@ -320,7 +323,10 @@ impl Fixture {
         }
     }
     fn run(&self, args: &[&str], stdin: Option<&[u8]>) -> Output {
-        let mut command = self.command(args);
+        self.run_profile("p", args, stdin)
+    }
+    fn run_profile(&self, profile: &str, args: &[&str], stdin: Option<&[u8]>) -> Output {
+        let mut command = self.command_profile(profile, args);
         if stdin.is_some() {
             command.stdin(Stdio::piped());
         }
@@ -392,6 +398,69 @@ impl Drop for Fixture {
         self.provider.stop.store(true, Ordering::SeqCst);
         let _ = std::fs::remove_dir_all(&self.root);
     }
+}
+
+#[test]
+fn unconfigured_run_and_doctor_name_the_profile_and_offer_saved_setup_elsewhere() {
+    let f = Fixture::new(); // Only profile p has saved configuration.
+    let before = std::fs::read(f.paths.config_file()).unwrap();
+    for active in ["default", "scratch"] {
+        let run = f.run_profile(
+            active,
+            &["run", "task", "--output", "json", "--quiet"],
+            None,
+        );
+        assert_eq!(
+            run.status.code(),
+            Some(2),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(run.stdout.is_empty());
+        let message = String::from_utf8(run.stderr).unwrap();
+        assert!(
+            message.contains(&format!("Profile '{active}'")),
+            "{message}"
+        );
+        assert!(
+            message.contains("formless --profile p") && message.contains("formless profiles list"),
+            "{message}"
+        );
+        let doctor = f.run_profile(active, &["doctor"], None);
+        assert!(
+            doctor.status.success(),
+            "{}",
+            String::from_utf8_lossy(&doctor.stderr)
+        );
+        let text = String::from_utf8(doctor.stdout).unwrap();
+        assert!(text.contains(&format!("profile:    {active}")), "{text}");
+        assert!(
+            text.contains("formless --profile p") && text.contains("formless profiles list"),
+            "{text}"
+        );
+        let json = f.run_profile(active, &["doctor", "--json"], None);
+        assert!(
+            json.status.success(),
+            "{}",
+            String::from_utf8_lossy(&json.stderr)
+        );
+        let value: Value = serde_json::from_slice(&json.stdout).unwrap();
+        assert_eq!(value["profile"], active);
+        assert!(value["problems"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|problem| problem["next"]
+                .as_str()
+                .is_some_and(|next| next.contains("formless --profile p"))));
+    }
+    assert_eq!(
+        f.provider.count(),
+        0,
+        "alternate configuration is inspected, never probed"
+    );
+    assert!(!formless_core::daemon::daemon_reachable(&f.paths));
+    assert_eq!(std::fs::read(f.paths.config_file()).unwrap(), before);
 }
 
 #[test]

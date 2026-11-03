@@ -21,6 +21,8 @@ mod mermaid;
 mod notify;
 mod picker;
 pub mod plain;
+#[cfg(test)]
+mod profile_context_tests;
 pub mod qr;
 mod session_ui;
 mod settings;
@@ -725,6 +727,8 @@ enum WizardStep {
 }
 
 struct Wizard {
+    profile: String,
+    setup_hint: Option<String>,
     step: WizardStep,
     /// Highlighted row in `PickPreset`: a preset, or `PRESETS.len()` for
     /// a custom URL.
@@ -795,6 +799,8 @@ impl Wizard {
             .and_then(|e| EFFORTS.iter().position(|x| *x == Some(e)))
             .unwrap_or(0);
         Self {
+            profile: "default".into(),
+            setup_hint: None,
             step,
             preset_idx,
             preset,
@@ -821,11 +827,20 @@ impl Wizard {
         }
     }
 
-    /// The wizard to show: a resumed draft (SPEC §10.1) when there is one
-    /// and no saved setup, else a fresh one that offers a local server
-    /// already running when no key is around.
-    fn start(cfg: &Config, paths: &Paths) -> Self {
+    /// Profile context is discovered once, never during frame rendering.
+    fn new_for_profile(cfg: &Config, paths: &Paths) -> Self {
         let mut w = Self::new(cfg);
+        w.profile = paths.profile.clone();
+        if !cfg.provider.is_configured() {
+            w.setup_hint = formless_core::profile_setup::alternate_setup_hint(paths)
+                .map(|hint| format!("This profile needs setup. {hint}"));
+        }
+        w
+    }
+
+    /// Resume a draft, or offer an already running local server.
+    fn start(cfg: &Config, paths: &Paths) -> Self {
+        let mut w = Self::new_for_profile(cfg, paths);
         if w.step != WizardStep::PickPreset {
             return w;
         }
@@ -8037,7 +8052,7 @@ impl App {
                 // re-enter a key, or Esc back to change provider (§10.1).
                 match Config::load(&self.paths) {
                     Ok(cfg) => {
-                        let mut w = Wizard::new(&cfg);
+                        let mut w = Wizard::new_for_profile(&cfg, &self.paths);
                         w.can_cancel = cfg.provider.is_configured();
                         if w.step == WizardStep::PickPreset {
                             w.offer_local();
@@ -12248,6 +12263,13 @@ fn input_height(app: &App, width: u16) -> u16 {
 fn draw_status(f: &mut Frame, area: Rect, app: &App) {
     let sep = || Span::styled(" │ ", ui::dim(app.color));
     let mut left: Vec<Span> = vec![Span::raw(" ")];
+    if app.paths.profile != "default" {
+        left.push(Span::styled(
+            format!("{}: {}", i18n::tr("profile"), app.paths.profile),
+            ui::dim(app.color),
+        ));
+        left.push(sep());
+    }
     if let Some((since, _)) = app.offline {
         left.push(Span::styled(
             format!(
@@ -18009,8 +18031,18 @@ fn draw_wizard(f: &mut Frame, w: &Wizard, color: bool) {
         Line::styled(w.status.clone(), status_style),
         Line::raw(""),
     ];
+    let mut hint_rows = 0;
+    if let Some(hint) = &w.setup_hint {
+        let rows = wrap_rows(
+            hint,
+            f.area().width.min(84).saturating_sub(2).max(1) as usize,
+        );
+        hint_rows = rows.len() + 1;
+        text.extend(rows.into_iter().map(Line::raw));
+        text.push(Line::raw(""));
+    }
     let area = f.area();
-    let max_items = (area.height as usize).saturating_sub(12).max(3);
+    let max_items = (area.height as usize).saturating_sub(12 + hint_rows).max(3);
     let pick = |items: Vec<String>, idx: usize| -> Vec<Line<'static>> {
         // Long model lists scroll so the selection is always on screen.
         let start = idx
@@ -18103,7 +18135,11 @@ fn draw_wizard(f: &mut Frame, w: &Wizard, color: bool) {
     };
     f.render_widget(
         Paragraph::new(text)
-            .block(ui::panel(" ◇ Formless setup ", color, Color::Cyan))
+            .block(ui::panel(
+                format!(" ◇ Formless setup · profile: {} ", w.profile),
+                color,
+                Color::Cyan,
+            ))
             .wrap(Wrap { trim: false }),
         rect,
     );
