@@ -298,7 +298,7 @@ enum Cmd {
     /// Open the guides in a browser: gallery, capabilities, approvals,
     /// keys, troubleshooting, mcp, skills, jobs, spec
     Docs {
-        /// Guide name to open; omit to list the available guides
+        /// Guide name to open; omit to open the gallery
         topic: Option<String>,
         /// Print the URL instead of opening it
         #[arg(long)]
@@ -1602,6 +1602,27 @@ fn exit_code(e: &anyhow::Error) -> i32 {
     }
 }
 
+fn docs_cmd(topic: Option<&str>, print: bool, keys: bool) -> Result<()> {
+    if keys {
+        print!("{}", formless_tui::keys_reference());
+        return Ok(());
+    }
+    let url = formless_core::docs::resolve(topic).map_err(|error| {
+        let topics = formless_core::docs::TOPICS
+            .iter()
+            .map(|(name, _, what)| format!("  {name:<16} {what}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        usage(format!("{error}\n\nTOPIC            WHAT\n{topics}"))
+    })?;
+    if print || !formless_core::docs::open_url(&url) {
+        println!("{url}");
+    } else {
+        println!("opened {url}");
+    }
+    Ok(())
+}
+
 fn main() {
     let cli = Cli::parse();
     if let Err(e) = run_cli(cli) {
@@ -1636,6 +1657,10 @@ fn run_cli(cli: Cli) -> Result<()> {
             .with_writer(std::io::stderr)
             .with_ansi(std::io::stderr().is_terminal() && table::color_allowed())
             .init();
+    }
+    // Documentation needs no profile/config/daemon, even for invalid topics.
+    if let Some(Cmd::Docs { topic, print, keys }) = &cli.cmd {
+        return docs_cmd(topic.as_deref(), *print, *keys);
     }
     // Completions and the man page need nothing else: no profile, config
     // or daemon.
@@ -1979,26 +2004,7 @@ fn run_cli(cli: Cli) -> Result<()> {
             yes,
         }) => uninstall_cmd(&paths, keep_data, keep_binary, yes),
         Some(Cmd::Storage { json }) => storage_cmd(&paths, json),
-        Some(Cmd::Docs { topic, print, keys }) => {
-            if keys {
-                print!("{}", formless_tui::keys_reference());
-                return Ok(());
-            }
-            let Some(url) = formless_core::docs::url(topic.as_deref()) else {
-                let mut tbl = Table::new(&["TOPIC", "WHAT"]);
-                for (name, _, what) in formless_core::docs::TOPICS {
-                    tbl.row(vec![t(*name, Tone::Strong), c(*what)]);
-                }
-                tbl.print();
-                return Ok(());
-            };
-            if print || !formless_core::docs::open_url(&url) {
-                println!("{url}");
-            } else {
-                println!("opened {url}");
-            }
-            Ok(())
-        }
+        Some(Cmd::Docs { topic, print, keys }) => docs_cmd(topic.as_deref(), print, keys),
         Some(Cmd::Gc { dry_run }) => gc_cmd(&paths, dry_run),
         Some(Cmd::Backup { action }) => match action {
             None => backup_cmd(&paths),

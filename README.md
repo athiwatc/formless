@@ -539,7 +539,7 @@ The table covers every visible root command, including Clap's generated
 | `formless completions` | `bash`, `zsh`, `fish`, `powershell`, `elvish` | Print a shell completion script. |
 | `formless config` | `path`, `get`, `set`, `edit` | Locate, inspect, validate, or edit configuration. |
 | `formless daemon` | `start`, `stop`, `restart`, `status`, `serve`, `install-service`, `uninstall-service` | Manage the daemon and its optional login service. |
-| `formless docs` | Optional topic; `--print`, `--keys` | Open a guide, print its URL, or print the embedded keyboard reference. |
+| `formless docs` | Optional topic; `--print`, `--keys` | Open a guide (gallery by default), print its URL, or print the embedded keyboard reference. |
 | `formless doctor` | `--json`, `--fix`, `--restore-drill` | Diagnose setup, apply safe fixes, or rehearse the newest backup. |
 | `formless export-all` | `--sessions`, `-o FILE` / `--output FILE` | Write a portable setup bundle, optionally including Session transcripts. |
 | `formless gc` | `--dry-run` | Free reclaimable storage or preview what would be freed. |
@@ -926,6 +926,10 @@ RUST_LOG=debug cargo run -- run "write a tool that converts a CSV to JSON"
 without dispatching commands, and compares the rendered root help and command
 definitions with the README §3.11 and SPEC §12 reference tables. It runs as part
 of the workspace tests and rejects missing, stale, or duplicate entries.
+Examples are shell-split and parsed by the real CLI without dispatching
+operations, so obsolete flags fail locally. Documentation topic checks reject
+ambiguous prefixes and unknown names; `docs --print` never needs a profile or
+browser.
 
 Rules of the road: **no behaviour may live only in a client** — the CLI and TUI are both clients of the daemon protocol. Every Tool is validated and smoke-tested at creation, and every behavioural change should be reflected in `SPEC.md` first.
 

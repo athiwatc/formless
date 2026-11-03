@@ -7970,8 +7970,8 @@ impl App {
             "status" => self.request(Pending::DaemonStatus, Request::Status),
             cmd if cmd == "docs" || cmd.starts_with("docs ") => {
                 let topic = cmd["docs".len()..].trim();
-                match formless_core::docs::url(Some(topic).filter(|t| !t.is_empty())) {
-                    Some(url) => {
+                match formless_core::docs::resolve(Some(topic).filter(|t| !t.is_empty())) {
+                    Ok(url) => {
                         let opened = formless_core::docs::open_url(&url);
                         self.notes.push(if opened {
                             format!("opened {url}")
@@ -7979,10 +7979,10 @@ impl App {
                             format!("docs: {url}")
                         });
                     }
-                    None => {
+                    Err(error) => {
                         let names: Vec<&str> =
                             formless_core::docs::TOPICS.iter().map(|(n, _, _)| *n).collect();
-                        self.notes.push(format!("docs topics: {}", names.join(", ")));
+                        self.notes.push(format!("{error}; docs topics: {}", names.join(", ")));
                     }
                 }
             }
@@ -21555,6 +21555,23 @@ mod tests {
         );
         for (width, height) in [(1, 1), (20, 5), (80, 24)] {
             render(&mut app, width, height);
+        }
+    }
+
+    #[test]
+    fn docs_topic_mistakes_are_explicit_notes_without_opening_a_browser() {
+        let mut app = test_app();
+        for (command, expected) in [
+            ("docs nope", "unknown docs topic \"nope\""),
+            ("docs s", "ambiguous docs topic \"s\": matches skills, spec"),
+        ] {
+            app.slash(command);
+            let note = app.notes.last().unwrap();
+            assert!(note.contains(expected), "{note}");
+            assert!(
+                note.contains("docs topics:") && note.contains("troubleshooting"),
+                "{note}"
+            );
         }
     }
 

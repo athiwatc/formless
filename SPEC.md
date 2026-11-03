@@ -4626,12 +4626,23 @@ undo, redo and replacements invalidate prior asynchronous editor previews.
   Capabilities in plain words, the main keys and every command, troubleshooting,
   and Docker. `/docs [topic]` (TUI and web) and `formless docs [topic]
   [--print]` open one (`gallery`, `capabilities`, `approvals`, `keys`,
-  `troubleshooting`, `mcp`, `skills`, `jobs`, `spec`; a prefix works;
-  none lists them). `formless doctor` prints the troubleshooting link, and
+  `troubleshooting`, `mcp`, `skills`, `jobs`, `spec`; a unique prefix works;
+  none opens the gallery). `formless doctor` prints the troubleshooting link, and
   `/help` points to `/docs`.
 - `docs/keys.md` is generated from the same key and command tables `/help`
   shows (`formless docs --keys`); a test fails when it is stale, and when
   a web key it lists is gone from the web UI.
+
+Terminal docs commands default to the gallery. Exact topic names win;
+otherwise a unique prefix is required. Unknown names and ambiguous prefixes
+are reported explicitly (CLI usage exit 2 with available topics; TUI/plain
+notes name the error and candidates). CLI help examples are shell-tokenized
+and checked against the real parser without dispatch. SSH sessions and
+headless Linux print the URL without launching an opener; desktop openers
+must exit successfully within two seconds, and every child is reaped
+(stalled launchers are stopped). An opener's success does not prove browser
+navigation; the URL is retained in every result. `formless docs --print` and
+topic errors need no profile/config or daemon.
 
 ## 11. Compaction
 
@@ -4711,7 +4722,7 @@ the TUI. Command-specific arguments and defaults are available through
 | `formless completions` | `bash`, `zsh`, `fish`, `powershell`, `elvish` | Print a shell completion script. |
 | `formless config` | `path`, `get`, `set`, `edit` | Locate, inspect, validate, or edit configuration. |
 | `formless daemon` | `start`, `stop`, `restart`, `status`, `serve`, `install-service`, `uninstall-service` | Manage the daemon and its optional login service. |
-| `formless docs` | Optional topic; `--print`, `--keys` | Open a guide, print its URL, or print the embedded keyboard reference. |
+| `formless docs` | Optional topic; `--print`, `--keys` | Open a guide (gallery by default), print its URL, or print the embedded keyboard reference. |
 | `formless doctor` | `--json`, `--fix`, `--restore-drill` | Diagnose setup, apply safe fixes, or rehearse the newest backup. |
 | `formless export-all` | `--sessions`, `-o FILE` / `--output FILE` | Write a portable setup bundle, optionally including Session transcripts. |
 | `formless gc` | `--dry-run` | Free reclaimable storage or preview what would be freed. |
