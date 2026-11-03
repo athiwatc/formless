@@ -907,8 +907,20 @@ task, with quality as a gate**.
   alt text and address as text (nothing is fetched when the page is
   opened), and links keep only http(s), mailto and relative targets. TUI `/export [json|md|html]`
   (writes to the exports directory), the web "Export…" dialog and
-  `/export`, and `formless sessions export ID --format md|html|json
-  [-o FILE]`.
+  `/export`, and `formless sessions export ID [--format json|markdown|html]
+  [-o FILE]` (`md` aliases `markdown`). The CLI infers omitted formats from
+  `.md`/`.markdown`, `.html`/`.htm`, or `.json` extensions, case-insensitively;
+  stdout and unknown extensions still default to JSON. Explicit conflicts with
+  recognized extensions are usage errors before profile setup, Session lookup
+  or daemon connection. On Unix, ordinary file output is replaced atomically,
+  preserving existing write-access checks and staging/final mode bits (not a
+  claim of extended ACL/xattr preservation); pre-commit failures
+  leave prior exports intact. Windows retains its existing direct writer with
+  an explicit warning until atomic replacement preserving existing Windows
+  access controls is supported. Leaf symlinks (including dangling links) keep
+  write-through semantics
+  with bounded link traversal. Descriptor/device streams use direct writes,
+  never pathname replacement.
 
 ### 5.2 Run lifecycle
 
@@ -4856,7 +4868,8 @@ previous headless Run's Session.
   the TUI and web: `list [--archived] [--json]`, `show ID [--json]`, `rename
   ID NAME`, `rm ID` (restorable for `daemon.delete_undo_secs`; it prints the
   restore command), `restore ID`, `archive`/`unarchive ID`, `export ID
-  [--format json|md|html] [-o FILE]`, `import FILE`, and `search QUERY
+  [--format json|markdown|html] [-o FILE]` (`md` aliases `markdown`),
+  `import FILE`, and `search QUERY
   [--limit N] [--json]`. IDs may be a unique prefix (`restore` needs the
   full id).
 - `formless run "task"` — headless Run (§5 semantics) in an ephemeral
