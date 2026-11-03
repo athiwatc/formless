@@ -26,6 +26,25 @@ class QuietHandler(http.server.SimpleHTTPRequestHandler):
         pass
 
 
+def native_select_key(page, selector, key):
+    # Native closed-select key semantics vary by OS. Compare the application
+    # field with an unhandled clone in the same modal, and independently prove
+    # that application handlers did not prevent or intercept the key.
+    field = page.locator(selector)
+    field.evaluate("""e => {const ref=e.cloneNode(true);ref.id='native-select-reference';ref.value=e.value;
+      window.__nativeSelectKey=null;ref.addEventListener('keydown',event=>window.__nativeSelectKey=event,{once:true});e.parentElement.append(ref);}""")
+    reference = page.locator('#native-select-reference')
+    reference.focus();page.keyboard.press(key)
+    expected = reference.evaluate("e=>({value:e.value,key:window.__nativeSelectKey?.key,prevented:window.__nativeSelectKey?.defaultPrevented})")
+    reference.evaluate('(e)=>e.remove()')
+    field.focus();field.evaluate("e=>{window.__appSelectKey=null;e.addEventListener('keydown',event=>window.__appSelectKey=event,{once:true});}")
+    page.keyboard.press(key)
+    actual = field.evaluate("e=>({value:e.value,key:window.__appSelectKey?.key,prevented:window.__appSelectKey?.defaultPrevented})")
+    assert expected['key']==key and expected['prevented'] is False, ('native reference key',expected)
+    assert actual['key']==key and actual['prevented'] is False, ('application intercepted native key',actual)
+    assert actual['value']==expected['value'], ('application differs from native select',actual,expected)
+
+
 def check(value, label):
     global PASSES
     assert value, label
@@ -196,8 +215,8 @@ def run():
                     field=page.locator('.picker select')
                     page.locator('.picker input').focus();page.keyboard.press('Tab')
                     check(field.evaluate('(e)=>e===document.activeElement'),'model picker Tab reaches native effort selector')
-                    before=field.input_value();page.keyboard.press('ArrowDown')
-                    check(field.input_value()!=before,'model picker effort selector retains native ArrowDown')
+                    native_select_key(page,'.picker select','ArrowDown')
+                    check(field.evaluate('(e)=>e===document.activeElement'),'model picker effort selector retains native ArrowDown and focus')
                     page.evaluate('__focus817.calls=[]');page.keyboard.press('Enter')
                     check(page.locator('.backdrop[aria-label="Model"]').count()==1,'effort selector Enter does not apply model or close picker')
                     check(page.evaluate('!__focus817.calls.some(t=>t==="set_session_model"||t==="set_setting")'),'effort selector Enter dispatches no model setting action')

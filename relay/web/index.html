@@ -96,7 +96,7 @@
           <div id="attach-chips" class="attach-chips hidden" aria-label="Attachments for your next message"></div>
           <div class="compose-row">
             <label class="btn ghost" id="attach-btn" title="Attach a file (or paste an image)">📎<input id="attach-input" type="file" multiple hidden></label>
-            <textarea id="input" rows="1" placeholder="Message Formless…" aria-label="Message" aria-describedby="compose-hint" enterkeyhint="send" inputmode="text"></textarea>
+            <textarea id="input" rows="1" placeholder="Message Formless…" aria-label="Message" aria-describedby="compose-hint" enterkeyhint="enter" inputmode="text"></textarea>
             <button class="btn danger" id="stop-btn" type="button" hidden>Stop</button>
             <button class="btn primary" id="send-btn" type="submit">Send</button>
           </div>
@@ -218,7 +218,7 @@
     <h2 id="ask-title"></h2>
     <p id="ask-text" class="muted"></p>
     <div id="ask-body"></div>
-    <input id="ask-input" type="text" spellcheck="false" aria-labelledby="ask-title" autocapitalize="none" autocorrect="off" inputmode="text">
+    <input id="ask-input" type="text" aria-labelledby="ask-title">
     <div class="modal-actions">
       <span class="spacer"></span>
       <button class="btn ghost" id="ask-cancel" type="button">Cancel</button>

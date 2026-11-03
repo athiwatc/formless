@@ -25,6 +25,25 @@ class QuietHandler(http.server.SimpleHTTPRequestHandler):
         pass
 
 
+def native_select_key(page, selector, key):
+    # Native closed-select key semantics vary by OS. Compare the application
+    # field with an unhandled clone in the same modal, and independently prove
+    # that application handlers did not prevent or intercept the key.
+    field = page.locator(selector)
+    field.evaluate("""e => {const ref=e.cloneNode(true);ref.id='native-select-reference';ref.value=e.value;
+      window.__nativeSelectKey=null;ref.addEventListener('keydown',event=>window.__nativeSelectKey=event,{once:true});e.parentElement.append(ref);}""")
+    reference = page.locator('#native-select-reference')
+    reference.focus();page.keyboard.press(key)
+    expected = reference.evaluate("e=>({value:e.value,key:window.__nativeSelectKey?.key,prevented:window.__nativeSelectKey?.defaultPrevented})")
+    reference.evaluate('(e)=>e.remove()')
+    field.focus();field.evaluate("e=>{window.__appSelectKey=null;e.addEventListener('keydown',event=>window.__appSelectKey=event,{once:true});}")
+    page.keyboard.press(key)
+    actual = field.evaluate("e=>({value:e.value,key:window.__appSelectKey?.key,prevented:window.__appSelectKey?.defaultPrevented})")
+    assert expected['key']==key and expected['prevented'] is False, ('native reference key',expected)
+    assert actual['key']==key and actual['prevented'] is False, ('application intercepted native key',actual)
+    assert actual['value']==expected['value'], ('application differs from native select',actual,expected)
+
+
 def check(value, label):
     global PASSES
     assert value, label
@@ -132,10 +151,16 @@ def run_engine(p, engine, url, artifacts, payload):
     before = len(calls(page))
     button(page,'tui.on_start').click()
     check(page.evaluate('document.activeElement.id')=='setting-choice', engine+' choice initially focused')
-    page.keyboard.press('End')
-    check(page.locator('#setting-choice').input_value()=='picker', engine+' native choice keyboard navigation')
-    page.keyboard.press('Tab')
-    page.keyboard.press('Tab')
+    native_select_key(page,'#setting-choice','End')
+    check(page.evaluate('document.activeElement.id')=='setting-choice', engine+' native choice keyboard navigation retains focus')
+    # Select a known typed value separately from OS-specific End behavior.
+    page.locator('#setting-choice').select_option('picker')
+    check(page.locator('#setting-choice').input_value()=='picker', engine+' typed choice selected for Save')
+    # Safari on macOS uses Option+Tab to include every native control without
+    # changing the user's system keyboard-navigation preference.
+    tab_key = 'Alt+Tab' if sys.platform == 'darwin' and engine == 'webkit' else 'Tab'
+    page.keyboard.press(tab_key)
+    page.keyboard.press(tab_key)
     check(page.evaluate('document.activeElement.id')=='ask-ok',engine+' choice keyboard reaches Save')
     page.keyboard.press('Enter')
     page.wait_for_function('(before)=>__settings822.calls.filter(r=>r.type==="set_setting").length>before',arg=before)
