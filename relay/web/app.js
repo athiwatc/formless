@@ -4412,7 +4412,12 @@
       rows.map(([k, v, key, kind, choices]) => [h("dt", { title: key || "", "data-setting-key": key || "" }, k), h("dd", null,
         v === "" || v == null ? h("span", { class: "muted" }, "(not set)") : settingDisplay(v),
         key && onTuiStart.has(key) ? h("span", { class: "tag", title: "A running TUI keeps the old value until it restarts" }, "applies when the TUI starts") : null,
-        key && kind ? h("button", { class: "btn ghost small", type: "button", "aria-label": "Edit " + key, onclick: () => editSetting(key, v, kind, choices) }, "Edit") : key ? h("span", { class: "muted setting-readonly" }, " · read-only: edit config.toml / use its CLI") : null,
+        key && kind ? h("button", { class: "btn ghost small", type: "button", "aria-label": "Edit " + key, onclick: (event) => {
+          // A pointer click need not focus a native button on macOS. Give the
+          // prompt a stable invoker to restore when it closes.
+          event.currentTarget.focus({ preventScroll: true });
+          editSetting(key, v, kind, choices);
+        } }, "Edit") : key ? h("span", { class: "muted setting-readonly" }, " · read-only: edit config.toml / use its CLI") : null,
         help(key))])));
     const grid = h("div", { class: "settings-grid" });
     const c = S.settings;
