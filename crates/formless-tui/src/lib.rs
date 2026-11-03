@@ -5,6 +5,8 @@ mod commands;
 mod external_editor;
 mod external_editor_ui;
 mod highlight;
+#[cfg(test)]
+mod history_tests;
 mod hunk_controller;
 mod hunk_ui;
 mod hunk_view;
@@ -1474,6 +1476,37 @@ fn truncate_chars(s: &str, max: usize) -> String {
     text::truncate(&flat, max)
 }
 
+/// Borrow this Session's user payloads; collecting the iterator copies only
+/// references. Rendering selects a single entry without collecting at all.
+fn input_history<'a>(
+    messages: &'a [MessageInfo],
+    session: Option<&'a str>,
+) -> impl DoubleEndedIterator<Item = &'a str> + 'a {
+    messages
+        .iter()
+        .filter(move |message| {
+            message.role == "user" && session == Some(message.session_id.as_str())
+        })
+        .map(|message| message.content.as_str())
+}
+
+/// Bound preview work before newline expansion/terminal measurement. Drop the
+/// final partial cluster when the byte budget cuts a very large history entry.
+fn history_preview(text: &str, columns: usize) -> String {
+    let mut end = text.len().min(columns.saturating_mul(32).max(64));
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    if end < text.len() {
+        end = text::prev_cluster(&text[..end], end);
+    }
+    let mut flat = text[..end].replace('\n', " ⏎ ");
+    if end < text.len() {
+        flat.push('…');
+    }
+    text::truncate(&flat, columns)
+}
+
 /// Render persisted assistant tool-call metadata as display lines.
 /// How long the TUI waits for a request's answer before giving up on it.
 const REQUEST_DEADLINE: Duration = Duration::from_secs(120);
@@ -2304,6 +2337,7 @@ impl App {
             // Do not move an old Session's retained input into another Session.
             self.stash_current_draft(&session_id);
             self.current = None;
+            self.input.invalidate_history();
             self.messages.clear();
             self.notes.push("The previous Session is no longer available; its draft is kept. Choose a Session or use /new once reconnected.".into());
         }
@@ -2488,6 +2522,7 @@ impl App {
             }
         }
         messages.sort_by_key(|message| message.seq);
+        self.input.invalidate_history();
         self.messages = messages;
         self.md_cache.borrow_mut().clear();
         self.queued = queued;
@@ -2710,6 +2745,7 @@ impl App {
         if !self.is_current(session_id) {
             return;
         }
+        self.input.invalidate_history();
         let draft = Draft {
             input: std::mem::take(&mut self.input),
             attachments: std::mem::take(&mut self.attachments),
@@ -4773,6 +4809,7 @@ impl App {
                             }
                             if let Some(msgs) = result.get("messages").cloned() {
                                 if let Ok(v) = serde_json::from_value::<Vec<MessageInfo>>(msgs) {
+                                    self.input.invalidate_history();
                                     self.messages = v;
                                     if let Some(at) = self.jump_to.take() {
                                         self.focus_call_at(&at);
@@ -5251,6 +5288,7 @@ impl App {
         // Each Session keeps its own unsent input (SPEC §10.2).
         if self.current.as_deref() != Some(id.as_str()) {
             if let Some(old) = self.current.take() {
+                self.input.invalidate_history();
                 let draft = Draft {
                     input: std::mem::take(&mut self.input),
                     attachments: std::mem::take(&mut self.attachments),
@@ -5261,6 +5299,7 @@ impl App {
             }
             let draft = self.drafts.remove(&id).unwrap_or_default();
             self.input = draft.input;
+            self.input.invalidate_history();
             self.attachments = draft.attachments;
             self.target_flash = Some(Instant::now() + Duration::from_millis(700));
         }
@@ -6332,6 +6371,7 @@ impl App {
                 if self.is_current(&id) {
                     self.stash_current_draft(&id);
                     self.current = None;
+                    self.input.invalidate_history();
                     self.messages.clear();
                     self.streaming.clear();
                     self.thinking.clear();
@@ -10897,16 +10937,6 @@ impl App {
         }
     }
 
-    /// The user messages of the current Session, oldest first: the input
-    /// history for Up/Down and Ctrl+R.
-    fn input_history(&self) -> Vec<String> {
-        self.messages
-            .iter()
-            .filter(|m| m.role == "user")
-            .map(|m| m.content.clone())
-            .collect()
-    }
-
     /// Chat-view keys: the line editor, history, sending and scrolling
     /// (PgUp/PgDn and the wheel; ↑/↓ belong to the input).
     fn input_key(&mut self, key: KeyEvent) {
@@ -10941,7 +10971,7 @@ impl App {
             return;
         }
         if self.input.searching().is_some() {
-            let history = self.input_history();
+            let history: Vec<_> = input_history(&self.messages, self.current.as_deref()).collect();
             match key.code {
                 KeyCode::Char('r') if ctrl => self.input.search_older(&history),
                 KeyCode::Char('g') if ctrl => self.input.search_cancel(),
@@ -11035,11 +11065,13 @@ impl App {
             KeyCode::Up if !self.input.on_first_line() => self.input.vertical(false),
             KeyCode::Down if !self.input.on_last_line() => self.input.vertical(true),
             KeyCode::Up => {
-                let history = self.input_history();
+                let history: Vec<_> =
+                    input_history(&self.messages, self.current.as_deref()).collect();
                 self.input.history_prev(&history);
             }
             KeyCode::Down => {
-                let history = self.input_history();
+                let history: Vec<_> =
+                    input_history(&self.messages, self.current.as_deref()).collect();
                 self.input.history_next(&history);
             }
             KeyCode::End if self.input.is_empty() => self.follow_chat_bottom(),
@@ -11126,7 +11158,8 @@ impl App {
                 'k' => self.input.kill_to_end(),
                 'd' => self.input.delete(),
                 'r' => {
-                    let history = self.input_history();
+                    let history: Vec<_> =
+                        input_history(&self.messages, self.current.as_deref()).collect();
                     self.input.search_older(&history);
                 }
                 'v' => self.paste_image(),
@@ -12046,13 +12079,13 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App, show_cursor: bool) {
     let mut cursor = Some((0usize, 0usize));
     if let Some((query, found)) = app.input.searching() {
         let hit = found
-            .and_then(|i| app.input_history().get(i).cloned())
+            .and_then(|i| input_history(&app.messages, app.current.as_deref()).nth(i))
             .unwrap_or_default();
         let label = format!("(history search) {query}▏: ");
         lines.push(Line::from(vec![
             Span::styled(label.clone(), bold_fg(app.color, Color::Magenta)),
-            Span::raw(truncate_chars(
-                &hit.replace('\n', " ⏎ "),
+            Span::raw(history_preview(
+                hit,
                 avail.saturating_sub(label.chars().count()),
             )),
         ]));
@@ -13869,6 +13902,7 @@ impl App {
         }
         self.switch_session(s.id.clone());
         self.sessions.insert(0, s);
+        self.input.invalidate_history();
         self.messages.clear();
         self.view = View::Chat;
     }
@@ -21420,7 +21454,7 @@ mod tests {
             .enumerate()
             .map(|(i, c)| MessageInfo {
                 id: format!("m{i}"),
-                session_id: "s".into(),
+                session_id: "s1".into(),
                 seq: i as i64,
                 role: "user".into(),
                 content: c.to_string(),
