@@ -1625,14 +1625,22 @@
   const RULE = /^\s{0,3}([-*_])(?:\s*\1){2,}\s*$/;
   const ITEM = /^(\s*)([-*+]|\d{1,9}[.)])(\s+|$)(.*)$/;
   const QUOTE = /^\s{0,3}>/;
+  const MATH_BLOCK = /^\s*\$\$/;
   const TABLE_SEP = /^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$/;
   const ALERTS = { NOTE: "ℹ Note", TIP: "★ Tip", IMPORTANT: "‼ Important", WARNING: "⚠ Warning", CAUTION: "✖ Caution" };
   const indentOf = (l) => l.match(/^\s*/)[0].replace(/\t/g, "    ").length;
   const startsBlock = (lines, i) => {
     const l = lines[i];
-    return FENCE.test(l) || HEADING.test(l) || RULE.test(l) || ITEM.test(l) || QUOTE.test(l) || /^\s*\$\$/.test(l)
+    return FENCE.test(l) || HEADING.test(l) || RULE.test(l) || ITEM.test(l) || QUOTE.test(l) || MATH_BLOCK.test(l)
       || (l.includes("|") && i + 1 < lines.length && TABLE_SEP.test(lines[i + 1]) && lines[i + 1].includes("-"));
   };
+  // Shared delimiter rules keep persisted and streamed block boundaries aligned.
+  function fenceCloses(line, marker) {
+    return new RegExp("^\\s*" + marker[0] + "{" + marker.length + ",}\\s*$").test(line);
+  }
+  function mathBlockOpen(line, open = false) {
+    return open ? !line.includes("$$") : MATH_BLOCK.test(line) && !line.replace(MATH_BLOCK, "").includes("$$");
+  }
   function splitRow(line) {
     let s = line.trim();
     if (s.startsWith("|")) s = s.slice(1);
@@ -1653,7 +1661,7 @@
         const lead = fence[1].length;
         const buf = [];
         i++;
-        while (i < lines.length && !new RegExp("^\\s*" + marker[0] + "{" + marker.length + ",}\\s*$").test(lines[i])) {
+        while (i < lines.length && !fenceCloses(lines[i], marker)) {
           buf.push(lines[i].slice(Math.min(lead, indentOf(lines[i]))));
           i++;
         }
@@ -1663,10 +1671,15 @@
         root.append(lang.toLowerCase() === "mermaid" ? diagramBlock(buf.join("\n"), closed) : codeBlock(buf.join("\n"), lang));
         continue;
       }
-      if (/^\s*\$\$/.test(line)) {
-        const buf = [line.replace(/^\s*\$\$/, "")];
+      if (MATH_BLOCK.test(line)) {
+        const buf = [line.replace(MATH_BLOCK, "")];
+        let open = mathBlockOpen(line);
         i++;
-        while (i < lines.length && !buf[buf.length - 1].includes("$$")) buf.push(lines[i++]);
+        while (i < lines.length && open) {
+          const next = lines[i++];
+          buf.push(next);
+          open = mathBlockOpen(next, true);
+        }
         root.append(h("pre", { class: "math block" }, buf.join("\n").replace(/\$\$\s*$/, "").trim()));
         continue;
       }
@@ -1728,6 +1741,11 @@
           let j = i + 1;
           while (j < lines.length && !lines[j].trim()) j++;
           if (j < lines.length && indentOf(lines[j]) > base) { body.push(""); loose = loose || !ITEM.test(lines[j]); i++; continue; }
+          const sibling = j < lines.length && lines[j].match(ITEM);
+          if (sibling && !RULE.test(lines[j]) && indentOf(sibling[1]) === base && /\d/.test(sibling[2]) === ordered) {
+            loose = true;
+            i = j;
+          }
           break;
         }
         const ind = indentOf(l);
@@ -1745,8 +1763,6 @@
       }
       blocks(body, li, depth + 1);
       el.append(li);
-      // Blank line before a sibling item makes the list loose.
-      if (i > 0 && !lines[i - 1].trim() && i < lines.length && ITEM.test(lines[i])) loose = true;
     }
     if (loose) el.classList.add("loose");
     root.append(el);
@@ -2546,18 +2562,40 @@
   }
   /** A streaming answer split into its finished Markdown blocks and the
    * unfinished tail (the TUI's complete-prefix rule): blocks end at a blank
-   * line outside a code fence, so an open fence, table or list stays plain
-   * text until it's done and nothing above it reflows. */
+   * line outside a code fence or display math. An unfinished block stays
+   * plain text, and completed blocks above it keep their DOM identity. */
   function splitStreaming(text) {
-    let fence = null, cut = 0, at = 0;
+    let fence = null, math = false, cut = 0, at = 0;
     for (const line of text.split("\n")) {
       const next = at + line.length + 1;
-      const m = line.match(/^\s*(`{3,}|~{3,})/);
-      if (m && (!fence || (m[1][0] === fence[0] && m[1].length >= fence.length))) fence = fence ? null : m[1];
-      else if (!fence && !line.trim() && next <= text.length) cut = next;
+      if (math) math = mathBlockOpen(line, true);
+      else if (fence) {
+        if (fenceCloses(line, fence)) fence = null;
+      } else {
+        const marker = line.match(FENCE);
+        if (marker) fence = marker[2];
+        else if (MATH_BLOCK.test(line)) math = mathBlockOpen(line);
+        else if (!line.trim() && next <= text.length) cut = next;
+      }
       at = next;
     }
     return [text.slice(0, cut), text.slice(cut)];
+  }
+  function reuseStreamingBlock(previous, node) {
+    if (previous?.isEqualNode(node)) return previous;
+    // A later loose sibling changes a list's structure, not earlier content.
+    // Retain list/item containers and identical descendants when extending it.
+    if (previous && /^(UL|OL|LI)$/.test(node.nodeName) && previous.nodeName === node.nodeName
+      && previous.getAttribute("start") === node.getAttribute("start")) {
+      const items = [...previous.childNodes];
+      const next = [...node.childNodes].map((item, i) => reuseStreamingBlock(items[i], item));
+      const classes = node.getAttribute("class");
+      if (classes == null) previous.removeAttribute("class");
+      else previous.setAttribute("class", classes);
+      reconcileChildren(previous, next);
+      return previous;
+    }
+    return node;
   }
   // Completed Markdown chunks and the unfinished tail keep their DOM identity.
   const liveDone = { session: undefined, text: "", src: "", node: null, done: null, tail: null, tailText: null, plainText: null };
@@ -2576,7 +2614,10 @@
     const [done, tail] = splitStreaming(text);
     if (liveDone.src !== done) {
       const extra = done.startsWith(liveDone.src) ? done.slice(liveDone.src.length) : null;
-      const continuation = extra && /^\s+\S/.test(extra) && /^(UL|OL)$/.test(liveDone.done.lastElementChild?.tagName || "");
+      const last = liveDone.done.lastElementChild;
+      const sibling = extra && extra.split("\n").find(line => line.trim())?.match(ITEM);
+      const continuation = extra && /^(UL|OL)$/.test(last?.tagName || "")
+        && (/^\s+\S/.test(extra) || sibling && (/\d/.test(sibling[2]) ? "OL" : "UL") === last.tagName);
       if (done.length > MD_FORMAT_CHARS) {
         if (!liveDone.plainText) {
           liveDone.plainText = document.createTextNode(done);
@@ -2585,11 +2626,11 @@
       } else if (extra !== null && !continuation && !liveDone.plainText) {
         if (extra) liveDone.done.append(...markdown(extra).childNodes);
       } else {
-        // A restarted stream or an indented continuation can change the last
+        // A restarted stream or a list continuation can change the last
         // Markdown block's meaning. Retain identical earlier blocks in place.
         const next = markdown(done);
         const previous = [...liveDone.done.childNodes];
-        const nodes = [...next.childNodes].map((node, index) => previous[index]?.isEqualNode(node) ? previous[index] : node);
+        const nodes = [...next.childNodes].map((node, index) => reuseStreamingBlock(previous[index], node));
         reconcileChildren(liveDone.done, nodes);
         liveDone.plainText = null;
       }

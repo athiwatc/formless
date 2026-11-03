@@ -152,7 +152,12 @@ The complete check requires both Chromium and a supported Playwright WebKit
 installation with its native dependencies. `--browser chromium` is explicitly
 partial validation. It checks animation-frame batching, retained DOM/text nodes,
 pixel-stable anchors without native scroll anchoring, delayed layout and
-Session/view transitions. WebKit engine evidence is not physical Safari testing.
+Session/view transitions. It also compares streamed and stored Markdown block
+structure over five burst sizes, including loose/nested lists, display math with
+blank lines, and math/fence delimiter precedence; list/item identity stays stable
+when later siblings arrive. Pure block regressions are in
+`node --test relay/web-markdown.test.mjs` (also included in all relay Node tests).
+WebKit engine evidence is not physical Safari testing.
 
 Mobile keyboard/viewport and input regressions run with
 `python relay/web-mobile.browser-test.py /tmp/formless-mobile-check` using
