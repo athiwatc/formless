@@ -7,7 +7,7 @@ use serde_json::Value;
 
 #[path = "pipeline_input.rs"]
 mod input;
-pub use input::read_schema_file;
+pub use input::{parse_schema_bytes, read_schema_file};
 
 #[path = "pipeline_output.rs"]
 mod output;

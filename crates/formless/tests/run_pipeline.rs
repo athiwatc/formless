@@ -519,6 +519,7 @@ fn shipped_pipeline_validates_repairs_once_keeps_stdout_clean_and_never_persists
             let value: Value = serde_json::from_slice(&out.stdout).unwrap();
             assert_eq!(value["status"], "schema_mismatch");
             assert!(value["answer"].is_null());
+            assert!(value["result"].is_null());
         }
     }
     assert_eq!(f.provider.count(), 10);
@@ -593,6 +594,101 @@ fn shipped_pipeline_validates_repairs_once_keeps_stdout_clean_and_never_persists
         f.provider.replies.lock().unwrap().is_empty(),
         "every queued response was used exactly once"
     );
+}
+
+#[test]
+fn shipped_schema_json_result_is_structured_on_stdout_and_in_output_files() {
+    let mut f = Fixture::new();
+    let store = Store::open(&f.paths.db_file()).unwrap();
+    let session = store
+        .create_session(Some("structured result".into()))
+        .unwrap()
+        .id;
+    drop(store);
+    let schema = f.root.join("bom-schema.json");
+    let schema_bytes = [b"\xef\xbb\xbf".as_slice(), br#"{"type":"object","required":["n"],"properties":{"n":{"type":"integer"}},"additionalProperties":false}"#].concat();
+    std::fs::write(&schema, &schema_bytes).unwrap();
+    let destination = f.root.join("structured-result.json");
+    f.start();
+    let answer = " {\"n\":2} ";
+    for from_stdin in [false, true] {
+        for to_file in [false, true] {
+            f.provider.queue(answer);
+            let mut args = vec![
+                "run",
+                "task",
+                "--session",
+                &session,
+                "--schema",
+                if from_stdin {
+                    "-"
+                } else {
+                    schema.to_str().unwrap()
+                },
+                "--max-usd",
+                "0.10",
+                "--output",
+                "json",
+                "--quiet",
+            ];
+            if to_file {
+                std::fs::write(&destination, b"previous output").unwrap();
+                args.extend(["--output-file", destination.to_str().unwrap()]);
+            }
+            let out = f.run(&args, from_stdin.then_some(schema_bytes.as_slice()));
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let bytes = if to_file {
+                assert!(out.stdout.is_empty());
+                std::fs::read(&destination).unwrap()
+            } else {
+                out.stdout
+            };
+            let value: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(value["session_id"], session);
+            assert_eq!(value["status"], "completed");
+            assert_eq!(
+                value["answer"], answer,
+                "existing answer text remains compatible"
+            );
+            assert_eq!(value["result"], json!({"n":2}));
+            assert!(value["result"].is_object());
+            assert!(value["error"].is_null());
+        }
+    }
+    // JSON-looking free text is not a schema-validated result.
+    f.provider.queue(answer);
+    let out = f.run(
+        &[
+            "run",
+            "task",
+            "--session",
+            &session,
+            "--max-usd",
+            "0.10",
+            "--output",
+            "json",
+            "--quiet",
+        ],
+        None,
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["answer"], answer);
+    assert!(value.get("result").unwrap().is_null());
+    assert_eq!(f.provider.count(), 5);
+    assert!(Store::open(&f.paths.db_file())
+        .unwrap()
+        .pending_attachments(&session)
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
