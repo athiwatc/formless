@@ -441,6 +441,10 @@ h3 { font-size: 0.9375rem; margin: 1.375rem 0 0.5rem; }
   .spinner { border: 0; width: auto; height: auto; }
   .spinner::before { content: "⋯"; font-weight: 700; line-height: 1; }
 }
+/* The shared setting has the same effect; OS reduction remains authoritative. */
+:root[data-reduced-motion] * { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
+:root[data-reduced-motion] .spinner { border: 0; width: auto; height: auto; }
+:root[data-reduced-motion] .spinner::before { content: "⋯"; font-weight: 700; line-height: 1; }
 
 /* Tool version diffs */
 .diff { margin: 0; padding: 0.5rem; overflow-x: auto; font: 0.75rem/1.4 var(--mono); background: var(--code-bg); }
