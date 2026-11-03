@@ -4392,10 +4392,13 @@ undo, redo and replacements invalidate prior asynchronous editor previews.
   Suggestions include loaded and shadowed template names, with shadowing reasons.
   A diagnostic key is forgotten when absent from a refreshed snapshot, allowing
   a newly broken file to be announced again after repair.
-  TUI discovery refreshes at most every 250 ms while idle and forces a fresh
-  snapshot for help and explicit expansion; its cache binds the profile path,
-  selected Session and working directory. Diagnostic notes are deduplicated by
-  path/reason in a bounded 1024-entry history. Roots may resolve trusted aliases;
+  TUI discovery loads once when the profile/Session/working-directory binding
+  changes. Ordinary idle frames do not read template files or poll their metadata.
+  While a non-literal slash palette is open, it checks bounded directory/file
+  metadata at most every 250 ms and reloads only when that fingerprint changes
+  or cannot be obtained. Help and explicit expansion always force a fresh Core
+  load, regardless of the preview-cache hint. Diagnostic notes are deduplicated
+  by the current snapshot's bounded path/reason keys. Roots may resolve trusted aliases;
   command-directory descendants and files use native no-follow reads and refuse
   reparse points, symlinks, hardlinked files and unsupported namespaces. Each
   directory is bounded to 256 entries and 128 Markdown templates; files are at

@@ -130,12 +130,110 @@ pub(super) fn suggestion(snapshot: &Snapshot, typed: &str) -> Option<String> {
     Some(text)
 }
 
+#[derive(PartialEq, Eq)]
+struct Stamp {
+    len: u64,
+    modified: std::time::SystemTime,
+    kind: [bool; 3],
+    #[cfg(unix)]
+    identity: (u64, u64, u64, i64, i64),
+}
+impl TryFrom<std::fs::Metadata> for Stamp {
+    type Error = std::io::Error;
+    fn try_from(metadata: std::fs::Metadata) -> Result<Self, Self::Error> {
+        Ok(Self {
+            len: metadata.len(),
+            modified: metadata.modified()?,
+            kind: [
+                metadata.is_dir(),
+                metadata.is_file(),
+                metadata.file_type().is_symlink(),
+            ],
+            #[cfg(unix)]
+            identity: {
+                use std::os::unix::fs::MetadataExt;
+                (
+                    metadata.dev(),
+                    metadata.ino(),
+                    metadata.nlink(),
+                    metadata.ctime(),
+                    metadata.ctime_nsec(),
+                )
+            },
+        })
+    }
+}
+type Fingerprint = Vec<(PathBuf, Option<Stamp>)>;
+
+/// A bounded preview-cache hint: inspect names/metadata, never template bytes.
+/// Explicit help/expansion always load through Core, regardless of this hint.
+fn fingerprint(config: &std::path::Path, project: &std::path::Path) -> Option<Fingerprint> {
+    let mut out = Vec::new();
+    for (root, is_project) in [(config, false), (project, true)] {
+        // Configured roots may be trusted aliases, as in Core's loader.
+        let root = match root.canonicalize() {
+            Ok(root) => root,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                out.push((root.to_path_buf(), None));
+                continue;
+            }
+            Err(_) => return None,
+        };
+        let mut dir = root;
+        let parts: &[&str] = if is_project {
+            &[".formless", "commands"]
+        } else {
+            &["commands"]
+        };
+        for (index, part) in parts.iter().enumerate() {
+            dir.push(part);
+            let metadata = match std::fs::symlink_metadata(&dir) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    out.push((dir.clone(), None));
+                    break;
+                }
+                Err(_) => return None,
+            };
+            // Do not enumerate a known symlink or non-directory descendant.
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                out.push((dir.clone(), Some(metadata.try_into().ok()?)));
+                break;
+            }
+            if index + 1 != parts.len() {
+                continue;
+            }
+            out.push((dir.clone(), Some(metadata.try_into().ok()?)));
+            for (count, entry) in std::fs::read_dir(&dir).ok()?.enumerate() {
+                // Match Core's directory-entry bound; never scan unboundedly.
+                if count >= 256 {
+                    return None;
+                }
+                let path = entry.ok()?.path();
+                if path.extension() == Some(std::ffi::OsStr::new("md")) {
+                    out.push((
+                        path.clone(),
+                        Some(std::fs::symlink_metadata(path).ok()?.try_into().ok()?),
+                    ));
+                }
+            }
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Some(out)
+}
+
 #[derive(Default)]
 pub(super) struct State {
     binding: Option<(PathBuf, PathBuf, Option<String>)>,
     checked: Option<Instant>,
     snapshot: Option<Arc<Snapshot>>,
     seen: VecDeque<String>,
+    fingerprint: Option<Fingerprint>,
+    #[cfg(test)]
+    loads: usize,
+    #[cfg(test)]
+    probes: usize,
 }
 impl App {
     pub(super) fn user_command_snapshot(&self, force: bool) -> Arc<Snapshot> {
@@ -145,17 +243,42 @@ impl App {
             self.current.clone(),
         );
         let mut state = self.user_commands.borrow_mut();
-        if force
-            || state.binding.as_ref() != Some(&binding)
-            || state
-                .checked
-                .is_none_or(|checked| checked.elapsed() >= Duration::from_millis(250))
-        {
-            state.snapshot = Some(Arc::new(user_commands::load(
-                &binding.0,
-                Some(&binding.1),
-                &builtin_command_names(),
-            )));
+        let binding_changed = state.binding.as_ref() != Some(&binding);
+        let palette = self.view == View::Chat
+            && self.input.strip_prefix('/').is_some_and(|query| {
+                !query.starts_with('/') && !query.chars().any(char::is_whitespace)
+            })
+            && !self.input.is_literal()
+            && self.palette_hidden.as_deref() != Some(&*self.input)
+            && !self.search_mode
+            && self.renaming.is_none()
+            && self.instructing.is_none()
+            && self.import_mode.is_none()
+            && self.bulk.is_none()
+            && !self.editing_step;
+        let due = state
+            .checked
+            .is_none_or(|checked| checked.elapsed() >= Duration::from_millis(250));
+        if force || binding_changed || palette && due {
+            #[cfg(test)]
+            {
+                state.probes += 1;
+            }
+            // Capture before loading: a concurrent edit must not stamp an old
+            // snapshot with newer metadata and hide it from the next poll.
+            let next = fingerprint(&binding.0, &binding.1);
+            if force || binding_changed || next.is_none() || state.fingerprint != next {
+                #[cfg(test)]
+                {
+                    state.loads += 1;
+                }
+                state.snapshot = Some(Arc::new(user_commands::load(
+                    &binding.0,
+                    Some(&binding.1),
+                    &builtin_command_names(),
+                )));
+            }
+            state.fingerprint = next;
             state.binding = Some(binding);
             state.checked = Some(Instant::now());
         }
@@ -253,5 +376,192 @@ impl App {
                 runnable: true,
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod refresh_tests {
+    use super::*;
+    struct Fixture {
+        app: App,
+        root: PathBuf,
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+    fn fixture() -> Fixture {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "fl-refresh-{}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut app = crate::tests::test_app();
+        app.paths = Paths::from_dirs(root.join("data"), root.join("config")).unwrap();
+        let project = root.join("project");
+        std::fs::create_dir_all(project.join(".formless/commands")).unwrap();
+        std::fs::create_dir_all(app.paths.config_dir.join("commands")).unwrap();
+        app.current = Some("refresh".into());
+        app.sessions = vec![serde_json::from_value(serde_json::json!({"id":"refresh", "name":"Refresh", "created_at":"", "updated_at":"", "cwd":project})).unwrap()];
+        std::fs::write(
+            project.join(".formless/commands/workflow.md"),
+            "---\ndescription: Old workflow\n---\nOld workflow",
+        )
+        .unwrap();
+        Fixture { app, root }
+    }
+    fn expire(app: &App) {
+        app.user_commands.borrow_mut().checked = Some(Instant::now() - Duration::from_millis(251));
+    }
+    #[test]
+    fn unchanged_idle_templates_are_loaded_once_not_every_tick() {
+        let mut fixture = fixture();
+        for i in 0..64 {
+            std::fs::write(
+                fixture
+                    .app
+                    .paths
+                    .config_dir
+                    .join(format!("commands/template{i}.md")),
+                format!("Template fixture\n{}", "x".repeat(8192)),
+            )
+            .unwrap();
+        }
+        fixture.app.user_commands_tick();
+        assert_eq!(fixture.app.user_commands.borrow().loads, 1);
+        for _ in 0..100 {
+            expire(&fixture.app);
+            fixture.app.user_commands_tick();
+        }
+        assert_eq!(
+            fixture.app.user_commands.borrow().loads,
+            1,
+            "ordinary idle frames must not read template bodies again"
+        );
+        assert_eq!(
+            fixture.app.user_commands.borrow().probes,
+            1,
+            "ordinary idle frames must not probe template metadata either"
+        );
+        fixture.app.input.set("/template");
+        for _ in 0..100 {
+            expire(&fixture.app);
+            fixture.app.user_commands_tick();
+        }
+        assert_eq!(
+            fixture.app.user_commands.borrow().loads,
+            1,
+            "unchanged palette polls must not read template bodies"
+        );
+        assert_eq!(fixture.app.user_commands.borrow().probes, 101);
+        fixture.app.palette_hidden = Some(fixture.app.input.to_string());
+        expire(&fixture.app);
+        fixture.app.user_commands_tick();
+        assert_eq!(
+            fixture.app.user_commands.borrow().probes,
+            101,
+            "dismissed palettes must not keep polling"
+        );
+    }
+    #[test]
+    fn palette_polls_notice_edits_additions_and_removals_on_the_next_refresh() {
+        let mut fixture = fixture();
+        fixture.app.input.set("/work");
+        assert!(fixture.app.user_command_palette("work")[0]
+            .desc
+            .contains("Old workflow"));
+        let path = fixture.root.join("project/.formless/commands/workflow.md");
+        std::fs::write(
+            &path,
+            "---\ndescription: Updated workflow\n---\nNew body with $ARGUMENTS",
+        )
+        .unwrap();
+        expire(&fixture.app);
+        assert_eq!(
+            fixture.app.user_command_palette("work")[0].desc,
+            "Updated workflow"
+        );
+        assert_eq!(fixture.app.user_commands.borrow().loads, 2);
+        let added = path.with_file_name("worker.md");
+        std::fs::write(&added, "Added worker").unwrap();
+        expire(&fixture.app);
+        assert_eq!(fixture.app.user_command_palette("work").len(), 2);
+        std::fs::remove_file(&path).unwrap();
+        expire(&fixture.app);
+        let rows = fixture.app.user_command_palette("work");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].insert, "/worker ");
+    }
+    #[test]
+    fn help_expansion_and_binding_changes_do_not_depend_on_palette_cache_hints() {
+        let mut fixture = fixture();
+        fixture.app.user_commands_tick();
+        let path = fixture.root.join("project/.formless/commands/workflow.md");
+        std::fs::write(
+            &path,
+            "---\ndescription: Help sees this\n---\nFresh $ARGUMENTS",
+        )
+        .unwrap();
+        assert!(fixture
+            .app
+            .user_command_help()
+            .iter()
+            .any(|line| line.contains("Help sees this")));
+        std::fs::write(&path, "Newest $ARGUMENTS").unwrap();
+        fixture.app.input.set("/workflow exact");
+        assert!(fixture.app.expand_user_command());
+        assert_eq!(fixture.app.input.expanded(), "Newest exact");
+        // A changed Session/project binding loads once even without a slash.
+        let other = fixture.root.join("other");
+        std::fs::create_dir_all(other.join(".formless/commands")).unwrap();
+        std::fs::write(
+            other.join(".formless/commands/workflow.md"),
+            "Other project",
+        )
+        .unwrap();
+        fixture.app.sessions[0].cwd = Some(other.to_string_lossy().into_owned());
+        fixture.app.input.clear();
+        let loads = fixture.app.user_commands.borrow().loads;
+        fixture.app.user_commands_tick();
+        assert_eq!(fixture.app.user_commands.borrow().loads, loads + 1);
+        assert_eq!(
+            fixture
+                .app
+                .user_command_snapshot(false)
+                .find("workflow")
+                .unwrap()
+                .expand("")
+                .unwrap(),
+            "Other project"
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn explicit_expansion_rechecks_core_file_guards_instead_of_using_cached_text() {
+        let mut fixture = fixture();
+        fixture.app.user_commands_tick();
+        let outside = fixture.root.join("outside.md");
+        std::fs::write(&outside, "Never loaded through a descendant link").unwrap();
+        let path = fixture.root.join("project/.formless/commands/workflow.md");
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&outside, &path).unwrap();
+        fixture.app.input.set("/workflow");
+        assert!(!fixture.app.expand_user_command());
+        assert_eq!(fixture.app.input.expanded(), "/workflow");
+        assert!(fixture
+            .app
+            .notes
+            .iter()
+            .any(|note| note.contains("isn't loaded")));
+        assert_eq!(
+            std::fs::read_to_string(outside).unwrap(),
+            "Never loaded through a descendant link"
+        );
     }
 }
