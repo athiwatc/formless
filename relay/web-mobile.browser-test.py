@@ -2,8 +2,9 @@
 """Issue #815 mobile input/visible-viewport regressions in Chromium and WebKit.
 
 Run: python relay/web-mobile.browser-test.py [artifact-directory]
-Uses installed /usr/bin/chromium and official Playwright WebKit (normal headless
-WPE executable), with no installation or provider/Tool execution. Keyboard
+Uses installed Chromium and official headless Playwright WebKit, with no
+provider/Tool execution. Route-mocked contexts block service workers so the
+fixture remains in control of app.js; offline shell behavior has separate tests. Keyboard
 geometry is an explicit visualViewport EventTarget simulation; native resize,
 rotation and Chromium CDP pinch are separate checks. This is browser-engine
 emulation, not evidence from physical iOS/Android keyboards or hybrid hardware.
@@ -59,10 +60,14 @@ def expose_script(route):
     hooks=r'''
     const fixture815={S,h,renderAll,renderHistory,renderLive,autosize,setReading,onEvent,scrollToBottom,resetReadingSession,
       updatePalette,updateMentions,closePalette,closeMentions,sessionMenu,messageMenu,closePopover,ask,closeAsk,
-      openModelPicker,codeEditor,modal,activeDialog,closeDialog,calls:[]};
+      openModelPicker,codeEditor,modal,activeDialog,closeDialog,setEnterSends,composerEnterSends,renderComposer,renderSettings,
+      renameSession,suggestName,editInstructions,editSetting,bulkSessions,calls:[],submits:[]};
+    const submit815=submit;
+    submit=(...args)=>{fixture815.submits.push(args[0]);return submit815(...args);};
     const reply815=async req=>{
       fixture815.calls.push({...req});
       if(req.type==='send_message')return {accepted:true};
+      if(req.type==='suggest_session_name')return {name:'Suggested fixture name'};
       if(req.type==='list_tools'||req.type==='list_modules')return [];
       if(req.type==='list_files')return {files:[{path:'fixture.txt',dir:false},{path:'fixtures/example.txt',dir:false},{path:'files/notes.txt',dir:false}]};
       if(req.type==='list_models')return {models:['fixture-a','fixture-b'],roles:[],aliases:{},recent:[],current:{model:'fixture-a'}};
@@ -143,7 +148,7 @@ def anchor_check(page,offset,label):
 def input_checks(page,coarse,label):
     page.evaluate('__mobile815.closePopover();__mobile815.closePalette();__mobile815.closeMentions();__mobile815.S.running.clear();__mobile815.S.streaming="";__mobile815.renderAll();__mobile815.calls=[]')
     check(page.evaluate('matchMedia("(pointer: coarse)").matches')==coarse,label+' primary pointer capability is real browser media')
-    check(page.locator('#input').get_attribute('enterkeyhint')=='send',label+' composer advertises send key hint')
+    check(page.locator('#input').get_attribute('enterkeyhint')==('enter' if coarse else 'send'),label+' composer key hint matches effective default Enter action')
     page.locator('#input').fill('first line');page.keyboard.press('Enter');settle(page)
     sent=page.evaluate('__mobile815.calls.filter(r=>r.type==="send_message")')
     if coarse:
@@ -210,6 +215,122 @@ def input_checks(page,coarse,label):
         page.locator('#input').fill('Repeated local send '+str(i));page.locator('#send-btn').click();settle(page,30)
     check(page.evaluate('__mobile815.calls.filter(r=>r.type==="send_message").length')==3,label+' repeated Send uses harmless local replies')
     check('user-scalable=no' not in (page.locator('meta[name=viewport]').get_attribute('content') or '').replace(' ',''),label+' zoom remains available')
+
+
+def input_preference_checks(page,coarse,label):
+    page.locator('#tabs [data-view="settings"]').click()
+    toggle=page.locator('#enter-sends')
+    check(toggle.is_checked()==(not coarse),label+' Settings shows effective pointer default')
+    try:
+        toggle.scroll_into_view_if_needed()
+        toggle.focus()
+    except Exception as exc:
+        state=page.evaluate('''()=>({view:__mobile815.S.view,current:__mobile815.S.current,present:!!document.querySelector('#enter-sends'),settings:document.querySelector('#settings').innerHTML.slice(-1200),active:document.activeElement?.outerHTML.slice(0,200),dialogs:[...document.querySelectorAll('.backdrop:not(.hidden)')].map(e=>e.id)})''')
+        raise AssertionError('Preference focus unavailable: '+json.dumps(state)) from exc
+    page.keyboard.press('Space');settle(page,30)
+    check(page.evaluate('document.activeElement.id')=='enter-sends',label+' keyboard toggle retains its Settings control focus')
+    check(page.evaluate('JSON.parse(localStorage.getItem("formless.enterSends"))')==coarse,label+' explicit Enter preference persists locally')
+    page.evaluate("__mobile815.S.view='chat';__mobile815.renderAll();__mobile815.calls=[]")
+    check(page.locator('#input').get_attribute('enterkeyhint')==('send' if coarse else 'enter'),label+' preference changes effective keyboard hint')
+    check('Settings' in page.locator('#compose-hint').inner_text() and 'Enter sends:' in page.locator('.compose-enter-pref').get_attribute('title'),label+' compose hint exposes preference and its Settings location')
+    check(page.locator('#compose-hint').is_visible(),label+' compose hint remains visible on narrow layouts')
+    page.locator('#input').fill('Preference fixture');page.locator('#input').focus();page.keyboard.press('Enter');settle(page)
+    sent=page.evaluate('__mobile815.calls.filter(r=>r.type==="send_message")')
+    check((len(sent)==1 and sent[0]['mode']=='send') if coarse else (not sent and page.locator('#input').input_value()=='Preference fixture\n'),label+' hardware-style Enter follows explicit device preference')
+    page.locator('#input').fill('/he');page.locator('#input').focus();page.wait_for_selector('.compose-popup');page.evaluate('__mobile815.calls=[]')
+    page.keyboard.press('Shift+Enter');settle(page,30)
+    check(page.locator('#input').input_value()=='/he\n' and page.evaluate('!__mobile815.calls.some(r=>r.type==="send_message")'),label+' Shift+Enter stays native while a palette is open')
+    page.locator('#input').fill('/he');page.wait_for_selector('.compose-popup');page.evaluate('__mobile815.submits=[]');page.keyboard.press('Control+Enter');settle(page)
+    # The partial slash command is handled by submit(), not sent as ordinary
+    # text. Observe the real submit boundary without changing its semantics.
+    check(page.evaluate('__mobile815.submits.length===1 && __mobile815.submits[0]===true'),label+' explicit queue wins over palette selection')
+    before=page.evaluate('__mobile815.calls.filter(r=>r.type==="send_message").length')
+    for mod in [False,True]:
+        page.locator('#input').evaluate('(e,ctrl)=>e.dispatchEvent(new KeyboardEvent("keydown",{key:"Enter",bubbles:true,cancelable:true,repeat:true,ctrlKey:ctrl}))',mod)
+    check(page.evaluate('__mobile815.calls.filter(r=>r.type==="send_message").length')==before and page.evaluate('__mobile815.submits.length')==1,label+' held Enter never duplicates send/queue actions')
+    page.evaluate("__mobile815.closePalette();__mobile815.closeMentions();__mobile815.S.view='settings';__mobile815.renderAll()")
+    reset=page.get_by_role('button',name='Use device default',exact=True);reset.focus();page.keyboard.press('Enter');settle(page,30)
+    check(reset.evaluate('(e)=>e===document.activeElement'),label+' pointer-default reset retains keyboard focus')
+    check(page.locator('#enter-sends').is_checked()==(not coarse),label+' reset restores effective pointer default')
+    page.evaluate("__mobile815.S.view='chat';__mobile815.renderAll();document.querySelector('#input').value='';__mobile815.autosize();__mobile815.calls=[]")
+
+
+def prompt_metadata(page,label,kind):
+    expected={'prose':('text','true','sentences','on','text','on'),'machine':('text','false','none','off','text','off'),'url':('text','false','none','off','url','url'),'secret':('password','false','none','off','text','off')}[kind]
+    field=page.locator('#ask-input');page.wait_for_selector('#ask-input:not(.hidden)')
+    actual=field.evaluate('(e)=>[e.type,...["spellcheck","autocapitalize","autocorrect","inputmode","autocomplete"].map(k=>e.getAttribute(k))]')
+    check(tuple(actual)==expected,label+' '+kind+' prompt resets every keyboard/autocomplete attribute: '+repr(actual))
+
+
+def prompt_checks(page,label):
+    for function in ['renameSession','suggestName','editInstructions']:
+        page.evaluate('(name)=>{void __mobile815[name](__mobile815.S.sessions[0]);}',function)
+        prompt_metadata(page,label+' actual '+function,'prose');page.keyboard.press('Escape')
+    page.evaluate("__mobile815.S.memories=[{id:'memory-fixture',text:'Use pnpm for this fixture',scope:'global',author:'user',enabled:true}];__mobile815.S.view='settings';__mobile815.renderAll()")
+    memory=page.get_by_role('heading',name='Memory',exact=True).locator('..')
+    for action in ['Add','Edit']:
+        memory.get_by_role('button',name=action,exact=True).click();prompt_metadata(page,label+' actual memory '+action,'prose');page.keyboard.press('Escape')
+    page.evaluate("void __mobile815.editSetting('provider.max_retries',5,'number')")
+    prompt_metadata(page,label+' actual settings','machine');page.keyboard.press('Escape')
+    page.evaluate("void __mobile815.bulkSessions('delete',['mobile-A'])")
+    prompt_metadata(page,label+' actual type-to-confirm','machine')
+    before=page.evaluate('__mobile815.calls.filter(r=>r.type==="delete_session").length')
+    page.locator('#ask-input').fill('Delete');page.locator('#ask-ok').click();settle(page,30)
+    check(page.evaluate('__mobile815.calls.filter(r=>r.type==="delete_session").length')==before,label+' case-sensitive confirmation value is not corrected or accepted')
+    page.evaluate("document.querySelector('#import-tool-url').click()")
+    prompt_metadata(page,label+' actual URL import','url');page.keyboard.press('Escape')
+    for kind in ['secret','prose','machine','url','secret','prose']:
+        page.evaluate('(kind)=>{const d=__mobile815;d.ask({title:"Metadata fixture",input:true,inputKind:kind,secret:kind==="secret"}).then(v=>d.lastPromptValue=v);}',kind)
+        prompt_metadata(page,label+' repeated '+kind,kind)
+        value=' Exact fixture '+kind+' value '
+        page.locator('#ask-input').fill(value);page.locator('#ask-ok').click();settle(page,20)
+        check(page.evaluate('__mobile815.lastPromptValue')==value,label+' '+kind+' resolve preserves exact typed value')
+        check(page.locator('#ask-input').input_value()=='',label+' '+kind+' hidden shared input clears after resolve')
+    page.evaluate('''()=>{const d=__mobile815;d.ask({title:'Legacy secret',input:true,secret:true,inputKind:'prose'}).then(v=>d.legacyValue=v);d.ask({title:'Queued prose',input:true,inputKind:'prose'});}''')
+    prompt_metadata(page,label+' legacy secret compatibility','secret');page.locator('#ask-input').fill('legacy fixture');page.locator('#ask-ok').click()
+    prompt_metadata(page,label+' queued after secret','prose')
+    check(page.locator('#ask-input').input_value()=='' and page.evaluate('__mobile815.legacyValue')=='legacy fixture',label+' queue captures secret result before clearing and changing metadata')
+    page.keyboard.press('Escape')
+    page.evaluate("__mobile815.S.view='chat';__mobile815.renderAll();__mobile815.calls=[]")
+
+
+POINTER_INIT=r'''(() => {
+  const original=window.matchMedia.bind(window),state={coarse:false,any:true};
+  const primary=new EventTarget(),any=new EventTarget();
+  Object.defineProperties(primary,{matches:{get:()=>state.coarse},media:{value:'(pointer: coarse)'}});
+  Object.defineProperties(any,{matches:{get:()=>state.any},media:{value:'(any-pointer: coarse)'}});
+  window.matchMedia=query=>query==='(pointer: coarse)'?primary:query==='(any-pointer: coarse)'?any:original(query);
+  window.__pointerInput={set(coarse,hasAny){const changed=coarse!==state.coarse;state.coarse=coarse;state.any=hasAny;if(changed)primary.dispatchEvent(new Event('change'));any.dispatchEvent(new Event('change'));}};
+})();'''
+
+
+def hybrid_checks(browser,name,url):
+    context=browser.new_context(viewport={'width':1280,'height':900},has_touch=False,reduced_motion='reduce',service_workers='block')
+    context.add_init_script(INIT);context.add_init_script(POINTER_INIT);context.route('**/app.js',expose_script)
+    page=context.new_page();page.set_default_timeout(5000);errors=[];page.on('pageerror',lambda e:errors.append(str(e)))
+    page.goto(url);page.wait_for_function('!!__mobile815');fixture(page);page.evaluate('__mobile815.S.running.clear();__mobile815.S.streaming="";__mobile815.setReading(.85);__mobile815.renderAll()')
+    check(page.evaluate('matchMedia("(any-pointer: coarse)").matches && !matchMedia("(pointer: coarse)").matches'),name+' simulated hybrid has primary fine and secondary coarse')
+    fine_size=page.locator('#settings-filter').evaluate('(e)=>parseFloat(getComputedStyle(e).fontSize)')
+    check(fine_size<16 and not page.evaluate('document.documentElement.hasAttribute("data-input-touch")'),name+' hybrid preserves desktop field size at85%: '+str(fine_size))
+    page.locator('#input').fill('Hybrid fixture');page.keyboard.press('Enter');settle(page)
+    check(page.evaluate('__mobile815.calls.filter(r=>r.type==="send_message").at(-1)?.mode')=='send',name+' hybrid retains desktop Enter sends')
+    page.evaluate("__mobile815.S.view='settings';__mobile815.renderAll();document.querySelector('#enter-sends').focus();__pointerInput.set(true,true)")
+    check(page.evaluate('document.activeElement.id')=='enter-sends',name+' primary-pointer change retains Settings checkbox focus')
+    check(page.evaluate('document.documentElement.hasAttribute("data-input-touch")') and page.locator('#settings-filter').evaluate('(e)=>parseFloat(getComputedStyle(e).fontSize)')>=16,name+' coarse change applies the same16px/default signal')
+    check(not page.locator('#enter-sends').is_checked() and page.locator('#input').get_attribute('enterkeyhint')=='enter',name+' unset preference follows changed primary pointer')
+    page.locator('#enter-sends').focus();page.keyboard.press('Space');check(page.evaluate('document.activeElement.id')=='enter-sends',name+' explicit preference toggle does not rebuild Settings')
+    page.reload();page.wait_for_function('!!__mobile815');fixture(page);page.evaluate('__pointerInput.set(true,true)')
+    check(page.evaluate('__mobile815.S.enterSends') is True and page.locator('#input').get_attribute('enterkeyhint')=='send',name+' coarse-device hardware preference persists through reload')
+    page.evaluate('__mobile815.setEnterSends(false)');page.reload();page.wait_for_function('!!__mobile815');fixture(page)
+    check(page.evaluate('__mobile815.S.enterSends') is False and page.locator('#input').get_attribute('enterkeyhint')=='enter',name+' fine-device newline preference persists through reload')
+    page.evaluate("__mobile815.S.view='settings';__mobile815.renderAll()")
+    page.get_by_role('button',name='Use device default',exact=True).focus();page.keyboard.press('Enter')
+    check(page.evaluate('document.activeElement.textContent')=='Use device default' and page.locator('#enter-sends').is_checked(),name+' reset keeps focused control and restores fine default')
+    page.evaluate('__mobile815.setReading(.85);__pointerInput.set(true,false)')
+    check(page.locator('#settings-filter').evaluate('(e)=>parseFloat(getComputedStyle(e).fontSize)')>=16,name+' primary coarse floor does not depend on any-pointer')
+    page.evaluate('__pointerInput.set(false,true)')
+    check(page.locator('#settings-filter').evaluate('(e)=>parseFloat(getComputedStyle(e).fontSize)')==fine_size,name+' return to fine restores desktop font size exactly')
+    check(not errors,name+' hybrid/pointer/reload no page errors: '+repr(errors));context.close()
 
 
 def geometry_checks(page,name,out,context):
@@ -306,19 +427,23 @@ def geometry_checks(page,name,out,context):
 
 def run_engine(p,name,url,out):
     start=PASSES;reports=[]
-    browser=p.chromium.launch(executable_path='/usr/bin/chromium',headless=True,args=['--no-sandbox']) if name=='chromium' else p.webkit.launch(executable_path=p.webkit.executable_path,headless=True)
+    chromium_path=os.environ.get('FORMLESS_CHROMIUM_EXECUTABLE') or ('/usr/bin/chromium' if pathlib.Path('/usr/bin/chromium').is_file() else None)
+    browser=p.chromium.launch(executable_path=chromium_path,headless=True,args=['--no-sandbox']) if name=='chromium' else p.webkit.launch(headless=True)
     for coarse in [True,False]:
-        context=browser.new_context(viewport={'width':390,'height':844} if coarse else {'width':1280,'height':900},is_mobile=coarse,has_touch=coarse,reduced_motion='reduce')
+        context=browser.new_context(viewport={'width':390,'height':844} if coarse else {'width':1280,'height':900},is_mobile=coarse,has_touch=coarse,reduced_motion='reduce',service_workers='block')
         context.add_init_script(INIT);context.route('**/app.js',expose_script)
         page=context.new_page();page.set_default_timeout(5000);errors=[];page.on('pageerror',lambda e:errors.append(str(e)))
         page.goto(url);page.wait_for_function('!!__mobile815');fixture(page)
         label=name+(' coarse' if coarse else ' fine')
         input_checks(page,coarse,label)
+        input_preference_checks(page,coarse,label)
+        prompt_checks(page,label)
         if coarse:
             geometry_checks(page,name,out,context)
         check(not errors,label+' no page errors: '+repr(errors))
         reports.append({'pointer':'coarse' if coarse else 'fine','errors':errors})
         context.close()
+    hybrid_checks(browser,name,url)
     report={'engine':name,'version':browser.version,'assertions':PASSES-start,'contexts':reports,'physicalKeyboard':False,'nativePinch':name=='chromium','hybridHardware':False,'pauseGesture':'native Home key' if name=='webkit' else 'native wheel'}
     (out/'report.json').write_text(json.dumps(report,indent=2));browser.close()
     print('ENGINE',json.dumps(report),flush=True)

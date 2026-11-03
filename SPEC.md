@@ -1246,13 +1246,15 @@ pasting paths.
   within the visible screen. Following keeps the transcript tail above the
   composer; paused reading retains its anchor. Pinch zoom remains enabled and
   does not inverse-scale text or reflow the main transcript to the zoomed width.
-  Touch-capable text fields and editor layers have a 16 CSS-pixel font floor,
-  including at an 85% manual reading size. On a primary coarse pointer, plain
-  Enter inserts a native newline and Send is explicit; fine-pointer desktop
-  shortcuts and Ctrl/Command+Enter queue behavior are retained. IME composition
-  keys never trigger palette, mention or send actions. The composer advertises
-  `enterkeyhint="send"`; secret, code and filter fields disable capitalization
-  and autocorrection.
+  On a primary coarse pointer, text fields and editor layers have a 16
+  CSS-pixel font floor, including at an 85% manual reading size. Plain Enter
+  defaults to a native newline on coarse pointers and sending on fine pointers.
+  This browser's Settings can override or restore that device default; the
+  visible compose hint and `enterkeyhint` follow the effective preference.
+  Shift+Enter inserts a newline and Ctrl/Command+Enter queues. IME composition
+  keys never trigger palette, mention or send actions. Shared prompts classify
+  prose, machine values, URLs and secrets to reset correction, capitalization,
+  spelling and autocomplete metadata on each use; closing clears hidden input.
 - **Device display and printing (web).** Auto theme follows OS changes;
   the browser theme/status-bar color follows the effective Auto, Light or Dark
   theme, with media-specific initial colors before JavaScript loads. Shell

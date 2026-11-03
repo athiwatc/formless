@@ -114,6 +114,7 @@
     notes: [],
     unread: 0,
     showThinking: prefs.get("thinking", true),
+    enterSends: prefs.get("enterSends", null),
     follow: true,
     editMessageId: null,
     nextId: Math.floor(Math.random() * 1e9) + 1,
@@ -492,6 +493,19 @@
       if (!askResolve) showNextAsk();
     });
   }
+  function configureAskInput(input, opts) {
+    const kind = opts.secret ? "secret" : ["prose", "machine", "url", "secret"].includes(opts.inputKind) ? opts.inputKind : "prose";
+    const prose = kind === "prose";
+    // URL uses its keyboard layout without adding new native form validation.
+    input.type = kind === "secret" ? "password" : "text";
+    for (const [key, value] of Object.entries({
+      spellcheck: prose ? "true" : "false",
+      autocapitalize: prose ? "sentences" : "none",
+      autocorrect: prose ? "on" : "off",
+      inputmode: kind === "url" ? "url" : "text",
+      autocomplete: prose ? "on" : kind === "url" ? "url" : "off",
+    })) input.setAttribute(key, value);
+  }
   function showNextAsk() {
     if (!askQueue.length) return;
     const { opts, resolve } = askQueue.shift();
@@ -502,9 +516,9 @@
     $("ask-text").textContent = opts.text || "";
     $("ask-body").replaceChildren(...(opts.body ? [opts.body] : []));
     const input = $("ask-input");
-    input.type = opts.secret ? "password" : "text";
+    configureAskInput(input, opts);
     input.classList.toggle("hidden", !opts.input);
-    input.value = opts.value || "";
+    input.value = opts.input ? opts.value || "" : "";
     input.placeholder = opts.placeholder || "";
     const cancel = $("ask-cancel");
     cancel.textContent = opts.cancelLabel || "Cancel";
@@ -519,6 +533,8 @@
     if (opts.input && activeDialog()?.node === $("ask-backdrop")) input.select();
   }
   function closeAsk(value) {
+    // Callers pass/capture the resolved value before the shared DOM is cleared.
+    $("ask-input").value = "";
     $("ask-backdrop").classList.add("hidden");
     restoreFocus("ask-backdrop");
     const resolve = askResolve;
@@ -582,6 +598,23 @@
   const isRunning = () => S.current != null && S.running.has(S.current);
   const coarsePointer = window.matchMedia("(pointer: coarse)");
   function inputTouchMode() { return coarsePointer.matches; }
+  function syncInputTouchMode() {
+    document.documentElement.toggleAttribute("data-input-touch", inputTouchMode());
+  }
+  function composerEnterSends() {
+    return typeof S.enterSends === "boolean" ? S.enterSends : !inputTouchMode();
+  }
+  function updateEnterSendsControl() {
+    const input = $("enter-sends");
+    if (input) input.checked = composerEnterSends();
+  }
+  function setEnterSends(value) {
+    S.enterSends = typeof value === "boolean" ? value : null;
+    prefs.set("enterSends", S.enterSends);
+    renderComposer();
+    updateEnterSendsControl();
+  }
+  syncInputTouchMode();
 
   // UI work from a burst of protocol events is coalesced, while event state
   // itself is reduced immediately. Navigation invalidates rather than replays
@@ -3104,7 +3137,7 @@
         h("details", null, h("summary", null, "arguments"), h("pre", { class: "diff" }, pretty))),
       h("button", { class: "btn small primary", type: "button", onclick: () => decide("continue") }, tr("Run")),
       h("button", { class: "btn small", type: "button", onclick: async () => {
-        const v = await ask({ title: "Edit the arguments for " + st.tool_name, text: "JSON object", input: true, value: pretty });
+        const v = await ask({ title: "Edit the arguments for " + st.tool_name, inputKind: "machine", text: "JSON object", input: true, value: pretty });
         if (v != null) decide("edit", v);
       } }, tr("Edit")),
       h("button", { class: "btn small", type: "button", onclick: () => decide("skip") }, tr("Skip")),
@@ -3233,9 +3266,11 @@
     $("send-btn").textContent = tr(S.editMessageId ? "Re-run" : running ? "Steer" : "Send");
     $("stop-btn").textContent = tr("Stop");
     $("input").placeholder = tr(running ? "Steer, or Ctrl/⌘+Enter to queue…" : "Message Formless…");
-    $("compose-hint").textContent = inputTouchMode()
-      ? "Enter newline · Send button sends · Ctrl/⌘+Enter queue · /help"
-      : "Enter send · Shift+Enter newline · Ctrl/⌘+Enter queue · /help · ? shortcuts";
+    const enterSends = composerEnterSends();
+    $("input").setAttribute("enterkeyhint", enterSends ? "send" : "enter");
+    $("compose-hint").replaceChildren(
+      h("span", { class: "compose-enter-pref", title: "Enter sends: " + (enterSends ? "on" : "off") + " · This browser Settings" }, enterSends ? "Enter: sends · Settings" : "Enter: newline · Settings"),
+      h("span", { class: "compose-key-help" }, " · Shift+Enter newline · Ctrl/⌘+Enter queue · /help · ? shortcuts"));
     const mode = $("compose-mode");
     mode.replaceChildren();
     if (S.editMessageId) {
@@ -4500,7 +4535,7 @@
             h("div", { class: "muted" }, m.scope + " · " + (m.session_id ? "from session " + m.session_id.slice(0, 8) : m.author) + (m.enabled ? "" : " · off"))),
           h("td", null,
             h("button", { class: "btn small", type: "button", onclick: async () => {
-              const text = await ask({ title: "Edit memory", input: true, value: m.text, ok: "Save" });
+              const text = await ask({ title: "Edit memory", inputKind: "prose", input: true, value: m.text, ok: "Save" });
               if (text && text !== m.text) { await act({ type: "upsert_memory", id: m.id, text }, "Saved"); refreshSettings(); }
             } }, "Edit"),
             h("button", { class: "btn small", type: "button", onclick: () => act({ type: "upsert_memory", id: m.id, enabled: !m.enabled }, m.enabled ? "Disabled" : "Enabled").then(refreshSettings) }, m.enabled ? "Disable" : "Enable"),
@@ -4510,14 +4545,19 @@
         : h("p", { class: "muted" }, "None yet."),
       h("div", { class: "detail-actions" },
         h("button", { class: "btn small", type: "button", onclick: async () => {
-          const text = await ask({ title: "Add a memory", input: true, placeholder: "e.g. Use pnpm, not npm", ok: "Add" });
+          const text = await ask({ title: "Add a memory", inputKind: "prose", input: true, placeholder: "e.g. Use pnpm, not npm", ok: "Add" });
           if (text) { await act({ type: "upsert_memory", text }, "Added"); refreshSettings(); }
         } }, "Add"))));
     const thinking = h("input", { type: "checkbox", onchange: (e) => setThinking(e.target.checked) });
     thinking.checked = S.showThinking;
+    const enterSends = h("input", { id: "enter-sends", type: "checkbox", onchange: e => setEnterSends(e.target.checked) });
+    enterSends.checked = composerEnterSends();
     grid.append(h("section", null, h("h3", null, "This browser"),
       h("dl", { class: "kv" },
         h("dt", null, "thinking"), h("dd", null, h("label", { class: "toggle" }, thinking, "show live reasoning")),
+        h("dt", null, "Enter sends"), h("dd", null, h("label", { class: "toggle" }, enterSends, "Enter sends"),
+          h("div", { class: "muted" }, "Shift+Enter inserts a newline; Ctrl/⌘+Enter queues. This preference is saved on this device."),
+          h("button", { class: "btn ghost small", type: "button", onclick: () => setEnterSends(null) }, "Use device default")),
         h("dt", null, "text size"), h("dd", null, h("span", { class: "read-controls" },
           h("button", { class: "btn small", type: "button", "aria-label": "Smaller text", onclick: () => setReading(S.readScale - 0.1, null) }, "A−"),
           h("span", { "aria-live": "polite" }, uiFormat(S.readScale, { style: "percent", maximumFractionDigits: 0 })),
@@ -4705,7 +4745,7 @@
       value = select.value || null;
     } else {
       const initial = current == null ? "" : kind === "json" || kind === "list" ? JSON.stringify(current) : String(current);
-      const text = await ask({ title: "Set " + key, input: true, value: initial, ok: "Save",
+      const text = await ask({ title: "Set " + key, inputKind: "machine", input: true, value: initial, ok: "Save",
         text: "Leave empty for the default. " + (kind === "list" ? "Comma-separated strings or a JSON array (numbers stay numeric)." : kind === "json" ? "JSON value (quote strings; maps and numeric lists use JSON)." : "") });
       if (text == null) return;
       try { value = parseSettingInput(text, kind); }
@@ -4909,7 +4949,7 @@
       h("td", null, e.added ? h("span", { class: "muted" }, "added") : h("button", { class: "btn small", type: "button", onclick: async () => {
         const params = {};
         for (const p of e.params) {
-          const v = await ask({ title: e.title + ": " + p.name, text: p.description, input: true, secret: p.kind === "secret" });
+          const v = await ask({ title: e.title + ": " + p.name, inputKind: p.kind === "secret" ? "secret" : "machine", text: p.description, input: true, secret: p.kind === "secret" });
           if (v == null || !v.trim()) return;
           params[p.name] = v.trim();
         }
@@ -5451,7 +5491,7 @@
     } else toast("usage: /template save NAME [FIRST MESSAGE] · /template delete NAME", true);
   }
   async function tagSession(s) {
-    const text = await ask({ title: "Tags for " + s.name, input: true, value: (s.tags || []).join(" "), placeholder: "work client-a", ok: "Save" });
+    const text = await ask({ title: "Tags for " + s.name, inputKind: "machine", input: true, value: (s.tags || []).join(" "), placeholder: "work client-a", ok: "Save" });
     if (text == null) return;
     const r = await act({ type: "set_session_tags", id: s.id, tags: text.split(/[\s,]+/).filter(Boolean) });
     if (!r) return;
@@ -5460,7 +5500,7 @@
     renderSessions();
   }
   async function renameSession(s) {
-    const name = await ask({ title: "Rename session", input: true, value: s.name, ok: "Rename" });
+    const name = await ask({ title: "Rename session", inputKind: "prose", input: true, value: s.name, ok: "Rename" });
     if (name && name.trim() && name.trim() !== s.name) await act({ type: "rename_session", id: s.id, name: name.trim() });
   }
   /** Re-run the namer on the recent messages and offer its name to edit. */
@@ -5468,13 +5508,13 @@
     const r = await act({ type: "suggest_session_name", id: s.id }, null, 60000);
     if (!r) return;
     if (!r.name) return toast("No name to suggest yet.");
-    const name = await ask({ title: "Suggested name", input: true, value: r.name, ok: "Rename" });
+    const name = await ask({ title: "Suggested name", inputKind: "prose", input: true, value: r.name, ok: "Rename" });
     if (name && name.trim() && name.trim() !== s.name) await act({ type: "rename_session", id: s.id, name: name.trim() });
   }
   /** Standing instructions for one Session's agent; empty clears them. */
   async function editInstructions(s, text) {
     if (text === undefined) {
-      text = await ask({ title: "Instructions for " + s.name, input: true, value: s.instructions || "", placeholder: "Answer in Thai. This Session is about the billing service.", ok: "Save" });
+      text = await ask({ title: "Instructions for " + s.name, inputKind: "prose", input: true, value: s.instructions || "", placeholder: "Answer in Thai. This Session is about the billing service.", ok: "Save" });
       if (text == null) return;
     }
     const r = await act({ type: "set_session_instructions", id: s.id, instructions: text.trim() || null }, text.trim() ? "Instructions saved" : "Instructions cleared");
@@ -5492,7 +5532,7 @@
   async function bulkSessions(action, ids) {
     const list = S.sessions.filter((s) => ids.includes(s.id));
     if (action === "delete") {
-      const typed = await ask({ title: "Delete " + list.length + " Sessions?", text: "Type delete to confirm. Their transcripts are deleted.", input: true, placeholder: "delete", ok: "Delete", danger: true });
+      const typed = await ask({ title: "Delete " + list.length + " Sessions?", inputKind: "machine", text: "Type delete to confirm. Their transcripts are deleted.", input: true, placeholder: "delete", ok: "Delete", danger: true });
       if (typed == null || typed.trim() !== "delete") return;
       for (const s of list) await act({ type: "delete_session", id: s.id });
       toast("Deleted " + list.length + " Sessions");
@@ -5502,7 +5542,7 @@
     } else if (action === "export") {
       for (const s of list) await exportSession(s.id);
     } else if (action === "tag") {
-      const text = await ask({ title: "Tag " + list.length + " Sessions", input: true, placeholder: "work client-a", ok: "Add tags" });
+      const text = await ask({ title: "Tag " + list.length + " Sessions", inputKind: "machine", input: true, placeholder: "work client-a", ok: "Add tags" });
       if (!text) return;
       const add = text.split(/[\s,]+/).filter(Boolean);
       for (const s of list) await act({ type: "set_session_tags", id: s.id, tags: [...(s.tags || []), ...add] });
@@ -5582,7 +5622,7 @@
   }
   async function purgeTool(t) {
     const users = S.toolDetail && S.toolDetail.tool.id === t.id ? S.toolDetail.used_by || [] : [];
-    const typed = await ask({ title: "Purge " + t.name + " permanently?", text: (users.length ? "It is used by " + users.join(", ") + "; their calls to it will fail. " : "") + "All versions, metrics, and history are deleted. Type the Tool name to confirm.", input: true, placeholder: t.name, ok: "Purge", danger: true });
+    const typed = await ask({ title: "Purge " + t.name + " permanently?", inputKind: "machine", text: (users.length ? "It is used by " + users.join(", ") + "; their calls to it will fail. " : "") + "All versions, metrics, and history are deleted. Type the Tool name to confirm.", input: true, placeholder: t.name, ok: "Purge", danger: true });
     if (typed == null) return;
     if (typed.trim() !== t.name) { toast("Name did not match; nothing was purged.", true); return; }
     const r = await act({ type: "purge_tool", id: t.id }, "Purged " + t.name);
@@ -6814,7 +6854,7 @@
   // From an https URL or gist (SPEC §7.8): fetched by the daemon, shown in
   // full (source, Capabilities, code), imported only on a second yes.
   $("import-tool-url").onclick = async () => {
-    const url = await ask({ title: "Import Tools from a URL", text: "An https link to a Tool bundle: a gist, a GitHub file, or any JSON export.", input: true, placeholder: "https://gist.github.com/…", ok: "Fetch" });
+    const url = await ask({ title: "Import Tools from a URL", inputKind: "url", text: "An https link to a Tool bundle: a gist, a GitHub file, or any JSON export.", input: true, placeholder: "https://gist.github.com/…", ok: "Fetch" });
     if (!url || !url.trim()) return;
     const fetched = await act({ type: "fetch_tool_bundle", url: url.trim() });
     if (!fetched) return;
@@ -6940,19 +6980,24 @@
   $("input").addEventListener("blur", () => setTimeout(() => { closeMentions(); closePalette(); }, 100));
   $("input").addEventListener("keydown", (e) => {
     if (e.isComposing || e.keyCode === 229) return;
-    // Let the textarea perform its native newline insertion, including when
-    // suggestions are open. Fine-pointer desktop shortcuts remain unchanged.
-    if (e.key === "Enter" && inputTouchMode() && !e.ctrlKey && !e.metaKey) return;
+    // Native newlines (including Shift+Enter and open suggestions) remain
+    // native; only explicit send/queue actions suppress held-key repeats.
+    if (e.key === "Enter" && (!composerEnterSends() || e.shiftKey) && !e.ctrlKey && !e.metaKey) return;
+    if (e.key === "Enter" && e.repeat && (e.ctrlKey || e.metaKey || composerEnterSends())) { e.preventDefault(); return; }
+    if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); submit(true); return; }
     if (paletteKey(e) || mentionKey(e)) return;
     if (e.key === "?" && !$("input").value && !e.ctrlKey && !e.metaKey) { e.preventDefault(); return showHelp(); }
-    if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); submit(true); }
-    else if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); submit(false); }
+    if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); submit(false); }
     else if (e.key === "Escape") {
       if (S.editMessageId) cancelEdit();
       else stop();
     }
   });
-  coarsePointer.addEventListener("change", () => renderComposer());
+  coarsePointer.addEventListener("change", () => {
+    syncInputTouchMode();
+    renderComposer();
+    updateEnterSendsControl();
+  });
   document.addEventListener("click", (e) => {
     if (popover && !popover.contains(e.target)) closePopover();
     // A modal click belongs to that layer, including a button that removed

@@ -430,7 +430,7 @@ h3 { font-size: 0.9375rem; margin: 1.375rem 0 0.5rem; }
   .notes-panel { position: absolute; z-index: 20; inset: 0 var(--safe-right) 0 auto; width: min(20rem, calc(90vw - var(--safe-left) - var(--safe-right))); box-shadow: var(--shadow); }
   .view { padding: 1rem; }
   .transcript, .chat-head, .composer { padding-left: 1rem; padding-right: 1rem; }
-  .compose-hint { display: none; }
+  .compose-key-help { display: none; }
   .statusbar { padding: 0.3125rem 0.75rem; }
   #status-model, #status-model + .sep, .statusbar .sep:nth-of-type(2) { display: none; }
   .kv { grid-template-columns: 5.625rem minmax(0, 1fr); }
@@ -644,13 +644,11 @@ mark.find { background: var(--accent-soft); color: inherit; border-radius: 0.187
 .ed-err { background: var(--err-soft); }
 .ed-status { font-size: 0.75rem; margin-top: 0.25rem; font-family: var(--mono); }
 
-/* A touch-capable browser may focus even a small secondary/code field. Keep
+/* A primary coarse pointer may focus even a small secondary/code field. Keep
    the CSS-pixel floor at 16 when the manual root reading size is 85%. The
    editor's painted layers must use the same metrics as its native textarea. */
-@media (any-pointer: coarse) {
-  input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="button"]):not([type="submit"]):not([type="reset"]):not([type="color"]):not([type="file"]):not([type="hidden"]),
-  textarea, select, .ed-layer { font-size: max(1rem, 16px) !important; }
-}
+:root[data-input-touch] input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="button"]):not([type="submit"]):not([type="reset"]):not([type="color"]):not([type="file"]):not([type="hidden"]),
+:root[data-input-touch] textarea, :root[data-input-touch] select, :root[data-input-touch] .ed-layer { font-size: max(1rem, 16px) !important; }
 
 /* Right-to-left text (#791): each paragraph of a message takes its
    direction from its own first strong letter, so an Arabic or Hebrew
@@ -735,7 +733,7 @@ mark.find { background: var(--accent-soft); color: inherit; border-radius: 0.187
   .view { padding: 1rem; }
   .chat-view { padding: 0; }
   .transcript, .chat-head, .composer { padding-left: 1rem; padding-right: 1rem; }
-  .compose-hint { display: none; }
+  .compose-key-help { display: none; }
   #status-model, #status-model + .sep, .statusbar .sep:nth-of-type(2) { display: none; }
   .kv { grid-template-columns: 5.625rem minmax(0, 1fr); }
   .settings-grid { grid-template-columns: minmax(0, 1fr); }
@@ -933,3 +931,5 @@ mark.find { background: var(--accent-soft); color: inherit; border-radius: 0.187
   .settings-grid .kv { grid-template-columns: minmax(0, 1fr); }
   .settings-grid dt:not(:first-child) { margin-top: .5rem; }
 }
+
+:root[data-viewport-zoomed] .compose-hint { display: none; }
