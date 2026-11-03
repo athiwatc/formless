@@ -292,6 +292,10 @@ def geometry_checks(page,name,out,context):
     page.screenshot(path=str(out/'composer-200-long-draft.png'))
     page.evaluate('''()=>{document.documentElement.style.setProperty('--safe-top','24px');document.documentElement.style.setProperty('--safe-bottom','22px');void __mobile815.ask({title:'Large text viewport fixture',input:true,value:'Visible native field'});}''')
     viewport(page,{'offsetLeft':0,'offsetTop':0,'width':390,'height':200,'scale':1});settle(page,100)
+    # Focus and visualViewport layout settle asynchronously in WebKit under
+    # load. Observe the same required bounds; do not reposition the field or
+    # relax the assertion below merely because the first 100ms elapsed.
+    page.wait_for_function('''()=>{const f=document.querySelector('#ask-input').getBoundingClientRect(),s=document.querySelector('#ask-form').getBoundingClientRect(),v=__vv815.snapshot();return f.left>=v.left-1&&f.top>=v.top-1&&f.right<=v.right+1&&f.bottom<=v.bottom+1&&f.top>=s.top-1&&f.bottom<=s.bottom+1;}''')
     field=rect(page,'#ask-input');surface=rect(page,'#ask-form')
     check(fits(field,page.evaluate('__vv815.snapshot()')) and field['y']>=surface['y']-1 and field['bottom']<=surface['bottom']+1,name+'200% modal field is fully visible through local scrolling')
     check(page.locator('#ask-input').evaluate('(e)=>e===document.activeElement'),name+'200% modal retains native field focus')

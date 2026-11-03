@@ -4580,6 +4580,13 @@ undo, redo and replacements invalidate prior asynchronous editor previews.
 
 ### 10.8 Language
 
+- Web dates and numbers use the active UI language through one formatter:
+  English uses `en-US`, Thai uses `th-TH`, with the Gregorian calendar and
+  Latin digits pinned explicitly to match TUI/ISO years. Currency remains USD
+  and uses that locale's currency conventions. The document's `lang` follows
+  the effective UI language, including Auto and live settings changes. Machine
+  values (JSON, identifiers, form values and CSS coordinates) remain unlocalized.
+
 - UI strings live in catalogs keyed by the English text: the TUI's
   `i18n.rs` (`tr`) and the web's `I18N` table in `app.js` (`tr`). A
   string is translated by wrapping it and adding a row; anything without

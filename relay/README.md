@@ -165,6 +165,11 @@ WebKit with `python relay/web-motion.browser-test.py /tmp/formless-motion-check`
 It checks repeated settings events, animation/transition restoration, static
 spinner labels and failed-refresh recovery with local fixture replies.
 
+Locale formatting and live language metadata run in both engines with
+`python relay/web-locale.browser-test.py /tmp/formless-locale-check` (English/
+Thai browser contexts, UTC/Bangkok time zones). `node --test relay/*.test.mjs`
+also rejects bare locale calls and numeric-formatting bypasses.
+
 `dev.mjs` runs the Worker's own code: each room is `worker.js`'s
 `RelayRoom` over a real SQLite ledger through Node's built-in `node:sqlite`
 (Node 22.13+), and every
