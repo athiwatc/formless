@@ -5358,6 +5358,9 @@ enum ConfigAction {
         key: String,
         /// New value as JSON when valid JSON, otherwise as literal text
         value: String,
+        /// Replace the complete map instead of merging entries; use '{}' to clear
+        #[arg(long)]
+        replace: bool,
     },
     /// Edit config.toml in $EDITOR; it is replaced only if it still parses
     Edit,
@@ -5366,27 +5369,34 @@ enum ConfigAction {
 fn config_cmd(paths: Paths, action: ConfigAction) -> Result<()> {
     match action {
         ConfigAction::Path => println!("{}", paths.config_file().display()),
-        ConfigAction::Get { key } => {
-            let cfg = serde_json::to_value(Config::load(&paths)?)?;
-            match cfg.pointer(&format!("/{}", key.replace('.', "/"))) {
-                Some(serde_json::Value::String(s)) => println!("{s}"),
-                Some(v) => println!("{}", serde_json::to_string_pretty(v)?),
-                None => {
-                    eprintln!("no setting '{key}' (see SPEC §13, or `formless config edit`)");
-                    std::process::exit(2);
-                }
+        ConfigAction::Get { key } => match Config::load(&paths)?.setting_value(&key)? {
+            Some(serde_json::Value::String(s)) => println!("{s}"),
+            Some(v) => println!("{}", serde_json::to_string_pretty(&v)?),
+            None => {
+                eprintln!("no setting '{key}' (see SPEC §13, or `formless config edit`)");
+                std::process::exit(2);
             }
-        }
-        ConfigAction::Set { key, value } => {
+        },
+        ConfigAction::Set {
+            key,
+            value,
+            replace,
+        } => {
             let value = serde_json::from_str(&value).unwrap_or(serde_json::Value::String(value));
-            formless_core::daemon::ensure_daemon(&paths)?;
-            let r = formless_tui::client::request_once(
-                &paths,
+            let request = if !replace && formless_core::config::SETTING_MAPS.contains(&key.as_str())
+            {
+                Request::MergeSetting {
+                    key: key.clone(),
+                    value: value.clone(),
+                }
+            } else {
                 Request::SetSetting {
                     key: key.clone(),
                     value: value.clone(),
-                },
-            )?;
+                }
+            };
+            formless_core::daemon::ensure_daemon(&paths)?;
+            let r = formless_tui::client::request_once(&paths, request)?;
             println!(
                 "{key} = {value}{}",
                 if r["applies"] == "on_tui_start" {

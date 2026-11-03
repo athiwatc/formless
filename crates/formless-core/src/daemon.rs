@@ -2816,13 +2816,27 @@ impl Daemon {
                     limit.unwrap_or(100),
                 )
             })?)?),
-            Request::SetSetting { key, value } => {
+            request @ (Request::SetSetting { .. } | Request::MergeSetting { .. }) => {
+                let (key, value, merge) = match request {
+                    Request::SetSetting { key, value } => (key, value, false),
+                    Request::MergeSetting { key, value } => (key, value, true),
+                    _ => unreachable!(),
+                };
                 self.with_config_edit(|cfg| {
-                    cfg.set_key(&key, value.clone())?;
+                    if merge {
+                        cfg.merge_key(&key, value.clone())?;
+                    } else {
+                        cfg.set_key(&key, value.clone())?;
+                    }
                     Ok(true)
                 })?;
-                let _ = self
-                    .with_store(|st| st.audit("user", "setting.set", &format!("{key} = {value}")));
+                let _ = self.with_store(|st| {
+                    st.audit(
+                        "user",
+                        "setting.set",
+                        &format!("{key} {} {value}", if merge { "merge" } else { "=" }),
+                    )
+                });
                 // Nothing settable needs a daemon restart; a few TUI keys
                 // apply when the TUI next starts.
                 let applies = if crate::config::ON_TUI_START.contains(&key.as_str()) {
@@ -10348,14 +10362,16 @@ impl Daemon {
             "skills.add" | "skills.remove" => Value::Null,
             "models.set" | "config.set" => {
                 let key = args["key"].as_str().context("key required")?;
-                let mut v = toml::Value::try_from(&cfg)?;
-                for p in key.split('.') {
-                    match v.get(p) {
-                        Some(x) => v = x.clone(),
+                // Keep absent optional fields absent so a snapshot can be
+                // replayed through the TOML-backed setter during undo.
+                let mut value = toml::Value::try_from(&cfg)?;
+                for part in crate::config::setting_key_parts(key) {
+                    match value.get(part) {
+                        Some(next) => value = next.clone(),
                         None => return Ok(Value::Null),
                     }
                 }
-                serde_json::to_value(v)?
+                serde_json::to_value(value)?
             }
             "providers.upsert" | "providers.remove" => json!(cfg
                 .providers
@@ -10428,9 +10444,7 @@ impl Daemon {
             }
             "models.set" | "config.set" => {
                 let key = args["key"].as_str().context("key required")?.to_string();
-                let models_key = crate::config::HARNESS_MODEL_KEYS
-                    .iter()
-                    .any(|k| key == *k || key.starts_with(&format!("{k}.")));
+                let models_key = crate::config::is_model_setting(&key);
                 if (op == "models.set") != models_key {
                     return Err(anyhow!(
                         "'{key}' is {}",
@@ -18503,3 +18517,7 @@ mod approval_batch;
 #[cfg(test)]
 #[path = "approval_batch_tests.rs"]
 mod approval_batch_tests;
+
+#[cfg(test)]
+#[path = "setting_map_tests.rs"]
+mod setting_map_tests;

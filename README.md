@@ -439,6 +439,25 @@ formless config set tui.notify_min_secs 30 # validated, audited, applied at once
 formless config edit                       # $EDITOR; saved only if it still parses
 ```
 
+Map settings (`provider.prices`, `provider.model_context_tokens`,
+`provider.model_audio_input`, `provider.model_pdf_input`, `tui.colors`) merge
+entries by default. Each supplied entry replaces that entry's whole value;
+`null` removes that entry. Use `--replace` for whole-map replacement or clearing:
+
+```bash
+formless config set provider.prices '{"claude-sonnet-4.5":{"input":1,"output":2}}'
+formless config get provider.prices.claude-sonnet-4.5
+formless config set provider.model_context_tokens '{"vendor/qwen2.5":32768}'
+formless config set provider.model_context_tokens.vendor/qwen2.5 null
+formless config set provider.prices '{}' --replace
+```
+
+After a listed map's root, the entire suffix is one literal entry name,
+including dots and slashes. Quote the key in your shell if it contains spaces.
+Lists still replace their complete value. A merge needs an updated daemon;
+older daemons reject it without changing the file. Restart an older daemon
+after updating the binary.
+
 ### 3.6 Daemon, diagnostics and reset
 
 ```bash

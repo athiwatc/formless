@@ -4884,9 +4884,14 @@ previous headless Run's Session.
   - `path` prints the config file.
   - `get KEY` prints the effective value (after `FORMLESS_*` overrides);
     an unknown key exits 2.
-  - `set KEY VALUE` goes through `SetSetting`, so it's validated against
+  - `set KEY VALUE` goes through the settings API, so it's validated against
     the allow-list, audited and hot. VALUE is JSON when it parses (`5`,
-    `true`, `["a"]`), else text.
+    `true`, `["a"]`), else text. The five exposed maps (`provider.prices`,
+    `provider.model_context_tokens`, `provider.model_audio_input`,
+    `provider.model_pdf_input`, `tui.colors`) use `MergeSetting` by default:
+    supplied entries replace their whole value, null entries are removed,
+    and siblings survive. `--replace` uses `SetSetting` for whole-map
+    replacement; `--replace '{}'` clears. Lists remain replace-only.
   - `edit` opens a copy in `$VISUAL`/`$EDITOR` (run through `sh -c`, so
     arguments and quotes work) and replaces config.toml only when the copy
     parses. Otherwise it shows the error and, on a terminal, offers to edit
@@ -5303,7 +5308,17 @@ during its snapshot fetch, deduplicated by message id.
   a temporary file beside it, flushed to disk, renamed over it, so a crash
   leaves the old file or the new one.
 - **Changing settings from a client:** clients never write the file.
-  `SetSetting {key, value}` asks the daemon to set one dotted key. The
+  `SetSetting {key, value}` replaces one value. `MergeSetting {key, value}`
+  accepts a JSON object for one of the five exposed maps listed above,
+  merging or deleting entries atomically within the serialized edit.
+  Merge is a separate request so an older daemon rejects it instead of
+  ignoring an unfamiliar mode field and destructively replacing a map.
+  Existing full-map editors continue to use replacement. After an exposed
+  map root, the complete dotted suffix is one literal entry name (including
+  dots and slashes), e.g. `provider.model_context_tokens.vendor/qwen2.5`.
+  `SetSetting` with null removes that one entry; get, harness snapshot/undo,
+  and setters use this same grammar. `models.set` admits entries only for
+  its allow-listed model maps; prices remain `config.set`. The
   daemon checks the key against an allow-list: provider model, effort,
   routing and timing, a few `daemon.*` keys, and the whole `tui`, `tools`,
   `metrics`, `optimiser`, `compaction`, `naming`, `skills` and `artifacts`
