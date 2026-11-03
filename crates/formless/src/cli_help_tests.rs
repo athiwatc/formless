@@ -1,4 +1,4 @@
-//! CLI documentation checks deliberately stop at Clap's help/version exits.
+//! CLI documentation checks parse arguments or stop at Clap's help/version exits.
 //! They never dispatch a command, open a profile, or contact a daemon/provider.
 
 use clap::{error::ErrorKind, Command, CommandFactory, Parser};
@@ -193,6 +193,140 @@ fn root_and_command_groups_have_rendered_examples() {
         let mut command = command.clone();
         assert!(normalized(&command.render_help().to_string()).contains(&normalized(&examples)));
     }
+}
+
+// Split only the final pipeline stage, respecting quoted/escaped literal pipes.
+// shlex then handles shell quoting; no shell or command dispatcher is invoked.
+fn example_args(line: &str) -> Result<Option<Vec<String>>, String> {
+    let (mut quote, mut escaped, mut start) = (None, false, 0);
+    for (index, ch) in line.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && quote != Some('\'') {
+            escaped = true;
+            continue;
+        }
+        if ch == '\'' || ch == '"' {
+            if quote == Some(ch) {
+                quote = None;
+            } else if quote.is_none() {
+                quote = Some(ch);
+            }
+        } else if ch == '|' && quote.is_none() {
+            start = index + 1;
+        }
+    }
+    let stage = line[start..].trim();
+    if !stage.starts_with("formless ") && stage != "formless" {
+        return Ok(None);
+    }
+    let mut args = shlex::split(stage).ok_or_else(|| format!("bad shell quoting: {line}"))?;
+    for arg in &mut args {
+        *arg = match arg.as_str() {
+            "SESSION_ID" | "RUN_ID" | "JOB_ID" => "00000000-0000-0000-0000-000000000001".into(),
+            "TOOL_NAME" => "fixture-tool".into(),
+            "SERVER_NAME" => "fixture-server".into(),
+            _ => continue,
+        };
+    }
+    Ok(Some(args))
+}
+
+fn example_problems(text: &str) -> Vec<String> {
+    let Some((_, examples)) = text.split_once("Examples:") else {
+        return Vec::new();
+    };
+    let mut problems = Vec::new();
+    let mut count = 0;
+    for line in examples.lines().filter(|line| !line.trim().is_empty()) {
+        match example_args(line) {
+            Ok(Some(args)) => {
+                count += 1;
+                if let Err(error) = super::Cli::try_parse_from(args) {
+                    problems.push(format!("{}: {error}", line.trim()));
+                }
+            }
+            Err(error) => problems.push(error),
+            Ok(None) => {}
+        }
+    }
+    if count == 0 {
+        problems.push("Examples has no parseable formless command lines".into());
+    }
+    problems
+}
+
+#[test]
+fn every_documented_help_example_parses_without_dispatch() {
+    fn visit(command: &Command, problems: &mut Vec<String>, count: &mut usize) {
+        if let Some(text) = command.get_after_help() {
+            let text = text.to_string();
+            if text.contains("Examples:") {
+                *count += 1;
+                problems.extend(
+                    example_problems(&text)
+                        .into_iter()
+                        .map(|problem| format!("{}: {problem}", command.get_name())),
+                );
+            }
+        }
+        for child in command
+            .get_subcommands()
+            .filter(|child| !child.is_hide_set() && child.get_name() != "help")
+        {
+            visit(child, problems, count);
+        }
+    }
+    let (mut problems, mut count) = (Vec::new(), 0);
+    visit(&command_tree(), &mut problems, &mut count);
+    assert!(count > 15, "root and command groups must be covered");
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+#[test]
+fn example_gate_rejects_removed_flags_and_preserves_shell_arguments() {
+    assert!(!example_problems("Examples:\n  formless run fixture --removed-docs-flag").is_empty());
+    assert!(!example_problems("Examples:\n  formless run \"unclosed").is_empty());
+    for line in [
+        "formless sessions show SESSION_ID",
+        "formless runs show RUN_ID",
+        "formless jobs history JOB_ID --json",
+        "git diff | formless run \"Review this diff\" --output json",
+        "printf 'a|b' | formless run -",
+    ] {
+        assert!(
+            example_problems(&format!("Examples:\n  {line}")).is_empty(),
+            "{line}"
+        );
+    }
+    let args = example_args("formless run 'literal | with spaces'")
+        .unwrap()
+        .unwrap();
+    assert_eq!(args[2], "literal | with spaces");
+    let args = example_args("printf fixture | formless run \"formless\"")
+        .unwrap()
+        .unwrap();
+    assert_eq!(args[2], "formless");
+}
+
+#[test]
+fn docs_no_topic_help_matches_the_gallery_default() {
+    let root = command_tree();
+    let help = root
+        .find_subcommand("docs")
+        .unwrap()
+        .get_arguments()
+        .find(|arg| arg.get_id() == "topic")
+        .unwrap()
+        .get_help()
+        .unwrap()
+        .to_string();
+    assert!(help.contains("omit to open the gallery"), "{help}");
+    assert!(formless_core::docs::resolve(None)
+        .unwrap()
+        .ends_with("docs/gallery.md"));
 }
 
 #[test]

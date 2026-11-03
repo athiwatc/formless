@@ -12,6 +12,18 @@ use std::io::{BufRead, Write};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+fn docs_lines(topic: &str) -> Vec<String> {
+    let result = match formless_core::docs::resolve(Some(topic)) {
+        Ok(url) => format!("The guide is at {url}"),
+        Err(error) => error.to_string(),
+    };
+    let topics = formless_core::docs::TOPICS
+        .iter()
+        .map(|(name, _, what)| format!("{name} ({what})"))
+        .collect::<Vec<_>>();
+    vec![result, format!("Topics: {}.", topics.join(", "))]
+}
+
 fn display_text(text: &str) -> String {
     text.chars().flat_map(|c| {
         if c.is_control() || matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}') {
@@ -1064,16 +1076,9 @@ pub fn run_with(paths: Paths, start: ChatStart, label: &str) -> Result<()> {
             "/help" => say("Commands: /new starts a Session, /sessions lists them, /switch N opens one, /stop stops the Run, /files [RUN] shows tracked changes, /rewind [PATH] attempts safe restoration, /recap shows the recorded recap, /docs [topic] gives the guides' addresses, /quit exits (Runs keep going in the daemon). Anything else is sent as a message; to send text that starts with /, begin it with //."),
             cmd if cmd == "/docs" || cmd.starts_with("/docs ") => {
                 let topic = cmd["/docs".len()..].trim();
-                match formless_core::docs::url(Some(topic).filter(|t| !t.is_empty())) {
-                    Some(url) => say(&format!("The guide is at {url}")),
-                    None => say(&format!("No guide called {topic}.")),
-                }
-                let topics: Vec<String> = formless_core::docs::TOPICS
-                    .iter()
-                    .map(|(name, _, what)| format!("{name} ({what})"))
-                    .collect();
-                say(&format!("Topics: {}.", topics.join(", ")));
+                for line in docs_lines(topic) { say(&line); }
             }
+
             cmd if cmd == "/summarise-branch" || cmd.starts_with("/summarise-branch ") => {
                 say("Open the full TUI or web, switch to the target Session, then use /summarise-branch SOURCE_SESSION to generate and review a candidate before inserting one note.");
             }
@@ -1498,3 +1503,19 @@ mod reply_ack_tests;
 #[cfg(test)]
 #[path = "plain_pause_restore_tests.rs"]
 mod pause_restore_tests;
+
+#[cfg(test)]
+mod docs_topic_tests {
+    #[test]
+    fn plain_docs_reports_unknown_ambiguous_and_the_gallery_without_launching() {
+        let unknown = super::docs_lines("nope");
+        assert!(unknown[0].contains("unknown docs topic \"nope\""));
+        let ambiguous = super::docs_lines("s");
+        assert!(ambiguous[0].contains("ambiguous docs topic \"s\": matches skills, spec"));
+        for lines in [unknown, ambiguous] {
+            assert!(lines[1].contains("Topics:") && lines[1].contains("troubleshooting"));
+        }
+        assert!(super::docs_lines("")[0].ends_with("docs/gallery.md"));
+        assert!(super::docs_lines("spe")[0].ends_with("SPEC.md"));
+    }
+}

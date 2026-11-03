@@ -30,6 +30,8 @@ tokio.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+# Already locked; parse documentation examples without running a shell.
+shlex = "2"
 formless-runtime = { path = "../formless-runtime" }
 keyring.workspace = true
 
