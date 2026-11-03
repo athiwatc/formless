@@ -2706,7 +2706,7 @@
     const cancel = h("button", { type: "button", class: "btn danger small", onclick: (e) => { e.preventDefault(); cancelTool(row.tool.handle); } }, "Cancel");
     const transcript = h("button", { type: "button", class: "btn ghost small", onclick: (e) => { e.preventDefault(); showSubagent(row.tool.subagent); } }, "Transcript");
     const timer = document.createTextNode("");
-    const summary = h("summary", null, h("span", { class: "muted", "data-live-depth": "" }, "└"), mark,
+    const summary = h("summary", null, h("span", { class: "muted", role: "img", "data-live-depth": "" }, "└"), mark,
       h("span", { class: "tname" }, name), h("span", { class: "targs" }, args), folded, progressBox, stalled, cancel, transcript,
       h("span", { class: "tstat", "data-live-timer": "" }, timer));
     row = { tool, node: h("details", { class: "chip live tree-node" }, summary), summary, mark, name, args, folded, progress, progressText, progressBox, stalled, cancel, transcript, timer, payload: null, payloadInitialized: false, payloadArgs: undefined, payloadSubagent: undefined };
@@ -2717,8 +2717,16 @@
     const t = row.tool, running = t.status === "running";
     const rowClass = "chip live tree-node" + (running ? "" : " done");
     if (row.node.className !== rowClass) row.node.className = rowClass;
-    const indent = (t.depth || 0) * 1.125 + "rem";
-    if (row.node.style.marginLeft !== indent) row.node.style.marginLeft = indent;
+    // Keep room for the call at large reading sizes and narrow viewports.
+    // The marker exposes the real depth even when visual indentation is capped.
+    const depth = Math.max(0, t.depth || 0);
+    const indent = `min(${Math.min(depth, 4) * 1.125}rem, 15%)`;
+    if (row.node.style.marginInlineStart !== indent) row.node.style.marginInlineStart = indent;
+    const depthLabel = `Nesting depth ${depth}`;
+    if (row.summary.firstChild.getAttribute("aria-label") !== depthLabel) {
+      row.summary.firstChild.setAttribute("aria-label", depthLabel);
+      row.summary.firstChild.title = depthLabel;
+    }
     const identity = t.invocationId || t.handle || t.subagent || t.name || "tool";
     if (row.node.dataset.liveTool !== identity) row.node.dataset.liveTool = identity;
     if (row.summary.firstChild.hidden !== !t.depth) row.summary.firstChild.hidden = !t.depth;
