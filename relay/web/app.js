@@ -1469,6 +1469,15 @@
   let mermaidQueue = Promise.resolve();
   let mermaidSeq = 0;
   const darkScheme = window.matchMedia("(prefers-color-scheme: dark)");
+  const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
+  let configuredAnimations = true;
+  function applyMotion() {
+    const setting = S.settings?.tui?.animations;
+    if (typeof setting === "boolean") configuredAnimations = setting;
+    document.documentElement.toggleAttribute("data-reduced-motion", reducedMotion.matches || !configuredAnimations);
+  }
+  reducedMotion.addEventListener("change", applyMotion);
+  applyMotion();
   /** Scale the browser's default root size (85–200%), per device. */
   function readingScale(scale) {
     return Number.isFinite(scale) ? Math.round(Math.min(2, Math.max(0.85, scale)) * 100) / 100 : 1;
@@ -3199,7 +3208,7 @@
     const others = S.others || [];
     $("status-others").classList.toggle("hidden", !others.length);
     $("status-others").textContent = others.length ? " · also open in " + othersText(others) : "";
-    $("status-model").textContent = (s && s.model) || (S.settings && S.settings.provider.model) || "";
+    $("status-model").textContent = (s && s.model) || S.settings?.provider?.model || "";
     const u = S.usage && S.usage[S.current];
     $("status-usage").textContent = u && u.steps ? " │ " + usageText(u) : "";
     $("status-usage").title = S.sessionUsage && S.sessionUsage.id === S.current ? "Session (" + S.sessionUsage.runs + " Runs): " + usageText(S.sessionUsage.total) : "";
@@ -5008,6 +5017,7 @@
     } catch (e) {
       S.settings = { error: "This daemon does not expose settings remotely (" + e.message + "). Update formless to see them here." };
     }
+    applyMotion();
     S.status = await act({ type: "status" });
     renderView();
     renderStatus();

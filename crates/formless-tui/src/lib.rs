@@ -67,6 +67,27 @@ fn animations_enabled(setting: bool) -> bool {
     setting && !reduced
 }
 
+/// Synchronize the terminal effect at startup and after live settings events.
+/// Remember only successful writes, so a transient output error can recover.
+#[derive(Default)]
+struct MotionCursor {
+    applied: Option<bool>,
+}
+
+impl MotionCursor {
+    fn sync(&mut self, out: &mut impl Write, animations: bool) -> std::io::Result<()> {
+        if self.applied != Some(animations) {
+            out.execute(if animations {
+                crossterm::cursor::SetCursorStyle::DefaultUserShape
+            } else {
+                crossterm::cursor::SetCursorStyle::SteadyBar
+            })?;
+            self.applied = Some(animations);
+        }
+        Ok(())
+    }
+}
+
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// Multi-pane layout is active only when persisted on and wide enough.
@@ -18092,10 +18113,8 @@ pub fn run_with(paths: Paths, start: Option<&str>) -> Result<()> {
     let _ = out.execute(crossterm::event::EnableBracketedPaste);
     // Focus events: notify only while the user is elsewhere.
     let _ = out.execute(crossterm::event::EnableFocusChange);
-    // Reduced motion: a steady (non-blinking) cursor.
-    if !app.animations {
-        let _ = out.execute(crossterm::cursor::SetCursorStyle::SteadyBar);
-    }
+    let mut motion_cursor = MotionCursor::default();
+    let _ = motion_cursor.sync(&mut out, app.animations);
     // Ctrl+Enter is only distinguishable with the kitty keyboard protocol.
     app.enhanced_keys = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false)
         && out
@@ -18112,6 +18131,8 @@ pub fn run_with(paths: Paths, start: Option<&str>) -> Result<()> {
             app.forecast_tick();
             app.try_reconnect();
             app.wizard_poll();
+            // SettingsChanged may have arrived through any connected client.
+            let _ = motion_cursor.sync(&mut stdout(), app.animations);
             if std::mem::take(&mut app.force_redraw) {
                 terminal.clear()?;
                 app.painted_links.clear();
@@ -18295,6 +18316,7 @@ mod tests {
     include!("run_state_tests.rs");
     include!("approval_resolution_tests.rs");
     include!("provider_retry_ui_tests.rs");
+    include!("motion_tests.rs");
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)

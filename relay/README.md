@@ -160,6 +160,11 @@ Chromium and the same supported Playwright WebKit runtime. The check separates
 native browser resizing and touch input from simulated visual-viewport/keyboard
 geometry. Simulations are not physical iOS/Android keyboard or device evidence.
 
+Live reduced-motion settings and OS preference changes run in Chromium and
+WebKit with `python relay/web-motion.browser-test.py /tmp/formless-motion-check`.
+It checks repeated settings events, animation/transition restoration, static
+spinner labels and failed-refresh recovery with local fixture replies.
+
 `dev.mjs` runs the Worker's own code: each room is `worker.js`'s
 `RelayRoom` over a real SQLite ledger through Node's built-in `node:sqlite`
 (Node 22.13+), and every
