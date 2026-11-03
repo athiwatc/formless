@@ -23,7 +23,7 @@
     for (const [k, v] of Object.entries(props || {})) {
       if (v == null || v === false) continue;
       if (k === "class") node.className = v;
-      else if (k === "text") node.textContent = v;
+      else if (k === "text") node.textContent = typeof v === "number" ? uiFormat(v) : v;
       // CSSOM, not a style attribute: the CSP has no 'unsafe-inline'.
       else if (k === "style") node.style.cssText = v;
       else if (k.startsWith("on")) node.addEventListener(k.slice(2), v);
@@ -32,7 +32,7 @@
     configureTextInput(node);
     for (const kid of kids.flat(Infinity)) {
       if (kid == null || kid === false) continue;
-      node.append(kid instanceof Node ? kid : String(kid));
+      node.append(kid instanceof Node ? kid : typeof kid === "number" ? uiFormat(kid) : String(kid));
     }
     return node;
   }
@@ -318,10 +318,28 @@
     const t = I18N[uiLang()];
     return (t && t[s]) || s;
   }
-  /** The locale for dates and numbers: the UI language's, else the browser's. */
+  /** Match the TUI/ISO calendar and digits, independently of browser defaults. */
   function uiLocale() {
-    return uiLang() === "th" ? "th-TH" : undefined;
+    return uiLang() === "th" ? "th-TH-u-ca-gregory-nu-latn" : "en-US-u-ca-gregory-nu-latn";
   }
+  /** The sole localized date/number formatter; machine values stay ASCII. */
+  function uiFormat(value, options = {}) {
+    const valid = value instanceof Date ? Number.isFinite(value.getTime()) : typeof value === "number" && Number.isFinite(value);
+    return valid ? value.toLocaleString(uiLocale(), options) : "—";
+  }
+  function uiFixed(value, digits) {
+    return uiFormat(value, { minimumFractionDigits: digits, maximumFractionDigits: digits, useGrouping: false });
+  }
+  function uiMoney(value, digits = 3) {
+    return uiFormat(value, { style: "currency", currency: "USD", minimumFractionDigits: digits ?? 0, maximumFractionDigits: digits ?? 20 });
+  }
+  function applyLanguage() {
+    const language = uiLang(), changed = document.documentElement.lang !== language;
+    document.documentElement.lang = language;
+    return changed;
+  }
+  applyLanguage();
+  window.addEventListener("languagechange", () => { applyLanguage(); renderAll(); });
 
   // -------------------------------------------------------------- helpers
   function relTime(ts) {
@@ -329,28 +347,28 @@
     if (isNaN(t)) return ts || "";
     const s = Math.max(0, (Date.now() - t) / 1000);
     if (s < 60) return tr("just now");
-    if (s < 3600) return Math.floor(s / 60) + tr("m ago");
-    if (s < 86400) return Math.floor(s / 3600) + tr("h ago");
-    if (s < 604800) return Math.floor(s / 86400) + tr("d ago");
-    return new Date(t).toLocaleDateString(uiLocale());
+    if (s < 3600) return uiFormat(Math.floor(s / 60)) + tr("m ago");
+    if (s < 86400) return uiFormat(Math.floor(s / 3600)) + tr("h ago");
+    if (s < 604800) return uiFormat(Math.floor(s / 86400)) + tr("d ago");
+    return uiFormat(new Date(t), { year: "numeric", month: "numeric", day: "numeric" });
   }
   /** "in 42m": how long until a future time. */
   function untilTime(ts) {
     const s = (Date.parse(ts) - Date.now()) / 1000;
     if (isNaN(s)) return ts || "";
     if (s <= 0) return "ended";
-    if (s < 3600) return "in " + Math.max(1, Math.ceil(s / 60)) + "m";
-    return "in " + Math.round(s / 3600) + "h";
+    if (s < 3600) return "in " + uiFormat(Math.max(1, Math.ceil(s / 60))) + "m";
+    return "in " + uiFormat(Math.round(s / 3600)) + "h";
   }
   function clock(ts) {
-    const t = Date.parse(ts);
-    return isNaN(t) ? "" : new Date(t).toLocaleTimeString(uiLocale() || [], { hour: "2-digit", minute: "2-digit" });
+    const t = typeof ts === "number" ? ts : Date.parse(ts);
+    return Number.isFinite(t) ? uiFormat(new Date(t), { hour: "2-digit", minute: "2-digit" }) : "";
   }
   function elapsed(since) {
     const s = Math.floor((Date.now() - since) / 1000);
-    return s < 60 ? s + "s" : Math.floor(s / 60) + "m" + String(s % 60).padStart(2, "0") + "s";
+    return s < 60 ? uiFormat(s) + "s" : uiFormat(Math.floor(s / 60)) + "m" + uiFormat(s % 60, { minimumIntegerDigits: 2, useGrouping: false }) + "s";
   }
-  const pct = (r) => (r == null ? "-" : Math.round(r * 100) + "%");
+  const pct = (r) => (r == null ? "-" : uiFormat(r, { style: "percent", maximumFractionDigits: 0 }));
   // Same thresholds as the TUI: green at the optimiser trigger (90%).
   const rateClass = (r) => (r == null ? "muted" : r >= 0.9 ? "rate-good" : r >= 0.7 ? "rate-mid" : "rate-bad");
   const truncate = (s, n) => {
@@ -742,7 +760,7 @@
       else if (e.key === "End") next = enabled.length - 1;
       else if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey && e.key !== " ") {
         const ordered = enabled.slice(current + 1).concat(enabled.slice(0, current + 1));
-        const match = ordered.find((item) => item.textContent.trim().toLocaleLowerCase().startsWith(e.key.toLocaleLowerCase()));
+        const match = ordered.find((item) => item.textContent.trim().toLocaleLowerCase(uiLocale()).startsWith(e.key.toLocaleLowerCase(uiLocale())));
         if (match) next = enabled.indexOf(match);
       }
       if (next != null) { e.preventDefault(); focus(enabled[next]); }
@@ -1002,8 +1020,8 @@
       const s = S.sessions.find((x) => x.id === i.session_id);
       return h("div", { class: "running-item" + (i.stalled ? " stalled" : "") },
         h("button", { class: "linklike", type: "button", title: "Open its session", onclick: () => openSession(i.session_id) },
-          h("strong", null, i.tool_name), " · " + Math.round(i.elapsed_ms / 1000) + "s" + (s ? " · " + s.name : "") +
-          (i.stalled ? " · silent " + Math.round(i.silent_ms / 1000) + "s" : "") + progressDiagnostic(i) + (i.abandoned ? " · abandoned" : "")),
+          h("strong", null, i.tool_name), " · " + uiFormat(Math.round(i.elapsed_ms / 1000)) + "s" + (s ? " · " + s.name : "") +
+          (i.stalled ? " · silent " + uiFormat(Math.round(i.silent_ms / 1000)) + "s" : "") + progressDiagnostic(i) + (i.abandoned ? " · abandoned" : "")),
         h("button", { class: "btn ghost small", type: "button", title: "Cancel (user-cancelled)", onclick: () => act({ type: "cancel_invocation", handle: i.handle }, "Cancelled " + i.tool_name).then(refreshRunning) }, "Cancel"),
         i.abandoned ? null : h("button", { class: "btn ghost small", type: "button", title: "Stop waiting for it", onclick: () => act({ type: "abandon_invocation", handle: i.handle }, "Abandoned " + i.tool_name).then(refreshRunning) }, "Abandon"));
     }));
@@ -1058,9 +1076,9 @@
       lines.push(label + ": " + side.session.name + " (" + side.session.id + ")", "  " + usage.scope,
         "  Recorded: " + usage.recorded_prompt_tokens + " input / " + usage.recorded_completion_tokens + " output tokens · " + usage.recorded_cached_tokens + " cached / " + usage.recorded_cache_write_tokens + " cache-write · " + usage.requests + " requests",
         "  Usage coverage: " + (usage.usage_complete ? "complete" : "incomplete; missing usage is not zero") + " · " + usage.unallocated_requests + " unallocated requests (" + usage.unallocated_prompt_tokens + " input / " + usage.unallocated_completion_tokens + " output) · " + usage.unknown_runs + " unknown Runs",
-        usage.cost != null ? "  Recorded branch cost: $" + usage.cost.toFixed(6) : "  Total cost: unknown · priced allocated subtotal only: $" + usage.priced_cost_subtotal.toFixed(6));
-      if (usage.known_records_cost_range) lines.push("  Observed priced rows allocation range only: $" + usage.known_records_cost_range.map(value => value.toFixed(6)).join("–$") + "; excludes missing usage and unpriced rows");
-      if (usage.unallocated_requests) lines.push("  Unallocated priced subtotal only: $" + usage.unallocated_priced_cost_subtotal.toFixed(6));
+        usage.cost != null ? "  Recorded branch cost: " + uiMoney(usage.cost, 6) : "  Total cost: unknown · priced allocated subtotal only: " + uiMoney(usage.priced_cost_subtotal, 6));
+      if (usage.known_records_cost_range) lines.push("  Observed priced rows allocation range only: " + usage.known_records_cost_range.map(value => uiMoney(value, 6)).join("–") + "; excludes missing usage and unpriced rows");
+      if (usage.unallocated_requests) lines.push("  Unallocated priced subtotal only: " + uiMoney(usage.unallocated_priced_cost_subtotal, 6));
       if (usage.estimated_requests) lines.push("  " + usage.estimated_requests + " request prices estimated from local prices");
       if ((usage.unpriced || []).length) lines.push("  Unpriced: " + usage.unpriced.join(", "));
       lines.push(...(usage.warnings || []).map(warning => "  Warning: " + warning));
@@ -1140,7 +1158,7 @@
       "Provider: " + (preview.provider || "unknown") + " · requested model: " + (preview.requested_model || "unknown") + " · served model: " + (preview.served_model || "unknown"),
       "Reported usage: " + usage.reported_prompt_tokens + " input / " + usage.reported_completion_tokens + " output tokens · " + usage.reported_cached_tokens + " cached / " + usage.reported_cache_write_tokens + " cache-write · " + usage.reported_requests + "/" + usage.requests + " requests reported",
       usage.usage_complete ? "Usage coverage: complete" : "Usage coverage: incomplete or unknown; missing usage is not zero",
-      usage.cost != null ? "Recorded cost: $" + usage.cost.toFixed(6) : "Total cost: unknown · priced subtotal only: $" + usage.priced_cost_subtotal.toFixed(6),
+      usage.cost != null ? "Recorded cost: " + uiMoney(usage.cost, 6) : "Total cost: unknown · priced subtotal only: " + uiMoney(usage.priced_cost_subtotal, 6),
       "Source projection: " + projection.included_messages + "/" + projection.total_messages + " messages and " + projection.included_bytes + "/" + projection.total_bytes + " bytes; " + projection.omitted_messages + " messages and " + projection.omitted_bytes + " bytes omitted; " + projection.truncated_messages + " messages truncated"];
     if (projection.metadata_omitted) lines.push("Source metadata omitted from generation.");
     if (projection.attachment_bodies_omitted) lines.push("Attachment bodies omitted from generation.");
@@ -2050,7 +2068,7 @@
     const parts = [];
     m = m || {};
     if (m.context) parts.push(m.context >= 1e6 ? Math.floor(m.context / 1e6) + "M ctx" : Math.floor(m.context / 1000) + "k ctx");
-    if (m.input_price != null && m.output_price != null) parts.push("$" + m.input_price + "/$" + m.output_price + " per M");
+    if (m.input_price != null && m.output_price != null) parts.push(uiMoney(m.input_price, null) + "/" + uiMoney(m.output_price, null) + " per M");
     if (m.vision) parts.push("vision");
     if (m.tools === true) parts.push("tools");
     if (m.tools === false) parts.push("no tools");
@@ -2193,7 +2211,7 @@
     while (cursor) { const next = cursor.nextSibling; cursor.remove(); cursor = next; }
   }
   function updateText(node, value) {
-    const text = String(value == null ? "" : value);
+    const text = typeof value === "number" ? uiFormat(value) : String(value == null ? "" : value);
     if (node.data !== text) node.data = text;
   }
   function messageBody(m, build) {
@@ -2471,7 +2489,7 @@
   }
   function progressDiagnostic(ev) {
     if (ev.last_fraction == null && ev.last_label == null) return "";
-    return " · last progress " + (ev.last_fraction == null ? "unknown" : Math.round(ev.last_fraction * 100) + "%") + (ev.last_label ? " (" + ev.last_label + ")" : "");
+    return " · last progress " + (ev.last_fraction == null ? "unknown" : uiFormat(ev.last_fraction, { style: "percent", maximumFractionDigits: 0 })) + (ev.last_label ? " (" + ev.last_label + ")" : "");
   }
   async function retryProviderRequest() {
     const sid = S.current;
@@ -2639,13 +2657,13 @@
     if (row.progressBox.hidden !== hideProgress) row.progressBox.hidden = hideProgress;
     if (row.progress.hidden !== (t.progress?.fraction == null)) row.progress.hidden = t.progress?.fraction == null;
     if (t.progress?.fraction != null) row.progress.value = t.progress.fraction;
-    updateText(row.progressText, t.progress ? (t.progress.fraction != null ? " " + Math.round(t.progress.fraction * 100) + "%" : "") + (t.progress.label ? " " + t.progress.label : "") : "");
+    updateText(row.progressText, t.progress ? (t.progress.fraction != null ? " " + uiFormat(t.progress.fraction, { style: "percent", maximumFractionDigits: 0 }) : "") + (t.progress.label ? " " + t.progress.label : "") : "");
     if (row.stalled.hidden !== (t.stalledSecs == null)) row.stalled.hidden = t.stalledSecs == null;
     if (row.stalled.textContent !== "stalled " + t.stalledSecs + "s") row.stalled.textContent = "stalled " + t.stalledSecs + "s";
     const hideCancel = !t.handle || !running;
     if (row.cancel.hidden !== hideCancel) row.cancel.hidden = hideCancel;
     if (row.transcript.hidden !== !t.subagent) row.transcript.hidden = !t.subagent;
-    updateText(row.timer, t.elapsedMs != null ? (t.elapsedMs / 1000).toFixed(1) + "s" : elapsed(t.started));
+    updateText(row.timer, t.elapsedMs != null ? uiFixed(t.elapsedMs / 1000, 1) + "s" : elapsed(t.started));
     if (!row.payloadInitialized || row.payloadArgs !== t.arguments || row.payloadSubagent !== t.subagent) {
       row.payloadInitialized = true;
       row.payloadArgs = t.arguments;
@@ -3161,8 +3179,8 @@
         if (!row.calibration_eligible || row.token_error == null) group.unknown++; else {group.n++;group.error+=row.token_error;group.covered+=row.token_covered_p50_p90 ? 1 : 0;}
         groups.set(key,group);
       }
-      for (const [key,g] of groups) box.append(h("p",null,key+": "+g.n+" completed comparisons · mean token error "+(g.n ? Math.round(g.error/g.n) : "unknown")+" · p50–p90 coverage "+(g.n ? Math.round(100*g.covered/g.n)+"%" : "unknown")+" · "+g.unknown+" excluded/interrupted/unknown/no-history"));
-      for (const row of rows) box.append(h("details",null,h("summary",null,row.model+" · "+row.status+" · "+row.comparable_runs+" comparable Runs · actual "+(row.actual.tokens == null ? "unknown" : row.actual.tokens)+" tokens · error "+(row.token_error == null ? "unknown" : Math.round(row.token_error))),h("pre",null,JSON.stringify({forecast:row.forecast,actual:row.actual},null,2))));
+      for (const [key,g] of groups) box.append(h("p",null,key+": "+g.n+" completed comparisons · mean token error "+(g.n ? uiFormat(Math.round(g.error/g.n)) : "unknown")+" · p50–p90 coverage "+(g.n ? uiFormat(g.covered/g.n,{style:"percent",maximumFractionDigits:0}) : "unknown")+" · "+g.unknown+" excluded/interrupted/unknown/no-history"));
+      for (const row of rows) box.append(h("details",null,h("summary",null,row.model+" · "+row.status+" · "+row.comparable_runs+" comparable Runs · actual "+(row.actual.tokens == null ? "unknown" : row.actual.tokens)+" tokens · error "+(row.token_error == null ? "unknown" : uiFormat(Math.round(row.token_error)))),h("pre",null,JSON.stringify({forecast:row.forecast,actual:row.actual},null,2))));
     } catch (_) { /* Metrics are read-only and optional on older daemons. */ }
   }
 
@@ -3239,7 +3257,7 @@
     if (!S.notes.length) list.append(h("li", { class: "muted" }, h("time"), h("span", null, "Nothing yet.")));
     for (const n of [...S.notes].reverse()) {
       list.append(h("li", { class: n.err ? "err" : "" },
-        h("time", null, new Date(n.at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })),
+        h("time", null, clock(n.at)),
         h("span", null, n.text)));
     }
   }
@@ -3248,14 +3266,14 @@
   /** A job's recent firings: when, trigger, outcome, time, cost, Session. */
   async function showJobHistory(j) {
     const runs = (await request({ type: "job_runs", id: j.id }).catch(() => null)) || [];
-    const secs = (r) => r.finished_at ? Math.round((new Date(r.finished_at) - new Date(r.started_at)) / 1000) + "s" : "…";
+    const secs = (r) => r.finished_at ? uiFormat(Math.round((new Date(r.finished_at) - new Date(r.started_at)) / 1000)) + "s" : "…";
     const body = runs.length
       ? h("table", { class: "table" }, h("tbody", null, runs.map((r) => h("tr", null,
-          h("td", { class: "muted" }, new Date(r.started_at).toLocaleString()),
+          h("td", { class: "muted" }, uiFormat(new Date(r.started_at))),
           h("td", null, r.trigger),
           h("td", { class: r.status === "completed" ? "" : "error" }, r.status),
           h("td", { class: "muted" }, secs(r)),
-          h("td", { class: "muted" }, r.cost != null ? "$" + r.cost.toFixed(3) : "—"),
+          h("td", { class: "muted" }, r.cost != null ? uiMoney(r.cost, 3) : "—"),
           h("td", null, r.session_id ? h("button", { class: "btn ghost small", type: "button", onclick: () => openSession(r.session_id) }, "Open") : null),
           h("td", { class: "muted" }, r.detail || "")))))
       : h("p", { class: "muted" }, "It has not run yet.");
@@ -3871,11 +3889,11 @@
     return h("dl", { class: "kv" },
       h("dt", null, "Success"), h("dd", null, bar(m.success_rate), " ", rateCell(m.success_rate), h("span", { class: "muted" }, "  retry " + pct(m.retry_rate))),
       h("dt", null, "Invocations"), h("dd", null, m.total + " total · " + m.success + " ok · " + m.failure + " failed · " + m.denied + " denied · " + m.cancelled + " cancelled · " + m.validation_failures + " invalid"),
-      h("dt", null, "Latency"), h("dd", null, "p50 " + (m.p50_ms == null ? "-" : Math.round(m.p50_ms) + "ms") + " · p95 " + (m.p95_ms == null ? "-" : Math.round(m.p95_ms) + "ms")),
-      h("dt", null, "Cost per success"), h("dd", null, m.ms_per_success == null ? "-" : (m.ms_per_success / 1000).toFixed(1) + "s · " + Math.round(m.tokens_per_success || 0) + " tokens"),
+      h("dt", null, "Latency"), h("dd", null, "p50 " + (m.p50_ms == null ? "-" : uiFormat(Math.round(m.p50_ms)) + "ms") + " · p95 " + (m.p95_ms == null ? "-" : uiFormat(Math.round(m.p95_ms)) + "ms")),
+      h("dt", null, "Cost per success"), h("dd", null, m.ms_per_success == null ? "-" : uiFixed(m.ms_per_success / 1000, 1) + "s · " + uiFormat(Math.round(m.tokens_per_success || 0)) + " tokens"),
       // The Tool's own model use (llm / agent), per call (SPEC §10.4).
-      m.model_tokens_per_call == null ? null : [h("dt", null, "Model use"), h("dd", null, Math.round(m.model_tokens_per_call) + " tokens" +
-        (m.model_cost_per_call == null ? " per call (unpriced)" : " · $" + m.model_cost_per_call.toFixed(4) + " per call"))]);
+      m.model_tokens_per_call == null ? null : [h("dt", null, "Model use"), h("dd", null, uiFormat(Math.round(m.model_tokens_per_call)) + " tokens" +
+        (m.model_cost_per_call == null ? " per call (unpriced)" : " · " + uiMoney(m.model_cost_per_call, 4) + " per call"))]);
   }
 
   /** "Try it": a form from the Tool's input schema; runs it through the
@@ -4198,9 +4216,9 @@
       const n = st.successes + st.failures;
       const r = n ? st.successes / n : null;
       body.append(h("tr", null, h("td", null, st.model), h("td", { class: "num" }, n), h("td", { class: "num" }, rateCell(r)),
-        h("td", { class: "num" }, n ? Math.round(st.total_ms / n) + "ms" : "-"),
-        h("td", { class: "num" }, st.prompt_tokens ? st.prompt_tokens.toLocaleString() : "-"),
-        h("td", { class: "num" }, st.prompt_tokens ? Math.round(100 * st.cached_tokens / st.prompt_tokens) + "%" : "-")));
+        h("td", { class: "num" }, n ? uiFormat(Math.round(st.total_ms / n)) + "ms" : "-"),
+        h("td", { class: "num" }, st.prompt_tokens ? uiFormat(st.prompt_tokens) : "-"),
+        h("td", { class: "num" }, st.prompt_tokens ? uiFormat(st.cached_tokens / st.prompt_tokens, { style: "percent", maximumFractionDigits: 0 }) : "-")));
     }
     rt.append(body);
   }
@@ -4308,7 +4326,7 @@
         ["build", st.stale ? "older than the installed binary" : "current"]]));
       grid.append(section("Daemon", [["protocol", st.protocol], ["pid", st.pid], ["sessions", st.sessions],
         ["credential", auth.credential_present ? "present" : "missing"], ["auth mode", auth.mode],
-        ["token expires", auth.expires_at ? new Date(auth.expires_at * 1000).toLocaleString() : ""]]));
+        ["token expires", auth.expires_at ? uiFormat(new Date(auth.expires_at * 1000)) : ""]]));
     }
     for (const warning of ((c && c.security && c.security.scope_warnings) || [])) grid.append(h("p", { class: "error scope-warning" }, "⚠ " + warning));
     grid.append(providersSection());
@@ -4350,7 +4368,7 @@
             sk.has_scripts ? h("div", { class: "muted" }, "bundles scripts (never run on the host)") : null,
             sk.author === "auto" ? h("div", { class: "muted" }, sk.retired ? "auto-created · retired (enable to restore)" : "auto-created from a successful Run") : null,
             sk.retired && sk.retire_reason ? h("div", { class: "muted" }, "Retired: " + sk.retire_reason) : null),
-          h("td", { class: "num" }, sk.loads + " loads" + (sk.runs ? " · " + Math.round(100 * sk.runs_completed / sk.runs) + "% of " + sk.runs + " Runs completed" : "")),
+          h("td", { class: "num" }, sk.loads + " loads" + (sk.runs ? " · " + uiFormat(sk.runs_completed / sk.runs, { style: "percent", maximumFractionDigits: 0 }) + " of " + sk.runs + " Runs completed" : "")),
           h("td", null,
             h("button", { class: "btn small", type: "button", onclick: () => reviewSkill(sk.name) }, "Review"),
             h("button", { class: "btn small" + (sk.enabled ? "" : " primary"), type: "button", onclick: () => act({ type: "set_skill_enabled", name: sk.name, enabled: !sk.enabled }, (sk.enabled ? "Disabled " : "Enabled ") + sk.name).then(refreshSettings) }, sk.enabled ? "Disable" : "Enable"),
@@ -4379,7 +4397,7 @@
       jobs.length ? h("table", { class: "table" },
         h("tbody", null, jobs.map((j) => h("tr", null,
           h("td", null, h("div", null, j.prompt),
-            h("div", { class: "muted" }, (j.cron ? describeCron(j.cron) : "once") + " · next " + (j.next_run ? new Date(j.next_run).toLocaleString() : "-") + (j.last_status ? " · last: " + j.last_status : "") + " · " + j.author)),
+            h("div", { class: "muted" }, (j.cron ? describeCron(j.cron) : "once") + " · next " + (j.next_run ? uiFormat(new Date(j.next_run)) : "-") + (j.last_status ? " · last: " + j.last_status : "") + " · " + j.author)),
           h("td", null,
             h("button", { class: "btn small" + (j.enabled && j.approved ? "" : " primary"), type: "button", onclick: () => act({ type: "set_job_enabled", id: j.id, enabled: !(j.enabled && j.approved) }, "Updated").then(refreshSettings) },
               !j.approved ? "Approve" : j.enabled ? "Disable" : "Enable"),
@@ -4419,7 +4437,7 @@
         h("dt", null, "thinking"), h("dd", null, h("label", { class: "toggle" }, thinking, "show live reasoning")),
         h("dt", null, "text size"), h("dd", null, h("span", { class: "read-controls" },
           h("button", { class: "btn small", type: "button", "aria-label": "Smaller text", onclick: () => setReading(S.readScale - 0.1, null) }, "A−"),
-          h("span", { "aria-live": "polite" }, Math.round(S.readScale * 100) + "%"),
+          h("span", { "aria-live": "polite" }, uiFormat(S.readScale, { style: "percent", maximumFractionDigits: 0 })),
           h("button", { class: "btn small", type: "button", "aria-label": "Larger text", onclick: () => setReading(S.readScale + 0.1, null) }, "A+"))),
         h("dt", null, "density"), h("dd", null, h("span", { class: "read-controls" },
           ["comfortable", "compact"].map((d) => h("button", { class: "btn small" + (S.density === d ? " primary" : ""), type: "button", "aria-pressed": String(S.density === d), onclick: () => setReading(null, d) }, d)))),
@@ -4714,7 +4732,7 @@
     const u = ["B", "KB", "MB", "GB", "TB"];
     let v = b || 0, i = 0;
     while (v >= 1000 && i < u.length - 1) { v /= 1000; i++; }
-    return i ? v.toFixed(1) + " " + u[i] : v + " B";
+    return i ? uiFixed(v, 1) + " " + u[i] : uiFormat(v) + " B";
   }
   function kindsTable(r, gc) {
     return h("table", { class: "table" }, h("tbody", null, (r.kinds || []).map((k) => h("tr", { class: k.inside_db ? "muted" : "" },
@@ -4750,7 +4768,7 @@
     const rows = [
       ["daemon", "pid " + v.pid + " · " + v.version],
       ["uptime", r.uptime_secs != null ? Math.floor(r.uptime_secs / 60) + " min" : "?"],
-      ["memory", r.memory_bytes != null ? humanBytes(r.memory_bytes) + " · cpu " + (r.cpu_percent != null ? r.cpu_percent.toFixed(1) : "?") + "%" : "n/a"],
+      ["memory", r.memory_bytes != null ? humanBytes(r.memory_bytes) + " · cpu " + (r.cpu_percent != null ? uiFixed(r.cpu_percent, 1) : "?") + "%" : "n/a"],
       ["database", humanBytes(r.db_bytes) + " · artifacts " + humanBytes(r.artifacts_bytes)],
       ["work", v.sessions + " Sessions · " + (v.running_sessions || []).length + " running Runs · " + r.running_invocations + " pending Invocations"],
     ];
@@ -4968,7 +4986,7 @@
     if (!prompt.value.trim()) return toast("The job needs a task.", true);
     if (!s.cron && !s.at) return toast("Pick when it runs.", true);
     const j = await act({ type: "add_job", prompt: prompt.value.trim(), session_id: session.value || null, cron: s.cron || null, at: s.at || null });
-    if (j) { note("Scheduled: next run " + new Date(j.next_run).toLocaleString()); refreshSettings(); }
+    if (j) { note("Scheduled: next run " + uiFormat(new Date(j.next_run))); refreshSettings(); }
   }
   /** A labelled form field for ask() bodies. */
   function field(label, input) {
@@ -5018,18 +5036,19 @@
       S.settings = { error: "This daemon does not expose settings remotely (" + e.message + "). Update formless to see them here." };
     }
     applyMotion();
+    const languageChanged = applyLanguage();
     S.status = await act({ type: "status" });
-    renderView();
-    renderStatus();
+    if (languageChanged) renderAll();
+    else { renderView(); renderStatus(); }
   }
   // "3 steps · 12.3k in / 1.2k out · 40% cached · $0.021" (SPEC §10.6).
   function usageText(u) {
-    const k = (n) => (n >= 1000 ? (n / 1000).toFixed(1) + "k" : String(n));
+    const k = (n) => (n >= 1000 ? uiFixed(n / 1000, 1) + "k" : uiFormat(n));
     let s = u.steps + " step" + (u.steps === 1 ? "" : "s") + " · " + k(u.prompt_tokens) + " in / " + k(u.completion_tokens) + " out";
-    if (u.prompt_tokens > 0 && u.cached_tokens > 0) s += " · " + Math.round((100 * u.cached_tokens) / u.prompt_tokens) + "% cached";
+    if (u.prompt_tokens > 0 && u.cached_tokens > 0) s += " · " + uiFormat(u.cached_tokens / u.prompt_tokens, { style: "percent", maximumFractionDigits: 0 }) + " cached";
     if (u.cache_write_tokens > 0) s += " · " + u.cache_write_tokens + " written to cache";
     if (u.cost == null && (u.unpriced || []).length) s += " · no price for " + u.unpriced.join(", ");
-    if (u.cost != null) s += " · $" + u.cost.toFixed(3);
+    if (u.cost != null) s += " · " + uiMoney(u.cost, 3);
     if (u.memories > 0) s += " · used " + u.memories + (u.memories === 1 ? " memory" : " memories");
     return s;
   }
@@ -5578,8 +5597,8 @@
         h("h3", null, (d.kind || "") + " → " + d.picked), h("p", { class: "muted" }, relTime(d.at) + " · " + d.reason),
         h("table", { class: "table" }, h("tbody", null, (d.candidates || []).map((c) => h("tr", { class: c.model === d.picked ? "" : "muted" },
           h("td", null, (c.model === d.picked ? "▸ " : "") + c.model), h("td", { class: "num" }, c.samples + " samples"),
-          h("td", { class: "num" }, c.good_rate != null ? Math.round(c.good_rate * 100) + "% good" : c.score != null ? "score " + c.score.toFixed(2) : ""),
-          h("td", { class: "num" }, c.avg_ms != null ? (c.avg_ms / 1000).toFixed(1) + "s" : ""),
+          h("td", { class: "num" }, c.good_rate != null ? uiFormat(c.good_rate, { style: "percent", maximumFractionDigits: 0 }) + " good" : c.score != null ? "score " + uiFixed(c.score, 2) : ""),
+          h("td", { class: "num" }, c.avg_ms != null ? uiFixed(c.avg_ms / 1000, 1) + "s" : ""),
           h("td", null, c.qualified === false ? "below the quality gate" : "")))))))), { trigger });
     } },
     { name: "pull", args: "MODEL", group: "Settings", desc: "Ollama: download a model", run: async (arg) => {
@@ -5759,7 +5778,7 @@
     const n = (k, what) => (k ? " · " + k + " " + what : "");
     const list = (title, items) => (items.length ? [h("div", { class: "muted" }, title), h("ul", null, items.map((i) => h("li", null, i)))] : []);
     return h("details", { class: "recap" },
-      h("summary", null, tr("What I did") + " · " + r.steps + " steps · " + Math.round(r.duration_ms / 1000) + "s" + (r.status ? " · " + r.status : "") + (r.total_calls != null ? " · " + r.total_calls + " calls" : "") + n(r.unfinished_calls || 0, "unfinished calls") + n(r.built.length, "Tools changed") + n(r.files.length, "tracked paths") + (r.untracked_writes_possible ? " · " + runFilesCaveat() : "")),
+      h("summary", null, tr("What I did") + " · " + r.steps + " steps · " + uiFormat(Math.round(r.duration_ms / 1000)) + "s" + (r.status ? " · " + r.status : "") + (r.total_calls != null ? " · " + r.total_calls + " calls" : "") + n(r.unfinished_calls || 0, "unfinished calls") + n(r.built.length, "Tools changed") + n(r.files.length, "tracked paths") + (r.untracked_writes_possible ? " · " + runFilesCaveat() : "")),
       ...list("Used", r.used), ...list("Built", r.built), ...list("Tracked paths", r.files),
       r.untracked_writes_possible ? h("p", { class: "muted" }, runFilesCaveat()) : null,
       r.steered ? h("div", { class: "muted" }, "You steered it " + r.steered + " time(s).") : null);
@@ -5952,7 +5971,7 @@
         const took = (Date.now() - (runStarts.get(ev.session_id) || Date.now())) / 1000;
         runStarts.delete(ev.session_id);
         const min = (S.settings && S.settings.tui && S.settings.tui.notify_min_secs) || 20;
-        if (took >= min && ev.status !== "interrupted") alertUser("Run " + ev.status, sessionName(ev.session_id) + " · " + Math.round(took) + "s");
+        if (took >= min && ev.status !== "interrupted") alertUser("Run " + ev.status, sessionName(ev.session_id) + " · " + uiFormat(Math.round(took)) + "s");
         return;
       }
       case "run_paused": runStarts.delete(ev.session_id); return alertUser("Run paused", sessionName(ev.session_id) + ": " + truncate((ev.explained && ev.explained.message) || ev.error || "", 120));
@@ -6051,7 +6070,7 @@
         if (here) {
           const cols = ev.results.map((r) => h("div", { class: "compare-col" },
             h("h3", null, r.model),
-            h("div", { class: "muted" }, r.status + " · " + (r.duration_ms / 1000).toFixed(1) + "s · " + r.tokens + " tokens · " + r.steps + " steps" + (r.cost != null ? " · $" + r.cost.toFixed(4) : "")),
+            h("div", { class: "muted" }, r.status + " · " + uiFixed(r.duration_ms / 1000, 1) + "s · " + r.tokens + " tokens · " + r.steps + " steps" + (r.cost != null ? " · " + uiMoney(r.cost, 4) : "")),
             h("div", { class: "compare-answer" }, markdown(r.answer || "(no answer)")),
             h("button", { class: "btn small", type: "button", onclick: (e) => { closeDialog(e.currentTarget.closest(".backdrop")); openSession(r.session_id); } }, "Continue in this Session")));
           modal("Compare: " + ev.results.map((r) => r.model).join(" vs "), h("div", { class: "compare" }, cols));

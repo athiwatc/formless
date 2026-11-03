@@ -5,6 +5,9 @@ import vm from 'node:vm';
 import assert from 'node:assert/strict';
 
 export function installEventRenderFixture(context, fn) {
+  // Keep presentation dependencies real when reducers render localized values.
+  context.navigator ??= { language: 'en-US' };
+  vm.runInContext(['uiLang', 'uiLocale', 'uiFormat', 'uiFixed', 'uiMoney'].map(fn).join('\n'), context);
   const frames = new Map();
   let nextFrame = 0;
   context.requestAnimationFrame = callback => {
