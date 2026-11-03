@@ -33,6 +33,8 @@ pub struct Row {
     pub label: String,
     pub value: String,
     pub kind: Kind,
+    /// SPEC description, default and loaded-config comparison for the selected row.
+    pub help: Option<String>,
 }
 
 /// The approvals row: the running daemon's mode, and the remedy when the
@@ -61,6 +63,7 @@ impl Row {
             label: label.into(),
             value,
             kind,
+            help: None,
         }
     }
 
@@ -328,6 +331,81 @@ pub fn rows(
             ReadOnly("edit config.toml; /security lists them"),
         ),
     ];
+    // Discover every allowed setting, including section-wide keys and optional
+    // fields omitted by serde. Keep the existing editors; missing keys are
+    // deliberately pointers, never new setters or policy controls.
+    let current = serde_json::to_value(cfg).unwrap_or_default();
+    let defaults = defaults();
+    let docs = docs();
+    let mut keys = std::collections::BTreeSet::new();
+    for allowed in formless_core::config::SETTABLE {
+        if let Some(section) = allowed.strip_suffix('.') {
+            for values in [&current, defaults] {
+                for key in values[section]
+                    .as_object()
+                    .into_iter()
+                    .flat_map(|v| v.keys())
+                {
+                    keys.insert(format!("{section}.{key}"));
+                }
+            }
+            keys.extend(
+                docs.as_object()
+                    .into_iter()
+                    .flat_map(|v| v.keys())
+                    .filter(|key| key.starts_with(allowed))
+                    .cloned(),
+            );
+        } else {
+            keys.insert((*allowed).to_string());
+        }
+    }
+    for key in keys {
+        if out.iter().any(|row| row.key == key) {
+            continue;
+        }
+        let value = current
+            .pointer(&format!("/{}", key.replace('.', "/")))
+            .unwrap_or(&Value::Null);
+        out.push(Row::new(
+            "More settings (file-only)",
+            &key,
+            &key,
+            summary(value),
+            ReadOnly("edit config.toml"),
+        ));
+    }
+    // Non-settable areas stay discoverable without printing commands, tokens,
+    // hook bodies, server URLs or custom secret patterns.
+    for (key, label, value) in [
+        ("hooks", "hooks", format!("{} configured", cfg.hooks.len())),
+        (
+            "mcp.servers",
+            "MCP servers",
+            format!("{} configured", cfg.mcp.servers.len()),
+        ),
+        (
+            "security",
+            "security configuration",
+            format!(
+                "{} trusted folders · {} trusted hosts · {} custom secret patterns",
+                cfg.security.roots().len(),
+                cfg.security.trusted_hosts.len(),
+                cfg.security.secret_patterns.len()
+            ),
+        ),
+    ] {
+        out.push(Row::new(
+            "File-only areas",
+            key,
+            label,
+            value,
+            ReadOnly("edit config.toml"),
+        ));
+    }
+    for row in &mut out {
+        row.help = help(&row.key, &current);
+    }
     let warnings = cfg.security.network_scope_warnings();
     if !warnings.is_empty() {
         out.push(Row::new(
@@ -409,6 +487,51 @@ pub fn rows(
         ReadOnly(""),
     ));
     out
+}
+
+fn defaults() -> &'static Value {
+    static DEFAULTS: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+    DEFAULTS.get_or_init(|| serde_json::to_value(Config::default()).unwrap_or_default())
+}
+
+fn docs() -> &'static Value {
+    static DOCS: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+    DOCS.get_or_init(formless_core::config::setting_docs_json)
+}
+
+/// Compact state for read-only pointers; collections expose counts, not contents.
+fn summary(value: &Value) -> String {
+    match value {
+        Value::Null => "unset".into(),
+        Value::Array(items) => format!("{} entries", items.len()),
+        Value::Object(items) => format!("{} entries", items.len()),
+        Value::String(text) if text.is_empty() => "unset".into(),
+        Value::String(text) => text.chars().take(80).collect(),
+        value => value.to_string(),
+    }
+}
+
+fn help(key: &str, current: &Value) -> Option<String> {
+    let doc = &docs()[key];
+    let description = doc["description"].as_str()?;
+    let default = match &doc["default"] {
+        Value::String(text) => text.clone(),
+        value => value.to_string(),
+    };
+    // Compare typed config values, not display text (e.g. false vs "off",
+    // or null vs SPEC's explanatory default). Compare loaded config, not a
+    // display label or the running daemon's approval-mode override.
+    let pointer = format!("/{}", key.replace('.', "/"));
+    let changed = current.pointer(&pointer).unwrap_or(&Value::Null)
+        != defaults().pointer(&pointer).unwrap_or(&Value::Null);
+    Some(format!(
+        "{description} · default {default}\nConfigured value: {}",
+        if changed {
+            "changed from default"
+        } else {
+            "matches default"
+        }
+    ))
 }
 
 /// The value after `current` in `choices`, as JSON (null for "").
@@ -770,6 +893,102 @@ mod tests {
         assert_eq!(find("explorer").kind, Kind::Role("explorer".into()));
         assert!(rows.iter().all(|r| r.key != "default"));
         assert_eq!(find("thinking").value, "on");
+    }
+
+    #[test]
+    fn every_settable_key_is_discoverable_without_expanding_edit_permissions() {
+        let cfg = Config::default();
+        let paths = formless_core::Paths {
+            data_dir: "/d".into(),
+            config_dir: "/c".into(),
+            profile: "p".into(),
+        };
+        let rows = rows(&cfg, &json!({}), false, &paths);
+        let serialized = serde_json::to_value(&cfg).unwrap();
+        let mut expected = std::collections::BTreeSet::new();
+        for allowed in formless_core::config::SETTABLE {
+            if let Some(section) = allowed.strip_suffix('.') {
+                for key in serialized[section].as_object().unwrap().keys() {
+                    expected.insert(format!("{section}.{key}"));
+                }
+                for key in formless_core::config::setting_docs()
+                    .keys()
+                    .filter(|k| k.starts_with(allowed))
+                {
+                    expected.insert(key.clone());
+                }
+            } else {
+                expected.insert((*allowed).to_string());
+            }
+        }
+        assert!(expected.len() > 100, "section keys must be expanded");
+        for key in expected {
+            let matching: Vec<_> = rows.iter().filter(|row| row.key == key).collect();
+            assert_eq!(matching.len(), 1, "missing or duplicate {key}");
+            assert!(matching[0].help.is_some(), "SPEC help missing for {key}");
+            assert!(
+                matches!(
+                    matching[0].kind,
+                    Kind::ReadOnly(_) | Kind::Bool | Kind::Choice(_) | Kind::Number | Kind::Model
+                ),
+                "{key} has no editor or pointer"
+            );
+        }
+        for key in [
+            "provider.fallback_models",
+            "provider.routing_models",
+            "provider.prices",
+            "skills.auto_create",
+            "optimiser.cooldown_secs",
+        ] {
+            let row = rows.iter().find(|row| row.key == key).unwrap();
+            assert_eq!(row.kind, Kind::ReadOnly("edit config.toml"));
+        }
+    }
+
+    #[test]
+    fn file_only_summaries_count_private_values_and_compare_typed_defaults() {
+        let mut cfg = Config::default();
+        cfg.provider.max_retries += 1;
+        cfg.provider.fallback_models = vec!["small".into(), "large".into()];
+        cfg.provider
+            .extra_headers
+            .insert("Authorization".into(), "PrivateHeaderSentinel".into());
+        cfg.security
+            .secret_patterns
+            .push("PrivatePatternSentinel".into());
+        let paths = formless_core::Paths {
+            data_dir: "/d".into(),
+            config_dir: "/c".into(),
+            profile: "p".into(),
+        };
+        let rows = rows(&cfg, &json!({}), false, &paths);
+        let find = |key: &str| rows.iter().find(|row| row.key == key).unwrap();
+        assert!(find("provider.max_retries")
+            .help
+            .as_ref()
+            .unwrap()
+            .contains("changed from default"));
+        assert!(find("provider.tool_use_nudge")
+            .help
+            .as_ref()
+            .unwrap()
+            .contains("matches default"));
+        assert!(find("limits.daily_usd")
+            .help
+            .as_ref()
+            .unwrap()
+            .contains("matches default"));
+        assert_eq!(find("provider.fallback_models").value, "2 entries");
+        assert!(find("security").value.contains("1 custom secret patterns"));
+        assert_eq!(find("hooks").value, "0 configured");
+        for key in ["hooks", "security", "mcp.servers"] {
+            assert_eq!(find(key).kind, Kind::ReadOnly("edit config.toml"));
+        }
+        let display = format!("{rows:?}");
+        assert!(!display.contains("PrivateHeaderSentinel"));
+        assert!(!display.contains("PrivatePatternSentinel"));
+        assert!(!display.contains("provider.extra_headers"));
     }
 
     #[test]

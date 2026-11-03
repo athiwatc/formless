@@ -4241,6 +4241,15 @@ run_tool = "network_policy"     # a registry Tool, or…
   - `model` opens the model picker for the global default;
   - numbers edit inline and are checked before saving, with errors shown
     under the row;
+  - the selected row wraps its SPEC §13 description, units and default,
+    and states whether the typed loaded configuration matches that default
+    (including configuration environment overrides, but independent of the
+    running daemon's approval-mode display override). `?` opens the complete entry
+    in the scrollable text viewer for long descriptions or small terminals;
+  - every settable key has an editor or a read-only pointer to config.toml,
+    including keys in whole settable sections; optional keys remain visible
+    when unset. File-only hooks, security and MCP areas show compact counts,
+    never hook bodies, credentials or custom secret patterns;
   - read-only rows (endpoint, auth, relay, paths) say where they change.
   Changes go through `SetSetting`, so they are audited and other clients
   get `SettingsChanged`. A daemon refusal also shows under the row.
@@ -5283,7 +5292,7 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
 | `provider.cache_key` | `session` | Send a per-Session `prompt_cache_key` for better cache routing (`off` never sends it; dropped automatically if the endpoint rejects it) |
 | `provider.max_backoff_secs` | 30 | Cap for exponential backoff with full jitter; a server's `Retry-After` / `x-ratelimit-reset-*` is honoured instead (up to 5 min) |
 | `provider.tool_use_nudge` | true | Push models to build Tools: a GPT-family system-prompt addendum, and one nudge per step when an answer refuses for lack of access before using any Tool (§5.2) |
-| `provider.stall_notice_secs` | 120 | Flag an open stream that sent no bytes for this long (`ProviderStalled`; `/resend` re-sends); 0 = never |
+| `provider.stall_notice_secs` | 120 | Flag an open stream that sent no bytes for this many seconds (`ProviderStalled`; `/resend` re-sends); 0 = never |
 | `provider.first_byte_timeout_secs` | 0 | Auto re-send when no first byte arrives in time (up to `max_retries`); 0 = off |
 | `provider.api_style` | `chat` | `chat`, `responses` or `anthropic` (native Messages API) (§4.1) |
 | `provider.tool_mode` | `native` | `native` or prompt-based fallback (§4.1) |
