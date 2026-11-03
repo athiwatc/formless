@@ -8,15 +8,17 @@ use std::{
     path::PathBuf,
     process::{Child, Command, Output, Stdio},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
     time::{Duration, Instant},
 };
 fn unique() -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
     format!(
-        "{}-{}",
+        "{}-{}-{}",
         std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -390,6 +392,145 @@ impl Drop for Fixture {
         self.provider.stop.store(true, Ordering::SeqCst);
         let _ = std::fs::remove_dir_all(&self.root);
     }
+}
+
+#[test]
+fn shipped_plain_templates_expand_literally_and_help_reports_local_diagnostics() {
+    let mut f = Fixture::new();
+    let project = f.root.join("template-project");
+    let local = project.join(".formless/commands");
+    std::fs::create_dir_all(&local).unwrap();
+    std::fs::create_dir_all(f.paths.config_dir.join("commands")).unwrap();
+    std::fs::write(
+        f.paths.config_dir.join("commands/workflow.md"),
+        "Global review",
+    )
+    .unwrap();
+    std::fs::write(
+        local.join("workflow.md"),
+        "---\ndescription: Project review template\n---\nReview $ARGUMENTS",
+    )
+    .unwrap();
+    std::fs::write(
+        local.join("literal.md"),
+        "---\ndescription: Literal slash body\n---\n/quit",
+    )
+    .unwrap();
+    std::fs::write(local.join("quit.md"), "Never shadow the builtin").unwrap();
+    std::fs::write(local.join("broken.md"), "---\ndescription: not closed").unwrap();
+    let store = Store::open(&f.paths.db_file()).unwrap();
+    let session = store
+        .create_session(Some("Plain template fixture".into()))
+        .unwrap()
+        .id;
+    store
+        .set_session_cwd(&session, Some(project.to_str().unwrap()))
+        .unwrap();
+    drop(store);
+    f.start();
+    let mut command = f.command(&["chat", "--session", &session]);
+    command.stdin(Stdio::piped()).stderr(Stdio::null());
+    let mut child = Owned(Some(command.spawn().unwrap()));
+    let mut input = child.0.as_mut().unwrap().stdin.take().unwrap();
+    let mut stdout = child.0.as_mut().unwrap().stdout.take().unwrap();
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let output = captured.clone();
+    let reader = std::thread::spawn(move || {
+        let mut buf = [0; 4096];
+        loop {
+            let n = stdout.read(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            let mut output = output.lock().unwrap();
+            assert!(output.len() + n <= 1024 * 1024, "owned plain output limit");
+            output.extend_from_slice(&buf[..n]);
+        }
+    });
+    let wait_for = |needle: &str| {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let text = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+            if text.contains(needle) {
+                return text;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "plain output missing {needle}: {text}"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    };
+    wait_for("Formless, chat.");
+    input.write_all(b"/help\n/help\n").unwrap();
+    let help = wait_for("Shadowed /workflow");
+    assert!(
+        help.contains("Yours")
+            && help.contains("Project review template")
+            && help.contains("Shadowed /workflow"),
+        "{help}"
+    );
+    input.write_all(b"/notpresent\n/broken x\n").unwrap();
+    let errors = wait_for("/broken isn't loaded:");
+    assert!(errors.contains("/notpresent is not a command here"));
+    assert!(errors.contains("broken.md") && errors.contains("frontmatter"));
+    assert_eq!(
+        errors
+            .lines()
+            .filter(|line| line.starts_with("Command template ") && line.contains("broken.md"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        f.provider.count(),
+        0,
+        "help/errors are local and never sent to a model"
+    );
+    for (line, response) in [
+        ("/workflow Alpha  Beta\n", "REVIEW-DELIVERED"),
+        ("/literal\n", "LITERAL-DELIVERED"),
+        ("//quit\n", "ESCAPED-DELIVERED"),
+    ] {
+        f.provider.queue(response);
+        input.write_all(line.as_bytes()).unwrap();
+        wait_for(response);
+        // Do not let the next invocation steer a still-finishing prior Run.
+        let wanted = f.provider.count();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let text = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+            if text.matches("Run completed.").count() >= wanted {
+                break;
+            }
+            assert!(Instant::now() < deadline, "plain Run completion: {text}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    input.write_all(b"/quit\n").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = child.0.as_mut().unwrap().try_wait().unwrap() {
+            assert!(status.success());
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "builtin Quit must win over the local template"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    reader.join().unwrap();
+    assert_eq!(f.provider.count(), 3);
+    let messages = Store::open(&f.paths.db_file())
+        .unwrap()
+        .list_messages(&session)
+        .unwrap();
+    let users: Vec<_> = messages
+        .iter()
+        .filter(|message| message.role == "user")
+        .map(|message| message.content.as_str())
+        .collect();
+    assert_eq!(users, ["Review Alpha  Beta", "/quit", "/quit"]);
 }
 
 #[test]

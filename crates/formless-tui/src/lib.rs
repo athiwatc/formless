@@ -8250,10 +8250,17 @@ impl App {
             }
             "quit" if !self.running_sessions.is_empty() => self.quit_confirm = true,
             "quit" => self.should_quit = true,
-            other => self.notes.push(match commands::closest(other) {
-                Some(name) => format!("unknown command: /{other} — did you mean /{name}?"),
-                None => format!("unknown command: /{other} (/help lists them)"),
-            }),
+            other => {
+                let snapshot = self.user_command_snapshot(true);
+                self.user_commands_tick();
+                self.notes.push(match user_commands_ui::unavailable(&snapshot, other.split_whitespace().next().unwrap_or(other)) {
+                    Some(message) => message,
+                    None => match user_commands_ui::suggestion(&snapshot, other) {
+                        Some(suggestion) => format!("unknown command: /{other} — {suggestion}"),
+                        None => format!("unknown command: /{other} (/help lists them)"),
+                    }
+                });
+            },
         }
     }
 
@@ -26753,6 +26760,69 @@ mod tests {
                 "expansion never dispatches another slash or shell action"
             );
         }
+    }
+    #[test]
+    fn custom_commands_invalid_invocation_names_the_current_file_and_reason() {
+        let (mut app, project) = custom_command_fixture("valid");
+        let path = project.join(".formless/commands/workflow.md");
+        std::fs::write(&path, "---\ndescription: not closed").unwrap();
+        app.user_command_snapshot(true);
+        app.user_commands_tick();
+        app.notes.clear(); // A previous one-time diagnostic is no substitute.
+        let (client, sent) = DaemonClient::recording();
+        app.client = Some(client);
+        app.input.set("/workflow x");
+        app.key(key(KeyCode::Enter));
+        assert!(
+            app.notes
+                .iter()
+                .any(|note| note.contains("/workflow isn't loaded:")
+                    && note.contains(&path.to_string_lossy().to_string())
+                    && note.contains("frontmatter")),
+            "{:?}",
+            app.notes
+        );
+        assert!(sent.try_recv().is_err());
+    }
+    #[test]
+    fn custom_commands_suggest_templates_and_announce_a_diagnostic_after_repair() {
+        let (mut app, project) = custom_command_fixture("valid");
+        std::fs::write(
+            app.paths.config_dir.join("commands/workflow.md"),
+            "Global template",
+        )
+        .unwrap();
+        app.slash("worklfow");
+        assert!(
+            app.notes
+                .last()
+                .unwrap()
+                .contains("did you mean /workflow?"),
+            "{:?}",
+            app.notes
+        );
+        assert!(app
+            .notes
+            .last()
+            .unwrap()
+            .contains("Project command overrides global command"));
+        let path = project.join(".formless/commands/broken.md");
+        for _ in 0..2 {
+            std::fs::write(&path, "---\ndescription: not closed").unwrap();
+            app.user_command_snapshot(true);
+            app.user_commands_tick();
+            app.user_commands_tick();
+            std::fs::write(&path, "Repaired").unwrap();
+            app.user_command_snapshot(true);
+            app.user_commands_tick();
+        }
+        assert_eq!(
+            app.notes
+                .iter()
+                .filter(|note| note.contains("broken.md"))
+                .count(),
+            2
+        );
     }
     #[test]
     fn custom_commands_arguments_mentions_and_queue_steer_use_normal_message_intake() {
