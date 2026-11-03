@@ -5,6 +5,161 @@ use formless_protocol::Request;
 use std::sync::Arc;
 
 #[test]
+fn map_updates_preserve_siblings_remove_entries_and_validate_atomically() {
+    use serde_json::json;
+    let mut cfg = Config::default();
+    for (key, first, second) in [
+        (
+            "provider.prices",
+            json!({"input":1,"output":2}),
+            json!({"input":3,"output":4}),
+        ),
+        ("provider.model_context_tokens", json!(1000), json!(2000)),
+        ("provider.model_audio_input", json!(true), json!(false)),
+        ("provider.model_pdf_input", json!(false), json!(true)),
+        ("tui.colors", json!("red"), json!("blue")),
+    ] {
+        cfg.set_key(key, json!({"old": first})).unwrap();
+        let expected_first = cfg.setting_value(&format!("{key}.old")).unwrap().unwrap();
+        let mut replacement = cfg.clone();
+        replacement.set_key(key, json!({"new":second})).unwrap();
+        let expected_second = replacement
+            .setting_value(&format!("{key}.new"))
+            .unwrap()
+            .unwrap();
+        cfg.merge_key(key, json!({"vendor/model.4.5": second}))
+            .unwrap();
+        assert_eq!(
+            cfg.setting_value(key)
+                .unwrap()
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .len(),
+            2
+        );
+        let entry = format!("{key}.vendor/model.4.5");
+        assert_eq!(cfg.setting_value(&entry).unwrap(), Some(expected_second));
+        cfg.set_key(&entry, serde_json::Value::Null).unwrap();
+        assert_eq!(
+            cfg.setting_value(key).unwrap(),
+            Some(json!({"old":expected_first}))
+        );
+        cfg.merge_key(key, json!({"old":null})).unwrap();
+        assert_eq!(cfg.setting_value(key).unwrap(), Some(json!({})));
+        cfg.merge_key(key, json!({"a":first,"b":second})).unwrap();
+        let before = serde_json::to_value(&cfg).unwrap();
+        assert!(cfg.merge_key(key, json!({"a": null,"bad":[true]})).is_err());
+        assert_eq!(serde_json::to_value(&cfg).unwrap(), before);
+        cfg.set_key(key, json!({"only":first})).unwrap();
+        assert_eq!(
+            cfg.setting_value(key).unwrap(),
+            Some(json!({"only":expected_first}))
+        );
+        cfg.set_key(key, json!({})).unwrap();
+        assert_eq!(cfg.setting_value(key).unwrap(), Some(json!({})));
+    }
+    for blocked in ["provider.extra_headers", "relay", "tools", "provider.model"] {
+        assert!(cfg.merge_key(blocked, json!({"x":1})).is_err());
+    }
+    assert!(cfg.merge_key("provider.prices", json!(null)).is_err());
+    assert!(cfg.set_key("provider.prices.", json!({})).is_err());
+    assert!(cfg
+        .set_key("provider.extra_headers.secret", json!("x"))
+        .is_err());
+    assert!(formless_core::config::is_model_setting(
+        "provider.model_context_tokens.vendor/model.4.5"
+    ));
+    assert!(!formless_core::config::is_model_setting(
+        "provider.model.typo"
+    ));
+    assert!(!formless_core::config::is_model_setting(
+        "provider.prices.model.4.5"
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_map_merges_and_entry_deletion_survive_save_reload() {
+    use serde_json::json;
+    let base = std::env::temp_dir().join(format!("fl-map-{}", uuid::Uuid::new_v4()));
+    let paths = Paths {
+        data_dir: base.join("d"),
+        config_dir: base.join("c"),
+        profile: "map".into(),
+    };
+    let mut cfg = Config::default();
+    cfg.set_key("provider.model_context_tokens", json!({"original": 500}))
+        .unwrap();
+    cfg.save(&paths).unwrap();
+    let daemon = Arc::new(formless_core::daemon::Daemon::new(paths.clone()).unwrap());
+    let mut tasks = Vec::new();
+    for i in 0..8 {
+        let d = daemon.clone();
+        tasks.push(tokio::spawn(async move {
+            d.handle(Request::MergeSetting {
+                key: "provider.model_context_tokens".into(),
+                value: json!({format!("model.{i}"): 1000+i}),
+            })
+            .await
+            .unwrap();
+        }));
+    }
+    for task in tasks {
+        task.await.unwrap();
+    }
+    let saved = Config::load_file_only(&paths).unwrap();
+    assert_eq!(saved.provider.model_context_tokens.len(), 9);
+    for i in 0..8 {
+        assert_eq!(
+            saved.provider.model_context_tokens[&format!("model.{i}")],
+            1000 + i
+        );
+    }
+    daemon
+        .handle(Request::SetSetting {
+            key: "provider.model_context_tokens.model.3".into(),
+            value: json!(null),
+        })
+        .await
+        .unwrap();
+    daemon
+        .handle(Request::MergeSetting {
+            key: "provider.model_context_tokens".into(),
+            value: json!({"model.4":null}),
+        })
+        .await
+        .unwrap();
+    let saved = Config::load_file_only(&paths).unwrap();
+    assert_eq!(saved.provider.model_context_tokens.len(), 7);
+    assert_eq!(saved.provider.model_context_tokens["original"], 500);
+    assert!(!saved.provider.model_context_tokens.contains_key("model.3"));
+    assert!(!saved.provider.model_context_tokens.contains_key("model.4"));
+    let before = std::fs::read(paths.config_file()).unwrap();
+    assert!(daemon
+        .handle(Request::MergeSetting {
+            key: "provider.model_context_tokens".into(),
+            value: json!({"original":null,"bad":"oops"})
+        })
+        .await
+        .is_err());
+    assert_eq!(std::fs::read(paths.config_file()).unwrap(), before);
+    daemon
+        .handle(Request::SetSetting {
+            key: "provider.model_context_tokens".into(),
+            value: json!({}),
+        })
+        .await
+        .unwrap();
+    assert!(Config::load_file_only(&paths)
+        .unwrap()
+        .provider
+        .model_context_tokens
+        .is_empty());
+    drop(daemon);
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
 fn set_key_validates_types_keys_and_the_allow_list() {
     let mut c = Config::default();
     c.set_key("tools.inline_limit", serde_json::json!(12))

@@ -601,6 +601,37 @@ pub const HARNESS_MODEL_KEYS: &[&str] = &[
     "provider.routing_strong_models",
 ];
 
+/// Collection roots exposed by the settings API. After one of these roots,
+/// the entire suffix is a literal entry name (dots and slashes included).
+pub const SETTING_MAPS: &[&str] = &[
+    "provider.prices",
+    "provider.model_context_tokens",
+    "provider.model_audio_input",
+    "provider.model_pdf_input",
+    "tui.colors",
+];
+
+pub fn setting_key_parts(key: &str) -> Vec<&str> {
+    for root in SETTING_MAPS {
+        if let Some(entry) = key.strip_prefix(root).and_then(|s| s.strip_prefix('.')) {
+            let mut parts: Vec<_> = root.split('.').collect();
+            parts.push(entry);
+            return parts;
+        }
+    }
+    key.split('.').collect()
+}
+
+pub fn is_model_setting(key: &str) -> bool {
+    HARNESS_MODEL_KEYS.contains(&key)
+        || SETTING_MAPS.iter().any(|root| {
+            HARNESS_MODEL_KEYS.contains(root)
+                && key
+                    .strip_prefix(root)
+                    .is_some_and(|s| s.starts_with('.') && s.len() > 1)
+        })
+}
+
 /// Settings clients may change through the daemon (`SetSetting`): exact
 /// keys, or whole sections ending in '.'. Credentials, the endpoint, extra
 /// headers, the relay, MCP servers and hooks stay file-only.
@@ -1951,9 +1982,17 @@ impl Config {
     /// credentials, endpoints, the relay, MCP servers or hooks. `null`
     /// clears an optional key back to its default.
     pub fn set_key(&mut self, key: &str, value: serde_json::Value) -> Result<()> {
+        let parts = setting_key_parts(key);
+        if parts.iter().any(|p| p.is_empty()) {
+            anyhow::bail!("empty setting key segment");
+        }
         if !SETTABLE
             .iter()
             .any(|p| key == *p || (p.ends_with('.') && key.starts_with(p)))
+            && !SETTING_MAPS.iter().any(|root| {
+                key.strip_prefix(root)
+                    .is_some_and(|s| s.starts_with('.') && s.len() > 1)
+            })
         {
             anyhow::bail!(
                 "'{key}' cannot be changed this way; edit config.toml on the daemon's machine"
@@ -1966,7 +2005,6 @@ impl Config {
             }
         }
         let mut doc = toml::Value::try_from(&*self)?;
-        let parts: Vec<&str> = key.split('.').collect();
         let (leaf, path) = parts.split_last().context("empty key")?;
         let mut table = doc.as_table_mut().context("config is not a table")?;
         for p in path {
@@ -1997,6 +2035,49 @@ impl Config {
         }
         *self = next;
         Ok(())
+    }
+
+    /// Merge entries of an exposed map, removing entries whose value is null.
+    /// This is shallow: a supplied price replaces that model's complete price.
+    /// Validate the complete result before modifying this config.
+    pub fn merge_key(&mut self, key: &str, value: serde_json::Value) -> Result<()> {
+        if !SETTING_MAPS.contains(&key) {
+            anyhow::bail!("'{key}' is not a mergeable map setting");
+        }
+        let changes = value
+            .as_object()
+            .context("map merge requires a JSON object; use replacement to clear the map")?;
+        // TOML omits optional fields such as a price's cached_input. JSON's
+        // explicit nulls cannot be reinserted into a TOML value.
+        let mut current = toml::Value::try_from(&*self)?;
+        for part in setting_key_parts(key) {
+            current = current.get(part).cloned().context("missing map setting")?;
+        }
+        let mut merged = serde_json::to_value(current)?;
+        let entries = merged.as_object_mut().context("setting is not a map")?;
+        for (name, value) in changes {
+            if name.is_empty() {
+                anyhow::bail!("empty map entry name");
+            }
+            if value.is_null() {
+                entries.remove(name);
+            } else {
+                entries.insert(name.clone(), value.clone());
+            }
+        }
+        self.set_key(key, merged)
+    }
+
+    /// Resolve the same literal map-entry grammar as the writer.
+    pub fn setting_value(&self, key: &str) -> Result<Option<serde_json::Value>> {
+        let mut value = serde_json::to_value(self)?;
+        for part in setting_key_parts(key) {
+            match value.get(part) {
+                Some(next) => value = next.clone(),
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(value))
     }
 
     /// Write the config (SPEC §13): merged into the existing file so its

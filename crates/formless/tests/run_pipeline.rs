@@ -401,6 +401,77 @@ impl Drop for Fixture {
 }
 
 #[test]
+fn config_maps_merge_read_delete_and_explicitly_replace() {
+    let mut f = Fixture::new();
+    f.start();
+    let set = |key: &str, value: &str, replace: bool| {
+        let mut args = vec!["config", "set", key, value];
+        if replace {
+            args.push("--replace");
+        }
+        let result = f.run(&args, None);
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    };
+    let get = |key: &str| -> Value {
+        let result = f.run(&["config", "get", key], None);
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        serde_json::from_slice(&result.stdout).unwrap()
+    };
+    set(
+        "provider.prices",
+        r#"{"claude-sonnet-4.5":{"input":2,"output":3}}"#,
+        false,
+    );
+    let prices = get("provider.prices");
+    assert_eq!(prices["model"]["input"], 1.0);
+    assert_eq!(prices["claude-sonnet-4.5"]["input"], 2.0);
+    assert_eq!(get("provider.prices.claude-sonnet-4.5")["output"], 3.0);
+    set(
+        "provider.model_context_tokens",
+        r#"{"vendor/qwen2.5":2000}"#,
+        false,
+    );
+    assert_eq!(
+        get("provider.model_context_tokens"),
+        json!({"model":100000,"vendor/qwen2.5":2000})
+    );
+    set("provider.model_context_tokens.model", "null", false);
+    assert_eq!(
+        get("provider.model_context_tokens"),
+        json!({"vendor/qwen2.5":2000})
+    );
+    assert_eq!(get("provider.model_context_tokens.vendor/qwen2.5"), 2000);
+    set(
+        "provider.model_context_tokens",
+        r#"{"vendor/qwen2.5":null}"#,
+        false,
+    );
+    assert_eq!(get("provider.model_context_tokens"), json!({}));
+    set(
+        "provider.prices",
+        r#"{"sole":{"input":5,"output":6}}"#,
+        true,
+    );
+    assert_eq!(get("provider.prices").as_object().unwrap().len(), 1);
+    assert_eq!(get("provider.prices")["sole"]["input"], 5.0);
+    set("provider.prices", "{}", true);
+    assert_eq!(get("provider.prices"), json!({}));
+    let rejected = f.run(&["config", "set", "provider.prices", "null"], None);
+    assert!(!rejected.status.success());
+    assert_eq!(get("provider.prices"), json!({}));
+    assert!(f.provider.seen.lock().unwrap().is_empty());
+    assert!(f.provider.failure.lock().unwrap().is_none());
+}
+
+#[test]
 fn unconfigured_run_and_doctor_name_the_profile_and_offer_saved_setup_elsewhere() {
     let f = Fixture::new(); // Only profile p has saved configuration.
     let before = std::fs::read(f.paths.config_file()).unwrap();
