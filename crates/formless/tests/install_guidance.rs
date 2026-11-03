@@ -78,6 +78,7 @@ printf '# fixture completion\n'
         command
             .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/install.sh"))
             .env_clear()
+            .env("SHELL", "sh")
             .env("PATH", &self.path)
             .env("HOME", &self.home)
             .env("PREFIX", &self.prefix)
