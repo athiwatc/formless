@@ -202,6 +202,70 @@ def long_message_case(page,name,out):
     check(page.evaluate('__stream816.S.follow') is False,name+' Space disclosure closing does not reattach follow')
 
 
+def markdown_block_cases(page, name):
+    result=page.evaluate(r'''() => {
+      const d=__stream816;
+      const corpus=[
+        ['ordered loose','Intro.\n\n3. first\n\n4. second\n\n5. third\n\n',true],
+        ['unordered loose','Intro.\n\n- first\n\n- second\n\n- third\n\n',true],
+        ['nested loose','- parent\n\n  - child one\n\n  - child two\n\n- sibling\n\n',true],
+        ['item paragraphs','- first\n\n  second paragraph\n\n- sibling\n\nAfter.\n\n',true],
+        ['different kinds','- first\n\n1. second\n\nAfter.\n\n',true],
+        ['list rule boundary','- first\n\n- - -\n\n- second\n\n',true],
+        ['display math blank','Before\n\n$$\na = 1\n\nb = 2\n$$\n\nAfter paragraph.\n\n',true],
+        ['math fence-looking text','Before\n\n$$\n```js\n\na = 1\n```\n\nb = 2\n$$\n\nAfter.\n\n',true],
+        ['inline math close','Before\n\n$$ a = 1\n\nb = 2 $$ trailing text\n\nAfter.\n\n',true],
+        ['single line math','Before\n\n$$a = 1$$\n\nAfter.\n\n',true],
+        ['math inside fence','Before\n\n````text\n$$\n\n```\n\nstill code\n````\n\nAfter.\n\n',true],
+        ['tilde fence with math','Before\n\n~~~~text\n$$\n\n~~~\n\nstill code\n~~~~\n\nAfter.\n\n',true],
+        ['fence language-looking close','Before\n\n```js\ncode\n```js\n\nstill code\n```\n\nAfter.\n\n',true],
+        ['incomplete math','Before\n\n$$\na = 1\n\nb = 2\n\n',false],
+      ];
+      const cases=[];
+      for(const [label,text,closed] of corpus){
+        let failure=null;
+        for(const size of [1,2,5,13,64]){
+          d.S.current='markdown-'+label+'-'+size;
+          for(let at=1;at<text.length+size;at+=size){
+            const prefix=text.slice(0,Math.min(at,text.length)), node=d.streamingNode(prefix);
+            const [done,tail]=d.splitStreaming(prefix), full=d.markdown(done);
+            if(node.querySelector('.md').innerHTML!==full.innerHTML||node.querySelector('.stream-tail').textContent!==tail){
+              failure={size,at,done,actual:node.querySelector('.md').innerHTML,expected:full.innerHTML};break;
+            }
+            if(at>=text.length)break;
+          }
+          if(failure)break;
+          const node=d.streamingNode(text),[done,tail]=d.splitStreaming(text);
+          if(closed&&(tail!==''||node.querySelector('.md').innerHTML!==d.markdown(text).innerHTML))failure={size,complete:true,done,tail};
+          if(!closed&&(!tail.includes('$$')||done!=='Before\n\n'))failure={size,incomplete:true,done,tail};
+        }
+        cases.push({label,failure});
+      }
+      d.S.current='loose-list-identity';
+      const initial='Intro.\n\n3. first\n\n', node=d.streamingNode(initial);
+      const paragraph=node.querySelector('p'), list=node.querySelector('ol'), item=list.firstElementChild, tail=node.querySelector('.stream-tail').firstChild;
+      d.streamingNode(initial+'4. second\n\n');const second=list.children[1];
+      d.streamingNode(initial+'4. second\n\n5. third\n\n');
+      const identities={paragraph:paragraph===node.querySelector('p'),list:list===node.querySelector('ol'),
+        items:item===list.children[0]&&second===list.children[1],tail:tail===node.querySelector('.stream-tail').firstChild,
+        structure:node.querySelectorAll('ol').length===1&&list.children.length===3&&list.classList.contains('loose')&&list.start===3};
+      d.S.current='nested-list-identity';
+      const nestedPrefix='- parent\n\n  - child one\n\n', nestedNode=d.streamingNode(nestedPrefix);
+      const outer=nestedNode.querySelector('ul'),parent=outer.firstElementChild,parentText=parent.querySelector('p'),nested=parent.querySelector('ul'),child=nested.firstElementChild;
+      d.streamingNode(nestedPrefix+'  - child two\n\n');
+      Object.assign(identities,{nestedRoot:outer===nestedNode.querySelector('ul'),nestedParent:parent===outer.firstElementChild,
+        nestedList:nested===parent.querySelector('ul'),nestedContent:child===nested.children[0]&&parentText===parent.querySelector('p')});
+      const math=corpus.find(row=>row[0]==='display math blank')[1];d.S.current='math-final';const mathNode=d.streamingNode(math);
+      const mathElements=mathNode.querySelectorAll('.math.block');
+      return {cases,identities,math:mathElements.length===1&&mathElements[0].textContent==='a = 1\n\nb = 2'};
+    }''')
+    for case in result['cases']:
+        check(case['failure'] is None,name+' streaming/final block parity across five burst sizes: '+case['label']+' '+json.dumps(case['failure']))
+    for key,value in result['identities'].items():
+        check(value,name+' loose-list sibling append preserves '+key)
+    check(result['math'],name+' completed display math has one nonempty box and both equation lines')
+
+
 def run_engine(p, name, url, out):
     start=PASSES
     browser=p.chromium.launch(executable_path='/usr/bin/chromium',headless=True,args=['--no-sandbox']) if name=='chromium' else p.webkit.launch(executable_path=p.webkit.executable_path,headless=True)
@@ -229,6 +293,7 @@ def run_engine(p, name, url, out):
     check(parsed['list'],name+' indented loose-list continuation matches full Markdown parsing')
     check(parsed['cap'],name+' crossing Markdown formatting bound replaces old formatted content')
     check(parsed['plainStable'],name+' large plain-text stream retains its Text node')
+    markdown_block_cases(page,name)
     fixture(page)
     check(page.locator('.msg[data-message-id]').count()==30,name+' renders actual persisted fixture messages')
     supported=page.evaluate('CSS.supports("overflow-anchor","none")')
