@@ -7,7 +7,7 @@ use std::{
     path::PathBuf,
     process::{Child, Command, Output, Stdio},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
     time::{Duration, Instant},
@@ -18,14 +18,16 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
+        static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
         // Keep private socket fixtures short on macOS as well as Linux.
         #[cfg(unix)]
         let temp = PathBuf::from("/tmp");
         #[cfg(not(unix))]
         let temp = std::env::temp_dir();
         let root = temp.join(format!(
-            "f633-{}-{}",
+            "f633-{}-{}-{}",
             std::process::id(),
+            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -143,6 +145,7 @@ impl Provider {
                     }
                     Err(e) => panic!("{e}"),
                 };
+                socket.set_nonblocking(false).unwrap();
                 socket
                     .set_read_timeout(Some(Duration::from_secs(2)))
                     .unwrap();
@@ -681,8 +684,8 @@ fn broad_session_grant_requires_actual_tty_double_confirmation_even_with_yes() {
                     &mut master,
                     &mut slave,
                     std::ptr::null_mut(),
-                    std::ptr::null(),
-                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
                 )
             },
             0
