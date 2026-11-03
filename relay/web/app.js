@@ -513,7 +513,7 @@
     ok.textContent = opts.ok || "OK";
     ok.className = "btn " + (opts.danger ? "danger" : "primary");
     $("ask-backdrop").classList.remove("hidden");
-    const first = opts.body && opts.body.querySelector("input");
+    const first = opts.body && opts.body.querySelector("input, select, textarea");
     openDialog($("ask-backdrop"), { trigger: focusBefore["ask-backdrop"],
       initialFocus: opts.input ? input : first || ok, onDismiss: () => closeAsk(null) });
     if (opts.input && activeDialog()?.node === $("ask-backdrop")) input.select();
@@ -4268,6 +4268,57 @@
     }
   }
 
+  // The daemon projects documented keys through its existing settable allow-list.
+  // Never infer edit permission from a section name or a rendered value.
+  function settingsRows(settings) {
+    const docs = settings.docs || {};
+    const choices = settings.choices || {};
+    const rows = new Map();
+    for (const [key, value] of Object.entries(settings.values || {})) {
+      if (!Object.hasOwn(docs, key)) continue;
+      const options = choices[key];
+      const kind = Array.isArray(options) ? "choice" : typeof value === "boolean" ? "bool"
+        : typeof value === "number" ? "number" : typeof value === "string" ? "text"
+        : Array.isArray(value) ? "list" : "json";
+      rows.set(key, { key, value, kind, choices: options || [], editable: true });
+    }
+    // Old daemons can still show their safe summary, but cannot grant edit
+    // permission without the new explicit projection.
+    const readOnly = settings.read_only || Object.fromEntries(
+      ["provider", "tui", "limits", "naming", "relay", "paths"].flatMap(prefix =>
+        Object.entries(settings[prefix] || {}).map(([key, value]) => [prefix + "." + key, value])));
+    for (const [key, value] of Object.entries(readOnly)) {
+      if (!rows.has(key)) rows.set(key, { key, value, editable: false });
+    }
+    return [...rows.values()].sort((a, b) => a.key < b.key ? -1 : a.key > b.key ? 1 : 0);
+  }
+  function settingDisplay(value) {
+    if (value == null) return "";
+    if (typeof value === "boolean") return value ? "on" : "off";
+    if (typeof value === "number") return uiFormat(value);
+    if (typeof value === "string") return value;
+    return JSON.stringify(value);
+  }
+  function parseSettingInput(text, kind) {
+    const value = text.trim();
+    if (!value) return null; // SetSetting already uses null to restore a default.
+    if (kind === "number") {
+      const number = Number(value);
+      if (!Number.isFinite(number)) throw new Error("not a number");
+      return number;
+    }
+    if (kind === "json") return JSON.parse(value);
+    if (kind === "list") {
+      if (value.startsWith("[")) {
+        const list = JSON.parse(value);
+        if (!Array.isArray(list)) throw new Error("Use a JSON array.");
+        return list;
+      }
+      return value.split(",").map(item => item.trim()).filter(Boolean);
+    }
+    return value;
+  }
+
   function renderSettings() {
     const box = $("settings");
     box.replaceChildren();
@@ -4282,33 +4333,24 @@
       return h("div", { class: "setting-desc muted" }, d.description + (def ? " · default " + def : ""));
     };
     const section = (title, rows) => h("section", null, h("h3", null, title), h("dl", { class: "kv" },
-      rows.map(([k, v, key, kind]) => [h("dt", { title: key || "" }, k), h("dd", null,
-        v === "" || v == null ? h("span", { class: "muted" }, "(not set)") : String(v),
+      rows.map(([k, v, key, kind, choices]) => [h("dt", { title: key || "", "data-setting-key": key || "" }, k), h("dd", null,
+        v === "" || v == null ? h("span", { class: "muted" }, "(not set)") : settingDisplay(v),
         key && onTuiStart.has(key) ? h("span", { class: "tag", title: "A running TUI keeps the old value until it restarts" }, "applies when the TUI starts") : null,
-        key ? h("button", { class: "btn ghost small", type: "button", onclick: () => editSetting(key, v, kind) }, "Edit") : null,
+        key && kind ? h("button", { class: "btn ghost small", type: "button", "aria-label": "Edit " + key, onclick: () => editSetting(key, v, kind, choices) }, "Edit") : key ? h("span", { class: "muted setting-readonly" }, " · read-only: edit config.toml / use its CLI") : null,
         help(key))])));
-    const on = (b) => (b ? "on" : "off");
     const grid = h("div", { class: "settings-grid" });
     const c = S.settings;
     if (c && !c.error) {
-      grid.append(
-        section("Provider", [["base_url", c.provider.base_url], ["model", c.provider.model, "provider.model", "text"],
-          ["reasoning_effort", c.provider.reasoning_effort || "default", "provider.reasoning_effort", "optional"],
-          ["api_style", c.provider.api_style, "provider.api_style", "text"], ["tool_mode", c.provider.tool_mode, "provider.tool_mode", "text"], ["auth", c.provider.auth_mode],
-          ["context_tokens", c.provider.context_tokens, "provider.context_tokens", "number"],
-          ["fallback_models", (c.provider.fallback_models || []).join(", "), "provider.fallback_models", "list"]]),
-        section("Interface", [["multi_pane", on(c.tui.multi_pane), "tui.multi_pane", "bool"], ["queue_key", c.tui.queue_key],
-          ["notify (off, bell, desktop)", c.tui.notify, "tui.notify", "text"],
-          ["notify_min_secs", c.tui.notify_min_secs, "tui.notify_min_secs", "number"],
-          ["timestamps", on(c.tui.timestamps), "tui.timestamps", "bool"],
-          ["language (auto, en, th)", c.tui.language || "auto", "tui.language", "text"],
-          ["animations", on(c.tui.animations), "tui.animations", "bool"],
-          ["on_start (last, new, picker)", c.tui.on_start, "tui.on_start", "text"],
-          ["screen_reader", on(c.tui.screen_reader), "tui.screen_reader", "bool"]]),
-        section("Forecast", [["confirm above p90 USD", c.limits && c.limits.forecast_confirm_usd, "limits.forecast_confirm_usd", "number"]]),
-        section("Relay", [["enabled", on(c.relay.enabled)], ["url", c.relay.url]]),
-        relayDevicesSection(),
-        section("Paths", [["config", c.paths.config], ["data", c.paths.data]]));
+      const groups = new Map();
+      for (const row of settingsRows(c)) {
+        const prefix = ["config", "data"].includes(row.key) ? "files" : row.key.split(".")[0];
+        if (!groups.has(prefix)) groups.set(prefix, []);
+        const label = row.key === "security.secure" ? "secure (configured)" : row.key.includes(".") ? row.key.slice(prefix.length + 1) : row.key;
+        groups.get(prefix).push([label, row.value, row.key, row.editable ? row.kind : null, row.choices]);
+      }
+      for (const [prefix, rows] of groups) grid.append(section(prefix === "tui" ? "Interface (tui)" : prefix, rows));
+      if (!c.values) grid.append(h("p", { class: "muted" }, "Update the daemon for the complete editable Settings inventory."));
+      grid.append(relayDevicesSection());
     } else if (c && c.error) {
       grid.append(h("section", null, h("h3", null, "Daemon settings"), h("p", { class: "muted" }, c.error)));
     }
@@ -4445,7 +4487,7 @@
         S.local ? null : [h("dt", null, "notifications"), h("dd", null, pushControl())]),
       h("div", { class: "detail-actions" },
         h("button", { class: "btn danger small", type: "button", onclick: forget }, "Disconnect and forget this device"))));
-    box.append(grid, h("p", { class: "muted" }, "Edit applies through the daemon (next Run). Credentials, the endpoint, the relay and MCP servers are changed in config.toml on the daemon's machine."));
+    box.append(grid, h("p", { class: "muted" }, "Edits are validated and applied by the daemon; rows marked for TUI startup need a TUI restart. Credentials, endpoint and relay configuration use config.toml or their CLI. Manage MCP servers above."));
     filterSettings();
   }
   /** The Settings filter: rows whose label, key, value or description
@@ -4610,17 +4652,23 @@
     if (!r) return;
     await ask({ title: r.skill.name + " v" + r.skill.version, text: r.body + "\n\nFiles: " + r.files.join(", "), body: descriptionReviewCard(r.skill.description_review, r.skill.description_reviews), ok: "Close" });
   }
-  async function editSetting(key, current, kind) {
+  async function editSetting(key, current, kind, choices = []) {
     let value;
     if (kind === "bool") value = !(current === "on" || current === true);
-    else {
-      const text = await ask({ title: "Set " + key, input: true, value: current == null || current === "default" ? "" : String(current), ok: "Save",
-        text: kind === "list" ? "Comma-separated." : kind === "optional" ? "Leave empty for the default." : "" });
+    else if (kind === "choice") {
+      const select = h("select", { id: "setting-choice" },
+        h("option", { value: "" }, "default"), choices.map(choice => h("option", { value: choice }, choice)));
+      select.value = current == null ? "" : String(current);
+      const body = h("label", null, "Value ", select);
+      if (!await ask({ title: "Set " + key, body, ok: "Save" })) return;
+      value = select.value || null;
+    } else {
+      const initial = current == null ? "" : kind === "json" || kind === "list" ? JSON.stringify(current) : String(current);
+      const text = await ask({ title: "Set " + key, input: true, value: initial, ok: "Save",
+        text: "Leave empty for the default. " + (kind === "list" ? "Comma-separated strings or a JSON array (numbers stay numeric)." : kind === "json" ? "JSON value (quote strings; maps and numeric lists use JSON)." : "") });
       if (text == null) return;
-      if (kind === "number") { value = Number(text); if (!Number.isFinite(value)) { toast("not a number", true); return; } }
-      else if (kind === "list") value = text.split(",").map((s) => s.trim()).filter(Boolean);
-      else if (kind === "optional") value = text.trim() ? text.trim() : null;
-      else value = text.trim();
+      try { value = parseSettingInput(text, kind); }
+      catch (error) { toast(error.message || "invalid value", true); return; }
     }
     const r = await act({ type: "set_setting", key, value });
     if (!r) return;

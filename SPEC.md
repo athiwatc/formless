@@ -4230,6 +4230,14 @@ run_tool = "network_policy"     # a registry Tool, or…
     `on_tui_start`, and `SetSetting` answers `applies: "now" |
     "on_tui_start"`. The web marks those rows and, after saving one, says
     to restart any running TUI.
+  - Web configuration rows are generated from documented current values,
+    grouped by their key prefix. The daemon projects only existing SETTABLE
+    keys; credentials and file-only controls remain excluded or read-only.
+    Booleans toggle, choices use a select, and numeric/text/list/JSON edits
+    use SetSetting with typed values. Empty input restores the default;
+    numeric lists and maps use JSON. The payload's values, choices and
+    read_only inventories are additive; older summaries remain readable but
+    need a daemon update for the full editable inventory.
   - The web Settings view has a filter box. Rows (and table rows) whose
     label, key, value or description contain every typed word stay, with
     the words marked in the label. Sections left empty hide unless their

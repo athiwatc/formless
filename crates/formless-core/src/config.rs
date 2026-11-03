@@ -1813,7 +1813,60 @@ impl Config {
     /// view). Mirrors what the TUI shows; deliberately omits
     /// `extra_headers` and every other field that can carry credentials.
     pub fn settings_summary(&self, paths: &Paths) -> serde_json::Value {
+        // Project only documented, already-settable keys. Whole config blocks
+        // must never be sent to clients: file-only credential fields stay out.
+        let config = serde_json::to_value(self).unwrap_or_default();
+        let docs = setting_docs_json();
+        let values: serde_json::Map<String, serde_json::Value> = docs
+            .as_object()
+            .into_iter()
+            .flat_map(|docs| docs.keys())
+            .filter(|key| {
+                SETTABLE.iter().any(|allowed| {
+                    key.as_str() == *allowed || (allowed.ends_with('.') && key.starts_with(allowed))
+                })
+            })
+            .map(|key| {
+                (
+                    key.clone(),
+                    config
+                        .pointer(&format!("/{}", key.replace('.', "/")))
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                )
+            })
+            .collect();
+        let choices: serde_json::Map<String, serde_json::Value> = CHOICES
+            .iter()
+            .filter(|(key, _)| values.contains_key(*key))
+            .map(|(key, choices)| ((*key).into(), serde_json::json!(choices)))
+            .collect();
+        let mut read_only = serde_json::json!({
+            "provider.base_url": self.provider.base_url,
+            "provider.auth": self.provider.auth.mode,
+            "relay.enabled": self.relay.enabled,
+            "relay.url": self.relay.url,
+            "security.secure": self.security.secure,
+            "security.trusted_paths": self.security.roots().len(),
+            "security.trusted_hosts": self.security.trusted_hosts.len(),
+            "security": format!("{} trusted folders · {} trusted hosts · {} custom secret patterns",
+                self.security.roots().len(), self.security.trusted_hosts.len(), self.security.secret_patterns.len()),
+            "hooks": format!("{} configured", self.hooks.len()),
+            "mcp.servers": format!("{} configured", self.mcp.servers.len()),
+            "naming.installed": self.naming.spec().is_some_and(|m| m.installed(paths)),
+            "config": paths.config_file().display().to_string(),
+            "data": paths.data_dir.display().to_string(),
+        });
+        let scope_warnings = self.security.network_scope_warnings();
+        if !scope_warnings.is_empty() {
+            read_only["security.network_scope_warnings"] =
+                serde_json::json!(format!("{} warning(s); see Security", scope_warnings.len()));
+        }
+
         serde_json::json!({
+            "values": values,
+            "choices": choices,
+            "read_only": read_only,
             "provider": {
                 "base_url": self.provider.base_url,
                 "model": self.provider.model,
@@ -1840,7 +1893,7 @@ impl Config {
             // Keys that apply only when the TUI next starts.
             "on_tui_start": ON_TUI_START,
             // What each key means and its default (SPEC §13).
-            "docs": setting_docs_json(),
+            "docs": docs,
             "limits": self.limits,
             "relay": { "enabled": self.relay.enabled, "url": self.relay.url },
             // The approval posture, read-only here (config.toml or --secure).
