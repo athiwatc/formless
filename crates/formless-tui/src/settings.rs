@@ -947,6 +947,31 @@ mod tests {
     }
 
     #[test]
+    fn web_inventory_covers_every_tui_config_row() {
+        let cfg = Config::default();
+        let paths = formless_core::Paths {
+            data_dir: "/d".into(),
+            config_dir: "/c".into(),
+            profile: "p".into(),
+        };
+        let summary = cfg.settings_summary(&paths);
+        let rows = rows(&cfg, &json!({}), false, &paths);
+        for row in rows.iter().filter(|row| {
+            matches!(
+                row.kind,
+                Kind::ReadOnly(_) | Kind::Bool | Kind::Choice(_) | Kind::Number | Kind::Model
+            )
+        }) {
+            assert!(
+                summary["values"].get(&row.key).is_some()
+                    || summary["read_only"].get(&row.key).is_some(),
+                "web cannot render TUI key {}",
+                row.key
+            );
+        }
+    }
+
+    #[test]
     fn file_only_summaries_count_private_values_and_compare_typed_defaults() {
         let mut cfg = Config::default();
         cfg.provider.max_retries += 1;

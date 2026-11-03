@@ -241,3 +241,17 @@ the CSP blocks those and the browser console logs the violations. They
 are harmless, because `.mermaid-measure` in `app.css` supplies the font.
 To upgrade, replace the file, update the version and hash here, and
 check the `markdown demo` reply.
+
+The generated Settings inventory has a Rust-to-browser fixture and a TUI parity
+gate. Export the current Rust payload, then exercise typed edits, read-only
+rows, filters, keyboard choice input and 200% narrow layout in both engines:
+
+```sh
+FORMLESS_SETTINGS_FIXTURE=/tmp/formless-settings.json cargo test -p formless-core --test settings_inventory --locked
+python relay/web-settings.browser-test.py /tmp/formless-settings-browser /tmp/formless-settings.json
+```
+
+The browser suite uses local fixture replies and performs no real settings,
+provider, daemon or Tool operations. WebKit is engine coverage, not physical
+Safari or assistive-technology evidence. `node --test relay/*.test.mjs` also
+checks dynamic row generation and typed/cancelled/invalid Edit requests.
