@@ -13,13 +13,17 @@ use std::{
 pub(super) enum RunsAction {
     /// Inspect a stored Run (full id or unambiguous prefix)
     Show {
+        /// Stored Run ID or unambiguous prefix to inspect
         id: String,
+        /// Print machine-readable JSON instead of human-readable output
         #[arg(long)]
         json: bool,
     },
     /// Cancel only this Run; a later Run in its Session is unaffected
     Cancel {
+        /// Run ID to cancel
         id: String,
+        /// Print machine-readable JSON instead of human-readable output
         #[arg(long)]
         json: bool,
     },

@@ -1,5 +1,7 @@
 mod cli_attach;
 mod cli_commands;
+#[cfg(test)]
+mod cli_help_tests;
 mod cli_pipeline;
 mod cli_run_identity;
 mod table;
@@ -35,7 +37,8 @@ fn parse_profile_name(value: &str) -> std::result::Result<String, String> {
 #[command(
     name = "formless",
     version,
-    about = "General-purpose agent harness (SPEC.md)"
+    about = "General-purpose agent harness (SPEC.md)",
+    after_help = "Examples:\n  formless\n  formless chat --new\n  formless run \"Summarize README.md\" --estimate\n  formless sessions list --json"
 )]
 struct Cli {
     /// Isolated profile (separate daemon + data dir)
@@ -63,6 +66,8 @@ struct Cli {
 enum Cmd {
     /// Launch the TUI (default)
     Tui,
+    /// Manage the background daemon and its login service
+    #[command(after_help = "Examples:\n  formless daemon status\n  formless daemon status --json")]
     Daemon {
         #[command(subcommand)]
         action: DaemonAction,
@@ -78,17 +83,24 @@ enum Cmd {
         new: bool,
     },
     /// Every approval grant, and revoking them
+    #[command(
+        after_help = "Examples:\n  formless approvals pending\n  formless approvals list --json"
+    )]
     Approvals {
         #[command(subcommand)]
         action: ApprovalsAction,
     },
     /// What the daemon can reach: grants, denials, trusted folders, MCP
     /// servers, trusted hooks, relay and web UI
+    #[command(
+        after_help = "Examples:\n  formless security status\n  formless security status --json"
+    )]
     Security {
         #[command(subcommand)]
         action: SecurityAction,
     },
     /// List or remove profiles (isolated data dirs made with --profile)
+    #[command(after_help = "Examples:\n  formless profiles list\n  formless profiles list --json")]
     Profiles {
         #[command(subcommand)]
         action: ProfilesAction,
@@ -113,11 +125,15 @@ enum Cmd {
         output: Option<std::path::PathBuf>,
     },
     /// List local user-defined slash commands without starting a daemon
+    #[command(after_help = "Examples:\n  formless commands list\n  formless commands list --json")]
     Commands {
         #[command(subcommand)]
         action: cli_commands::Action,
     },
     /// Skills: SKILL.md know-how the agent loads on demand (SPEC §7.10)
+    #[command(
+        after_help = "Examples:\n  formless skills list\n  formless skills show example-skill"
+    )]
     Skills {
         #[command(subcommand)]
         action: SkillsAction,
@@ -135,16 +151,25 @@ enum Cmd {
         stop: bool,
     },
     /// Extra model providers (SPEC §4.5)
+    #[command(
+        after_help = "Examples:\n  formless providers list\n  formless providers test local"
+    )]
     Providers {
         #[command(subcommand)]
         action: ProvidersAction,
     },
     /// Model prices for spending limits and cost (provider.prices)
+    #[command(
+        after_help = "Examples:\n  formless prices import --dry-run\n  formless prices import --provider local --dry-run"
+    )]
     Prices {
         #[command(subcommand)]
         action: PricesAction,
     },
     /// Sessions: list, show, search, rename, delete, export or import them
+    #[command(
+        after_help = "Examples:\n  formless sessions list\n  formless sessions show SESSION_ID\n  formless sessions export SESSION_ID --format markdown"
+    )]
     Sessions {
         #[command(subcommand)]
         action: SessionsAction,
@@ -169,59 +194,84 @@ enum Cmd {
     },
     /// Print a shell completion script (bash, zsh, fish, powershell, elvish)
     Completions {
+        /// Shell that will load the generated completion script
         #[arg(value_enum)]
         shell: clap_complete::Shell,
     },
     /// Settings: get, set (validated by the daemon), edit or locate config.toml
+    #[command(
+        after_help = "Examples:\n  formless config path\n  formless config get provider.model"
+    )]
     Config {
         #[command(subcommand)]
         action: ConfigAction,
     },
     /// Roles: a purpose mapped to a provider + model (SPEC §4.5)
+    #[command(after_help = "Examples:\n  formless roles list\n  formless roles list --json")]
     Roles {
         #[command(subcommand)]
         action: RolesAction,
     },
     /// Scheduled jobs: prompts that run later or on a cron (SPEC §9.7)
+    #[command(
+        after_help = "Examples:\n  formless jobs list\n  formless jobs history JOB_ID --json"
+    )]
     Jobs {
         #[command(subcommand)]
         action: JobsAction,
     },
     /// Recent Runs and their outcomes: steps, tool calls, tokens (SPEC §8.7)
+    #[command(
+        after_help = "Examples:\n  formless runs --limit 10\n  formless runs show RUN_ID --json"
+    )]
     Runs {
         #[command(subcommand)]
         action: Option<cli_attach::RunsAction>,
+        /// Maximum number of recent Runs to list
         #[arg(long, default_value_t = 20)]
         limit: usize,
+        /// Print machine-readable JSON instead of human-readable output
         #[arg(long)]
         json: bool,
     },
     /// User memory: notes the agent keeps about your preferences (SPEC §7.11)
+    #[command(after_help = "Examples:\n  formless memory list\n  formless memory list --json")]
     Memory {
         #[command(subcommand)]
         action: MemoryAction,
     },
     /// External MCP servers (SPEC §7.9)
+    #[command(
+        after_help = "Examples:\n  formless mcp list\n  formless mcp catalog\n  formless mcp tools SERVER_NAME"
+    )]
     Mcp {
         #[command(subcommand)]
         action: McpAction,
     },
     /// Provider credential login/status/logout (API key or OAuth)
+    #[command(
+        after_help = "Examples:\n  formless auth status\n  formless auth status --provider local --json"
+    )]
     Auth {
         #[command(subcommand)]
         action: AuthAction,
     },
     /// Hosted relay + web frontend (SPEC §12, v2)
+    #[command(
+        after_help = "Examples:\n  formless relay status --json\n  formless relay status --qr"
+    )]
     Relay {
         #[command(subcommand)]
         action: RelayAction,
     },
     /// Prompt/memory self-optimisation proposals
+    #[command(after_help = "Examples:\n  formless prompts list\n  formless prompts list --json")]
     Prompts {
         #[command(subcommand)]
         action: PromptsAction,
     },
     /// Check for a newer release, show what changed, and how to upgrade
+    #[command(after_help = "Examples:\n  formless update check\n  formless update --check")]
     Update {
         #[command(subcommand)]
         action: Option<UpdateAction>,
@@ -230,11 +280,17 @@ enum Cmd {
         check: bool,
     },
     /// Tool registry inspection/transfer (SPEC §7.8, §12)
+    #[command(
+        after_help = "Examples:\n  formless tools list\n  formless tools show TOOL_NAME --json\n  formless tools export TOOL_NAME --output tool.json"
+    )]
     Tools {
         #[command(subcommand)]
         action: ToolsAction,
     },
     /// Embedded session-naming model: status, install, try it out
+    #[command(
+        after_help = "Examples:\n  formless naming status\n  formless naming test \"Plan my week\""
+    )]
     Naming {
         #[command(subcommand)]
         action: NamingAction,
@@ -242,6 +298,7 @@ enum Cmd {
     /// Open the guides in a browser: gallery, capabilities, approvals,
     /// keys, troubleshooting, mcp, skills, jobs, spec
     Docs {
+        /// Guide name to open; omit to list the available guides
         topic: Option<String>,
         /// Print the URL instead of opening it
         #[arg(long)]
@@ -253,6 +310,7 @@ enum Cmd {
     },
     /// Disk used by Sessions, artifacts, Tool versions, logs, backups
     Storage {
+        /// Print machine-readable JSON instead of human-readable output
         #[arg(long)]
         json: bool,
     },
@@ -264,6 +322,9 @@ enum Cmd {
         dry_run: bool,
     },
     /// Back up the database now (kept with the daily ones in <data>/backups)
+    #[command(
+        after_help = "Examples:\n  formless backup list\n  formless backup verify backup.sqlite\n  formless backup drill backup.sqlite"
+    )]
     Backup {
         #[command(subcommand)]
         action: Option<BackupAction>,
@@ -279,10 +340,16 @@ enum Cmd {
         output: Option<std::path::PathBuf>,
     },
     /// Load a file from `formless export-all` (adds; never overwrites)
-    ImportAll { file: std::path::PathBuf },
+    ImportAll {
+        /// Path to a bundle produced by export-all
+        file: std::path::PathBuf,
+    },
     /// Replace the database with a backup (stop the daemon first); the
     /// current one is saved next to the backups
-    Restore { file: std::path::PathBuf },
+    Restore {
+        /// Path to the database backup to restore
+        file: std::path::PathBuf,
+    },
     /// Remove Formless from this machine: stop the daemon, remove the login
     /// service, delete keychain entries and every profile's data, and the
     /// binary (SPEC §15)
@@ -300,6 +367,7 @@ enum Cmd {
     },
     /// Wipe config, keychain entry, and the entire data dir (SPEC §15)
     Reset {
+        /// Skip the interactive reset confirmation
         #[arg(long)]
         force: bool,
     },
@@ -307,6 +375,9 @@ enum Cmd {
     /// A message queued while an earlier Run closes exits 2 without a
     /// foreground answer. JSON reports status queued; JSONL emits only
     /// actual events, and result output files remain unchanged.
+    #[command(
+        after_help = "Examples:\n  formless run \"Summarize README.md\" --estimate\n  formless run \"Summarize README.md\" --output final\n  printf 'Summarize README.md' | formless run -\n  git diff | formless run \"Review this diff\" --output json"
+    )]
     Run {
         /// Print a local forecast and exit without starting or changing anything
         #[arg(long)]
@@ -376,15 +447,23 @@ enum BackupAction {
         json: bool,
     },
     /// Verify a standalone snapshot without changing its bytes
-    Verify { file: std::path::PathBuf },
+    Verify {
+        /// Path to the standalone backup snapshot to verify
+        file: std::path::PathBuf,
+    },
     /// Restore using exclusive ownership and seven bounded recovery copies
     Restore {
+        /// Path to the database backup to restore
         file: std::path::PathBuf,
+        /// Check and preview the restore without replacing the database
         #[arg(long)]
         dry_run: bool,
     },
     /// Migrate and read a private copy without serving or running any work
-    Drill { file: Option<std::path::PathBuf> },
+    Drill {
+        /// Snapshot to rehearse; omit to use the newest available backup
+        file: Option<std::path::PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -409,6 +488,7 @@ enum AuthAction {
     },
     /// Revoke and delete the selected provider's stored OAuth tokens
     Logout {
+        /// Provider name from [providers.NAME] (default: [provider])
         #[arg(long)]
         provider: Option<String>,
     },
@@ -445,6 +525,7 @@ enum RelayAction {
     },
     /// Disable the relay (pairing secret is kept unless --forget)
     Disable {
+        /// Also delete the pairing secret instead of keeping it for later
         #[arg(long)]
         forget: bool,
     },
@@ -476,23 +557,36 @@ enum PromptsAction {
     /// Generate and measure a new proposal
     Generate,
     /// Apply a measured proposal
-    Apply { id: String },
+    Apply {
+        /// ID of the prompt or memory proposal
+        id: String,
+    },
     /// Reject a proposal
-    Reject { id: String },
+    Reject {
+        /// ID of the prompt or memory proposal
+        id: String,
+    },
     /// Roll back an applied proposal
-    Rollback { id: String },
+    Rollback {
+        /// ID of the prompt or memory proposal
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
 enum ToolsAction {
     /// Retained description warnings and exact before/after changes
     Reviews {
+        /// Tool name to inspect; omit to list retained reviews
         name: Option<String>,
+        /// Filter retained reviews by their recorded kind
         #[arg(long)]
         kind: Option<String>,
+        /// Print machine-readable JSON instead of human-readable output
         #[arg(long)]
         json: bool,
     },
+    /// List registered Tools and their current status
     List {
         /// One JSON value instead of a table
         #[arg(long)]
@@ -502,20 +596,33 @@ enum ToolsAction {
         tag: Option<String>,
     },
     /// Switch a Tool off: hidden from the agent and uncallable, nothing else changes
-    Disable { name: String },
+    Disable {
+        /// Tool name or ID
+        name: String,
+    },
     /// Switch a Tool back on
-    Enable { name: String },
+    Enable {
+        /// Tool name or ID
+        name: String,
+    },
     /// Revert the newest registry change (create, update, retire, restore
     /// or rollback, by anyone)
     Undo,
     /// Always list a Tool to the agent (from each Session's next listing)
-    Pin { name: String },
+    Pin {
+        /// Tool name or ID
+        name: String,
+    },
     /// Stop always listing a Tool
-    Unpin { name: String },
+    Unpin {
+        /// Tool name or ID
+        name: String,
+    },
     /// Set a Tool's tags (none clears them): `tools tag fetch_page web http`
     Tag {
         /// Tool name or id
         name: String,
+        /// Tags to assign to this Tool; omit all tags to clear them
         tags: Vec<String>,
     },
     /// A Tool's description, schemas, Capabilities, versions and stats
@@ -528,21 +635,28 @@ enum ToolsAction {
     },
     /// Retire a Tool: hidden from the agent, kept with its history
     Retire {
+        /// Tool name or ID
         name: String,
         /// Retire even when other Tools use it (required when not on a terminal)
         #[arg(long)]
         force: bool,
     },
     /// Bring a retired Tool back
-    Restore { name: String },
+    Restore {
+        /// Tool name or ID
+        name: String,
+    },
     /// Make an earlier version current again (default: the one before)
     Rollback {
+        /// Tool name or ID
         name: String,
+        /// Version number to make current; omit for the preceding version
         #[arg(long)]
         to: Option<i64>,
     },
     /// Delete a Tool and all its versions and history for good
     Purge {
+        /// Tool name or ID
         name: String,
         /// Required without a terminal to confirm on
         #[arg(long)]
@@ -566,11 +680,14 @@ enum ToolsAction {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Write one Tool or the whole registry as an importable bundle
     Export {
         /// Tool name or id (omit with --all)
         name: Option<String>,
+        /// Export every Tool instead of naming one
         #[arg(long, conflicts_with = "name")]
         all: bool,
+        /// Bundle destination; omit to write to standard output
         #[arg(short, long)]
         output: Option<String>,
     },
@@ -589,12 +706,15 @@ enum ToolsAction {
 enum SkillsAction {
     /// Retained Skill description warnings and changes
     Reviews {
+        /// Skill name to inspect; omit to list retained reviews
         name: Option<String>,
+        /// Print machine-readable JSON instead of human-readable output
         #[arg(long)]
         json: bool,
     },
     /// Install from a folder, a git URL or a .zip (installed disabled)
     Add {
+        /// Folder, Git URL or .zip archive containing the Skill
         source: String,
         /// Folder inside the source that holds SKILL.md
         #[arg(long)]
@@ -606,34 +726,46 @@ enum SkillsAction {
         #[arg(long)]
         enable: bool,
     },
+    /// Remove an installed Skill
     Remove {
+        /// Installed Skill name
         name: String,
     },
+    /// List installed Skills and whether they are enabled
     List {
         /// One JSON value instead of a table
         #[arg(long)]
         json: bool,
     },
+    /// Make an installed Skill available to the agent
     Enable {
+        /// Installed Skill name
         name: String,
     },
+    /// Keep an installed Skill but hide it from the agent
     Disable {
+        /// Installed Skill name
         name: String,
     },
     /// Print a skill's SKILL.md and files, to review before enabling
     Show {
+        /// Installed Skill name
         name: String,
     },
     /// Write a skill (or --all) as a bundle file (no metrics)
     Export {
+        /// Installed Skill name; omit with --all
         name: Option<String>,
+        /// Export every installed Skill instead of naming one
         #[arg(long, conflicts_with = "name")]
         all: bool,
+        /// Bundle destination; omit to write to standard output
         #[arg(short, long)]
         output: Option<String>,
     },
     /// Install a bundle; imported skills start disabled for review
     Import {
+        /// Path to an exported Skill bundle
         file: String,
     },
 }
@@ -658,6 +790,7 @@ enum PricesAction {
 
 #[derive(Subcommand)]
 enum ProvidersAction {
+    /// List configured providers and their endpoint/model settings
     List {
         /// One JSON value instead of a table
         #[arg(long)]
@@ -665,7 +798,9 @@ enum ProvidersAction {
     },
     /// Add or update a provider; the API key is read from stdin (not argv)
     Add {
+        /// Name to store for this provider configuration
         name: String,
+        /// Provider API base URL; use --preset or Azure options instead when applicable
         #[arg(long, required_unless_present_any = ["preset", "azure_resource"])]
         base_url: Option<String>,
         /// Azure OpenAI: the resource name (or its https://… endpoint)
@@ -697,13 +832,17 @@ enum ProvidersAction {
         #[arg(long)]
         no_key: bool,
     },
+    /// Remove a named provider configuration
     Remove {
+        /// Configured provider name
         name: String,
     },
     /// Fetch the provider's /models list; with --model, test that model:
     /// latency, streaming, reasoning and tool calls
     Test {
+        /// Configured provider name
         name: String,
+        /// Model ID to probe; omit to list the provider's available models
         #[arg(long)]
         model: Option<String>,
     },
@@ -711,6 +850,7 @@ enum ProvidersAction {
 
 #[derive(Subcommand)]
 enum RolesAction {
+    /// List configured Roles and their provider/model mappings
     List {
         /// One JSON value instead of a table
         #[arg(long)]
@@ -718,6 +858,7 @@ enum RolesAction {
     },
     /// Create or replace a role
     Add {
+        /// Name to store for this Role
         name: String,
         /// When to use it, for the agent ("fast; broad read-only search")
         #[arg(long)]
@@ -725,21 +866,26 @@ enum RolesAction {
         /// Provider name (default: [provider])
         #[arg(long)]
         provider: Option<String>,
+        /// Model ID or configured alias for this Role
         #[arg(long, default_value = "")]
         model: String,
+        /// Reasoning-effort override, for example low, medium or high
         #[arg(long)]
         effort: Option<String>,
         /// Extra system prompt for sub-agents in this role
         #[arg(long)]
         system: Option<String>,
     },
+    /// Remove a configured Role
     Rm {
+        /// Configured Role name
         name: String,
     },
 }
 
 #[derive(Subcommand)]
 enum JobsAction {
+    /// List scheduled jobs and their current state
     List {
         /// One JSON value instead of a table
         #[arg(long)]
@@ -748,6 +894,7 @@ enum JobsAction {
     /// Schedule a prompt: --every "weekday at 9am" or --cron "0 3 * * *"
     /// (recurring), or --at "in 30m"
     Add {
+        /// Task text to send to the agent when the job fires
         prompt: String,
         /// Cron expression, or plain English ("every 2 hours")
         #[arg(
@@ -778,22 +925,30 @@ enum JobsAction {
     },
     /// Fire a job now (its schedule is unchanged)
     Run {
+        /// Scheduled job ID
         id: String,
     },
     /// A job's recent firings: time, trigger, outcome, cost, Session
     History {
+        /// Scheduled job ID
         id: String,
+        /// Print machine-readable JSON instead of human-readable output
         #[arg(long)]
         json: bool,
     },
     /// Enable (and approve) a job
     Enable {
+        /// Scheduled job ID
         id: String,
     },
+    /// Pause a scheduled job without deleting it
     Disable {
+        /// Scheduled job ID
         id: String,
     },
+    /// Remove a scheduled job
     Rm {
+        /// Scheduled job ID
         id: String,
     },
 }
@@ -802,6 +957,7 @@ enum JobsAction {
 enum SecurityAction {
     /// One-screen audit of the attack surface
     Status {
+        /// Print machine-readable JSON instead of human-readable output
         #[arg(long)]
         json: bool,
     },
@@ -817,22 +973,31 @@ enum MemoryAction {
     },
     /// Add a note
     Add {
+        /// Note text to remember
         text: String,
         /// "global" or "project:/abs/path"
         #[arg(long, default_value = "global")]
         scope: String,
     },
     /// Delete a note
-    Rm { id: String },
+    Rm {
+        /// ID of the memory note
+        id: String,
+    },
     /// Change a note's text or scope, or disable/enable it
     Edit {
+        /// ID of the memory note
         id: String,
+        /// Replacement note text; omit to leave the text unchanged
         #[arg(long)]
         text: Option<String>,
+        /// Replacement scope: global or project:/absolute/path
         #[arg(long)]
         scope: Option<String>,
+        /// Keep the note but stop including it in agent context
         #[arg(long, conflicts_with = "enable")]
         disable: bool,
+        /// Include a previously disabled note in agent context again
         #[arg(long)]
         enable: bool,
     },
@@ -843,6 +1008,7 @@ enum McpAction {
     /// Add a server: `add NAME -- COMMAND [ARGS]` (stdio), `add NAME --url
     /// URL` (http), or `add ID` for a catalog server (`mcp catalog`)
     Add {
+        /// Server name to configure, or a catalog entry ID
         name: String,
         /// A catalog server's setting, `key=value` (e.g. `path=~/notes`)
         #[arg(long = "param")]
@@ -870,7 +1036,10 @@ enum McpAction {
         command: Vec<String>,
     },
     /// Remove a server (its tools are retired, metrics kept)
-    Remove { name: String },
+    Remove {
+        /// Configured MCP server name
+        name: String,
+    },
     /// Configured servers: state, tool count, last error
     List {
         /// One JSON value instead of a table
@@ -878,11 +1047,20 @@ enum McpAction {
         json: bool,
     },
     /// Restart a server and list its tools again
-    Test { name: String },
+    Test {
+        /// Configured MCP server name
+        name: String,
+    },
     /// Authorize Formless with a remote (http) MCP server via OAuth
-    Login { server: String },
+    Login {
+        /// Configured remote MCP server name
+        server: String,
+    },
     /// Delete a server's stored OAuth tokens
-    Logout { server: String },
+    Logout {
+        /// Configured remote MCP server name
+        server: String,
+    },
     /// Popular servers you can add by name (`formless mcp add ID`)
     Catalog,
     /// Find servers configured in Claude Desktop, Cursor or VS Code and
@@ -897,18 +1075,27 @@ enum McpAction {
     },
     /// The end of a stdio server's stderr log
     Log {
+        /// Configured MCP server name
         name: String,
+        /// Maximum number of recent stderr log lines to show
         #[arg(long, default_value_t = 50)]
         lines: usize,
     },
     /// A server's tools, on or off, with their token cost
-    Tools { name: String },
+    Tools {
+        /// Configured MCP server name
+        name: String,
+    },
     /// Turn one of a server's tools on or off
     Tool {
+        /// Configured MCP server name
         name: String,
+        /// Name of the server's Tool to change
         tool: String,
+        /// Enable this server Tool
         #[arg(long, conflicts_with = "off")]
         on: bool,
+        /// Disable this server Tool
         #[arg(long)]
         off: bool,
     },
@@ -928,31 +1115,42 @@ enum NamingAction {
         model: Option<String>,
     },
     /// Print the title the namer would give a first message
-    Test { text: String },
+    Test {
+        /// First-message text to turn into a Session title
+        text: String,
+    },
 }
 
 #[derive(Subcommand)]
 enum ApprovalsAction {
     /// Outstanding capability requests (no daemon is started)
     Pending {
+        /// Print machine-readable JSON instead of human-readable output
         #[arg(long)]
         json: bool,
     },
     /// Answer one pending request; Once unless --session is given
     Approve {
+        /// ID or unambiguous prefix of the pending approval to answer
         id: String,
+        /// Grant this pending request once (the default scope)
         #[arg(long, conflicts_with = "session")]
         once: bool,
+        /// Grant this pending request for its Session
         #[arg(long)]
         session: bool,
+        /// Confirm a broad Session grant without terminal input
         #[arg(long)]
         yes: bool,
+        /// Print machine-readable JSON instead of human-readable output
         #[arg(long)]
         json: bool,
     },
     /// Deny one pending request without a permanent denial
     Deny {
+        /// ID or unambiguous prefix of the pending approval to deny
         id: String,
+        /// Print machine-readable JSON instead of human-readable output
         #[arg(long)]
         json: bool,
     },
@@ -961,6 +1159,7 @@ enum ApprovalsAction {
         /// Only this Capability family (fs, net, process, env, …)
         #[arg(long)]
         family: Option<String>,
+        /// Print machine-readable JSON instead of human-readable output
         #[arg(long)]
         json: bool,
     },
@@ -979,15 +1178,19 @@ enum ApprovalsAction {
         /// Every grant (with --family, every grant of that family)
         #[arg(long, conflicts_with_all = ["tool", "capability", "scope", "session"])]
         all: bool,
+        /// With --all, restrict revocation to one Capability family
         #[arg(long)]
         family: Option<String>,
     },
     /// Capabilities you always deny; --forget CAP (or --all) to ask again
     Denials {
+        /// Forget the stored denial for this exact Capability
         #[arg(long)]
         forget: Option<String>,
+        /// Forget every stored permanent denial
         #[arg(long)]
         all: bool,
+        /// Print machine-readable JSON instead of human-readable output
         #[arg(long)]
         json: bool,
     },
@@ -1215,11 +1418,13 @@ fn approvals_cmd(paths: &Paths, action: ApprovalsAction) -> Result<()> {
 enum ProfilesAction {
     /// Every profile, whether its daemon runs, and where its data lives
     List {
+        /// Print machine-readable JSON instead of human-readable output
         #[arg(long)]
         json: bool,
     },
     /// Delete a profile's data, config and stored secrets
     Rm {
+        /// Name of the non-default profile to remove
         #[arg(value_parser = parse_profile_name)]
         name: String,
         /// Don't ask for confirmation (required when not on a terminal)
@@ -1347,6 +1552,7 @@ enum DaemonAction {
     UninstallService,
     /// Start the daemon if not running
     Start,
+    /// Stop the running daemon
     Stop,
     /// Stop the daemon once its Runs finish, then start a fresh one
     Restart {
@@ -1354,6 +1560,7 @@ enum DaemonAction {
         #[arg(long)]
         force: bool,
     },
+    /// Show whether the daemon is running and its current status
     Status {
         /// JSON even when the daemon isn't running ({"running": false})
         #[arg(long)]
@@ -3704,9 +3911,13 @@ fn format_duration(d: std::time::Duration) -> String {
 /// What `formless run` prints (SPEC §12).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum RunOutput {
+    /// Stream the answer and progress as readable text
     Text,
+    /// Print only the final answer on standard output
     Final,
+    /// Print one result object after the Run ends
     Json,
+    /// Print each actual Run event as one JSON line
     #[value(name = "jsonl-events")]
     JsonlEvents,
 }
@@ -4766,23 +4977,31 @@ fn web_cmd(paths: Paths, port: Option<u16>, no_open: bool, stop: bool) -> Result
 enum SessionsAction {
     /// Fork stored history without starting a Run
     Fork {
+        /// Session ID or unambiguous prefix
         id: String,
+        /// Name for the new branch Session
         #[arg(long)]
         name: Option<String>,
+        /// Last stored message sequence to include in the fork
         #[arg(long)]
         up_to_seq: Option<i64>,
+        /// Print machine-readable JSON instead of human-readable output
         #[arg(long)]
         json: bool,
     },
     /// Compare stored branch messages and recorded local usage (no model call)
     Compare {
+        /// First Session ID or unambiguous prefix, in comparison order
         left: String,
+        /// Second Session ID or unambiguous prefix, in comparison order
         right: String,
+        /// Print machine-readable JSON instead of human-readable output
         #[arg(long)]
         json: bool,
     },
     /// List Sessions (archived ones only with --archived)
     List {
+        /// List archived Sessions instead of active Sessions
         #[arg(long)]
         archived: bool,
         /// One JSON array of SessionInfo
@@ -4791,6 +5010,7 @@ enum SessionsAction {
     },
     /// Show a Session's transcript
     Show {
+        /// Session ID or unambiguous prefix
         id: String,
         /// Observe the current/latest Run without interrupting it on Ctrl+C
         #[arg(long)]
@@ -4804,44 +5024,75 @@ enum SessionsAction {
     },
     /// Show a Run's tracked files and diffs
     Files {
+        /// Session ID or unambiguous prefix
         id: String,
+        /// Run ID whose tracked files to inspect; omit for the latest Run
         #[arg(long)]
         run: Option<String>,
+        /// Print machine-readable JSON instead of human-readable output
         #[arg(long)]
         json: bool,
     },
     /// Attempt safe restoration of one path or all tracked files
     Rewind {
+        /// Session ID or unambiguous prefix
         id: String,
+        /// Tracked path to restore; omit to consider all tracked files
         path: Option<String>,
+        /// Run ID whose tracked files to restore; omit for the latest Run
         #[arg(long)]
         run: Option<String>,
+        /// Print machine-readable JSON instead of human-readable output
         #[arg(long)]
         json: bool,
     },
     /// Rename a Session
-    Rename { id: String, name: String },
+    Rename {
+        /// Session ID or unambiguous prefix
+        id: String,
+        /// New display name for the Session
+        name: String,
+    },
     /// Delete a Session (restorable for daemon.delete_undo_secs)
-    Rm { id: String },
+    Rm {
+        /// Session ID or unambiguous prefix
+        id: String,
+    },
     /// Bring back a Session deleted moments ago (full id)
-    Restore { id: String },
+    Restore {
+        /// Full ID of the recently deleted Session
+        id: String,
+    },
     /// Import a Session bundle (from `sessions export --format json`)
-    Import { file: std::path::PathBuf },
+    Import {
+        /// Path to an exported JSON Session bundle
+        file: std::path::PathBuf,
+    },
     /// Search every Session's messages
     Search {
+        /// Text to find in stored Session messages
         query: String,
+        /// Maximum number of matching messages to return
         #[arg(long, default_value_t = 20)]
         limit: usize,
+        /// Print machine-readable JSON instead of human-readable output
         #[arg(long)]
         json: bool,
     },
     /// Hide a Session from the default list (kept and searchable)
-    Archive { id: String },
+    Archive {
+        /// Session ID or unambiguous prefix
+        id: String,
+    },
     /// Bring an archived Session back
-    Unarchive { id: String },
+    Unarchive {
+        /// Session ID or unambiguous prefix
+        id: String,
+    },
     /// Export a Session: the re-importable JSON bundle, or a readable
     /// Markdown or HTML transcript
     Export {
+        /// Session ID or unambiguous prefix
         id: String,
         /// json, markdown (md) or html
         #[arg(long, default_value = "json")]
@@ -5075,10 +5326,18 @@ enum ConfigAction {
     /// Print where config.toml is
     Path,
     /// Print a setting's value (with FORMLESS_* overrides applied)
-    Get { key: String },
+    Get {
+        /// Dotted setting name, for example provider.model
+        key: String,
+    },
     /// Set a setting through the daemon: validated, audited and applied at
     /// once. VALUE is JSON when it parses as JSON (5, true, ["a"]), else text
-    Set { key: String, value: String },
+    Set {
+        /// Dotted setting name, for example limits.run_steps
+        key: String,
+        /// New value as JSON when valid JSON, otherwise as literal text
+        value: String,
+    },
     /// Edit config.toml in $EDITOR; it is replaced only if it still parses
     Edit,
 }

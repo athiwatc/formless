@@ -516,24 +516,83 @@ formless profiles rm sandbox     # stops its daemon, deletes its data, config an
 
 ### 3.11 CLI reference
 
-| Command | Behaviour |
-|---|---|
-| `formless` (or `formless tui`) | Launch the TUI, auto-starting the daemon |
-| `formless approvals list\|revoke` | Every approval grant (Tool, Capability, scope, when, by which client, last used); revoke one, several (`--family`) or all |
-| `formless chat [--session ID \| --new]` | Line-mode REPL (no full screen): streamed answers, approvals and questions answered inline, for dumb terminals, SSH and screen readers |
-| `formless run "task"` | Headless Run in an ephemeral Session; `--session <id>` to continue one (`--continue`/`-c` = the last run's); `--json` for one JSON event per line; `--yes` to auto-approve sensitive Invocations for that Run (nothing is stored) |
-| `formless daemon start\|stop\|status\|serve` | Daemon lifecycle |
-| `formless relay enable\|disable\|status` | Encrypted browser access (v2) |
-| `formless tools list\|show\|run\|export\|import` | Registry inspection, direct runs, and transfer (no secrets, no metrics) |
-| `formless tools retire\|restore\|rollback [--to N]\|purge [--force]` | Tool lifecycle, as in the Tools view |
-| `formless auth login\|status\|logout` | OAuth sign-in for subscription providers (v2) |
-| `formless prompts list\|generate\|apply\|reject\|rollback` | Measured prompt/memory proposals (v2) |
-| `formless update [--check]` | Show the release notes of every newer release, then the upgrade command for how you installed (`--check` / `update check` only reports); never modifies the binary |
-| `formless naming status\|pull\|test "<message>"` | Session-naming model: install state, download now, preview a title |
-| `formless doctor` | Config validity, data dir, keychain reachability, endpoint + tool-calling probe |
-| `formless reset [--force]` | Full wipe of config, keychain entry and data dir |
+With no command, `formless` launches the TUI and auto-starts its daemon.
+The table covers every visible root command, including Clap's generated
+`help` command. Use `formless COMMAND --help` for arguments and defaults;
+`formless help COMMAND SUBCOMMAND` also opens nested help.
 
-Global flags: `--profile <name>`, `--secure` (turn approval prompts on for the daemon this starts). Approvals are opt-in; with them on, headless approvals **fail closed**: an unapproved sensitive Invocation fails with a clear error unless `--yes` is passed.
+| Command | Actions / useful options | Purpose |
+|---|---|---|
+| `formless approvals` | `pending`, `approve`, `deny`, `list`, `revoke`, `denials` | Inspect pending requests, answer one, or inspect and manage existing grants/denials. |
+| `formless auth` | `login`, `status`, `logout` | Manage provider credentials (API key or OAuth). |
+| `formless backup` | No action: create; `list`, `verify`, `restore`, `drill` | Create, inspect, verify, restore, or rehearse database snapshots. |
+| `formless bug-report` | `-o FILE` / `--output FILE` | Write a redacted Markdown diagnostic report. |
+| `formless chat` | `--session ID` or `--new` | Line-mode chat with streamed answers and inline questions. |
+| `formless commands` | `list` | List local user-defined slash-command metadata without starting a daemon. |
+| `formless completions` | `bash`, `zsh`, `fish`, `powershell`, `elvish` | Print a shell completion script. |
+| `formless config` | `path`, `get`, `set`, `edit` | Locate, inspect, validate, or edit configuration. |
+| `formless daemon` | `start`, `stop`, `restart`, `status`, `serve`, `install-service`, `uninstall-service` | Manage the daemon and its optional login service. |
+| `formless docs` | Optional topic; `--print`, `--keys` | Open a guide, print its URL, or print the embedded keyboard reference. |
+| `formless doctor` | `--json`, `--fix`, `--restore-drill` | Diagnose setup, apply safe fixes, or rehearse the newest backup. |
+| `formless export-all` | `--sessions`, `-o FILE` / `--output FILE` | Write a portable setup bundle, optionally including Session transcripts. |
+| `formless gc` | `--dry-run` | Free reclaimable storage or preview what would be freed. |
+| `formless help` | Optional command path, such as `sessions show` | Print help for the CLI or a nested command. |
+| `formless import-all` | `FILE` | Add a portable setup bundle without overwriting existing entries. |
+| `formless jobs` | `list`, `add`, `run`, `history`, `enable`, `disable`, `rm` | Manage scheduled prompts and inspect their history. |
+| `formless logs` | `--follow`, `--level`, `--since`, `--lines` | Read or follow the daemon log and rotated files. |
+| `formless mcp` | `add`, `remove`, `list`, `test`, `login`, `logout`, `catalog`, `import`, `log`, `tools`, `tool` | Manage external MCP servers and inspect their tools/logs. |
+| `formless memory` | `list`, `add`, `rm`, `edit` | Inspect or change saved user-memory notes. |
+| `formless naming` | `status`, `pull`, `test` | Inspect, install, or preview the embedded Session-naming model. |
+| `formless prices` | `import` | Import a model-price catalog for cost and spending limits. |
+| `formless profiles` | `list`, `rm` | List or remove isolated profiles. |
+| `formless prompts` | `list`, `generate`, `apply`, `reject`, `rollback` | Inspect and manage measured prompt/memory proposals. |
+| `formless providers` | `list`, `add`, `remove`, `test` | Manage named model providers and test a connection. |
+| `formless relay` | `enable`, `disable`, `status` | Manage encrypted browser access through the relay. |
+| `formless reset` | `--force` | Wipe configuration, credentials, and the current profile's data. |
+| `formless restore` | `FILE` | Replace the database from a backup, preserving the current database. |
+| `formless roles` | `list`, `add`, `rm` | Map named purposes to a provider and model. |
+| `formless run` | `TASK`; `--estimate`, `--session`, `--output`, `--attach` and other Run options | Run one headless task, or print its local forecast without starting it. |
+| `formless runs` | No action: list; `show`, `cancel` | List recent Runs, inspect one by ID/prefix, or cancel that exact Run. |
+| `formless security` | `status` | Inspect the daemon's grants, denials, trusted resources, and exposed interfaces. |
+| `formless sessions` | `fork`, `compare`, `list`, `show`, `files`, `rewind`, `rename`, `rm`, `restore`, `import`, `search`, `archive`, `unarchive`, `export` | Manage stored Sessions, follow a Run with `show --follow`, or inspect tracked files. |
+| `formless skills` | `reviews`, `add`, `remove`, `list`, `enable`, `disable`, `show`, `export`, `import` | Inspect and manage Skills and their retained description reviews. |
+| `formless storage` | `--json` | Report disk usage by data category. |
+| `formless tools` | `reviews`, `list`, `disable`, `enable`, `undo`, `pin`, `unpin`, `tag`, `show`, `retire`, `restore`, `rollback`, `purge`, `run`, `export`, `import` | Inspect, manage, run, or transfer registry Tools. |
+| `formless tui` | No action | Launch the full-screen terminal client; also the default with no command. |
+| `formless uninstall` | `--keep-data`, `--keep-binary`, `--yes` (alias `--force`) | Remove Formless, optionally retaining data or the binary. |
+| `formless update` | No action, `check`, or `--check` | Show newer release notes and the applicable upgrade command; never rewrite the binary. |
+| `formless web` | `--port`, `--no-open`, `--stop` | Open, print a link for, or stop the local browser UI. |
+
+#### Root and global flags
+
+| Flag | Short | Availability | Meaning |
+|---|---|---|---|
+| `--profile` | — | Global | Select isolated profile `NAME`; separate daemon and data directory. |
+| `--secure` | — | Global | Ask for approval before sensitive Tool calls; also `security.secure = true`. |
+| `--plain` | — | Root/TUI startup | Use line-oriented, screen-reader-friendly output without redraws, spinners, or borders. |
+| `--continue` | `-c` | Root/TUI startup | Open the most recently active Session; conflicts with `--new`. |
+| `--new` | — | Root/TUI startup | Start a fresh Session; conflicts with `--continue`. |
+| `--help` | `-h` | Root; also available on subcommands | Print help for the selected command. |
+| `--version` | `-V` | Root | Print the executable version. |
+
+Global flags can appear before or after a subcommand. `--plain`,
+`--continue`/`-c`, and `--new` are root-only options for TUI startup: put them
+before `tui`, or omit the command. They are not inherited by subcommands.
+The separate `run --continue`/`run -c`
+continues the Session used by the previous headless Run.
+
+Approvals are opt-in; with them on, headless approvals **fail closed**: an
+unapproved sensitive Invocation fails with a clear error unless `run --yes`
+is passed.
+
+For example, these print help without running a task:
+
+```sh
+formless --help
+formless sessions --help
+formless runs show --help
+formless help sessions show
+```
 
 ### 3.12 Updating
 
@@ -855,6 +914,11 @@ cargo clippy --workspace --all-targets # lints
 RUST_LOG=debug cargo run -- daemon status
 RUST_LOG=debug cargo run -- run "write a tool that converts a CSV to JSON"
 ```
+
+`cargo test -p formless-bin cli_help_tests` checks every visible command's help
+without dispatching commands, and compares the rendered root help and command
+definitions with the README §3.11 and SPEC §12 reference tables. It runs as part
+of the workspace tests and rejects missing, stale, or duplicate entries.
 
 Rules of the road: **no behaviour may live only in a client** — the CLI and TUI are both clients of the daemon protocol. Every Tool is validated and smoke-tested at creation, and every behavioural change should be reflected in `SPEC.md` first.
 

@@ -5,6 +5,7 @@ use super::*;
 #[derive(Subcommand)]
 pub(super) enum Action {
     /// List config/commands and this project's .formless/commands templates
+    #[command(after_help = "Examples:\n  formless commands list\n  formless commands list --json")]
     List {
         /// Metadata, diagnostics and shadowed files as one JSON object
         #[arg(long)]
