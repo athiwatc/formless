@@ -68,7 +68,7 @@ def expose_script(route):
     const fixture816={S, onEvent, openSession, setView, renderChrome, renderHistory,
       renderLive, scrollToBottom, resetReadingSession, withTranscriptLayout,
       scheduleEventRender, cancelEventRender, updateElapsedTimers, setThinking, streamingNode, splitStreaming, markdown, MD_FORMAT_CHARS,
-      stats:{history:0,live:0,status:0,composer:0}, diagrams:new Map(), calls:[]};
+      stats:{history:0,live:0,status:0,composer:0}, diagrams:new Map(), snapshots:new Map(), calls:[]};
     const painted816={renderHistory,renderLive,renderStatus,renderComposer};
     renderHistory=(...args)=>{fixture816.stats.history++;return painted816.renderHistory(...args);};
     renderLive=(...args)=>{fixture816.stats.live++;return painted816.renderLive(...args);};
@@ -95,6 +95,7 @@ def expose_script(route):
     };
     const reply816=async req=>{
       fixture816.calls.push(req.type);
+      if(req.type==='get_session'&&fixture816.snapshots.has(req.id))return fixture816.snapshots.get(req.id);
       if(req.type==='get_session')return {session:S.sessions.find(s=>s.id===req.id),messages:fixture816.messages(req.id,24),queued_items:[],plan_items:[]};
       if(req.type==='subscribe')return {conn:'fixture-browser'};
       if(req.type==='context_usage')return {used_tokens:100,context_tokens:10000};
@@ -264,6 +265,49 @@ def markdown_block_cases(page, name):
     for key,value in result['identities'].items():
         check(value,name+' loose-list sibling append preserves '+key)
     check(result['math'],name+' completed display math has one nonempty box and both equation lines')
+
+
+def committed_stream_cases(page, name):
+    for mode in ['complete','tool-step','background-event','background-snapshot']:
+        sid='commit-'+mode
+        page.evaluate(r'''sid=>{const d=__stream816;__raf816.release();d.S.current=sid;d.S.view='chat';d.S.channel={};d.S.daemonOnline=true;
+          d.S.sessions=[{id:sid,name:'Reading commit fixture',updated_at:'2026-11-02T12:00:00Z'},{id:'reading-away',name:'Away fixture',updated_at:'2026-11-02T12:00:00Z'}];
+          d.S.messages=[{id:sid+'-user',seq:1,role:'user',content:'Read this long streamed answer',meta:'{}',created_at:'2026-11-02T12:00:00Z'}];
+          d.S.running.clear();d.S.running.add(sid);d.S.liveRun={id:sid+'-run',ended:false};d.S.thinking='Harmless visible thinking';d.S.showThinking=true;
+          d.S.liveTools=[{invocationId:'reading-display-call',name:'fixture_display_work',version:1,arguments:'{}',status:'running',started:Date.now(),depth:0}];
+          d.S.activity={label:'responding',since:Date.now()};
+          d.S.streaming=Array.from({length:45},(_,i)=>'Unique paragraph '+i+': '+('Keep this paragraph at the same screen position while the answer is persisted. '.repeat(8))).join('\n\n')+'\n\n';
+          window.commitText816=d.S.streaming;window.commitUser816=d.S.messages[0];
+          d.resetReadingSession(sid);d.renderChrome();d.paintHistory();d.scrollToBottom(true);
+        }''',sid)
+        settle(page);detach(page)
+        before=page.evaluate(r'''()=>{const box=document.querySelector('#transcript').getBoundingClientRect();
+          const block=[...document.querySelectorAll('#live .streaming p')].find(e=>{const r=e.getBoundingClientRect();return r.top>=box.top+5&&r.bottom<box.bottom-10;});
+          if(!block)throw new Error('No visible middle paragraph in live answer');
+          window.commitBlock816=block;return {text:block.textContent,top:block.getBoundingClientRect().top};}''')
+        check(page.evaluate('__stream816.S.follow') is False,name+' '+mode+' genuinely pauses in live answer')
+        check(page.evaluate('commitBlock816.closest("[data-live-root]")!=null'),name+' '+mode+' anchor starts inside live root')
+        if mode.startswith('background'):
+            page.evaluate('(sid)=>__stream816.openSession("reading-away")',sid);settle(page)
+            check(page.evaluate('__stream816.S.current')=='reading-away',name+' '+mode+' actually switches away before commit')
+        page.evaluate(r'''({sid,mode})=>{const d=__stream816;
+          const meta=mode==='tool-step'?JSON.stringify({tool_calls:[{id:'display-call',function:{name:'fixture_display_only',arguments:'{}'}}]}):'{}';
+          const message={id:sid+'-step',seq:2,role:'assistant',content:commitText816,meta,created_at:'2026-11-02T12:01:00Z'};
+          d.snapshots.set(sid,{session:d.S.sessions.find(s=>s.id===sid),messages:[commitUser816,message],queued_items:[],plan_items:[]});
+          if(mode!=='background-snapshot')d.onEvent({type:mode==='tool-step'?'message_appended':'message_complete',session_id:sid,message});
+        }''',{'sid':sid,'mode':mode})
+        if mode.startswith('background'):
+            page.evaluate('(sid)=>__stream816.openSession(sid)',sid)
+        settle(page,150)
+        after=page.evaluate(r'''({sid,text})=>{const message=[...document.querySelectorAll('[data-message-id]')].find(e=>e.dataset.messageId===sid+'-step');
+          const block=message&&[...message.querySelectorAll('p')].find(e=>e.textContent===text);
+          return {exists:!!block,top:block?.getBoundingClientRect().top,follow:__stream816.S.follow,oldConnected:commitBlock816.isConnected,current:__stream816.S.current};}''',{'sid':sid,'text':before['text']})
+        check(after['exists'] and after['current']==sid,name+' '+mode+' maps to matching persisted paragraph')
+        check(after['top']==before['top'],name+' '+mode+f' pixel-identical live-to-history anchor ({before["top"]} → {after["top"]})')
+        check(after['follow'] is False,name+' '+mode+' preserves paused follow state')
+        check(not after['oldConnected'],name+' '+mode+' really replaced the old live paragraph')
+        if mode=='tool-step':
+            check(page.evaluate('__stream816.S.running.has(__stream816.S.current)'),name+' Tool-call step commit is tested before Run completion')
 
 
 def run_engine(p, name, url, out):
@@ -460,6 +504,7 @@ def run_engine(p, name, url, out):
     check(not page.locator('#jump').evaluate('(e)=>e.classList.contains("hidden")'),name+' returning to Chat reports output received below the paused viewport')
 
     long_message_case(page,name,out)
+    committed_stream_cases(page,name)
     check(not errors,name+' no browser page errors: '+repr(errors))
     page.screenshot(path=str(out/'final-state.png'))
     report={'engine':name,'version':browser.version,'assertions':PASSES-start,'nativeOverflowAnchor':supported,'physicalSafari':False,'errors':errors}

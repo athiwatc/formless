@@ -1203,10 +1203,15 @@ pasting paths.
   input or a result's output.
 - **Accessible dialogs (web).** Every modal (including output viewers,
   model pickers, Session switchers, help and detail dialogs) uses shared
-  focus management: Tab and Shift+Tab stay in the top dialog, background
+  focus management: Tab and Shift+Tab stay in the top dialog and its feedback
+  actions, background
   content is inert, and closing restores its invoking element or a visible
   control in the active view if the original element disappeared. Nested
   dialogs restore the dialog underneath before returning to the page.
+  Live feedback stays non-inert and above every dialog; its actions support
+  pointer and keyboard activation. Recovery after removed or state-hidden
+  controls is coalesced to a frame, without layout probes on normal streamed
+  paints. Hover-only hiding and deliberate pointer click-away do not move focus.
   Escape and backdrop clicks use the dialog's existing cancellation or
   deferral action where dismissal is safe; they never choose a decision.
   The approval and question dialogs additionally:
@@ -1237,6 +1242,11 @@ pasting paths.
   pixel offsets across persisted output, disclosure changes and delayed diagram
   layout without native scroll anchoring. View and Session navigation retain
   paused reading state and discard stale paint callbacks. The new-output pill
+  Streamed paragraphs retain their offsets when their step becomes persisted
+  history, including Tool-call steps and saved Session bookmarks. Missing
+  semantic blocks never resolve to an empty live root; bounded text/sequence
+  signatures identify the matching persisted step after an offscreen commit.
+  The new-output pill
   tracks new content below the viewport; timer ticks and layout changes alone
   do not create it. Following resumes on an explicit user scroll to the bottom
   or pill action, rather than an approximate distance threshold or a

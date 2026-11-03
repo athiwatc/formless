@@ -20,6 +20,8 @@ export function installEventRenderFixture(context, fn) {
   // These fixtures isolate reducer/intent behavior rather than geometry.
   context.withTranscriptLayout ??= update => update();
   context.resetReadingSession ??= () => {};
+  context.reading ??= { session: null, anchor: null, saved: new Map() };
+  vm.runInContext(['readingStreamMatches', 'remapReadingStream', 'commitReadingStream'].map(fn).join('\n'), context);
   context.flushEventRender = () => {
     for (let turn = 0; frames.size; turn++) {
       assert.ok(turn < 10, 'presentation RAF queue must settle');

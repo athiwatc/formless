@@ -59,12 +59,15 @@ def expose_script(route):
     exposure = '''
     window.__focus817 = {
       S,h,openArtifact,openModelPicker,openSwitcher,showHelp,showRunFiles,modal,
-      ask,closeAsk,renderApproval,sessionMenu,messageMenu,closePopover,
+      ask,closeAsk,renderApproval,sessionMenu,messageMenu,closePopover,toast,onEvent,
       renderHistory,renderSessions,renderChrome,setView,
       openDialog,closeDialog,activeDialog,focusReturn,
       calls:[], deferredArtifact:false, deferredModels:false,
     };
     const fixture817 = window.__focus817;
+    fixture817.focusChecks=0;
+    const focusVisible817=focusVisible;
+    focusVisible=(...args)=>{fixture817.focusChecks++;return focusVisible817(...args);};
     const reply817 = async (req) => {
       fixture817.calls.push(req.type);
       if(req.type==='get_artifact') {
@@ -182,6 +185,56 @@ def menu_check(page, trigger, label):
     page.keyboard.press('Escape')
 
 
+def feedback_checks(page, cdp):
+    # Static pending presentation and harmless local feedback only. No approval
+    # action, authorization request, Tool execution or grant is performed.
+    page.evaluate("""()=>{const d=__focus817;d.calls=[];d.feedbackActions=0;
+      d.S.approvals=[{id:'feedback-approval',kind:'promotion',capabilities:[],tool_name:'feedback_fixture',deciding:true}];d.renderApproval();
+      d.toast('Broad access fixture: press again to grant it',true);
+      d.toast('Local feedback action',false,{label:'Fixture feedback action',ms:60000,run:()=>d.feedbackActions++});}""")
+    page.wait_for_selector('#modal-backdrop:not(.hidden)')
+    check(not page.locator('#toasts').evaluate('(e)=>e.inert'),'modal feedback region remains non-inert')
+    check(not ax_ignored(cdp,'#toasts [role=alert]'),'modal error feedback remains in accessibility tree')
+    action=page.get_by_role('button',name='Fixture feedback action',exact=True)
+    check(action.evaluate('(e)=>{const r=e.getBoundingClientRect();return e.contains(document.elementFromPoint(r.x+r.width/2,r.y+r.height/2));}'),'feedback action is topmost above approval backdrop')
+    action.focus();check(action.evaluate('(e)=>document.activeElement===e'),'dialog focus boundary permits feedback action')
+    action.click();check(page.evaluate('__focus817.feedbackActions')==1,'feedback action is genuinely clickable over modal')
+    page.evaluate("""()=>{const d=__focus817;d.modal('Nested feedback fixture',d.h('p',null,'Harmless display-only fixture'));
+      d.toast('Keyboard feedback',false,{label:'Keyboard feedback action',ms:60000,run:()=>d.feedbackActions++});}""")
+    keyboard_action=page.get_by_role('button',name='Keyboard feedback action',exact=True)
+    check(keyboard_action.evaluate('(e)=>{const r=e.getBoundingClientRect();return e.contains(document.elementFromPoint(r.x+r.width/2,r.y+r.height/2));}'),'feedback remains above nested dialog')
+    page.locator('.backdrop[aria-label="Nested feedback fixture"] button').last.focus();page.keyboard.press('Tab')
+    check(keyboard_action.evaluate('(e)=>document.activeElement===e'),'Tab from nested modal reaches feedback action')
+    page.keyboard.press('Enter');check(page.evaluate('__focus817.feedbackActions')==2,'feedback action supports keyboard activation')
+    check(page.evaluate('__focus817.calls.length')==0,'feedback fixtures never dispatch approval or Tool requests')
+    page.evaluate("""()=>{const d=__focus817;d.closeDialog(d.activeDialog().node);d.S.approvals=[];d.renderApproval();document.querySelector('#toasts').replaceChildren();}""")
+    check(not page.locator('#app').evaluate('(e)=>e.inert'),'closing dialogs restores normal app interactivity')
+
+
+def click_away_checks(page):
+    page.evaluate("""()=>{const d=__focus817;d.setView('chat');d.renderSessions();
+      const blank=document.createElement('div');blank.id='focus-click-away';blank.style.cssText='position:fixed;left:0;top:0;width:12px;height:12px;z-index:5000';document.body.append(blank);}""")
+    row=page.locator('.session:not(.active)').first;menu=row.locator('.menu')
+    row.hover();menu.focus();check(menu.evaluate('(e)=>e===document.activeElement'),'inactive Session menu genuinely focused before click-away')
+    page.mouse.click(4,4);page.mouse.move(900,700);page.wait_for_timeout(40)
+    check(page.evaluate('document.activeElement===document.body'),'blank pointer click intentionally leaves focus on body')
+    check(menu.evaluate('(e)=>getComputedStyle(e).visibility')=='hidden','previous menu is hidden by hover CSS only')
+    page.evaluate("""()=>{const d=__focus817;d.focusChecks=0;d.S.running.add(d.S.current);
+      for(let i=0;i<50;i++)d.onEvent({type:'message_delta',session_id:d.S.current,delta:'harmless focus stream '});}""")
+    page.wait_for_timeout(180)
+    check(page.evaluate('document.activeElement===document.body'),'streamed deltas do not undo deliberate click-away')
+    check(page.evaluate('__focus817.focusChecks')==0,'click-away streaming performs no focus visibility/layout probes')
+    row.hover();menu.focus();menu.evaluate('(e)=>e.blur()');page.mouse.move(900,700)
+    page.evaluate("__focus817.focusChecks=0;document.querySelector('#toasts').append(document.createTextNode('local status mutation'))")
+    page.wait_for_timeout(80)
+    check(page.evaluate('document.activeElement===document.body'),'CSS-only hidden menu is not treated as removed app state')
+    check(page.evaluate('__focus817.focusChecks')==0,'body mutation after hover loss performs no focus visibility/layout probes')
+    page.evaluate("""()=>{const e=document.createElement('button');e.id='focus-removed-fixture';e.textContent='Temporary recovery fixture';document.querySelector('#view-chat').append(e);e.focus();e.remove();}""")
+    page.wait_for_timeout(80)
+    check(page.evaluate('document.activeElement.matches(\'#tabs button[aria-current="page"]\')'),'actual removed invoker still recovers to active view control')
+    page.evaluate("""()=>{const d=__focus817;d.S.running.delete(d.S.current);d.S.streaming='';d.S.view='tools';d.renderChrome();d.renderHistory();document.querySelector('#focus-click-away').remove();document.querySelector('#toasts').replaceChildren();}""")
+
+
 def run():
     server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), functools.partial(QuietHandler, directory=str(ROOT / 'web')))
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -199,6 +252,8 @@ def run():
             fixture(page)
             cdp = context.new_cdp_session(page)
             cdp.send('Accessibility.enable')
+            feedback_checks(page,cdp)
+            click_away_checks(page)
             dialogs = [
                 ('artifact viewer', "__focus817.openArtifact('00000000-0000-0000-0000-000000000000')", '.backdrop:has(.viewer)'),
                 ('model picker', '__focus817.openModelPicker()', '.backdrop[aria-label="Model"]'),
