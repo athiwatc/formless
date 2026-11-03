@@ -10456,6 +10456,24 @@ impl App {
             self.settings_remove_arm = None;
         }
         match key.code {
+            KeyCode::Char('?') => {
+                let text = format!(
+                    "{}: {}\n{}\n{}",
+                    row.key,
+                    row.value,
+                    row.hint(),
+                    row.help.as_deref().unwrap_or("")
+                );
+                self.pager = Some(Pager {
+                    title: format!("Setting: {}", row.key),
+                    // Short lines work on narrow terminals; the normal pager
+                    // supports vertical and horizontal scrolling at any size.
+                    lines: wrap_rows(&text, 40),
+                    top: 0,
+                    left: 0,
+                    styled: Vec::new(),
+                });
+            }
             KeyCode::Esc => self.view = View::Chat,
             KeyCode::Up | KeyCode::Char('k') => self.settings_sel = sel.saturating_sub(1),
             KeyCode::Down | KeyCode::Char('j') => self.settings_sel = (sel + 1).min(rows.len() - 1),
@@ -15730,6 +15748,7 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &App) {
     let sel = app.settings_sel.min(rows.len().saturating_sub(1));
     let mut lines: Vec<Line> = Vec::new();
     let mut sel_line = 0;
+    let mut sel_end = 0;
     let mut section = "";
     for (i, row) in rows.iter().enumerate() {
         if row.section != section {
@@ -15759,19 +15778,19 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &App) {
             _ if row.value.is_empty() => Span::raw(""),
             _ => Span::raw(row.value.clone()),
         };
-        let mut spans = vec![
+        lines.push(Line::from(vec![
             Span::styled(format!("{mark}{}", ui::pad(&row.label, 20)), label_style),
             value,
-        ];
+        ]));
         if selected {
-            spans.push(Span::styled(
-                format!("   {}", row.hint()),
-                ui::dim(app.color),
-            ));
-        }
-        lines.push(Line::from(spans));
-        if let Some(help) = selected.then(|| setting_help(&row.key)).flatten() {
-            lines.push(Line::styled(format!("    {help}"), ui::dim(app.color)));
+            let width = area.width.saturating_sub(6) as usize;
+            for text in std::iter::once(format!("{} · ? full description", row.hint()))
+                .chain(row.help.clone())
+            {
+                for line in wrap_rows(&text, width) {
+                    lines.push(Line::styled(format!("    {line}"), ui::dim(app.color)));
+                }
+            }
         }
         if let Some((k, e)) = &app.settings_error {
             if *k == row.key {
@@ -15780,6 +15799,9 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &App) {
                     fg(app.color, Color::Red),
                 ));
             }
+        }
+        if selected {
+            sel_end = lines.len();
         }
     }
     if rows.is_empty() {
@@ -15790,7 +15812,7 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &App) {
     }
     // Keep the selection on screen.
     let height = area.height.saturating_sub(2) as usize;
-    let top = sel_line.saturating_sub(height.saturating_sub(2));
+    let top = sel_end.saturating_sub(height).min(sel_line);
     f.render_widget(
         Paragraph::new(lines.into_iter().skip(top).collect::<Vec<_>>()).block(ui::panel(
             " Settings ",
@@ -15802,19 +15824,6 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &App) {
     if let Some(form) = &app.settings_form {
         draw_settings_form(f, form, app.color);
     }
-}
-
-/// What a setting means and its default, from SPEC §13 (the same text the
-/// web Settings view shows).
-fn setting_help(key: &str) -> Option<String> {
-    static DOCS: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
-    let d = &DOCS.get_or_init(formless_core::config::setting_docs_json)[key];
-    let description = d["description"].as_str()?;
-    let default = match &d["default"] {
-        serde_json::Value::String(s) => s.clone(),
-        v => v.to_string(),
-    };
-    Some(format!("{description} · default {default}"))
 }
 
 fn draw_settings_form(f: &mut Frame, form: &settings::Form, color: bool) {
@@ -21471,6 +21480,82 @@ mod tests {
         assert!(screen.contains("Downloads and runs code"), "{screen}");
         assert!(!screen.contains("SecretForMcpOnly"));
         assert!(screen.contains("••••"));
+    }
+
+    #[test]
+    fn settings_selected_help_wraps_and_file_pointers_cannot_save() {
+        let mut app = test_app();
+        let mut cfg = Config::default();
+        cfg.provider.stall_notice_secs = 121;
+        cfg.save(&app.paths).unwrap();
+        app.view = View::Settings;
+        let rows = app.settings_rows();
+        app.settings_sel = rows
+            .iter()
+            .position(|r| r.key == "provider.stall_notice_secs")
+            .unwrap();
+        for (width, height) in [(80, 24), (48, 24)] {
+            let mut term =
+                Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            term.draw(|f| draw_settings(f, f.area(), &app)).unwrap();
+            let buffer = term.backend().buffer();
+            let screen: String = (0..height)
+                .map(|y| {
+                    (0..width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect();
+            let joined: String = screen.split_whitespace().collect();
+            assert!(joined.contains("default120"), "{screen}");
+            assert!(joined.contains("changedfromdefault"), "{screen}");
+            assert!(joined.contains("seconds"), "units are visible: {screen}");
+        }
+        // Even a long SPEC entry is fully readable in the existing scrollable
+        // pager, and closing it returns to the same Settings selection.
+        app.settings_sel = rows.iter().position(|r| r.key == "tui.theme").unwrap();
+        let selected = app.settings_sel;
+        app.settings_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+        let pager = app.pager.as_ref().unwrap();
+        let all: String = pager
+            .lines
+            .iter()
+            .flat_map(|line| line.split_whitespace())
+            .collect();
+        assert!(all.contains("defaultauto"));
+        assert!(all.contains("Configuredvalue:matchesdefault"));
+        assert!(all.contains("Everytextcolour"));
+        app.key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        assert_eq!(
+            app.pager.as_ref().unwrap().top,
+            app.pager.as_ref().unwrap().lines.len() - 1
+        );
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.pager.is_none());
+        assert_eq!(app.view, View::Settings);
+        assert_eq!(app.settings_sel, selected);
+        let (client, sent) = DaemonClient::recording();
+        app.client = Some(client);
+        for key in [
+            "provider.prices",
+            "provider.routing_models",
+            "hooks",
+            "security",
+            "optimiser.cooldown_secs",
+        ] {
+            app.settings_sel = rows.iter().position(|r| r.key == key).unwrap();
+            app.settings_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            assert!(app.settings_edit.is_none());
+            assert!(app.settings_form.is_none());
+            assert!(app.notes.last().unwrap().contains("edit config.toml"));
+        }
+        assert!(
+            matches!(sent.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)),
+            "read-only pointers issue no requests"
+        );
+        for (width, height) in [(1, 1), (20, 5), (80, 24)] {
+            render(&mut app, width, height);
+        }
     }
 
     #[test]
