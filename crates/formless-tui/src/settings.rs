@@ -583,6 +583,7 @@ pub enum FormKind {
 pub struct Form {
     pub kind: FormKind,
     catalog: Option<&'static formless_core::mcp_catalog::Entry>,
+    role_base: Option<Value>,
     pub title: String,
     pub review: Vec<String>,
     pub fields: Vec<Field>,
@@ -628,6 +629,7 @@ impl Form {
         Form {
             kind: FormKind::Provider,
             catalog: None,
+            role_base: None,
             review: Vec::new(),
             title: if existing.is_some() {
                 format!("Edit provider {}", get("name"))
@@ -692,10 +694,23 @@ impl Form {
                 .unwrap_or_default()
                 .to_string()
         };
+        let mut review = Vec::new();
+        if let Some(role) = existing {
+            review.push("Preserved advanced fields (edit in config.toml):".into());
+            for key in ["candidates", "reasoning_effort", "max_turns"] {
+                let line = format!("{key}: {}", role.get(key).unwrap_or(&Value::Null));
+                review.push(crate::text::truncate(&crate::text::escape_bidi(&line), 64));
+            }
+            review.push(match role["system"].as_str() {
+                Some(system) => format!("system: set ({} characters)", system.chars().count()),
+                None => "system: not set".into(),
+            });
+        }
         Form {
             kind: FormKind::Role,
             catalog: None,
-            review: Vec::new(),
+            role_base: existing.cloned(),
+            review,
             title: match name {
                 Some(n) => format!("Edit role {n}"),
                 None => "Add role".into(),
@@ -754,6 +769,7 @@ impl Form {
         Form {
             kind: FormKind::McpCatalog,
             catalog: Some(entry),
+            role_base: None,
             title: format!("Add MCP: {}", entry.title),
             review: vec![
                 target(entry),
@@ -842,13 +858,25 @@ impl Form {
                     return Err("description: say when the agent should use this role".into());
                 }
                 let provider = self.value(1);
+                let mut role = self
+                    .role_base
+                    .as_ref()
+                    .and_then(Value::as_object)
+                    .cloned()
+                    .unwrap_or_default();
+                role.insert(
+                    "provider".into(),
+                    json!(if provider.is_empty() {
+                        "default".into()
+                    } else {
+                        provider
+                    }),
+                );
+                role.insert("model".into(), json!(self.value(2)));
+                role.insert("description".into(), json!(description));
                 Ok(Request::UpsertRole {
                     name,
-                    role: json!({
-                        "provider": if provider.is_empty() { "default".into() } else { provider },
-                        "model": self.value(2),
-                        "description": description,
-                    }),
+                    role: Value::Object(role),
                 })
             }
         }
@@ -858,6 +886,40 @@ impl Form {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn role_form_preserves_hidden_role_fields_when_only_description_changes() {
+        let existing = json!({"provider":"local", "model":"auto", "description":"Original", "candidates":["fast","precise"], "system":"Private role instructions", "reasoning_effort":"high", "max_turns":7});
+        let mut form = Form::role(Some("primary"), Some(&existing));
+        form.fields[3].input.set("Changed description");
+        let Request::UpsertRole { name, role } = form.request().unwrap() else {
+            panic!("role request");
+        };
+        assert_eq!(name, "primary");
+        let mut expected = existing.clone();
+        expected["description"] = json!("Changed description");
+        assert_eq!(role, expected);
+        let typed: formless_core::config::RoleCfg = serde_json::from_value(role).unwrap();
+        assert_eq!(typed.candidates, ["fast", "precise"]);
+        assert_eq!(typed.system.as_deref(), Some("Private role instructions"));
+        assert_eq!(typed.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(typed.max_turns, Some(7));
+        let review = form.review.join(" ");
+        for label in [
+            "candidates",
+            "fast",
+            "reasoning_effort",
+            "max_turns",
+            "system",
+            "config.toml",
+        ] {
+            assert!(review.contains(label), "missing {label}: {review}");
+        }
+        assert!(
+            !review.contains("Private role instructions"),
+            "read-only summary need not disclose the system prompt"
+        );
+    }
 
     #[test]
     fn choices_cycle_through_unset() {

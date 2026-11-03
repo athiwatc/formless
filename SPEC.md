@@ -4282,6 +4282,18 @@ run_tool = "network_policy"     # a registry Tool, or…
   Providers and Roles sections list them with add/edit forms (the API key
   is masked and goes to the keychain through `UpsertProvider`) and `d`
   twice to remove. "config.toml" opens the file in `$VISUAL`/`$EDITOR`.
+  Editing a Role preserves its advanced candidates, system prompt, reasoning
+  effort and turn cap. The form shows a bounded read-only summary of those
+  fields and points to config.toml for editing them; system content is summarized
+  by presence/length. Visible-field edits round-trip the existing Role object.
+
+The setup wizard identifies its active profile in the header; the normal TUI
+status line identifies non-default profiles. If the active profile is
+unconfigured, setup, headless Run errors and doctor diagnostics point to another
+profile with saved provider configuration and show its exact launch command plus
+`formless profiles list`. Alternate discovery reads configuration files only,
+without loading credentials or probing providers. Wizard hints are captured once
+when opened, rather than rescanning profiles during rendering.
 
 ### External composition in the TUI
 
