@@ -5180,16 +5180,21 @@ fn atomic_session_export_with(
     Ok(())
 }
 
+#[cfg(windows)]
+mod session_export_windows;
+
 fn write_regular_session_export(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
     #[cfg(unix)]
     {
         atomic_session_export_with(path, |file| file.write_all(bytes))
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        // The portable rename helper cannot preserve an existing Windows DACL
-        // or private temp ACL. Retain the previous writer until that path has
-        // a validated atomic replacement implementation; do not claim parity.
+        session_export_windows::write(path, bytes).map_err(Into::into)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        // Platforms other than Unix/Windows retain their previous output path.
         eprintln!("warning: atomic export replacement preserving access controls is not available on this platform; retaining direct output");
         std::fs::write(path, bytes).map_err(Into::into)
     }

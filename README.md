@@ -395,8 +395,11 @@ extension is a usage error before any Session lookup or daemon connection.
 On Unix, ordinary file output uses atomic replacement with existing mode bits
 applied before staging content; failed pre-commit writes leave the prior export
 intact. This does not claim extended ACL or xattr preservation.
-Windows currently retains direct file output with an explicit warning: atomic
-replacement preserving existing Windows access controls is not implemented.
+The Windows implementation uses verified user-private staging and preserves an
+existing file's DACL through replacement, without ignoring ACL merge failures.
+It remains pending native Windows acceptance. If an OS replacement failure
+retains private recovery files, the error identifies their directory for
+inspection before retrying; no destructive replacement fallback is used.
 Existing symbolic links keep writing through to their targets,
 and descriptor/device streams retain their existing direct-write behavior.
 

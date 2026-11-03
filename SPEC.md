@@ -915,9 +915,12 @@ task, with quality as a gate**.
   or daemon connection. On Unix, ordinary file output is replaced atomically,
   preserving existing write-access checks and staging/final mode bits (not a
   claim of extended ACL/xattr preservation); pre-commit failures
-  leave prior exports intact. Windows retains its existing direct writer with
-  an explicit warning until atomic replacement preserving existing Windows
-  access controls is supported. Leaf symlinks (including dangling links) keep
+  leave prior exports intact. The Windows implementation verifies protected
+  user-only staging ACLs before writing, publishes new files without clobbering
+  competing creators, and uses DACL-preserving replacement with a private
+  backup. Partial OS replacement failures use no-clobber restoration or retain
+  recovery files identified in the error. Native Windows acceptance remains
+  pending; no complete Windows validation is claimed. Leaf symlinks (including dangling links) keep
   write-through semantics
   with bounded link traversal. Descriptor/device streams use direct writes,
   never pathname replacement.
