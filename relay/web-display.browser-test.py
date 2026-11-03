@@ -43,7 +43,7 @@ def expose_script(route):
     source = (ROOT / 'web/app.js').read_text()
     end = source.rfind('\n})();')
     assert end > 0
-    source = source[:end] + '\nwindow.__display = {S,setReading,applyTheme,sessionMenu,messageMenu,closePopover,renderHistory,toast,pauseWithNewOutput(){S.follow=false;const box=$("transcript");box.scrollTop=0;reading.anchor=captureReadingAnchor();reading.unseen.set([...box.querySelectorAll("[data-message-id]")].at(-1),null);updateReadingPill();}};' + source[end:]
+    source = source[:end] + '\nwindow.__display = {S,renderLive,setReading,applyTheme,sessionMenu,messageMenu,closePopover,renderHistory,toast,pauseWithNewOutput(){S.follow=false;const box=$("transcript");box.scrollTop=0;reading.anchor=captureReadingAnchor();reading.unseen.set([...box.querySelectorAll("[data-message-id]")].at(-1),null);updateReadingPill();}};' + source[end:]
     route.fulfill(status=200, content_type='text/javascript', body=source)
 
 
@@ -152,6 +152,31 @@ def run():
                         check(rect(page,'#sidebar')['right']<=1, f'closed sidebar clears safe area at 200% in {width}x{height}')
                         page.screenshot(path=str(OUT/f'screen-200-closed-{width}x{height}.png'),full_page=True)
                         page.locator('#toasts').evaluate('e=>e.replaceChildren()')
+                    # Deep live calls must retain readable names and timing, even
+                    # with larger browser text and either writing direction.
+                    page.set_viewport_size({'width':360,'height':800})
+                    page.evaluate("__display.setReading(2);document.documentElement.style.setProperty('--safe-left','0px');document.documentElement.style.setProperty('--safe-right','0px')")
+                    for direction in ('ltr', 'rtl'):
+                        for depth in (8, 100, 0):
+                            page.evaluate("""({direction,depth}) => {
+                              document.documentElement.dir=direction;
+                              __display.S.liveTools=[{name:'nested_tool_with_a_long_name',depth,status:'running',invocationId:'deep-fixture',arguments:'{}',elapsedMs:1250}];
+                              __display.renderLive();
+                            }""", {'direction':direction,'depth':depth})
+                            row=page.locator('[data-live-tool="deep-fixture"]')
+                            row.scroll_into_view_if_needed()
+                            geometry=row.evaluate("""e=>{
+                              const r=e.getBoundingClientRect(), p=e.parentElement.getBoundingClientRect();
+                              const n=e.querySelector('.tname'),t=e.querySelector('.tstat');
+                              const inside=x=>{const b=x.getBoundingClientRect();return b.left>=r.left && b.right<=r.right && b.top>=r.top && b.bottom<=r.bottom;};
+                              return {rowFits:r.left>=p.left-1 && r.right<=p.right+1, noOverflow:e.scrollWidth<=e.clientWidth, nameFits:inside(n)&&n.scrollWidth<=n.clientWidth, timeFits:inside(t), indent:parseFloat(getComputedStyle(e).marginInlineStart), parentWidth:p.width, depthLabel:e.querySelector('[data-live-depth]').getAttribute('aria-label')};
+                            }""")
+                            check(geometry['rowFits'] and geometry['noOverflow'],f'depth {depth} live row fits 360px at 200% in {direction}: {geometry}')
+                            check(geometry['nameFits'] and geometry['timeFits'],f'depth {depth} full tool name and timing remain visible in {direction}')
+                            check(geometry['indent']<=geometry['parentWidth']*.15+1,f'depth {depth} visual indent capped in {direction}')
+                            if depth:
+                                check(geometry['depthLabel']==f'Nesting depth {depth}',f'actual depth {depth} remains accessible in {direction}')
+                    page.evaluate("document.documentElement.removeAttribute('dir');__display.S.liveTools=[];__display.renderLive()")
                     page.set_viewport_size({'width':1280,'height':900})
                     page.evaluate("__display.setReading(1);__display.applyTheme('dark');document.querySelectorAll('details').forEach(e=>e.open=false)")
                     # Printing from Settings still renders the current Session.

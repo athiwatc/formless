@@ -608,6 +608,10 @@ button.linkish:hover { text-decoration: underline; }
 .tree-ok { color: var(--accent); }
 .tree-fail { color: var(--err); }
 .chip.tree-node.done { border-color: var(--line); opacity: .85; }
+.chip.tree-node summary { flex-wrap: wrap; }
+.chip.tree-node .tname { min-width: 0; white-space: normal; overflow-wrap: anywhere; }
+.chip.tree-node .tstat { margin-left: 0; margin-inline-start: auto; }
+
 .subagent-log { max-height: 55vh; overflow-y: auto; display: grid; gap: 0.375rem; font-size: 0.8125rem; }
 .subagent-msg { white-space: pre-wrap; overflow-wrap: anywhere; border-left: 2px solid var(--line); padding-left: 0.5rem; }
 .subagent-msg.assistant { border-color: var(--accent); }
