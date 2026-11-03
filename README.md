@@ -332,7 +332,7 @@ formless run "now group those by author" --session 3f9c    # continue a Session
 formless run -c "and sort them by date"                     # continue the last `formless run` Session
 formless run "audit my Downloads folder" --json            # one JSON event per line
 formless run "one-line summary of README.md" --output final -q   # just the answer on stdout
-formless run "triage this" --output json                   # {session_id, status, answer, error}
+formless run "triage this" --output json                   # {session_id, status, answer, result, error}
 formless run "clean up the temp files" --yes               # auto-approve sensitive Tools
 formless run "classify these titles" --model small-model --effort low
 formless run "plan the migration" --role planner           # a configured Role's provider and model
@@ -342,6 +342,7 @@ formless run "what's wrong here?" --attach shot.png --attach app.log   # files a
 git diff | formless run "review this"                      # piped input goes along as stdin.txt
 cat task.md | formless run -                               # `-` reads the task itself from stdin
 formless run "classify these titles" --schema result.schema.json --system "Use concise labels" --max-usd 0.10 --output final --output-file result.json
+formless run "return an object" --schema object.schema.json --output json | jq '.result'
 ```
 
 `--schema` validates the final answer and allows one paid repair; a second
@@ -356,6 +357,14 @@ Runs must be resubmitted with their options; `/resume` cannot recover ephemeral
 instructions. `--output-file` leaves stdout empty and atomically replaces the
 file only after successful output (at most 8 MiB); failure leaves the previous
 file intact.
+
+Schema files and `--schema -` accept one leading UTF-8 BOM; the 64 KiB input
+limit includes those bytes. With `--schema --output json`, the envelope keeps
+`answer` as the original validated text and adds `result` as the parsed JSON
+value, for example `"result": {"n": 2}`. Consumers can read `.result` directly
+without parsing the answer twice. The same envelope is written by
+`--output-file`. Without a schema, or when schema validation fails, `result`
+is null; a schema mismatch also keeps `answer` null.
 
 Before sending, the TUI and web composer show a local forecast for the current
 draft: prompt tokens, comparable model/role Runs, likely cost and steps, and

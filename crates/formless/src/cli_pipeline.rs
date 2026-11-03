@@ -55,14 +55,7 @@ impl Args {
         };
         let schema = if let Some(path) = &self.schema {
             Some(match stdin_schema {
-                Some(bytes) => {
-                    anyhow::ensure!(
-                        bytes.len() <= formless_core::pipeline::MAX_SCHEMA_BYTES,
-                        "schema file exceeds the 64 KiB limit"
-                    );
-                    serde_json::from_slice(&bytes)
-                        .context("--schema must contain one JSON Schema")?
-                }
+                Some(bytes) => formless_core::pipeline::parse_schema_bytes(&bytes)?,
                 None => formless_core::pipeline::read_schema_file(path)?,
             })
         } else {
@@ -90,11 +83,12 @@ pub(super) fn render_result(
     session: &str,
     status: &str,
     answer: Option<&str>,
+    result: Option<&Value>,
     error: Option<&str>,
 ) -> Result<Vec<u8>> {
     let mut bytes = match output {
         RunOutput::Json => serde_json::to_vec(
-            &serde_json::json!({"session_id":session,"status":status,"answer":answer,"error":error}),
+            &serde_json::json!({"session_id":session,"status":status,"answer":answer,"result":result,"error":error}),
         )?,
         RunOutput::Text | RunOutput::Final => {
             answer.unwrap_or_default().trim_end().as_bytes().to_vec()
@@ -111,6 +105,35 @@ pub(super) fn render_result(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn bom_schema_stdin_matches_plain_and_keeps_the_raw_byte_limit() {
+        let args = Args {
+            schema: Some("-".into()),
+            ..Default::default()
+        };
+        let plain = br#"{"type":"integer"}"#;
+        let bom = [b"\xef\xbb\xbf".as_slice(), plain].concat();
+        assert_eq!(
+            args.prepare("task".into(), Some(bom))
+                .unwrap()
+                .options
+                .schema,
+            args.prepare("task".into(), Some(plain.to_vec()))
+                .unwrap()
+                .options
+                .schema
+        );
+        for invalid in [
+            b"\xef\xbb\xbfnot JSON".to_vec(),
+            [
+                b"\xef\xbb\xbf".as_slice(),
+                &vec![b' '; formless_core::pipeline::MAX_SCHEMA_BYTES],
+            ]
+            .concat(),
+        ] {
+            assert!(args.prepare("task".into(), Some(invalid)).is_err());
+        }
+    }
     #[test]
     fn schema_stdin_is_never_attached_or_reused_as_task_input() {
         let args = Args {
@@ -167,14 +190,24 @@ mod tests {
             "session",
             "schema_mismatch",
             None,
+            None,
             Some("schema: mismatch"),
         )
         .unwrap();
         let value: Value = serde_json::from_slice(&bytes).unwrap();
         assert!(value["answer"].is_null());
+        assert!(value["result"].is_null());
         assert_eq!(value["status"], "schema_mismatch");
         assert_eq!(
-            render_result(RunOutput::Final, "s", "completed", Some("{\"n\":2}"), None).unwrap(),
+            render_result(
+                RunOutput::Final,
+                "s",
+                "completed",
+                Some("{\"n\":2}"),
+                None,
+                None
+            )
+            .unwrap(),
             b"{\"n\":2}\n"
         );
     }

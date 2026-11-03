@@ -4043,6 +4043,7 @@ fn run_headless(
         };
     let interactive = matches!(output, RunOutput::Text | RunOutput::Final);
     let mut final_answer: Option<String> = None;
+    let mut validated_result: Option<Value> = None;
     let mut run_error: Option<String> = None;
     let mut paused_exit_code = None;
     let mut queued_delivery = false;
@@ -4296,14 +4297,20 @@ fn run_headless(
                         }
                         // The last answer the agent gave is the final one.
                         if message.role == "assistant" && !message.content.trim().is_empty() {
-                            if policy.has_schema()
-                                && policy.validate_final(&message.content).is_err()
-                            {
-                                final_answer = None;
-                                run_error =
-                                    Some("schema: daemon delivered an invalid final answer".into());
-                                code = 3;
-                                break;
+                            if policy.has_schema() {
+                                match policy.validate_final(&message.content) {
+                                    Ok(value) => validated_result = Some(value),
+                                    Err(_) => {
+                                        final_answer = None;
+                                        validated_result = None;
+                                        run_error = Some(
+                                            "schema: daemon delivered an invalid final answer"
+                                                .into(),
+                                        );
+                                        code = 3;
+                                        break;
+                                    }
+                                }
                             }
                             final_answer = Some(message.content);
                         }
@@ -4494,6 +4501,7 @@ fn run_headless(
     }
     if policy.has_schema() && code != 0 {
         final_answer = None;
+        validated_result = None;
     }
     if budget_stopped {
         let spend = target
@@ -4554,6 +4562,7 @@ fn run_headless(
                     &session_id,
                     status,
                     final_answer.as_deref(),
+                    validated_result.as_ref(),
                     run_error.as_deref(),
                 )?
             };
@@ -4572,6 +4581,7 @@ fn run_headless(
                 &session_id,
                 status,
                 final_answer.as_deref(),
+                validated_result.as_ref(),
                 run_error.as_deref(),
             )?;
             std::io::stdout().write_all(&bytes)?;

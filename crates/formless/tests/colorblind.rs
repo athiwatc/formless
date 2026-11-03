@@ -199,11 +199,22 @@ fn success(out: Output) -> String {
 }
 
 #[test]
-fn shipped_theme_setting_status_markers_and_json_preserve_all_meaning_without_color() {
+fn shipped_piped_tables_keep_original_cells_even_with_no_color_or_colorblind_theme() {
     let f = Fixture::new();
     let daemon = f.daemon();
     let before: serde_json::Value =
         serde_json::from_str(&success(f.run(&["tools", "list", "--json"], None))).unwrap();
+    // A pipe without NO_COLOR or an explicit theme keeps its original fields.
+    let ordinary = success(f.run(&["tools", "list"], None));
+    let row = ordinary
+        .lines()
+        .find(|line| line.starts_with("good635 "))
+        .unwrap();
+    assert!(row.split_whitespace().any(|cell| cell == "100%"));
+    assert!(
+        !row.contains("ok 100%") && !row.contains("ok active"),
+        "{row}"
+    );
     let set = success(f.run(&["config", "set", "tui.theme", "colorblind"], Some("1")));
     assert!(set.contains("colorblind"));
     assert_eq!(
@@ -217,15 +228,16 @@ fn shipped_theme_setting_status_markers_and_json_preserve_all_meaning_without_co
             "good635",
             "bad635",
             "warn635",
-            "ok 100%",
-            "fail 0%",
-            "ok active",
-            "fail needs attention",
-            "warn off",
+            "100%",
+            "0%",
+            "active",
+            "needs attention",
+            "off",
             "ไทย",
         ] {
             assert!(text.contains(value), "missing {value}: {text}");
         }
+        assert_eq!(text, ordinary, "theme and NO_COLOR never add pipe fields");
         let json: serde_json::Value =
             serde_json::from_str(&success(f.run(&["tools", "list", "--json"], no_color))).unwrap();
         assert_eq!(
@@ -235,8 +247,8 @@ fn shipped_theme_setting_status_markers_and_json_preserve_all_meaning_without_co
     }
     let grants = success(f.run(&["approvals", "list"], Some("1")));
     assert!(
-        grants.contains("warn always"),
-        "permanent broad scope must carry an explicit warning: {grants}"
+        grants.contains("always") && !grants.contains("warn always"),
+        "piped scope retains the original cell value: {grants}"
     );
     f.no_provider_contact();
     drop(daemon);

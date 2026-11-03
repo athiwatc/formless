@@ -4886,7 +4886,9 @@ previous headless Run's Session.
   - `text` (default): the answer streams, progress on stderr;
   - `final`: only the last answer, on stdout when the Run ends, with
     progress on stderr only when it's a terminal;
-  - `json`: one `{session_id, status, answer, error}` object at the end;
+  - `json`: one `{session_id, status, answer, result, error}` object at the end;
+    `answer` retains its text form. `result` carries the validated JSON value
+    on a successful schema Run and is null otherwise;
   - `jsonl-events`: every event, one per line; `--json` is the same.
 
   Pipeline options are per Run, never edits to the profile configuration or
@@ -4915,7 +4917,8 @@ previous headless Run's Session.
   background model tests, including when `provider.auto_test_models` is on.
 
   `--schema FILE|-` reads a bounded JSON Schema and compiles it offline before
-  admission. With `-`, stdin is the schema rather than a task or stdin.txt;
+  admission. Both sources accept one leading UTF-8 BOM; the 64 KiB limit counts
+  the original bytes, including the BOM. With `-`, stdin is the schema rather than a task or stdin.txt;
   combining it with task `-` is a usage error. The final answer is validated
   before assistant storage or delivery. Candidate text is not streamed for a
   schema Run. A JSON/schema mismatch allows exactly one paid, no-tools logical
