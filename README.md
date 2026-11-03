@@ -225,6 +225,13 @@ curl -fsSL https://raw.githubusercontent.com/athiwatc/formless/main/scripts/inst
 # GitHub repository at FORMLESS_VERSION)
 ```
 
+The installer prints the next setup and verification commands and checks
+whether its `bin` directory is on `PATH`. If needed, it prints a quoted command
+for your `$SHELL` (bash, zsh, fish, or a POSIX shell) and names the startup file
+where you can keep it. It does not edit shell configuration files. Run
+`formless` to start setup, or `formless doctor` to check your configuration;
+you need a provider API key or a local model endpoint.
+
 **From source** (any platform with a toolchain):
 
 ```bash

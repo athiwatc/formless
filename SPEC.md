@@ -4653,6 +4653,14 @@ undo, redo and replacements invalidate prior asynchronous editor previews.
 
 ## 12. CLI
 
+The macOS/Linux installer reports the next commands (`formless` for setup,
+`formless doctor` for verification) and the need for a provider API key or a
+local model endpoint. After either a source or prebuilt install, it checks
+whether the install directory is a complete PATH entry and, when missing,
+prints a quoted, shell-appropriate PATH command and its startup-file location.
+It does not edit shell startup files. Unsupported prebuilt platforms name
+the source-install alternative and its Rust/cargo and C compiler prerequisites.
+
 The Windows executable reserves 8 MiB of virtual address space for its main
 thread, committed on demand, to accommodate the finite generated CLI command
 builder and normal command work. It keeps TUI/clipboard operations on the

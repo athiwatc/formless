@@ -338,6 +338,12 @@ fn install_script_is_atomic_and_preflights() {
         "#!/bin/sh\necho new\n"
     );
     assert!(prefix.join("share/man/man1/formless.1").exists());
+    let guidance = String::from_utf8_lossy(&out.stdout);
+    assert!(guidance.contains("export PATH="), "{guidance}");
+    assert!(guidance.contains(".profile"), "{guidance}");
+    assert!(guidance.contains("formless to start the setup wizard"));
+    assert!(guidance.contains("formless doctor"));
+    assert!(guidance.contains("API key or a local model"));
     let mode = std::fs::metadata(&target).unwrap().permissions().mode();
     assert_eq!(mode & 0o111, 0o111, "executable");
 

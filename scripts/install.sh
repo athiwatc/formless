@@ -46,6 +46,48 @@ install_completions() {
     echo "note: could not install shell completions (formless completions <shell> prints them)" >&2
 }
 
+# Quote literal paths, including spaces, quotes, dollars and backslashes.
+quote_path() {
+  printf "'"
+  printf '%s' "$1" | sed "s/'/'\\\\''/g"
+  printf "'"
+}
+
+install_guidance() {
+  installed_bin="$PREFIX/bin"
+  case ":${PATH:-}:" in
+    *":$installed_bin:"* | *":$installed_bin/:"*) ;;
+    *)
+      printf '\n%s is not on PATH. For this shell session, run:\n' "$installed_bin"
+      user_shell="${SHELL:-sh}"
+      case "${user_shell##*/}" in
+        fish)
+          # fish single quotes escape both backslashes and single quotes.
+          quoted_bin="$(printf '%s' "$installed_bin" | sed -e 's/\\/\\\\/g' -e "s/'/\\\\'/g")"
+          printf "  set -gx PATH '%s' \$PATH\n" "$quoted_bin"
+          printf 'To keep it, add that line to %s/fish/config.fish.\n' "${XDG_CONFIG_HOME:-${HOME:-~}/.config}"
+          ;;
+        *)
+          case "${user_shell##*/}" in
+            bash | zsh | sh | dash | ksh) ;;
+            *) printf 'Shell %s is not recognized; the following command is for a POSIX-compatible shell:\n' "$user_shell" ;;
+          esac
+          quoted_bin="$(quote_path "$installed_bin")"
+          printf '  export PATH=%s:"$PATH"\n' "$quoted_bin"
+          case "${user_shell##*/}" in
+            bash) printf 'To keep it, add that line to %s/.bashrc (interactive shells) or %s/.bash_profile (login shells).\n' "${HOME:-~}" "${HOME:-~}" ;;
+            zsh) printf 'To keep it, add that line to %s/.zshrc.\n' "${ZDOTDIR:-${HOME:-~}}" ;;
+            sh | dash | ksh) printf 'To keep it, add that line to %s/.profile.\n' "${HOME:-~}" ;;
+            *) printf 'Persist the equivalent PATH change in your shell startup configuration.\n' ;;
+          esac
+          ;;
+      esac
+      ;;
+  esac
+  printf '\nNext: run formless to start the setup wizard, or formless doctor to verify configuration.\n'
+  printf 'Setup needs a provider API key or a local model endpoint.\n'
+}
+
 # Copy $1 over $2 atomically: a temp file next to the target, then a
 # rename, so an interrupted install never leaves a truncated binary and a
 # running daemon keeps its old file.
@@ -68,8 +110,9 @@ if [ "${FORMLESS_FROM_SOURCE:-0}" = "1" ]; then
   else
     cargo install --git "$REPO" --locked --root "$PREFIX" formless-bin
   fi
-  echo "installed: $PREFIX/bin/formless"
+  printf 'installed: %s/bin/formless\n' "$PREFIX"
   install_completions
+  install_guidance
   exit 0
 fi
 
@@ -88,7 +131,7 @@ case "${FORMLESS_TARGET:-$os/$arch}" in
   Darwin/arm64) target="aarch64-apple-darwin" ;;
   Darwin/x86_64) target="x86_64-apple-darwin" ;;
   Linux/x86_64) target="x86_64-unknown-linux-gnu" ;;
-  */*) die "unsupported platform $os/$arch; use FORMLESS_FROM_SOURCE=1" ;;
+  */*) die "unsupported platform $os/$arch; build from source with FORMLESS_FROM_SOURCE=1 (requires Rust/cargo and a C compiler/linker; see README.md source-build requirements)" ;;
   *) target="$FORMLESS_TARGET" ;;
 esac
 
@@ -119,5 +162,6 @@ if [ -f "$tmp/formless-$version-$target/formless.1" ]; then
   mkdir -p "$PREFIX/share/man/man1"
   install_file "$tmp/formless-$version-$target/formless.1" "$PREFIX/share/man/man1/formless.1" 644
 fi
-echo "installed: $PREFIX/bin/formless ($version)"
+printf 'installed: %s/bin/formless (%s)\n' "$PREFIX" "$version"
 install_completions
+install_guidance
