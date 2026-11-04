@@ -270,7 +270,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         listener.set_nonblocking(true).unwrap();
-        env.set("OLLAMA_HOST", &address.to_string());
+        env.set("OLLAMA_HOST", address.to_string());
         for key in [
             "HTTP_PROXY",
             "http_proxy",

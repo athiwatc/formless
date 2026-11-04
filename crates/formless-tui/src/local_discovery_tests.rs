@@ -187,7 +187,10 @@ fn local_discovery_remote_ollama_host_guidance_reaches_the_rendered_picker_witho
         .iter()
         .map(|c| c.symbol())
         .collect::<String>();
-    assert!(text.contains("OLLAMA_HOST"), "{text}");
+    assert!(
+        text.contains("OLLAMA_HOST") && text.contains("manually"),
+        "{text}"
+    );
     app.flush_wizard_draft(true);
     assert!(!formless_core::setup_draft::file(&app.paths).exists());
     assert!(!app.paths.config_file().exists());
