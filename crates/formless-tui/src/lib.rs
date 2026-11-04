@@ -4552,24 +4552,14 @@ impl App {
                             });
                         }
                         Pending::RateLimits => {
-                            for (endpoint, l) in result.as_object().into_iter().flatten() {
-                                let mut parts = Vec::new();
-                                for kind in ["requests", "tokens"] {
-                                    if let Some(rem) = l[format!("remaining-{kind}")].as_str() {
-                                        let limit =
-                                            l[format!("limit-{kind}")].as_str().unwrap_or("?");
-                                        let reset = l[format!("reset-{kind}")]
-                                            .as_str()
-                                            .map(|r| format!(", resets {r}"))
-                                            .unwrap_or_default();
-                                        parts.push(format!("{rem}/{limit} {kind} left{reset}"));
-                                    }
-                                }
-                                if !parts.is_empty() {
-                                    self.notes.push(format!(
-                                        "rate limit at {endpoint}: {}",
-                                        parts.join(" · ")
-                                    ));
+                            for entry in result
+                                .as_object()
+                                .into_iter()
+                                .flatten()
+                                .map(|(_, value)| value)
+                            {
+                                if let Some(line) = entry["line"].as_str() {
+                                    self.notes.push(line.to_string());
                                 }
                             }
                         }
@@ -18434,6 +18424,7 @@ mod tests {
     include!("approval_resolution_tests.rs");
     include!("provider_retry_ui_tests.rs");
     include!("motion_tests.rs");
+    include!("rate_limit_tests.rs");
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)

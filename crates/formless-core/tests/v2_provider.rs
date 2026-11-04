@@ -850,7 +850,11 @@ async fn aliases_key_header_query_rate_limits_and_model_test() {
     );
     assert!(t.first_token_ms.is_some());
     let limits = formless_core::provider::rate_limits();
-    assert_eq!(limits[&base]["remaining-requests"], "41");
+    let entry = limits
+        .values()
+        .find(|entry| entry["endpoint"] == base && entry["provider"] == "default")
+        .expect("scoped rate-limit observation");
+    assert_eq!(entry["remaining-requests"], "41");
 }
 
 #[test]
