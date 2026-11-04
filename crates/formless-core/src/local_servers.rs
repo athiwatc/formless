@@ -290,6 +290,9 @@ mod tests {
             while !stopped.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((mut socket, _)) => {
+                        // Darwin inherits the listener's nonblocking flag.
+                        // The fixture's bounded read must wait for the GET.
+                        socket.set_nonblocking(false).unwrap();
                         socket
                             .set_read_timeout(Some(Duration::from_secs(2)))
                             .unwrap();
@@ -355,6 +358,9 @@ mod tests {
                     Err(error) => panic!("{error}"),
                 }
             };
+            // accept(2) inherits O_NONBLOCK on Darwin; reset it before the
+            // timeout-bounded read instead of racing the client's first byte.
+            socket.set_nonblocking(false).unwrap();
             socket
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .unwrap();
