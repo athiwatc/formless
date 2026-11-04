@@ -11,7 +11,7 @@ fn local_discovery_env() -> credential_env::EnvGuard {
 fn local_discovery_offer(models: usize) -> formless_core::local_servers::LocalServer {
     formless_core::local_servers::LocalServer {
         preset_id: "ollama",
-        base_url: "http://[::1]:0/v1".into(),
+        base_url: "http://[::1]:0/prefix/v1".into(),
         models,
     }
 }
@@ -51,7 +51,7 @@ fn local_discovery_first_paint_does_not_wait_for_the_worker_and_keeps_ipv6_url()
     let w = app.wizard.as_mut().unwrap();
     assert!(w.status.contains("Local model API") && w.status.contains("1 model"));
     w.choose_preset();
-    assert_eq!(w.base_url, "http://[::1]:0/v1");
+    assert_eq!(w.base_url, "http://[::1]:0/prefix/v1");
     assert_eq!(w.credential_endpoint, w.base_url);
     assert_eq!(w.preset.unwrap().id, "ollama");
 }
@@ -67,7 +67,7 @@ fn local_discovery_empty_models_show_pull_guidance_in_the_rendered_offer() {
     w.job_tx
         .send(WizardJob::Local(
             w.generation,
-            vec![local_discovery_offer(0)],
+            vec![local_discovery_offer(0)].into(),
         ))
         .unwrap();
     app.wizard = Some(w);
@@ -109,8 +109,11 @@ fn local_discovery_late_results_cannot_override_user_choice_or_a_later_step() {
         }
         let expected = app.wizard.as_ref().unwrap().preset_idx;
         let status = app.wizard.as_ref().unwrap().status.clone();
-        tx.send(WizardJob::Local(generation, vec![local_discovery_offer(1)]))
-            .unwrap();
+        tx.send(WizardJob::Local(
+            generation,
+            vec![local_discovery_offer(1)].into(),
+        ))
+        .unwrap();
         app.wizard_poll();
         assert_eq!(app.wizard.as_ref().unwrap().preset_idx, expected);
         assert_eq!(app.wizard.as_ref().unwrap().status, status);
@@ -136,7 +139,7 @@ fn local_discovery_usable_endpoint_is_preferred_to_an_empty_one() {
     w.job_tx
         .send(WizardJob::Local(
             w.generation,
-            vec![local_discovery_offer(0), available.clone()],
+            vec![local_discovery_offer(0), available.clone()].into(),
         ))
         .unwrap();
     app.wizard = Some(w);
@@ -146,4 +149,74 @@ fn local_discovery_usable_endpoint_is_preferred_to_an_empty_one() {
         Some(&available)
     );
     assert!(app.wizard.as_ref().unwrap().status.contains("2 model"));
+}
+
+#[test]
+fn local_discovery_remote_ollama_host_guidance_reaches_the_rendered_picker_without_a_draft() {
+    let env = local_discovery_env();
+    env.set("OLLAMA_HOST", "remote-private.example:11500");
+    let mut app = test_app();
+    let mut cfg = Config::default();
+    cfg.provider.base_url.clear();
+    app.wizard = Some(Wizard::start(&cfg, &app.paths));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while app.wizard.as_ref().unwrap().local_pending {
+        assert!(Instant::now() < deadline);
+        app.wizard_poll();
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let w = app.wizard.as_ref().unwrap();
+    assert!(
+        w.status.contains("OLLAMA_HOST points at a remote host"),
+        "{}",
+        w.status
+    );
+    assert!(w.status.contains("manually"));
+    assert!(!w.status.contains("remote-private.example"));
+    assert!(w
+        .local_offer
+        .as_ref()
+        .is_none_or(|s| s.preset_id != "ollama"));
+    assert!(w.draft_changed.is_none());
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+    terminal.draw(|f| draw_wizard(f, w, false)).unwrap();
+    let text = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|c| c.symbol())
+        .collect::<String>();
+    assert!(
+        text.contains("OLLAMA_HOST") && text.contains("manually"),
+        "{text}"
+    );
+    app.flush_wizard_draft(true);
+    assert!(!formless_core::setup_draft::file(&app.paths).exists());
+    assert!(!app.paths.config_file().exists());
+}
+
+#[test]
+fn local_discovery_guidance_does_not_override_a_newer_user_choice() {
+    let _env = local_discovery_env();
+    let mut app = test_app();
+    let mut cfg = Config::default();
+    cfg.provider.base_url.clear();
+    let mut w = Wizard::new(&cfg);
+    w.local_pending = true;
+    let tx = w.job_tx.clone();
+    let generation = w.generation;
+    app.wizard = Some(w);
+    app.wizard_step_key(key(KeyCode::Down));
+    let status = app.wizard.as_ref().unwrap().status.clone();
+    tx.send(WizardJob::Local(
+        generation,
+        formless_core::local_servers::Discovery {
+            servers: Vec::new(),
+            hint: Some("stale OLLAMA_HOST guidance".into()),
+        },
+    ))
+    .unwrap();
+    app.wizard_poll();
+    assert_eq!(app.wizard.as_ref().unwrap().status, status);
 }

@@ -3611,6 +3611,13 @@ run_tool = "network_policy"     # a registry Tool, or…
   the untouched provider picker remains current, and selection keeps the
   detected address, including IPv6. Empty Ollama offers say to run
   `ollama pull MODEL`; other empty model APIs say to load a model first.
+  `OLLAMA_HOST` selects Ollama's local discovery address/port/path instead of
+  the default Ollama candidates. Schemeless addresses default to 11434;
+  explicit HTTP/HTTPS default to 80/443, matching Ollama. `localhost` maps to
+  literal loopbacks; unspecified bind addresses map to their loopback family.
+  Remote hosts, credentials, queries/fragments and invalid forms are not
+  probed; setup gives manual-provider guidance without echoing the value.
+  LM-compatible default candidates remain within the same four-GET budget.
 - **The first approval** (TUI and web) adds a short explainer: Tools have
   no access by default, what the Capabilities are, Always vs Once vs this
   Session vs Deny, and `/approvals` / `/revoke` to undo. It is shown until
