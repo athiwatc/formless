@@ -702,7 +702,7 @@ fn approval_inspection_lines(req: &ApprovalReq, summary: Option<&str>) -> Vec<St
 }
 
 enum WizardJob {
-    Local(u64, Vec<formless_core::local_servers::LocalServer>),
+    Local(u64, formless_core::local_servers::Discovery),
     Models(u64, Result<Vec<String>, String>),
     Probe(u64, Result<ProbeResult, String>),
 }
@@ -845,13 +845,26 @@ impl Wizard {
 
     /// Resume a draft, or offer an already running local server.
     fn start(cfg: &Config, paths: &Paths) -> Self {
-        Self::start_with_detector(cfg, paths, formless_core::local_servers::discover)
+        Self::start_with_discovery(
+            cfg,
+            paths,
+            formless_core::local_servers::discover_with_guidance,
+        )
     }
 
+    #[cfg(test)]
     fn start_with_detector(
         cfg: &Config,
         paths: &Paths,
         detect: impl FnOnce() -> Vec<formless_core::local_servers::LocalServer> + Send + 'static,
+    ) -> Self {
+        Self::start_with_discovery(cfg, paths, move || detect().into())
+    }
+
+    fn start_with_discovery(
+        cfg: &Config,
+        paths: &Paths,
+        detect: impl FnOnce() -> formless_core::local_servers::Discovery + Send + 'static,
     ) -> Self {
         let mut w = Self::new_for_profile(cfg, paths);
         if w.step != WizardStep::PickPreset {
@@ -908,12 +921,12 @@ impl Wizard {
     /// No saved setup and no key in the environment: offer Ollama or
     /// LM Studio if one is already running here (#398).
     fn offer_local(&mut self) {
-        self.offer_local_with(formless_core::local_servers::discover);
+        self.offer_local_with(formless_core::local_servers::discover_with_guidance);
     }
 
     fn offer_local_with(
         &mut self,
-        detect: impl FnOnce() -> Vec<formless_core::local_servers::LocalServer> + Send + 'static,
+        detect: impl FnOnce() -> formless_core::local_servers::Discovery + Send + 'static,
     ) {
         let presets = formless_core::presets::PRESETS;
         if presets
@@ -8448,15 +8461,23 @@ impl App {
                     w.draft_changed = Some(Instant::now());
                 }
                 match job {
-                    WizardJob::Local(_, offers) => {
+                    WizardJob::Local(_, discovery) => {
                         w.local_pending = false;
-                        if let Some(offer) = offers.into_iter().min_by_key(|s| s.models == 0) {
+                        if let Some(hint) = discovery.hint.as_deref() {
+                            w.status = hint.to_string();
+                        }
+                        if let Some(offer) =
+                            discovery.servers.into_iter().min_by_key(|s| s.models == 0)
+                        {
                             if let Some(index) = formless_core::presets::PRESETS
                                 .iter()
                                 .position(|p| p.id == offer.preset_id)
                             {
                                 w.preset_idx = index;
-                                w.status = offer.offer();
+                                w.status = match discovery.hint {
+                                    Some(hint) => format!("{hint} {}", offer.offer()),
+                                    None => offer.offer(),
+                                };
                                 w.local_offer = Some(offer);
                             }
                         }
