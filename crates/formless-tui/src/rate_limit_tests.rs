@@ -6,6 +6,8 @@ fn rate_limits_vendor_headers_reach_the_tui_and_status_line() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     for (name, headers, expected) in [
         ("openai-fixture", "x-ratelimit-limit-requests: 50\r\nx-ratelimit-remaining-requests: 41\r\nx-ratelimit-reset-requests: 40s\r\n", "41/50 requests left, resets in 40s"),
+        ("mixed-window-fixture", "x-ratelimit-limit-requests: 50\r\nx-ratelimit-remaining-requests: 41\r\nx-ratelimit-reset-requests: 2000-01-01T00:00:00Z\r\nx-ratelimit-limit-tokens: 1000\r\nx-ratelimit-remaining-tokens: 900\r\nx-ratelimit-reset-tokens: vendor-window\r\n", "900/1000 tokens left"),
+        ("numeric-window-fixture", "x-ratelimit-limit: 10\r\nx-ratelimit-remaining: 3\r\nx-ratelimit-reset: 60\r\n", "3/10 requests left, reset 60 (unparsed)"),
         ("anthropic-fixture", "anthropic-ratelimit-input-tokens-limit: 5000\r\nanthropic-ratelimit-input-tokens-remaining: 4000\r\nanthropic-ratelimit-output-tokens-limit: 1000\r\nanthropic-ratelimit-output-tokens-remaining: 900\r\n", "4000/5000 input-tokens left"),
         ("openrouter-fixture", "x-ratelimit-limit: 20\r\nx-ratelimit-remaining: 0\r\nx-ratelimit-reset: vendor-window\r\n", "0/20 requests left, reset vendor-window (unparsed)"),
     ] {
@@ -64,7 +66,11 @@ fn rate_limits_vendor_headers_reach_the_tui_and_status_line() {
         assert!(!serde_json::to_string(&limits).unwrap().contains("fixture-secret"));
 
         let mut app = test_app();
-        if name == "anthropic-fixture" {
+        if name == "mixed-window-fixture" {
+            assert!(!line.contains("requests"));
+            for field in ["limit", "remaining", "reset"] { assert!(entry.get(format!("{field}-requests")).is_none()); }
+        }
+        if name == "anthropic-fixture" || name == "mixed-window-fixture" || name == "numeric-window-fixture" {
             let mut config = formless_core::Config::default();
             config.naming.enabled = false;
             config.save(&app.paths).unwrap();
