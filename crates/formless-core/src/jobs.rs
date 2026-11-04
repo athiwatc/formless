@@ -113,30 +113,42 @@ impl Cron {
     }
 }
 
-/// When a one-shot job runs: RFC 3339, or relative "in 30m" / "2h" / "1d".
+/// When a one-shot job runs: strictly future RFC 3339/local time, or a
+/// checked relative offset of at most 366 days.
 pub fn parse_at(at: &str, now: DateTime<Local>) -> Result<DateTime<Local>> {
     let s = at.trim();
-    if let Ok(t) = DateTime::parse_from_rfc3339(s) {
-        return Ok(t.with_timezone(&Local));
-    }
-    if let Ok(t) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M") {
-        return Local
+    let target = if let Ok(t) = DateTime::parse_from_rfc3339(s) {
+        t.with_timezone(&Local)
+    } else if let Ok(t) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M") {
+        Local
             .from_local_datetime(&t)
             .single()
-            .context("ambiguous local time");
-    }
-    let rel = s.strip_prefix("in ").unwrap_or(s).trim();
-    let (num, unit) = rel.split_at(rel.find(|c: char| !c.is_ascii_digit()).unwrap_or(rel.len()));
-    let n: i64 = num.parse().map_err(|_| {
-        anyhow!("at must be RFC 3339, \"YYYY-MM-DD HH:MM\" or like \"in 30m\": {at}")
-    })?;
-    let d = match unit.trim() {
-        "m" | "min" | "mins" | "minute" | "minutes" => Duration::minutes(n),
-        "h" | "hour" | "hours" => Duration::hours(n),
-        "d" | "day" | "days" => Duration::days(n),
-        u => bail!("unknown time unit '{u}' in at: {at}"),
+            .context("ambiguous or nonexistent local time")?
+    } else {
+        let rel = s.strip_prefix("in ").unwrap_or(s).trim();
+        let (num, unit) =
+            rel.split_at(rel.find(|c: char| !c.is_ascii_digit()).unwrap_or(rel.len()));
+        let n: i64 = num.parse().map_err(|_| {
+            anyhow!("at must be RFC 3339, \"YYYY-MM-DD HH:MM\" or like \"in 30m\": {at}")
+        })?;
+        let seconds_per_unit = match unit.trim() {
+            "m" | "min" | "mins" | "minute" | "minutes" => 60,
+            "h" | "hour" | "hours" => 60 * 60,
+            "d" | "day" | "days" => 24 * 60 * 60,
+            u => bail!("unknown time unit '{u}' in at: {at}"),
+        };
+        let seconds = n
+            .checked_mul(seconds_per_unit)
+            .filter(|seconds| *seconds <= 366 * 24 * 60 * 60)
+            .context("relative job time must be at most 366 days")?;
+        let delta = Duration::try_seconds(seconds).context("relative job time is out of range")?;
+        now.checked_add_signed(delta)
+            .context("job time is out of range")?
     };
-    Ok(now + d)
+    if target <= now {
+        bail!("job time must be strictly in the future; use jobs run ID for an immediate firing");
+    }
+    Ok(target)
 }
 
 /// A job's first run: the next cron match, or the `at` time.
