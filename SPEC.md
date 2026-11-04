@@ -3581,10 +3581,16 @@ run_tool = "network_policy"     # a registry Tool, or…
   drafted. Drafts expire after 24 hours and are discarded when config is
   newer. The next launch resumes there (at the key step for providers
   that need one); successful config saves, including CLI setup, delete it.
-- **No key needed.** With no saved setup and no provider key in the
-  environment, a running Ollama or LM Studio (a quick check of its port)
-  is pre-selected and offered: "press Enter to use it (no account or API
-  key needed)".
+- **Local discovery.** With no saved setup or provider key in the
+  environment, a background worker checks the local model-list APIs on
+  `127.0.0.1` and `::1`. First paint does not wait for network I/O. Ollama's
+  `/api/tags` and the OpenAI-compatible `/v1/models` shape identify a model
+  endpoint; an open TCP port alone makes no product claim. Discovery uses
+  at most four bounded GETs (350ms each, 1MiB body cap), without credentials,
+  proxies, redirects, model loads or downloads. The offer arrives only while
+  the untouched provider picker remains current, and selection keeps the
+  detected address, including IPv6. Empty Ollama offers say to run
+  `ollama pull MODEL`; other empty model APIs say to load a model first.
 - **The first approval** (TUI and web) adds a short explainer: Tools have
   no access by default, what the Capabilities are, Always vs Once vs this
   Session vs Deny, and `/approvals` / `/revoke` to undo. It is shown until

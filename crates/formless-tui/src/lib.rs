@@ -702,6 +702,7 @@ fn approval_inspection_lines(req: &ApprovalReq, summary: Option<&str>) -> Vec<St
 }
 
 enum WizardJob {
+    Local(u64, Vec<formless_core::local_servers::LocalServer>),
     Models(u64, Result<Vec<String>, String>),
     Probe(u64, Result<ProbeResult, String>),
 }
@@ -751,6 +752,8 @@ struct Wizard {
     reveal_key: bool,
     reveal_until: Option<Instant>,
     generation: u64,
+    local_pending: bool,
+    local_offer: Option<formless_core::local_servers::LocalServer>,
     /// Endpoint under which the current key/model were entered.
     credential_endpoint: String,
     /// Only an explicitly re-opened setup can return to an existing Session.
@@ -816,6 +819,8 @@ impl Wizard {
             reveal_key: false,
             reveal_until: None,
             generation: 0,
+            local_pending: false,
+            local_offer: None,
             credential_endpoint: cfg.provider.base_url.trim().to_string(),
             can_cancel: false,
             confirm_key_change: false,
@@ -840,6 +845,14 @@ impl Wizard {
 
     /// Resume a draft, or offer an already running local server.
     fn start(cfg: &Config, paths: &Paths) -> Self {
+        Self::start_with_detector(cfg, paths, formless_core::local_servers::discover)
+    }
+
+    fn start_with_detector(
+        cfg: &Config,
+        paths: &Paths,
+        detect: impl FnOnce() -> Vec<formless_core::local_servers::LocalServer> + Send + 'static,
+    ) -> Self {
         let mut w = Self::new_for_profile(cfg, paths);
         if w.step != WizardStep::PickPreset {
             return w;
@@ -848,7 +861,7 @@ impl Wizard {
             w.resume(&d);
             return w;
         }
-        w.offer_local();
+        w.offer_local_with(detect);
         w
     }
 
@@ -895,6 +908,13 @@ impl Wizard {
     /// No saved setup and no key in the environment: offer Ollama or
     /// LM Studio if one is already running here (#398).
     fn offer_local(&mut self) {
+        self.offer_local_with(formless_core::local_servers::discover);
+    }
+
+    fn offer_local_with(
+        &mut self,
+        detect: impl FnOnce() -> Vec<formless_core::local_servers::LocalServer> + Send + 'static,
+    ) {
         let presets = formless_core::presets::PRESETS;
         if presets
             .iter()
@@ -902,16 +922,12 @@ impl Wizard {
         {
             return;
         }
-        for (i, p) in presets.iter().enumerate().filter(|(_, p)| p.local) {
-            if local_server_running(p.base_url) {
-                self.preset_idx = i;
-                self.status = format!(
-                    "Welcome to Formless. {} is running on this machine: press Enter to use it (no account or API key needed), or choose another provider.",
-                    p.name
-                );
-                return;
-            }
-        }
+        self.local_pending = true;
+        let generation = self.generation;
+        let tx = self.job_tx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(WizardJob::Local(generation, detect()));
+        });
     }
 
     /// What to keep if the TUI quits here: never the key.
@@ -963,6 +979,7 @@ impl Wizard {
     }
 
     fn invalidate_jobs(&mut self) {
+        self.local_pending = false;
         self.generation = self.generation.wrapping_add(1);
         self.hide_key();
         self.confirm_key_change = false;
@@ -1068,14 +1085,20 @@ impl Wizard {
             self.status = "Enter your provider base URL (any OpenAI-compatible endpoint).".into();
             return;
         };
+        let endpoint = self
+            .local_offer
+            .as_ref()
+            .filter(|offer| offer.preset_id == p.id)
+            .map(|offer| offer.base_url.clone())
+            .unwrap_or_else(|| p.base_url.to_string());
         if self.preset.map(|old| old.id) != Some(p.id)
-            || self.credential_endpoint != p.base_url.trim()
+            || self.credential_endpoint != endpoint.trim()
         {
             self.clear_provider_state();
         }
         self.preset = Some(p);
-        self.base_url = p.base_url.to_string();
-        self.credential_endpoint = p.base_url.trim().to_string();
+        self.base_url = endpoint;
+        self.credential_endpoint = self.base_url.trim().to_string();
         if self.saved_model.is_empty() {
             self.saved_model = p.default_model.to_string();
         }
@@ -1126,21 +1149,6 @@ fn wizard_draft_file(paths: &Paths) -> std::path::PathBuf {
 
 fn load_wizard_draft(paths: &Paths) -> Option<serde_json::Value> {
     formless_core::setup_draft::load(paths)
-}
-
-/// Something answers on a local server's port (a quick TCP check).
-fn local_server_running(base_url: &str) -> bool {
-    let Some(hostport) = base_url
-        .split("://")
-        .nth(1)
-        .and_then(|r| r.split('/').next())
-    else {
-        return false;
-    };
-    let hostport = hostport.replace("localhost", "127.0.0.1");
-    hostport
-        .parse::<std::net::SocketAddr>()
-        .is_ok_and(|a| std::net::TcpStream::connect_timeout(&a, Duration::from_millis(150)).is_ok())
 }
 
 /// A Tool call waiting in step mode (SPEC §5.9).
@@ -8428,6 +8436,11 @@ impl App {
             }
             while let Ok(job) = w.jobs.try_recv() {
                 let current = match &job {
+                    WizardJob::Local(generation, _) => {
+                        *generation == w.generation
+                            && w.step == WizardStep::PickPreset
+                            && w.local_pending
+                    }
                     WizardJob::Models(generation, _) => {
                         *generation == w.generation && w.step == WizardStep::FetchModels
                     }
@@ -8443,6 +8456,19 @@ impl App {
                 w.generation = w.generation.wrapping_add(1);
                 w.draft_changed = Some(Instant::now());
                 match job {
+                    WizardJob::Local(_, offers) => {
+                        w.local_pending = false;
+                        if let Some(offer) = offers.into_iter().min_by_key(|s| s.models == 0) {
+                            if let Some(index) = formless_core::presets::PRESETS
+                                .iter()
+                                .position(|p| p.id == offer.preset_id)
+                            {
+                                w.preset_idx = index;
+                                w.status = offer.offer();
+                                w.local_offer = Some(offer);
+                            }
+                        }
+                    }
                     WizardJob::Models(_, Ok(models)) if !models.is_empty() => {
                         let items = models
                             .into_iter()
@@ -8645,6 +8671,9 @@ impl App {
         }
         let Some(w) = &mut self.wizard else { return };
         let presets = formless_core::presets::PRESETS.len();
+        if w.step == WizardStep::PickPreset {
+            w.local_pending = false;
+        }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         // Ctrl+R shows the key while typing it (#396).
         if ctrl && key.code == KeyCode::Char('r') {
@@ -20139,14 +20168,7 @@ mod tests {
         assert!(w.reveal_key && w.api_key.is_empty());
     }
 
-    #[test]
-    fn a_local_server_is_found_by_its_port() {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = l.local_addr().unwrap().port();
-        assert!(local_server_running(&format!("http://localhost:{port}/v1")));
-        drop(l);
-        assert!(!local_server_running("not a url"));
-    }
+    include!("local_discovery_tests.rs");
 
     #[test]
     fn reduced_motion_shows_a_static_indicator() {
