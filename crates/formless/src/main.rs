@@ -5397,6 +5397,14 @@ fn config_cmd(paths: Paths, action: ConfigAction) -> Result<()> {
             };
             formless_core::daemon::ensure_daemon(&paths)?;
             let r = formless_tui::client::request_once(&paths, request)?;
+            if r["applies"] == "env_override" {
+                println!(
+                    "saved {key} = {value}; daemon uses {} from {} (environment override)",
+                    r["effective_value"],
+                    r["override_source"].as_str().unwrap_or("its environment")
+                );
+                return Ok(());
+            }
             println!(
                 "{key} = {value}{}",
                 if r["applies"] == "on_tui_start" {

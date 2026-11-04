@@ -2822,7 +2822,7 @@ impl Daemon {
                     Request::MergeSetting { key, value } => (key, value, true),
                     _ => unreachable!(),
                 };
-                self.with_config_edit(|cfg| {
+                let effective = self.with_config_edit(|cfg| {
                     if merge {
                         cfg.merge_key(&key, value.clone())?;
                     } else {
@@ -2839,13 +2839,17 @@ impl Daemon {
                 });
                 // Nothing settable needs a daemon restart; a few TUI keys
                 // apply when the TUI next starts.
-                let applies = if crate::config::ON_TUI_START.contains(&key.as_str()) {
+                let override_source = crate::config::setting_override_source(&key)?;
+                let applies = if override_source.is_some() {
+                    "env_override"
+                } else if crate::config::ON_TUI_START.contains(&key.as_str()) {
                     "on_tui_start"
                 } else {
                     "now"
                 };
                 Ok(
-                    json!({"key": key, "value": value, "restart_required": false, "applies": applies}),
+                    json!({"key": key, "value": value, "restart_required": false, "applies": applies,
+                        "override_source": override_source, "effective_value": effective.setting_value(&key)?}),
                 )
             }
             Request::RevokeApproval {

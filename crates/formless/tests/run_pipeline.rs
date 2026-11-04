@@ -303,8 +303,12 @@ impl Fixture {
         command
     }
     fn start(&mut self) {
+        self.start_with_env(&[]);
+    }
+    fn start_with_env(&mut self, overrides: &[(&str, &str)]) {
         let stderr = std::fs::File::create(self.root.join("daemon.stderr")).unwrap();
         let mut command = self.command(&["daemon", "serve", "--stay"]);
+        command.envs(overrides.iter().copied());
         command.stdout(Stdio::null()).stderr(stderr);
         self.daemon = Some(Owned(Some(command.spawn().unwrap())));
         let deadline = Instant::now() + Duration::from_secs(15);
@@ -326,7 +330,17 @@ impl Fixture {
         self.run_profile("p", args, stdin)
     }
     fn run_profile(&self, profile: &str, args: &[&str], stdin: Option<&[u8]>) -> Output {
+        self.run_profile_env(profile, args, stdin, &[])
+    }
+    fn run_profile_env(
+        &self,
+        profile: &str,
+        args: &[&str],
+        stdin: Option<&[u8]>,
+        overrides: &[(&str, &str)],
+    ) -> Output {
         let mut command = self.command_profile(profile, args);
+        command.envs(overrides.iter().copied());
         if stdin.is_some() {
             command.stdin(Stdio::piped());
         }
@@ -397,6 +411,73 @@ impl Drop for Fixture {
         drop(self.daemon.take());
         self.provider.stop.store(true, Ordering::SeqCst);
         let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+#[test]
+fn config_set_reports_daemon_overrides_independently_of_client_environment() {
+    let mut f = Fixture::new();
+    f.start_with_env(&[
+        ("FORMLESS_MODEL", " daemon-model "),
+        ("FORMLESS_IDLE_GRACE_SECS", "600"),
+    ]);
+    for (key, saved, source, effective) in [
+        (
+            "provider.model",
+            "saved-model",
+            "FORMLESS_MODEL",
+            "daemon-model",
+        ),
+        (
+            "daemon.idle_grace_secs",
+            "42",
+            "FORMLESS_IDLE_GRACE_SECS",
+            "600",
+        ),
+    ] {
+        let r = f.run(&["config", "set", key, saved], None);
+        assert!(r.status.success(), "{}", String::from_utf8_lossy(&r.stderr));
+        let text = String::from_utf8(r.stdout).unwrap();
+        for expected in ["saved", saved, source, effective, "environment override"] {
+            assert!(text.contains(expected), "missing {expected}: {text}");
+        }
+        let r = f.run(&["config", "get", key], None);
+        assert!(r.status.success());
+        assert_eq!(String::from_utf8(r.stdout).unwrap().trim(), saved);
+    }
+    // A client-only override must not be presented as the daemon's source.
+    let mut other = Fixture::new();
+    other.start();
+    let r = other.run_profile_env(
+        "p",
+        &["config", "set", "provider.model", "new-file-model"],
+        None,
+        &[("FORMLESS_MODEL", "client-only")],
+    );
+    assert!(r.status.success(), "{}", String::from_utf8_lossy(&r.stderr));
+    let text = String::from_utf8(r.stdout).unwrap();
+    assert!(!text.contains("environment override"), "{text}");
+    assert!(!text.contains("client-only"), "{text}");
+    assert_eq!(
+        Config::load_file_only(&other.paths).unwrap().provider.model,
+        "new-file-model"
+    );
+    let invalid = other.run_profile_env(
+        "p",
+        &["config", "get", "daemon.idle_grace_secs"],
+        None,
+        &[("FORMLESS_IDLE_GRACE_SECS", "60s")],
+    );
+    assert!(!invalid.status.success());
+    let error = String::from_utf8(invalid.stderr).unwrap();
+    assert!(
+        error.contains("FORMLESS_IDLE_GRACE_SECS")
+            && error.contains("nonnegative whole number of seconds"),
+        "{error}"
+    );
+    for fixture in [&f, &other] {
+        assert!(fixture.provider.seen.lock().unwrap().is_empty());
+        assert!(fixture.provider.failure.lock().unwrap().is_none());
     }
 }
 

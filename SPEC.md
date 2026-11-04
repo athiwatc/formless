@@ -4246,7 +4246,10 @@ run_tool = "network_policy"     # a registry Tool, or…
   - Only `config::ON_TUI_START` (`tui.on_start`, `tui.screen_reader`)
     apply when the TUI next starts. `GetSettings` lists them as
     `on_tui_start`, and `SetSetting` answers `applies: "now" |
-    "on_tui_start"`. The web marks those rows and, after saving one, says
+    "on_tui_start" | "env_override"`. The last means the file was saved but
+    the daemon's environment still controls that key; `override_source`
+    names the variable and `effective_value` gives the runtime value.
+    The web marks TUI-start rows and, after saving one, says
     to restart any running TUI.
   - Web configuration rows are generated from documented current values,
     grouped by their key prefix. The daemon projects only existing SETTABLE
@@ -5297,7 +5300,16 @@ during its snapshot fetch, deduplicated by message id.
 ## 13. Configuration (complete settings table)
 
 - File: `config.toml` in the OS config dir; sections `[daemon] [provider]
-  [optimiser] [metrics] [tools]`. Env vars `FORMLESS_*` override file values.
+  [optimiser] [metrics] [tools]`. The exact config environment overrides are
+  `FORMLESS_BASE_URL` → `provider.base_url`, `FORMLESS_MODEL` → `provider.model`,
+  `FORMLESS_IDLE_GRACE_SECS` → `daemon.idle_grace_secs`, and `FORMLESS_SECURE`
+  → `security.secure`. There is no general `FORMLESS_<SECTION>_<KEY>` rule.
+  Endpoint/model values are trimmed; blank values leave the file value intact.
+  Idle seconds must parse as a nonnegative whole number in the u64 range;
+  whitespace around the number is allowed, but empty, invalid and non-text
+  values produce errors naming the variable and expected form. Secure mode
+  uses the yes/no grammar documented in §10.3. These overrides apply only to
+  the loading process and are never written back by a setting edit.
   Per-Session model/effort live in SQLite, not the file. Nothing configurable
   is a hidden constant: this table is exhaustive for v1.
 - **Saving keeps your file (#610).** Every save (a setting, an MCP
@@ -5331,6 +5343,13 @@ during its snapshot fetch, deduplicated by message id.
   that operation releases its lock; environment overrides remain runtime-only.
   Failed mutations or saves do not publish a changed configuration, and an
   import that adds no configuration entries does not rewrite the file.
+  A successful setting write reports `applies: "env_override"` when the
+  daemon's environment supplies its model or idle timeout, with the variable
+  in `override_source` and runtime value in `effective_value`. `value` remains
+  the requested file mutation; unshadowed writes keep `now`/`on_tui_start` and
+  a null `override_source`. Both setting operations return `effective_value`.
+  The CLI names the saved and effective values and source. Its own environment
+  is independent of the daemon's; `config get` uses the client's environment.
   Credentials, `base_url`, `extra_headers`, auth, the relay, MCP servers and
   hooks are never settable this way, locally or over the relay. The TUI
   (`/panes`) and the web Settings view (Edit) use `SetSetting`.
@@ -5883,6 +5902,24 @@ and fallback tests use the same lock as setters. Tests pin hostile inherited
 credentials, named-provider/file overrides, unwind restoration and contrasting
 parallel mock keys. A source check rejects bare environment mutation outside the
 shared helper.
+
+The environment documentation inventory checks every `FORMLESS_*` reference
+under `crates/*/src` against README or SPEC, including test-only references.
+`FORMLESS_DAEMON_LOG` is explicitly excluded: it is internal log-routing state,
+not a user override. Named key fixtures use the documented
+`FORMLESS_API_KEY_<NAME>` / `FORMLESS_API_KEY_<NAME>_FILE` families.
+Private subprocess fixtures also use these test-only variables (no product
+configuration interface): `FORMLESS_DOCS_OPENER_FIXTURE`,
+`FORMLESS_FORECAST_FIXTURE_DB`, `FORMLESS_FORECAST_FIXTURE_MODE`,
+`FORMLESS_MOTION_TEST_CHILD`, `FORMLESS_PRIVATE_ARTIFACT_PERMISSION_DATA`,
+`FORMLESS_PRIVATE_EDITOR_ACK`, `FORMLESS_PRIVATE_EDITOR_FILE`,
+`FORMLESS_PRIVATE_EDITOR_MODE`, `FORMLESS_PRIVATE_EDITOR_RECORD`,
+`FORMLESS_PRIVATE_EDITOR_RESULT`, `FORMLESS_PRIVATE_REFRESH_LOCK_FIXTURE`,
+`FORMLESS_PRIVATE_SNAPSHOT_CASE`, `FORMLESS_TEST_IMMEDIATE_RELEASE_MODE`,
+`FORMLESS_TEST_MAINTENANCE_CONFIG`, `FORMLESS_TEST_MAINTENANCE_DATA`,
+`FORMLESS_TEST_MAINTENANCE_ISOLATION`, `FORMLESS_TEST_MAINTENANCE_OPERATION`,
+`FORMLESS_TEST_OWNERSHIP_CONFIG`, `FORMLESS_TEST_OWNERSHIP_DATA`,
+`FORMLESS_TEST_PANIC_MARKER`.
 
 ### Local pre-Run forecasts (§5.2, §10.6, §12)
 

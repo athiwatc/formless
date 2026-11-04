@@ -22,6 +22,7 @@ pub const MIN_PROTOCOL_VERSION: u32 = 1;
 
 /// Named optional capabilities, advertised by `Ping` and `Status`.
 pub const FEATURES: &[&str] = &[
+    "setting_env_override",
     "setting_map_merge",
     "subscribe_filter",
     "ask_user",
