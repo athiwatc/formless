@@ -45,10 +45,12 @@ fn rate_limits_vendor_headers_reach_the_tui_and_status_line() {
             };
             write!(socket, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nConnection: close\r\n{headers}Content-Length: {}\r\n\r\n{body}", body.len()).unwrap();
         });
-        let mut cfg = formless_core::config::ProviderCfg::default();
-        cfg.base_url = base.clone();
-        cfg.fallback_models.clear();
-        cfg.max_retries = 0;
+        let cfg = formless_core::config::ProviderCfg {
+            base_url: base.clone(),
+            fallback_models: Vec::new(),
+            max_retries: 0,
+            ..Default::default()
+        };
         let provider = formless_core::provider::Provider::new(cfg, "fixture-secret".into()).unwrap().with_name(name);
         let completion = runtime.block_on(provider.complete(&[json!({"role":"user","content":"hi"})], "fixture", None));
         if name == "openrouter-fixture" { assert!(completion.is_err()); } else { assert_eq!(completion.unwrap(), "ok"); }
