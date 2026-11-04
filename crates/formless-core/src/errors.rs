@@ -242,11 +242,11 @@ pub fn explain_with_previous(
         "context" => "provider.context_tokens, provider.model_context_tokens and compaction.trigger_fraction",
         "rate_limit" => "provider.model and provider.max_retries",
         "unreachable" => "provider.base_url and provider.proxy",
-        "request" | "server" | "other" => "provider.base_url, provider.api_style, provider.reasoning_effort and provider.extra_body",
+        "request" | "server" | "other" => "provider.api_style, provider.reasoning_effort, provider.base_url and provider.extra_body",
         _ => return current,
     };
     current.message = format!(
-        "This {} error happened again after Resume. {}",
+        "Same {} error again after Resume: check {keys}. {}",
         current.category, current.message
     );
     current.action = Some(format!("Check {keys} with `formless config edit`; inspect /details, try /model, and run `formless doctor` before retrying"));
@@ -288,6 +288,16 @@ mod tests {
         let repeated =
             explain_with_previous(raw, Some("provider error: 422 unsupported argument"), &c);
         assert!(repeated.message.contains("again"));
+        assert!(
+            repeated
+                .message
+                .chars()
+                .take(200)
+                .collect::<String>()
+                .contains("provider.extra_body"),
+            "configuration keys must fit in the TUI banner: {}",
+            repeated.message
+        );
         assert!(repeated.action.unwrap().contains("provider.api_style"));
         assert_eq!(repeated.details, raw);
         assert!(

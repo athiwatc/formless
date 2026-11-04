@@ -140,6 +140,8 @@ async fn repeated_provider_error_after_resume_escalates_but_new_input_resets_it(
         }
     }
     assert!(second.message.contains("again"), "{}", second.message);
+    assert!(second.message.contains("provider.api_style"));
+    assert!(second.message.contains("provider.reasoning_effort"));
     assert!(second
         .action
         .as_deref()
