@@ -45,6 +45,9 @@ fn local_discovery_first_paint_does_not_wait_for_the_worker_and_keeps_ipv6_url()
         app.wizard_poll();
         std::thread::sleep(Duration::from_millis(2));
     }
+    assert!(app.wizard.as_ref().unwrap().draft_changed.is_none());
+    app.flush_wizard_draft(true);
+    assert!(!formless_core::setup_draft::file(&app.paths).exists());
     let w = app.wizard.as_mut().unwrap();
     assert!(w.status.contains("Local model API") && w.status.contains("1 model"));
     w.choose_preset();

@@ -8453,8 +8453,10 @@ impl App {
                 }
                 // An operation settles once; duplicate deliveries cannot
                 // override its outcome or finish a subsequently edited flow.
-                w.generation = w.generation.wrapping_add(1);
-                w.draft_changed = Some(Instant::now());
+                if !matches!(&job, WizardJob::Local(..)) {
+                    w.generation = w.generation.wrapping_add(1);
+                    w.draft_changed = Some(Instant::now());
+                }
                 match job {
                     WizardJob::Local(_, offers) => {
                         w.local_pending = false;
