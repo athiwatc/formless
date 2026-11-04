@@ -1012,6 +1012,14 @@ task, with quality as a gate**.
   replaces `limits.run_steps` for that Run and is cleared when the Run
   ends. Reaching it pauses the Run with the budget banner: `/resume`
   continues past it, `/abandon` stops. `/limit off` removes it.
+- **Live profile limits.** `limits.run_usd`, `limits.daily_usd` and
+  `limits.run_steps` are re-read before each model step, including checks
+  in nested completions and sub-agents. A setting edit applies to an
+  in-flight Run at its next step boundary; already-sent requests may finish
+  and their usage is still recorded. Clearing a profile limit also takes
+  effect at the next check. Explicit per-Run `/limit`/`--max-steps` and
+  `--max-usd` retain precedence over the corresponding profile limit;
+  the daily profile limit remains live with `--max-usd`.
 - **Steering is marked.** A message sent while a Run is active is stored
   with `meta.steer = {step, run_id}` (the Run's step count when it arrived),
   and clients show it as `↳ steer at step N` under the message.
@@ -5489,7 +5497,7 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
 | `tui.notify` | desktop | `off`, `bell`, or `desktop` (terminal or browser notification plus the bell) while you are elsewhere (§10.6) |
 | `tui.notify_min_secs` | 20 | Runs shorter than this finish without a notification (§10.6) |
 | `limits.forecast_confirm_usd` | (none) | Ask before sending when a priced local forecast p90 exceeds this finite nonnegative USD amount; previews add no caps and unpriced/no-history forecasts have no invented dollar range (§5.2) |
-| `limits.daily_usd` / `run_usd` / `run_steps` | (none) | Opt-in spending limits: provider spend per UTC day across Sessions, spend of one Run, and model steps of one Run; a note at 80%, a pause at 100% (§5.2) |
+| `limits.daily_usd` / `run_usd` / `run_steps` | (none) | Opt-in spending limits: provider spend per UTC day across Sessions, spend of one Run, and model steps of one Run; a note at 80%, a pause at 100% (§5.2). Profile edits apply to an in-flight Run before its next model step (§5.4). |
 | `naming.enabled` | true | Rename "Untitled" Sessions after their first Run |
 | `naming.model` / `auto_download` / `timeout_secs` | qwen2.5-0.5b / true / 30 | Embedded naming model (empty: a heuristic title), fetched on first use, and how long one naming may take before the heuristic is used |
 

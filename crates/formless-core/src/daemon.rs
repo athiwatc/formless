@@ -10623,7 +10623,9 @@ impl Daemon {
     /// a note at 80%, and at 100% an error that pauses the Run ("budget:
     /// …"). A known spending floor still applies when the full total is unknown.
     fn check_budget(&self, session_id: &str, run_id: &str, cfg: &Config) -> Result<()> {
-        let mut l = cfg.limits.clone();
+        // A Run keeps its model/config snapshot, but profile limits are an
+        // emergency brake and must reflect edits at every step boundary.
+        let mut l = self.config()?.limits;
         let pipeline = self.pipeline_policy(run_id)?;
         let explicit = pipeline.as_ref().and_then(|p| p.options.options().max_usd);
         let live_cfg = explicit.map(|_| Config::load(&self.paths)).transpose()?;
