@@ -540,13 +540,24 @@ formless profiles rm sandbox     # stops its daemon, deletes its data, config an
 | Variable | Effect |
 |---|---|
 | `FORMLESS_API_KEY` | provider key; wins over the keychain and fallback file |
+| `FORMLESS_API_KEY_<NAME>` | key for a named provider; uppercase the name and replace non-alphanumeric characters with `_` |
+| `FORMLESS_API_KEY_FILE`, `FORMLESS_API_KEY_<NAME>_FILE` | paths to files containing the default/named provider key |
 | `FORMLESS_OAUTH_ACCESS_TOKEN` | OAuth mode: use this access token instead of stored tokens |
 | `FORMLESS_OAUTH_CLIENT_SECRET` | OAuth mode: client secret for providers that need one (never stored in config) |
-| `FORMLESS_BASE_URL`, `FORMLESS_MODEL` | override the configured endpoint/model for this process |
+| `FORMLESS_BASE_URL`, `FORMLESS_MODEL` | override the configured endpoint/model for this process; trimmed, empty/whitespace-only values ignored |
 | `FORMLESS_DATA_DIR`, `FORMLESS_CONFIG_DIR` | relocate state (also how the auto-started daemon inherits them) |
-| `FORMLESS_IDLE_GRACE_SECS` | how long an idle daemon lingers before exiting |
+| `FORMLESS_IDLE_GRACE_SECS` | idle daemon timeout as a nonnegative whole number of seconds; invalid or empty values are errors |
+| `FORMLESS_SECURE` | process override for `security.secure`: `1/true/yes/on` or `0/false/no/off`, case insensitive; blank is ignored, invalid values are errors |
+| `FORMLESS_DAEMON_STAY` | keep the daemon alive as with `daemon serve --stay`; presence enables it |
 | `FORMLESS_RELAY_SECRET` | pairing secret override for the relay |
 | `RUST_LOG` | log filter for the daemon, e.g. `RUST_LOG=debug` |
+
+Only the four config overrides listed in SPEC §13 are supported; setting an
+arbitrary `FORMLESS_*` name does not override a config key. A setting saved
+under the daemon's `FORMLESS_MODEL` or `FORMLESS_IDLE_GRACE_SECS` override is
+persisted for later use. `config set` reports the saved value, the daemon's
+effective value and the overriding variable; `config get` reads the file with
+the client's own environment applied.
 
 ### 3.10 Troubleshooting
 

@@ -588,6 +588,43 @@ pub fn env_flag(name: &str) -> Result<Option<bool>> {
     }
 }
 
+/// Nonblank text overrides use the same whitespace rule as yes/no flags.
+fn env_text(name: &str) -> Result<Option<String>> {
+    match std::env::var(name) {
+        Ok(value) => Ok((!value.trim().is_empty()).then(|| value.trim().to_string())),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => anyhow::bail!("{name} is not text"),
+    }
+}
+
+fn env_seconds(name: &str) -> Result<Option<u64>> {
+    let value = match std::env::var(name) {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("{name} is not text; use a nonnegative whole number of seconds")
+        }
+    };
+    value.trim().parse().map(Some).with_context(|| {
+        format!(
+            "{name}={value:?}: expected a nonnegative whole number of seconds (0..={})",
+            u64::MAX
+        )
+    })
+}
+
+/// Only these settable keys have process-environment overrides. The daemon
+/// uses its own environment, independently of the requesting client's.
+pub(crate) fn setting_override_source(key: &str) -> Result<Option<&'static str>> {
+    Ok(match key {
+        "provider.model" if env_text("FORMLESS_MODEL")?.is_some() => Some("FORMLESS_MODEL"),
+        "daemon.idle_grace_secs" if env_seconds("FORMLESS_IDLE_GRACE_SECS")?.is_some() => {
+            Some("FORMLESS_IDLE_GRACE_SECS")
+        }
+        _ => None,
+    })
+}
+
 /// Keys `harness:models` may change (SPEC §7.13); other settable keys are
 /// `harness:config`.
 pub const HARNESS_MODEL_KEYS: &[&str] = &[
@@ -2121,16 +2158,14 @@ impl Config {
         if let Some(secure) = env_flag("FORMLESS_SECURE")? {
             self.security.secure = secure;
         }
-        if let Ok(v) = std::env::var("FORMLESS_BASE_URL") {
+        if let Some(v) = env_text("FORMLESS_BASE_URL")? {
             self.provider.base_url = v;
         }
-        if let Ok(v) = std::env::var("FORMLESS_MODEL") {
+        if let Some(v) = env_text("FORMLESS_MODEL")? {
             self.provider.model = v;
         }
-        if let Ok(v) = std::env::var("FORMLESS_IDLE_GRACE_SECS") {
-            if let Ok(n) = v.parse() {
-                self.daemon.idle_grace_secs = n;
-            }
+        if let Some(n) = env_seconds("FORMLESS_IDLE_GRACE_SECS")? {
+            self.daemon.idle_grace_secs = n;
         }
         Ok(())
     }
