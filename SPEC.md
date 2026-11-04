@@ -497,6 +497,16 @@ an empty listing just asks for one.
 
 ### 4.4 Provider failure handling
 
+Persistent request errors (such as unknown parameters or an API-style mismatch
+reported as HTTP400/422) point to `/details`, `/model` and `formless doctor`
+rather than retrying the identical request. Transient failures retain retry
+guidance. If the same provider-error category recurs after Resume, the Run
+banner names likely configuration keys to check (for example
+`provider.api_style`, `provider.reasoning_effort`, `provider.base_url` and
+`provider.extra_body`). This compares the immediately preceding resumed Run
+in that Session; a fresh user message resets the escalation. Raw details stay
+available, and budget/correction decisions keep their existing guidance.
+
 Model requests made by a daemon share budget admission, including Run turns,
 sub-agents, nested `llm.complete` and internal model work. With a positive dollar
 limit configured, one request at a time reserves the available budget headroom;

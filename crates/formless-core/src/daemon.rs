@@ -5586,10 +5586,17 @@ impl Daemon {
                     self.close_run_steering(&session_id, &run_id);
                     self.record_run_status(&session_id, &run_id, "paused");
                     let _ = self.with_store(|st| st.set_run_error(&run_id, &e.to_string()));
+                    let previous = self
+                        .with_reader(|st| st.previous_resumed_run_error(&session_id, &run_id))
+                        .unwrap_or_else(|error| {
+                            tracing::warn!("cannot read previous resume error: {error}");
+                            None
+                        });
                     let mut explained = self.config().ok().map(|cfg| {
                         let (model, _) = self.session_model_effort(&session_id, &cfg);
-                        crate::errors::explain(
+                        crate::errors::explain_with_previous(
                             &format!("{e:#}"),
+                            previous.as_deref(),
                             &crate::errors::ErrorContext::from_config(&cfg, &model),
                         )
                     });
@@ -18551,3 +18558,7 @@ mod setting_map_tests;
 #[cfg(test)]
 #[path = "role_reference_tests.rs"]
 mod role_reference_tests;
+
+#[cfg(test)]
+#[path = "provider_error_guidance_tests.rs"]
+mod provider_error_guidance_tests;

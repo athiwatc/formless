@@ -193,11 +193,23 @@ pub fn explain(raw: &str, ctx: &ErrorContext) -> ErrorExplained {
             format!("{host} had a server error."),
             Some("Try again with /resume".into()),
         )
+    } else if code.is_some_and(|c| (400..500).contains(&c)) && !is_transient(raw) {
+        (
+            "request",
+            format!("The provider rejected the request for {}.", ctx.model),
+            Some("Inspect /details, try another model with /model, and run `formless doctor` to check endpoint/API settings".into()),
+        )
+    } else if is_transient(raw) {
+        (
+            "other",
+            "The provider request failed temporarily.".into(),
+            Some("/resume to retry".into()),
+        )
     } else {
         (
             "other",
             "The provider request failed.".into(),
-            Some("/resume to retry".into()),
+            Some("Inspect /details, try another model with /model, and run `formless doctor` to check the provider configuration".into()),
         )
     };
     ErrorExplained {
@@ -206,6 +218,39 @@ pub fn explain(raw: &str, ctx: &ErrorContext) -> ErrorExplained {
         action,
         details: raw.to_string(),
     }
+}
+
+/// A resumed Run gets stronger guidance when its predecessor failed in the
+/// same category. Budget/correction choices retain their existing semantics.
+pub fn explain_with_previous(
+    raw: &str,
+    previous: Option<&str>,
+    ctx: &ErrorContext,
+) -> ErrorExplained {
+    let mut current = explain(raw, ctx);
+    let Some(previous) = previous else {
+        return current;
+    };
+    if explain(previous, ctx).category != current.category {
+        return current;
+    }
+    let keys = match current.category.as_str() {
+        "auth" => "provider.base_url and provider.auth.mode",
+        "model" => "provider.model and provider.aliases",
+        "endpoint" => "provider.base_url and provider.api_style",
+        "tool_calling" => "provider.tool_mode, provider.api_style and provider.model",
+        "context" => "provider.context_tokens, provider.model_context_tokens and compaction.trigger_fraction",
+        "rate_limit" => "provider.model and provider.max_retries",
+        "unreachable" => "provider.base_url and provider.proxy",
+        "request" | "server" | "other" => "provider.base_url, provider.api_style, provider.reasoning_effort and provider.extra_body",
+        _ => return current,
+    };
+    current.message = format!(
+        "This {} error happened again after Resume. {}",
+        current.category, current.message
+    );
+    current.action = Some(format!("Check {keys} with `formless config edit`; inspect /details, try /model, and run `formless doctor` before retrying"));
+    current
 }
 
 #[cfg(test)]
@@ -218,6 +263,54 @@ mod tests {
             model: "gpt-x",
             alternatives: vec![],
         }
+    }
+
+    #[test]
+    fn persistent_bad_requests_point_to_diagnostics_instead_of_resume() {
+        for raw in [
+            "provider error: 400 Bad Request: unknown parameter reasoning_effort",
+            "provider error: 400 Bad Request: API style mismatch; expected Messages API",
+        ] {
+            let e = explain(raw, &ctx("https://private.invalid/v1"));
+            assert_eq!(e.category, "request");
+            let action = e.action.unwrap();
+            for command in ["/details", "/model", "formless doctor"] {
+                assert!(action.contains(command), "{action}");
+            }
+            assert!(!action.contains("/resume"), "{action}");
+        }
+    }
+
+    #[test]
+    fn repeated_categories_escalate_without_rewriting_details_or_local_budget_choices() {
+        let c = ctx("https://private.invalid/v1");
+        let raw = "provider error: 400 Bad Request: unknown parameter reasoning_effort";
+        let repeated =
+            explain_with_previous(raw, Some("provider error: 422 unsupported argument"), &c);
+        assert!(repeated.message.contains("again"));
+        assert!(repeated.action.unwrap().contains("provider.api_style"));
+        assert_eq!(repeated.details, raw);
+        assert!(
+            !explain_with_previous(raw, Some("provider error: 401 Unauthorized"), &c)
+                .message
+                .contains("again")
+        );
+        let budget = "budget: limit reached";
+        assert_eq!(
+            explain_with_previous(budget, Some(budget), &c).action,
+            explain(budget, &c).action
+        );
+        for transient in [
+            "provider error: 408 timeout",
+            "provider error: 503 Service Unavailable",
+            "connection reset",
+        ] {
+            assert!(explain(transient, &c).action.unwrap().contains("/resume"));
+        }
+        assert!(!explain("malformed reply", &c)
+            .action
+            .unwrap()
+            .contains("/resume"));
     }
 
     #[test]

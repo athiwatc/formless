@@ -286,6 +286,51 @@ fn cost_per_success_counts_attributed_tokens_and_time() {
     assert_eq!(m.model_cost_per_call, None, "an unpriced model: no total");
 }
 
+#[test]
+fn repeated_error_context_uses_only_the_preceding_resumed_run_in_this_session() {
+    let st = Store::open_in_memory().unwrap();
+    let session = st.create_session(None).unwrap().id;
+    let old = st.create_run(&session).unwrap();
+    st.set_run_error(&old, "provider error: 400 unknown parameter")
+        .unwrap();
+    st.set_run_status(&old, "paused").unwrap();
+    let current = st.create_run(&session).unwrap();
+    assert_eq!(
+        st.previous_resumed_run_error(&session, &current).unwrap(),
+        None
+    );
+    st.set_run_status(&old, "resumed").unwrap();
+    assert_eq!(
+        st.previous_resumed_run_error(&session, &current)
+            .unwrap()
+            .as_deref(),
+        Some("provider error: 400 unknown parameter")
+    );
+    let other = st.create_session(None).unwrap().id;
+    let peer = st.create_run(&other).unwrap();
+    st.set_run_error(&peer, "wrong session").unwrap();
+    st.set_run_status(&peer, "resumed").unwrap();
+    // Later rows cannot become the predecessor of an existing Run.
+    let future = st.create_run(&session).unwrap();
+    st.set_run_error(&future, "future error").unwrap();
+    st.set_run_status(&future, "resumed").unwrap();
+    assert_eq!(
+        st.previous_resumed_run_error(&session, &current)
+            .unwrap()
+            .as_deref(),
+        Some("provider error: 400 unknown parameter")
+    );
+    st.set_run_status(&current, "completed").unwrap();
+    assert_eq!(
+        st.previous_resumed_run_error(&session, &future).unwrap(),
+        None
+    );
+    assert_eq!(
+        st.previous_resumed_run_error(&other, &current).unwrap(),
+        None
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn session_usage_totals_and_priced_cost() {
     use formless_core::config::ModelPrice;

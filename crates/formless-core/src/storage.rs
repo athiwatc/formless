@@ -2441,6 +2441,26 @@ impl Store {
         Ok((rows, steps))
     }
 
+    /// Error of the immediately preceding Run only when it was explicitly
+    /// resumed. A fresh message after a paused/completed Run resets guidance.
+    pub fn previous_resumed_run_error(
+        &self,
+        session_id: &str,
+        run_id: &str,
+    ) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT CASE WHEN status='resumed' THEN error END FROM runs
+             WHERE session_id=?1 AND rowid<(SELECT rowid FROM runs WHERE id=?2 AND session_id=?1)
+             ORDER BY rowid DESC LIMIT 1",
+                params![session_id, run_id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
     /// Record why a Run stopped.
     pub fn run_error(&self, run_id: &str) -> Result<Option<String>> {
         Ok(self
