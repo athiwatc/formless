@@ -415,6 +415,73 @@ impl Drop for Fixture {
 }
 
 #[test]
+fn doctor_reports_unknown_role_providers_without_changing_configuration() {
+    use formless_core::config::{ProviderCfg, RoleCfg};
+    let f = Fixture::new();
+    let mut cfg = Config::load_file_only(&f.paths).unwrap();
+    cfg.provider.model.clear(); // Diagnostics need no provider request.
+    cfg.providers.insert(
+        "local".into(),
+        ProviderCfg {
+            base_url: f.provider.url.clone(),
+            model: "model".into(),
+            ..Default::default()
+        },
+    );
+    for (name, provider) in [
+        ("broken", Some("missing-provider")),
+        ("valid", Some("local")),
+        ("default", Some("default")),
+        ("empty", Some("")),
+        ("implicit", None),
+    ] {
+        cfg.roles.insert(
+            name.into(),
+            RoleCfg {
+                provider: provider.map(str::to_string),
+                model: "model".into(),
+                ..Default::default()
+            },
+        );
+    }
+    cfg.save(&f.paths).unwrap();
+    let before = std::fs::read(f.paths.config_file()).unwrap();
+    let human = f.run(&["doctor"], None);
+    assert!(
+        human.status.success(),
+        "{}",
+        String::from_utf8_lossy(&human.stderr)
+    );
+    let text = String::from_utf8(human.stdout).unwrap();
+    assert!(
+        text.contains("role \"broken\"") && text.contains("unknown provider \"missing-provider\""),
+        "{text}"
+    );
+    let json = f.run(&["doctor", "--json"], None);
+    assert!(
+        json.status.success(),
+        "{}",
+        String::from_utf8_lossy(&json.stderr)
+    );
+    let value: Value = serde_json::from_slice(&json.stdout).unwrap();
+    let role_problems: Vec<_> = value["problems"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|p| p["what"].as_str().is_some_and(|s| s.starts_with("role ")))
+        .collect();
+    assert_eq!(role_problems.len(), 1, "{value}");
+    assert!(role_problems[0]["next"]
+        .as_str()
+        .unwrap()
+        .contains("formless config edit"));
+    assert_eq!(std::fs::read(f.paths.config_file()).unwrap(), before);
+    assert!(!f.paths.socket_path().exists());
+    assert!(f.provider.seen.lock().unwrap().is_empty());
+    assert!(f.provider.failure.lock().unwrap().is_none());
+}
+
+#[test]
 fn config_set_reports_daemon_overrides_independently_of_client_environment() {
     let mut f = Fixture::new();
     f.start_with_env(&[

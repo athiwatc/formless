@@ -1095,6 +1095,38 @@ impl Daemon {
         }
     }
 
+    /// Both management paths use one referential-integrity check. Lock in
+    /// config-edit -> writer order, retaining the writer through the save so
+    /// existing pins cannot change between inspection and file replacement.
+    fn delete_role(&self, name: &str) -> Result<()> {
+        let _edit = self.config_guard();
+        self.with_store(|st| {
+            let mut cfg = Config::load_file_only(&self.paths)?;
+            if !cfg.roles.contains_key(name) {
+                return Err(anyhow::Error::new(RequestFailure::not_found(format!(
+                    "no role '{name}'"
+                ))));
+            }
+            let mut users = st.role_references(name)?;
+            let pin = format!("role:{name}");
+            if cfg.provider.model == pin {
+                users.insert(0, "provider.model".into());
+            } else if self.config()?.provider.model == pin {
+                users.insert(0, "provider.model (FORMLESS_MODEL)".into());
+            }
+            if !users.is_empty() {
+                return Err(anyhow!(
+                    "role '{name}' is used by {}; change those references first",
+                    users.join(", ")
+                ));
+            }
+            cfg.roles.remove(name);
+            cfg.save(&self.paths)?;
+            self.config_with_refresh(true)?;
+            Ok(())
+        })
+    }
+
     /// A named provider (SPEC §4.5); `default`/unset is `[provider]`.
     pub(crate) async fn provider_named(
         &self,
@@ -3411,14 +3443,7 @@ impl Daemon {
                 Ok(json!({"role": name}))
             }
             Request::DeleteRole { name } => {
-                self.with_config_edit(|cfg| {
-                    if cfg.roles.remove(&name).is_none() {
-                        return Err(anyhow::Error::new(RequestFailure::not_found(format!(
-                            "no role '{name}'"
-                        ))));
-                    }
-                    Ok(true)
-                })?;
+                self.delete_role(&name)?;
                 let _ = self.with_store(|st| st.audit("user", "role.delete", &name));
                 Ok(json!({"deleted": name}))
             }
@@ -10552,12 +10577,7 @@ impl Daemon {
                 Ok(json!({"role": name}))
             }
             "roles.delete" => {
-                edit_config(&|cfg| {
-                    cfg.roles
-                        .remove(&name)
-                        .map(|_| ())
-                        .with_context(|| RequestFailure::not_found(format!("no role '{name}'")))
-                })?;
+                self.delete_role(&name)?;
                 Ok(json!({"deleted": name}))
             }
             other => Err(anyhow!("unknown harness operation '{other}'")),
@@ -18527,3 +18547,7 @@ mod approval_batch_tests;
 #[cfg(test)]
 #[path = "setting_map_tests.rs"]
 mod setting_map_tests;
+
+#[cfg(test)]
+#[path = "role_reference_tests.rs"]
+mod role_reference_tests;

@@ -639,6 +639,12 @@ The user talks to one **primary** model; work can go to others.
   (empty = that provider's default), an optional `reasoning_effort`, and
   an optional `system` addendum for sub-agents in the role. Roles change
   through `UpsertRole` and `DeleteRole`.
+  Deletion through `DeleteRole` or harness `roles.delete` refuses while
+  file or daemon-effective `provider.model`, any Session model (including archived or soft-deleted
+  Sessions), or a Session template names `role:<name>`. The error names the
+  references to repoint first; after they are changed, deletion succeeds.
+  `doctor` reports file-edited roles that name an unknown provider, with
+  guidance to select or configure that provider.
   - CLI: `formless providers list|add|remove|test` and `formless roles
     list|add|rm`. The CLI reads the key from stdin, never argv.
   - TUI: `/roles`, `/role add NAME PROVIDER MODEL description…` and
