@@ -415,6 +415,68 @@ impl Drop for Fixture {
 }
 
 #[test]
+fn job_times_cli_reports_rejections_and_future_enable_without_firing() {
+    let mut f = Fixture::new();
+    f.start();
+    for (prompt, at, expected) in [
+        ("past", "2020-01-01T03:00:00Z", "future"),
+        ("zero", "in 0m", "future"),
+        ("overflow", "in 9999999999d", "366 days"),
+        ("  \t", "in 1h", "prompt required"),
+    ] {
+        let output = f.run(&["jobs", "add", prompt, "--at", at], None);
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "accepted {at}");
+        assert!(error.contains(expected), "{error}");
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("scheduled"));
+    }
+    let store = Store::open(&f.paths.db_file()).unwrap();
+    assert!(store.list_jobs().unwrap().is_empty());
+    let pending = store
+        .create_job(
+            "pending",
+            None,
+            Some("0 3 * * *"),
+            "2020-01-01T03:00:00Z",
+            false,
+            "agent",
+        )
+        .unwrap();
+    let output = f.run(&["jobs", "enable", &pending.id], None);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let enabled = store.get_job(&pending.id).unwrap().unwrap();
+    assert!(enabled.enabled && enabled.approved);
+    assert!(
+        chrono::DateTime::parse_from_rfc3339(enabled.next_run.as_deref().unwrap()).unwrap()
+            > chrono::Utc::now()
+    );
+
+    let expired = store
+        .create_job("expired", None, None, "2020-01-01T03:00:00Z", false, "user")
+        .unwrap();
+    let output = f.run(&["jobs", "enable", &expired.id], None);
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        error.contains("expired") && error.contains("jobs run"),
+        "{error}"
+    );
+    assert!(!store.get_job(&expired.id).unwrap().unwrap().enabled);
+    let valid = f.run(&["jobs", "add", "future", "--at", "in 1h"], None);
+    assert!(
+        valid.status.success(),
+        "{}",
+        String::from_utf8_lossy(&valid.stderr)
+    );
+    assert!(String::from_utf8_lossy(&valid.stdout).contains("scheduled"));
+    assert_eq!(f.provider.count(), 0, "admission must not fire any prompt");
+}
+
+#[test]
 fn doctor_reports_unknown_role_providers_without_changing_configuration() {
     use formless_core::config::{ProviderCfg, RoleCfg};
     let f = Fixture::new();

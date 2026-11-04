@@ -3468,10 +3468,20 @@ refresh a cache, nightly cleanup.
     18:30", "hourly", "every monday and friday at noon", "every weekend
     at 8pm"; it is stored as cron. `PreviewSchedule {schedule}` returns
     the cron and the next 3 runs, which `jobs add` prints to confirm.
+  - Both entry points require a nonblank prompt and a one-shot time strictly
+    after now. Relative offsets use checked arithmetic and may be at most
+    366 days; zero, past and overflowing times return errors without saving
+    a job. Explicit immediate firing uses `RunJobNow` / `jobs run ID`.
 - **Trust:** one-shot jobs from the agent are scheduled at once.
   Recurring ones need the user's approval: asked immediately, or, with
   nobody connected, saved as "awaiting approval" until the user enables
-  them. Enabling a job approves it.
+  them. Enabling a job approves it. Enabling/approving a disabled recurring
+  job recomputes its next future cron slot; time spent disabled is not missed
+  downtime. An expired or completed disabled one-shot cannot be enabled:
+  the error names its expired state and the explicit run-now alternative.
+  Re-enabling an already enabled/approved job is idempotent, preserving
+  ordinary daemon-downtime catch-up. Cron creation uses the time after any
+  approval wait when choosing its first slot.
 - **Running:** the daemon checks every 20 s. A due job sends its prompt to
   its Session (queued if that Session is busy), or to a new Session named
   `Job: …`. A one-shot job then ends; a recurring one moves to its next

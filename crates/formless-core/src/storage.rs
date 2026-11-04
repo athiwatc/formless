@@ -8,6 +8,10 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
+#[cfg(test)]
+#[path = "job_schedule_tests.rs"]
+mod job_schedule_tests;
+
 /// Token use for one key and model: (key, model, prompt, completion,
 /// cached, provider-reported USD when every request reported one).
 /// (key, provider, model, prompt, completion, cached, cache-write, reported cost).
@@ -2326,10 +2330,45 @@ impl Store {
 
     /// The user enables (which also approves) or disables a job.
     pub fn set_job_enabled(&self, id: &str, enabled: bool) -> Result<bool> {
-        Ok(self.ex(
-            "UPDATE jobs SET enabled=?2, approved=CASE WHEN ?2 THEN 1 ELSE approved END WHERE id=?1",
-            params![id, enabled],
-        )? > 0)
+        self.set_job_enabled_with_clock(id, enabled, chrono::Local::now)
+    }
+
+    #[cfg(test)]
+    fn set_job_enabled_at(
+        &self,
+        id: &str,
+        enabled: bool,
+        now: chrono::DateTime<chrono::Local>,
+    ) -> Result<bool> {
+        self.set_job_enabled_with_clock(id, enabled, || now)
+    }
+
+    fn set_job_enabled_with_clock(
+        &self,
+        id: &str,
+        enabled: bool,
+        clock: impl FnOnce() -> chrono::DateTime<chrono::Local>,
+    ) -> Result<bool> {
+        self.transaction(|st| {
+            let Some(job) = st.get_job(id)? else { return Ok(false); };
+            if !enabled {
+                return Ok(st.ex("UPDATE jobs SET enabled=0 WHERE id=?1", params![id])? > 0);
+            }
+            // Repeated enable must not discard legitimate downtime catch-up.
+            if job.enabled && job.approved { return Ok(true); }
+            // Read time after acquiring the SQLite writer boundary; waiting
+            // for a busy writer must not leave the next slot in the past.
+            let now = clock();
+            let next = match job.cron.as_deref() {
+                Some(cron) => crate::jobs::first_run(Some(cron), None, now)?,
+                None => {
+                    let error = "one-shot job has expired or completed; use jobs run ID explicitly or create a new schedule";
+                    let at = job.next_run.as_deref().context(error)?;
+                    crate::jobs::parse_at(at, now).context(error)?
+                }
+            };
+            Ok(st.ex("UPDATE jobs SET enabled=1, approved=1, next_run=?2 WHERE id=?1", params![id, next.to_rfc3339()])? > 0)
+        })
     }
 
     /// Record a job's run; `next_run` None ends a one-shot job.

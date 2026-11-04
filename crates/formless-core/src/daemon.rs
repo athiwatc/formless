@@ -3462,6 +3462,9 @@ impl Daemon {
                 overlap,
                 deliver,
             } => {
+                if prompt.trim().is_empty() {
+                    bail!("prompt required");
+                }
                 // Plain English ("every weekday at 9am") is stored as cron.
                 let cron = cron.as_deref().map(crate::jobs::to_cron).transpose()?;
                 check_overlap(overlap.as_deref())?;
@@ -11496,6 +11499,13 @@ impl Daemon {
         if cancel.is_cancelled() {
             bail!("interrupted");
         }
+        // A recurring job may have waited for approval past its previewed
+        // slot. Creation starts from now, not from before that wait.
+        let next = if cron.is_some() {
+            crate::jobs::first_run(cron, None, chrono::Local::now())?
+        } else {
+            next
+        };
         let job = self.with_store(|st| {
             st.create_job(
                 prompt,
