@@ -119,13 +119,15 @@ fn reset_at(raw: &str, at: DateTime<Utc>) -> Option<DateTime<Utc>> {
         return Some(date.with_timezone(&Utc));
     }
     if let Ok(epoch) = raw.trim().parse::<f64>() {
-        // Timestamp-only numbers: seconds or milliseconds, never relative seconds.
+        // A small bare number may mean relative seconds. Without a unit we
+        // cannot distinguish that from an old epoch; retain a labelled raw
+        // value rather than silently treating it as an expired 1970 reset.
         let millis = if epoch >= 100_000_000_000.0 {
             epoch
         } else {
             epoch * 1000.0
         };
-        if millis.is_finite() && millis >= 0.0 && millis < i64::MAX as f64 {
+        if millis.is_finite() && millis >= 1_000_000_000_000.0 && millis < i64::MAX as f64 {
             return DateTime::from_timestamp_millis(millis.ceil() as i64);
         }
         return None;
@@ -134,11 +136,20 @@ fn reset_at(raw: &str, at: DateTime<Utc>) -> Option<DateTime<Utc>> {
 }
 
 impl Observation {
-    fn fresh(&self, now: DateTime<Utc>) -> bool {
+    fn prune(&mut self, now: DateTime<Utc>) -> bool {
         let age = now.signed_duration_since(self.at);
-        age >= TimeDelta::zero()
-            && age < TimeDelta::seconds(MAX_AGE_SECONDS)
-            && self.resets.values().all(|reset| *reset > now)
+        if age < TimeDelta::zero() || age >= TimeDelta::seconds(MAX_AGE_SECONDS) {
+            return false;
+        }
+        for kind in KINDS {
+            if self.resets.get(kind).is_some_and(|reset| *reset <= now) {
+                self.resets.remove(kind);
+                for field in ["limit", "remaining", "reset"] {
+                    self.fields.remove(&format!("{field}-{kind}"));
+                }
+            }
+        }
+        !self.fields.is_empty()
     }
 
     fn public(&self, now: DateTime<Utc>) -> Value {
@@ -196,7 +207,7 @@ impl Registry {
         at: DateTime<Utc>,
         redact: impl Fn(&str) -> String,
     ) {
-        self.0.retain(|_, entry| entry.fresh(at));
+        self.0.retain(|_, entry| entry.prune(at));
         let mut fields = Map::new();
         for (header, value) in headers {
             if let (Some(key), Ok(raw)) = (canonical(header.as_str()), value.to_str()) {
@@ -258,7 +269,7 @@ impl Registry {
     }
 
     fn snapshot(&mut self, now: DateTime<Utc>) -> HashMap<String, Value> {
-        self.0.retain(|_, entry| entry.fresh(now));
+        self.0.retain(|_, entry| entry.prune(now));
         self.0
             .values()
             .map(|entry| (entry.id.clone(), entry.public(now)))
@@ -288,6 +299,76 @@ pub(crate) fn snapshot() -> HashMap<String, Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn kind_expiry_retains_the_other_quota_and_observation_identity() {
+        let mut registry = Registry::default();
+        let fields = headers(&[
+            ("x-ratelimit-limit-requests", "50"),
+            ("x-ratelimit-remaining-requests", "41"),
+            ("x-ratelimit-reset-requests", "6ms"),
+            ("x-ratelimit-limit-tokens", "1000"),
+            ("x-ratelimit-remaining-tokens", "900"),
+            ("x-ratelimit-reset-tokens", "2m"),
+        ]);
+        observe(
+            &mut registry,
+            "work",
+            "https://example.com",
+            "secret",
+            &fields,
+            at(),
+        );
+        let before = registry.snapshot(at());
+        let id = before.keys().next().unwrap().clone();
+        let during = registry.snapshot(at() + TimeDelta::seconds(10));
+        assert_eq!(
+            during.len(),
+            1,
+            "fast request window hid the still-current tokens"
+        );
+        let value = &during[&id];
+        for field in ["limit", "remaining", "reset"] {
+            assert!(value.get(format!("{field}-requests")).is_none());
+        }
+        assert_eq!(value["remaining-tokens"], "900");
+        assert_eq!(value["at"], before[&id]["at"]);
+        assert!(value["line"]
+            .as_str()
+            .unwrap()
+            .contains("900/1000 tokens left, resets in 110s"));
+        assert!(!value["line"].as_str().unwrap().contains("requests"));
+        assert!(registry.snapshot(at() + TimeDelta::seconds(120)).is_empty());
+    }
+
+    #[test]
+    fn kind_expiry_small_numeric_reset_remains_visible_and_labelled() {
+        let mut registry = Registry::default();
+        observe(
+            &mut registry,
+            "work",
+            "https://example.com",
+            "secret",
+            &headers(&[
+                ("x-ratelimit-remaining", "3"),
+                ("x-ratelimit-limit", "10"),
+                ("x-ratelimit-reset", "60"),
+            ]),
+            at(),
+        );
+        let snapshot = registry.snapshot(at());
+        assert_eq!(
+            snapshot.len(),
+            1,
+            "ambiguous number was misread as an expired epoch"
+        );
+        assert!(snapshot.values().next().unwrap()["line"]
+            .as_str()
+            .unwrap()
+            .contains("3/10 requests left, reset 60 (unparsed)"));
+        for raw in ["0", "60", "999999999", "100000000000"] {
+            assert_eq!(reset_at(raw, at()), None, "{raw}");
+        }
+    }
     fn at() -> DateTime<Utc> {
         DateTime::from_timestamp(1_800_000_000, 0).unwrap()
     }
@@ -487,7 +568,7 @@ mod tests {
     }
 
     #[test]
-    fn no_header_refresh_no_field_carryover_and_earliest_reset_is_conservative() {
+    fn no_header_refresh_no_field_carryover_and_independent_resets() {
         let mut registry = Registry::default();
         let fields = headers(&[
             ("x-ratelimit-remaining-requests", "41"),
@@ -511,7 +592,13 @@ mod tests {
             &HeaderMap::new(),
             at() + TimeDelta::seconds(5),
         );
-        assert!(registry.snapshot(at() + TimeDelta::seconds(10)).is_empty());
+        let partial = registry.snapshot(at() + TimeDelta::seconds(10));
+        assert_eq!(partial.len(), 1);
+        let value = partial.values().next().unwrap();
+        assert!(value.get("remaining-requests").is_none());
+        assert_eq!(value["remaining-tokens"], "100");
+        assert_eq!(value["at"], at().to_rfc3339());
+        assert!(registry.snapshot(at() + TimeDelta::seconds(120)).is_empty());
         observe(
             &mut registry,
             "work",

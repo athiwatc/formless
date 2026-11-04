@@ -612,8 +612,11 @@ than growing the map or losing an in-flight probe.
   provider/endpoint/observation time and the same `line` shown by TUI `/usage`:
   "41/50 requests left, resets in 40s". Duration, epoch-second/millisecond and
   RFC3339 resets are relative; unknown reset formats are labelled unparsed.
-  Entries expire after five minutes or the earliest parsed reset, whichever
-  comes first. Headerless responses do not refresh them; at most 64 are retained.
+  Each quota kind loses its limit/remaining/reset fields after its own parsed
+  reset; other kinds remain visible. Entries expire when no kind remains or
+  after five minutes. Bare numbers predating 2001 as epoch seconds/milliseconds
+  are ambiguous and labelled unparsed. Headerless responses do not refresh
+  observations; at most 64 entries are retained.
 - **Explained errors.** When a Run pauses on a provider failure,
   `RunPaused.explained` sorts it into a category with a short message and
   the next step (`errors.rs`):
