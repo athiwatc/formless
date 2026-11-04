@@ -119,6 +119,14 @@ pub fn find(id: &str) -> Option<&'static Preset> {
 /// don't matter (`https://api.anthropic.com` is the Anthropic preset).
 fn url_key(url: &str) -> String {
     let u = url.trim().trim_end_matches('/').to_ascii_lowercase();
+    let u = if let Some(rest) = u
+        .strip_prefix("http://127.0.0.1:")
+        .or_else(|| u.strip_prefix("http://[::1]:"))
+    {
+        format!("http://localhost:{rest}")
+    } else {
+        u
+    };
     u.strip_suffix("/v1").unwrap_or(&u).to_string()
 }
 
@@ -238,6 +246,9 @@ mod tests {
         );
         assert!(find("ollama").unwrap().local);
         assert_eq!(for_url("http://localhost:11434/v1/").unwrap().id, "ollama");
+        assert_eq!(for_url("http://127.0.0.1:11434/v1").unwrap().id, "ollama");
+        assert_eq!(for_url("http://[::1]:11434/v1").unwrap().id, "ollama");
+        assert_eq!(for_url("http://[::1]:1234/v1").unwrap().id, "lmstudio");
         assert_eq!(
             resolve_base_url("groq").as_deref(),
             Some("https://api.groq.com/openai/v1")
