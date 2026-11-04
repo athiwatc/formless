@@ -43,6 +43,7 @@ pub mod profile_lock;
 pub mod profile_setup;
 pub mod provenance;
 pub mod provider;
+mod rate_limits;
 pub mod relay;
 mod relay_buffers;
 mod relay_input;

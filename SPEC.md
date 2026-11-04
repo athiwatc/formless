@@ -605,8 +605,15 @@ than growing the map or losing an in-flight probe.
   a muted stop note for stored `stop_reason`/`truncated` metadata, using
   the same wording as live stop notes; ordinary completions show none.
 - **Rate limits.** The `x-ratelimit-*` (and `anthropic-ratelimit-*`)
-  headers of each endpoint's latest response are kept: `RateLimits`,
-  `Status.rate_limits`; `/usage` adds "41/50 requests left, resets …".
+  headers are normalized to `limit/remaining/reset-{requests,tokens,input-tokens,output-tokens}`;
+  OpenRouter's unqualified fields describe requests. Observations are scoped by
+  provider name, normalized base URL and credential fingerprint (never exposed).
+  `RateLimits` and `Status.rate_limits` return opaque entry IDs, canonical fields,
+  provider/endpoint/observation time and the same `line` shown by TUI `/usage`:
+  "41/50 requests left, resets in 40s". Duration, epoch-second/millisecond and
+  RFC3339 resets are relative; unknown reset formats are labelled unparsed.
+  Entries expire after five minutes or the earliest parsed reset, whichever
+  comes first. Headerless responses do not refresh them; at most 64 are retained.
 - **Explained errors.** When a Run pauses on a provider failure,
   `RunPaused.explained` sorts it into a category with a short message and
   the next step (`errors.rs`):
