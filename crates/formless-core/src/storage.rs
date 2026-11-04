@@ -1404,6 +1404,27 @@ impl Store {
         self.get_session(id)
     }
 
+    /// Exact role pins, including archived and soft-deleted Sessions which
+    /// can still be restored. Do not use the paginated visible Session list.
+    pub fn role_references(&self, role: &str) -> Result<Vec<String>> {
+        let mut stmt = self.ps(
+            "SELECT 'Session', id, COALESCE(NULLIF(name,''),id) FROM sessions WHERE model=?1
+             UNION ALL SELECT 'template', name, name FROM session_templates WHERE model=?1
+             ORDER BY 1,2",
+        )?;
+        let rows = stmt.query_map(params![format!("role:{role}")], |r| {
+            let kind: String = r.get(0)?;
+            let id: String = r.get(1)?;
+            let label: String = r.get(2)?;
+            Ok(if kind == "Session" {
+                format!("Session {label:?} ({id})")
+            } else {
+                format!("template {label:?}")
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     pub fn save_template(&self, t: &TemplateInfo) -> Result<()> {
         self.ex(
             "INSERT OR REPLACE INTO session_templates

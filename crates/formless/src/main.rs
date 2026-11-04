@@ -3480,6 +3480,15 @@ fn doctor_report(paths: &Paths, quiet: bool) -> Result<Vec<Problem>> {
         say!("keychain:   unavailable: file-only fallback in use (0600 files in the config dir)");
     }
     let cfg = Config::load(&paths)?;
+    for (name, role) in &cfg.roles {
+        if cfg.provider_cfg(role.provider.as_deref()).is_err() {
+            problems.push(Problem {
+                what: format!("role {name:?} references unknown provider {:?}", role.provider.as_deref().unwrap_or_default()),
+                next: Some("formless config edit (choose an existing role provider), or formless providers add NAME".into()),
+                fix: None,
+            });
+        }
+    }
     if let Ok((n, bytes)) =
         Store::open(&paths.db_file()).and_then(|s| formless_core::artifacts::usage(&s))
     {
