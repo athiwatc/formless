@@ -18409,11 +18409,13 @@ mod tests {
     }
 
     pub(super) fn test_app() -> App {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let short = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let base = std::env::temp_dir().join(format!("fl-tui-{short}"));
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let base = std::env::temp_dir().join(format!("fl-tui-{}-{short}-{id}", std::process::id()));
         let paths = Paths::from_dirs(base.join("d"), base.join("c")).unwrap();
         App {
             paths,
