@@ -3274,15 +3274,7 @@ fn doctor_json(paths: &Paths) -> Result<serde_json::Value> {
 /// all redacted, in one Markdown file to attach to an issue.
 fn bug_report(paths: &Paths, output: Option<std::path::PathBuf>) -> Result<()> {
     let doctor = doctor_json(paths)?;
-    let log = std::fs::read_to_string(paths.log_file()).unwrap_or_default();
-    let tail: Vec<&str> = log
-        .lines()
-        .rev()
-        .take(200)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
+    let log = bug_report_log(paths);
     let text = format!(
         "# formless bug report\n\n\
          - formless {} on {} {}\n\
@@ -3291,14 +3283,13 @@ fn bug_report(paths: &Paths, output: Option<std::path::PathBuf>) -> Result<()> {
          redacted. Read it through before attaching it.\n\n\
          ## What happened\n\n(describe it here)\n\n\
          ## Doctor\n\n```json\n{}\n```\n\n\
-         ## Daemon log (last {} lines)\n\n```\n{}\n```\n",
+         {}",
         env!("CARGO_PKG_VERSION"),
         std::env::consts::OS,
         std::env::consts::ARCH,
         chrono::Utc::now().format("%Y-%m-%d %H:%M UTC"),
         serde_json::to_string_pretty(&doctor)?,
-        tail.len(),
-        redact(&tail.join("\n")),
+        log,
     );
     let path = output.unwrap_or_else(|| {
         std::path::PathBuf::from(format!(
@@ -3312,6 +3303,33 @@ fn bug_report(paths: &Paths, output: Option<std::path::PathBuf>) -> Result<()> {
         path.display()
     );
     Ok(())
+}
+
+/// The report consumes the shared raw-line tail, not an entire live file.
+fn bug_report_log(paths: &Paths) -> String {
+    match formless_core::logs::tail_lines(paths, 200, 1024 * 1024) {
+        Ok(tail) => {
+            let mut section = format!(
+                "## Daemon log (last {} lines)\n\n```\n{}\n```\n",
+                tail.lines.len(),
+                redact(&tail.lines.join("\n"))
+            );
+            if tail.byte_limit_hit {
+                section.push_str("\nLog tail incomplete: the 1 MiB read limit was reached; the leading boundary line was omitted to avoid partial content.\n");
+            }
+            if tail.truncated_lines > 0 {
+                section.push_str(&format!(
+                    "\n{} log line(s) exceeded 64 KiB and were truncated.\n",
+                    tail.truncated_lines
+                ));
+            }
+            section
+        }
+        Err(error) => format!(
+            "## Daemon log\n\nLog history unavailable: {}\n",
+            redact(&error.to_string())
+        ),
+    }
 }
 
 /// Print the doctor report and return the problems found.
@@ -7218,18 +7236,33 @@ fn log_level(word: &str) -> Option<u8> {
     })
 }
 
-/// Group log text into entries.
+fn log_start(line: &str) -> Option<(chrono::DateTime<chrono::FixedOffset>, u8)> {
+    let mut words = line.split_whitespace();
+    let at = chrono::DateTime::parse_from_rfc3339(words.next()?).ok()?;
+    Some((at, words.next().and_then(log_level).unwrap_or(2)))
+}
+
+#[path = "log_output.rs"]
+mod log_output;
+
+fn log_truncation_notice(summary: &log_output::OutputSummary) {
+    if summary.read.truncated_lines > 0 || summary.truncated_entries > 0 {
+        eprintln!(
+            "warning: log output truncated {} long line(s) and {} oversized entry(s) at 64 KiB",
+            summary.read.truncated_lines, summary.truncated_entries
+        );
+    }
+}
+
+/// Group log text into entries (small regression fixtures only).
+#[cfg(test)]
 fn parse_log(text: &str) -> Vec<LogEntry> {
     let mut out: Vec<LogEntry> = Vec::new();
     for line in text.lines() {
-        let mut words = line.split_whitespace();
-        let at = words
-            .next()
-            .and_then(|w| chrono::DateTime::parse_from_rfc3339(w).ok());
-        match at {
-            Some(at) => out.push(LogEntry {
+        match log_start(line) {
+            Some((at, level)) => out.push(LogEntry {
                 at: Some(at),
-                level: words.next().and_then(log_level).unwrap_or(2),
+                level,
                 text: line.to_string(),
             }),
             None => match out.last_mut() {
@@ -7269,27 +7302,9 @@ fn logs_cmd(
             }
     };
     let live = paths.log_file();
-    let mut files: Vec<std::path::PathBuf> = (1..=20)
-        .map(|n| std::path::PathBuf::from(format!("{}.{n}", live.display())))
-        .filter(|p| p.exists())
-        .collect();
-    files.reverse();
-    files.push(live.clone());
-    let text: String = files
-        .iter()
-        .filter_map(|f| std::fs::read_to_string(f).ok())
-        .collect::<Vec<_>>()
-        .join("\n");
-    let entries: Vec<LogEntry> = parse_log(&text).into_iter().filter(|e| keep(e)).collect();
-    let skip = if lines == 0 {
-        0
-    } else {
-        entries.len().saturating_sub(lines)
-    };
-    for e in &entries[skip..] {
-        println!("{}", e.text);
-    }
-    if entries.is_empty() && !follow {
+    let summary = log_output::history(paths, lines, &keep, &mut std::io::stdout().lock())?;
+    log_truncation_notice(&summary);
+    if summary.entries == 0 && !follow {
         eprintln!(
             "no log entries{} in {}",
             if level.is_some() || since.is_some() {
@@ -7312,15 +7327,10 @@ fn logs_cmd(
             pos = 0;
         }
         if len > pos {
-            use std::io::{Read, Seek, SeekFrom};
-            let mut f = std::fs::File::open(&live)?;
-            f.seek(SeekFrom::Start(pos))?;
-            let mut new = String::new();
-            f.read_to_string(&mut new)?;
+            let summary =
+                log_output::appended(&live, pos, len, &keep, &mut std::io::stdout().lock())?;
             pos = len;
-            for e in parse_log(&new).into_iter().filter(|e| keep(e)) {
-                println!("{}", e.text);
-            }
+            log_truncation_notice(&summary);
         }
     }
 }
@@ -8862,3 +8872,7 @@ mod tests {
         assert_eq!(parse_version("nope"), None);
     }
 }
+
+#[cfg(test)]
+#[path = "log_cli_tests.rs"]
+mod log_cli_tests;
