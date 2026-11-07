@@ -4485,7 +4485,12 @@ undo, redo and replacements invalidate prior asynchronous editor previews.
   most 64 KiB, combined template bytes 1 MiB, and diagnostics at most 64.
   Expansion is a single literal pass: `$ARGUMENTS` preserves the text after the
   invocation's first separator; `$1` through `$9` select Unicode-whitespace
-  separated positions. Quotes, environment variables, shell syntax, backticks
+  separated positions. `$$` emits one literal `$`, so `$$1`, `$$5` and
+  `$$9.99` preserve shell examples or prices. Escaped dollars and inserted
+  arguments are not re-expanded. Missing referenced positions stop expansion
+  before send with the template filename, position and `$$N` escape guidance;
+  they never silently become empty strings. `$0` and multi-digit `$10`/`$100`
+  remain literal text. Quotes, environment variables, shell syntax, backticks
   and substituted text are never evaluated or recursively expanded. Arguments
   are bounded to 64 KiB and expanded text to 1 MiB. `@path` remains ordinary
   text until the existing attachment intake and protected-path checks on send.
