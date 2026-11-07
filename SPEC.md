@@ -1359,7 +1359,12 @@ pasting paths.
   launched programs or MCP tools when appropriate, including an empty tracked
   list. The marker is conservative: a process-capable Tool need not actually
   launch a program or write anything. `RunFiles {session_id, run_id?}` adds a
-  bounded context diff for text files. The TUI's `/files` opens them in the pager; the
+  bounded context diff for text files. Common prefix/suffix lines are preserved
+  before aligning the differing middle, so a local edit in a large file keeps
+  only nearby context. The LCS matrix is capped at four million cells;
+  human context output labels any remaining unaligned middle explicitly.
+  Raw diff lines retain their original reconstruction contract and kinds.
+  The TUI's `/files` opens them in the pager; the
   web shows a dialog with diffs and Revert buttons. Explicit Run IDs must belong
   to the requested live Session, including every recorded path row.
 - **Rewind.** `RewindRun {session_id, run_id?, path?}` (`/rewind [PATH]`)
