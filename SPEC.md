@@ -3782,7 +3782,15 @@ run_tool = "network_policy"     # a registry Tool, or…
   Supported Normal commands: h/j/k/l, w/b/e and W/B/E, 0/$, gg/G; d/c/y with
   those motions, dd/cc/yy, iw/aw/iW/aW, single/double/backtick quotes and nested
   ()/[]/{}/<> objects; i/a/I/A/o/O, x, p/P and dot repeat. Word/character and
-  operator counts are bounded to 999. Yank stays in an internal register;
+  operator counts are bounded to 999. Counts also apply to i/a/I/A/o/O,
+  p/P and dot: insert edits repeat on Esc (open-line commands also repeat
+  their new lines), puts repeat the register, and an explicit dot count
+  replaces the prior change's count. Counted changes insert replacement text
+  once after changing their counted range. Linewise deletes reaching the
+  final line remove its preceding separator, leave the cursor on the first
+  nonblank of the new last line, and retain only the deleted line text in
+  the linewise yank register. Change and yank ranges keep their separators.
+  Yank stays in an internal register;
   no OS clipboard is read or written. Dot repeats the last editing command
   and its unmodified Insert keys/paste; movement and yanks do not replace it.
   Readline control shortcuts in Insert break the current repeat group.
