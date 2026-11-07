@@ -4789,6 +4789,13 @@ topic errors need no profile/config or daemon.
 
 ## 12. CLI
 
+Release metadata fetched by `formless update` has a 5-second connect and
+15-second total deadline, including the response body. Installer curl attempts
+have a 10-second connect and 120-second total transfer deadline, retaining
+three transient-error retries. Timeout errors suggest retrying, pinning
+`FORMLESS_VERSION` for the installer lookup, or a trusted installer mirror;
+failed metadata bodies are never treated as successful release lookups.
+
 The macOS/Linux installer reports the next commands (`formless` for setup,
 `formless doctor` for verification) and the need for a provider API key or a
 local model endpoint. After either a source or prebuilt install, it checks
