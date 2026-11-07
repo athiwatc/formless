@@ -339,7 +339,11 @@ fn strip_title_wrapper(t: &str) -> Option<&str> {
         ('「', '」'),
     ] {
         if let Some(inner) = t.strip_prefix(open).and_then(|s| s.strip_suffix(close)) {
-            return Some(inner);
+            // A prior closer means these are separate quoted phrases,
+            // not one enclosing quote around the entire title.
+            if !inner.contains(close) {
+                return Some(inner);
+            }
         }
     }
     for marker in ['*', '`'] {
@@ -348,7 +352,12 @@ fn strip_title_wrapper(t: &str) -> Option<&str> {
         // Both markers are ASCII; these offsets are UTF-8 boundaries.
         if leading > 0 && leading == trailing {
             if leading * 2 <= t.len() {
-                return Some(&t[leading..t.len() - trailing]);
+                let inner = &t[leading..t.len() - trailing];
+                // An equal-width delimiter inside closes the first span
+                // before the title ends (`foo` and `bar`, for example).
+                if !inner.split(|c| c != marker).any(|run| run.len() == leading) {
+                    return Some(inner);
+                }
             }
             if leading == t.len() && leading % 2 == 0 {
                 return Some("");
@@ -561,6 +570,11 @@ mod tests {
             "``Unequal backticks`",
             "#No heading",
             "Keep trailing #",
+            "`foo` and `bar`",
+            "*foo* and *bar*",
+            "**foo** and **bar**",
+            "\"foo\" and \"bar\"",
+            "“foo” and “bar”",
             "*",
             "`",
         ] {
@@ -589,6 +603,8 @@ mod tests {
             ("***Title***", "Title"),
             ("`Title`", "Title"),
             ("``Title``", "Title"),
+            ("``Title with `code` ``", "Title with `code`"),
+            ("**Title with *italic* text**", "Title with *italic* text"),
             ("'Title'", "Title"),
             ("“Title”", "Title"),
             ("‘Title’", "Title"),
