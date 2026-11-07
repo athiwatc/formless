@@ -3719,7 +3719,13 @@ run_tool = "network_policy"     # a registry Tool, or…
   `;` splits statements except inside quotes, brackets, `|edge labels|`
   and the text after a `:`; a subgraph's `direction` stays inside it;
   note bodies are never states; participants may contain hyphens; a
-  labelled self-loop shows `↺ label`.
+  labelled self-loop shows `↺ label`. Leading YAML frontmatter is removed
+  before parsing any supported diagram; its root scalar or literal/folded
+  block title is a heading (frontmatter takes precedence over an inline pie
+  or sequence title). Configuration/style metadata, tags and aliases are not
+  evaluated by the native renderer. Unclosed frontmatter and overwide titles
+  fall back to source. Sequence participant `box` groups close silently;
+  nested loop/alt/opt/par/critical/break/rect blocks retain their own dividers.
 - **Wide Mermaid diagrams (TUI).** A diagram wider than the chat shows a
   cut-down preview of its first 12 rows with the hint `/pager diagram N ·
   /open diagram N` (N is the block's `[N]` label). `/pager diagram [N]`

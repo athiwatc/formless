@@ -23,12 +23,14 @@ pub(crate) struct Diagram {
 }
 
 pub(crate) fn render(src: &str, color: bool, width: usize) -> Option<Diagram> {
+    let frontmatter = split_frontmatter(src)?;
+    let src = frontmatter.body;
     let header = src
         .lines()
         .map(str::trim)
         .find(|l| !l.is_empty() && !l.starts_with("%%"))?;
     let word = header.split_whitespace().next().unwrap_or("");
-    let (kind, lines) = match word {
+    let (kind, mut lines) = match word {
         "graph" | "flowchart" => (
             "flowchart",
             graph_lines(parse_flowchart(src)?, color, width)?,
@@ -40,7 +42,171 @@ pub(crate) fn render(src: &str, color: bool, width: usize) -> Option<Diagram> {
         "pie" => ("pie", pie(src, color, width)?),
         _ => return None,
     };
+    let title = frontmatter.title.or_else(|| inline_title(src, kind));
+    if let Some(title) = title.filter(|t| !t.is_empty()) {
+        if title.lines().any(|line| line.width() > width) {
+            return None;
+        }
+        let mut heading: Vec<_> = title
+            .lines()
+            .map(|line| Line::styled(line.to_owned(), bold_fg(color, Color::Cyan)))
+            .collect();
+        heading.append(&mut lines);
+        lines = heading;
+    }
     Some(Diagram { kind, lines })
+}
+
+/// Frontmatter is metadata, never diagram statements. An unclosed block
+/// falls back to source instead of guessing where the diagram begins.
+struct Frontmatter<'a> {
+    body: &'a str,
+    title: Option<String>,
+}
+
+fn split_frontmatter(src: &str) -> Option<Frontmatter<'_>> {
+    let src = src.strip_prefix('\u{feff}').unwrap_or(src);
+    let mut offset = 0;
+    let mut start = None;
+    for line in src.split_inclusive('\n') {
+        let before = offset;
+        offset += line.len();
+        let trimmed = line.trim();
+        if let Some((start, opening_indent)) = start {
+            let indent = line.len() - line.trim_start().len();
+            if trimmed == "---" && indent <= opening_indent {
+                return Some(Frontmatter {
+                    body: &src[offset..],
+                    title: frontmatter_title(&src[start..before]),
+                });
+            }
+        } else if !trimmed.is_empty() && !trimmed.starts_with("%%") {
+            if trimmed != "---" {
+                return Some(Frontmatter {
+                    body: src,
+                    title: None,
+                });
+            }
+            start = Some((offset, line.len() - line.trim_start().len()));
+        }
+    }
+    if start.is_some() {
+        None
+    } else {
+        Some(Frontmatter {
+            body: src,
+            title: None,
+        })
+    }
+}
+
+/// Only the root title is displayed; nested config/style keys are ignored.
+/// Scalar and literal/folded block titles cover the terminal title subset;
+/// this never evaluates YAML tags, aliases or Mermaid configuration.
+fn frontmatter_title(metadata: &str) -> Option<String> {
+    let lines: Vec<_> = metadata.lines().collect();
+    let indent = |line: &str| line.len() - line.trim_start().len();
+    let root = lines
+        .iter()
+        .filter(|line| !line.trim().is_empty() && !line.trim().starts_with('#'))
+        .map(|line| indent(line))
+        .min()?;
+    for (i, line) in lines.iter().enumerate() {
+        if indent(line) != root {
+            continue;
+        }
+        let Some(value) = line.trim().strip_prefix("title:").map(str::trim) else {
+            continue;
+        };
+        if matches!(
+            value.split_whitespace().next(),
+            Some("|" | "|-" | "|+" | ">" | ">-" | ">+")
+        ) {
+            let block: Vec<_> = lines[i + 1..]
+                .iter()
+                .take_while(|line| line.trim().is_empty() || indent(line) > root)
+                .copied()
+                .collect();
+            let base = block
+                .iter()
+                .filter(|line| !line.trim().is_empty())
+                .map(|line| indent(line))
+                .min()?;
+            let text = block
+                .iter()
+                .map(|line| line.get(base..).unwrap_or(""))
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Some(
+                if value.starts_with('>') {
+                    text.split("\n\n")
+                        .map(|paragraph| paragraph.lines().collect::<Vec<_>>().join(" "))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                } else {
+                    text
+                }
+                .trim_end()
+                .to_owned(),
+            );
+        }
+        if value.starts_with('"') {
+            let mut parser = serde_json::Deserializer::from_str(value).into_iter::<String>();
+            let title = parser.next()?.ok()?;
+            let rest = value[parser.byte_offset()..].trim();
+            return (rest.is_empty() || rest.starts_with('#')).then_some(title);
+        }
+        if let Some(value) = value.strip_prefix('\'') {
+            let mut title = String::new();
+            let mut chars = value.chars().peekable();
+            while let Some(c) = chars.next() {
+                if c == '\'' {
+                    if chars.peek() == Some(&'\'') {
+                        chars.next();
+                        title.push(c);
+                    } else {
+                        let rest: String = chars.collect();
+                        return (rest.trim().is_empty() || rest.trim_start().starts_with('#'))
+                            .then_some(title);
+                    }
+                } else {
+                    title.push(c);
+                }
+            }
+            return None;
+        }
+        if value.starts_with(['[', '{', '&', '*', '!', '|', '>']) {
+            return None;
+        }
+        let comment = value
+            .char_indices()
+            .find(|(i, c)| *c == '#' && (*i == 0 || value[..*i].ends_with(char::is_whitespace)))
+            .map_or(value.len(), |(i, _)| i);
+        return Some(value[..comment].trim_end().to_owned());
+    }
+    None
+}
+
+fn inline_title(src: &str, kind: &str) -> Option<String> {
+    if !matches!(kind, "pie" | "sequence") {
+        return None;
+    }
+    let mut title = if kind == "pie" {
+        src.lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty() && !l.starts_with("%%"))?
+            .split_once("title")
+            .map(|(_, t)| t.trim().to_owned())
+    } else {
+        None
+    };
+    for stmt in statements(src) {
+        let (head, rest) = stmt.split_once(char::is_whitespace).unwrap_or((stmt, ""));
+        if head == "title" {
+            title = Some(rest.trim().to_owned());
+        }
+    }
+    title
 }
 
 // ---------------------------------------------------------------- canvas
@@ -347,7 +513,9 @@ fn direction_is_lr(word: Option<&str>) -> bool {
 
 /// Statements of a diagram body: header removed, `;` split, comments gone.
 fn statements(src: &str) -> impl Iterator<Item = &str> {
-    src.lines()
+    split_frontmatter(src)
+        .map_or("", |frontmatter| frontmatter.body)
+        .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with("%%"))
         .skip(1)
@@ -386,6 +554,7 @@ fn split_statements(line: &str) -> Vec<&str> {
 }
 
 fn parse_flowchart(src: &str) -> Option<Graph> {
+    let src = split_frontmatter(src)?.body;
     let header = src
         .lines()
         .map(str::trim)
@@ -1165,6 +1334,7 @@ fn sequence(src: &str, color: bool, width: usize) -> Option<Vec<Line<'static>>> 
         i
     };
     let mut evs = Vec::new();
+    let mut blocks = Vec::new(); // true: visible control block; false: participant box
     let mut numbered = false;
     let mut n = 0;
     for stmt in statements(src) {
@@ -1177,12 +1347,18 @@ fn sequence(src: &str, color: bool, width: usize) -> Option<Vec<Line<'static>>> 
                 };
             }
             "autonumber" => numbered = true,
-            "loop" | "alt" | "opt" | "par" | "critical" | "break" | "rect" | "else" | "and" => {
-                evs.push(SeqEv::Block(format!("{head} {rest}").trim().to_string()))
+            "loop" | "alt" | "opt" | "par" | "critical" | "break" | "rect" => {
+                blocks.push(true);
+                evs.push(SeqEv::Block(format!("{head} {rest}").trim().to_string()));
             }
-            "end" => evs.push(SeqEv::Block(String::new())),
-            "activate" | "deactivate" | "box" | "create" | "destroy" | "title" | "links"
-            | "link" => {}
+            "else" | "and" => evs.push(SeqEv::Block(format!("{head} {rest}").trim().to_string())),
+            "box" => blocks.push(false),
+            "end" => {
+                if blocks.pop() == Some(true) {
+                    evs.push(SeqEv::Block(String::new()));
+                }
+            }
+            "activate" | "deactivate" | "create" | "destroy" | "title" | "links" | "link" => {}
             _ if head.eq_ignore_ascii_case("note") => {
                 let Some((pos, text)) = rest.split_once(':') else {
                     continue;
@@ -1412,19 +1588,13 @@ fn sequence(src: &str, color: bool, width: usize) -> Option<Vec<Line<'static>>> 
 // --------------------------------------------------------------------- pie
 
 fn pie(src: &str, color: bool, width: usize) -> Option<Vec<Line<'static>>> {
-    let mut title = String::new();
+    let src = split_frontmatter(src)?.body;
     let mut slices: Vec<(String, f64)> = Vec::new();
-    let header = src
-        .lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty() && !l.starts_with("%%"))?;
-    if let Some(t) = header.split_once("title").map(|(_, t)| t.trim()) {
-        title = t.to_string();
-    }
     for stmt in statements(src) {
-        if let Some(t) = stmt.strip_prefix("title") {
-            title = t.trim().to_string();
-        } else if let Some((label, value)) = stmt.rsplit_once(':') {
+        if stmt.starts_with("title") {
+            continue;
+        }
+        if let Some((label, value)) = stmt.rsplit_once(':') {
             if let Ok(v) = value.trim().parse::<f64>() {
                 slices.push((label.trim().trim_matches('"').to_string(), v.max(0.0)));
             }
@@ -1451,9 +1621,6 @@ fn pie(src: &str, color: bool, width: usize) -> Option<Vec<Line<'static>>> {
         Color::Red,
     ];
     let mut lines = Vec::new();
-    if !title.is_empty() {
-        lines.push(Line::styled(title, bold_fg(color, Color::Cyan)));
-    }
     for (i, (label, v)) in slices.iter().enumerate() {
         let cells = ((v / max) * bar_w as f64).round() as usize;
         let shown = super::ui::pad(label, label_w);
@@ -1587,6 +1754,109 @@ mod tests {
         // A plain `;` still separates statements.
         let all = text("graph LR\n  A --> B; B --> C", 80).join("\n");
         assert!(all.contains("│ A ") && all.contains("│ C │"), "{all}");
+    }
+
+    #[test]
+    fn frontmatter_is_metadata_for_every_supported_diagram() {
+        for body in [
+            "flowchart LR\nA --> B",
+            "stateDiagram-v2\n[*] --> Idle",
+            "sequenceDiagram\nA->>B: Hello",
+            "pie\n\"Dogs\" : 3\n\"Cats\" : 1",
+        ] {
+            let source = format!("\u{feff}\r\n%% comment\r\n---\r\ntitle: Checkout flow\r\nconfig:\r\n  title: Not a heading\r\n  theme: dark\r\n---\r\n{body}");
+            let out = text(&source, 80);
+            assert_eq!(out[0], "Checkout flow");
+            assert_eq!(&out[1..], text(body, 80));
+            assert_eq!(
+                statements(&source).collect::<Vec<_>>(),
+                statements(body).collect::<Vec<_>>()
+            );
+            assert!(render(&source, true, 80).is_some());
+        }
+        assert!(
+            parse_flowchart("---\ntitle: LR\n---\nflowchart LR\nA --> B")
+                .unwrap()
+                .left_right
+        );
+        assert_eq!(
+            pie("---\nconfig:\n  theme: dark\n---\npie\n\"A\":1", false, 80)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(render("---\ntitle: Unclosed\nflowchart LR\nA-->B", false, 80).is_none());
+        assert!(render("---\ntitle: No diagram\n---", false, 80).is_none());
+        assert!(render("---\ntitle: Unsupported\n---\ngantt", false, 80).is_none());
+    }
+
+    #[test]
+    fn diagram_titles_are_unquoted_once_and_respect_the_pane() {
+        let body = "flowchart LR\nA --> B";
+        for (metadata, expected) in [
+            ("title: Plain # comment", "Plain"),
+            ("title: \"Quoted # title\" # comment", "Quoted # title"),
+            ("title: 'Checkout''s flow'", "Checkout's flow"),
+            ("title: |-\n  Checkout\n  flow", "Checkout\nflow"),
+            ("title: |-\n  ---\n  Checkout", "---\nCheckout"),
+            ("title: >-\n  Checkout\n  flow", "Checkout flow"),
+        ] {
+            let out = text(&format!("---\n{metadata}\n---\n{body}"), 80);
+            assert!(out.join("\n").starts_with(expected), "{out:?}");
+            assert_eq!(out.len(), text(body, 80).len() + expected.lines().count());
+        }
+        let source = "---\ntitle: Preferred\n---\npie title Old\n\"A\":1";
+        let out = text(source, 80);
+        assert_eq!(out[0], "Preferred");
+        assert!(!out.iter().any(|line| line == "Old"));
+        assert_eq!(
+            text("sequenceDiagram\ntitle Request flow\nA->>B: hi", 80)[0],
+            "Request flow"
+        );
+        assert!(render(
+            &format!("---\ntitle: {}\n---\n{body}", "long".repeat(30)),
+            false,
+            80
+        )
+        .is_none());
+        let nested = format!("---\nconfig:\n  title: Not root\n---\n{body}");
+        assert_eq!(text(&nested, 80), text(body, 80));
+        let tagged = format!("---\ntitle: !unsupported value\n---\n{body}");
+        assert_eq!(text(&tagged, 80), text(body, 80));
+    }
+
+    #[test]
+    fn participant_boxes_close_silently_without_consuming_control_blocks() {
+        let plain = "sequenceDiagram\nparticipant UI\nparticipant API\nUI->>API: GET /cart";
+        let boxed = "sequenceDiagram\nbox Frontend\nparticipant UI\nend\nparticipant API\nUI->>API: GET /cart";
+        assert_eq!(text(boxed, 80), text(plain, 80));
+        for block in [
+            "loop retry",
+            "alt success",
+            "opt optional",
+            "par work",
+            "critical access",
+            "break failure",
+            "rect rgb(0,0,0)",
+        ] {
+            let plain = format!("sequenceDiagram\n{block}\nparticipant UI\nUI->>API: hi\nend");
+            let inner_box = format!(
+                "sequenceDiagram\n{block}\nbox Frontend\nparticipant UI\nend\nUI->>API: hi\nend"
+            );
+            let outer_box = format!(
+                "sequenceDiagram\nbox Frontend\n{block}\nparticipant UI\nUI->>API: hi\nend\nend"
+            );
+            assert_eq!(text(&inner_box, 80), text(&plain, 80), "{block}");
+            assert_eq!(text(&outer_box, 80), text(&plain, 80), "{block}");
+        }
+        let branches = "sequenceDiagram\nalt ok\nA->>B: yes\nelse failed\nA->>B: no\nend\npar work\nA->>B: one\nand more\nA->>B: two\nend";
+        let boxed = branches.replace("A->>B: no", "box Group\nA->>B: no\nend");
+        assert_eq!(text(&boxed, 80), text(branches, 80));
+        assert_eq!(
+            text(&format!("{plain}\nend"), 80),
+            text(plain, 80),
+            "unmatched end is not a divider"
+        );
     }
 
     /// Constructs that used to draw a wrong picture now draw the right one
