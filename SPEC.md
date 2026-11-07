@@ -2279,6 +2279,14 @@ pattern (§4.4).
 
 ### 7.8 Import / export
 
+Local tools/skills/Sessions imports, TUI import and URL bundle previews share
+a UTF-8 JSON reader. A leading UTF-8 BOM is accepted; UTF-16/UTF-32 BOMs
+are refused with the source filename/URL and an instruction to re-save as
+UTF-8 JSON. Other I/O, encoding and JSON errors identify the source. Only
+the leading BOM is ignored for parsing: original source text remains intact
+for existing preview fingerprints. Bundle validation and import decisions
+are unchanged.
+
 - Single Tools or the whole registry export as bundle files (JS + schemas +
   Capability declarations + `memory_mb`; **no secrets, no Invocation
   history, no metrics**).

@@ -6662,14 +6662,13 @@ impl App {
             return;
         }
         if let Some(kind) = self.import_mode.take() {
-            match std::fs::read_to_string(&text)
+            match formless_core::bundle_json::read_with_text(&text)
+                .map(|(bundle, source)| {
+                    let fingerprint = formless_core::descriptions::fingerprint(&source);
+                    (bundle, fingerprint)
+                })
                 .map_err(|e| e.to_string())
-                .and_then(|s| {
-                    let fingerprint = formless_core::descriptions::fingerprint(&s);
-                    serde_json::from_str::<serde_json::Value>(&s)
-                        .map(|bundle| (bundle, fingerprint))
-                        .map_err(|e| e.to_string())
-                }) {
+            {
                 Ok((bundle, fingerprint)) => {
                     if kind == ImportKind::Tool {
                         let signature = (text.clone(), fingerprint);
@@ -25607,6 +25606,49 @@ mod tests {
         assert!(
             matches!(save.request,Request::UpdateToolSpec{description:Some(ref text),..} if text == "never first call current")
         );
+    }
+
+    #[test]
+    fn session_import_uses_shared_bom_and_named_encoding_boundary() {
+        let _env = credential_env::EnvGuard::isolated();
+        let bundle = serde_json::json!({"format":"formless.session/1","name":"ชื่อ","messages":[]});
+        let cases = [
+            (format!("\u{feff}{bundle}\r\n").into_bytes(), None),
+            (vec![0xff, 0xfe, 123, 0], Some("UTF-16")),
+            (vec![0xfe, 0xff, 0, 123], Some("UTF-16")),
+            (b"\xef\xbb\xbf{bad".to_vec(), Some("not a JSON bundle")),
+        ];
+        for (bytes, error) in cases {
+            let mut app = test_app();
+            let (client, sent) = DaemonClient::recording();
+            app.client = Some(client);
+            let file = app.paths.data_dir.join("session encoding fixture.json");
+            std::fs::write(&file, bytes).unwrap();
+            app.import_mode = Some(ImportKind::Session);
+            app.input.set(file.to_str().unwrap());
+            app.submit_chat(false);
+            if let Some(expected) = error {
+                assert!(
+                    sent.try_recv().is_err(),
+                    "invalid encoding must not send an import"
+                );
+                let note = app.notes.last().unwrap();
+                assert!(
+                    note.contains(file.to_str().unwrap()) && note.contains(expected),
+                    "{note}"
+                );
+                if expected == "UTF-16" {
+                    assert!(note.contains("re-save it as UTF-8"), "{note}");
+                }
+            } else {
+                let request: RequestEnvelope =
+                    serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+                assert!(
+                    matches!(request.request, Request::ImportSession {bundle: value} if value == bundle)
+                );
+            }
+            std::fs::remove_file(file).unwrap();
+        }
     }
 
     #[test]

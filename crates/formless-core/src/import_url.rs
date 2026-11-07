@@ -74,7 +74,9 @@ pub fn bundle_in_gist(gist: &Value) -> Result<(String, Option<Value>, Option<Str
                 return Ok((name.clone(), None, Some(raw.to_string())));
             }
         }
-        if let Ok(v) = serde_json::from_str::<Value>(f["content"].as_str().unwrap_or_default()) {
+        if let Ok(v) =
+            crate::bundle_json::parse(f["content"].as_str().unwrap_or_default().as_bytes(), name)
+        {
             if check_bundle(&v).is_ok() {
                 return Ok((name.clone(), Some(v), None));
             }
@@ -128,7 +130,7 @@ async fn get_json(url: &str, allow_private: bool) -> Result<Value> {
                 bail!("{url} is larger than {} MB", MAX_BYTES / (1024 * 1024));
             }
         }
-        return serde_json::from_slice(&body).with_context(|| format!("{url} is not JSON"));
+        return crate::bundle_json::parse(&body, url.as_str());
     }
     bail!("{url}: too many redirects")
 }
@@ -192,6 +194,58 @@ pub async fn fetch_from(url: &str, allow_private: bool) -> Result<Value> {
 #[cfg(test)]
 mod fetch_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn fetched_and_embedded_bundles_use_shared_encoding_errors() {
+        let bundle = serde_json::json!({"format":"formless.tool/1","name":"fixture"});
+        let body = format!("\u{feff}{bundle}");
+        let app = axum::Router::new()
+            .route(
+                "/bom",
+                axum::routing::get(move || {
+                    let body = body.clone();
+                    async move { body }
+                }),
+            )
+            .route(
+                "/le",
+                axum::routing::get(|| async { vec![0xffu8, 0xfe, 123, 0] }),
+            )
+            .route(
+                "/be",
+                axum::routing::get(|| async { vec![0xfeu8, 0xff, 0, 123] }),
+            )
+            .route("/broken", axum::routing::get(|| async { "\u{feff}{bad" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        for (path, expected) in [
+            ("bom", None),
+            ("le", Some("UTF-16")),
+            ("be", Some("UTF-16")),
+            ("broken", Some("not a JSON bundle")),
+        ] {
+            let url = format!("http://{addr}/{path}");
+            let result =
+                tokio::time::timeout(std::time::Duration::from_secs(2), get_json(&url, true))
+                    .await
+                    .unwrap();
+            if let Some(expected) = expected {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains(&url) && error.contains(expected), "{error}");
+            } else {
+                assert_eq!(result.unwrap(), bundle);
+            }
+        }
+        let gist =
+            serde_json::json!({"files":{"bom.json":{"content":format!("\u{feff}{bundle}")}}});
+        assert_eq!(
+            bundle_in_gist(&gist).unwrap(),
+            ("bom.json".into(), Some(bundle), None)
+        );
+        server.abort();
+        let _ = server.await;
+    }
 
     /// A bundle URL naming a local host is refused before anything is sent.
     #[tokio::test]
