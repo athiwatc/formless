@@ -152,12 +152,10 @@ impl Vim {
         if c == '?' && self.pending.is_empty() {
             return Outcome::Help;
         }
-        if self.pending.is_empty() {
-            if c == '/' && surface == Surface::Composer {
-                self.apply(line, Command::Insert('i', 1));
-                self.paste(line, "/");
-                return Outcome::Handled;
-            }
+        if self.pending.is_empty() && c == '/' && surface == Surface::Composer {
+            self.apply(line, Command::Insert('i', 1));
+            self.paste(line, "/");
+            return Outcome::Handled;
         }
         self.pending.push(c);
         let (count, rest) = count_prefix(&self.pending);
