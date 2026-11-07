@@ -11620,37 +11620,27 @@ fn highlight_matches(
     query: &str,
     style: impl Fn(usize) -> Style,
 ) -> (Line<'static>, usize) {
-    let q: Vec<char> = query.chars().flat_map(char::to_lowercase).collect();
-    if q.is_empty() {
+    if formless_core::fuzzy::fold(query).is_empty() {
         return (line, 0);
     }
     let mut found = 0;
     let mut spans = Vec::new();
     for span in line.spans {
         let chars: Vec<char> = span.content.chars().collect();
-        let low: Vec<char> = chars
-            .iter()
-            .map(|c| c.to_lowercase().next().unwrap_or(*c))
-            .collect();
-        let (mut start, mut i) = (0, 0);
-        while i + q.len() <= chars.len() {
-            if low[i..i + q.len()] == q[..] {
-                if i > start {
-                    spans.push(Span::styled(
-                        chars[start..i].iter().collect::<String>(),
-                        span.style,
-                    ));
-                }
+        let mut start = 0;
+        for range in formless_core::fuzzy::folded_match_ranges(&span.content, query) {
+            if range.start > start {
                 spans.push(Span::styled(
-                    chars[i..i + q.len()].iter().collect::<String>(),
-                    style(found),
+                    chars[start..range.start].iter().collect::<String>(),
+                    span.style,
                 ));
-                found += 1;
-                i += q.len();
-                start = i;
-            } else {
-                i += 1;
             }
+            spans.push(Span::styled(
+                chars[range.clone()].iter().collect::<String>(),
+                style(found),
+            ));
+            found += 1;
+            start = range.end;
         }
         if start == 0 {
             spans.push(span);
@@ -22577,6 +22567,37 @@ mod tests {
         assert!(app.find.is_none() && app.chat_scroll_top.is_none());
         let (line, n) = highlight_matches(Line::raw("Aa aA"), "aa", |_| Style::default());
         assert_eq!((n, line.spans.len()), (2, 3));
+    }
+
+    #[test]
+    fn find_highlights_unicode_with_shared_folding() {
+        let marked = Style::default().add_modifier(Modifier::REVERSED);
+        for query in ["straße", "STRASSE", "STRAẞE"] {
+            let (line, count) =
+                highlight_matches(Line::raw("a straße STRASSE!"), query, |_| marked);
+            assert_eq!(count, 2);
+            assert_eq!(line.to_string(), "a straße STRASSE!");
+            let highlighted: Vec<_> = line
+                .spans
+                .iter()
+                .filter(|s| s.style == marked)
+                .map(|s| s.content.as_ref())
+                .collect();
+            assert_eq!(highlighted, vec!["straße", "STRASSE"]);
+        }
+        let (line, count) = highlight_matches(Line::raw("ßß"), "s", |_| marked);
+        assert_eq!(count, 2);
+        assert_eq!(line.to_string(), "ßß");
+        let (line, count) =
+            highlight_matches(Line::raw("İ cafe\u{301} café"), "CAFE", |_| marked);
+        assert_eq!(count, 2);
+        assert_eq!(line.to_string(), "İ cafe\u{301} café");
+        let source = Line::from(vec![Span::raw("stra"), Span::raw("ße")]);
+        let (line, count) = highlight_matches(source, "strasse", |_| marked);
+        assert_eq!(count, 0, "span-boundary behavior remains unchanged");
+        assert_eq!(line.to_string(), "straße");
+        let (_, count) = highlight_matches(Line::raw("straße"), "\u{301}", |_| marked);
+        assert_eq!(count, 0);
     }
 
     #[test]
