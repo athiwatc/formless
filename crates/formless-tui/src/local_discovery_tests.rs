@@ -246,7 +246,7 @@ fn local_discovery_retains_both_servers_marks_rows_and_uses_the_selected_url() {
     let w = app.wizard.as_ref().unwrap();
     assert_eq!(w.local_offers.len(), 2);
     assert!(w.status.contains("Ollama (5 models)") && w.status.contains("LM Studio (2 models)"), "{}", w.status);
-    assert!(w.status.contains("Press Enter for Ollama"));
+    assert!(w.status.contains("Press Enter") && w.status.contains("highlighted provider"));
     assert_eq!(formless_core::presets::PRESETS[w.preset_idx].id, "ollama");
     assert!(w.draft_changed.is_none());
     assert!(!app.paths.config_file().exists());
@@ -262,6 +262,7 @@ fn local_discovery_retains_both_servers_marks_rows_and_uses_the_selected_url() {
     let lm_index = formless_core::presets::PRESETS.iter().position(|p|p.id == "lmstudio").unwrap();
     while app.wizard.as_ref().unwrap().preset_idx < lm_index { app.wizard_step_key(key(KeyCode::Down)); }
     while app.wizard.as_ref().unwrap().preset_idx > lm_index { app.wizard_step_key(key(KeyCode::Up)); }
+    assert!(app.wizard.as_ref().unwrap().status.contains("highlighted provider"));
     app.wizard_step_key(key(KeyCode::Enter));
     let w = app.wizard.as_ref().unwrap();
     assert_eq!(w.base_url, expected);

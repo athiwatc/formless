@@ -8512,12 +8512,7 @@ impl App {
                                     let action = if offer.models == 0 {
                                         offer.offer()
                                     } else {
-                                        let name = formless_core::presets::PRESETS[index]
-                                            .name
-                                            .trim_end_matches(" (local)");
-                                        format!(
-                                            "Press Enter for {name}, or choose another provider."
-                                        )
+                                        "Press Enter to use the highlighted provider.".to_string()
                                     };
                                     format!("Found {summary}. {action}")
                                 };
