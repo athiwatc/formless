@@ -77,15 +77,20 @@ async function malformedUpgrade(port){
 }
 
 async function closeChild(child){
-  if(child.exitCode!==null||child.signalCode!==null)return;
-  const exited=once(child,'exit');child.kill('SIGTERM');
-  let timer;
-  try{await Promise.race([exited,new Promise((_,reject)=>{timer=setTimeout(()=>{child.kill('SIGKILL');reject(Error('owned relay teardown deadline'));},3000);})]);}
-  finally{clearTimeout(timer);}
+  if(!child.pid||child.exitCode!==null||child.signalCode!==null)return;
+  const exited=once(child,'exit');
+  const wait=async(ms)=>{let timer;try{return await Promise.race([exited.then(()=>true),new Promise(resolve=>{timer=setTimeout(()=>resolve(false),ms);})]);}finally{clearTimeout(timer);}};
+  child.kill('SIGTERM');
+  if(await wait(3000))return;
+  child.kill('SIGKILL');
+  if(!await wait(3000))throw Error('owned relay was not reaped after forced teardown');
+  throw Error('owned relay exceeded graceful teardown deadline (forced exit reaped)');
 }
 
-test('owned dev relay survives repeated malformed paths, mock bodies and Upgrade targets',{timeout:20000},async()=>{
+test('owned dev relay survives repeated malformed paths, mock bodies and Upgrade targets',{timeout:20000},async t=>{
   const child=spawn(process.execPath,[fileURLToPath(new URL('./dev.mjs',import.meta.url)),'--port','0','--mock-provider'],{stdio:['ignore','pipe','pipe']});
+  let closing;const cleanup=()=>closing??=closeChild(child);
+  t.after(cleanup);t.signal.addEventListener('abort',()=>{void cleanup().catch(()=>{});},{once:true});
   let out='',errors='';
   child.stderr.on('data',bytes=>{errors=(errors+bytes).slice(-16384);});
   try{
@@ -136,5 +141,5 @@ test('owned dev relay survives repeated malformed paths, mock bodies and Upgrade
     const asset=await http(port,'/');assert.equal(asset.status,200);assert.ok(asset.headers['content-security-policy']);
     await healthy();assert.ok(!errors.includes('fixture-body-must-not-log'),errors);
     assert.ok(!errors.includes('UnhandledPromiseRejection'),errors);
-  }finally{await closeChild(child);}
+  }finally{await cleanup();}
 });
