@@ -44,17 +44,32 @@ pub(crate) fn render(src: &str, color: bool, width: usize) -> Option<Diagram> {
     };
     let title = frontmatter.title.or_else(|| inline_title(src, kind));
     if let Some(title) = title.filter(|t| !t.is_empty()) {
-        if title.lines().any(|line| line.width() > width) {
-            return None;
-        }
         let mut heading: Vec<_> = title
             .lines()
-            .map(|line| Line::styled(line.to_owned(), bold_fg(color, Color::Cyan)))
+            .map(|line| Line::styled(heading_text(line), bold_fg(color, Color::Cyan)))
             .collect();
+        if heading.iter().any(|line| line.width() > width) {
+            return None;
+        }
         heading.append(&mut lines);
         lines = heading;
     }
     Some(Diagram { kind, lines })
+}
+
+/// Quoted YAML can decode escaped controls; keep those visible in headings.
+fn heading_text(text: &str) -> String {
+    let mut out = String::new();
+    for c in text.chars() {
+        if c.is_control()
+            || matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        {
+            out.extend(c.escape_unicode());
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Frontmatter is metadata, never diagram statements. An unclosed block
@@ -1823,6 +1838,20 @@ mod tests {
         assert_eq!(text(&nested, 80), text(body, 80));
         let tagged = format!("---\ntitle: !unsupported value\n---\n{body}");
         assert_eq!(text(&tagged, 80), text(body, 80));
+        let controls = format!(
+            r#"---
+title: "\u001b[31mHi\u202e"
+---
+{body}"#
+        );
+        let out = text(&controls, 80);
+        assert_eq!(out[0], r"\u{1b}[31mHi\u{202e}");
+        assert!(!out[0].contains('\x1b') && !out[0].contains('\u{202e}'));
+        let wide_controls = format!("---\ntitle: \"{}\"\n---\n{body}", "\\u0000".repeat(20));
+        assert!(
+            render(&wide_controls, false, 80).is_none(),
+            "measure visible escapes before fitting"
+        );
     }
 
     #[test]

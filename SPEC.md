@@ -3724,7 +3724,8 @@ run_tool = "network_policy"     # a registry Tool, or…
   block title is a heading (frontmatter takes precedence over an inline pie
   or sequence title). Configuration/style metadata, tags and aliases are not
   evaluated by the native renderer. Unclosed frontmatter and overwide titles
-  fall back to source. Sequence participant `box` groups close silently;
+  fall back to source. Decoded title controls are shown as visible escapes
+  before width measurement. Sequence participant `box` groups close silently;
   nested loop/alt/opt/par/critical/break/rect blocks retain their own dividers.
 - **Wide Mermaid diagrams (TUI).** A diagram wider than the chat shows a
   cut-down preview of its first 12 rows with the hint `/pager diagram N ·
