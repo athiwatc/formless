@@ -4881,7 +4881,12 @@ previous headless Run's Session.
   dim header, secondary fields dimmed, status in colour, and the widest
   column cut with "…" to fit the terminal. Colour and fitting happen only
   when stdout is a terminal, and `NO_COLOR` turns colour off. Piped output
-  is plain aligned text.
+  is plain aligned text. Headers and cells collapse whitespace to one space
+  before width measurement; other C0/C1 controls and bidi direction marks/overrides/
+  isolates are shown as Unicode escapes in both terminal and piped tables.
+  A cell cannot add rows or terminal styles; the renderer's own colour styles
+  are applied afterward. Printable Unicode (including emoji joiners) is retained.
+  Structured `--json` values are unchanged by table formatting.
 - Every CLI `list`/`status` subcommand takes `--json` and prints one JSON
   value (the daemon's data) instead of a table: `providers`, `roles`,
   `jobs`, `memory`, `mcp`, `skills`, `tools`, `prompts` and `sessions list`,
