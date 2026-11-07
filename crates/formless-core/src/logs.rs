@@ -73,7 +73,7 @@ pub fn rotated_logs(paths: &Paths) -> std::io::Result<Vec<(u64, PathBuf)>> {
         a_digits
             .len()
             .cmp(&b_digits.len())
-            .then_with(|| a_digits.cmp(&b_digits))
+            .then_with(|| a_digits.cmp(b_digits))
             .then_with(|| a.1.cmp(&b.1))
     });
     Ok(files)
