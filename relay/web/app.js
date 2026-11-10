@@ -7054,6 +7054,9 @@
       attachFiles([...e.dataTransfer.files]);
     });
   }
+  // A real button so Tab, Enter and Space reach it (#1740); its click is
+  // the user gesture that opens the hidden file picker.
+  $("attach-btn").addEventListener("click", () => $("attach-input").click());
   $("attach-input").addEventListener("change", (e) => { attachFiles([...e.target.files]); e.target.value = ""; });
   $("input").addEventListener("paste", (e) => {
     const files = [...((e.clipboardData && e.clipboardData.files) || [])];
