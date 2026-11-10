@@ -15,8 +15,8 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
-const BEGIN: &str = "FORMLESS_PRIVATE_DOCTOR_STDOUT_BEGIN\n";
-const END: &str = "FORMLESS_PRIVATE_DOCTOR_STDOUT_END\n";
+const BEGIN: &str = "PRIVATE_DOCTOR_STDOUT_BEGIN\n";
+const END: &str = "PRIVATE_DOCTOR_STDOUT_END\n";
 
 struct OwnedChild(Child);
 impl Drop for OwnedChild {
