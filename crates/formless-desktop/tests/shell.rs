@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use formless_desktop::fixture;
 use formless_desktop::memory::{limits, IntentKind, IntentRecord};
-use formless_desktop::model::{tokens, Destination};
+use formless_desktop::model::{tokens, Destination, TextScale};
 use formless_desktop::shell::{self, session_row_id, Shell};
 use formless_desktop::timeline::TimelineBlock;
 use formless_protocol::SendMode;
@@ -1161,4 +1161,265 @@ fn streaming_does_not_move_older_content_that_is_being_read(cx: &mut TestAppCont
         // The streamed tail is off screen and was not built.
         assert!(window.try_find(("block", 201usize)).is_none());
     });
+}
+
+// ---- Text size -----------------------------------------------------------
+//
+// These set the shell's own text-size setting and the display scale factor in
+// the test window. They are not observations of a macOS accessibility
+// setting, and nobody looked at the result.
+
+fn set_text_scale(
+    cx: &mut TestAppContext,
+    handle: WindowHandle<Root>,
+    shell: &Entity<Shell>,
+    percent: u16,
+) {
+    step(cx, handle, |window, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.set_text_scale(TextScale::from_percent(percent), window, cx)
+        });
+        window.render_frame(cx);
+    });
+}
+
+const SHELL_PARTS: [&str; 5] = [
+    "header",
+    "region-sidebar",
+    "region-conversation",
+    "region-inspector",
+    "status",
+];
+
+#[gpui_kit::test]
+fn at_200_percent_a_window_twice_as_wide_has_the_same_layout_at_twice_the_size(
+    cx: &mut TestAppContext,
+) {
+    let (normal, normal_shell) = open(cx, WIDE, 200, 40);
+    let first_row = step(cx, normal, |_, cx| {
+        session_row_id(&normal_shell.read(cx).sidebar().rows()[0].id)
+    });
+    let measure = |cx: &mut TestAppContext, handle: WindowHandle<Root>| {
+        step(cx, handle, |window, cx| {
+            window.render_frame(cx);
+            let mut bounds: Vec<Bounds<Pixels>> = SHELL_PARTS
+                .iter()
+                .map(|id| window.find(*id).bounds())
+                .collect();
+            bounds.push(window.find(first_row.clone()).bounds());
+            let controls =
+                ["composer-primary", "toggle-inspector"].map(|id| window.find(id).bounds());
+            (bounds, controls)
+        })
+    };
+    let (at_100, controls_100) = measure(cx, normal);
+
+    let (large, large_shell) = open(cx, size(px(2880.), px(1800.)), 200, 40);
+    set_text_scale(cx, large, &large_shell, 200);
+    let (at_200, controls_200) = measure(cx, large);
+
+    // Twice the size to within one pixel: rem-based sizes round per element.
+    let doubled = |big: Pixels, small: Pixels| (big - small * 2.).abs() <= px(1.);
+    for (index, (small, big)) in at_100.iter().zip(&at_200).enumerate() {
+        let name = SHELL_PARTS
+            .get(index)
+            .copied()
+            .unwrap_or("first session row");
+        assert!(
+            doubled(big.origin.x, small.origin.x)
+                && doubled(big.origin.y, small.origin.y)
+                && doubled(big.size.width, small.size.width)
+                && doubled(big.size.height, small.size.height),
+            "{name}: {small:?} -> {big:?}"
+        );
+    }
+    // Kit controls scale with the text too. How exactly is the kit's
+    // business; they must at least have grown clearly in both directions.
+    for (small, big) in controls_100.iter().zip(&controls_200) {
+        println!(
+            "EVIDENCE text_scale_200 control: {:?} -> {:?}",
+            small.size, big.size
+        );
+        assert!(big.size.height >= small.size.height * 1.5);
+        assert!(big.size.width >= small.size.width * 1.5);
+    }
+}
+
+#[gpui_kit::test]
+fn at_200_percent_in_the_same_window_the_panels_give_way_and_controls_stay_reachable(
+    cx: &mut TestAppContext,
+) {
+    let (handle, shell) = open(cx, WIDE, 200, 40);
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        window.input("ข้อความเดิม", cx);
+    });
+    set_text_scale(cx, handle, &shell, 200);
+    step(cx, handle, |window, cx| {
+        // 1440 px at 200% lays out like 720 px: neither panel is docked, and
+        // nothing was dropped over the conversation.
+        assert!(window.try_find("region-sidebar").is_none());
+        assert!(window.try_find("region-inspector").is_none());
+        assert!(window.try_find("overlay-backdrop").is_none());
+        assert_eq!(
+            window.find("region-conversation").bounds().size.width,
+            px(1440.)
+        );
+        assert_eq!(window.find("header").bounds().size.height, px(88.));
+
+        // Every control is whole and inside the window, in reading order.
+        let viewport = Bounds {
+            origin: Point::default(),
+            size: WIDE,
+        };
+        let controls = [
+            "toggle-sidebar",
+            "toggle-inspector",
+            "toggle-theme",
+            "composer-stop",
+            "composer-primary",
+        ];
+        for id in controls {
+            let control = window.find(id);
+            assert!(control.visible(), "{id}");
+            let bounds = control.bounds();
+            assert!(
+                bounds.left() >= viewport.left()
+                    && bounds.right() <= viewport.right()
+                    && bounds.top() >= viewport.top()
+                    && bounds.bottom() <= viewport.bottom(),
+                "{id} is not inside the window: {bounds:?}"
+            );
+        }
+        let header: Vec<_> = controls[..3]
+            .iter()
+            .map(|id| window.find(*id).bounds())
+            .collect();
+        assert!(header[0].right() <= header[1].left());
+        assert!(header[1].right() <= header[2].left());
+
+        // The draft and focus survived the change, and typing still works.
+        assert_eq!(window.find_by_label("Message").focused(), Some(true));
+        window.input(" ที่พิมพ์ต่อ", cx);
+        assert_eq!(
+            window.find_by_label("Message").value(),
+            Some("ข้อความเดิม ที่พิมพ์ต่อ")
+        );
+
+        // The sidebar is still one keystroke away, at twice the size.
+        window.press(TOGGLE_SIDEBAR, cx);
+        let sidebar = window.find("region-sidebar").bounds();
+        assert_eq!(sidebar.size.width, px(tokens::SIDEBAR_DEFAULT * 2.));
+        let row = session_row_id(&shell.read(cx).sidebar().rows()[0].id);
+        assert_eq!(window.find(row).bounds().size.height, px(88.));
+        window.press("escape", cx);
+        assert_eq!(window.find_by_label("Message").focused(), Some(true));
+    });
+}
+
+const REACHABLE_AT_ANY_SIZE: [&str; 7] = [
+    "toggle-sidebar",
+    "toggle-inspector",
+    "toggle-theme",
+    "composer-stop",
+    "composer-primary",
+    "region-composer",
+    "status",
+];
+
+fn inside_window(window: &Window, id: &'static str, window_size: Size<Pixels>) -> bool {
+    let bounds = window.find(id).bounds();
+    bounds.left() >= px(0.)
+        && bounds.right() <= window_size.width
+        && bounds.top() >= px(0.)
+        && bounds.bottom() <= window_size.height
+}
+
+#[gpui_kit::test]
+fn the_minimum_window_must_grow_with_the_text_size(cx: &mut TestAppContext) {
+    // 480 x 360 is the binary's minimum window size. At 100% it holds every
+    // control.
+    let minimum = size(px(480.), px(360.));
+    let (handle, shell) = open(cx, minimum, 200, 40);
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        for id in REACHABLE_AT_ANY_SIZE {
+            assert!(inside_window(window, id, minimum), "{id} at 100%");
+        }
+    });
+
+    // At 200% the same window does not: this is a measured limitation, kept
+    // here as a record rather than asserted either way.
+    set_text_scale(cx, handle, &shell, 200);
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        let report: Vec<String> = REACHABLE_AT_ANY_SIZE
+            .into_iter()
+            .map(|id| {
+                let place = if inside_window(window, id, minimum) {
+                    "inside"
+                } else {
+                    "OUTSIDE"
+                };
+                format!("{id}={place}")
+            })
+            .collect();
+        println!("EVIDENCE min_window_200pct 480x360: {}", report.join(" "));
+    });
+
+    // A minimum that scales with the text (960 x 720 at 200%) holds them all.
+    let scaled_minimum = size(px(960.), px(720.));
+    cx.simulate_window_resize(handle.into(), scaled_minimum);
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        for id in REACHABLE_AT_ANY_SIZE {
+            assert!(
+                inside_window(window, id, scaled_minimum),
+                "{id} at 200% in 960x720"
+            );
+        }
+    });
+}
+
+#[gpui_kit::test]
+fn text_size_shortcuts_step_up_to_200_percent_and_reset(cx: &mut TestAppContext) {
+    let (handle, shell) = open(cx, WIDE, 200, 40);
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        window.input("draft", cx);
+        let mut seen = vec![shell.read(cx).text_scale().percent()];
+        for _ in 0..6 {
+            window.press(&chord("="), cx);
+            seen.push(shell.read(cx).text_scale().percent());
+        }
+        // It stops at 200% however often the shortcut is pressed.
+        assert_eq!(seen, [100, 125, 150, 175, 200, 200, 200]);
+        assert_eq!(window.find("header").bounds().size.height, px(88.));
+
+        window.press(&chord("-"), cx);
+        assert_eq!(shell.read(cx).text_scale().percent(), 175);
+        window.press(&chord("0"), cx);
+        assert_eq!(shell.read(cx).text_scale(), TextScale::DEFAULT);
+        assert_eq!(window.find("header").bounds().size.height, px(44.));
+        // Back to three panes, with the draft and focus untouched.
+        assert!(window.find("region-inspector").visible());
+        assert_eq!(shell.read(cx).draft(cx).as_ref(), "draft");
+        assert_eq!(window.find_by_label("Message").focused(), Some(true));
+    });
+}
+
+#[gpui_kit::test]
+fn the_display_scale_factor_does_not_change_the_logical_layout(cx: &mut TestAppContext) {
+    let (handle, _) = open(cx, WIDE, 200, 40);
+    let measure = |cx: &mut TestAppContext| {
+        step(cx, handle, |window, cx| {
+            window.render_frame(cx);
+            SHELL_PARTS.map(|id| window.find(id).bounds())
+        })
+    };
+    let before = measure(cx);
+    cx.simulate_window_scale_factor_change(handle.into(), 2.0);
+    assert_eq!(measure(cx), before);
+    cx.simulate_window_scale_factor_change(handle.into(), 1.0);
+    assert_eq!(measure(cx), before);
 }

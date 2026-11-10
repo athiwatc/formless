@@ -35,7 +35,7 @@ use crate::memory::{
 };
 use crate::model::{
     send_mode_label, tokens, BlockKind, ComposerActions, Destination, Drafts, InspectorMode,
-    Intent, Layout, PanelPrefs, Region, RunState, Sidebar, SidebarMode,
+    Intent, Layout, PanelPrefs, Region, RunState, Sidebar, SidebarMode, TextScale,
 };
 use crate::timeline::{Coalescer, Timeline, TimelineBlock, FLUSH_INTERVAL_MS};
 
@@ -47,6 +47,9 @@ gpui_kit::actions!(
         ToggleSidebar,
         ToggleInspector,
         DismissOverlay,
+        IncreaseTextSize,
+        DecreaseTextSize,
+        ResetTextSize,
         SelectNextSession,
         SelectPreviousSession,
         ActivateSession,
@@ -60,6 +63,11 @@ const OVERLAY_CONTEXT: &str = "FormlessOverlay";
 const MODAL_DESCRIPTION: &str =
     "Modal panel. Press Escape to close it and return to where you were.";
 const SESSION_ROW_HEIGHT: f32 = 44.0;
+const HEADER_HEIGHT: f32 = 44.0;
+const STATUS_HEIGHT: f32 = 28.0;
+/// The kit theme's default font sizes, which 100% text size maps to.
+const BASE_FONT_SIZE: f32 = 16.0;
+const BASE_MONO_FONT_SIZE: f32 = 13.0;
 /// Region and panel shortcuts. F6 / Shift+F6 move between regions; nothing
 /// here binds a bare printable key, so typing in the composer is untouched.
 pub fn bind_keys(cx: &mut App) {
@@ -67,12 +75,20 @@ pub fn bind_keys(cx: &mut App) {
     const PANEL_KEYS: [&str; 2] = ["cmd-b", "cmd-alt-b"];
     #[cfg(not(target_os = "macos"))]
     const PANEL_KEYS: [&str; 2] = ["ctrl-b", "ctrl-alt-b"];
+    #[cfg(target_os = "macos")]
+    const TEXT_SIZE_KEYS: [&str; 4] = ["cmd-=", "cmd-+", "cmd--", "cmd-0"];
+    #[cfg(not(target_os = "macos"))]
+    const TEXT_SIZE_KEYS: [&str; 4] = ["ctrl-=", "ctrl-+", "ctrl--", "ctrl-0"];
 
     cx.bind_keys([
         KeyBinding::new("f6", FocusNextRegion, None),
         KeyBinding::new("shift-f6", FocusPreviousRegion, None),
         KeyBinding::new(PANEL_KEYS[0], ToggleSidebar, None),
         KeyBinding::new(PANEL_KEYS[1], ToggleInspector, None),
+        KeyBinding::new(TEXT_SIZE_KEYS[0], IncreaseTextSize, None),
+        KeyBinding::new(TEXT_SIZE_KEYS[1], IncreaseTextSize, None),
+        KeyBinding::new(TEXT_SIZE_KEYS[2], DecreaseTextSize, None),
+        KeyBinding::new(TEXT_SIZE_KEYS[3], ResetTextSize, None),
         KeyBinding::new("escape", DismissOverlay, Some(OVERLAY_CONTEXT)),
         KeyBinding::new("down", SelectNextSession, Some(SESSION_LIST_CONTEXT)),
         KeyBinding::new("up", SelectPreviousSession, Some(SESSION_LIST_CONTEXT)),
@@ -115,6 +131,8 @@ pub struct Shell {
     stream: Coalescer,
     drafts: Drafts,
     prefs: PanelPrefs,
+    /// The text size. Fixed sizes and layout breakpoints follow it.
+    text_scale: TextScale,
     destination: Destination,
     /// What the last composer action was. Sizes only: no message text is
     /// kept once an intent has been handed on.
@@ -164,13 +182,14 @@ impl Shell {
             vec![cx.observe_window_bounds(window, |this, window, cx| this.settle(window, cx))];
         composer.update(cx, |composer, cx| composer.focus(window, cx));
 
-        let session_sizes = Self::row_sizes(sidebar.rows().len());
+        let session_sizes = Self::row_sizes(sidebar.rows().len(), TextScale::default());
         Self {
             sidebar,
             blocks: Rc::new(RefCell::new(Timeline::new(blocks))),
             stream: Coalescer::default(),
             drafts: Drafts::new(limits::DRAFT_MAX_ENTRIES, limits::DRAFT_MAX_BYTES),
             prefs: PanelPrefs::default(),
+            text_scale: TextScale::default(),
             destination: Destination::Chat,
             last_intent: None,
             draft_bytes: 0,
@@ -314,14 +333,49 @@ impl Shell {
         }
     }
 
-    fn row_sizes(count: usize) -> Rc<Vec<Size<Pixels>>> {
-        Rc::new(vec![
-            size(
-                px(tokens::SIDEBAR_DEFAULT),
-                px(SESSION_ROW_HEIGHT)
-            );
-            count
-        ])
+    fn row_sizes(count: usize, scale: TextScale) -> Rc<Vec<Size<Pixels>>> {
+        let row = size(
+            px(tokens::SIDEBAR_DEFAULT * scale.factor()),
+            px(SESSION_ROW_HEIGHT * scale.factor()),
+        );
+        Rc::new(vec![row; count])
+    }
+
+    /// A fixed size from the layout tokens, at the current text size.
+    fn scaled(&self, value: f32) -> Pixels {
+        px(value * self.text_scale.factor())
+    }
+
+    /// The window width the layout breakpoints see: the real width divided
+    /// by the text size factor.
+    fn effective_width(&self, window: &Window) -> f32 {
+        f32::from(window.viewport_size().width) / self.text_scale.factor()
+    }
+
+    pub fn text_scale(&self) -> TextScale {
+        self.text_scale
+    }
+
+    /// Change the text size. The kit theme's font sizes drive every
+    /// rem-based size (text, controls); the shell's own fixed sizes and its
+    /// breakpoints follow the same factor, so the layout may change, and
+    /// focus is settled as for a resize.
+    pub fn set_text_scale(
+        &mut self,
+        scale: TextScale,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if scale == self.text_scale {
+            return;
+        }
+        self.text_scale = scale;
+        let theme = Theme::global_mut(cx);
+        theme.font_size = px(BASE_FONT_SIZE * scale.factor());
+        theme.mono_font_size = px(BASE_MONO_FONT_SIZE * scale.factor());
+        self.session_sizes = Self::row_sizes(self.sidebar.rows().len(), scale);
+        cx.refresh_windows();
+        self.settle(window, cx);
     }
 
     pub fn sidebar(&self) -> &Sidebar {
@@ -414,7 +468,7 @@ impl Shell {
     }
 
     pub fn layout(&self, window: &Window) -> Layout {
-        Layout::for_width(f32::from(window.viewport_size().width), self.prefs)
+        Layout::for_width(self.effective_width(window), self.prefs)
             .for_destination(self.destination)
     }
 
@@ -563,7 +617,7 @@ impl Shell {
     /// provided its region is still shown. Otherwise focus only moves if the
     /// region holding it is no longer on screen.
     fn settle(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.prefs.settle(f32::from(window.viewport_size().width));
+        self.prefs.settle(self.effective_width(window));
         let layout = self.layout(window);
         let focused = self.focused_region(window, cx);
         let before = std::mem::replace(&mut self.modal, layout.modal());
@@ -597,7 +651,7 @@ impl Shell {
     }
 
     fn toggle_panel(&mut self, region: Region, window: &mut Window, cx: &mut Context<Self>) {
-        let width = f32::from(window.viewport_size().width);
+        let width = self.effective_width(window);
         match region {
             Region::Sidebar => self.prefs.toggle_sidebar(width),
             Region::Inspector => self.prefs.toggle_inspector(width),
@@ -619,7 +673,7 @@ impl Shell {
         h_flex()
             .id("header")
             .test_support()
-            .h(px(44.))
+            .h(self.scaled(HEADER_HEIGHT))
             .flex_shrink_0()
             .px_3()
             .gap_2()
@@ -718,7 +772,7 @@ impl Shell {
             .on_action(cx.listener(|this, _: &ActivateSession, window, cx| {
                 this.activate_selected(window, cx)
             }))
-            .w(px(tokens::SIDEBAR_DEFAULT))
+            .w(self.scaled(tokens::SIDEBAR_DEFAULT))
             .flex_shrink_0()
             .h_full()
             .bg(cx.theme().sidebar)
@@ -783,7 +837,7 @@ impl Shell {
         v_flex()
             .id(session_row_id(&row.id))
             .test_support()
-            .h(px(SESSION_ROW_HEIGHT))
+            .h(self.scaled(SESSION_ROW_HEIGHT))
             .w_full()
             .px_3()
             .justify_center()
@@ -810,6 +864,7 @@ impl Shell {
     fn render_conversation(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let run_state = self.run_state();
         let blocks = self.blocks.clone();
+        let reading_width = self.scaled(tokens::READING_MAX);
         let focused = self.conversation_focus.is_focused(window);
         let timeline = MessageScroller::new("timeline", self.timeline.clone(), {
             move |index, _, cx| {
@@ -837,7 +892,7 @@ impl Shell {
                     .id(("block", id))
                     .test_support()
                     .w_full()
-                    .max_w(px(tokens::READING_MAX))
+                    .max_w(reading_width)
                     .mx_auto()
                     .px_4()
                     .py_2()
@@ -916,7 +971,7 @@ impl Shell {
             .child(Label::new(format!("{name}: not built")))
             .child(
                 div()
-                    .max_w(px(480.))
+                    .max_w(self.scaled(480.))
                     .text_sm()
                     .text_color(cx.theme().muted_foreground)
                     .child(Label::new(format!(
@@ -1019,7 +1074,7 @@ impl Shell {
             })
             .aria_label("Context")
             .when(modal, |panel| panel.aria_description(MODAL_DESCRIPTION))
-            .w(px(tokens::INSPECTOR_DEFAULT))
+            .w(self.scaled(tokens::INSPECTOR_DEFAULT))
             .flex_shrink_0()
             .h_full()
             .p_3()
@@ -1121,7 +1176,7 @@ impl Shell {
         h_flex()
             .id("status")
             .test_support()
-            .h(px(28.))
+            .h(self.scaled(STATUS_HEIGHT))
             .flex_shrink_0()
             .px_3()
             .gap_3()
@@ -1133,7 +1188,8 @@ impl Shell {
             .child(intent)
             .child(div().flex_1())
             .child(format!(
-                "{destination} · inspector {}",
+                "Text {}% · {destination} · inspector {}",
+                self.text_scale.percent(),
                 match layout.inspector {
                     InspectorMode::Docked => "docked",
                     InspectorMode::Overlay => "overlay",
@@ -1167,6 +1223,15 @@ impl Render for Shell {
             }))
             .on_action(cx.listener(|this, _: &ToggleInspector, window, cx| {
                 this.toggle_panel(Region::Inspector, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &IncreaseTextSize, window, cx| {
+                this.set_text_scale(this.text_scale.larger(), window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &DecreaseTextSize, window, cx| {
+                this.set_text_scale(this.text_scale.smaller(), window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ResetTextSize, window, cx| {
+                this.set_text_scale(TextScale::DEFAULT, window, cx)
             }))
             .child(self.render_header(layout, cx))
             .child(

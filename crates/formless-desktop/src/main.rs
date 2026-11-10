@@ -5,6 +5,7 @@
 //! Options:
 //! - `--sessions N`, `--blocks N`: size the fixture.
 //! - `--huge-block-mb N`: add one N MiB output block at the tail.
+//! - `--text-scale P`: start at P percent text size (100 to 200).
 //! - `--smoke`: print startup timings up to the first rendered frame, quit.
 //! - `--stream-seconds S` (with `--stream-rate R`, default 100 deltas per
 //!   second; 0 streams nothing and measures the idle window): stream into
@@ -15,18 +16,21 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use formless_desktop::model::TextScale;
 use formless_desktop::shell::Shell;
 use formless_desktop::{fixture, shell};
 use gpui_kit::prelude::*;
 use gpui_kit::{px, size, App, Bounds, Entity, Window, WindowBounds, WindowOptions};
 
 const USAGE: &str = "usage: formless-desktop [--sessions N] [--blocks N] [--huge-block-mb N] \
+                     [--text-scale P] \
                      [--smoke] [--stream-seconds S [--stream-rate R]]";
 
 struct Options {
     sessions: usize,
     blocks: usize,
     huge_block_mb: usize,
+    text_scale: usize,
     smoke: bool,
     stream_seconds: usize,
     stream_rate: usize,
@@ -37,6 +41,7 @@ fn parse_options() -> Result<Options, String> {
         sessions: 10_000,
         blocks: 10_000,
         huge_block_mb: 0,
+        text_scale: 100,
         smoke: false,
         stream_seconds: 0,
         stream_rate: 100,
@@ -53,6 +58,7 @@ fn parse_options() -> Result<Options, String> {
             "--sessions" => options.sessions = count("--sessions")?,
             "--blocks" => options.blocks = count("--blocks")?,
             "--huge-block-mb" => options.huge_block_mb = count("--huge-block-mb")?,
+            "--text-scale" => options.text_scale = count("--text-scale")?,
             "--smoke" => options.smoke = true,
             "--stream-seconds" => options.stream_seconds = count("--stream-seconds")?,
             "--stream-rate" => options.stream_rate = count("--stream-rate")?,
@@ -197,7 +203,10 @@ fn main() {
         };
         let (window, shell) = gpui_kit::open_window(window_options, cx, |window, cx| {
             window.set_window_title("Formless (Phase 0 spike)");
-            cx.new(|cx| shell::Shell::new(&sessions, &running, blocks, window, cx))
+            let shell = cx.new(|cx| shell::Shell::new(&sessions, &running, blocks, window, cx));
+            let scale = TextScale::from_percent(options.text_scale.min(1_000) as u16);
+            shell.update(cx, |shell, cx| shell.set_text_scale(scale, window, cx));
+            shell
         })
         .expect("failed to open the shell window");
         cx.activate(true);
@@ -210,11 +219,12 @@ fn main() {
                         // up, then the synthetic data exists, then one frame
                         // of the shell has been drawn.
                         println!(
-                            "smoke: sessions={} blocks={} huge_block_mb={} app_ready_ms={} \
-                             fixture_ms={} first_frame_ms={}",
+                            "smoke: sessions={} blocks={} huge_block_mb={} text_scale={} \
+                             app_ready_ms={} fixture_ms={} first_frame_ms={}",
                             options.sessions,
                             options.blocks,
                             options.huge_block_mb,
+                            options.text_scale,
                             app_ready.as_millis(),
                             fixture_built.as_millis(),
                             started.elapsed().as_millis()

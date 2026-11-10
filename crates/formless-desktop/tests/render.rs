@@ -19,6 +19,7 @@ mod render {
     use std::sync::Arc;
 
     use formless_desktop::fixture;
+    use formless_desktop::model::TextScale;
     use formless_desktop::shell::{self, Shell};
     use gpui_kit::assets::Assets;
     use gpui_kit::component::{Theme, ThemeMode};
@@ -27,35 +28,48 @@ mod render {
         px, size, AppContext as _, Bounds, HeadlessAppContext, WindowBounds, WindowOptions,
     };
 
-    /// Name, window width, theme, and a control to click before capturing.
-    const STATES: [(&str, f32, ThemeMode, Option<&str>); 7] = [
-        ("wide-light", 1440., ThemeMode::Light, None),
-        ("wide-dark", 1440., ThemeMode::Dark, None),
-        ("medium-light", 1100., ThemeMode::Light, None),
-        ("narrow-dark", 800., ThemeMode::Dark, None),
+    /// Name, window width, theme, text size in percent, and a control to
+    /// click before capturing.
+    const STATES: [(&str, f32, ThemeMode, u16, Option<&str>); 10] = [
+        ("wide-light", 1440., ThemeMode::Light, 100, None),
+        ("wide-dark", 1440., ThemeMode::Dark, 100, None),
+        ("medium-light", 1100., ThemeMode::Light, 100, None),
+        ("narrow-dark", 800., ThemeMode::Dark, 100, None),
         (
             "medium-inspector-overlay-light",
             1100.,
             ThemeMode::Light,
+            100,
             Some("toggle-inspector"),
         ),
         (
             "narrow-sidebar-overlay-dark",
             800.,
             ThemeMode::Dark,
+            100,
             Some("toggle-sidebar"),
         ),
         (
             "wide-tools-scaffold-light",
             1440.,
             ThemeMode::Light,
+            100,
             Some("destination-Tools"),
         ),
+        ("wide-light-200pct", 1440., ThemeMode::Light, 200, None),
+        (
+            "wide-sidebar-overlay-light-200pct",
+            1440.,
+            ThemeMode::Light,
+            200,
+            Some("toggle-sidebar"),
+        ),
+        ("minimum-dark-200pct", 480., ThemeMode::Dark, 200, None),
     ];
 
     pub fn run() {
         let keep = std::env::var("FORMLESS_DESKTOP_RENDER_DIR").ok();
-        for (name, width, mode, click) in STATES {
+        for (name, width, mode, percent, click) in STATES {
             let mut cx = HeadlessAppContext::with_platform(
                 gpui_kit::platform::current_platform(true).text_system(),
                 Arc::new(Assets),
@@ -72,14 +86,20 @@ mod render {
                     let options = WindowOptions {
                         window_bounds: Some(WindowBounds::Windowed(Bounds {
                             origin: Default::default(),
-                            size: size(px(width), px(900.)),
+                            // The last state is the binary's minimum window.
+                            size: size(px(width), px(if width < 500. { 360. } else { 900. })),
                         })),
                         focus: false,
                         show: false,
                         ..Default::default()
                     };
                     gpui_kit::open_window(options, cx, |window, cx| {
-                        cx.new(|cx| Shell::new(&sessions, &running, blocks, window, cx))
+                        let shell =
+                            cx.new(|cx| Shell::new(&sessions, &running, blocks, window, cx));
+                        shell.update(cx, |shell, cx| {
+                            shell.set_text_scale(TextScale::from_percent(percent), window, cx)
+                        });
+                        shell
                     })
                 })
                 .expect("open offscreen window");

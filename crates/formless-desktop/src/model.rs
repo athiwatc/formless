@@ -29,6 +29,61 @@ pub mod tokens {
     pub const GRID: f32 = 4.0;
 }
 
+/// The user's text size, as a percentage of the default.
+///
+/// The whole layout scales with it: fixed sizes are multiplied by
+/// [`TextScale::factor`] and the layout breakpoints are applied to the window
+/// width divided by it. At 200% a window therefore lays out like one half as
+/// wide at 100%, with everything twice the size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TextScale(u16);
+
+impl TextScale {
+    pub const STEPS: [u16; 5] = [100, 125, 150, 175, 200];
+    pub const DEFAULT: TextScale = TextScale(100);
+    pub const LARGEST: TextScale = TextScale(200);
+
+    /// The step closest to `percent`.
+    pub fn from_percent(percent: u16) -> Self {
+        let step = Self::STEPS
+            .into_iter()
+            .min_by_key(|step| step.abs_diff(percent))
+            .unwrap_or(100);
+        Self(step)
+    }
+
+    pub fn percent(self) -> u16 {
+        self.0
+    }
+
+    pub fn factor(self) -> f32 {
+        f32::from(self.0) / 100.0
+    }
+
+    /// One step larger; the largest step stays where it is.
+    pub fn larger(self) -> Self {
+        Self::STEPS
+            .into_iter()
+            .find(|step| *step > self.0)
+            .map_or(self, Self)
+    }
+
+    /// One step smaller; the default is the smallest.
+    pub fn smaller(self) -> Self {
+        Self::STEPS
+            .into_iter()
+            .rev()
+            .find(|step| *step < self.0)
+            .map_or(self, Self)
+    }
+}
+
+impl Default for TextScale {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
 /// The seven destinations of the existing clients. Search is transient: it
 /// is reachable but not part of the persistent navigation order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -624,6 +679,40 @@ mod tests {
 
     fn running(ids: &[&str]) -> HashSet<String> {
         ids.iter().map(|id| id.to_string()).collect()
+    }
+
+    #[test]
+    fn text_scale_steps_between_100_and_200_percent_and_stops_at_the_ends() {
+        let mut scale = TextScale::default();
+        assert_eq!((scale.percent(), scale.factor()), (100, 1.0));
+        assert_eq!(scale.smaller(), TextScale::DEFAULT);
+        let mut seen = vec![scale.percent()];
+        while scale.larger() != scale {
+            scale = scale.larger();
+            seen.push(scale.percent());
+        }
+        assert_eq!(seen, TextScale::STEPS);
+        assert_eq!(scale, TextScale::LARGEST);
+        assert_eq!(scale.factor(), 2.0);
+        assert_eq!(scale.smaller().percent(), 175);
+        assert_eq!(TextScale::from_percent(200), TextScale::LARGEST);
+        assert_eq!(TextScale::from_percent(140).percent(), 150);
+        assert_eq!(TextScale::from_percent(0).percent(), 100);
+        assert_eq!(TextScale::from_percent(9_999).percent(), 200);
+    }
+
+    #[test]
+    fn at_200_percent_a_window_lays_out_like_one_half_as_wide() {
+        let prefs = PanelPrefs::default();
+        let factor = TextScale::LARGEST.factor();
+        // 1440 px at 200% is 720 effective: too narrow for either panel.
+        let layout = Layout::for_width(1440.0 / factor, prefs);
+        assert_eq!(layout.sidebar, SidebarMode::Collapsed);
+        assert_eq!(layout.inspector, InspectorMode::Hidden);
+        // 2880 px at 200% is the three-pane layout again.
+        let layout = Layout::for_width(2880.0 / factor, prefs);
+        assert_eq!(layout.sidebar, SidebarMode::Docked);
+        assert_eq!(layout.inspector, InspectorMode::Docked);
     }
 
     #[test]
