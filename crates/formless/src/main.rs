@@ -7977,6 +7977,9 @@ fn ask_on_terminal(q: &Question) -> QuestionAnswer {
 mod oauth_credential_env;
 
 #[cfg(test)]
+mod cli_doctor_tests;
+
+#[cfg(test)]
 mod tests {
     #[test]
     fn profile_namespace_parser_refuses_reserved_names_before_running_cli_actions() {
