@@ -295,10 +295,10 @@ enum Cmd {
         #[command(subcommand)]
         action: NamingAction,
     },
-    /// Open the guides in a browser: gallery, capabilities, approvals,
-    /// keys, troubleshooting, mcp, skills, jobs, spec
+    /// Open the guides in a browser
     Docs {
         /// Guide name to open; omit to open the gallery
+        #[arg(value_parser = DocsTopicParser::new())]
         topic: Option<String>,
         /// Print the URL instead of opening it
         #[arg(long)]
@@ -1599,6 +1599,38 @@ fn exit_code(e: &anyhow::Error) -> i32 {
     {
         Some(codes::NOT_FOUND | codes::BAD_REQUEST | codes::INVALID | codes::UNSUPPORTED) => 2,
         _ => 1,
+    }
+}
+
+// Possible values are suggestions from `docs::TOPICS` only. `StringValueParser`
+// still accepts every string; `docs::resolve` does case, prefix, blank, and errors.
+#[derive(Clone)]
+struct DocsTopicParser(clap::builder::StringValueParser);
+
+impl DocsTopicParser {
+    fn new() -> Self {
+        Self(clap::builder::StringValueParser::new())
+    }
+}
+
+impl clap::builder::TypedValueParser for DocsTopicParser {
+    type Value = String;
+
+    fn parse_ref(
+        &self,
+        cmd: &clap::Command,
+        arg: Option<&clap::Arg>,
+        value: &std::ffi::OsStr,
+    ) -> Result<Self::Value, clap::Error> {
+        self.0.parse_ref(cmd, arg, value)
+    }
+
+    fn possible_values(
+        &self,
+    ) -> Option<Box<dyn Iterator<Item = clap::builder::PossibleValue> + '_>> {
+        Some(Box::new(formless_core::docs::TOPICS.iter().map(
+            |(name, _, description)| clap::builder::PossibleValue::new(*name).help(*description),
+        )))
     }
 }
 
