@@ -74,6 +74,7 @@ pub fn rotated_logs(paths: &Paths) -> std::io::Result<Vec<(u64, PathBuf)>> {
             .len()
             .cmp(&b_digits.len())
             .then_with(|| a_digits.cmp(b_digits))
+            .then_with(|| a.1.as_os_str().len().cmp(&b.1.as_os_str().len()))
             .then_with(|| a.1.cmp(&b.1))
     });
     Ok(files)
@@ -100,6 +101,44 @@ fn remove_if_present(path: PathBuf) -> std::io::Result<()> {
     }
 }
 
+/// Add the canonical name without replacing any destination created since
+/// discovery. Keep both names if identity verification fails; never guess
+/// which path is safe to remove after concurrent changes.
+fn promote_alias(source: &std::path::Path, destination: &std::path::Path) -> std::io::Result<()> {
+    let fail = |message: &str| {
+        std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!(
+                "normalize log history {} to {}: {message}",
+                source.display(),
+                destination.display()
+            ),
+        )
+    };
+    if !std::fs::symlink_metadata(source)?.is_file() {
+        return Err(fail("source is no longer a regular file"));
+    }
+    let original = same_file::Handle::from_path(source)?;
+    std::fs::hard_link(source, destination).map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!(
+                "normalize log history {} to {}: {e}",
+                source.display(),
+                destination.display()
+            ),
+        )
+    })?;
+    if !std::fs::symlink_metadata(source)?.is_file()
+        || !std::fs::symlink_metadata(destination)?.is_file()
+        || same_file::Handle::from_path(source)? != original
+        || same_file::Handle::from_path(destination)? != original
+    {
+        return Err(fail("file identity changed; both names preserved"));
+    }
+    std::fs::remove_file(source)
+}
+
 /// Enforce retention even below the live size cap, then rotate if needed.
 /// `keep` is bounded to 0..=64; zero discards rotated history.
 pub fn rotate_if_needed(paths: &Paths, max_bytes: u64, keep: usize) -> std::io::Result<bool> {
@@ -109,8 +148,39 @@ pub fn rotate_if_needed(paths: &Paths, max_bytes: u64, keep: usize) -> std::io::
             "daemon.log_keep must be between 0 and 64",
         ));
     }
-    for (index, path) in rotated_logs(paths)? {
+    // Numeric aliases occupy the same retention slot. Prefer the canonical
+    // regular file, otherwise normalize the shortest alias before discarding
+    // duplicates. Never replace a directory, symlink or special destination.
+    let history = rotated_logs(paths)?;
+    for index in 1..=keep {
+        let canonical = rotated(paths, index);
+        match std::fs::symlink_metadata(&canonical) {
+            Ok(m) if !m.is_file() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!(
+                        "cannot normalize log history: {} is not a regular file",
+                        canonical.display()
+                    ),
+                ));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    let mut normalized = std::collections::BTreeSet::new();
+    for (index, path) in history {
         if index > keep as u64 {
+            remove_if_present(path)?;
+            continue;
+        }
+        let canonical = rotated(paths, index as usize);
+        if normalized.insert(index) && path != canonical {
+            // Canonical sorts first, so this slot has only aliases. Promote
+            // before removing any duplicates, preserving them if it fails.
+            promote_alias(&path, &canonical)?;
+        } else if path != canonical {
             remove_if_present(path)?;
         }
     }
@@ -177,4 +247,56 @@ pub fn reopen_stdio(paths: &Paths) -> std::io::Result<()> {
 #[cfg(not(unix))]
 pub fn reopen_stdio(_paths: &Paths) -> std::io::Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod alias_promotion_tests {
+    use super::promote_alias;
+
+    #[test]
+    fn late_canonical_file_is_never_overwritten() {
+        let base = std::env::temp_dir().join(format!("fl-alias-race-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let source = base.join("daemon.log.01");
+        let destination = base.join("daemon.log.1");
+        std::fs::write(&source, "old alias").unwrap();
+        // Model the directory snapshot/preflight, then a writer creating .1.
+        assert!(std::fs::symlink_metadata(&destination).is_err());
+        std::fs::write(&destination, "new canonical").unwrap();
+        assert_eq!(
+            promote_alias(&source, &destination).unwrap_err().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(std::fs::read_to_string(&source).unwrap(), "old alias");
+        assert_eq!(
+            std::fs::read_to_string(&destination).unwrap(),
+            "new canonical"
+        );
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn late_canonical_symlink_is_never_replaced() {
+        let base = std::env::temp_dir().join(format!("fl-alias-link-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let source = base.join("daemon.log.01");
+        let destination = base.join("daemon.log.1");
+        let target = base.join("unrelated");
+        std::fs::write(&source, "old alias").unwrap();
+        std::fs::write(&target, "preserve target").unwrap();
+        assert!(std::fs::symlink_metadata(&destination).is_err());
+        std::os::unix::fs::symlink(&target, &destination).unwrap();
+        assert_eq!(
+            promote_alias(&source, &destination).unwrap_err().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert!(std::fs::symlink_metadata(&destination)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "preserve target");
+        assert_eq!(std::fs::read_to_string(&source).unwrap(), "old alias");
+        std::fs::remove_dir_all(base).unwrap();
+    }
 }

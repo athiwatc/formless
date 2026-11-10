@@ -306,3 +306,94 @@ fn usage_preserves_known_live_bytes_when_directory_listing_is_unavailable() {
     // discovery-error path. Both environments retain their known subtotal.
     assert_eq!(usage, if listing.is_err() { 4 } else { 11 });
 }
+
+#[test]
+fn numeric_aliases_normalize_age_and_obey_retention() {
+    let base = std::env::temp_dir().join(format!("fl-log-alias-{}", uuid::Uuid::new_v4()));
+    let paths = Paths::from_dirs(base.join("d"), base.join("c")).unwrap();
+    let log = paths.log_file();
+    let file = |suffix: &str| std::path::PathBuf::from(format!("{}.{suffix}", log.display()));
+    std::fs::write(file("001"), "long alias").unwrap();
+    std::fs::write(file("01"), "short alias").unwrap();
+    std::fs::write(file("tmp"), "unrelated").unwrap();
+    std::fs::write(file("0"), "zero lookalike").unwrap();
+    std::fs::write(file("999999999999999999999999"), "old").unwrap();
+    assert!(!rotate_if_needed(&paths, 0, 2).unwrap());
+    assert_eq!(std::fs::read_to_string(file("1")).unwrap(), "short alias");
+    assert!(!file("01").exists());
+    assert!(!file("001").exists());
+    assert!(!file("999999999999999999999999").exists());
+    std::fs::write(file("01"), "duplicate").unwrap();
+    std::fs::write(&log, "latest").unwrap();
+    assert!(rotate_if_needed(&paths, 1, 2).unwrap());
+    assert_eq!(std::fs::read_to_string(file("1")).unwrap(), "latest");
+    assert_eq!(std::fs::read_to_string(file("2")).unwrap(), "short alias");
+    assert!(!file("01").exists());
+    assert_eq!(formless_core::logs::rotated_logs(&paths).unwrap().len(), 2);
+    std::fs::write(file("09"), "alias nine").unwrap();
+    std::fs::write(file("9"), "canonical nine").unwrap();
+    std::fs::write(&log, "next").unwrap();
+    assert!(rotate_if_needed(&paths, 1, 10).unwrap());
+    assert_eq!(
+        std::fs::read_to_string(file("10")).unwrap(),
+        "canonical nine"
+    );
+    assert!(!file("09").exists());
+    assert!(!rotate_if_needed(&paths, 0, 0).unwrap());
+    assert!(formless_core::logs::rotated_logs(&paths)
+        .unwrap()
+        .is_empty());
+    assert_eq!(std::fs::read_to_string(file("tmp")).unwrap(), "unrelated");
+    assert_eq!(
+        std::fs::read_to_string(file("0")).unwrap(),
+        "zero lookalike"
+    );
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn numeric_alias_normalization_preserves_files_on_invalid_destination() {
+    let base = std::env::temp_dir().join(format!("fl-log-alias-fail-{}", uuid::Uuid::new_v4()));
+    let paths = Paths::from_dirs(base.join("d"), base.join("c")).unwrap();
+    let log = paths.log_file();
+    let canonical = std::path::PathBuf::from(format!("{}.1", log.display()));
+    let alias = std::path::PathBuf::from(format!("{}.01", log.display()));
+    std::fs::write(&alias, "preserve").unwrap();
+    std::fs::create_dir(&canonical).unwrap();
+    let error = rotate_if_needed(&paths, 0, 2).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+    assert!(error.to_string().contains("not a regular file"));
+    assert_eq!(std::fs::read_to_string(&alias).unwrap(), "preserve");
+    std::fs::remove_dir(&canonical).unwrap();
+    #[cfg(unix)]
+    {
+        let target = base.join("unrelated");
+        std::fs::write(&target, "target").unwrap();
+        std::os::unix::fs::symlink(&target, &canonical).unwrap();
+        assert!(rotate_if_needed(&paths, 0, 2).is_err());
+        assert_eq!(std::fs::read_to_string(&alias).unwrap(), "preserve");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "target");
+    }
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
+fn reverse_reader_reports_truncation_after_snapshot() {
+    let base = std::env::temp_dir().join(format!("fl-log-shrink-{}", uuid::Uuid::new_v4()));
+    let paths = Paths::from_dirs(base.join("d"), base.join("c")).unwrap();
+    let log = paths.log_file();
+    std::fs::write(&log, "older\nlatest\n").unwrap();
+    let mut seen = Vec::new();
+    let error = formless_core::logs::visit_lines(&paths, true, |line| {
+        seen.push(line);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&log)?
+            .set_len(0)?;
+        Ok(true)
+    })
+    .unwrap_err();
+    assert_eq!(seen, ["latest"]);
+    assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+    std::fs::remove_dir_all(base).unwrap();
+}

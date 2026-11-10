@@ -5434,7 +5434,7 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
 | `daemon.idle_grace_secs` | 60 | Idle-close grace after last Run + last client (§9.1) |
 | `daemon.stall_warning_secs` | 300 | Silence before `possibly stalled` flag (§6.1) |
 | `daemon.start_timeout_secs` | 60 | How long a client waits for an auto-started daemon (it fails early, with the log's last lines, if the daemon exits) |
-| `daemon.log_max_bytes` / `log_keep` | 10 MB / 5 | Size-triggered rotation; `log_keep` is 0–64. Each retention check removes numeric rotations above the current keep count, including all rotations at 0; max bytes 0 disables live-file rotation (§9.4) |
+| `daemon.log_max_bytes` / `log_keep` | 10 MB / 5 | Size-triggered rotation; `log_keep` is 0–64. Each retention check removes numeric rotations above the current keep count, including all rotations at 0; leading-zero aliases share one slot (canonical regular file wins, otherwise the shortest alias is normalized before duplicates are removed). Alias promotion refuses occupied/non-regular canonical destinations and preserves aliases on failure; max bytes 0 disables live-file rotation (§9.4) |
 | `daemon.keep_alive_for_jobs` | false | Stay up while scheduled jobs wait (§9.7) |
 | `daemon.delete_undo_secs` | 30 | Undo window for Session deletes (§5.1) |
 | `daemon.backups_keep` | 7 | Daily database backups kept in `<data>/backups` (`formless backup` / `restore`); 0 = no automatic backups (§9.6) |
