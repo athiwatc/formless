@@ -469,6 +469,7 @@ pub const COMMANDS: &[Command] = &[
     cmd("memory rm", "ID", "delete a memory", Integrations),
     cmd("memory on", "ID", "use a memory again", Integrations),
     cmd("memory off", "ID", "stop using a memory", Integrations),
+    cmd("memory used", "", "memories reportedly carried by the latest Run", Integrations),
     cmd(
         "jobs",
         "[enable|disable|run|history|rm ID]",
@@ -870,5 +871,27 @@ mod tests {
             .unwrap();
         assert!(session < attach && attach < run);
         assert!(help.iter().any(|l| l == "Keys"));
+    }
+
+    #[test]
+    fn memory_used_is_registered_and_visible() {
+        let used = COMMANDS
+            .iter()
+            .find(|c| c.name == "memory used")
+            .expect("/memory used is registered");
+        assert_eq!(used.args, "");
+        assert!(!used.needs_args());
+        assert_eq!(used.group, Group::Integrations);
+        assert_eq!(used.desc, "memories reportedly carried by the latest Run");
+        assert_eq!(used.usage(), "/memory used");
+        assert!(matches("memory").iter().any(|c| c.name == "memory used"));
+        let help = help_lines();
+        let integrations = help.iter().position(|l| l == "Integrations").unwrap();
+        let app = help.iter().position(|l| l == "App").unwrap();
+        let row = help
+            .iter()
+            .position(|l| l.contains("/memory used"))
+            .unwrap();
+        assert!(integrations < row && row < app);
     }
 }
