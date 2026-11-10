@@ -723,7 +723,7 @@ Everything else — the web, the filesystem, the shell, git, file formats, domai
 | `read_mcp_resource` | `server`, `uri` | Reads one of them; large contents become an artifact. |
 | `load_skill` | `name` | Loads an enabled [skill's](#skills) `SKILL.md` instructions before doing the kind of task it covers. |
 | `read_skill_file` | `name`, `path` | Reads one of that skill's extra files — reference docs, templates. |
-| `schedule_run` | `prompt`, `at` or `cron`, `session_id?` | Runs a prompt later or on a schedule (five-field cron, local time); recurring jobs need the user's approval. |
+| `schedule_run` | `prompt`, `at` or `cron`, `session_id?` | Runs a prompt later or on a schedule (five-field cron with month/weekday names or `@yearly`, local time); recurring jobs need the user's approval. |
 
 Built-ins lead every Session's Tool list, in a fixed order, and are never unloaded by `unload_tools`.
 

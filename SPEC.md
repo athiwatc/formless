@@ -3467,15 +3467,23 @@ refresh a cache, nightly cleanup.
 - **Creating:**
   - The agent uses `schedule_run({prompt, cron? | at?, session_id?})`.
     `cron` is a 5-field expression in local time (`*`, lists, ranges,
-    `/step`, `@hourly`/`@daily`/`@weekly`/`@monthly`; when both day fields
-    are restricted, either may match). `at` is RFC 3339,
-    `YYYY-MM-DD HH:MM` or `in 30m|2h|1d`.
+    `/step`; month/weekday fields also accept case-insensitive three-letter
+    names such as `JAN-MAR` and `MON,WED,FRI`, including in ranges/lists/steps;
+    Sunday is `SUN`, 0 or 7). Aliases are `@hourly`, `@daily`/`@midnight`,
+    `@weekly`, `@monthly`, and `@yearly`/`@annually` (January 1 at midnight).
+    When both day fields are restricted, either may match. Invalid field
+    values and range endpoints identify their field in both entry points.
+    `at` is RFC 3339, `YYYY-MM-DD HH:MM` or `in 30m|2h|1d`.
   - The user uses `AddJob` or `formless jobs add PROMPT --every … |
     --cron … | --at …`. A user's schedule may be plain English: "every
     weekday at 9am", "every 2 hours", "every 15 minutes", "daily at
     18:30", "hourly", "every monday and friday at noon", "every weekend
-    at 8pm"; it is stored as cron. `PreviewSchedule {schedule}` returns
-    the cron and the next 3 runs, which `jobs add` prints to confirm.
+    at 8pm", "yearly"/"annually"/"every year at 9am" (January 1).
+    Clock suffixes accept `am`/`pm`, `a.m.`/`p.m.` and `am.`/`pm.`,
+    case-insensitively; a dotted minute separator such as `9.30am` remains
+    unsupported. Natural schedules are stored as cron.
+    `PreviewSchedule {schedule}` returns the cron and the next 3 runs,
+    which `jobs add` prints to confirm.
   - Both entry points require a nonblank prompt and a one-shot time strictly
     after now. Relative offsets use checked arithmetic and may be at most
     366 days; zero, past and overflowing times return errors without saving
