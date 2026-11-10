@@ -174,7 +174,8 @@ Known limits of what is there:
 - The timeline's jump-to-latest control comes from the kit and is untested
   here. Every Session shows the same synthetic timeline.
 - The draft bound counts stored drafts only. The text in the composer itself
-  is unbounded, as is the kit's undo history.
+  is unbounded, as is the kit's undo history. The retained `last_intent`
+  and its text clones are also outside that stored-draft byte budget.
 
 The layout tokens are the epic's starting values and have not been checked at
 200% text scaling.
@@ -482,4 +483,3 @@ in the worktree's git-ignored `.screenshots/gpui-1753-phase0/` directory:
 
 That directory is local to one machine and is not part of the repository;
 anyone else reproduces it by running the script.
-
