@@ -4,16 +4,20 @@
 //! testing, key dispatch, focus and layout. They do not prove pixels, OS IME
 //! behaviour, a screen reader, or anything about a Daemon Core.
 
+use std::time::{Duration, Instant};
+
 use formless_desktop::fixture;
-use formless_desktop::model::{tokens, Destination, Intent};
+use formless_desktop::memory::{limits, IntentKind, IntentRecord};
+use formless_desktop::model::{tokens, Destination};
 use formless_desktop::shell::{self, session_row_id, Shell};
+use formless_desktop::timeline::TimelineBlock;
 use formless_protocol::SendMode;
 use gpui_kit::base::test_support::texts;
 use gpui_kit::base::Root;
 use gpui_kit::test::{TestQueryExt as _, TestWindowExt as _};
 use gpui_kit::{
-    px, size, App, AppContext as _, Bounds, Entity, Pixels, Point, Role, Size, TestAppContext,
-    Window, WindowBounds, WindowHandle, WindowOptions,
+    point, px, size, App, AppContext as _, Bounds, ClipboardItem, Entity, Pixels, Point, Role,
+    ScrollDelta, Size, TestAppContext, Window, WindowBounds, WindowHandle, WindowOptions,
 };
 
 const WIDE: Size<Pixels> = Size {
@@ -186,11 +190,13 @@ fn composer_takes_thai_cjk_and_emoji_and_keeps_the_draft_after_a_recorded_send(
     step(cx, handle, |_, cx| {
         assert_eq!(
             shell.read(cx).last_intent(),
-            Some(&Intent::SendMessage {
+            // The record has the sizes of what was sent and none of its text.
+            Some(&IntentRecord {
+                kind: IntentKind::Send(SendMode::Send),
                 // The pinned fixture Session sorts first and opens at start.
                 session_id: "fixture-session-3".to_string(),
-                content: draft.clone(),
-                mode: SendMode::Send,
+                content_bytes: draft.len(),
+                content_chars: draft.chars().count(),
             })
         );
         // Nothing acknowledged the request, so the draft is still there.
@@ -206,8 +212,8 @@ fn a_running_session_offers_steer_queue_and_a_separate_stop(cx: &mut TestAppCont
     const SECONDARY_ENTER: &str = "ctrl-enter";
 
     let (handle, shell) = open(cx, WIDE, 200, 40);
-    let last_mode = |cx: &App| match shell.read(cx).last_intent() {
-        Some(Intent::SendMessage { mode, .. }) => Some(*mode),
+    let last_mode = |cx: &App| match shell.read(cx).last_intent().map(|record| record.kind) {
+        Some(IntentKind::Send(mode)) => Some(mode),
         _ => None,
     };
     step(cx, handle, |window, cx| {
@@ -229,8 +235,11 @@ fn a_running_session_offers_steer_queue_and_a_separate_stop(cx: &mut TestAppCont
         window.click("composer-stop", cx);
         assert_eq!(
             shell.read(cx).last_intent(),
-            Some(&Intent::InterruptRun {
-                session_id: "fixture-session-7".to_string()
+            Some(&IntentRecord {
+                kind: IntentKind::Stop,
+                session_id: "fixture-session-7".to_string(),
+                content_bytes: 0,
+                content_chars: 0,
             })
         );
 
@@ -773,5 +782,383 @@ fn focus_falls_back_when_the_originating_control_is_gone(cx: &mut TestAppContext
         assert!(window.try_find("region-sidebar").is_none());
         assert!(window.try_find("region-composer").is_none());
         assert_eq!(window.find("region-conversation").focused(), Some(true));
+    });
+}
+
+// ---- Memory policy and stress -------------------------------------------
+
+#[cfg(target_os = "macos")]
+const COMMAND: &str = "cmd";
+#[cfg(not(target_os = "macos"))]
+const COMMAND: &str = "ctrl";
+
+fn chord(key: &str) -> String {
+    format!("{COMMAND}-{key}")
+}
+
+fn open_blocks(
+    cx: &mut TestAppContext,
+    window_size: Size<Pixels>,
+    blocks: Vec<TimelineBlock>,
+) -> (WindowHandle<Root>, Entity<Shell>) {
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        shell::bind_keys(cx);
+        let sessions = fixture::sessions(20);
+        let running = fixture::running(&sessions);
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(Bounds {
+                origin: Point::default(),
+                size: window_size,
+            })),
+            ..Default::default()
+        };
+        let (window, shell) = gpui_kit::open_window(options, cx, |window, cx| {
+            cx.new(|cx| Shell::new(&sessions, &running, blocks, window, cx))
+        })
+        .expect("open test window");
+        (window.downcast::<Root>().expect("Base Root"), shell)
+    })
+}
+
+/// Lines of text adding up to exactly `bytes` bytes.
+fn text_of(bytes: usize) -> String {
+    let line = "the quick brown fox jumps over the lazy dog, again and again and again.\n";
+    let mut text = line.repeat(bytes / line.len());
+    text.push_str(&"x".repeat(bytes - text.len()));
+    text
+}
+
+fn painted(window: &Window) -> Vec<String> {
+    texts(window)
+        .iter()
+        .map(|text| text.text().to_string())
+        .collect()
+}
+
+#[gpui_kit::test]
+fn a_five_megabyte_block_shows_a_bounded_preview_and_typing_still_works(cx: &mut TestAppContext) {
+    const FIVE_MIB: usize = 5 * 1024 * 1024;
+    let typed = "ยังพิมพ์ได้ still typing 12345";
+
+    // The same typing with no large block, to compare against.
+    let (baseline, _) = open_blocks(cx, size(px(1440.), px(2400.)), fixture::timeline(9));
+    cx.run_until_parked();
+    let baseline_typing = step(cx, baseline, |window, cx| {
+        window.draw(cx).clear(cx);
+        let typing = Instant::now();
+        window.input(typed, cx);
+        typing.elapsed()
+    });
+
+    let mut blocks = fixture::timeline(8);
+    blocks.push(fixture::huge_block(9, FIVE_MIB));
+    assert!(blocks[8].total_bytes() >= FIVE_MIB);
+
+    let started = Instant::now();
+    let (handle, shell) = open_blocks(cx, size(px(1440.), px(2400.)), blocks);
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| {
+        window.draw(cx).clear(cx);
+        let first_draw = started.elapsed();
+
+        assert!(window.find(("block-truncated", 9usize)).visible());
+        let painted = painted(window);
+        let notice = painted
+            .iter()
+            .find(|text| text.starts_with("Preview: the first"))
+            .unwrap_or_else(|| panic!("no truncation notice painted"));
+        assert!(notice.contains("of 5.0 MiB"), "{notice}");
+        // The start of the output was laid out; lines past the preview were
+        // never given to the text layout.
+        assert!(painted
+            .iter()
+            .any(|text| text.contains("00000001 output line")));
+        assert!(painted
+            .iter()
+            .any(|text| text.contains("00000390 output line")));
+        assert!(!painted
+            .iter()
+            .any(|text| text.contains("00000450 output line")));
+        let laid_out: usize = painted.iter().map(String::len).sum();
+        assert!(
+            laid_out < 4 * limits::BLOCK_PREVIEW_MAX_BYTES,
+            "{laid_out} bytes of text laid out for the whole window"
+        );
+
+        // The composer is not held up by the block above it.
+        let typing = Instant::now();
+        window.input(typed, cx);
+        let typing = typing.elapsed();
+        assert_eq!(shell.read(cx).draft(cx).as_ref(), typed);
+
+        println!(
+            "EVIDENCE five_mib_block: open_and_first_draw_ms={} typing_ms={} \
+             baseline_typing_ms={} for {} keystrokes (each a full frame), \
+             painted_text_bytes={laid_out}",
+            first_draw.as_millis(),
+            typing.as_millis(),
+            baseline_typing.as_millis(),
+            typed.chars().count()
+        );
+        // Generous: this guards against a freeze, it is not a budget.
+        assert!(first_draw < Duration::from_secs(20));
+        assert!(typing < Duration::from_secs(20));
+    });
+}
+
+#[gpui_kit::test]
+fn a_five_megabyte_paste_is_refused_whole_and_explained(cx: &mut TestAppContext) {
+    let (handle, shell) = open(cx, WIDE, 200, 40);
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        window.input("keep", cx);
+    });
+    cx.write_to_clipboard(ClipboardItem::new_string(text_of(5 * 1024 * 1024)));
+    let pasting = Instant::now();
+    step(cx, handle, |window, cx| window.press(&chord("v"), cx));
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        println!(
+            "EVIDENCE five_mib_paste: refused_in_ms={}",
+            pasting.elapsed().as_millis()
+        );
+        // Nothing of the clipboard went in.
+        assert_eq!(shell.read(cx).draft(cx).as_ref(), "keep");
+        let notice = shell.read(cx).composer_notice().expect("a reason is shown");
+        assert!(notice.starts_with("Paste not added"), "{notice}");
+        assert!(
+            notice.contains("5.0 MiB") && notice.contains("1.0 MiB"),
+            "{notice}"
+        );
+        assert!(window.find("composer-notice").visible());
+        assert_eq!(window.find_by_label("Message").focused(), Some(true));
+
+        // A paste that fits goes in as usual and clears the notice.
+        cx.write_to_clipboard(ClipboardItem::new_string(" and this".to_string()));
+        window.press(&chord("v"), cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        assert_eq!(shell.read(cx).draft(cx).as_ref(), "keep and this");
+        assert_eq!(shell.read(cx).composer_notice(), None);
+        assert!(window.try_find("composer-notice").is_none());
+    });
+}
+
+#[gpui_kit::test]
+fn the_composer_never_holds_more_than_its_limit(cx: &mut TestAppContext) {
+    let (handle, shell) = open(cx, WIDE, 200, 40);
+    let full = text_of(limits::COMPOSER_MAX_BYTES);
+    cx.write_to_clipboard(ClipboardItem::new_string(full.clone()));
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        window.press(&chord("v"), cx);
+    });
+    step(cx, handle, |window, cx| {
+        // Exactly at the limit is allowed.
+        assert_eq!(shell.read(cx).draft(cx).len(), limits::COMPOSER_MAX_BYTES);
+        assert_eq!(shell.read(cx).composer_notice(), None);
+        // One more character, typed rather than pasted, goes over.
+        window.input("ก", cx);
+    });
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        let draft = shell.read(cx).draft(cx);
+        assert_eq!(draft.len(), limits::COMPOSER_MAX_BYTES);
+        assert_eq!(draft.as_ref(), full);
+        let notice = shell.read(cx).composer_notice().expect("a reason is shown");
+        assert!(notice.contains("limit"), "{notice}");
+        // The composer was replaced and still has focus.
+        assert_eq!(window.find_by_label("Message").focused(), Some(true));
+    });
+}
+
+#[gpui_kit::test]
+fn undo_cannot_bring_back_another_sessions_draft(cx: &mut TestAppContext) {
+    let (handle, shell) = open(cx, WIDE, 200, 40);
+    let rows = |cx: &App| -> Vec<String> {
+        shell
+            .read(cx)
+            .sidebar()
+            .rows()
+            .iter()
+            .take(2)
+            .map(|row| row.id.clone())
+            .collect()
+    };
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        window.input("for the first session only", cx);
+        // Undo works within one Session's composer.
+        window.press(&chord("z"), cx);
+    });
+    step(cx, handle, |window, cx| {
+        assert_ne!(
+            shell.read(cx).draft(cx).as_ref(),
+            "for the first session only"
+        );
+        window.press(&chord("shift-z"), cx);
+    });
+    step(cx, handle, |window, cx| {
+        assert_eq!(
+            shell.read(cx).draft(cx).as_ref(),
+            "for the first session only"
+        );
+        let second = rows(cx)[1].clone();
+        window.click(session_row_id(&second), cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        assert_eq!(shell.read(cx).draft(cx).as_ref(), "");
+        // Clicking a row took focus out of the composer; put it back.
+        window.click_at("region-composer", point(px(40.), px(20.)), cx);
+        assert_eq!(window.find_by_label("Message").focused(), Some(true));
+        // Undo in the second Session has nothing of the first to restore.
+        window.press(&chord("z"), cx);
+        window.press(&chord("z"), cx);
+    });
+    step(cx, handle, |window, cx| {
+        assert_eq!(shell.read(cx).draft(cx).as_ref(), "");
+        let first = rows(cx)[0].clone();
+        window.click(session_row_id(&first), cx);
+    });
+    step(cx, handle, |_, cx| {
+        // The draft itself was parked and comes back.
+        assert_eq!(
+            shell.read(cx).draft(cx).as_ref(),
+            "for the first session only"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn large_pastes_drop_the_undo_history_once_the_budget_is_spent(cx: &mut TestAppContext) {
+    let (handle, shell) = open(cx, WIDE, 200, 40);
+    let chunk = text_of(limits::COMPOSER_MAX_BYTES);
+    let pastes = limits::UNDO_PASTE_BUDGET_BYTES / limits::COMPOSER_MAX_BYTES + 1;
+    cx.write_to_clipboard(ClipboardItem::new_string(chunk.clone()));
+    step(cx, handle, |window, cx| window.render_frame(cx));
+    for round in 0..pastes {
+        step(cx, handle, |window, cx| window.press(&chord("v"), cx));
+        cx.run_until_parked();
+        step(cx, handle, |window, cx| {
+            assert_eq!(shell.read(cx).draft(cx).len(), chunk.len(), "round {round}");
+            if round + 1 < pastes {
+                assert_eq!(shell.read(cx).composer_notice(), None, "round {round}");
+                window.press(&chord("a"), cx);
+                window.press("backspace", cx);
+            }
+        });
+        cx.run_until_parked();
+    }
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        let notice = shell.read(cx).composer_notice().expect("a reason is shown");
+        assert!(notice.starts_with("Undo history was cleared"), "{notice}");
+        assert_eq!(window.find_by_label("Message").focused(), Some(true));
+        // The history is gone: undo changes nothing.
+        window.press(&chord("z"), cx);
+    });
+    step(cx, handle, |_, cx| {
+        assert_eq!(shell.read(cx).draft(cx).as_ref(), chunk);
+    });
+}
+
+// ---- Streaming -----------------------------------------------------------
+
+#[gpui_kit::test]
+fn a_burst_of_stream_deltas_reaches_the_view_in_one_update(cx: &mut TestAppContext) {
+    let (handle, shell) = open(cx, size(px(1440.), px(1200.)), 20, 40);
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        assert!(window.find(("block", 40usize)).visible());
+        shell.update(cx, |shell, cx| {
+            shell.begin_stream(cx);
+            for index in 0..1_000 {
+                shell.push_stream_delta(&format!("คำที่ {index} "), cx);
+            }
+        });
+        // The data is already complete; the view has not been told yet.
+        assert_eq!(shell.read(cx).block_count(), 41);
+        assert_eq!(shell.read(cx).stream_stats(), (1_001, 0));
+    });
+    cx.executor().advance_clock(Duration::from_millis(
+        2 * formless_desktop::timeline::FLUSH_INTERVAL_MS,
+    ));
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| {
+        window.draw(cx).clear(cx);
+        assert_eq!(shell.read(cx).stream_stats(), (1_001, 1));
+        // Following the tail: the streamed block is on screen with its text.
+        assert!(window.find(("block", 41usize)).visible());
+        assert!(painted(window)
+            .iter()
+            .any(|text| text.contains("คำที่ 0 ") && text.contains("คำที่ 999")));
+
+        // Finishing shows the final state at once, with no timer involved.
+        shell.update(cx, |shell, cx| {
+            shell.push_stream_delta("จบ", cx);
+            shell.finish_stream(cx);
+        });
+        assert_eq!(shell.read(cx).stream_stats().1, 2);
+    });
+    // The kit parses Markdown off the main thread, so the new text is painted
+    // a frame after the update, not within it. The timer armed by the last
+    // delta also fires here and finds nothing left to do.
+    cx.executor().advance_clock(Duration::from_millis(100));
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| {
+        window.draw(cx).clear(cx);
+        assert!(painted(window).iter().any(|text| text.ends_with("จบ")));
+        assert_eq!(shell.read(cx).stream_stats().1, 2);
+    });
+}
+
+#[gpui_kit::test]
+fn streaming_does_not_move_older_content_that_is_being_read(cx: &mut TestAppContext) {
+    let (handle, shell) = open(cx, size(px(1440.), px(1200.)), 20, 200);
+    cx.run_until_parked();
+    let anchor = step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        // Scroll well away from the tail.
+        window.scroll(
+            "region-conversation",
+            ScrollDelta::Pixels(point(px(0.), px(4000.))),
+            cx,
+        );
+        window.render_frame(cx);
+        assert!(window.try_find(("block", 200usize)).is_none());
+        let id = (1..=200usize)
+            .rev()
+            .find(|id| {
+                window
+                    .try_find(("block", *id))
+                    .is_some_and(|block| block.visible() && block.bounds().top() > px(100.))
+            })
+            .expect("an older block is on screen");
+        (id, window.find(("block", id)).bounds())
+    });
+
+    step(cx, handle, |_, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.begin_stream(cx);
+            for index in 0..300 {
+                shell.push_stream_delta(&format!("streamed paragraph {index}\n\n"), cx);
+            }
+        });
+    });
+    cx.executor().advance_clock(Duration::from_millis(50));
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        assert_eq!(shell.read(cx).stream_stats(), (301, 1));
+        assert_eq!(shell.read(cx).block_count(), 201);
+        // The block being read is exactly where it was.
+        assert_eq!(window.find(("block", anchor.0)).bounds(), anchor.1);
+        // The streamed tail is off screen and was not built.
+        assert!(window.try_find(("block", 201usize)).is_none());
     });
 }

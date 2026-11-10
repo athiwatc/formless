@@ -149,7 +149,9 @@ impl ComposerActions {
 }
 
 /// A typed request the shell would hand to the client layer. Phase 0 has no
-/// client layer: the shell records the intent and leaves the draft in place.
+/// client layer: the shell notes that the intent happened (a
+/// `memory::IntentRecord`, which holds no message text), drops the intent,
+/// and leaves the draft in place.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Intent {
     SendMessage {
@@ -593,15 +595,6 @@ impl BlockKind {
             BlockKind::RunRecap => "Run recap",
         }
     }
-}
-
-/// One timeline row. `id` is stable for the life of the transcript so list
-/// state, selection and caches can key on it instead of on a position.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TimelineBlock {
-    pub id: u64,
-    pub kind: BlockKind,
-    pub markdown: String,
 }
 
 #[cfg(test)]

@@ -7,8 +7,10 @@
 //! sent, and the draft stays in place. Only Chat has a view; every other
 //! destination shows a notice saying so.
 
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::rc::Rc;
+use std::time::Duration;
 
 use formless_protocol::SessionInfo;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -22,15 +24,20 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    div, px, size, AnyElement, App, Context, ElementId, Entity, FocusHandle, Focusable as _, Hsla,
-    KeyBinding, Pixels, Role, ScrollStrategy, SharedString, Size, Subscription,
-    TestSupportExt as _, Window,
+    div, px, size, AnyElement, App, ClipboardItem, Context, ElementId, Entity, FocusHandle,
+    Focusable as _, Hsla, KeyBinding, Pixels, Role, ScrollStrategy, SharedString, Size,
+    Subscription, TestSupportExt as _, Window,
 };
 
-use crate::model::{
-    send_mode_label, tokens, ComposerActions, Destination, Drafts, InspectorMode, Intent, Layout,
-    PanelPrefs, Region, RunState, Sidebar, SidebarMode, TimelineBlock,
+use crate::memory::{
+    admit_paste, clamp_to_limit, format_bytes, limits, IntentKind, IntentRecord, PasteAdmission,
+    UndoBudget,
 };
+use crate::model::{
+    send_mode_label, tokens, BlockKind, ComposerActions, Destination, Drafts, InspectorMode,
+    Intent, Layout, PanelPrefs, Region, RunState, Sidebar, SidebarMode,
+};
+use crate::timeline::{Coalescer, Timeline, TimelineBlock, FLUSH_INTERVAL_MS};
 
 gpui_kit::actions!(
     formless_desktop,
@@ -53,10 +60,6 @@ const OVERLAY_CONTEXT: &str = "FormlessOverlay";
 const MODAL_DESCRIPTION: &str =
     "Modal panel. Press Escape to close it and return to where you were.";
 const SESSION_ROW_HEIGHT: f32 = 44.0;
-/// Draft retention: at most this many Sessions and this much text in total.
-const DRAFT_MAX_ENTRIES: usize = 64;
-const DRAFT_MAX_BYTES: usize = 4 * 1024 * 1024;
-
 /// Region and panel shortcuts. F6 / Shift+F6 move between regions; nothing
 /// here binds a bare printable key, so typing in the composer is untouched.
 pub fn bind_keys(cx: &mut App) {
@@ -106,11 +109,22 @@ struct FocusOrigin {
 
 pub struct Shell {
     sidebar: Sidebar,
-    blocks: Rc<Vec<TimelineBlock>>,
+    /// Shared with the timeline's row renderer.
+    blocks: Rc<RefCell<Timeline>>,
+    /// Collapses stream deltas into one view update per flush interval.
+    stream: Coalescer,
     drafts: Drafts,
     prefs: PanelPrefs,
     destination: Destination,
-    last_intent: Option<Intent>,
+    /// What the last composer action was. Sizes only: no message text is
+    /// kept once an intent has been handed on.
+    last_intent: Option<IntentRecord>,
+    /// The composer's size as of its last change event. The paste check uses
+    /// this because it runs while the composer itself is being updated.
+    draft_bytes: usize,
+    undo_budget: UndoBudget,
+    /// Why the composer refused or changed something, shown under it.
+    composer_notice: Option<SharedString>,
     /// The overlay that held the window modally at the last settle.
     modal: Option<Region>,
     /// What had focus when the current overlay came up.
@@ -125,6 +139,7 @@ pub struct Shell {
     /// The header toggles own stable handles so focus can return to them.
     sidebar_toggle_focus: FocusHandle,
     inspector_toggle_focus: FocusHandle,
+    composer_subscription: Subscription,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -142,42 +157,25 @@ impl Shell {
         sidebar.activate_selected();
 
         let timeline = cx.new(|cx| MessageScrollerState::new(blocks.len(), cx));
-        let composer = cx.new(|cx| {
-            TextareaState::new(window, cx)
-                .auto_grow(2, 8)
-                .submit_on_enter(true)
-                .placeholder("Message Formless")
-        });
-        let subscriptions = vec![
-            cx.subscribe(&composer, |this, _, event: &InputEvent, cx| {
-                match event {
-                    // Plain Enter is the primary action; the secondary chord
-                    // is the secondary one (Queue during a Run). Shift+Enter
-                    // also reports PressEnter, but it has already inserted a
-                    // newline.
-                    InputEvent::PressEnter {
-                        secondary,
-                        shift: false,
-                    } => this.submit(*secondary, cx),
-                    // Button availability depends on whether there is a draft.
-                    InputEvent::Change => cx.notify(),
-                    _ => {}
-                }
-            }),
-            // A resize can end an overlay (the panel docks again) or hide the
-            // panel that holds focus.
-            cx.observe_window_bounds(window, |this, window, cx| this.settle(window, cx)),
-        ];
+        let (composer, composer_subscription) = Self::build_composer("", window, cx);
+        // A resize can end an overlay (the panel docks again) or hide the
+        // panel that holds focus.
+        let subscriptions =
+            vec![cx.observe_window_bounds(window, |this, window, cx| this.settle(window, cx))];
         composer.update(cx, |composer, cx| composer.focus(window, cx));
 
         let session_sizes = Self::row_sizes(sidebar.rows().len());
         Self {
             sidebar,
-            blocks: Rc::new(blocks),
-            drafts: Drafts::new(DRAFT_MAX_ENTRIES, DRAFT_MAX_BYTES),
+            blocks: Rc::new(RefCell::new(Timeline::new(blocks))),
+            stream: Coalescer::default(),
+            drafts: Drafts::new(limits::DRAFT_MAX_ENTRIES, limits::DRAFT_MAX_BYTES),
             prefs: PanelPrefs::default(),
             destination: Destination::Chat,
             last_intent: None,
+            draft_bytes: 0,
+            undo_budget: UndoBudget::default(),
+            composer_notice: None,
             modal: None,
             restore_focus: None,
             timeline,
@@ -189,7 +187,130 @@ impl Shell {
             inspector_focus: cx.focus_handle(),
             sidebar_toggle_focus: cx.focus_handle(),
             inspector_toggle_focus: cx.focus_handle(),
+            composer_subscription,
             _subscriptions: subscriptions,
+        }
+    }
+
+    /// A composer holding `text`, with an empty undo history, and the
+    /// subscription that routes its events to the shell.
+    fn build_composer(
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> (Entity<TextareaState>, Subscription) {
+        let composer = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .auto_grow(2, 8)
+                .submit_on_enter(true)
+                .placeholder("Message Formless")
+                .default_value(text.to_string())
+        });
+        let subscription = cx.subscribe_in(
+            &composer,
+            window,
+            |this, _, event: &InputEvent, window, cx| match event {
+                // Plain Enter is the primary action; the secondary chord is
+                // the secondary one (Queue during a Run). Shift+Enter also
+                // reports PressEnter, but it has already inserted a newline.
+                InputEvent::PressEnter {
+                    secondary,
+                    shift: false,
+                } => this.submit(*secondary, cx),
+                InputEvent::Change => this.composer_changed(window, cx),
+                _ => {}
+            },
+        );
+        (composer, subscription)
+    }
+
+    /// Swap in a fresh composer holding `text`. This is the only way to drop
+    /// the kit's undo history, so it is how a Session switch keeps one
+    /// Session's text out of another's undo, and how the history is bounded
+    /// after large pastes. Focus stays in the composer if it was there.
+    fn rebuild_composer(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let had_focus = self.composer.focus_handle(cx).contains_focused(window, cx);
+        let (composer, subscription) = Self::build_composer(text, window, cx);
+        self.composer = composer;
+        self.composer_subscription = subscription;
+        // An open overlay may be waiting to hand focus back to the composer
+        // that was just replaced; point it at the new one.
+        if let Some(origin) = &mut self.restore_focus {
+            if origin.region == Some(Region::Composer) {
+                origin.handle = self.composer.focus_handle(cx);
+            }
+        }
+        self.draft_bytes = text.len();
+        self.undo_budget.reset();
+        if had_focus {
+            self.composer
+                .update(cx, |composer, cx| composer.focus(window, cx));
+        }
+        cx.notify();
+    }
+
+    /// Runs after every edit. Whatever path the text came by, the composer
+    /// ends up within its limit.
+    fn composer_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let draft = self.draft(cx);
+        self.draft_bytes = draft.len();
+        // Either case replaces the composer: with the clamped text, or with
+        // the same text and an empty undo history.
+        let replacement = if draft.len() > limits::COMPOSER_MAX_BYTES {
+            Some((
+                clamp_to_limit(&draft, limits::COMPOSER_MAX_BYTES).to_string(),
+                format!(
+                    "The message is at its {} limit. Text past the limit was not kept.",
+                    format_bytes(limits::COMPOSER_MAX_BYTES)
+                ),
+            ))
+        } else if self.undo_budget.is_spent() {
+            Some((
+                draft.to_string(),
+                "Undo history was cleared to bound memory after large pastes.".to_string(),
+            ))
+        } else {
+            None
+        };
+        match replacement {
+            Some((kept, notice)) => {
+                self.composer_notice = Some(notice.into());
+                // Not from inside the old composer's own event delivery.
+                cx.defer_in(window, move |this, window, cx| {
+                    this.rebuild_composer(&kept, window, cx)
+                });
+            }
+            None => self.composer_notice = None,
+        }
+        // Button availability depends on whether there is a draft.
+        cx.notify();
+    }
+
+    /// The composer's paste hook. Returns true to consume the paste so that
+    /// nothing is inserted.
+    fn paste_refused(&mut self, item: &ClipboardItem, cx: &mut Context<Self>) -> bool {
+        let Some(text) = item.text() else {
+            return false;
+        };
+        match admit_paste(self.draft_bytes, text.len()) {
+            PasteAdmission::Accept => {
+                self.undo_budget.record_paste(text.len());
+                false
+            }
+            PasteAdmission::Reject { would_be_bytes } => {
+                self.composer_notice = Some(
+                    format!(
+                        "Paste not added: it is {} and the message would be {}. The limit is {}; \
+                         attach larger content instead.",
+                        format_bytes(text.len()),
+                        format_bytes(would_be_bytes),
+                        format_bytes(limits::COMPOSER_MAX_BYTES)
+                    )
+                    .into(),
+                );
+                cx.notify();
+                true
+            }
         }
     }
 
@@ -211,8 +332,81 @@ impl Shell {
         self.destination
     }
 
-    pub fn last_intent(&self) -> Option<&Intent> {
+    pub fn last_intent(&self) -> Option<&IntentRecord> {
         self.last_intent.as_ref()
+    }
+
+    pub fn composer_notice(&self) -> Option<&str> {
+        self.composer_notice.as_deref()
+    }
+
+    pub fn block_count(&self) -> usize {
+        self.blocks.borrow().len()
+    }
+
+    /// Stream deltas received and view updates made for them.
+    pub fn stream_stats(&self) -> (u64, u64) {
+        (self.stream.requests(), self.stream.flushes())
+    }
+
+    /// Hand an intent on. There is no client layer to hand it to yet, so it
+    /// is dropped here; only its record stays.
+    fn emit(&mut self, intent: Intent, cx: &mut Context<Self>) {
+        self.last_intent = Some(IntentRecord::from(&intent));
+        cx.notify();
+    }
+
+    /// Start a streamed assistant block at the tail of the timeline.
+    pub fn begin_stream(&mut self, cx: &mut Context<Self>) {
+        self.blocks.borrow_mut().begin_stream(BlockKind::Assistant);
+        self.request_flush(cx);
+    }
+
+    /// Append streamed text to the tail. The data is updated at once; the
+    /// view is told at most once per flush interval.
+    pub fn push_stream_delta(&mut self, text: &str, cx: &mut Context<Self>) {
+        if self.blocks.borrow_mut().push_delta(text) {
+            self.request_flush(cx);
+        }
+    }
+
+    /// End the stream and show its final state without waiting.
+    pub fn finish_stream(&mut self, cx: &mut Context<Self>) {
+        self.blocks.borrow_mut().finish_stream();
+        self.stream.request();
+        self.flush_stream(cx);
+    }
+
+    fn request_flush(&mut self, cx: &mut Context<Self>) {
+        if !self.stream.request() {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(FLUSH_INTERVAL_MS))
+                .await;
+            this.update(cx, |this, cx| this.flush_stream(cx)).ok();
+        })
+        .detach();
+    }
+
+    /// Bring the list in line with the data: new rows are appended and the
+    /// tail row, the only one that can have changed, is measured again.
+    fn flush_stream(&mut self, cx: &mut Context<Self>) {
+        if !self.stream.take() {
+            return;
+        }
+        let count = self.blocks.borrow().len();
+        self.timeline.update(cx, |timeline, cx| {
+            let known = timeline.item_count();
+            if count > known {
+                timeline.append(count - known, cx);
+            }
+            if count > 0 {
+                timeline.remeasure_items(count - 1..count, cx);
+            }
+        });
+        cx.notify();
     }
 
     pub fn draft(&self, cx: &App) -> SharedString {
@@ -249,12 +443,15 @@ impl Shell {
         let Some(session_id) = self.sidebar.active_id().map(str::to_string) else {
             return;
         };
-        self.last_intent = Some(Intent::SendMessage {
-            session_id,
-            content: self.draft(cx).to_string(),
-            mode,
-        });
-        cx.notify();
+        let content = self.draft(cx).to_string();
+        self.emit(
+            Intent::SendMessage {
+                session_id,
+                content,
+                mode,
+            },
+            cx,
+        );
     }
 
     fn stop(&mut self, cx: &mut Context<Self>) {
@@ -262,8 +459,7 @@ impl Shell {
             return;
         }
         if let Some(session_id) = self.sidebar.active_id().map(str::to_string) {
-            self.last_intent = Some(Intent::InterruptRun { session_id });
-            cx.notify();
+            self.emit(Intent::InterruptRun { session_id }, cx);
         }
     }
 
@@ -291,9 +487,11 @@ impl Shell {
                 .active_id()
                 .map(|id| self.drafts.get(id).to_string())
                 .unwrap_or_default();
-            self.composer
-                .update(cx, |composer, cx| composer.set_value(restored, window, cx));
-            let count = self.blocks.len();
+            // A fresh composer, not a new value in the old one: the old one's
+            // undo history holds the other Session's text.
+            self.rebuild_composer(&restored, window, cx);
+            self.composer_notice = None;
+            let count = self.blocks.borrow().len();
             self.timeline
                 .update(cx, |timeline, cx| timeline.reset(count, cx));
             self.last_intent = None;
@@ -615,9 +813,28 @@ impl Shell {
         let focused = self.conversation_focus.is_focused(window);
         let timeline = MessageScroller::new("timeline", self.timeline.clone(), {
             move |index, _, cx| {
-                let block = &blocks[index];
+                let blocks = blocks.borrow();
+                let Some(block) = blocks.blocks().get(index) else {
+                    return div().into_any_element();
+                };
+                let id = block.id as usize;
+                // Only the preview is laid out. A block of any size costs a
+                // bounded amount per frame, and the row says when it is cut.
+                let truncated = block.is_truncated().then(|| {
+                    div()
+                        .id(("block-truncated", id))
+                        .test_support()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(Label::new(format!(
+                            "Preview: the first {} of {} is shown. The rest is not laid out, \
+                             and this scaffold has no full-output viewer.",
+                            format_bytes(block.preview().len()),
+                            format_bytes(block.total_bytes())
+                        )))
+                });
                 v_flex()
-                    .id(("block", block.id as usize))
+                    .id(("block", id))
                     .test_support()
                     .w_full()
                     .max_w(px(tokens::READING_MAX))
@@ -632,9 +849,14 @@ impl Shell {
                             .child(block.kind.label()),
                     )
                     .child(
-                        TextView::markdown(("markdown", block.id as usize), block.markdown.clone())
-                            .selectable(true),
+                        TextView::markdown(
+                            ("markdown", id),
+                            SharedString::from(block.preview().clone()),
+                        )
+                        .selectable(true),
                     )
+                    .children(truncated)
+                    .into_any_element()
             }
         });
         v_flex()
@@ -657,7 +879,7 @@ impl Shell {
                         div()
                             .flex_1()
                             .text_sm()
-                            .child(format!("{} blocks", self.blocks.len())),
+                            .child(format!("{} blocks", self.blocks.borrow().len())),
                     )
                     .child(
                         div()
@@ -744,7 +966,23 @@ impl Shell {
             .gap_2()
             .border_t_1()
             .border_color(cx.theme().border)
-            .child(Textarea::new(&self.composer).aria_label("Message").w_full())
+            .child(
+                Textarea::new(&self.composer)
+                    .aria_label("Message")
+                    .on_paste({
+                        let shell = cx.entity();
+                        move |item, _, cx| shell.update(cx, |this, cx| this.paste_refused(item, cx))
+                    })
+                    .w_full(),
+            )
+            .children(self.composer_notice.clone().map(|notice| {
+                div()
+                    .id("composer-notice")
+                    .test_support()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(Label::new(notice))
+            }))
             .child(
                 h_flex()
                     .gap_2()
@@ -865,12 +1103,14 @@ impl Shell {
 
     fn render_status(&self, layout: Layout, cx: &mut Context<Self>) -> impl IntoElement {
         let intent = match &self.last_intent {
-            Some(Intent::SendMessage { mode, content, .. }) => format!(
-                "Recorded {} ({} characters), not sent",
-                send_mode_label(*mode),
-                content.chars().count()
-            ),
-            Some(Intent::InterruptRun { .. }) => "Recorded Stop, not sent".to_string(),
+            Some(record) => match record.kind {
+                IntentKind::Send(mode) => format!(
+                    "Recorded {} ({} characters), not sent",
+                    send_mode_label(mode),
+                    record.content_chars
+                ),
+                IntentKind::Stop => "Recorded Stop, not sent".to_string(),
+            },
             None => "No intent recorded".to_string(),
         };
         let destination = if self.destination == Destination::Chat {

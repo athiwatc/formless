@@ -8,7 +8,8 @@ use std::collections::HashSet;
 
 use formless_protocol::SessionInfo;
 
-use crate::model::{BlockKind, TimelineBlock};
+use crate::model::BlockKind;
+use crate::timeline::TimelineBlock;
 
 /// Titles that exercise shaping: Thai (no word spaces, stacked marks), CJK,
 /// emoji with ZWJ sequences, and mixed-direction text.
@@ -86,12 +87,31 @@ pub fn running(sessions: &[SessionInfo]) -> HashSet<String> {
 /// `count` mixed timeline blocks with stable, strictly increasing ids.
 pub fn timeline(count: usize) -> Vec<TimelineBlock> {
     (0..count)
-        .map(|index| TimelineBlock {
-            id: index as u64 + 1,
-            kind: KINDS[index % KINDS.len()],
-            markdown: format!("{}\n\n_block {}_", BODIES[index % BODIES.len()], index + 1),
+        .map(|index| {
+            TimelineBlock::new(
+                index as u64 + 1,
+                KINDS[index % KINDS.len()],
+                format!("{}\n\n_block {}_", BODIES[index % BODIES.len()], index + 1),
+            )
         })
         .collect()
+}
+
+/// One fenced code block of about `bytes` bytes: the "five-megabyte output"
+/// of the epic's stress case. Every line is distinct so a truncated preview
+/// can be told from the whole.
+pub fn huge_block(id: u64, bytes: usize) -> TimelineBlock {
+    let mut markdown = String::with_capacity(bytes + 64);
+    markdown.push_str("```text\n");
+    let mut line = 0usize;
+    while markdown.len() < bytes {
+        line += 1;
+        markdown.push_str(&format!(
+            "{line:08} output line with some payload: 0123456789abcdefghijklmnopqrstuvwxyz\n"
+        ));
+    }
+    markdown.push_str("```\n");
+    TimelineBlock::new(id, BlockKind::ToolSummary, markdown)
 }
 
 #[cfg(test)]
