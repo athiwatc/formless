@@ -15739,14 +15739,11 @@ fn draw_sessions(f: &mut Frame, area: Rect, app: &App) {
     let name_w = (area.width as usize / 3).clamp(10, 40);
     let rows = app.session_rows();
     let visible: Vec<_> = rows.iter().map(|row| row.index).collect();
-    let items: Vec<ListItem> = if app.sessions.is_empty() {
+    let archived = app.sessions.iter().filter(|s| s.archived).count();
+    let filter_active = app.session_filter.active();
+    let items: Vec<ListItem> = if visible.is_empty() {
         vec![ListItem::new(Line::styled(
-            "No sessions yet — press n to start one.",
-            ui::dim(app.color),
-        ))]
-    } else if visible.is_empty() {
-        vec![ListItem::new(Line::styled(
-            "No match — Esc clears the filter.",
+            session_ui::empty_body(app.sessions.len(), archived, filter_active),
             ui::dim(app.color),
         ))]
     } else {
@@ -15824,6 +15821,11 @@ fn draw_sessions(f: &mut Frame, area: Rect, app: &App) {
                         lists::SESSION_SORTS,
                         lists::SESSION_QUICK,
                     );
+                    if let Some(hidden) =
+                        session_ui::archived_hidden_segment(filter_active, archived)
+                    {
+                        t.push_str(&hidden);
+                    }
                     t.push_str(if app.session_filter.tree {
                         " · T tree on "
                     } else {
@@ -23692,6 +23694,122 @@ mod tests {
         assert_eq!(app.selected_session().unwrap().id, "parent");
         app.key(key(KeyCode::Char('T')));
         assert_eq!(app.selected_session().unwrap().id, "parent");
+    }
+
+    fn archive_fixture(active: usize, archived: usize) -> Vec<SessionInfo> {
+        (0..active + archived)
+            .map(|i| {
+                let parent = (i % 4 == 1).then(|| format!("s{}", i - 1));
+                serde_json::from_value(serde_json::json!({
+                    "id": format!("s{i}"),
+                    "name": format!("ไทย 会话 🚀 {i}"),
+                    "created_at": "",
+                    "updated_at": format!("2026-01-{:02}T00:00:00Z", i + 1),
+                    "forked_from": parent,
+                    "pinned": i == 5,
+                    "archived": i >= active,
+                }))
+                .unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn default_sessions_title_explains_archived_sessions_it_hides() {
+        let mut app = test_app();
+        app.sessions = archive_fixture(12, 3);
+        app.view = View::Sessions;
+        let flat = app.visible_sessions();
+        assert_eq!(flat.len(), 12);
+        assert_eq!(flat[0], 5, "pinned first is unchanged");
+        assert!(flat.iter().all(|&i| !app.sessions[i].archived));
+        let screen = render(&mut app, 180, 24);
+        assert!(
+            screen.contains("Sessions · 12/15 · 3 archived hidden · T tree off"),
+            "{screen}"
+        );
+        // Wide graphemes may pad their trailing cell; compare without spaces.
+        assert!(screen.replace(' ', "").contains("ไทย会话🚀11"), "{screen}");
+        // Tree rows keep the same membership; only the title text changed.
+        app.key(key(KeyCode::Char('T')));
+        let mut tree = app.visible_sessions();
+        tree.sort_unstable();
+        let mut sorted = flat.clone();
+        sorted.sort_unstable();
+        assert_eq!(tree, sorted);
+        assert!(render(&mut app, 180, 24).contains("12/15 · 3 archived hidden · T tree on"));
+        // Narrow terminals truncate rather than panic.
+        for w in [30, 45] {
+            assert_eq!(render(&mut app, w, 12).lines().count(), 12);
+        }
+    }
+
+    #[test]
+    fn archived_only_sessions_name_the_v_cycle_instead_of_esc() {
+        let mut app = test_app();
+        app.sessions = archive_fixture(0, 3);
+        app.view = View::Sessions;
+        assert!(!app.session_filter.active());
+        let screen = render(&mut app, 180, 24);
+        assert!(
+            screen.contains("All sessions are archived — press v twice"),
+            "{screen}"
+        );
+        assert!(!screen.contains("No match"), "{screen}");
+        assert!(
+            screen.contains("Sessions · 0/3 · 3 archived hidden"),
+            "{screen}"
+        );
+        for w in [30, 45] {
+            assert_eq!(render(&mut app, w, 12).lines().count(), 12);
+        }
+        app.key(key(KeyCode::Char('v')));
+        assert_eq!(app.session_filter.quick, 1);
+        let running = render(&mut app, 180, 24);
+        assert!(
+            running.contains("No match — Esc clears the filter."),
+            "{running}"
+        );
+        assert!(running.contains("Sessions · 0/3 · running"), "{running}");
+        assert!(!running.contains("archived hidden"), "{running}");
+        app.key(key(KeyCode::Char('v')));
+        assert_eq!(lists::SESSION_QUICK[app.session_filter.quick], "archived");
+        assert_eq!(app.visible_sessions().len(), 3);
+        let archived = render(&mut app, 180, 24);
+        assert!(archived.contains("Sessions · 3 · archived"), "{archived}");
+        assert!(!archived.contains("archived hidden"), "{archived}");
+    }
+
+    #[test]
+    fn empty_and_active_filter_session_texts_are_unchanged() {
+        let mut app = test_app();
+        app.view = View::Sessions;
+        let screen = render(&mut app, 180, 24);
+        assert!(
+            screen.contains("No sessions yet — press n to start one."),
+            "{screen}"
+        );
+        assert!(!screen.contains("archived hidden"), "{screen}");
+        app.sessions = archive_fixture(12, 3);
+        app.session_filter.query = "zzz-no-such".into();
+        let screen = render(&mut app, 180, 24);
+        assert!(
+            screen.contains("No match — Esc clears the filter."),
+            "{screen}"
+        );
+        assert!(!screen.contains("archived hidden"), "{screen}");
+        app.key(key(KeyCode::Esc));
+        assert!(app.session_filter.query.is_empty() && app.session_filter.quick == 0);
+        app.session_filter.quick = 1;
+        let screen = render(&mut app, 180, 24);
+        assert!(
+            screen.contains("No match — Esc clears the filter."),
+            "{screen}"
+        );
+        assert!(screen.contains("Sessions · 0/15 · running"), "{screen}");
+        assert!(!screen.contains("archived hidden"), "{screen}");
+        app.key(key(KeyCode::Esc));
+        assert_eq!(app.session_filter.quick, 0);
     }
 
     #[test]
