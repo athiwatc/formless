@@ -131,6 +131,18 @@ The `#k=` fragment is never sent to any server.
 
 ## Local development
 
+The Node adapter contains errors per HTTP request or Upgrade socket. Malformed
+asset path escapes return 400, and malformed mock-provider JSON returns an
+OpenAI-shaped 400 error without echoing the body. Unexpected failures return a
+generic 500 before headers or close a response that has started streaming;
+Upgrade failures close that socket. Diagnostics identify the handler/error
+class without logging request bodies or claim headers. Claim/transport checks
+and the scripted mock responses keep their existing behavior.
+
+`node --test relay/dev-errors.test.mjs` checks these boundaries with private
+loopback servers, malformed requests and injected handler faults. It verifies
+health and valid mock replies after failures; it does not deploy a Worker.
+
 Run the relay/web regression suite with `node --test relay/*.test.mjs` from
 the repository root. Display regressions also have a browser check:
 `python relay/web-display.browser-test.py /tmp/formless-display-check`.

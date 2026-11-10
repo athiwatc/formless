@@ -5930,6 +5930,14 @@ without an approver fails closed.
 
 ## 19. Testing strategy (summary)
 
+The local Node relay adapter contains HTTP and Upgrade handler failures within
+that request/socket. Malformed asset path escapes return 400; malformed mock
+provider JSON returns an OpenAI-shaped 400 error. Unexpected HTTP failures
+return a generic 500 before headers, or close the response after streaming
+starts. Upgrade failures close only their socket. These dev-only boundaries
+do not change Worker claim checks, transport/room rules or mock script behavior.
+Loopback regressions verify subsequent health and valid requests still work.
+
 Test waits for daemon subscriptions and pipe creation have a ten-second
 absolute timeout with a diagnostic naming the missing event. Test-running
 CI jobs have an explicit job timeout. The Windows transport gate parses a
