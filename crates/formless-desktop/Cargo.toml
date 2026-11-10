@@ -1,0 +1,51 @@
+# Phase 0 spike for the native desktop client (epic #1753).
+#
+# Deliberately NOT a member of the repository workspace: it has its own
+# workspace root and lockfile so `cargo build/test --workspace` at the
+# repository root, the release workflows and the root Cargo.lock never see
+# GPUI. Build it from this directory.
+[package]
+name = "formless-desktop"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Optional native desktop client spike for Formless (GPUI Kit)"
+publish = false
+
+[workspace]
+
+[features]
+default = ["gui"]
+# The GPUI Kit shell. Without it only the presentation model and fixture
+# build, which lets their tests run on hosts with no GUI toolchain.
+gui = ["dep:gpui-kit"]
+# The kit's headless window harness, for tests/shell.rs. A feature rather
+# than a dev-dependency: dev-dependencies cannot be optional, and one on the
+# kit would compile GPUI even for the model tests.
+test-support = ["gui", "gpui-kit/test-support"]
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "formless-desktop"
+path = "src/main.rs"
+required-features = ["gui"]
+
+[[test]]
+name = "shell"
+path = "tests/shell.rs"
+required-features = ["test-support"]
+
+# Offscreen render through GPUI's real renderer; it has its own `main`.
+[[test]]
+name = "render"
+path = "tests/render.rs"
+harness = false
+required-features = ["test-support"]
+
+[dependencies]
+formless-protocol = { path = "../formless-protocol" }
+# Exact pin: the kit pins its GPUI layer exactly (gpui-pre =0.3.12), so the
+# whole family moves together and only on purpose.
+gpui-kit = { version = "=0.9.1", optional = true }
