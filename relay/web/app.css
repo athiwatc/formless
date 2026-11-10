@@ -457,8 +457,8 @@ h3 { font-size: 0.9375rem; margin: 1.375rem 0 0.5rem; }
 .detail-text { white-space: pre-wrap; font-family: var(--mono); font-size: 0.8125rem; }
 
 /* Running Invocations panel (sidebar) */
-.running { border-top: 1px solid var(--border, #333); margin-top: 0.5rem; padding: 0.5rem 0.25rem; font-size: 0.75rem; }
-.running h4 { margin: 0 0 0.375rem; font-size: 0.75rem; text-transform: uppercase; letter-spacing: .04em; opacity: .7; }
+#running { border-top: 1px solid var(--border, #333); margin-top: 0.5rem; padding: 0.5rem 0.25rem; font-size: 0.75rem; }
+#running h4 { margin: 0 0 0.375rem; font-size: 0.75rem; text-transform: uppercase; letter-spacing: .04em; opacity: .7; }
 .running-item { display: flex; align-items: center; gap: 0.25rem; padding: 0.125rem 0; }
 .running-item .linklike { flex: 1; text-align: left; background: none; border: 0; color: inherit; cursor: pointer; padding: 0; font: inherit; }
 .running-item.stalled .linklike { color: var(--warn, #e0b050); }
