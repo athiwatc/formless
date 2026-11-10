@@ -1065,9 +1065,31 @@ mod tests {
         let alias = fixture.0.join("trusted-config-alias");
         symlink(fixture.config(), &alias).unwrap();
         let bad = std::ffi::OsStr::from_bytes(b"bad\xff.md");
-        std::fs::write(fixture.config().join("commands").join(bad), b"Body").unwrap();
+        let bad_path = fixture.config().join("commands").join(bad);
+        let created = match std::fs::write(&bad_path, b"Body") {
+            Ok(()) => true,
+            // APFS rejects invalid UTF-8 names. Still exercise diagnostic
+            // serialization below without requiring an impossible directory entry.
+            Err(error)
+                if cfg!(target_os = "macos") && error.raw_os_error() == Some(libc::EILSEQ) =>
+            {
+                false
+            }
+            Err(error) => panic!("create malformed-name fixture: {error}"),
+        };
         let snapshot = load(&alias, None, &[]);
         assert!(snapshot.find("review").is_some());
+        assert_eq!(snapshot.diagnostics.len(), usize::from(created));
+        if created {
+            assert_eq!(
+                snapshot.diagnostics[0].message,
+                "Command filename is not UTF-8"
+            );
+        }
+        let mut snapshot = snapshot;
+        if !created {
+            snapshot.diagnostic(&bad_path, "Command filename is not UTF-8");
+        }
         assert_eq!(snapshot.diagnostics.len(), 1);
         assert!(serde_json::to_string(&snapshot.projection()).is_ok());
     }
