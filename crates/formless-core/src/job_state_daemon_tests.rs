@@ -2,7 +2,7 @@
 use super::*;
 
 struct Fixture {
-    daemon: Arc<Daemon>,
+    daemon: Option<Arc<Daemon>>,
     root: std::path::PathBuf,
     events: mpsc::Receiver<ServerMessage>,
 }
@@ -29,20 +29,26 @@ impl Fixture {
             gaps: Default::default(),
         });
         Self {
-            daemon,
+            daemon: Some(daemon),
             root,
             events,
         }
     }
 
-    fn session(&self) -> String {
+    fn daemon(&self) -> &Arc<Daemon> {
         self.daemon
+            .as_ref()
+            .expect("fixture daemon is present until drop")
+    }
+
+    fn session(&self) -> String {
+        self.daemon()
             .with_store(|st| Ok(st.create_session(None)?.id))
             .unwrap()
     }
 
     fn due(&self, target: Option<&str>, cron: Option<&str>) -> JobInfo {
-        self.daemon
+        self.daemon()
             .with_store(|st| {
                 st.create_job(
                     "fixture prompt",
@@ -57,7 +63,7 @@ impl Fixture {
     }
 
     fn job(&self, id: &str) -> JobInfo {
-        self.daemon
+        self.daemon()
             .with_store(|st| st.get_job(id))
             .unwrap()
             .unwrap()
@@ -75,7 +81,7 @@ impl Fixture {
         assert!(after.last_status.starts_with("paused: "), "{after:?}");
         assert!(after.last_status.contains(reason), "{after:?}");
         let runs = self
-            .daemon
+            .daemon()
             .with_store(|st| st.job_runs(&job.id, 20))
             .unwrap();
         assert!(!runs.is_empty());
@@ -83,7 +89,7 @@ impl Fixture {
             .iter()
             .all(|r| r.status == "failed" && r.finished_at.is_some()));
         assert!(self
-            .daemon
+            .daemon()
             .with_store(|st| st.recent_audit(Some(action), 20))
             .unwrap()
             .iter()
@@ -114,11 +120,14 @@ impl Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         assert_eq!(
-            Arc::strong_count(&self.daemon),
+            Arc::strong_count(self.daemon()),
             1,
             "fixture spawned unexpected async work"
         );
-        std::fs::remove_dir_all(&self.root).unwrap();
+        // Release the sole daemon (DB, readers, profile lock) before removal.
+        drop(self.daemon.take());
+        std::fs::remove_dir_all(&self.root)
+            .expect("remove job-state fixture root after daemon shutdown");
     }
 }
 
@@ -129,7 +138,7 @@ async fn job_state_creation_checks_both_entry_points_and_current_target() {
     let current = f.session();
     let soft = f.session();
     let hard = f.session();
-    f.daemon
+    f.daemon()
         .with_store(|st| {
             st.soft_delete_session(&soft)?;
             st.delete_session(&hard)?;
@@ -138,7 +147,7 @@ async fn job_state_creation_checks_both_entry_points_and_current_target() {
         .unwrap();
     for target in ["missing", "", &soft, &hard] {
         let error = f
-            .daemon
+            .daemon()
             .handle(Request::AddJob {
                 prompt: "fixture".into(),
                 session_id: Some(target.into()),
@@ -153,7 +162,7 @@ async fn job_state_creation_checks_both_entry_points_and_current_target() {
         // schedule_run historically treats an empty target as unpinned.
         if !target.is_empty() {
             let error = f
-                .daemon
+                .daemon()
                 .call_tool_direct(
                     &current,
                     "schedule_run",
@@ -162,10 +171,14 @@ async fn job_state_creation_checks_both_entry_points_and_current_target() {
                 .await;
             assert!(error.contains("job target Session"), "{error}");
         }
-        assert!(f.daemon.with_store(|st| st.list_jobs()).unwrap().is_empty());
+        assert!(f
+            .daemon()
+            .with_store(|st| st.list_jobs())
+            .unwrap()
+            .is_empty());
     }
     let out = f
-        .daemon
+        .daemon()
         .call_tool_direct(
             &current,
             "schedule_run",
@@ -178,7 +191,7 @@ async fn job_state_creation_checks_both_entry_points_and_current_target() {
         Some(current.as_str())
     );
     let out = f
-        .daemon
+        .daemon()
         .handle(Request::AddJob {
             prompt: "fixture".into(),
             session_id: Some(current.clone()),
@@ -190,14 +203,14 @@ async fn job_state_creation_checks_both_entry_points_and_current_target() {
         .await
         .unwrap();
     assert_eq!(out["session_id"], current);
-    f.daemon
+    f.daemon()
         .with_store(|st| {
             st.soft_delete_session(&current)?;
             Ok(())
         })
         .unwrap();
     let error = f
-        .daemon
+        .daemon()
         .call_tool_direct(
             &current,
             "schedule_run",
@@ -205,7 +218,7 @@ async fn job_state_creation_checks_both_entry_points_and_current_target() {
         )
         .await;
     assert!(error.contains("job target Session"), "{error}");
-    assert_eq!(f.daemon.with_store(|st| st.list_jobs()).unwrap().len(), 2);
+    assert_eq!(f.daemon().with_store(|st| st.list_jobs()).unwrap().len(), 2);
 }
 
 #[tokio::test]
@@ -215,7 +228,7 @@ async fn job_state_deleted_target_never_falls_back_on_repeated_scheduled_or_manu
     for soft in [false, true] {
         let sid = f.session();
         let job = f.due(Some(&sid), Some("* * * * *"));
-        f.daemon
+        f.daemon()
             .with_store(|st| {
                 if soft {
                     st.soft_delete_session(&sid)?;
@@ -225,11 +238,15 @@ async fn job_state_deleted_target_never_falls_back_on_repeated_scheduled_or_manu
                 Ok(())
             })
             .unwrap();
-        let before = f.daemon.with_store(|st| st.list_sessions()).unwrap().len();
-        f.daemon.run_due_jobs().await;
-        f.daemon.run_due_jobs().await;
+        let before = f
+            .daemon()
+            .with_store(|st| st.list_sessions())
+            .unwrap()
+            .len();
+        f.daemon().run_due_jobs().await;
+        f.daemon().run_due_jobs().await;
         assert_eq!(
-            f.daemon
+            f.daemon()
                 .with_store(|st| st.job_runs(&job.id, 20))
                 .unwrap()
                 .len(),
@@ -239,7 +256,7 @@ async fn job_state_deleted_target_never_falls_back_on_repeated_scheduled_or_manu
         f.assert_paused(&job, "job.target_missing", &sid);
         for _ in 0..2 {
             let out = f
-                .daemon
+                .daemon()
                 .handle(Request::RunJobNow { id: job.id.clone() })
                 .await
                 .unwrap();
@@ -249,7 +266,10 @@ async fn job_state_deleted_target_never_falls_back_on_repeated_scheduled_or_manu
             );
         }
         assert_eq!(
-            f.daemon.with_store(|st| st.list_sessions()).unwrap().len(),
+            f.daemon()
+                .with_store(|st| st.list_sessions())
+                .unwrap()
+                .len(),
             before
         );
         f.assert_paused(&job, "job.target_missing", &sid);
@@ -262,16 +282,23 @@ async fn job_state_bad_or_uncomputable_recurrence_is_flagged_before_delivery() {
     let mut f = Fixture::new(&env);
     for cron in ["invalid old cron", "0 0 31 2 *"] {
         let job = f.due(None, Some(cron));
-        let before = f.daemon.with_store(|st| st.list_sessions()).unwrap().len();
-        f.daemon.run_due_jobs().await;
-        f.daemon.run_due_jobs().await;
+        let before = f
+            .daemon()
+            .with_store(|st| st.list_sessions())
+            .unwrap()
+            .len();
+        f.daemon().run_due_jobs().await;
+        f.daemon().run_due_jobs().await;
         assert_eq!(
-            f.daemon.with_store(|st| st.list_sessions()).unwrap().len(),
+            f.daemon()
+                .with_store(|st| st.list_sessions())
+                .unwrap()
+                .len(),
             before
         );
         f.assert_paused(&job, "job.reschedule_failed", "could not be rescheduled");
         assert_eq!(
-            f.daemon
+            f.daemon()
                 .with_store(|st| st.job_runs(&job.id, 20))
                 .unwrap()
                 .len(),
@@ -289,12 +316,12 @@ async fn job_state_delivery_failure_retains_one_shot_and_recurring_occurrences()
     let recurring = f.due(Some(&sid), Some("* * * * *"));
     // Private malformed config causes send admission to fail before provider IO.
     std::fs::write(
-        f.daemon.paths.config_file(),
+        f.daemon().paths.config_file(),
         b"[ intentionally malformed private fixture",
     )
     .unwrap();
-    f.daemon.run_due_jobs().await;
-    f.daemon.run_due_jobs().await;
+    f.daemon().run_due_jobs().await;
+    f.daemon().run_due_jobs().await;
     for job in [&once, &recurring] {
         // Drain per-job events independently by checking all notes below.
         let after = f.job(&job.id);
@@ -304,12 +331,15 @@ async fn job_state_delivery_failure_retains_one_shot_and_recurring_occurrences()
             after.last_status.contains("paused: prompt delivery failed"),
             "{after:?}"
         );
-        let runs = f.daemon.with_store(|st| st.job_runs(&job.id, 20)).unwrap();
+        let runs = f
+            .daemon()
+            .with_store(|st| st.job_runs(&job.id, 20))
+            .unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].status, "failed");
         assert!(runs[0].finished_at.is_some());
         assert!(f
-            .daemon
+            .daemon()
             .with_store(|st| st.recent_audit(Some("job.delivery_failed"), 10))
             .unwrap()
             .iter()
@@ -327,7 +357,7 @@ async fn job_state_delivery_failure_retains_one_shot_and_recurring_occurrences()
     }
     assert_eq!(noted.len(), 2);
     assert!(f
-        .daemon
+        .daemon()
         .with_store(|st| st.list_messages(&sid))
         .unwrap()
         .is_empty());
@@ -340,29 +370,29 @@ async fn job_state_late_completion_cannot_erase_pause_but_normal_or_resumed_jobs
     let sid = f.session();
     let job = f.due(Some(&sid), Some("* * * * *"));
     let row = f
-        .daemon
+        .daemon()
         .with_store(|st| st.job_run_start(&job.id, Some(&sid), "schedule", "running", ""))
         .unwrap();
-    f.daemon
+    f.daemon()
         .job_pending
         .locked()
         .insert(sid.clone(), (row.clone(), job.id.clone(), 0));
-    let status = f.daemon.pause_job(
+    let status = f.daemon().pause_job(
         &job,
         "job.target_missing",
         "target vanished",
         Some("schedule"),
     );
-    f.daemon
+    f.daemon()
         .job_run_ended(&sid, "fixture-no-provider-run", "completed");
     assert_eq!(f.job(&job.id).last_status, status);
     assert!(f
-        .daemon
+        .daemon()
         .with_store(|st| st.job_runs(&job.id, 20))
         .unwrap()
         .iter()
         .any(|r| r.id == row && r.status == "completed"));
-    f.daemon
+    f.daemon()
         .with_store(|st| {
             st.set_job_enabled(&job.id, true)?;
             st.job_ran_status(&job.id, "completed")
@@ -370,7 +400,7 @@ async fn job_state_late_completion_cannot_erase_pause_but_normal_or_resumed_jobs
         .unwrap();
     assert_eq!(f.job(&job.id).last_status, "completed");
     let once = f.due(None, None);
-    f.daemon
+    f.daemon()
         .with_store(|st| {
             st.job_ran(&once.id, "started", None)?;
             st.job_ran_status(&once.id, "completed")
