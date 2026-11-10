@@ -1,5 +1,7 @@
 //! Shipped file commands against an owned, provider-free fake daemon.
 #![cfg(unix)]
+#[path = "support/unix_fixture_io.rs"]
+mod unix_fixture_io;
 use formless_core::Paths;
 use formless_protocol::{Request, RequestEnvelope};
 use serde_json::{json, Value};
@@ -13,6 +15,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
+use unix_fixture_io::FixtureStream;
 
 struct Fixture {
     root: std::path::PathBuf,
@@ -47,7 +50,7 @@ impl Fixture {
         let seen = requests.clone();
         let thread = std::thread::spawn(move || {
             while !stopped.load(Ordering::SeqCst) {
-                let (mut socket, _) = match listener.accept() {
+                let (socket, _) = match listener.accept() {
                     Ok(pair) => pair,
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         std::thread::sleep(Duration::from_millis(2));
@@ -55,9 +58,13 @@ impl Fixture {
                     }
                     Err(e) => panic!("{e}"),
                 };
-                socket
-                    .set_read_timeout(Some(Duration::from_secs(2)))
-                    .unwrap();
+                let mut socket = FixtureStream::new(
+                    socket,
+                    stopped.clone(),
+                    Instant::now() + Duration::from_secs(15),
+                    Duration::from_secs(2),
+                )
+                .unwrap();
                 let mut reader = BufReader::new(socket.try_clone().unwrap());
                 let mut line = String::new();
                 while reader.read_line(&mut line).unwrap_or(0) > 0 {

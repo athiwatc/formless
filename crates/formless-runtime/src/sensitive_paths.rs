@@ -377,13 +377,16 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         let policy = PathPolicy::new(vec![root.clone()], vec![]).unwrap();
         let file = root.join("missing-child");
+        // The second argument is the resolved destination, including when
+        // Darwin's temporary-directory spelling traverses /var -> /private/var.
+        let canonical = crate::caps::canonical_path(file.to_str().unwrap()).unwrap();
         assert_eq!(
-            policy.classify(&file, &file).unwrap(),
+            policy.classify(&file, &canonical).unwrap(),
             PathDecision::Forbidden
         );
         assert_eq!(
             policy
-                .classify(&std::env::temp_dir().join("alias"), &file)
+                .classify(&std::env::temp_dir().join("alias"), &canonical)
                 .unwrap(),
             PathDecision::Forbidden
         );
