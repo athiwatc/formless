@@ -4079,6 +4079,12 @@ run_tool = "network_policy"     # a registry Tool, or…
   "ข่าวเทคโนโลยีสัปดาห์นี้"; "このリポジトリのビルドが失敗する原因を…" →
   "ビルド失敗の原因を調べる"; mixed "ช่วย debug โค้ด Rust ตัวนี้…" →
   "Debug Rust Code".
+- **Title cleanup.** Model and fallback heuristic titles strip balanced
+  quote/backtick/emphasis wrappers and a leading Markdown heading marker only
+  when followed by whitespace. Unpaired punctuation is retained: `C#`,
+  `#1234`, an inline code span at the end, and `'til` remain ordinary text.
+  Existing first-line, word/grapheme budgets and trailing sentence-punctuation
+  cleanup still apply.
 - **Attached clients.** `Subscribe` takes a `client` label ("TUI",
   "TUI (plain)", "web", "web (relay)", "CLI") and replies with the
   connection's id, `{subscribed, conn}`. Whenever the clients showing a
