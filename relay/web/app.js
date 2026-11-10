@@ -3858,14 +3858,18 @@
     const sort = opts.sortable && S.toolSort;
     const cols = TOOL_COLS.concat([[opts.bars ? "" : "Capabilities", null]]);
     // Sortable headers: click (or Enter) sorts by the column, again reverses.
+    // Name and version ascend; calls, success and last used descend. The
+    // active glyph and aria-sort both come from that one direction.
     table.append(h("thead", null, h("tr", null, cols.map(([label, key, num]) => {
       const active = sort && key && sort.key === key;
-      const th = h("th", { class: num ? "num" : null, "aria-sort": active ? (sort.reverse !== (key === "name" || key === "version") ? "ascending" : "descending") : null },
+      const direction = active ? (sort.reverse !== (key === "name" || key === "version") ? "ascending" : "descending") : null;
+      const glyph = direction === "ascending" ? " ▴" : direction === "descending" ? " ▾" : "";
+      const th = h("th", { class: num ? "num" : null, "aria-sort": direction },
         opts.sortable && key ? h("button", { class: "th-sort", type: "button", title: "Sort by " + label.toLowerCase(), onclick: () => {
           S.toolSort = { key, reverse: active ? !sort.reverse : false };
           if ([...$("tools-sort").options].some((o) => o.value === key)) $("tools-sort").value = key;
           renderTools();
-        } }, label, active ? (sort.reverse ? " ▴" : " ▾") : "") : label);
+        } }, label, glyph) : label);
       return th;
     }))));
     const body = h("tbody");
