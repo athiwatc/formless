@@ -694,6 +694,60 @@ fn open_private(path: &Path, create: bool) -> Result<File> {
     }
 }
 
+/// Decode the SDDL text returned by
+/// `ConvertSecurityDescriptorToStringSecurityDescriptorW`.
+///
+/// Microsoft documents `StringSecurityDescriptorLen` as the size of the
+/// returned buffer in TCHARs. On Windows that value is the buffer capacity,
+/// not the string length, and the capacity may contain more than one trailing
+/// NUL. Only the units before the first NUL are decoded. Padding is ignored.
+/// A null pointer or a capacity outside `1..=32768` is rejected before a
+/// slice is created. A missing terminator, or invalid UTF-16 before it, fails
+/// closed.
+///
+/// # Safety
+/// For a non-null pointer with a valid capacity, the caller must provide an
+/// readable allocation of at least `capacity` UTF-16 units, initialized through
+/// the first terminator (or the entire capacity if no terminator exists).
+#[cfg(any(windows, test))]
+unsafe fn private_review_dacl_text(text: *const u16, capacity: u32) -> Result<String> {
+    if text.is_null() {
+        bail!("Private review DACL string is missing");
+    }
+    if capacity == 0 || capacity > 32768 {
+        bail!("Private review DACL exceeds its inspection limit");
+    }
+    let mut units = Vec::new();
+    for index in 0..capacity as usize {
+        // SAFETY: the caller guarantees readable initialized units through the
+        // first terminator; the checked capacity bounds every pointer offset.
+        let unit = unsafe { text.add(index).read() };
+        if unit == 0 {
+            return String::from_utf16(&units)
+                .context("Private review DACL string is not valid UTF-16");
+        }
+        units.push(unit);
+    }
+    bail!("Private review DACL string is missing its terminator")
+}
+
+/// Exact `(ACE)` spellings. The set comparison is unchanged: order does not
+/// matter, and a missing or unclosed ACE is rejected.
+#[cfg(any(windows, test))]
+fn private_review_dacl_aces(text: &str) -> Result<std::collections::BTreeSet<String>> {
+    let first = text
+        .find('(')
+        .context("Private review DACL has no explicit grants")?;
+    let mut aces = std::collections::BTreeSet::new();
+    let mut remaining = &text[first..];
+    while !remaining.is_empty() {
+        let end = remaining.find(')').context("Invalid private review DACL")?;
+        aces.insert(remaining[..=end].to_string());
+        remaining = &remaining[end + 1..];
+    }
+    Ok(aces)
+}
+
 #[cfg(windows)]
 pub(crate) fn windows_private(file: &File) -> Result<()> {
     use std::os::windows::io::AsRawHandle;
@@ -717,7 +771,7 @@ pub(crate) fn windows_private(file: &File) -> Result<()> {
             bail!("Private review storage has an inheritable DACL");
         }
         let mut text = std::ptr::null_mut();
-        let mut length = 0;
+        let mut length: u32 = 0;
         if unsafe {
             ConvertSecurityDescriptorToStringSecurityDescriptorW(
                 sd,
@@ -731,22 +785,13 @@ pub(crate) fn windows_private(file: &File) -> Result<()> {
             return Err(std::io::Error::last_os_error().into());
         }
         let allocation = Allocation(text.cast());
-        if length == 0 || length > 32768 {
-            bail!("Private review DACL exceeds its inspection limit");
-        }
-        let text =
-            String::from_utf16(unsafe { std::slice::from_raw_parts(text, length as usize - 1) })?;
+        // `allocation` drops on both failures below, so LocalFree runs before
+        // either error returns. The decoded string is owned and outlives it.
+        // SAFETY: successful Win32 conversion owns the reported allocation
+        // and returns a NUL-terminated UTF-16 string within that capacity.
+        let decoded = unsafe { private_review_dacl_text(text, length) }?;
+        let aces = private_review_dacl_aces(&decoded)?;
         drop(allocation);
-        let first = text
-            .find('(')
-            .context("Private review DACL has no explicit grants")?;
-        let mut aces = std::collections::BTreeSet::new();
-        let mut remaining = &text[first..];
-        while !remaining.is_empty() {
-            let end = remaining.find(')').context("Invalid private review DACL")?;
-            aces.insert(remaining[..=end].to_string());
-            remaining = &remaining[end + 1..];
-        }
         Ok(aces)
     }
     windows_identity(file)?;
@@ -1046,5 +1091,103 @@ mod tests {
             assert!(journal.read(&action.id).is_err(), "{key}");
             assert_eq!(std::fs::read(&target).unwrap(), b"post image remains exact");
         }
+    }
+    fn dacl_units(text: &str) -> Vec<u16> {
+        text.encode_utf16().collect()
+    }
+    fn dacl_capacity(units: &[u16]) -> u32 {
+        u32::try_from(units.len()).unwrap()
+    }
+    fn dacl_error<T: std::fmt::Debug>(result: Result<T>) -> String {
+        format!("{:#}", result.unwrap_err())
+    }
+    #[test]
+    fn private_dacl_padded_capacity_decodes_through_the_first_nul_only() {
+        let mut units = dacl_units("D:P(A;;GA;;;SY)");
+        units.push(0);
+        assert_eq!(
+            unsafe { private_review_dacl_text(units.as_ptr(), dacl_capacity(&units)) }.unwrap(),
+            "D:P(A;;GA;;;SY)"
+        );
+        units.push(0);
+        units.push(0);
+        units.extend(dacl_units("(A;;GA;;;WD)"));
+        units.push(0);
+        units.push(0xD800);
+        let text =
+            unsafe { private_review_dacl_text(units.as_ptr(), dacl_capacity(&units)) }.unwrap();
+        assert_eq!(text, "D:P(A;;GA;;;SY)");
+        let aces = private_review_dacl_aces(&text).unwrap();
+        assert_eq!(aces.len(), 1);
+        assert!(aces.contains("(A;;GA;;;SY)"));
+        assert!(!aces.contains("(A;;GA;;;WD)"));
+    }
+    #[test]
+    fn private_dacl_missing_terminator_fails_closed() {
+        let units = dacl_units("D:P(A;;GA;;;SY)");
+        let error =
+            dacl_error(unsafe { private_review_dacl_text(units.as_ptr(), dacl_capacity(&units)) });
+        assert!(error.contains("missing its terminator"), "{error}");
+    }
+    #[test]
+    fn private_dacl_invalid_utf16_before_terminator_fails_closed() {
+        let mut units = dacl_units("D:P(");
+        units.push(0xD800);
+        units.extend(dacl_units("A;;GA;;;SY)"));
+        units.push(0);
+        units.extend(dacl_units("(A;;GA;;;WD)"));
+        let error =
+            dacl_error(unsafe { private_review_dacl_text(units.as_ptr(), dacl_capacity(&units)) });
+        assert!(error.contains("not valid UTF-16"), "{error}");
+    }
+    #[test]
+    fn private_dacl_zero_capacity_fails_closed_before_slice() {
+        let units = [0u16];
+        let error = dacl_error(unsafe { private_review_dacl_text(units.as_ptr(), 0) });
+        assert!(error.contains("exceeds its inspection limit"), "{error}");
+    }
+    #[test]
+    fn private_dacl_oversize_capacity_fails_closed_before_slice() {
+        let units = [0u16];
+        let error = dacl_error(unsafe { private_review_dacl_text(units.as_ptr(), 32_769) });
+        assert!(error.contains("exceeds its inspection limit"), "{error}");
+        let bounded = vec![0u16; 32_768];
+        let decoded = unsafe { private_review_dacl_text(bounded.as_ptr(), 32_768) }.unwrap();
+        assert!(decoded.is_empty());
+    }
+    #[test]
+    fn private_dacl_null_pointer_fails_closed_before_slice() {
+        let error = dacl_error(unsafe { private_review_dacl_text(std::ptr::null(), 8) });
+        assert!(error.contains("string is missing"), "{error}");
+    }
+    #[test]
+    fn private_dacl_strict_aces_reject_missing_unclosed_and_interior_nul() {
+        assert!(dacl_error(private_review_dacl_aces("D:P")).contains("no explicit grants"));
+        let unclosed = dacl_error(private_review_dacl_aces("D:P(A;;GA;;;SY"));
+        assert!(
+            unclosed.contains("Invalid private review DACL"),
+            "{unclosed}"
+        );
+        let interior = dacl_error(private_review_dacl_aces("(A;;GA;;;SY)\u{0}"));
+        assert!(
+            interior.contains("Invalid private review DACL"),
+            "{interior}"
+        );
+        let trailing = dacl_error(private_review_dacl_aces("(A;;GA;;;SY) trailing"));
+        assert!(
+            trailing.contains("Invalid private review DACL"),
+            "{trailing}"
+        );
+    }
+    #[test]
+    fn private_dacl_exact_ace_set_ignores_order_and_rejects_extra_grant() {
+        let forward = private_review_dacl_aces("D:P(A;;GA;;;SY)(A;;GA;;;BA)").unwrap();
+        let reverse = private_review_dacl_aces("(A;;GA;;;BA)(A;;GA;;;SY)").unwrap();
+        assert_eq!(forward, reverse);
+        assert_eq!(forward.len(), 2);
+        assert!(forward.contains("(A;;GA;;;SY)"));
+        assert!(forward.contains("(A;;GA;;;BA)"));
+        let wider = private_review_dacl_aces("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;WD)").unwrap();
+        assert_ne!(forward, wider);
     }
 }
