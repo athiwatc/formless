@@ -5912,22 +5912,13 @@ impl Daemon {
         }
         // The default name or a provisional (heuristic) one may change; a
         // user's or the model's name is final (#871).
-        let users = self.with_store(|st| {
+        let user = self.with_store(|st| {
             if !st.name_is_provisional(session_id)? {
-                return Ok(None);
+                return Ok(None::<String>);
             }
-            Ok(Some(
-                st.list_messages(session_id)?
-                    .into_iter()
-                    .filter(|m| m.role == "user")
-                    .map(|m| m.content)
-                    .collect::<Vec<_>>(),
-            ))
+            st.user_naming_text(session_id)
         });
-        let Ok(Some(users)) = users else {
-            return;
-        };
-        let Some(user) = namer::naming_text(&users) else {
+        let Ok(Some(user)) = user else {
             return;
         };
         let spec = cfg.naming.spec();

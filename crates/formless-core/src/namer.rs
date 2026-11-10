@@ -251,6 +251,19 @@ fn trivial(message: &str) -> bool {
     !t.contains('\n') && t.graphemes(true).count() < 12
 }
 
+/// `text` is already trimmed. A long message keeps the head and the tail
+/// (`MAX_PROMPT_CHARS * 2 / 3` and `MAX_PROMPT_CHARS / 3`).
+fn shape_naming_text(text: &str) -> String {
+    if text.chars().count() <= MAX_PROMPT_CHARS {
+        return text.to_string();
+    }
+    let head = truncate_chars(text, MAX_PROMPT_CHARS * 2 / 3);
+    let tail_chars = MAX_PROMPT_CHARS / 3;
+    let skip = text.chars().count() - tail_chars;
+    let tail_at = text.char_indices().nth(skip).map_or(text.len(), |(i, _)| i);
+    format!("{head}\n…\n{}", &text[tail_at..])
+}
+
 /// What to name a Session from (#871): its first substantive user message
 /// (greetings and other trivial openers are skipped when something follows
 /// them), with its head and its tail when it is long, since the task often
@@ -262,14 +275,35 @@ pub fn naming_text(user_messages: &[String]) -> Option<String> {
         .filter(|m| !m.is_empty());
     let first = msgs.clone().find(|m| !trivial(m));
     let text = first.or_else(|| msgs.next())?;
-    if text.chars().count() <= MAX_PROMPT_CHARS {
-        return Some(text.to_string());
+    Some(shape_naming_text(text))
+}
+
+/// Oldest-first user contents. Keeps the first nonempty trimmed row as the
+/// fallback and the current row, and stops at the first nontrivial row.
+/// Empty and trivial follow [`naming_text`]: Unicode trim, then one line
+/// shorter than 12 graphemes.
+pub(crate) fn try_naming_text_from_contents<I, S, E>(
+    contents: I,
+) -> std::result::Result<Option<String>, E>
+where
+    I: IntoIterator<Item = std::result::Result<S, E>>,
+    S: AsRef<str>,
+{
+    let mut fallback: Option<String> = None;
+    for content in contents {
+        let content = content?;
+        let trimmed = content.as_ref().trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if !trivial(trimmed) {
+            return Ok(Some(shape_naming_text(trimmed)));
+        }
+        if fallback.is_none() {
+            fallback = Some(trimmed.to_string());
+        }
     }
-    let head = truncate_chars(text, MAX_PROMPT_CHARS * 2 / 3);
-    let tail_chars = MAX_PROMPT_CHARS / 3;
-    let skip = text.chars().count() - tail_chars;
-    let tail_at = text.char_indices().nth(skip).map_or(text.len(), |(i, _)| i);
-    Some(format!("{head}\n…\n{}", &text[tail_at..]))
+    Ok(fallback.as_deref().map(shape_naming_text))
 }
 
 /// Normalise raw model output into a title: first line, no "Title:"
