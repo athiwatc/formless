@@ -158,6 +158,8 @@ h3 { font-size: 0.9375rem; margin: 1.375rem 0 0.5rem; }
 .session .when { font-size: 0.75rem; color: var(--muted); white-space: nowrap; }
 .session .menu { visibility: hidden; }
 .session:hover .menu, .session:focus-within .menu, .session.active .menu, .session .menu[aria-expanded="true"] { visibility: visible; }
+/* No hover on touch screens: every row shows its Session actions (#1735) */
+@media (hover: none) { .session .menu { visibility: visible; } }
 .session .running { width: 0.5rem; height: 0.5rem; border-radius: 50%; background: var(--warn); animation: pulse 1.2s infinite; }
 .popover { position: fixed; z-index: 30; background: var(--panel); border: 1px solid var(--line); border-radius: 0.625rem; box-shadow: var(--shadow); padding: 0.25rem; min-width: 9.375rem; }
 .popover button { display: block; width: 100%; text-align: left; border: 0; background: none; padding: 0.4375rem 0.625rem; border-radius: 0.375rem; cursor: pointer; }
