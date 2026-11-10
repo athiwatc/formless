@@ -2218,16 +2218,30 @@
     test.onclick = async () => {
       const model = choice();
       if (!model) return;
-      status.textContent = "testing " + model + "…";
+      const testing = "testing " + model + "…";
+      status.textContent = testing;
       const t = await act({ type: "test_model", model }, null, 120000);
-      if (!t) return;
+      // act already reported why; end the label it left, unless newer text
+      // replaced it (#1730).
+      if (!t) {
+        if (status.textContent === testing) status.textContent = "✗ " + model + ": test did not complete";
+        return;
+      }
       tests[model] = t;
       status.textContent = modelTestText(t);
       draw();
     };
     openDialog(dialog, { initialFocus: input, onDismiss: close });
     const r = await act({ type: "list_models" }, null, 30000);
-    if (!r || !dialog.isConnected) return;
+    if (!dialog.isConnected) return;
+    if (!r) {
+      // act already reported why; free-form entry still works (#1730).
+      if (status.textContent === "loading models…") {
+        status.textContent = "could not load models — type a model id";
+        status.classList.add("err");
+      }
+      return;
+    }
     const recent = r.recent || [];
     meta = r.meta || {};
     tests = r.tests || {};
@@ -2242,7 +2256,8 @@
     items.sort((a, b) => b.recent - a.recent);
     const current = (session && session.model) || (r.current && r.current.model) || "";
     sel = Math.max(0, items.findIndex((i) => i.id === current));
-    status.textContent = r.error ? "could not list models: " + r.error : "";
+    status.textContent = r.error ? "could not list models: " + r.error
+      : items.length ? "" : "no models listed — type a model id";
     if (!items.length && r.error) status.classList.add("err");
     draw();
   }
