@@ -93,7 +93,8 @@ impl Table {
     }
 
     /// Terminal readers get accessible status markers when colour alone is
-    /// insufficient. Pipes retain the original cells, regardless of theme.
+    /// insufficient. Pipes omit semantic markers, regardless of theme;
+    /// both modes normalize cell whitespace and show input controls visibly.
     pub fn render(&self, terminal: bool, color: bool, width: Option<usize>) -> String {
         self.render_theme(terminal, color, width, COLORBLIND.with(Cell::get))
     }
@@ -105,20 +106,25 @@ impl Table {
         width: Option<usize>,
         colorblind: bool,
     ) -> String {
-        // Labels participate in width calculation before clipping/padding.
+        // Normalize before measuring, labeling or clipping. Input cells never
+        // contribute terminal escapes; only paint() below emits trusted styles.
+        let headers: Vec<_> = self.headers.iter().map(|h| cell_text(h)).collect();
         let rows: Vec<Vec<_>> = self
             .rows
             .iter()
             .map(|row| {
                 row.iter()
                     .map(|(text, tone)| {
-                        (tone.label(text, terminal && (!color || colorblind)), *tone)
+                        (
+                            tone.label(&cell_text(text), terminal && (!color || colorblind)),
+                            *tone,
+                        )
                     })
                     .collect()
             })
             .collect();
         let n = self.headers.len();
-        let mut widths: Vec<usize> = self.headers.iter().map(|h| h.width()).collect();
+        let mut widths: Vec<usize> = headers.iter().map(|h| h.width()).collect();
         for r in &rows {
             for (i, (text, _)) in r.iter().enumerate().take(n) {
                 widths[i] = widths[i].max(text.width());
@@ -161,17 +167,43 @@ impl Table {
             }
             out.trim_end().to_string() + "\n"
         };
-        let header = self
-            .headers
-            .iter()
-            .map(|h| (h.to_string(), Tone::Dim))
-            .collect();
+        let header = headers.into_iter().map(|h| (h, Tone::Dim)).collect();
         let mut out = line(header);
         for r in &rows {
             out.push_str(&line(r.clone()));
         }
         out
     }
+}
+
+/// Controls already made visible in CLI comparison output. Keep the same
+/// policy for table cells: C0/C1, direction marks/overrides and isolates.
+pub(super) fn terminal_control(c: char) -> bool {
+    c.is_control()
+        || matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
+/// One visible line, with whitespace collapsed and input controls escaped.
+/// Apply this to piped text too: redirected tables may be displayed later.
+fn cell_text(text: &str) -> String {
+    let mut visible = String::with_capacity(text.len());
+    let mut space = false;
+    for c in text.chars() {
+        if c.is_whitespace() {
+            space = !visible.is_empty();
+            continue;
+        }
+        if space {
+            visible.push(' ');
+            space = false;
+        }
+        if terminal_control(c) {
+            visible.extend(c.escape_unicode());
+        } else {
+            visible.push(c);
+        }
+    }
+    visible
 }
 
 /// Colour is allowed unless `NO_COLOR` is set to anything (no-color.org).
@@ -255,6 +287,63 @@ mod tests {
         assert!(
             coloured.contains("\x1b[2mUpper-case some text\x1b[0m"),
             "{coloured}"
+        );
+    }
+
+    #[test]
+    fn cells_are_single_line_and_controls_are_visible_before_layout() {
+        let mut table = Table::new(&["NAME", "TASK"]);
+        table.row(vec![c("first"), c("  a\nb\tc\r\n\x1b[31m\u{202e}  ")]);
+        table.row(vec![c("second"), c("ไทย 👩‍💻 e\u{301}  text")]);
+        let plain = table.render(false, false, None);
+        assert_eq!(plain.lines().count(), 3, "{plain:?}");
+        assert!(plain.contains(r"a b c \u{1b}[31m\u{202e}"), "{plain:?}");
+        assert!(!plain.contains('\x1b') && !plain.contains('\u{202e}'));
+        assert!(plain.contains("ไทย 👩‍💻 e\u{301} text"), "{plain:?}");
+        for color in [false, true] {
+            let out = table.render(true, color, Some(45));
+            let stripped = regex::Regex::new(r"\x1b\[[0-9;]*m")
+                .unwrap()
+                .replace_all(&out, "")
+                .into_owned();
+            assert_eq!(stripped.lines().count(), 3, "{out:?}");
+            assert!(stripped.lines().all(|line| line.width() <= 45), "{out:?}");
+            assert!(
+                !out.contains("\x1b[31m"),
+                "cell must not inject style: {out:?}"
+            );
+            assert!(
+                !stripped.chars().any(|c| c != '\n' && terminal_control(c)),
+                "{stripped:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn normalization_preserves_text_and_escapes_all_existing_control_classes() {
+        assert_eq!(
+            cell_text("\t  alpha\r\n\u{2028}\u{2029} beta\u{a0}\t"),
+            "alpha beta"
+        );
+        assert_eq!(cell_text("\n\t"), "");
+        let mut input = String::from("start");
+        for c in [
+            '\0', '\x08', '\x1b', '\x7f', '\u{80}', '\u{9f}', '\u{61c}', '\u{200e}', '\u{200f}',
+            '\u{202a}', '\u{202e}', '\u{2066}', '\u{2069}',
+        ] {
+            input.push(c);
+        }
+        let out = cell_text(&input);
+        assert!(out.starts_with("start\\u{0}\\u{8}\\u{1b}"), "{out:?}");
+        assert!(!out.chars().any(terminal_control), "{out:?}");
+        let mut table = Table::new(&[" HEAD\nER ", "EMPTY"]);
+        table.row(vec![t("\t\n ", Tone::Good), c("value")]);
+        let out = table.render(true, false, None);
+        assert_eq!(out.lines().count(), 2);
+        assert!(out.starts_with("HEAD ER"));
+        assert!(
+            !out.contains("ok"),
+            "empty normalized cells have no status label"
         );
     }
 

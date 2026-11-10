@@ -5528,15 +5528,10 @@ fn find_session_in(list: &[SessionInfo], id: &str) -> Result<SessionInfo> {
     }
 }
 
-fn comparison_terminal_control(c: char) -> bool {
-    c.is_control()
-        || matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
-}
-
 fn comparison_terminal_text(text: &str) -> String {
     let mut visible = String::with_capacity(text.len());
     for c in text.chars() {
-        if comparison_terminal_control(c) {
+        if table::terminal_control(c) {
             visible.extend(c.escape_unicode());
         } else {
             visible.push(c);
@@ -5550,7 +5545,7 @@ fn comparison_quoted_metadata(text: &str) -> Result<String> {
     let quoted = serde_json::to_string(text)?;
     let mut visible = String::with_capacity(quoted.len());
     for c in quoted.chars() {
-        if comparison_terminal_control(c) {
+        if table::terminal_control(c) {
             // All relevant control/format characters are in the BMP. Keep a
             // valid JSON string while making bidi and C1 controls visible too.
             write!(&mut visible, "\\u{:04x}", c as u32).expect("writing to String");
