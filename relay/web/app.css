@@ -405,6 +405,9 @@ h3 { font-size: 0.9375rem; margin: 1.375rem 0 0.5rem; }
 .statusbar .note.err { color: var(--err); }
 .statusbar .err { color: var(--err); font-weight: 650; }
 #status-context.clickable { cursor: pointer; }
+/* #1734: long Session, also-open and usage text wraps inside the status bar
+   (long unbroken runs too) so the full string stays visible without hover. */
+#status-session, #status-others, #status-usage { white-space: normal; overflow-wrap: anywhere; min-width: 0; max-width: 100%; }
 .state { color: var(--accent); display: inline-flex; align-items: center; gap: 0.375rem; }
 .state.busy { color: var(--warn); font-weight: 650; }
 
