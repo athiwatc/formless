@@ -859,12 +859,22 @@ formless skills export pdf -o pdf.skill.json   # files only, no metrics
 formless skills import pdf.skill.json          # imported disabled, contents printed
 ```
 
-The agent remembers stable preferences you state ("use pnpm", "answer in Thai") as short notes that go into new sessions. You see every one, and you can edit them:
+The agent remembers stable preferences you state ("use pnpm", "answer in Thai") as short notes. You see every one, and you can edit them.
+
+A note's scope is `global` (the default) or `project:/absolute/path`. The memory
+prompt lists global notes followed by project notes grouped under `When working in <path>:`. A newly added note applies from the next Session, or in the current
+Session after compaction.
+
+Manage notes with the commands below, in the TUI with `/memory` (see the
+[key reference](docs/keys.md#integrations)), or on the web under **Settings → Memory**.
+See [User memory](SPEC.md#711-user-memory) for details.
 
 ```bash
 formless memory list
 formless memory add "Projects live in ~/code"
+formless memory add "Use pnpm" --scope project:/absolute/project/path
 formless memory edit m1a2b3c4 --disable
+formless memory edit m1a2b3c4 --scope project:/absolute/project/path
 formless memory rm m1a2b3c4
 ```
 
