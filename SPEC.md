@@ -5843,6 +5843,11 @@ credentials, named-provider/file overrides, unwind restoration and contrasting
 parallel mock keys. A source check rejects bare environment mutation outside the
 shared helper.
 
+`FORMLESS_EXPORT_DESCRIPTOR_FIXTURE` is a Linux-only export test hook pointing
+to an owned redirected-stdout alias; it verifies that descriptor output preserves
+the underlying file instead of atomically replacing the alias. The shipped
+binary does not read this variable.
+
 ### Local pre-Run forecasts (§5.2, §10.6, §12)
 
 `ForecastRun` previews the current draft, held attachments, checkpoint and frozen
