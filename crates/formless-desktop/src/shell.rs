@@ -23,8 +23,8 @@ use gpui_kit::component::{
 use gpui_kit::prelude::*;
 use gpui_kit::{
     div, px, size, AnyElement, App, Context, ElementId, Entity, FocusHandle, Focusable as _, Hsla,
-    KeyBinding, Pixels, ScrollStrategy, SharedString, Size, Subscription, TestSupportExt as _,
-    Window,
+    KeyBinding, Pixels, Role, ScrollStrategy, SharedString, Size, Subscription,
+    TestSupportExt as _, Window,
 };
 
 use crate::model::{
@@ -48,6 +48,10 @@ gpui_kit::actions!(
 
 const SESSION_LIST_CONTEXT: &str = "FormlessSessionList";
 const OVERLAY_CONTEXT: &str = "FormlessOverlay";
+/// Read out with a modal panel's name. The kit has no "modal" accessibility
+/// property to set, so the behaviour is also stated in words.
+const MODAL_DESCRIPTION: &str =
+    "Modal panel. Press Escape to close it and return to where you were.";
 const SESSION_ROW_HEIGHT: f32 = 44.0;
 /// Draft retention: at most this many Sessions and this much text in total.
 const DRAFT_MAX_ENTRIES: usize = 64;
@@ -90,6 +94,16 @@ fn region_border(focused: bool, idle: Hsla, cx: &App) -> Hsla {
     }
 }
 
+/// The control that had focus when a modal overlay came up, so dismissing the
+/// overlay can hand focus back to exactly that control.
+struct FocusOrigin {
+    handle: FocusHandle,
+    /// The region the control sits in, or `None` for a header control (the
+    /// header is always on screen). Focus only returns to a control whose
+    /// region is still shown.
+    region: Option<Region>,
+}
+
 pub struct Shell {
     sidebar: Sidebar,
     blocks: Rc<Vec<TimelineBlock>>,
@@ -99,8 +113,8 @@ pub struct Shell {
     last_intent: Option<Intent>,
     /// The overlay that held the window modally at the last settle.
     modal: Option<Region>,
-    /// Where focus was when the current overlay came up.
-    restore_focus: Option<Region>,
+    /// What had focus when the current overlay came up.
+    restore_focus: Option<FocusOrigin>,
     timeline: Entity<MessageScrollerState>,
     composer: Entity<TextareaState>,
     session_scroll: VirtualListScrollHandle,
@@ -108,6 +122,9 @@ pub struct Shell {
     sidebar_focus: FocusHandle,
     conversation_focus: FocusHandle,
     inspector_focus: FocusHandle,
+    /// The header toggles own stable handles so focus can return to them.
+    sidebar_toggle_focus: FocusHandle,
+    inspector_toggle_focus: FocusHandle,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -170,6 +187,8 @@ impl Shell {
             sidebar_focus: cx.focus_handle(),
             conversation_focus: cx.focus_handle(),
             inspector_focus: cx.focus_handle(),
+            sidebar_toggle_focus: cx.focus_handle(),
+            inspector_toggle_focus: cx.focus_handle(),
             _subscriptions: subscriptions,
         }
     }
@@ -295,20 +314,28 @@ impl Shell {
         self.settle(window, cx);
     }
 
-    fn current_region(&self, window: &Window, cx: &App) -> Region {
+    /// The region holding focus, or `None` when focus is in the header or
+    /// nowhere.
+    fn focused_region(&self, window: &Window, cx: &App) -> Option<Region> {
         // The composer is drawn inside the conversation column, so it has to
         // be told apart from the conversation before the containment checks.
         if self.composer.focus_handle(cx).contains_focused(window, cx) {
-            Region::Composer
+            Some(Region::Composer)
         } else if self.sidebar_focus.contains_focused(window, cx) {
-            Region::Sidebar
+            Some(Region::Sidebar)
         } else if self.inspector_focus.contains_focused(window, cx) {
-            Region::Inspector
+            Some(Region::Inspector)
         } else if self.conversation_focus.contains_focused(window, cx) {
-            Region::Conversation
+            Some(Region::Conversation)
         } else {
-            Region::Composer
+            None
         }
+    }
+
+    /// Where the F6 cycle starts from: the focused region, or the composer
+    /// when focus is outside every region.
+    fn current_region(&self, window: &Window, cx: &App) -> Region {
+        self.focused_region(window, cx).unwrap_or(Region::Composer)
     }
 
     fn focus_region(&mut self, region: Region, window: &mut Window, cx: &mut Context<Self>) {
@@ -333,13 +360,14 @@ impl Shell {
     /// Bring focus into line with the layout after anything that can change
     /// it: a panel toggle, a dismissed overlay, a resize, a new destination.
     ///
-    /// An overlay that comes up takes focus and remembers where focus was.
-    /// When it goes away focus returns there. Otherwise focus only moves if
-    /// the region holding it is no longer on screen.
+    /// An overlay that comes up takes focus and remembers the exact control
+    /// that had it. When the overlay goes away focus returns to that control,
+    /// provided its region is still shown. Otherwise focus only moves if the
+    /// region holding it is no longer on screen.
     fn settle(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.prefs.settle(f32::from(window.viewport_size().width));
         let layout = self.layout(window);
-        let focused = self.current_region(window, cx);
+        let focused = self.focused_region(window, cx);
         let before = std::mem::replace(&mut self.modal, layout.modal());
         let fallback = if layout.composer {
             Region::Composer
@@ -349,19 +377,22 @@ impl Shell {
         match (before, self.modal) {
             (before, Some(modal)) if before != Some(modal) => {
                 if before.is_none() {
-                    self.restore_focus = Some(focused);
+                    self.restore_focus = window.focused(cx).map(|handle| FocusOrigin {
+                        handle,
+                        region: focused,
+                    });
                 }
                 self.focus_region(modal, window, cx);
             }
-            (Some(_), None) => {
-                let target = self
-                    .restore_focus
-                    .take()
-                    .filter(|region| region.is_visible(layout))
-                    .unwrap_or(fallback);
-                self.focus_region(target, window, cx);
+            (Some(_), None) => match self.restore_focus.take() {
+                Some(origin) if origin.region.is_none_or(|region| region.is_visible(layout)) => {
+                    window.focus(&origin.handle, cx);
+                }
+                _ => self.focus_region(fallback, window, cx),
+            },
+            _ if focused.is_some_and(|region| !region.is_visible(layout)) => {
+                self.focus_region(fallback, window, cx)
             }
-            _ if !focused.is_visible(layout) => self.focus_region(fallback, window, cx),
             _ => {}
         }
         cx.notify();
@@ -409,6 +440,7 @@ impl Shell {
                     .ghost()
                     .label("Sessions")
                     .tooltip("Show or hide the Sessions sidebar")
+                    .track_focus(&self.sidebar_toggle_focus)
                     .selected(layout.sidebar != SidebarMode::Collapsed)
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.toggle_panel(Region::Sidebar, window, cx)
@@ -420,6 +452,7 @@ impl Shell {
                     .ghost()
                     .label("Context")
                     .tooltip("Show or hide the Context inspector")
+                    .track_focus(&self.inspector_toggle_focus)
                     .selected(layout.inspector != InspectorMode::Hidden)
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.toggle_panel(Region::Inspector, window, cx)
@@ -472,6 +505,13 @@ impl Shell {
         let panel = v_flex()
             .id("region-sidebar")
             .test_support()
+            .role(if modal {
+                Role::Dialog
+            } else {
+                Role::Navigation
+            })
+            .aria_label("Sessions")
+            .when(modal, |panel| panel.aria_description(MODAL_DESCRIPTION))
             .key_context(SESSION_LIST_CONTEXT)
             .on_action(cx.listener(|this, _: &SelectNextSession, _, cx| this.move_selection(1, cx)))
             .on_action(
@@ -734,6 +774,13 @@ impl Shell {
         let panel = v_flex()
             .id("region-inspector")
             .test_support()
+            .role(if modal {
+                Role::Dialog
+            } else {
+                Role::Complementary
+            })
+            .aria_label("Context")
+            .when(modal, |panel| panel.aria_description(MODAL_DESCRIPTION))
             .w(px(tokens::INSPECTOR_DEFAULT))
             .flex_shrink_0()
             .h_full()

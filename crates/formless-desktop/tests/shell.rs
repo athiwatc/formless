@@ -656,3 +656,122 @@ fn other_destinations_show_a_scaffold_notice_instead_of_the_conversation(cx: &mu
         assert_eq!(shell.read(cx).draft(cx).as_ref(), "still here");
     });
 }
+
+/// Press Tab until `id` holds keyboard focus.
+fn tab_to(window: &mut Window, id: &'static str, cx: &mut App) {
+    for _ in 0..60 {
+        if window.find(id).focused() == Some(true) {
+            return;
+        }
+        window.press("tab", cx);
+    }
+    panic!("Tab never reached {id}");
+}
+
+#[gpui_kit::test]
+fn panels_expose_landmark_roles_docked_and_named_dialogs_as_overlays(cx: &mut TestAppContext) {
+    let (handle, _) = open(cx, WIDE, 200, 40);
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        let sidebar = window.find("region-sidebar");
+        assert_eq!(sidebar.role(), Some(Role::Navigation));
+        assert_eq!(sidebar.label(), Some("Sessions"));
+        assert_eq!(sidebar.description(), None);
+        let inspector = window.find("region-inspector");
+        assert_eq!(inspector.role(), Some(Role::Complementary));
+        assert_eq!(inspector.label(), Some("Context"));
+    });
+
+    cx.simulate_window_resize(handle.into(), size(px(800.), px(900.)));
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        window.press(TOGGLE_INSPECTOR, cx);
+        let inspector = window.find("region-inspector");
+        assert_eq!(inspector.role(), Some(Role::Dialog));
+        assert_eq!(inspector.label(), Some("Context"));
+        assert!(inspector
+            .description()
+            .is_some_and(|text| text.contains("Escape")));
+        // Exactly one dialog is exposed while an overlay is up.
+        assert_eq!(window.find_all_by_role(Role::Dialog).len(), 1);
+
+        window.press(TOGGLE_SIDEBAR, cx);
+        let sidebar = window.find("region-sidebar");
+        assert_eq!(sidebar.role(), Some(Role::Dialog));
+        assert_eq!(sidebar.label(), Some("Sessions"));
+        assert_eq!(window.find_all_by_role(Role::Dialog).len(), 1);
+
+        window.press("escape", cx);
+        assert!(window.find_all_by_role(Role::Dialog).is_empty());
+    });
+}
+
+#[gpui_kit::test]
+fn dismissing_an_overlay_returns_focus_to_the_header_control_that_opened_it(
+    cx: &mut TestAppContext,
+) {
+    let (handle, _) = open(cx, WIDE, 200, 40);
+    cx.simulate_window_resize(handle.into(), size(px(1100.), px(900.)));
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        tab_to(window, "toggle-inspector", cx);
+        // Activate the focused toggle from the keyboard.
+        window.press("enter", cx);
+        assert_eq!(window.find("region-inspector").focused(), Some(true));
+        assert_eq!(window.find("toggle-inspector").focused(), Some(false));
+
+        window.press("escape", cx);
+        assert!(window.try_find("region-inspector").is_none());
+        // Back on the very button, not on the composer or a neighbour.
+        assert_eq!(window.find("toggle-inspector").focused(), Some(true));
+        assert_eq!(window.find("toggle-sidebar").focused(), Some(false));
+        assert_eq!(window.find_by_label("Message").focused(), Some(false));
+
+        // The same button closes it again, and focus stays on that button.
+        window.press("enter", cx);
+        assert!(window.find("region-inspector").visible());
+        window.click_at("overlay-backdrop", gpui_kit::point(px(40.), px(60.)), cx);
+        assert!(window.try_find("region-inspector").is_none());
+        assert_eq!(window.find("toggle-inspector").focused(), Some(true));
+    });
+}
+
+#[gpui_kit::test]
+fn dismissing_an_overlay_returns_focus_to_the_control_inside_a_region(cx: &mut TestAppContext) {
+    let (handle, _) = open(cx, WIDE, 200, 40);
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        window.click("destination-Tools", cx);
+    });
+    cx.simulate_window_resize(handle.into(), size(px(1100.), px(900.)));
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        tab_to(window, "back-to-chat", cx);
+
+        window.press(TOGGLE_INSPECTOR, cx);
+        assert_eq!(window.find("region-inspector").focused(), Some(true));
+        assert_eq!(window.find("back-to-chat").focused(), Some(false));
+        window.press("escape", cx);
+        // `focused()` on a region means "contains focus", so the button, a
+        // leaf, is what shows that focus came back to the control itself.
+        assert_eq!(window.find("back-to-chat").focused(), Some(true));
+    });
+}
+
+#[gpui_kit::test]
+fn focus_falls_back_when_the_originating_control_is_gone(cx: &mut TestAppContext) {
+    let (handle, shell) = open(cx, WIDE, 200, 40);
+    cx.simulate_window_resize(handle.into(), size(px(800.), px(900.)));
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        // Opened from the composer, then a destination without a composer is
+        // chosen inside the overlay: the composer cannot take focus back.
+        assert_eq!(window.find_by_label("Message").focused(), Some(true));
+        window.press(TOGGLE_SIDEBAR, cx);
+        window.click("destination-Metrics", cx);
+        assert_eq!(shell.read(cx).destination(), Destination::Metrics);
+        assert!(window.try_find("region-sidebar").is_none());
+        assert!(window.try_find("region-composer").is_none());
+        assert_eq!(window.find("region-conversation").focused(), Some(true));
+    });
+}
