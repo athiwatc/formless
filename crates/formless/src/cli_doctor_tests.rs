@@ -287,6 +287,8 @@ fn doctor_reports_unknown_role_providers_without_changing_configuration() {
         .unwrap()
         .contains("formless config edit"));
     assert_eq!(std::fs::read(f.paths.config_file()).unwrap(), before);
+    assert!(!formless_core::daemon::endpoint_occupied(&f.paths).unwrap());
+    #[cfg(unix)]
     assert!(!f.paths.socket_path().exists());
     f.assert_no_provider_calls();
 }
