@@ -62,65 +62,171 @@ pub fn window_start(text: &str, end: usize, max_bytes: usize, max_lines: usize) 
         .map_or(floor, |newline| floor + newline + 1)
 }
 
+/// The most fence markers the opening line given to layout repeats.
+const FENCE_RUN_MAX: usize = 32;
+
+/// The longest language name the opening line given to layout carries, and
+/// how far past the markers one is looked for.
+const FENCE_INFO_MAX: usize = 64;
+
+/// The longest text [`TimelineBlock::preview`] puts before its window: an
+/// indent of up to three spaces, the markers, the language name and a line
+/// break.
+const FENCE_OPENER_MAX_BYTES: usize = 3 + FENCE_RUN_MAX + FENCE_INFO_MAX + 1;
+
+/// The longest text a row lays out, whatever the block holds.
+pub const PREVIEW_MAX_BYTES: usize = limits::BLOCK_PREVIEW_MAX_BYTES + FENCE_OPENER_MAX_BYTES;
+
 /// The fence a line opens or closes, by CommonMark's rule for fenced code:
-/// up to three spaces, then at least three backticks or tildes.
-fn fence_run(line: &str) -> Option<(char, usize)> {
-    let indent = line.len() - line.trim_start_matches(' ').len();
+/// up to three spaces, then at least three backticks or tildes. Returns the
+/// marker, the indent and the number of markers.
+fn fence_run(line: &str) -> Option<(u8, usize, usize)> {
+    let bytes = line.as_bytes();
+    let indent = bytes.iter().take(4).take_while(|b| **b == b' ').count();
     if indent > 3 {
         return None;
     }
-    let rest = &line[indent..];
-    let marker = rest.chars().next().filter(|c| *c == '`' || *c == '~')?;
-    let run = rest.chars().take_while(|c| *c == marker).count();
-    (run >= 3).then_some((marker, run))
+    let marker = *bytes.get(indent).filter(|b| matches!(b, b'`' | b'~'))?;
+    let run = bytes[indent..].iter().take_while(|b| **b == marker).count();
+    (run >= 3).then_some((marker, indent, run))
+}
+
+/// The language name at the start of a fence's info string, if it ends
+/// within the first [`FENCE_INFO_MAX`] bytes of that string. One that goes
+/// on past them is left out: half a name is not a language. Looks at no
+/// more than those bytes and the character after them.
+fn info_word(info: &str) -> &str {
+    let mut cut = info.len().min(FENCE_INFO_MAX);
+    while !info.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let head = info[..cut].trim_start();
+    let word = head.find(char::is_whitespace).unwrap_or(head.len());
+    let ends_here = word < head.len() || info[cut..].chars().next().is_none_or(char::is_whitespace);
+    if ends_here {
+        &head[..word]
+    } else {
+        ""
+    }
+}
+
+/// One fenced code block, as positions in the text. Nothing is copied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Fenced {
+    /// Offset of the first marker of the opening line.
+    markers: usize,
+    /// How many markers open it. A closing line needs at least as many.
+    run: usize,
+    /// Offset just after the opening line: where the code starts.
+    body: usize,
+    /// Offset just after the closing line, or [`Fenced::OPEN`].
+    end: usize,
+}
+
+impl Fenced {
+    const OPEN: usize = usize::MAX;
+
+    /// An opening line for layout that stands for the real one. It is at
+    /// most [`FENCE_OPENER_MAX_BYTES`] long however long the real one is:
+    /// the same indent and marker, at most [`FENCE_RUN_MAX`] markers, and
+    /// the language name if it is short enough to be one.
+    ///
+    /// The one way this differs from the real line in what it lays out: a
+    /// block opened with more than [`FENCE_RUN_MAX`] markers is closed, in
+    /// the row, by a line of that many, where the real one needs more.
+    fn layout_opener(&self, text: &str) -> String {
+        let bytes = text.as_bytes();
+        let marker = char::from(bytes[self.markers]);
+        let indent = bytes[..self.markers]
+            .iter()
+            .rev()
+            .take(3)
+            .take_while(|b| **b == b' ')
+            .count();
+        let info = info_word(&text[self.markers + self.run..self.body - 1]);
+        let mut opener = String::with_capacity(FENCE_OPENER_MAX_BYTES);
+        opener.extend(std::iter::repeat_n(' ', indent));
+        opener.extend(std::iter::repeat_n(marker, self.run.min(FENCE_RUN_MAX)));
+        opener.push_str(info);
+        opener.push('\n');
+        opener
+    }
 }
 
 /// Which fenced code block, if any, is open at each point of a text.
 ///
 /// A window that starts inside a fenced block would otherwise be laid out as
-/// prose. This remembers where fences open and close so the window can be
-/// given the opening line it is missing. It reads each complete line once, as
+/// prose. This remembers where fenced blocks start and end, so the window
+/// can be given an opening line. It holds positions only, 32 bytes for each
+/// fenced block, and looks for line breaks in each byte of the text once, as
 /// the text grows.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct FenceIndex {
-    /// (offset just after a fence line, the opening line now in force).
-    events: Vec<(usize, Option<Arc<str>>)>,
-    /// Lines before this offset have been read.
-    scanned: usize,
-    open: Option<(char, usize)>,
+    blocks: Vec<Fenced>,
+    /// Where the line still being received starts.
+    line: usize,
+    /// No line break has been found between `line` and here.
+    searched: usize,
+    /// Bytes looked at for line breaks, to show each is looked at once.
+    #[cfg(test)]
+    work: usize,
 }
 
 impl FenceIndex {
-    /// Read the lines of `text` that are complete and not yet read.
+    /// Read the lines of `text` that are complete and not yet read. `text`
+    /// is the text given last time with more added at the end.
     fn extend(&mut self, text: &str) {
-        while let Some(length) = text[self.scanned..].find('\n') {
-            let line = &text[self.scanned..self.scanned + length];
-            let after = self.scanned + length + 1;
-            match (self.open, fence_run(line)) {
-                (None, Some(fence)) => {
-                    self.open = Some(fence);
-                    self.events.push((after, Some(Arc::from(line))));
-                }
-                (Some((marker, opened)), Some((closing, run)))
-                    if closing == marker
-                        && run >= opened
-                        && line.trim_start_matches(' ')[run..].trim().is_empty() =>
-                {
-                    self.open = None;
-                    self.events.push((after, None));
-                }
-                _ => {}
+        loop {
+            let unsearched = &text[self.searched..];
+            let found = unsearched.find('\n');
+            #[cfg(test)]
+            {
+                self.work += found.map_or(unsearched.len(), |at| at + 1);
             }
-            self.scanned = after;
+            let Some(length) = found else {
+                // A line can arrive in any number of pieces. The next piece
+                // is searched from here, not from the start of the line.
+                self.searched = text.len();
+                return;
+            };
+            let end = self.searched + length;
+            self.read_line(text, self.line..end);
+            self.line = end + 1;
+            self.searched = end + 1;
         }
     }
 
-    /// The opening line of the fenced block that contains `offset`.
-    fn opener_at(&self, offset: usize) -> Option<&str> {
-        let before = self.events.partition_point(|(after, _)| *after <= offset);
-        before
-            .checked_sub(1)
-            .and_then(|index| self.events[index].1.as_deref())
+    fn read_line(&mut self, text: &str, line: Range<usize>) {
+        let Some((marker, indent, run)) = fence_run(&text[line.clone()]) else {
+            return;
+        };
+        let after_markers = &text[line.start + indent + run..line.end];
+        match self.blocks.last_mut().filter(|b| b.end == Fenced::OPEN) {
+            // A line of backticks with another backtick after them is inline
+            // code, not an opening line.
+            None if marker == b'`' && after_markers.contains('`') => {}
+            None => self.blocks.push(Fenced {
+                markers: line.start + indent,
+                run,
+                body: line.end + 1,
+                end: Fenced::OPEN,
+            }),
+            Some(open) => {
+                let closes = text.as_bytes()[open.markers] == marker
+                    && run >= open.run
+                    && after_markers.trim().is_empty();
+                if closes {
+                    open.end = line.end + 1;
+                }
+            }
+        }
+    }
+
+    /// The fenced block whose code contains `offset`.
+    fn fenced_at(&self, offset: usize) -> Option<&Fenced> {
+        let before = self.blocks.partition_point(|b| b.body <= offset);
+        let fenced = &self.blocks[before.checked_sub(1)?];
+        (offset < fenced.end).then_some(fenced)
     }
 }
 
@@ -176,11 +282,12 @@ impl TimelineBlock {
             Anchor::At(start) => start..start + preview_len(&text[start..], BYTES, LINES),
         };
         let shown = &text[self.window.clone()];
-        // A window that starts inside a fenced code block is given that
-        // block's opening line, so it is still laid out as code. This is for
-        // layout only; `markdown` is what a copy must use.
-        self.preview = match self.fences.opener_at(self.window.start) {
-            Some(opener) => Arc::from(format!("{opener}\n{shown}")),
+        // A window that starts inside a fenced code block is given a short
+        // opening line that stands for that block's own, so it is still laid
+        // out as code. This is for layout only; `markdown` is what a copy
+        // must use.
+        self.preview = match self.fences.fenced_at(self.window.start) {
+            Some(fenced) => Arc::from(fenced.layout_opener(text) + shown),
             None => Arc::from(shown),
         };
     }
@@ -190,8 +297,9 @@ impl TimelineBlock {
         &self.markdown
     }
 
-    /// What the row lays out: the window, preceded by the opening line of a
-    /// fenced code block it starts inside. Cheap to clone.
+    /// What the row lays out: the window, preceded by a short opening line
+    /// for a fenced code block it starts inside. Never longer than
+    /// [`PREVIEW_MAX_BYTES`]. Cheap to clone.
     pub fn preview(&self) -> &Arc<str> {
         &self.preview
     }
@@ -567,21 +675,214 @@ mod tests {
         assert!(b.preview().ends_with("```\n\nAfterword.\n"));
     }
 
+    /// The opening line a window starting at `offset` would be given.
+    fn opener_at(index: &FenceIndex, text: &str, offset: usize) -> Option<String> {
+        index
+            .fenced_at(offset)
+            .map(|fenced| fenced.layout_opener(text))
+    }
+
+    fn index_of(text: &str) -> FenceIndex {
+        let mut index = FenceIndex::default();
+        index.extend(text);
+        index
+    }
+
     #[test]
     fn fences_are_tracked_by_commonmark_rules() {
-        let mut index = FenceIndex::default();
         let text = "before\n~~~~ text\n```\n~~~\n~~~~\nafter\n    ```\ndone\n";
-        index.extend(text);
-        let at = |needle: &str| text.find(needle).unwrap();
-        assert_eq!(index.opener_at(at("before")), None);
+        let index = index_of(text);
+        let at = |needle: &str| opener_at(&index, text, text.find(needle).unwrap());
+        let tildes = Some("~~~~text\n".to_string());
+        assert_eq!(at("before"), None);
         // Inside the tilde fence: backticks do not close it, and neither does
         // a shorter run of tildes.
-        assert_eq!(index.opener_at(at("```")), Some("~~~~ text"));
-        assert_eq!(index.opener_at(at("~~~\n")), Some("~~~~ text"));
-        assert_eq!(index.opener_at(at("~~~~\nafter")), Some("~~~~ text"));
-        assert_eq!(index.opener_at(at("after")), None);
+        assert_eq!(at("```"), tildes);
+        assert_eq!(at("~~~\n"), tildes);
+        assert_eq!(at("~~~~\nafter"), tildes);
+        assert_eq!(at("after"), None);
         // Four spaces of indent is not a fence.
-        assert_eq!(index.opener_at(at("done")), None);
+        assert_eq!(at("done"), None);
+
+        // Backticks around inline code do not open a fence; tildes with a
+        // backtick after them do.
+        let text = "```inline``` code\nprose\n~~~ a`b\nbody\n";
+        let index = index_of(text);
+        let at = |needle: &str| opener_at(&index, text, text.find(needle).unwrap());
+        assert_eq!(at("prose"), None);
+        assert_eq!(at("body"), Some("~~~a`b\n".to_string()));
+    }
+
+    #[test]
+    fn the_layout_opener_keeps_the_indent_the_marker_and_a_short_language() {
+        let opener = |opening_line: &str| {
+            let text = format!("{opening_line}\ncode\n");
+            opener_at(&index_of(&text), &text, text.find("code").unwrap()).unwrap()
+        };
+        assert_eq!(opener("```"), "```\n");
+        assert_eq!(opener("```rust"), "```rust\n");
+        assert_eq!(opener("  ~~~~   python title=\"x\"  "), "  ~~~~python\n");
+        assert_eq!(opener("```ภาษาไทย\r"), "```ภาษาไทย\n");
+
+        // A name as long as the limit is kept; one byte more and it is
+        // left out rather than shortened.
+        let longest = "n".repeat(FENCE_INFO_MAX);
+        assert_eq!(opener(&format!("```{longest}")), format!("```{longest}\n"));
+        assert_eq!(
+            opener(&format!("```{longest} more")),
+            format!("```{longest}\n")
+        );
+        assert_eq!(opener(&format!("```{longest}n")), "```\n");
+        // Space before the name counts toward the limit.
+        assert_eq!(opener(&format!("```{}rust", " ".repeat(60))), "```rust\n");
+        assert_eq!(opener(&format!("```{}rust", " ".repeat(61))), "```\n");
+        // The limit falls inside a three-byte character.
+        let thai = "ก".repeat(FENCE_INFO_MAX / 3 + 1);
+        assert_eq!(opener(&format!("```{thai}")), "```\n");
+        // A short name is kept whatever follows it.
+        let rest = "x".repeat(4096);
+        assert_eq!(opener(&format!("```rust {rest}")), "```rust\n");
+
+        // More markers than the limit: the row's opening line has the limit.
+        let many = "`".repeat(FENCE_RUN_MAX + 8);
+        let capped = "`".repeat(FENCE_RUN_MAX);
+        assert_eq!(opener(&format!("{many}sh")), format!("{capped}sh\n"));
+    }
+
+    #[test]
+    fn the_index_closes_a_long_fence_only_on_its_real_closing_line() {
+        // The index works from the real number of markers, not the number
+        // the row's opening line is given.
+        let opening = "`".repeat(FENCE_RUN_MAX + 8);
+        let shorter = "`".repeat(FENCE_RUN_MAX + 2);
+        let text = format!("{opening}\none\n{shorter}\ntwo\n{opening}\nafter\n");
+        let index = index_of(&text);
+        assert!(index.fenced_at(text.find("one").unwrap()).is_some());
+        assert!(index.fenced_at(text.find("two").unwrap()).is_some());
+        assert!(index.fenced_at(text.find("after").unwrap()).is_none());
+    }
+
+    /// Opening lines that are enormous in each of the ways one can be.
+    fn enormous_opening_lines() -> Vec<(String, String)> {
+        const HUGE: usize = 1024 * 1024;
+        vec![
+            // The independent review's case: a megabyte of info string.
+            (format!("```{}", "x".repeat(HUGE)), "```\n".to_string()),
+            // A megabyte of markers.
+            ("~".repeat(HUGE), format!("{}\n", "~".repeat(FENCE_RUN_MAX))),
+            // A language name with a megabyte of space before it.
+            (format!("```{}rust", " ".repeat(HUGE)), "```\n".to_string()),
+            // A language name with a megabyte of Thai after it.
+            (
+                format!("   ```rust {}", "ก".repeat(HUGE / 3)),
+                "   ```rust\n".to_string(),
+            ),
+        ]
+    }
+
+    #[test]
+    fn an_enormous_fence_opening_line_cannot_make_the_row_unbounded() {
+        for (opening_line, expected) in enormous_opening_lines() {
+            let text = format!("{opening_line}\n{}", "body\n".repeat(20_000));
+            let mut b = block(&text);
+            let check = |b: &TimelineBlock, what: &str| {
+                let window = b.window();
+                assert!(window.len() <= BYTES, "{what}");
+                assert!(b.preview().len() <= PREVIEW_MAX_BYTES, "{what}");
+                assert_eq!(
+                    &**b.preview(),
+                    format!("{expected}{}", &text[window]),
+                    "{what}"
+                );
+            };
+
+            // The head window is the start of the opening line itself: the
+            // raw text, cut by size, and nothing added.
+            assert_eq!(&**b.preview(), &text[b.window()]);
+            assert!(b.preview().len() <= BYTES);
+
+            b.show_end();
+            check(&b, "tail");
+            b.show_earlier();
+            check(&b, "one window earlier");
+            b.show_later();
+            check(&b, "one window later");
+
+            // Copying is not affected: the block keeps the text as received.
+            assert_eq!(b.markdown(), text);
+        }
+    }
+
+    #[test]
+    fn an_enormous_fence_opening_line_that_is_streamed_stays_bounded() {
+        for (opening_line, expected) in enormous_opening_lines() {
+            let text = format!("{opening_line}\n{}", "body\n".repeat(20_000));
+            let mut timeline = Timeline::default();
+            timeline.begin_stream(BlockKind::Assistant);
+            // Pieces of 1000 bytes that fall anywhere, cut back to a
+            // character boundary.
+            let mut sent = 0;
+            while sent < text.len() {
+                let mut end = (sent + 1000).min(text.len());
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                timeline.push_delta(&text[sent..end]);
+                sent = end;
+                let preview = timeline.blocks()[0].preview();
+                assert!(preview.len() <= PREVIEW_MAX_BYTES, "after {sent} bytes");
+            }
+            let tail = &timeline.blocks()[0];
+            assert_eq!(tail.hidden_after(), 0);
+            assert_eq!(
+                &**tail.preview(),
+                format!("{expected}{}", &text[tail.window()])
+            );
+            assert_eq!(tail.markdown(), text);
+        }
+    }
+
+    #[test]
+    fn a_line_that_arrives_in_many_pieces_is_searched_once() {
+        // 10,000 pieces of one line: searching from the start of the line
+        // each time would look at 5 GB; once each is 1 MB.
+        let piece = "x".repeat(100);
+        let mut text = String::from("```");
+        let mut index = FenceIndex::default();
+        for _ in 0..10_000 {
+            text.push_str(&piece);
+            index.extend(&text);
+        }
+        assert_eq!(index.work, text.len());
+        assert!(index.blocks.is_empty(), "the line is not finished yet");
+
+        text.push_str("\ncode\n```\nafter\n");
+        index.extend(&text);
+        assert_eq!(index.work, text.len());
+        assert_eq!(index, index_of(&text));
+        assert!(index.fenced_at(text.find("code").unwrap()).is_some());
+        assert!(index.fenced_at(text.find("after").unwrap()).is_none());
+    }
+
+    #[test]
+    fn the_index_is_the_same_however_the_text_is_cut_into_pieces() {
+        let text = "intro\n```rust\nfn main() {}\n~~~\n```  \n\n  ~~~~ ไทย\nก ข ค\n```\n~~~~~\nend\n```\nlast";
+        let whole = index_of(text);
+        assert_eq!(whole.blocks.len(), 3);
+        assert_eq!(whole.blocks[2].end, Fenced::OPEN, "the last is not closed");
+        for size in [1, 2, 3, 5, 7, 16, 64] {
+            let mut index = FenceIndex::default();
+            let mut sent = 0;
+            while sent < text.len() {
+                let mut end = (sent + size).min(text.len());
+                while !text.is_char_boundary(end) {
+                    end += 1;
+                }
+                sent = end;
+                index.extend(&text[..sent]);
+            }
+            assert_eq!(index, whole, "pieces of {size} bytes");
+        }
     }
 
     #[test]

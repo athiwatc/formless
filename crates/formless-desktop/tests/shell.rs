@@ -14,9 +14,9 @@ use std::time::{Duration, Instant};
 
 use formless_desktop::fixture;
 use formless_desktop::memory::{limits, IntentKind, IntentRecord};
-use formless_desktop::model::{tokens, Destination, TextScale};
+use formless_desktop::model::{tokens, BlockKind, Destination, TextScale};
 use formless_desktop::shell::{self, session_row_id, Shell};
-use formless_desktop::timeline::TimelineBlock;
+use formless_desktop::timeline::{self, TimelineBlock};
 use formless_protocol::SendMode;
 use gpui_kit::base::test_support::texts;
 use gpui_kit::base::Root;
@@ -1993,6 +1993,36 @@ fn a_five_megabyte_block_can_be_paged_from_either_end_in_bounded_windows(cx: &mu
         // Nothing about the block itself changed.
         assert_eq!(shell.read(cx).block_count(), 9);
         let _ = total;
+    });
+}
+
+#[gpui_kit::test]
+fn a_fenced_block_with_an_enormous_opening_line_is_still_a_bounded_row(cx: &mut TestAppContext) {
+    // A megabyte of info string on the fence's opening line, then code.
+    let code: String = (1..=20_000)
+        .map(|line| format!("code line {line:06}\n"))
+        .collect();
+    let markdown = format!("```{}\n{code}", "x".repeat(1024 * 1024));
+    let mut blocks = fixture::timeline(8);
+    blocks.push(TimelineBlock::new(9, BlockKind::ToolSummary, markdown));
+    let (handle, shell) = open_blocks(cx, size(px(1440.), px(1200.)), blocks);
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| {
+        window.draw(cx).clear(cx);
+        click_window_control(window, 9, "end", cx);
+    });
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| {
+        window.draw(cx).clear(cx);
+        // The row is given a short opening line in place of the real one.
+        let row = shell.read(cx).last_block_preview();
+        assert!(row.len() <= timeline::PREVIEW_MAX_BYTES, "{}", row.len());
+        assert!(row.starts_with("```\ncode line "), "{:?}", &row[..32]);
+        let painted = painted(window);
+        let bytes: usize = painted.iter().map(String::len).sum();
+        assert!(bytes <= 2 * timeline::PREVIEW_MAX_BYTES, "{bytes} bytes");
+        assert!(painted.iter().any(|text| text.contains("code line 020000")));
+        assert!(!painted.iter().any(|text| text.contains("xxxxxxxx")));
     });
 }
 

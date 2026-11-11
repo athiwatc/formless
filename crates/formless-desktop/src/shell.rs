@@ -662,6 +662,16 @@ impl Shell {
         })
     }
 
+    /// What the last block's row lays out.
+    pub fn last_block_preview(&self) -> String {
+        self.blocks
+            .borrow()
+            .blocks()
+            .last()
+            .map(|block| block.preview().to_string())
+            .unwrap_or_default()
+    }
+
     /// Stream deltas received and view updates made for them.
     pub fn stream_stats(&self) -> (u64, u64) {
         (self.stream.requests(), self.stream.flushes())
