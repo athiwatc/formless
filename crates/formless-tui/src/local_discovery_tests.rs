@@ -145,10 +145,13 @@ fn local_discovery_usable_endpoint_is_preferred_to_an_empty_one() {
     app.wizard = Some(w);
     app.wizard_poll();
     assert_eq!(
-        app.wizard.as_ref().unwrap().local_offer.as_ref(),
+        app.wizard.as_ref().unwrap().local_offer_for("lmstudio"),
         Some(&available)
     );
     assert!(app.wizard.as_ref().unwrap().status.contains("2 model"));
+    assert_eq!(app.wizard.as_ref().unwrap().local_offers.len(), 2);
+    assert_eq!(app.wizard.as_ref().unwrap().local_offer_for("ollama").unwrap().models, 0);
+    assert_eq!(formless_core::presets::PRESETS[app.wizard.as_ref().unwrap().preset_idx].id, "lmstudio");
 }
 
 #[test]
@@ -158,7 +161,20 @@ fn local_discovery_remote_ollama_host_guidance_reaches_the_rendered_picker_witho
     let mut app = test_app();
     let mut cfg = Config::default();
     cfg.provider.base_url.clear();
-    app.wizard = Some(Wizard::start(&cfg, &app.paths));
+    // Real OLLAMA_HOST rejection, no probes: an accepted host would make the
+    // fake Ollama endpoint answer, so a rejection regression fails below.
+    app.wizard = Some(Wizard::start_with_discovery(&cfg, &app.paths, || {
+        let value = std::env::var("OLLAMA_HOST");
+        let hint = formless_core::local_servers::ollama_host_guidance(&value);
+        formless_core::local_servers::Discovery {
+            servers: if hint.is_some() {
+                Vec::new()
+            } else {
+                vec![local_discovery_offer(1)]
+            },
+            hint,
+        }
+    }));
     let deadline = Instant::now() + Duration::from_secs(5);
     while app.wizard.as_ref().unwrap().local_pending {
         assert!(Instant::now() < deadline);
@@ -174,9 +190,9 @@ fn local_discovery_remote_ollama_host_guidance_reaches_the_rendered_picker_witho
     assert!(w.status.contains("manually"));
     assert!(!w.status.contains("remote-private.example"));
     assert!(w
-        .local_offer
-        .as_ref()
-        .is_none_or(|s| s.preset_id != "ollama"));
+        .local_offers
+        .iter()
+        .all(|s| s.preset_id != "ollama"));
     assert!(w.draft_changed.is_none());
     let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
     terminal.draw(|f| draw_wizard(f, w, false)).unwrap();
@@ -219,4 +235,78 @@ fn local_discovery_guidance_does_not_override_a_newer_user_choice() {
     .unwrap();
     app.wizard_poll();
     assert_eq!(app.wizard.as_ref().unwrap().status, status);
+}
+
+
+#[test]
+fn local_discovery_retains_both_servers_marks_rows_and_uses_the_selected_url() {
+    let _env = local_discovery_env();
+    let mut app = test_app();
+    let mut cfg = Config::default();
+    cfg.provider.base_url.clear();
+    let lmstudio = formless_core::local_servers::LocalServer {
+        preset_id: "lmstudio", base_url: "http://127.0.0.1:0/studio/prefix/v1".into(), models: 2,
+    };
+    let expected = lmstudio.base_url.clone();
+    let w = Wizard::start_with_detector(&cfg, &app.paths, move || vec![local_discovery_offer(5), lmstudio]);
+    app.wizard = Some(w);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while app.wizard.as_ref().unwrap().local_pending {
+        assert!(Instant::now() < deadline);
+        app.wizard_poll();
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let w = app.wizard.as_ref().unwrap();
+    assert_eq!(w.local_offers.len(), 2);
+    assert!(w.status.contains("Ollama (5 models)") && w.status.contains("LM Studio (2 models)"), "{}", w.status);
+    assert!(w.status.contains("Press Enter") && w.status.contains("highlighted provider"));
+    assert_eq!(formless_core::presets::PRESETS[w.preset_idx].id, "ollama");
+    assert!(w.draft_changed.is_none());
+    assert!(!app.paths.config_file().exists());
+    for (width, height) in [(60, 20), (80, 24), (100, 30)] {
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| draw_wizard(f, w, false)).unwrap();
+        let rows: Vec<String> = terminal.backend().buffer().content.chunks(width as usize)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect()).collect();
+        assert!(rows.iter().any(|row| row.contains("Ollama") && row.contains("found: 5 models")), "{width}x{height}: {rows:?}");
+        assert!(rows.iter().any(|row| row.contains("LM Studio") && row.contains("found: 2 models")), "{width}x{height}: {rows:?}");
+        assert!(rows.iter().any(|row| row.contains("Ctrl+C quit")), "footer clipped: {rows:?}");
+    }
+    let lm_index = formless_core::presets::PRESETS.iter().position(|p|p.id == "lmstudio").unwrap();
+    while app.wizard.as_ref().unwrap().preset_idx < lm_index { app.wizard_step_key(key(KeyCode::Down)); }
+    while app.wizard.as_ref().unwrap().preset_idx > lm_index { app.wizard_step_key(key(KeyCode::Up)); }
+    assert!(app.wizard.as_ref().unwrap().status.contains("highlighted provider"));
+    app.wizard_step_key(key(KeyCode::Enter));
+    let w = app.wizard.as_ref().unwrap();
+    assert_eq!(w.base_url, expected);
+    assert_eq!(w.credential_endpoint, expected);
+    assert_eq!(w.preset.unwrap().id, "lmstudio");
+    assert_eq!(w.local_offers.len(), 2, "selection retains other offers");
+}
+
+#[test]
+fn local_discovery_multiple_empty_servers_keep_guidance_and_both_offers() {
+    let _env = local_discovery_env();
+    let mut app = test_app();
+    let mut cfg = Config::default();
+    cfg.provider.base_url.clear();
+    let mut w = Wizard::new(&cfg);
+    w.local_pending = true;
+    w.job_tx.send(WizardJob::Local(w.generation, formless_core::local_servers::Discovery {
+        servers: vec![local_discovery_offer(0), formless_core::local_servers::LocalServer {
+            preset_id:"lmstudio", base_url:"http://127.0.0.1:0/prefix/v1".into(), models:0,
+        }], hint:Some("Existing local discovery guidance.".into()),
+    })).unwrap();
+    app.wizard = Some(w);
+    app.wizard_poll();
+    let w = app.wizard.as_ref().unwrap();
+    assert_eq!(w.local_offers.len(), 2);
+    assert!(w.status.starts_with("Existing local discovery guidance."));
+    assert!(w.status.contains("Ollama (0 models)") && w.status.contains("LM Studio (0 models)"), "{}", w.status);
+    assert!(w.status.contains("ollama pull MODEL") && !w.status.contains("Press Enter"), "{}", w.status);
+    assert_eq!(w.local_offer_for("lmstudio").unwrap().models, 0);
+    assert!(w.local_offer_for("openai").is_none());
+    app.flush_wizard_draft(true);
+    assert!(!formless_core::setup_draft::file(&app.paths).exists());
+    assert!(!app.paths.config_file().exists());
 }

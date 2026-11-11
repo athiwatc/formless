@@ -3622,7 +3622,12 @@ run_tool = "network_policy"     # a registry Tool, or…
   at most four bounded GETs (350ms each, 1MiB body cap), without credentials,
   proxies, redirects, model loads or downloads. The offer arrives only while
   the untouched provider picker remains current, and selection keeps the
-  detected address, including IPv6. Empty Ollama offers say to run
+  detected address, including IPv6. All detected servers remain available;
+  when several answer, the status names each with its model count and each
+  matching preset row is marked found. The initial highlight prefers an
+  endpoint with models, while choosing another detected preset uses its own
+  discovered address. Wrapped status text is included in the picker layout.
+  Empty Ollama offers say to run
   `ollama pull MODEL`; other empty model APIs say to load a model first.
   `OLLAMA_HOST` selects Ollama's local discovery address/port/path instead of
   the default Ollama candidates. Schemeless addresses default to 11434;

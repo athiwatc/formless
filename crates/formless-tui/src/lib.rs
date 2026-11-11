@@ -753,7 +753,7 @@ struct Wizard {
     reveal_until: Option<Instant>,
     generation: u64,
     local_pending: bool,
-    local_offer: Option<formless_core::local_servers::LocalServer>,
+    local_offers: Vec<formless_core::local_servers::LocalServer>,
     /// Endpoint under which the current key/model were entered.
     credential_endpoint: String,
     /// Only an explicitly re-opened setup can return to an existing Session.
@@ -820,7 +820,7 @@ impl Wizard {
             reveal_until: None,
             generation: 0,
             local_pending: false,
-            local_offer: None,
+            local_offers: Vec::new(),
             credential_endpoint: cfg.provider.base_url.trim().to_string(),
             can_cancel: false,
             confirm_key_change: false,
@@ -1086,6 +1086,16 @@ impl Wizard {
         });
     }
 
+    fn local_offer_for(
+        &self,
+        preset_id: &str,
+    ) -> Option<&formless_core::local_servers::LocalServer> {
+        self.local_offers
+            .iter()
+            .filter(|offer| offer.preset_id == preset_id)
+            .min_by_key(|offer| offer.models == 0)
+    }
+
     /// Apply the highlighted preset (or go to the custom URL step).
     fn choose_preset(&mut self) {
         let Some(p) = formless_core::presets::PRESETS.get(self.preset_idx) else {
@@ -1099,9 +1109,7 @@ impl Wizard {
             return;
         };
         let endpoint = self
-            .local_offer
-            .as_ref()
-            .filter(|offer| offer.preset_id == p.id)
+            .local_offer_for(p.id)
             .map(|offer| offer.base_url.clone())
             .unwrap_or_else(|| p.base_url.to_string());
         if self.preset.map(|old| old.id) != Some(p.id)
@@ -8466,19 +8474,52 @@ impl App {
                         if let Some(hint) = discovery.hint.as_deref() {
                             w.status = hint.to_string();
                         }
-                        if let Some(offer) =
-                            discovery.servers.into_iter().min_by_key(|s| s.models == 0)
+                        w.local_offers = discovery.servers;
+                        if let Some(offer) = w
+                            .local_offers
+                            .iter()
+                            .filter(|offer| {
+                                formless_core::presets::find(offer.preset_id)
+                                    .is_some_and(|p| p.local)
+                            })
+                            .min_by_key(|offer| offer.models == 0)
                         {
                             if let Some(index) = formless_core::presets::PRESETS
                                 .iter()
                                 .position(|p| p.id == offer.preset_id)
                             {
                                 w.preset_idx = index;
-                                w.status = match discovery.hint {
-                                    Some(hint) => format!("{hint} {}", offer.offer()),
-                                    None => offer.offer(),
+                                let offer_text = if w.local_offers.len() == 1 {
+                                    offer.offer()
+                                } else {
+                                    let summary = w
+                                        .local_offers
+                                        .iter()
+                                        .map(|server| {
+                                            let name =
+                                                formless_core::presets::find(server.preset_id)
+                                                    .map_or(server.preset_id, |p| {
+                                                        p.name.trim_end_matches(" (local)")
+                                                    });
+                                            format!(
+                                                "{name} ({} model{})",
+                                                server.models,
+                                                if server.models == 1 { "" } else { "s" }
+                                            )
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join(", ");
+                                    let action = if offer.models == 0 {
+                                        offer.offer()
+                                    } else {
+                                        "Press Enter to use the highlighted provider.".to_string()
+                                    };
+                                    format!("Found {summary}. {action}")
                                 };
-                                w.local_offer = Some(offer);
+                                w.status = match discovery.hint {
+                                    Some(hint) => format!("{hint} {offer_text}"),
+                                    None => offer_text,
+                                };
                             }
                         }
                     }
@@ -18060,9 +18101,18 @@ fn draw_wizard(f: &mut Frame, w: &Wizard, color: bool) {
             ),
         ]),
         Line::raw(""),
-        Line::styled(w.status.clone(), status_style),
-        Line::raw(""),
     ];
+    let status_rows = wrap_rows(
+        &w.status,
+        f.area().width.min(84).saturating_sub(2).max(1) as usize,
+    );
+    let status_extra = status_rows.len().saturating_sub(1);
+    text.extend(
+        status_rows
+            .into_iter()
+            .map(|line| Line::styled(line, status_style)),
+    );
+    text.push(Line::raw(""));
     let mut hint_rows = 0;
     if let Some(hint) = &w.setup_hint {
         let rows = wrap_rows(
@@ -18074,7 +18124,9 @@ fn draw_wizard(f: &mut Frame, w: &Wizard, color: bool) {
         text.push(Line::raw(""));
     }
     let area = f.area();
-    let max_items = (area.height as usize).saturating_sub(12 + hint_rows).max(3);
+    let max_items = (area.height as usize)
+        .saturating_sub(12 + hint_rows + status_extra)
+        .max(3);
     let pick = |items: Vec<String>, idx: usize| -> Vec<Line<'static>> {
         // Long model lists scroll so the selection is always on screen.
         let start = idx
@@ -18111,7 +18163,17 @@ fn draw_wizard(f: &mut Frame, w: &Wizard, color: bool) {
                     let env = formless_core::presets::env_key(p)
                         .map(|(var, _)| format!("  (${var} found)"))
                         .unwrap_or_default();
-                    format!("{}. {}{env}", i + 1, p.name)
+                    let found = w
+                        .local_offer_for(p.id)
+                        .map(|offer| {
+                            format!(
+                                "  (found: {} model{})",
+                                offer.models,
+                                if offer.models == 1 { "" } else { "s" }
+                            )
+                        })
+                        .unwrap_or_default();
+                    format!("{}. {}{env}{found}", i + 1, p.name)
                 })
                 .collect();
             rows.push(format!("{}. Custom URL…", rows.len() + 1));
