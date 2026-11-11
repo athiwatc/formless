@@ -2218,16 +2218,30 @@
     test.onclick = async () => {
       const model = choice();
       if (!model) return;
-      status.textContent = "testing " + model + "…";
+      const testing = "testing " + model + "…";
+      status.textContent = testing;
       const t = await act({ type: "test_model", model }, null, 120000);
-      if (!t) return;
+      // act already reported why; end the label it left, unless newer text
+      // replaced it (#1730).
+      if (!t) {
+        if (status.textContent === testing) status.textContent = "✗ " + model + ": test did not complete";
+        return;
+      }
       tests[model] = t;
       status.textContent = modelTestText(t);
       draw();
     };
     openDialog(dialog, { initialFocus: input, onDismiss: close });
     const r = await act({ type: "list_models" }, null, 30000);
-    if (!r || !dialog.isConnected) return;
+    if (!dialog.isConnected) return;
+    if (!r) {
+      // act already reported why; free-form entry still works (#1730).
+      if (status.textContent === "loading models…") {
+        status.textContent = "could not load models — type a model id";
+        status.classList.add("err");
+      }
+      return;
+    }
     const recent = r.recent || [];
     meta = r.meta || {};
     tests = r.tests || {};
@@ -2242,7 +2256,8 @@
     items.sort((a, b) => b.recent - a.recent);
     const current = (session && session.model) || (r.current && r.current.model) || "";
     sel = Math.max(0, items.findIndex((i) => i.id === current));
-    status.textContent = r.error ? "could not list models: " + r.error : "";
+    status.textContent = r.error ? "could not list models: " + r.error
+      : items.length ? "" : "no models listed — type a model id";
     if (!items.length && r.error) status.classList.add("err");
     draw();
   }
@@ -3858,14 +3873,18 @@
     const sort = opts.sortable && S.toolSort;
     const cols = TOOL_COLS.concat([[opts.bars ? "" : "Capabilities", null]]);
     // Sortable headers: click (or Enter) sorts by the column, again reverses.
+    // Name and version ascend; calls, success and last used descend. The
+    // active glyph and aria-sort both come from that one direction.
     table.append(h("thead", null, h("tr", null, cols.map(([label, key, num]) => {
       const active = sort && key && sort.key === key;
-      const th = h("th", { class: num ? "num" : null, "aria-sort": active ? (sort.reverse !== (key === "name" || key === "version") ? "ascending" : "descending") : null },
+      const direction = active ? (sort.reverse !== (key === "name" || key === "version") ? "ascending" : "descending") : null;
+      const glyph = direction === "ascending" ? " ▴" : direction === "descending" ? " ▾" : "";
+      const th = h("th", { class: num ? "num" : null, "aria-sort": direction },
         opts.sortable && key ? h("button", { class: "th-sort", type: "button", title: "Sort by " + label.toLowerCase(), onclick: () => {
           S.toolSort = { key, reverse: active ? !sort.reverse : false };
           if ([...$("tools-sort").options].some((o) => o.value === key)) $("tools-sort").value = key;
           renderTools();
-        } }, label, active ? (sort.reverse ? " ▴" : " ▾") : "") : label);
+        } }, label, glyph) : label);
       return th;
     }))));
     const body = h("tbody");
@@ -4656,31 +4675,39 @@
   }
   /** The Settings filter: rows whose label, key, value or description
    * contain the words stay (matches marked); sections with none left hide,
-   * unless their title matches. */
+   * unless their title matches. Every word must be in one target (label,
+   * value, key or table row), folded by `foldMap` as `markWords` folds it,
+   * so a visible label shows its highlight (#1731). */
   function filterSettings() {
-    const words = $("settings-filter").value.toLowerCase().split(/\s+/).filter(Boolean);
-    const hit = (el) => { const t = el.textContent.toLowerCase(); return words.every((w) => t.includes(w)); };
-    for (const m of $("settings").querySelectorAll("mark.find")) m.replaceWith(m.textContent);
+    const words = $("settings-filter").value.split(/\s+/).filter(Boolean);
+    const keys = words.map((w) => foldMap(w).folded).filter(Boolean);
+    // Each target's text is folded once per call, not once per word.
+    const hitText = (text) => { const t = foldMap(text).folded; return keys.every((k) => t.includes(k)); };
+    const hit = (el) => hitText(el.textContent);
+    // Unwrap the last marks, then merge the split text back together so the
+    // next query can match across the old mark's edges (#1731).
+    const parents = new Set();
+    for (const m of $("settings").querySelectorAll("mark.find")) { parents.add(m.parentNode); m.replaceWith(m.textContent); }
+    for (const p of parents) p.normalize();
     for (const sec of $("settings").querySelectorAll("section")) {
-      const titleHit = words.length && hit(sec.querySelector("h3") || sec);
+      const titleHit = keys.length && hit(sec.querySelector("h3") || sec);
       let shown = 0;
       for (const dt of sec.querySelectorAll("dl.kv > dt")) {
         const dd = dt.nextElementSibling;
-        const ok = !words.length || titleHit || hit(dt) || (dd && hit(dd)) || (dt.title && words.every((w) => dt.title.toLowerCase().includes(w)));
+        const ok = !keys.length || titleHit || hit(dt) || (dd && hit(dd)) || (dt.title && hitText(dt.title));
         dt.classList.toggle("hidden", !ok);
         if (dd) dd.classList.toggle("hidden", !ok);
-        if (ok) { shown++; if (words.length) markWords(dt, words); }
+        if (ok) { shown++; if (keys.length) markWords(dt, words); }
       }
       for (const tr of sec.querySelectorAll("tbody > tr")) {
-        const ok = !words.length || titleHit || hit(tr);
+        const ok = !keys.length || titleHit || hit(tr);
         tr.classList.toggle("hidden", !ok);
         if (ok) shown++;
       }
       const hasRows = sec.querySelector("dl.kv > dt, tbody > tr");
-      sec.classList.toggle("hidden", !!words.length && !titleHit && (hasRows ? !shown : !hit(sec)));
+      sec.classList.toggle("hidden", !!keys.length && !titleHit && (hasRows ? !shown : !hit(sec)));
     }
   }
-  /** Wrap the words' first occurrences in an element's own text in <mark>. */
   /** `text` folded for matching with, per folded UTF-16 unit, the offset
    * of the original character it came from (#789): decomposed, marks
    * dropped, lower-cased one character at a time, so `İ` stays one
@@ -4698,6 +4725,8 @@
     from.push(at);
     return { folded, from };
   }
+  /** Wrap the words' first occurrences in an element's own text in <mark>,
+   * adding no empty text nodes. */
   function markWords(el, words) {
     const keys = words.map((w) => foldMap(w).folded).filter((w) => w);
     for (const node of [...el.childNodes].filter((n) => n.nodeType === 3)) {
@@ -4709,16 +4738,18 @@
         .map((w) => [folded.indexOf(w), w.length])
         .filter(([i]) => i >= 0)
         .map(([i, n]) => [from[i], from[i + n] - from[i]])
+        .filter(([, n]) => n > 0)
         .sort((a, b) => a[0] - b[0]);
       if (!spans.length) continue;
       const parts = [];
       let at = 0;
       for (const [i, n] of spans) {
         if (i < at) continue;
-        parts.push(text.slice(at, i), h("mark", { class: "find" }, text.slice(i, i + n)));
+        if (i > at) parts.push(text.slice(at, i));
+        parts.push(h("mark", { class: "find" }, text.slice(i, i + n)));
         at = i + n;
       }
-      parts.push(text.slice(at));
+      if (at < text.length) parts.push(text.slice(at));
       node.replaceWith(...parts);
     }
   }
@@ -7054,6 +7085,9 @@
       attachFiles([...e.dataTransfer.files]);
     });
   }
+  // A real button so Tab, Enter and Space reach it (#1740); its click is
+  // the user gesture that opens the hidden file picker.
+  $("attach-btn").addEventListener("click", () => $("attach-input").click());
   $("attach-input").addEventListener("change", (e) => { attachFiles([...e.target.files]); e.target.value = ""; });
   $("input").addEventListener("paste", (e) => {
     const files = [...((e.clipboardData && e.clipboardData.files) || [])];

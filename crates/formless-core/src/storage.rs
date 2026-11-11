@@ -1724,6 +1724,28 @@ impl Store {
         Ok(n as usize)
     }
 
+    /// Sum of top-level `attachments` array lengths for one Session.
+    ///
+    /// Selects only `meta` and steps one row at a time, so context usage
+    /// does not materialize transcript content. Unreadable metadata and
+    /// malformed JSON add nothing, matching `row_msg`. Any role counts.
+    pub(crate) fn attachment_entry_count(&self, session_id: &str) -> Result<usize> {
+        let mut statement =
+            self.ps("SELECT meta FROM messages WHERE session_id=?1 AND meta IS NOT NULL")?;
+        let mut rows = statement.query(params![session_id])?;
+        let mut total = 0usize;
+        while let Some(row) = rows.next()? {
+            // Same conversion as `row_msg`: unreadable metadata is absence.
+            let meta: Option<String> = row.get("meta").ok().flatten();
+            if let Some(meta) = meta {
+                if let Ok(value) = serde_json::from_str::<Value>(&meta) {
+                    total += value["attachments"].as_array().map_or(0, Vec::len);
+                }
+            }
+        }
+        Ok(total)
+    }
+
     pub fn list_checkpoints(&self, session_id: &str) -> Result<Vec<(String, i64)>> {
         let mut stmt = self.ps(
             "SELECT summary, up_to_seq FROM checkpoints WHERE session_id=?1 ORDER BY up_to_seq",
@@ -2381,10 +2403,20 @@ impl Store {
         Ok(())
     }
 
+    /// Pause a scheduler failure without consuming its due occurrence.
+    pub(crate) fn pause_job(&self, id: &str, status: &str) -> Result<()> {
+        self.ex(
+            "UPDATE jobs SET enabled=0, last_run=?2, last_status=?3 WHERE id=?1",
+            params![id, now(), status],
+        )?;
+        Ok(())
+    }
+
     /// A firing's Run ended: its outcome becomes the job's last status.
     pub fn job_ran_status(&self, id: &str, status: &str) -> Result<()> {
         self.ex(
-            "UPDATE jobs SET last_status=?2 WHERE id=?1",
+            "UPDATE jobs SET last_status=?2 WHERE id=?1
+             AND NOT (enabled=0 AND last_status LIKE 'paused: %')",
             params![id, status],
         )?;
         Ok(())
@@ -7299,6 +7331,10 @@ mod description_store_tests;
 #[cfg(test)]
 #[path = "session_lineage_tests.rs"]
 mod session_lineage_tests;
+
+#[cfg(test)]
+#[path = "attachment_entry_count_tests.rs"]
+mod attachment_entry_count_tests;
 
 #[path = "session_comparison.rs"]
 mod session_comparison;

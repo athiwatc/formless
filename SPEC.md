@@ -933,8 +933,23 @@ task, with quality as a gate**.
   alt text and address as text (nothing is fetched when the page is
   opened), and links keep only http(s), mailto and relative targets. TUI `/export [json|md|html]`
   (writes to the exports directory), the web "Export…" dialog and
-  `/export`, and `formless sessions export ID --format md|html|json
-  [-o FILE]`.
+  `/export`, and `formless sessions export ID [--format json|markdown|html]
+  [-o FILE]` (`md` aliases `markdown`). The CLI infers omitted formats from
+  `.md`/`.markdown`, `.html`/`.htm`, or `.json` extensions, case-insensitively;
+  stdout and unknown extensions still default to JSON. Explicit conflicts with
+  recognized extensions are usage errors before profile setup, Session lookup
+  or daemon connection. On Unix, ordinary file output is replaced atomically,
+  preserving existing write-access checks and staging/final mode bits (not a
+  claim of extended ACL/xattr preservation); pre-commit failures
+  leave prior exports intact. The Windows implementation verifies protected
+  user-only staging ACLs before writing, publishes new files without clobbering
+  competing creators, and uses DACL-preserving replacement with a private
+  backup. Partial OS replacement failures use no-clobber restoration or retain
+  recovery files identified in the error. Native Windows acceptance remains
+  pending; no complete Windows validation is claimed. Leaf symlinks (including dangling links) keep
+  write-through semantics
+  with bounded link traversal. Descriptor/device streams use direct writes,
+  never pathname replacement.
 
 ### 5.2 Run lifecycle
 
@@ -1359,7 +1374,12 @@ pasting paths.
   launched programs or MCP tools when appropriate, including an empty tracked
   list. The marker is conservative: a process-capable Tool need not actually
   launch a program or write anything. `RunFiles {session_id, run_id?}` adds a
-  bounded context diff for text files. The TUI's `/files` opens them in the pager; the
+  bounded context diff for text files. Common prefix/suffix lines are preserved
+  before aligning the differing middle, so a local edit in a large file keeps
+  only nearby context. The LCS matrix is capped at four million cells;
+  human context output labels any remaining unaligned middle explicitly.
+  Raw diff lines retain their original reconstruction contract and kinds.
+  The TUI's `/files` opens them in the pager; the
   web shows a dialog with diffs and Revert buttons. Explicit Run IDs must belong
   to the requested live Session, including every recorded path row.
 - **Rewind.** `RewindRun {session_id, run_id?, path?}` (`/rewind [PATH]`)
@@ -3462,19 +3482,30 @@ refresh a cache, nightly cleanup.
 - **Creating:**
   - The agent uses `schedule_run({prompt, cron? | at?, session_id?})`.
     `cron` is a 5-field expression in local time (`*`, lists, ranges,
-    `/step`, `@hourly`/`@daily`/`@weekly`/`@monthly`; when both day fields
-    are restricted, either may match). `at` is RFC 3339,
-    `YYYY-MM-DD HH:MM` or `in 30m|2h|1d`.
+    `/step`; month/weekday fields also accept case-insensitive three-letter
+    names such as `JAN-MAR` and `MON,WED,FRI`, including in ranges/lists/steps;
+    Sunday is `SUN`, 0 or 7). Aliases are `@hourly`, `@daily`/`@midnight`,
+    `@weekly`, `@monthly`, and `@yearly`/`@annually` (January 1 at midnight).
+    When both day fields are restricted, either may match. Invalid field
+    values and range endpoints identify their field in both entry points.
+    `at` is RFC 3339, `YYYY-MM-DD HH:MM` or `in 30m|2h|1d`.
   - The user uses `AddJob` or `formless jobs add PROMPT --every … |
     --cron … | --at …`. A user's schedule may be plain English: "every
     weekday at 9am", "every 2 hours", "every 15 minutes", "daily at
     18:30", "hourly", "every monday and friday at noon", "every weekend
-    at 8pm"; it is stored as cron. `PreviewSchedule {schedule}` returns
-    the cron and the next 3 runs, which `jobs add` prints to confirm.
+    at 8pm", "yearly"/"annually"/"every year at 9am" (January 1).
+    Clock suffixes accept `am`/`pm`, `a.m.`/`p.m.` and `am.`/`pm.`,
+    case-insensitively; a dotted minute separator such as `9.30am` remains
+    unsupported. Natural schedules are stored as cron.
+    `PreviewSchedule {schedule}` returns the cron and the next 3 runs,
+    which `jobs add` prints to confirm.
   - Both entry points require a nonblank prompt and a one-shot time strictly
     after now. Relative offsets use checked arithmetic and may be at most
     366 days; zero, past and overflowing times return errors without saving
     a job. Explicit immediate firing uses `RunJobNow` / `jobs run ID`.
+  - A pinned `session_id` must name an existing, non-deleted Session. The
+    agent may use `current`; that resolves to its current Session and is
+    validated again when the job is saved after any approval wait.
 - **Trust:** one-shot jobs from the agent are scheduled at once.
   Recurring ones need the user's approval: asked immediately, or, with
   nobody connected, saved as "awaiting approval" until the user enables
@@ -3487,10 +3518,21 @@ refresh a cache, nightly cleanup.
   approval wait when choosing its first slot.
 - **Running:** the daemon checks every 20 s. A due job sends its prompt to
   its Session (queued if that Session is busy), or to a new Session named
-  `Job: …`. A one-shot job then ends; a recurring one moves to its next
+  `Job: …` only when no target was pinned. A deleted/missing pinned target
+  pauses the job, preserves its due slot and target, and records a failed
+  history row, `job.target_missing` audit and client note; firing it again
+  never silently creates a replacement Session. A one-shot job then ends
+  after successful prompt delivery; a recurring one moves to its next
   match after now. Firings missed while the daemon was down or the
   machine slept run once, and its history says "ran late, N firings
-  coalesced". Everything is audit-logged and broadcasts `JobsChanged`.
+  coalesced". An invalid stored cron or an uncomputable next occurrence
+  pauses before prompt delivery with an explicit `paused:` last status,
+  failed history row, `job.reschedule_failed` audit and client note. A prompt
+  delivery error similarly pauses with `job.delivery_failed`, retaining the
+  original due slot even for a one-shot; it is not recorded as completed.
+  Repair the cause, then explicitly run it or re-enable a recurring job.
+  Run completion updates history but cannot erase a paused scheduler error.
+  Everything is audit-logged and broadcasts `JobsChanged`.
 - **Overlap:** each job has `overlap`: `skip` (default) skips a firing
   while the previous one is still queued or running; `queue` queues it.
   Either way a Session never holds more than 5 queued messages: further
@@ -3503,7 +3545,8 @@ refresh a cache, nightly cleanup.
   Run doesn't complete posts a note to every client.
 - **Run now:** `RunJobNow {id}` (`formless jobs run ID`, `/jobs run ID`,
   web "Run now") fires a job at once under the same overlap rules; its
-  schedule is unchanged.
+  schedule is unchanged. A successful manual retry records its outcome in
+  history; it does not resume a paused schedule or clear its pause reason.
 - **Delivery:** `deliver` (`AddJob`, `SetJobOptions`; `jobs add --notify
   --to-file PATH --webhook URL`) sends the answer when the firing's Run
   ends: a desktop notification, a Markdown entry appended to a file,
@@ -3609,7 +3652,12 @@ run_tool = "network_policy"     # a registry Tool, or…
   at most four bounded GETs (350ms each, 1MiB body cap), without credentials,
   proxies, redirects, model loads or downloads. The offer arrives only while
   the untouched provider picker remains current, and selection keeps the
-  detected address, including IPv6. Empty Ollama offers say to run
+  detected address, including IPv6. All detected servers remain available;
+  when several answer, the status names each with its model count and each
+  matching preset row is marked found. The initial highlight prefers an
+  endpoint with models, while choosing another detected preset uses its own
+  discovered address. Wrapped status text is included in the picker layout.
+  Empty Ollama offers say to run
   `ollama pull MODEL`; other empty model APIs say to load a model first.
   `OLLAMA_HOST` selects Ollama's local discovery address/port/path instead of
   the default Ollama candidates. Schemeless addresses default to 11434;
@@ -3719,7 +3767,14 @@ run_tool = "network_policy"     # a registry Tool, or…
   `;` splits statements except inside quotes, brackets, `|edge labels|`
   and the text after a `:`; a subgraph's `direction` stays inside it;
   note bodies are never states; participants may contain hyphens; a
-  labelled self-loop shows `↺ label`.
+  labelled self-loop shows `↺ label`. Leading YAML frontmatter is removed
+  before parsing any supported diagram; its root scalar or literal/folded
+  block title is a heading (frontmatter takes precedence over an inline pie
+  or sequence title). Configuration/style metadata, tags and aliases are not
+  evaluated by the native renderer. Unclosed frontmatter and overwide titles
+  fall back to source. Decoded title controls are shown as visible escapes
+  before width measurement. Sequence participant `box` groups close silently;
+  nested loop/alt/opt/par/critical/break/rect blocks retain their own dividers.
 - **Wide Mermaid diagrams (TUI).** A diagram wider than the chat shows a
   cut-down preview of its first 12 rows with the hint `/pager diagram N ·
   /open diagram N` (N is the block's `[N]` label). `/pager diagram [N]`
@@ -3782,7 +3837,15 @@ run_tool = "network_policy"     # a registry Tool, or…
   Supported Normal commands: h/j/k/l, w/b/e and W/B/E, 0/$, gg/G; d/c/y with
   those motions, dd/cc/yy, iw/aw/iW/aW, single/double/backtick quotes and nested
   ()/[]/{}/<> objects; i/a/I/A/o/O, x, p/P and dot repeat. Word/character and
-  operator counts are bounded to 999. Yank stays in an internal register;
+  operator counts are bounded to 999. Counts also apply to i/a/I/A/o/O,
+  p/P and dot: insert edits repeat on Esc (open-line commands also repeat
+  their new lines), puts repeat the register, and an explicit dot count
+  replaces the prior change's count. Counted changes insert replacement text
+  once after changing their counted range. Linewise deletes reaching the
+  final line remove its preceding separator, leave the cursor on the first
+  nonblank of the new last line, and retain only the deleted line text in
+  the linewise yank register. Change and yank ranges keep their separators.
+  Yank stays in an internal register;
   no OS clipboard is read or written. Dot repeats the last editing command
   and its unmodified Insert keys/paste; movement and yanks do not replace it.
   Readline control shortcuts in Insert break the current repeat group.
@@ -3831,7 +3894,9 @@ run_tool = "network_policy"     # a registry Tool, or…
   search snippets and web search highlights match on folded text that
   keeps each character's original position: case folding never shifts a
   highlight (`İstanbul`), and NFC and NFD spellings match each other
-  (macOS file names are NFD). Fuzzy match positions count original
+  (macOS file names are NFD). Native fuzzy matching, snippets and TUI Find
+  also equate German `ß`/`ẞ` with `ss`, preserving each source glyph once
+  in highlights. Query and candidate use the same folding. Fuzzy match positions count original
   Unicode characters, including when a match follows `İ`, rather than
   indices into a lowercased copy. In the web client each message paragraph
   takes its direction from its own text, so Arabic and Hebrew answers are
@@ -4079,6 +4144,12 @@ run_tool = "network_policy"     # a registry Tool, or…
   "ข่าวเทคโนโลยีสัปดาห์นี้"; "このリポジトリのビルドが失敗する原因を…" →
   "ビルド失敗の原因を調べる"; mixed "ช่วย debug โค้ด Rust ตัวนี้…" →
   "Debug Rust Code".
+- **Title cleanup.** Model and fallback heuristic titles strip balanced
+  quote/backtick/emphasis wrappers and a leading Markdown heading marker only
+  when followed by whitespace. Unpaired punctuation is retained: `C#`,
+  `#1234`, an inline code span at the end, and `'til` remain ordinary text.
+  Existing first-line, word/grapheme budgets and trailing sentence-punctuation
+  cleanup still apply.
 - **Attached clients.** `Subscribe` takes a `client` label ("TUI",
   "TUI (plain)", "web", "web (relay)", "CLI") and replies with the
   connection's id, `{subscribed, conn}`. Whenever the clients showing a
@@ -4485,7 +4556,12 @@ undo, redo and replacements invalidate prior asynchronous editor previews.
   most 64 KiB, combined template bytes 1 MiB, and diagnostics at most 64.
   Expansion is a single literal pass: `$ARGUMENTS` preserves the text after the
   invocation's first separator; `$1` through `$9` select Unicode-whitespace
-  separated positions. Quotes, environment variables, shell syntax, backticks
+  separated positions. `$$` emits one literal `$`, so `$$1`, `$$5` and
+  `$$9.99` preserve shell examples or prices. Escaped dollars and inserted
+  arguments are not re-expanded. Missing referenced positions stop expansion
+  before send with the template filename, position and `$$N` escape guidance;
+  they never silently become empty strings. `$0` and multi-digit `$10`/`$100`
+  remain literal text. Quotes, environment variables, shell syntax, backticks
   and substituted text are never evaluated or recursively expanded. Arguments
   are bounded to 64 KiB and expanded text to 1 MiB. `@path` remains ordinary
   text until the existing attachment intake and protected-path checks on send.
@@ -4789,6 +4865,13 @@ topic errors need no profile/config or daemon.
 
 ## 12. CLI
 
+Release metadata fetched by `formless update` has a 5-second connect and
+15-second total deadline, including the response body. Installer curl attempts
+have a 10-second connect and 120-second total transfer deadline, retaining
+three transient-error retries. Timeout errors suggest retrying, pinning
+`FORMLESS_VERSION` for the installer lookup, or a trusted installer mirror;
+failed metadata bodies are never treated as successful release lookups.
+
 The macOS/Linux installer reports the next commands (`formless` for setup,
 `formless doctor` for verification) and the need for a provider API key or a
 local model endpoint. After either a source or prebuilt install, it checks
@@ -4881,7 +4964,12 @@ previous headless Run's Session.
   dim header, secondary fields dimmed, status in colour, and the widest
   column cut with "…" to fit the terminal. Colour and fitting happen only
   when stdout is a terminal, and `NO_COLOR` turns colour off. Piped output
-  is plain aligned text.
+  is plain aligned text. Headers and cells collapse whitespace to one space
+  before width measurement; other C0/C1 controls and bidi direction marks/overrides/
+  isolates are shown as Unicode escapes in both terminal and piped tables.
+  A cell cannot add rows or terminal styles; the renderer's own colour styles
+  are applied afterward. Printable Unicode (including emoji joiners) is retained.
+  Structured `--json` values are unchanged by table formatting.
 - Every CLI `list`/`status` subcommand takes `--json` and prints one JSON
   value (the daemon's data) instead of a table: `providers`, `roles`,
   `jobs`, `memory`, `mcp`, `skills`, `tools`, `prompts` and `sessions list`,
@@ -4927,7 +5015,10 @@ previous headless Run's Session.
   the daemon is running, and the problems (with next steps and whether
   they're fixable).
 - `formless bug-report [-o FILE]` writes a Markdown file with versions, OS,
-  that JSON, and the last 200 daemon log lines, for attaching to an issue.
+  that JSON, and the last 200 daemon log lines across live and numeric
+  rotations, for attaching to an issue. The log tail reads at most 1 MiB;
+  the leading boundary line is conservatively omitted and a notice explains
+  byte-budget or line truncation.
 - Both are redacted: bearer tokens, `key`/`token`/`secret`/`password`
   values, `#k=`/`#local=` fragments, URL credentials, `sk-`/`ghp_`-style
   keys, long opaque tokens, and the home path (shown as `~`). The file says
@@ -4936,7 +5027,13 @@ previous headless Run's Session.
   daemon log: rotated files oldest first, then `daemon.log`. Entries are
   grouped (continuation lines stay with their entry), filtered by level
   (that level and worse) and age, and show the last `-n` (0 = all). `-f`
-  keeps printing appended entries and follows rotation. The daemon logs
+  keeps printing appended entries and follows rotation. Numeric rotations
+  are discovered from the directory (including old suffixes above 64),
+  rather than a fixed filename range. Bounded tails read newest first until
+  enough matching entries are found; `-n 0` streams all history oldest first.
+  Lines and grouped entries are capped at 64 KiB with visible truncation
+  notices; damaged UTF-8 is replaced rather than dropping an entire file.
+  Read failures are reported instead of silently hiding history. The daemon logs
   `info` and above by default (other commands only errors), `RUST_LOG`
   overrides it, and colour codes are only used on a terminal, never in the
   file.
@@ -4960,7 +5057,8 @@ previous headless Run's Session.
   the TUI and web: `list [--archived] [--json]`, `show ID [--json]`, `rename
   ID NAME`, `rm ID` (restorable for `daemon.delete_undo_secs`; it prints the
   restore command), `restore ID`, `archive`/`unarchive ID`, `export ID
-  [--format json|md|html] [-o FILE]`, `import FILE`, and `search QUERY
+  [--format json|markdown|html] [-o FILE]` (`md` aliases `markdown`),
+  `import FILE`, and `search QUERY
   [--limit N] [--json]`. IDs may be a unique prefix (`restore` needs the
   full id).
 - `formless run "task"` — headless Run (§5 semantics) in an ephemeral
@@ -5425,7 +5523,7 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
 | `daemon.idle_grace_secs` | 60 | Idle-close grace after last Run + last client (§9.1) |
 | `daemon.stall_warning_secs` | 300 | Silence before `possibly stalled` flag (§6.1) |
 | `daemon.start_timeout_secs` | 60 | How long a client waits for an auto-started daemon (it fails early, with the log's last lines, if the daemon exits) |
-| `daemon.log_max_bytes` / `log_keep` | 10 MB / 5 | Daemon log rotation (§9.4) |
+| `daemon.log_max_bytes` / `log_keep` | 10 MB / 5 | Size-triggered rotation; `log_keep` is 0–64. Each retention check removes numeric rotations above the current keep count, including all rotations at 0; leading-zero aliases share one slot (canonical regular file wins, otherwise the shortest alias is normalized before duplicates are removed). Alias promotion refuses occupied/non-regular canonical destinations and preserves aliases on failure; max bytes 0 disables live-file rotation (§9.4) |
 | `daemon.keep_alive_for_jobs` | false | Stay up while scheduled jobs wait (§9.7) |
 | `daemon.delete_undo_secs` | 30 | Undo window for Session deletes (§5.1) |
 | `daemon.backups_keep` | 7 | Daily database backups kept in `<data>/backups` (`formless backup` / `restore`); 0 = no automatic backups (§9.6) |
@@ -5930,6 +6028,14 @@ without an approver fails closed.
 
 ## 19. Testing strategy (summary)
 
+The local Node relay adapter contains HTTP and Upgrade handler failures within
+that request/socket. Malformed asset path escapes return 400; malformed mock
+provider JSON returns an OpenAI-shaped 400 error. Unexpected HTTP failures
+return a generic 500 before headers, or close the response after streaming
+starts. Upgrade failures close only their socket. These dev-only boundaries
+do not change Worker claim checks, transport/room rules or mock script behavior.
+Loopback regressions verify subsequent health and valid requests still work.
+
 Test waits for daemon subscriptions and pipe creation have a ten-second
 absolute timeout with a diagnostic naming the missing event. Test-running
 CI jobs have an explicit job timeout. The Windows transport gate parses a
@@ -5977,6 +6083,11 @@ configuration interface): `FORMLESS_DOCS_OPENER_FIXTURE`,
 `FORMLESS_TEST_MAINTENANCE_ISOLATION`, `FORMLESS_TEST_MAINTENANCE_OPERATION`,
 `FORMLESS_TEST_OWNERSHIP_CONFIG`, `FORMLESS_TEST_OWNERSHIP_DATA`,
 `FORMLESS_TEST_PANIC_MARKER`.
+
+`FORMLESS_EXPORT_DESCRIPTOR_FIXTURE` is a Linux-only export test hook pointing
+to an owned redirected-stdout alias; it verifies that descriptor output preserves
+the underlying file instead of atomically replacing the alias. The shipped
+binary does not read this variable.
 
 ### Local pre-Run forecasts (§5.2, §10.6, §12)
 

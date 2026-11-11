@@ -111,26 +111,27 @@ impl Snapshot {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ExpansionError(&'static str);
+pub struct ExpansionError(String);
 impl std::fmt::Display for ExpansionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.0)
+        f.write_str(&self.0)
     }
 }
 impl std::error::Error for ExpansionError {}
 impl UserCommand {
     /// Literal single pass. Positions 1..9 split on Unicode whitespace; all
     /// arguments preserve their original spelling/whitespace in $ARGUMENTS.
+    /// `$$` emits a literal dollar; missing positions are errors before send.
     /// No quote, environment, shell, backtick or recursive template evaluation.
     pub fn expand(&self, arguments: &str) -> Result<String, ExpansionError> {
         if arguments.len() > MAX_ARGUMENT_BYTES {
-            return Err(ExpansionError("Command arguments exceed 64 KiB"));
+            return Err(ExpansionError("Command arguments exceed 64 KiB".into()));
         }
         let positions: Vec<&str> = arguments.split_whitespace().take(9).collect();
         let mut output = String::new();
         let push = |output: &mut String, text: &str| -> Result<(), ExpansionError> {
             if text.len() > MAX_EXPANDED_BYTES.saturating_sub(output.len()) {
-                return Err(ExpansionError("Expanded command exceeds 1 MiB"));
+                return Err(ExpansionError("Expanded command exceeds 1 MiB".into()));
             }
             output.push_str(text);
             Ok(())
@@ -139,17 +140,21 @@ impl UserCommand {
         while let Some(index) = rest.find('$') {
             push(&mut output, &rest[..index])?;
             rest = &rest[index..];
-            if let Some(tail) = rest.strip_prefix("$ARGUMENTS") {
+            if let Some(tail) = rest.strip_prefix("$$") {
+                push(&mut output, "$")?;
+                rest = tail;
+            } else if let Some(tail) = rest.strip_prefix("$ARGUMENTS") {
                 push(&mut output, arguments)?;
                 rest = tail;
             } else if rest.as_bytes().get(1).is_some_and(u8::is_ascii_digit) {
                 let digits = rest[1..].bytes().take_while(u8::is_ascii_digit).count();
                 if digits == 1 && rest.as_bytes()[1] != b'0' {
                     let position = (rest.as_bytes()[1] - b'1') as usize;
-                    push(
-                        &mut output,
-                        positions.get(position).copied().unwrap_or_default(),
-                    )?;
+                    let value = positions.get(position).ok_or_else(|| ExpansionError(format!(
+                        "{} references ${}, but only {} argument(s) were supplied; provide at least {} or write $${} for a literal ${}",
+                        self.path.display(), position + 1, positions.len(), position + 1, position + 1, position + 1,
+                    )))?;
+                    push(&mut output, value)?;
                 } else {
                     push(&mut output, &rest[..1 + digits])?;
                 }
@@ -860,17 +865,66 @@ mod tests {
     #[test]
     fn literal_expansion_is_one_pass_preserves_mentions_and_never_executes() {
         let template = command(
-            "$ARGUMENTS|$1|$2|$9|$10|$0|$HOME|$(touch never)|`touch never`|@notes.md|/quit",
+            "$ARGUMENTS|$1|$2|$3|$10|$0|$HOME|$(touch never)|`touch never`|@notes.md|/quit",
         );
         let expanded = template.expand("$2  @private.txt\n$ARGUMENTS").unwrap();
-        assert_eq!(expanded,"$2  @private.txt\n$ARGUMENTS|$2|@private.txt||$10|$0|$HOME|$(touch never)|`touch never`|@notes.md|/quit");
+        assert_eq!(expanded,"$2  @private.txt\n$ARGUMENTS|$2|@private.txt|$ARGUMENTS|$10|$0|$HOME|$(touch never)|`touch never`|@notes.md|/quit");
         assert_eq!(command("é-$1-$ARGUMENTS").expand("雪").unwrap(), "é-雪-雪");
-        assert_eq!(command("$1/$2").expand("").unwrap(), "/");
+        assert!(command("$1/$2")
+            .expand("")
+            .unwrap_err()
+            .to_string()
+            .contains("references $1"));
         assert_eq!(
             command("$1 $2 $3").expand("'two words' x").unwrap(),
             "'two words' x"
         );
     }
+    #[test]
+    fn dollar_escapes_preserve_prices_code_and_single_pass_substitution() {
+        for (body, expected) in [
+            ("Keep it under $$5 per run", "Keep it under $5 per run"),
+            ("Our plan costs $$9.99", "Our plan costs $9.99"),
+            ("Explain `echo $$1`", "Explain `echo $1`"),
+            ("$$ARGUMENTS", "$ARGUMENTS"),
+            ("$$$$ / $0 / $10 / $100", "$$ / $0 / $10 / $100"),
+            ("trailing $", "trailing $"),
+        ] {
+            assert_eq!(command(body).expand("").unwrap(), expected);
+        }
+        assert_eq!(command("$$$1|$ARGUMENTS").expand("$2").unwrap(), "$$2|$2");
+        assert_eq!(
+            command("$1/$2/$3/$4/$5/$6/$7/$8/$9")
+                .expand("a b c d e f g h i")
+                .unwrap(),
+            "a/b/c/d/e/f/g/h/i"
+        );
+    }
+
+    #[test]
+    fn missing_positions_are_named_actionable_errors_without_partial_output() {
+        for (body, args, position, count) in [
+            ("Keep it under $5 per run", "", 5, 0),
+            ("Our plan costs $9.99", "", 9, 0),
+            ("Explain `echo $1`", "", 1, 0),
+            ("first $1 then $2", "private-argument", 2, 1),
+            ("$9", "a b c d e f g h", 9, 8),
+        ] {
+            let error = command(body).expand(args).unwrap_err().to_string();
+            assert!(
+                error.contains("test.md")
+                    && error.contains(&format!("references ${position}"))
+                    && error.contains(&format!("only {count} argument(s)")),
+                "{error}"
+            );
+            assert!(error.contains(&format!("write $${position}")), "{error}");
+            assert!(
+                !error.contains("private-argument"),
+                "argument contents do not enter diagnostics"
+            );
+        }
+    }
+
     #[test]
     fn expansion_bounds_arguments_and_repeated_insertions_before_allocation_growth() {
         assert!(command("$ARGUMENTS")
@@ -1065,9 +1119,31 @@ mod tests {
         let alias = fixture.0.join("trusted-config-alias");
         symlink(fixture.config(), &alias).unwrap();
         let bad = std::ffi::OsStr::from_bytes(b"bad\xff.md");
-        std::fs::write(fixture.config().join("commands").join(bad), b"Body").unwrap();
+        let bad_path = fixture.config().join("commands").join(bad);
+        let created = match std::fs::write(&bad_path, b"Body") {
+            Ok(()) => true,
+            // APFS rejects invalid UTF-8 names. Still exercise diagnostic
+            // serialization below without requiring an impossible directory entry.
+            Err(error)
+                if cfg!(target_os = "macos") && error.raw_os_error() == Some(libc::EILSEQ) =>
+            {
+                false
+            }
+            Err(error) => panic!("create malformed-name fixture: {error}"),
+        };
         let snapshot = load(&alias, None, &[]);
         assert!(snapshot.find("review").is_some());
+        assert_eq!(snapshot.diagnostics.len(), usize::from(created));
+        if created {
+            assert_eq!(
+                snapshot.diagnostics[0].message,
+                "Command filename is not UTF-8"
+            );
+        }
+        let mut snapshot = snapshot;
+        if !created {
+            snapshot.diagnostic(&bad_path, "Command filename is not UTF-8");
+        }
         assert_eq!(snapshot.diagnostics.len(), 1);
         assert!(serde_json::to_string(&snapshot.projection()).is_ok());
     }

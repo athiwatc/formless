@@ -215,7 +215,7 @@ Prebuilt binaries need none of the toolchain requirements. On Linux a Secret Ser
 
 ### 3.2 Install
 
-**Prebuilt binary (macOS, Linux).** The installer resolves the latest GitHub release for your platform, downloads it, verifies the `.sha256` (with `sha256sum` or `shasum`) and puts `formless` in `$PREFIX/bin` (default `~/.local`). It checks that `$PREFIX/bin` is writable before downloading, and replaces the binary atomically (a temp file renamed into place), so an interrupted or failed install leaves the previous version working:
+**Prebuilt binary (macOS, Linux).** The installer resolves the latest GitHub release for your platform, downloads it, verifies the `.sha256` (with `sha256sum` or `shasum`) and puts `formless` in `$PREFIX/bin` (default `~/.local`). Each installer curl attempt has a 10-second connection and 120-second transfer limit, with three retries for transient errors; a timed-out lookup suggests pinning `FORMLESS_VERSION` or using a trusted mirror (`FORMLESS_LATEST_URL` / `FORMLESS_RELEASES_URL`). It checks that `$PREFIX/bin` is writable before downloading, and replaces the binary atomically (a temp file renamed into place), so an interrupted or failed install leaves the previous version working:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/athiwatc/formless/main/scripts/install.sh | sh
@@ -304,6 +304,12 @@ description: Review the proposed change
 ---
 Review $ARGUMENTS. Focus first on $1, and include @notes/review-checklist.md.
 ```
+
+Invoke `/workflow src/parser.rs` to supply its first argument. Use `$$` for a
+literal dollar: `$$5 per run`, `$$9.99`, and `echo $$1` become `$5 per run`,
+`$9.99`, and `echo $1`. A referenced `$1`–`$9` without enough arguments stops
+expansion with the filename, missing position and escape guidance before send;
+the message is not sent with text silently removed.
 
 New files and edits appear without restarting the TUI or plain client. `/help` lists them under
 **Yours**; project files override global files with the same name. Builtin
@@ -403,10 +409,26 @@ formless sessions list                     # --archived, --json
 formless sessions show 3f9c                # the transcript (--json for scripts)
 formless sessions search "invoice"         # across every Session
 formless sessions rename 3f9c "Q3 report"
-formless sessions export 3f9c --format md -o q3.md
+formless sessions export 3f9c -o q3.md       # infer Markdown from the filename
 formless sessions import bundle.json
 formless sessions rm 3f9c                  # restorable for a short while: sessions restore <id>
 ```
+
+`--format` accepts `json`, `markdown` (alias `md`), or `html`. When omitted,
+`.md`/`.markdown`, `.html`/`.htm`, and `.json` output extensions select their
+matching format, ignoring extension case. Standard output and other extensions
+still default to JSON. An explicit format conflicting with a recognized output
+extension is a usage error before any Session lookup or daemon connection.
+On Unix, ordinary file output uses atomic replacement with existing mode bits
+applied before staging content; failed pre-commit writes leave the prior export
+intact. This does not claim extended ACL or xattr preservation.
+The Windows implementation uses verified user-private staging and preserves an
+existing file's DACL through replacement, without ignoring ACL merge failures.
+It remains pending native Windows acceptance. If an OS replacement failure
+retains private recovery files, the error identifies their directory for
+inspection before retrying; no destructive replacement fallback is used.
+Existing symbolic links keep writing through to their targets,
+and descriptor/device streams retain their existing direct-write behavior.
 
 ### Reporting a bug
 
@@ -654,7 +676,7 @@ formless help sessions show
 
 ### 3.12 Updating
 
-`formless update` lists every GitHub release newer than the running binary, oldest first, with its release notes, then prints the command that upgrades it the way it was installed (`brew upgrade formless`, `cargo install … --force`, or the install script). `formless update --check` (or `update check`) stops after the report. Neither downloads or replaces anything. Re-run `scripts/install.sh` (it fetches the latest release, or `FORMLESS_VERSION`, and verifies the checksum), or rebuild from source. Your data dir and Tools are untouched by an update — config is migrated automatically, with a backup taken first ([§4](#4-data-config-and-profiles)).
+`formless update` bounds its release lookup to 15 seconds overall (5 seconds to connect), including the response body, and reports an actionable timeout error. It lists every GitHub release newer than the running binary, oldest first, with its release notes, then prints the command that upgrades it the way it was installed (`brew upgrade formless`, `cargo install … --force`, or the install script). `formless update --check` (or `update check`) stops after the report. Neither downloads or replaces anything. Re-run `scripts/install.sh` (it fetches the latest release, or `FORMLESS_VERSION`, and verifies the checksum), or rebuild from source. Your data dir and Tools are untouched by an update — config is migrated automatically, with a backup taken first ([§4](#4-data-config-and-profiles)).
 
 ---
 
@@ -723,7 +745,7 @@ Everything else — the web, the filesystem, the shell, git, file formats, domai
 | `read_mcp_resource` | `server`, `uri` | Reads one of them; large contents become an artifact. |
 | `load_skill` | `name` | Loads an enabled [skill's](#skills) `SKILL.md` instructions before doing the kind of task it covers. |
 | `read_skill_file` | `name`, `path` | Reads one of that skill's extra files — reference docs, templates. |
-| `schedule_run` | `prompt`, `at` or `cron`, `session_id?` | Runs a prompt later or on a schedule (five-field cron, local time); recurring jobs need the user's approval. |
+| `schedule_run` | `prompt`, `at` or `cron`, `session_id?` | Runs a prompt later or on a schedule (five-field cron with month/weekday names or `@yearly`, local time); recurring jobs need the user's approval. |
 
 Built-ins lead every Session's Tool list, in a fixed order, and are never unloaded by `unload_tools`.
 
@@ -859,12 +881,22 @@ formless skills export pdf -o pdf.skill.json   # files only, no metrics
 formless skills import pdf.skill.json          # imported disabled, contents printed
 ```
 
-The agent remembers stable preferences you state ("use pnpm", "answer in Thai") as short notes that go into new sessions. You see every one, and you can edit them:
+The agent remembers stable preferences you state ("use pnpm", "answer in Thai") as short notes. You see every one, and you can edit them.
+
+A note's scope is `global` (the default) or `project:/absolute/path`. The memory
+prompt lists global notes followed by project notes grouped under `When working in <path>:`. A newly added note applies from the next Session, or in the current
+Session after compaction.
+
+Manage notes with the commands below, in the TUI with `/memory` (see the
+[key reference](docs/keys.md#integrations)), or on the web under **Settings → Memory**.
+See [User memory](SPEC.md#711-user-memory) for details.
 
 ```bash
 formless memory list
 formless memory add "Projects live in ~/code"
+formless memory add "Use pnpm" --scope project:/absolute/project/path
 formless memory edit m1a2b3c4 --disable
+formless memory edit m1a2b3c4 --scope project:/absolute/project/path
 formless memory rm m1a2b3c4
 ```
 

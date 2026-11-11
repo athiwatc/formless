@@ -136,12 +136,25 @@ case "${FORMLESS_TARGET:-$os/$arch}" in
 esac
 
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
-fetch() { curl -fsSL --retry 3 --retry-delay 2 "$1" -o "$2"; }
+# Each attempt bounds connection establishment and the complete transfer,
+# including redirects/body reads. Three retries retain transient-error recovery.
+fetch() {
+  if curl -fsSL --connect-timeout 10 --max-time 120 --retry 3 --retry-delay 2 "$1" -o "$2"; then
+    return 0
+  else
+    fetch_status=$?
+  fi
+  [ "$fetch_status" -ne 28 ] || die "download timed out; retry or set FORMLESS_RELEASES_URL to a trusted release mirror"
+  return "$fetch_status"
+}
 
 if [ -z "$version" ]; then
   # Keep curl's status: a rate-limited API (403) says so instead of
   # becoming "no release".
-  code="$(curl -sSL --retry 3 --retry-delay 2 -o "$tmp/latest.json" -w '%{http_code}' "$LATEST_API" 2>"$tmp/curl.err" || true)"
+  lookup_status=0
+  code="$(curl -sSL --connect-timeout 10 --max-time 120 --retry 3 --retry-delay 2 -o "$tmp/latest.json" -w '%{http_code}' "$LATEST_API" 2>"$tmp/curl.err")" || lookup_status=$?
+  [ "$lookup_status" -ne 28 ] || die "release lookup timed out; retry, pin FORMLESS_VERSION, or set FORMLESS_LATEST_URL to a trusted mirror"
+  [ "$lookup_status" -eq 0 ] || die "could not reach $LATEST_API: $(cat "$tmp/curl.err")"
   case "$code" in
     200) ;;
     403 | 429) die "GitHub refused the release lookup (HTTP $code, probably the unauthenticated rate limit); set FORMLESS_VERSION, e.g. FORMLESS_VERSION=v0.1.0" ;;

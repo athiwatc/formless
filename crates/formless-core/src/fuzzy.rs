@@ -4,17 +4,21 @@
 use unicode_normalization::char::is_combining_mark;
 use unicode_normalization::UnicodeNormalization;
 
-/// `s` folded for matching, one key per base letter, each with the index
-/// of the original char it came from (#789): case folded without
-/// changing length (`İ` is one key, `i`), and decomposed with its marks
-/// dropped, so an NFC `é` typed by the user matches the NFD `e`+U+0301
-/// macOS returns for file names, and `cafe` matches `café`.
+/// Accent-insensitive matching keys tagged with their original char indices.
+/// Lowercase expansions retain every key; German sharp S explicitly matches
+/// `ss` (lowercasing alone does not perform that case-fold expansion). NFC/NFD
+/// spellings share keys, without shifting highlights into a folded copy.
 pub fn fold(s: &str) -> Vec<(usize, char)> {
     let mut out = Vec::with_capacity(s.len());
     for (i, ch) in s.chars().enumerate() {
         for base in std::iter::once(ch).nfd().filter(|c| !is_combining_mark(*c)) {
-            let lower = base.to_lowercase().next().unwrap_or(base);
-            out.push((i, lower));
+            for lower in base.to_lowercase() {
+                if lower == 'ß' {
+                    out.extend([(i, 's'), (i, 's')]);
+                } else {
+                    out.push((i, lower));
+                }
+            }
         }
     }
     out
@@ -27,10 +31,30 @@ pub fn find_folded(s: &str, needle: &str) -> Option<std::ops::Range<usize>> {
     if n.is_empty() {
         return None;
     }
-    let at = hay
+    let window = hay
         .windows(n.len())
-        .position(|w| w.iter().map(|(_, c)| *c).eq(n.iter().copied()))?;
-    Some(hay[at].0..hay[at + n.len() - 1].0 + 1)
+        .find(|w| w.iter().map(|(_, c)| *c).eq(n.iter().copied()))?;
+    Some(window[0].0..window[n.len() - 1].0 + 1)
+}
+
+/// Non-overlapping matches, as original character ranges. A folded expansion
+/// can match once per source glyph, never twice inside a single `ß`.
+pub fn folded_match_ranges(s: &str, needle: &str) -> Vec<std::ops::Range<usize>> {
+    let hay = fold(s);
+    let n: Vec<char> = fold(needle).into_iter().map(|(_, c)| c).collect();
+    if n.is_empty() {
+        return Vec::new();
+    }
+    let mut ranges = Vec::new();
+    let mut end = 0;
+    for window in hay.windows(n.len()) {
+        if window[0].0 >= end && window.iter().map(|(_, c)| *c).eq(n.iter().copied()) {
+            let range = window[0].0..window[n.len() - 1].0 + 1;
+            end = range.end;
+            ranges.push(range);
+        }
+    }
+    ranges
 }
 
 /// Score `candidate` against `query` as a case-insensitive subsequence;
@@ -99,6 +123,33 @@ fn match_from(q: &[char], c: &[char], start: usize) -> Option<(i64, Vec<usize>)>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sharp_s_matching_preserves_original_glyphs() {
+        for spelling in ["straße", "STRAẞE", "strasse"] {
+            for query in ["straße", "STRAẞE", "strasse"] {
+                let (_, positions) = fuzzy_match(query, spelling).unwrap();
+                assert_eq!(positions, (0..spelling.chars().count()).collect::<Vec<_>>());
+                assert_eq!(
+                    find_folded(&format!("see {spelling}!"), query),
+                    Some(4..4 + spelling.chars().count())
+                );
+            }
+        }
+        assert_eq!(fold("ßẞ"), vec![(0, 's'), (0, 's'), (1, 's'), (1, 's')]);
+        assert_eq!(fuzzy_match("rs", "straße.rs").unwrap().1, vec![7, 8]);
+        assert_eq!(
+            folded_match_ranges("ß ss ẞ", "s"),
+            vec![0..1, 2..3, 3..4, 5..6]
+        );
+        assert_eq!(folded_match_ranges("ßß", "sss"), vec![0..2]);
+        assert!(folded_match_ranges("abc", "").is_empty());
+        assert!(folded_match_ranges("abc", "xyz").is_empty());
+        assert_eq!(
+            folded_match_ranges("café cafe\u{301} İ", "CAFE"),
+            vec![0..4, 5..9]
+        );
+    }
 
     #[test]
     fn subsequence_matching() {

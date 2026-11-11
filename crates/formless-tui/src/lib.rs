@@ -753,7 +753,7 @@ struct Wizard {
     reveal_until: Option<Instant>,
     generation: u64,
     local_pending: bool,
-    local_offer: Option<formless_core::local_servers::LocalServer>,
+    local_offers: Vec<formless_core::local_servers::LocalServer>,
     /// Endpoint under which the current key/model were entered.
     credential_endpoint: String,
     /// Only an explicitly re-opened setup can return to an existing Session.
@@ -820,7 +820,7 @@ impl Wizard {
             reveal_until: None,
             generation: 0,
             local_pending: false,
-            local_offer: None,
+            local_offers: Vec::new(),
             credential_endpoint: cfg.provider.base_url.trim().to_string(),
             can_cancel: false,
             confirm_key_change: false,
@@ -1086,6 +1086,16 @@ impl Wizard {
         });
     }
 
+    fn local_offer_for(
+        &self,
+        preset_id: &str,
+    ) -> Option<&formless_core::local_servers::LocalServer> {
+        self.local_offers
+            .iter()
+            .filter(|offer| offer.preset_id == preset_id)
+            .min_by_key(|offer| offer.models == 0)
+    }
+
     /// Apply the highlighted preset (or go to the custom URL step).
     fn choose_preset(&mut self) {
         let Some(p) = formless_core::presets::PRESETS.get(self.preset_idx) else {
@@ -1099,9 +1109,7 @@ impl Wizard {
             return;
         };
         let endpoint = self
-            .local_offer
-            .as_ref()
-            .filter(|offer| offer.preset_id == p.id)
+            .local_offer_for(p.id)
             .map(|offer| offer.base_url.clone())
             .unwrap_or_else(|| p.base_url.to_string());
         if self.preset.map(|old| old.id) != Some(p.id)
@@ -8466,19 +8474,52 @@ impl App {
                         if let Some(hint) = discovery.hint.as_deref() {
                             w.status = hint.to_string();
                         }
-                        if let Some(offer) =
-                            discovery.servers.into_iter().min_by_key(|s| s.models == 0)
+                        w.local_offers = discovery.servers;
+                        if let Some(offer) = w
+                            .local_offers
+                            .iter()
+                            .filter(|offer| {
+                                formless_core::presets::find(offer.preset_id)
+                                    .is_some_and(|p| p.local)
+                            })
+                            .min_by_key(|offer| offer.models == 0)
                         {
                             if let Some(index) = formless_core::presets::PRESETS
                                 .iter()
                                 .position(|p| p.id == offer.preset_id)
                             {
                                 w.preset_idx = index;
-                                w.status = match discovery.hint {
-                                    Some(hint) => format!("{hint} {}", offer.offer()),
-                                    None => offer.offer(),
+                                let offer_text = if w.local_offers.len() == 1 {
+                                    offer.offer()
+                                } else {
+                                    let summary = w
+                                        .local_offers
+                                        .iter()
+                                        .map(|server| {
+                                            let name =
+                                                formless_core::presets::find(server.preset_id)
+                                                    .map_or(server.preset_id, |p| {
+                                                        p.name.trim_end_matches(" (local)")
+                                                    });
+                                            format!(
+                                                "{name} ({} model{})",
+                                                server.models,
+                                                if server.models == 1 { "" } else { "s" }
+                                            )
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join(", ");
+                                    let action = if offer.models == 0 {
+                                        offer.offer()
+                                    } else {
+                                        "Press Enter to use the highlighted provider.".to_string()
+                                    };
+                                    format!("Found {summary}. {action}")
                                 };
-                                w.local_offer = Some(offer);
+                                w.status = match discovery.hint {
+                                    Some(hint) => format!("{hint} {offer_text}"),
+                                    None => offer_text,
+                                };
                             }
                         }
                     }
@@ -11620,37 +11661,27 @@ fn highlight_matches(
     query: &str,
     style: impl Fn(usize) -> Style,
 ) -> (Line<'static>, usize) {
-    let q: Vec<char> = query.chars().flat_map(char::to_lowercase).collect();
-    if q.is_empty() {
+    if formless_core::fuzzy::fold(query).is_empty() {
         return (line, 0);
     }
     let mut found = 0;
     let mut spans = Vec::new();
     for span in line.spans {
         let chars: Vec<char> = span.content.chars().collect();
-        let low: Vec<char> = chars
-            .iter()
-            .map(|c| c.to_lowercase().next().unwrap_or(*c))
-            .collect();
-        let (mut start, mut i) = (0, 0);
-        while i + q.len() <= chars.len() {
-            if low[i..i + q.len()] == q[..] {
-                if i > start {
-                    spans.push(Span::styled(
-                        chars[start..i].iter().collect::<String>(),
-                        span.style,
-                    ));
-                }
+        let mut start = 0;
+        for range in formless_core::fuzzy::folded_match_ranges(&span.content, query) {
+            if range.start > start {
                 spans.push(Span::styled(
-                    chars[i..i + q.len()].iter().collect::<String>(),
-                    style(found),
+                    chars[start..range.start].iter().collect::<String>(),
+                    span.style,
                 ));
-                found += 1;
-                i += q.len();
-                start = i;
-            } else {
-                i += 1;
             }
+            spans.push(Span::styled(
+                chars[range.clone()].iter().collect::<String>(),
+                style(found),
+            ));
+            found += 1;
+            start = range.end;
         }
         if start == 0 {
             spans.push(span);
@@ -15739,14 +15770,11 @@ fn draw_sessions(f: &mut Frame, area: Rect, app: &App) {
     let name_w = (area.width as usize / 3).clamp(10, 40);
     let rows = app.session_rows();
     let visible: Vec<_> = rows.iter().map(|row| row.index).collect();
-    let items: Vec<ListItem> = if app.sessions.is_empty() {
+    let archived = app.sessions.iter().filter(|s| s.archived).count();
+    let filter_active = app.session_filter.active();
+    let items: Vec<ListItem> = if visible.is_empty() {
         vec![ListItem::new(Line::styled(
-            "No sessions yet — press n to start one.",
-            ui::dim(app.color),
-        ))]
-    } else if visible.is_empty() {
-        vec![ListItem::new(Line::styled(
-            "No match — Esc clears the filter.",
+            session_ui::empty_body(app.sessions.len(), archived, filter_active),
             ui::dim(app.color),
         ))]
     } else {
@@ -15824,6 +15852,11 @@ fn draw_sessions(f: &mut Frame, area: Rect, app: &App) {
                         lists::SESSION_SORTS,
                         lists::SESSION_QUICK,
                     );
+                    if let Some(hidden) =
+                        session_ui::archived_hidden_segment(filter_active, archived)
+                    {
+                        t.push_str(&hidden);
+                    }
                     t.push_str(if app.session_filter.tree {
                         " · T tree on "
                     } else {
@@ -18070,9 +18103,18 @@ fn draw_wizard(f: &mut Frame, w: &Wizard, color: bool) {
             ),
         ]),
         Line::raw(""),
-        Line::styled(w.status.clone(), status_style),
-        Line::raw(""),
     ];
+    let status_rows = wrap_rows(
+        &w.status,
+        f.area().width.min(84).saturating_sub(2).max(1) as usize,
+    );
+    let status_extra = status_rows.len().saturating_sub(1);
+    text.extend(
+        status_rows
+            .into_iter()
+            .map(|line| Line::styled(line, status_style)),
+    );
+    text.push(Line::raw(""));
     let mut hint_rows = 0;
     if let Some(hint) = &w.setup_hint {
         let rows = wrap_rows(
@@ -18084,7 +18126,9 @@ fn draw_wizard(f: &mut Frame, w: &Wizard, color: bool) {
         text.push(Line::raw(""));
     }
     let area = f.area();
-    let max_items = (area.height as usize).saturating_sub(12 + hint_rows).max(3);
+    let max_items = (area.height as usize)
+        .saturating_sub(12 + hint_rows + status_extra)
+        .max(3);
     let pick = |items: Vec<String>, idx: usize| -> Vec<Line<'static>> {
         // Long model lists scroll so the selection is always on screen.
         let start = idx
@@ -18121,7 +18165,17 @@ fn draw_wizard(f: &mut Frame, w: &Wizard, color: bool) {
                     let env = formless_core::presets::env_key(p)
                         .map(|(var, _)| format!("  (${var} found)"))
                         .unwrap_or_default();
-                    format!("{}. {}{env}", i + 1, p.name)
+                    let found = w
+                        .local_offer_for(p.id)
+                        .map(|offer| {
+                            format!(
+                                "  (found: {} model{})",
+                                offer.models,
+                                if offer.models == 1 { "" } else { "s" }
+                            )
+                        })
+                        .unwrap_or_default();
+                    format!("{}. {}{env}{found}", i + 1, p.name)
                 })
                 .collect();
             rows.push(format!("{}. Custom URL…", rows.len() + 1));
@@ -22580,6 +22634,37 @@ mod tests {
     }
 
     #[test]
+    fn find_highlights_unicode_with_shared_folding() {
+        let marked = Style::default().add_modifier(Modifier::REVERSED);
+        for query in ["straße", "STRASSE", "STRAẞE"] {
+            let (line, count) =
+                highlight_matches(Line::raw("a straße STRASSE!"), query, |_| marked);
+            assert_eq!(count, 2);
+            assert_eq!(line.to_string(), "a straße STRASSE!");
+            let highlighted: Vec<_> = line
+                .spans
+                .iter()
+                .filter(|s| s.style == marked)
+                .map(|s| s.content.as_ref())
+                .collect();
+            assert_eq!(highlighted, vec!["straße", "STRASSE"]);
+        }
+        let (line, count) = highlight_matches(Line::raw("ßß"), "s", |_| marked);
+        assert_eq!(count, 2);
+        assert_eq!(line.to_string(), "ßß");
+        let (line, count) =
+            highlight_matches(Line::raw("İ cafe\u{301} café"), "CAFE", |_| marked);
+        assert_eq!(count, 2);
+        assert_eq!(line.to_string(), "İ cafe\u{301} café");
+        let source = Line::from(vec![Span::raw("stra"), Span::raw("ße")]);
+        let (line, count) = highlight_matches(source, "strasse", |_| marked);
+        assert_eq!(count, 0, "span-boundary behavior remains unchanged");
+        assert_eq!(line.to_string(), "straße");
+        let (_, count) = highlight_matches(Line::raw("straße"), "\u{301}", |_| marked);
+        assert_eq!(count, 0);
+    }
+
+    #[test]
     fn new_lines_badge_while_scrolled_up() {
         use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
         let mut app = test_app();
@@ -23692,6 +23777,122 @@ mod tests {
         assert_eq!(app.selected_session().unwrap().id, "parent");
         app.key(key(KeyCode::Char('T')));
         assert_eq!(app.selected_session().unwrap().id, "parent");
+    }
+
+    fn archive_fixture(active: usize, archived: usize) -> Vec<SessionInfo> {
+        (0..active + archived)
+            .map(|i| {
+                let parent = (i % 4 == 1).then(|| format!("s{}", i - 1));
+                serde_json::from_value(serde_json::json!({
+                    "id": format!("s{i}"),
+                    "name": format!("ไทย 会话 🚀 {i}"),
+                    "created_at": "",
+                    "updated_at": format!("2026-01-{:02}T00:00:00Z", i + 1),
+                    "forked_from": parent,
+                    "pinned": i == 5,
+                    "archived": i >= active,
+                }))
+                .unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn default_sessions_title_explains_archived_sessions_it_hides() {
+        let mut app = test_app();
+        app.sessions = archive_fixture(12, 3);
+        app.view = View::Sessions;
+        let flat = app.visible_sessions();
+        assert_eq!(flat.len(), 12);
+        assert_eq!(flat[0], 5, "pinned first is unchanged");
+        assert!(flat.iter().all(|&i| !app.sessions[i].archived));
+        let screen = render(&mut app, 180, 24);
+        assert!(
+            screen.contains("Sessions · 12/15 · 3 archived hidden · T tree off"),
+            "{screen}"
+        );
+        // Wide graphemes may pad their trailing cell; compare without spaces.
+        assert!(screen.replace(' ', "").contains("ไทย会话🚀11"), "{screen}");
+        // Tree rows keep the same membership; only the title text changed.
+        app.key(key(KeyCode::Char('T')));
+        let mut tree = app.visible_sessions();
+        tree.sort_unstable();
+        let mut sorted = flat.clone();
+        sorted.sort_unstable();
+        assert_eq!(tree, sorted);
+        assert!(render(&mut app, 180, 24).contains("12/15 · 3 archived hidden · T tree on"));
+        // Narrow terminals truncate rather than panic.
+        for w in [30, 45] {
+            assert_eq!(render(&mut app, w, 12).lines().count(), 12);
+        }
+    }
+
+    #[test]
+    fn archived_only_sessions_name_the_v_cycle_instead_of_esc() {
+        let mut app = test_app();
+        app.sessions = archive_fixture(0, 3);
+        app.view = View::Sessions;
+        assert!(!app.session_filter.active());
+        let screen = render(&mut app, 180, 24);
+        assert!(
+            screen.contains("All sessions are archived — press v twice"),
+            "{screen}"
+        );
+        assert!(!screen.contains("No match"), "{screen}");
+        assert!(
+            screen.contains("Sessions · 0/3 · 3 archived hidden"),
+            "{screen}"
+        );
+        for w in [30, 45] {
+            assert_eq!(render(&mut app, w, 12).lines().count(), 12);
+        }
+        app.key(key(KeyCode::Char('v')));
+        assert_eq!(app.session_filter.quick, 1);
+        let running = render(&mut app, 180, 24);
+        assert!(
+            running.contains("No match — Esc clears the filter."),
+            "{running}"
+        );
+        assert!(running.contains("Sessions · 0/3 · running"), "{running}");
+        assert!(!running.contains("archived hidden"), "{running}");
+        app.key(key(KeyCode::Char('v')));
+        assert_eq!(lists::SESSION_QUICK[app.session_filter.quick], "archived");
+        assert_eq!(app.visible_sessions().len(), 3);
+        let archived = render(&mut app, 180, 24);
+        assert!(archived.contains("Sessions · 3 · archived"), "{archived}");
+        assert!(!archived.contains("archived hidden"), "{archived}");
+    }
+
+    #[test]
+    fn empty_and_active_filter_session_texts_are_unchanged() {
+        let mut app = test_app();
+        app.view = View::Sessions;
+        let screen = render(&mut app, 180, 24);
+        assert!(
+            screen.contains("No sessions yet — press n to start one."),
+            "{screen}"
+        );
+        assert!(!screen.contains("archived hidden"), "{screen}");
+        app.sessions = archive_fixture(12, 3);
+        app.session_filter.query = "zzz-no-such".into();
+        let screen = render(&mut app, 180, 24);
+        assert!(
+            screen.contains("No match — Esc clears the filter."),
+            "{screen}"
+        );
+        assert!(!screen.contains("archived hidden"), "{screen}");
+        app.key(key(KeyCode::Esc));
+        assert!(app.session_filter.query.is_empty() && app.session_filter.quick == 0);
+        app.session_filter.quick = 1;
+        let screen = render(&mut app, 180, 24);
+        assert!(
+            screen.contains("No match — Esc clears the filter."),
+            "{screen}"
+        );
+        assert!(screen.contains("Sessions · 0/15 · running"), "{screen}");
+        assert!(!screen.contains("archived hidden"), "{screen}");
+        app.key(key(KeyCode::Esc));
+        assert_eq!(app.session_filter.quick, 0);
     }
 
     #[test]
@@ -26872,7 +27073,10 @@ mod tests {
     #[test]
     fn custom_commands_invalid_invocation_names_the_current_file_and_reason() {
         let (mut app, project) = custom_command_fixture("valid");
-        let path = project.join(".formless/commands/workflow.md");
+        // Compose exactly as Core's loader reports it (`root.join(".formless/commands")`
+        // then `.join(name)`), so the full expected path keeps Core's separators on
+        // every platform rather than a single test-only joined literal.
+        let path = project.join(".formless/commands").join("workflow.md");
         std::fs::write(&path, "---\ndescription: not closed").unwrap();
         app.user_command_snapshot(true);
         app.user_commands_tick();
