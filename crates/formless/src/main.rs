@@ -7,6 +7,7 @@ mod cli_run_identity;
 #[cfg(test)]
 mod session_export_tests;
 mod table;
+mod update_http;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -2280,16 +2281,6 @@ fn run_cli(cli: Cli) -> Result<()> {
     }
 }
 
-fn http_get(url: &str) -> Result<String> {
-    let resp = reqwest::blocking::Client::builder()
-        .user_agent(concat!("formless/", env!("CARGO_PKG_VERSION")))
-        .build()?
-        .get(url)
-        .send()?
-        .error_for_status()?;
-    Ok(resp.text()?)
-}
-
 pub fn parse_version(tag: &str) -> Option<(u64, u64, u64)> {
     let core = tag
         .trim()
@@ -2362,8 +2353,9 @@ const INSTALL_COMMAND: &str = concat!(
 /// each release, then how to upgrade (`--check` stops after the report).
 fn update_cmd(check: bool) -> Result<()> {
     let current = env!("CARGO_PKG_VERSION");
-    let body = match http_get("https://api.github.com/repos/athiwatc/formless/releases?per_page=50")
-    {
+    let body = match update_http::get(
+        "https://api.github.com/repos/athiwatc/formless/releases?per_page=50",
+    ) {
         Ok(b) => b,
         Err(e) if e.to_string().contains("404") => {
             println!("installed: v{current}");

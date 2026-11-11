@@ -215,7 +215,7 @@ Prebuilt binaries need none of the toolchain requirements. On Linux a Secret Ser
 
 ### 3.2 Install
 
-**Prebuilt binary (macOS, Linux).** The installer resolves the latest GitHub release for your platform, downloads it, verifies the `.sha256` (with `sha256sum` or `shasum`) and puts `formless` in `$PREFIX/bin` (default `~/.local`). It checks that `$PREFIX/bin` is writable before downloading, and replaces the binary atomically (a temp file renamed into place), so an interrupted or failed install leaves the previous version working:
+**Prebuilt binary (macOS, Linux).** The installer resolves the latest GitHub release for your platform, downloads it, verifies the `.sha256` (with `sha256sum` or `shasum`) and puts `formless` in `$PREFIX/bin` (default `~/.local`). Each installer curl attempt has a 10-second connection and 120-second transfer limit, with three retries for transient errors; a timed-out lookup suggests pinning `FORMLESS_VERSION` or using a trusted mirror (`FORMLESS_LATEST_URL` / `FORMLESS_RELEASES_URL`). It checks that `$PREFIX/bin` is writable before downloading, and replaces the binary atomically (a temp file renamed into place), so an interrupted or failed install leaves the previous version working:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/athiwatc/formless/main/scripts/install.sh | sh
@@ -670,7 +670,7 @@ formless help sessions show
 
 ### 3.12 Updating
 
-`formless update` lists every GitHub release newer than the running binary, oldest first, with its release notes, then prints the command that upgrades it the way it was installed (`brew upgrade formless`, `cargo install … --force`, or the install script). `formless update --check` (or `update check`) stops after the report. Neither downloads or replaces anything. Re-run `scripts/install.sh` (it fetches the latest release, or `FORMLESS_VERSION`, and verifies the checksum), or rebuild from source. Your data dir and Tools are untouched by an update — config is migrated automatically, with a backup taken first ([§4](#4-data-config-and-profiles)).
+`formless update` bounds its release lookup to 15 seconds overall (5 seconds to connect), including the response body, and reports an actionable timeout error. It lists every GitHub release newer than the running binary, oldest first, with its release notes, then prints the command that upgrades it the way it was installed (`brew upgrade formless`, `cargo install … --force`, or the install script). `formless update --check` (or `update check`) stops after the report. Neither downloads or replaces anything. Re-run `scripts/install.sh` (it fetches the latest release, or `FORMLESS_VERSION`, and verifies the checksum), or rebuild from source. Your data dir and Tools are untouched by an update — config is migrated automatically, with a backup taken first ([§4](#4-data-config-and-profiles)).
 
 ---
 
