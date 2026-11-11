@@ -46,6 +46,9 @@ required-features = ["test-support"]
 
 [dependencies]
 formless-protocol = { path = "../formless-protocol" }
+# Grapheme boundaries, so a restored selection never lands inside a
+# character the user sees as one. Already in the graph through the kit.
+unicode-segmentation = "1"
 # Exact pin: the kit pins its GPUI layer exactly (gpui-pre =0.3.12), so the
 # whole family moves together and only on purpose.
 gpui-kit = { version = "=0.9.1", optional = true }

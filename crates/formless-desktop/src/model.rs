@@ -597,26 +597,37 @@ impl Drafts {
             .map_or("", |(_, text)| text.as_str())
     }
 
-    /// Store a draft; an empty draft frees its slot.
-    pub fn set(&mut self, session_id: &str, text: &str) {
+    /// Store a draft; an empty draft frees its slot. Returns the ids of the
+    /// Sessions whose older drafts were evicted to make room, oldest first.
+    /// Eviction discards what a user wrote, so the caller must tell them.
+    #[must_use = "evicted drafts are lost user text and have to be reported"]
+    pub fn set(&mut self, session_id: &str, text: &str) -> Vec<String> {
         if let Some(index) = self.entries.iter().position(|(id, _)| id == session_id) {
             if let Some((_, old)) = self.entries.remove(index) {
                 self.bytes -= old.len();
             }
         }
         if text.is_empty() {
-            return;
+            return Vec::new();
         }
         self.bytes += text.len();
         self.entries
             .push_back((session_id.to_string(), text.to_string()));
+        let mut evicted = Vec::new();
         while self.entries.len() > 1
             && (self.entries.len() > self.max_entries || self.bytes > self.max_bytes)
         {
-            if let Some((_, evicted)) = self.entries.pop_front() {
-                self.bytes -= evicted.len();
+            if let Some((id, text)) = self.entries.pop_front() {
+                self.bytes -= text.len();
+                evicted.push(id);
             }
         }
+        evicted
+    }
+
+    /// Whether a draft is stored for this Session.
+    pub fn has(&self, session_id: &str) -> bool {
+        self.entries.iter().any(|(id, _)| id == session_id)
     }
 
     pub fn len(&self) -> usize {
@@ -1040,63 +1051,69 @@ mod tests {
         assert_eq!(sidebar.active_id(), None);
     }
 
+    const NONE: [&str; 0] = [];
+
     #[test]
     fn drafts_are_bounded_by_entries_and_empty_drafts_free_their_slot() {
         let mut drafts = Drafts::new(2, usize::MAX);
-        drafts.set("a", "one");
-        drafts.set("b", "two");
-        drafts.set("a", "one again");
-        drafts.set("c", "three");
-        // "b" was the least recently stored.
+        assert_eq!(drafts.set("a", "one"), NONE);
+        assert_eq!(drafts.set("b", "two"), NONE);
+        assert_eq!(drafts.set("a", "one again"), NONE);
+        // "b" was the least recently stored, and the caller is told.
+        assert_eq!(drafts.set("c", "three"), ["b"]);
         assert_eq!(drafts.get("b"), "");
+        assert!(!drafts.has("b"));
         assert_eq!(drafts.get("a"), "one again");
         assert_eq!(drafts.get("c"), "three");
+        assert!(drafts.has("a") && drafts.has("c"));
         assert_eq!(drafts.len(), 2);
         assert_eq!(drafts.bytes(), "one again".len() + "three".len());
 
-        drafts.set("a", "");
+        // Clearing a draft evicts nothing.
+        assert_eq!(drafts.set("a", ""), NONE);
         assert_eq!(drafts.len(), 1);
         assert!(!drafts.is_empty());
         assert_eq!(drafts.bytes(), "three".len());
     }
 
     #[test]
-    fn drafts_are_bounded_by_bytes_and_evict_oldest_first() {
+    fn drafts_are_bounded_by_bytes_and_report_every_eviction_oldest_first() {
         let mut drafts = Drafts::new(100, 10);
-        drafts.set("a", "aaaa");
-        drafts.set("b", "bbbb");
+        assert_eq!(drafts.set("a", "aaaa"), NONE);
+        assert_eq!(drafts.set("b", "bbbb"), NONE);
         assert_eq!(drafts.bytes(), 8);
         // Twelve bytes would exceed ten: the oldest goes.
-        drafts.set("c", "cccc");
+        assert_eq!(drafts.set("c", "cccc"), ["a"]);
         assert_eq!(drafts.get("a"), "");
         assert_eq!(drafts.get("b"), "bbbb");
         assert_eq!(drafts.get("c"), "cccc");
         assert_eq!(drafts.bytes(), 8);
 
-        // Bytes, not characters: three Thai letters are nine bytes.
-        drafts.set("d", "กขค");
+        // Bytes, not characters: three Thai letters are nine bytes, and
+        // making room for them costs both older drafts.
+        assert_eq!(drafts.set("d", "กขค"), ["b", "c"]);
         assert_eq!(drafts.len(), 1);
         assert_eq!(drafts.get("d"), "กขค");
         assert_eq!(drafts.bytes(), 9);
 
         // Replacing a draft counts its new size only.
-        drafts.set("d", "กข");
+        assert_eq!(drafts.set("d", "กข"), NONE);
         assert_eq!(drafts.bytes(), 6);
     }
 
     #[test]
     fn the_newest_draft_is_kept_even_when_it_alone_exceeds_the_byte_budget() {
         let mut drafts = Drafts::new(100, 10);
-        drafts.set("a", "small");
+        assert_eq!(drafts.set("a", "small"), NONE);
         let large = "x".repeat(64);
-        drafts.set("b", &large);
+        assert_eq!(drafts.set("b", &large), ["a"]);
         assert_eq!(drafts.get("a"), "");
         assert_eq!(drafts.get("b"), large);
         assert_eq!(drafts.len(), 1);
         assert_eq!(drafts.bytes(), 64);
 
         // The next draft evicts the oversized one and the budget holds again.
-        drafts.set("c", "tiny");
+        assert_eq!(drafts.set("c", "tiny"), ["b"]);
         assert_eq!(drafts.get("b"), "");
         assert_eq!(drafts.bytes(), 4);
     }

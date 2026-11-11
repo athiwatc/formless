@@ -9,12 +9,13 @@
 
 use std::cell::RefCell;
 use std::collections::HashSet;
+use std::ops::Range;
 use std::rc::Rc;
 use std::time::Duration;
 
 use formless_protocol::SessionInfo;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
+use gpui_kit::component::input::{InputEvent, Textarea, TextareaState, Undo};
 use gpui_kit::component::label::Label;
 use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
 use gpui_kit::component::text::TextView;
@@ -24,14 +25,14 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    div, px, size, AnyElement, App, ClipboardItem, Context, ElementId, Entity, FocusHandle,
-    Focusable as _, Hsla, KeyBinding, Pixels, Role, ScrollStrategy, SharedString, Size,
-    Subscription, TestSupportExt as _, Window,
+    div, px, size, AnyElement, App, ClipboardItem, Context, ElementId, Entity,
+    EntityInputHandler as _, FocusHandle, Focusable as _, Hsla, KeyBinding, Pixels, Role,
+    ScrollStrategy, SharedString, Size, Subscription, TestSupportExt as _, Window,
 };
 
 use crate::memory::{
-    admit_paste, clamp_to_limit, format_bytes, limits, IntentKind, IntentRecord, PasteAdmission,
-    UndoBudget,
+    edit_span, format_bytes, limits, paste_can_never_fit, snap_to_graphemes, within_composer_limit,
+    IntentKind, IntentRecord, UndoBudget,
 };
 use crate::model::{
     send_mode_label, tokens, BlockKind, ComposerActions, Destination, Drafts, InspectorMode,
@@ -137,9 +138,9 @@ pub struct Shell {
     /// What the last composer action was. Sizes only: no message text is
     /// kept once an intent has been handed on.
     last_intent: Option<IntentRecord>,
-    /// The composer's size as of its last change event. The paste check uses
-    /// this because it runs while the composer itself is being updated.
-    draft_bytes: usize,
+    /// The composer's text as of its last accepted change: always within
+    /// the limit, and what an over-limit edit is rolled back to.
+    accepted_draft: SharedString,
     undo_budget: UndoBudget,
     /// Why the composer refused or changed something, shown under it.
     composer_notice: Option<SharedString>,
@@ -157,7 +158,8 @@ pub struct Shell {
     /// The header toggles own stable handles so focus can return to them.
     sidebar_toggle_focus: FocusHandle,
     inspector_toggle_focus: FocusHandle,
-    composer_subscription: Subscription,
+    /// The composer's event subscription and its observer. Replaced with it.
+    composer_subscriptions: [Subscription; 2],
     _subscriptions: Vec<Subscription>,
 }
 
@@ -175,7 +177,7 @@ impl Shell {
         sidebar.activate_selected();
 
         let timeline = cx.new(|cx| MessageScrollerState::new(blocks.len(), cx));
-        let (composer, composer_subscription) = Self::build_composer("", window, cx);
+        let (composer, composer_subscriptions) = Self::build_composer("", window, cx);
         // A resize can end an overlay (the panel docks again) or hide the
         // panel that holds focus.
         let subscriptions =
@@ -192,7 +194,7 @@ impl Shell {
             text_scale: TextScale::default(),
             destination: Destination::Chat,
             last_intent: None,
-            draft_bytes: 0,
+            accepted_draft: SharedString::default(),
             undo_budget: UndoBudget::default(),
             composer_notice: None,
             modal: None,
@@ -206,18 +208,18 @@ impl Shell {
             inspector_focus: cx.focus_handle(),
             sidebar_toggle_focus: cx.focus_handle(),
             inspector_toggle_focus: cx.focus_handle(),
-            composer_subscription,
+            composer_subscriptions,
             _subscriptions: subscriptions,
         }
     }
 
-    /// A composer holding `text`, with an empty undo history, and the
-    /// subscription that routes its events to the shell.
+    /// A composer holding `text`, with an empty undo history, and what
+    /// routes its events and its changes to the shell.
     fn build_composer(
         text: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> (Entity<TextareaState>, Subscription) {
+    ) -> (Entity<TextareaState>, [Subscription; 2]) {
         let composer = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .auto_grow(2, 8)
@@ -225,33 +227,43 @@ impl Shell {
                 .placeholder("Message Formless")
                 .default_value(text.to_string())
         });
-        let subscription = cx.subscribe_in(
-            &composer,
-            window,
-            |this, _, event: &InputEvent, window, cx| match event {
-                // Plain Enter is the primary action; the secondary chord is
-                // the secondary one (Queue during a Run). Shift+Enter also
-                // reports PressEnter, but it has already inserted a newline.
-                InputEvent::PressEnter {
-                    secondary,
-                    shift: false,
-                } => this.submit(*secondary, cx),
-                InputEvent::Change => this.composer_changed(window, cx),
-                _ => {}
-            },
-        );
-        (composer, subscription)
+        let events = cx.subscribe_in(&composer, window, |this, _, event: &InputEvent, _, cx| {
+            // Plain Enter is the primary action; the secondary chord is
+            // the secondary one (Queue during a Run). Shift+Enter also
+            // reports PressEnter, but it has already inserted a newline.
+            if let InputEvent::PressEnter {
+                secondary,
+                shift: false,
+            } = event
+            {
+                this.submit(*secondary, cx)
+            }
+        });
+        // The limit is checked whenever the composer changes in any way, not
+        // on its Change event: ending an input-method composition makes its
+        // text part of the draft without emitting one.
+        let changes = cx.observe_in(&composer, window, |this, _, window, cx| {
+            this.composer_changed(window, cx)
+        });
+        (composer, [events, changes])
     }
 
-    /// Swap in a fresh composer holding `text`. This is the only way to drop
-    /// the kit's undo history, so it is how a Session switch keeps one
-    /// Session's text out of another's undo, and how the history is bounded
-    /// after large pastes. Focus stays in the composer if it was there.
-    fn rebuild_composer(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+    /// Swap in a fresh composer holding `text`, with the selection at
+    /// `selection` if given. This is the only way to drop the kit's undo
+    /// history, so it is how a Session switch keeps one Session's text out
+    /// of another's undo and how the history is bounded. Focus stays in the
+    /// composer if it was there.
+    fn rebuild_composer(
+        &mut self,
+        text: &str,
+        selection: Option<Range<usize>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let had_focus = self.composer.focus_handle(cx).contains_focused(window, cx);
-        let (composer, subscription) = Self::build_composer(text, window, cx);
+        let (composer, subscriptions) = Self::build_composer(text, window, cx);
         self.composer = composer;
-        self.composer_subscription = subscription;
+        self.composer_subscriptions = subscriptions;
         // An open overlay may be waiting to hand focus back to the composer
         // that was just replaced; point it at the new one.
         if let Some(origin) = &mut self.restore_focus {
@@ -259,78 +271,146 @@ impl Shell {
                 origin.handle = self.composer.focus_handle(cx);
             }
         }
-        self.draft_bytes = text.len();
+        self.accepted_draft = text.to_string().into();
         self.undo_budget.reset();
-        if had_focus {
-            self.composer
-                .update(cx, |composer, cx| composer.focus(window, cx));
-        }
+        self.composer.update(cx, |composer, cx| {
+            if let Some(selection) = selection {
+                composer.set_selected_range(selection, cx);
+            }
+            if had_focus {
+                composer.focus(window, cx);
+            }
+        });
         cx.notify();
     }
 
-    /// Runs after every edit. Whatever path the text came by, the composer
-    /// ends up within its limit.
+    /// Runs whenever the composer changes, whatever path the text came by.
+    ///
+    /// An edit whose result is over the limit is rejected whole. Nothing is
+    /// ever cut to fit, so text after an insertion point is never lost and no
+    /// character is split. The kit has no hook to refuse a multi-line edit
+    /// before it happens, so the rejection is made afterwards, in two steps:
+    ///
+    /// 1. The kit is asked to undo its own last edit. That puts back exactly
+    ///    the previous text and selection and keeps the earlier undo history.
+    /// 2. [`Self::finish_rejection`] checks the result. If the composer does
+    ///    not hold exactly the previous draft, the previous draft is put back
+    ///    whole by rebuilding the composer, at the cost of its undo history.
     fn composer_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let draft = self.draft(cx);
-        self.draft_bytes = draft.len();
-        // Either case replaces the composer: with the clamped text, or with
-        // the same text and an empty undo history.
-        let replacement = if draft.len() > limits::COMPOSER_MAX_BYTES {
-            Some((
-                clamp_to_limit(&draft, limits::COMPOSER_MAX_BYTES).to_string(),
+        if draft == self.accepted_draft {
+            return;
+        }
+        // Text still being composed by an input method is not judged: taking
+        // it back mid-composition would fight the input method. It is judged
+        // the moment the composition ends, committed or not.
+        let composing = self.composer.update(cx, |composer, cx| {
+            composer.marked_text_range(window, cx).is_some()
+        });
+        if composing {
+            return;
+        }
+        let span = edit_span(&self.accepted_draft, &draft);
+        if !within_composer_limit(&draft) {
+            let previous = self.accepted_draft.clone();
+            let selection = snap_to_graphemes(&previous, span.start..span.old_end);
+            self.composer_notice = Some(
                 format!(
-                    "The message is at its {} limit. Text past the limit was not kept.",
+                    "Not added: the message would be {} and the limit is {}. Your text is \
+                     unchanged.",
+                    format_bytes(draft.len()),
                     format_bytes(limits::COMPOSER_MAX_BYTES)
-                ),
-            ))
-        } else if self.undo_budget.is_spent() {
-            Some((
-                draft.to_string(),
-                "Undo history was cleared to bound memory after large pastes.".to_string(),
-            ))
-        } else {
-            None
-        };
-        match replacement {
-            Some((kept, notice)) => {
-                self.composer_notice = Some(notice.into());
-                // Not from inside the old composer's own event delivery.
-                cx.defer_in(window, move |this, window, cx| {
-                    this.rebuild_composer(&kept, window, cx)
-                });
+                )
+                .into(),
+            );
+            // The action only reaches the composer while it has focus.
+            if self.composer.focus_handle(cx).contains_focused(window, cx) {
+                window.dispatch_action(Box::new(Undo), cx);
             }
-            None => self.composer_notice = None,
+            // Queued behind the undo, and not run from inside the composer's
+            // own event delivery.
+            cx.defer_in(window, move |this, window, cx| {
+                this.finish_rejection(previous, selection, window, cx)
+            });
+            cx.notify();
+            return;
+        }
+        self.accepted_draft = draft.clone();
+        self.undo_budget.record_edit(span);
+        if self.undo_budget.is_spent() {
+            let selection = self.composer.read(cx).selected_range();
+            self.composer_notice = Some(
+                "Undo history was cleared to bound memory after large edits. Your text is \
+                 unchanged."
+                    .into(),
+            );
+            cx.defer_in(window, move |this, window, cx| {
+                this.rebuild_composer(&draft, Some(selection), window, cx)
+            });
+        } else {
+            self.composer_notice = None;
         }
         // Button availability depends on whether there is a draft.
         cx.notify();
     }
 
+    /// Second step of rejecting an over-limit edit. The kit's undo may have
+    /// done exactly what was needed. It may also have undone more (it merges
+    /// quick typing into one step) or nothing (the composer did not have
+    /// focus). Either way the composer must end up holding `previous`.
+    fn finish_rejection(
+        &mut self,
+        previous: SharedString,
+        selection: Range<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.draft(cx) == previous {
+            return;
+        }
+        self.rebuild_composer(&previous, Some(selection), window, cx);
+        if let Some(notice) = self.composer_notice.take() {
+            self.composer_notice = Some(format!("{notice} Undo history was cleared.").into());
+        }
+    }
+
     /// The composer's paste hook. Returns true to consume the paste so that
-    /// nothing is inserted.
+    /// nothing is inserted. Only a clipboard that could not fit even if it
+    /// replaced the whole draft is refused here; a smaller one is inserted
+    /// and judged in [`Self::composer_changed`] on the text that results, so
+    /// a replaced selection is accounted for exactly.
     fn paste_refused(&mut self, item: &ClipboardItem, cx: &mut Context<Self>) -> bool {
         let Some(text) = item.text() else {
             return false;
         };
-        match admit_paste(self.draft_bytes, text.len()) {
-            PasteAdmission::Accept => {
-                self.undo_budget.record_paste(text.len());
-                false
-            }
-            PasteAdmission::Reject { would_be_bytes } => {
-                self.composer_notice = Some(
-                    format!(
-                        "Paste not added: it is {} and the message would be {}. The limit is {}; \
-                         attach larger content instead.",
-                        format_bytes(text.len()),
-                        format_bytes(would_be_bytes),
-                        format_bytes(limits::COMPOSER_MAX_BYTES)
-                    )
-                    .into(),
-                );
-                cx.notify();
-                true
-            }
+        if !paste_can_never_fit(text.len()) {
+            return false;
         }
+        self.composer_notice = Some(
+            format!(
+                "Paste not added: it is {} and the limit is {}. Attach larger content instead.",
+                format_bytes(text.len()),
+                format_bytes(limits::COMPOSER_MAX_BYTES)
+            )
+            .into(),
+        );
+        cx.notify();
+        true
+    }
+
+    /// Whether an unsent draft is stored for a Session other than the open one.
+    pub fn has_stored_draft(&self, session_id: &str) -> bool {
+        self.drafts.has(session_id)
+    }
+
+    /// The composer's text state, for driving its input handler directly.
+    pub fn composer(&self) -> &Entity<TextareaState> {
+        &self.composer
+    }
+
+    /// The composer's selection as byte offsets into the draft.
+    pub fn composer_selection(&self, cx: &App) -> Range<usize> {
+        self.composer.read(cx).selected_range()
     }
 
     fn row_sizes(count: usize, scale: TextScale) -> Rc<Vec<Size<Pixels>>> {
@@ -489,6 +569,19 @@ impl Shell {
         if actions.disabled_reason.is_some() {
             return;
         }
+        // Only an unfinished composition can leave the composer over its
+        // limit; whatever the reason, over-limit text is never handed on.
+        if !within_composer_limit(&self.draft(cx)) {
+            self.composer_notice = Some(
+                format!(
+                    "Not sent: the message is over the {} limit.",
+                    format_bytes(limits::COMPOSER_MAX_BYTES)
+                )
+                .into(),
+            );
+            cx.notify();
+            return;
+        }
         let mode = match (secondary, actions.secondary) {
             (true, Some(mode)) => mode,
             (true, None) => return,
@@ -534,7 +627,29 @@ impl Shell {
         if self.sidebar.activate_selected() {
             if let Some(previous) = previous {
                 let draft = self.draft(cx);
-                self.drafts.set(&previous, &draft);
+                // Parking a draft can push older ones out. That discards
+                // text someone wrote, so it is said, not done silently.
+                // An input method can leave text past the limit in the
+                // composer with no signal (see `composer_changed`). Such a
+                // draft is not parked; the last accepted one is.
+                let draft = if within_composer_limit(&draft) {
+                    draft
+                } else {
+                    self.accepted_draft.clone()
+                };
+                let evicted = self.drafts.set(&previous, &draft);
+                self.composer_notice = (!evicted.is_empty()).then(|| {
+                    format!(
+                        "Unsent drafts for {} older Session(s) were discarded: stored drafts \
+                         are limited to {} Sessions and {} in total.",
+                        evicted.len(),
+                        limits::DRAFT_MAX_ENTRIES,
+                        format_bytes(limits::DRAFT_MAX_BYTES)
+                    )
+                    .into()
+                });
+            } else {
+                self.composer_notice = None;
             }
             let restored = self
                 .sidebar
@@ -543,8 +658,7 @@ impl Shell {
                 .unwrap_or_default();
             // A fresh composer, not a new value in the old one: the old one's
             // undo history holds the other Session's text.
-            self.rebuild_composer(&restored, window, cx);
-            self.composer_notice = None;
+            self.rebuild_composer(&restored, None, window, cx);
             let count = self.blocks.borrow().len();
             self.timeline
                 .update(cx, |timeline, cx| timeline.reset(count, cx));
@@ -833,7 +947,11 @@ impl Shell {
             row.group.label(),
             row.run_state.label(),
             if active { " · Open" } else { "" }
-        );
+        ) + if self.drafts.has(&row.id) {
+            " · Draft"
+        } else {
+            ""
+        };
         v_flex()
             .id(session_row_id(&row.id))
             .test_support()

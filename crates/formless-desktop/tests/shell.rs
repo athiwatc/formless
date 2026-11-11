@@ -14,10 +14,11 @@ use formless_desktop::timeline::TimelineBlock;
 use formless_protocol::SendMode;
 use gpui_kit::base::test_support::texts;
 use gpui_kit::base::Root;
-use gpui_kit::test::{TestQueryExt as _, TestWindowExt as _};
+use gpui_kit::test::{TestInput, TestQueryExt as _, TestWindowExt as _};
 use gpui_kit::{
-    point, px, size, App, AppContext as _, Bounds, ClipboardItem, Entity, Pixels, Point, Role,
-    ScrollDelta, Size, TestAppContext, Window, WindowBounds, WindowHandle, WindowOptions,
+    point, px, size, App, AppContext as _, Bounds, ClipboardItem, ElementInputHandler, Entity,
+    Pixels, Point, Role, ScrollDelta, Size, TestAppContext, Window, WindowBounds, WindowHandle,
+    WindowOptions,
 };
 
 const WIDE: Size<Pixels> = Size {
@@ -1034,35 +1035,413 @@ fn undo_cannot_bring_back_another_sessions_draft(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn large_pastes_drop_the_undo_history_once_the_budget_is_spent(cx: &mut TestAppContext) {
+fn large_edits_drop_the_undo_history_once_the_budget_is_spent(cx: &mut TestAppContext) {
     let (handle, shell) = open(cx, WIDE, 200, 40);
     let chunk = text_of(limits::COMPOSER_MAX_BYTES);
-    let pastes = limits::UNDO_PASTE_BUDGET_BYTES / limits::COMPOSER_MAX_BYTES + 1;
     cx.write_to_clipboard(ClipboardItem::new_string(chunk.clone()));
     step(cx, handle, |window, cx| window.render_frame(cx));
-    for round in 0..pastes {
+    // Each round inserts and then removes one composer's worth of text; both
+    // count against the budget.
+    let mut cleared_after = None;
+    for round in 0..6 {
         step(cx, handle, |window, cx| window.press(&chord("v"), cx));
         cx.run_until_parked();
+        let cleared = step(cx, handle, |_, cx| {
+            assert_eq!(shell.read(cx).draft(cx).as_ref(), chunk, "round {round}");
+            shell
+                .read(cx)
+                .composer_notice()
+                .is_some_and(|notice| notice.starts_with("Undo history was cleared"))
+        });
+        if cleared {
+            cleared_after = Some(round);
+            break;
+        }
         step(cx, handle, |window, cx| {
-            assert_eq!(shell.read(cx).draft(cx).len(), chunk.len(), "round {round}");
-            if round + 1 < pastes {
-                assert_eq!(shell.read(cx).composer_notice(), None, "round {round}");
-                window.press(&chord("a"), cx);
-                window.press("backspace", cx);
-            }
+            window.press(&chord("a"), cx);
+            window.press("backspace", cx);
         });
         cx.run_until_parked();
     }
+    // Insert 1 MiB, remove 1 MiB, insert 1 MiB, remove 1 MiB, insert 1 MiB:
+    // 5 MiB of edits passes the 4 MiB budget on the third paste.
+    assert_eq!(cleared_after, Some(2));
     step(cx, handle, |window, cx| {
         window.render_frame(cx);
-        let notice = shell.read(cx).composer_notice().expect("a reason is shown");
-        assert!(notice.starts_with("Undo history was cleared"), "{notice}");
         assert_eq!(window.find_by_label("Message").focused(), Some(true));
-        // The history is gone: undo changes nothing.
+        // The history is gone: undo changes nothing, and the text is whole.
         window.press(&chord("z"), cx);
     });
     step(cx, handle, |_, cx| {
         assert_eq!(shell.read(cx).draft(cx).as_ref(), chunk);
+    });
+}
+
+// ---- Over-limit edits: every pathway, whole draft kept ---------------------
+
+#[cfg(target_os = "macos")]
+const TO_START: &str = "cmd-up";
+#[cfg(not(target_os = "macos"))]
+const TO_START: &str = "ctrl-home";
+
+/// A draft of exactly `bytes` bytes that ends in a multi-code-point emoji, so
+/// a cut tail or a split character would show.
+const TAIL: &str = " the tail must survive 👩🏽‍💻";
+
+fn draft_of(bytes: usize) -> String {
+    text_of(bytes - TAIL.len()) + TAIL
+}
+
+/// Open the shell and paste `draft` into the composer.
+fn open_with_draft(cx: &mut TestAppContext, draft: &str) -> (WindowHandle<Root>, Entity<Shell>) {
+    let (handle, shell) = open(cx, WIDE, 200, 40);
+    cx.write_to_clipboard(ClipboardItem::new_string(draft.to_string()));
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        window.press(&chord("v"), cx);
+    });
+    cx.run_until_parked();
+    step(cx, handle, |_, cx| {
+        assert_eq!(shell.read(cx).draft(cx).as_ref(), draft);
+        assert_eq!(shell.read(cx).composer_notice(), None);
+    });
+    (handle, shell)
+}
+
+/// After a rejected edit: the whole previous draft, a reason on screen, and
+/// focus still in the composer.
+fn assert_rejected(
+    cx: &mut TestAppContext,
+    handle: WindowHandle<Root>,
+    shell: &Entity<Shell>,
+    expected: &str,
+    pathway: &str,
+) {
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        let draft = shell.read(cx).draft(cx);
+        assert_eq!(draft.len(), expected.len(), "{pathway}: length");
+        assert!(draft.as_ref() == expected, "{pathway}: the draft changed");
+        let notice = shell
+            .read(cx)
+            .composer_notice()
+            .unwrap_or_else(|| panic!("{pathway}: no reason shown"))
+            .to_string();
+        assert!(notice.starts_with("Not added"), "{pathway}: {notice}");
+        assert_eq!(
+            window.find_by_label("Message").focused(),
+            Some(true),
+            "{pathway}: focus"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn an_over_limit_insertion_in_the_middle_keeps_the_whole_draft_and_the_caret(
+    cx: &mut TestAppContext,
+) {
+    let full = draft_of(limits::COMPOSER_MAX_BYTES);
+    let (handle, shell) = open_with_draft(cx, &full);
+
+    // Typed in the middle, one byte over.
+    step(cx, handle, |window, cx| {
+        window.press(TO_START, cx);
+        for _ in 0..5 {
+            window.press("right", cx);
+        }
+        assert_eq!(shell.read(cx).composer_selection(cx), 5..5);
+        window.input("Z", cx);
+    });
+    assert_rejected(cx, handle, &shell, &full, "typing in the middle");
+    step(cx, handle, |_, cx| {
+        // The caret is where the insertion was attempted.
+        assert_eq!(shell.read(cx).composer_selection(cx), 5..5);
+    });
+
+    // Pasted in the middle.
+    step(cx, handle, |window, cx| {
+        cx.write_to_clipboard(ClipboardItem::new_string(
+            "pasted in the middle".to_string(),
+        ));
+        window.press(&chord("v"), cx);
+    });
+    assert_rejected(cx, handle, &shell, &full, "paste in the middle");
+    step(cx, handle, |_, cx| {
+        assert_eq!(shell.read(cx).composer_selection(cx), 5..5);
+    });
+
+    // Typed at the very end, after the emoji.
+    step(cx, handle, |window, cx| {
+        window.press(&chord("a"), cx);
+        window.press("right", cx);
+        assert_eq!(
+            shell.read(cx).composer_selection(cx),
+            full.len()..full.len()
+        );
+        window.input("!", cx);
+    });
+    assert_rejected(cx, handle, &shell, &full, "typing at the end");
+}
+
+#[gpui_kit::test]
+fn a_paste_is_judged_on_what_it_replaces(cx: &mut TestAppContext) {
+    let full = draft_of(limits::COMPOSER_MAX_BYTES);
+    let (handle, shell) = open_with_draft(cx, &full);
+    let select_first_ten = |window: &mut Window, cx: &mut App| {
+        window.press(TO_START, cx);
+        for _ in 0..10 {
+            window.press("shift-right", cx);
+        }
+    };
+
+    // Ten bytes over ten selected bytes: the draft stays at the limit.
+    step(cx, handle, |window, cx| {
+        select_first_ten(window, cx);
+        assert_eq!(shell.read(cx).composer_selection(cx), 0..10);
+        cx.write_to_clipboard(ClipboardItem::new_string("0123456789".to_string()));
+        window.press(&chord("v"), cx);
+    });
+    cx.run_until_parked();
+    let replaced = format!("0123456789{}", &full[10..]);
+    step(cx, handle, |_, cx| {
+        assert!(shell.read(cx).draft(cx).as_ref() == replaced);
+        assert_eq!(shell.read(cx).composer_notice(), None);
+    });
+
+    // Eleven bytes over ten selected bytes: one over, refused whole, and the
+    // selection it would have replaced is selected again.
+    step(cx, handle, |window, cx| {
+        select_first_ten(window, cx);
+        cx.write_to_clipboard(ClipboardItem::new_string("0123456789X".to_string()));
+        window.press(&chord("v"), cx);
+    });
+    assert_rejected(cx, handle, &shell, &replaced, "paste over a selection");
+    step(cx, handle, |_, cx| {
+        assert_eq!(shell.read(cx).composer_selection(cx), 0..10);
+    });
+
+    // A clipboard the size of the limit replaces a fully selected draft.
+    let other = draft_of(limits::COMPOSER_MAX_BYTES).replace("fox", "cat");
+    assert_eq!(other.len(), limits::COMPOSER_MAX_BYTES);
+    step(cx, handle, |window, cx| {
+        window.press(&chord("a"), cx);
+        cx.write_to_clipboard(ClipboardItem::new_string(other.clone()));
+        window.press(&chord("v"), cx);
+    });
+    cx.run_until_parked();
+    step(cx, handle, |_, cx| {
+        assert!(shell.read(cx).draft(cx).as_ref() == other);
+        assert_eq!(shell.read(cx).composer_notice(), None);
+    });
+}
+
+#[gpui_kit::test]
+fn a_multi_code_point_character_is_never_inserted_in_part(cx: &mut TestAppContext) {
+    // Four bytes of room; the emoji is one character of fifteen bytes.
+    let emoji = "👩🏽‍💻";
+    assert_eq!(emoji.len(), 15);
+    let nearly = draft_of(limits::COMPOSER_MAX_BYTES - 4);
+    let (handle, shell) = open_with_draft(cx, &nearly);
+
+    // Committed in one edit, as an input method or the emoji picker does.
+    step(cx, handle, |window, cx| {
+        let bounds = window.find_by_label("Message").bounds();
+        let composer = shell.read(cx).composer().clone();
+        TestInput::new(ElementInputHandler::new(bounds, composer), window).commit_text(emoji, cx);
+    });
+    assert_rejected(cx, handle, &shell, &nearly, "input method commit");
+
+    // Pasted.
+    step(cx, handle, |window, cx| {
+        cx.write_to_clipboard(ClipboardItem::new_string(emoji.to_string()));
+        window.press(&chord("v"), cx);
+    });
+    assert_rejected(cx, handle, &shell, &nearly, "emoji paste");
+
+    // A composition in progress (marked text) is left alone while the input
+    // method owns it: twelve bytes where three fit, and no complaint yet.
+    let ime = |cx: &mut TestAppContext, act: &dyn Fn(&mut TestInput, &mut App)| {
+        step(cx, handle, |window, cx| {
+            let bounds = window.find_by_label("Message").bounds();
+            let composer = shell.read(cx).composer().clone();
+            act(
+                &mut TestInput::new(ElementInputHandler::new(bounds, composer), window),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+    };
+    step(cx, handle, |window, cx| window.input("a", cx));
+    cx.run_until_parked();
+    let nearly = format!("{nearly}a");
+    ime(cx, &|input, cx| {
+        input.compose_text(None, "にほんご", None, cx)
+    });
+    step(cx, handle, |window, cx| {
+        assert_eq!(shell.read(cx).draft(cx).len(), nearly.len() + 12);
+        assert_eq!(shell.read(cx).composer_notice(), None);
+        // Over-limit text is not handed on even in this state.
+        window.click("composer-primary", cx);
+        assert_eq!(shell.read(cx).last_intent(), None);
+        assert!(shell
+            .read(cx)
+            .composer_notice()
+            .is_some_and(|notice| notice.starts_with("Not sent")));
+    });
+    // Ending the composition in place makes its text part of the draft, and
+    // the kit gives no signal at all when that happens (no event, no
+    // notification). Until the composer next changes, the excess is still
+    // there; it can be neither sent nor parked.
+    ime(cx, &|input, cx| input.unmark_text(cx));
+    step(cx, handle, |window, cx| {
+        assert_eq!(shell.read(cx).draft(cx).len(), nearly.len() + 12);
+        window.click("composer-primary", cx);
+        assert_eq!(shell.read(cx).last_intent(), None);
+        // The next change of any kind, here a caret move, is when it is
+        // judged, and it is taken back whole.
+        window.click_at("region-composer", point(px(40.), px(20.)), cx);
+        window.press("left", cx);
+    });
+    assert_rejected(cx, handle, &shell, &nearly, "composition ended in place");
+
+    // Composed again and committed with different text: same outcome.
+    ime(cx, &|input, cx| input.compose_text(None, "かな", None, cx));
+    ime(cx, &|input, cx| input.commit_text("仮名", cx));
+    assert_rejected(cx, handle, &shell, &nearly, "composition committed");
+
+    // What fits still goes in: three more ASCII bytes fill the draft exactly.
+    step(cx, handle, |window, cx| window.input("bcd", cx));
+    cx.run_until_parked();
+    step(cx, handle, |_, cx| {
+        let draft = shell.read(cx).draft(cx);
+        assert_eq!(draft.len(), limits::COMPOSER_MAX_BYTES);
+        assert!(draft.ends_with(&format!("{emoji}abcd")));
+    });
+}
+
+#[gpui_kit::test]
+fn a_rejected_edit_keeps_the_earlier_undo_history_and_cannot_be_redone(cx: &mut TestAppContext) {
+    let base = draft_of(limits::COMPOSER_MAX_BYTES - 20);
+    let (handle, shell) = open_with_draft(cx, &base);
+    // An accepted edit to undo later.
+    step(cx, handle, |window, cx| window.input("abc", cx));
+    cx.run_until_parked();
+    let accepted = format!("{base}abc");
+    step(cx, handle, |window, cx| {
+        assert!(shell.read(cx).draft(cx).as_ref() == accepted);
+        // Thirty bytes where seventeen fit.
+        cx.write_to_clipboard(ClipboardItem::new_string("x".repeat(30)));
+        window.press(&chord("v"), cx);
+    });
+    assert_rejected(cx, handle, &shell, &accepted, "paste at the end");
+    step(cx, handle, |window, cx| {
+        // The rejection went through the kit's own undo, so nothing else was
+        // lost: the notice does not report a cleared history.
+        let notice = shell.read(cx).composer_notice().unwrap_or_default();
+        assert!(!notice.contains("history was cleared"), "{notice}");
+        // Undo now takes back the accepted typing, not nothing.
+        window.press(&chord("z"), cx);
+    });
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| {
+        let draft = shell.read(cx).draft(cx);
+        assert!(draft.len() < accepted.len(), "undo had nothing to undo");
+        assert!(accepted.starts_with(draft.as_ref()));
+        // Redo brings the typing back; a second redo would re-apply the
+        // rejected paste, and is rejected again.
+        window.press(&chord("shift-z"), cx);
+    });
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| {
+        assert!(shell.read(cx).draft(cx).as_ref() == accepted);
+        window.press(&chord("shift-z"), cx);
+    });
+    cx.run_until_parked();
+    step(cx, handle, |_, cx| {
+        let draft = shell.read(cx).draft(cx);
+        assert!(draft.len() <= limits::COMPOSER_MAX_BYTES);
+        assert!(
+            draft.as_ref() == accepted,
+            "redo of the rejected paste got through"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn discarding_stored_drafts_is_reported_not_silent(cx: &mut TestAppContext) {
+    let (handle, shell) = open(cx, WIDE, 200, 40);
+    let ids: Vec<String> = step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        shell
+            .read(cx)
+            .sidebar()
+            .rows()
+            .iter()
+            .take(6)
+            .map(|row| row.id.clone())
+            .collect()
+    });
+    let draft = draft_of(limits::COMPOSER_MAX_BYTES);
+    cx.write_to_clipboard(ClipboardItem::new_string(draft.clone()));
+    let stored = limits::DRAFT_MAX_BYTES / limits::COMPOSER_MAX_BYTES;
+    assert_eq!(stored, 4);
+
+    // Leave a full-size draft in each of the first five Sessions.
+    for (index, id) in ids.iter().enumerate().take(stored + 1) {
+        step(cx, handle, |window, cx| {
+            window.click(session_row_id(id), cx);
+            window.click_at("region-composer", point(px(40.), px(20.)), cx);
+            window.press(&chord("v"), cx);
+        });
+        cx.run_until_parked();
+        step(cx, handle, |_, cx| {
+            assert_eq!(
+                shell.read(cx).draft(cx).len(),
+                draft.len(),
+                "session {index}"
+            );
+            // Four parked drafts fit the budget exactly: nothing discarded
+            // and nothing reported so far.
+            assert_eq!(shell.read(cx).composer_notice(), None, "session {index}");
+        });
+    }
+
+    // Leaving the fifth parks a fifth megabyte: the oldest draft has to go.
+    step(cx, handle, |window, cx| {
+        window.click(session_row_id(&ids[stored + 1]), cx);
+    });
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        let notice = shell
+            .read(cx)
+            .composer_notice()
+            .expect("the discard is reported");
+        assert!(
+            notice.starts_with("Unsent drafts for 1 older Session(s) were discarded"),
+            "{notice}"
+        );
+        assert!(
+            notice.contains("64 Sessions") && notice.contains("4.0 MiB"),
+            "{notice}"
+        );
+        assert!(window.find("composer-notice").visible());
+        assert!(!shell.read(cx).has_stored_draft(&ids[0]));
+        for id in &ids[1..=stored] {
+            assert!(shell.read(cx).has_stored_draft(id), "{id}");
+        }
+        // The discarded draft really is gone, and a kept one is intact.
+        window.click(session_row_id(&ids[0]), cx);
+    });
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| {
+        assert_eq!(shell.read(cx).draft(cx).as_ref(), "");
+        window.click(session_row_id(&ids[1]), cx);
+    });
+    cx.run_until_parked();
+    step(cx, handle, |_, cx| {
+        assert!(shell.read(cx).draft(cx).as_ref() == draft);
     });
 }
 
