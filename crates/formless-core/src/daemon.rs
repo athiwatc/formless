@@ -3194,13 +3194,7 @@ impl Daemon {
                 let (defs, attachments) = self.with_store(|st| {
                     let defs =
                         toolreg::tool_definitions(st, Some(&session_id), cfg.tools.inline_limit)?;
-                    let attachments: usize = st
-                        .list_messages(&session_id)?
-                        .iter()
-                        .filter_map(|m| m.meta.as_deref())
-                        .filter_map(|m| serde_json::from_str::<Value>(m).ok())
-                        .map(|m| m["attachments"].as_array().map_or(0, Vec::len))
-                        .sum();
+                    let attachments = st.attachment_entry_count(&session_id)?;
                     Ok((defs, attachments))
                 })?;
                 let used = self.calibrated_prompt_tokens(&provider, &model, &ctx, &defs)?;
