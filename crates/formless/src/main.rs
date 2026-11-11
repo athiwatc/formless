@@ -4994,7 +4994,7 @@ fn skills_cmd(paths: Paths, action: SkillsAction) -> Result<()> {
             }
         }
         SkillsAction::Import { file } => {
-            let bundle: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file)?)?;
+            let bundle = formless_core::bundle_json::read(&file)?;
             print_bundle_description_preview(&paths, &bundle)?;
             let imported = daemon(Request::ImportSkill { bundle })?;
             for info in imported.as_array().into_iter().flatten() {
@@ -5607,8 +5607,7 @@ fn sessions_cmd(paths: Paths, action: SessionsAction) -> Result<()> {
             println!("restored {}", s.name);
         }
         SessionsAction::Import { file } => {
-            let bundle: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file)?)
-                .with_context(|| format!("{} is not a JSON bundle", file.display()))?;
+            let bundle = formless_core::bundle_json::read(&file)?;
             let s: SessionInfo =
                 serde_json::from_value(daemon(Request::ImportSession { bundle })?)?;
             println!("imported {}  ({})", s.name, s.id);
@@ -7334,7 +7333,7 @@ fn tools_cmd(paths: Paths, action: ToolsAction) -> Result<()> {
                 }
                 fetched["bundle"].clone()
             } else {
-                serde_json::from_str(&std::fs::read_to_string(&file)?)?
+                formless_core::bundle_json::read(&file)?
             };
             print_bundle_description_preview(&paths, &bundle)?;
             let v = request_once(&paths, Request::ImportTool { bundle })?;

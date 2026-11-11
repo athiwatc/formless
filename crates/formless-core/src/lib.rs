@@ -6,6 +6,7 @@ mod attachment_access;
 pub mod auth;
 pub mod backup_verification;
 mod budget;
+pub mod bundle_json;
 pub mod config;
 pub mod daemon;
 pub mod descriptions;
