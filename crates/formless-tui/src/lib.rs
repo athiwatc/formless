@@ -26955,7 +26955,10 @@ mod tests {
     #[test]
     fn custom_commands_invalid_invocation_names_the_current_file_and_reason() {
         let (mut app, project) = custom_command_fixture("valid");
-        let path = project.join(".formless/commands/workflow.md");
+        // Compose exactly as Core's loader reports it (`root.join(".formless/commands")`
+        // then `.join(name)`), so the full expected path keeps Core's separators on
+        // every platform rather than a single test-only joined literal.
+        let path = project.join(".formless/commands").join("workflow.md");
         std::fs::write(&path, "---\ndescription: not closed").unwrap();
         app.user_command_snapshot(true);
         app.user_commands_tick();

@@ -305,6 +305,12 @@ description: Review the proposed change
 Review $ARGUMENTS. Focus first on $1, and include @notes/review-checklist.md.
 ```
 
+Invoke `/workflow src/parser.rs` to supply its first argument. Use `$$` for a
+literal dollar: `$$5 per run`, `$$9.99`, and `echo $$1` become `$5 per run`,
+`$9.99`, and `echo $1`. A referenced `$1`–`$9` without enough arguments stops
+expansion with the filename, missing position and escape guidance before send;
+the message is not sent with text silently removed.
+
 New files and edits appear without restarting the TUI or plain client. `/help` lists them under
 **Yours**; project files override global files with the same name. Builtin
 commands always win, and shadowed files and malformed templates are reported.
