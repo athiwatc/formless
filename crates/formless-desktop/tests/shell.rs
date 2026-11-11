@@ -2269,49 +2269,261 @@ fn inside_window(window: &Window, id: &'static str, window_size: Size<Pixels>) -
         && bounds.bottom() <= window_size.height
 }
 
+fn assert_controls_inside(window: &Window, window_size: Size<Pixels>, context: &str) {
+    for id in REACHABLE_AT_ANY_SIZE {
+        assert!(
+            inside_window(window, id, window_size),
+            "{id} is not inside the window: {context}"
+        );
+    }
+    // The composer sits above the status line, not under it.
+    assert!(
+        window.find("region-composer").bounds().bottom() <= window.find("status").bounds().top(),
+        "the status line overlaps the composer: {context}"
+    );
+}
+
+fn status_text_size(window: &mut Window, cx: &mut App) -> Option<String> {
+    window.draw(cx).clear(cx);
+    painted(window)
+        .into_iter()
+        .find(|text| text.contains("needs a window of at least"))
+}
+
 #[gpui_kit::test]
-fn the_minimum_window_must_grow_with_the_text_size(cx: &mut TestAppContext) {
-    // 480 x 360 is the binary's minimum window size. At 100% it holds every
-    // control.
+fn a_window_too_small_for_the_text_size_shows_the_largest_size_it_can_hold(
+    cx: &mut TestAppContext,
+) {
+    // 480 x 360 is the binary's minimum window size.
     let minimum = size(px(480.), px(360.));
     let (handle, shell) = open(cx, minimum, 200, 40);
     step(cx, handle, |window, cx| {
         window.render_frame(cx);
-        for id in REACHABLE_AT_ANY_SIZE {
-            assert!(inside_window(window, id, minimum), "{id} at 100%");
-        }
+        assert_controls_inside(window, minimum, "100%");
+        window.input("ร่างข้อความ", cx);
     });
 
-    // At 200% the same window does not: this is a measured limitation, kept
-    // here as a record rather than asserted either way.
+    // 200% is asked for. This window cannot hold it: every control would be
+    // off screen. The default size stays in use, every control stays
+    // reachable, and the status line says what was asked for and what it
+    // would take.
     set_text_scale(cx, handle, &shell, 200);
     step(cx, handle, |window, cx| {
         window.render_frame(cx);
-        let report: Vec<String> = REACHABLE_AT_ANY_SIZE
-            .into_iter()
-            .map(|id| {
-                let place = if inside_window(window, id, minimum) {
-                    "inside"
-                } else {
-                    "OUTSIDE"
-                };
-                format!("{id}={place}")
-            })
-            .collect();
-        println!("EVIDENCE min_window_200pct 480x360: {}", report.join(" "));
+        assert_eq!(shell.read(cx).text_scale().percent(), 200);
+        assert_eq!(shell.read(cx).shown_text_scale().percent(), 100);
+        assert_controls_inside(window, minimum, "200% asked for in 480 x 360");
+        assert_eq!(
+            status_text_size(window, cx).as_deref(),
+            Some("Text 100% shown: 200% needs a window of at least 960 × 720.")
+        );
+        assert!(inside_window(window, "status-text-size", minimum));
+        // Nothing about the draft or focus changed.
+        assert_eq!(shell.read(cx).draft(cx).as_ref(), "ร่างข้อความ");
+        assert_eq!(window.find_by_label("Message").focused(), Some(true));
     });
 
-    // A minimum that scales with the text (960 x 720 at 200%) holds them all.
-    let scaled_minimum = size(px(960.), px(720.));
-    cx.simulate_window_resize(handle.into(), scaled_minimum);
+    // The window grows a step at a time. Each size it can hold is used as
+    // soon as it fits, the controls stay inside, and the request is not
+    // forgotten.
+    for (width, height, shown) in [
+        (600., 450., 125),
+        (720., 540., 150),
+        (840., 630., 175),
+        (959., 719., 175),
+        (960., 720., 200),
+        (1440., 900., 200),
+    ] {
+        let window_size = size(px(width), px(height));
+        cx.simulate_window_resize(handle.into(), window_size);
+        step(cx, handle, |window, cx| {
+            window.render_frame(cx);
+            let context = format!("{width} x {height}");
+            assert_eq!(
+                shell.read(cx).shown_text_scale().percent(),
+                shown,
+                "{context}"
+            );
+            assert_eq!(shell.read(cx).text_scale().percent(), 200, "{context}");
+            assert_controls_inside(window, window_size, &context);
+            assert_eq!(
+                status_text_size(window, cx).is_some(),
+                shown != 200,
+                "{context}"
+            );
+            assert_eq!(shell.read(cx).draft(cx).as_ref(), "ร่างข้อความ", "{context}");
+            assert_eq!(
+                window.find_by_label("Message").focused(),
+                Some(true),
+                "{context}"
+            );
+        });
+    }
+
+    // And shrinks again, all the way.
+    cx.simulate_window_resize(handle.into(), minimum);
     step(cx, handle, |window, cx| {
         window.render_frame(cx);
-        for id in REACHABLE_AT_ANY_SIZE {
-            assert!(
-                inside_window(window, id, scaled_minimum),
-                "{id} at 200% in 960x720"
+        assert_eq!(shell.read(cx).shown_text_scale().percent(), 100);
+        assert_controls_inside(window, minimum, "shrunk back to 480 x 360");
+        // Typing still works at the end of all that.
+        window.input(" ต่อ", cx);
+        assert_eq!(shell.read(cx).draft(cx).as_ref(), "ร่างข้อความ ต่อ");
+    });
+}
+
+#[gpui_kit::test]
+fn raising_the_text_size_asks_the_window_to_grow_to_fit_it(cx: &mut TestAppContext) {
+    let minimum = size(px(480.), px(360.));
+    let (handle, shell) = open(cx, minimum, 200, 40);
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.bounds().size, minimum);
+        // The shortcut asks for 125%, which needs 600 x 450.
+        window.press(&chord("="), cx);
+        assert_eq!(shell.read(cx).text_scale().percent(), 125);
+        assert_eq!(window.bounds().size, size(px(600.), px(450.)));
+        // The test window does not deliver the resize the way a real one
+        // does, so the view still has its old size here; until a resize
+        // arrives the shell goes on showing what that size can hold.
+        assert_eq!(shell.read(cx).shown_text_scale().percent(), 100);
+        assert_controls_inside(window, minimum, "before the resize arrives");
+    });
+    // The resize arrives.
+    cx.simulate_window_resize(handle.into(), size(px(600.), px(450.)));
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        assert_eq!(shell.read(cx).shown_text_scale().percent(), 125);
+        assert_controls_inside(window, size(px(600.), px(450.)), "after the resize");
+        // A window already large enough is left alone.
+        window.press(&chord("-"), cx);
+        assert_eq!(window.bounds().size, size(px(600.), px(450.)));
+    });
+}
+
+#[gpui_kit::test]
+fn repeated_text_size_changes_and_resizes_leave_the_shell_consistent(cx: &mut TestAppContext) {
+    let (handle, shell) = open(cx, WIDE, 200, 40);
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        window.input("draft", cx);
+    });
+    // A long, irregular run of size changes with resizes in between and no
+    // settling time: the same batch of events, over and over.
+    let sizes = [
+        size(px(1440.), px(900.)),
+        size(px(700.), px(500.)),
+        size(px(480.), px(360.)),
+        size(px(2000.), px(1200.)),
+        size(px(960.), px(720.)),
+    ];
+    for round in 0..40usize {
+        step(cx, handle, |window, cx| {
+            let keys: &[&str] = match round % 4 {
+                0 => &["=", "="],
+                1 => &["-"],
+                2 => &["=", "=", "="],
+                _ => &["0", "="],
+            };
+            for key in keys {
+                window.press(&chord(key), cx);
+            }
+        });
+        let window_size = sizes[round % sizes.len()];
+        cx.simulate_window_resize(handle.into(), window_size);
+        step(cx, handle, |window, cx| {
+            window.render_frame(cx);
+            let requested = shell.read(cx).text_scale();
+            let shown = shell.read(cx).shown_text_scale();
+            let context = format!(
+                "round {round}: {window_size:?}, asked {}%",
+                requested.percent()
             );
-        }
+            // What is shown is exactly what the model says fits.
+            assert_eq!(
+                shown,
+                requested.fitted_to(f32::from(window_size.width), f32::from(window_size.height)),
+                "{context}"
+            );
+            assert_controls_inside(window, window_size, &context);
+            assert_eq!(shell.read(cx).draft(cx).as_ref(), "draft", "{context}");
+            assert_eq!(
+                window.find_by_label("Message").focused(),
+                Some(true),
+                "{context}"
+            );
+        });
+    }
+}
+
+#[gpui_kit::test]
+fn a_text_size_change_while_an_overlay_is_open_keeps_the_overlay_and_its_focus(
+    cx: &mut TestAppContext,
+) {
+    let (handle, shell) = open(cx, WIDE, 200, 40);
+    cx.simulate_window_resize(handle.into(), size(px(1100.), px(900.)));
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        window.input("draft", cx);
+        window.press(TOGGLE_INSPECTOR, cx);
+        assert_eq!(window.find("region-inspector").focused(), Some(true));
+        assert!(window.find("region-sidebar").visible());
+
+        // Larger text: the window now lays out like a narrower one, so the
+        // docked sidebar gives way. The overlay stays up with focus in it.
+        window.press(&chord("="), cx);
+        window.press(&chord("="), cx);
+        assert_eq!(shell.read(cx).shown_text_scale().percent(), 150);
+        assert!(window.try_find("region-sidebar").is_none());
+        assert!(window.find("overlay-backdrop").visible());
+        assert_eq!(window.find("region-inspector").focused(), Some(true));
+
+        // Dismissing it still returns focus to where it came from.
+        window.press("escape", cx);
+        assert!(window.try_find("region-inspector").is_none());
+        assert_eq!(window.find_by_label("Message").focused(), Some(true));
+        assert_eq!(shell.read(cx).draft(cx).as_ref(), "draft");
+
+        // Back to the default size: the sidebar docks again, and the overlay
+        // that was dismissed does not come back.
+        window.press(&chord("0"), cx);
+        assert!(window.find("region-sidebar").visible());
+        assert!(window.try_find("overlay-backdrop").is_none());
+    });
+}
+
+#[gpui_kit::test]
+fn a_text_size_change_in_the_middle_of_a_stream_loses_nothing(cx: &mut TestAppContext) {
+    let (handle, shell) = open(cx, size(px(1440.), px(1200.)), 20, 40);
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        shell.update(cx, |shell, cx| {
+            shell.begin_stream(cx);
+            for index in 0..200 {
+                shell.push_stream_delta(&format!("คำ #{index:04}# "), cx);
+            }
+        });
+        // Before those deltas have reached the view.
+        window.press(&chord("="), cx);
+        shell.update(cx, |shell, cx| {
+            for index in 200..400 {
+                shell.push_stream_delta(&format!("คำ #{index:04}# "), cx);
+            }
+        });
+        window.press(&chord("="), cx);
+    });
+    cx.executor().advance_clock(Duration::from_millis(50));
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| {
+        window.draw(cx).clear(cx);
+        assert_eq!(shell.read(cx).shown_text_scale().percent(), 150);
+        assert_eq!(shell.read(cx).block_count(), 41);
+        assert!(window.find(("block", 41usize)).visible());
+        let painted = painted(window);
+        assert!(painted
+            .iter()
+            .any(|text| text.contains("#0000#") && text.contains("#0399#")));
     });
 }
 

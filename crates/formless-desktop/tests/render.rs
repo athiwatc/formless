@@ -29,54 +29,129 @@ mod render {
         WindowOptions,
     };
 
-    /// Name, window width, theme, text size in percent, and a control to
-    /// click before capturing.
-    const STATES: [(&str, f32, ThemeMode, u16, Option<&str>); 10] = [
-        ("wide-light", 1440., ThemeMode::Light, 100, None),
-        ("wide-dark", 1440., ThemeMode::Dark, 100, None),
-        ("medium-light", 1100., ThemeMode::Light, 100, None),
-        ("narrow-dark", 800., ThemeMode::Dark, 100, None),
-        (
+    /// One state to draw: window size, theme, the text size asked for, a
+    /// control to click first, and the text size that should end up in use.
+    struct State {
+        name: &'static str,
+        width: f32,
+        height: f32,
+        mode: ThemeMode,
+        percent: u16,
+        click: Option<&'static str>,
+        shown_percent: u16,
+    }
+
+    const fn state(
+        name: &'static str,
+        width: f32,
+        height: f32,
+        mode: ThemeMode,
+        percent: u16,
+        click: Option<&'static str>,
+        shown_percent: u16,
+    ) -> State {
+        State {
+            name,
+            width,
+            height,
+            mode,
+            percent,
+            click,
+            shown_percent,
+        }
+    }
+
+    const LIGHT: ThemeMode = ThemeMode::Light;
+    const DARK: ThemeMode = ThemeMode::Dark;
+
+    const STATES: [State; 14] = [
+        state("wide-light", 1440., 900., LIGHT, 100, None, 100),
+        state("wide-dark", 1440., 900., DARK, 100, None, 100),
+        state("medium-light", 1100., 900., LIGHT, 100, None, 100),
+        state("narrow-dark", 800., 900., DARK, 100, None, 100),
+        state(
             "medium-inspector-overlay-light",
             1100.,
-            ThemeMode::Light,
+            900.,
+            LIGHT,
             100,
             Some("toggle-inspector"),
+            100,
         ),
-        (
+        state(
             "narrow-sidebar-overlay-dark",
             800.,
-            ThemeMode::Dark,
+            900.,
+            DARK,
             100,
             Some("toggle-sidebar"),
+            100,
         ),
-        (
+        state(
             "wide-tools-scaffold-light",
             1440.,
-            ThemeMode::Light,
+            900.,
+            LIGHT,
             100,
             Some("destination-Tools"),
+            100,
         ),
-        ("wide-light-200pct", 1440., ThemeMode::Light, 200, None),
-        (
+        state("wide-light-200pct", 1440., 900., LIGHT, 200, None, 200),
+        state(
             "wide-sidebar-overlay-light-200pct",
             1440.,
-            ThemeMode::Light,
+            900.,
+            LIGHT,
             200,
             Some("toggle-sidebar"),
+            200,
         ),
-        ("minimum-dark-200pct", 480., ThemeMode::Dark, 200, None),
+        // The binary's minimum window. 200% does not fit it; the default
+        // size is used and the status line says so.
+        state("minimum-light-100pct", 480., 360., LIGHT, 100, None, 100),
+        state("minimum-dark-200pct", 480., 360., DARK, 200, None, 100),
+        // The smallest window that holds each larger size.
+        state("fits-150pct-light", 720., 540., LIGHT, 200, None, 150),
+        state("fits-200pct-light", 960., 720., LIGHT, 200, None, 200),
+        state(
+            "just-short-of-200pct-dark",
+            959.,
+            719.,
+            DARK,
+            200,
+            None,
+            175,
+        ),
+    ];
+
+    /// Controls that must be whole and inside the window in every state.
+    const ALWAYS_REACHABLE: [&str; 6] = [
+        "toggle-sidebar",
+        "toggle-inspector",
+        "toggle-theme",
+        "composer-stop",
+        "composer-primary",
+        "status",
     ];
 
     pub fn run() {
         let keep = std::env::var("FORMLESS_DESKTOP_RENDER_DIR").ok();
-        for (name, width, mode, percent, click) in STATES {
+        for State {
+            name,
+            width,
+            height,
+            mode,
+            percent,
+            click,
+            shown_percent,
+        } in STATES
+        {
             let mut cx = HeadlessAppContext::with_platform(
                 gpui_kit::platform::current_platform(true).text_system(),
                 Arc::new(Assets),
                 gpui_kit::platform::current_headless_renderer,
             );
-            let (handle, _) = cx
+            let (handle, shell) = cx
                 .update(|cx| {
                     gpui_kit::init(cx);
                     shell::bind_keys(cx);
@@ -87,8 +162,7 @@ mod render {
                     let options = WindowOptions {
                         window_bounds: Some(WindowBounds::Windowed(Bounds {
                             origin: Default::default(),
-                            // The last state is the binary's minimum window.
-                            size: size(px(width), px(if width < 500. { 360. } else { 900. })),
+                            size: size(px(width), px(height)),
                         })),
                         focus: false,
                         show: false,
@@ -105,14 +179,38 @@ mod render {
                 })
                 .expect("open offscreen window");
             cx.run_until_parked();
-            if let Some(control) = click {
-                cx.update_window(handle, |_, window, cx| {
-                    window.render_frame(cx);
+            cx.update_window(handle, |_, window, cx| {
+                window.render_frame(cx);
+                // With real fonts: the text size in use is the one this
+                // window can hold, and at that size every control is whole
+                // and inside the window, with the composer above the status
+                // line. (Checked before any overlay is opened over them.)
+                assert_eq!(
+                    shell.read(cx).shown_text_scale().percent(),
+                    shown_percent,
+                    "{name}: text size in use"
+                );
+                let inside = |id: &'static str| {
+                    let bounds = window.find(id).bounds();
+                    bounds.left() >= px(0.)
+                        && bounds.right() <= px(width)
+                        && bounds.top() >= px(0.)
+                        && bounds.bottom() <= px(height)
+                };
+                for id in ALWAYS_REACHABLE {
+                    assert!(inside(id), "{name}: {id} is not inside the window");
+                }
+                assert!(
+                    window.find("region-composer").bounds().bottom()
+                        <= window.find("status").bounds().top(),
+                    "{name}: the status line overlaps the composer"
+                );
+                if let Some(control) = click {
                     window.click(control, cx);
-                })
-                .expect("offscreen window is open");
-                cx.run_until_parked();
-            }
+                }
+            })
+            .expect("offscreen window is open");
+            cx.run_until_parked();
             let image = cx
                 .capture_screenshot(handle)
                 .expect("offscreen rendering must be available");

@@ -200,8 +200,11 @@ pub struct Shell {
     stream: Coalescer,
     drafts: Drafts,
     prefs: PanelPrefs,
-    /// The text size. Fixed sizes and layout breakpoints follow it.
+    /// The text size the user asked for.
     text_scale: TextScale,
+    /// The text size in use: the requested one, or the largest smaller one
+    /// the window can hold. Fixed sizes and layout breakpoints follow this.
+    shown_scale: TextScale,
     destination: Destination,
     /// What the last composer action was. Sizes only: no message text is
     /// kept once an intent has been handed on.
@@ -271,6 +274,7 @@ impl Shell {
             drafts: Drafts::new(limits::DRAFT_MAX_ENTRIES, limits::DRAFT_MAX_BYTES),
             prefs: PanelPrefs::default(),
             text_scale: TextScale::default(),
+            shown_scale: TextScale::default(),
             destination: Destination::Chat,
             last_intent: None,
             accepted_draft: SharedString::default(),
@@ -546,23 +550,30 @@ impl Shell {
 
     /// A fixed size from the layout tokens, at the current text size.
     fn scaled(&self, value: f32) -> Pixels {
-        px(value * self.text_scale.factor())
+        px(value * self.shown_scale.factor())
     }
 
     /// The window width the layout breakpoints see: the real width divided
     /// by the text size factor.
     fn effective_width(&self, window: &Window) -> f32 {
-        f32::from(window.viewport_size().width) / self.text_scale.factor()
+        f32::from(window.viewport_size().width) / self.shown_scale.factor()
     }
 
+    /// The text size the user asked for.
     pub fn text_scale(&self) -> TextScale {
         self.text_scale
     }
 
-    /// Change the text size. The kit theme's font sizes drive every
-    /// rem-based size (text, controls); the shell's own fixed sizes and its
-    /// breakpoints follow the same factor, so the layout may change, and
-    /// focus is settled as for a resize.
+    /// The text size in use, which is smaller than the one asked for when
+    /// the window cannot hold that.
+    pub fn shown_text_scale(&self) -> TextScale {
+        self.shown_scale
+    }
+
+    /// Ask for a text size in the window as it is. The size shown is the
+    /// largest one the window can hold (see [`Self::fit_text_scale`]), so a
+    /// window too small for the request gets smaller text, not controls out
+    /// of reach, and the status line says so.
     pub fn set_text_scale(
         &mut self,
         scale: TextScale,
@@ -573,12 +584,50 @@ impl Shell {
             return;
         }
         self.text_scale = scale;
-        let theme = Theme::global_mut(cx);
-        theme.font_size = px(BASE_FONT_SIZE * scale.factor());
-        theme.mono_font_size = px(BASE_MONO_FONT_SIZE * scale.factor());
-        self.session_sizes = Self::row_sizes(self.sidebar.rows().len(), scale);
-        cx.refresh_windows();
         self.settle(window, cx);
+    }
+
+    /// Ask for a text size, and first ask the window to grow to the size
+    /// that text size needs if it is smaller. This is what the shortcuts
+    /// do. Whether the window grows is up to the platform (a display can be
+    /// too small); whatever size it ends up, the rule of
+    /// [`Self::set_text_scale`] holds, at once and again when the resize
+    /// arrives.
+    pub fn set_text_scale_growing_window(
+        &mut self,
+        scale: TextScale,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (needed_width, needed_height) = scale.minimum_window();
+        let viewport = window.viewport_size();
+        if f32::from(viewport.width) < needed_width || f32::from(viewport.height) < needed_height {
+            window.resize(size(
+                viewport.width.max(px(needed_width)),
+                viewport.height.max(px(needed_height)),
+            ));
+        }
+        self.set_text_scale(scale, window, cx);
+    }
+
+    /// Bring the size in use into line with the size asked for and the
+    /// window as it is now. The kit theme's font sizes drive every rem-based
+    /// size (text, controls); the shell's own fixed sizes and its
+    /// breakpoints follow the same factor.
+    fn fit_text_scale(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let viewport = window.viewport_size();
+        let fitted = self
+            .text_scale
+            .fitted_to(f32::from(viewport.width), f32::from(viewport.height));
+        if fitted == self.shown_scale {
+            return;
+        }
+        self.shown_scale = fitted;
+        let theme = Theme::global_mut(cx);
+        theme.font_size = px(BASE_FONT_SIZE * fitted.factor());
+        theme.mono_font_size = px(BASE_MONO_FONT_SIZE * fitted.factor());
+        self.session_sizes = Self::row_sizes(self.sidebar.rows().len(), fitted);
+        cx.refresh_windows();
     }
 
     pub fn sidebar(&self) -> &Sidebar {
@@ -881,6 +930,8 @@ impl Shell {
     /// provided its region is still shown. Otherwise focus only moves if the
     /// region holding it is no longer on screen.
     fn settle(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // First, because the size in use decides the layout below.
+        self.fit_text_scale(window, cx);
         self.prefs.settle(self.effective_width(window));
         let layout = self.layout(window);
         let focused = self.focused_region(window, cx);
@@ -1430,6 +1481,20 @@ impl Shell {
             },
             None => "No intent recorded".to_string(),
         };
+        // When the window cannot hold the text size that was asked for, the
+        // smaller size in use is not passed off as the requested one.
+        let reduced = (self.shown_scale != self.text_scale).then(|| {
+            let (width, height) = self.text_scale.minimum_window();
+            div()
+                .id("status-text-size")
+                .test_support()
+                .flex_shrink_0()
+                .child(Label::new(format!(
+                    "Text {}% shown: {}% needs a window of at least {width} × {height}.",
+                    self.shown_scale.percent(),
+                    self.text_scale.percent()
+                )))
+        });
         let destination = if self.destination == Destination::Chat {
             "Chat".to_string()
         } else {
@@ -1446,12 +1511,15 @@ impl Shell {
             .text_color(cx.theme().muted_foreground)
             .border_t_1()
             .border_color(cx.theme().border)
+            // First, so it is not the part that is clipped in the small
+            // window it is about.
+            .children(reduced)
             .child("Synthetic fixture: no Daemon Core connection")
             .child(intent)
             .child(div().flex_1())
             .child(format!(
                 "Text {}% · {destination} · inspector {}",
-                self.text_scale.percent(),
+                self.shown_scale.percent(),
                 match layout.inspector {
                     InspectorMode::Docked => "docked",
                     InspectorMode::Overlay => "overlay",
@@ -1487,13 +1555,13 @@ impl Render for Shell {
                 this.toggle_panel(Region::Inspector, window, cx)
             }))
             .on_action(cx.listener(|this, _: &IncreaseTextSize, window, cx| {
-                this.set_text_scale(this.text_scale.larger(), window, cx)
+                this.set_text_scale_growing_window(this.text_scale.larger(), window, cx)
             }))
             .on_action(cx.listener(|this, _: &DecreaseTextSize, window, cx| {
-                this.set_text_scale(this.text_scale.smaller(), window, cx)
+                this.set_text_scale_growing_window(this.text_scale.smaller(), window, cx)
             }))
             .on_action(cx.listener(|this, _: &ResetTextSize, window, cx| {
-                this.set_text_scale(TextScale::DEFAULT, window, cx)
+                this.set_text_scale_growing_window(TextScale::DEFAULT, window, cx)
             }))
             .child(self.render_header(layout, cx))
             .child(

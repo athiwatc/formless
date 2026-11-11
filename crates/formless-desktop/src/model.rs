@@ -27,6 +27,11 @@ pub mod tokens {
     pub const SIDEBAR_DOCK_MIN: f32 = SIDEBAR_DEFAULT + READING_MIN;
     /// Spacing grid unit.
     pub const GRID: f32 = 4.0;
+    /// The smallest window in which every header and composer control is on
+    /// screen at 100% text size. At a larger text size the shell needs this
+    /// multiplied by the text size factor.
+    pub const MIN_WINDOW_WIDTH: f32 = 480.0;
+    pub const MIN_WINDOW_HEIGHT: f32 = 360.0;
 }
 
 /// The user's text size, as a percentage of the default.
@@ -66,6 +71,32 @@ impl TextScale {
             .into_iter()
             .find(|step| *step > self.0)
             .map_or(self, Self)
+    }
+
+    /// The smallest window that keeps every control on screen at this text
+    /// size, as (width, height).
+    pub fn minimum_window(self) -> (f32, f32) {
+        (
+            tokens::MIN_WINDOW_WIDTH * self.factor(),
+            tokens::MIN_WINDOW_HEIGHT * self.factor(),
+        )
+    }
+
+    /// The text size to actually show in a window of this size: the largest
+    /// step, no larger than this one, whose minimum window fits. A window too
+    /// small for a size would push controls off screen, which costs more
+    /// than smaller text does; the default size is shown however small the
+    /// window is.
+    pub fn fitted_to(self, width: f32, height: f32) -> Self {
+        Self::STEPS
+            .into_iter()
+            .rev()
+            .map(Self)
+            .find(|step| {
+                let (needed_width, needed_height) = step.minimum_window();
+                *step <= self && needed_width <= width && needed_height <= height
+            })
+            .unwrap_or(Self::DEFAULT)
     }
 
     /// One step smaller; the default is the smallest.
@@ -715,6 +746,44 @@ mod tests {
         assert_eq!(TextScale::from_percent(140).percent(), 150);
         assert_eq!(TextScale::from_percent(0).percent(), 100);
         assert_eq!(TextScale::from_percent(9_999).percent(), 200);
+    }
+
+    #[test]
+    fn the_shown_text_size_is_the_largest_step_the_window_can_hold() {
+        let requested = TextScale::LARGEST;
+        assert_eq!(requested.minimum_window(), (960.0, 720.0));
+        // The smallest window holds the default size and nothing larger.
+        assert_eq!(requested.fitted_to(480.0, 360.0).percent(), 100);
+        // One step fits at each multiple of the base minimum, and not a
+        // pixel before.
+        for (width, height, percent) in [
+            (599.0, 4_000.0, 100),
+            (600.0, 450.0, 125),
+            (720.0, 540.0, 150),
+            (840.0, 630.0, 175),
+            (959.0, 4_000.0, 175),
+            (4_000.0, 719.0, 175),
+            (960.0, 720.0, 200),
+            (4_000.0, 4_000.0, 200),
+        ] {
+            assert_eq!(
+                requested.fitted_to(width, height).percent(),
+                percent,
+                "{width} x {height}"
+            );
+        }
+        // Either dimension can be the one that limits it.
+        assert_eq!(requested.fitted_to(4_000.0, 450.0).percent(), 125);
+        assert_eq!(requested.fitted_to(600.0, 4_000.0).percent(), 125);
+        // Never larger than asked for, never smaller than the default.
+        assert_eq!(
+            TextScale::from_percent(125)
+                .fitted_to(4_000.0, 4_000.0)
+                .percent(),
+            125
+        );
+        assert_eq!(TextScale::DEFAULT.fitted_to(10.0, 10.0), TextScale::DEFAULT);
+        assert_eq!(requested.fitted_to(0.0, 0.0), TextScale::DEFAULT);
     }
 
     #[test]

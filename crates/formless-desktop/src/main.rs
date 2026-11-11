@@ -6,6 +6,7 @@
 //! - `--sessions N`, `--blocks N`: size the fixture.
 //! - `--huge-block-mb N`: add one N MiB output block at the tail.
 //! - `--text-scale P`: start at P percent text size (100 to 200).
+//! - `--window WxH`: open at this size instead of 1440x900.
 //! - `--smoke`: print startup timings up to the first rendered frame, quit.
 //! - `--stream-seconds S` (with `--stream-rate R`, default 100 deltas per
 //!   second; 0 streams nothing and measures the idle window): stream into
@@ -16,14 +17,14 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use formless_desktop::model::TextScale;
+use formless_desktop::model::{tokens, TextScale};
 use formless_desktop::shell::Shell;
 use formless_desktop::{fixture, shell};
 use gpui_kit::prelude::*;
 use gpui_kit::{px, size, App, Bounds, Entity, Window, WindowBounds, WindowOptions};
 
 const USAGE: &str = "usage: formless-desktop [--sessions N] [--blocks N] [--huge-block-mb N] \
-                     [--text-scale P] \
+                     [--text-scale P] [--window WxH] \
                      [--smoke] [--stream-seconds S [--stream-rate R]]";
 
 struct Options {
@@ -31,6 +32,7 @@ struct Options {
     blocks: usize,
     huge_block_mb: usize,
     text_scale: usize,
+    window: (f32, f32),
     smoke: bool,
     stream_seconds: usize,
     stream_rate: usize,
@@ -42,6 +44,7 @@ fn parse_options() -> Result<Options, String> {
         blocks: 10_000,
         huge_block_mb: 0,
         text_scale: 100,
+        window: (1440., 900.),
         smoke: false,
         stream_seconds: 0,
         stream_rate: 100,
@@ -59,6 +62,13 @@ fn parse_options() -> Result<Options, String> {
             "--blocks" => options.blocks = count("--blocks")?,
             "--huge-block-mb" => options.huge_block_mb = count("--huge-block-mb")?,
             "--text-scale" => options.text_scale = count("--text-scale")?,
+            "--window" => {
+                let value = args.next().ok_or("--window needs WIDTHxHEIGHT")?;
+                options.window = value
+                    .split_once('x')
+                    .and_then(|(width, height)| Some((width.parse().ok()?, height.parse().ok()?)))
+                    .ok_or(format!("--window: {value:?} is not WIDTHxHEIGHT"))?;
+            }
             "--smoke" => options.smoke = true,
             "--stream-seconds" => options.stream_seconds = count("--stream-seconds")?,
             "--stream-rate" => options.stream_rate = count("--stream-rate")?,
@@ -195,17 +205,22 @@ fn main() {
         }
         let fixture_built = started.elapsed() - app_ready;
 
-        let bounds = Bounds::centered(None, size(px(1440.), px(900.)), cx);
+        let bounds = Bounds::centered(None, size(px(options.window.0), px(options.window.1)), cx);
         let window_options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
-            window_min_size: Some(size(px(480.), px(360.))),
+            window_min_size: Some(size(
+                px(tokens::MIN_WINDOW_WIDTH),
+                px(tokens::MIN_WINDOW_HEIGHT),
+            )),
             ..Default::default()
         };
         let (window, shell) = gpui_kit::open_window(window_options, cx, |window, cx| {
             window.set_window_title("Formless (Phase 0 spike)");
             let shell = cx.new(|cx| shell::Shell::new(&sessions, &running, blocks, window, cx));
             let scale = TextScale::from_percent(options.text_scale.min(1_000) as u16);
-            shell.update(cx, |shell, cx| shell.set_text_scale(scale, window, cx));
+            shell.update(cx, |shell, cx| {
+                shell.set_text_scale_growing_window(scale, window, cx)
+            });
             shell
         })
         .expect("failed to open the shell window");
@@ -238,9 +253,29 @@ fn main() {
                                 cx,
                             );
                         } else {
+                            let handle = window.window_handle();
+                            let requested_window = options.window;
                             cx.spawn(async move |cx| {
                                 cx.background_executor().timer(Duration::from_secs(1)).await;
-                                cx.update(|cx| cx.quit());
+                                cx.update(|cx| {
+                                    // A second after the first frame: what the
+                                    // window and the text size settled at.
+                                    let _ = cx.update_window(handle, |_, window, cx| {
+                                        let viewport = window.viewport_size();
+                                        let shell = shell.read(cx);
+                                        println!(
+                                            "window: requested={}x{} viewport={}x{} \
+                                             text_scale_requested={} text_scale_shown={}",
+                                            requested_window.0,
+                                            requested_window.1,
+                                            f32::from(viewport.width),
+                                            f32::from(viewport.height),
+                                            shell.text_scale().percent(),
+                                            shell.shown_text_scale().percent()
+                                        );
+                                    });
+                                    cx.quit()
+                                });
                             })
                             .detach();
                         }
