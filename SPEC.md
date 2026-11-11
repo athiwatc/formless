@@ -933,8 +933,23 @@ task, with quality as a gate**.
   alt text and address as text (nothing is fetched when the page is
   opened), and links keep only http(s), mailto and relative targets. TUI `/export [json|md|html]`
   (writes to the exports directory), the web "Export…" dialog and
-  `/export`, and `formless sessions export ID --format md|html|json
-  [-o FILE]`.
+  `/export`, and `formless sessions export ID [--format json|markdown|html]
+  [-o FILE]` (`md` aliases `markdown`). The CLI infers omitted formats from
+  `.md`/`.markdown`, `.html`/`.htm`, or `.json` extensions, case-insensitively;
+  stdout and unknown extensions still default to JSON. Explicit conflicts with
+  recognized extensions are usage errors before profile setup, Session lookup
+  or daemon connection. On Unix, ordinary file output is replaced atomically,
+  preserving existing write-access checks and staging/final mode bits (not a
+  claim of extended ACL/xattr preservation); pre-commit failures
+  leave prior exports intact. The Windows implementation verifies protected
+  user-only staging ACLs before writing, publishes new files without clobbering
+  competing creators, and uses DACL-preserving replacement with a private
+  backup. Partial OS replacement failures use no-clobber restoration or retain
+  recovery files identified in the error. Native Windows acceptance remains
+  pending; no complete Windows validation is claimed. Leaf symlinks (including dangling links) keep
+  write-through semantics
+  with bounded link traversal. Descriptor/device streams use direct writes,
+  never pathname replacement.
 
 ### 5.2 Run lifecycle
 
@@ -5021,7 +5036,8 @@ previous headless Run's Session.
   the TUI and web: `list [--archived] [--json]`, `show ID [--json]`, `rename
   ID NAME`, `rm ID` (restorable for `daemon.delete_undo_secs`; it prints the
   restore command), `restore ID`, `archive`/`unarchive ID`, `export ID
-  [--format json|md|html] [-o FILE]`, `import FILE`, and `search QUERY
+  [--format json|markdown|html] [-o FILE]` (`md` aliases `markdown`),
+  `import FILE`, and `search QUERY
   [--limit N] [--json]`. IDs may be a unique prefix (`restore` needs the
   full id).
 - `formless run "task"` — headless Run (§5 semantics) in an ephemeral
@@ -6046,6 +6062,11 @@ configuration interface): `FORMLESS_DOCS_OPENER_FIXTURE`,
 `FORMLESS_TEST_MAINTENANCE_ISOLATION`, `FORMLESS_TEST_MAINTENANCE_OPERATION`,
 `FORMLESS_TEST_OWNERSHIP_CONFIG`, `FORMLESS_TEST_OWNERSHIP_DATA`,
 `FORMLESS_TEST_PANIC_MARKER`.
+
+`FORMLESS_EXPORT_DESCRIPTOR_FIXTURE` is a Linux-only export test hook pointing
+to an owned redirected-stdout alias; it verifies that descriptor output preserves
+the underlying file instead of atomically replacing the alias. The shipped
+binary does not read this variable.
 
 ### Local pre-Run forecasts (§5.2, §10.6, §12)
 

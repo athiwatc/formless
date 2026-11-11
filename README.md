@@ -403,10 +403,26 @@ formless sessions list                     # --archived, --json
 formless sessions show 3f9c                # the transcript (--json for scripts)
 formless sessions search "invoice"         # across every Session
 formless sessions rename 3f9c "Q3 report"
-formless sessions export 3f9c --format md -o q3.md
+formless sessions export 3f9c -o q3.md       # infer Markdown from the filename
 formless sessions import bundle.json
 formless sessions rm 3f9c                  # restorable for a short while: sessions restore <id>
 ```
+
+`--format` accepts `json`, `markdown` (alias `md`), or `html`. When omitted,
+`.md`/`.markdown`, `.html`/`.htm`, and `.json` output extensions select their
+matching format, ignoring extension case. Standard output and other extensions
+still default to JSON. An explicit format conflicting with a recognized output
+extension is a usage error before any Session lookup or daemon connection.
+On Unix, ordinary file output uses atomic replacement with existing mode bits
+applied before staging content; failed pre-commit writes leave the prior export
+intact. This does not claim extended ACL or xattr preservation.
+The Windows implementation uses verified user-private staging and preserves an
+existing file's DACL through replacement, without ignoring ACL merge failures.
+It remains pending native Windows acceptance. If an OS replacement failure
+retains private recovery files, the error identifies their directory for
+inspection before retrying; no destructive replacement fallback is used.
+Existing symbolic links keep writing through to their targets,
+and descriptor/device streams retain their existing direct-write behavior.
 
 ### Reporting a bug
 

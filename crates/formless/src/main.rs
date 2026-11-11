@@ -4,6 +4,8 @@ mod cli_commands;
 mod cli_help_tests;
 mod cli_pipeline;
 mod cli_run_identity;
+#[cfg(test)]
+mod session_export_tests;
 mod table;
 
 use anyhow::{bail, Context, Result};
@@ -1638,6 +1640,9 @@ fn run_cli(cli: Cli) -> Result<()> {
             "--plain, -c/--continue and --new start the TUI; use them without a command (or `formless tui`)",
         ));
     }
+    // Export usage errors must precede profile setup, Session lookup and any
+    // daemon connection. sessions_cmd validates again for direct callers.
+    validate_cli_export_format(&cli)?;
     // The daemon logs warnings and info to daemon.log (`formless logs`);
     // other commands only errors. RUST_LOG overrides both. Colour codes
     // only on a terminal, never into the log file.
@@ -5003,6 +5008,263 @@ fn web_cmd(paths: Paths, port: Option<u16>, no_open: bool, stop: bool) -> Result
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum SessionExportFormat {
+    /// Re-importable JSON Session bundle
+    Json,
+    /// Readable Markdown transcript (alias: md)
+    #[value(alias = "md")]
+    Markdown,
+    /// Standalone HTML transcript
+    Html,
+}
+
+impl SessionExportFormat {
+    fn wire_name(self) -> &'static str {
+        match self {
+            Self::Json => "json",
+            Self::Markdown => "markdown",
+            Self::Html => "html",
+        }
+    }
+
+    fn from_extension(path: &std::path::Path) -> Option<Self> {
+        match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
+            "json" => Some(Self::Json),
+            "md" | "markdown" => Some(Self::Markdown),
+            "html" | "htm" => Some(Self::Html),
+            _ => None,
+        }
+    }
+}
+
+fn session_export_format(
+    explicit: Option<SessionExportFormat>,
+    output: Option<&std::path::Path>,
+) -> Result<SessionExportFormat> {
+    let inferred = output.and_then(SessionExportFormat::from_extension);
+    if let (Some(explicit), Some(inferred)) = (explicit, inferred) {
+        if explicit != inferred {
+            return Err(usage(format!("--format {} conflicts with output extension for {} ({}); choose a matching format or filename",
+                explicit.wire_name(), output.unwrap().display(), inferred.wire_name())));
+        }
+    }
+    Ok(explicit.or(inferred).unwrap_or(SessionExportFormat::Json))
+}
+
+fn validate_cli_export_format(cli: &Cli) -> Result<()> {
+    if let Some(Cmd::Sessions {
+        action: SessionsAction::Export { format, output, .. },
+    }) = &cli.cmd
+    {
+        session_export_format(*format, output.as_deref())?;
+    }
+    Ok(())
+}
+
+// Descriptor aliases keep the old stream-write behavior, even when redirected
+// to a regular file. Renaming their underlying pathname would detach that fd.
+fn export_descriptor_path(path: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        if ["/dev/stdout", "/dev/stderr", "/dev/stdin"]
+            .iter()
+            .any(|alias| path == std::path::Path::new(alias))
+        {
+            return true;
+        }
+        let parent = path.parent();
+        let fd = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.parse::<u32>().is_ok());
+        if fd
+            && parent.is_some_and(|parent| {
+                parent == std::path::Path::new("/dev/fd")
+                    || (parent.starts_with("/proc")
+                        && parent.file_name() == Some(std::ffi::OsStr::new("fd")))
+            })
+        {
+            return true;
+        }
+    }
+    #[cfg(windows)]
+    {
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        let name = name
+            .split('.')
+            .next()
+            .unwrap_or("")
+            .trim_end_matches(' ')
+            .to_ascii_uppercase();
+        if matches!(
+            name.as_str(),
+            "NUL" | "CON" | "CONIN$" | "CONOUT$" | "PRN" | "AUX"
+        ) || (name.len() == 4
+            && (name.starts_with("COM") || name.starts_with("LPT"))
+            && matches!(name.as_bytes()[3], b'1'..=b'9'))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn export_descriptor_alias(path: &std::path::Path) -> bool {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(std::path::Path::new("."));
+    export_descriptor_path(path)
+        || std::fs::canonicalize(parent)
+            .ok()
+            .zip(path.file_name())
+            .is_some_and(|(parent, name)| export_descriptor_path(&parent.join(name)))
+}
+
+#[cfg(unix)]
+fn atomic_session_export_with(
+    destination: &std::path::Path,
+    write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    struct Staged {
+        path: std::path::PathBuf,
+        committed: bool,
+    }
+    impl Drop for Staged {
+        fn drop(&mut self) {
+            if !self.committed {
+                let _ = std::fs::remove_file(&self.path);
+            }
+        }
+    }
+    let parent = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(std::path::Path::new("."));
+    destination
+        .file_name()
+        .context("export destination has no filename")?;
+    let metadata = std::fs::metadata(destination).ok();
+    let permissions = metadata
+        .as_ref()
+        .filter(|metadata| metadata.is_file())
+        .map(|metadata| metadata.permissions());
+    // Existing private exports must never become more readable while staged.
+    // New outputs retain the same 0666-and-umask semantics as fs::write.
+    let mode = if metadata
+        .as_ref()
+        .is_some_and(|metadata| !metadata.is_file())
+    {
+        0o600 // Invalid directory destinations must not stage readable data.
+    } else {
+        permissions
+            .as_ref()
+            .map_or(0o666, |permissions| permissions.mode())
+    };
+    let mut staged_file = None;
+    for _ in 0..64 {
+        let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = parent.join(format!(
+            ".formless-export-{}-{serial}.tmp",
+            std::process::id()
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(&path)
+        {
+            Ok(file) => {
+                staged_file = Some((
+                    Staged {
+                        path,
+                        committed: false,
+                    },
+                    file,
+                ));
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let (mut staged, mut file) = staged_file.context("cannot reserve an export staging file")?;
+    if let Some(permissions) = permissions {
+        file.set_permissions(permissions)?;
+    }
+    write(&mut file)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&staged.path, destination)?;
+    staged.committed = true;
+    std::fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(windows)]
+mod session_export_windows;
+
+fn write_regular_session_export(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    #[cfg(unix)]
+    {
+        atomic_session_export_with(path, |file| file.write_all(bytes))
+    }
+    #[cfg(windows)]
+    {
+        session_export_windows::write(path, bytes).map_err(Into::into)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        // Platforms other than Unix/Windows retain their previous output path.
+        eprintln!("warning: atomic export replacement preserving access controls is not available on this platform; retaining direct output");
+        std::fs::write(path, bytes).map_err(Into::into)
+    }
+}
+
+fn write_session_export(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    let mut destination = path.to_path_buf();
+    // Follow leaf links (including dangling ones) as the previous fs::write did,
+    // but stop cycles. Parent links retain normal filesystem resolution.
+    for _ in 0..64 {
+        if export_descriptor_alias(&destination) {
+            return std::fs::write(&destination, bytes).map_err(Into::into);
+        }
+        match std::fs::symlink_metadata(&destination) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                let target = std::fs::read_link(&destination)?;
+                destination = if target.is_absolute() {
+                    target
+                } else {
+                    destination
+                        .parent()
+                        .unwrap_or(std::path::Path::new("."))
+                        .join(target)
+                };
+            }
+            Ok(metadata) => {
+                if !metadata.is_file() && !metadata.is_dir() {
+                    // Never rename a regular file over a FIFO/device/socket.
+                    return std::fs::write(&destination, bytes).map_err(Into::into);
+                }
+                if metadata.is_file() {
+                    // Preserve existing write-access errors without truncating
+                    // the old export before the atomic replacement is ready.
+                    drop(std::fs::OpenOptions::new().write(true).open(&destination)?);
+                }
+                return write_regular_session_export(&destination, bytes);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return write_regular_session_export(&destination, bytes);
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    bail!("export destination has too many symbolic links")
+}
+
 #[derive(Subcommand)]
 enum SessionsAction {
     /// Fork stored history without starting a Run
@@ -5124,16 +5386,20 @@ enum SessionsAction {
     Export {
         /// Session ID or unambiguous prefix
         id: String,
-        /// json, markdown (md) or html
-        #[arg(long, default_value = "json")]
-        format: String,
-        /// Write here instead of standard output
+        /// Export format; omit to infer from the output extension, otherwise json
+        #[arg(long, value_enum)]
+        format: Option<SessionExportFormat>,
+        /// Write here instead of standard output; recognized extensions must match --format
         #[arg(short, long)]
         output: Option<std::path::PathBuf>,
     },
 }
 
 fn sessions_cmd(paths: Paths, action: SessionsAction) -> Result<()> {
+    if let SessionsAction::Export { format, output, .. } = &action {
+        session_export_format(*format, output.as_deref())?;
+    }
+
     let action = match action {
         SessionsAction::Show {
             id,
@@ -5330,10 +5596,11 @@ fn sessions_cmd(paths: Paths, action: SessionsAction) -> Result<()> {
         SessionsAction::Archive { id } => set_archived(&paths, &id, true)?,
         SessionsAction::Unarchive { id } => set_archived(&paths, &id, false)?,
         SessionsAction::Export { id, format, output } => {
+            let format = session_export_format(format, output.as_deref())?;
             let s = find_session(&paths, &id)?;
             let r = daemon(Request::ExportSession {
                 id: s.id,
-                format: Some(format),
+                format: Some(format.wire_name().to_string()),
             })?;
             let text = match r["content"].as_str() {
                 Some(c) => c.to_string(),
@@ -5341,7 +5608,7 @@ fn sessions_cmd(paths: Paths, action: SessionsAction) -> Result<()> {
             };
             match output {
                 Some(path) => {
-                    std::fs::write(&path, text)?;
+                    write_session_export(&path, text.as_bytes())?;
                     eprintln!("exported {} to {}", s.name, path.display());
                 }
                 None => print!("{text}"),
