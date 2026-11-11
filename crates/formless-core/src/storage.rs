@@ -2403,10 +2403,20 @@ impl Store {
         Ok(())
     }
 
+    /// Pause a scheduler failure without consuming its due occurrence.
+    pub(crate) fn pause_job(&self, id: &str, status: &str) -> Result<()> {
+        self.ex(
+            "UPDATE jobs SET enabled=0, last_run=?2, last_status=?3 WHERE id=?1",
+            params![id, now(), status],
+        )?;
+        Ok(())
+    }
+
     /// A firing's Run ended: its outcome becomes the job's last status.
     pub fn job_ran_status(&self, id: &str, status: &str) -> Result<()> {
         self.ex(
-            "UPDATE jobs SET last_status=?2 WHERE id=?1",
+            "UPDATE jobs SET last_status=?2 WHERE id=?1
+             AND NOT (enabled=0 AND last_status LIKE 'paused: %')",
             params![id, status],
         )?;
         Ok(())

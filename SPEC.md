@@ -3488,6 +3488,9 @@ refresh a cache, nightly cleanup.
     after now. Relative offsets use checked arithmetic and may be at most
     366 days; zero, past and overflowing times return errors without saving
     a job. Explicit immediate firing uses `RunJobNow` / `jobs run ID`.
+  - A pinned `session_id` must name an existing, non-deleted Session. The
+    agent may use `current`; that resolves to its current Session and is
+    validated again when the job is saved after any approval wait.
 - **Trust:** one-shot jobs from the agent are scheduled at once.
   Recurring ones need the user's approval: asked immediately, or, with
   nobody connected, saved as "awaiting approval" until the user enables
@@ -3500,10 +3503,21 @@ refresh a cache, nightly cleanup.
   approval wait when choosing its first slot.
 - **Running:** the daemon checks every 20 s. A due job sends its prompt to
   its Session (queued if that Session is busy), or to a new Session named
-  `Job: …`. A one-shot job then ends; a recurring one moves to its next
+  `Job: …` only when no target was pinned. A deleted/missing pinned target
+  pauses the job, preserves its due slot and target, and records a failed
+  history row, `job.target_missing` audit and client note; firing it again
+  never silently creates a replacement Session. A one-shot job then ends
+  after successful prompt delivery; a recurring one moves to its next
   match after now. Firings missed while the daemon was down or the
   machine slept run once, and its history says "ran late, N firings
-  coalesced". Everything is audit-logged and broadcasts `JobsChanged`.
+  coalesced". An invalid stored cron or an uncomputable next occurrence
+  pauses before prompt delivery with an explicit `paused:` last status,
+  failed history row, `job.reschedule_failed` audit and client note. A prompt
+  delivery error similarly pauses with `job.delivery_failed`, retaining the
+  original due slot even for a one-shot; it is not recorded as completed.
+  Repair the cause, then explicitly run it or re-enable a recurring job.
+  Run completion updates history but cannot erase a paused scheduler error.
+  Everything is audit-logged and broadcasts `JobsChanged`.
 - **Overlap:** each job has `overlap`: `skip` (default) skips a firing
   while the previous one is still queued or running; `queue` queues it.
   Either way a Session never holds more than 5 queued messages: further
@@ -3516,7 +3530,8 @@ refresh a cache, nightly cleanup.
   Run doesn't complete posts a note to every client.
 - **Run now:** `RunJobNow {id}` (`formless jobs run ID`, `/jobs run ID`,
   web "Run now") fires a job at once under the same overlap rules; its
-  schedule is unchanged.
+  schedule is unchanged. A successful manual retry records its outcome in
+  history; it does not resume a paused schedule or clear its pause reason.
 - **Delivery:** `deliver` (`AddJob`, `SetJobOptions`; `jobs add --notify
   --to-file PATH --webhook URL`) sends the answer when the firing's Run
   ends: a desktop notification, a Markdown entry appended to a file,

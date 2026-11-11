@@ -3465,16 +3465,19 @@ impl Daemon {
                 let next =
                     crate::jobs::first_run(cron.as_deref(), at.as_deref(), chrono::Local::now())?;
                 let job = self.with_store(|st| {
-                    let job = st.create_job(
-                        &prompt,
-                        session_id.as_deref(),
-                        cron.as_deref(),
-                        &next.to_rfc3339(),
-                        true,
-                        "user",
-                    )?;
-                    st.set_job_options(&job.id, overlap.as_deref(), deliver.as_ref())?;
-                    Ok(st.get_job(&job.id)?.unwrap_or(job))
+                    st.transaction(|st| {
+                        Self::validate_job_target(st, session_id.as_deref())?;
+                        let job = st.create_job(
+                            &prompt,
+                            session_id.as_deref(),
+                            cron.as_deref(),
+                            &next.to_rfc3339(),
+                            true,
+                            "user",
+                        )?;
+                        st.set_job_options(&job.id, overlap.as_deref(), deliver.as_ref())?;
+                        Ok(st.get_job(&job.id)?.unwrap_or(job))
+                    })
                 })?;
                 let _ = self.with_store(|st| st.audit("user", "job.add", &job.id));
                 self.broadcast(Event::JobsChanged);
@@ -3496,7 +3499,10 @@ impl Daemon {
                 let job = self
                     .with_store(|st| st.get_job(&id))?
                     .with_context(|| RequestFailure::not_found(format!("no job '{id}'")))?;
-                let status = self.fire_job(&job, "manual", 0).await;
+                let status = self
+                    .fire_job(&job, "manual", 0)
+                    .await
+                    .unwrap_or_else(|e| e.to_string());
                 let _ = self.with_store(|st| st.audit("user", "job.run_now", &id));
                 self.broadcast(Event::JobsChanged);
                 Ok(json!({"id": id, "status": status}))
@@ -11470,6 +11476,7 @@ impl Daemon {
             Some(s) if !s.is_empty() => Some(s.to_string()),
             _ => None,
         };
+        self.with_store(|st| Self::validate_job_target(st, target.as_deref()))?;
         let next = crate::jobs::first_run(cron, at, chrono::Local::now())?;
         let approved = match cron {
             None => true,
@@ -11501,14 +11508,17 @@ impl Daemon {
             next
         };
         let job = self.with_store(|st| {
-            st.create_job(
-                prompt,
-                target.as_deref(),
-                cron,
-                &next.to_rfc3339(),
-                approved,
-                "agent",
-            )
+            st.transaction(|st| {
+                Self::validate_job_target(st, target.as_deref())?;
+                st.create_job(
+                    prompt,
+                    target.as_deref(),
+                    cron,
+                    &next.to_rfc3339(),
+                    approved,
+                    "agent",
+                )
+            })
         })?;
         let _ = self.with_store(|st| st.audit("agent", "job.schedule", &job.id));
         self.broadcast(Event::JobsChanged);
@@ -11584,16 +11594,85 @@ impl Daemon {
                     .unwrap_or(0),
                 _ => 0,
             };
-            let next = job
-                .cron
-                .as_deref()
-                .and_then(|c| crate::jobs::Cron::parse(c).ok())
-                .and_then(|c| c.next_after(now))
-                .map(|t| t.to_rfc3339());
-            let status = self.fire_job(&job, "schedule", missed).await;
-            let _ = self.with_store(|st| st.job_ran(&job.id, &status, next.as_deref()));
-            self.broadcast(Event::JobsChanged);
+            let next = match job.cron.as_deref() {
+                None => None,
+                Some(cron) => match crate::jobs::Cron::parse(cron).and_then(|c| {
+                    c.next_after(now)
+                        .context("no next occurrence within the cron search window")
+                }) {
+                    Ok(next) => Some(next.to_rfc3339()),
+                    Err(error) => {
+                        self.pause_job(
+                            &job,
+                            "job.reschedule_failed",
+                            &format!("recurring schedule could not be rescheduled: {error}"),
+                            Some("schedule"),
+                        );
+                        continue;
+                    }
+                },
+            };
+            // Failed delivery already persisted a visible paused state. In
+            // particular, never consume a one-shot that did not deliver.
+            if let Ok(status) = self.fire_job(&job, "schedule", missed).await {
+                let _ = self.with_store(|st| st.job_ran(&job.id, &status, next.as_deref()));
+                self.broadcast(Event::JobsChanged);
+            }
         }
+    }
+
+    fn validate_job_target(st: &Store, target: Option<&str>) -> Result<()> {
+        if let Some(id) = target {
+            if st.get_session(id)?.is_none() || st.session_deleted(id)? {
+                return Err(RequestFailure::not_found(format!(
+                    "job target Session '{id}' does not exist or was deleted"
+                ))
+                .into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Preserve the due slot so failed delivery is distinguishable from
+    /// one-shot completion. The `paused:` prefix is a persisted scheduler
+    /// marker; a finishing older Run must not erase it (Store::job_ran_status).
+    fn pause_job(
+        &self,
+        job: &JobInfo,
+        action: &str,
+        detail: &str,
+        history_trigger: Option<&str>,
+    ) -> String {
+        let status = format!("paused: {detail}");
+        let notice = if let Err(error) = self.with_store(|st| {
+            st.transaction(|st| {
+                st.pause_job(&job.id, &status)?;
+                if let Some(trigger) = history_trigger {
+                    st.job_run_start(
+                        &job.id,
+                        job.session_id.as_deref(),
+                        trigger,
+                        "failed",
+                        &status,
+                    )?;
+                }
+                st.audit("daemon", action, &format!("{}: {status}", job.id))
+            })
+        }) {
+            tracing::error!(job_id = %job.id, %error, "could not persist paused job");
+            format!("error: could not persist job pause after {detail}: {error}")
+        } else {
+            status
+        };
+        self.broadcast(Event::Note {
+            session_id: None,
+            text: format!(
+                "Job {} {notice}; inspect its target/schedule and history before retrying",
+                job.id
+            ),
+        });
+        self.broadcast(Event::JobsChanged);
+        notice
     }
 
     /// Most job prompts one Session's queue holds; later firings are
@@ -11607,12 +11686,22 @@ impl Daemon {
         job: &formless_protocol::JobInfo,
         trigger: &str,
         missed: usize,
-    ) -> String {
+    ) -> Result<String> {
         let late = if missed > 0 {
             format!("ran late, {} firing(s) coalesced", missed + 1)
         } else {
             String::new()
         };
+        if let Err(error) =
+            self.with_store(|st| Self::validate_job_target(st, job.session_id.as_deref()))
+        {
+            return Err(anyhow!(self.pause_job(
+                job,
+                "job.target_missing",
+                &error.to_string(),
+                Some(trigger),
+            )));
+        }
         // This job's previous firing, in whichever Session it went to.
         let still_running = self
             .job_pending
@@ -11637,14 +11726,9 @@ impl Daemon {
                 )?;
                 st.audit("daemon", "job.skip", &format!("{}: {why}", job.id))
             });
-            return why;
+            return Ok(why);
         }
-        let session = match job.session_id.clone().filter(|s| {
-            self.with_store(|st| st.get_session(s))
-                .ok()
-                .flatten()
-                .is_some()
-        }) {
+        let session = match job.session_id.clone() {
             Some(s) => Ok(s),
             None => {
                 let name: String = job.prompt.chars().take(40).collect();
@@ -11658,10 +11742,12 @@ impl Daemon {
         let sid = match session {
             Ok(sid) => sid,
             Err(e) => {
-                let status = format!("error: {e}");
-                let _ = self
-                    .with_store(|st| st.job_run_start(&job.id, None, trigger, "failed", &status));
-                return status;
+                return Err(anyhow!(self.pause_job(
+                    job,
+                    "job.delivery_failed",
+                    &format!("could not create the job Session: {e}"),
+                    Some(trigger),
+                )));
             }
         };
         // Overlap: the previous firing still queued or running.
@@ -11687,7 +11773,7 @@ impl Daemon {
                 st.job_run_start(&job.id, Some(&sid), trigger, "skipped", &detail)?;
                 st.audit("daemon", "job.skip", &format!("{}: {why}", job.id))
             });
-            return why;
+            return Ok(why);
         }
         let run_row = self
             .with_store(|st| st.job_run_start(&job.id, Some(&sid), trigger, "running", &late))
@@ -11711,11 +11797,16 @@ impl Daemon {
             Err(e) => {
                 let _ = self
                     .with_store(|st| st.job_run_finish(&run_row, "failed", &e.to_string(), None));
-                format!("error: {e}")
+                return Err(anyhow!(self.pause_job(
+                    job,
+                    "job.delivery_failed",
+                    &format!("prompt delivery failed: {e}"),
+                    None,
+                )));
             }
         };
         let _ = self.with_store(|st| st.audit("daemon", "job.run", &job.id));
-        status
+        Ok(status)
     }
 
     /// A job's Run ended: finish its history row (outcome, cost), tell
@@ -18566,3 +18657,7 @@ mod role_reference_tests;
 #[cfg(test)]
 #[path = "provider_error_guidance_tests.rs"]
 mod provider_error_guidance_tests;
+
+#[cfg(test)]
+#[path = "job_state_daemon_tests.rs"]
+mod job_state_daemon_tests;
