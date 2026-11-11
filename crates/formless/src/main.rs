@@ -4,6 +4,7 @@ mod cli_commands;
 mod cli_help_tests;
 mod cli_pipeline;
 mod cli_run_identity;
+mod cli_tool_success;
 #[cfg(test)]
 mod session_export_tests;
 mod table;
@@ -7126,21 +7127,14 @@ fn tools_cmd(paths: Paths, action: ToolsAction) -> Result<()> {
                     t("active", Tone::Good)
                 };
                 let rate = tool.success_rate;
+                let (success_label, success_tone) = cli_tool_success::tool_success_cell(rate);
                 tbl.row(vec![
                     t(tool.name, Tone::Strong),
                     c(tool.title),
                     t(tool.tags.join(" "), Tone::Dim),
                     c(format!("v{}", tool.current_version)),
                     c(tool.invocations.to_string()),
-                    t(
-                        rate.map(|r| format!("{:.0}%", r * 100.0))
-                            .unwrap_or_else(|| "-".into()),
-                        match rate {
-                            Some(r) if r < 0.8 => Tone::Bad,
-                            Some(_) => Tone::Good,
-                            None => Tone::Dim,
-                        },
-                    ),
+                    t(success_label, success_tone),
                     status,
                     t(tool.capabilities.join(", "), Tone::Dim),
                 ]);
