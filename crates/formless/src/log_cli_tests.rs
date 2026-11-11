@@ -7,13 +7,20 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
+        // Unique per process (pid) and per fixture (counter); the timestamp only
+        // guards against stale roots left by an earlier process with a reused pid.
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let root = std::env::temp_dir().join(format!(
-            "fl-cli-logs-{}",
+            "fl-cli-logs-{}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
         ));
+        // Exclusive create: an existing root fails loudly instead of being shared.
+        std::fs::create_dir(&root).unwrap();
         let paths = Paths::from_dirs(root.join("data"), root.join("config")).unwrap();
         Self { paths, root }
     }
