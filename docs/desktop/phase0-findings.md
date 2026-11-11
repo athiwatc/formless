@@ -161,7 +161,7 @@ harness types text but does not run an OS input method).
 | Destinations | Chat is the only view. Sessions, Settings, Tools, Metrics and Proposals replace the conversation and composer with a "not built" notice and say so in the status line. Search is not reachable. | `Label`, `Button` |
 | Theme | Light and dark through the kit theme (the header toggle itself is untested); status never by colour alone | `Theme::change` |
 | Text size | 100% to 200% in 25% steps (Cmd/Ctrl with =, - and 0). Fixed sizes and layout breakpoints follow it (§11.5) | kit theme font sizes |
-| Timeline rows | A row lays out at most 32 KiB and 400 lines of its block and says when it is cut (§11.4) | `TextView::markdown`, `Label` |
+| Timeline rows | A row lays out one window of at most 32 KiB and 400 lines of its block. The window follows the tail of a block being streamed, and any row that shows less than its block says what is missing and can be paged (§12.1) | `TextView::markdown`, `Label`, `Button` |
 | Streaming | Deltas update the data at once and the view at most once per 16 ms; only the tail row is re-measured (§11.4) | `MessageScrollerState` |
 | Intents | `Intent::SendMessage` and `Intent::InterruptRun` are noted and shown, never sent. What is kept is a record of sizes; no message text is retained | none |
 
@@ -188,9 +188,14 @@ Known limits of what is there:
 - Memory bounds are stated in §11.3. In short: accepted composer text and
   stored drafts are bounded; the retained intent holds no text; **no bound
   is claimed for the kit's undo and redo history**, which was not measured.
-- A row's preview keeps the head of its block. A streamed block longer than
-  the preview stops showing its newest text.
-- The minimum window size does not grow with the text size (§11.5).
+- A row shows one window of a long block at a time. A window that starts
+  inside a table or a list is laid out without its beginning, and there is
+  no separate full-output viewer (§12.1).
+- A window too small for the text size asked for gets a smaller size, with
+  a notice, not the size asked for (§12.2). This keeps the controls usable;
+  it is not 200% text at the minimum window size, which would need a layout
+  that reflows and was not built. The right-hand status text is clipped in
+  small windows.
 
 The layout tokens are the epic's starting values. At 200% text size they
 scale with everything else (§11.5); nobody has looked at the result.
@@ -205,13 +210,13 @@ typical developer build.
 
 | Command | Result |
 |---|---|
-| `cargo test --no-default-features --lib --locked` | 42 passed (model, memory, timeline and fixture); no GPUI crate in its dependency graph |
-| `cargo test --features test-support --locked` | 42 passed, 45 passed (headless shell), 10 offscreen render states passed |
-| `cargo test --features test-support,thai-breaks --locked` | 47 passed, 45 passed, 10 render states and the real-text Thai measurement passed |
+| `cargo test --no-default-features --lib --locked` | 50 passed (model, memory, timeline and fixture); no GPUI crate in its dependency graph |
+| `cargo test --features test-support --locked` | 50 passed, 51 passed (headless shell), 14 offscreen render states passed |
+| `cargo test --features test-support,thai-breaks --locked` | 55 passed, 51 passed, 14 render states and the real-text Thai measurement passed |
 | `cargo fmt --check`, `cargo clippy --all-targets --locked` with and without `thai-breaks` | clean |
 
-These are the counts at the last code commit of the follow-up (§11). The
-first checkpoint had 22, 16 and 7.
+These are the counts at the last code commit (§12). The first checkpoint
+had 22, 16 and 7; the follow-up in §11 had 42, 45 and 10.
 
 What the headless shell tests establish, on macOS, in the kit's test window.
 That window's text system gives every character the same width (§11.1), so
@@ -446,7 +451,7 @@ none of them can be closed by anything measured so far.
 | Linux build and launch | Only dependency resolution was done. |
 | Real OS IME composition (Thai, CJK, dead keys) | The harness types finished text; no input method ran. |
 | VoiceOver (and NVDA on Windows) | Roles, names and descriptions, including the overlay dialogs, were read from the accessibility tree in tests. No screen reader ran, so what is announced, and in what order, is unknown. The kit cannot mark an element modal. |
-| 200% text scaling and display-scale changes | The shell's own text size setting is tested to 200% and captured offscreen (§11.5). Nobody has looked at it in a window, the minimum window size is too small at 200%, and no OS-level display or accessibility setting was changed. |
+| 200% text scaling and display-scale changes | The shell's own text size setting is tested to 200% and captured offscreen (§11.5). Nobody has looked at it in a window. A window too small for 200% shows a smaller text size and says so (§12.2): that keeps the controls usable, it is not 200% text at the minimum window size. No OS-level display or accessibility setting was changed. |
 | Streaming and performance budgets | Frame-delivery intervals were recorded while streaming in a real window (§11.4). That is not key-to-paint, scrolling, session switching, idle CPU or long-run memory, the window was not watched, and no budget is accepted on it. |
 | Thai line breaking | A study shows a workable approach on macOS fonts (§11.6). It is not wired in, and Windows and Linux fonts are untested. |
 | Parity | §6 is an inventory. Only Chat has a view, with synthetic data, and the approval, credential and setup surfaces are unexamined. |
@@ -497,7 +502,9 @@ in the worktree's git-ignored `.screenshots/gpui-1753-phase0/` directory:
   Thai study, release build, the smoke, 5 MiB, 200% and streaming launches,
   lockfile verification, dependency graphs, resolved features, build plans
   and on-disk artifacts.
-- `captures/`: the ten offscreen PNG captures.
+- `captures/`: the fourteen offscreen PNG captures.
+- `checkpoint-c686073/`: the complete evidence set of the acceptance
+  follow-up (§11), as it was.
 - `compare-captures.py`: the run-to-run pixel comparison quoted in §4.
 - `checkpoint-e21668b/`: the complete evidence set of the first checkpoint,
   as it was.
@@ -670,9 +677,10 @@ What this is and is not:
   kilobytes at most. At 1,000 per second it passes the 32 KiB preview a few
   seconds in, after which the row no longer changes, so most of that run
   measures a tail that has stopped growing on screen.
-- Known limit, not exercised here: a streamed block that outgrows the
-  32 KiB preview stops showing its newest text, because the preview keeps
-  the head. Long messages need splitting into several rows.
+- At the time of these runs a streamed block that outgrew the 32 KiB
+  preview stopped showing its newest text, because the preview kept the
+  head. That was a defect and is fixed (§12.1), and the runs were repeated
+  with blocks that outgrow one window (§12.3).
 - Headless tests cover the logic: 1,000 deltas in one burst cause one view
   update, the final state is shown without waiting, and a block being read
   further up does not move while the tail grows.
@@ -697,15 +705,15 @@ Tested, in the headless window:
   three panes with the draft and focus untouched.
 - Changing the display scale factor leaves the logical layout unchanged.
 
-Found: the binary's 480 × 360 minimum window cannot show the composer or
-any header control at 200%; only the status line stays inside. A minimum
-that grows with the text size (960 × 720) holds them all. The minimum is
-not yet tied to the text size.
+Found at this point: the binary's 480 × 360 minimum window could not show
+the composer or any header control at 200%; only the status line stayed
+inside. That was a defect and is fixed (§12.2): the text size in use is now
+the largest one the window can hold.
 
 Three 200% states are in the offscreen captures, drawn with real fonts. Two
 were looked at once by the implementing agent: the 1440 px one reads as
-intended; the 480 × 360 one shows the header clipped at the right edge and
-the status line drawn over the composer's buttons, which is the limitation
+intended; the 480 × 360 one showed the header clipped at the right edge and
+the status line drawn over the composer's buttons, which was the defect
 above. **Not observed:** any of this in a real window by a person; a macOS
 display or accessibility setting; anything on Windows.
 
@@ -805,8 +813,14 @@ asked for, and 960 x 720 at 200%); both read as intended. In a real window,
 unwatched: a 480 x 360 window with 200% asked for settled at 960 x 720
 showing 200%, and 700 x 500 with 150% at 720 x 540.
 
-Not addressed: the right-hand status text is still clipped in small
-windows.
+Not addressed:
+
+- This is a fallback that keeps the shell usable. It is not 200% text in a
+  480 x 360 window. A person who needs 200% text and cannot have a window
+  of 960 x 720 gets smaller text and a notice. Showing 200% at the minimum
+  size needs a layout that reflows (a stacked header, controls that wrap),
+  which was not built, so the 200% gate in §8 stays open.
+- The right-hand status text is still clipped in small windows.
 
 ### 12.3 Tests and stress, repeated
 
