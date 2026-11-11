@@ -917,6 +917,7 @@ pub struct DaemonCfg {
     pub idle_grace_secs: u64,
     pub stall_warning_secs: u64,
     pub log_max_bytes: u64,
+    #[serde(deserialize_with = "deserialize_log_keep")]
     pub log_keep: usize,
     /// How long a client waits for an auto-started daemon to accept
     /// connections (a first start may migrate and back up a large DB).
@@ -931,6 +932,18 @@ pub struct DaemonCfg {
     /// Offline restore rehearsal after each daily backup (opt-in).
     pub backup_restore_drill: bool,
 }
+fn deserialize_log_keep<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<usize, D::Error> {
+    let value = usize::deserialize(d)?;
+    if value > crate::logs::MAX_LOG_KEEP {
+        return Err(serde::de::Error::custom(
+            "daemon.log_keep must be between 0 and 64",
+        ));
+    }
+    Ok(value)
+}
+
 impl Default for DaemonCfg {
     fn default() -> Self {
         Self {
@@ -2121,6 +2134,9 @@ impl Config {
     /// comments, order and keys this build doesn't know survive, and
     /// replaced atomically so a crash mid-save leaves the old file.
     pub fn save(&self, paths: &Paths) -> Result<()> {
+        if self.daemon.log_keep > crate::logs::MAX_LOG_KEEP {
+            anyhow::bail!("daemon.log_keep must be between 0 and 64");
+        }
         let file = paths.config_file();
         if let Some(parent) = file.parent() {
             std::fs::create_dir_all(parent)?;

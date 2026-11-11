@@ -4,7 +4,10 @@ mod cli_commands;
 mod cli_help_tests;
 mod cli_pipeline;
 mod cli_run_identity;
+#[cfg(test)]
+mod session_export_tests;
 mod table;
+mod update_http;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -1638,6 +1641,9 @@ fn run_cli(cli: Cli) -> Result<()> {
             "--plain, -c/--continue and --new start the TUI; use them without a command (or `formless tui`)",
         ));
     }
+    // Export usage errors must precede profile setup, Session lookup and any
+    // daemon connection. sessions_cmd validates again for direct callers.
+    validate_cli_export_format(&cli)?;
     // The daemon logs warnings and info to daemon.log (`formless logs`);
     // other commands only errors. RUST_LOG overrides both. Colour codes
     // only on a terminal, never into the log file.
@@ -2275,16 +2281,6 @@ fn run_cli(cli: Cli) -> Result<()> {
     }
 }
 
-fn http_get(url: &str) -> Result<String> {
-    let resp = reqwest::blocking::Client::builder()
-        .user_agent(concat!("formless/", env!("CARGO_PKG_VERSION")))
-        .build()?
-        .get(url)
-        .send()?
-        .error_for_status()?;
-    Ok(resp.text()?)
-}
-
 pub fn parse_version(tag: &str) -> Option<(u64, u64, u64)> {
     let core = tag
         .trim()
@@ -2357,8 +2353,9 @@ const INSTALL_COMMAND: &str = concat!(
 /// each release, then how to upgrade (`--check` stops after the report).
 fn update_cmd(check: bool) -> Result<()> {
     let current = env!("CARGO_PKG_VERSION");
-    let body = match http_get("https://api.github.com/repos/athiwatc/formless/releases?per_page=50")
-    {
+    let body = match update_http::get(
+        "https://api.github.com/repos/athiwatc/formless/releases?per_page=50",
+    ) {
         Ok(b) => b,
         Err(e) if e.to_string().contains("404") => {
             println!("installed: v{current}");
@@ -3274,15 +3271,7 @@ fn doctor_json(paths: &Paths) -> Result<serde_json::Value> {
 /// all redacted, in one Markdown file to attach to an issue.
 fn bug_report(paths: &Paths, output: Option<std::path::PathBuf>) -> Result<()> {
     let doctor = doctor_json(paths)?;
-    let log = std::fs::read_to_string(paths.log_file()).unwrap_or_default();
-    let tail: Vec<&str> = log
-        .lines()
-        .rev()
-        .take(200)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
+    let log = bug_report_log(paths);
     let text = format!(
         "# formless bug report\n\n\
          - formless {} on {} {}\n\
@@ -3291,14 +3280,13 @@ fn bug_report(paths: &Paths, output: Option<std::path::PathBuf>) -> Result<()> {
          redacted. Read it through before attaching it.\n\n\
          ## What happened\n\n(describe it here)\n\n\
          ## Doctor\n\n```json\n{}\n```\n\n\
-         ## Daemon log (last {} lines)\n\n```\n{}\n```\n",
+         {}",
         env!("CARGO_PKG_VERSION"),
         std::env::consts::OS,
         std::env::consts::ARCH,
         chrono::Utc::now().format("%Y-%m-%d %H:%M UTC"),
         serde_json::to_string_pretty(&doctor)?,
-        tail.len(),
-        redact(&tail.join("\n")),
+        log,
     );
     let path = output.unwrap_or_else(|| {
         std::path::PathBuf::from(format!(
@@ -3312,6 +3300,33 @@ fn bug_report(paths: &Paths, output: Option<std::path::PathBuf>) -> Result<()> {
         path.display()
     );
     Ok(())
+}
+
+/// The report consumes the shared raw-line tail, not an entire live file.
+fn bug_report_log(paths: &Paths) -> String {
+    match formless_core::logs::tail_lines(paths, 200, 1024 * 1024) {
+        Ok(tail) => {
+            let mut section = format!(
+                "## Daemon log (last {} lines)\n\n```\n{}\n```\n",
+                tail.lines.len(),
+                redact(&tail.lines.join("\n"))
+            );
+            if tail.byte_limit_hit {
+                section.push_str("\nLog tail incomplete: the 1 MiB read limit was reached; the leading boundary line was omitted to avoid partial content.\n");
+            }
+            if tail.truncated_lines > 0 {
+                section.push_str(&format!(
+                    "\n{} log line(s) exceeded 64 KiB and were truncated.\n",
+                    tail.truncated_lines
+                ));
+            }
+            section
+        }
+        Err(error) => format!(
+            "## Daemon log\n\nLog history unavailable: {}\n",
+            redact(&error.to_string())
+        ),
+    }
 }
 
 /// Print the doctor report and return the problems found.
@@ -5003,6 +5018,263 @@ fn web_cmd(paths: Paths, port: Option<u16>, no_open: bool, stop: bool) -> Result
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum SessionExportFormat {
+    /// Re-importable JSON Session bundle
+    Json,
+    /// Readable Markdown transcript (alias: md)
+    #[value(alias = "md")]
+    Markdown,
+    /// Standalone HTML transcript
+    Html,
+}
+
+impl SessionExportFormat {
+    fn wire_name(self) -> &'static str {
+        match self {
+            Self::Json => "json",
+            Self::Markdown => "markdown",
+            Self::Html => "html",
+        }
+    }
+
+    fn from_extension(path: &std::path::Path) -> Option<Self> {
+        match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
+            "json" => Some(Self::Json),
+            "md" | "markdown" => Some(Self::Markdown),
+            "html" | "htm" => Some(Self::Html),
+            _ => None,
+        }
+    }
+}
+
+fn session_export_format(
+    explicit: Option<SessionExportFormat>,
+    output: Option<&std::path::Path>,
+) -> Result<SessionExportFormat> {
+    let inferred = output.and_then(SessionExportFormat::from_extension);
+    if let (Some(explicit), Some(inferred)) = (explicit, inferred) {
+        if explicit != inferred {
+            return Err(usage(format!("--format {} conflicts with output extension for {} ({}); choose a matching format or filename",
+                explicit.wire_name(), output.unwrap().display(), inferred.wire_name())));
+        }
+    }
+    Ok(explicit.or(inferred).unwrap_or(SessionExportFormat::Json))
+}
+
+fn validate_cli_export_format(cli: &Cli) -> Result<()> {
+    if let Some(Cmd::Sessions {
+        action: SessionsAction::Export { format, output, .. },
+    }) = &cli.cmd
+    {
+        session_export_format(*format, output.as_deref())?;
+    }
+    Ok(())
+}
+
+// Descriptor aliases keep the old stream-write behavior, even when redirected
+// to a regular file. Renaming their underlying pathname would detach that fd.
+fn export_descriptor_path(path: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        if ["/dev/stdout", "/dev/stderr", "/dev/stdin"]
+            .iter()
+            .any(|alias| path == std::path::Path::new(alias))
+        {
+            return true;
+        }
+        let parent = path.parent();
+        let fd = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.parse::<u32>().is_ok());
+        if fd
+            && parent.is_some_and(|parent| {
+                parent == std::path::Path::new("/dev/fd")
+                    || (parent.starts_with("/proc")
+                        && parent.file_name() == Some(std::ffi::OsStr::new("fd")))
+            })
+        {
+            return true;
+        }
+    }
+    #[cfg(windows)]
+    {
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        let name = name
+            .split('.')
+            .next()
+            .unwrap_or("")
+            .trim_end_matches(' ')
+            .to_ascii_uppercase();
+        if matches!(
+            name.as_str(),
+            "NUL" | "CON" | "CONIN$" | "CONOUT$" | "PRN" | "AUX"
+        ) || (name.len() == 4
+            && (name.starts_with("COM") || name.starts_with("LPT"))
+            && matches!(name.as_bytes()[3], b'1'..=b'9'))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn export_descriptor_alias(path: &std::path::Path) -> bool {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(std::path::Path::new("."));
+    export_descriptor_path(path)
+        || std::fs::canonicalize(parent)
+            .ok()
+            .zip(path.file_name())
+            .is_some_and(|(parent, name)| export_descriptor_path(&parent.join(name)))
+}
+
+#[cfg(unix)]
+fn atomic_session_export_with(
+    destination: &std::path::Path,
+    write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    struct Staged {
+        path: std::path::PathBuf,
+        committed: bool,
+    }
+    impl Drop for Staged {
+        fn drop(&mut self) {
+            if !self.committed {
+                let _ = std::fs::remove_file(&self.path);
+            }
+        }
+    }
+    let parent = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(std::path::Path::new("."));
+    destination
+        .file_name()
+        .context("export destination has no filename")?;
+    let metadata = std::fs::metadata(destination).ok();
+    let permissions = metadata
+        .as_ref()
+        .filter(|metadata| metadata.is_file())
+        .map(|metadata| metadata.permissions());
+    // Existing private exports must never become more readable while staged.
+    // New outputs retain the same 0666-and-umask semantics as fs::write.
+    let mode = if metadata
+        .as_ref()
+        .is_some_and(|metadata| !metadata.is_file())
+    {
+        0o600 // Invalid directory destinations must not stage readable data.
+    } else {
+        permissions
+            .as_ref()
+            .map_or(0o666, |permissions| permissions.mode())
+    };
+    let mut staged_file = None;
+    for _ in 0..64 {
+        let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = parent.join(format!(
+            ".formless-export-{}-{serial}.tmp",
+            std::process::id()
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(&path)
+        {
+            Ok(file) => {
+                staged_file = Some((
+                    Staged {
+                        path,
+                        committed: false,
+                    },
+                    file,
+                ));
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let (mut staged, mut file) = staged_file.context("cannot reserve an export staging file")?;
+    if let Some(permissions) = permissions {
+        file.set_permissions(permissions)?;
+    }
+    write(&mut file)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&staged.path, destination)?;
+    staged.committed = true;
+    std::fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(windows)]
+mod session_export_windows;
+
+fn write_regular_session_export(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    #[cfg(unix)]
+    {
+        atomic_session_export_with(path, |file| file.write_all(bytes))
+    }
+    #[cfg(windows)]
+    {
+        session_export_windows::write(path, bytes).map_err(Into::into)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        // Platforms other than Unix/Windows retain their previous output path.
+        eprintln!("warning: atomic export replacement preserving access controls is not available on this platform; retaining direct output");
+        std::fs::write(path, bytes).map_err(Into::into)
+    }
+}
+
+fn write_session_export(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    let mut destination = path.to_path_buf();
+    // Follow leaf links (including dangling ones) as the previous fs::write did,
+    // but stop cycles. Parent links retain normal filesystem resolution.
+    for _ in 0..64 {
+        if export_descriptor_alias(&destination) {
+            return std::fs::write(&destination, bytes).map_err(Into::into);
+        }
+        match std::fs::symlink_metadata(&destination) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                let target = std::fs::read_link(&destination)?;
+                destination = if target.is_absolute() {
+                    target
+                } else {
+                    destination
+                        .parent()
+                        .unwrap_or(std::path::Path::new("."))
+                        .join(target)
+                };
+            }
+            Ok(metadata) => {
+                if !metadata.is_file() && !metadata.is_dir() {
+                    // Never rename a regular file over a FIFO/device/socket.
+                    return std::fs::write(&destination, bytes).map_err(Into::into);
+                }
+                if metadata.is_file() {
+                    // Preserve existing write-access errors without truncating
+                    // the old export before the atomic replacement is ready.
+                    drop(std::fs::OpenOptions::new().write(true).open(&destination)?);
+                }
+                return write_regular_session_export(&destination, bytes);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return write_regular_session_export(&destination, bytes);
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    bail!("export destination has too many symbolic links")
+}
+
 #[derive(Subcommand)]
 enum SessionsAction {
     /// Fork stored history without starting a Run
@@ -5124,16 +5396,20 @@ enum SessionsAction {
     Export {
         /// Session ID or unambiguous prefix
         id: String,
-        /// json, markdown (md) or html
-        #[arg(long, default_value = "json")]
-        format: String,
-        /// Write here instead of standard output
+        /// Export format; omit to infer from the output extension, otherwise json
+        #[arg(long, value_enum)]
+        format: Option<SessionExportFormat>,
+        /// Write here instead of standard output; recognized extensions must match --format
         #[arg(short, long)]
         output: Option<std::path::PathBuf>,
     },
 }
 
 fn sessions_cmd(paths: Paths, action: SessionsAction) -> Result<()> {
+    if let SessionsAction::Export { format, output, .. } = &action {
+        session_export_format(*format, output.as_deref())?;
+    }
+
     let action = match action {
         SessionsAction::Show {
             id,
@@ -5330,10 +5606,11 @@ fn sessions_cmd(paths: Paths, action: SessionsAction) -> Result<()> {
         SessionsAction::Archive { id } => set_archived(&paths, &id, true)?,
         SessionsAction::Unarchive { id } => set_archived(&paths, &id, false)?,
         SessionsAction::Export { id, format, output } => {
+            let format = session_export_format(format, output.as_deref())?;
             let s = find_session(&paths, &id)?;
             let r = daemon(Request::ExportSession {
                 id: s.id,
-                format: Some(format),
+                format: Some(format.wire_name().to_string()),
             })?;
             let text = match r["content"].as_str() {
                 Some(c) => c.to_string(),
@@ -5341,7 +5618,7 @@ fn sessions_cmd(paths: Paths, action: SessionsAction) -> Result<()> {
             };
             match output {
                 Some(path) => {
-                    std::fs::write(&path, text)?;
+                    write_session_export(&path, text.as_bytes())?;
                     eprintln!("exported {} to {}", s.name, path.display());
                 }
                 None => print!("{text}"),
@@ -5528,15 +5805,10 @@ fn find_session_in(list: &[SessionInfo], id: &str) -> Result<SessionInfo> {
     }
 }
 
-fn comparison_terminal_control(c: char) -> bool {
-    c.is_control()
-        || matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
-}
-
 fn comparison_terminal_text(text: &str) -> String {
     let mut visible = String::with_capacity(text.len());
     for c in text.chars() {
-        if comparison_terminal_control(c) {
+        if table::terminal_control(c) {
             visible.extend(c.escape_unicode());
         } else {
             visible.push(c);
@@ -5550,7 +5822,7 @@ fn comparison_quoted_metadata(text: &str) -> Result<String> {
     let quoted = serde_json::to_string(text)?;
     let mut visible = String::with_capacity(quoted.len());
     for c in quoted.chars() {
-        if comparison_terminal_control(c) {
+        if table::terminal_control(c) {
             // All relevant control/format characters are in the BMP. Keep a
             // valid JSON string while making bidi and C1 controls visible too.
             write!(&mut visible, "\\u{:04x}", c as u32).expect("writing to String");
@@ -7218,18 +7490,33 @@ fn log_level(word: &str) -> Option<u8> {
     })
 }
 
-/// Group log text into entries.
+fn log_start(line: &str) -> Option<(chrono::DateTime<chrono::FixedOffset>, u8)> {
+    let mut words = line.split_whitespace();
+    let at = chrono::DateTime::parse_from_rfc3339(words.next()?).ok()?;
+    Some((at, words.next().and_then(log_level).unwrap_or(2)))
+}
+
+#[path = "log_output.rs"]
+mod log_output;
+
+fn log_truncation_notice(summary: &log_output::OutputSummary) {
+    if summary.read.truncated_lines > 0 || summary.truncated_entries > 0 {
+        eprintln!(
+            "warning: log output truncated {} long line(s) and {} oversized entry(s) at 64 KiB",
+            summary.read.truncated_lines, summary.truncated_entries
+        );
+    }
+}
+
+/// Group log text into entries (small regression fixtures only).
+#[cfg(test)]
 fn parse_log(text: &str) -> Vec<LogEntry> {
     let mut out: Vec<LogEntry> = Vec::new();
     for line in text.lines() {
-        let mut words = line.split_whitespace();
-        let at = words
-            .next()
-            .and_then(|w| chrono::DateTime::parse_from_rfc3339(w).ok());
-        match at {
-            Some(at) => out.push(LogEntry {
+        match log_start(line) {
+            Some((at, level)) => out.push(LogEntry {
                 at: Some(at),
-                level: words.next().and_then(log_level).unwrap_or(2),
+                level,
                 text: line.to_string(),
             }),
             None => match out.last_mut() {
@@ -7269,27 +7556,9 @@ fn logs_cmd(
             }
     };
     let live = paths.log_file();
-    let mut files: Vec<std::path::PathBuf> = (1..=20)
-        .map(|n| std::path::PathBuf::from(format!("{}.{n}", live.display())))
-        .filter(|p| p.exists())
-        .collect();
-    files.reverse();
-    files.push(live.clone());
-    let text: String = files
-        .iter()
-        .filter_map(|f| std::fs::read_to_string(f).ok())
-        .collect::<Vec<_>>()
-        .join("\n");
-    let entries: Vec<LogEntry> = parse_log(&text).into_iter().filter(|e| keep(e)).collect();
-    let skip = if lines == 0 {
-        0
-    } else {
-        entries.len().saturating_sub(lines)
-    };
-    for e in &entries[skip..] {
-        println!("{}", e.text);
-    }
-    if entries.is_empty() && !follow {
+    let summary = log_output::history(paths, lines, &keep, &mut std::io::stdout().lock())?;
+    log_truncation_notice(&summary);
+    if summary.entries == 0 && !follow {
         eprintln!(
             "no log entries{} in {}",
             if level.is_some() || since.is_some() {
@@ -7312,15 +7581,10 @@ fn logs_cmd(
             pos = 0;
         }
         if len > pos {
-            use std::io::{Read, Seek, SeekFrom};
-            let mut f = std::fs::File::open(&live)?;
-            f.seek(SeekFrom::Start(pos))?;
-            let mut new = String::new();
-            f.read_to_string(&mut new)?;
+            let summary =
+                log_output::appended(&live, pos, len, &keep, &mut std::io::stdout().lock())?;
             pos = len;
-            for e in parse_log(&new).into_iter().filter(|e| keep(e)) {
-                println!("{}", e.text);
-            }
+            log_truncation_notice(&summary);
         }
     }
 }
@@ -8862,3 +9126,7 @@ mod tests {
         assert_eq!(parse_version("nope"), None);
     }
 }
+
+#[cfg(test)]
+#[path = "log_cli_tests.rs"]
+mod log_cli_tests;

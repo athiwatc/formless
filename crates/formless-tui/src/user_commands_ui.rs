@@ -541,6 +541,39 @@ mod refresh_tests {
             "Other project"
         );
     }
+    #[test]
+    fn missing_template_argument_keeps_the_composer_and_stops_before_send() {
+        let mut fixture = fixture();
+        let path = fixture.root.join("project/.formless/commands/workflow.md");
+        std::fs::write(&path, "$1 then $2").unwrap();
+        let (client, sent) = crate::client::DaemonClient::recording();
+        fixture.app.client = Some(client);
+        fixture.app.input.set("/workflow private-argument");
+        fixture.app.submit_chat(false);
+        assert_eq!(fixture.app.input.expanded(), "/workflow private-argument");
+        assert!(!fixture.app.input.is_literal());
+        assert!(
+            sent.try_recv().is_err(),
+            "expansion failure sends no daemon request"
+        );
+        let note = fixture.app.notes.last().unwrap();
+        assert!(
+            note.contains("workflow.md")
+                && note.contains("references $2")
+                && note.contains("write $$2"),
+            "{note}"
+        );
+        assert!(!note.contains("private-argument"), "{note}");
+        std::fs::write(&path, "Cost $$5 and $$9.99; explain `echo $$1`").unwrap();
+        fixture.app.input.set("/workflow");
+        assert!(fixture.app.expand_user_command());
+        assert_eq!(
+            fixture.app.input.expanded(),
+            "Cost $5 and $9.99; explain `echo $1`"
+        );
+        assert!(fixture.app.input.is_literal());
+    }
+
     #[cfg(unix)]
     #[test]
     fn explicit_expansion_rechecks_core_file_guards_instead_of_using_cached_text() {
