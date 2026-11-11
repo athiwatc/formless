@@ -7,7 +7,7 @@
 //! sent, and the draft stays in place. Only Chat has a view; every other
 //! destination shows a notice saying so.
 
-use std::cell::RefCell;
+use std::cell::{Ref, RefCell};
 use std::collections::HashSet;
 use std::ops::Range;
 use std::rc::Rc;
@@ -655,7 +655,7 @@ impl Shell {
     /// The last block's size and how much of it its row does not show, as
     /// (total bytes, bytes before the window, bytes after it).
     pub fn last_block_window(&self) -> Option<(usize, usize, usize)> {
-        self.blocks.borrow().blocks().last().map(|block| {
+        self.shown_blocks().blocks().last().map(|block| {
             (
                 block.total_bytes(),
                 block.hidden_before(),
@@ -666,12 +666,19 @@ impl Shell {
 
     /// What the last block's row lays out.
     pub fn last_block_preview(&self) -> String {
-        self.blocks
-            .borrow()
+        self.shown_blocks()
             .blocks()
             .last()
             .map(|block| block.preview().to_string())
             .unwrap_or_default()
+    }
+
+    /// The blocks, with the streamed row brought up to date with its text
+    /// first. This is how a row is read to be shown: the row is rebuilt
+    /// here, when something looks at it, not when each delta arrives.
+    fn shown_blocks(&self) -> Ref<'_, Timeline> {
+        self.blocks.borrow_mut().settle();
+        self.blocks.borrow()
     }
 
     /// Work done so far to keep streamed rows up to date.
@@ -709,8 +716,9 @@ impl Shell {
         self.request_flush(cx);
     }
 
-    /// Append streamed text to the tail. The data is updated at once; the
-    /// view is told at most once per flush interval.
+    /// Append streamed text to the tail. The text is kept at once; the view
+    /// is told at most once per flush interval, and the row is rebuilt only
+    /// when it is next shown.
     pub fn push_stream_delta(&mut self, text: &str, cx: &mut Context<Self>) {
         if self.blocks.borrow_mut().push_delta(text) {
             self.request_flush(cx);
@@ -743,7 +751,8 @@ impl Shell {
         if !self.stream.take() {
             return;
         }
-        let count = self.blocks.borrow().len();
+        // The tail row is measured below, so it has to be up to date first.
+        let count = self.shown_blocks().len();
         self.timeline.update(cx, |timeline, cx| {
             let known = timeline.item_count();
             if count > known {
@@ -1217,6 +1226,10 @@ impl Shell {
         let focused = self.conversation_focus.is_focused(window);
         let timeline = MessageScroller::new("timeline", self.timeline.clone(), {
             move |index, _, cx| {
+                // A frame drawn between two flushes still shows the newest
+                // text: the streamed row is brought up to date when a row
+                // is built, at most once however many deltas arrived.
+                blocks.borrow_mut().settle();
                 let blocks = blocks.borrow();
                 let Some(block) = blocks.blocks().get(index) else {
                     return div().into_any_element();

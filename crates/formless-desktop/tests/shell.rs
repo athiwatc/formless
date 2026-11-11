@@ -2027,6 +2027,85 @@ fn a_fenced_block_with_an_enormous_opening_line_is_still_a_bounded_row(cx: &mut 
 }
 
 #[gpui_kit::test]
+fn a_burst_of_deltas_rebuilds_the_streamed_row_once_and_a_frame_shows_the_newest(
+    cx: &mut TestAppContext,
+) {
+    let (handle, shell) = open(cx, size(px(1440.), px(1200.)), 20, 40);
+    cx.run_until_parked();
+    let flush = |cx: &mut TestAppContext| {
+        cx.executor().advance_clock(Duration::from_millis(50));
+        cx.run_until_parked();
+    };
+    let delta = |index: usize| format!("ย่อหน้าที่ {index} 👩🏽‍💻 #{index:06}#\n\n");
+    // Start the stream and let the list learn of the new row.
+    step(cx, handle, |_, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.begin_stream(cx);
+            shell.push_stream_delta(&delta(0), cx);
+        });
+    });
+    flush(cx);
+    let rebuilds = |cx: &App| shell.read(cx).stream_work().rebuilds;
+    let view_updates = |cx: &App| shell.read(cx).stream_stats().1;
+    let mut updates_before_burst = 0;
+    step(cx, handle, |window, cx| {
+        window.draw(cx).clear(cx);
+        let before = rebuilds(cx);
+        updates_before_burst = view_updates(cx);
+        // Enough for several windows, all between two frames.
+        const BURST: usize = 5_000;
+        shell.update(cx, |shell, cx| {
+            for index in 1..=BURST {
+                shell.push_stream_delta(&delta(index), cx);
+            }
+        });
+        // Nothing was rebuilt for them.
+        assert_eq!(rebuilds(cx), before);
+        assert_eq!(shell.read(cx).stream_work().deltas, BURST as u64 + 1);
+
+        // A frame drawn now, before the flush that is on its way, rebuilds
+        // the row once and hands the newest text to the row's view.
+        window.draw(cx).clear(cx);
+        assert_eq!(rebuilds(cx), before + 1);
+        // Drawing again rebuilds nothing.
+        window.draw(cx).clear(cx);
+        assert_eq!(rebuilds(cx), before + 1);
+    });
+    // The kit lays markdown out off the main thread. Let that finish
+    // without letting the clock reach the flush.
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| {
+        window.draw(cx).clear(cx);
+        let painted = painted(window);
+        let bytes: usize = painted.iter().map(String::len).sum();
+        assert!(bytes <= 2 * timeline::PREVIEW_MAX_BYTES, "{bytes} bytes");
+        assert!(painted.iter().any(|text| text.contains("#005000#")));
+        // The newest text is on show and the flush has still not run.
+        assert_eq!(view_updates(cx), updates_before_burst);
+    });
+    // Neither does the flush: the row is already up to date.
+    flush(cx);
+    step(cx, handle, |_, cx| {
+        // Two rebuilds in all: the first delta's, and the burst's.
+        let work = shell.read(cx).stream_work();
+        assert_eq!(work.rebuilds, 2, "{work:?}");
+        assert!(
+            work.bytes_copied as usize <= 2 * timeline::PREVIEW_MAX_BYTES,
+            "{work:?}"
+        );
+        let row = shell.read(cx).last_block_preview();
+        assert!(row.len() <= timeline::PREVIEW_MAX_BYTES);
+        assert!(
+            row.ends_with("#005000#\n\n"),
+            "{:?}",
+            &row[row.len() - 40..]
+        );
+        let (_, _, after) = shell.read(cx).last_block_window().unwrap();
+        assert_eq!(after, 0);
+    });
+}
+
+#[gpui_kit::test]
 fn a_streamed_block_longer_than_one_window_keeps_showing_its_newest_text(cx: &mut TestAppContext) {
     let (handle, shell) = open(cx, size(px(1440.), px(1200.)), 20, 40);
     cx.run_until_parked();

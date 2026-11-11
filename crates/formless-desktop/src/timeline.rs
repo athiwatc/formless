@@ -5,6 +5,10 @@
 //! output cannot make a frame expensive. The window can be moved: it starts
 //! at the head of a finished block, follows the tail of a block that is
 //! being streamed, and can be paged through the rest.
+//!
+//! Streamed text is added to the block at once, but the window is rebuilt
+//! only when the view asks ([`Timeline::settle`]): once for each time the
+//! row is shown, however many deltas arrived since the last time.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -253,6 +257,8 @@ pub struct TimelineBlock {
     anchor: Anchor,
     window: Range<usize>,
     preview: Arc<str>,
+    /// How long `markdown` was when the window was last rebuilt.
+    settled_len: usize,
 }
 
 impl TimelineBlock {
@@ -265,6 +271,7 @@ impl TimelineBlock {
             anchor: Anchor::Head,
             window: 0..0,
             preview: Arc::from(""),
+            settled_len: 0,
         };
         block.fences.extend(&block.markdown);
         block.refresh();
@@ -290,6 +297,7 @@ impl TimelineBlock {
             Some(fenced) => Arc::from(fenced.layout_opener(text) + shown),
             None => Arc::from(shown),
         };
+        self.settled_len = text.len();
     }
 
     /// The whole block, exactly as received. Copying must use this.
@@ -345,6 +353,7 @@ impl TimelineBlock {
 
     /// Move the window back by one window. At the start this does nothing.
     pub fn show_earlier(&mut self) {
+        debug_assert!(!self.is_stale(), "settle the row before moving it");
         let end = self.window.start;
         let start = window_start(
             &self.markdown,
@@ -365,26 +374,43 @@ impl TimelineBlock {
     /// as [`Self::show_end`]: it starts where the page before it stopped,
     /// and it only grows with the block until it is full.
     pub fn show_later(&mut self) {
+        debug_assert!(!self.is_stale(), "settle the row before moving it");
         if self.hidden_after() > 0 {
             self.anchor = Anchor::At(self.window.end);
             self.refresh();
         }
     }
 
-    /// Append text. Returns the bytes copied to rebuild the row's window,
-    /// or `None` if the window did not need rebuilding.
-    fn push(&mut self, text: &str) -> Option<usize> {
-        let reached_end = self.hidden_after() == 0;
+    /// Whether text has been added that the window should take in and has
+    /// not yet. A window on the tail moves with the text. Any other window
+    /// only changes while it still reaches the end of the block, that is,
+    /// until it is full; text added past a full window cannot change it.
+    ///
+    /// While this is true, [`Self::preview`] and [`Self::window`] are what
+    /// they were before that text arrived. [`Self::markdown`] is never
+    /// behind.
+    pub fn is_stale(&self) -> bool {
+        self.markdown.len() > self.settled_len
+            && (self.anchor == Anchor::Tail || self.window.end == self.settled_len)
+    }
+
+    /// Append text. The window is not rebuilt: that waits for
+    /// [`Self::settle`], so a thousand deltas between two frames cost one
+    /// rebuild, not a thousand.
+    fn push(&mut self, text: &str) {
         self.markdown.push_str(text);
         self.fences.extend(&self.markdown);
-        // A window on the tail moves with the text. Any other window only
-        // changes while it still reaches the end of the block, that is,
-        // until it is full; text added past a full window cannot change it.
-        if self.anchor == Anchor::Tail || reached_end {
-            self.refresh();
-            return Some(self.preview.len());
+    }
+
+    /// Rebuild the window if text has been added that it should take in.
+    /// Returns the bytes copied to do it, or `None` if there was nothing to
+    /// do.
+    fn settle(&mut self) -> Option<usize> {
+        if !self.is_stale() {
+            return None;
         }
-        None
+        self.refresh();
+        Some(self.preview.len())
     }
 }
 
@@ -393,7 +419,7 @@ impl TimelineBlock {
 pub struct StreamWork {
     /// Deltas appended.
     pub deltas: u64,
-    /// Times the row's window was rebuilt for them.
+    /// Times the row's window was rebuilt to take them in.
     pub rebuilds: u64,
     /// Bytes copied into the text those rebuilds lay out.
     pub bytes_copied: u64,
@@ -446,6 +472,7 @@ impl Timeline {
     /// follows its end, so the newest text is what is shown however long
     /// the block gets.
     pub fn begin_stream(&mut self, kind: BlockKind) -> u64 {
+        self.finish_stream();
         let id = self.blocks.last().map_or(1, |block| block.id + 1);
         let mut block = TimelineBlock::new(id, kind, String::new());
         block.show_end();
@@ -458,6 +485,8 @@ impl Timeline {
     /// position, or `None` if there is no such block.
     pub fn move_window(&mut self, block_id: u64, to: WindowMove) -> Option<usize> {
         let index = self.blocks.iter().position(|block| block.id == block_id)?;
+        // Earlier and Later start from where the window is now.
+        self.settle();
         let block = &mut self.blocks[index];
         match to {
             WindowMove::Start => block.show_start(),
@@ -470,25 +499,33 @@ impl Timeline {
 
     /// Append to the streamed block. Returns false, changing nothing, when
     /// no stream is in progress. Completed blocks are never touched.
+    ///
+    /// The block's text is complete at once. Its row is not rebuilt until
+    /// [`Self::settle`].
     pub fn push_delta(&mut self, text: &str) -> bool {
         match self.blocks.last_mut() {
             Some(tail) if self.streaming => {
                 self.work.deltas += 1;
-                if let Some(copied) = tail.push(text) {
-                    self.work.rebuilds += 1;
-                    self.work.bytes_copied += copied as u64;
-                }
+                tail.push(text);
                 true
             }
             _ => false,
         }
     }
 
-    /// Bring the streamed block's row up to date with its text. Returns
-    /// whether there was anything to do. Every delta rebuilds the row at
-    /// once, so there never is.
+    /// Bring the streamed block's row up to date with its text: one rebuild
+    /// for all the deltas since the last one. Returns whether there was
+    /// anything to do. The view calls this before it reads a row.
+    ///
+    /// Only the last block can need it, and only while it is streamed:
+    /// finishing a stream settles it.
     pub fn settle(&mut self) -> bool {
-        false
+        let Some(copied) = self.blocks.last_mut().and_then(TimelineBlock::settle) else {
+            return false;
+        };
+        self.work.rebuilds += 1;
+        self.work.bytes_copied += copied as u64;
+        true
     }
 
     /// Work done so far to keep streamed rows up to date.
@@ -496,7 +533,10 @@ impl Timeline {
         self.work
     }
 
+    /// End the stream. The block's row is brought up to date, so a
+    /// finished block's row never lags behind its text.
     pub fn finish_stream(&mut self) {
+        self.settle();
         self.streaming = false;
     }
 }
@@ -539,6 +579,15 @@ impl Coalescer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fixture;
+
+    /// Append a delta and bring the row up to date, as a view that shows
+    /// every delta would.
+    fn push_shown(timeline: &mut Timeline, text: &str) -> bool {
+        let pushed = timeline.push_delta(text);
+        timeline.settle();
+        pushed
+    }
 
     fn block(markdown: &str) -> TimelineBlock {
         TimelineBlock::new(1, BlockKind::Assistant, markdown.to_string())
@@ -860,7 +909,7 @@ mod tests {
                 while !text.is_char_boundary(end) {
                     end -= 1;
                 }
-                timeline.push_delta(&text[sent..end]);
+                push_shown(&mut timeline, &text[sent..end]);
                 sent = end;
                 let preview = timeline.blocks()[0].preview();
                 assert!(preview.len() <= PREVIEW_MAX_BYTES, "after {sent} bytes");
@@ -923,11 +972,11 @@ mod tests {
         let mut timeline = Timeline::default();
         timeline.begin_stream(BlockKind::Assistant);
         for piece in ["Here is the code:\n\n`", "``", "py", "thon\n"] {
-            timeline.push_delta(piece);
+            push_shown(&mut timeline, piece);
         }
         let body = numbered_lines(1_200);
         for line in body.split_inclusive('\n') {
-            timeline.push_delta(line);
+            push_shown(&mut timeline, line);
         }
         let tail = &timeline.blocks()[0];
         assert!(tail.hidden_before() > 0);
@@ -943,13 +992,13 @@ mod tests {
             TimelineBlock::new(7, BlockKind::User, "question".to_string()),
             TimelineBlock::new(8, BlockKind::Assistant, "answer".to_string()),
         ]);
-        assert!(!timeline.push_delta("ignored"), "no stream yet");
+        assert!(!push_shown(&mut timeline, "ignored"), "no stream yet");
         assert_eq!(timeline.blocks()[1].markdown(), "answer");
 
         let id = timeline.begin_stream(BlockKind::Assistant);
         assert_eq!(id, 9);
-        assert!(timeline.push_delta("สวัส"));
-        assert!(timeline.push_delta("ดี"));
+        assert!(push_shown(&mut timeline, "สวัส"));
+        assert!(push_shown(&mut timeline, "ดี"));
         let ids: Vec<u64> = timeline.blocks().iter().map(|b| b.id).collect();
         assert_eq!(ids, [7, 8, 9]);
         assert_eq!(timeline.blocks()[0].markdown(), "question");
@@ -958,7 +1007,7 @@ mod tests {
         assert_eq!(&**timeline.blocks()[2].preview(), "สวัสดี");
 
         timeline.finish_stream();
-        assert!(!timeline.push_delta("late"));
+        assert!(!push_shown(&mut timeline, "late"));
         assert_eq!(timeline.blocks()[2].markdown(), "สวัสดี");
     }
 
@@ -973,7 +1022,7 @@ mod tests {
             // Multi-byte text, and deltas that end mid-line.
             let ending = if index % 9 == 0 { "\n\n" } else { "" };
             let delta = format!("คำที่ {index} 👩🏽‍💻 {ending}");
-            timeline.push_delta(&delta);
+            push_shown(&mut timeline, &delta);
             pushed.push_str(&delta);
 
             let tail = &timeline.blocks()[0];
@@ -996,14 +1045,14 @@ mod tests {
         let id = timeline.begin_stream(BlockKind::Assistant);
         let line = "streamed line of text\n";
         for _ in 0..(BYTES * 2 / line.len()) {
-            timeline.push_delta(line);
+            push_shown(&mut timeline, line);
         }
         // The reader goes back to the start.
         assert_eq!(timeline.move_window(id, WindowMove::Start), Some(0));
         let pinned = timeline.blocks()[0].preview().clone();
         let hidden_after = timeline.blocks()[0].hidden_after();
         for _ in 0..500 {
-            timeline.push_delta(line);
+            push_shown(&mut timeline, line);
         }
         let tail = &timeline.blocks()[0];
         // Same allocation: nothing was recomputed, nothing moved.
@@ -1014,7 +1063,7 @@ mod tests {
 
         // Going back to the end shows the newest text and follows it again.
         timeline.move_window(id, WindowMove::End);
-        timeline.push_delta("the very latest\n");
+        push_shown(&mut timeline, "the very latest\n");
         let tail = &timeline.blocks()[0];
         assert_eq!(tail.anchor(), Anchor::Tail);
         assert!(tail.preview().ends_with("the very latest\n"));
@@ -1029,10 +1078,154 @@ mod tests {
         let mut timeline = Timeline::default();
         let id = timeline.begin_stream(BlockKind::Assistant);
         timeline.move_window(id, WindowMove::Start);
-        timeline.push_delta("first\n");
-        timeline.push_delta("second\n");
+        push_shown(&mut timeline, "first\n");
+        push_shown(&mut timeline, "second\n");
         assert_eq!(&**timeline.blocks()[0].preview(), "first\nsecond\n");
         assert!(!timeline.blocks()[0].is_truncated());
+    }
+
+    #[test]
+    fn a_burst_of_deltas_rebuilds_the_row_once() {
+        let mut timeline = Timeline::default();
+        timeline.begin_stream(BlockKind::Assistant);
+        let mut text = String::new();
+        for index in 0..100_000 {
+            let delta = fixture::stream_delta(index);
+            text.push_str(delta);
+            timeline.push_delta(delta);
+        }
+        let work = timeline.stream_work();
+        assert_eq!(
+            (work.deltas, work.rebuilds, work.bytes_copied),
+            (100_000, 0, 0)
+        );
+        // The text is complete at once. The row is what it was.
+        let tail = &timeline.blocks()[0];
+        assert_eq!(tail.markdown(), text);
+        assert!(tail.is_stale());
+        assert_eq!(&**tail.preview(), "");
+
+        assert!(timeline.settle());
+        assert!(!timeline.settle(), "nothing more to do");
+        let work = timeline.stream_work();
+        assert_eq!(work.rebuilds, 1);
+        assert!(work.bytes_copied as usize <= PREVIEW_MAX_BYTES);
+        // It shows what a block given the whole text at once shows of its
+        // end: the newest text, and no more than one window.
+        let mut whole = block(&text);
+        whole.show_end();
+        let tail = &timeline.blocks()[0];
+        assert!(!tail.is_stale());
+        assert_eq!(tail.preview(), whole.preview());
+        assert_eq!(tail.window(), whole.window());
+        assert_eq!(tail.hidden_after(), 0);
+        assert_eq!(tail.markdown(), text);
+    }
+
+    #[test]
+    fn settling_now_and_then_shows_what_settling_after_every_delta_shows() {
+        const DELTAS: usize = 14_000;
+        // A reader's moves, by how many deltas had arrived when each was
+        // made: to a head window that is still growing, on a page, back a
+        // page, to the tail, back a page, and on to a last page that is
+        // still growing.
+        let moves = [
+            (2_000, WindowMove::Start),
+            (6_000, WindowMove::Later),
+            (6_500, WindowMove::Earlier),
+            (9_000, WindowMove::End),
+            (11_000, WindowMove::Earlier),
+            (11_500, WindowMove::Later),
+        ];
+        for every in [2, 7, 17, 250, 4_000] {
+            let mut each = Timeline::default();
+            let mut some = Timeline::default();
+            let id = each.begin_stream(BlockKind::Assistant);
+            some.begin_stream(BlockKind::Assistant);
+            let mut text = String::new();
+            let same = |each: &Timeline, some: &Timeline, text: &str, when: &str| {
+                let (a, b) = (&each.blocks()[0], &some.blocks()[0]);
+                assert!(!b.is_stale(), "{when}");
+                assert_eq!(b.preview(), a.preview(), "{when}");
+                assert_eq!(b.window(), a.window(), "{when}");
+                assert_eq!(b.anchor(), a.anchor(), "{when}");
+                assert_eq!(b.markdown(), text, "{when}");
+            };
+            for index in 0..DELTAS {
+                if let Some((_, to)) = moves.iter().find(|(at, _)| *at == index) {
+                    each.move_window(id, *to);
+                    some.move_window(id, *to);
+                    same(
+                        &each,
+                        &some,
+                        &text,
+                        &format!("moved at {index}, every {every}"),
+                    );
+                }
+                let delta = fixture::stream_delta(index);
+                text.push_str(delta);
+                push_shown(&mut each, delta);
+                some.push_delta(delta);
+                // Behind or not, the row is bounded and the text is whole.
+                let row = &some.blocks()[0];
+                assert!(row.preview().len() <= PREVIEW_MAX_BYTES);
+                assert_eq!(row.total_bytes(), text.len());
+                if (index + 1) % every == 0 {
+                    some.settle();
+                    same(
+                        &each,
+                        &some,
+                        &text,
+                        &format!("after {index}, every {every}"),
+                    );
+                }
+            }
+            each.finish_stream();
+            some.finish_stream();
+            same(&each, &some, &text, &format!("finished, every {every}"));
+            // One rebuild at most for each time the row was looked at.
+            let looks = (DELTAS / every + moves.len() + 1) as u64;
+            assert!(some.stream_work().rebuilds <= looks, "every {every}");
+            assert!(each.stream_work().rebuilds >= some.stream_work().rebuilds);
+        }
+    }
+
+    #[test]
+    fn finishing_or_restarting_a_stream_leaves_no_row_behind_its_text() {
+        let mut timeline = Timeline::default();
+        timeline.begin_stream(BlockKind::Assistant);
+        timeline.push_delta("one\n");
+        timeline.finish_stream();
+        assert!(!timeline.blocks()[0].is_stale());
+        assert_eq!(&**timeline.blocks()[0].preview(), "one\n");
+
+        // A second stream, and a third begun without finishing it.
+        timeline.begin_stream(BlockKind::Assistant);
+        timeline.push_delta("two\n");
+        timeline.begin_stream(BlockKind::Assistant);
+        assert_eq!(&**timeline.blocks()[1].preview(), "two\n");
+        assert!(timeline.blocks().iter().all(|block| !block.is_stale()));
+        assert_eq!(timeline.stream_work().rebuilds, 2);
+    }
+
+    #[test]
+    fn a_full_window_that_is_not_on_the_tail_is_never_rebuilt_by_a_stream() {
+        let mut timeline = Timeline::default();
+        let id = timeline.begin_stream(BlockKind::Assistant);
+        for line in numbered_lines(1_500).lines() {
+            timeline.push_delta(line);
+            timeline.push_delta("\n");
+        }
+        timeline.move_window(id, WindowMove::Start);
+        let before = timeline.stream_work().rebuilds;
+        let head = timeline.blocks()[0].preview().clone();
+        for index in 0..1_000 {
+            timeline.push_delta(fixture::stream_delta(index));
+            assert!(!timeline.blocks()[0].is_stale());
+            assert!(!timeline.settle());
+        }
+        assert_eq!(timeline.stream_work().rebuilds, before);
+        assert_eq!(timeline.blocks()[0].preview(), &head);
     }
 
     #[test]
