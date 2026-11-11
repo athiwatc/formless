@@ -643,6 +643,13 @@ callbacks. The display runs at 120 Hz, so an undisturbed interval is 8.3 ms.
 
 Intervals are in milliseconds. No interval exceeded 100 ms in any run.
 
+A second batch on identical code, collected a little later for the evidence
+manifest, came out worse at 100 per second: p95 11.9 to 12.1 ms, p99 16.9
+to 18.4 ms, 1.6% to 2.4% of intervals over 16.7 ms and none over 33.4 ms,
+with the idle run at p99 12.2 ms and 0.8% over 16.7 ms. The two batches
+differ by more than the runs inside either one. The machine was in use for
+other work throughout.
+
 What this is and is not:
 
 - It is the cadence of frame callbacks, which shows when the main thread
@@ -650,11 +657,14 @@ What this is and is not:
   reached the display was not checked. Nobody watched the windows.
 - Coalescing works as designed: 3,000 deltas became about 1,250 view
   updates, 10,000 became about 420.
-- About 1% of intervals were longer than 16.7 ms while streaming at the
-  epic's 100 deltas per second, against 0.8% idle. The idle run itself had
-  one interval over 33 ms, so the machine, not only the shell, contributes.
+- Between 0.8% and 2.4% of intervals were longer than 16.7 ms while
+  streaming at the epic's 100 deltas per second, depending on the batch,
+  against 0.8% idle. That share is known only to within a factor of two or
+  three. An idle run had an interval over 33 ms, so the machine, not only
+  the shell, contributes.
 - The epic's budget is a p95 frame time of 16.7 ms at 60 Hz with 100 deltas
-  per second. These runs are consistent with it. They are not an acceptance
+  per second. In both batches p95 was about 12 ms, which is consistent with
+  it. They are not an acceptance
   of it: one machine, one fixture, no scrolling or typing during the
   stream. At 100 per second the streamed block stays a few tens of
   kilobytes at most. At 1,000 per second it passes the 32 KiB preview a few
