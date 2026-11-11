@@ -23,7 +23,8 @@ not see GPUI. Run every command below from this directory.
 |---|---|---|
 | `src/model.rs` | Presentation model: destinations, Run state, composer actions, layout breakpoints and modal overlays, focus regions, Session list selection, text size, drafts bounded by count and bytes | none |
 | `src/memory.rs` | Memory policy: composer limit, whole-edit rejection bookkeeping, undo accounting, text-free intent records | none |
-| `src/timeline.rs` | Timeline blocks, a bounded movable window onto each long block, streamed tails and update coalescing | none |
+| `src/timeline.rs` | Timeline blocks, a bounded movable window onto each long block, streamed tails rebuilt when shown and update coalescing | none |
+| `examples/stream_model.rs` | Replays the synthetic stream into the model with no window and prints what keeping the streamed row up to date cost | none |
 | `src/thai.rs` | Study, off by default: Thai word boundaries from ICU's dictionary (`thai-breaks` feature) | none |
 | `src/fixture.rs` | Deterministic synthetic Sessions and timeline blocks (Thai, CJK, emoji, right-to-left) | none |
 | `src/shell.rs` | The GPUI Kit window over the model | `gui` feature |
@@ -62,6 +63,9 @@ cargo run --release --locked -- --smoke
 # display frames were delivered meanwhile, quit. Rate 0 measures the idle
 # window.
 cargo run --release --locked -- --stream-seconds 30 --stream-rate 100
+
+# The model's share of that work alone: no window, no GPUI in the build.
+cargo run --release --no-default-features --locked --example stream_model
 ```
 
 Always run Cargo here with `CARGO_TARGET_DIR` set if the build output should

@@ -210,9 +210,9 @@ typical developer build.
 
 | Command | Result |
 |---|---|
-| `cargo test --no-default-features --lib --locked` | 56 passed (model, memory, timeline and fixture); no GPUI crate in its dependency graph |
-| `cargo test --features test-support --locked` | 56 passed, 52 passed (headless shell), 14 offscreen render states passed |
-| `cargo test --features test-support,thai-breaks --locked` | 61 passed, 52 passed, 14 render states and the real-text Thai measurement passed |
+| `cargo test --no-default-features --lib --locked` | 60 passed (model, memory, timeline and fixture); no GPUI crate in its dependency graph |
+| `cargo test --features test-support --locked` | 60 passed, 53 passed (headless shell), 14 offscreen render states passed |
+| `cargo test --features test-support,thai-breaks --locked` | 65 passed, 53 passed, 14 render states and the real-text Thai measurement passed |
 | `cargo fmt --check`, `cargo clippy --all-targets --locked` with and without `thai-breaks` | clean |
 
 These are the counts at the last code commit (§12). The first checkpoint
@@ -507,7 +507,11 @@ in the worktree's git-ignored `.screenshots/gpui-1753-phase0/` directory:
   follow-up (§11), as it was.
 - `checkpoint-126595a/`: the complete evidence set of the two UI defect
   fixes (§12), as it was.
-- `ab-bin/`: the two release binaries compared in §13.3.
+- `checkpoint-5d16e93/`: the complete evidence set of the row preview
+  bound (§13), as it was, with the window runs of §13.3.
+- `ab-bin/`: the release binaries compared in §13.3 and §14.3.
+- `stream-model/`: the two replay binaries of §14.1 and their log.
+- `stream-ab-837d80a-vs-c8487eb/`: the window runs of §14.3.
 - `compare-captures.py`: the run-to-run pixel comparison quoted in §4.
 - `checkpoint-e21668b/`: the complete evidence set of the first checkpoint,
   as it was.
@@ -894,9 +898,9 @@ Known limits of this:
   at least 8 bytes of text and 32 bytes of index, so a text made of nothing
   but empty fenced blocks has an index four times its size, more while the
   vector grows.
-- A row that follows the tail copies its window, up to 32 KiB, on every
-  delta, not once a frame. That cost is inside the streaming figures below
-  and was not measured on its own.
+- A row that follows the tail copied its window, up to 32 KiB, on every
+  delta, not once a frame. That cost is inside the streaming figures below.
+  It has since been measured on its own and removed (§14).
 
 ### 13.2 Tests
 
@@ -945,6 +949,129 @@ any of this.
 
 In every run the streamed block's newest text was on show (nothing after
 the window unshown).
+
+Still open, unchanged: Windows (done elsewhere), Linux, real input methods,
+screen readers, a person looking at 200% in a window, 200% text at the
+minimum window size (§12.2), performance budgets, parity, packaging.
+Phase 1 is not started.
+
+## 14. Streamed-row rebuilding, measured and coalesced
+
+Local commits `837d80a` (counting and a replay harness; behaviour
+unchanged) and `c8487eb` (the change). Evidence collected at `c8487eb`.
+
+### 14.1 Measured first
+
+`837d80a` counts, for the streamed block, the deltas appended, the times
+its row was rebuilt and the bytes copied to do it, and adds
+`examples/stream_model.rs`: the synthetic stream (`fixture::stream_delta`,
+the same text the binary sends) replayed into the model on a simulated
+clock, with no window and no GPUI in the build. The view is brought up to
+date as the shell does it, one flush 16 ms after the first delta not yet
+shown. The replay source is byte-identical in the two commits. Each build
+was run in turn, five rounds of 200 trials. The counts are exact and the
+same in every round; the times are the range of the five rounds' medians,
+for the model's work alone.
+
+| Stream | Deltas | Rebuilds, every delta | when shown | Copied, every delta | when shown | Whole stream, every delta | when shown |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 100 per second, 30 s | 3,000 | 3,000 | 1,500 | 30.2 MB | 15.1 MB | 2.83 to 2.85 ms | 1.41 to 1.44 ms |
+| 100 per second, 90 s | 9,000 | 9,000 | 4,500 | 214 MB | 107 MB | 19.5 to 19.7 ms | 9.7 to 9.8 ms |
+| 1,000 per second, 10 s | 10,000 | 10,000 | 625 | 247 MB | 15.4 MB | 22.5 to 22.6 ms | 1.48 to 1.49 ms |
+| 1,000 per second, 60 s | 60,000 | 60,000 | 3,750 | 1.87 GB | 117 MB | 170 to 171 ms | 11.2 to 11.3 ms |
+| 100,000 at once | 100,000 | 100,000 | 1 | 3.18 GB | 32 KB | 288 to 290 ms | 1.11 to 1.13 ms |
+
+Both builds end every stream showing the same row and holding the same
+text (the digests the replay prints are equal).
+
+What this says: at the epic's rate the per-delta rebuilding was never a
+load. It took 2.8 ms of processor time for 30 seconds of stream, about
+0.01% of one core, which no frame measurement here could have shown. What
+was wrong with it is that the cost followed the deltas and not the frames:
+a hundred thousand deltas arriving together stopped the thread for 0.29 s
+to copy 3.18 GB that nobody would see. That, and not the 100 per second
+case, is why it was changed.
+
+### 14.2 The change
+
+Appending a delta now adds the text and extends the fence index, nothing
+else. The row's window is rebuilt by `Timeline::settle`, which the shell
+calls when it builds a row for a frame and when a flush measures the tail
+row: once for each time the row is shown, however many deltas arrived
+since.
+
+- The block's text is complete the moment a delta arrives and is never
+  behind, so a copy is exact at any time.
+- A frame drawn between two flushes still shows the newest text: the row
+  is settled when it is built, not only when the flush runs.
+- The row stays within `PREVIEW_MAX_BYTES`, behind or not.
+- Finishing or restarting a stream, and moving a window, settle first.
+- A settled row shows exactly what it showed when every delta rebuilt it.
+
+### 14.3 Tests, and the two builds in real windows
+
+60 model tests (65 with the Thai study), 53 headless shell tests, 14
+offscreen states. New: a burst of 100,000 deltas rebuilds the row once and
+shows what a block given the whole text shows of its end; a row settled
+every 2, 7, 17, 250 or 4,000 deltas shows, at each of those points, what
+one settled after every delta shows, through a reader's six moves in the
+stream; no row is left behind when a stream is finished or restarted; a
+full window that is not on the tail is never rebuilt by a stream; and in
+the shell, a burst between two frames is rebuilt once, the next frame shows
+the newest text before the flush has run, and the flush rebuilds nothing.
+With each of five parts of the change removed, tests fail
+(`mutation-check/coalesced-rebuild-removed.log`).
+
+The two release binaries in turn, in real windows, unwatched, on a machine
+in use for other work (load average 4 to 6):
+
+| Stream | Build | Rebuilds | Copied | Intervals over 16.7 ms | Processor time |
+|---|---|---:|---:|---:|---:|
+| 100 per second, 30 s (four runs each) | every delta | 3,000 to 3,001 | 30.2 MB | 106 to 148 | 9.2 to 9.7 s |
+| | when shown | 2,159 to 2,214 | 21.6 to 22.5 MB | 121 to 133 | 9.3 to 9.6 s |
+| 1,000 per second, 10 s (two runs each) | every delta | 10,002 to 10,009 | 247 MB | 32 to 37 | 3.8 s |
+| | when shown | 708 to 718 | 17.3 to 17.5 MB | 35 to 36 | 3.8 s |
+
+The counts moved as designed. The frame figures and the processor time of
+the two builds cannot be told apart in these runs, which is what §14.1
+predicts and is not evidence of anything more.
+
+In a window the saving at 100 per second is a quarter, not the half the
+replay shows. These runs draw a frame at the display's rate throughout, to
+time the frames, and the row is rebuilt for each frame drawn after a new
+delta; at 100 deltas a second on a 120 Hz display most deltas get a frame
+of their own. Rebuilds are bounded by frames, as intended, and at this rate
+frames are nearly as many as deltas.
+
+The stress runs of §13.3, repeated at `c8487eb`:
+
+| Run | Updates | Frames | p95 | p99 | Max | Over 16.7 ms | Tail | Before window, not shown | After | Rebuilds |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Idle, 10 s | 0 | 1,168 | 9.0 | 20.8 | 22.7 | 17 | | | | 0 |
+| 100 per second, 30 s (three runs) | 1,246 to 1,249 | about 3,300 | 16.7 | 20.8 to 20.9 | 36.5 to 50.0 | 129 to 149 | 20,100 or 20,104 bytes | 0 | 0 | 2,162 to 2,191 |
+| 100 per second, 90 s | 3,712 | 9,954 | 16.7 | 20.8 | 41.7 | 349 | 60,300 bytes | 27,732 | 0 | 6,359 |
+| 1,000 per second, 10 s | 414 | 1,100 | 16.7 | 20.8 | 33.3 | 47 | 67,056 bytes | 34,571 | 0 | 692 |
+
+### 14.4 Limits
+
+- The frame figures of this batch are the worst of the three batches
+  (§12.3, §13.3, this one), and the idle window is as bad as in §13.3.
+  Nothing here says why. The comparisons in §13.3 and above put each pair
+  of builds within each other's range on the day, which is inconclusive,
+  and the batches were taken on different days under different load. A
+  regression somewhere in this series is not excluded. It would take a
+  machine doing nothing else, or a frame-time measurement that does not go
+  through the window server, to say. No budget is accepted.
+- The replay times the model only, on one machine, in a release build. It
+  does not time what the kit then does with each rebuilt row: parsing up
+  to 32 KiB of markdown and laying it out, which is certainly much more
+  work and was neither measured nor changed. The kit does that off the main
+  thread; the shell test waits for it.
+- The replay's clock gives two deltas a flush at 100 per second. The real
+  windows gave about 2.4.
+- While a row is behind, what it would lay out is older than the block's
+  text, by at most the time to the next frame or flush. The bytes not yet
+  taken in count as not shown after the window.
 
 Still open, unchanged: Windows (done elsewhere), Linux, real input methods,
 screen readers, a person looking at 200% in a window, 200% text at the
