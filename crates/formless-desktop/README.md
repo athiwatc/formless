@@ -23,13 +23,13 @@ not see GPUI. Run every command below from this directory.
 |---|---|---|
 | `src/model.rs` | Presentation model: destinations, Run state, composer actions, layout breakpoints and modal overlays, focus regions, Session list selection, text size, drafts bounded by count and bytes | none |
 | `src/memory.rs` | Memory policy: composer limit, whole-edit rejection bookkeeping, undo accounting, text-free intent records | none |
-| `src/timeline.rs` | Timeline blocks, bounded row previews, streamed tails and update coalescing | none |
+| `src/timeline.rs` | Timeline blocks, a bounded movable window onto each long block, streamed tails and update coalescing | none |
 | `src/thai.rs` | Study, off by default: Thai word boundaries from ICU's dictionary (`thai-breaks` feature) | none |
 | `src/fixture.rs` | Deterministic synthetic Sessions and timeline blocks (Thai, CJK, emoji, right-to-left) | none |
 | `src/shell.rs` | The GPUI Kit window over the model | `gui` feature |
 | `src/main.rs` | `formless-desktop` binary | `gui` feature |
 | `tests/shell.rs` | Headless tests of the real shell view. The test window has no real fonts: every character is the same width | `test-support` feature |
-| `tests/render.rs` | Offscreen render of ten shell states through GPUI's real renderer, and measurements that need real fonts (macOS, Linux) | `test-support` feature |
+| `tests/render.rs` | Offscreen render of fourteen shell states through GPUI's real renderer, and measurements that need real fonts (macOS, Linux) | `test-support` feature |
 
 ## Commands
 
@@ -53,6 +53,7 @@ cargo test --features test-support,thai-breaks --locked
 cargo run --release --locked
 cargo run --release --locked -- --sessions 10000 --blocks 100000
 cargo run --release --locked -- --huge-block-mb 5 --text-scale 200
+cargo run --release --locked -- --window 480x360 --text-scale 200
 
 # Open, print startup timings up to the first frame, quit after one second.
 cargo run --release --locked -- --smoke
@@ -71,7 +72,13 @@ Sessions sidebar, Cmd/Ctrl+Alt+B toggles the Context inspector. Each panel
 docks when the window is wide enough (944 px for Sessions, 1280 px for
 Context) and otherwise opens as a modal overlay that Escape or a click
 outside dismisses. Cmd/Ctrl with =, - and 0 change the text size between
-100% and 200%. In the Sessions list, Up/Down move
+100% and 200% and ask the window to grow to fit. The text size in use is
+the largest one the window can hold (480 x 360 times the size); when that
+is less than the size asked for, the status line says so. This keeps the
+controls usable; it is not 200% text in a minimum-size window. A row shows
+at most 32 KiB or 400 lines of its block, follows the end of a block that
+is being streamed, and has Start, Earlier, Later and End controls when
+there is more. In the Sessions list, Up/Down move
 the selection and Enter opens it. In the composer, Enter is the primary
 action, Shift+Enter adds a line, Cmd/Ctrl+Enter is Queue during a Run.
 Composer actions are recorded in the status line and never sent.

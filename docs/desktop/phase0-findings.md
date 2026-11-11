@@ -210,9 +210,9 @@ typical developer build.
 
 | Command | Result |
 |---|---|
-| `cargo test --no-default-features --lib --locked` | 50 passed (model, memory, timeline and fixture); no GPUI crate in its dependency graph |
-| `cargo test --features test-support --locked` | 50 passed, 51 passed (headless shell), 14 offscreen render states passed |
-| `cargo test --features test-support,thai-breaks --locked` | 55 passed, 51 passed, 14 render states and the real-text Thai measurement passed |
+| `cargo test --no-default-features --lib --locked` | 56 passed (model, memory, timeline and fixture); no GPUI crate in its dependency graph |
+| `cargo test --features test-support --locked` | 56 passed, 52 passed (headless shell), 14 offscreen render states passed |
+| `cargo test --features test-support,thai-breaks --locked` | 61 passed, 52 passed, 14 render states and the real-text Thai measurement passed |
 | `cargo fmt --check`, `cargo clippy --all-targets --locked` with and without `thai-breaks` | clean |
 
 These are the counts at the last code commit (§12). The first checkpoint
@@ -505,6 +505,9 @@ in the worktree's git-ignored `.screenshots/gpui-1753-phase0/` directory:
 - `captures/`: the fourteen offscreen PNG captures.
 - `checkpoint-c686073/`: the complete evidence set of the acceptance
   follow-up (§11), as it was.
+- `checkpoint-126595a/`: the complete evidence set of the two UI defect
+  fixes (§12), as it was.
+- `ab-bin/`: the two release binaries compared in §13.3.
 - `compare-captures.py`: the run-to-run pixel comparison quoted in §4.
 - `checkpoint-e21668b/`: the complete evidence set of the first checkpoint,
   as it was.
@@ -786,8 +789,9 @@ arriving, and has Start, Earlier, Later and End controls above and below
 the text. A reader who moves off the tail stays put while the stream goes
 on; End resumes following. Paging forward shows every byte exactly once;
 cuts fall on line breaks where there are any and never inside a character.
-A window that starts inside a fenced code block is laid out with that
-block's opening line, for layout only.
+A window that starts inside a fenced code block is laid out with an
+opening line for that block, for layout only (a short one that stands for
+the real line, since §13).
 
 Not addressed: a window that starts inside a table or list is laid out
 without its beginning, and there is still no separate full-output viewer.
@@ -847,3 +851,101 @@ Still open, unchanged: Windows (done elsewhere), Linux, real input methods,
 screen readers, a person looking at 200% in a window, performance budgets,
 parity, packaging. Phase 1 is not started.
 
+## 13. Row preview bound, from independent review of `126595a`
+
+Local commit `7e8a44a`. Figures are from the evidence set collected at
+`5d16e93`, which differs from it only in this document.
+
+### 13.1 The defect and the fix
+
+Found by dot's review: a window that starts inside a fenced code block was
+given a copy of that block's real opening line, and that line has no length
+limit. An opening line with a megabyte of info string made a 2,000-byte
+window lay out 1,050,580 bytes.
+
+- The fence index now holds positions only: 32 bytes for each fenced
+  block, nothing copied from the text.
+- A window that starts inside a fenced block is given a short line that
+  stands for the real one: the same indent and marker, at most 32 markers,
+  and the language name if it ends within 64 bytes of the markers. A name
+  that goes on past that is left out, not shortened.
+- A row therefore never lays out more than 32 KiB and 100 bytes
+  (`timeline::PREVIEW_MAX_BYTES`), whatever the block holds.
+- The block's own text is not touched. A copy uses it and is exact.
+
+Assessed as asked, and also fixed: an unfinished line was searched for a
+line break from its start on every delta, so one line of a megabyte
+arriving in 100-byte deltas cost about 5 GB of searching. The search now
+resumes where the last one stopped, and a test counts the bytes looked at:
+exactly the length of the text. Reading a finished line looks at up to four
+bytes of indent, the run of markers, and, for a line that could be a fence,
+the rest of that line once.
+
+One more correction in the same code: a line of backticks with another
+backtick after them is inline code, not an opening line.
+
+Known limits of this:
+
+- A block opened with more than 32 markers is closed, in the row, by a line
+  of 32 or more of them, where the real one needs as many as the opening
+  line. The index itself uses the real count, so the windows after it are
+  still right.
+- The index is not bounded separately from the text. A fenced block takes
+  at least 8 bytes of text and 32 bytes of index, so a text made of nothing
+  but empty fenced blocks has an index four times its size, more while the
+  vector grows.
+- A row that follows the tail copies its window, up to 32 KiB, on every
+  delta, not once a frame. That cost is inside the streaming figures below
+  and was not measured on its own.
+
+### 13.2 Tests
+
+56 model tests (61 with the Thai study), 52 headless shell tests, 14
+offscreen states. New: an enormous opening line of each kind (a megabyte of
+info string, of markers, of space before the name, of Thai after it) at
+the head, at the tail, paged, and streamed in pieces; the short line's
+rules at the limits, including a limit that falls inside a three-byte
+character; a line in 10,000 pieces searched once; the index the same
+however the text is cut into pieces; and, in the shell, the row for such a
+block. With each of the three changes removed the matching tests fail, and
+the reviewer's own test passes unchanged against the fix
+(`mutation-check/fence-bound-fixes-removed.log`).
+
+### 13.3 Stress, repeated, on a busier machine
+
+Frame-callback intervals in milliseconds, as in §12.3:
+
+| Run | Updates | Frames | p95 | p99 | Max | Over 16.7 ms | Tail | Before window, not shown | After |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Idle, 10 s | 0 | 1,170 | 8.9 | 20.6 | 23.3 | 16 | | | |
+| 100 per second, 30 s (three runs) | 1,300 to 1,313 | about 3,390 | 12.5 to 16.6 | 17.3 to 20.8 | 31.7 to 41.7 | 72 to 101 | 20,100 bytes | 0 | 0 |
+| 100 per second, 90 s | 3,920 | 10,204 | 16.6 | 17.5 | 36.0 | 191 | 60,300 bytes | 27,732 | 0 |
+| 1,000 per second, 10 s | 432 | 1,106 | 16.6 | 18.5 | 33.3 | 22 | 67,006 bytes | 34,571 | 0 |
+
+These are worse than §12.3: three to four times as many intervals over
+16.7 ms, and the idle window is worse too. The machine was busier (load
+average about 7.5, the window server near one full core, other agents at
+work). To tell that from a regression, the release binary of `126595a` was
+built from an export of that commit and run in turn with this one, eight
+30-second runs at 100 per second in the order old, new, new, old, old, new,
+new, old:
+
+| Binary | p95 | p99 | Max | Over 16.7 ms |
+|---|---:|---:|---:|---:|
+| `126595a` (four runs) | 16.6 to 16.7 | 17.6 to 20.7 | 33.3 to 75.4 | 99 to 115 |
+| `5d16e93` (four runs) | 16.7 | 18.2 to 20.8 | 29.5 to 59.0 | 106 to 142 |
+
+The two overlap. On this evidence the slower figures are the machine on the
+day and not this change, and the figures in §12.3 were not a property of
+the code either: the same source gives 18 or 115 slow intervals in 30
+seconds depending on what else is running. Eight runs under uncontrolled
+load cannot rule out a small difference. No budget is accepted on any of
+this.
+
+In every run the streamed block's newest text was on show (nothing after
+the window unshown).
+
+Still open, unchanged: Windows (done elsewhere), Linux, real input methods,
+screen readers, a person looking at 200% in a window, 200% text at the
+minimum window size (§12.2), performance budgets, parity, packaging.
+Phase 1 is not started.
