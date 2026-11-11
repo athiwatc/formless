@@ -650,6 +650,18 @@ impl Shell {
         self.blocks.borrow().len()
     }
 
+    /// The last block's size and how much of it its row does not show, as
+    /// (total bytes, bytes before the window, bytes after it).
+    pub fn last_block_window(&self) -> Option<(usize, usize, usize)> {
+        self.blocks.borrow().blocks().last().map(|block| {
+            (
+                block.total_bytes(),
+                block.hidden_before(),
+                block.hidden_after(),
+            )
+        })
+    }
+
     /// Stream deltas received and view updates made for them.
     pub fn stream_stats(&self) -> (u64, u64) {
         (self.stream.requests(), self.stream.flushes())

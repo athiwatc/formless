@@ -156,10 +156,16 @@ fn run_stream(window: &Window, shell: Entity<Shell>, seconds: usize, rate: usize
                 .collect();
             intervals.sort_by(|a, b| a.total_cmp(b));
             let (deltas, flushes) = shell.read(cx).stream_stats();
+            // Where the streamed block ended up: how large it is, and how
+            // much of it its row leaves out on each side. Nothing after the
+            // window means the newest text is what is on show.
+            let (tail_bytes, tail_before, tail_after) =
+                shell.read(cx).last_block_window().unwrap_or_default();
             println!(
                 "stream: seconds={seconds} rate={rate} deltas_sent={sent} deltas_received={deltas} \
                  view_updates={flushes} frames={} frame_interval_ms p50={:.1} p95={:.1} p99={:.1} \
-                 max={:.1} over_16.7ms={} over_33.4ms={} over_100ms={}",
+                 max={:.1} over_16.7ms={} over_33.4ms={} over_100ms={} tail_bytes={tail_bytes} \
+                 tail_not_shown_before={tail_before} tail_not_shown_after={tail_after}",
                 frames.len(),
                 percentile(&intervals, 0.50),
                 percentile(&intervals, 0.95),
