@@ -22,7 +22,9 @@ The spike is [`crates/formless-desktop`](../../crates/formless-desktop/README.md
   `--workspace` command are unchanged.
 - Kit text input, virtualized lists, focus regions, Markdown and
   accessibility roles were exercised in the kit's headless test window with
-  Thai, CJK, emoji and right-to-left text.
+  Thai, CJK, emoji and right-to-left text. That window has no real fonts
+  (§11.1): it proves layout and input logic, not glyph widths or where real
+  text wraps.
 - Three findings need a decision before Phase 1: there is no Thai word-break
   model in GPUI's line wrapper, the client transport lives inside
   `formless-tui`, and the protocol has no transcript pagination.
@@ -32,6 +34,11 @@ The spike is [`crates/formless-desktop`](../../crates/formless-desktop/README.md
   them.
 - An independent early review raised six points; §9 records what was done
   about each.
+- §11 records the acceptance follow-up: overlay semantics and focus
+  restoration, the memory policy and the two review rounds it went through,
+  5 MiB and streaming stress runs, a text size setting tested to 200%, and a
+  Thai line-break study. None of it closes a gate that needs a real input
+  method, a screen reader, a person looking, or another platform.
 
 ## 1. Dependency pin
 
@@ -148,12 +155,15 @@ harness types text but does not run an OS input method).
 | Overlays | Below its docking width each panel's toggle opens it as a modal overlay instead: dimmed backdrop that swallows pointer input, focus moved in and trapped (F6 and Tab), Escape or a backdrop click to dismiss, focus returned to the region it came from. One overlay at a time. Widening docks it and forgets the overlay. | kit `focus_trap`, key contexts |
 | Sessions list | 10,000 rows, Pinned/Active/Recent order, textual status, selection separate from activation, row element ids derived from the Session id | `v_virtual_list` |
 | Timeline | 10,000 mixed blocks with stable block ids, tail following, jump-to-latest control | `MessageScroller` over GPUI `list`, `TextView::markdown` |
-| Composer | Multiline, Enter / Shift+Enter / Cmd-or-Ctrl+Enter, Send / Steer / Queue by Run state, Stop in its own fixed slot, disabled reasons, draft kept after a recorded send | `Textarea`, `Button` |
-| Drafts | One unsent draft per Session, bounded to 64 Sessions and 4 MiB of text in total, oldest evicted first; the newest draft is always kept even if it alone is over the byte budget | model only |
+| Composer | Multiline, Enter / Shift+Enter / Cmd-or-Ctrl+Enter, Send / Steer / Queue by Run state, Stop in its own fixed slot, disabled reasons, draft kept after a recorded send. Accepted text is limited to 1 MiB; an edit that would pass it is rejected whole (§11.3) | `Textarea`, `Button` |
+| Drafts | One unsent draft per Session, bounded to 64 Sessions and, given that no single draft exceeds it, 4 MiB of text in total. The oldest are evicted first and the user is told how many. Sessions holding a draft are marked in the list | model only |
 | Focus | F6 / Shift+F6 across regions, hidden panels skipped, focus never left in a region that is no longer on screen | GPUI focus handles |
 | Destinations | Chat is the only view. Sessions, Settings, Tools, Metrics and Proposals replace the conversation and composer with a "not built" notice and say so in the status line. Search is not reachable. | `Label`, `Button` |
 | Theme | Light and dark through the kit theme (the header toggle itself is untested); status never by colour alone | `Theme::change` |
-| Intents | `Intent::SendMessage` and `Intent::InterruptRun` recorded and shown, never sent | none |
+| Text size | 100% to 200% in 25% steps (Cmd/Ctrl with =, - and 0). Fixed sizes and layout breakpoints follow it (§11.5) | kit theme font sizes |
+| Timeline rows | A row lays out at most 32 KiB and 400 lines of its block and says when it is cut (§11.4) | `TextView::markdown`, `Label` |
+| Streaming | Deltas update the data at once and the view at most once per 16 ms; only the tail row is re-measured (§11.4) | `MessageScrollerState` |
+| Intents | `Intent::SendMessage` and `Intent::InterruptRun` are noted and shown, never sent. What is kept is a record of sizes; no message text is retained | none |
 
 Deliberately absent: any Daemon Core connection, real Sessions or
 transcripts, the action registry and command palette, Search, every
@@ -166,19 +176,24 @@ Known limits of what is there:
 - The header stays outside a modal overlay on purpose, because it holds the
   toggle that opened it. Its buttons therefore remain clickable while an
   overlay is up.
-- Focus restoration is per region, not per control. Opening an overlay from
-  a header button returns focus to the composer, not to that button.
-- The overlay's accessibility semantics (dialog role, modal state, announced
-  name) are not set and no screen reader has been run.
+- Dismissing an overlay returns focus to the exact control that had it, if
+  that control's region is still shown; otherwise to the composer or the
+  conversation.
+- Overlay panels expose the dialog role, a name and a description. The kit
+  has no "modal" accessibility property to set, and no screen reader has
+  been run.
 - Panel widths are fixed; nothing is resizable.
 - The timeline's jump-to-latest control comes from the kit and is untested
   here. Every Session shows the same synthetic timeline.
-- The draft bound counts stored drafts only. The text in the composer itself
-  is unbounded, as is the kit's undo history. The retained `last_intent`
-  and its text clones are also outside that stored-draft byte budget.
+- Memory bounds are stated in §11.3. In short: accepted composer text and
+  stored drafts are bounded; the retained intent holds no text; **no bound
+  is claimed for the kit's undo and redo history**, which was not measured.
+- A row's preview keeps the head of its block. A streamed block longer than
+  the preview stops showing its newest text.
+- The minimum window size does not grow with the text size (§11.5).
 
-The layout tokens are the epic's starting values and have not been checked at
-200% text scaling.
+The layout tokens are the epic's starting values. At 200% text size they
+scale with everything else (§11.5); nobody has looked at the result.
 
 ## 4. Measurements
 
@@ -190,11 +205,18 @@ typical developer build.
 
 | Command | Result |
 |---|---|
-| `cargo test --no-default-features --lib --locked` | 22 passed (model and fixture); no GPUI crate in its dependency graph |
-| `cargo test --features test-support --locked` | 22 passed (model and fixture), 16 passed (headless shell), 7 offscreen render states passed |
-| `cargo fmt --check`, `cargo clippy --features test-support --all-targets --locked` | clean |
+| `cargo test --no-default-features --lib --locked` | 42 passed (model, memory, timeline and fixture); no GPUI crate in its dependency graph |
+| `cargo test --features test-support --locked` | 42 passed, 45 passed (headless shell), 10 offscreen render states passed |
+| `cargo test --features test-support,thai-breaks --locked` | 47 passed, 45 passed, 10 render states and the real-text Thai measurement passed |
+| `cargo fmt --check`, `cargo clippy --all-targets --locked` with and without `thai-breaks` | clean |
 
-What the headless shell tests establish, on macOS, in the kit's test window:
+These are the counts at the last code commit of the follow-up (§11). The
+first checkpoint had 22, 16 and 7.
+
+What the headless shell tests establish, on macOS, in the kit's test window.
+That window's text system gives every character the same width (§11.1), so
+where a bullet below speaks of text wrapping or fitting it is by character
+count, not by real glyphs:
 
 - Three panes dock at their token widths at 1440 px. At 1100 px the
   inspector is gone until its toggle is pressed, then overlays the
@@ -334,10 +356,9 @@ LSTM model for Thai (or Lao, Khmer, Burmese) is present. Observed effects:
 
 - Every layout of Thai text prints `ICU4X data error: No segmentation model
   for complex script: Thai` to the process output.
-- Thai text still wraps and does not overflow (measured in the headless
-  test). Where it breaks was not measured; from the source, with no model
-  there is no word-boundary opportunity inside a Thai run, so the break
-  falls wherever the line fills.
+- Thai text still wraps and does not overflow. Measured since with real
+  fonts (§11.6): between 6 and 10 of every 9 to 16 line breaks in a Thai
+  paragraph fall inside a word.
 
 Not yet examined: whether word-wise caret movement and double-click
 selection in the kit's inputs have the same gap for Thai. This matters for a
@@ -407,10 +428,10 @@ this table is implemented beyond what §3 lists.
 | Pin kit release family, dependency graph, toolchain and platform requirements from release manifests | Done for macOS; Windows and Linux are resolution-only |
 | Build a disposable native shell on Mac | Done |
 | Build it on Windows | **Not done**, needs the Windows PC. **Required gate, open.** |
-| Verify kit input, virtualization, focus, Markdown and AccessKit with Thai/CJK text | Headless only; no OS IME, no screen reader. **Required gate, open.** |
+| Verify kit input, virtualization, focus, Markdown and AccessKit with Thai/CJK text | Headless only, extended in §11 (overlay roles, input-method commit and composition through the kit's test bridge); no OS IME, no screen reader. **Required gate, open.** |
 | Inventory UI intents and data availability; name missing contracts | First pass in §6; approvals, credentials and setup not examined |
 | Original shell, composer and inspector tokens; narrow and wide mock states | Starting tokens and three width states exist in code and as offscreen captures; no visual review with users |
-| Performance fixtures, baseline measurements, accepted budgets | Synthetic static fixture, first-frame timing and peak RSS only; no budget accepted. **Required gate, open.** |
+| Performance fixtures, baseline measurements, accepted budgets | Synthetic fixtures including a 5 MiB block and a streamed tail; first-frame timing, peak RSS and frame-delivery intervals while streaming (§11.4); no key-to-paint, scroll, idle CPU or long-run memory; no budget accepted. **Required gate, open.** |
 | Decide packaging and supported platform tier | Not started |
 
 ## 8. Pending gates and next steps
@@ -421,12 +442,13 @@ none of them can be closed by anything measured so far.
 
 | Gate | Why the current evidence does not cover it |
 |---|---|
-| Windows build, tests and launch | Only dependency resolution was done for Windows. Must run on the Windows PC. |
+| Windows build, tests and launch | Only dependency resolution was done for Windows here. The native Windows run is being done separately and is not duplicated or inferred in this document. |
 | Linux build and launch | Only dependency resolution was done. |
 | Real OS IME composition (Thai, CJK, dead keys) | The harness types finished text; no input method ran. |
-| VoiceOver (and NVDA on Windows) | Roles and labels were read from the accessibility tree in tests; no screen reader ran, and overlay dialog semantics are not set. |
-| 200% text scaling and display-scale changes | Not tried. Layout tokens are unverified at scale. |
-| Streaming and performance budgets | No streaming fixture, no frame timing, no key-to-paint, idle CPU or long-run memory. |
+| VoiceOver (and NVDA on Windows) | Roles, names and descriptions, including the overlay dialogs, were read from the accessibility tree in tests. No screen reader ran, so what is announced, and in what order, is unknown. The kit cannot mark an element modal. |
+| 200% text scaling and display-scale changes | The shell's own text size setting is tested to 200% and captured offscreen (§11.5). Nobody has looked at it in a window, the minimum window size is too small at 200%, and no OS-level display or accessibility setting was changed. |
+| Streaming and performance budgets | Frame-delivery intervals were recorded while streaming in a real window (§11.4). That is not key-to-paint, scrolling, session switching, idle CPU or long-run memory, the window was not watched, and no budget is accepted on it. |
+| Thai line breaking | A study shows a workable approach on macOS fonts (§11.6). It is not wired in, and Windows and Linux fonts are untested. |
 | Parity | §6 is an inventory. Only Chat has a view, with synthetic data, and the approval, credential and setup surfaces are unexamined. |
 | Packaging, signing, licence notices | Not started. |
 
@@ -468,18 +490,261 @@ in the worktree's git-ignored `.screenshots/gpui-1753-phase0/` directory:
 - `MANIFEST.md`: every command, its result, and the path of every log and
   capture, tied to the commit it describes.
 - `collect.sh <worktree root> <evidence dir>`: regenerates all of it. It
-  runs only this crate's commands, with two build jobs, and takes about a
-  minute on a warm target directory.
-- `logs/`: environment, format, lint, both test runs, release build, the six
-  smoke launches, lockfile verification, dependency graphs, resolved
-  features, build plans and on-disk artifacts.
-- `captures/`: the seven offscreen PNG captures.
+  runs only this crate's commands, with two build jobs, and takes about
+  four minutes on a warm target directory, most of it the streaming runs,
+  each of which opens a window.
+- `logs/`: environment, format, lint, the test runs with and without the
+  Thai study, release build, the smoke, 5 MiB, 200% and streaming launches,
+  lockfile verification, dependency graphs, resolved features, build plans
+  and on-disk artifacts.
+- `captures/`: the ten offscreen PNG captures.
 - `compare-captures.py`: the run-to-run pixel comparison quoted in §4.
-- `run-1-pre-commit/`: the run, minutes before the commit and on identical
-  crate files, that the revised-head figures in §4 were read from. The
-  canonical `logs/` were collected again at the commit itself, so their
-  smoke timings are a further batch and differ by the usual run-to-run
-  spread.
+- `checkpoint-e21668b/`: the complete evidence set of the first checkpoint,
+  as it was.
+- `receipt-ac004f3/`: the model and shell tests run on an exact export of
+  commit `ac004f3`, with the hashes that tie the export to the commit.
+- `mutation-check/`: logs of the review regressions failing with their
+  fixes removed.
 
 That directory is local to one machine and is not part of the repository;
 anyone else reproduces it by running the script.
+
+## 11. Acceptance follow-up
+
+Work done after the first checkpoint was reviewed and published as a draft,
+all local commits on top of it. Figures are from the evidence set collected
+at the last code commit, on the Mac in §2.
+
+### 11.1 Correction: the headless test window has no real fonts
+
+The kit's headless test window (`tests/shell.rs`) runs on GPUI's stand-in
+text system, in which every character is 0.6 em wide. This was found while
+measuring Thai line breaks, when a zero width space measured 9.6 px.
+
+Consequences for what has been claimed:
+
+- Layout, focus, key dispatch, hit testing, virtualization, accessibility
+  properties and all model behaviour in those tests are real.
+- Anything about glyph widths, or where real text wraps, is not. The earlier
+  statement that a Thai paragraph "wraps inside a 520 px conversation" is
+  true of a paragraph of that many characters, not of Thai glyphs.
+- Measurements that need real fonts now run in `tests/render.rs`, on the
+  platform text system through GPUI's offscreen renderer. That file asserts
+  it is on real font metrics (`mmmmmmmm` is at least 1.5 times as wide as
+  `iiiiiiii`) so it cannot silently fall back.
+
+### 11.2 Overlay semantics and focus restoration
+
+- An overlay panel exposes the dialog role, its name ("Sessions",
+  "Context") and a description that states the modal behaviour and the
+  Escape key in words. Docked, the same panels are navigation and
+  complementary landmarks. Exactly one dialog is exposed while an overlay
+  is up, none otherwise.
+- GPUI Kit 0.9.1 has no "modal" accessibility property on elements (its own
+  dialog sets only role and label), so that flag is not set. Whether an
+  assistive technology treats the content behind the dialog as unreachable
+  is therefore not established.
+- Dismissing an overlay returns focus to the exact control that had it: a
+  header toggle reached with Tab and activated with Enter, a button inside
+  a region, or the composer. If that control's region is no longer shown,
+  focus goes to the composer, or to the conversation where there is no
+  composer.
+
+Tested by reading the accessibility tree and dispatching synthetic keys.
+**Not observed:** VoiceOver or any other screen reader.
+
+### 11.3 Memory policy
+
+One stated position per place the shell holds user text (`src/memory.rs`):
+
+| Text | Position |
+|---|---|
+| Accepted composer text | At most 1 MiB. |
+| Stored drafts | At most 64 Sessions, and at most 4 MiB in total provided no single draft exceeds 4 MiB. The shell only stores drafts within the composer limit, so the precondition holds. |
+| Recorded intent | No message text at all: kind, Session id, byte and character counts. |
+| A timeline row | At most 32 KiB and 400 lines laid out, whatever the block's size. |
+| Composer undo and redo history | **No bound is claimed.** What the kit retains was not measured and is excluded from every figure here. |
+| The transcript | Not a view policy. How much is loaded is a protocol question (§5.3). |
+
+How the composer limit is kept, and where it bends:
+
+- An edit whose result is over the limit is rejected whole: the full
+  previous draft and its selection come back. Nothing is cut to fit, so
+  text after an insertion point is never lost and no character is split.
+- The kit has no hook to refuse a multi-line edit before it happens (its
+  validator applies to single-line inputs only), so the rejection is made
+  just after the edit. The composer is over the limit for that instant.
+- The rejection uses the kit's own undo, sent to that composer. When that
+  restores exactly the previous draft the undo history survives. When it
+  does not (the kit merges quick typing into one undo step and takes back
+  more), the previous draft is restored by rebuilding the composer and the
+  history is lost. The notice says which happened, every time.
+- A clipboard larger than the whole limit is refused before insertion. Any
+  smaller paste is judged on the text that results, so replacing a
+  selection is accounted for exactly.
+- Text an input method is still composing is not judged until the
+  composition ends, so the composer can exceed the limit by the length of
+  a composition.
+- When a composition ends in place the kit gives no signal at all. The
+  excess is judged at the composer's next change of any kind; until then it
+  can be neither sent nor stored as a draft.
+- A rejection is deferred work. It is tied by a ticket to one edit in one
+  composer. A rejection that outlives its composer, because the Session was
+  switched in between, sends no undo, restores no text and consumes no
+  newer record.
+- Switching Session while the composer holds text that was not accepted
+  (a pending rejection, or an over-limit composition) stores the last
+  accepted draft and says the rest was not kept.
+- The composer is rebuilt on every Session switch, because the kit's undo
+  history cannot be cleared any other way. Without that, undo in one
+  Session restored another Session's draft.
+- As mitigation only, the composer is also rebuilt after 4 MiB of edited
+  text (bytes removed plus bytes inserted). This is accounting, not a
+  measured bound.
+
+Not covered by any test: text dropped onto the composer (no harness for
+it), and anything a real input method does that the kit's test bridge does
+not model.
+
+This policy went through two independent review rounds after it was first
+committed; §11.7 lists what each found.
+
+### 11.4 Five-megabyte and streaming stress
+
+**A 5 MiB output block.** In the headless test (debug build, stand-in text
+system) the row shows a preview notice naming both sizes, lays out the
+block's 390th line and not its 450th, and the whole window paints 30,841
+bytes of text. Typing 30 characters into the composer took 801 ms with the block on
+screen and 721 ms without it, each keystroke a full frame; the two are
+within the noise of tests running in parallel. In a real window (release
+build), first frame callback and peak memory:
+
+| Fixture | First frame callback | Peak RSS |
+|---|---:|---:|
+| 10,000 blocks | 623 / 526 / 859 ms | 135 MiB |
+| 10,000 blocks and one 5 MiB block | 551 / 570 / 501 ms | 144 MiB |
+
+**A 5 MiB paste** into the composer is refused in about 61 ms (headless),
+with nothing inserted.
+
+**Streaming.** `--stream-seconds` streams into the tail of a 10,000-block
+timeline in a real window and records the interval between display-frame
+callbacks. The display runs at 120 Hz, so an undisturbed interval is 8.3 ms.
+
+| Run | Deltas | View updates | Frames | p50 | p95 | p99 | Max | Over 16.7 ms | Over 33.4 ms |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Idle, 10 s | 0 | 0 | 1,175 | 8.3 | 8.9 | 11.7 | 33.9 | 9 | 1 |
+| 100 per second, 30 s | 3,000 | 1,241 | 3,499 | 8.3 | 11.7 | 16.7 | 41.7 | 34 | 1 |
+| 100 per second, 30 s | 3,000 | 1,249 | 3,516 | 8.3 | 11.7 | 16.7 | 42.9 | 27 | 1 |
+| 100 per second, 30 s | 3,000 | 1,251 | 3,504 | 8.3 | 11.8 | 16.7 | 33.3 | 37 | 0 |
+| 1,000 per second, 10 s | 10,012 | 419 | 1,174 | 8.3 | 11.2 | 16.7 | 41.4 | 8 | 1 |
+| 100 per second, 10 s, with a 5 MiB block | 1,000 | 424 | 1,155 | 8.3 | 12.0 | 16.7 | 41.7 | 15 | 1 |
+| 100 per second, 10 s, at 200% text | 1,000 | 422 | 1,168 | 8.3 | 11.9 | 16.7 | 33.3 | 12 | 0 |
+
+Intervals are in milliseconds. No interval exceeded 100 ms in any run.
+
+What this is and is not:
+
+- It is the cadence of frame callbacks, which shows when the main thread
+  was too busy to take a frame. It is not key-to-paint latency, and what
+  reached the display was not checked. Nobody watched the windows.
+- Coalescing works as designed: 3,000 deltas became about 1,250 view
+  updates, 10,000 became about 420.
+- About 1% of intervals were longer than 16.7 ms while streaming at the
+  epic's 100 deltas per second, against 0.8% idle. The idle run itself had
+  one interval over 33 ms, so the machine, not only the shell, contributes.
+- The epic's budget is a p95 frame time of 16.7 ms at 60 Hz with 100 deltas
+  per second. These runs are consistent with it. They are not an acceptance
+  of it: one machine, one fixture, no scrolling or typing during the
+  stream. At 100 per second the streamed block stays a few tens of
+  kilobytes at most. At 1,000 per second it passes the 32 KiB preview a few
+  seconds in, after which the row no longer changes, so most of that run
+  measures a tail that has stopped growing on screen.
+- Known limit, not exercised here: a streamed block that outgrows the
+  32 KiB preview stops showing its newest text, because the preview keeps
+  the head. Long messages need splitting into several rows.
+- Headless tests cover the logic: 1,000 deltas in one burst cause one view
+  update, the final state is shown without waiting, and a block being read
+  further up does not move while the tail grows.
+
+### 11.5 Text size to 200%
+
+The shell has a text size setting. It sets the kit theme's font sizes,
+multiplies the shell's own fixed sizes by the same factor, and applies the
+layout breakpoints to the window width divided by it. A window at 200%
+therefore lays out like one half as wide at 100%.
+
+Tested, in the headless window:
+
+- A 2880 px window at 200% has the same layout as a 1440 px window at 100%,
+  every part twice the size to within a pixel. Kit buttons double too
+  (54 × 32 to 108 × 64, 75 × 24 to 150 × 48).
+- In the same 1440 px window at 200%, both panels give way, nothing is put
+  over the conversation, every header and composer control is whole and
+  inside the window, the draft and focus survive, typing still works, and
+  the sidebar opens as an overlay at twice the size.
+- The shortcuts step 100, 125, 150, 175, 200 and stop; reset returns to
+  three panes with the draft and focus untouched.
+- Changing the display scale factor leaves the logical layout unchanged.
+
+Found: the binary's 480 × 360 minimum window cannot show the composer or
+any header control at 200%; only the status line stays inside. A minimum
+that grows with the text size (960 × 720) holds them all. The minimum is
+not yet tied to the text size.
+
+Three 200% states are in the offscreen captures, drawn with real fonts. Two
+were looked at once by the implementing agent: the 1440 px one reads as
+intended; the 480 × 360 one shows the header clipped at the right edge and
+the status line drawn over the composer's buttons, which is the limitation
+above. **Not observed:** any of this in a real window by a person; a macOS
+display or accessibility setting; anything on Windows.
+
+### 11.6 Thai line breaking: feasibility
+
+A study, off by default (`thai-breaks` feature) and not wired into the
+shell. `src/thai.rs` finds Thai word boundaries with ICU's dictionary
+segmenter and can mark them with U+200B ZERO WIDTH SPACE. The dictionary is
+in data the GPUI layer already links: no new package, and the lockfile
+gains only a dependency edge.
+
+Measured on macOS with real fonts, a 528-character Thai paragraph:
+
+| Width | Unmarked: breaks | Unmarked: inside a word | Marked: breaks | Marked: inside a word |
+|---|---:|---:|---:|---:|
+| 240 px | 16 | 10 | 17 | 0 |
+| 300 px | 13 | 7 | 13 | 0 |
+| 420 px | 9 | 6 | 9 | 0 |
+
+The 131 marks add 0 px to the paragraph's width.
+
+So the approach is workable on this platform: GPUI breaks Thai mid-word
+today, and breaks only between words once the boundaries are marked, with
+no visible change otherwise. What it would take to use it:
+
+- Marks must go into prose only, never into code, link targets or anything
+  else where an extra character changes meaning. That needs the Markdown
+  structure, not the source text.
+- Marks must come out again when text is copied. A mark the author put
+  between Thai letters cannot be told from an inserted one.
+- The same measurement on Windows and Linux fonts.
+- The alternative is upstream: have GPUI build its line breaker with the
+  dictionary. That would fix every text surface at once, including the
+  composer, and needs no marks.
+
+Also recorded: word-wise caret movement in the kit's input crosses Thai
+almost one character at a time (24 presses for 29 characters in 7 words).
+That is the kit's word boundary logic, not line breaking, and marks in
+displayed text would not change it.
+
+### 11.7 Review rounds on the memory policy
+
+| Round | Found | Done |
+|---|---|---|
+| First (on `6ca5c4e`) | An over-limit edit was "clamped" by keeping a prefix of the edited text, so an insertion in the middle of a full draft deleted the end of the draft, irreversibly, and the undo history went with it. Paste admission ignored a replaced selection. Draft eviction was silent. Undo accounting counted pastes only and was described as a bound. | `ac004f3`: whole-edit rejection restoring the full draft and selection; paste judged on the resulting text; evictions reported; accounting covers every edit and is described as accounting. |
+| Second (on `ac004f3`) | Deferred work captured an old draft and applied it to whatever composer was current, so a Session switch in between could put one Session's text in another. A grouped undo could clear the notice before the fallback ran. A switch during an over-limit composition silently dropped it when nothing was evicted. The draft bound's precondition was unstated. | `3550eba`: generation guard; unconditional notice; switch notice; precondition documented. |
+| Third (on the in-progress second fix) | The rejection record was consumed before it was validated, so a stale callback could erase a newer one. A switch while a rejection was pending stored whatever the composer showed. The undo was sent to whatever had focus. | Also in `3550eba`: ticketed records validated before use; the pending record's draft is what is stored; the undo is sent to the composer itself, from the same step that validates the ticket. |
+
+Each regression was run with its fix removed and failed, then restored and
+passed. The logs are with the local evidence. No acceptance is claimed on
+the strength of this table: the fixes are for the reviewer to judge.
+
