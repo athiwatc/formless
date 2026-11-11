@@ -1746,6 +1746,17 @@ impl Store {
         Ok(total)
     }
 
+    /// Auto-naming text from user `content` in `seq` order. The scan ends at
+    /// the first nontrivial row and keeps at most the first nonempty trimmed
+    /// fallback plus that row.
+    pub(crate) fn user_naming_text(&self, session_id: &str) -> Result<Option<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT content FROM messages WHERE session_id=?1 AND role='user' ORDER BY seq",
+        )?;
+        let rows = stmt.query_map(params![session_id], |row| row.get::<_, String>(0))?;
+        crate::namer::try_naming_text_from_contents(rows).map_err(Into::into)
+    }
+
     pub fn list_checkpoints(&self, session_id: &str) -> Result<Vec<(String, i64)>> {
         let mut stmt = self.ps(
             "SELECT summary, up_to_seq FROM checkpoints WHERE session_id=?1 ORDER BY up_to_seq",
@@ -7558,5 +7569,352 @@ mod context_watermark_tests {
             .append_message(&session, "user", "after checkpoint")
             .unwrap();
         assert_eq!(cache.last_included_seq(), unseen.seq);
+    }
+}
+
+#[cfg(test)]
+mod user_naming_text_tests {
+    use super::*;
+    use crate::namer::{naming_text, try_naming_text_from_contents};
+    use std::cell::Cell;
+    use unicode_segmentation::UnicodeSegmentation;
+
+    const NAMING_TEXT_MAX_CHARS: usize = 800 + 3 + 400;
+
+    fn marked(token: &str) -> String {
+        format!("{token}{}", "x".repeat(16_384))
+    }
+
+    fn long_multibyte() -> String {
+        format!("{}ก{}", "a".repeat(799), "b".repeat(401))
+    }
+
+    fn huge_grapheme() -> String {
+        format!("a{}", "\u{0301}".repeat(5_000))
+    }
+
+    fn user_contents(store: &Store, session_id: &str) -> Vec<String> {
+        store
+            .list_messages(session_id)
+            .unwrap()
+            .into_iter()
+            .filter(|message| message.role == "user")
+            .map(|message| message.content)
+            .collect()
+    }
+
+    #[track_caller]
+    fn assert_same(store: &Store, session_id: &str, label: &str) -> Option<String> {
+        let got = store.user_naming_text(session_id).unwrap();
+        if let Some(text) = &got {
+            assert!(
+                text.chars().count() <= NAMING_TEXT_MAX_CHARS,
+                "{label} naming text is unbounded ({})",
+                text.chars().count()
+            );
+        }
+        assert_eq!(
+            got,
+            naming_text(&user_contents(store, session_id)),
+            "{label}"
+        );
+        got
+    }
+
+    #[track_caller]
+    fn assert_head_tail(got: &str, original: &str) {
+        let got: Vec<char> = got.chars().collect();
+        let original: Vec<char> = original.chars().collect();
+        assert!(original.len() > 1200);
+        assert_eq!(got.len(), NAMING_TEXT_MAX_CHARS);
+        assert_eq!(&got[..800], &original[..800]);
+        assert_eq!(&got[800..803], &['\n', '\u{2026}', '\n']);
+        assert_eq!(&got[803..], &original[original.len() - 400..]);
+    }
+
+    fn transcript(store: &Store, rows: &[(&str, &str)]) -> String {
+        let id = store.create_session(None).unwrap().id;
+        for (role, content) in rows {
+            store.append_message(&id, role, content).unwrap();
+        }
+        id
+    }
+
+    fn insert_user_at_seq(store: &Store, session_id: &str, seq: i64, content: &str) {
+        store
+            .conn
+            .execute(
+                "INSERT INTO messages(id,session_id,seq,role,content,created_at,meta) \
+                 VALUES(?1,?2,?3,'user',?4,'2020-01-01T00:00:00Z',NULL)",
+                rusqlite::params![uuid::Uuid::new_v4().to_string(), session_id, seq, content],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn user_naming_text_matches_naming_text_over_synthetic_rows() {
+        let store = Store::open_in_memory().unwrap();
+        let assistant = marked("ASSISTANT_ONLY");
+        let tool = marked("TOOL_ONLY");
+        let late = marked("LATE_ONLY");
+        let cluster = huge_grapheme();
+        let eleven = "e\u{0301}".repeat(11);
+        assert_eq!(cluster.graphemes(true).count(), 1);
+        assert!(cluster.chars().count() > 1200);
+        assert_eq!(eleven.graphemes(true).count(), 11);
+        assert!(eleven.chars().count() > 12);
+        let substantive = "convert this csv to json\nkeep the header row";
+        let mixed = transcript(
+            &store,
+            &[
+                ("assistant", &assistant),
+                ("tool", &tool),
+                ("user", " \u{00A0}\u{3000}\u{2003}\t\r\n"),
+                ("user", "  hi  "),
+                ("user", &eleven),
+                ("user", "\nab\n"),
+                ("user", "\u{200B}"),
+                ("user", &cluster),
+                ("user", substantive),
+                ("user", &late),
+                ("assistant", &assistant),
+            ],
+        );
+        let got = assert_same(&store, &mixed, "mixed").unwrap();
+        assert_eq!(got, substantive);
+        assert!(!got.contains("ASSISTANT_ONLY"));
+        assert!(!got.contains("TOOL_ONLY"));
+        assert!(!got.contains("LATE_ONLY"));
+        assert!(!got.contains('\u{0301}'));
+
+        let later = "summarise the quarterly notes in one page";
+        let earliest = "please convert this csv export into json";
+        let ordered = store.create_session(None).unwrap().id;
+        store.append_message(&ordered, "user", later).unwrap();
+        store.append_message(&ordered, "user", &late).unwrap();
+        store
+            .append_message(&ordered, "assistant", &assistant)
+            .unwrap();
+        insert_user_at_seq(&store, &ordered, -1, " \u{00A0}\u{3000}\n");
+        insert_user_at_seq(&store, &ordered, 0, earliest);
+        let users = user_contents(&store, &ordered);
+        assert!(users[0].trim().is_empty());
+        assert_eq!(users[1], earliest);
+        assert_eq!(
+            assert_same(&store, &ordered, "seq order").as_deref(),
+            Some(earliest)
+        );
+
+        let long = long_multibyte();
+        assert_eq!(long.chars().count(), 1201);
+        let long_id = transcript(
+            &store,
+            &[
+                ("assistant", &assistant),
+                ("user", "  hey  "),
+                ("user", &long),
+                ("tool", &tool),
+                ("user", &late),
+            ],
+        );
+        let got = assert_same(&store, &long_id, "long").unwrap();
+        assert_head_tail(&got, &long);
+        assert!(!got.contains("LATE_ONLY"));
+        assert!(!got.contains("ASSISTANT_ONLY"));
+
+        let exact = "b".repeat(1200);
+        let exact_id = transcript(&store, &[("user", &exact), ("user", &late)]);
+        let got = assert_same(&store, &exact_id, "exact 1200").unwrap();
+        assert_eq!(got, exact);
+        assert!(!got.contains('\u{2026}'));
+
+        let thai11 = "ก".repeat(11);
+        let thai12 = "ก".repeat(12);
+        assert_eq!(thai11.graphemes(true).count(), 11);
+        assert_eq!(thai12.graphemes(true).count(), 12);
+        assert_eq!("hello there".graphemes(true).count(), 11);
+        let graphemes = transcript(
+            &store,
+            &[
+                ("user", " \u{00A0}\n"),
+                ("user", &eleven),
+                ("user", "hello there"),
+                ("user", &thai11),
+                ("user", &thai12),
+                ("user", &late),
+                ("assistant", &assistant),
+            ],
+        );
+        let got = assert_same(&store, &graphemes, "12 graphemes").unwrap();
+        assert_eq!(got, thai12);
+        assert!(!got.contains('\u{0301}'));
+        assert!(!got.contains("LATE_ONLY"));
+
+        let short_nl = transcript(
+            &store,
+            &[
+                ("tool", &tool),
+                ("user", "yo"),
+                ("user", "go\non"),
+                ("user", &late),
+            ],
+        );
+        assert_eq!(
+            assert_same(&store, &short_nl, "short newline").as_deref(),
+            Some("go\non")
+        );
+    }
+
+    #[test]
+    fn user_naming_text_none_and_all_trivial_users() {
+        let store = Store::open_in_memory().unwrap();
+        let assistant = marked("ASSISTANT_ONLY");
+        let tool = marked("TOOL_ONLY");
+        let cluster = huge_grapheme();
+        assert_eq!(cluster.graphemes(true).count(), 1);
+
+        let absent = transcript(&store, &[("assistant", &assistant), ("tool", &tool)]);
+        assert_eq!(assert_same(&store, &absent, "no users"), None);
+
+        let blank = " \u{00A0}\u{3000}\u{2003}\t\r\n";
+        assert!(blank.trim().is_empty());
+        let whitespace = transcript(
+            &store,
+            &[("user", ""), ("user", blank), ("assistant", &assistant)],
+        );
+        assert_eq!(assert_same(&store, &whitespace, "whitespace users"), None);
+
+        let eleven = "e\u{0301}".repeat(11);
+        let trivial = transcript(
+            &store,
+            &[
+                ("user", blank),
+                ("user", "  hi  "),
+                ("user", "\nab\n"),
+                ("user", &eleven),
+                ("user", "\u{200B}"),
+                ("user", &cluster),
+                ("user", "hello"),
+                ("tool", &tool),
+            ],
+        );
+        let got = assert_same(&store, &trivial, "all trivial").unwrap();
+        assert_eq!(got, "hi");
+        assert!(!got.contains('\u{0301}'));
+
+        let trimmed = transcript(&store, &[("user", "\nab\n"), ("assistant", &assistant)]);
+        assert_eq!(
+            assert_same(&store, &trimmed, "trimmed newline").as_deref(),
+            Some("ab")
+        );
+
+        let zwsp = transcript(&store, &[("user", "\u{200B}")]);
+        assert_eq!(
+            assert_same(&store, &zwsp, "zwsp").as_deref(),
+            Some("\u{200B}")
+        );
+
+        let only_cluster = transcript(
+            &store,
+            &[
+                ("assistant", &assistant),
+                ("user", blank),
+                ("user", &cluster),
+                ("tool", &tool),
+            ],
+        );
+        let got = assert_same(&store, &only_cluster, "huge trivial grapheme").unwrap();
+        assert_head_tail(&got, &cluster);
+    }
+
+    #[test]
+    fn user_naming_text_does_not_decode_discarded_rows_or_columns() {
+        let store = Store::open_in_memory().unwrap();
+        let text = "please summarise this synthetic document";
+        let id = transcript(
+            &store,
+            &[("assistant", "ignored"), ("user", text), ("user", "later")],
+        );
+        // Synthetic invalid values are read probes, never real session data.
+        // The old full-row decoder reads metadata and every later content.
+        store
+            .conn
+            .execute(
+                "UPDATE messages SET meta='not-json' WHERE session_id=?1 AND role='assistant'",
+                [&id],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE messages SET content=x'ff' WHERE session_id=?1 AND content='later'",
+                [&id],
+            )
+            .unwrap();
+        assert_eq!(store.user_naming_text(&id).unwrap().as_deref(), Some(text));
+        assert!(store.list_messages(&id).is_err());
+    }
+
+    /// `last_relevant` is the last index the selector may pull. `pulls` counts
+    /// the terminating `None` only when the scan exhausts the iterator.
+    #[track_caller]
+    fn scanned(rows: &[String], last_relevant: usize, pulls: usize) -> Option<String> {
+        let seen = Cell::new(0usize);
+        let got = try_naming_text_from_contents(std::iter::from_fn(|| {
+            let index = seen.get();
+            if index > last_relevant {
+                panic!("selector read user row {index}; last relevant index is {last_relevant}");
+            }
+            seen.set(index + 1);
+            rows.get(index)
+                .map(|row| Ok::<&str, &'static str>(row.as_str()))
+        }))
+        .expect("probe");
+        assert_eq!(seen.get(), pulls, "pulled user rows");
+        if let Some(text) = &got {
+            assert!(text.chars().count() <= NAMING_TEXT_MAX_CHARS);
+        }
+        assert_eq!(got, naming_text(rows));
+        got
+    }
+
+    #[test]
+    fn user_naming_text_stops_before_irrelevant_late_rows() {
+        assert_eq!(scanned(&[], 0, 1), None);
+
+        let cluster = huge_grapheme();
+        let all_trivial = vec![
+            " \u{00A0}\u{3000}\n".to_string(),
+            "  hi  ".to_string(),
+            "\nab\n".to_string(),
+            cluster,
+        ];
+        assert_eq!(
+            scanned(&all_trivial, all_trivial.len(), all_trivial.len() + 1).as_deref(),
+            Some("hi")
+        );
+
+        let twelve = "ก".repeat(12);
+        assert_eq!(twelve.graphemes(true).count(), 12);
+        let late = marked("LATE_ONLY");
+        let graphemes = vec![
+            " \u{00A0}".to_string(),
+            "e\u{0301}".repeat(11),
+            "hello there".to_string(),
+            twelve.clone(),
+            late.clone(),
+        ];
+        let got = scanned(&graphemes, 3, 4).unwrap();
+        assert_eq!(got, twelve);
+        assert!(!got.contains("LATE_ONLY"));
+
+        let multiline = vec!["yo".to_string(), "go\non".to_string(), late.clone()];
+        assert_eq!(scanned(&multiline, 1, 2).as_deref(), Some("go\non"));
+
+        let long = long_multibyte();
+        let shaped = vec!["  hey  ".to_string(), long.clone(), late];
+        let got = scanned(&shaped, 1, 2).unwrap();
+        assert_head_tail(&got, &long);
+        assert!(!got.contains("LATE_ONLY"));
     }
 }
