@@ -161,7 +161,20 @@ fn local_discovery_remote_ollama_host_guidance_reaches_the_rendered_picker_witho
     let mut app = test_app();
     let mut cfg = Config::default();
     cfg.provider.base_url.clear();
-    app.wizard = Some(Wizard::start(&cfg, &app.paths));
+    // Real OLLAMA_HOST rejection, no probes: an accepted host would make the
+    // fake Ollama endpoint answer, so a rejection regression fails below.
+    app.wizard = Some(Wizard::start_with_discovery(&cfg, &app.paths, || {
+        let value = std::env::var("OLLAMA_HOST");
+        let hint = formless_core::local_servers::ollama_host_guidance(&value);
+        formless_core::local_servers::Discovery {
+            servers: if hint.is_some() {
+                Vec::new()
+            } else {
+                vec![local_discovery_offer(1)]
+            },
+            hint,
+        }
+    }));
     let deadline = Instant::now() + Duration::from_secs(5);
     while app.wizard.as_ref().unwrap().local_pending {
         assert!(Instant::now() < deadline);
