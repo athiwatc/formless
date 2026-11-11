@@ -5,7 +5,7 @@ use crate::input::InputLine;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::ops::Range;
 
-pub(crate) const HELP: &str = "Vim editing: i/a/I/A insert; Esc returns to Normal. h/j/k/l, w/b/e, W/B/E, 0/$, gg/G move. d/c/y + motion; dd/cc/yy operate on lines. iw/aw/iW/aW, quotes and ()/[]/{}/<> text objects. x deletes; p/P paste the private yank register; . repeats the last change. Counts 1–999. Normal Esc stops a Run; editor Ctrl+S saves and Ctrl+Q cancels. List-view keys are unchanged.";
+pub(crate) const HELP: &str = "Vim editing: i/a/I/A insert; Esc returns to Normal. h/j/k/l, w/b/e, W/B/E, 0/$, gg/G move. d/c/y + motion; dd/cc/yy operate on lines. iw/aw/iW/aW, quotes and ()/[]/{}/<> text objects. x deletes; p/P paste the private yank register; . repeats the last change. Counts 1–999; counted inserts repeat on Esc. Normal Esc stops a Run; editor Ctrl+S saves and Ctrl+Q cancels. List-view keys are unchanged.";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum Mode {
     Normal,
@@ -27,8 +27,8 @@ pub(crate) enum Outcome {
 #[derive(Debug, Clone)]
 enum Command {
     Operator(char, String, usize),
-    Insert(char),
-    Put(bool, String, bool, bool),
+    Insert(char, usize),
+    Put(bool, String, bool, bool, usize),
     Delete(usize),
 }
 #[derive(Debug, Clone)]
@@ -61,7 +61,7 @@ impl Vim {
     pub(crate) fn paste(&mut self, line: &mut InputLine, text: &str) {
         line.modal_expand_pastes();
         if self.mode == Mode::Normal {
-            self.apply(line, Command::Insert('i'));
+            self.apply(line, Command::Insert('i', 1));
         }
         for c in text.replace("\r\n", "\n").replace('\r', "\n").chars() {
             let key = if c == '\n' {
@@ -73,7 +73,7 @@ impl Vim {
             self.inserting
                 .get_or_insert(Change {
                     literal: line.is_literal(),
-                    command: Command::Insert('i'),
+                    command: Command::Insert('i', 1),
                     edits: vec![],
                 })
                 .edits
@@ -91,9 +91,10 @@ impl Vim {
                     if !change.edits.is_empty()
                         || matches!(
                             change.command,
-                            Command::Operator(..) | Command::Insert('o' | 'O')
+                            Command::Operator(..) | Command::Insert('o' | 'O', _)
                         )
                     {
+                        replay_edits(line, &change, surface, true);
                         self.last = Some(change);
                     }
                 }
@@ -125,7 +126,7 @@ impl Vim {
                 self.inserting
                     .get_or_insert(Change {
                         literal: line.is_literal(),
-                        command: Command::Insert('i'),
+                        command: Command::Insert('i', 1),
                         edits: Vec::new(),
                     })
                     .edits
@@ -151,17 +152,35 @@ impl Vim {
         if c == '?' && self.pending.is_empty() {
             return Outcome::Help;
         }
-        if c == '.' && self.pending.is_empty() {
-            if let Some(change) = self.last.clone() {
+        if self.pending.is_empty() && c == '/' && surface == Surface::Composer {
+            self.apply(line, Command::Insert('i', 1));
+            self.paste(line, "/");
+            return Outcome::Handled;
+        }
+        self.pending.push(c);
+        let (count, rest) = count_prefix(&self.pending);
+        if rest.is_empty() {
+            return Outcome::Handled;
+        }
+        if rest == "." {
+            let override_count = (rest.len() != self.pending.len()).then_some(count);
+            self.pending.clear();
+            if let Some(mut change) = self.last.clone() {
+                if let Some(count) = override_count {
+                    match &mut change.command {
+                        Command::Operator(_, _, n)
+                        | Command::Insert(_, n)
+                        | Command::Put(_, _, _, _, n)
+                        | Command::Delete(n) => *n = count,
+                    }
+                }
                 if !self.apply(line, change.command.clone()) {
                     return Outcome::Handled;
                 }
                 if !change.edits.is_empty() {
                     line.set_literal(line.is_literal() || change.literal);
                 }
-                for key in &change.edits {
-                    insert_key(line, *key, surface);
-                }
+                replay_edits(line, &change, surface, false);
                 if self.mode == Mode::Insert {
                     self.mode = Mode::Normal;
                     if line.cursor_byte() > line_start(line, line.cursor_byte()) {
@@ -174,36 +193,29 @@ impl Vim {
             }
             return Outcome::Handled;
         }
-        if self.pending.is_empty() {
-            if c == '/' && surface == Surface::Composer {
-                self.apply(line, Command::Insert('i'));
-                self.paste(line, "/");
-                return Outcome::Handled;
-            }
-            if matches!(c, 'i' | 'a' | 'I' | 'A' | 'o' | 'O') {
-                self.apply(line, Command::Insert(c));
-                return Outcome::Handled;
-            }
-            if c == 'p' || c == 'P' {
-                let cmd = Command::Put(
-                    c == 'p',
-                    self.register.clone(),
-                    self.register_linewise,
-                    self.register_literal,
-                );
-                if self.apply(line, cmd.clone()) {
-                    self.last = Some(Change {
-                        literal: line.is_literal(),
-                        command: cmd,
-                        edits: vec![],
-                    });
-                }
-                return Outcome::Handled;
-            }
+        if matches!(rest, "i" | "a" | "I" | "A" | "o" | "O") {
+            let kind = rest.chars().next().unwrap();
+            self.pending.clear();
+            self.apply(line, Command::Insert(kind, count));
+            return Outcome::Handled;
         }
-        self.pending.push(c);
-        let (count, rest) = count_prefix(&self.pending);
-        if rest.is_empty() {
+        if matches!(rest, "p" | "P") {
+            let after = rest == "p";
+            self.pending.clear();
+            let cmd = Command::Put(
+                after,
+                self.register.clone(),
+                self.register_linewise,
+                self.register_literal,
+                count,
+            );
+            if self.apply(line, cmd.clone()) {
+                self.last = Some(Change {
+                    literal: line.is_literal(),
+                    command: cmd,
+                    edits: vec![],
+                });
+            }
             return Outcome::Handled;
         }
         if let Some(op @ ('d' | 'c' | 'y')) = rest.chars().next() {
@@ -253,7 +265,7 @@ impl Vim {
     }
     fn apply(&mut self, line: &mut InputLine, command: Command) -> bool {
         match &command {
-            Command::Insert(kind) => {
+            Command::Insert(kind, _) => {
                 match kind {
                     'a' => {
                         if line.cursor_byte() < line_end(line, line.cursor_byte()) {
@@ -270,16 +282,7 @@ impl Vim {
                         line.set_modal_cursor(at);
                     }
                     'A' => line.end(),
-                    'o' => {
-                        line.end();
-                        line.newline();
-                    }
-                    'O' => {
-                        line.home();
-                        let at = line.cursor_byte();
-                        line.newline();
-                        line.set_modal_cursor(at);
-                    }
+                    'o' | 'O' => open_line(line, *kind),
                     _ => {}
                 }
                 self.mode = Mode::Insert;
@@ -307,16 +310,28 @@ impl Vim {
                 line.modal_replace(start..end, "");
                 normal_cursor(line);
             }
-            Command::Put(after, text, linewise, literal) => {
+            Command::Put(after, text, linewise, literal, count) => {
                 if text.is_empty() {
                     return false;
                 }
+                // EOF linewise registers may lack a terminating separator.
+                // Copies still need separators between them.
+                let text = if *linewise && *count > 1 && !text.ends_with('\n') {
+                    format!("{text}\n").repeat(*count)
+                } else {
+                    text.repeat(*count)
+                };
                 if *linewise {
-                    let mut text = text.clone();
+                    let mut text = text;
                     let at = if *after {
                         let end = line_end(line, line.cursor_byte());
                         if end == line.len() {
-                            text = format!("\n{}", text.trim_end_matches('\n'));
+                            let body = if *count > 1 {
+                                text.strip_suffix('\n').unwrap_or(&text)
+                            } else {
+                                text.trim_end_matches('\n')
+                            };
+                            text = format!("\n{body}");
                             end
                         } else {
                             end + 1
@@ -338,7 +353,7 @@ impl Vim {
                 } else {
                     line.cursor_byte()
                 };
-                line.modal_replace(at..at, text);
+                line.modal_replace(at..at, &text);
                 line.set_literal(line.is_literal() || *literal);
                 if !text.is_empty() {
                     line.left()
@@ -346,17 +361,28 @@ impl Vim {
                 normal_cursor(line);
             }
             Command::Operator(op, motion, count) => {
-                let Some(range) = operator_range(line, line.cursor_byte(), *op, motion, *count)
+                let Some((mut range, includes_last_line)) =
+                    operator_range(line, line.cursor_byte(), *op, motion, *count)
                 else {
                     return false;
                 };
-                if range.is_empty() && *op != 'c' {
+                let linewise =
+                    motion == &op.to_string() || matches!(motion.as_str(), "gg" | "G" | "j" | "k");
+                let delete_last_line = *op == 'd' && linewise && includes_last_line;
+                if range.is_empty() && *op != 'c' && !(delete_last_line && range.start > 0) {
                     return false;
                 }
+                // The private register contains line text, never the preceding
+                // separator removed only to avoid leaving a ghost final line.
                 self.register = line[range.clone()].into();
+                self.register_linewise = linewise;
                 self.register_literal = line.is_literal();
-                self.register_linewise =
-                    motion == &op.to_string() || matches!(motion.as_str(), "gg" | "G" | "j" | "k");
+                if delete_last_line && range.start > 0 {
+                    if self.register.is_empty() {
+                        self.register.push('\n');
+                    }
+                    range.start = prev(line, range.start);
+                }
                 if *op == 'y' {
                     line.set_modal_cursor(range.start);
                     return false;
@@ -370,6 +396,15 @@ impl Vim {
                         edits: vec![],
                     })
                 } else {
+                    if delete_last_line {
+                        let mut at = line_start(line, line.len());
+                        while at < line_end(line, at)
+                            && cluster(line, at).chars().all(char::is_whitespace)
+                        {
+                            at = next(line, at);
+                        }
+                        line.set_modal_cursor(at);
+                    }
                     normal_cursor(line)
                 }
             }
@@ -377,6 +412,38 @@ impl Vim {
         true
     }
 }
+
+fn open_line(line: &mut InputLine, kind: char) {
+    if kind == 'o' {
+        line.end();
+        line.newline();
+    } else {
+        line.home();
+        let at = line.cursor_byte();
+        line.newline();
+        line.set_modal_cursor(at);
+    }
+}
+
+/// Esc has already applied the first insert; dot has only entered Insert.
+/// Operator counts select a range and do not multiply replacement text.
+fn replay_edits(line: &mut InputLine, change: &Change, surface: Surface, skip_first: bool) {
+    let count = match change.command {
+        Command::Insert(_, count) => count,
+        _ => 1,
+    };
+    for n in usize::from(skip_first)..count {
+        if n > 0 {
+            if let Command::Insert(kind @ ('o' | 'O'), _) = change.command {
+                open_line(line, kind);
+            }
+        }
+        for key in &change.edits {
+            insert_key(line, *key, surface);
+        }
+    }
+}
+
 fn insert_key(line: &mut InputLine, key: KeyEvent, surface: Surface) -> bool {
     match key.code {
         KeyCode::Char(c) => line.insert_char(c),
@@ -569,31 +636,35 @@ fn motion_target(s: &str, at: usize, motion: &str, count: usize) -> Option<(usiz
     }
     Some((to, inclusive, linewise))
 }
+/// The range and whether it includes the actual final line, including an
+/// empty line after a trailing LF. An exclusive end at len alone is ambiguous.
 fn operator_range(
     s: &str,
     at: usize,
     op: char,
     motion: &str,
     count: usize,
-) -> Option<Range<usize>> {
+) -> Option<(Range<usize>, bool)> {
     if motion == op.to_string() {
         let start = line_start(s, at);
         let mut end = start;
+        let mut includes_last_line = false;
         for _ in 0..count {
             end = line_end(s, end);
             if end < s.len() {
                 end += 1
             } else {
+                includes_last_line = true;
                 break;
             }
         }
         if op == 'c' && end > start && s[..end].ends_with('\n') {
             end -= 1;
         }
-        return Some(start..end);
+        return Some((start..end, includes_last_line));
     }
     if motion.starts_with(['i', 'a']) && motion.chars().count() == 2 {
-        return object_range(s, at, motion, count);
+        return object_range(s, at, motion, count).map(|range| (range, false));
     }
     if op == 'c' && matches!(motion, "w" | "W") && at < s.len() && kind(cluster(s, at), false) != 0
     {
@@ -613,7 +684,7 @@ fn operator_range(
                 end = next(s, end)
             }
         }
-        return Some(at..end);
+        return Some((at..end, false));
     }
     let (target, inclusive, linewise) = motion_target(s, at, motion, count)?;
     if linewise {
@@ -623,7 +694,7 @@ fn operator_range(
         if op == 'c' && exclusive > start && s[..exclusive].ends_with('\n') {
             exclusive -= 1;
         }
-        return Some(start..exclusive);
+        return Some((start..exclusive, end == s.len()));
     }
     let start = at.min(target);
     let mut end = at.max(target);
@@ -636,7 +707,7 @@ fn operator_range(
             end = before
         }
     }
-    Some(start..end)
+    Some((start..end, false))
 }
 fn object_range(s: &str, at: usize, motion: &str, count: usize) -> Option<Range<usize>> {
     let mut chars = motion.chars();
@@ -967,3 +1038,7 @@ mod tests {
         assert_eq!(&*l, "word");
     }
 }
+
+#[cfg(test)]
+#[path = "vim_count_tests.rs"]
+mod count_tests;
