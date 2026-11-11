@@ -758,3 +758,78 @@ Each regression was run with its fix removed and failed, then restored and
 passed. The logs are with the local evidence. No acceptance is claimed on
 the strength of this table: the fixes are for the reviewer to judge.
 
+## 12. Two measured UI defects, fixed
+
+Local commits `797cb77`, `f0ab2d4` and `126595a`, after the review of
+`3550eba`. Figures are from the evidence set collected at `126595a`, on the
+Mac in §2. Where this section and §11 disagree, this section is the current
+state: §11.4's "known limit" about streamed blocks and §11.5's "Found" about
+the minimum window describe the defects fixed here.
+
+### 12.1 Long streamed blocks show their newest text
+
+A row laid out only the head of its block, so a streamed block longer than
+32 KiB or 400 lines stopped showing new text.
+
+A row now shows one bounded window of its block, and the window moves. A
+block being streamed is anchored to its tail. Any row that shows less than
+its block says how much is missing before and after, and whether more is
+arriving, and has Start, Earlier, Later and End controls above and below
+the text. A reader who moves off the tail stays put while the stream goes
+on; End resumes following. Paging forward shows every byte exactly once;
+cuts fall on line breaks where there are any and never inside a character.
+A window that starts inside a fenced code block is laid out with that
+block's opening line, for layout only.
+
+Not addressed: a window that starts inside a table or list is laid out
+without its beginning, and there is still no separate full-output viewer.
+
+### 12.2 Every control stays reachable at any text size
+
+At 200% text in the 480 x 360 minimum window the header toggles and the
+composer were off screen.
+
+The text size in use is now the largest step, no larger than the one asked
+for, that the window can hold (480 x 360 times the text size factor),
+refitted on every resize. When it is smaller than the size asked for, the
+status line says so first: what is shown, what was asked for, and the
+window that would take. The shortcuts also ask the window to grow to fit.
+GPUI can resize a window but cannot change its minimum size, so the fit is
+the rule whenever the window does not grow.
+
+Checked with real fonts in the offscreen renderer, in all 14 states: the
+text size in use is the expected one, every header and composer control is
+inside the window, and the composer is above the status line. Two captures
+were looked at once by the implementing agent (the minimum window with 200%
+asked for, and 960 x 720 at 200%); both read as intended. In a real window,
+unwatched: a 480 x 360 window with 200% asked for settled at 960 x 720
+showing 200%, and 700 x 500 with 150% at 720 x 540.
+
+Not addressed: the right-hand status text is still clipped in small
+windows.
+
+### 12.3 Tests and stress, repeated
+
+50 model tests (55 with the Thai study), 51 headless shell tests, 14
+offscreen states. Each new regression fails with its fix removed.
+
+Streaming in a real window, frame-callback intervals in milliseconds:
+
+| Run | Updates | Frames | p95 | p99 | Max | Over 16.7 ms | Tail | Before window, not shown | After |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Idle, 10 s | 0 | 1,177 | 9.3 | 11.9 | 21.3 | 9 | | | |
+| 100 per second, 30 s (three runs) | 1,213 to 1,226 | about 3,520 | 11.4 | 16.7 | 33.3 to 41.7 | 18 to 31 | 20,100 bytes | 0 | 0 |
+| 100 per second, 90 s | 3,912 | 10,414 | 11.8 | 16.8 | 32.8 | 118 | 60,300 bytes | 27,732 | 0 |
+| 1,000 per second, 10 s | 430 | 1,142 | 12.2 | 16.7 | 34.7 | 11 | 67,060 bytes | 34,571 | 0 |
+
+In the last two runs the streamed block outgrew one window and nothing
+after the window was left unshown: the newest text was the part on show.
+Following the tail did not change the frame figures beyond their usual
+spread. The same limits as §11.4 apply: this is frame-callback cadence on
+one machine in use for other work, nobody watched, and no budget is
+accepted on it.
+
+Still open, unchanged: Windows (done elsewhere), Linux, real input methods,
+screen readers, a person looking at 200% in a window, performance budgets,
+parity, packaging. Phase 1 is not started.
+
