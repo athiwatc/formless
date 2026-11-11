@@ -925,7 +925,7 @@ Frame-callback intervals in milliseconds, as in §12.3:
 These are worse than §12.3: three to four times as many intervals over
 16.7 ms, and the idle window is worse too. The machine was busier (load
 average about 7.5, the window server near one full core, other agents at
-work). To tell that from a regression, the release binary of `126595a` was
+work). To look for a regression, the release binary of `126595a` was
 built from an export of that commit and run in turn with this one, eight
 30-second runs at 100 per second in the order old, new, new, old, old, new,
 new, old:
@@ -935,12 +935,13 @@ new, old:
 | `126595a` (four runs) | 16.6 to 16.7 | 17.6 to 20.7 | 33.3 to 75.4 | 99 to 115 |
 | `5d16e93` (four runs) | 16.7 | 18.2 to 20.8 | 29.5 to 59.0 | 106 to 142 |
 
-The two overlap. On this evidence the slower figures are the machine on the
-day and not this change, and the figures in §12.3 were not a property of
-the code either: the same source gives 18 or 115 slow intervals in 30
-seconds depending on what else is running. Eight runs under uncontrolled
-load cannot rule out a small difference. No budget is accepted on any of
-this.
+The two ranges overlap. That is inconclusive. It does not show that the
+slowdown is only the machine, and it does not show that this change costs
+nothing: eight runs under uncontrolled load could hide a real difference in
+either direction. What it does show is that these frame figures move by a
+factor of three or more with what else the machine is doing, so neither
+this table nor the one in §12.3 measures the code. No budget is accepted on
+any of this.
 
 In every run the streamed block's newest text was on show (nothing after
 the window unshown).
