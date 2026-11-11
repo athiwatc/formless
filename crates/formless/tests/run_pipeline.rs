@@ -538,7 +538,19 @@ fn doctor_reports_unknown_role_providers_without_changing_configuration() {
         .unwrap()
         .contains("formless config edit"));
     assert_eq!(std::fs::read(f.paths.config_file()).unwrap(), before);
+    // Unix sockets leave a filesystem entry; Windows uses a named pipe.
+    // Check the actual transport on both platforms, failing on unknown access.
+    #[cfg(unix)]
     assert!(!f.paths.socket_path().exists());
+    assert!(
+        !formless_core::daemon::endpoint_occupied(&f.paths)
+            .expect("private doctor fixture endpoint must be inspectable"),
+        "doctor must not start a daemon"
+    );
+    assert!(
+        !f.paths.lock_file().exists(),
+        "doctor must not publish a PID"
+    );
     assert!(f.provider.seen.lock().unwrap().is_empty());
     assert!(f.provider.failure.lock().unwrap().is_none());
 }
