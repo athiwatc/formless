@@ -19,6 +19,7 @@ struct Mock {
     release: Notify,
     hold: bool,
     failover: bool,
+    loop_steps: bool,
 }
 impl Mock {
     fn new(hold: bool, failover: bool) -> Arc<Self> {
@@ -28,6 +29,7 @@ impl Mock {
             release: Notify::new(),
             hold,
             failover,
+            loop_steps: false,
         })
     }
 }
@@ -54,11 +56,16 @@ async fn setup(
         async move {
             let index = mock.posts.fetch_add(1, Ordering::SeqCst);
             mock.arrived.notify_one();
-            if mock.hold && index == 0 { mock.release.notified().await; }
+            if mock.hold && index == usize::from(mock.loop_steps) { mock.release.notified().await; }
             if mock.failover && body["model"] == "primary" {
                 return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "fixture primary unavailable").into_response();
             }
             let usage = json!({"prompt_tokens":10,"completion_tokens":10});
+            if mock.loop_steps && index == 0 {
+                let turn = json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"live-limit-call","type":"function","function":{"name":"live_budget_gate","arguments":"{}"}}]},"finish_reason":"tool_calls"}],"usage":usage});
+                let events = [turn.to_string(), "[DONE]".into()].into_iter().map(|data| Ok::<_,std::convert::Infallible>(axum::response::sse::Event::default().data(data)));
+                return axum::response::Sse::new(futures_util::stream::iter(events)).into_response();
+            }
             if body["stream"] == true {
                 let values = [json!({"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}],"usage":usage})];
                 let events = values.into_iter().map(|value| Ok::<_,std::convert::Infallible>(axum::response::sse::Event::default().data(value.to_string())))
@@ -156,6 +163,188 @@ async fn teardown(daemon: Arc<Daemon>, server: tokio::task::JoinHandle<()>) {
     .expect("daemon-owned tasks retained fixture credentials");
     server.abort();
     let _ = server.await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn live_profile_limits_are_checked_with_a_stale_run_snapshot() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let mock = Mock::new(false, false);
+    let (_root, _paths, cfg, daemon, server) = setup(&env, mock.clone(), None, false).await;
+    let sid = daemon.with_store(|st| st.create_session(None)).unwrap().id;
+    let run = daemon.with_store(|st| st.create_run(&sid)).unwrap();
+    seed_mixed_floor(&daemon, &sid, &run, Some(2.0));
+    daemon.with_store(|st| st.bump_run_steps(&run)).unwrap();
+    let mut outcomes = Vec::new();
+    for (key, value) in [
+        ("limits.run_usd", json!(1.0)),
+        ("limits.daily_usd", json!(1.0)),
+        ("limits.run_steps", json!(1)),
+    ] {
+        let r = daemon
+            .handle(Request::SetSetting {
+                key: key.into(),
+                value,
+            })
+            .await
+            .unwrap();
+        assert_eq!(r["applies"], "now");
+        let result = daemon.check_budget(&sid, &run, &cfg);
+        daemon
+            .handle(Request::SetSetting {
+                key: key.into(),
+                value: Value::Null,
+            })
+            .await
+            .unwrap();
+        let message = result.err().map(|e| e.to_string());
+        outcomes.push((key, message));
+        daemon.check_budget(&sid, &run, &cfg).unwrap();
+    }
+    assert!(mock.posts.load(Ordering::SeqCst) == 0);
+    teardown(daemon, server).await;
+    for (key, message) in outcomes {
+        assert!(
+            message
+                .as_ref()
+                .is_some_and(|m| m.starts_with("budget:") && m.contains(key)),
+            "{key} ignored live edit: {message:?}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn live_step_limit_removal_retains_explicit_run_override_precedence() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let mock = Mock::new(false, false);
+    let (_root, paths, mut cfg, daemon, server) = setup(&env, mock.clone(), None, false).await;
+    cfg.limits.run_steps = Some(1);
+    cfg.save(&paths).unwrap();
+    let sid = daemon.with_store(|st| st.create_session(None)).unwrap().id;
+    let run = daemon.with_store(|st| st.create_run(&sid)).unwrap();
+    daemon.with_store(|st| st.bump_run_steps(&run)).unwrap();
+    daemon.step_limits.locked().insert(sid.clone(), 3);
+    daemon.check_budget(&sid, &run, &cfg).unwrap();
+    daemon
+        .handle(Request::SetSetting {
+            key: "limits.run_steps".into(),
+            value: json!(2),
+        })
+        .await
+        .unwrap();
+    daemon.step_limits.locked().insert(sid.clone(), 1);
+    assert!(daemon
+        .check_budget(&sid, &run, &cfg)
+        .unwrap_err()
+        .to_string()
+        .contains("set with /limit"));
+    daemon.step_limits.locked().remove(&sid);
+    daemon.check_budget(&sid, &run, &cfg).unwrap();
+    daemon
+        .handle(Request::SetSetting {
+            key: "limits.run_steps".into(),
+            value: Value::Null,
+        })
+        .await
+        .unwrap();
+    daemon.check_budget(&sid, &run, &cfg).unwrap();
+    assert_eq!(
+        cfg.limits.run_steps,
+        Some(1),
+        "Run snapshot remains unchanged"
+    );
+    assert_eq!(mock.posts.load(Ordering::SeqCst), 0);
+    teardown(daemon, server).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lowering_limits_mid_run_pauses_at_the_next_step_with_committed_usage() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    for (key, value) in [
+        ("limits.run_usd", json!(0.5)),
+        ("limits.daily_usd", json!(0.5)),
+        ("limits.run_steps", json!(1)),
+    ] {
+        let mut mock = Mock::new(true, false);
+        Arc::get_mut(&mut mock).unwrap().loop_steps = true;
+        let (_root, _paths, cfg, daemon, server) = setup(&env, mock.clone(), None, false).await;
+        let sid = daemon.with_store(|st| st.create_session(None)).unwrap().id;
+        create(
+            &daemon,
+            &sid,
+            "live_budget_gate",
+            "function run(){return {text:llm.complete('hold the step boundary')};}",
+            &["llm"],
+        )
+        .await;
+        assert_eq!(mock.posts.load(Ordering::SeqCst), 0);
+        daemon
+            .handle(Request::SendMessage {
+                session_id: sid.clone(),
+                content: "use live_budget_gate".into(),
+                mode: SendMode::Send,
+                client_msg_id: None,
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let notice = mock.arrived.notified();
+                if mock.posts.load(Ordering::SeqCst) >= 2 {
+                    break;
+                }
+                notice.await;
+            }
+        })
+        .await
+        .expect("nested fixture request did not hold the step boundary");
+        let (run, _) = daemon.with_reader(|st| st.last_run(&sid)).unwrap().unwrap();
+        assert_eq!(
+            daemon.usage_info(None, Some(&run), &cfg).unwrap().cost,
+            Some(1.0),
+            "first response must already be committed"
+        );
+        assert_eq!(daemon.with_reader(|st| st.run_steps(&run)).unwrap(), 1);
+        let r = daemon
+            .handle(Request::SetSetting {
+                key: key.into(),
+                value,
+            })
+            .await
+            .unwrap();
+        assert_eq!(r["applies"], "now");
+        mock.release.notify_one();
+        let (status, error) = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let (_, status) = daemon.with_reader(|st| st.last_run(&sid)).unwrap().unwrap();
+                let error = daemon
+                    .with_reader(|st| st.run_error(&run))
+                    .unwrap()
+                    .unwrap_or_default();
+                // The daemon publishes paused status before its stop reason.
+                if status != "running" && (status != "paused" || !error.is_empty()) {
+                    break (status, error);
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let posts = mock.posts.load(Ordering::SeqCst);
+        teardown(daemon, server).await;
+        assert_eq!(status, "paused", "{key}: {error}");
+        assert!(
+            error.starts_with("budget:") && error.contains(key),
+            "{key}: {error}"
+        );
+        assert!(
+            error.contains("The Run is paused"),
+            "step boundary must explain the pause: {error}"
+        );
+        assert_eq!(
+            posts, 2,
+            "no subsequent root model request may reach the provider"
+        );
+    }
 }
 
 async fn create(daemon: &Arc<Daemon>, sid: &str, name: &str, code: &str, caps: &[&str]) {

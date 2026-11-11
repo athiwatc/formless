@@ -1095,6 +1095,38 @@ impl Daemon {
         }
     }
 
+    /// Both management paths use one referential-integrity check. Lock in
+    /// config-edit -> writer order, retaining the writer through the save so
+    /// existing pins cannot change between inspection and file replacement.
+    fn delete_role(&self, name: &str) -> Result<()> {
+        let _edit = self.config_guard();
+        self.with_store(|st| {
+            let mut cfg = Config::load_file_only(&self.paths)?;
+            if !cfg.roles.contains_key(name) {
+                return Err(anyhow::Error::new(RequestFailure::not_found(format!(
+                    "no role '{name}'"
+                ))));
+            }
+            let mut users = st.role_references(name)?;
+            let pin = format!("role:{name}");
+            if cfg.provider.model == pin {
+                users.insert(0, "provider.model".into());
+            } else if self.config()?.provider.model == pin {
+                users.insert(0, "provider.model (FORMLESS_MODEL)".into());
+            }
+            if !users.is_empty() {
+                return Err(anyhow!(
+                    "role '{name}' is used by {}; change those references first",
+                    users.join(", ")
+                ));
+            }
+            cfg.roles.remove(name);
+            cfg.save(&self.paths)?;
+            self.config_with_refresh(true)?;
+            Ok(())
+        })
+    }
+
     /// A named provider (SPEC §4.5); `default`/unset is `[provider]`.
     pub(crate) async fn provider_named(
         &self,
@@ -2816,22 +2848,40 @@ impl Daemon {
                     limit.unwrap_or(100),
                 )
             })?)?),
-            Request::SetSetting { key, value } => {
-                self.with_config_edit(|cfg| {
-                    cfg.set_key(&key, value.clone())?;
+            request @ (Request::SetSetting { .. } | Request::MergeSetting { .. }) => {
+                let (key, value, merge) = match request {
+                    Request::SetSetting { key, value } => (key, value, false),
+                    Request::MergeSetting { key, value } => (key, value, true),
+                    _ => unreachable!(),
+                };
+                let effective = self.with_config_edit(|cfg| {
+                    if merge {
+                        cfg.merge_key(&key, value.clone())?;
+                    } else {
+                        cfg.set_key(&key, value.clone())?;
+                    }
                     Ok(true)
                 })?;
-                let _ = self
-                    .with_store(|st| st.audit("user", "setting.set", &format!("{key} = {value}")));
+                let _ = self.with_store(|st| {
+                    st.audit(
+                        "user",
+                        "setting.set",
+                        &format!("{key} {} {value}", if merge { "merge" } else { "=" }),
+                    )
+                });
                 // Nothing settable needs a daemon restart; a few TUI keys
                 // apply when the TUI next starts.
-                let applies = if crate::config::ON_TUI_START.contains(&key.as_str()) {
+                let override_source = crate::config::setting_override_source(&key)?;
+                let applies = if override_source.is_some() {
+                    "env_override"
+                } else if crate::config::ON_TUI_START.contains(&key.as_str()) {
                     "on_tui_start"
                 } else {
                     "now"
                 };
                 Ok(
-                    json!({"key": key, "value": value, "restart_required": false, "applies": applies}),
+                    json!({"key": key, "value": value, "restart_required": false, "applies": applies,
+                        "override_source": override_source, "effective_value": effective.setting_value(&key)?}),
                 )
             }
             Request::RevokeApproval {
@@ -3144,13 +3194,7 @@ impl Daemon {
                 let (defs, attachments) = self.with_store(|st| {
                     let defs =
                         toolreg::tool_definitions(st, Some(&session_id), cfg.tools.inline_limit)?;
-                    let attachments: usize = st
-                        .list_messages(&session_id)?
-                        .iter()
-                        .filter_map(|m| m.meta.as_deref())
-                        .filter_map(|m| serde_json::from_str::<Value>(m).ok())
-                        .map(|m| m["attachments"].as_array().map_or(0, Vec::len))
-                        .sum();
+                    let attachments = st.attachment_entry_count(&session_id)?;
                     Ok((defs, attachments))
                 })?;
                 let used = self.calibrated_prompt_tokens(&provider, &model, &ctx, &defs)?;
@@ -3393,14 +3437,7 @@ impl Daemon {
                 Ok(json!({"role": name}))
             }
             Request::DeleteRole { name } => {
-                self.with_config_edit(|cfg| {
-                    if cfg.roles.remove(&name).is_none() {
-                        return Err(anyhow::Error::new(RequestFailure::not_found(format!(
-                            "no role '{name}'"
-                        ))));
-                    }
-                    Ok(true)
-                })?;
+                self.delete_role(&name)?;
                 let _ = self.with_store(|st| st.audit("user", "role.delete", &name));
                 Ok(json!({"deleted": name}))
             }
@@ -3419,22 +3456,28 @@ impl Daemon {
                 overlap,
                 deliver,
             } => {
+                if prompt.trim().is_empty() {
+                    bail!("prompt required");
+                }
                 // Plain English ("every weekday at 9am") is stored as cron.
                 let cron = cron.as_deref().map(crate::jobs::to_cron).transpose()?;
                 check_overlap(overlap.as_deref())?;
                 let next =
                     crate::jobs::first_run(cron.as_deref(), at.as_deref(), chrono::Local::now())?;
                 let job = self.with_store(|st| {
-                    let job = st.create_job(
-                        &prompt,
-                        session_id.as_deref(),
-                        cron.as_deref(),
-                        &next.to_rfc3339(),
-                        true,
-                        "user",
-                    )?;
-                    st.set_job_options(&job.id, overlap.as_deref(), deliver.as_ref())?;
-                    Ok(st.get_job(&job.id)?.unwrap_or(job))
+                    st.transaction(|st| {
+                        Self::validate_job_target(st, session_id.as_deref())?;
+                        let job = st.create_job(
+                            &prompt,
+                            session_id.as_deref(),
+                            cron.as_deref(),
+                            &next.to_rfc3339(),
+                            true,
+                            "user",
+                        )?;
+                        st.set_job_options(&job.id, overlap.as_deref(), deliver.as_ref())?;
+                        Ok(st.get_job(&job.id)?.unwrap_or(job))
+                    })
                 })?;
                 let _ = self.with_store(|st| st.audit("user", "job.add", &job.id));
                 self.broadcast(Event::JobsChanged);
@@ -3456,7 +3499,10 @@ impl Daemon {
                 let job = self
                     .with_store(|st| st.get_job(&id))?
                     .with_context(|| RequestFailure::not_found(format!("no job '{id}'")))?;
-                let status = self.fire_job(&job, "manual", 0).await;
+                let status = self
+                    .fire_job(&job, "manual", 0)
+                    .await
+                    .unwrap_or_else(|e| e.to_string());
                 let _ = self.with_store(|st| st.audit("user", "job.run_now", &id));
                 self.broadcast(Event::JobsChanged);
                 Ok(json!({"id": id, "status": status}))
@@ -5543,10 +5589,17 @@ impl Daemon {
                     self.close_run_steering(&session_id, &run_id);
                     self.record_run_status(&session_id, &run_id, "paused");
                     let _ = self.with_store(|st| st.set_run_error(&run_id, &e.to_string()));
+                    let previous = self
+                        .with_reader(|st| st.previous_resumed_run_error(&session_id, &run_id))
+                        .unwrap_or_else(|error| {
+                            tracing::warn!("cannot read previous resume error: {error}");
+                            None
+                        });
                     let mut explained = self.config().ok().map(|cfg| {
                         let (model, _) = self.session_model_effort(&session_id, &cfg);
-                        crate::errors::explain(
+                        crate::errors::explain_with_previous(
                             &format!("{e:#}"),
+                            previous.as_deref(),
                             &crate::errors::ErrorContext::from_config(&cfg, &model),
                         )
                     });
@@ -10348,14 +10401,16 @@ impl Daemon {
             "skills.add" | "skills.remove" => Value::Null,
             "models.set" | "config.set" => {
                 let key = args["key"].as_str().context("key required")?;
-                let mut v = toml::Value::try_from(&cfg)?;
-                for p in key.split('.') {
-                    match v.get(p) {
-                        Some(x) => v = x.clone(),
+                // Keep absent optional fields absent so a snapshot can be
+                // replayed through the TOML-backed setter during undo.
+                let mut value = toml::Value::try_from(&cfg)?;
+                for part in crate::config::setting_key_parts(key) {
+                    match value.get(part) {
+                        Some(next) => value = next.clone(),
                         None => return Ok(Value::Null),
                     }
                 }
-                serde_json::to_value(v)?
+                serde_json::to_value(value)?
             }
             "providers.upsert" | "providers.remove" => json!(cfg
                 .providers
@@ -10428,9 +10483,7 @@ impl Daemon {
             }
             "models.set" | "config.set" => {
                 let key = args["key"].as_str().context("key required")?.to_string();
-                let models_key = crate::config::HARNESS_MODEL_KEYS
-                    .iter()
-                    .any(|k| key == *k || key.starts_with(&format!("{k}.")));
+                let models_key = crate::config::is_model_setting(&key);
                 if (op == "models.set") != models_key {
                     return Err(anyhow!(
                         "'{key}' is {}",
@@ -10534,12 +10587,7 @@ impl Daemon {
                 Ok(json!({"role": name}))
             }
             "roles.delete" => {
-                edit_config(&|cfg| {
-                    cfg.roles
-                        .remove(&name)
-                        .map(|_| ())
-                        .with_context(|| RequestFailure::not_found(format!("no role '{name}'")))
-                })?;
+                self.delete_role(&name)?;
                 Ok(json!({"deleted": name}))
             }
             other => Err(anyhow!("unknown harness operation '{other}'")),
@@ -10605,7 +10653,9 @@ impl Daemon {
     /// a note at 80%, and at 100% an error that pauses the Run ("budget:
     /// …"). A known spending floor still applies when the full total is unknown.
     fn check_budget(&self, session_id: &str, run_id: &str, cfg: &Config) -> Result<()> {
-        let mut l = cfg.limits.clone();
+        // A Run keeps its model/config snapshot, but profile limits are an
+        // emergency brake and must reflect edits at every step boundary.
+        let mut l = self.config()?.limits;
         let pipeline = self.pipeline_policy(run_id)?;
         let explicit = pipeline.as_ref().and_then(|p| p.options.options().max_usd);
         let live_cfg = explicit.map(|_| Config::load(&self.paths)).transpose()?;
@@ -11426,6 +11476,7 @@ impl Daemon {
             Some(s) if !s.is_empty() => Some(s.to_string()),
             _ => None,
         };
+        self.with_store(|st| Self::validate_job_target(st, target.as_deref()))?;
         let next = crate::jobs::first_run(cron, at, chrono::Local::now())?;
         let approved = match cron {
             None => true,
@@ -11449,15 +11500,25 @@ impl Daemon {
         if cancel.is_cancelled() {
             bail!("interrupted");
         }
+        // A recurring job may have waited for approval past its previewed
+        // slot. Creation starts from now, not from before that wait.
+        let next = if cron.is_some() {
+            crate::jobs::first_run(cron, None, chrono::Local::now())?
+        } else {
+            next
+        };
         let job = self.with_store(|st| {
-            st.create_job(
-                prompt,
-                target.as_deref(),
-                cron,
-                &next.to_rfc3339(),
-                approved,
-                "agent",
-            )
+            st.transaction(|st| {
+                Self::validate_job_target(st, target.as_deref())?;
+                st.create_job(
+                    prompt,
+                    target.as_deref(),
+                    cron,
+                    &next.to_rfc3339(),
+                    approved,
+                    "agent",
+                )
+            })
         })?;
         let _ = self.with_store(|st| st.audit("agent", "job.schedule", &job.id));
         self.broadcast(Event::JobsChanged);
@@ -11533,16 +11594,85 @@ impl Daemon {
                     .unwrap_or(0),
                 _ => 0,
             };
-            let next = job
-                .cron
-                .as_deref()
-                .and_then(|c| crate::jobs::Cron::parse(c).ok())
-                .and_then(|c| c.next_after(now))
-                .map(|t| t.to_rfc3339());
-            let status = self.fire_job(&job, "schedule", missed).await;
-            let _ = self.with_store(|st| st.job_ran(&job.id, &status, next.as_deref()));
-            self.broadcast(Event::JobsChanged);
+            let next = match job.cron.as_deref() {
+                None => None,
+                Some(cron) => match crate::jobs::Cron::parse(cron).and_then(|c| {
+                    c.next_after(now)
+                        .context("no next occurrence within the cron search window")
+                }) {
+                    Ok(next) => Some(next.to_rfc3339()),
+                    Err(error) => {
+                        self.pause_job(
+                            &job,
+                            "job.reschedule_failed",
+                            &format!("recurring schedule could not be rescheduled: {error}"),
+                            Some("schedule"),
+                        );
+                        continue;
+                    }
+                },
+            };
+            // Failed delivery already persisted a visible paused state. In
+            // particular, never consume a one-shot that did not deliver.
+            if let Ok(status) = self.fire_job(&job, "schedule", missed).await {
+                let _ = self.with_store(|st| st.job_ran(&job.id, &status, next.as_deref()));
+                self.broadcast(Event::JobsChanged);
+            }
         }
+    }
+
+    fn validate_job_target(st: &Store, target: Option<&str>) -> Result<()> {
+        if let Some(id) = target {
+            if st.get_session(id)?.is_none() || st.session_deleted(id)? {
+                return Err(RequestFailure::not_found(format!(
+                    "job target Session '{id}' does not exist or was deleted"
+                ))
+                .into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Preserve the due slot so failed delivery is distinguishable from
+    /// one-shot completion. The `paused:` prefix is a persisted scheduler
+    /// marker; a finishing older Run must not erase it (Store::job_ran_status).
+    fn pause_job(
+        &self,
+        job: &JobInfo,
+        action: &str,
+        detail: &str,
+        history_trigger: Option<&str>,
+    ) -> String {
+        let status = format!("paused: {detail}");
+        let notice = if let Err(error) = self.with_store(|st| {
+            st.transaction(|st| {
+                st.pause_job(&job.id, &status)?;
+                if let Some(trigger) = history_trigger {
+                    st.job_run_start(
+                        &job.id,
+                        job.session_id.as_deref(),
+                        trigger,
+                        "failed",
+                        &status,
+                    )?;
+                }
+                st.audit("daemon", action, &format!("{}: {status}", job.id))
+            })
+        }) {
+            tracing::error!(job_id = %job.id, %error, "could not persist paused job");
+            format!("error: could not persist job pause after {detail}: {error}")
+        } else {
+            status
+        };
+        self.broadcast(Event::Note {
+            session_id: None,
+            text: format!(
+                "Job {} {notice}; inspect its target/schedule and history before retrying",
+                job.id
+            ),
+        });
+        self.broadcast(Event::JobsChanged);
+        notice
     }
 
     /// Most job prompts one Session's queue holds; later firings are
@@ -11556,12 +11686,22 @@ impl Daemon {
         job: &formless_protocol::JobInfo,
         trigger: &str,
         missed: usize,
-    ) -> String {
+    ) -> Result<String> {
         let late = if missed > 0 {
             format!("ran late, {} firing(s) coalesced", missed + 1)
         } else {
             String::new()
         };
+        if let Err(error) =
+            self.with_store(|st| Self::validate_job_target(st, job.session_id.as_deref()))
+        {
+            return Err(anyhow!(self.pause_job(
+                job,
+                "job.target_missing",
+                &error.to_string(),
+                Some(trigger),
+            )));
+        }
         // This job's previous firing, in whichever Session it went to.
         let still_running = self
             .job_pending
@@ -11586,14 +11726,9 @@ impl Daemon {
                 )?;
                 st.audit("daemon", "job.skip", &format!("{}: {why}", job.id))
             });
-            return why;
+            return Ok(why);
         }
-        let session = match job.session_id.clone().filter(|s| {
-            self.with_store(|st| st.get_session(s))
-                .ok()
-                .flatten()
-                .is_some()
-        }) {
+        let session = match job.session_id.clone() {
             Some(s) => Ok(s),
             None => {
                 let name: String = job.prompt.chars().take(40).collect();
@@ -11607,10 +11742,12 @@ impl Daemon {
         let sid = match session {
             Ok(sid) => sid,
             Err(e) => {
-                let status = format!("error: {e}");
-                let _ = self
-                    .with_store(|st| st.job_run_start(&job.id, None, trigger, "failed", &status));
-                return status;
+                return Err(anyhow!(self.pause_job(
+                    job,
+                    "job.delivery_failed",
+                    &format!("could not create the job Session: {e}"),
+                    Some(trigger),
+                )));
             }
         };
         // Overlap: the previous firing still queued or running.
@@ -11636,7 +11773,7 @@ impl Daemon {
                 st.job_run_start(&job.id, Some(&sid), trigger, "skipped", &detail)?;
                 st.audit("daemon", "job.skip", &format!("{}: {why}", job.id))
             });
-            return why;
+            return Ok(why);
         }
         let run_row = self
             .with_store(|st| st.job_run_start(&job.id, Some(&sid), trigger, "running", &late))
@@ -11660,11 +11797,16 @@ impl Daemon {
             Err(e) => {
                 let _ = self
                     .with_store(|st| st.job_run_finish(&run_row, "failed", &e.to_string(), None));
-                format!("error: {e}")
+                return Err(anyhow!(self.pause_job(
+                    job,
+                    "job.delivery_failed",
+                    &format!("prompt delivery failed: {e}"),
+                    None,
+                )));
             }
         };
         let _ = self.with_store(|st| st.audit("daemon", "job.run", &job.id));
-        status
+        Ok(status)
     }
 
     /// A job's Run ended: finish its history row (outcome, cost), tell
@@ -18503,3 +18645,19 @@ mod approval_batch;
 #[cfg(test)]
 #[path = "approval_batch_tests.rs"]
 mod approval_batch_tests;
+
+#[cfg(test)]
+#[path = "setting_map_tests.rs"]
+mod setting_map_tests;
+
+#[cfg(test)]
+#[path = "role_reference_tests.rs"]
+mod role_reference_tests;
+
+#[cfg(test)]
+#[path = "provider_error_guidance_tests.rs"]
+mod provider_error_guidance_tests;
+
+#[cfg(test)]
+#[path = "job_state_daemon_tests.rs"]
+mod job_state_daemon_tests;

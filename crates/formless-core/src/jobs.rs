@@ -6,7 +6,8 @@ use chrono::{DateTime, Datelike, Duration, Local, TimeZone, Timelike};
 
 /// A parsed 5-field cron expression: minute hour day-of-month month
 /// day-of-week (0 or 7 = Sunday). Supports `*`, numbers, `a-b`, lists
-/// and `/step`, plus `@hourly`, `@daily`, `@weekly`, `@monthly`.
+/// and `/step`, three-letter month/weekday names, plus `@hourly`,
+/// `@daily`, `@weekly`, `@monthly`, `@yearly` and `@annually`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Cron {
     minute: Vec<bool>,
@@ -19,8 +20,23 @@ pub struct Cron {
 }
 
 fn field(spec: &str, min: u32, max: u32, what: &str) -> Result<Vec<bool>> {
+    let names: &[&str] = match what {
+        "month" => &[
+            "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+        ],
+        "weekday" => &["sun", "mon", "tue", "wed", "thu", "fri", "sat"],
+        _ => &[],
+    };
     let mut set = vec![false; max as usize + 1];
     for part in spec.split(',') {
+        let value = |token: &str| -> Result<u32> {
+            names
+                .iter()
+                .position(|name| token.eq_ignore_ascii_case(name))
+                .map(|i| min + i as u32)
+                .or_else(|| token.parse::<u32>().ok())
+                .with_context(|| format!("bad {what}: {part}"))
+        };
         let (range, step) = match part.split_once('/') {
             Some((r, s)) => (
                 r,
@@ -34,11 +50,9 @@ fn field(spec: &str, min: u32, max: u32, what: &str) -> Result<Vec<bool>> {
         let (lo, hi) = if range == "*" {
             (min, max)
         } else if let Some((a, b)) = range.split_once('-') {
-            (a.parse()?, b.parse()?)
+            (value(a)?, value(b)?)
         } else {
-            let v: u32 = range
-                .parse()
-                .with_context(|| format!("bad {what}: {part}"))?;
+            let v = value(range)?;
             (v, if part.contains('/') { max } else { v })
         };
         if lo < min || hi > max || lo > hi {
@@ -58,6 +72,7 @@ impl Cron {
             "@daily" | "@midnight" => "0 0 * * *",
             "@weekly" => "0 0 * * 0",
             "@monthly" => "0 0 1 * *",
+            "@yearly" | "@annually" => "0 0 1 1 *",
             e => e,
         };
         let f: Vec<&str> = expr.split_whitespace().collect();
@@ -113,30 +128,42 @@ impl Cron {
     }
 }
 
-/// When a one-shot job runs: RFC 3339, or relative "in 30m" / "2h" / "1d".
+/// When a one-shot job runs: strictly future RFC 3339/local time, or a
+/// checked relative offset of at most 366 days.
 pub fn parse_at(at: &str, now: DateTime<Local>) -> Result<DateTime<Local>> {
     let s = at.trim();
-    if let Ok(t) = DateTime::parse_from_rfc3339(s) {
-        return Ok(t.with_timezone(&Local));
-    }
-    if let Ok(t) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M") {
-        return Local
+    let target = if let Ok(t) = DateTime::parse_from_rfc3339(s) {
+        t.with_timezone(&Local)
+    } else if let Ok(t) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M") {
+        Local
             .from_local_datetime(&t)
             .single()
-            .context("ambiguous local time");
-    }
-    let rel = s.strip_prefix("in ").unwrap_or(s).trim();
-    let (num, unit) = rel.split_at(rel.find(|c: char| !c.is_ascii_digit()).unwrap_or(rel.len()));
-    let n: i64 = num.parse().map_err(|_| {
-        anyhow!("at must be RFC 3339, \"YYYY-MM-DD HH:MM\" or like \"in 30m\": {at}")
-    })?;
-    let d = match unit.trim() {
-        "m" | "min" | "mins" | "minute" | "minutes" => Duration::minutes(n),
-        "h" | "hour" | "hours" => Duration::hours(n),
-        "d" | "day" | "days" => Duration::days(n),
-        u => bail!("unknown time unit '{u}' in at: {at}"),
+            .context("ambiguous or nonexistent local time")?
+    } else {
+        let rel = s.strip_prefix("in ").unwrap_or(s).trim();
+        let (num, unit) =
+            rel.split_at(rel.find(|c: char| !c.is_ascii_digit()).unwrap_or(rel.len()));
+        let n: i64 = num.parse().map_err(|_| {
+            anyhow!("at must be RFC 3339, \"YYYY-MM-DD HH:MM\" or like \"in 30m\": {at}")
+        })?;
+        let seconds_per_unit = match unit.trim() {
+            "m" | "min" | "mins" | "minute" | "minutes" => 60,
+            "h" | "hour" | "hours" => 60 * 60,
+            "d" | "day" | "days" => 24 * 60 * 60,
+            u => bail!("unknown time unit '{u}' in at: {at}"),
+        };
+        let seconds = n
+            .checked_mul(seconds_per_unit)
+            .filter(|seconds| *seconds <= 366 * 24 * 60 * 60)
+            .context("relative job time must be at most 366 days")?;
+        let delta = Duration::try_seconds(seconds).context("relative job time is out of range")?;
+        now.checked_add_signed(delta)
+            .context("job time is out of range")?
     };
-    Ok(now + d)
+    if target <= now {
+        bail!("job time must be strictly in the future; use jobs run ID for an immediate firing");
+    }
+    Ok(target)
 }
 
 /// A job's first run: the next cron match, or the `at` time.
@@ -160,14 +187,21 @@ pub fn first_run(
 /// Returns the cron expression to store.
 pub fn to_cron(schedule: &str) -> Result<String> {
     let s = schedule.trim();
-    if Cron::parse(s).is_ok() {
-        return Ok(s.to_string());
+    let cron_error = match Cron::parse(s) {
+        Ok(_) => return Ok(s.to_string()),
+        Err(error) => error,
+    };
+    // Natural phrases can also contain five whitespace-separated words,
+    // e.g. "every weekday at 9 a.m.". Try them before reporting cron errors.
+    if let Some(cron) = natural_to_cron(s) {
+        return Ok(cron);
     }
-    natural_to_cron(s).with_context(|| {
-        format!(
-            "not a cron expression or a schedule like \"every weekday at 9am\", \"every 2 hours\", \"daily at 18:30\": {schedule}"
-        )
-    })
+    if s.starts_with('@') || s.split_whitespace().count() == 5 {
+        bail!("invalid cron expression: {cron_error}");
+    }
+    bail!(
+        "not a cron expression or a schedule like \"every weekday at 9am\", \"every 2 hours\", \"daily at 18:30\": {schedule}"
+    )
 }
 
 /// The next `n` run times of a cron expression after `now`.
@@ -197,17 +231,23 @@ const DAYS: [(&str, u32); 7] = [
     ("saturday", 6),
 ];
 
-/// "9am", "9:30 pm", "18:30", "noon", "midnight" → (hour, minute).
+/// "9am", "9:30 p.m.", "18:30", "noon", "midnight" → (hour, minute).
 fn parse_time(t: &str) -> Option<(u32, u32)> {
-    let t = t.trim().replace(' ', "");
+    let t = t.trim().replace(' ', "").to_ascii_lowercase();
     match t.as_str() {
         "noon" | "midday" => return Some((12, 0)),
         "midnight" => return Some((0, 0)),
         _ => {}
     }
-    let (body, pm) = if let Some(b) = t.strip_suffix("pm") {
+    let (body, pm) = if let Some(b) = ["p.m.", "p.m", "pm.", "pm"]
+        .into_iter()
+        .find_map(|suffix| t.strip_suffix(suffix))
+    {
         (b, Some(true))
-    } else if let Some(b) = t.strip_suffix("am") {
+    } else if let Some(b) = ["a.m.", "a.m", "am.", "am"]
+        .into_iter()
+        .find_map(|suffix| t.strip_suffix(suffix))
+    {
         (b, Some(false))
     } else {
         (t.as_str(), None)
@@ -265,6 +305,7 @@ fn natural_to_cron(s: &str) -> Option<String> {
         ["weekend"] | ["weekends"] => return Some(format!("{m} {h} * * 0,6")),
         ["week"] | ["weekly"] => return Some(format!("{m} {h} * * 1")),
         ["month"] | ["monthly"] => return Some(format!("{m} {h} 1 * *")),
+        ["year"] | ["yearly"] | ["annually"] => return Some(format!("{m} {h} 1 1 *")),
         _ => {}
     }
     // Named days: "monday", "monday and friday", "mon, wed, fri".
@@ -442,3 +483,7 @@ mod schedule_tests {
         assert_eq!(missed_since("0 * * * *", due, now), 5);
     }
 }
+
+#[cfg(test)]
+#[path = "job_input_tests.rs"]
+mod input_schedule_tests;

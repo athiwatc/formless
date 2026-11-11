@@ -3466,6 +3466,7 @@ fn doctor_report(paths: &Paths, quiet: bool) -> Result<Vec<Problem>> {
     );
     say!("data dir:   {}", paths.data_dir.display());
     say!("config dir: {}", paths.config_dir.display());
+    say!("profile:    {}", paths.profile);
     say!(
         "db:         {} ({})",
         paths.db_file().display(),
@@ -3484,6 +3485,15 @@ fn doctor_report(paths: &Paths, quiet: bool) -> Result<Vec<Problem>> {
         say!("keychain:   unavailable: file-only fallback in use (0600 files in the config dir)");
     }
     let cfg = Config::load(&paths)?;
+    for (name, role) in &cfg.roles {
+        if cfg.provider_cfg(role.provider.as_deref()).is_err() {
+            problems.push(Problem {
+                what: format!("role {name:?} references unknown provider {:?}", role.provider.as_deref().unwrap_or_default()),
+                next: Some("formless config edit (choose an existing role provider), or formless providers add NAME".into()),
+                fix: None,
+            });
+        }
+    }
     if let Ok((n, bytes)) =
         Store::open(&paths.db_file()).and_then(|s| formless_core::artifacts::usage(&s))
     {
@@ -3860,10 +3870,11 @@ fn doctor_report(paths: &Paths, quiet: bool) -> Result<Vec<Problem>> {
             }
         }
     } else {
-        say!("probe:      skipped (not configured; run `formless` for the wizard)");
+        let setup = formless_core::profile_setup::missing_setup_message(&paths);
+        say!("probe:      skipped ({setup})");
         problems.push(Problem {
-            what: "no provider is configured".into(),
-            next: Some("formless (the setup wizard)".into()),
+            what: format!("no provider is configured for profile '{}'", paths.profile),
+            next: Some(setup),
             fix: None,
         });
     }
@@ -4048,6 +4059,7 @@ fn run_headless(
         };
     let interactive = matches!(output, RunOutput::Text | RunOutput::Final);
     let mut final_answer: Option<String> = None;
+    let mut validated_result: Option<Value> = None;
     let mut run_error: Option<String> = None;
     let mut paused_exit_code = None;
     let mut queued_delivery = false;
@@ -4055,7 +4067,10 @@ fn run_headless(
     let mut summary = RunSummary::default();
     let cfg = Config::load(&paths)?;
     if !cfg.provider.is_configured() {
-        eprintln!("not configured; run `formless` for the wizard");
+        eprintln!(
+            "{}",
+            formless_core::profile_setup::missing_setup_message(&paths)
+        );
         return Ok(2);
     }
     formless_core::daemon::ensure_daemon(&paths)?;
@@ -4301,14 +4316,20 @@ fn run_headless(
                         }
                         // The last answer the agent gave is the final one.
                         if message.role == "assistant" && !message.content.trim().is_empty() {
-                            if policy.has_schema()
-                                && policy.validate_final(&message.content).is_err()
-                            {
-                                final_answer = None;
-                                run_error =
-                                    Some("schema: daemon delivered an invalid final answer".into());
-                                code = 3;
-                                break;
+                            if policy.has_schema() {
+                                match policy.validate_final(&message.content) {
+                                    Ok(value) => validated_result = Some(value),
+                                    Err(_) => {
+                                        final_answer = None;
+                                        validated_result = None;
+                                        run_error = Some(
+                                            "schema: daemon delivered an invalid final answer"
+                                                .into(),
+                                        );
+                                        code = 3;
+                                        break;
+                                    }
+                                }
                             }
                             final_answer = Some(message.content);
                         }
@@ -4499,6 +4520,7 @@ fn run_headless(
     }
     if policy.has_schema() && code != 0 {
         final_answer = None;
+        validated_result = None;
     }
     if budget_stopped {
         let spend = target
@@ -4559,6 +4581,7 @@ fn run_headless(
                     &session_id,
                     status,
                     final_answer.as_deref(),
+                    validated_result.as_ref(),
                     run_error.as_deref(),
                 )?
             };
@@ -4577,6 +4600,7 @@ fn run_headless(
                 &session_id,
                 status,
                 final_answer.as_deref(),
+                validated_result.as_ref(),
                 run_error.as_deref(),
             )?;
             std::io::stdout().write_all(&bytes)?;
@@ -5610,6 +5634,9 @@ enum ConfigAction {
         key: String,
         /// New value as JSON when valid JSON, otherwise as literal text
         value: String,
+        /// Replace the complete map instead of merging entries; use '{}' to clear
+        #[arg(long)]
+        replace: bool,
     },
     /// Edit config.toml in $EDITOR; it is replaced only if it still parses
     Edit,
@@ -5618,27 +5645,42 @@ enum ConfigAction {
 fn config_cmd(paths: Paths, action: ConfigAction) -> Result<()> {
     match action {
         ConfigAction::Path => println!("{}", paths.config_file().display()),
-        ConfigAction::Get { key } => {
-            let cfg = serde_json::to_value(Config::load(&paths)?)?;
-            match cfg.pointer(&format!("/{}", key.replace('.', "/"))) {
-                Some(serde_json::Value::String(s)) => println!("{s}"),
-                Some(v) => println!("{}", serde_json::to_string_pretty(v)?),
-                None => {
-                    eprintln!("no setting '{key}' (see SPEC §13, or `formless config edit`)");
-                    std::process::exit(2);
-                }
+        ConfigAction::Get { key } => match Config::load(&paths)?.setting_value(&key)? {
+            Some(serde_json::Value::String(s)) => println!("{s}"),
+            Some(v) => println!("{}", serde_json::to_string_pretty(&v)?),
+            None => {
+                eprintln!("no setting '{key}' (see SPEC §13, or `formless config edit`)");
+                std::process::exit(2);
             }
-        }
-        ConfigAction::Set { key, value } => {
+        },
+        ConfigAction::Set {
+            key,
+            value,
+            replace,
+        } => {
             let value = serde_json::from_str(&value).unwrap_or(serde_json::Value::String(value));
-            formless_core::daemon::ensure_daemon(&paths)?;
-            let r = formless_tui::client::request_once(
-                &paths,
+            let request = if !replace && formless_core::config::SETTING_MAPS.contains(&key.as_str())
+            {
+                Request::MergeSetting {
+                    key: key.clone(),
+                    value: value.clone(),
+                }
+            } else {
                 Request::SetSetting {
                     key: key.clone(),
                     value: value.clone(),
-                },
-            )?;
+                }
+            };
+            formless_core::daemon::ensure_daemon(&paths)?;
+            let r = formless_tui::client::request_once(&paths, request)?;
+            if r["applies"] == "env_override" {
+                println!(
+                    "saved {key} = {value}; daemon uses {} from {} (environment override)",
+                    r["effective_value"],
+                    r["override_source"].as_str().unwrap_or("its environment")
+                );
+                return Ok(());
+            }
             println!(
                 "{key} = {value}{}",
                 if r["applies"] == "on_tui_start" {
@@ -5753,15 +5795,10 @@ fn find_session_in(list: &[SessionInfo], id: &str) -> Result<SessionInfo> {
     }
 }
 
-fn comparison_terminal_control(c: char) -> bool {
-    c.is_control()
-        || matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
-}
-
 fn comparison_terminal_text(text: &str) -> String {
     let mut visible = String::with_capacity(text.len());
     for c in text.chars() {
-        if comparison_terminal_control(c) {
+        if table::terminal_control(c) {
             visible.extend(c.escape_unicode());
         } else {
             visible.push(c);
@@ -5775,7 +5812,7 @@ fn comparison_quoted_metadata(text: &str) -> Result<String> {
     let quoted = serde_json::to_string(text)?;
     let mut visible = String::with_capacity(quoted.len());
     for c in quoted.chars() {
-        if comparison_terminal_control(c) {
+        if table::terminal_control(c) {
             // All relevant control/format characters are in the BMP. Keep a
             // valid JSON string while making bidi and C1 controls visible too.
             write!(&mut visible, "\\u{:04x}", c as u32).expect("writing to String");

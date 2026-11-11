@@ -2218,16 +2218,30 @@
     test.onclick = async () => {
       const model = choice();
       if (!model) return;
-      status.textContent = "testing " + model + "…";
+      const testing = "testing " + model + "…";
+      status.textContent = testing;
       const t = await act({ type: "test_model", model }, null, 120000);
-      if (!t) return;
+      // act already reported why; end the label it left, unless newer text
+      // replaced it (#1730).
+      if (!t) {
+        if (status.textContent === testing) status.textContent = "✗ " + model + ": test did not complete";
+        return;
+      }
       tests[model] = t;
       status.textContent = modelTestText(t);
       draw();
     };
     openDialog(dialog, { initialFocus: input, onDismiss: close });
     const r = await act({ type: "list_models" }, null, 30000);
-    if (!r || !dialog.isConnected) return;
+    if (!dialog.isConnected) return;
+    if (!r) {
+      // act already reported why; free-form entry still works (#1730).
+      if (status.textContent === "loading models…") {
+        status.textContent = "could not load models — type a model id";
+        status.classList.add("err");
+      }
+      return;
+    }
     const recent = r.recent || [];
     meta = r.meta || {};
     tests = r.tests || {};
@@ -2242,7 +2256,8 @@
     items.sort((a, b) => b.recent - a.recent);
     const current = (session && session.model) || (r.current && r.current.model) || "";
     sel = Math.max(0, items.findIndex((i) => i.id === current));
-    status.textContent = r.error ? "could not list models: " + r.error : "";
+    status.textContent = r.error ? "could not list models: " + r.error
+      : items.length ? "" : "no models listed — type a model id";
     if (!items.length && r.error) status.classList.add("err");
     draw();
   }
@@ -2631,7 +2646,7 @@
     return node;
   }
   // Completed Markdown chunks and the unfinished tail keep their DOM identity.
-  const liveDone = { session: undefined, text: "", src: "", node: null, done: null, tail: null, tailText: null, plainText: null };
+  const liveDone = { session: undefined, text: "", src: "", node: null, done: null, tail: null, tailText: null, plainText: null, afterSeq: -1, messages: null, messageCount: -1 };
   const liveRender = { session: undefined, root: null, who: null, thinking: null, thinkingText: null, rows: new Map(), activity: null, activityText: null };
   const statusRender = { root: null, spinner: null, text: null };
   function streamingNode(text) {
@@ -2670,6 +2685,11 @@
       liveDone.src = done;
     }
     liveDone.text = text;
+    if (liveDone.messages !== S.messages || liveDone.messageCount !== S.messages.length) {
+      liveDone.afterSeq = S.messages.reduce((seq, item) => Math.max(seq, item.seq ?? -1), -1);
+      liveDone.messages = S.messages;
+      liveDone.messageCount = S.messages.length;
+    }
     liveDone.done.hidden = !done;
     liveDone.tail.hidden = !tail;
     updateText(liveDone.tailText, tail);
@@ -2701,7 +2721,7 @@
     const cancel = h("button", { type: "button", class: "btn danger small", onclick: (e) => { e.preventDefault(); cancelTool(row.tool.handle); } }, "Cancel");
     const transcript = h("button", { type: "button", class: "btn ghost small", onclick: (e) => { e.preventDefault(); showSubagent(row.tool.subagent); } }, "Transcript");
     const timer = document.createTextNode("");
-    const summary = h("summary", null, h("span", { class: "muted", "data-live-depth": "" }, "└"), mark,
+    const summary = h("summary", null, h("span", { class: "muted", role: "img", "data-live-depth": "" }, "└"), mark,
       h("span", { class: "tname" }, name), h("span", { class: "targs" }, args), folded, progressBox, stalled, cancel, transcript,
       h("span", { class: "tstat", "data-live-timer": "" }, timer));
     row = { tool, node: h("details", { class: "chip live tree-node" }, summary), summary, mark, name, args, folded, progress, progressText, progressBox, stalled, cancel, transcript, timer, payload: null, payloadInitialized: false, payloadArgs: undefined, payloadSubagent: undefined };
@@ -2712,8 +2732,16 @@
     const t = row.tool, running = t.status === "running";
     const rowClass = "chip live tree-node" + (running ? "" : " done");
     if (row.node.className !== rowClass) row.node.className = rowClass;
-    const indent = (t.depth || 0) * 1.125 + "rem";
-    if (row.node.style.marginLeft !== indent) row.node.style.marginLeft = indent;
+    // Keep room for the call at large reading sizes and narrow viewports.
+    // The marker exposes the real depth even when visual indentation is capped.
+    const depth = Math.max(0, t.depth || 0);
+    const indent = `min(${Math.min(depth, 4) * 1.125}rem, 15%)`;
+    if (row.node.style.marginInlineStart !== indent) row.node.style.marginInlineStart = indent;
+    const depthLabel = `Nesting depth ${depth}`;
+    if (row.summary.firstChild.getAttribute("aria-label") !== depthLabel) {
+      row.summary.firstChild.setAttribute("aria-label", depthLabel);
+      row.summary.firstChild.title = depthLabel;
+    }
     const identity = t.invocationId || t.handle || t.subagent || t.name || "tool";
     if (row.node.dataset.liveTool !== identity) row.node.dataset.liveTool = identity;
     if (row.summary.firstChild.hidden !== !t.depth) row.summary.firstChild.hidden = !t.depth;
@@ -2838,16 +2866,54 @@
         block = child;
       }
       candidates.push({ node: block, id: message.dataset.messageId || null, live: message.hasAttribute("data-live-root"),
-        block: blocks.indexOf(block), offset: block.getBoundingClientRect().top - origin });
+        block: blocks.indexOf(block), offset: block.getBoundingClientRect().top - origin,
+        stream: readingStreamStamp(message, block) });
     }
     return { candidates, top: box.scrollTop };
+  }
+  function readingStreamStamp(message, block) {
+    const stream = message.querySelector(".streaming");
+    if (!message.hasAttribute("data-live-root") || !stream?.contains(block) || stream !== liveDone.node) return null;
+    // Reducer state may already contain the committed step while its old live
+    // DOM is still visible. Stamp the rendered text and its original sequence.
+    const text = liveDone.text.trimEnd();
+    // Copy only the small signatures; a sliced string must not retain an
+    // entire long answer through a saved per-Session bookmark.
+    const head = JSON.parse(JSON.stringify(text.slice(0, 128)));
+    const tail = JSON.parse(JSON.stringify(text.slice(-128)));
+    return { block: [...stream.querySelectorAll(anchorBlocks)].indexOf(block), length: text.length,
+      head, tail,
+      afterSeq: liveDone.afterSeq };
+  }
+  function readingStreamMatches(message, stream) {
+    if (!stream || !stream.length || message.role !== "assistant" || message.seq <= stream.afterSeq || typeof message.content !== "string") return false;
+    return message.content.length >= stream.length && message.content.startsWith(stream.head)
+      && message.content.slice(stream.length - stream.tail.length, stream.length) === stream.tail;
+  }
+  function remapReadingStream(candidate, message) {
+    if (!candidate.live || !readingStreamMatches(message, candidate.stream)) return false;
+    candidate.id = message.id;
+    candidate.live = false;
+    candidate.block = candidate.stream.block;
+    candidate.node = null;
+    return true;
+  }
+  function commitReadingStream(session, message) {
+    const anchors = [reading.session === session ? reading.anchor : null, reading.saved.get(session)?.anchor];
+    for (const anchor of anchors) for (const candidate of anchor?.candidates || []) remapReadingStream(candidate, message);
   }
   function resolveReadingBlock(candidate) {
     const box = $("transcript");
     if (candidate.node?.isConnected && box.contains(candidate.node)) return candidate.node;
+    // A Session may have finished while it was not selected. Resolve a saved
+    // live bookmark against the matching persisted step, not an empty #live.
+    if (candidate.live && candidate.stream) {
+      const committed = S.messages.find(message => readingStreamMatches(message, candidate.stream));
+      if (committed) remapReadingStream(candidate, committed);
+    }
     const message = candidate.live ? box.querySelector("[data-live-root]")
       : [...box.querySelectorAll("[data-message-id]")].find(node => node.dataset.messageId === candidate.id);
-    const node = message && (candidate.block < 0 ? message : message.querySelectorAll(anchorBlocks)[candidate.block] || message);
+    const node = message && (candidate.block < 0 ? message : message.querySelectorAll(anchorBlocks)[candidate.block]);
     if (node) candidate.node = node;
     return node;
   }
@@ -3529,6 +3595,7 @@
   const focusBefore = {};
   let syncingDialogs = false;
   let lastFocusTarget = null;
+  let focusRecoveryFrame = 0;
   function activeDialog() {
     return dialogStack[dialogStack.length - 1] || null;
   }
@@ -3538,12 +3605,17 @@
       && getComputedStyle(el).visibility !== "hidden");
   }
   function dialogItems(node) {
-    return [...node.querySelectorAll("button, a[href], input, select, textarea, summary, [tabindex]")]
+    const selector = "button, a[href], input, select, textarea, summary, [tabindex]";
+    const feedback = node === activeDialog()?.node ? [...$("toasts").querySelectorAll(selector)] : [];
+    return [...node.querySelectorAll(selector), ...feedback]
       .filter((el) => el.tabIndex >= 0 && focusVisible(el));
+  }
+  function dialogAllows(entry, node) {
+    return entry.node.contains(node) || $("toasts").contains(node);
   }
   function focusReturn(el) {
     const top = activeDialog();
-    if (focusVisible(el) && (!top || top.node.contains(el))) {
+    if (focusVisible(el) && (!top || dialogAllows(top, el))) {
       el.focus({ preventScroll: true });
       if (document.activeElement === el) return;
     }
@@ -3560,7 +3632,7 @@
   function focusDialog(entry, preferred) {
     if (activeDialog() !== entry) return;
     const initial = preferred || (typeof entry.initialFocus === "function" ? entry.initialFocus() : entry.initialFocus);
-    const target = focusVisible(initial) && entry.node.contains(initial) ? initial : dialogItems(entry.node)[0];
+    const target = focusVisible(initial) && entry.node.contains(initial) ? initial : dialogItems(entry.node).find(item => entry.node.contains(item));
     const surface = entry.node.querySelector(".modal") || entry.node;
     if (!target) surface.tabIndex = -1;
     (target || surface).focus({ preventScroll: true });
@@ -3579,17 +3651,19 @@
     if (top) {
       for (const node of document.body.children) {
         if (!dialogInert.has(node)) dialogInert.set(node, node.inert);
-        const inert = node !== top.node;
+        const inert = node !== top.node && !node.hasAttribute("data-dialog-keep");
         if (node.inert !== inert) node.inert = inert;
       }
       dialogStack.forEach((entry, index) => { entry.node.style.zIndex = String(100 + index); });
+      $("toasts").style.zIndex = String(101 + dialogStack.length);
     } else {
       for (const [node, inert] of dialogInert) if (node.inert !== inert) node.inert = inert;
       dialogInert.clear();
+      $("toasts").style.removeProperty("z-index");
     }
     syncingDialogs = false;
     if (previousTop && removed.includes(previousTop)) focusReturn(previousTop.trigger);
-    else if (top && !top.node.contains(document.activeElement)) focusDialog(top);
+    else if (top && !dialogAllows(top, document.activeElement)) focusDialog(top);
   }
   function openDialog(node, options = {}) {
     const existing = dialogStack.find((entry) => entry.node === node);
@@ -3679,7 +3753,12 @@
       const items = dialogItems(top.node);
       const first = items[0], last = items[items.length - 1];
       if (!items.length) { e.preventDefault(); focusDialog(top); }
-      else if (!top.node.contains(document.activeElement)) { e.preventDefault(); (e.shiftKey ? last : first).focus(); }
+      else if (items.some(item => !top.node.contains(item))) {
+        const index = items.indexOf(document.activeElement);
+        e.preventDefault();
+        (index < 0 ? e.shiftKey ? last : first : items[(index + (e.shiftKey ? -1 : 1) + items.length) % items.length]).focus();
+      }
+      else if (!dialogAllows(top, document.activeElement)) { e.preventDefault(); (e.shiftKey ? last : first).focus(); }
       else if (e.shiftKey && (document.activeElement === first || !items.includes(document.activeElement))) { e.preventDefault(); last.focus(); }
       else if (!e.shiftKey && (document.activeElement === last || !items.includes(document.activeElement))) { e.preventDefault(); first.focus(); }
     }
@@ -3687,15 +3766,29 @@
   document.addEventListener("focusin", (e) => {
     if (e.target !== document.body && e.target !== document.documentElement) lastFocusTarget = e.target;
     const top = activeDialog();
-    if (top && !top.node.contains(e.target)) focusDialog(top);
+    if (top && !dialogAllows(top, e.target)) focusDialog(top);
     else if (top) top.lastFocus = e.target;
   });
+  document.addEventListener("pointerdown", (event) => {
+    if (lastFocusTarget && !lastFocusTarget.contains(event.target)) lastFocusTarget = null;
+  }, true);
+  function focusRemovedByState(target) {
+    return !target.isConnected || !!target.closest(".hidden, [hidden], [inert]");
+  }
+  function scheduleFocusRecovery() {
+    if (focusRecoveryFrame || document.activeElement !== document.body || !lastFocusTarget || !focusRemovedByState(lastFocusTarget)) return;
+    focusRecoveryFrame = requestAnimationFrame(() => {
+      focusRecoveryFrame = 0;
+      const target = lastFocusTarget;
+      if (target && document.activeElement === document.body && focusRemovedByState(target)) focusReturn(target);
+    });
+  }
   new MutationObserver(() => {
     if (dialogStack.length || dialogInert.size) syncDialogs();
     // A menu action, view transition or streamed re-render can remove the
     // restored control after a dialog has already closed. Retain visible user
     // focus; recover only when its previous target itself disappeared/was hidden.
-    if (lastFocusTarget && !focusVisible(lastFocusTarget) && !focusVisible(document.activeElement)) focusReturn(lastFocusTarget);
+    scheduleFocusRecovery();
   })
     .observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ["class", "hidden"] });
   async function decide(approved, scope, rememberDenial) {
@@ -3780,14 +3873,18 @@
     const sort = opts.sortable && S.toolSort;
     const cols = TOOL_COLS.concat([[opts.bars ? "" : "Capabilities", null]]);
     // Sortable headers: click (or Enter) sorts by the column, again reverses.
+    // Name and version ascend; calls, success and last used descend. The
+    // active glyph and aria-sort both come from that one direction.
     table.append(h("thead", null, h("tr", null, cols.map(([label, key, num]) => {
       const active = sort && key && sort.key === key;
-      const th = h("th", { class: num ? "num" : null, "aria-sort": active ? (sort.reverse !== (key === "name" || key === "version") ? "ascending" : "descending") : null },
+      const direction = active ? (sort.reverse !== (key === "name" || key === "version") ? "ascending" : "descending") : null;
+      const glyph = direction === "ascending" ? " ▴" : direction === "descending" ? " ▾" : "";
+      const th = h("th", { class: num ? "num" : null, "aria-sort": direction },
         opts.sortable && key ? h("button", { class: "th-sort", type: "button", title: "Sort by " + label.toLowerCase(), onclick: () => {
           S.toolSort = { key, reverse: active ? !sort.reverse : false };
           if ([...$("tools-sort").options].some((o) => o.value === key)) $("tools-sort").value = key;
           renderTools();
-        } }, label, active ? (sort.reverse ? " ▴" : " ▾") : "") : label);
+        } }, label, glyph) : label);
       return th;
     }))));
     const body = h("tbody");
@@ -4578,31 +4675,39 @@
   }
   /** The Settings filter: rows whose label, key, value or description
    * contain the words stay (matches marked); sections with none left hide,
-   * unless their title matches. */
+   * unless their title matches. Every word must be in one target (label,
+   * value, key or table row), folded by `foldMap` as `markWords` folds it,
+   * so a visible label shows its highlight (#1731). */
   function filterSettings() {
-    const words = $("settings-filter").value.toLowerCase().split(/\s+/).filter(Boolean);
-    const hit = (el) => { const t = el.textContent.toLowerCase(); return words.every((w) => t.includes(w)); };
-    for (const m of $("settings").querySelectorAll("mark.find")) m.replaceWith(m.textContent);
+    const words = $("settings-filter").value.split(/\s+/).filter(Boolean);
+    const keys = words.map((w) => foldMap(w).folded).filter(Boolean);
+    // Each target's text is folded once per call, not once per word.
+    const hitText = (text) => { const t = foldMap(text).folded; return keys.every((k) => t.includes(k)); };
+    const hit = (el) => hitText(el.textContent);
+    // Unwrap the last marks, then merge the split text back together so the
+    // next query can match across the old mark's edges (#1731).
+    const parents = new Set();
+    for (const m of $("settings").querySelectorAll("mark.find")) { parents.add(m.parentNode); m.replaceWith(m.textContent); }
+    for (const p of parents) p.normalize();
     for (const sec of $("settings").querySelectorAll("section")) {
-      const titleHit = words.length && hit(sec.querySelector("h3") || sec);
+      const titleHit = keys.length && hit(sec.querySelector("h3") || sec);
       let shown = 0;
       for (const dt of sec.querySelectorAll("dl.kv > dt")) {
         const dd = dt.nextElementSibling;
-        const ok = !words.length || titleHit || hit(dt) || (dd && hit(dd)) || (dt.title && words.every((w) => dt.title.toLowerCase().includes(w)));
+        const ok = !keys.length || titleHit || hit(dt) || (dd && hit(dd)) || (dt.title && hitText(dt.title));
         dt.classList.toggle("hidden", !ok);
         if (dd) dd.classList.toggle("hidden", !ok);
-        if (ok) { shown++; if (words.length) markWords(dt, words); }
+        if (ok) { shown++; if (keys.length) markWords(dt, words); }
       }
       for (const tr of sec.querySelectorAll("tbody > tr")) {
-        const ok = !words.length || titleHit || hit(tr);
+        const ok = !keys.length || titleHit || hit(tr);
         tr.classList.toggle("hidden", !ok);
         if (ok) shown++;
       }
       const hasRows = sec.querySelector("dl.kv > dt, tbody > tr");
-      sec.classList.toggle("hidden", !!words.length && !titleHit && (hasRows ? !shown : !hit(sec)));
+      sec.classList.toggle("hidden", !!keys.length && !titleHit && (hasRows ? !shown : !hit(sec)));
     }
   }
-  /** Wrap the words' first occurrences in an element's own text in <mark>. */
   /** `text` folded for matching with, per folded UTF-16 unit, the offset
    * of the original character it came from (#789): decomposed, marks
    * dropped, lower-cased one character at a time, so `İ` stays one
@@ -4620,6 +4725,8 @@
     from.push(at);
     return { folded, from };
   }
+  /** Wrap the words' first occurrences in an element's own text in <mark>,
+   * adding no empty text nodes. */
   function markWords(el, words) {
     const keys = words.map((w) => foldMap(w).folded).filter((w) => w);
     for (const node of [...el.childNodes].filter((n) => n.nodeType === 3)) {
@@ -4631,16 +4738,18 @@
         .map((w) => [folded.indexOf(w), w.length])
         .filter(([i]) => i >= 0)
         .map(([i, n]) => [from[i], from[i + n] - from[i]])
+        .filter(([, n]) => n > 0)
         .sort((a, b) => a[0] - b[0]);
       if (!spans.length) continue;
       const parts = [];
       let at = 0;
       for (const [i, n] of spans) {
         if (i < at) continue;
-        parts.push(text.slice(at, i), h("mark", { class: "find" }, text.slice(i, i + n)));
+        if (i > at) parts.push(text.slice(at, i));
+        parts.push(h("mark", { class: "find" }, text.slice(i, i + n)));
         at = i + n;
       }
-      parts.push(text.slice(at));
+      if (at < text.length) parts.push(text.slice(at));
       node.replaceWith(...parts);
     }
   }
@@ -6182,6 +6291,7 @@
       case "message_complete":
         // A persisted assistant step (e.g. text before a Tool call) replaces
         // the live stream, so the next step starts fresh.
+        if (ev.message.role === "assistant") commitReadingStream(ev.session_id, ev.message);
         if (here && (ev.type === "message_complete" || ev.message.role === "assistant")) { S.streaming = ""; S.thinking = ""; }
         if (here) {
           const index = S.messages.findIndex((m) => m.id === ev.message.id);
@@ -6975,6 +7085,9 @@
       attachFiles([...e.dataTransfer.files]);
     });
   }
+  // A real button so Tab, Enter and Space reach it (#1740); its click is
+  // the user gesture that opens the hidden file picker.
+  $("attach-btn").addEventListener("click", () => $("attach-input").click());
   $("attach-input").addEventListener("change", (e) => { attachFiles([...e.target.files]); e.target.value = ""; });
   $("input").addEventListener("paste", (e) => {
     const files = [...((e.clipboardData && e.clipboardData.files) || [])];

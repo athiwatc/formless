@@ -497,6 +497,16 @@ an empty listing just asks for one.
 
 ### 4.4 Provider failure handling
 
+Persistent request errors (such as unknown parameters or an API-style mismatch
+reported as HTTP400/422) point to `/details`, `/model` and `formless doctor`
+rather than retrying the identical request. Transient failures retain retry
+guidance. If the same provider-error category recurs after Resume, the Run
+banner names likely configuration keys to check (for example
+`provider.api_style`, `provider.reasoning_effort`, `provider.base_url` and
+`provider.extra_body`). This compares the immediately preceding resumed Run
+in that Session; a fresh user message resets the escalation. Raw details stay
+available, and budget/correction decisions keep their existing guidance.
+
 Model requests made by a daemon share budget admission, including Run turns,
 sub-agents, nested `llm.complete` and internal model work. With a positive dollar
 limit configured, one request at a time reserves the available budget headroom;
@@ -595,8 +605,18 @@ than growing the map or losing an in-flight probe.
   a muted stop note for stored `stop_reason`/`truncated` metadata, using
   the same wording as live stop notes; ordinary completions show none.
 - **Rate limits.** The `x-ratelimit-*` (and `anthropic-ratelimit-*`)
-  headers of each endpoint's latest response are kept: `RateLimits`,
-  `Status.rate_limits`; `/usage` adds "41/50 requests left, resets …".
+  headers are normalized to `limit/remaining/reset-{requests,tokens,input-tokens,output-tokens}`;
+  OpenRouter's unqualified fields describe requests. Observations are scoped by
+  provider name, normalized base URL and credential fingerprint (never exposed).
+  `RateLimits` and `Status.rate_limits` return opaque entry IDs, canonical fields,
+  provider/endpoint/observation time and the same `line` shown by TUI `/usage`:
+  "41/50 requests left, resets in 40s". Duration, epoch-second/millisecond and
+  RFC3339 resets are relative; unknown reset formats are labelled unparsed.
+  Each quota kind loses its limit/remaining/reset fields after its own parsed
+  reset; other kinds remain visible. Entries expire when no kind remains or
+  after five minutes. Bare numbers predating 2001 as epoch seconds/milliseconds
+  are ambiguous and labelled unparsed. Headerless responses do not refresh
+  observations; at most 64 entries are retained.
 - **Explained errors.** When a Run pauses on a provider failure,
   `RunPaused.explained` sorts it into a category with a short message and
   the next step (`errors.rs`):
@@ -639,6 +659,12 @@ The user talks to one **primary** model; work can go to others.
   (empty = that provider's default), an optional `reasoning_effort`, and
   an optional `system` addendum for sub-agents in the role. Roles change
   through `UpsertRole` and `DeleteRole`.
+  Deletion through `DeleteRole` or harness `roles.delete` refuses while
+  file or daemon-effective `provider.model`, any Session model (including archived or soft-deleted
+  Sessions), or a Session template names `role:<name>`. The error names the
+  references to repoint first; after they are changed, deletion succeeds.
+  `doctor` reports file-edited roles that name an unknown provider, with
+  guidance to select or configure that provider.
   - CLI: `formless providers list|add|remove|test` and `formless roles
     list|add|rm`. The CLI reads the key from stdin, never argv.
   - TUI: `/roles`, `/role add NAME PROVIDER MODEL description…` and
@@ -1027,6 +1053,14 @@ task, with quality as a gate**.
   replaces `limits.run_steps` for that Run and is cleared when the Run
   ends. Reaching it pauses the Run with the budget banner: `/resume`
   continues past it, `/abandon` stops. `/limit off` removes it.
+- **Live profile limits.** `limits.run_usd`, `limits.daily_usd` and
+  `limits.run_steps` are re-read before each model step, including checks
+  in nested completions and sub-agents. A setting edit applies to an
+  in-flight Run at its next step boundary; already-sent requests may finish
+  and their usage is still recorded. Clearing a profile limit also takes
+  effect at the next check. Explicit per-Run `/limit`/`--max-steps` and
+  `--max-usd` retain precedence over the corresponding profile limit;
+  the daily profile limit remains live with `--max-usd`.
 - **Steering is marked.** A message sent while a Run is active is stored
   with `meta.steer = {step, run_id}` (the Run's step count when it arrived),
   and clients show it as `↳ steer at step N` under the message.
@@ -1218,10 +1252,14 @@ pasting paths.
   input or a result's output.
 - **Accessible dialogs (web).** Every modal (including output viewers,
   model pickers, Session switchers, help and detail dialogs) uses shared
-  focus management: Tab and Shift+Tab stay in the top dialog, background
-  content is inert, and closing restores its invoking element or a visible
+  focus management: Tab and Shift+Tab stay in the top dialog and its feedback
+  actions. Background content is inert, and closing restores its invoking element or a visible
   control in the active view if the original element disappeared. Nested
   dialogs restore the dialog underneath before returning to the page.
+  Live feedback stays non-inert and above every dialog; its actions support
+  pointer and keyboard activation. Recovery after removed or state-hidden
+  controls is coalesced to a frame, without layout probes on normal streamed
+  paints. Hover-only hiding and deliberate pointer click-away do not move focus.
   Escape and backdrop clicks use the dialog's existing cancellation or
   deferral action where dismissal is safe; they never choose a decision.
   The approval and question dialogs additionally:
@@ -1251,8 +1289,12 @@ pasting paths.
   Reading history pauses following. Explicit block/message anchors preserve
   pixel offsets across persisted output, disclosure changes and delayed diagram
   layout without native scroll anchoring. View and Session navigation retain
-  paused reading state and discard stale paint callbacks. The new-output pill
-  tracks new content below the viewport; timer ticks and layout changes alone
+  paused reading state and discard stale paint callbacks.
+  Streamed paragraphs retain their offsets when their step becomes persisted
+  history, including Tool-call steps and saved Session bookmarks. Missing
+  semantic blocks never resolve to an empty live root; bounded text/sequence
+  signatures identify the matching persisted step after an offscreen commit.
+  The new-output pill tracks new content below the viewport; timer ticks and layout changes alone
   do not create it. Following resumes on an explicit user scroll to the bottom
   or pill action, rather than an approximate distance threshold or a
   programmatic scroll.
@@ -1332,7 +1374,12 @@ pasting paths.
   launched programs or MCP tools when appropriate, including an empty tracked
   list. The marker is conservative: a process-capable Tool need not actually
   launch a program or write anything. `RunFiles {session_id, run_id?}` adds a
-  bounded context diff for text files. The TUI's `/files` opens them in the pager; the
+  bounded context diff for text files. Common prefix/suffix lines are preserved
+  before aligning the differing middle, so a local edit in a large file keeps
+  only nearby context. The LCS matrix is capped at four million cells;
+  human context output labels any remaining unaligned middle explicitly.
+  Raw diff lines retain their original reconstruction contract and kinds.
+  The TUI's `/files` opens them in the pager; the
   web shows a dialog with diffs and Revert buttons. Explicit Run IDs must belong
   to the requested live Session, including every recorded path row.
 - **Rewind.** `RewindRun {session_id, run_id?, path?}` (`/rewind [PATH]`)
@@ -3435,25 +3482,57 @@ refresh a cache, nightly cleanup.
 - **Creating:**
   - The agent uses `schedule_run({prompt, cron? | at?, session_id?})`.
     `cron` is a 5-field expression in local time (`*`, lists, ranges,
-    `/step`, `@hourly`/`@daily`/`@weekly`/`@monthly`; when both day fields
-    are restricted, either may match). `at` is RFC 3339,
-    `YYYY-MM-DD HH:MM` or `in 30m|2h|1d`.
+    `/step`; month/weekday fields also accept case-insensitive three-letter
+    names such as `JAN-MAR` and `MON,WED,FRI`, including in ranges/lists/steps;
+    Sunday is `SUN`, 0 or 7). Aliases are `@hourly`, `@daily`/`@midnight`,
+    `@weekly`, `@monthly`, and `@yearly`/`@annually` (January 1 at midnight).
+    When both day fields are restricted, either may match. Invalid field
+    values and range endpoints identify their field in both entry points.
+    `at` is RFC 3339, `YYYY-MM-DD HH:MM` or `in 30m|2h|1d`.
   - The user uses `AddJob` or `formless jobs add PROMPT --every … |
     --cron … | --at …`. A user's schedule may be plain English: "every
     weekday at 9am", "every 2 hours", "every 15 minutes", "daily at
     18:30", "hourly", "every monday and friday at noon", "every weekend
-    at 8pm"; it is stored as cron. `PreviewSchedule {schedule}` returns
-    the cron and the next 3 runs, which `jobs add` prints to confirm.
+    at 8pm", "yearly"/"annually"/"every year at 9am" (January 1).
+    Clock suffixes accept `am`/`pm`, `a.m.`/`p.m.` and `am.`/`pm.`,
+    case-insensitively; a dotted minute separator such as `9.30am` remains
+    unsupported. Natural schedules are stored as cron.
+    `PreviewSchedule {schedule}` returns the cron and the next 3 runs,
+    which `jobs add` prints to confirm.
+  - Both entry points require a nonblank prompt and a one-shot time strictly
+    after now. Relative offsets use checked arithmetic and may be at most
+    366 days; zero, past and overflowing times return errors without saving
+    a job. Explicit immediate firing uses `RunJobNow` / `jobs run ID`.
+  - A pinned `session_id` must name an existing, non-deleted Session. The
+    agent may use `current`; that resolves to its current Session and is
+    validated again when the job is saved after any approval wait.
 - **Trust:** one-shot jobs from the agent are scheduled at once.
   Recurring ones need the user's approval: asked immediately, or, with
   nobody connected, saved as "awaiting approval" until the user enables
-  them. Enabling a job approves it.
+  them. Enabling a job approves it. Enabling/approving a disabled recurring
+  job recomputes its next future cron slot; time spent disabled is not missed
+  downtime. An expired or completed disabled one-shot cannot be enabled:
+  the error names its expired state and the explicit run-now alternative.
+  Re-enabling an already enabled/approved job is idempotent, preserving
+  ordinary daemon-downtime catch-up. Cron creation uses the time after any
+  approval wait when choosing its first slot.
 - **Running:** the daemon checks every 20 s. A due job sends its prompt to
   its Session (queued if that Session is busy), or to a new Session named
-  `Job: …`. A one-shot job then ends; a recurring one moves to its next
+  `Job: …` only when no target was pinned. A deleted/missing pinned target
+  pauses the job, preserves its due slot and target, and records a failed
+  history row, `job.target_missing` audit and client note; firing it again
+  never silently creates a replacement Session. A one-shot job then ends
+  after successful prompt delivery; a recurring one moves to its next
   match after now. Firings missed while the daemon was down or the
   machine slept run once, and its history says "ran late, N firings
-  coalesced". Everything is audit-logged and broadcasts `JobsChanged`.
+  coalesced". An invalid stored cron or an uncomputable next occurrence
+  pauses before prompt delivery with an explicit `paused:` last status,
+  failed history row, `job.reschedule_failed` audit and client note. A prompt
+  delivery error similarly pauses with `job.delivery_failed`, retaining the
+  original due slot even for a one-shot; it is not recorded as completed.
+  Repair the cause, then explicitly run it or re-enable a recurring job.
+  Run completion updates history but cannot erase a paused scheduler error.
+  Everything is audit-logged and broadcasts `JobsChanged`.
 - **Overlap:** each job has `overlap`: `skip` (default) skips a firing
   while the previous one is still queued or running; `queue` queues it.
   Either way a Session never holds more than 5 queued messages: further
@@ -3466,7 +3545,8 @@ refresh a cache, nightly cleanup.
   Run doesn't complete posts a note to every client.
 - **Run now:** `RunJobNow {id}` (`formless jobs run ID`, `/jobs run ID`,
   web "Run now") fires a job at once under the same overlap rules; its
-  schedule is unchanged.
+  schedule is unchanged. A successful manual retry records its outcome in
+  history; it does not resume a paused schedule or clear its pause reason.
 - **Delivery:** `deliver` (`AddJob`, `SetJobOptions`; `jobs add --notify
   --to-file PATH --webhook URL`) sends the answer when the firing's Run
   ends: a desktop notification, a Markdown entry appended to a file,
@@ -3564,10 +3644,28 @@ run_tool = "network_policy"     # a registry Tool, or…
   drafted. Drafts expire after 24 hours and are discarded when config is
   newer. The next launch resumes there (at the key step for providers
   that need one); successful config saves, including CLI setup, delete it.
-- **No key needed.** With no saved setup and no provider key in the
-  environment, a running Ollama or LM Studio (a quick check of its port)
-  is pre-selected and offered: "press Enter to use it (no account or API
-  key needed)".
+- **Local discovery.** With no saved setup or provider key in the
+  environment, a background worker checks the local model-list APIs on
+  `127.0.0.1` and `::1`. First paint does not wait for network I/O. Ollama's
+  `/api/tags` and the OpenAI-compatible `/v1/models` shape identify a model
+  endpoint; an open TCP port alone makes no product claim. Discovery uses
+  at most four bounded GETs (350ms each, 1MiB body cap), without credentials,
+  proxies, redirects, model loads or downloads. The offer arrives only while
+  the untouched provider picker remains current, and selection keeps the
+  detected address, including IPv6. All detected servers remain available;
+  when several answer, the status names each with its model count and each
+  matching preset row is marked found. The initial highlight prefers an
+  endpoint with models, while choosing another detected preset uses its own
+  discovered address. Wrapped status text is included in the picker layout.
+  Empty Ollama offers say to run
+  `ollama pull MODEL`; other empty model APIs say to load a model first.
+  `OLLAMA_HOST` selects Ollama's local discovery address/port/path instead of
+  the default Ollama candidates. Schemeless addresses default to 11434;
+  explicit HTTP/HTTPS default to 80/443, matching Ollama. `localhost` maps to
+  literal loopbacks; unspecified bind addresses map to their loopback family.
+  Remote hosts, credentials, queries/fragments and invalid forms are not
+  probed; setup gives manual-provider guidance without echoing the value.
+  LM-compatible default candidates remain within the same four-GET budget.
 - **The first approval** (TUI and web) adds a short explainer: Tools have
   no access by default, what the Capabilities are, Always vs Once vs this
   Session vs Deny, and `/approvals` / `/revoke` to undo. It is shown until
@@ -3669,7 +3767,14 @@ run_tool = "network_policy"     # a registry Tool, or…
   `;` splits statements except inside quotes, brackets, `|edge labels|`
   and the text after a `:`; a subgraph's `direction` stays inside it;
   note bodies are never states; participants may contain hyphens; a
-  labelled self-loop shows `↺ label`.
+  labelled self-loop shows `↺ label`. Leading YAML frontmatter is removed
+  before parsing any supported diagram; its root scalar or literal/folded
+  block title is a heading (frontmatter takes precedence over an inline pie
+  or sequence title). Configuration/style metadata, tags and aliases are not
+  evaluated by the native renderer. Unclosed frontmatter and overwide titles
+  fall back to source. Decoded title controls are shown as visible escapes
+  before width measurement. Sequence participant `box` groups close silently;
+  nested loop/alt/opt/par/critical/break/rect blocks retain their own dividers.
 - **Wide Mermaid diagrams (TUI).** A diagram wider than the chat shows a
   cut-down preview of its first 12 rows with the hint `/pager diagram N ·
   /open diagram N` (N is the block's `[N]` label). `/pager diagram [N]`
@@ -3732,7 +3837,15 @@ run_tool = "network_policy"     # a registry Tool, or…
   Supported Normal commands: h/j/k/l, w/b/e and W/B/E, 0/$, gg/G; d/c/y with
   those motions, dd/cc/yy, iw/aw/iW/aW, single/double/backtick quotes and nested
   ()/[]/{}/<> objects; i/a/I/A/o/O, x, p/P and dot repeat. Word/character and
-  operator counts are bounded to 999. Yank stays in an internal register;
+  operator counts are bounded to 999. Counts also apply to i/a/I/A/o/O,
+  p/P and dot: insert edits repeat on Esc (open-line commands also repeat
+  their new lines), puts repeat the register, and an explicit dot count
+  replaces the prior change's count. Counted changes insert replacement text
+  once after changing their counted range. Linewise deletes reaching the
+  final line remove its preceding separator, leave the cursor on the first
+  nonblank of the new last line, and retain only the deleted line text in
+  the linewise yank register. Change and yank ranges keep their separators.
+  Yank stays in an internal register;
   no OS clipboard is read or written. Dot repeats the last editing command
   and its unmodified Insert keys/paste; movement and yanks do not replace it.
   Readline control shortcuts in Insert break the current repeat group.
@@ -3754,7 +3867,15 @@ run_tool = "network_policy"     # a registry Tool, or…
     newline. The box grows to 8 rows.
   - ↑/↓ move between lines. On the first or last line they walk the
     current Session's earlier messages, and Down past the newest returns
-    the draft. Ctrl+R searches that history.
+    the draft. Ctrl+R searches that history. History entries are borrowed from
+    the selected Session; typing/searching does not copy every message's text
+    or allocate a lowercased copy of each entry. The search preview reads one
+    matched entry and bounds its text before flattening and measuring it.
+    Reloads, reconnects and stashed-draft restoration invalidate old history
+    indices while preserving the draft, cursor and search query. An invalidated
+    match is blank until another explicit search step; Enter cancels that search
+    without submitting the draft or recalling a different shifted message.
+    Out-of-range Up/Down/search indices cancel safely instead of indexing blindly.
   - Bracketed paste is on, so a paste is one block and its newlines
     never send. Pastes over 8 lines or 1,500 characters show as
     `[pasted N lines #k]` and are sent in full; Backspace removes one as
@@ -3773,7 +3894,9 @@ run_tool = "network_policy"     # a registry Tool, or…
   search snippets and web search highlights match on folded text that
   keeps each character's original position: case folding never shifts a
   highlight (`İstanbul`), and NFC and NFD spellings match each other
-  (macOS file names are NFD). Fuzzy match positions count original
+  (macOS file names are NFD). Native fuzzy matching, snippets and TUI Find
+  also equate German `ß`/`ẞ` with `ss`, preserving each source glyph once
+  in highlights. Query and candidate use the same folding. Fuzzy match positions count original
   Unicode characters, including when a match follows `İ`, rather than
   indices into a lowercased copy. In the web client each message paragraph
   takes its direction from its own text, so Arabic and Hebrew answers are
@@ -4021,6 +4144,12 @@ run_tool = "network_policy"     # a registry Tool, or…
   "ข่าวเทคโนโลยีสัปดาห์นี้"; "このリポジトリのビルドが失敗する原因を…" →
   "ビルド失敗の原因を調べる"; mixed "ช่วย debug โค้ด Rust ตัวนี้…" →
   "Debug Rust Code".
+- **Title cleanup.** Model and fallback heuristic titles strip balanced
+  quote/backtick/emphasis wrappers and a leading Markdown heading marker only
+  when followed by whitespace. Unpaired punctuation is retained: `C#`,
+  `#1234`, an inline code span at the end, and `'til` remain ordinary text.
+  Existing first-line, word/grapheme budgets and trailing sentence-punctuation
+  cleanup still apply.
 - **Attached clients.** `Subscribe` takes a `client` label ("TUI",
   "TUI (plain)", "web", "web (relay)", "CLI") and replies with the
   connection's id, `{subscribed, conn}`. Whenever the clients showing a
@@ -4245,7 +4374,10 @@ run_tool = "network_policy"     # a registry Tool, or…
   - Only `config::ON_TUI_START` (`tui.on_start`, `tui.screen_reader`)
     apply when the TUI next starts. `GetSettings` lists them as
     `on_tui_start`, and `SetSetting` answers `applies: "now" |
-    "on_tui_start"`. The web marks those rows and, after saving one, says
+    "on_tui_start" | "env_override"`. The last means the file was saved but
+    the daemon's environment still controls that key; `override_source`
+    names the variable and `effective_value` gives the runtime value.
+    The web marks TUI-start rows and, after saving one, says
     to restart any running TUI.
   - Web configuration rows are generated from documented current values,
     grouped by their key prefix. The daemon projects only existing SETTABLE
@@ -4281,6 +4413,18 @@ run_tool = "network_policy"     # a registry Tool, or…
   Providers and Roles sections list them with add/edit forms (the API key
   is masked and goes to the keychain through `UpsertProvider`) and `d`
   twice to remove. "config.toml" opens the file in `$VISUAL`/`$EDITOR`.
+  Editing a Role preserves its advanced candidates, system prompt, reasoning
+  effort and turn cap. The form shows a bounded read-only summary of those
+  fields and points to config.toml for editing them; system content is summarized
+  by presence/length. Visible-field edits round-trip the existing Role object.
+
+The setup wizard identifies its active profile in the header; the normal TUI
+status line identifies non-default profiles. If the active profile is
+unconfigured, setup, headless Run errors and doctor diagnostics point to another
+profile with saved provider configuration and show its exact launch command plus
+`formless profiles list`. Alternate discovery reads configuration files only,
+without loading credentials or probing providers. Wizard hints are captured once
+when opened, rather than rescanning profiles during rendering.
 
 ### External composition in the TUI
 
@@ -4384,17 +4528,28 @@ undo, redo and replacements invalidate prior asynchronous editor previews.
   executed. Valid project templates override global templates. Built-in slash
   roots always win, including their subcommands; `/help` groups custom commands
   under **Yours** and identifies shadowed files.
-  The shared Core loader supplies the TUI palette/help and
+  The shared Core loader supplies the TUI palette/help, plain-client expansion/help and
   `formless commands list [--json]`. JSON contains command metadata, diagnostics
   and shadowed-file metadata, never template bodies or expanded arguments.
   CLI discovery resolves paths read-only before profile/daemon setup and never
   creates a profile, starts a daemon, invokes a provider or reads `@path` targets.
   Human-readable file labels escape terminal controls and directional formatting;
   JSON retains the original metadata path strings.
-  TUI discovery refreshes at most every 250 ms while idle and forces a fresh
-  snapshot for help and explicit expansion; its cache binds the profile path,
-  selected Session and working directory. Diagnostic notes are deduplicated by
-  path/reason in a bounded 1024-entry history. Roots may resolve trusted aliases;
+  Plain mode uses the current Session working directory and preserves built-in
+  precedence, including its `/exit` and `/switch` aliases. Expanded bodies are
+  sent as literal message text and never redispatched as slash commands; `//`
+  remains the raw slash-text escape. Invalid-template invocations report the
+  current filename and reason even after a diagnostic note was dismissed.
+  Suggestions include loaded and shadowed template names, with shadowing reasons.
+  A diagnostic key is forgotten when absent from a refreshed snapshot, allowing
+  a newly broken file to be announced again after repair.
+  TUI discovery loads once when the profile/Session/working-directory binding
+  changes. Ordinary idle frames do not read template files or poll their metadata.
+  While a non-literal slash palette is open, it checks bounded directory/file
+  metadata at most every 250 ms and reloads only when that fingerprint changes
+  or cannot be obtained. Help and explicit expansion always force a fresh Core
+  load, regardless of the preview-cache hint. Diagnostic notes are deduplicated
+  by the current snapshot's bounded path/reason keys. Roots may resolve trusted aliases;
   command-directory descendants and files use native no-follow reads and refuse
   reparse points, symlinks, hardlinked files and unsupported namespaces. Each
   directory is bounded to 256 entries and 128 Markdown templates; files are at
@@ -4797,7 +4952,12 @@ previous headless Run's Session.
   dim header, secondary fields dimmed, status in colour, and the widest
   column cut with "…" to fit the terminal. Colour and fitting happen only
   when stdout is a terminal, and `NO_COLOR` turns colour off. Piped output
-  is plain aligned text.
+  is plain aligned text. Headers and cells collapse whitespace to one space
+  before width measurement; other C0/C1 controls and bidi direction marks/overrides/
+  isolates are shown as Unicode escapes in both terminal and piped tables.
+  A cell cannot add rows or terminal styles; the renderer's own colour styles
+  are applied afterward. Printable Unicode (including emoji joiners) is retained.
+  Structured `--json` values are unchanged by table formatting.
 - Every CLI `list`/`status` subcommand takes `--json` and prints one JSON
   value (the daemon's data) instead of a table: `providers`, `roles`,
   `jobs`, `memory`, `mcp`, `skills`, `tools`, `prompts` and `sessions list`,
@@ -4860,9 +5020,14 @@ previous headless Run's Session.
   - `path` prints the config file.
   - `get KEY` prints the effective value (after `FORMLESS_*` overrides);
     an unknown key exits 2.
-  - `set KEY VALUE` goes through `SetSetting`, so it's validated against
+  - `set KEY VALUE` goes through the settings API, so it's validated against
     the allow-list, audited and hot. VALUE is JSON when it parses (`5`,
-    `true`, `["a"]`), else text.
+    `true`, `["a"]`), else text. The five exposed maps (`provider.prices`,
+    `provider.model_context_tokens`, `provider.model_audio_input`,
+    `provider.model_pdf_input`, `tui.colors`) use `MergeSetting` by default:
+    supplied entries replace their whole value, null entries are removed,
+    and siblings survive. `--replace` uses `SetSetting` for whole-map
+    replacement; `--replace '{}'` clears. Lists remain replace-only.
   - `edit` opens a copy in `$VISUAL`/`$EDITOR` (run through `sh -c`, so
     arguments and quotes work) and replaces config.toml only when the copy
     parses. Otherwise it shows the error and, on a terminal, offers to edit
@@ -4894,7 +5059,9 @@ previous headless Run's Session.
   - `text` (default): the answer streams, progress on stderr;
   - `final`: only the last answer, on stdout when the Run ends, with
     progress on stderr only when it's a terminal;
-  - `json`: one `{session_id, status, answer, error}` object at the end;
+  - `json`: one `{session_id, status, answer, result, error}` object at the end;
+    `answer` retains its text form. `result` carries the validated JSON value
+    on a successful schema Run and is null otherwise;
   - `jsonl-events`: every event, one per line; `--json` is the same.
 
   Pipeline options are per Run, never edits to the profile configuration or
@@ -4923,7 +5090,8 @@ previous headless Run's Session.
   background model tests, including when `provider.auto_test_models` is on.
 
   `--schema FILE|-` reads a bounded JSON Schema and compiles it offline before
-  admission. With `-`, stdin is the schema rather than a task or stdin.txt;
+  admission. Both sources accept one leading UTF-8 BOM; the 64 KiB limit counts
+  the original bytes, including the BOM. With `-`, stdin is the schema rather than a task or stdin.txt;
   combining it with task `-` is a usage error. The final answer is validated
   before assistant storage or delivery. Candidate text is not streamed for a
   schema Run. A JSON/schema mismatch allows exactly one paid, no-tools logical
@@ -5266,7 +5434,16 @@ during its snapshot fetch, deduplicated by message id.
 ## 13. Configuration (complete settings table)
 
 - File: `config.toml` in the OS config dir; sections `[daemon] [provider]
-  [optimiser] [metrics] [tools]`. Env vars `FORMLESS_*` override file values.
+  [optimiser] [metrics] [tools]`. The exact config environment overrides are
+  `FORMLESS_BASE_URL` → `provider.base_url`, `FORMLESS_MODEL` → `provider.model`,
+  `FORMLESS_IDLE_GRACE_SECS` → `daemon.idle_grace_secs`, and `FORMLESS_SECURE`
+  → `security.secure`. There is no general `FORMLESS_<SECTION>_<KEY>` rule.
+  Endpoint/model values are trimmed; blank values leave the file value intact.
+  Idle seconds must parse as a nonnegative whole number in the u64 range;
+  whitespace around the number is allowed, but empty, invalid and non-text
+  values produce errors naming the variable and expected form. Secure mode
+  uses the yes/no grammar documented in §10.3. These overrides apply only to
+  the loading process and are never written back by a setting edit.
   Per-Session model/effort live in SQLite, not the file. Nothing configurable
   is a hidden constant: this table is exhaustive for v1.
 - **Saving keeps your file (#610).** Every save (a setting, an MCP
@@ -5277,7 +5454,17 @@ during its snapshot fetch, deduplicated by message id.
   a temporary file beside it, flushed to disk, renamed over it, so a crash
   leaves the old file or the new one.
 - **Changing settings from a client:** clients never write the file.
-  `SetSetting {key, value}` asks the daemon to set one dotted key. The
+  `SetSetting {key, value}` replaces one value. `MergeSetting {key, value}`
+  accepts a JSON object for one of the five exposed maps listed above,
+  merging or deleting entries atomically within the serialized edit.
+  Merge is a separate request so an older daemon rejects it instead of
+  ignoring an unfamiliar mode field and destructively replacing a map.
+  Existing full-map editors continue to use replacement. After an exposed
+  map root, the complete dotted suffix is one literal entry name (including
+  dots and slashes), e.g. `provider.model_context_tokens.vendor/qwen2.5`.
+  `SetSetting` with null removes that one entry; get, harness snapshot/undo,
+  and setters use this same grammar. `models.set` admits entries only for
+  its allow-listed model maps; prices remain `config.set`. The
   daemon checks the key against an allow-list: provider model, effort,
   routing and timing, a few `daemon.*` keys, and the whole `tui`, `tools`,
   `metrics`, `optimiser`, `compaction`, `naming`, `skills` and `artifacts`
@@ -5290,6 +5477,13 @@ during its snapshot fetch, deduplicated by message id.
   that operation releases its lock; environment overrides remain runtime-only.
   Failed mutations or saves do not publish a changed configuration, and an
   import that adds no configuration entries does not rewrite the file.
+  A successful setting write reports `applies: "env_override"` when the
+  daemon's environment supplies its model or idle timeout, with the variable
+  in `override_source` and runtime value in `effective_value`. `value` remains
+  the requested file mutation; unshadowed writes keep `now`/`on_tui_start` and
+  a null `override_source`. Both setting operations return `effective_value`.
+  The CLI names the saved and effective values and source. Its own environment
+  is independent of the daemon's; `config get` uses the client's environment.
   Credentials, `base_url`, `extra_headers`, auth, the relay, MCP servers and
   hooks are never settable this way, locally or over the relay. The TUI
   (`/panes`) and the web Settings view (Edit) use `SetSetting`.
@@ -5429,7 +5623,7 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
 | `tui.notify` | desktop | `off`, `bell`, or `desktop` (terminal or browser notification plus the bell) while you are elsewhere (§10.6) |
 | `tui.notify_min_secs` | 20 | Runs shorter than this finish without a notification (§10.6) |
 | `limits.forecast_confirm_usd` | (none) | Ask before sending when a priced local forecast p90 exceeds this finite nonnegative USD amount; previews add no caps and unpriced/no-history forecasts have no invented dollar range (§5.2) |
-| `limits.daily_usd` / `run_usd` / `run_steps` | (none) | Opt-in spending limits: provider spend per UTC day across Sessions, spend of one Run, and model steps of one Run; a note at 80%, a pause at 100% (§5.2) |
+| `limits.daily_usd` / `run_usd` / `run_steps` | (none) | Opt-in spending limits: provider spend per UTC day across Sessions, spend of one Run, and model steps of one Run; a note at 80%, a pause at 100% (§5.2). Profile edits apply to an in-flight Run before its next model step (§5.4). |
 | `naming.enabled` | true | Rename "Untitled" Sessions after their first Run |
 | `naming.model` / `auto_download` / `timeout_secs` | qwen2.5-0.5b / true / 30 | Embedded naming model (empty: a heuristic title), fetched on first use, and how long one naming may take before the heuristic is used |
 
@@ -5813,6 +6007,14 @@ without an approver fails closed.
 
 ## 19. Testing strategy (summary)
 
+The local Node relay adapter contains HTTP and Upgrade handler failures within
+that request/socket. Malformed asset path escapes return 400; malformed mock
+provider JSON returns an OpenAI-shaped 400 error. Unexpected HTTP failures
+return a generic 500 before headers, or close the response after streaming
+starts. Upgrade failures close only their socket. These dev-only boundaries
+do not change Worker claim checks, transport/room rules or mock script behavior.
+Loopback regressions verify subsequent health and valid requests still work.
+
 Test waits for daemon subscriptions and pipe creation have a ten-second
 absolute timeout with a diagnostic naming the missing event. Test-running
 CI jobs have an explicit job timeout. The Windows transport gate parses a
@@ -5842,6 +6044,24 @@ and fallback tests use the same lock as setters. Tests pin hostile inherited
 credentials, named-provider/file overrides, unwind restoration and contrasting
 parallel mock keys. A source check rejects bare environment mutation outside the
 shared helper.
+
+The environment documentation inventory checks every `FORMLESS_*` reference
+under `crates/*/src` against README or SPEC, including test-only references.
+`FORMLESS_DAEMON_LOG` is explicitly excluded: it is internal log-routing state,
+not a user override. Named key fixtures use the documented
+`FORMLESS_API_KEY_<NAME>` / `FORMLESS_API_KEY_<NAME>_FILE` families.
+Private subprocess fixtures also use these test-only variables (no product
+configuration interface): `FORMLESS_DOCS_OPENER_FIXTURE`,
+`FORMLESS_FORECAST_FIXTURE_DB`, `FORMLESS_FORECAST_FIXTURE_MODE`,
+`FORMLESS_MOTION_TEST_CHILD`, `FORMLESS_PRIVATE_ARTIFACT_PERMISSION_DATA`,
+`FORMLESS_PRIVATE_EDITOR_ACK`, `FORMLESS_PRIVATE_EDITOR_FILE`,
+`FORMLESS_PRIVATE_EDITOR_MODE`, `FORMLESS_PRIVATE_EDITOR_RECORD`,
+`FORMLESS_PRIVATE_EDITOR_RESULT`, `FORMLESS_PRIVATE_REFRESH_LOCK_FIXTURE`,
+`FORMLESS_PRIVATE_SNAPSHOT_CASE`, `FORMLESS_TEST_IMMEDIATE_RELEASE_MODE`,
+`FORMLESS_TEST_MAINTENANCE_CONFIG`, `FORMLESS_TEST_MAINTENANCE_DATA`,
+`FORMLESS_TEST_MAINTENANCE_ISOLATION`, `FORMLESS_TEST_MAINTENANCE_OPERATION`,
+`FORMLESS_TEST_OWNERSHIP_CONFIG`, `FORMLESS_TEST_OWNERSHIP_DATA`,
+`FORMLESS_TEST_PANIC_MARKER`.
 
 `FORMLESS_EXPORT_DESCRIPTOR_FIXTURE` is a Linux-only export test hook pointing
 to an owned redirected-stdout alias; it verifies that descriptor output preserves

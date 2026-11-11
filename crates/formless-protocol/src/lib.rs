@@ -22,6 +22,8 @@ pub const MIN_PROTOCOL_VERSION: u32 = 1;
 
 /// Named optional capabilities, advertised by `Ping` and `Status`.
 pub const FEATURES: &[&str] = &[
+    "setting_env_override",
+    "setting_map_merge",
     "subscribe_filter",
     "ask_user",
     "approval_batches",
@@ -2300,7 +2302,14 @@ pub enum Request {
     },
     /// Change one setting (SPEC §13), validated by the daemon against an
     /// allow-list; credentials and endpoints are never settable.
+    /// Replace a complete value, or set/remove one literal map entry.
     SetSetting {
+        key: String,
+        value: serde_json::Value,
+    },
+    /// Merge a map atomically. A separate request makes older daemons reject
+    /// the operation instead of ignoring a new mode field and replacing it.
+    MergeSetting {
         key: String,
         value: serde_json::Value,
     },

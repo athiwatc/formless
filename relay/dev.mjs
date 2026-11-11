@@ -21,6 +21,7 @@ import { readFile } from "node:fs/promises";
 import { extname, join, normalize, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DevStorage } from "./dev-storage.mjs";
+import { httpBoundary, upgradeBoundary } from "./dev-errors.mjs";
 import { LIMITS } from "./web/transport.mjs";
 import { verifyDaemonClaim } from "./daemon-claim.mjs";
 import worker, { RelayRoom, SECURITY_HEADERS } from "./worker.js";
@@ -46,7 +47,14 @@ const env = {
   ASSETS: {
     async fetch(request) {
       const path = new URL(request.url).pathname;
-      const rel = path === "/" ? "index.html" : normalize(decodeURIComponent(path)).replace(/^[/\\]+/, "");
+      let decoded;
+      try {
+        decoded = decodeURIComponent(path);
+      } catch (error) {
+        if (error instanceof URIError) return new Response("bad request", { status: 400 });
+        throw error;
+      }
+      const rel = path === "/" ? "index.html" : normalize(decoded).replace(/^[/\\]+/, "");
       const file = join(webRoot, rel);
       if (!file.startsWith(webRoot)) return new Response("not found", { status: 404 });
       try {
@@ -236,7 +244,7 @@ async function mockChat(body, res) {
 }
 
 // ---------------------------------------------------------------- server
-export const server = createServer(async (req, res) => {
+async function handleHttp(req, res) {
   const url = new URL(req.url, "http://localhost");
   if (mock && url.pathname.startsWith("/mock/v1/")) {
     if (url.pathname.endsWith("/models")) {
@@ -245,7 +253,18 @@ export const server = createServer(async (req, res) => {
     }
     let raw = "";
     for await (const chunk of req) raw += chunk;
-    return mockChat(JSON.parse(raw || "{}"), res);
+    let body;
+    try {
+      body = JSON.parse(raw || "{}");
+    } catch (error) {
+      if (!(error instanceof SyntaxError)) throw error;
+      return mockBadRequest(res, "Invalid JSON request body", "invalid_json");
+    }
+    if (body === null || typeof body !== "object" || Array.isArray(body)) {
+      return mockBadRequest(res, "Request body must be a JSON object", "invalid_request");
+    }
+    // Keep asynchronous mock failures within the awaited request handler.
+    return await mockChat(body, res);
   }
   // Everything else is the Worker's: /health, /push/key and the assets.
   const response = await worker.fetch(new Request("http://localhost" + req.url, { method: req.method, headers: req.headers }), env);
@@ -253,8 +272,12 @@ export const server = createServer(async (req, res) => {
   if (headers["content-security-policy"]) headers["content-security-policy"] = DEV_CSP;
   res.writeHead(response.status, headers);
   res.end(Buffer.from(await response.arrayBuffer()));
-});
-server.on("upgrade", async (req, socket) => {
+}
+function mockBadRequest(res, message, code) {
+  res.writeHead(400, { "content-type": "application/json; charset=utf-8" });
+  res.end(JSON.stringify({ error: { message, type: "invalid_request_error", param: null, code } }));
+}
+async function handleUpgrade(req, socket) {
   const url = new URL(req.url, "http://localhost");
   const m = url.pathname.match(/^\/relay\/([a-f0-9]{32})$/);
   if (!m) return socket.destroy();
@@ -266,7 +289,9 @@ server.on("upgrade", async (req, socket) => {
   if (url.searchParams.get("transport")!=="1"||(role==="daemon"&&url.searchParams.get("mux")!=="1")) {socket.end("HTTP/1.1 426 Upgrade Required\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");return;}
   if (socket.destroyed) return;
   joinRoom(m[1], role, url.searchParams.get("mux") === "1", req.headers["user-agent"] || "", req, socket);
-});
+}
+export const server = createServer((req, res) => { void httpBoundary(req, res, handleHttp); });
+server.on("upgrade", (req, socket) => { void upgradeBoundary(req, socket, handleUpgrade); });
 if(process.argv[1]&&resolve(process.argv[1])===fileURLToPath(import.meta.url))server.listen(port, "127.0.0.1", () => {
   console.log("formless dev relay on http://127.0.0.1:" + server.address().port + (mock ? " (mock provider at /mock/v1)" : ""));
 });

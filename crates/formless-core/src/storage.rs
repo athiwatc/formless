@@ -8,6 +8,10 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
+#[cfg(test)]
+#[path = "job_schedule_tests.rs"]
+mod job_schedule_tests;
+
 /// Token use for one key and model: (key, model, prompt, completion,
 /// cached, provider-reported USD when every request reported one).
 /// (key, provider, model, prompt, completion, cached, cache-write, reported cost).
@@ -1404,6 +1408,27 @@ impl Store {
         self.get_session(id)
     }
 
+    /// Exact role pins, including archived and soft-deleted Sessions which
+    /// can still be restored. Do not use the paginated visible Session list.
+    pub fn role_references(&self, role: &str) -> Result<Vec<String>> {
+        let mut stmt = self.ps(
+            "SELECT 'Session', id, COALESCE(NULLIF(name,''),id) FROM sessions WHERE model=?1
+             UNION ALL SELECT 'template', name, name FROM session_templates WHERE model=?1
+             ORDER BY 1,2",
+        )?;
+        let rows = stmt.query_map(params![format!("role:{role}")], |r| {
+            let kind: String = r.get(0)?;
+            let id: String = r.get(1)?;
+            let label: String = r.get(2)?;
+            Ok(if kind == "Session" {
+                format!("Session {label:?} ({id})")
+            } else {
+                format!("template {label:?}")
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     pub fn save_template(&self, t: &TemplateInfo) -> Result<()> {
         self.ex(
             "INSERT OR REPLACE INTO session_templates
@@ -1697,6 +1722,28 @@ impl Store {
             |r| r.get(0),
         )?;
         Ok(n as usize)
+    }
+
+    /// Sum of top-level `attachments` array lengths for one Session.
+    ///
+    /// Selects only `meta` and steps one row at a time, so context usage
+    /// does not materialize transcript content. Unreadable metadata and
+    /// malformed JSON add nothing, matching `row_msg`. Any role counts.
+    pub(crate) fn attachment_entry_count(&self, session_id: &str) -> Result<usize> {
+        let mut statement =
+            self.ps("SELECT meta FROM messages WHERE session_id=?1 AND meta IS NOT NULL")?;
+        let mut rows = statement.query(params![session_id])?;
+        let mut total = 0usize;
+        while let Some(row) = rows.next()? {
+            // Same conversion as `row_msg`: unreadable metadata is absence.
+            let meta: Option<String> = row.get("meta").ok().flatten();
+            if let Some(meta) = meta {
+                if let Ok(value) = serde_json::from_str::<Value>(&meta) {
+                    total += value["attachments"].as_array().map_or(0, Vec::len);
+                }
+            }
+        }
+        Ok(total)
     }
 
     pub fn list_checkpoints(&self, session_id: &str) -> Result<Vec<(String, i64)>> {
@@ -2305,10 +2352,45 @@ impl Store {
 
     /// The user enables (which also approves) or disables a job.
     pub fn set_job_enabled(&self, id: &str, enabled: bool) -> Result<bool> {
-        Ok(self.ex(
-            "UPDATE jobs SET enabled=?2, approved=CASE WHEN ?2 THEN 1 ELSE approved END WHERE id=?1",
-            params![id, enabled],
-        )? > 0)
+        self.set_job_enabled_with_clock(id, enabled, chrono::Local::now)
+    }
+
+    #[cfg(test)]
+    fn set_job_enabled_at(
+        &self,
+        id: &str,
+        enabled: bool,
+        now: chrono::DateTime<chrono::Local>,
+    ) -> Result<bool> {
+        self.set_job_enabled_with_clock(id, enabled, || now)
+    }
+
+    fn set_job_enabled_with_clock(
+        &self,
+        id: &str,
+        enabled: bool,
+        clock: impl FnOnce() -> chrono::DateTime<chrono::Local>,
+    ) -> Result<bool> {
+        self.transaction(|st| {
+            let Some(job) = st.get_job(id)? else { return Ok(false); };
+            if !enabled {
+                return Ok(st.ex("UPDATE jobs SET enabled=0 WHERE id=?1", params![id])? > 0);
+            }
+            // Repeated enable must not discard legitimate downtime catch-up.
+            if job.enabled && job.approved { return Ok(true); }
+            // Read time after acquiring the SQLite writer boundary; waiting
+            // for a busy writer must not leave the next slot in the past.
+            let now = clock();
+            let next = match job.cron.as_deref() {
+                Some(cron) => crate::jobs::first_run(Some(cron), None, now)?,
+                None => {
+                    let error = "one-shot job has expired or completed; use jobs run ID explicitly or create a new schedule";
+                    let at = job.next_run.as_deref().context(error)?;
+                    crate::jobs::parse_at(at, now).context(error)?
+                }
+            };
+            Ok(st.ex("UPDATE jobs SET enabled=1, approved=1, next_run=?2 WHERE id=?1", params![id, next.to_rfc3339()])? > 0)
+        })
     }
 
     /// Record a job's run; `next_run` None ends a one-shot job.
@@ -2321,10 +2403,20 @@ impl Store {
         Ok(())
     }
 
+    /// Pause a scheduler failure without consuming its due occurrence.
+    pub(crate) fn pause_job(&self, id: &str, status: &str) -> Result<()> {
+        self.ex(
+            "UPDATE jobs SET enabled=0, last_run=?2, last_status=?3 WHERE id=?1",
+            params![id, now(), status],
+        )?;
+        Ok(())
+    }
+
     /// A firing's Run ended: its outcome becomes the job's last status.
     pub fn job_ran_status(&self, id: &str, status: &str) -> Result<()> {
         self.ex(
-            "UPDATE jobs SET last_status=?2 WHERE id=?1",
+            "UPDATE jobs SET last_status=?2 WHERE id=?1
+             AND NOT (enabled=0 AND last_status LIKE 'paused: %')",
             params![id, status],
         )?;
         Ok(())
@@ -2418,6 +2510,26 @@ impl Store {
             |r| r.get(0),
         )?;
         Ok((rows, steps))
+    }
+
+    /// Error of the immediately preceding Run only when it was explicitly
+    /// resumed. A fresh message after a paused/completed Run resets guidance.
+    pub fn previous_resumed_run_error(
+        &self,
+        session_id: &str,
+        run_id: &str,
+    ) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT CASE WHEN status='resumed' THEN error END FROM runs
+             WHERE session_id=?1 AND rowid<(SELECT rowid FROM runs WHERE id=?2 AND session_id=?1)
+             ORDER BY rowid DESC LIMIT 1",
+                params![session_id, run_id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
     }
 
     /// Record why a Run stopped.
@@ -7219,6 +7331,10 @@ mod description_store_tests;
 #[cfg(test)]
 #[path = "session_lineage_tests.rs"]
 mod session_lineage_tests;
+
+#[cfg(test)]
+#[path = "attachment_entry_count_tests.rs"]
+mod attachment_entry_count_tests;
 
 #[path = "session_comparison.rs"]
 mod session_comparison;

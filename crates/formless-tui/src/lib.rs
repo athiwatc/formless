@@ -5,6 +5,8 @@ mod commands;
 mod external_editor;
 mod external_editor_ui;
 mod highlight;
+#[cfg(test)]
+mod history_tests;
 mod hunk_controller;
 mod hunk_ui;
 mod hunk_view;
@@ -19,6 +21,8 @@ mod mermaid;
 mod notify;
 mod picker;
 pub mod plain;
+#[cfg(test)]
+mod profile_context_tests;
 pub mod qr;
 mod session_ui;
 mod settings;
@@ -698,6 +702,7 @@ fn approval_inspection_lines(req: &ApprovalReq, summary: Option<&str>) -> Vec<St
 }
 
 enum WizardJob {
+    Local(u64, formless_core::local_servers::Discovery),
     Models(u64, Result<Vec<String>, String>),
     Probe(u64, Result<ProbeResult, String>),
 }
@@ -723,6 +728,8 @@ enum WizardStep {
 }
 
 struct Wizard {
+    profile: String,
+    setup_hint: Option<String>,
     step: WizardStep,
     /// Highlighted row in `PickPreset`: a preset, or `PRESETS.len()` for
     /// a custom URL.
@@ -745,6 +752,8 @@ struct Wizard {
     reveal_key: bool,
     reveal_until: Option<Instant>,
     generation: u64,
+    local_pending: bool,
+    local_offers: Vec<formless_core::local_servers::LocalServer>,
     /// Endpoint under which the current key/model were entered.
     credential_endpoint: String,
     /// Only an explicitly re-opened setup can return to an existing Session.
@@ -793,6 +802,8 @@ impl Wizard {
             .and_then(|e| EFFORTS.iter().position(|x| *x == Some(e)))
             .unwrap_or(0);
         Self {
+            profile: "default".into(),
+            setup_hint: None,
             step,
             preset_idx,
             preset,
@@ -808,6 +819,8 @@ impl Wizard {
             reveal_key: false,
             reveal_until: None,
             generation: 0,
+            local_pending: false,
+            local_offers: Vec::new(),
             credential_endpoint: cfg.provider.base_url.trim().to_string(),
             can_cancel: false,
             confirm_key_change: false,
@@ -819,11 +832,41 @@ impl Wizard {
         }
     }
 
-    /// The wizard to show: a resumed draft (SPEC §10.1) when there is one
-    /// and no saved setup, else a fresh one that offers a local server
-    /// already running when no key is around.
-    fn start(cfg: &Config, paths: &Paths) -> Self {
+    /// Profile context is discovered once, never during frame rendering.
+    fn new_for_profile(cfg: &Config, paths: &Paths) -> Self {
         let mut w = Self::new(cfg);
+        w.profile = paths.profile.clone();
+        if !cfg.provider.is_configured() {
+            w.setup_hint = formless_core::profile_setup::alternate_setup_hint(paths)
+                .map(|hint| format!("This profile needs setup. {hint}"));
+        }
+        w
+    }
+
+    /// Resume a draft, or offer an already running local server.
+    fn start(cfg: &Config, paths: &Paths) -> Self {
+        Self::start_with_discovery(
+            cfg,
+            paths,
+            formless_core::local_servers::discover_with_guidance,
+        )
+    }
+
+    #[cfg(test)]
+    fn start_with_detector(
+        cfg: &Config,
+        paths: &Paths,
+        detect: impl FnOnce() -> Vec<formless_core::local_servers::LocalServer> + Send + 'static,
+    ) -> Self {
+        Self::start_with_discovery(cfg, paths, move || detect().into())
+    }
+
+    fn start_with_discovery(
+        cfg: &Config,
+        paths: &Paths,
+        detect: impl FnOnce() -> formless_core::local_servers::Discovery + Send + 'static,
+    ) -> Self {
+        let mut w = Self::new_for_profile(cfg, paths);
         if w.step != WizardStep::PickPreset {
             return w;
         }
@@ -831,7 +874,7 @@ impl Wizard {
             w.resume(&d);
             return w;
         }
-        w.offer_local();
+        w.offer_local_with(detect);
         w
     }
 
@@ -878,6 +921,13 @@ impl Wizard {
     /// No saved setup and no key in the environment: offer Ollama or
     /// LM Studio if one is already running here (#398).
     fn offer_local(&mut self) {
+        self.offer_local_with(formless_core::local_servers::discover_with_guidance);
+    }
+
+    fn offer_local_with(
+        &mut self,
+        detect: impl FnOnce() -> formless_core::local_servers::Discovery + Send + 'static,
+    ) {
         let presets = formless_core::presets::PRESETS;
         if presets
             .iter()
@@ -885,16 +935,12 @@ impl Wizard {
         {
             return;
         }
-        for (i, p) in presets.iter().enumerate().filter(|(_, p)| p.local) {
-            if local_server_running(p.base_url) {
-                self.preset_idx = i;
-                self.status = format!(
-                    "Welcome to Formless. {} is running on this machine: press Enter to use it (no account or API key needed), or choose another provider.",
-                    p.name
-                );
-                return;
-            }
-        }
+        self.local_pending = true;
+        let generation = self.generation;
+        let tx = self.job_tx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(WizardJob::Local(generation, detect()));
+        });
     }
 
     /// What to keep if the TUI quits here: never the key.
@@ -946,6 +992,7 @@ impl Wizard {
     }
 
     fn invalidate_jobs(&mut self) {
+        self.local_pending = false;
         self.generation = self.generation.wrapping_add(1);
         self.hide_key();
         self.confirm_key_change = false;
@@ -1039,6 +1086,16 @@ impl Wizard {
         });
     }
 
+    fn local_offer_for(
+        &self,
+        preset_id: &str,
+    ) -> Option<&formless_core::local_servers::LocalServer> {
+        self.local_offers
+            .iter()
+            .filter(|offer| offer.preset_id == preset_id)
+            .min_by_key(|offer| offer.models == 0)
+    }
+
     /// Apply the highlighted preset (or go to the custom URL step).
     fn choose_preset(&mut self) {
         let Some(p) = formless_core::presets::PRESETS.get(self.preset_idx) else {
@@ -1051,14 +1108,18 @@ impl Wizard {
             self.status = "Enter your provider base URL (any OpenAI-compatible endpoint).".into();
             return;
         };
+        let endpoint = self
+            .local_offer_for(p.id)
+            .map(|offer| offer.base_url.clone())
+            .unwrap_or_else(|| p.base_url.to_string());
         if self.preset.map(|old| old.id) != Some(p.id)
-            || self.credential_endpoint != p.base_url.trim()
+            || self.credential_endpoint != endpoint.trim()
         {
             self.clear_provider_state();
         }
         self.preset = Some(p);
-        self.base_url = p.base_url.to_string();
-        self.credential_endpoint = p.base_url.trim().to_string();
+        self.base_url = endpoint;
+        self.credential_endpoint = self.base_url.trim().to_string();
         if self.saved_model.is_empty() {
             self.saved_model = p.default_model.to_string();
         }
@@ -1109,21 +1170,6 @@ fn wizard_draft_file(paths: &Paths) -> std::path::PathBuf {
 
 fn load_wizard_draft(paths: &Paths) -> Option<serde_json::Value> {
     formless_core::setup_draft::load(paths)
-}
-
-/// Something answers on a local server's port (a quick TCP check).
-fn local_server_running(base_url: &str) -> bool {
-    let Some(hostport) = base_url
-        .split("://")
-        .nth(1)
-        .and_then(|r| r.split('/').next())
-    else {
-        return false;
-    };
-    let hostport = hostport.replace("localhost", "127.0.0.1");
-    hostport
-        .parse::<std::net::SocketAddr>()
-        .is_ok_and(|a| std::net::TcpStream::connect_timeout(&a, Duration::from_millis(150)).is_ok())
 }
 
 /// A Tool call waiting in step mode (SPEC §5.9).
@@ -1472,6 +1518,37 @@ fn window_source_text(source: &str) -> &'static str {
 fn truncate_chars(s: &str, max: usize) -> String {
     let flat: String = s.chars().map(|c| if c == '\n' { ' ' } else { c }).collect();
     text::truncate(&flat, max)
+}
+
+/// Borrow this Session's user payloads; collecting the iterator copies only
+/// references. Rendering selects a single entry without collecting at all.
+fn input_history<'a>(
+    messages: &'a [MessageInfo],
+    session: Option<&'a str>,
+) -> impl DoubleEndedIterator<Item = &'a str> + 'a {
+    messages
+        .iter()
+        .filter(move |message| {
+            message.role == "user" && session == Some(message.session_id.as_str())
+        })
+        .map(|message| message.content.as_str())
+}
+
+/// Bound preview work before newline expansion/terminal measurement. Drop the
+/// final partial cluster when the byte budget cuts a very large history entry.
+fn history_preview(text: &str, columns: usize) -> String {
+    let mut end = text.len().min(columns.saturating_mul(32).max(64));
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    if end < text.len() {
+        end = text::prev_cluster(&text[..end], end);
+    }
+    let mut flat = text[..end].replace('\n', " ⏎ ");
+    if end < text.len() {
+        flat.push('…');
+    }
+    text::truncate(&flat, columns)
 }
 
 /// Render persisted assistant tool-call metadata as display lines.
@@ -2304,6 +2381,7 @@ impl App {
             // Do not move an old Session's retained input into another Session.
             self.stash_current_draft(&session_id);
             self.current = None;
+            self.input.invalidate_history();
             self.messages.clear();
             self.notes.push("The previous Session is no longer available; its draft is kept. Choose a Session or use /new once reconnected.".into());
         }
@@ -2488,6 +2566,7 @@ impl App {
             }
         }
         messages.sort_by_key(|message| message.seq);
+        self.input.invalidate_history();
         self.messages = messages;
         self.md_cache.borrow_mut().clear();
         self.queued = queued;
@@ -2710,6 +2789,7 @@ impl App {
         if !self.is_current(session_id) {
             return;
         }
+        self.input.invalidate_history();
         let draft = Draft {
             input: std::mem::take(&mut self.input),
             attachments: std::mem::take(&mut self.attachments),
@@ -4493,24 +4573,14 @@ impl App {
                             });
                         }
                         Pending::RateLimits => {
-                            for (endpoint, l) in result.as_object().into_iter().flatten() {
-                                let mut parts = Vec::new();
-                                for kind in ["requests", "tokens"] {
-                                    if let Some(rem) = l[format!("remaining-{kind}")].as_str() {
-                                        let limit =
-                                            l[format!("limit-{kind}")].as_str().unwrap_or("?");
-                                        let reset = l[format!("reset-{kind}")]
-                                            .as_str()
-                                            .map(|r| format!(", resets {r}"))
-                                            .unwrap_or_default();
-                                        parts.push(format!("{rem}/{limit} {kind} left{reset}"));
-                                    }
-                                }
-                                if !parts.is_empty() {
-                                    self.notes.push(format!(
-                                        "rate limit at {endpoint}: {}",
-                                        parts.join(" · ")
-                                    ));
+                            for entry in result
+                                .as_object()
+                                .into_iter()
+                                .flatten()
+                                .map(|(_, value)| value)
+                            {
+                                if let Some(line) = entry["line"].as_str() {
+                                    self.notes.push(line.to_string());
                                 }
                             }
                         }
@@ -4773,6 +4843,7 @@ impl App {
                             }
                             if let Some(msgs) = result.get("messages").cloned() {
                                 if let Ok(v) = serde_json::from_value::<Vec<MessageInfo>>(msgs) {
+                                    self.input.invalidate_history();
                                     self.messages = v;
                                     if let Some(at) = self.jump_to.take() {
                                         self.focus_call_at(&at);
@@ -5251,6 +5322,7 @@ impl App {
         // Each Session keeps its own unsent input (SPEC §10.2).
         if self.current.as_deref() != Some(id.as_str()) {
             if let Some(old) = self.current.take() {
+                self.input.invalidate_history();
                 let draft = Draft {
                     input: std::mem::take(&mut self.input),
                     attachments: std::mem::take(&mut self.attachments),
@@ -5261,6 +5333,7 @@ impl App {
             }
             let draft = self.drafts.remove(&id).unwrap_or_default();
             self.input = draft.input;
+            self.input.invalidate_history();
             self.attachments = draft.attachments;
             self.target_flash = Some(Instant::now() + Duration::from_millis(700));
         }
@@ -6332,6 +6405,7 @@ impl App {
                 if self.is_current(&id) {
                     self.stash_current_draft(&id);
                     self.current = None;
+                    self.input.invalidate_history();
                     self.messages.clear();
                     self.streaming.clear();
                     self.thinking.clear();
@@ -7997,7 +8071,7 @@ impl App {
                 // re-enter a key, or Esc back to change provider (§10.1).
                 match Config::load(&self.paths) {
                     Ok(cfg) => {
-                        let mut w = Wizard::new(&cfg);
+                        let mut w = Wizard::new_for_profile(&cfg, &self.paths);
                         w.can_cancel = cfg.provider.is_configured();
                         if w.step == WizardStep::PickPreset {
                             w.offer_local();
@@ -8250,10 +8324,17 @@ impl App {
             }
             "quit" if !self.running_sessions.is_empty() => self.quit_confirm = true,
             "quit" => self.should_quit = true,
-            other => self.notes.push(match commands::closest(other) {
-                Some(name) => format!("unknown command: /{other} — did you mean /{name}?"),
-                None => format!("unknown command: /{other} (/help lists them)"),
-            }),
+            other => {
+                let snapshot = self.user_command_snapshot(true);
+                self.user_commands_tick();
+                self.notes.push(match user_commands_ui::unavailable(&snapshot, other.split_whitespace().next().unwrap_or(other)) {
+                    Some(message) => message,
+                    None => match user_commands_ui::suggestion(&snapshot, other) {
+                        Some(suggestion) => format!("unknown command: /{other} — {suggestion}"),
+                        None => format!("unknown command: /{other} (/help lists them)"),
+                    }
+                });
+            },
         }
     }
 
@@ -8366,6 +8447,11 @@ impl App {
             }
             while let Ok(job) = w.jobs.try_recv() {
                 let current = match &job {
+                    WizardJob::Local(generation, _) => {
+                        *generation == w.generation
+                            && w.step == WizardStep::PickPreset
+                            && w.local_pending
+                    }
                     WizardJob::Models(generation, _) => {
                         *generation == w.generation && w.step == WizardStep::FetchModels
                     }
@@ -8378,9 +8464,65 @@ impl App {
                 }
                 // An operation settles once; duplicate deliveries cannot
                 // override its outcome or finish a subsequently edited flow.
-                w.generation = w.generation.wrapping_add(1);
-                w.draft_changed = Some(Instant::now());
+                if !matches!(&job, WizardJob::Local(..)) {
+                    w.generation = w.generation.wrapping_add(1);
+                    w.draft_changed = Some(Instant::now());
+                }
                 match job {
+                    WizardJob::Local(_, discovery) => {
+                        w.local_pending = false;
+                        if let Some(hint) = discovery.hint.as_deref() {
+                            w.status = hint.to_string();
+                        }
+                        w.local_offers = discovery.servers;
+                        if let Some(offer) = w
+                            .local_offers
+                            .iter()
+                            .filter(|offer| {
+                                formless_core::presets::find(offer.preset_id)
+                                    .is_some_and(|p| p.local)
+                            })
+                            .min_by_key(|offer| offer.models == 0)
+                        {
+                            if let Some(index) = formless_core::presets::PRESETS
+                                .iter()
+                                .position(|p| p.id == offer.preset_id)
+                            {
+                                w.preset_idx = index;
+                                let offer_text = if w.local_offers.len() == 1 {
+                                    offer.offer()
+                                } else {
+                                    let summary = w
+                                        .local_offers
+                                        .iter()
+                                        .map(|server| {
+                                            let name =
+                                                formless_core::presets::find(server.preset_id)
+                                                    .map_or(server.preset_id, |p| {
+                                                        p.name.trim_end_matches(" (local)")
+                                                    });
+                                            format!(
+                                                "{name} ({} model{})",
+                                                server.models,
+                                                if server.models == 1 { "" } else { "s" }
+                                            )
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join(", ");
+                                    let action = if offer.models == 0 {
+                                        offer.offer()
+                                    } else {
+                                        "Press Enter to use the highlighted provider.".to_string()
+                                    };
+                                    format!("Found {summary}. {action}")
+                                };
+                                w.status = match discovery.hint {
+                                    Some(hint) => format!("{hint} {offer_text}"),
+                                    None => offer_text,
+                                };
+                            }
+                        }
+                    }
                     WizardJob::Models(_, Ok(models)) if !models.is_empty() => {
                         let items = models
                             .into_iter()
@@ -8583,6 +8725,9 @@ impl App {
         }
         let Some(w) = &mut self.wizard else { return };
         let presets = formless_core::presets::PRESETS.len();
+        if w.step == WizardStep::PickPreset {
+            w.local_pending = false;
+        }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         // Ctrl+R shows the key while typing it (#396).
         if ctrl && key.code == KeyCode::Char('r') {
@@ -10890,16 +11035,6 @@ impl App {
         }
     }
 
-    /// The user messages of the current Session, oldest first: the input
-    /// history for Up/Down and Ctrl+R.
-    fn input_history(&self) -> Vec<String> {
-        self.messages
-            .iter()
-            .filter(|m| m.role == "user")
-            .map(|m| m.content.clone())
-            .collect()
-    }
-
     /// Chat-view keys: the line editor, history, sending and scrolling
     /// (PgUp/PgDn and the wheel; ↑/↓ belong to the input).
     fn input_key(&mut self, key: KeyEvent) {
@@ -10934,7 +11069,7 @@ impl App {
             return;
         }
         if self.input.searching().is_some() {
-            let history = self.input_history();
+            let history: Vec<_> = input_history(&self.messages, self.current.as_deref()).collect();
             match key.code {
                 KeyCode::Char('r') if ctrl => self.input.search_older(&history),
                 KeyCode::Char('g') if ctrl => self.input.search_cancel(),
@@ -11028,11 +11163,13 @@ impl App {
             KeyCode::Up if !self.input.on_first_line() => self.input.vertical(false),
             KeyCode::Down if !self.input.on_last_line() => self.input.vertical(true),
             KeyCode::Up => {
-                let history = self.input_history();
+                let history: Vec<_> =
+                    input_history(&self.messages, self.current.as_deref()).collect();
                 self.input.history_prev(&history);
             }
             KeyCode::Down => {
-                let history = self.input_history();
+                let history: Vec<_> =
+                    input_history(&self.messages, self.current.as_deref()).collect();
                 self.input.history_next(&history);
             }
             KeyCode::End if self.input.is_empty() => self.follow_chat_bottom(),
@@ -11119,7 +11256,8 @@ impl App {
                 'k' => self.input.kill_to_end(),
                 'd' => self.input.delete(),
                 'r' => {
-                    let history = self.input_history();
+                    let history: Vec<_> =
+                        input_history(&self.messages, self.current.as_deref()).collect();
                     self.input.search_older(&history);
                 }
                 'v' => self.paste_image(),
@@ -11523,37 +11661,27 @@ fn highlight_matches(
     query: &str,
     style: impl Fn(usize) -> Style,
 ) -> (Line<'static>, usize) {
-    let q: Vec<char> = query.chars().flat_map(char::to_lowercase).collect();
-    if q.is_empty() {
+    if formless_core::fuzzy::fold(query).is_empty() {
         return (line, 0);
     }
     let mut found = 0;
     let mut spans = Vec::new();
     for span in line.spans {
         let chars: Vec<char> = span.content.chars().collect();
-        let low: Vec<char> = chars
-            .iter()
-            .map(|c| c.to_lowercase().next().unwrap_or(*c))
-            .collect();
-        let (mut start, mut i) = (0, 0);
-        while i + q.len() <= chars.len() {
-            if low[i..i + q.len()] == q[..] {
-                if i > start {
-                    spans.push(Span::styled(
-                        chars[start..i].iter().collect::<String>(),
-                        span.style,
-                    ));
-                }
+        let mut start = 0;
+        for range in formless_core::fuzzy::folded_match_ranges(&span.content, query) {
+            if range.start > start {
                 spans.push(Span::styled(
-                    chars[i..i + q.len()].iter().collect::<String>(),
-                    style(found),
+                    chars[start..range.start].iter().collect::<String>(),
+                    span.style,
                 ));
-                found += 1;
-                i += q.len();
-                start = i;
-            } else {
-                i += 1;
             }
+            spans.push(Span::styled(
+                chars[range.clone()].iter().collect::<String>(),
+                style(found),
+            ));
+            found += 1;
+            start = range.end;
         }
         if start == 0 {
             spans.push(span);
@@ -12039,13 +12167,13 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App, show_cursor: bool) {
     let mut cursor = Some((0usize, 0usize));
     if let Some((query, found)) = app.input.searching() {
         let hit = found
-            .and_then(|i| app.input_history().get(i).cloned())
+            .and_then(|i| input_history(&app.messages, app.current.as_deref()).nth(i))
             .unwrap_or_default();
         let label = format!("(history search) {query}▏: ");
         lines.push(Line::from(vec![
             Span::styled(label.clone(), bold_fg(app.color, Color::Magenta)),
-            Span::raw(truncate_chars(
-                &hit.replace('\n', " ⏎ "),
+            Span::raw(history_preview(
+                hit,
                 avail.saturating_sub(label.chars().count()),
             )),
         ]));
@@ -12208,6 +12336,13 @@ fn input_height(app: &App, width: u16) -> u16 {
 fn draw_status(f: &mut Frame, area: Rect, app: &App) {
     let sep = || Span::styled(" │ ", ui::dim(app.color));
     let mut left: Vec<Span> = vec![Span::raw(" ")];
+    if app.paths.profile != "default" {
+        left.push(Span::styled(
+            format!("{}: {}", i18n::tr("profile"), app.paths.profile),
+            ui::dim(app.color),
+        ));
+        left.push(sep());
+    }
     if let Some((since, _)) = app.offline {
         left.push(Span::styled(
             format!(
@@ -13862,6 +13997,7 @@ impl App {
         }
         self.switch_session(s.id.clone());
         self.sessions.insert(0, s);
+        self.input.invalidate_history();
         self.messages.clear();
         self.view = View::Chat;
     }
@@ -17965,11 +18101,32 @@ fn draw_wizard(f: &mut Frame, w: &Wizard, color: bool) {
             ),
         ]),
         Line::raw(""),
-        Line::styled(w.status.clone(), status_style),
-        Line::raw(""),
     ];
+    let status_rows = wrap_rows(
+        &w.status,
+        f.area().width.min(84).saturating_sub(2).max(1) as usize,
+    );
+    let status_extra = status_rows.len().saturating_sub(1);
+    text.extend(
+        status_rows
+            .into_iter()
+            .map(|line| Line::styled(line, status_style)),
+    );
+    text.push(Line::raw(""));
+    let mut hint_rows = 0;
+    if let Some(hint) = &w.setup_hint {
+        let rows = wrap_rows(
+            hint,
+            f.area().width.min(84).saturating_sub(2).max(1) as usize,
+        );
+        hint_rows = rows.len() + 1;
+        text.extend(rows.into_iter().map(Line::raw));
+        text.push(Line::raw(""));
+    }
     let area = f.area();
-    let max_items = (area.height as usize).saturating_sub(12).max(3);
+    let max_items = (area.height as usize)
+        .saturating_sub(12 + hint_rows + status_extra)
+        .max(3);
     let pick = |items: Vec<String>, idx: usize| -> Vec<Line<'static>> {
         // Long model lists scroll so the selection is always on screen.
         let start = idx
@@ -18006,7 +18163,17 @@ fn draw_wizard(f: &mut Frame, w: &Wizard, color: bool) {
                     let env = formless_core::presets::env_key(p)
                         .map(|(var, _)| format!("  (${var} found)"))
                         .unwrap_or_default();
-                    format!("{}. {}{env}", i + 1, p.name)
+                    let found = w
+                        .local_offer_for(p.id)
+                        .map(|offer| {
+                            format!(
+                                "  (found: {} model{})",
+                                offer.models,
+                                if offer.models == 1 { "" } else { "s" }
+                            )
+                        })
+                        .unwrap_or_default();
+                    format!("{}. {}{env}{found}", i + 1, p.name)
                 })
                 .collect();
             rows.push(format!("{}. Custom URL…", rows.len() + 1));
@@ -18062,7 +18229,11 @@ fn draw_wizard(f: &mut Frame, w: &Wizard, color: bool) {
     };
     f.render_widget(
         Paragraph::new(text)
-            .block(ui::panel(" ◇ Formless setup ", color, Color::Cyan))
+            .block(ui::panel(
+                format!(" ◇ Formless setup · profile: {} ", w.profile),
+                color,
+                Color::Cyan,
+            ))
             .wrap(Wrap { trim: false }),
         rect,
     );
@@ -18326,17 +18497,20 @@ mod tests {
     include!("approval_resolution_tests.rs");
     include!("provider_retry_ui_tests.rs");
     include!("motion_tests.rs");
+    include!("rate_limit_tests.rs");
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
     pub(super) fn test_app() -> App {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let short = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let base = std::env::temp_dir().join(format!("fl-tui-{short}"));
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let base = std::env::temp_dir().join(format!("fl-tui-{}-{short}-{id}", std::process::id()));
         let paths = Paths::from_dirs(base.join("d"), base.join("c")).unwrap();
         App {
             paths,
@@ -20060,14 +20234,7 @@ mod tests {
         assert!(w.reveal_key && w.api_key.is_empty());
     }
 
-    #[test]
-    fn a_local_server_is_found_by_its_port() {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = l.local_addr().unwrap().port();
-        assert!(local_server_running(&format!("http://localhost:{port}/v1")));
-        drop(l);
-        assert!(!local_server_running("not a url"));
-    }
+    include!("local_discovery_tests.rs");
 
     #[test]
     fn reduced_motion_shows_a_static_indicator() {
@@ -21413,7 +21580,7 @@ mod tests {
             .enumerate()
             .map(|(i, c)| MessageInfo {
                 id: format!("m{i}"),
-                session_id: "s".into(),
+                session_id: "s1".into(),
                 seq: i as i64,
                 role: "user".into(),
                 content: c.to_string(),
@@ -22462,6 +22629,37 @@ mod tests {
         assert!(app.find.is_none() && app.chat_scroll_top.is_none());
         let (line, n) = highlight_matches(Line::raw("Aa aA"), "aa", |_| Style::default());
         assert_eq!((n, line.spans.len()), (2, 3));
+    }
+
+    #[test]
+    fn find_highlights_unicode_with_shared_folding() {
+        let marked = Style::default().add_modifier(Modifier::REVERSED);
+        for query in ["straße", "STRASSE", "STRAẞE"] {
+            let (line, count) =
+                highlight_matches(Line::raw("a straße STRASSE!"), query, |_| marked);
+            assert_eq!(count, 2);
+            assert_eq!(line.to_string(), "a straße STRASSE!");
+            let highlighted: Vec<_> = line
+                .spans
+                .iter()
+                .filter(|s| s.style == marked)
+                .map(|s| s.content.as_ref())
+                .collect();
+            assert_eq!(highlighted, vec!["straße", "STRASSE"]);
+        }
+        let (line, count) = highlight_matches(Line::raw("ßß"), "s", |_| marked);
+        assert_eq!(count, 2);
+        assert_eq!(line.to_string(), "ßß");
+        let (line, count) =
+            highlight_matches(Line::raw("İ cafe\u{301} café"), "CAFE", |_| marked);
+        assert_eq!(count, 2);
+        assert_eq!(line.to_string(), "İ cafe\u{301} café");
+        let source = Line::from(vec![Span::raw("stra"), Span::raw("ße")]);
+        let (line, count) = highlight_matches(source, "strasse", |_| marked);
+        assert_eq!(count, 0, "span-boundary behavior remains unchanged");
+        assert_eq!(line.to_string(), "straße");
+        let (_, count) = highlight_matches(Line::raw("straße"), "\u{301}", |_| marked);
+        assert_eq!(count, 0);
     }
 
     #[test]
@@ -26753,6 +26951,69 @@ mod tests {
                 "expansion never dispatches another slash or shell action"
             );
         }
+    }
+    #[test]
+    fn custom_commands_invalid_invocation_names_the_current_file_and_reason() {
+        let (mut app, project) = custom_command_fixture("valid");
+        let path = project.join(".formless/commands/workflow.md");
+        std::fs::write(&path, "---\ndescription: not closed").unwrap();
+        app.user_command_snapshot(true);
+        app.user_commands_tick();
+        app.notes.clear(); // A previous one-time diagnostic is no substitute.
+        let (client, sent) = DaemonClient::recording();
+        app.client = Some(client);
+        app.input.set("/workflow x");
+        app.key(key(KeyCode::Enter));
+        assert!(
+            app.notes
+                .iter()
+                .any(|note| note.contains("/workflow isn't loaded:")
+                    && note.contains(&path.to_string_lossy().to_string())
+                    && note.contains("frontmatter")),
+            "{:?}",
+            app.notes
+        );
+        assert!(sent.try_recv().is_err());
+    }
+    #[test]
+    fn custom_commands_suggest_templates_and_announce_a_diagnostic_after_repair() {
+        let (mut app, project) = custom_command_fixture("valid");
+        std::fs::write(
+            app.paths.config_dir.join("commands/workflow.md"),
+            "Global template",
+        )
+        .unwrap();
+        app.slash("worklfow");
+        assert!(
+            app.notes
+                .last()
+                .unwrap()
+                .contains("did you mean /workflow?"),
+            "{:?}",
+            app.notes
+        );
+        assert!(app
+            .notes
+            .last()
+            .unwrap()
+            .contains("Project command overrides global command"));
+        let path = project.join(".formless/commands/broken.md");
+        for _ in 0..2 {
+            std::fs::write(&path, "---\ndescription: not closed").unwrap();
+            app.user_command_snapshot(true);
+            app.user_commands_tick();
+            app.user_commands_tick();
+            std::fs::write(&path, "Repaired").unwrap();
+            app.user_command_snapshot(true);
+            app.user_commands_tick();
+        }
+        assert_eq!(
+            app.notes
+                .iter()
+                .filter(|note| note.contains("broken.md"))
+                .count(),
+            2
+        );
     }
     #[test]
     fn custom_commands_arguments_mentions_and_queue_steer_use_normal_message_intake() {

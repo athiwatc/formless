@@ -137,34 +137,10 @@ fn apply_headers(
     req
 }
 
-/// The latest rate-limit headers per endpoint (SPEC §4.4), from any
-/// response that carried them: `x-ratelimit-*` / `anthropic-ratelimit-*`.
-static RATE_LIMITS: std::sync::Mutex<Option<HashMap<String, Value>>> = std::sync::Mutex::new(None);
-
-/// What the endpoint's last response said about its rate limits.
+/// Fresh rate-limit observations scoped to provider, normalized endpoint and
+/// credential. Public keys are opaque; fingerprints are never serialized.
 pub fn rate_limits() -> HashMap<String, Value> {
-    RATE_LIMITS.locked().clone().unwrap_or_default()
-}
-
-fn note_rate_limits(base_url: &str, headers: &reqwest::header::HeaderMap) {
-    let mut found = serde_json::Map::new();
-    for (k, v) in headers {
-        let k = k.as_str().to_ascii_lowercase();
-        let short = k
-            .strip_prefix("x-ratelimit-")
-            .or_else(|| k.strip_prefix("anthropic-ratelimit-"));
-        if let (Some(short), Ok(v)) = (short, v.to_str()) {
-            found.insert(short.to_string(), json!(v));
-        }
-    }
-    if !found.is_empty() {
-        found.insert("at".into(), json!(chrono::Utc::now().to_rfc3339()));
-        RATE_LIMITS
-            .lock()
-            .unwrap()
-            .get_or_insert_with(HashMap::new)
-            .insert(base_url.to_string(), Value::Object(found));
-    }
+    crate::rate_limits::snapshot()
 }
 
 /// What `TestModel` found (SPEC §4.3).
@@ -2789,7 +2765,13 @@ impl Provider {
                                 routing.neutral(http_routing_neutral(status.as_u16(), ""));
                             }
                         }
-                        note_rate_limits(&self.cfg.base_url, resp.headers());
+                        crate::rate_limits::note(
+                            &self.name,
+                            &self.cfg.base_url,
+                            &credential,
+                            resp.headers(),
+                            |text| self.redacted_error(text, &credential),
+                        );
                         if status.is_success() {
                             permit.accounting =
                                 Some(self.request_accounting(model, lease.release(), &b, routing));

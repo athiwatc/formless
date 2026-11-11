@@ -544,14 +544,22 @@ pub fn matches(query: &str) -> Vec<&'static Command> {
 }
 
 /// The closest command name to a mistyped one, for "did you mean".
+#[cfg(test)]
 pub fn closest(typed: &str) -> Option<&'static str> {
+    closest_in(
+        typed,
+        COMMANDS
+            .iter()
+            .map(|c| c.name.split(' ').next().unwrap_or(c.name)),
+    )
+}
+
+pub(super) fn closest_in<'a>(typed: &str, names: impl Iterator<Item = &'a str>) -> Option<&'a str> {
     let word = typed.split_whitespace().next().unwrap_or("");
-    if word.is_empty() {
+    if word.is_empty() || word.chars().count() > 128 {
         return None;
     }
-    COMMANDS
-        .iter()
-        .map(|c| c.name.split(' ').next().unwrap_or(c.name))
+    names
         .map(|n| (edit_distance(word, n), n))
         .filter(|(d, n)| *d <= 2.max(n.len() / 3))
         // Ties go to the command as long as what was typed ("modle" is
@@ -748,17 +756,21 @@ mod tests {
             (
                 "Enter",
                 &[
-                    r#"else if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); submit(false); }"#,
+                    r#"if (e.key === "Enter" && (!composerEnterSends() || e.shiftKey) && !e.ctrlKey && !e.metaKey) return;"#,
+                    r#"if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); submit(false); }"#,
                 ],
             ),
             (
                 "Shift+Enter",
-                &[r#"e.key === "Enter" && !e.shiftKey && !e.isComposing"#],
+                &[
+                    r#"if (e.key === "Enter" && (!composerEnterSends() || e.shiftKey) && !e.ctrlKey && !e.metaKey) return;"#,
+                    r#"e.key === "Enter" && !e.shiftKey && !e.isComposing"#,
+                ],
             ),
             (
                 "Ctrl/⌘+Enter",
                 &[
-                    r#"if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); submit(true); }"#,
+                    r#"if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); submit(true); return; }"#,
                 ],
             ),
             ("Esc", &[r#"else if (e.key === "Escape") {"#]),

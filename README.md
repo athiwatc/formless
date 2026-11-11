@@ -260,13 +260,18 @@ cargo build --release          # binary at ./target/release/formless
 
 With no arguments `formless` launches the **TUI**, which auto-starts the daemon on first use (`formless daemon serve`, detached, logging to `<data dir>/daemon.log`) and then walks the wizard:
 
-1. **Provider** — pick a preset (OpenAI, Anthropic, OpenRouter, Gemini, Groq, Ollama, LM Studio) or enter any OpenAI-compatible base URL. Local presets skip the key step, and a key in `OPENAI_API_KEY` (etc.) is offered automatically. Add more later with `formless providers add NAME --preset openrouter`.
+1. **Provider** — pick a preset (OpenAI, Anthropic, OpenRouter, Gemini, Groq, Ollama, LM Studio) or enter any OpenAI-compatible base URL. Local presets skip the key step, and a key in `OPENAI_API_KEY` (etc.) is offered automatically. Local setup discovery honors `OLLAMA_HOST`, including custom loopback ports; remote hosts need a manually configured provider. Add more later with `formless providers add NAME --preset openrouter`.
 2. **API key** — stored in the OS keychain plus a `0600` fallback file (`api_key`) in the config dir, so rebuilding a dev binary never loses it.
 3. **Model** — picked from the endpoint's model list, or typed by hand.
 4. **Reasoning effort** — for models that accept it.
 5. **Probe** — verifies connectivity, streaming and **tool calling**. If the endpoint cannot call tools the wizard refuses to continue: every Run would fail, and a prompt-mode fallback has to be chosen deliberately ([§3.8](#38-provider-options-v2)).
 
 The result is written to `config.toml` in the config dir ([§4](#4-data-config-and-profiles)); you never need to edit it by hand. Re-run the wizard at any time with `formless doctor` for a diagnosis, or delete the config to go through it again.
+
+Setup names the active profile, and the TUI status line identifies a non-default
+profile. If this profile needs setup while another profile has saved provider
+configuration, the wizard, `formless run`, and `formless doctor` show the exact
+command to open it. `formless profiles list` lists the available profiles.
 
 ### 3.4 Using the TUI
 
@@ -300,11 +305,18 @@ description: Review the proposed change
 Review $ARGUMENTS. Focus first on $1, and include @notes/review-checklist.md.
 ```
 
-New files and edits appear without restarting the TUI. `/help` lists them under
+New files and edits appear without restarting the TUI or plain client. `/help` lists them under
 **Yours**; project files override global files with the same name. Builtin
 commands always win, and shadowed files and malformed templates are reported.
-Expansion substitutes arguments into prompt text and uses the existing `@path`
-attachment flow; template text does not execute shell commands or Tools by itself.
+Expansion substitutes arguments into prompt text; the full TUI then uses its
+existing `@path` attachment flow. Template text does not execute shell commands
+or Tools by itself.
+Plain mode (`--plain` or `formless chat`) loads the current Session's templates
+and sends expanded bodies as literal messages, including bodies beginning with
+`/`. Its `//` escape still sends raw slash text. Invalid-template invocations
+name the file and reason; typo suggestions include local and shadowed templates.
+Diagnostics are announced once while present and can be announced again after
+a repaired file becomes invalid again.
 
 `formless commands list` shows the available metadata, diagnostics and shadowed
 files; `formless commands list --json` returns the same shared metadata projection
@@ -332,7 +344,7 @@ formless run "now group those by author" --session 3f9c    # continue a Session
 formless run -c "and sort them by date"                     # continue the last `formless run` Session
 formless run "audit my Downloads folder" --json            # one JSON event per line
 formless run "one-line summary of README.md" --output final -q   # just the answer on stdout
-formless run "triage this" --output json                   # {session_id, status, answer, error}
+formless run "triage this" --output json                   # {session_id, status, answer, result, error}
 formless run "clean up the temp files" --yes               # auto-approve sensitive Tools
 formless run "classify these titles" --model small-model --effort low
 formless run "plan the migration" --role planner           # a configured Role's provider and model
@@ -342,6 +354,7 @@ formless run "what's wrong here?" --attach shot.png --attach app.log   # files a
 git diff | formless run "review this"                      # piped input goes along as stdin.txt
 cat task.md | formless run -                               # `-` reads the task itself from stdin
 formless run "classify these titles" --schema result.schema.json --system "Use concise labels" --max-usd 0.10 --output final --output-file result.json
+formless run "return an object" --schema object.schema.json --output json | jq '.result'
 ```
 
 `--schema` validates the final answer and allows one paid repair; a second
@@ -356,6 +369,14 @@ Runs must be resubmitted with their options; `/resume` cannot recover ephemeral
 instructions. `--output-file` leaves stdout empty and atomically replaces the
 file only after successful output (at most 8 MiB); failure leaves the previous
 file intact.
+
+Schema files and `--schema -` accept one leading UTF-8 BOM; the 64 KiB input
+limit includes those bytes. With `--schema --output json`, the envelope keeps
+`answer` as the original validated text and adds `result` as the parsed JSON
+value, for example `"result": {"n": 2}`. Consumers can read `.result` directly
+without parsing the answer twice. The same envelope is written by
+`--output-file`. Without a schema, or when schema validation fails, `result`
+is null; a schema mismatch also keeps `answer` null.
 
 Before sending, the TUI and web composer show a local forecast for the current
 draft: prompt tokens, comparable model/role Runs, likely cost and steps, and
@@ -433,6 +454,25 @@ formless config get tools.inline_limit     # effective value (env overrides appl
 formless config set tui.notify_min_secs 30 # validated, audited, applied at once
 formless config edit                       # $EDITOR; saved only if it still parses
 ```
+
+Map settings (`provider.prices`, `provider.model_context_tokens`,
+`provider.model_audio_input`, `provider.model_pdf_input`, `tui.colors`) merge
+entries by default. Each supplied entry replaces that entry's whole value;
+`null` removes that entry. Use `--replace` for whole-map replacement or clearing:
+
+```bash
+formless config set provider.prices '{"claude-sonnet-4.5":{"input":1,"output":2}}'
+formless config get provider.prices.claude-sonnet-4.5
+formless config set provider.model_context_tokens '{"vendor/qwen2.5":32768}'
+formless config set provider.model_context_tokens.vendor/qwen2.5 null
+formless config set provider.prices '{}' --replace
+```
+
+After a listed map's root, the entire suffix is one literal entry name,
+including dots and slashes. Quote the key in your shell if it contains spaces.
+Lists still replace their complete value. A merge needs an updated daemon;
+older daemons reject it without changing the file. Restart an older daemon
+after updating the binary.
 
 ### 3.6 Daemon, diagnostics and reset
 
@@ -516,13 +556,24 @@ formless profiles rm sandbox     # stops its daemon, deletes its data, config an
 | Variable | Effect |
 |---|---|
 | `FORMLESS_API_KEY` | provider key; wins over the keychain and fallback file |
+| `FORMLESS_API_KEY_<NAME>` | key for a named provider; uppercase the name and replace non-alphanumeric characters with `_` |
+| `FORMLESS_API_KEY_FILE`, `FORMLESS_API_KEY_<NAME>_FILE` | paths to files containing the default/named provider key |
 | `FORMLESS_OAUTH_ACCESS_TOKEN` | OAuth mode: use this access token instead of stored tokens |
 | `FORMLESS_OAUTH_CLIENT_SECRET` | OAuth mode: client secret for providers that need one (never stored in config) |
-| `FORMLESS_BASE_URL`, `FORMLESS_MODEL` | override the configured endpoint/model for this process |
+| `FORMLESS_BASE_URL`, `FORMLESS_MODEL` | override the configured endpoint/model for this process; trimmed, empty/whitespace-only values ignored |
 | `FORMLESS_DATA_DIR`, `FORMLESS_CONFIG_DIR` | relocate state (also how the auto-started daemon inherits them) |
-| `FORMLESS_IDLE_GRACE_SECS` | how long an idle daemon lingers before exiting |
+| `FORMLESS_IDLE_GRACE_SECS` | idle daemon timeout as a nonnegative whole number of seconds; invalid or empty values are errors |
+| `FORMLESS_SECURE` | process override for `security.secure`: `1/true/yes/on` or `0/false/no/off`, case insensitive; blank is ignored, invalid values are errors |
+| `FORMLESS_DAEMON_STAY` | keep the daemon alive as with `daemon serve --stay`; presence enables it |
 | `FORMLESS_RELAY_SECRET` | pairing secret override for the relay |
 | `RUST_LOG` | log filter for the daemon, e.g. `RUST_LOG=debug` |
+
+Only the four config overrides listed in SPEC §13 are supported; setting an
+arbitrary `FORMLESS_*` name does not override a config key. A setting saved
+under the daemon's `FORMLESS_MODEL` or `FORMLESS_IDLE_GRACE_SECS` override is
+persisted for later use. `config set` reports the saved value, the daemon's
+effective value and the overriding variable; `config get` reads the file with
+the client's own environment applied.
 
 ### 3.10 Troubleshooting
 
@@ -688,7 +739,7 @@ Everything else — the web, the filesystem, the shell, git, file formats, domai
 | `read_mcp_resource` | `server`, `uri` | Reads one of them; large contents become an artifact. |
 | `load_skill` | `name` | Loads an enabled [skill's](#skills) `SKILL.md` instructions before doing the kind of task it covers. |
 | `read_skill_file` | `name`, `path` | Reads one of that skill's extra files — reference docs, templates. |
-| `schedule_run` | `prompt`, `at` or `cron`, `session_id?` | Runs a prompt later or on a schedule (five-field cron, local time); recurring jobs need the user's approval. |
+| `schedule_run` | `prompt`, `at` or `cron`, `session_id?` | Runs a prompt later or on a schedule (five-field cron with month/weekday names or `@yearly`, local time); recurring jobs need the user's approval. |
 
 Built-ins lead every Session's Tool list, in a fixed order, and are never unloaded by `unload_tools`.
 
@@ -824,12 +875,22 @@ formless skills export pdf -o pdf.skill.json   # files only, no metrics
 formless skills import pdf.skill.json          # imported disabled, contents printed
 ```
 
-The agent remembers stable preferences you state ("use pnpm", "answer in Thai") as short notes that go into new sessions. You see every one, and you can edit them:
+The agent remembers stable preferences you state ("use pnpm", "answer in Thai") as short notes. You see every one, and you can edit them.
+
+A note's scope is `global` (the default) or `project:/absolute/path`. The memory
+prompt lists global notes followed by project notes grouped under `When working in <path>:`. A newly added note applies from the next Session, or in the current
+Session after compaction.
+
+Manage notes with the commands below, in the TUI with `/memory` (see the
+[key reference](docs/keys.md#integrations)), or on the web under **Settings → Memory**.
+See [User memory](SPEC.md#711-user-memory) for details.
 
 ```bash
 formless memory list
 formless memory add "Projects live in ~/code"
+formless memory add "Use pnpm" --scope project:/absolute/project/path
 formless memory edit m1a2b3c4 --disable
+formless memory edit m1a2b3c4 --scope project:/absolute/project/path
 formless memory rm m1a2b3c4
 ```
 

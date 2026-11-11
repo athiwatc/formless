@@ -95,7 +95,8 @@
           <div id="compose-mode" class="compose-mode hidden"></div>
           <div id="attach-chips" class="attach-chips hidden" aria-label="Attachments for your next message"></div>
           <div class="compose-row">
-            <label class="btn ghost" id="attach-btn" title="Attach a file (or paste an image)">📎<input id="attach-input" type="file" multiple hidden></label>
+            <button class="btn ghost" id="attach-btn" type="button" aria-label="Attach a file" title="Attach a file (or paste an image)"><span aria-hidden="true">📎</span></button>
+            <input id="attach-input" type="file" multiple hidden>
             <textarea id="input" rows="1" placeholder="Message Formless…" aria-label="Message" aria-describedby="compose-hint" enterkeyhint="enter" inputmode="text"></textarea>
             <button class="btn danger" id="stop-btn" type="button" hidden>Stop</button>
             <button class="btn primary" id="send-btn" type="submit">Send</button>
@@ -228,6 +229,6 @@
 </div>
 
 <input id="file-input" type="file" accept="application/json,.json" class="hidden">
-<div id="toasts" class="toasts" aria-live="assertive"></div>
+<div id="toasts" class="toasts" aria-live="assertive" data-dialog-keep></div>
 </body>
 </html>

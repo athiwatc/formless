@@ -5,6 +5,8 @@ mod credential_env;
 
 use chrono::{Local, TimeZone};
 use formless_core::jobs::{parse_at, Cron};
+include!("support/job_times.rs");
+include!("support/schedule_names.rs");
 use formless_core::{Paths, Store};
 use std::sync::Arc;
 

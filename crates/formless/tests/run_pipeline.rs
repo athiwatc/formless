@@ -8,15 +8,17 @@ use std::{
     path::PathBuf,
     process::{Child, Command, Output, Stdio},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
     time::{Duration, Instant},
 };
 fn unique() -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
     format!(
-        "{}-{}",
+        "{}-{}-{}",
         std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -272,6 +274,9 @@ impl Fixture {
         }
     }
     fn command(&self, args: &[&str]) -> Command {
+        self.command_profile("p", args)
+    }
+    fn command_profile(&self, profile: &str, args: &[&str]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_formless"));
         for (key, _) in std::env::vars_os() {
             let value = key.to_string_lossy().to_ascii_uppercase();
@@ -283,7 +288,7 @@ impl Fixture {
             }
         }
         command
-            .args(["--profile", "p"])
+            .args(["--profile", profile])
             .args(args)
             .current_dir(&self.root)
             .env("FORMLESS_DATA_DIR", self.root.join("d"))
@@ -298,8 +303,12 @@ impl Fixture {
         command
     }
     fn start(&mut self) {
+        self.start_with_env(&[]);
+    }
+    fn start_with_env(&mut self, overrides: &[(&str, &str)]) {
         let stderr = std::fs::File::create(self.root.join("daemon.stderr")).unwrap();
         let mut command = self.command(&["daemon", "serve", "--stay"]);
+        command.envs(overrides.iter().copied());
         command.stdout(Stdio::null()).stderr(stderr);
         self.daemon = Some(Owned(Some(command.spawn().unwrap())));
         let deadline = Instant::now() + Duration::from_secs(15);
@@ -318,7 +327,20 @@ impl Fixture {
         }
     }
     fn run(&self, args: &[&str], stdin: Option<&[u8]>) -> Output {
-        let mut command = self.command(args);
+        self.run_profile("p", args, stdin)
+    }
+    fn run_profile(&self, profile: &str, args: &[&str], stdin: Option<&[u8]>) -> Output {
+        self.run_profile_env(profile, args, stdin, &[])
+    }
+    fn run_profile_env(
+        &self,
+        profile: &str,
+        args: &[&str],
+        stdin: Option<&[u8]>,
+        overrides: &[(&str, &str)],
+    ) -> Output {
+        let mut command = self.command_profile(profile, args);
+        command.envs(overrides.iter().copied());
         if stdin.is_some() {
             command.stdin(Stdio::piped());
         }
@@ -390,6 +412,475 @@ impl Drop for Fixture {
         self.provider.stop.store(true, Ordering::SeqCst);
         let _ = std::fs::remove_dir_all(&self.root);
     }
+}
+
+#[test]
+fn job_times_cli_reports_rejections_and_future_enable_without_firing() {
+    let mut f = Fixture::new();
+    f.start();
+    for (prompt, at, expected) in [
+        ("past", "2020-01-01T03:00:00Z", "future"),
+        ("zero", "in 0m", "future"),
+        ("overflow", "in 9999999999d", "366 days"),
+        ("  \t", "in 1h", "prompt required"),
+    ] {
+        let output = f.run(&["jobs", "add", prompt, "--at", at], None);
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "accepted {at}");
+        assert!(error.contains(expected), "{error}");
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("scheduled"));
+    }
+    let store = Store::open(&f.paths.db_file()).unwrap();
+    assert!(store.list_jobs().unwrap().is_empty());
+    let pending = store
+        .create_job(
+            "pending",
+            None,
+            Some("0 3 * * *"),
+            "2020-01-01T03:00:00Z",
+            false,
+            "agent",
+        )
+        .unwrap();
+    let output = f.run(&["jobs", "enable", &pending.id], None);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let enabled = store.get_job(&pending.id).unwrap().unwrap();
+    assert!(enabled.enabled && enabled.approved);
+    assert!(
+        chrono::DateTime::parse_from_rfc3339(enabled.next_run.as_deref().unwrap()).unwrap()
+            > chrono::Utc::now()
+    );
+
+    let expired = store
+        .create_job("expired", None, None, "2020-01-01T03:00:00Z", false, "user")
+        .unwrap();
+    let output = f.run(&["jobs", "enable", &expired.id], None);
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        error.contains("expired") && error.contains("jobs run"),
+        "{error}"
+    );
+    assert!(!store.get_job(&expired.id).unwrap().unwrap().enabled);
+    let valid = f.run(&["jobs", "add", "future", "--at", "in 1h"], None);
+    assert!(
+        valid.status.success(),
+        "{}",
+        String::from_utf8_lossy(&valid.stderr)
+    );
+    assert!(String::from_utf8_lossy(&valid.stdout).contains("scheduled"));
+    assert_eq!(f.provider.count(), 0, "admission must not fire any prompt");
+}
+
+#[test]
+fn doctor_reports_unknown_role_providers_without_changing_configuration() {
+    use formless_core::config::{ProviderCfg, RoleCfg};
+    let f = Fixture::new();
+    let mut cfg = Config::load_file_only(&f.paths).unwrap();
+    cfg.provider.model.clear(); // Diagnostics need no provider request.
+    cfg.providers.insert(
+        "local".into(),
+        ProviderCfg {
+            base_url: f.provider.url.clone(),
+            model: "model".into(),
+            ..Default::default()
+        },
+    );
+    for (name, provider) in [
+        ("broken", Some("missing-provider")),
+        ("valid", Some("local")),
+        ("default", Some("default")),
+        ("empty", Some("")),
+        ("implicit", None),
+    ] {
+        cfg.roles.insert(
+            name.into(),
+            RoleCfg {
+                provider: provider.map(str::to_string),
+                model: "model".into(),
+                ..Default::default()
+            },
+        );
+    }
+    cfg.save(&f.paths).unwrap();
+    let before = std::fs::read(f.paths.config_file()).unwrap();
+    let human = f.run(&["doctor"], None);
+    assert!(
+        human.status.success(),
+        "{}",
+        String::from_utf8_lossy(&human.stderr)
+    );
+    let text = String::from_utf8(human.stdout).unwrap();
+    assert!(
+        text.contains("role \"broken\"") && text.contains("unknown provider \"missing-provider\""),
+        "{text}"
+    );
+    let json = f.run(&["doctor", "--json"], None);
+    assert!(
+        json.status.success(),
+        "{}",
+        String::from_utf8_lossy(&json.stderr)
+    );
+    let value: Value = serde_json::from_slice(&json.stdout).unwrap();
+    let role_problems: Vec<_> = value["problems"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|p| p["what"].as_str().is_some_and(|s| s.starts_with("role ")))
+        .collect();
+    assert_eq!(role_problems.len(), 1, "{value}");
+    assert!(role_problems[0]["next"]
+        .as_str()
+        .unwrap()
+        .contains("formless config edit"));
+    assert_eq!(std::fs::read(f.paths.config_file()).unwrap(), before);
+    assert!(!f.paths.socket_path().exists());
+    assert!(f.provider.seen.lock().unwrap().is_empty());
+    assert!(f.provider.failure.lock().unwrap().is_none());
+}
+
+#[test]
+fn config_set_reports_daemon_overrides_independently_of_client_environment() {
+    let mut f = Fixture::new();
+    f.start_with_env(&[
+        ("FORMLESS_MODEL", " daemon-model "),
+        ("FORMLESS_IDLE_GRACE_SECS", "600"),
+    ]);
+    for (key, saved, source, effective) in [
+        (
+            "provider.model",
+            "saved-model",
+            "FORMLESS_MODEL",
+            "daemon-model",
+        ),
+        (
+            "daemon.idle_grace_secs",
+            "42",
+            "FORMLESS_IDLE_GRACE_SECS",
+            "600",
+        ),
+    ] {
+        let r = f.run(&["config", "set", key, saved], None);
+        assert!(r.status.success(), "{}", String::from_utf8_lossy(&r.stderr));
+        let text = String::from_utf8(r.stdout).unwrap();
+        for expected in ["saved", saved, source, effective, "environment override"] {
+            assert!(text.contains(expected), "missing {expected}: {text}");
+        }
+        let r = f.run(&["config", "get", key], None);
+        assert!(r.status.success());
+        assert_eq!(String::from_utf8(r.stdout).unwrap().trim(), saved);
+    }
+    // A client-only override must not be presented as the daemon's source.
+    let mut other = Fixture::new();
+    other.start();
+    let r = other.run_profile_env(
+        "p",
+        &["config", "set", "provider.model", "new-file-model"],
+        None,
+        &[("FORMLESS_MODEL", "client-only")],
+    );
+    assert!(r.status.success(), "{}", String::from_utf8_lossy(&r.stderr));
+    let text = String::from_utf8(r.stdout).unwrap();
+    assert!(!text.contains("environment override"), "{text}");
+    assert!(!text.contains("client-only"), "{text}");
+    assert_eq!(
+        Config::load_file_only(&other.paths).unwrap().provider.model,
+        "new-file-model"
+    );
+    let invalid = other.run_profile_env(
+        "p",
+        &["config", "get", "daemon.idle_grace_secs"],
+        None,
+        &[("FORMLESS_IDLE_GRACE_SECS", "60s")],
+    );
+    assert!(!invalid.status.success());
+    let error = String::from_utf8(invalid.stderr).unwrap();
+    assert!(
+        error.contains("FORMLESS_IDLE_GRACE_SECS")
+            && error.contains("nonnegative whole number of seconds"),
+        "{error}"
+    );
+    for fixture in [&f, &other] {
+        assert!(fixture.provider.seen.lock().unwrap().is_empty());
+        assert!(fixture.provider.failure.lock().unwrap().is_none());
+    }
+}
+
+#[test]
+fn config_maps_merge_read_delete_and_explicitly_replace() {
+    let mut f = Fixture::new();
+    f.start();
+    let set = |key: &str, value: &str, replace: bool| {
+        let mut args = vec!["config", "set", key, value];
+        if replace {
+            args.push("--replace");
+        }
+        let result = f.run(&args, None);
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    };
+    let get = |key: &str| -> Value {
+        let result = f.run(&["config", "get", key], None);
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        serde_json::from_slice(&result.stdout).unwrap()
+    };
+    set(
+        "provider.prices",
+        r#"{"claude-sonnet-4.5":{"input":2,"output":3}}"#,
+        false,
+    );
+    let prices = get("provider.prices");
+    assert_eq!(prices["model"]["input"], 1.0);
+    assert_eq!(prices["claude-sonnet-4.5"]["input"], 2.0);
+    assert_eq!(get("provider.prices.claude-sonnet-4.5")["output"], 3.0);
+    set(
+        "provider.model_context_tokens",
+        r#"{"vendor/qwen2.5":2000}"#,
+        false,
+    );
+    assert_eq!(
+        get("provider.model_context_tokens"),
+        json!({"model":100000,"vendor/qwen2.5":2000})
+    );
+    set("provider.model_context_tokens.model", "null", false);
+    assert_eq!(
+        get("provider.model_context_tokens"),
+        json!({"vendor/qwen2.5":2000})
+    );
+    assert_eq!(get("provider.model_context_tokens.vendor/qwen2.5"), 2000);
+    set(
+        "provider.model_context_tokens",
+        r#"{"vendor/qwen2.5":null}"#,
+        false,
+    );
+    assert_eq!(get("provider.model_context_tokens"), json!({}));
+    set(
+        "provider.prices",
+        r#"{"sole":{"input":5,"output":6}}"#,
+        true,
+    );
+    assert_eq!(get("provider.prices").as_object().unwrap().len(), 1);
+    assert_eq!(get("provider.prices")["sole"]["input"], 5.0);
+    set("provider.prices", "{}", true);
+    assert_eq!(get("provider.prices"), json!({}));
+    let rejected = f.run(&["config", "set", "provider.prices", "null"], None);
+    assert!(!rejected.status.success());
+    assert_eq!(get("provider.prices"), json!({}));
+    assert!(f.provider.seen.lock().unwrap().is_empty());
+    assert!(f.provider.failure.lock().unwrap().is_none());
+}
+
+#[test]
+fn unconfigured_run_and_doctor_name_the_profile_and_offer_saved_setup_elsewhere() {
+    let f = Fixture::new(); // Only profile p has saved configuration.
+    let before = std::fs::read(f.paths.config_file()).unwrap();
+    for active in ["default", "scratch"] {
+        let run = f.run_profile(
+            active,
+            &["run", "task", "--output", "json", "--quiet"],
+            None,
+        );
+        assert_eq!(
+            run.status.code(),
+            Some(2),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(run.stdout.is_empty());
+        let message = String::from_utf8(run.stderr).unwrap();
+        assert!(
+            message.contains(&format!("Profile '{active}'")),
+            "{message}"
+        );
+        assert!(
+            message.contains("formless --profile p") && message.contains("formless profiles list"),
+            "{message}"
+        );
+        let doctor = f.run_profile(active, &["doctor"], None);
+        assert!(
+            doctor.status.success(),
+            "{}",
+            String::from_utf8_lossy(&doctor.stderr)
+        );
+        let text = String::from_utf8(doctor.stdout).unwrap();
+        assert!(text.contains(&format!("profile:    {active}")), "{text}");
+        assert!(
+            text.contains("formless --profile p") && text.contains("formless profiles list"),
+            "{text}"
+        );
+        let json = f.run_profile(active, &["doctor", "--json"], None);
+        assert!(
+            json.status.success(),
+            "{}",
+            String::from_utf8_lossy(&json.stderr)
+        );
+        let value: Value = serde_json::from_slice(&json.stdout).unwrap();
+        assert_eq!(value["profile"], active);
+        assert!(value["problems"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|problem| problem["next"]
+                .as_str()
+                .is_some_and(|next| next.contains("formless --profile p"))));
+    }
+    assert_eq!(
+        f.provider.count(),
+        0,
+        "alternate configuration is inspected, never probed"
+    );
+    assert!(!formless_core::daemon::daemon_reachable(&f.paths));
+    assert_eq!(std::fs::read(f.paths.config_file()).unwrap(), before);
+}
+
+#[test]
+fn shipped_plain_templates_expand_literally_and_help_reports_local_diagnostics() {
+    let mut f = Fixture::new();
+    let project = f.root.join("template-project");
+    let local = project.join(".formless/commands");
+    std::fs::create_dir_all(&local).unwrap();
+    std::fs::create_dir_all(f.paths.config_dir.join("commands")).unwrap();
+    std::fs::write(
+        f.paths.config_dir.join("commands/workflow.md"),
+        "Global review",
+    )
+    .unwrap();
+    std::fs::write(
+        local.join("workflow.md"),
+        "---\ndescription: Project review template\n---\nReview $ARGUMENTS",
+    )
+    .unwrap();
+    std::fs::write(
+        local.join("literal.md"),
+        "---\ndescription: Literal slash body\n---\n/quit",
+    )
+    .unwrap();
+    std::fs::write(local.join("quit.md"), "Never shadow the builtin").unwrap();
+    std::fs::write(local.join("broken.md"), "---\ndescription: not closed").unwrap();
+    let store = Store::open(&f.paths.db_file()).unwrap();
+    let session = store
+        .create_session(Some("Plain template fixture".into()))
+        .unwrap()
+        .id;
+    store
+        .set_session_cwd(&session, Some(project.to_str().unwrap()))
+        .unwrap();
+    drop(store);
+    f.start();
+    let mut command = f.command(&["chat", "--session", &session]);
+    command.stdin(Stdio::piped()).stderr(Stdio::null());
+    let mut child = Owned(Some(command.spawn().unwrap()));
+    let mut input = child.0.as_mut().unwrap().stdin.take().unwrap();
+    let mut stdout = child.0.as_mut().unwrap().stdout.take().unwrap();
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let output = captured.clone();
+    let reader = std::thread::spawn(move || {
+        let mut buf = [0; 4096];
+        loop {
+            let n = stdout.read(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            let mut output = output.lock().unwrap();
+            assert!(output.len() + n <= 1024 * 1024, "owned plain output limit");
+            output.extend_from_slice(&buf[..n]);
+        }
+    });
+    let wait_for = |needle: &str| {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let text = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+            if text.contains(needle) {
+                return text;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "plain output missing {needle}: {text}"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    };
+    wait_for("Formless, chat.");
+    input.write_all(b"/help\n/help\n").unwrap();
+    let help = wait_for("Shadowed /workflow");
+    assert!(
+        help.contains("Yours")
+            && help.contains("Project review template")
+            && help.contains("Shadowed /workflow"),
+        "{help}"
+    );
+    input.write_all(b"/notpresent\n/broken x\n").unwrap();
+    let errors = wait_for("/broken isn't loaded:");
+    assert!(errors.contains("/notpresent is not a command here"));
+    assert!(errors.contains("broken.md") && errors.contains("frontmatter"));
+    assert_eq!(
+        errors
+            .lines()
+            .filter(|line| line.starts_with("Command template ") && line.contains("broken.md"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        f.provider.count(),
+        0,
+        "help/errors are local and never sent to a model"
+    );
+    for (line, response) in [
+        ("/workflow Alpha  Beta\n", "REVIEW-DELIVERED"),
+        ("/literal\n", "LITERAL-DELIVERED"),
+        ("//quit\n", "ESCAPED-DELIVERED"),
+    ] {
+        f.provider.queue(response);
+        input.write_all(line.as_bytes()).unwrap();
+        wait_for(response);
+        // Do not let the next invocation steer a still-finishing prior Run.
+        let wanted = f.provider.count();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let text = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+            if text.matches("Run completed.").count() >= wanted {
+                break;
+            }
+            assert!(Instant::now() < deadline, "plain Run completion: {text}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    input.write_all(b"/quit\n").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = child.0.as_mut().unwrap().try_wait().unwrap() {
+            assert!(status.success());
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "builtin Quit must win over the local template"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    reader.join().unwrap();
+    assert_eq!(f.provider.count(), 3);
+    let messages = Store::open(&f.paths.db_file())
+        .unwrap()
+        .list_messages(&session)
+        .unwrap();
+    let users: Vec<_> = messages
+        .iter()
+        .filter(|message| message.role == "user")
+        .map(|message| message.content.as_str())
+        .collect();
+    assert_eq!(users, ["Review Alpha  Beta", "/quit", "/quit"]);
 }
 
 #[test]
@@ -519,6 +1010,7 @@ fn shipped_pipeline_validates_repairs_once_keeps_stdout_clean_and_never_persists
             let value: Value = serde_json::from_slice(&out.stdout).unwrap();
             assert_eq!(value["status"], "schema_mismatch");
             assert!(value["answer"].is_null());
+            assert!(value["result"].is_null());
         }
     }
     assert_eq!(f.provider.count(), 10);
@@ -593,6 +1085,101 @@ fn shipped_pipeline_validates_repairs_once_keeps_stdout_clean_and_never_persists
         f.provider.replies.lock().unwrap().is_empty(),
         "every queued response was used exactly once"
     );
+}
+
+#[test]
+fn shipped_schema_json_result_is_structured_on_stdout_and_in_output_files() {
+    let mut f = Fixture::new();
+    let store = Store::open(&f.paths.db_file()).unwrap();
+    let session = store
+        .create_session(Some("structured result".into()))
+        .unwrap()
+        .id;
+    drop(store);
+    let schema = f.root.join("bom-schema.json");
+    let schema_bytes = [b"\xef\xbb\xbf".as_slice(), br#"{"type":"object","required":["n"],"properties":{"n":{"type":"integer"}},"additionalProperties":false}"#].concat();
+    std::fs::write(&schema, &schema_bytes).unwrap();
+    let destination = f.root.join("structured-result.json");
+    f.start();
+    let answer = " {\"n\":2} ";
+    for from_stdin in [false, true] {
+        for to_file in [false, true] {
+            f.provider.queue(answer);
+            let mut args = vec![
+                "run",
+                "task",
+                "--session",
+                &session,
+                "--schema",
+                if from_stdin {
+                    "-"
+                } else {
+                    schema.to_str().unwrap()
+                },
+                "--max-usd",
+                "0.10",
+                "--output",
+                "json",
+                "--quiet",
+            ];
+            if to_file {
+                std::fs::write(&destination, b"previous output").unwrap();
+                args.extend(["--output-file", destination.to_str().unwrap()]);
+            }
+            let out = f.run(&args, from_stdin.then_some(schema_bytes.as_slice()));
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let bytes = if to_file {
+                assert!(out.stdout.is_empty());
+                std::fs::read(&destination).unwrap()
+            } else {
+                out.stdout
+            };
+            let value: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(value["session_id"], session);
+            assert_eq!(value["status"], "completed");
+            assert_eq!(
+                value["answer"], answer,
+                "existing answer text remains compatible"
+            );
+            assert_eq!(value["result"], json!({"n":2}));
+            assert!(value["result"].is_object());
+            assert!(value["error"].is_null());
+        }
+    }
+    // JSON-looking free text is not a schema-validated result.
+    f.provider.queue(answer);
+    let out = f.run(
+        &[
+            "run",
+            "task",
+            "--session",
+            &session,
+            "--max-usd",
+            "0.10",
+            "--output",
+            "json",
+            "--quiet",
+        ],
+        None,
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["answer"], answer);
+    assert!(value.get("result").unwrap().is_null());
+    assert_eq!(f.provider.count(), 5);
+    assert!(Store::open(&f.paths.db_file())
+        .unwrap()
+        .pending_attachments(&session)
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
