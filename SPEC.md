@@ -5003,7 +5003,10 @@ previous headless Run's Session.
   the daemon is running, and the problems (with next steps and whether
   they're fixable).
 - `formless bug-report [-o FILE]` writes a Markdown file with versions, OS,
-  that JSON, and the last 200 daemon log lines, for attaching to an issue.
+  that JSON, and the last 200 daemon log lines across live and numeric
+  rotations, for attaching to an issue. The log tail reads at most 1 MiB;
+  the leading boundary line is conservatively omitted and a notice explains
+  byte-budget or line truncation.
 - Both are redacted: bearer tokens, `key`/`token`/`secret`/`password`
   values, `#k=`/`#local=` fragments, URL credentials, `sk-`/`ghp_`-style
   keys, long opaque tokens, and the home path (shown as `~`). The file says
@@ -5012,7 +5015,13 @@ previous headless Run's Session.
   daemon log: rotated files oldest first, then `daemon.log`. Entries are
   grouped (continuation lines stay with their entry), filtered by level
   (that level and worse) and age, and show the last `-n` (0 = all). `-f`
-  keeps printing appended entries and follows rotation. The daemon logs
+  keeps printing appended entries and follows rotation. Numeric rotations
+  are discovered from the directory (including old suffixes above 64),
+  rather than a fixed filename range. Bounded tails read newest first until
+  enough matching entries are found; `-n 0` streams all history oldest first.
+  Lines and grouped entries are capped at 64 KiB with visible truncation
+  notices; damaged UTF-8 is replaced rather than dropping an entire file.
+  Read failures are reported instead of silently hiding history. The daemon logs
   `info` and above by default (other commands only errors), `RUST_LOG`
   overrides it, and colour codes are only used on a terminal, never in the
   file.
@@ -5502,7 +5511,7 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
 | `daemon.idle_grace_secs` | 60 | Idle-close grace after last Run + last client (§9.1) |
 | `daemon.stall_warning_secs` | 300 | Silence before `possibly stalled` flag (§6.1) |
 | `daemon.start_timeout_secs` | 60 | How long a client waits for an auto-started daemon (it fails early, with the log's last lines, if the daemon exits) |
-| `daemon.log_max_bytes` / `log_keep` | 10 MB / 5 | Daemon log rotation (§9.4) |
+| `daemon.log_max_bytes` / `log_keep` | 10 MB / 5 | Size-triggered rotation; `log_keep` is 0–64. Each retention check removes numeric rotations above the current keep count, including all rotations at 0; leading-zero aliases share one slot (canonical regular file wins, otherwise the shortest alias is normalized before duplicates are removed). Alias promotion refuses occupied/non-regular canonical destinations and preserves aliases on failure; max bytes 0 disables live-file rotation (§9.4) |
 | `daemon.keep_alive_for_jobs` | false | Stay up while scheduled jobs wait (§9.7) |
 | `daemon.delete_undo_secs` | 30 | Undo window for Session deletes (§5.1) |
 | `daemon.backups_keep` | 7 | Daily database backups kept in `<data>/backups` (`formless backup` / `restore`); 0 = no automatic backups (§9.6) |
