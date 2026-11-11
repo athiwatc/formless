@@ -1345,7 +1345,8 @@ fn a_rejected_edit_keeps_the_earlier_undo_history_and_cannot_be_redone(cx: &mut 
         // The rejection went through the kit's own undo, so nothing else was
         // lost: the notice does not report a cleared history.
         let notice = shell.read(cx).composer_notice().unwrap_or_default();
-        assert!(!notice.contains("history was cleared"), "{notice}");
+        assert!(notice.ends_with("Your text is unchanged."), "{notice}");
+        assert!(!notice.contains("undo history"), "{notice}");
         // Undo now takes back the accepted typing, not nothing.
         window.press(&chord("z"), cx);
     });
@@ -1448,6 +1449,355 @@ fn discarding_stored_drafts_is_reported_not_silent(cx: &mut TestAppContext) {
     cx.run_until_parked();
     step(cx, handle, |_, cx| {
         assert!(shell.read(cx).draft(cx).as_ref() == draft);
+    });
+}
+
+// ---- Deferred composer work never crosses Sessions ------------------------
+
+/// The ids of the first few Session rows, in sidebar order.
+fn first_rows(
+    cx: &mut TestAppContext,
+    handle: WindowHandle<Root>,
+    shell: &Entity<Shell>,
+) -> Vec<String> {
+    step(cx, handle, |_, cx| {
+        shell
+            .read(cx)
+            .sidebar()
+            .rows()
+            .iter()
+            .take(3)
+            .map(|row| row.id.clone())
+            .collect()
+    })
+}
+
+/// Queue a click on a Session row to run after the effects already queued in
+/// this update (a composer change, for one) and before anything those
+/// effects go on to defer.
+fn queue_switch(handle: WindowHandle<Root>, session_id: &str, cx: &mut App) {
+    let row = session_row_id(session_id);
+    cx.defer(move |cx| {
+        cx.update_window(handle.into(), |_, window, cx| window.click(row, cx))
+            .expect("shell window is open");
+    });
+}
+
+#[gpui_kit::test]
+fn a_switch_queued_behind_an_over_limit_edit_leaves_the_other_session_alone(
+    cx: &mut TestAppContext,
+) {
+    let full = draft_of(limits::COMPOSER_MAX_BYTES);
+    let (handle, shell) = open_with_draft(cx, &full);
+    let rows = first_rows(cx, handle, &shell);
+
+    // One batch: an over-limit paste into the first Session, then a switch
+    // to the second. The paste's rejection is scheduled when its change is
+    // delivered; the switch runs next; the rejection's deferred steps run
+    // last, for a composer that no longer exists.
+    step(cx, handle, |window, cx| {
+        cx.write_to_clipboard(ClipboardItem::new_string("over the limit".to_string()));
+        window.press(&chord("v"), cx);
+        queue_switch(handle, &rows[1], cx);
+    });
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        assert_eq!(shell.read(cx).sidebar().active_id(), Some(rows[1].as_str()));
+        // The second Session's composer has nothing of the first in it.
+        assert_eq!(shell.read(cx).draft(cx).as_ref(), "");
+        assert_eq!(shell.read(cx).composer_selection(cx), 0..0);
+        // The over-limit text was not stored; the accepted draft was, and
+        // that is said.
+        let notice = shell
+            .read(cx)
+            .composer_notice()
+            .expect("the loss is reported");
+        assert!(
+            notice.starts_with("Text over the 1.0 MiB limit"),
+            "{notice}"
+        );
+        assert!(shell.read(cx).has_stored_draft(&rows[0]));
+        // Typing here stays here.
+        window.click_at("region-composer", point(px(40.), px(20.)), cx);
+        window.input("second", cx);
+    });
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| {
+        assert_eq!(shell.read(cx).draft(cx).as_ref(), "second");
+        window.click(session_row_id(&rows[0]), cx);
+    });
+    cx.run_until_parked();
+    step(cx, handle, |_, cx| {
+        // The first Session's draft is exactly what it was before the paste.
+        assert!(shell.read(cx).draft(cx).as_ref() == full);
+    });
+}
+
+#[gpui_kit::test]
+fn a_switch_queued_behind_an_undo_history_reset_leaves_the_other_session_alone(
+    cx: &mut TestAppContext,
+) {
+    let chunk = draft_of(limits::COMPOSER_MAX_BYTES);
+    let (handle, shell) = open_with_draft(cx, &chunk);
+    let rows = first_rows(cx, handle, &shell);
+    // The opening paste, a removal, a paste and a removal: 4 MiB of edits,
+    // exactly the budget and not yet over it.
+    let select_all_and_delete = |window: &mut Window, cx: &mut App| {
+        window.press(&chord("a"), cx);
+        window.press("backspace", cx);
+    };
+    step(cx, handle, |window, cx| select_all_and_delete(window, cx));
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| window.press(&chord("v"), cx));
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| select_all_and_delete(window, cx));
+    cx.run_until_parked();
+    step(cx, handle, |_, cx| {
+        assert_eq!(shell.read(cx).draft(cx).as_ref(), "");
+        assert_eq!(shell.read(cx).composer_notice(), None);
+    });
+    // One batch: the edit that spends the budget, then a switch. The history
+    // reset is scheduled first and must not be applied to the second
+    // Session's composer.
+    step(cx, handle, |window, cx| {
+        window.press(&chord("v"), cx);
+        queue_switch(handle, &rows[1], cx);
+    });
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        assert_eq!(shell.read(cx).sidebar().active_id(), Some(rows[1].as_str()));
+        assert_eq!(shell.read(cx).draft(cx).as_ref(), "");
+        // No notice about a history that is not this Session's.
+        assert_eq!(shell.read(cx).composer_notice(), None);
+        window.click_at("region-composer", point(px(40.), px(20.)), cx);
+        window.input("second", cx);
+        // Undo works in the second Session: its history was not dropped.
+        window.press(&chord("z"), cx);
+    });
+    cx.run_until_parked();
+    step(cx, handle, |_, cx| {
+        assert_ne!(shell.read(cx).draft(cx).as_ref(), "second");
+    });
+}
+
+/// Queue work on the window to run after the effects already queued in this
+/// update and before anything those effects go on to defer.
+fn queue_on_window(
+    handle: WindowHandle<Root>,
+    cx: &mut App,
+    work: impl FnOnce(&mut Window, &mut App) + 'static,
+) {
+    cx.defer(move |cx| {
+        cx.update_window(handle.into(), |_, window, cx| work(window, cx))
+            .expect("shell window is open");
+    });
+}
+
+#[gpui_kit::test]
+fn a_switch_while_a_rejection_is_pending_stores_the_accepted_draft_not_what_is_on_screen(
+    cx: &mut TestAppContext,
+) {
+    // Room for two bytes. "a" and "b" are accepted; "c" goes over.
+    let base = draft_of(limits::COMPOSER_MAX_BYTES - 2);
+    let (handle, shell) = open_with_draft(cx, &base);
+    let rows = first_rows(cx, handle, &shell);
+    for character in ["a", "b"] {
+        step(cx, handle, |window, cx| window.input(character, cx));
+        cx.run_until_parked();
+    }
+    let accepted = format!("{base}ab");
+    step(cx, handle, |_, cx| {
+        assert!(shell.read(cx).draft(cx).as_ref() == accepted);
+    });
+
+    // One batch. The third character's rejection is recorded when its change
+    // is delivered. Before that rejection is finished, an undo takes the
+    // whole typing group out (as the kit's grouped undo does), so the
+    // composer holds less than the accepted draft, and the Session is
+    // switched in that state.
+    let target = rows[1].clone();
+    let observed = shell.clone();
+    let base_len = base.len();
+    step(cx, handle, |window, cx| {
+        window.input("c", cx);
+        queue_on_window(handle, cx, move |window, cx| {
+            window.press(&chord("z"), cx);
+            // On screen now: neither the over-limit text nor the accepted
+            // draft, and it is under the limit.
+            assert_eq!(observed.read(cx).draft(cx).len(), base_len);
+            window.click(session_row_id(&target), cx);
+        });
+    });
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        assert_eq!(shell.read(cx).sidebar().active_id(), Some(rows[1].as_str()));
+        assert_eq!(shell.read(cx).draft(cx).as_ref(), "");
+        let notice = shell
+            .read(cx)
+            .composer_notice()
+            .expect("the loss is reported");
+        assert!(
+            notice.starts_with("Text over the 1.0 MiB limit"),
+            "{notice}"
+        );
+        window.click(session_row_id(&rows[0]), cx);
+    });
+    cx.run_until_parked();
+    step(cx, handle, |_, cx| {
+        // The accepted draft was stored: both characters that fitted are
+        // there, and the one that did not is not.
+        let draft = shell.read(cx).draft(cx);
+        assert_eq!(draft.len(), accepted.len());
+        assert!(draft.as_ref() == accepted);
+    });
+}
+
+#[gpui_kit::test]
+fn a_stale_rejection_undoes_nothing_in_the_session_switched_to(cx: &mut TestAppContext) {
+    let full = draft_of(limits::COMPOSER_MAX_BYTES);
+    let (handle, shell) = open_with_draft(cx, &full);
+    let rows = first_rows(cx, handle, &shell);
+    let typed = "typed in the second session";
+
+    // One batch: an over-limit paste in the first Session; then a switch,
+    // and typing in the second Session, which gives its composer focus and
+    // an undo history of its own. The first Session's rejection is finished
+    // last. It must not send an undo to the composer that has focus now.
+    let target = rows[1].clone();
+    step(cx, handle, |window, cx| {
+        cx.write_to_clipboard(ClipboardItem::new_string("over the limit".to_string()));
+        window.press(&chord("v"), cx);
+        queue_on_window(handle, cx, move |window, cx| {
+            window.click(session_row_id(&target), cx);
+            window.click_at("region-composer", point(px(40.), px(20.)), cx);
+            window.input(typed, cx);
+        });
+    });
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        assert_eq!(shell.read(cx).sidebar().active_id(), Some(rows[1].as_str()));
+        assert_eq!(window.find_by_label("Message").focused(), Some(true));
+        // Nothing of the second Session's typing was undone.
+        assert_eq!(shell.read(cx).draft(cx).as_ref(), typed);
+        // Its history is its own and still there.
+        window.press(&chord("z"), cx);
+    });
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| {
+        assert_ne!(shell.read(cx).draft(cx).as_ref(), typed);
+        window.click(session_row_id(&rows[0]), cx);
+    });
+    cx.run_until_parked();
+    step(cx, handle, |_, cx| {
+        assert!(shell.read(cx).draft(cx).as_ref() == full);
+    });
+}
+
+#[gpui_kit::test]
+fn typing_across_the_limit_keeps_what_fitted_and_says_the_history_went(cx: &mut TestAppContext) {
+    // Room for two more bytes. Three characters are typed one event at a
+    // time with no pause between them, which the kit records as one undo
+    // step.
+    let base = draft_of(limits::COMPOSER_MAX_BYTES - 2);
+    let (handle, shell) = open_with_draft(cx, &base);
+    for character in ["a", "b", "c"] {
+        step(cx, handle, |window, cx| window.input(character, cx));
+        cx.run_until_parked();
+    }
+    let kept = format!("{base}ab");
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        // The two characters that fitted are still there. The kit's undo
+        // took them along with the third, so the draft was restored the
+        // other way, and the notice says what that cost.
+        let draft = shell.read(cx).draft(cx);
+        assert_eq!(draft.len(), kept.len());
+        assert!(draft.as_ref() == kept);
+        assert_eq!(
+            shell.read(cx).composer_selection(cx),
+            kept.len()..kept.len()
+        );
+        let notice = shell.read(cx).composer_notice().expect("a reason is shown");
+        println!("EVIDENCE grouped_typing_rejection notice: {notice}");
+        assert!(notice.starts_with("Not added"), "{notice}");
+        assert!(
+            notice.ends_with("but its undo history had to be cleared."),
+            "{notice}"
+        );
+        assert_eq!(window.find_by_label("Message").focused(), Some(true));
+        // And it really is gone: undo changes nothing.
+        window.press(&chord("z"), cx);
+    });
+    cx.run_until_parked();
+    step(cx, handle, |_, cx| {
+        assert!(shell.read(cx).draft(cx).as_ref() == kept);
+    });
+}
+
+#[gpui_kit::test]
+fn typing_delivered_as_one_batch_is_judged_and_rejected_as_one_edit(cx: &mut TestAppContext) {
+    // The same three characters arriving before the shell is told about any
+    // of them: the shell sees one change, from the draft it last accepted to
+    // one that is over the limit, and takes all of it back.
+    let base = draft_of(limits::COMPOSER_MAX_BYTES - 2);
+    let (handle, shell) = open_with_draft(cx, &base);
+    step(cx, handle, |window, cx| window.input("abc", cx));
+    assert_rejected(cx, handle, &shell, &base, "a batch of typing");
+    step(cx, handle, |_, cx| {
+        let notice = shell.read(cx).composer_notice().unwrap_or_default();
+        assert!(notice.ends_with("Your text is unchanged."), "{notice}");
+    });
+}
+
+#[gpui_kit::test]
+fn switching_sessions_during_an_over_limit_composition_says_what_was_not_kept(
+    cx: &mut TestAppContext,
+) {
+    let nearly = draft_of(limits::COMPOSER_MAX_BYTES - 4);
+    let (handle, shell) = open_with_draft(cx, &nearly);
+    let rows = first_rows(cx, handle, &shell);
+    // Twelve bytes of composition where four fit, still marked.
+    step(cx, handle, |window, cx| {
+        let bounds = window.find_by_label("Message").bounds();
+        let composer = shell.read(cx).composer().clone();
+        TestInput::new(ElementInputHandler::new(bounds, composer), window).compose_text(
+            None,
+            "にほんご",
+            None,
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| {
+        assert_eq!(shell.read(cx).draft(cx).len(), nearly.len() + 12);
+        assert_eq!(shell.read(cx).composer_notice(), None);
+        window.click(session_row_id(&rows[1]), cx);
+    });
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        assert_eq!(shell.read(cx).draft(cx).as_ref(), "");
+        // Nothing was evicted, so this notice is only about the composition.
+        let notice = shell
+            .read(cx)
+            .composer_notice()
+            .expect("the loss is reported");
+        assert_eq!(
+            notice,
+            "Text over the 1.0 MiB limit in the Session you left was not kept; its draft was \
+             stored without it."
+        );
+        assert!(window.find("composer-notice").visible());
+        window.click(session_row_id(&rows[0]), cx);
+    });
+    cx.run_until_parked();
+    step(cx, handle, |_, cx| {
+        // What was accepted before the composition is what was stored.
+        assert!(shell.read(cx).draft(cx).as_ref() == nearly);
     });
 }
 

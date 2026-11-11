@@ -3,8 +3,8 @@
 //! | Text | Bound | How it is kept |
 //! |---|---|---|
 //! | Active composer | [`limits::COMPOSER_MAX_BYTES`] for accepted text | An edit whose result is over the limit is taken back whole: the full previous draft and its selection are restored. Nothing is ever cut to fit. The kit cannot refuse a multi-line edit beforehand, so the text is over the limit for the instant between the edit and its rejection. |
-//! | Stored drafts | [`limits::DRAFT_MAX_ENTRIES`] and [`limits::DRAFT_MAX_BYTES`], hard limits | `model::Drafts` evicts the oldest stored drafts and reports which, and the shell tells the user. |
-//! | Composer undo history | An accounting limit, not a measured one: [`limits::UNDO_EDIT_BUDGET_BYTES`] of edited text, and the kit's own 1,000 transactions | [`UndoBudget`] adds up what every edit removed and inserted; when the sum passes the budget the shell rebuilds the composer, which is the only way to drop the kit's history. What the kit really retains per transaction was not measured. |
+//! | Stored drafts | [`limits::DRAFT_MAX_ENTRIES`], and [`limits::DRAFT_MAX_BYTES`] provided no single stored draft exceeds it | `model::Drafts` evicts the oldest stored drafts and reports which, and the shell tells the user. The shell only stores drafts within the composer limit, which is what makes the byte bound hold. |
+//! | Composer undo and redo history | **No bound is claimed.** What the kit retains was not measured and is excluded from every figure here. | Mitigation only: [`UndoBudget`] adds up what every edit removed and inserted, and when the sum passes [`limits::UNDO_EDIT_BUDGET_BYTES`] the shell rebuilds the composer, which is the only way to drop the kit's history. The kit also caps undo at 1,000 transactions, by count, not size. |
 //! | Recorded intent | No text at all | [`IntentRecord`] keeps sizes only. |
 //! | A timeline row | [`limits::BLOCK_PREVIEW_MAX_BYTES`] and [`limits::BLOCK_PREVIEW_MAX_LINES`] laid out | `timeline::TimelineBlock`. |
 //!
@@ -17,11 +17,18 @@
 //!   then judged at the composer's next change of any kind, and until then
 //!   it can be neither sent nor stored as a draft.
 //!
-//! Rejecting an edit normally keeps the undo history, because it is done
-//! with the kit's own undo. When that does not restore exactly the previous
-//! draft (the kit merges quick typing into one undo step; the composer may
-//! not have focus), the previous draft is restored by rebuilding the
-//! composer, and the history is lost. The user is told which happened.
+//! Rejecting an edit keeps the undo history when the kit's own undo,
+//! addressed to that composer, restores exactly the previous draft. When it
+//! does not (the kit merges quick typing into one undo step, so its undo
+//! takes back more than the rejected edit), the previous draft is restored
+//! by rebuilding the composer, and the history is lost. The user is told
+//! which happened, every time.
+//!
+//! A rejection is deferred work. [`Rejections`] ties it to one edit in one
+//! composer, so a rejection that outlives its composer (a Session switch in
+//! between) does nothing at all: it sends no undo, restores no text and
+//! consumes no newer record. While a rejection is pending, the user's draft
+//! is the one the record holds, not what the composer shows.
 //!
 //! Not covered: the transcript itself (how much history is loaded is a
 //! protocol question; there is no pagination), and whatever the kit keeps
@@ -163,6 +170,96 @@ impl UndoBudget {
 
     pub fn reset(&mut self) {
         self.edited_bytes = 0;
+    }
+}
+
+/// An over-limit edit waiting to be taken back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingRejection {
+    ticket: u64,
+    generation: u64,
+    /// The full draft to return to: the last one that was accepted.
+    pub previous: String,
+    /// Where in `previous` the edit was made, on grapheme boundaries.
+    pub selection: Range<usize>,
+    /// How large the draft would have been.
+    pub would_be_bytes: usize,
+}
+
+/// Holds at most one [`PendingRejection`] and decides who may finish it.
+///
+/// Taking an edit back is deferred work, and deferred work can outlive what
+/// it was scheduled for: the composer may have been replaced (a Session
+/// switch) and a different rejection may have started in its place. So
+/// every rejection gets a ticket, and a callback may only act on, or
+/// consume, the record its own ticket names, for the composer generation
+/// that is current. A stale callback must leave a newer record alone.
+#[derive(Debug, Default)]
+pub struct Rejections {
+    issued: u64,
+    pending: Option<PendingRejection>,
+}
+
+impl Rejections {
+    pub fn is_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// The draft a pending rejection will return to. While a rejection is
+    /// pending this, not whatever the composer holds at the moment, is the
+    /// user's draft.
+    pub fn pending_previous(&self) -> Option<&str> {
+        self.pending
+            .as_ref()
+            .map(|pending| pending.previous.as_str())
+    }
+
+    /// Record an over-limit edit made in the composer of `generation` and
+    /// return the ticket for finishing it. Replaces any earlier record.
+    pub fn begin(
+        &mut self,
+        generation: u64,
+        previous: String,
+        selection: Range<usize>,
+        would_be_bytes: usize,
+    ) -> u64 {
+        self.issued += 1;
+        self.pending = Some(PendingRejection {
+            ticket: self.issued,
+            generation,
+            previous,
+            selection,
+            would_be_bytes,
+        });
+        self.issued
+    }
+
+    /// Whether `ticket` names the pending record and that record belongs to
+    /// the composer that is current. Checks without consuming.
+    pub fn is_current(&self, ticket: u64, current_generation: u64) -> bool {
+        self.pending.as_ref().is_some_and(|pending| {
+            pending.ticket == ticket && pending.generation == current_generation
+        })
+    }
+
+    /// Consume the pending record, but only for the ticket that names it and
+    /// only if it belongs to the current composer. Otherwise nothing is
+    /// consumed and `None` is returned.
+    pub fn take_if_current(
+        &mut self,
+        ticket: u64,
+        current_generation: u64,
+    ) -> Option<PendingRejection> {
+        if self.is_current(ticket, current_generation) {
+            self.pending.take()
+        } else {
+            None
+        }
+    }
+
+    /// The composer was replaced: whatever was pending for it is void.
+    pub fn void(&mut self) {
+        self.pending = None;
     }
 }
 
@@ -340,6 +437,50 @@ mod tests {
         assert!(budget.is_spent());
         budget.reset();
         assert!(!budget.is_spent());
+    }
+
+    #[test]
+    fn a_stale_ticket_neither_acts_on_nor_consumes_a_newer_rejection() {
+        let mut rejections = Rejections::default();
+        // An edit is rejected in the first composer...
+        let old = rejections.begin(1, "first session".to_string(), 3..3, 2_000_000);
+        assert!(rejections.is_current(old, 1));
+        // ...the composer is replaced before that is finished...
+        rejections.void();
+        assert!(!rejections.is_pending());
+        // ...and an edit is rejected in the new composer.
+        let new = rejections.begin(2, "second session".to_string(), 0..6, 3_000_000);
+        assert_ne!(old, new);
+
+        // The first callback arrives late. It must not see the new record as
+        // its own, under either generation, and must not consume it.
+        assert!(!rejections.is_current(old, 2));
+        assert!(!rejections.is_current(old, 1));
+        assert_eq!(rejections.take_if_current(old, 2), None);
+        assert_eq!(rejections.take_if_current(old, 1), None);
+        assert_eq!(rejections.pending_previous(), Some("second session"));
+
+        // The second callback finishes its own record, once.
+        let taken = rejections.take_if_current(new, 2).expect("its own record");
+        assert_eq!(taken.previous, "second session");
+        assert_eq!(taken.selection, 0..6);
+        assert_eq!(taken.would_be_bytes, 3_000_000);
+        assert_eq!(rejections.take_if_current(new, 2), None);
+        assert!(!rejections.is_pending());
+    }
+
+    #[test]
+    fn a_rejection_is_not_finished_for_a_composer_that_is_no_longer_current() {
+        let mut rejections = Rejections::default();
+        let ticket = rejections.begin(4, "draft".to_string(), 0..0, 9);
+        // Right ticket, wrong composer: left in place, not consumed.
+        assert!(!rejections.is_current(ticket, 5));
+        assert_eq!(rejections.take_if_current(ticket, 5), None);
+        assert!(rejections.is_pending());
+        // A ticket that was never issued matches nothing.
+        assert_eq!(rejections.take_if_current(ticket + 1, 4), None);
+        assert!(rejections.is_pending());
+        assert!(rejections.take_if_current(ticket, 4).is_some());
     }
 
     #[test]

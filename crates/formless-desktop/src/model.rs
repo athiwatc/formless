@@ -568,10 +568,15 @@ impl Sidebar {
 /// Unsent composer text per Session, bounded both by how many Sessions it
 /// remembers and by the total bytes of text it holds.
 ///
-/// The draft stored most recently is always kept, even when it alone exceeds
-/// the byte budget: silently discarding what the user just wrote is worse
-/// than holding one oversized string. Older drafts are evicted, oldest
-/// first, until both bounds hold again.
+/// The byte bound has a precondition: it holds only if no single draft given
+/// to [`Drafts::set`] is larger than the byte budget. The draft stored most
+/// recently is always kept, even when it alone exceeds the budget, because
+/// silently discarding what the user just wrote is worse than holding one
+/// oversized string; the store then holds that one draft and nothing else.
+/// The shell meets the precondition: it only stores drafts within the
+/// composer limit (`memory::limits::COMPOSER_MAX_BYTES`), which is checked at
+/// compile time to be no larger than the draft budget. Older drafts are
+/// evicted, oldest first, until both bounds hold again.
 #[derive(Debug)]
 pub struct Drafts {
     max_entries: usize,

@@ -32,7 +32,7 @@ use gpui_kit::{
 
 use crate::memory::{
     edit_span, format_bytes, limits, paste_can_never_fit, snap_to_graphemes, within_composer_limit,
-    IntentKind, IntentRecord, UndoBudget,
+    IntentKind, IntentRecord, Rejections, UndoBudget,
 };
 use crate::model::{
     send_mode_label, tokens, BlockKind, ComposerActions, Destination, Drafts, InspectorMode,
@@ -141,6 +141,17 @@ pub struct Shell {
     /// The composer's text as of its last accepted change: always within
     /// the limit, and what an over-limit edit is rolled back to.
     accepted_draft: SharedString,
+    /// Counts composer replacements. Work deferred from a composer change
+    /// records the generation it was scheduled under and does nothing if the
+    /// composer has been replaced since (a Session switch, another rebuild).
+    /// A late callback must never write one Session's text, or apply one
+    /// Session's selection, to another Session's composer.
+    composer_generation: u64,
+    /// The over-limit edit being taken back, if any. From the moment one is
+    /// seen until [`Shell::finish_rejection`] has dealt with it, the
+    /// composer is not judged again and its contents are not the user's
+    /// draft: the record's `previous` is.
+    rejections: Rejections,
     undo_budget: UndoBudget,
     /// Why the composer refused or changed something, shown under it.
     composer_notice: Option<SharedString>,
@@ -195,6 +206,8 @@ impl Shell {
             destination: Destination::Chat,
             last_intent: None,
             accepted_draft: SharedString::default(),
+            composer_generation: 0,
+            rejections: Rejections::default(),
             undo_budget: UndoBudget::default(),
             composer_notice: None,
             modal: None,
@@ -251,7 +264,8 @@ impl Shell {
     /// Swap in a fresh composer holding `text`, with the selection at
     /// `selection` if given. This is the only way to drop the kit's undo
     /// history, so it is how a Session switch keeps one Session's text out
-    /// of another's undo and how the history is bounded. Focus stays in the
+    /// of another's undo and how the history is dropped after large edits
+    /// (which mitigates its growth; no bound on it is claimed). Focus stays in the
     /// composer if it was there.
     fn rebuild_composer(
         &mut self,
@@ -272,6 +286,9 @@ impl Shell {
             }
         }
         self.accepted_draft = text.to_string().into();
+        // Anything still queued for the old composer is now void.
+        self.composer_generation += 1;
+        self.rejections.void();
         self.undo_budget.reset();
         self.composer.update(cx, |composer, cx| {
             if let Some(selection) = selection {
@@ -289,14 +306,14 @@ impl Shell {
     /// An edit whose result is over the limit is rejected whole. Nothing is
     /// ever cut to fit, so text after an insertion point is never lost and no
     /// character is split. The kit has no hook to refuse a multi-line edit
-    /// before it happens, so the rejection is made afterwards, in two steps:
-    ///
-    /// 1. The kit is asked to undo its own last edit. That puts back exactly
-    ///    the previous text and selection and keeps the earlier undo history.
-    /// 2. [`Self::finish_rejection`] checks the result. If the composer does
-    ///    not hold exactly the previous draft, the previous draft is put back
-    ///    whole by rebuilding the composer, at the cost of its undo history.
+    /// before it happens, so the rejection is made afterwards, by
+    /// [`Self::finish_rejection`]. It cannot run from inside the composer's
+    /// own change delivery, so it is deferred, and it is tied by a ticket to
+    /// this edit in this composer (see [`Rejections`]).
     fn composer_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.rejections.is_pending() {
+            return;
+        }
         let draft = self.draft(cx);
         if draft == self.accepted_draft {
             return;
@@ -311,41 +328,24 @@ impl Shell {
             return;
         }
         let span = edit_span(&self.accepted_draft, &draft);
+        let generation = self.composer_generation;
         if !within_composer_limit(&draft) {
-            let previous = self.accepted_draft.clone();
-            let selection = snap_to_graphemes(&previous, span.start..span.old_end);
-            self.composer_notice = Some(
-                format!(
-                    "Not added: the message would be {} and the limit is {}. Your text is \
-                     unchanged.",
-                    format_bytes(draft.len()),
-                    format_bytes(limits::COMPOSER_MAX_BYTES)
-                )
-                .into(),
+            let ticket = self.rejections.begin(
+                generation,
+                self.accepted_draft.to_string(),
+                snap_to_graphemes(&self.accepted_draft, span.start..span.old_end),
+                draft.len(),
             );
-            // The action only reaches the composer while it has focus.
-            if self.composer.focus_handle(cx).contains_focused(window, cx) {
-                window.dispatch_action(Box::new(Undo), cx);
-            }
-            // Queued behind the undo, and not run from inside the composer's
-            // own event delivery.
             cx.defer_in(window, move |this, window, cx| {
-                this.finish_rejection(previous, selection, window, cx)
+                this.finish_rejection(ticket, window, cx)
             });
-            cx.notify();
             return;
         }
-        self.accepted_draft = draft.clone();
+        self.accepted_draft = draft;
         self.undo_budget.record_edit(span);
         if self.undo_budget.is_spent() {
-            let selection = self.composer.read(cx).selected_range();
-            self.composer_notice = Some(
-                "Undo history was cleared to bound memory after large edits. Your text is \
-                 unchanged."
-                    .into(),
-            );
             cx.defer_in(window, move |this, window, cx| {
-                this.rebuild_composer(&draft, Some(selection), window, cx)
+                this.drop_undo_history(generation, window, cx)
             });
         } else {
             self.composer_notice = None;
@@ -354,24 +354,79 @@ impl Shell {
         cx.notify();
     }
 
-    /// Second step of rejecting an over-limit edit. The kit's undo may have
-    /// done exactly what was needed. It may also have undone more (it merges
-    /// quick typing into one step) or nothing (the composer did not have
-    /// focus). Either way the composer must end up holding `previous`.
-    fn finish_rejection(
-        &mut self,
-        previous: SharedString,
-        selection: Range<usize>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.draft(cx) == previous {
+    /// Take an over-limit edit back, in one uninterrupted step:
+    ///
+    /// 1. Check that the ticket still names the pending rejection and that
+    ///    the composer it was made in is still the current one. If not, this
+    ///    callback is stale: it touches nothing, dispatches nothing and
+    ///    consumes nothing, because whatever replaced the composer has
+    ///    already dealt with the over-limit text.
+    /// 2. Ask the kit to undo its own last edit, addressed to this composer
+    ///    by its focus handle, not to whatever has focus. At best that puts
+    ///    back exactly the previous text and selection and keeps the earlier
+    ///    undo history.
+    /// 3. Check the result. The undo may have done more (the kit merges
+    ///    quick typing into one step) or nothing. If the composer does not
+    ///    hold exactly the previous draft, the previous draft is put back
+    ///    whole by rebuilding the composer, at the cost of its history.
+    ///
+    /// The user is always told, including whether the history survived.
+    fn finish_rejection(&mut self, ticket: u64, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.rejections.is_current(ticket, self.composer_generation) {
             return;
         }
-        self.rebuild_composer(&previous, Some(selection), window, cx);
-        if let Some(notice) = self.composer_notice.take() {
-            self.composer_notice = Some(format!("{notice} Undo history was cleared.").into());
+        self.composer
+            .focus_handle(cx)
+            .dispatch_action(&Undo, window, cx);
+        // Still current: the dispatch above runs the kit's handler and
+        // nothing of this shell's.
+        let Some(rejection) = self
+            .rejections
+            .take_if_current(ticket, self.composer_generation)
+        else {
+            return;
+        };
+        let history_kept = self.draft(cx) == rejection.previous;
+        if !history_kept {
+            self.rebuild_composer(&rejection.previous, Some(rejection.selection), window, cx);
         }
+        self.composer_notice = Some(
+            format!(
+                "Not added: the message would be {} and the limit is {}. Your text is \
+                 unchanged{}",
+                format_bytes(rejection.would_be_bytes),
+                format_bytes(limits::COMPOSER_MAX_BYTES),
+                if history_kept {
+                    "."
+                } else {
+                    ", but its undo history had to be cleared."
+                }
+            )
+            .into(),
+        );
+        cx.notify();
+    }
+
+    /// Drop the composer's undo history once [`UndoBudget`] is spent, keeping
+    /// the text and selection it has now. Deferred, so it works from the
+    /// composer's current state, not from anything captured earlier, and
+    /// only if it is still the composer it was scheduled for.
+    fn drop_undo_history(&mut self, generation: u64, window: &mut Window, cx: &mut Context<Self>) {
+        if generation != self.composer_generation || self.rejections.is_pending() {
+            return;
+        }
+        let draft = self.draft(cx);
+        if !within_composer_limit(&draft) {
+            // A later edit went over the limit; its rejection comes first.
+            return;
+        }
+        let selection = self.composer.read(cx).selected_range();
+        self.rebuild_composer(&draft, Some(selection), window, cx);
+        self.composer_notice = Some(
+            "Undo history was cleared to bound memory after large edits. Your text is unchanged."
+                .into(),
+        );
+        cx.notify();
     }
 
     /// The composer's paste hook. Returns true to consume the paste so that
@@ -626,28 +681,43 @@ impl Shell {
         let previous = self.sidebar.active_id().map(str::to_string);
         if self.sidebar.activate_selected() {
             if let Some(previous) = previous {
+                // What the composer holds at this moment is not always the
+                // user's draft:
+                // - An over-limit edit may be waiting to be taken back. Its
+                //   record says what the draft is; the composer may hold the
+                //   over-limit text, or something else the user or the kit's
+                //   undo left there in between.
+                // - An input method may be composing, or may have ended a
+                //   composition with no signal, leaving text past the limit.
+                // In both cases the last accepted draft is stored, the rest
+                // is not, and the user is told.
                 let draft = self.draft(cx);
+                let (parked, text_not_kept) = match self.rejections.pending_previous() {
+                    Some(previous) => (SharedString::from(previous.to_string()), true),
+                    None if !within_composer_limit(&draft) => (self.accepted_draft.clone(), true),
+                    None => (draft, false),
+                };
                 // Parking a draft can push older ones out. That discards
                 // text someone wrote, so it is said, not done silently.
-                // An input method can leave text past the limit in the
-                // composer with no signal (see `composer_changed`). Such a
-                // draft is not parked; the last accepted one is.
-                let draft = if within_composer_limit(&draft) {
-                    draft
-                } else {
-                    self.accepted_draft.clone()
-                };
-                let evicted = self.drafts.set(&previous, &draft);
-                self.composer_notice = (!evicted.is_empty()).then(|| {
-                    format!(
+                let evicted = self.drafts.set(&previous, &parked);
+                let mut notices = Vec::new();
+                if text_not_kept {
+                    notices.push(format!(
+                        "Text over the {} limit in the Session you left was not kept; its \
+                         draft was stored without it.",
+                        format_bytes(limits::COMPOSER_MAX_BYTES)
+                    ));
+                }
+                if !evicted.is_empty() {
+                    notices.push(format!(
                         "Unsent drafts for {} older Session(s) were discarded: stored drafts \
                          are limited to {} Sessions and {} in total.",
                         evicted.len(),
                         limits::DRAFT_MAX_ENTRIES,
                         format_bytes(limits::DRAFT_MAX_BYTES)
-                    )
-                    .into()
-                });
+                    ));
+                }
+                self.composer_notice = (!notices.is_empty()).then(|| notices.join(" ").into());
             } else {
                 self.composer_notice = None;
             }
