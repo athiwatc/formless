@@ -97,6 +97,26 @@ pub fn timeline(count: usize) -> Vec<TimelineBlock> {
         .collect()
 }
 
+/// The text of the `index`th delta of the synthetic stream: a short word in
+/// one of three scripts, and a paragraph break every sixtieth delta.
+pub fn stream_delta(index: usize) -> &'static str {
+    const WORDS: [&str; 8] = [
+        "The ",
+        "stream ",
+        "keeps ",
+        "going ",
+        "ต่อไป ",
+        "続く ",
+        "and ",
+        "on. ",
+    ];
+    if index % 60 == 59 {
+        "\n\n"
+    } else {
+        WORDS[index % WORDS.len()]
+    }
+}
+
 /// One fenced code block of about `bytes` bytes: the "five-megabyte output"
 /// of the epic's stress case. Every line is distinct so a truncated preview
 /// can be told from the whole.

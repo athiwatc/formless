@@ -38,7 +38,9 @@ use crate::model::{
     send_mode_label, tokens, BlockKind, ComposerActions, Destination, Drafts, InspectorMode,
     Intent, Layout, PanelPrefs, Region, RunState, Sidebar, SidebarMode, TextScale,
 };
-use crate::timeline::{Anchor, Coalescer, Timeline, TimelineBlock, WindowMove, FLUSH_INTERVAL_MS};
+use crate::timeline::{
+    Anchor, Coalescer, StreamWork, Timeline, TimelineBlock, WindowMove, FLUSH_INTERVAL_MS,
+};
 
 gpui_kit::actions!(
     formless_desktop,
@@ -670,6 +672,11 @@ impl Shell {
             .last()
             .map(|block| block.preview().to_string())
             .unwrap_or_default()
+    }
+
+    /// Work done so far to keep streamed rows up to date.
+    pub fn stream_work(&self) -> StreamWork {
+        self.blocks.borrow().stream_work()
     }
 
     /// Stream deltas received and view updates made for them.

@@ -371,7 +371,9 @@ impl TimelineBlock {
         }
     }
 
-    fn push(&mut self, text: &str) {
+    /// Append text. Returns the bytes copied to rebuild the row's window,
+    /// or `None` if the window did not need rebuilding.
+    fn push(&mut self, text: &str) -> Option<usize> {
         let reached_end = self.hidden_after() == 0;
         self.markdown.push_str(text);
         self.fences.extend(&self.markdown);
@@ -380,8 +382,21 @@ impl TimelineBlock {
         // until it is full; text added past a full window cannot change it.
         if self.anchor == Anchor::Tail || reached_end {
             self.refresh();
+            return Some(self.preview.len());
         }
+        None
     }
+}
+
+/// Work done to keep the streamed block's row up to date.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StreamWork {
+    /// Deltas appended.
+    pub deltas: u64,
+    /// Times the row's window was rebuilt for them.
+    pub rebuilds: u64,
+    /// Bytes copied into the text those rebuilds lay out.
+    pub bytes_copied: u64,
 }
 
 /// How to move a block's window.
@@ -398,6 +413,7 @@ pub enum WindowMove {
 pub struct Timeline {
     blocks: Vec<TimelineBlock>,
     streaming: bool,
+    work: StreamWork,
 }
 
 impl Timeline {
@@ -405,6 +421,7 @@ impl Timeline {
         Self {
             blocks,
             streaming: false,
+            work: StreamWork::default(),
         }
     }
 
@@ -456,11 +473,27 @@ impl Timeline {
     pub fn push_delta(&mut self, text: &str) -> bool {
         match self.blocks.last_mut() {
             Some(tail) if self.streaming => {
-                tail.push(text);
+                self.work.deltas += 1;
+                if let Some(copied) = tail.push(text) {
+                    self.work.rebuilds += 1;
+                    self.work.bytes_copied += copied as u64;
+                }
                 true
             }
             _ => false,
         }
+    }
+
+    /// Bring the streamed block's row up to date with its text. Returns
+    /// whether there was anything to do. Every delta rebuilds the row at
+    /// once, so there never is.
+    pub fn settle(&mut self) -> bool {
+        false
+    }
+
+    /// Work done so far to keep streamed rows up to date.
+    pub fn stream_work(&self) -> StreamWork {
+        self.work
     }
 
     pub fn finish_stream(&mut self) {

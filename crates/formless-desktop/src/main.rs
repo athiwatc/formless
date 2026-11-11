@@ -102,16 +102,6 @@ fn percentile(sorted: &[f64], fraction: f64) -> f64 {
 /// print how frames were delivered meanwhile and quit.
 fn run_stream(window: &Window, shell: Entity<Shell>, seconds: usize, rate: usize, cx: &mut App) {
     const TICK: Duration = Duration::from_millis(10);
-    const WORDS: [&str; 8] = [
-        "The ",
-        "stream ",
-        "keeps ",
-        "going ",
-        "ต่อไป ",
-        "続く ",
-        "and ",
-        "on. ",
-    ];
     let frames = Rc::new(RefCell::new(Vec::new()));
     let running = Rc::new(RefCell::new(true));
     sample_frames(window, frames.clone(), running.clone());
@@ -132,12 +122,7 @@ fn run_stream(window: &Window, shell: Entity<Shell>, seconds: usize, rate: usize
                 cx.update(|cx| {
                     shell.update(cx, |shell, cx| {
                         for index in sent..due {
-                            let word = if index % 60 == 59 {
-                                "\n\n"
-                            } else {
-                                WORDS[index % WORDS.len()]
-                            };
-                            shell.push_stream_delta(word, cx);
+                            shell.push_stream_delta(fixture::stream_delta(index), cx);
                         }
                     })
                 });
@@ -161,11 +146,13 @@ fn run_stream(window: &Window, shell: Entity<Shell>, seconds: usize, rate: usize
             // window means the newest text is what is on show.
             let (tail_bytes, tail_before, tail_after) =
                 shell.read(cx).last_block_window().unwrap_or_default();
+            let work = shell.read(cx).stream_work();
             println!(
                 "stream: seconds={seconds} rate={rate} deltas_sent={sent} deltas_received={deltas} \
                  view_updates={flushes} frames={} frame_interval_ms p50={:.1} p95={:.1} p99={:.1} \
                  max={:.1} over_16.7ms={} over_33.4ms={} over_100ms={} tail_bytes={tail_bytes} \
-                 tail_not_shown_before={tail_before} tail_not_shown_after={tail_after}",
+                 tail_not_shown_before={tail_before} tail_not_shown_after={tail_after} \
+                 row_rebuilds={} row_bytes_copied={}",
                 frames.len(),
                 percentile(&intervals, 0.50),
                 percentile(&intervals, 0.95),
@@ -174,6 +161,8 @@ fn run_stream(window: &Window, shell: Entity<Shell>, seconds: usize, rate: usize
                 intervals.iter().filter(|ms| **ms > 16.7).count(),
                 intervals.iter().filter(|ms| **ms > 33.4).count(),
                 intervals.iter().filter(|ms| **ms > 100.0).count(),
+                work.rebuilds,
+                work.bytes_copied,
             );
         });
         cx.background_executor()
