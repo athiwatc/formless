@@ -38,7 +38,7 @@ use crate::model::{
     send_mode_label, tokens, BlockKind, ComposerActions, Destination, Drafts, InspectorMode,
     Intent, Layout, PanelPrefs, Region, RunState, Sidebar, SidebarMode, TextScale,
 };
-use crate::timeline::{Coalescer, Timeline, TimelineBlock, FLUSH_INTERVAL_MS};
+use crate::timeline::{Anchor, Coalescer, Timeline, TimelineBlock, WindowMove, FLUSH_INTERVAL_MS};
 
 gpui_kit::actions!(
     formless_desktop,
@@ -102,6 +102,74 @@ pub fn bind_keys(cx: &mut App) {
 /// hover, focus and scroll state) when the list reorders.
 pub fn session_row_id(session_id: &str) -> ElementId {
     ElementId::from(SharedString::from(format!("session-row-{session_id}")))
+}
+
+/// For a row that shows less than its whole block: what is missing on each
+/// side, and controls to move the window. `None` when the row shows it all.
+fn block_window_line(
+    block: &TimelineBlock,
+    streaming: bool,
+    position: &'static str,
+    shell: &Entity<Shell>,
+    cx: &App,
+) -> Option<AnyElement> {
+    if !block.is_truncated() {
+        return None;
+    }
+    let mut text = format!(
+        "Showing {} of {}.",
+        format_bytes(block.window().len()),
+        format_bytes(block.total_bytes())
+    );
+    if block.hidden_before() > 0 {
+        text.push_str(&format!(
+            " {} before it is not shown.",
+            format_bytes(block.hidden_before())
+        ));
+    }
+    if block.hidden_after() > 0 {
+        text.push_str(&format!(
+            " {} after it is not shown{}.",
+            format_bytes(block.hidden_after()),
+            if streaming {
+                ", and more is arriving"
+            } else {
+                ""
+            }
+        ));
+    }
+    let id = block.id;
+    let button = |action: &'static str, to: WindowMove, enabled: bool| {
+        let shell = shell.clone();
+        Button::new(SharedString::from(format!(
+            "block-{id}-{position}-{}",
+            action.to_lowercase()
+        )))
+        .xsmall()
+        .ghost()
+        .label(action)
+        .disabled(!enabled)
+        .on_click(move |_, _, cx| shell.update(cx, |this, cx| this.move_block_window(id, to, cx)))
+    };
+    let has_earlier = block.hidden_before() > 0;
+    let has_later = block.hidden_after() > 0;
+    // "End" also resumes following a block that is still being streamed.
+    let can_follow = streaming && block.anchor() != Anchor::Tail;
+    Some(
+        h_flex()
+            .id(SharedString::from(format!("block-{id}-{position}-window")))
+            .test_support()
+            .flex_wrap()
+            .gap_1()
+            .text_xs()
+            .text_color(cx.theme().muted_foreground)
+            .child(Label::new(text))
+            .child(button("Start", WindowMove::Start, has_earlier))
+            .child(button("Earlier", WindowMove::Earlier, has_earlier))
+            .child(button("Later", WindowMove::Later, has_later))
+            .child(button("End", WindowMove::End, has_later || can_follow))
+            .into_any_element(),
+    )
 }
 
 /// A region's border colour: the focus ring while the region itself holds
@@ -542,6 +610,18 @@ impl Shell {
     /// is dropped here; only its record stays.
     fn emit(&mut self, intent: Intent, cx: &mut Context<Self>) {
         self.last_intent = Some(IntentRecord::from(&intent));
+        cx.notify();
+    }
+
+    /// Move the window a row shows onto another part of its block. The row
+    /// changes height, so it is measured again.
+    pub fn move_block_window(&mut self, block_id: u64, to: WindowMove, cx: &mut Context<Self>) {
+        let Some(index) = self.blocks.borrow_mut().move_window(block_id, to) else {
+            return;
+        };
+        self.timeline.update(cx, |timeline, cx| {
+            timeline.remeasure_items(index..index + 1, cx);
+        });
         cx.notify();
     }
 
@@ -1052,6 +1132,7 @@ impl Shell {
     fn render_conversation(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let run_state = self.run_state();
         let blocks = self.blocks.clone();
+        let shell = cx.entity();
         let reading_width = self.scaled(tokens::READING_MAX);
         let focused = self.conversation_focus.is_focused(window);
         let timeline = MessageScroller::new("timeline", self.timeline.clone(), {
@@ -1061,21 +1142,13 @@ impl Shell {
                     return div().into_any_element();
                 };
                 let id = block.id as usize;
-                // Only the preview is laid out. A block of any size costs a
-                // bounded amount per frame, and the row says when it is cut.
-                let truncated = block.is_truncated().then(|| {
-                    div()
-                        .id(("block-truncated", id))
-                        .test_support()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(Label::new(format!(
-                            "Preview: the first {} of {} is shown. The rest is not laid out, \
-                             and this scaffold has no full-output viewer.",
-                            format_bytes(block.preview().len()),
-                            format_bytes(block.total_bytes())
-                        )))
-                });
+                // Only one bounded window of the block is laid out, so a
+                // block of any size costs a bounded amount per frame. The
+                // line that says so goes above and below the text, because a
+                // window can be far taller than the viewport.
+                let streaming = blocks.is_streaming() && index + 1 == blocks.len();
+                let above = block_window_line(block, streaming, "top", &shell, cx);
+                let below = block_window_line(block, streaming, "bottom", &shell, cx);
                 v_flex()
                     .id(("block", id))
                     .test_support()
@@ -1091,6 +1164,7 @@ impl Shell {
                             .text_color(cx.theme().muted_foreground)
                             .child(block.kind.label()),
                     )
+                    .children(above)
                     .child(
                         TextView::markdown(
                             ("markdown", id),
@@ -1098,7 +1172,7 @@ impl Shell {
                         )
                         .selectable(true),
                     )
-                    .children(truncated)
+                    .children(below)
                     .into_any_element()
             }
         });

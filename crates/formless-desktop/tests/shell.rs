@@ -869,13 +869,17 @@ fn a_five_megabyte_block_shows_a_bounded_preview_and_typing_still_works(cx: &mut
         window.draw(cx).clear(cx);
         let first_draw = started.elapsed();
 
-        assert!(window.find(("block-truncated", 9usize)).visible());
+        // The timeline is at its tail, so the line below the block's text
+        // is the one on screen.
+        assert!(window.find("block-9-bottom-window").visible());
         let painted = painted(window);
         let notice = painted
             .iter()
-            .find(|text| text.starts_with("Preview: the first"))
-            .unwrap_or_else(|| panic!("no truncation notice painted"));
-        assert!(notice.contains("of 5.0 MiB"), "{notice}");
+            .find(|text| text.starts_with("Showing "))
+            .unwrap_or_else(|| panic!("no window line painted"));
+        assert!(notice.contains("of 5.0 MiB."), "{notice}");
+        assert!(notice.contains("after it is not shown."), "{notice}");
+        assert!(!notice.contains("before it"), "{notice}");
         // The start of the output was laid out; lines past the preview were
         // never given to the text layout.
         assert!(painted
@@ -1895,6 +1899,201 @@ fn streaming_does_not_move_older_content_that_is_being_read(cx: &mut TestAppCont
         assert_eq!(window.find(("block", anchor.0)).bounds(), anchor.1);
         // The streamed tail is off screen and was not built.
         assert!(window.try_find(("block", 201usize)).is_none());
+    });
+}
+
+// ---- Windows onto long blocks ---------------------------------------------
+
+/// Click a control by id if it is on screen, trying the line below the
+/// block's text first and then the one above it.
+fn click_window_control(window: &mut Window, block: usize, action: &str, cx: &mut App) {
+    for position in ["bottom", "top"] {
+        let id = gpui_kit::SharedString::from(format!("block-{block}-{position}-{action}"));
+        if window
+            .try_find(id.clone())
+            .is_some_and(|control| control.visible())
+        {
+            window.click(id, cx);
+            return;
+        }
+    }
+    panic!("no {action} control of block {block} is on screen");
+}
+
+#[gpui_kit::test]
+fn a_five_megabyte_block_can_be_paged_from_either_end_in_bounded_windows(cx: &mut TestAppContext) {
+    let mut blocks = fixture::timeline(8);
+    blocks.push(fixture::huge_block(9, 5 * 1024 * 1024));
+    let total = blocks[8].markdown().len();
+    let last_line = blocks[8]
+        .markdown()
+        .lines()
+        .rev()
+        .find(|line| line.contains("output line"))
+        .expect("the block has output lines")[..8]
+        .to_string();
+    let (handle, shell) = open_blocks(cx, size(px(1440.), px(1200.)), blocks);
+    cx.run_until_parked();
+    let laid_out = |window: &mut Window, cx: &mut App| -> Vec<String> {
+        window.draw(cx).clear(cx);
+        let painted = painted(window);
+        let bytes: usize = painted.iter().map(String::len).sum();
+        assert!(
+            bytes < 4 * limits::BLOCK_PREVIEW_MAX_BYTES,
+            "{bytes} bytes laid out"
+        );
+        painted
+    };
+    step(cx, handle, |window, cx| {
+        let painted = laid_out(window, cx);
+        assert!(painted
+            .iter()
+            .any(|text| text.contains("00000001 output line")));
+        assert!(!painted.iter().any(|text| text.contains(&last_line)));
+        // Jump to the end.
+        click_window_control(window, 9, "end", cx);
+    });
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| {
+        let painted = laid_out(window, cx);
+        assert!(painted.iter().any(|text| text.contains(&last_line)));
+        assert!(!painted
+            .iter()
+            .any(|text| text.contains("00000001 output line")));
+        let notice = painted
+            .iter()
+            .find(|text| text.starts_with("Showing "))
+            .expect("the window line is painted");
+        assert!(notice.contains("before it is not shown."), "{notice}");
+        assert!(!notice.contains("after it"), "{notice}");
+        // One window back, then back to the start.
+        click_window_control(window, 9, "earlier", cx);
+    });
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| {
+        let painted = laid_out(window, cx);
+        assert!(!painted.iter().any(|text| text.contains(&last_line)));
+        let notice = painted
+            .iter()
+            .find(|text| text.starts_with("Showing "))
+            .expect("the window line is painted");
+        // In the middle: something is missing on both sides, and it says so.
+        assert!(
+            notice.contains("before it is not shown.") && notice.contains("after it is not shown."),
+            "{notice}"
+        );
+        click_window_control(window, 9, "start", cx);
+    });
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| {
+        let painted = laid_out(window, cx);
+        assert!(painted
+            .iter()
+            .any(|text| text.contains("00000001 output line")));
+        // Nothing about the block itself changed.
+        assert_eq!(shell.read(cx).block_count(), 9);
+        let _ = total;
+    });
+}
+
+#[gpui_kit::test]
+fn a_streamed_block_longer_than_one_window_keeps_showing_its_newest_text(cx: &mut TestAppContext) {
+    let (handle, shell) = open(cx, size(px(1440.), px(1200.)), 20, 40);
+    cx.run_until_parked();
+    let flush = |cx: &mut TestAppContext| {
+        cx.executor().advance_clock(Duration::from_millis(50));
+        cx.run_until_parked();
+    };
+    // Stream about three windows' worth: Thai, an emoji sequence, and a
+    // marker in every delta.
+    let delta = |index: usize| format!("ย่อหน้าที่ {index} 👩🏽‍💻 จบย่อหน้า #{index:06}#\n\n");
+    let per_delta = delta(1_000).len();
+    let count = 3 * limits::BLOCK_PREVIEW_MAX_BYTES / per_delta;
+    step(cx, handle, |_, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.begin_stream(cx);
+            for index in 1..=count {
+                shell.push_stream_delta(&delta(index), cx);
+            }
+        });
+    });
+    flush(cx);
+    let newest = |index: usize| format!("จบย่อหน้า #{index:06}#");
+    step(cx, handle, |window, cx| {
+        window.draw(cx).clear(cx);
+        let painted = painted(window);
+        // The newest text is on screen, the oldest is not laid out, and the
+        // row says how much is missing before it.
+        assert!(window.find(("block", 41usize)).visible());
+        assert!(painted.iter().any(|text| text.contains(&newest(count))));
+        assert!(!painted.iter().any(|text| text.contains(&newest(1))));
+        let notice = painted
+            .iter()
+            .find(|text| text.starts_with("Showing "))
+            .expect("the window line is painted");
+        assert!(notice.contains("before it is not shown."), "{notice}");
+        assert!(!notice.contains("after it"), "{notice}");
+        let bytes: usize = painted.iter().map(String::len).sum();
+        assert!(
+            bytes < 4 * limits::BLOCK_PREVIEW_MAX_BYTES,
+            "{bytes} bytes laid out"
+        );
+
+        // More arrives: still the newest text.
+        shell.update(cx, |shell, cx| {
+            for index in count + 1..=count + 50 {
+                shell.push_stream_delta(&delta(index), cx);
+            }
+        });
+    });
+    flush(cx);
+    step(cx, handle, |window, cx| {
+        window.draw(cx).clear(cx);
+        assert!(painted(window)
+            .iter()
+            .any(|text| text.contains(&newest(count + 50))));
+        // The reader goes back to the start of the block...
+        click_window_control(window, 41, "start", cx);
+    });
+    flush(cx);
+    step(cx, handle, |window, cx| {
+        window.draw(cx).clear(cx);
+        assert!(painted(window).iter().any(|text| text.contains(&newest(1))));
+        // ...and the stream goes on.
+        shell.update(cx, |shell, cx| {
+            for index in count + 51..=count + 100 {
+                shell.push_stream_delta(&delta(index), cx);
+            }
+        });
+    });
+    flush(cx);
+    step(cx, handle, |window, cx| {
+        window.draw(cx).clear(cx);
+        let painted = painted(window);
+        // The start stays on show; the row says more is arriving below it.
+        assert!(painted.iter().any(|text| text.contains(&newest(1))));
+        assert!(!painted
+            .iter()
+            .any(|text| text.contains(&newest(count + 100))));
+        let notice = painted
+            .iter()
+            .find(|text| text.starts_with("Showing "))
+            .expect("the window line is painted");
+        assert!(notice.contains("and more is arriving."), "{notice}");
+        // "End" brings the newest text back and follows it again.
+        click_window_control(window, 41, "end", cx);
+        shell.update(cx, |shell, cx| {
+            shell.push_stream_delta(&delta(count + 101), cx);
+            shell.finish_stream(cx);
+        });
+    });
+    flush(cx);
+    step(cx, handle, |window, cx| {
+        window.draw(cx).clear(cx);
+        assert!(painted(window)
+            .iter()
+            .any(|text| text.contains(&newest(count + 101))));
+        assert_eq!(shell.read(cx).block_count(), 41);
     });
 }
 
