@@ -2300,9 +2300,12 @@ pattern (§4.4).
 ### 7.8 Import / export
 
 Local tools/skills/Sessions imports, TUI import and URL bundle previews share
-a UTF-8 JSON reader. A leading UTF-8 BOM is accepted; UTF-16/UTF-32 BOMs
-are refused with the source filename/URL and an instruction to re-save as
-UTF-8 JSON. Other I/O, encoding and JSON errors identify the source. Only
+a UTF-8 JSON reader. A leading UTF-8 BOM is accepted. Local files and direct
+URL fetches reject UTF-16/UTF-32 BOMs with the source filename/URL and an
+instruction to re-save as UTF-8 JSON; their other I/O, encoding and JSON
+errors also identify the source. Embedded gist file candidates that cannot
+be parsed or validated are skipped; if none qualify, the gist reports that
+no file is a bundle rather than a candidate-specific encoding error. Only
 the leading BOM is ignored for parsing: original source text remains intact
 for existing preview fingerprints. Bundle validation and import decisions
 are unchanged.
