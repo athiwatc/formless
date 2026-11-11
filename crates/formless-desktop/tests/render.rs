@@ -25,7 +25,8 @@ mod render {
     use gpui_kit::component::{Theme, ThemeMode};
     use gpui_kit::test::TestWindowExt as _;
     use gpui_kit::{
-        px, size, AppContext as _, Bounds, HeadlessAppContext, WindowBounds, WindowOptions,
+        px, size, AppContext as _, Bounds, HeadlessAppContext, Pixels, Window, WindowBounds,
+        WindowOptions,
     };
 
     /// Name, window width, theme, text size in percent, and a control to
@@ -133,5 +134,133 @@ mod render {
             );
         }
         println!("render: ok ({} states)", STATES.len());
+        real_text_measurements();
+    }
+
+    /// Where the real text system wraps `text` at `width`, as byte offsets,
+    /// and the width of the text laid out on one line.
+    fn wraps(window: &mut Window, text: &str, width: Pixels) -> (Vec<usize>, Pixels) {
+        let style = window.text_style();
+        let font_size = style.font_size.to_pixels(window.rem_size());
+        let run = style.to_run(text.len());
+        let lines = window
+            .text_system()
+            .shape_text(
+                text.to_string().into(),
+                font_size,
+                &[run],
+                Some(width),
+                None,
+            )
+            .expect("the text shapes");
+        assert_eq!(lines.len(), 1, "one paragraph");
+        let line = &lines[0];
+        let offsets = line
+            .wrap_boundaries
+            .iter()
+            .map(|boundary| {
+                line.unwrapped_layout.runs[boundary.run_ix].glyphs[boundary.glyph_ix].index
+            })
+            .collect();
+        (offsets, line.unwrapped_layout.width)
+    }
+
+    /// Measurements that need real fonts. The kit's headless test window
+    /// (tests/shell.rs) uses a stand-in text system in which every character
+    /// is the same width, so nothing about glyph widths or where real text
+    /// wraps can be learned there. This runs on the platform text system.
+    fn real_text_measurements() {
+        let mut cx = HeadlessAppContext::with_platform(
+            gpui_kit::platform::current_platform(true).text_system(),
+            Arc::new(Assets),
+            gpui_kit::platform::current_headless_renderer,
+        );
+        let (handle, _) = cx
+            .update(|cx| {
+                gpui_kit::init(cx);
+                let sessions = fixture::sessions(4);
+                let running = fixture::running(&sessions);
+                let options = WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: Default::default(),
+                        size: size(px(1440.), px(900.)),
+                    })),
+                    focus: false,
+                    show: false,
+                    ..Default::default()
+                };
+                gpui_kit::open_window(options, cx, |window, cx| {
+                    cx.new(|cx| Shell::new(&sessions, &running, fixture::timeline(4), window, cx))
+                })
+            })
+            .expect("open offscreen window");
+        cx.update_window(handle, |_, window, _| {
+            let thai = "ข้อความอ้างอิงภาษาไทยที่ยาวพอจะตัดบรรทัดได้หลายครั้งเมื่อหน้าต่างแคบลงเพื่อทดสอบการตัดคำ";
+            let latin = "the quick brown fox jumps over the lazy dog";
+            let (_, thai_width) = wraps(window, thai, px(100_000.));
+            let (_, latin_width) = wraps(window, latin, px(100_000.));
+            println!(
+                "render: real text widths at 16 px: {} Thai characters {thai_width:?}, {} Latin \
+                 characters {latin_width:?}",
+                thai.chars().count(),
+                latin.chars().count()
+            );
+            // A stand-in text system would make every character equally wide.
+            let (_, narrow) = wraps(window, "iiiiiiii", px(100_000.));
+            let (_, wide) = wraps(window, "mmmmmmmm", px(100_000.));
+            assert!(wide > narrow * 1.5, "these are not real font metrics");
+            #[cfg(feature = "thai-breaks")]
+            thai_breaks(window, thai);
+        })
+        .expect("offscreen window is open");
+    }
+
+    /// With real fonts: does GPUI break Thai inside words, do zero width
+    /// space marks at word boundaries fix that, and do the marks take space?
+    #[cfg(feature = "thai-breaks")]
+    fn thai_breaks(window: &mut Window, sentence: &str) {
+        use formless_desktop::thai::{self, ZERO_WIDTH_SPACE};
+
+        let raw = sentence.repeat(6);
+        let marked = thai::with_break_opportunities(&raw).into_owned();
+        let word_starts: HashSet<usize> = thai::word_boundaries(&raw).into_iter().collect();
+        let marks = marked.matches(ZERO_WIDTH_SPACE).count();
+        for width in [px(240.), px(300.), px(420.)] {
+            let (raw_wraps, _) = wraps(window, &raw, width);
+            let (marked_wraps, _) = wraps(window, &marked, width);
+            let raw_mid_word = raw_wraps
+                .iter()
+                .filter(|offset| !word_starts.contains(offset))
+                .count();
+            // In the marked text a break between words is at a mark.
+            let at_mark = |offset: usize| {
+                marked[..offset].ends_with(ZERO_WIDTH_SPACE)
+                    || marked[offset..].starts_with(ZERO_WIDTH_SPACE)
+            };
+            let marked_mid_word = marked_wraps
+                .iter()
+                .filter(|offset| !at_mark(**offset))
+                .count();
+            println!(
+                "render: thai wrap at {width:?}: unmarked {} breaks, {raw_mid_word} inside a word; \
+                 marked {} breaks, {marked_mid_word} inside a word",
+                raw_wraps.len(),
+                marked_wraps.len()
+            );
+            assert!(raw_wraps.len() >= 4, "the paragraph wraps");
+            assert!(raw_mid_word > 0, "unmarked Thai broke inside a word");
+            assert_eq!(marked_mid_word, 0, "marked Thai breaks only between words");
+        }
+        let (_, raw_width) = wraps(window, &raw, px(100_000.));
+        let (_, marked_width) = wraps(window, &marked, px(100_000.));
+        let (_, latin) = wraps(window, "abab", px(100_000.));
+        let (_, latin_marked) = wraps(window, &format!("ab{ZERO_WIDTH_SPACE}ab"), px(100_000.));
+        println!(
+            "render: zero width space: {marks} marks between Thai words add {:?} to {raw_width:?} \
+             ({:?} each); one between Latin letters adds {:?}",
+            marked_width - raw_width,
+            (marked_width - raw_width) / marks as f32,
+            latin_marked - latin
+        );
     }
 }

@@ -8,4 +8,6 @@ pub mod memory;
 pub mod model;
 #[cfg(feature = "gui")]
 pub mod shell;
+#[cfg(feature = "thai-breaks")]
+pub mod thai;
 pub mod timeline;

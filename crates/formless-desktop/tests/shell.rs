@@ -3,6 +3,12 @@
 //! These drive the real `Shell` view in the kit's test window: real hit
 //! testing, key dispatch, focus and layout. They do not prove pixels, OS IME
 //! behaviour, a screen reader, or anything about a Daemon Core.
+//!
+//! The test window has no real fonts. Its text system gives every character
+//! the same width (0.6 em), so text here wraps and sizes by character count.
+//! Layout logic is real; glyph widths and where real text breaks are not.
+//! Anything that depends on those is measured in `tests/render.rs`, which
+//! runs on the platform text system.
 
 use std::time::{Duration, Instant};
 
@@ -1801,4 +1807,46 @@ fn the_display_scale_factor_does_not_change_the_logical_layout(cx: &mut TestAppC
     assert_eq!(measure(cx), before);
     cx.simulate_window_scale_factor_change(handle.into(), 1.0);
     assert_eq!(measure(cx), before);
+}
+
+// ---- Thai ----------------------------------------------------------------
+
+#[gpui_kit::test]
+fn word_wise_caret_movement_over_thai_is_recorded(cx: &mut TestAppContext) {
+    #[cfg(target_os = "macos")]
+    const WORD_LEFT: &str = "alt-left";
+    #[cfg(not(target_os = "macos"))]
+    const WORD_LEFT: &str = "ctrl-left";
+
+    // Seven words, no spaces: ภาษา ไทย ไม่มี ช่อง ว่าง ระหว่าง คำ
+    let sentence = "ภาษาไทยไม่มีช่องว่างระหว่างคำ";
+    let (handle, shell) = open(cx, WIDE, 200, 40);
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        window.input(sentence, cx);
+        assert_eq!(
+            shell.read(cx).composer_selection(cx),
+            sentence.len()..sentence.len()
+        );
+        let mut stops = Vec::new();
+        for _ in 0..60 {
+            window.press(WORD_LEFT, cx);
+            let caret = shell.read(cx).composer_selection(cx).start;
+            if stops.last() == Some(&caret) {
+                break;
+            }
+            stops.push(caret);
+        }
+        println!(
+            "EVIDENCE thai_word_left: {} presses to cross {} characters in 7 words; stops at \
+             byte offsets {stops:?}",
+            stops.len(),
+            sentence.chars().count()
+        );
+        // Recorded, not judged: the kit decides where a "word" starts. It must
+        // at least reach the start of the text and stop on character
+        // boundaries.
+        assert_eq!(stops.last(), Some(&0));
+        assert!(stops.iter().all(|stop| sentence.is_char_boundary(*stop)));
+    });
 }

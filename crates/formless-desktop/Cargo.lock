@@ -1890,6 +1890,7 @@ version = "0.1.0"
 dependencies = [
  "formless-protocol",
  "gpui-kit",
+ "icu_segmenter",
  "unicode-segmentation",
 ]
 

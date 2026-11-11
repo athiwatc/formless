@@ -23,6 +23,10 @@ gui = ["dep:gpui-kit"]
 # than a dev-dependency: dev-dependencies cannot be optional, and one on the
 # kit would compile GPUI even for the model tests.
 test-support = ["gui", "gpui-kit/test-support"]
+# Feasibility study, off by default and not wired into the shell: Thai word
+# boundaries from ICU's dictionary, for giving GPUI's line breaker somewhere
+# to break. See src/thai.rs and the findings document.
+thai-breaks = ["dep:icu_segmenter"]
 
 [lib]
 path = "src/lib.rs"
@@ -49,6 +53,9 @@ formless-protocol = { path = "../formless-protocol" }
 # Grapheme boundaries, so a restored selection never lands inside a
 # character the user sees as one. Already in the graph through the kit.
 unicode-segmentation = "1"
+# The same crate and features the GPUI layer already builds (it is in the
+# lockfile through gpui-pre), so the GUI build compiles nothing new for it.
+icu_segmenter = { version = "2.4", default-features = false, features = ["compiled_data"], optional = true }
 # Exact pin: the kit pins its GPUI layer exactly (gpui-pre =0.3.12), so the
 # whole family moves together and only on purpose.
 gpui-kit = { version = "=0.9.1", optional = true }
