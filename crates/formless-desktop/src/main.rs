@@ -15,6 +15,17 @@
 //!   opens, so whatever the user is typing into keeps the keyboard.
 //! - `--lifetime S`: quit by itself after S seconds. With `--background`,
 //!   this is for inspecting the window from outside without leaving it open.
+//! - `--dump-a11y PATH`: every half second, write to PATH the accessibility
+//!   tree GPUI last handed to the platform's adapter, as JSON. GPUI only
+//!   builds that tree once something has asked the platform for it (a
+//!   screen reader, an inspector), so the file appears after the first such
+//!   request. This is what the shell gives the adapter, before the adapter
+//!   or any reader filters it.
+//! - `--dump-platform-a11y PATH` (macOS, `ax-dump` feature): every half
+//!   second, walk the window's own NSAccessibility elements from inside the
+//!   process and write them to PATH, one per line. This is what the
+//!   platform adapter exposes to any assistive technology, read without
+//!   one. The first walk is itself the request that starts the adapter.
 //! - `--smoke`: print startup timings up to the first rendered frame, quit.
 //! - `--stream-seconds S` (with `--stream-rate R`, default 100 deltas per
 //!   second; 0 streams nothing and measures the idle window): stream into
@@ -33,7 +44,8 @@ use gpui_kit::{px, size, App, Bounds, Entity, Window, WindowBounds, WindowOption
 
 const USAGE: &str = "usage: formless-desktop [--sessions N] [--blocks N] [--huge-block-mb N] \
                      [--text-scale P] [--window WxH] [--keep-window] \
-                     [--background] [--lifetime S] \
+                     [--background] [--lifetime S] [--dump-a11y PATH] \
+                     [--dump-platform-a11y PATH] \
                      [--smoke] [--stream-seconds S [--stream-rate R]]";
 
 struct Options {
@@ -45,6 +57,8 @@ struct Options {
     keep_window: bool,
     background: bool,
     lifetime_seconds: usize,
+    dump_a11y: Option<String>,
+    dump_platform_a11y: Option<String>,
     smoke: bool,
     stream_seconds: usize,
     stream_rate: usize,
@@ -60,6 +74,8 @@ fn parse_options() -> Result<Options, String> {
         keep_window: false,
         background: false,
         lifetime_seconds: 0,
+        dump_a11y: None,
+        dump_platform_a11y: None,
         smoke: false,
         stream_seconds: 0,
         stream_rate: 100,
@@ -87,6 +103,15 @@ fn parse_options() -> Result<Options, String> {
             "--keep-window" => options.keep_window = true,
             "--background" => options.background = true,
             "--lifetime" => options.lifetime_seconds = count("--lifetime")?,
+            "--dump-platform-a11y" => {
+                options.dump_platform_a11y = Some(
+                    args.next()
+                        .ok_or("--dump-platform-a11y needs a file path")?,
+                );
+            }
+            "--dump-a11y" => {
+                options.dump_a11y = Some(args.next().ok_or("--dump-a11y needs a file path")?);
+            }
             "--smoke" => options.smoke = true,
             "--stream-seconds" => options.stream_seconds = count("--stream-seconds")?,
             "--stream-rate" => options.stream_rate = count("--stream-rate")?,
@@ -94,6 +119,156 @@ fn parse_options() -> Result<Options, String> {
         }
     }
     Ok(options)
+}
+
+/// The window's NSAccessibility elements, read from inside the process.
+#[cfg(all(target_os = "macos", feature = "ax-dump"))]
+// The `objc` macros test a `cfg` this crate does not declare.
+#[allow(unexpected_cfgs)]
+mod platform_a11y {
+    use std::ffi::CStr;
+    use std::fmt::Write as _;
+    use std::os::raw::c_char;
+
+    use gpui_kit::Window;
+    use objc::runtime::{Object, Sel, BOOL, NO};
+    use objc::{msg_send, sel, sel_impl, Message as _};
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    /// More than any real tree here; stops a cycle from running away.
+    const MAX_ELEMENTS: usize = 5_000;
+
+    unsafe fn responds(object: *mut Object, selector: Sel) -> bool {
+        let responds: BOOL = msg_send![object, respondsToSelector: selector];
+        responds != NO
+    }
+
+    /// An attribute as text: a string as it is, anything else by its
+    /// description. `None` if the element has no such attribute or it is nil.
+    unsafe fn text(object: *mut Object, selector: Sel) -> Option<String> {
+        if !responds(object, selector) {
+            return None;
+        }
+        let value: *mut Object = (*object).send_message(selector, ()).ok()?;
+        if value.is_null() {
+            return None;
+        }
+        let string: *mut Object = if responds(value, sel!(UTF8String)) {
+            value
+        } else {
+            msg_send![value, description]
+        };
+        let utf8: *const c_char = msg_send![string, UTF8String];
+        (!utf8.is_null()).then(|| CStr::from_ptr(utf8).to_string_lossy().into_owned())
+    }
+
+    unsafe fn flag(object: *mut Object, selector: Sel) -> Option<bool> {
+        if !responds(object, selector) {
+            return None;
+        }
+        let value: BOOL = (*object).send_message(selector, ()).ok()?;
+        Some(value != NO)
+    }
+
+    unsafe fn walk_element(element: *mut Object, depth: usize, out: &mut String, left: &mut usize) {
+        if element.is_null() || *left == 0 {
+            return;
+        }
+        *left -= 1;
+        let _ = write!(out, "{}", "  ".repeat(depth));
+        let _ = write!(
+            out,
+            "{}",
+            text(element, sel!(accessibilityRole)).unwrap_or_else(|| "(no role)".into())
+        );
+        for (name, selector) in [
+            ("subrole", sel!(accessibilitySubrole)),
+            ("label", sel!(accessibilityLabel)),
+            ("title", sel!(accessibilityTitle)),
+            ("value", sel!(accessibilityValue)),
+            ("placeholder", sel!(accessibilityPlaceholderValue)),
+            ("help", sel!(accessibilityHelp)),
+        ] {
+            if let Some(value) = text(element, selector).filter(|value| !value.is_empty()) {
+                let _ = write!(out, " {name}={value:?}");
+            }
+        }
+        for (name, selector) in [
+            ("element", sel!(isAccessibilityElement)),
+            ("enabled", sel!(isAccessibilityEnabled)),
+            ("focused", sel!(isAccessibilityFocused)),
+        ] {
+            if let Some(value) = flag(element, selector) {
+                let _ = write!(out, " {name}={value}");
+            }
+        }
+        out.push('\n');
+        if !responds(element, sel!(accessibilityChildren)) {
+            return;
+        }
+        let children: *mut Object = msg_send![element, accessibilityChildren];
+        if children.is_null() {
+            return;
+        }
+        let count: usize = msg_send![children, count];
+        for index in 0..count {
+            let child: *mut Object = msg_send![children, objectAtIndex: index];
+            walk_element(child, depth + 1, out, left);
+        }
+    }
+
+    /// One line for each element under the window's content view, indented
+    /// by depth: role, then the attributes it has. `element=false` marks an
+    /// element the platform tells assistive technology to skip.
+    pub fn walk(window: &Window) -> String {
+        // The trait's method, not the window's own of the same name.
+        let Ok(handle) = HasWindowHandle::window_handle(window) else {
+            return "no window handle
+"
+            .into();
+        };
+        let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
+            return "not an AppKit window
+"
+            .into();
+        };
+        let view = handle.ns_view.as_ptr().cast::<Object>();
+        let mut out = String::new();
+        let mut left = MAX_ELEMENTS;
+        // Safety: this runs on the main thread, inside a window update, with
+        // the window's own view. Every message is sent only to an object
+        // that says it responds to it.
+        unsafe {
+            // The platform adapter attaches to the window's content view,
+            // which need not be the view GPUI draws into.
+            let window: *mut Object = msg_send![view, window];
+            let content: *mut Object = if window.is_null() {
+                view
+            } else {
+                msg_send![window, contentView]
+            };
+            if content != view {
+                out.push_str("(walking the window's content view, not the drawing view)\n");
+            }
+            walk_element(content, 0, &mut out, &mut left);
+        }
+        if left == 0 {
+            out.push_str(
+                "(stopped at the element limit)
+",
+            );
+        }
+        out
+    }
+}
+
+#[cfg(not(all(target_os = "macos", feature = "ax-dump")))]
+mod platform_a11y {
+    pub fn walk(_window: &gpui_kit::Window) -> String {
+        "the platform accessibility walk needs macOS and the ax-dump feature
+"
+        .into()
+    }
 }
 
 /// Print what the window and the layout settled at. Returns whether the
@@ -309,6 +484,51 @@ fn main() {
         .expect("failed to open the shell window");
         if !options.background {
             cx.activate(true);
+        }
+        if let Some(path) = options.dump_a11y.clone() {
+            let handle = window;
+            cx.spawn(async move |cx| {
+                let mut was_active = false;
+                loop {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(500))
+                        .await;
+                    let dumped = cx.update(|cx| {
+                        cx.update_window(handle, |_, window, _| {
+                            (window.is_a11y_active(), window.debug_a11y_tree_json())
+                        })
+                    });
+                    let Ok((active, tree)) = dumped else { break };
+                    if active != was_active {
+                        println!("a11y: active={active}");
+                        was_active = active;
+                    }
+                    if let Some(tree) = tree {
+                        if let Err(error) = std::fs::write(&path, tree) {
+                            println!("a11y: cannot write {path}: {error}");
+                            break;
+                        }
+                    }
+                }
+            })
+            .detach();
+        }
+        if let Some(path) = options.dump_platform_a11y.clone() {
+            let handle = window;
+            cx.spawn(async move |cx| loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(500))
+                    .await;
+                let walked = cx.update(|cx| {
+                    cx.update_window(handle, |_, window, _| platform_a11y::walk(window))
+                });
+                let Ok(tree) = walked else { break };
+                if let Err(error) = std::fs::write(&path, tree) {
+                    println!("a11y: cannot write {path}: {error}");
+                    break;
+                }
+            })
+            .detach();
         }
         if options.lifetime_seconds > 0 {
             let lifetime = Duration::from_secs(options.lifetime_seconds as u64);

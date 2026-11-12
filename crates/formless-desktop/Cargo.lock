@@ -1891,6 +1891,8 @@ dependencies = [
  "formless-protocol",
  "gpui-kit",
  "icu_segmenter",
+ "objc",
+ "raw-window-handle",
  "unicode-segmentation",
 ]
 

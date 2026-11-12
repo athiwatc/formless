@@ -27,6 +27,11 @@ test-support = ["gui", "gpui-kit/test-support"]
 # boundaries from ICU's dictionary, for giving GPUI's line breaker somewhere
 # to break. See src/thai.rs and the findings document.
 thai-breaks = ["dep:icu_segmenter"]
+# Diagnostic, off by default, macOS only: lets the binary walk its own
+# window's NSAccessibility elements from inside the process and write them
+# out (`--dump-platform-a11y`). That is what the platform adapter exposes,
+# read without an assistive-technology permission. See the findings document.
+ax-dump = ["gui", "dep:objc", "dep:raw-window-handle"]
 
 [lib]
 path = "src/lib.rs"
@@ -59,3 +64,9 @@ icu_segmenter = { version = "2.4", default-features = false, features = ["compil
 # Exact pin: the kit pins its GPUI layer exactly (gpui-pre =0.3.12), so the
 # whole family moves together and only on purpose.
 gpui-kit = { version = "=0.9.1", optional = true }
+
+# Both are already in the lockfile through the GPUI layer; `ax-dump` only
+# adds the edges from this crate.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc = { version = "0.2.7", optional = true }
+raw-window-handle = { version = "0.6", optional = true }
