@@ -11,6 +11,10 @@
 //!   a small window shows the reflowed shell. With `--smoke`, focus is then
 //!   moved to each part of the page in turn and where the page scrolled to
 //!   is printed.
+//! - `--background`: do not bring the application to the front when it
+//!   opens, so whatever the user is typing into keeps the keyboard.
+//! - `--lifetime S`: quit by itself after S seconds. With `--background`,
+//!   this is for inspecting the window from outside without leaving it open.
 //! - `--smoke`: print startup timings up to the first rendered frame, quit.
 //! - `--stream-seconds S` (with `--stream-rate R`, default 100 deltas per
 //!   second; 0 streams nothing and measures the idle window): stream into
@@ -29,6 +33,7 @@ use gpui_kit::{px, size, App, Bounds, Entity, Window, WindowBounds, WindowOption
 
 const USAGE: &str = "usage: formless-desktop [--sessions N] [--blocks N] [--huge-block-mb N] \
                      [--text-scale P] [--window WxH] [--keep-window] \
+                     [--background] [--lifetime S] \
                      [--smoke] [--stream-seconds S [--stream-rate R]]";
 
 struct Options {
@@ -38,6 +43,8 @@ struct Options {
     text_scale: usize,
     window: (f32, f32),
     keep_window: bool,
+    background: bool,
+    lifetime_seconds: usize,
     smoke: bool,
     stream_seconds: usize,
     stream_rate: usize,
@@ -51,6 +58,8 @@ fn parse_options() -> Result<Options, String> {
         text_scale: 100,
         window: (1440., 900.),
         keep_window: false,
+        background: false,
+        lifetime_seconds: 0,
         smoke: false,
         stream_seconds: 0,
         stream_rate: 100,
@@ -76,6 +85,8 @@ fn parse_options() -> Result<Options, String> {
                     .ok_or(format!("--window: {value:?} is not WIDTHxHEIGHT"))?;
             }
             "--keep-window" => options.keep_window = true,
+            "--background" => options.background = true,
+            "--lifetime" => options.lifetime_seconds = count("--lifetime")?,
             "--smoke" => options.smoke = true,
             "--stream-seconds" => options.stream_seconds = count("--stream-seconds")?,
             "--stream-rate" => options.stream_rate = count("--stream-rate")?,
@@ -296,7 +307,17 @@ fn main() {
             shell
         })
         .expect("failed to open the shell window");
-        cx.activate(true);
+        if !options.background {
+            cx.activate(true);
+        }
+        if options.lifetime_seconds > 0 {
+            let lifetime = Duration::from_secs(options.lifetime_seconds as u64);
+            cx.spawn(async move |cx| {
+                cx.background_executor().timer(lifetime).await;
+                cx.update(|cx| cx.quit());
+            })
+            .detach();
+        }
 
         if options.smoke || options.stream_seconds > 0 {
             window
