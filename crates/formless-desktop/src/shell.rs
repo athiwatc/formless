@@ -27,9 +27,9 @@ use gpui_kit::component::{
 use gpui_kit::prelude::*;
 use gpui_kit::{
     canvas, div, point, px, size, AnyElement, App, Bounds, ClipboardItem, Context, DispatchPhase,
-    ElementId, Entity, EntityInputHandler as _, FocusHandle, Focusable as _, Hsla, KeyBinding,
-    Pixels, Role, ScrollEvent, ScrollHandle, ScrollStrategy, SharedString, Size, Subscription,
-    TestSupportExt as _, Window,
+    ElementId, Entity, EntityInputHandler as _, FocusHandle, Focusable as _, HitboxBehavior, Hsla,
+    KeyBinding, Pixels, Role, ScrollEvent, ScrollHandle, ScrollStrategy, SharedString, Size,
+    Subscription, TestSupportExt as _, Window,
 };
 
 use crate::memory::{
@@ -1572,19 +1572,25 @@ impl Shell {
     /// The kit's timeline keeps every wheel event that reaches it, even when
     /// it has nothing further to scroll to, so on a page it would be a trap:
     /// with the timeline under the pointer the page could not be moved. This
-    /// sits over the timeline, takes no pointer input itself, and sees the
+    /// is drawn under the timeline, blocks no pointer input, and sees the
     /// wheel first. When the timeline is already at the end the wheel is
     /// turning towards, the page is scrolled instead.
+    ///
+    /// It acts only when the timeline is what the wheel would reach: its
+    /// own hitbox has to be in the window's hit test for the pointer. A
+    /// modal overlay in front, or anything else that blocks the pointer,
+    /// takes it out, and then the wheel is not this listener's to move the
+    /// page with.
     fn wheel_to_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let timeline = self.timeline.clone();
         let page = self.page_scroll.clone();
         let shell = cx.entity_id();
         canvas(
-            |_, _, _| (),
-            move |bounds, (), window, _| {
+            |bounds, window, _| window.insert_hitbox(bounds, HitboxBehavior::Normal),
+            move |_, hitbox, window, _| {
                 let line_height = window.line_height();
-                window.on_mouse_event(move |event: &ScrollEvent, phase, _, cx| {
-                    if phase != DispatchPhase::Capture || !bounds.contains(&event.position) {
+                window.on_mouse_event(move |event: &ScrollEvent, phase, window, cx| {
+                    if phase != DispatchPhase::Capture || !hitbox.should_handle_scroll(window) {
                         return;
                     }
                     // Negative is towards the end of the page.

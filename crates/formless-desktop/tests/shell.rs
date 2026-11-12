@@ -2431,6 +2431,12 @@ fn wheel_page(window: &mut Window, delta: f32, window_size: Size<Pixels>, cx: &m
         !timeline.contains(&position),
         "no part of the page but the timeline is in the window"
     );
+    wheel_at(window, position, delta, cx);
+}
+
+/// Turn the wheel with the pointer at a point in the window.
+fn wheel_at(window: &mut Window, position: Point<Pixels>, delta: f32, cx: &mut App) {
+    window.render_frame(cx);
     window.dispatch_event(
         MouseMoveEvent {
             position,
@@ -2450,7 +2456,7 @@ fn wheel_page(window: &mut Window, delta: f32, window_size: Size<Pixels>, cx: &m
         .to_platform_input(),
         cx,
     );
-    window.render_frame(cx);
+    settle_frames(window, cx);
 }
 
 fn inside_window(window: &Window, id: &'static str, window_size: Size<Pixels>) -> bool {
@@ -2903,6 +2909,179 @@ fn overlay_panels_fit_a_reflowed_window_and_their_contents_are_reachable(cx: &mu
         assert!(window.try_find("region-inspector").is_none());
         assert_composer_in_view(window, MINIMUM, "after Context");
         assert_eq!(shell.read(cx).draft(cx).as_ref(), "draft");
+    });
+}
+
+#[gpui_kit::test]
+fn the_wheel_over_a_modal_panel_never_moves_the_page_under_it(cx: &mut TestAppContext) {
+    let (handle, shell) = open(cx, MINIMUM, 200, 40);
+    set_text_scale(cx, handle, &shell, 200);
+    cx.run_until_parked();
+    let scrolled = |cx: &App| shell.read(cx).page_metrics().scrolled;
+    let middle = point(MINIMUM.width / 2., MINIMUM.height / 2.);
+    // With the page under the overlay scrolled to each of its parts. With
+    // the conversation in view, the middle of the window is the timeline,
+    // at its newest block: the place where a wheel turned downwards is
+    // handed on to the page when nothing is in front of it.
+    for section in [
+        PageSection::Conversation,
+        PageSection::Composer,
+        PageSection::Header,
+    ] {
+        step(cx, handle, |window, cx| {
+            shell.update(cx, |shell, cx| shell.focus_section(section, window, cx));
+            settle_frames(window, cx);
+            let before = scrolled(cx);
+
+            // Context. The wheel belongs to the panel: its details scroll
+            // and the page under it stays exactly where it was, at the
+            // first turn, at the panel's end and well past it, and all the
+            // way back past its start.
+            window.press(TOGGLE_INSPECTOR, cx);
+            settle_frames(window, cx);
+            assert_eq!(window.find("region-inspector").focused(), Some(true));
+            let detail = window.find("inspector-last-message").bounds().top();
+            window.scroll(
+                "region-inspector",
+                ScrollDelta::Pixels(point(px(0.), px(-100.))),
+                cx,
+            );
+            settle_frames(window, cx);
+            assert_eq!(scrolled(cx), before, "modal wheel moved background");
+            assert_eq!(
+                window.find("inspector-last-message").bounds().top(),
+                detail - px(100.),
+                "the wheel did not scroll the panel"
+            );
+            for delta in [-100., 100.] {
+                for turn in 0..12 {
+                    wheel_at(window, middle, delta, cx);
+                    assert_eq!(
+                        scrolled(cx),
+                        before,
+                        "{section:?}: Context, turn {turn} of {delta}"
+                    );
+                }
+            }
+            assert_eq!(window.find("inspector-last-message").bounds().top(), detail);
+            window.press("escape", cx);
+            settle_frames(window, cx);
+            assert!(window.try_find("region-inspector").is_none());
+            assert_eq!(scrolled(cx), before, "{section:?}: after Context");
+
+            // Sessions. The same, with a list that scrolls a long way.
+            window.press(TOGGLE_SIDEBAR, cx);
+            settle_frames(window, cx);
+            assert_eq!(window.find("region-sidebar").focused(), Some(true));
+            let first = session_row_id(&shell.read(cx).sidebar().rows()[0].id);
+            let row = window.find(first.clone()).bounds();
+            wheel_at(window, row.center(), -100., cx);
+            assert_eq!(scrolled(cx), before, "modal wheel moved background");
+            assert!(
+                window
+                    .try_find(first.clone())
+                    .is_none_or(|moved| moved.bounds().top() < row.top()),
+                "the wheel did not scroll the list"
+            );
+            // Further up than it went down, to end at the list's start.
+            for (delta, turns) in [(-100., 12), (100., 14)] {
+                for turn in 0..turns {
+                    wheel_at(window, row.center(), delta, cx);
+                    assert_eq!(
+                        scrolled(cx),
+                        before,
+                        "{section:?}: Sessions, turn {turn} of {delta}"
+                    );
+                }
+            }
+            // Back at its start, and still not handed on from there.
+            assert_eq!(window.find(first).bounds().top(), row.top());
+            window.press("escape", cx);
+            settle_frames(window, cx);
+            assert!(window.try_find("region-sidebar").is_none());
+            assert_eq!(scrolled(cx), before, "{section:?}: after Sessions");
+        });
+    }
+
+    // With nothing in front of it the timeline hands the wheel on as
+    // before: the overlays coming and going changed nothing about that.
+    step(cx, handle, |window, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.focus_section(PageSection::Conversation, window, cx)
+        });
+        settle_frames(window, cx);
+        let before = scrolled(cx);
+        assert!(window.find("timeline-area").bounds().contains(&middle));
+        wheel_at(window, middle, -100., cx);
+        assert_eq!(scrolled(cx), before + px(100.));
+        // Upwards the timeline has blocks to show, so it takes the wheel.
+        wheel_at(window, middle, 60., cx);
+        assert_eq!(scrolled(cx), before + px(100.));
+    });
+}
+
+/// The independent review's test of `61e1958`, as written there apart from
+/// formatting. It failed: the page under the Context panel went from 213 px
+/// to 313 px.
+#[gpui_kit::test]
+fn modal_wheel_does_not_scroll_background(cx: &mut TestAppContext) {
+    let (handle, shell) = open(cx, MINIMUM, 200, 40);
+    set_text_scale(cx, handle, &shell, 200);
+    step(cx, handle, |window, cx| {
+        shell.update(cx, |s, cx| {
+            s.focus_section(PageSection::Conversation, window, cx)
+        });
+        settle_frames(window, cx);
+        window.press(TOGGLE_INSPECTOR, cx);
+        settle_frames(window, cx);
+        let before = shell.read(cx).page_metrics().scrolled;
+        window.scroll(
+            "region-inspector",
+            ScrollDelta::Pixels(point(px(0.), px(-100.))),
+            cx,
+        );
+        settle_frames(window, cx);
+        assert_eq!(
+            shell.read(cx).page_metrics().scrolled,
+            before,
+            "modal wheel moved background"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn the_wheel_over_a_modal_backdrop_moves_nothing(cx: &mut TestAppContext) {
+    // 700 x 500 at 200%: reflowed, and wider than the Sessions panel, so
+    // some of the backdrop shows beside it.
+    let window_size = size(px(700.), px(500.));
+    let (handle, shell) = open(cx, window_size, 200, 40);
+    set_text_scale(cx, handle, &shell, 200);
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.focus_section(PageSection::Conversation, window, cx)
+        });
+        settle_frames(window, cx);
+        let before = shell.read(cx).page_metrics().scrolled;
+        window.press(TOGGLE_SIDEBAR, cx);
+        settle_frames(window, cx);
+        let panel = window.find("region-sidebar").bounds();
+        assert!(panel.right() < window_size.width - px(40.), "{panel:?}");
+        // Over the backdrop, with the timeline under it.
+        let beside = point(panel.right() + px(20.), window_size.height / 2.);
+        assert!(window.find("timeline-area").bounds().contains(&beside));
+        let first = session_row_id(&shell.read(cx).sidebar().rows()[0].id);
+        let row = window.find(first.clone()).bounds().top();
+        for delta in [-100., 100.] {
+            for _ in 0..6 {
+                wheel_at(window, beside, delta, cx);
+                assert_eq!(shell.read(cx).page_metrics().scrolled, before);
+                assert_eq!(window.find(first.clone()).bounds().top(), row);
+            }
+        }
+        // The overlay is still up and still has focus.
+        assert!(window.find("overlay-backdrop").visible());
+        assert_eq!(window.find("region-sidebar").focused(), Some(true));
     });
 }
 
