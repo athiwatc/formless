@@ -68,6 +68,13 @@ cargo run --release --locked -- --stream-seconds 30 --stream-rate 100
 
 # The model's share of that work alone: no window, no GPUI in the build.
 cargo run --release --no-default-features --locked --example stream_model
+
+# For looking at a real window from outside: open it without coming to the
+# front, quit after ten minutes, and write out the accessibility tree GPUI
+# hands the platform and (macOS, `ax-dump` feature) the one the platform
+# then exposes.
+cargo run --release --locked --features ax-dump -- --background --lifetime 600 \
+  --dump-a11y /tmp/gpui-tree.json --dump-platform-a11y /tmp/platform-tree.txt
 ```
 
 Always run Cargo here with `CARGO_TARGET_DIR` set if the build output should

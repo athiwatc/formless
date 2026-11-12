@@ -209,8 +209,8 @@ typical developer build.
 | Command | Result |
 |---|---|
 | `cargo test --no-default-features --lib --locked` | 61 passed (model, memory, timeline and fixture); no GPUI crate in its dependency graph |
-| `cargo test --features test-support --locked` | 61 passed, 63 passed (headless shell), 19 offscreen render states passed (37 captures) |
-| `cargo test --features test-support,thai-breaks --locked` | 66 passed, 63 passed, 19 render states and the real-text Thai measurement passed |
+| `cargo test --features test-support --locked` | 61 passed, 66 passed (headless shell), 19 offscreen render states passed (37 captures) |
+| `cargo test --features test-support,thai-breaks --locked` | 66 passed, 66 passed, 19 render states and the real-text Thai measurement passed |
 | `cargo fmt --check`, `cargo clippy --all-targets --locked` with and without `thai-breaks` | clean |
 
 These are the counts at the last code commit (§12). The first checkpoint
@@ -447,9 +447,10 @@ none of them can be closed by anything measured so far.
 |---|---|
 | Windows build, tests and launch | Only dependency resolution was done for Windows here. The native Windows run is being done separately and is not duplicated or inferred in this document. |
 | Linux build and launch | Only dependency resolution was done. |
-| Real OS IME composition (Thai, CJK, dead keys) | The harness types finished text; no input method ran. |
-| VoiceOver (and NVDA on Windows) | Roles, names and descriptions, including the overlay dialogs, were read from the accessibility tree in tests. No screen reader ran, so what is announced, and in what order, is unknown. The kit cannot mark an element modal. |
-| 200% text scaling and display-scale changes | The shell's own text size setting goes to 200% in a window of any size. A window too small for it is reflowed, not given smaller text (§15). That is tested headlessly, checked offscreen with real fonts, and reported by the process from real windows. Nobody has looked at it in a window, no screen reader has read it, it is not assessed against any published criterion, and no OS-level display or accessibility setting was changed. |
+| Real OS IME composition (Thai, CJK, dead keys) | The harness types finished text, and finished Thai and Chinese characters were posted to a real window as key events (§16.4). No input method composed anything. |
+| VoiceOver (and NVDA on Windows) | No screen reader ran. The real macOS window's platform accessibility tree was read and acted on (§16): that shows what is exposed, and it was not what the tests implied. What is spoken, and in what order, is unknown. The kit cannot mark an element modal, so the page behind a dialog stays in the tree. |
+| A person's keyboard, pointer and trackpad | Not done. Synthetic OS-level key and wheel events were delivered to real windows in the background (§16.4). No hardware input, pointer movement, hover, drag or gesture, and the window was never frontmost. |
+| 200% text scaling and display-scale changes | The shell's own text size setting goes to 200% in a window of any size. A window too small for it is reflowed, not given smaller text (§15). That is tested headlessly, checked offscreen with real fonts, reported by the process from real windows, and seen by the implementing agent in captures of a real window (§16.4). No person has looked at it, no screen reader has read it, it is not assessed against any published criterion, and no OS-level display or accessibility setting was changed. |
 | Streaming and performance budgets | Frame-delivery intervals were recorded while streaming in a real window (§11.4). That is not key-to-paint, scrolling, session switching, idle CPU or long-run memory, the window was not watched, and no budget is accepted on it. |
 | Thai line breaking | A study shows a workable approach on macOS fonts (§11.6). It is not wired in, and Windows and Linux fonts are untested. |
 | Parity | §6 is an inventory. Only Chat has a view, with synthetic data, and the approval, credential and setup surfaces are unexamined. |
@@ -1197,9 +1198,10 @@ at 200%, and its Sessions overlay). They read as intended.
 
 ### 15.4 Limits
 
-- Nobody has seen this in a real window, and no picture of a real window
-  was taken: that needs screen recording permission, which is a system
-  setting.
+- No person has seen this in a real window. (When this was written no
+  picture of a real window had been taken either. Captures of the real
+  window were taken later, through a tool that already had the
+  permission: §16.4.)
 - No screen reader ran. What it announces for a page whose parts are
   stacked, and for a status line that is a tab stop, is unknown. A
   focusable line of status text is a compromise made for the keyboard.
@@ -1261,3 +1263,150 @@ The 200% gate in §8 stays open until a person, and a screen reader, have
 been at it. Still open as well, unchanged: Windows (done elsewhere), Linux,
 real input methods, performance budgets, parity, packaging. Phase 1 is not
 started.
+
+## 16. A real macOS window: what assistive technology is given, and real events
+
+Local commits `87e02f2` and `c70f4b0` (options for inspecting a window) and
+`63753dd` (the fix). The raw material is in the evidence directory under
+`macos-real-window/`, with its own notes.
+
+### 16.1 How, and what kind of evidence it is
+
+Until now every statement here about accessibility came from the kit's
+test window, and every statement about input from events the test harness
+dispatches. This section is about real windows of the release binary on
+macOS, and it uses four kinds of evidence that should not be confused:
+
+- **The platform accessibility tree.** The window's own NSAccessibility
+  elements, walked from inside the shell's process (`--dump-platform-a11y`,
+  behind the off-by-default `ax-dump` feature), and the same window read
+  from outside through the macOS accessibility API by an automation
+  driver. This is what the platform exposes to any assistive technology.
+  It is not what a screen reader says.
+- **GPUI's tree.** What GPUI hands the platform's adapter (`--dump-a11y`).
+- **Accessibility actions.** `AXPress` sent to an element, the way
+  assistive technology activates a control.
+- **Synthetic OS-level events.** Key and wheel events posted to the
+  process and delivered through AppKit's ordinary path to a window that
+  was not brought to the front. They are not a person's keyboard or
+  trackpad, no input method ran, and no pointer moved.
+
+The driver (cua-driver 0.38.0) was already installed and already had
+Accessibility and Screen Recording permission. No permission or setting
+was changed and VoiceOver was not started. Two things happened that were
+not intended: the driver's `doctor` command contacted GitHub to look for
+an update, and one read-only `osascript` query to System Events hung for
+two minutes and may have raised a consent prompt, which was not answered.
+Neither was repeated.
+
+### 16.2 What the real window exposed
+
+A 1440 x 900 window, read at three layers at once:
+
+| Layer | What it held |
+|---|---|
+| GPUI's tree | 16 nodes: the window; the buttons Sessions, Context, Dark; a navigation landmark with the six destination buttons; the timeline as an empty log; the Message input; Stop; Send; an empty complementary landmark |
+| Platform tree, in process | The same 16, as landmark groups, buttons and a text area; Stop and Send disabled |
+| Driver, from outside | 14 of them. It leaves group elements out of its listing (it visited 22 nodes), and lists the disabled buttons without an index |
+
+Two different things were missing, for two different reasons:
+
+- **The landmarks were missing only from the driver's listing.** The
+  platform adapter exposes them; the in-process walk shows them. That is
+  the driver's filtering and not a defect of the shell.
+- **The text was missing at the source.** No Session in the list, no
+  message in the timeline, no Context detail, no status line, no title: none
+  of it was in GPUI's own tree, so nothing after it could have it. In the
+  pinned GPUI an element gets a node only if it has both an id and a
+  role. A plain string, the kit's `Label` and its markdown view have
+  neither.
+
+The second is a real defect, and the tests had not shown it: they read
+roles and names from the kit's test tree, which answers for the elements
+asked about and says nothing of what is absent. On a reflowed page there
+was a third: keyboard focus on the status line, or on the conversation,
+was on nothing the platform could name.
+
+A window's first read returns only its title-bar buttons. The adapter
+starts when it is first asked, and the content is there from the second
+read.
+
+### 16.3 The fix
+
+- Text the shell draws is a static-text node whose value is the text: the
+  header's profile, the Sessions count, the block count and Run state, each
+  Context detail as "name: value", the three status lines, a composer
+  notice.
+- The header's title is a heading named by the whole title, even where the
+  window cuts it short.
+- The Sessions list is a list box. Each row is an option named by its
+  title and read with its status, with its selected state and its place
+  among all the Sessions.
+- The conversation is the main landmark. Each block on screen is an
+  article named by who it is from, holding the text its row lays out.
+- The status line is a status region, so focus on it has a name.
+
+In the real window afterwards the platform tree has 62 elements where it
+had 18, a Session opens when its row is pressed through the accessibility
+API, and focus on the status line and on the conversation is reported.
+
+Headless: 66 shell tests. The three new ones check roles as well as
+values, because a value on an element with no role is in the test tree and
+not in the platform's; one mutation got past the first version of them for
+exactly that reason (`mutation-check/accessibility-nodes-removed.log`).
+
+### 16.4 Real events, in the background
+
+All through the accessibility API or as synthetic OS-level events, to a
+window that stayed 11th of 12 from the front.
+
+| Window | Event | What followed |
+|---|---|---|
+| 1440 x 900 | `AXPress` on Context | The Context landmark left the platform tree |
+| | 20 characters as key events: Thai, Latin, Chinese, an emoji joined by zero-width joiners | The Message field's platform value was exactly that text; Send became enabled |
+| | `AXPress` on Send | Draft kept; the status line in the capture reads "Recorded Send (20 characters), not sent" |
+| | Cmd-B twice | The Sessions landmark left the tree and came back |
+| | F6 | Platform focus moved to the Sessions landmark |
+| | Wheel over the timeline | Only the timeline's part of the window changed |
+| | `AXPress` on a Session's row (after the fix) | The heading, the open row and the Context details changed to that Session |
+| 480 x 360 at 200% | Cmd-B | Sessions came up as a dialog, titled, with its help text, focused |
+| | Wheel over the open dialog, four times, then Escape | The dialog's list scrolled; the page's pixels after closing are identical to before opening |
+| | Tab from the composer | The status line came into view |
+| | F6 | The conversation came into view |
+| | Wheel over the timeline at its end | The page moved to its end |
+| | Shift-Tab | Focus on Dark, reported by the platform; the header came into view |
+
+The implementing agent looked at the real-window captures of the wide
+window after Send and of the reflowed window at each of those steps. They
+are the first pictures of a real window in this work, and they match the
+offscreen captures.
+
+### 16.5 Not done, and what would settle it
+
+- **A screen reader.** VoiceOver was not started: it changes how the Mac
+  behaves for whoever is using it, and scripting it needs a VoiceOver
+  setting that was not touched. Nothing here says what is spoken, in what
+  order, or whether a status change is noticed.
+- **A person's input.** No hardware keyboard, pointer, hover, drag or
+  trackpad gesture, and the window was never frontmost, so activation, the
+  menu bar and system shortcuts are untried.
+- **An input method.** The Thai and Chinese were finished characters.
+- **What the kit owns.** A block's text is its markdown source in one
+  node: headings, lists, links and code inside it have no structure of
+  their own. A cut block's node holds its bounded window. Rows away from
+  the viewport do not exist as elements, in the Sessions list or the
+  timeline.
+- **Live regions.** Nothing is marked as one. A new block, a status change
+  and a refusal notice are in the tree and are not pushed.
+- **The page behind a dialog** is still in the tree.
+- **Windows and Linux.** Not run.
+
+Next checks, in order of use: a person with VoiceOver reading the window
+top to bottom, moving by landmark and heading, opening a Session, hearing
+a streamed block and a refusal; the same in the 480 x 360 window at 200%
+with a dialog open; a real keyboard and trackpad pass with the window
+frontmost; a Thai or Japanese input method composing into the composer;
+Accessibility Inspector's audit.
+
+Still open, unchanged otherwise: Windows (done elsewhere), Linux,
+performance budgets, parity, packaging. Phase 1 is not started.
