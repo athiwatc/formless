@@ -18,6 +18,7 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{InputEvent, Textarea, TextareaState, Undo};
 use gpui_kit::component::label::Label;
 use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
+use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::text::TextView;
 use gpui_kit::component::{
     h_flex, v_flex, v_virtual_list, ActiveTheme as _, Disableable as _, FocusTrapElement as _,
@@ -25,9 +26,10 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::*;
 use gpui_kit::{
-    div, px, size, AnyElement, App, ClipboardItem, Context, ElementId, Entity,
-    EntityInputHandler as _, FocusHandle, Focusable as _, Hsla, KeyBinding, Pixels, Role,
-    ScrollStrategy, SharedString, Size, Subscription, TestSupportExt as _, Window,
+    canvas, div, point, px, size, AnyElement, App, Bounds, ClipboardItem, Context, DispatchPhase,
+    ElementId, Entity, EntityInputHandler as _, FocusHandle, Focusable as _, Hsla, KeyBinding,
+    Pixels, Role, ScrollEvent, ScrollHandle, ScrollStrategy, SharedString, Size, Subscription,
+    TestSupportExt as _, Window,
 };
 
 use crate::memory::{
@@ -35,7 +37,7 @@ use crate::memory::{
     IntentKind, IntentRecord, Rejections, UndoBudget,
 };
 use crate::model::{
-    send_mode_label, tokens, BlockKind, ComposerActions, Destination, Drafts, InspectorMode,
+    send_mode_label, tokens, BlockKind, ComposerActions, Destination, Drafts, Fit, InspectorMode,
     Intent, Layout, PanelPrefs, Region, RunState, Sidebar, SidebarMode, TextScale,
 };
 use crate::timeline::{
@@ -56,11 +58,16 @@ gpui_kit::actions!(
         SelectNextSession,
         SelectPreviousSession,
         ActivateSession,
+        ScrollInspectorUp,
+        ScrollInspectorDown,
+        ScrollInspectorPageUp,
+        ScrollInspectorPageDown,
     ]
 );
 
 const SESSION_LIST_CONTEXT: &str = "FormlessSessionList";
 const OVERLAY_CONTEXT: &str = "FormlessOverlay";
+const INSPECTOR_CONTEXT: &str = "FormlessInspector";
 /// Read out with a modal panel's name. The kit has no "modal" accessibility
 /// property to set, so the behaviour is also stated in words.
 const MODAL_DESCRIPTION: &str =
@@ -68,6 +75,8 @@ const MODAL_DESCRIPTION: &str =
 const SESSION_ROW_HEIGHT: f32 = 44.0;
 const HEADER_HEIGHT: f32 = 44.0;
 const STATUS_HEIGHT: f32 = 28.0;
+/// How far an arrow key scrolls the inspector, at 100% text size.
+const INSPECTOR_LINE: f32 = 40.0;
 /// The kit theme's default font sizes, which 100% text size maps to.
 const BASE_FONT_SIZE: f32 = 16.0;
 const BASE_MONO_FONT_SIZE: f32 = 13.0;
@@ -96,6 +105,12 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("down", SelectNextSession, Some(SESSION_LIST_CONTEXT)),
         KeyBinding::new("up", SelectPreviousSession, Some(SESSION_LIST_CONTEXT)),
         KeyBinding::new("enter", ActivateSession, Some(SESSION_LIST_CONTEXT)),
+        // The inspector holds text only, so with focus in it the arrow and
+        // page keys scroll it: in a short window it is taller than its panel.
+        KeyBinding::new("up", ScrollInspectorUp, Some(INSPECTOR_CONTEXT)),
+        KeyBinding::new("down", ScrollInspectorDown, Some(INSPECTOR_CONTEXT)),
+        KeyBinding::new("pageup", ScrollInspectorPageUp, Some(INSPECTOR_CONTEXT)),
+        KeyBinding::new("pagedown", ScrollInspectorPageDown, Some(INSPECTOR_CONTEXT)),
     ]);
 }
 
@@ -194,6 +209,79 @@ struct FocusOrigin {
     region: Option<Region>,
 }
 
+/// The parts of a reflowed page, top to bottom. Each can hold focus, so
+/// each can be brought into view from the keyboard. The composer is only
+/// there in Chat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageSection {
+    Header,
+    Conversation,
+    Composer,
+    Status,
+}
+
+impl PageSection {
+    /// The parts a page has, in order.
+    fn of_page(chat: bool) -> &'static [PageSection] {
+        if chat {
+            &[
+                Self::Header,
+                Self::Conversation,
+                Self::Composer,
+                Self::Status,
+            ]
+        } else {
+            &[Self::Header, Self::Conversation, Self::Status]
+        }
+    }
+}
+
+/// What a reflowed page was last scrolled to show, and the layout it was
+/// shown in. When any of it changes, the part that holds focus is scrolled
+/// into view again; between changes the page stays where the user put it.
+#[derive(Clone, PartialEq)]
+struct Reveal {
+    /// The control that holds focus, not only its part: moving from one
+    /// control to the next in a part the user scrolled away from brings
+    /// that part back.
+    focused: Option<FocusHandle>,
+    section: Option<PageSection>,
+    viewport: Size<Pixels>,
+    scale: TextScale,
+}
+
+/// Where a reflowed page and its parts are, as last laid out.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PageMetrics {
+    /// The part of the window the page scrolls in.
+    pub viewport: Bounds<Pixels>,
+    /// How far the page is scrolled down, and how far it can be.
+    pub scrolled: Pixels,
+    pub scroll_max: Pixels,
+    /// The page's parts, top to bottom, where they are with the page
+    /// scrolled to its top.
+    pub sections: Vec<(PageSection, Bounds<Pixels>)>,
+}
+
+impl PageMetrics {
+    /// Where a part is in the window now, with the page scrolled as it is.
+    pub fn shown(&self, section: PageSection) -> Option<Bounds<Pixels>> {
+        let (_, mut bounds) = *self.sections.iter().find(|(part, _)| *part == section)?;
+        bounds.origin.y -= self.scrolled;
+        Some(bounds)
+    }
+
+    /// Whether a part is wholly inside the page's part of the window now.
+    pub fn is_inside(&self, section: PageSection) -> bool {
+        self.shown(section).is_some_and(|part| {
+            part.top() >= self.viewport.top()
+                && part.bottom() <= self.viewport.bottom()
+                && part.left() >= self.viewport.left()
+                && part.right() <= self.viewport.right()
+        })
+    }
+}
+
 pub struct Shell {
     sidebar: Sidebar,
     /// Shared with the timeline's row renderer.
@@ -202,11 +290,19 @@ pub struct Shell {
     stream: Coalescer,
     drafts: Drafts,
     prefs: PanelPrefs,
-    /// The text size the user asked for.
+    /// The text size the user asked for. It is the size shown, in a window
+    /// of any size: a window too small for it is reflowed, not given
+    /// smaller text.
     text_scale: TextScale,
-    /// The text size in use: the requested one, or the largest smaller one
-    /// the window can hold. Fixed sizes and layout breakpoints follow this.
-    shown_scale: TextScale,
+    /// The text size the theme's fonts were last set to.
+    applied_scale: TextScale,
+    /// Scrolls the whole shell up and down in a reflowed window.
+    page_scroll: ScrollHandle,
+    /// Frames still to be drawn with the focused part scrolled into view.
+    reveal_frames: u8,
+    /// Scrolls the inspector's details in a panel too short for them.
+    inspector_scroll: ScrollHandle,
+    revealed: Option<Reveal>,
     destination: Destination,
     /// What the last composer action was. Sizes only: no message text is
     /// kept once an intent has been handed on.
@@ -239,9 +335,14 @@ pub struct Shell {
     sidebar_focus: FocusHandle,
     conversation_focus: FocusHandle,
     inspector_focus: FocusHandle,
-    /// The header toggles own stable handles so focus can return to them.
+    /// The header controls own stable handles so focus can return to them,
+    /// and so a reflowed page knows when to scroll the header into view.
     sidebar_toggle_focus: FocusHandle,
     inspector_toggle_focus: FocusHandle,
+    theme_toggle_focus: FocusHandle,
+    /// The status line is a tab stop on a reflowed page, where it can be
+    /// off screen and holds nothing else that focus could bring into view.
+    status_focus: FocusHandle,
     /// The composer's event subscription and its observer. Replaced with it.
     composer_subscriptions: [Subscription; 2],
     _subscriptions: Vec<Subscription>,
@@ -276,7 +377,11 @@ impl Shell {
             drafts: Drafts::new(limits::DRAFT_MAX_ENTRIES, limits::DRAFT_MAX_BYTES),
             prefs: PanelPrefs::default(),
             text_scale: TextScale::default(),
-            shown_scale: TextScale::default(),
+            applied_scale: TextScale::default(),
+            page_scroll: ScrollHandle::new(),
+            reveal_frames: 0,
+            inspector_scroll: ScrollHandle::new(),
+            revealed: None,
             destination: Destination::Chat,
             last_intent: None,
             accepted_draft: SharedString::default(),
@@ -295,6 +400,8 @@ impl Shell {
             inspector_focus: cx.focus_handle(),
             sidebar_toggle_focus: cx.focus_handle(),
             inspector_toggle_focus: cx.focus_handle(),
+            theme_toggle_focus: cx.focus_handle(),
+            status_focus: cx.focus_handle().tab_stop(true),
             composer_subscriptions,
             _subscriptions: subscriptions,
         }
@@ -392,6 +499,9 @@ impl Shell {
         if draft == self.accepted_draft {
             return;
         }
+        // Typing brings the composer back into view on a reflowed page the
+        // user had scrolled away from it.
+        self.revealed = None;
         // Text still being composed by an input method is not judged: taking
         // it back mid-composition would fight the input method. It is judged
         // the moment the composition ends, committed or not.
@@ -552,30 +662,53 @@ impl Shell {
 
     /// A fixed size from the layout tokens, at the current text size.
     fn scaled(&self, value: f32) -> Pixels {
-        px(value * self.shown_scale.factor())
+        px(value * self.text_scale.factor())
     }
 
-    /// The window width the layout breakpoints see: the real width divided
-    /// by the text size factor.
+    /// Scroll the inspector's details by a line or by most of a panel, down
+    /// for a positive `direction`.
+    fn scroll_inspector(&mut self, direction: f32, page: bool, cx: &mut Context<Self>) {
+        let step = if page {
+            self.inspector_scroll.bounds().size.height * 0.8
+        } else {
+            self.scaled(INSPECTOR_LINE)
+        };
+        let mut offset = self.inspector_scroll.offset();
+        let furthest = -self.inspector_scroll.max_offset().y;
+        offset.y = (offset.y - step * direction).clamp(furthest, px(0.));
+        self.inspector_scroll.set_offset(offset);
+        cx.notify();
+    }
+
+    /// A panel's width: its token width at the current text size, or the
+    /// window's width if that is less, so an overlay panel is never wider
+    /// than the window it covers.
+    fn panel_width(&self, token: f32, window: &Window) -> Pixels {
+        self.scaled(token).min(window.viewport_size().width)
+    }
+
+    /// How the shell is fitted into the window as it is now.
+    pub fn fit(&self, window: &Window) -> Fit {
+        let viewport = window.viewport_size();
+        self.text_scale
+            .fit(f32::from(viewport.width), f32::from(viewport.height))
+    }
+
+    /// The window width the layout breakpoints see.
     fn effective_width(&self, window: &Window) -> f32 {
-        f32::from(window.viewport_size().width) / self.shown_scale.factor()
+        let viewport = window.viewport_size();
+        self.text_scale
+            .layout_width(f32::from(viewport.width), f32::from(viewport.height))
     }
 
-    /// The text size the user asked for.
+    /// The text size the user asked for, which is the size shown.
     pub fn text_scale(&self) -> TextScale {
         self.text_scale
     }
 
-    /// The text size in use, which is smaller than the one asked for when
-    /// the window cannot hold that.
-    pub fn shown_text_scale(&self) -> TextScale {
-        self.shown_scale
-    }
-
-    /// Ask for a text size in the window as it is. The size shown is the
-    /// largest one the window can hold (see [`Self::fit_text_scale`]), so a
-    /// window too small for the request gets smaller text, not controls out
-    /// of reach, and the status line says so.
+    /// Set the text size in the window as it is. The text is shown at this
+    /// size whatever the window's size: a window smaller than the size needs
+    /// is reflowed ([`Fit::Reflowed`]), with every control still reachable.
     pub fn set_text_scale(
         &mut self,
         scale: TextScale,
@@ -589,12 +722,10 @@ impl Shell {
         self.settle(window, cx);
     }
 
-    /// Ask for a text size, and first ask the window to grow to the size
-    /// that text size needs if it is smaller. This is what the shortcuts
-    /// do. Whether the window grows is up to the platform (a display can be
-    /// too small); whatever size it ends up, the rule of
-    /// [`Self::set_text_scale`] holds, at once and again when the resize
-    /// arrives.
+    /// Set the text size, and first ask the window to grow to the size that
+    /// shows everything at once at that text size, if it is smaller. This is
+    /// what the shortcuts do. Whether the window grows is up to the platform
+    /// (a display can be too small); if it does not, the shell is reflowed.
     pub fn set_text_scale_growing_window(
         &mut self,
         scale: TextScale,
@@ -612,24 +743,118 @@ impl Shell {
         self.set_text_scale(scale, window, cx);
     }
 
-    /// Bring the size in use into line with the size asked for and the
-    /// window as it is now. The kit theme's font sizes drive every rem-based
-    /// size (text, controls); the shell's own fixed sizes and its
-    /// breakpoints follow the same factor.
-    fn fit_text_scale(&mut self, window: &Window, cx: &mut Context<Self>) {
-        let viewport = window.viewport_size();
-        let fitted = self
-            .text_scale
-            .fitted_to(f32::from(viewport.width), f32::from(viewport.height));
-        if fitted == self.shown_scale {
+    /// Bring the fonts into line with the text size. The kit theme's font
+    /// sizes drive every rem-based size (text, controls); the shell's own
+    /// fixed sizes and its breakpoints follow the same factor.
+    fn apply_text_scale(&mut self, cx: &mut Context<Self>) {
+        let scale = self.text_scale;
+        if scale == self.applied_scale {
             return;
         }
-        self.shown_scale = fitted;
+        self.applied_scale = scale;
         let theme = Theme::global_mut(cx);
-        theme.font_size = px(BASE_FONT_SIZE * fitted.factor());
-        theme.mono_font_size = px(BASE_MONO_FONT_SIZE * fitted.factor());
-        self.session_sizes = Self::row_sizes(self.sidebar.rows().len(), fitted);
+        theme.font_size = px(BASE_FONT_SIZE * scale.factor());
+        theme.mono_font_size = px(BASE_MONO_FONT_SIZE * scale.factor());
+        self.session_sizes = Self::row_sizes(self.sidebar.rows().len(), scale);
         cx.refresh_windows();
+    }
+
+    /// Where the reflowed page and its parts were when last laid out.
+    pub fn page_metrics(&self) -> PageMetrics {
+        let sections = PageSection::of_page(self.destination == Destination::Chat)
+            .iter()
+            .enumerate()
+            .filter_map(|(index, section)| {
+                Some((*section, self.page_scroll.bounds_for_item(index)?))
+            })
+            .collect();
+        PageMetrics {
+            viewport: self.page_scroll.bounds(),
+            scrolled: -self.page_scroll.offset().y,
+            scroll_max: self.page_scroll.max_offset().y,
+            sections,
+        }
+    }
+
+    /// Move focus to a part of the page: its first header control, the
+    /// conversation, the composer, or the status line.
+    pub fn focus_section(
+        &mut self,
+        section: PageSection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match section {
+            PageSection::Header => window.focus(&self.sidebar_toggle_focus, cx),
+            PageSection::Conversation => window.focus(&self.conversation_focus, cx),
+            PageSection::Composer => self
+                .composer
+                .update(cx, |composer, cx| composer.focus(window, cx)),
+            PageSection::Status => window.focus(&self.status_focus, cx),
+        }
+        // Asking for a part shows it, even if focus was already there.
+        self.revealed = None;
+        cx.notify();
+    }
+
+    /// The part of a reflowed page that holds focus, if one does. Focus in
+    /// an overlay panel is in none of them.
+    pub fn focused_section(&self, window: &Window, cx: &App) -> Option<PageSection> {
+        if self.composer.focus_handle(cx).contains_focused(window, cx) {
+            Some(PageSection::Composer)
+        } else if self.conversation_focus.contains_focused(window, cx) {
+            Some(PageSection::Conversation)
+        } else if self.status_focus.is_focused(window) {
+            Some(PageSection::Status)
+        } else if [
+            &self.sidebar_toggle_focus,
+            &self.inspector_toggle_focus,
+            &self.theme_toggle_focus,
+        ]
+        .into_iter()
+        .any(|handle| handle.is_focused(window))
+        {
+            Some(PageSection::Header)
+        } else {
+            None
+        }
+    }
+
+    /// In a reflowed window, scroll the part that holds focus into view
+    /// when focus has moved to another part or the layout has changed (the
+    /// window was resized, the text size changed), or the user asked for a
+    /// part by name. A focused control is then never left off screen by a
+    /// change it did not make. Nothing happens otherwise, so the page stays
+    /// where the user scrolled it.
+    ///
+    /// GPUI scrolls to a child using where that child was in the frame
+    /// before. When the layout has just changed, that is where it used to
+    /// be, or nowhere. So the request is made for two frames running, and
+    /// the second frame is asked for: the first lays the page out as it now
+    /// is, the second scrolls to where the part really is.
+    fn reveal_focused(&mut self, window: &mut Window, cx: &App) {
+        let reveal = Reveal {
+            focused: window.focused(cx),
+            section: self.focused_section(window, cx),
+            viewport: window.viewport_size(),
+            scale: self.text_scale,
+        };
+        if self.revealed.as_ref() != Some(&reveal) {
+            self.revealed = Some(reveal);
+            self.reveal_frames = 2;
+        }
+        if self.reveal_frames == 0 {
+            return;
+        }
+        self.reveal_frames -= 1;
+        let section = self.revealed.as_ref().and_then(|reveal| reveal.section);
+        let parts = PageSection::of_page(self.destination == Destination::Chat);
+        if let Some(index) = parts.iter().position(|part| Some(*part) == section) {
+            self.page_scroll.scroll_to_item(index);
+            if self.reveal_frames > 0 {
+                window.request_animation_frame();
+            }
+        }
     }
 
     pub fn sidebar(&self) -> &Sidebar {
@@ -950,6 +1175,9 @@ impl Shell {
                 .composer
                 .update(cx, |composer, cx| composer.focus(window, cx)),
         }
+        // On a reflowed page, moving to a region shows it, even if focus
+        // was already there and the page had been scrolled away.
+        self.revealed = None;
         cx.notify();
     }
 
@@ -968,8 +1196,7 @@ impl Shell {
     /// provided its region is still shown. Otherwise focus only moves if the
     /// region holding it is no longer on screen.
     fn settle(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // First, because the size in use decides the layout below.
-        self.fit_text_scale(window, cx);
+        self.apply_text_scale(cx);
         self.prefs.settle(self.effective_width(window));
         let layout = self.layout(window);
         let focused = self.focused_region(window, cx);
@@ -1018,70 +1245,87 @@ impl Shell {
         self.settle(window, cx);
     }
 
-    fn render_header(&self, layout: Layout, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The header. In a reflowed window the title takes a line of its own
+    /// and the controls wrap under it, so none of them is pushed off the
+    /// side; the header is then as tall as that takes.
+    fn render_header(
+        &self,
+        layout: Layout,
+        reflowed: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let title = self
             .sidebar
             .active_row()
             .map_or_else(|| "No Session".into(), |row| row.title.clone());
-        h_flex()
+        let profile = div()
+            .text_sm()
+            .text_color(cx.theme().muted_foreground)
+            .child("Fixture Profile /");
+        let title = div().flex_1().min_w_0().truncate().child(title);
+        let controls = [
+            Button::new("toggle-sidebar")
+                .small()
+                .ghost()
+                .label("Sessions")
+                .tooltip("Show or hide the Sessions sidebar")
+                .track_focus(&self.sidebar_toggle_focus)
+                .selected(layout.sidebar != SidebarMode::Collapsed)
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.toggle_panel(Region::Sidebar, window, cx)
+                })),
+            Button::new("toggle-inspector")
+                .small()
+                .ghost()
+                .label("Context")
+                .tooltip("Show or hide the Context inspector")
+                .track_focus(&self.inspector_toggle_focus)
+                .selected(layout.inspector != InspectorMode::Hidden)
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.toggle_panel(Region::Inspector, window, cx)
+                })),
+            Button::new("toggle-theme")
+                .small()
+                .ghost()
+                .label(if cx.theme().is_dark() {
+                    "Light"
+                } else {
+                    "Dark"
+                })
+                .tooltip("Switch between the light and dark theme")
+                .track_focus(&self.theme_toggle_focus)
+                .on_click(|_, window, cx| {
+                    let next = if cx.theme().is_dark() {
+                        ThemeMode::Light
+                    } else {
+                        ThemeMode::Dark
+                    };
+                    Theme::change(next, Some(window), cx);
+                }),
+        ];
+        let header = div()
             .id("header")
             .test_support()
-            .h(self.scaled(HEADER_HEIGHT))
+            .flex()
             .flex_shrink_0()
             .px_3()
             .gap_2()
             .border_b_1()
-            .border_color(cx.theme().border)
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child("Fixture Profile /"),
-            )
-            .child(div().flex_1().min_w_0().truncate().child(title))
-            .child(
-                Button::new("toggle-sidebar")
-                    .small()
-                    .ghost()
-                    .label("Sessions")
-                    .tooltip("Show or hide the Sessions sidebar")
-                    .track_focus(&self.sidebar_toggle_focus)
-                    .selected(layout.sidebar != SidebarMode::Collapsed)
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.toggle_panel(Region::Sidebar, window, cx)
-                    })),
-            )
-            .child(
-                Button::new("toggle-inspector")
-                    .small()
-                    .ghost()
-                    .label("Context")
-                    .tooltip("Show or hide the Context inspector")
-                    .track_focus(&self.inspector_toggle_focus)
-                    .selected(layout.inspector != InspectorMode::Hidden)
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.toggle_panel(Region::Inspector, window, cx)
-                    })),
-            )
-            .child(
-                Button::new("toggle-theme")
-                    .small()
-                    .ghost()
-                    .label(if cx.theme().is_dark() {
-                        "Light"
-                    } else {
-                        "Dark"
-                    })
-                    .tooltip("Switch between the light and dark theme")
-                    .on_click(|_, window, cx| {
-                        let next = if cx.theme().is_dark() {
-                            ThemeMode::Light
-                        } else {
-                            ThemeMode::Dark
-                        };
-                        Theme::change(next, Some(window), cx);
-                    }),
-            )
+            .border_color(cx.theme().border);
+        if reflowed {
+            header
+                .flex_col()
+                .py_2()
+                .child(h_flex().gap_2().child(profile).child(title))
+                .child(h_flex().flex_wrap().gap_2().children(controls))
+        } else {
+            header
+                .items_center()
+                .h(self.scaled(HEADER_HEIGHT))
+                .child(profile)
+                .child(title)
+                .children(controls)
+        }
     }
 
     /// The Sessions panel. As a modal overlay it is a focus trap: Tab stays
@@ -1125,7 +1369,7 @@ impl Shell {
             .on_action(cx.listener(|this, _: &ActivateSession, window, cx| {
                 this.activate_selected(window, cx)
             }))
-            .w(self.scaled(tokens::SIDEBAR_DEFAULT))
+            .w(self.panel_width(tokens::SIDEBAR_DEFAULT, window))
             .flex_shrink_0()
             .h_full()
             .bg(cx.theme().sidebar)
@@ -1218,7 +1462,17 @@ impl Shell {
             )
     }
 
-    fn render_conversation(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The conversation: its heading, the timeline and, under it, the
+    /// composer. In a reflowed window (`page_height` is the height it is
+    /// given there) the composer is not inside it: it is the page's next
+    /// part, so the page can scroll to either.
+    fn render_conversation(
+        &self,
+        page_height: Option<Pixels>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let reflowed = page_height.is_some();
         let run_state = self.run_state();
         let blocks = self.blocks.clone();
         let shell = cx.entity();
@@ -1248,7 +1502,8 @@ impl Shell {
                     .w_full()
                     .max_w(reading_width)
                     .mx_auto()
-                    .px_4()
+                    // Less margin where the window is narrow for its text.
+                    .map(|row| if reflowed { row.px_2() } else { row.px_4() })
                     .py_2()
                     .gap_1()
                     .child(
@@ -1273,14 +1528,12 @@ impl Shell {
             .id("region-conversation")
             .test_support()
             .track_focus(&self.conversation_focus)
-            .flex_1()
-            .min_w_0()
-            .h_full()
+            .map(|region| Self::main_size(region, page_height))
             .border_1()
             .border_color(region_border(focused, cx.theme().background, cx))
             .child(
                 h_flex()
-                    .px_4()
+                    .map(|row| if reflowed { row.px_2() } else { row.px_4() })
                     .py_2()
                     .gap_2()
                     .border_b_1()
@@ -1300,48 +1553,122 @@ impl Shell {
                             .child(format!("Run: {}", run_state.label())),
                     ),
             )
-            .child(div().flex_1().min_h_0().child(timeline))
-            .child(self.render_composer(cx))
+            .child(
+                div()
+                    .id("timeline-area")
+                    .test_support()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    // Before the timeline, so it is first to see the wheel.
+                    .when(reflowed, |area| area.child(self.wheel_to_page(cx)))
+                    .child(timeline),
+            )
+            .when(!reflowed, |region| region.child(self.render_composer(cx)))
+    }
+
+    /// Hands the wheel on from the timeline to the reflowed page around it.
+    ///
+    /// The kit's timeline keeps every wheel event that reaches it, even when
+    /// it has nothing further to scroll to, so on a page it would be a trap:
+    /// with the timeline under the pointer the page could not be moved. This
+    /// sits over the timeline, takes no pointer input itself, and sees the
+    /// wheel first. When the timeline is already at the end the wheel is
+    /// turning towards, the page is scrolled instead.
+    fn wheel_to_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let timeline = self.timeline.clone();
+        let page = self.page_scroll.clone();
+        let shell = cx.entity_id();
+        canvas(
+            |_, _, _| (),
+            move |bounds, (), window, _| {
+                let line_height = window.line_height();
+                window.on_mouse_event(move |event: &ScrollEvent, phase, _, cx| {
+                    if phase != DispatchPhase::Capture || !bounds.contains(&event.position) {
+                        return;
+                    }
+                    // Negative is towards the end of the page.
+                    let delta = event.delta.pixel_delta(line_height).y;
+                    let timeline = timeline.read(cx);
+                    let timeline_is_done = if delta < px(0.) {
+                        !timeline.is_scrolled_up()
+                    } else {
+                        let top = timeline.logical_scroll_top();
+                        top.item_ix == 0 && top.offset_in_item == px(0.)
+                    };
+                    let offset = page.offset();
+                    let target = (offset.y + delta).clamp(-page.max_offset().y, px(0.));
+                    if delta == px(0.) || !timeline_is_done || target == offset.y {
+                        return;
+                    }
+                    page.set_offset(point(offset.x, target));
+                    cx.stop_propagation();
+                    cx.notify(shell);
+                });
+            },
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full()
+    }
+
+    /// The size of the main part (the conversation, or the notice that
+    /// stands in for it). Beside docked panels it fills the row. On a
+    /// reflowed page it is as wide as the page and at least `page_height`
+    /// tall, taller if its own contents are, and takes any height the page
+    /// has left over.
+    fn main_size<E: Styled>(main: E, page_height: Option<Pixels>) -> E {
+        match page_height {
+            Some(height) => main.w_full().flex_grow(1.).flex_shrink_0().min_h(height),
+            None => main.flex_1().min_w_0().h_full(),
+        }
     }
 
     /// Every destination but Chat. It takes the conversation's place and
     /// says plainly that nothing is here, so a working navigation button is
     /// never mistaken for a working page.
-    fn render_scaffold_notice(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_scaffold_notice(
+        &self,
+        page_height: Option<Pixels>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let focused = self.conversation_focus.is_focused(window);
+        let reflowed = page_height.is_some();
         let name = self.destination.label();
-        v_flex()
+        let explanation = div()
+            .max_w(self.scaled(480.))
+            .text_sm()
+            .text_color(cx.theme().muted_foreground)
+            .child(Label::new(format!(
+                "This Phase 0 scaffold only has a Chat view. {name} has no screen, \
+                 data or actions here, and this notice is not a preview of one."
+            )));
+        let back = Button::new("back-to-chat")
+            .outline()
+            .label("Back to Chat")
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.set_destination(Destination::Chat, window, cx)
+            }));
+        let notice = v_flex()
             .id("region-conversation")
             .test_support()
             .track_focus(&self.conversation_focus)
-            .flex_1()
-            .min_w_0()
-            .h_full()
+            .map(|region| Self::main_size(region, page_height))
             .items_center()
-            .justify_center()
             .gap_3()
-            .p_6()
             .border_1()
             .border_color(region_border(focused, cx.theme().background, cx))
-            .child(Label::new(format!("{name}: not built")))
-            .child(
-                div()
-                    .max_w(self.scaled(480.))
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(Label::new(format!(
-                        "This Phase 0 scaffold only has a Chat view. {name} has no screen, \
-                         data or actions here, and this notice is not a preview of one."
-                    ))),
-            )
-            .child(
-                Button::new("back-to-chat")
-                    .outline()
-                    .label("Back to Chat")
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.set_destination(Destination::Chat, window, cx)
-                    })),
-            )
+            .child(Label::new(format!("{name}: not built")));
+        if reflowed {
+            // From the top, with the way back before the explanation: the
+            // notice can be taller than the window, and its top is what
+            // focus brings into view.
+            notice.p_3().child(back).child(explanation)
+        } else {
+            notice.justify_center().p_6().child(explanation).child(back)
+        }
     }
 
     fn render_composer(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1394,7 +1721,10 @@ impl Shell {
                     .child(Label::new(notice))
             }))
             .child(
+                // Wraps, so the actions stay inside a window too narrow for
+                // them side by side.
                 h_flex()
+                    .flex_wrap()
                     .gap_2()
                     .child(stop)
                     .child(div().flex_1())
@@ -1419,24 +1749,15 @@ impl Shell {
                 )
                 .child(div().text_sm().child(value))
         };
-        let panel = v_flex()
-            .id("region-inspector")
+        let details = v_flex()
+            .id("inspector-details")
             .test_support()
-            .role(if modal {
-                Role::Dialog
-            } else {
-                Role::Complementary
-            })
-            .aria_label("Context")
-            .when(modal, |panel| panel.aria_description(MODAL_DESCRIPTION))
-            .w(self.scaled(tokens::INSPECTOR_DEFAULT))
-            .flex_shrink_0()
-            .h_full()
+            .size_full()
+            // In a short window the details are taller than the panel.
+            .overflow_y_scroll()
+            .track_scroll(&self.inspector_scroll)
             .p_3()
             .gap_3()
-            .bg(cx.theme().background)
-            .border_l_1()
-            .border_color(region_border(focused, cx.theme().border, cx))
             .child(div().text_sm().child("Context"))
             .child(detail(
                 "Session",
@@ -1447,11 +1768,48 @@ impl Shell {
                 row.map_or_else(|| "None".to_string(), |row| row.id.clone()),
             ))
             .child(detail("Run", self.run_state().label().to_string()))
-            .child(detail(
-                "Last message",
-                row.and_then(|row| row.preview.clone())
-                    .unwrap_or_else(|| "None".to_string()),
-            ));
+            .child(
+                div()
+                    .id("inspector-last-message")
+                    .test_support()
+                    .child(detail(
+                        "Last message",
+                        row.and_then(|row| row.preview.clone())
+                            .unwrap_or_else(|| "None".to_string()),
+                    )),
+            );
+        let panel = div()
+            .id("region-inspector")
+            .test_support()
+            .role(if modal {
+                Role::Dialog
+            } else {
+                Role::Complementary
+            })
+            .aria_label("Context")
+            .when(modal, |panel| panel.aria_description(MODAL_DESCRIPTION))
+            .key_context(INSPECTOR_CONTEXT)
+            .on_action(cx.listener(|this, _: &ScrollInspectorUp, _, cx| {
+                this.scroll_inspector(-1., false, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ScrollInspectorDown, _, cx| {
+                this.scroll_inspector(1., false, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ScrollInspectorPageUp, _, cx| {
+                this.scroll_inspector(-1., true, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ScrollInspectorPageDown, _, cx| {
+                this.scroll_inspector(1., true, cx)
+            }))
+            .relative()
+            .w(self.panel_width(tokens::INSPECTOR_DEFAULT, window))
+            .flex_shrink_0()
+            .h_full()
+            .bg(cx.theme().background)
+            .border_l_1()
+            .border_color(region_border(focused, cx.theme().border, cx))
+            .child(details)
+            .vertical_scrollbar(&self.inspector_scroll);
         if modal {
             panel
                 .focus_trap("region-inspector", &self.inspector_focus)
@@ -1463,8 +1821,10 @@ impl Shell {
 
     /// A modal overlay: a backdrop that swallows pointer input for everything
     /// under it and dismisses on click, with the panel on top. Escape
-    /// dismisses too. The header, and so the toggle that opened it, stays
-    /// outside and usable.
+    /// dismisses too. Where the shell is whole, the overlay covers the row
+    /// under the header, so the header, and the toggle that opened it, stays
+    /// usable. On a reflowed page it covers the window, header and all: the
+    /// page under it can be scrolled anywhere, and the panel must not be.
     fn render_overlay(
         &self,
         region: Region,
@@ -1511,7 +1871,16 @@ impl Shell {
             )
     }
 
-    fn render_status(&self, layout: Layout, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The status line. On a reflowed page it can be off screen and nothing
+    /// in it takes focus, so there it is a tab stop itself: focus brings it
+    /// into view like any other part.
+    fn render_status(
+        &self,
+        layout: Layout,
+        reflowed: bool,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let intent = match &self.last_intent {
             Some(record) => match record.kind {
                 IntentKind::Send(mode) => format!(
@@ -1523,64 +1892,111 @@ impl Shell {
             },
             None => "No intent recorded".to_string(),
         };
-        // When the window cannot hold the text size that was asked for, the
-        // smaller size in use is not passed off as the requested one.
-        let reduced = (self.shown_scale != self.text_scale).then(|| {
-            let (width, height) = self.text_scale.minimum_window();
-            div()
-                .id("status-text-size")
-                .test_support()
-                .flex_shrink_0()
-                .child(Label::new(format!(
-                    "Text {}% shown: {}% needs a window of at least {width} × {height}.",
-                    self.shown_scale.percent(),
-                    self.text_scale.percent()
-                )))
-        });
         let destination = if self.destination == Destination::Chat {
             "Chat".to_string()
         } else {
             format!("{} (scaffold: no view)", self.destination.label())
         };
-        h_flex()
+        let detail = format!(
+            "Text {}% · {destination} · inspector {}",
+            self.text_scale.percent(),
+            match layout.inspector {
+                InspectorMode::Docked => "docked",
+                InspectorMode::Overlay => "overlay",
+                InspectorMode::Hidden => "hidden",
+            }
+        );
+        let status = div()
             .id("status")
             .test_support()
-            .h(self.scaled(STATUS_HEIGHT))
+            .flex()
             .flex_shrink_0()
             .px_3()
-            .gap_3()
             .text_xs()
             .text_color(cx.theme().muted_foreground)
             .border_t_1()
-            .border_color(cx.theme().border)
-            // First, so it is not the part that is clipped in the small
-            // window it is about.
-            .children(reduced)
-            .child("Synthetic fixture: no Daemon Core connection")
-            .child(intent)
-            .child(div().flex_1())
-            .child(format!(
-                "Text {}% · {destination} · inspector {}",
-                self.shown_scale.percent(),
-                match layout.inspector {
-                    InspectorMode::Docked => "docked",
-                    InspectorMode::Overlay => "overlay",
-                    InspectorMode::Hidden => "hidden",
-                }
-            ))
+            .border_color(cx.theme().border);
+        if reflowed {
+            // One under the other, each wrapping to the window's width, so
+            // nothing is cut off at the side.
+            status
+                .track_focus(&self.status_focus)
+                .border_1()
+                .border_color(region_border(
+                    self.status_focus.is_focused(window),
+                    cx.theme().border,
+                    cx,
+                ))
+                .flex_col()
+                .py_1()
+                .child("Synthetic fixture: no Daemon Core connection")
+                .child(intent)
+                .child(detail)
+        } else {
+            status
+                .items_center()
+                .h(self.scaled(STATUS_HEIGHT))
+                .gap_3()
+                .child("Synthetic fixture: no Daemon Core connection")
+                .child(intent)
+                .child(div().flex_1())
+                .child(detail)
+        }
+    }
+
+    /// The whole shell as one page that scrolls up and down, for a window
+    /// smaller than the text size needs: header, conversation, composer and
+    /// status line, each as wide as the window, one under the other.
+    fn render_page(
+        &mut self,
+        layout: Layout,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        self.reveal_focused(window, cx);
+        // One screen of conversation at most, so the composer under it is
+        // never more than one screen away.
+        let height = window
+            .viewport_size()
+            .height
+            .min(self.scaled(tokens::REFLOW_CONVERSATION_MIN));
+        let chat = self.destination == Destination::Chat;
+        let main = if chat {
+            self.render_conversation(Some(height), window, cx)
+                .into_any_element()
+        } else {
+            self.render_scaffold_notice(Some(height), window, cx)
+                .into_any_element()
+        };
+        div()
+            .relative()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .child(
+                // These children are `PageSection::of_page`, in order.
+                v_flex()
+                    .id("shell-page")
+                    .test_support()
+                    .size_full()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.page_scroll)
+                    .child(self.render_header(layout, true, cx))
+                    .child(main)
+                    .when(chat, |page| page.child(self.render_composer(cx)))
+                    .child(self.render_status(layout, true, window, cx)),
+            )
+            .vertical_scrollbar(&self.page_scroll)
     }
 }
 
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let layout = self.layout(window);
-        let main = if self.destination == Destination::Chat {
-            self.render_conversation(window, cx).into_any_element()
-        } else {
-            self.render_scaffold_notice(window, cx).into_any_element()
-        };
+        let reflowed = self.fit(window) == Fit::Reflowed;
         v_flex()
             .id("shell")
+            .relative()
             .size_full()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
@@ -1605,24 +2021,53 @@ impl Render for Shell {
             .on_action(cx.listener(|this, _: &ResetTextSize, window, cx| {
                 this.set_text_scale_growing_window(TextScale::DEFAULT, window, cx)
             }))
-            .child(self.render_header(layout, cx))
-            .child(
-                h_flex()
-                    .relative()
-                    .flex_1()
-                    .min_h_0()
-                    .items_start()
-                    .when(layout.sidebar == SidebarMode::Docked, |body| {
-                        body.child(self.render_sidebar(false, window, cx))
-                    })
-                    .child(main)
-                    .when(layout.inspector == InspectorMode::Docked, |body| {
-                        body.child(self.render_inspector(false, window, cx))
-                    })
-                    .when_some(layout.modal(), |body, region| {
-                        body.child(self.render_overlay(region, window, cx))
-                    }),
-            )
-            .child(self.render_status(layout, cx))
+            .map(|shell| {
+                if reflowed {
+                    shell
+                        .child(self.render_page(layout, window, cx))
+                        .when_some(layout.modal(), |shell, region| {
+                            shell.child(self.render_overlay(region, window, cx))
+                        })
+                } else {
+                    shell
+                        .child(self.render_header(layout, false, cx))
+                        .child(self.render_body(layout, window, cx))
+                        .child(self.render_status(layout, false, window, cx))
+                }
+            })
+    }
+}
+
+impl Shell {
+    /// The row under the header where the shell is whole: docked panels on
+    /// either side of the main part, and any overlay over all of it.
+    fn render_body(
+        &self,
+        layout: Layout,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let main = if self.destination == Destination::Chat {
+            self.render_conversation(None, window, cx)
+                .into_any_element()
+        } else {
+            self.render_scaffold_notice(None, window, cx)
+                .into_any_element()
+        };
+        h_flex()
+            .relative()
+            .flex_1()
+            .min_h_0()
+            .items_start()
+            .when(layout.sidebar == SidebarMode::Docked, |body| {
+                body.child(self.render_sidebar(false, window, cx))
+            })
+            .child(main)
+            .when(layout.inspector == InspectorMode::Docked, |body| {
+                body.child(self.render_inspector(false, window, cx))
+            })
+            .when_some(layout.modal(), |body, region| {
+                body.child(self.render_overlay(region, window, cx))
+            })
     }
 }

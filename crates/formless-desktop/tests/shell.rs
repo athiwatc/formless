@@ -14,8 +14,8 @@ use std::time::{Duration, Instant};
 
 use formless_desktop::fixture;
 use formless_desktop::memory::{limits, IntentKind, IntentRecord};
-use formless_desktop::model::{tokens, BlockKind, Destination, TextScale};
-use formless_desktop::shell::{self, session_row_id, Shell};
+use formless_desktop::model::{tokens, BlockKind, Destination, Fit, TextScale};
+use formless_desktop::shell::{self, session_row_id, PageSection, Shell};
 use formless_desktop::timeline::{self, TimelineBlock};
 use formless_protocol::SendMode;
 use gpui_kit::base::test_support::texts;
@@ -23,8 +23,8 @@ use gpui_kit::base::Root;
 use gpui_kit::test::{TestInput, TestQueryExt as _, TestWindowExt as _};
 use gpui_kit::{
     point, px, size, App, AppContext as _, Bounds, ClipboardItem, ElementInputHandler, Entity,
-    Pixels, Point, Role, ScrollDelta, Size, TestAppContext, Window, WindowBounds, WindowHandle,
-    WindowOptions,
+    InputEvent as _, MouseMoveEvent, Pixels, Point, Role, ScrollDelta, ScrollEvent, Size,
+    TestAppContext, Window, WindowBounds, WindowHandle, WindowOptions,
 };
 
 const WIDE: Size<Pixels> = Size {
@@ -2222,7 +2222,7 @@ fn set_text_scale(
         shell.update(cx, |shell, cx| {
             shell.set_text_scale(TextScale::from_percent(percent), window, cx)
         });
-        window.render_frame(cx);
+        settle_frames(window, cx);
     });
 }
 
@@ -2360,7 +2360,21 @@ fn at_200_percent_in_the_same_window_the_panels_give_way_and_controls_stay_reach
     });
 }
 
-const REACHABLE_AT_ANY_SIZE: [&str; 7] = [
+// ---- Windows smaller than the text size needs ------------------------------
+//
+// The text keeps the size that was asked for. The shell is reflowed: every
+// part is as wide as the window, the parts stack, and the shell scrolls up
+// and down as one page. The test window has no real fonts, so these check
+// the layout and the behaviour; `tests/render.rs` checks the same layout
+// with real fonts.
+
+/// 480 x 360: the binary's minimum window size.
+const MINIMUM: Size<Pixels> = Size {
+    width: px(480.),
+    height: px(360.),
+};
+
+const REACHABLE_AT_ONCE: [&str; 7] = [
     "toggle-sidebar",
     "toggle-inspector",
     "toggle-theme",
@@ -2370,6 +2384,75 @@ const REACHABLE_AT_ANY_SIZE: [&str; 7] = [
     "status",
 ];
 
+/// The parts of a reflowed page, top to bottom.
+const PAGE_PARTS: [&str; 4] = ["header", "region-conversation", "region-composer", "status"];
+
+/// Draw, and go on drawing while the shell asks for another frame, as a
+/// real window does. Bringing a part of a reflowed page into view takes a
+/// second frame, which the shell asks for.
+fn settle_frames(window: &mut Window, cx: &mut App) {
+    window.render_frame(cx);
+    for _ in 0..4 {
+        if window.simulate_next_frame(cx) == 0 {
+            break;
+        }
+        window.render_frame(cx);
+    }
+}
+
+/// The part of a reflowed page whose middle is in the window, to turn the
+/// wheel over.
+fn part_under_pointer(window: &Window, window_size: Size<Pixels>) -> &'static str {
+    PAGE_PARTS
+        .into_iter()
+        .rev()
+        .find(|id| {
+            let middle = window.find(*id).bounds().center().y;
+            middle > px(0.) && middle < window_size.height
+        })
+        .expect("some part of the page has its middle in the window")
+}
+
+/// Turn the wheel with the pointer over a part of a reflowed page that
+/// does not scroll by itself: whichever of the bands above and below the
+/// timeline has more of the window.
+fn wheel_page(window: &mut Window, delta: f32, window_size: Size<Pixels>, cx: &mut App) {
+    window.render_frame(cx);
+    let timeline = window.find("timeline-area").bounds();
+    let above = timeline.top().clamp(px(0.), window_size.height);
+    let below = timeline.bottom().clamp(px(0.), window_size.height);
+    let y = if above > window_size.height - below {
+        above / 2.
+    } else {
+        (below + window_size.height) / 2.
+    };
+    let position = point(px(24.), y);
+    assert!(
+        !timeline.contains(&position),
+        "no part of the page but the timeline is in the window"
+    );
+    window.dispatch_event(
+        MouseMoveEvent {
+            position,
+            pressed_button: None,
+            modifiers: window.modifiers(),
+        }
+        .to_platform_input(),
+        cx,
+    );
+    window.dispatch_event(
+        ScrollEvent {
+            position,
+            delta: ScrollDelta::Pixels(point(px(0.), px(delta))),
+            modifiers: window.modifiers(),
+            ..Default::default()
+        }
+        .to_platform_input(),
+        cx,
+    );
+    window.render_frame(cx);
+}
+
 fn inside_window(window: &Window, id: &'static str, window_size: Size<Pixels>) -> bool {
     let bounds = window.find(id).bounds();
     bounds.left() >= px(0.)
@@ -2378,135 +2461,595 @@ fn inside_window(window: &Window, id: &'static str, window_size: Size<Pixels>) -
         && bounds.bottom() <= window_size.height
 }
 
-fn assert_controls_inside(window: &Window, window_size: Size<Pixels>, context: &str) {
-    for id in REACHABLE_AT_ANY_SIZE {
-        assert!(
-            inside_window(window, id, window_size),
-            "{id} is not inside the window: {context}"
-        );
+/// The shell is fitted into its window the way the model says, at the text
+/// size that was asked for, with nothing cut off or overlapping.
+fn assert_fitted(
+    window: &Window,
+    shell: &Entity<Shell>,
+    window_size: Size<Pixels>,
+    cx: &App,
+    context: &str,
+) {
+    let scale = shell.read(cx).text_scale();
+    let fit = scale.fit(f32::from(window_size.width), f32::from(window_size.height));
+    assert_eq!(shell.read(cx).fit(window), fit, "{context}");
+    // The text is the size asked for, in a window of any size.
+    assert_eq!(window.rem_size(), px(16. * scale.factor()), "{context}");
+    match fit {
+        Fit::Whole => {
+            for id in REACHABLE_AT_ONCE {
+                assert!(
+                    inside_window(window, id, window_size),
+                    "{id} is not inside the window: {context}"
+                );
+            }
+            assert!(
+                window.find("region-composer").bounds().bottom()
+                    <= window.find("status").bounds().top(),
+                "the status line overlaps the composer: {context}"
+            );
+            assert!(window.try_find("shell-page").is_none(), "{context}");
+        }
+        Fit::Reflowed => {
+            // Nothing is cut off at either side.
+            for id in PAGE_PARTS.into_iter().chain(REACHABLE_AT_ONCE) {
+                let bounds = window.find(id).bounds();
+                assert!(
+                    bounds.left() >= px(0.) && bounds.right() <= window_size.width,
+                    "{id} runs {:?}..{:?} in a window {:?} wide: {context}",
+                    bounds.left(),
+                    bounds.right(),
+                    window_size.width
+                );
+            }
+            // The parts stack in order and do not overlap.
+            for pair in PAGE_PARTS.windows(2) {
+                assert!(
+                    window.find(pair[0]).bounds().bottom() <= window.find(pair[1]).bounds().top(),
+                    "{} overlaps {}: {context}",
+                    pair[0],
+                    pair[1]
+                );
+            }
+            // The page's end can be scrolled into the window.
+            let page = shell.read(cx).page_metrics();
+            let (_, last) = page.sections.last().expect("the page has parts");
+            assert!(
+                last.bottom() - page.scroll_max <= window_size.height,
+                "the status line cannot be scrolled into the window: {context}"
+            );
+        }
     }
-    // The composer sits above the status line, not under it.
-    assert!(
-        window.find("region-composer").bounds().bottom() <= window.find("status").bounds().top(),
-        "the status line overlaps the composer: {context}"
-    );
 }
 
-fn status_text_size(window: &mut Window, cx: &mut App) -> Option<String> {
-    window.draw(cx).clear(cx);
-    painted(window)
-        .into_iter()
-        .find(|text| text.contains("needs a window of at least"))
+/// The composer holds focus and is wholly inside the window.
+fn assert_composer_in_view(window: &Window, window_size: Size<Pixels>, context: &str) {
+    assert_eq!(
+        window.find_by_label("Message").focused(),
+        Some(true),
+        "{context}"
+    );
+    for id in ["region-composer", "composer-stop", "composer-primary"] {
+        assert!(
+            inside_window(window, id, window_size),
+            "{id} is at {:?}, not inside the window: {context}",
+            window.find(id).bounds()
+        );
+    }
 }
 
 #[gpui_kit::test]
-fn a_window_too_small_for_the_text_size_shows_the_largest_size_it_can_hold(
-    cx: &mut TestAppContext,
-) {
-    // 480 x 360 is the binary's minimum window size.
-    let minimum = size(px(480.), px(360.));
-    let (handle, shell) = open(cx, minimum, 200, 40);
+fn a_window_too_small_for_the_text_size_keeps_the_size_and_reflows(cx: &mut TestAppContext) {
+    let measured = ["toggle-sidebar", "composer-primary", "composer-stop"];
+    let (handle, shell) = open(cx, MINIMUM, 200, 40);
     step(cx, handle, |window, cx| {
-        window.render_frame(cx);
-        assert_controls_inside(window, minimum, "100%");
+        settle_frames(window, cx);
+        assert_fitted(window, &shell, MINIMUM, cx, "100%");
         window.input("ร่างข้อความ", cx);
     });
 
-    // 200% is asked for. This window cannot hold it: every control would be
-    // off screen. The default size stays in use, every control stays
-    // reachable, and the status line says what was asked for and what it
-    // would take.
+    // 200% in a window made for 100%. The text is 200%; it is not given a
+    // smaller size to make it fit.
     set_text_scale(cx, handle, &shell, 200);
-    step(cx, handle, |window, cx| {
-        window.render_frame(cx);
+    let reflowed_sizes = step(cx, handle, |window, cx| {
+        settle_frames(window, cx);
         assert_eq!(shell.read(cx).text_scale().percent(), 200);
-        assert_eq!(shell.read(cx).shown_text_scale().percent(), 100);
-        assert_controls_inside(window, minimum, "200% asked for in 480 x 360");
-        assert_eq!(
-            status_text_size(window, cx).as_deref(),
-            Some("Text 100% shown: 200% needs a window of at least 960 × 720.")
-        );
-        assert!(inside_window(window, "status-text-size", minimum));
-        // Nothing about the draft or focus changed.
+        assert_eq!(shell.read(cx).fit(window), Fit::Reflowed);
+        assert_fitted(window, &shell, MINIMUM, cx, "200% in 480 x 360");
+        // The draft and focus are untouched, the composer was brought into
+        // view, and typing still works.
         assert_eq!(shell.read(cx).draft(cx).as_ref(), "ร่างข้อความ");
-        assert_eq!(window.find_by_label("Message").focused(), Some(true));
+        assert_composer_in_view(window, MINIMUM, "after the change to 200%");
+        window.input(" ต่อ", cx);
+        assert_eq!(shell.read(cx).draft(cx).as_ref(), "ร่างข้อความ ต่อ");
+        measured.map(|id| window.find(id).bounds().size)
     });
 
-    // The window grows a step at a time. Each size it can hold is used as
-    // soon as it fits, the controls stay inside, and the request is not
-    // forgotten.
-    for (width, height, shown) in [
-        (600., 450., 125),
-        (720., 540., 150),
-        (840., 630., 175),
-        (959., 719., 175),
-        (960., 720., 200),
-        (1440., 900., 200),
+    // The window grows a step at a time. The text never changes size; the
+    // shell is whole as soon as the window holds it, and reflowed until
+    // then, with the composer in view throughout.
+    for (width, height, fit) in [
+        (600., 450., Fit::Reflowed),
+        (720., 540., Fit::Reflowed),
+        (959., 719., Fit::Reflowed),
+        (960., 720., Fit::Whole),
+        (1440., 900., Fit::Whole),
+        (1440., 500., Fit::Reflowed),
+        (480., 900., Fit::Reflowed),
     ] {
         let window_size = size(px(width), px(height));
         cx.simulate_window_resize(handle.into(), window_size);
         step(cx, handle, |window, cx| {
-            window.render_frame(cx);
+            settle_frames(window, cx);
             let context = format!("{width} x {height}");
-            assert_eq!(
-                shell.read(cx).shown_text_scale().percent(),
-                shown,
-                "{context}"
-            );
             assert_eq!(shell.read(cx).text_scale().percent(), 200, "{context}");
-            assert_controls_inside(window, window_size, &context);
+            assert_eq!(shell.read(cx).fit(window), fit, "{context}");
+            assert_fitted(window, &shell, window_size, cx, &context);
+            assert_composer_in_view(window, window_size, &context);
             assert_eq!(
-                status_text_size(window, cx).is_some(),
-                shown != 200,
+                shell.read(cx).draft(cx).as_ref(),
+                "ร่างข้อความ ต่อ",
                 "{context}"
             );
-            assert_eq!(shell.read(cx).draft(cx).as_ref(), "ร่างข้อความ", "{context}");
-            assert_eq!(
-                window.find_by_label("Message").focused(),
-                Some(true),
-                "{context}"
-            );
+            // Wide enough to dock panels, but reflowed: they stay overlays.
+            assert!(window.try_find("region-sidebar").is_none() || fit == Fit::Whole);
+            // Controls are as tall reflowed as where the shell is whole at
+            // the same text size, and no narrower: the text was not shrunk.
+            if (width, height) == (960., 720.) {
+                for (id, reflowed) in measured.into_iter().zip(reflowed_sizes) {
+                    let whole = window.find(id).bounds().size;
+                    assert_eq!(reflowed.height, whole.height, "{id}");
+                    assert!(reflowed.width >= whole.width, "{id}");
+                }
+            }
         });
     }
 
     // And shrinks again, all the way.
-    cx.simulate_window_resize(handle.into(), minimum);
+    cx.simulate_window_resize(handle.into(), MINIMUM);
     step(cx, handle, |window, cx| {
-        window.render_frame(cx);
-        assert_eq!(shell.read(cx).shown_text_scale().percent(), 100);
-        assert_controls_inside(window, minimum, "shrunk back to 480 x 360");
-        // Typing still works at the end of all that.
-        window.input(" ต่อ", cx);
-        assert_eq!(shell.read(cx).draft(cx).as_ref(), "ร่างข้อความ ต่อ");
+        settle_frames(window, cx);
+        assert_fitted(window, &shell, MINIMUM, cx, "shrunk back to 480 x 360");
+        assert_composer_in_view(window, MINIMUM, "shrunk back to 480 x 360");
+        window.input("!", cx);
+        assert_eq!(shell.read(cx).draft(cx).as_ref(), "ร่างข้อความ ต่อ!");
+    });
+}
+
+#[gpui_kit::test]
+fn every_part_of_a_reflowed_page_is_reached_from_the_keyboard(cx: &mut TestAppContext) {
+    let (handle, shell) = open(cx, MINIMUM, 200, 40);
+    set_text_scale(cx, handle, &shell, 200);
+    step(cx, handle, |window, cx| {
+        settle_frames(window, cx);
+        // Focus starts in the composer, at the foot of the page: the header
+        // is out of view.
+        assert_composer_in_view(window, MINIMUM, "at the start");
+        assert!(!inside_window(window, "toggle-sidebar", MINIMUM));
+
+        // Tab reaches each header control, and each is in view when it has
+        // focus.
+        for id in ["toggle-sidebar", "toggle-inspector", "toggle-theme"] {
+            tab_to(window, id, cx);
+            settle_frames(window, cx);
+            assert!(
+                inside_window(window, id, MINIMUM),
+                "{id} has focus at {:?}",
+                window.find(id).bounds()
+            );
+        }
+        assert!(inside_window(window, "header", MINIMUM));
+
+        // The status line holds no control. On a reflowed page it is a tab
+        // stop itself, so the keyboard can bring it into view.
+        tab_to(window, "status", cx);
+        settle_frames(window, cx);
+        assert!(inside_window(window, "status", MINIMUM));
+        assert_eq!(
+            shell.read(cx).focused_section(window, cx),
+            Some(PageSection::Status)
+        );
+
+        // F6 goes round the regions as it does anywhere, and shows each.
+        window.press("f6", cx);
+        settle_frames(window, cx);
+        assert_eq!(window.find("region-conversation").focused(), Some(true));
+        assert!(inside_window(window, "region-conversation", MINIMUM));
+        assert!(inside_window(window, "run-status", MINIMUM));
+        window.press("f6", cx);
+        settle_frames(window, cx);
+        assert_composer_in_view(window, MINIMUM, "after F6");
+    });
+
+    // Where the shell is whole the status line is not a tab stop: there is
+    // nothing to bring into view.
+    cx.simulate_window_resize(handle.into(), size(px(1440.), px(900.)));
+    step(cx, handle, |window, cx| {
+        settle_frames(window, cx);
+        assert_eq!(shell.read(cx).fit(window), Fit::Whole);
+        for _ in 0..60 {
+            window.press("tab", cx);
+            assert_ne!(window.find("status").focused(), Some(true));
+        }
+    });
+}
+
+#[gpui_kit::test]
+fn a_reflowed_page_stays_where_it_was_scrolled_until_focus_or_typing_moves_it(
+    cx: &mut TestAppContext,
+) {
+    let (handle, shell) = open(cx, MINIMUM, 200, 40);
+    set_text_scale(cx, handle, &shell, 200);
+    let scrolled = |cx: &App| shell.read(cx).page_metrics().scrolled;
+    let at_composer = step(cx, handle, |window, cx| {
+        settle_frames(window, cx);
+        window.input("draft", cx);
+        settle_frames(window, cx);
+        assert_composer_in_view(window, MINIMUM, "at the start");
+        let at_composer = scrolled(cx);
+        assert!(at_composer > px(0.));
+
+        // The wheel, turned anywhere but over the timeline, back to the top.
+        for _ in 0..20 {
+            wheel_page(window, 100., MINIMUM, cx);
+        }
+        assert_eq!(scrolled(cx), px(0.));
+        assert!(inside_window(window, "toggle-sidebar", MINIMUM));
+
+        // Nothing brings it back while nothing changes: the user put it
+        // there. Focus is still in the composer, which is out of view.
+        for _ in 0..3 {
+            settle_frames(window, cx);
+        }
+        assert_eq!(scrolled(cx), px(0.));
+        assert_eq!(window.find_by_label("Message").focused(), Some(true));
+        assert!(!inside_window(window, "composer-primary", MINIMUM));
+
+        // Typing does: the text goes to the composer, and the composer
+        // comes back into view.
+        window.input("!", cx);
+        at_composer
+    });
+    // (The shell hears of the change once this batch of input is over.)
+    step(cx, handle, |window, cx| {
+        settle_frames(window, cx);
+        assert_eq!(shell.read(cx).draft(cx).as_ref(), "draft!");
+        assert_composer_in_view(window, MINIMUM, "after typing");
+        assert_eq!(scrolled(cx), at_composer);
+
+        // So does asking for the part that already has focus.
+        for _ in 0..20 {
+            wheel_page(window, 100., MINIMUM, cx);
+        }
+        assert_eq!(scrolled(cx), px(0.));
+        shell.update(cx, |shell, cx| {
+            shell.focus_section(PageSection::Composer, window, cx)
+        });
+        settle_frames(window, cx);
+        assert_composer_in_view(window, MINIMUM, "after asking for the composer");
+
+        // So does moving focus, even within the part that already had it.
+        tab_to(window, "toggle-sidebar", cx);
+        settle_frames(window, cx);
+        assert_eq!(scrolled(cx), px(0.));
+        for _ in 0..3 {
+            wheel_page(window, -100., MINIMUM, cx);
+        }
+        assert!(!inside_window(window, "toggle-inspector", MINIMUM));
+        tab_to(window, "toggle-inspector", cx);
+        settle_frames(window, cx);
+        assert!(inside_window(window, "toggle-inspector", MINIMUM));
+    });
+}
+
+#[gpui_kit::test]
+fn the_wheel_over_the_timeline_moves_the_page_once_the_timeline_is_at_its_end(
+    cx: &mut TestAppContext,
+) {
+    let (handle, shell) = open(cx, MINIMUM, 200, 40);
+    set_text_scale(cx, handle, &shell, 200);
+    cx.run_until_parked();
+    let scrolled = |cx: &App| shell.read(cx).page_metrics().scrolled;
+    let wheel = |window: &mut Window, delta: f32, cx: &mut App| {
+        // The conversation fills the window, so its middle is the timeline.
+        window.scroll(
+            "region-conversation",
+            ScrollDelta::Pixels(point(px(0.), px(delta))),
+            cx,
+        );
+    };
+    step(cx, handle, |window, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.focus_section(PageSection::Conversation, window, cx)
+        });
+        settle_frames(window, cx);
+        assert!(inside_window(window, "region-conversation", MINIMUM));
+        let at_conversation = scrolled(cx);
+        let max = shell.read(cx).page_metrics().scroll_max;
+        assert!(at_conversation > px(0.) && at_conversation < max);
+
+        // The timeline is at its newest block. Up: the timeline scrolls,
+        // the page does not.
+        wheel(window, 300., cx);
+        assert_eq!(scrolled(cx), at_conversation);
+        // Down again: first the timeline takes it, back to its end.
+        wheel(window, -100., cx);
+        assert_eq!(scrolled(cx), at_conversation);
+        // From there on the page does, to its own end, where the status
+        // line is. Without this the timeline would be a trap: the kit's
+        // list keeps every wheel event that reaches it.
+        let mut over_timeline = 0;
+        for _ in 0..40 {
+            if scrolled(cx) == max {
+                break;
+            }
+            let over = part_under_pointer(window, MINIMUM);
+            if over == "region-conversation" {
+                over_timeline += 1;
+            }
+            window.scroll(over, ScrollDelta::Pixels(point(px(0.), px(-100.))), cx);
+        }
+        assert!(over_timeline > 0, "the wheel was never over the timeline");
+        assert_eq!(scrolled(cx), max);
+        assert!(inside_window(window, "status", MINIMUM));
+    });
+
+    // A timeline with nothing to scroll hands the wheel on in both
+    // directions.
+    let brief = vec![TimelineBlock::new(1, BlockKind::Assistant, "ok".into())];
+    let (short, short_shell) = open_blocks(cx, MINIMUM, brief);
+    set_text_scale(cx, short, &short_shell, 200);
+    cx.run_until_parked();
+    step(cx, short, |window, cx| {
+        short_shell.update(cx, |shell, cx| {
+            shell.focus_section(PageSection::Conversation, window, cx)
+        });
+        settle_frames(window, cx);
+        let at_conversation = short_shell.read(cx).page_metrics().scrolled;
+        wheel(window, 60., cx);
+        let up = short_shell.read(cx).page_metrics().scrolled;
+        assert!(up < at_conversation, "{up:?} {at_conversation:?}");
+        wheel(window, -60., cx);
+        assert_eq!(
+            short_shell.read(cx).page_metrics().scrolled,
+            at_conversation
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn overlay_panels_fit_a_reflowed_window_and_their_contents_are_reachable(cx: &mut TestAppContext) {
+    let (handle, shell) = open(cx, MINIMUM, 200, 40);
+    set_text_scale(cx, handle, &shell, 200);
+    step(cx, handle, |window, cx| {
+        settle_frames(window, cx);
+        window.input("draft", cx);
+        settle_frames(window, cx);
+        assert_composer_in_view(window, MINIMUM, "at the start");
+
+        // Sessions, opened from the composer with the page scrolled to it.
+        // The panel covers the window and no more, whatever is under it.
+        window.press(TOGGLE_SIDEBAR, cx);
+        settle_frames(window, cx);
+        let panel = window.find("region-sidebar");
+        assert_eq!(panel.role(), Some(Role::Dialog));
+        assert_eq!(panel.focused(), Some(true));
+        assert_eq!(
+            panel.bounds(),
+            Bounds {
+                origin: Point::default(),
+                size: MINIMUM
+            }
+        );
+        // Its list and its destinations are inside it, and the list works.
+        let first = session_row_id(&shell.read(cx).sidebar().rows()[0].id);
+        assert!(window.find(first).bounds().right() <= MINIMUM.width);
+        for destination in ["Chat", "Tools", "Proposals"] {
+            let id = gpui_kit::SharedString::from(format!("destination-{destination}"));
+            let bounds = window.find(id).bounds();
+            assert!(
+                bounds.left() >= px(0.)
+                    && bounds.right() <= MINIMUM.width
+                    && bounds.bottom() <= MINIMUM.height,
+                "{destination}: {bounds:?}"
+            );
+        }
+        window.press("down", cx);
+        assert_eq!(shell.read(cx).sidebar().selected_index(), Some(1));
+
+        // Escape gives focus back to the composer, in view.
+        window.press("escape", cx);
+        settle_frames(window, cx);
+        assert!(window.try_find("region-sidebar").is_none());
+        assert_composer_in_view(window, MINIMUM, "after Sessions");
+
+        // Context. Its details are taller than the window, so with focus
+        // in it the arrow and page keys scroll it.
+        window.press(TOGGLE_INSPECTOR, cx);
+        settle_frames(window, cx);
+        let panel = window.find("region-inspector");
+        assert_eq!(panel.role(), Some(Role::Dialog));
+        assert_eq!(panel.focused(), Some(true));
+        assert_eq!(
+            panel.bounds(),
+            Bounds {
+                origin: Point::default(),
+                size: MINIMUM
+            }
+        );
+        assert!(!inside_window(window, "inspector-last-message", MINIMUM));
+        let before = window.find("inspector-last-message").bounds().top();
+        window.press("down", cx);
+        settle_frames(window, cx);
+        let after_line = window.find("inspector-last-message").bounds().top();
+        assert_eq!(before - after_line, px(80.), "one line at 200%");
+        for _ in 0..6 {
+            window.press("pagedown", cx);
+            settle_frames(window, cx);
+        }
+        assert!(
+            inside_window(window, "inspector-last-message", MINIMUM),
+            "{:?}",
+            window.find("inspector-last-message").bounds()
+        );
+        for _ in 0..6 {
+            window.press("pageup", cx);
+            settle_frames(window, cx);
+        }
+        assert_eq!(window.find("inspector-last-message").bounds().top(), before);
+
+        window.press("escape", cx);
+        settle_frames(window, cx);
+        assert!(window.try_find("region-inspector").is_none());
+        assert_composer_in_view(window, MINIMUM, "after Context");
+        assert_eq!(shell.read(cx).draft(cx).as_ref(), "draft");
+    });
+}
+
+#[gpui_kit::test]
+fn a_wide_but_short_window_opens_its_panels_as_overlays(cx: &mut TestAppContext) {
+    // 2000 px at 200% lays out like 1000 px, wide enough to dock the
+    // sidebar. But the window is too short for 200%, so it is reflowed, and
+    // a reflowed page has no room beside it: the panel is an overlay.
+    let window_size = size(px(2000.), px(600.));
+    let (handle, shell) = open(cx, window_size, 200, 40);
+    set_text_scale(cx, handle, &shell, 200);
+    step(cx, handle, |window, cx| {
+        settle_frames(window, cx);
+        assert_eq!(shell.read(cx).fit(window), Fit::Reflowed);
+        assert_fitted(window, &shell, window_size, cx, "2000 x 600 at 200%");
+        assert!(window.try_find("region-sidebar").is_none());
+
+        window.press(TOGGLE_SIDEBAR, cx);
+        settle_frames(window, cx);
+        let panel = window.find("region-sidebar");
+        assert_eq!(panel.role(), Some(Role::Dialog));
+        assert_eq!(panel.focused(), Some(true));
+        assert!(window.find("overlay-backdrop").visible());
+        assert!(inside_window(window, "region-sidebar", window_size));
+        window.press("escape", cx);
+        settle_frames(window, cx);
+        assert!(window.try_find("region-sidebar").is_none());
+        assert_composer_in_view(window, window_size, "after Sessions");
+
+        // Tall enough again: the shell is whole and the sidebar docks.
+    });
+    let whole = size(px(2000.), px(800.));
+    cx.simulate_window_resize(handle.into(), whole);
+    step(cx, handle, |window, cx| {
+        settle_frames(window, cx);
+        assert_eq!(shell.read(cx).fit(window), Fit::Whole);
+        assert_eq!(window.find("region-sidebar").role(), Some(Role::Navigation));
+        assert!(window.try_find("overlay-backdrop").is_none());
+    });
+}
+
+#[gpui_kit::test]
+fn a_destination_without_a_view_is_reflowed_too(cx: &mut TestAppContext) {
+    let (handle, shell) = open(cx, MINIMUM, 200, 40);
+    set_text_scale(cx, handle, &shell, 200);
+    step(cx, handle, |window, cx| {
+        settle_frames(window, cx);
+        window.press(TOGGLE_SIDEBAR, cx);
+        settle_frames(window, cx);
+        window.click("destination-Tools", cx);
+        settle_frames(window, cx);
+        assert_eq!(shell.read(cx).destination(), Destination::Tools);
+        // No composer here: the page is header, notice, status line.
+        assert!(window.try_find("region-composer").is_none());
+        let page = shell.read(cx).page_metrics();
+        assert_eq!(
+            page.sections
+                .iter()
+                .map(|(part, _)| *part)
+                .collect::<Vec<_>>(),
+            [
+                PageSection::Header,
+                PageSection::Conversation,
+                PageSection::Status
+            ]
+        );
+        for id in ["header", "region-conversation", "back-to-chat", "status"] {
+            let bounds = window.find(id).bounds();
+            assert!(
+                bounds.left() >= px(0.) && bounds.right() <= MINIMUM.width,
+                "{id}: {bounds:?}"
+            );
+        }
+        // The way back is reachable from the keyboard, and in view.
+        tab_to(window, "back-to-chat", cx);
+        settle_frames(window, cx);
+        assert!(inside_window(window, "back-to-chat", MINIMUM));
+        tab_to(window, "status", cx);
+        settle_frames(window, cx);
+        assert!(inside_window(window, "status", MINIMUM));
+        tab_to(window, "back-to-chat", cx);
+        settle_frames(window, cx);
+        window.click("back-to-chat", cx);
+    });
+    step(cx, handle, |window, cx| {
+        settle_frames(window, cx);
+        assert_eq!(shell.read(cx).destination(), Destination::Chat);
+        assert_fitted(window, &shell, MINIMUM, cx, "back in Chat");
+    });
+}
+
+#[gpui_kit::test]
+fn a_stream_into_a_reflowed_window_shows_its_newest_text(cx: &mut TestAppContext) {
+    let (handle, shell) = open(cx, MINIMUM, 20, 40);
+    set_text_scale(cx, handle, &shell, 200);
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| {
+        settle_frames(window, cx);
+        window.input("draft", cx);
+        shell.update(cx, |shell, cx| {
+            shell.begin_stream(cx);
+            for index in 0..600 {
+                shell.push_stream_delta(&format!("คำ #{index:04}# "), cx);
+            }
+        });
+    });
+    cx.executor().advance_clock(Duration::from_millis(50));
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| {
+        window.draw(cx).clear(cx);
+        // The composer kept focus and its place; the newest text is in the
+        // strip of timeline above it.
+        assert_composer_in_view(window, MINIMUM, "while streaming");
+        assert_eq!(shell.read(cx).draft(cx).as_ref(), "draft");
+        assert!(painted(window).iter().any(|text| text.contains("#0599#")));
+        assert_fitted(window, &shell, MINIMUM, cx, "while streaming");
     });
 }
 
 #[gpui_kit::test]
 fn raising_the_text_size_asks_the_window_to_grow_to_fit_it(cx: &mut TestAppContext) {
-    let minimum = size(px(480.), px(360.));
-    let (handle, shell) = open(cx, minimum, 200, 40);
+    let (handle, shell) = open(cx, MINIMUM, 200, 40);
     step(cx, handle, |window, cx| {
-        window.render_frame(cx);
-        assert_eq!(window.bounds().size, minimum);
-        // The shortcut asks for 125%, which needs 600 x 450.
+        settle_frames(window, cx);
+        assert_eq!(window.bounds().size, MINIMUM);
+        // The shortcut asks for 125%, which needs 600 x 450 to be whole.
         window.press(&chord("="), cx);
         assert_eq!(shell.read(cx).text_scale().percent(), 125);
         assert_eq!(window.bounds().size, size(px(600.), px(450.)));
         // The test window does not deliver the resize the way a real one
-        // does, so the view still has its old size here; until a resize
-        // arrives the shell goes on showing what that size can hold.
-        assert_eq!(shell.read(cx).shown_text_scale().percent(), 100);
-        assert_controls_inside(window, minimum, "before the resize arrives");
+        // does, so the view still has its old size here. Until a resize
+        // arrives the shell is reflowed, at 125%.
+        settle_frames(window, cx);
+        assert_fitted(window, &shell, MINIMUM, cx, "before the resize arrives");
+        assert_eq!(shell.read(cx).fit(window), Fit::Reflowed);
+        assert_composer_in_view(window, MINIMUM, "before the resize arrives");
     });
     // The resize arrives.
-    cx.simulate_window_resize(handle.into(), size(px(600.), px(450.)));
+    let grown = size(px(600.), px(450.));
+    cx.simulate_window_resize(handle.into(), grown);
     step(cx, handle, |window, cx| {
-        window.render_frame(cx);
-        assert_eq!(shell.read(cx).shown_text_scale().percent(), 125);
-        assert_controls_inside(window, size(px(600.), px(450.)), "after the resize");
+        settle_frames(window, cx);
+        assert_eq!(shell.read(cx).fit(window), Fit::Whole);
+        assert_fitted(window, &shell, grown, cx, "after the resize");
         // A window already large enough is left alone.
         window.press(&chord("-"), cx);
-        assert_eq!(window.bounds().size, size(px(600.), px(450.)));
+        assert_eq!(window.bounds().size, grown);
     });
 }
 
@@ -2514,19 +3057,23 @@ fn raising_the_text_size_asks_the_window_to_grow_to_fit_it(cx: &mut TestAppConte
 fn repeated_text_size_changes_and_resizes_leave_the_shell_consistent(cx: &mut TestAppContext) {
     let (handle, shell) = open(cx, WIDE, 200, 40);
     step(cx, handle, |window, cx| {
-        window.render_frame(cx);
+        settle_frames(window, cx);
         window.input("draft", cx);
     });
     // A long, irregular run of size changes with resizes in between and no
-    // settling time: the same batch of events, over and over.
+    // settling time: the same batch of events, over and over. Many of the
+    // combinations are reflowed.
     let sizes = [
         size(px(1440.), px(900.)),
         size(px(700.), px(500.)),
         size(px(480.), px(360.)),
         size(px(2000.), px(1200.)),
         size(px(960.), px(720.)),
+        size(px(1440.), px(400.)),
+        size(px(480.), px(1000.)),
     ];
-    for round in 0..40usize {
+    let mut reflowed_rounds = 0;
+    for round in 0..56usize {
         step(cx, handle, |window, cx| {
             let keys: &[&str] = match round % 4 {
                 0 => &["=", "="],
@@ -2541,28 +3088,22 @@ fn repeated_text_size_changes_and_resizes_leave_the_shell_consistent(cx: &mut Te
         let window_size = sizes[round % sizes.len()];
         cx.simulate_window_resize(handle.into(), window_size);
         step(cx, handle, |window, cx| {
-            window.render_frame(cx);
-            let requested = shell.read(cx).text_scale();
-            let shown = shell.read(cx).shown_text_scale();
+            settle_frames(window, cx);
             let context = format!(
-                "round {round}: {window_size:?}, asked {}%",
-                requested.percent()
+                "round {round}: {window_size:?} at {}%",
+                shell.read(cx).text_scale().percent()
             );
-            // What is shown is exactly what the model says fits.
-            assert_eq!(
-                shown,
-                requested.fitted_to(f32::from(window_size.width), f32::from(window_size.height)),
-                "{context}"
-            );
-            assert_controls_inside(window, window_size, &context);
+            assert_fitted(window, &shell, window_size, cx, &context);
+            if shell.read(cx).fit(window) == Fit::Reflowed {
+                reflowed_rounds += 1;
+            }
+            // Whatever happened, the draft is whole and the composer has
+            // focus and is in view.
             assert_eq!(shell.read(cx).draft(cx).as_ref(), "draft", "{context}");
-            assert_eq!(
-                window.find_by_label("Message").focused(),
-                Some(true),
-                "{context}"
-            );
+            assert_composer_in_view(window, window_size, &context);
         });
     }
+    assert!(reflowed_rounds >= 20, "{reflowed_rounds} reflowed rounds");
 }
 
 #[gpui_kit::test]
@@ -2582,7 +3123,8 @@ fn a_text_size_change_while_an_overlay_is_open_keeps_the_overlay_and_its_focus(
         // docked sidebar gives way. The overlay stays up with focus in it.
         window.press(&chord("="), cx);
         window.press(&chord("="), cx);
-        assert_eq!(shell.read(cx).shown_text_scale().percent(), 150);
+        assert_eq!(shell.read(cx).text_scale().percent(), 150);
+        assert_eq!(shell.read(cx).fit(window), Fit::Whole);
         assert!(window.try_find("region-sidebar").is_none());
         assert!(window.find("overlay-backdrop").visible());
         assert_eq!(window.find("region-inspector").focused(), Some(true));
@@ -2626,7 +3168,7 @@ fn a_text_size_change_in_the_middle_of_a_stream_loses_nothing(cx: &mut TestAppCo
     cx.run_until_parked();
     step(cx, handle, |window, cx| {
         window.draw(cx).clear(cx);
-        assert_eq!(shell.read(cx).shown_text_scale().percent(), 150);
+        assert_eq!(shell.read(cx).text_scale().percent(), 150);
         assert_eq!(shell.read(cx).block_count(), 41);
         assert!(window.find(("block", 41usize)).visible());
         let painted = painted(window);

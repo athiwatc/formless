@@ -28,10 +28,28 @@ pub mod tokens {
     /// Spacing grid unit.
     pub const GRID: f32 = 4.0;
     /// The smallest window in which every header and composer control is on
-    /// screen at 100% text size. At a larger text size the shell needs this
-    /// multiplied by the text size factor.
+    /// screen at once at 100% text size. At a larger text size that takes
+    /// this multiplied by the text size factor; a window smaller than that
+    /// is reflowed ([`Fit::Reflowed`]).
     pub const MIN_WINDOW_WIDTH: f32 = 480.0;
     pub const MIN_WINDOW_HEIGHT: f32 = 360.0;
+    /// The least height the conversation is given in a reflowed window, or
+    /// the height of the window if that is less: never more than one screen.
+    pub const REFLOW_CONVERSATION_MIN: f32 = 220.0;
+}
+
+/// How the shell is fitted into its window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fit {
+    /// The window is at least [`TextScale::minimum_window`]: the header,
+    /// the conversation, the composer and the status line are all on screen
+    /// at once.
+    Whole,
+    /// The window is smaller than that. The text stays the size that was
+    /// asked for. Each part is as wide as the window and wraps inside it,
+    /// the parts stack, and the shell scrolls up and down as one page; it
+    /// never scrolls sideways.
+    Reflowed,
 }
 
 /// The user's text size, as a percentage of the default.
@@ -73,8 +91,8 @@ impl TextScale {
             .map_or(self, Self)
     }
 
-    /// The smallest window that keeps every control on screen at this text
-    /// size, as (width, height).
+    /// The smallest window that keeps every control on screen at once at
+    /// this text size, as (width, height).
     pub fn minimum_window(self) -> (f32, f32) {
         (
             tokens::MIN_WINDOW_WIDTH * self.factor(),
@@ -82,21 +100,27 @@ impl TextScale {
         )
     }
 
-    /// The text size to actually show in a window of this size: the largest
-    /// step, no larger than this one, whose minimum window fits. A window too
-    /// small for a size would push controls off screen, which costs more
-    /// than smaller text does; the default size is shown however small the
-    /// window is.
-    pub fn fitted_to(self, width: f32, height: f32) -> Self {
-        Self::STEPS
-            .into_iter()
-            .rev()
-            .map(Self)
-            .find(|step| {
-                let (needed_width, needed_height) = step.minimum_window();
-                *step <= self && needed_width <= width && needed_height <= height
-            })
-            .unwrap_or(Self::DEFAULT)
+    /// How the shell is fitted into a window of this size at this text
+    /// size. The text size itself never gives way to the window.
+    pub fn fit(self, width: f32, height: f32) -> Fit {
+        let (needed_width, needed_height) = self.minimum_window();
+        if width >= needed_width && height >= needed_height {
+            Fit::Whole
+        } else {
+            Fit::Reflowed
+        }
+    }
+
+    /// The width the layout breakpoints see in a window of this size: the
+    /// real width divided by the text size factor. A reflowed window never
+    /// docks a panel, however wide it is, so there it is also less than the
+    /// narrowest width that docks one.
+    pub fn layout_width(self, width: f32, height: f32) -> f32 {
+        let scaled = width / self.factor();
+        match self.fit(width, height) {
+            Fit::Whole => scaled,
+            Fit::Reflowed => scaled.min(tokens::SIDEBAR_DOCK_MIN - 1.0),
+        }
     }
 
     /// One step smaller; the default is the smallest.
@@ -749,41 +773,47 @@ mod tests {
     }
 
     #[test]
-    fn the_shown_text_size_is_the_largest_step_the_window_can_hold() {
-        let requested = TextScale::LARGEST;
-        assert_eq!(requested.minimum_window(), (960.0, 720.0));
-        // The smallest window holds the default size and nothing larger.
-        assert_eq!(requested.fitted_to(480.0, 360.0).percent(), 100);
-        // One step fits at each multiple of the base minimum, and not a
-        // pixel before.
-        for (width, height, percent) in [
-            (599.0, 4_000.0, 100),
-            (600.0, 450.0, 125),
-            (720.0, 540.0, 150),
-            (840.0, 630.0, 175),
-            (959.0, 4_000.0, 175),
-            (4_000.0, 719.0, 175),
-            (960.0, 720.0, 200),
-            (4_000.0, 4_000.0, 200),
+    fn a_window_smaller_than_the_text_size_needs_is_reflowed_at_that_size() {
+        let largest = TextScale::LARGEST;
+        assert_eq!(largest.minimum_window(), (960.0, 720.0));
+        // Either dimension one pixel short is enough.
+        for (width, height, fit) in [
+            (480.0, 360.0, Fit::Reflowed),
+            (959.0, 4_000.0, Fit::Reflowed),
+            (4_000.0, 719.0, Fit::Reflowed),
+            (960.0, 720.0, Fit::Whole),
+            (4_000.0, 4_000.0, Fit::Whole),
         ] {
-            assert_eq!(
-                requested.fitted_to(width, height).percent(),
-                percent,
-                "{width} x {height}"
-            );
+            assert_eq!(largest.fit(width, height), fit, "{width} x {height}");
         }
-        // Either dimension can be the one that limits it.
-        assert_eq!(requested.fitted_to(4_000.0, 450.0).percent(), 125);
-        assert_eq!(requested.fitted_to(600.0, 4_000.0).percent(), 125);
-        // Never larger than asked for, never smaller than the default.
-        assert_eq!(
-            TextScale::from_percent(125)
-                .fitted_to(4_000.0, 4_000.0)
-                .percent(),
-            125
-        );
-        assert_eq!(TextScale::DEFAULT.fitted_to(10.0, 10.0), TextScale::DEFAULT);
-        assert_eq!(requested.fitted_to(0.0, 0.0), TextScale::DEFAULT);
+        // Each step has its own minimum.
+        for (percent, width, height) in [
+            (100, 480.0, 360.0),
+            (125, 600.0, 450.0),
+            (150, 720.0, 540.0),
+            (175, 840.0, 630.0),
+        ] {
+            let scale = TextScale::from_percent(percent);
+            assert_eq!(scale.fit(width, height), Fit::Whole, "{percent}%");
+            assert_eq!(scale.fit(width - 1.0, height), Fit::Reflowed, "{percent}%");
+            assert_eq!(scale.fit(width, height - 1.0), Fit::Reflowed, "{percent}%");
+        }
+    }
+
+    #[test]
+    fn a_reflowed_window_never_docks_a_panel_however_wide_it_is() {
+        let largest = TextScale::LARGEST;
+        // Whole: the breakpoints see the width divided by the factor.
+        assert_eq!(largest.layout_width(2_880.0, 1_800.0), 1_440.0);
+        // Wide enough to dock both panels, but too short: reflowed, and the
+        // panels are overlays.
+        let width = largest.layout_width(2_880.0, 600.0);
+        assert!(width < tokens::SIDEBAR_DOCK_MIN);
+        let layout = Layout::for_width(width, PanelPrefs::default());
+        assert_eq!(layout.sidebar, SidebarMode::Collapsed);
+        assert_eq!(layout.inspector, InspectorMode::Hidden);
+        // Narrow and reflowed: the real width, scaled.
+        assert_eq!(largest.layout_width(480.0, 360.0), 240.0);
     }
 
     #[test]

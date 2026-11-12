@@ -7,6 +7,10 @@
 //! - `--huge-block-mb N`: add one N MiB output block at the tail.
 //! - `--text-scale P`: start at P percent text size (100 to 200).
 //! - `--window WxH`: open at this size instead of 1440x900.
+//! - `--keep-window`: do not ask the window to grow to fit the text size, so
+//!   a small window shows the reflowed shell. With `--smoke`, focus is then
+//!   moved to each part of the page in turn and where the page scrolled to
+//!   is printed.
 //! - `--smoke`: print startup timings up to the first rendered frame, quit.
 //! - `--stream-seconds S` (with `--stream-rate R`, default 100 deltas per
 //!   second; 0 streams nothing and measures the idle window): stream into
@@ -17,14 +21,14 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use formless_desktop::model::{tokens, TextScale};
-use formless_desktop::shell::Shell;
+use formless_desktop::model::{tokens, Fit, TextScale};
+use formless_desktop::shell::{PageSection, Shell};
 use formless_desktop::{fixture, shell};
 use gpui_kit::prelude::*;
 use gpui_kit::{px, size, App, Bounds, Entity, Window, WindowBounds, WindowOptions};
 
 const USAGE: &str = "usage: formless-desktop [--sessions N] [--blocks N] [--huge-block-mb N] \
-                     [--text-scale P] [--window WxH] \
+                     [--text-scale P] [--window WxH] [--keep-window] \
                      [--smoke] [--stream-seconds S [--stream-rate R]]";
 
 struct Options {
@@ -33,6 +37,7 @@ struct Options {
     huge_block_mb: usize,
     text_scale: usize,
     window: (f32, f32),
+    keep_window: bool,
     smoke: bool,
     stream_seconds: usize,
     stream_rate: usize,
@@ -45,6 +50,7 @@ fn parse_options() -> Result<Options, String> {
         huge_block_mb: 0,
         text_scale: 100,
         window: (1440., 900.),
+        keep_window: false,
         smoke: false,
         stream_seconds: 0,
         stream_rate: 100,
@@ -69,6 +75,7 @@ fn parse_options() -> Result<Options, String> {
                     .and_then(|(width, height)| Some((width.parse().ok()?, height.parse().ok()?)))
                     .ok_or(format!("--window: {value:?} is not WIDTHxHEIGHT"))?;
             }
+            "--keep-window" => options.keep_window = true,
             "--smoke" => options.smoke = true,
             "--stream-seconds" => options.stream_seconds = count("--stream-seconds")?,
             "--stream-rate" => options.stream_rate = count("--stream-rate")?,
@@ -76,6 +83,72 @@ fn parse_options() -> Result<Options, String> {
         }
     }
     Ok(options)
+}
+
+/// Print what the window and the layout settled at. Returns whether the
+/// shell is reflowed.
+fn report_window(requested: (f32, f32), shell: &Entity<Shell>, window: &Window, cx: &App) -> bool {
+    let viewport = window.viewport_size();
+    let shell = shell.read(cx);
+    let reflowed = shell.fit(window) == Fit::Reflowed;
+    // The text size shown is the one asked for. Both are printed because a
+    // window too small for it used to be given a smaller size.
+    println!(
+        "window: requested={}x{} viewport={}x{} text_scale_requested={} text_scale_shown={} fit={}",
+        requested.0,
+        requested.1,
+        f32::from(viewport.width),
+        f32::from(viewport.height),
+        shell.text_scale().percent(),
+        shell.text_scale().percent(),
+        if reflowed { "reflowed" } else { "whole" },
+    );
+    if reflowed {
+        let page = shell.page_metrics();
+        let parts: Vec<String> = page
+            .sections
+            .iter()
+            .map(|(section, part)| {
+                format!(
+                    "{section:?}:{:.0}..{:.0}x{:.0}..{:.0}",
+                    f32::from(part.left()),
+                    f32::from(part.right()),
+                    f32::from(part.top()),
+                    f32::from(part.bottom())
+                )
+            })
+            .collect();
+        println!(
+            "page: viewport={:.0}x{:.0} scroll_max={:.0} parts_left..rightxtop..bottom={}",
+            f32::from(page.viewport.size.width),
+            f32::from(page.viewport.size.height),
+            f32::from(page.scroll_max),
+            parts.join(",")
+        );
+    }
+    reflowed
+}
+
+/// Print where a reflowed page is after focus moved to one of its parts,
+/// and whether that part is now inside the window.
+fn report_section(section: PageSection, shell: &Entity<Shell>, cx: &App) {
+    let page = shell.read(cx).page_metrics();
+    let Some(part) = page.shown(section) else {
+        println!("page-focus: section={section:?} MISSING");
+        return;
+    };
+    println!(
+        "page-focus: section={section:?} scrolled={:.0} of {:.0} shown_at={:.0}..{:.0} \
+         window={:.0}..{:.0} inside={}",
+        // Adding zero turns the negative zero of an unscrolled page into zero.
+        f32::from(page.scrolled) + 0.0,
+        f32::from(page.scroll_max),
+        f32::from(part.top()),
+        f32::from(part.bottom()),
+        f32::from(page.viewport.top()),
+        f32::from(page.viewport.bottom()),
+        page.is_inside(section),
+    );
 }
 
 /// Record when each display frame is delivered, for as long as `running`
@@ -214,7 +287,11 @@ fn main() {
             let shell = cx.new(|cx| shell::Shell::new(&sessions, &running, blocks, window, cx));
             let scale = TextScale::from_percent(options.text_scale.min(1_000) as u16);
             shell.update(cx, |shell, cx| {
-                shell.set_text_scale_growing_window(scale, window, cx)
+                if options.keep_window {
+                    shell.set_text_scale(scale, window, cx)
+                } else {
+                    shell.set_text_scale_growing_window(scale, window, cx)
+                }
             });
             shell
         })
@@ -252,25 +329,39 @@ fn main() {
                             let requested_window = options.window;
                             cx.spawn(async move |cx| {
                                 cx.background_executor().timer(Duration::from_secs(1)).await;
-                                cx.update(|cx| {
-                                    // A second after the first frame: what the
-                                    // window and the text size settled at.
-                                    let _ = cx.update_window(handle, |_, window, cx| {
-                                        let viewport = window.viewport_size();
-                                        let shell = shell.read(cx);
-                                        println!(
-                                            "window: requested={}x{} viewport={}x{} \
-                                             text_scale_requested={} text_scale_shown={}",
-                                            requested_window.0,
-                                            requested_window.1,
-                                            f32::from(viewport.width),
-                                            f32::from(viewport.height),
-                                            shell.text_scale().percent(),
-                                            shell.shown_text_scale().percent()
-                                        );
-                                    });
-                                    cx.quit()
+                                // A second after the first frame: what the
+                                // window and the layout settled at.
+                                let reflowed = cx.update(|cx| {
+                                    cx.update_window(handle, |_, window, cx| {
+                                        report_window(requested_window, &shell, window, cx)
+                                    })
+                                    .unwrap_or(false)
                                 });
+                                if reflowed {
+                                    // Every part of the page has to be
+                                    // reachable: move focus to each in turn
+                                    // and see where the page scrolled to.
+                                    for section in [
+                                        PageSection::Header,
+                                        PageSection::Conversation,
+                                        PageSection::Composer,
+                                        PageSection::Status,
+                                        PageSection::Header,
+                                    ] {
+                                        cx.update(|cx| {
+                                            let _ = cx.update_window(handle, |_, window, cx| {
+                                                shell.update(cx, |shell, cx| {
+                                                    shell.focus_section(section, window, cx)
+                                                });
+                                            });
+                                        });
+                                        cx.background_executor()
+                                            .timer(Duration::from_millis(300))
+                                            .await;
+                                        cx.update(|cx| report_section(section, &shell, cx));
+                                    }
+                                }
+                                cx.update(|cx| cx.quit());
                             })
                             .detach();
                         }
