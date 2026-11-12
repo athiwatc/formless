@@ -209,8 +209,8 @@ typical developer build.
 | Command | Result |
 |---|---|
 | `cargo test --no-default-features --lib --locked` | 61 passed (model, memory, timeline and fixture); no GPUI crate in its dependency graph |
-| `cargo test --features test-support --locked` | 61 passed, 60 passed (headless shell), 19 offscreen render states passed (37 captures) |
-| `cargo test --features test-support,thai-breaks --locked` | 66 passed, 60 passed, 19 render states and the real-text Thai measurement passed |
+| `cargo test --features test-support --locked` | 61 passed, 63 passed (headless shell), 19 offscreen render states passed (37 captures) |
+| `cargo test --features test-support,thai-breaks --locked` | 66 passed, 63 passed, 19 render states and the real-text Thai measurement passed |
 | `cargo fmt --check`, `cargo clippy --all-targets --locked` with and without `thai-breaks` | clean |
 
 These are the counts at the last code commit (§12). The first checkpoint
@@ -509,6 +509,8 @@ in the worktree's git-ignored `.screenshots/gpui-1753-phase0/` directory:
   bound (§13), as it was, with the window runs of §13.3.
 - `checkpoint-c8487eb/`: the complete evidence set of the streamed-row
   change (§14), as it was, from before small windows were reflowed.
+- `checkpoint-6783bf5/`: the complete evidence set of the reflowed shell
+  (§15.1 to §15.4), as it was.
 - `ab-bin/`: the release binaries compared in §13.3 and §14.3.
 - `stream-model/`: the two replay binaries of §14.1 and their log.
 - `stream-ab-837d80a-vs-c8487eb/`: the window runs of §14.3.
@@ -1122,7 +1124,8 @@ changes there. A smaller one is reflowed:
 - The kit's timeline keeps every wheel event that reaches it, even at its
   end. On a page that made it a trap: with the pointer over the timeline
   the page could not be moved. The wheel is now handed on to the page once
-  the timeline is at the end the wheel is turning towards.
+  the timeline is at the end the wheel is turning towards, and only when
+  the timeline is what the pointer can reach (§15.5).
 - An overlay panel covers the window and is never wider than it. The
   inspector's details scroll inside it, by the wheel and by the arrow and
   page keys.
@@ -1130,8 +1133,9 @@ changes there. A smaller one is reflowed:
 
 ### 15.3 What was checked
 
-Headless, in the kit's test window (no real fonts): 60 shell tests and 61
-model tests (66 with the Thai study). The ones for this:
+Headless, in the kit's test window (no real fonts): 60 shell tests at this
+commit (63 since §15.5) and 61 model tests (66 with the Thai study). The
+ones for this:
 
 - The text stays 200% from 480 x 360 up through every window size to one
   that holds it and back, through a wide-and-short and a narrow-and-tall
@@ -1222,6 +1226,36 @@ at 200%, and its Sessions overlay). They read as intended.
   code) was not looked at. Scrolling the timeline itself from the keyboard
   is the kit's and is untested, as before.
 - Windows and Linux were not run.
+
+### 15.5 The wheel over a modal panel, from independent review of `61e1958`
+
+Local commit `055a93d`. Evidence collected at it.
+
+Found by dot's review: on a reflowed page, with the conversation in view
+and the Context panel open over it, a wheel turned over the panel moved
+the page behind the panel, from 213 px to 313 px. The listener that hands
+the wheel on from the timeline went by the timeline's bounds, and the
+timeline was still there, under the panel. Having moved the page it
+stopped the event, so the panel did not scroll either.
+
+The listener now has a hitbox of its own and acts only when that hitbox
+is in the window's hit test for the pointer. A modal overlay blocks the
+pointer for everything under it, and so does anything else drawn in
+front, so the wheel is then left alone and goes to what is under the
+pointer.
+
+Tests, 63 shell tests in all: the review's own test, as written; under
+Context and under Sessions, with the page at each of three parts, the
+page stays exactly where it was at the first turn of the wheel, at the
+panel's end and past it, and back past its start, while the panel itself
+scrolls by what the wheel turned; the same over the strip of backdrop
+beside a panel that is narrower than the window, where nothing moves at
+all; and with nothing in front, the timeline hands the wheel on as
+before. With the fix removed, the review's test and both new ones fail
+(`mutation-check/modal-wheel-isolation-removed.log`).
+
+Not done: no wheel was turned in a real window. These are synthetic wheel
+events in the test window, dispatched the way the platform's are.
 
 The 200% gate in §8 stays open until a person, and a screen reader, have
 been at it. Still open as well, unchanged: Windows (done elsewhere), Linux,
