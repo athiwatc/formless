@@ -191,11 +191,9 @@ Known limits of what is there:
 - A row shows one window of a long block at a time. A window that starts
   inside a table or a list is laid out without its beginning, and there is
   no separate full-output viewer (§12.1).
-- A window too small for the text size asked for gets a smaller size, with
-  a notice, not the size asked for (§12.2). This keeps the controls usable;
-  it is not 200% text at the minimum window size, which would need a layout
-  that reflows and was not built. The right-hand status text is clipped in
-  small windows.
+- A window too small for its text size keeps that text size and is
+  reflowed into a page that scrolls up and down (§15). Nobody has looked
+  at that in a real window and no screen reader has read it.
 
 The layout tokens are the epic's starting values. At 200% text size they
 scale with everything else (§11.5); nobody has looked at the result.
@@ -210,9 +208,9 @@ typical developer build.
 
 | Command | Result |
 |---|---|
-| `cargo test --no-default-features --lib --locked` | 60 passed (model, memory, timeline and fixture); no GPUI crate in its dependency graph |
-| `cargo test --features test-support --locked` | 60 passed, 53 passed (headless shell), 14 offscreen render states passed |
-| `cargo test --features test-support,thai-breaks --locked` | 65 passed, 53 passed, 14 render states and the real-text Thai measurement passed |
+| `cargo test --no-default-features --lib --locked` | 61 passed (model, memory, timeline and fixture); no GPUI crate in its dependency graph |
+| `cargo test --features test-support --locked` | 61 passed, 60 passed (headless shell), 19 offscreen render states passed (37 captures) |
+| `cargo test --features test-support,thai-breaks --locked` | 66 passed, 60 passed, 19 render states and the real-text Thai measurement passed |
 | `cargo fmt --check`, `cargo clippy --all-targets --locked` with and without `thai-breaks` | clean |
 
 These are the counts at the last code commit (§12). The first checkpoint
@@ -451,7 +449,7 @@ none of them can be closed by anything measured so far.
 | Linux build and launch | Only dependency resolution was done. |
 | Real OS IME composition (Thai, CJK, dead keys) | The harness types finished text; no input method ran. |
 | VoiceOver (and NVDA on Windows) | Roles, names and descriptions, including the overlay dialogs, were read from the accessibility tree in tests. No screen reader ran, so what is announced, and in what order, is unknown. The kit cannot mark an element modal. |
-| 200% text scaling and display-scale changes | The shell's own text size setting is tested to 200% and captured offscreen (§11.5). Nobody has looked at it in a window. A window too small for 200% shows a smaller text size and says so (§12.2): that keeps the controls usable, it is not 200% text at the minimum window size. No OS-level display or accessibility setting was changed. |
+| 200% text scaling and display-scale changes | The shell's own text size setting goes to 200% in a window of any size. A window too small for it is reflowed, not given smaller text (§15). That is tested headlessly, checked offscreen with real fonts, and reported by the process from real windows. Nobody has looked at it in a window, no screen reader has read it, it is not assessed against any published criterion, and no OS-level display or accessibility setting was changed. |
 | Streaming and performance budgets | Frame-delivery intervals were recorded while streaming in a real window (§11.4). That is not key-to-paint, scrolling, session switching, idle CPU or long-run memory, the window was not watched, and no budget is accepted on it. |
 | Thai line breaking | A study shows a workable approach on macOS fonts (§11.6). It is not wired in, and Windows and Linux fonts are untested. |
 | Parity | §6 is an inventory. Only Chat has a view, with synthetic data, and the approval, credential and setup surfaces are unexamined. |
@@ -502,13 +500,15 @@ in the worktree's git-ignored `.screenshots/gpui-1753-phase0/` directory:
   Thai study, release build, the smoke, 5 MiB, 200% and streaming launches,
   lockfile verification, dependency graphs, resolved features, build plans
   and on-disk artifacts.
-- `captures/`: the fourteen offscreen PNG captures.
+- `captures/`: the 37 offscreen PNG captures of 19 states.
 - `checkpoint-c686073/`: the complete evidence set of the acceptance
   follow-up (§11), as it was.
 - `checkpoint-126595a/`: the complete evidence set of the two UI defect
   fixes (§12), as it was.
 - `checkpoint-5d16e93/`: the complete evidence set of the row preview
   bound (§13), as it was, with the window runs of §13.3.
+- `checkpoint-c8487eb/`: the complete evidence set of the streamed-row
+  change (§14), as it was, from before small windows were reflowed.
 - `ab-bin/`: the release binaries compared in §13.3 and §14.3.
 - `stream-model/`: the two replay binaries of §14.1 and their log.
 - `stream-ab-837d80a-vs-c8487eb/`: the window runs of §14.3.
@@ -714,8 +714,9 @@ Tested, in the headless window:
 
 Found at this point: the binary's 480 × 360 minimum window could not show
 the composer or any header control at 200%; only the status line stayed
-inside. That was a defect and is fixed (§12.2): the text size in use is now
-the largest one the window can hold.
+inside. That was a defect. It was first worked around with smaller text
+(§12.2) and is now fixed by reflowing the shell at the size asked for
+(§15).
 
 Three 200% states are in the offscreen captures, drawn with real fonts. Two
 were looked at once by the implementing agent: the 1440 px one reads as
@@ -801,6 +802,9 @@ Not addressed: a window that starts inside a table or list is laid out
 without its beginning, and there is still no separate full-output viewer.
 
 ### 12.2 Every control stays reachable at any text size
+
+Superseded by §15. What follows was a fallback, kept here as the record of
+it: it gave a small window smaller text. No code path does that any more.
 
 At 200% text in the 480 x 360 minimum window the header toggles and the
 composer were off screen.
@@ -1077,3 +1081,149 @@ Still open, unchanged: Windows (done elsewhere), Linux, real input methods,
 screen readers, a person looking at 200% in a window, 200% text at the
 minimum window size (§12.2), performance budgets, parity, packaging.
 Phase 1 is not started.
+
+## 15. 200% text in the minimum window: the shell reflows
+
+Local commit `6783bf5`. Evidence collected at it.
+
+### 15.1 Why §12.2 was not enough
+
+A window smaller than a text size needs was given smaller text and a
+notice. That kept the controls on screen. It was not 200% text: a person
+who needs 200% and has a 480 x 360 window got 100%. That fallback is gone.
+The text is the size asked for in a window of any size, and what gives way
+is the layout.
+
+There is no layout that shows everything at once. 480 x 360 at 200% is the
+area of 240 x 180 at 100%, about five lines of body text tall. At 200% the
+header, the composer and the status line need 550 px between them, in a
+window 360 px tall. So some of the shell is off screen at any moment, and
+the work is in how it is reached.
+
+### 15.2 The layout
+
+A window at least 480 x 360 times the text size factor is whole: nothing
+changes there. A smaller one is reflowed:
+
+- Each part is as wide as the window and wraps inside it. The header's
+  title takes a line of its own and its controls wrap under it. The status
+  line's three parts go one under the other. The composer's actions wrap.
+  Nothing is cut off at the side and the shell never scrolls sideways.
+- The parts stack, header, conversation, composer, status line, and the
+  shell scrolls up and down as one page with a scrollbar. The conversation
+  is one screen tall at most, so the composer is never more than one screen
+  below its top.
+- Focus brings its part into view: when focus moves, when the window is
+  resized or the text size changes, when the user types in a composer they
+  had scrolled away from, and when a part is asked for by name (F6).
+  Otherwise the page stays where it was scrolled.
+- The status line holds no control, so on a reflowed page it is a tab stop
+  itself. Without that the keyboard could not bring it into view.
+- The kit's timeline keeps every wheel event that reaches it, even at its
+  end. On a page that made it a trap: with the pointer over the timeline
+  the page could not be moved. The wheel is now handed on to the page once
+  the timeline is at the end the wheel is turning towards.
+- An overlay panel covers the window and is never wider than it. The
+  inspector's details scroll inside it, by the wheel and by the arrow and
+  page keys.
+- A reflowed window never docks a panel, however wide it is.
+
+### 15.3 What was checked
+
+Headless, in the kit's test window (no real fonts): 60 shell tests and 61
+model tests (66 with the Thai study). The ones for this:
+
+- The text stays 200% from 480 x 360 up through every window size to one
+  that holds it and back, through a wide-and-short and a narrow-and-tall
+  window; controls are as tall reflowed as they are where the shell is
+  whole; nothing is cut off at the side, the parts do not overlap, the end
+  of the page can be scrolled to; the draft and focus are untouched and
+  the composer is in view at every step.
+- Every part is reached from the keyboard: Tab to each header control and
+  to the status line, F6 round the regions, each in view when it has focus.
+- The page stays where the wheel left it until typing, a move of focus
+  (even within the part that had it) or asking for a part brings it back.
+- The wheel over the timeline scrolls the timeline first, then the page;
+  a timeline with nothing to scroll hands it on both ways.
+- Overlay panels are exactly the window; the Sessions list and its
+  destinations are inside; the inspector's last detail is reached with the
+  page keys; Escape returns focus to the composer, in view.
+- A wide but short window opens its panels as overlays and docks them
+  again when it is tall enough.
+- A destination with no view is reflowed too, and its way back is in view.
+- A stream into a reflowed window shows its newest text.
+- Fifty-six rounds of text size shortcuts and resizes, many of them
+  reflowed, leave the draft whole and the composer focused and in view.
+
+Offscreen, through the real renderer with real fonts (`tests/render.rs`):
+19 states, 8 of them reflowed, 37 captures. For each reflowed state: the
+font and rem size are the ones asked for; controls are exactly as tall as
+in the whole 200% state; no part or control is outside the window's width;
+the parts stack without overlapping; the header's controls do not overlap
+each other; focus in each of the four parts brings it wholly into the
+window (and the shell asks for the second frame that takes); the wheel
+reaches the end of the page; an overlay panel is inside the window.
+
+With each of eleven parts of the change removed, tests fail
+(`mutation-check/reflow-parts-removed.log`). Two of the eleven were not
+caught by the shell tests at first; a test was added for each.
+
+In real windows, opened small and left small (`--keep-window`). Nobody
+watched; these are the figures the process printed about its own layout
+after moving focus to each part in turn:
+
+| Window | Text | Page height | Scroll range | Header, conversation, composer, status line brought wholly into the window by focus |
+|---|---:|---:|---:|---|
+| 480 x 360 | 200% | 910 | 550 | yes, all four |
+| 480 x 360 | 150% | 718 | 358 | yes, all four |
+| 700 x 500 | 200% | 951 | 451 | yes, all four |
+| 1440 x 500 | 200% | 951 | 451 | yes, all four |
+| 480 x 360, with a 5 MiB block | 200% | 910 | 550 | yes, all four |
+
+In each, every part was laid out from the window's left edge to its right
+edge. In 480 x 360 at 200% the header is 149 px tall, the conversation 360,
+the composer 227 and the status line 174. With the conversation in view the
+timeline has about 280 px; with the composer in view, 133 px of timeline
+show above it. Streaming for 10 s at 100 deltas a second into that window
+ran and ended showing the newest text.
+
+Four of the captures were looked at once by the implementing agent at this
+commit (the header, the composer and the status line of the minimum window
+at 200%, and its Sessions overlay). They read as intended.
+
+### 15.4 Limits
+
+- Nobody has seen this in a real window, and no picture of a real window
+  was taken: that needs screen recording permission, which is a system
+  setting.
+- No screen reader ran. What it announces for a page whose parts are
+  stacked, and for a status line that is a tab stop, is unknown. A
+  focusable line of status text is a compromise made for the keyboard.
+- This is not a conformance claim. The minimum window at 200% is smaller
+  than the 320 x 256 points that WCAG 1.4.10 asks content to reflow at,
+  and nothing here was assessed against that or any other criterion. OS
+  text size and zoom settings were not tried.
+- Bringing a part into view takes two frames after a layout change: GPUI
+  scrolls to where a child was the frame before. For one frame the page is
+  at its old position.
+- Focus brings a part into view, not the control inside it. A part taller
+  than the window shows its top. The only such part found is the notice
+  for a destination with no view, and its button was moved to the top for
+  that reason.
+- The Sessions overlay in 480 x 360 at 200% shows less than two rows of
+  the list above the destination buttons. It scrolls and the arrow keys
+  work.
+- The header's title is cut short with an ellipsis in a narrow window. The
+  whole title is in the Context panel and the Sessions list.
+- Handing the wheel on depends on what the kit reports about its timeline
+  and on the order GPUI calls listeners in. Both are tested at the pinned
+  versions; a kit update could change either.
+- Markdown wider than the window inside a row (a table, a long line of
+  code) was not looked at. Scrolling the timeline itself from the keyboard
+  is the kit's and is untested, as before.
+- Windows and Linux were not run.
+
+The 200% gate in §8 stays open until a person, and a screen reader, have
+been at it. Still open as well, unchanged: Windows (done elsewhere), Linux,
+real input methods, performance budgets, parity, packaging. Phase 1 is not
+started.
