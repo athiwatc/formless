@@ -176,6 +176,9 @@ fn block_window_line(
         h_flex()
             .id(SharedString::from(format!("block-{id}-{position}-window")))
             .test_support()
+            // What is missing is the name of the group its controls are in.
+            .role(Role::Group)
+            .aria_label(text.clone())
             .flex_wrap()
             .gap_1()
             .text_xs()
@@ -187,6 +190,23 @@ fn block_window_line(
             .child(button("End", WindowMove::End, has_later || can_follow))
             .into_any_element(),
     )
+}
+
+/// A line of text that assistive technology can read.
+///
+/// The pinned GPUI gives an element an accessibility node only if it has
+/// both an id and a role, and a plain string, the kit's `Label` and its
+/// markdown view have neither. Read from a real window, the platform tree
+/// held the buttons and the composer and none of the text. So the element
+/// that holds the text is made a static-text node whose value is the text.
+fn readable(id: impl Into<ElementId>, text: impl Into<SharedString>) -> impl IntoElement + Styled {
+    let text = text.into();
+    div()
+        .id(id)
+        .test_support()
+        .role(Role::Label)
+        .aria_value(text.clone())
+        .child(text)
 }
 
 /// A region's border colour: the focus ring while the region itself holds
@@ -1258,11 +1278,21 @@ impl Shell {
             .sidebar
             .active_row()
             .map_or_else(|| "No Session".into(), |row| row.title.clone());
-        let profile = div()
+        let profile = readable("header-profile", "Fixture Profile /")
             .text_sm()
-            .text_color(cx.theme().muted_foreground)
-            .child("Fixture Profile /");
-        let title = div().flex_1().min_w_0().truncate().child(title);
+            .text_color(cx.theme().muted_foreground);
+        // The whole title is the heading's name even where the window is
+        // too narrow to show all of it.
+        let title = div()
+            .id("header-title")
+            .test_support()
+            .role(Role::Heading)
+            .aria_level(1)
+            .aria_label(title.clone())
+            .flex_1()
+            .min_w_0()
+            .truncate()
+            .child(title);
         let controls = [
             Button::new("toggle-sidebar")
                 .small()
@@ -1377,27 +1407,36 @@ impl Shell {
             .border_r_1()
             .border_color(region_border(focused, cx.theme().sidebar_border, cx))
             .child(
-                div()
-                    .px_3()
-                    .py_2()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(format!("Sessions ({})", self.sidebar.rows().len())),
+                readable(
+                    "session-count",
+                    format!("Sessions ({})", self.sidebar.rows().len()),
+                )
+                .px_3()
+                .py_2()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground),
             )
             .child(
-                div().flex_1().min_h_0().child(
-                    v_virtual_list(
-                        cx.entity(),
-                        "sessions",
-                        self.session_sizes.clone(),
-                        |this, range, _, cx| {
-                            range
-                                .map(|index| this.render_session_row(index, cx))
-                                .collect::<Vec<_>>()
-                        },
-                    )
-                    .track_scroll(&self.session_scroll),
-                ),
+                div()
+                    .id("session-list")
+                    .test_support()
+                    .role(Role::ListBox)
+                    .aria_label("Sessions")
+                    .flex_1()
+                    .min_h_0()
+                    .child(
+                        v_virtual_list(
+                            cx.entity(),
+                            "sessions",
+                            self.session_sizes.clone(),
+                            |this, range, _, cx| {
+                                range
+                                    .map(|index| this.render_session_row(index, cx))
+                                    .collect::<Vec<_>>()
+                            },
+                        )
+                        .track_scroll(&self.session_scroll),
+                    ),
             )
             .child(
                 h_flex()
@@ -1438,6 +1477,15 @@ impl Shell {
         v_flex()
             .id(session_row_id(&row.id))
             .test_support()
+            // One option of the list: named by its title, read with its
+            // status, and told its place among all the Sessions, of which
+            // only those near the viewport exist as elements.
+            .role(Role::ListBoxOption)
+            .aria_label(row.title.clone())
+            .aria_value(format!("{}, {status}", row.title))
+            .aria_selected(selected)
+            .aria_position_in_set(index + 1)
+            .aria_size_of_set(self.sidebar.rows().len())
             .h(self.scaled(SESSION_ROW_HEIGHT))
             .w_full()
             .px_3()
@@ -1499,6 +1547,9 @@ impl Shell {
                 v_flex()
                     .id(("block", id))
                     .test_support()
+                    // One article of the log, named by who it is from.
+                    .role(Role::Article)
+                    .aria_label(block.kind.label())
                     .w_full()
                     .max_w(reading_width)
                     .mx_auto()
@@ -1513,13 +1564,19 @@ impl Shell {
                             .child(block.kind.label()),
                     )
                     .children(above)
-                    .child(
-                        TextView::markdown(
-                            ("markdown", id),
-                            SharedString::from(block.preview().clone()),
-                        )
-                        .selectable(true),
-                    )
+                    .child({
+                        // The kit's markdown view gives assistive technology
+                        // nothing, so its container carries the text it
+                        // lays out: the row's bounded window, as markdown
+                        // source.
+                        let text = SharedString::from(block.preview().clone());
+                        div()
+                            .id(("block-text", id))
+                            .test_support()
+                            .role(Role::Label)
+                            .aria_value(text.clone())
+                            .child(TextView::markdown(("markdown", id), text).selectable(true))
+                    })
                     .children(below)
                     .into_any_element()
             }
@@ -1527,6 +1584,8 @@ impl Shell {
         v_flex()
             .id("region-conversation")
             .test_support()
+            .role(Role::Main)
+            .aria_label("Conversation")
             .track_focus(&self.conversation_focus)
             .map(|region| Self::main_size(region, page_height))
             .border_1()
@@ -1539,18 +1598,17 @@ impl Shell {
                     .border_b_1()
                     .border_color(cx.theme().border)
                     .child(
-                        div()
-                            .flex_1()
-                            .text_sm()
-                            .child(format!("{} blocks", self.blocks.borrow().len())),
+                        readable(
+                            "block-count",
+                            format!("{} blocks", self.blocks.borrow().len()),
+                        )
+                        .flex_1()
+                        .text_sm(),
                     )
                     .child(
-                        div()
-                            .id("run-status")
-                            .test_support()
+                        readable("run-status", format!("Run: {}", run_state.label()))
                             .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(format!("Run: {}", run_state.label())),
+                            .text_color(cx.theme().muted_foreground),
                     ),
             )
             .child(
@@ -1660,6 +1718,12 @@ impl Shell {
         let notice = v_flex()
             .id("region-conversation")
             .test_support()
+            .role(Role::Main)
+            .aria_label(format!("{name}: not built"))
+            .aria_description(format!(
+                "This Phase 0 scaffold only has a Chat view. {name} has no screen, data or \
+                 actions here, and this notice is not a preview of one."
+            ))
             .track_focus(&self.conversation_focus)
             .map(|region| Self::main_size(region, page_height))
             .items_center()
@@ -1722,6 +1786,8 @@ impl Shell {
                 div()
                     .id("composer-notice")
                     .test_support()
+                    .role(Role::Label)
+                    .aria_value(notice.clone())
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
                     .child(Label::new(notice))
@@ -1744,8 +1810,14 @@ impl Shell {
     fn render_inspector(&self, modal: bool, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let focused = self.inspector_focus.is_focused(window);
         let row = self.sidebar.active_row();
-        let detail = |label: &'static str, value: String| {
+        // Each detail is one line to assistive technology: its name, then
+        // its value.
+        let detail = |id: &'static str, label: &'static str, value: String| {
             v_flex()
+                .id(id)
+                .test_support()
+                .role(Role::Label)
+                .aria_value(format!("{label}: {value}"))
                 .gap_0p5()
                 .child(
                     div()
@@ -1764,26 +1836,28 @@ impl Shell {
             .track_scroll(&self.inspector_scroll)
             .p_3()
             .gap_3()
-            .child(div().text_sm().child("Context"))
+            .child(readable("inspector-title", "Context").text_sm())
             .child(detail(
+                "inspector-session",
                 "Session",
                 row.map_or_else(|| "None".to_string(), |row| row.title.clone()),
             ))
             .child(detail(
+                "inspector-session-id",
                 "Session id",
                 row.map_or_else(|| "None".to_string(), |row| row.id.clone()),
             ))
-            .child(detail("Run", self.run_state().label().to_string()))
-            .child(
-                div()
-                    .id("inspector-last-message")
-                    .test_support()
-                    .child(detail(
-                        "Last message",
-                        row.and_then(|row| row.preview.clone())
-                            .unwrap_or_else(|| "None".to_string()),
-                    )),
-            );
+            .child(detail(
+                "inspector-run",
+                "Run",
+                self.run_state().label().to_string(),
+            ))
+            .child(detail(
+                "inspector-last-message",
+                "Last message",
+                row.and_then(|row| row.preview.clone())
+                    .unwrap_or_else(|| "None".to_string()),
+            ));
         let panel = div()
             .id("region-inspector")
             .test_support()
@@ -1912,9 +1986,16 @@ impl Shell {
                 InspectorMode::Hidden => "hidden",
             }
         );
+        let fixture = readable(
+            "status-fixture",
+            "Synthetic fixture: no Daemon Core connection",
+        );
+        let intent = readable("status-intent", intent);
         let status = div()
             .id("status")
             .test_support()
+            .role(Role::Status)
+            .aria_label("Status")
             .flex()
             .flex_shrink_0()
             .px_3()
@@ -1935,18 +2016,18 @@ impl Shell {
                 ))
                 .flex_col()
                 .py_1()
-                .child("Synthetic fixture: no Daemon Core connection")
+                .child(fixture)
                 .child(intent)
-                .child(detail)
+                .child(readable("status-detail", detail))
         } else {
             status
                 .items_center()
                 .h(self.scaled(STATUS_HEIGHT))
                 .gap_3()
-                .child("Synthetic fixture: no Daemon Core connection")
+                .child(fixture)
                 .child(intent)
                 .child(div().flex_1())
-                .child(detail)
+                .child(readable("status-detail", detail))
         }
     }
 

@@ -684,6 +684,245 @@ fn tab_to(window: &mut Window, id: &'static str, cx: &mut App) {
     panic!("Tab never reached {id}");
 }
 
+// The pinned GPUI gives an element an accessibility node only if it has an
+// id and a role. Read from a real macOS window, the platform tree held the
+// buttons and the composer and none of the shell's text: no Session, no
+// message, no status. These check what the shell now hands the platform
+// adapter. They read the kit's test tree, not the platform's; the real
+// window was read separately (see the findings).
+
+#[gpui_kit::test]
+fn the_shells_text_and_rows_are_in_the_accessibility_tree(cx: &mut TestAppContext) {
+    let (handle, shell) = open(cx, WIDE, 200, 40);
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        let rows = shell.read(cx).sidebar().rows().to_vec();
+        let active = &rows[0];
+
+        // The header names the open Session, whole, as a heading.
+        let title = window.find("header-title");
+        assert_eq!(title.role(), Some(Role::Heading));
+        assert_eq!(title.label(), Some(active.title.as_str()));
+        assert_eq!(
+            window.find("header-profile").value(),
+            Some("Fixture Profile /")
+        );
+
+        // The Sessions list is a list of options. Each is named by its
+        // title, read with its status, knows whether it is selected and
+        // where it is among all of them, and can be pressed.
+        let list = window.find("session-list");
+        assert_eq!(list.role(), Some(Role::ListBox));
+        assert_eq!(list.label(), Some("Sessions"));
+        assert_eq!(
+            window.find("session-count").value(),
+            Some(format!("Sessions ({})", rows.len()).as_str())
+        );
+        let first = window.find(session_row_id(&active.id));
+        assert_eq!(first.role(), Some(Role::ListBoxOption));
+        assert_eq!(first.label(), Some(active.title.as_str()));
+        let value = first.value().expect("a row has a value").to_string();
+        assert!(value.starts_with(&active.title), "{value}");
+        assert!(value.ends_with("· Open"), "{value}");
+        assert_eq!(first.selected(), Some(true));
+        let second = window.find(session_row_id(&rows[1].id));
+        assert_eq!(second.selected(), Some(false));
+        assert!(!second.value().unwrap().contains("Open"));
+
+        // The conversation is the main landmark; its heading line is text.
+        let conversation = window.find("region-conversation");
+        assert_eq!(conversation.role(), Some(Role::Main));
+        assert_eq!(conversation.label(), Some("Conversation"));
+        assert_eq!(window.find("block-count").value(), Some("40 blocks"));
+        assert_eq!(window.find("run-status").value(), Some("Run: Idle"));
+
+        // Each block on screen is an article named by who it is from, and
+        // holds the text its row lays out.
+        let block = window.find(("block", 40usize));
+        assert_eq!(block.role(), Some(Role::Article));
+        assert_eq!(block.label(), Some("Run recap"));
+        let text = window.find(("block-text", 40usize));
+        assert_eq!(text.role(), Some(Role::Label));
+        assert_eq!(
+            text.value(),
+            Some(
+                "Done. 3 files changed, 2 Tools created, 1 Invocation still pending.\n\n_block 40_"
+            )
+        );
+
+        // The Context panel's details, each as one line.
+        assert_eq!(window.find("inspector-title").value(), Some("Context"));
+        assert_eq!(
+            window.find("inspector-session").value(),
+            Some(format!("Session: {}", active.title).as_str())
+        );
+        assert_eq!(
+            window.find("inspector-session-id").value(),
+            Some(format!("Session id: {}", active.id).as_str())
+        );
+        assert_eq!(window.find("inspector-run").value(), Some("Run: Idle"));
+        assert!(window
+            .find("inspector-last-message")
+            .value()
+            .is_some_and(|value| value.starts_with("Last message: ")));
+
+        // The status line is a status region holding its three lines.
+        let status = window.find("status");
+        assert_eq!(status.role(), Some(Role::Status));
+        assert_eq!(status.label(), Some("Status"));
+        assert_eq!(
+            window.find("status-fixture").value(),
+            Some("Synthetic fixture: no Daemon Core connection")
+        );
+        assert_eq!(
+            window.find("status-intent").value(),
+            Some("No intent recorded")
+        );
+        assert_eq!(
+            window.find("status-detail").value(),
+            Some("Text 100% · Chat · inspector docked")
+        );
+
+        // A value alone is not enough: an element without a role is not
+        // in the platform's tree at all, whatever else it carries.
+        for id in [
+            "header-profile",
+            "session-count",
+            "block-count",
+            "run-status",
+            "inspector-title",
+            "inspector-session",
+            "inspector-session-id",
+            "inspector-run",
+            "inspector-last-message",
+            "status-fixture",
+            "status-intent",
+            "status-detail",
+        ] {
+            assert_eq!(window.find(id).role(), Some(Role::Label), "{id}");
+        }
+
+        // What the status line says changes with what was done.
+        window.input("hello", cx);
+        window.click("composer-primary", cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("status-intent").value(),
+            Some("Recorded Send (5 characters), not sent")
+        );
+
+        // Pressing another Session's row opens it, and everything that
+        // names the open Session follows.
+        let rows = shell.read(cx).sidebar().rows().to_vec();
+        window.click(session_row_id(&rows[1].id), cx);
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("header-title").label(),
+            Some(rows[1].title.as_str())
+        );
+        assert_eq!(
+            window.find("inspector-session").value(),
+            Some(format!("Session: {}", rows[1].title).as_str())
+        );
+        assert_eq!(
+            window.find(session_row_id(&rows[1].id)).selected(),
+            Some(true)
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn a_notice_and_a_cut_block_say_what_they_say_to_assistive_technology(cx: &mut TestAppContext) {
+    let mut blocks = fixture::timeline(8);
+    blocks.push(fixture::huge_block(9, 256 * 1024));
+    let (handle, shell) = open_blocks(cx, size(px(1440.), px(1200.)), blocks);
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        // A row that shows less than its block: the line that says so is
+        // the name of the group its controls are in, and the row's text is
+        // the bounded window, not the whole block.
+        let line = window.find("block-9-top-window");
+        assert_eq!(line.role(), Some(Role::Group));
+        let name = line.label().expect("the line is named").to_string();
+        assert!(name.starts_with("Showing "), "{name}");
+        assert!(name.contains("after it is not shown."), "{name}");
+        let text = window.find(("block-text", 9usize));
+        let value = text.value().expect("the row has text");
+        assert!(
+            value.len() <= timeline::PREVIEW_MAX_BYTES,
+            "{}",
+            value.len()
+        );
+        assert_eq!(value, shell.read(cx).last_block_preview());
+
+        // A refusal is text too.
+        let paste = "x".repeat(limits::COMPOSER_MAX_BYTES + 1);
+        cx.write_to_clipboard(ClipboardItem::new_string(paste));
+        window.press(&chord("v"), cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        let notice = window.find("composer-notice");
+        assert_eq!(notice.role(), Some(Role::Label));
+        assert_eq!(
+            notice.value(),
+            shell.read(cx).composer_notice(),
+            "the notice on screen and the one read are the same"
+        );
+        assert!(notice
+            .value()
+            .is_some_and(|value| value.starts_with("Paste not added")));
+    });
+}
+
+#[gpui_kit::test]
+fn every_place_focus_can_rest_on_a_reflowed_page_has_an_accessibility_node(
+    cx: &mut TestAppContext,
+) {
+    let (handle, shell) = open(cx, size(px(480.), px(360.)), 200, 40);
+    step(cx, handle, |window, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.set_text_scale(TextScale::from_percent(200), window, cx)
+        });
+        window.render_frame(cx);
+        // In a real window, focus on the status line or on the
+        // conversation used to be on nothing the platform could name.
+        for (id, role, label) in [
+            ("status", Role::Status, "Status"),
+            ("region-conversation", Role::Main, "Conversation"),
+        ] {
+            let element = window.find(id);
+            assert_eq!(element.role(), Some(role), "{id}");
+            assert_eq!(element.label(), Some(label), "{id}");
+        }
+        tab_to(window, "status", cx);
+        assert_eq!(window.find("status").focused(), Some(true));
+        // The stacked status lines are still there to be read.
+        assert_eq!(
+            window.find("status-detail").value(),
+            Some("Text 200% · Chat · inspector hidden")
+        );
+        // A destination with no view: the notice is the landmark's name
+        // and description.
+        window.press(TOGGLE_SIDEBAR, cx);
+        window.render_frame(cx);
+        window.click("destination-Tools", cx);
+    });
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        let notice = window.find("region-conversation");
+        assert_eq!(notice.role(), Some(Role::Main));
+        assert_eq!(notice.label(), Some("Tools: not built"));
+        assert!(notice
+            .description()
+            .is_some_and(|text| text.contains("only has a Chat view")));
+    });
+}
+
 #[gpui_kit::test]
 fn panels_expose_landmark_roles_docked_and_named_dialogs_as_overlays(cx: &mut TestAppContext) {
     let (handle, _) = open(cx, WIDE, 200, 40);
