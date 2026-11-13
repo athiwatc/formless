@@ -1,9 +1,10 @@
 name: windows
 
+# Automatic CI builds are paused at the owner's request. Validate changes on
+# local Windows and macOS before merging, recording the exact commit and results.
+# Keep the existing recipe available for an explicitly requested manual run.
 on:
-  pull_request:
-  push:
-    branches: [main]
+  workflow_dispatch:
 
 jobs:
   core:
