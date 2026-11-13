@@ -89,6 +89,11 @@ export function validSubscription(sub, allowLocalHttp, extraHosts) {
 export async function loadVapid(env) {
   if (!env.VAPID_PUBLIC_KEY && !env.VAPID_PRIVATE_JWK) return { state: "off" };
   const bad = (reason) => ({ state: "misconfigured", reason });
+  for (const name of ["VAPID_PUBLIC_KEY", "VAPID_PRIVATE_JWK"]) {
+    if (typeof env[name] === "string" && env[name].startsWith(name + "=")) {
+      return bad(`${name} includes its '${name}=' prefix; store only the value`);
+    }
+  }
   if (!env.VAPID_PUBLIC_KEY || !env.VAPID_PRIVATE_JWK) return bad("set both VAPID_PUBLIC_KEY and VAPID_PRIVATE_JWK");
   let jwk;
   try { jwk = JSON.parse(env.VAPID_PRIVATE_JWK); } catch (_) { return bad("VAPID_PRIVATE_JWK is not JSON"); }

@@ -232,11 +232,21 @@ Optional. Without keys, `/push/key` answers 404 and the web app says the
 relay hasn't set up notifications. To turn it on:
 
 ```sh
-node relay/vapid-keys.mjs          # prints the two values
-npx wrangler secret put VAPID_PUBLIC_KEY
-npx wrangler secret put VAPID_PRIVATE_JWK
+# Generate once so both secrets belong to the same pair.
+umask 077
+node relay/vapid-keys.mjs --json > vapid-keys.json
+node relay/vapid-keys.mjs --public vapid-keys.json | npx wrangler secret put VAPID_PUBLIC_KEY
+node relay/vapid-keys.mjs --private vapid-keys.json | npx wrangler secret put VAPID_PRIVATE_JWK
+rm vapid-keys.json
 npx wrangler secret put VAPID_SUBJECT   # optional, e.g. mailto:you@example.com
 ```
+
+The saved JSON contains the private key; keep it private and out of version
+control, then delete it after setup. The default `node relay/vapid-keys.mjs`
+output remains `NAME=value` for `dev.mjs` environment variables. When copying
+into a Wrangler prompt by hand, paste **only the part after the first `=`**,
+without `VAPID_PUBLIC_KEY=` or `VAPID_PRIVATE_JWK=`. Do not generate a new pair
+between setting the public and private secrets.
 
 Browsers opt in from Settings → This browser. The room keeps their
 subscriptions (at most 10). Pushes carry no payload at all, so the relay
