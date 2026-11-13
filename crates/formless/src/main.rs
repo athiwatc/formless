@@ -1123,7 +1123,8 @@ enum NamingAction {
     },
     /// Download the model (default: the configured one)
     Pull {
-        /// Model id: qwen2.5-0.5b or lfm2.5-350m
+        /// Model ID to download; omit to use the configured model
+        #[arg(value_parser = NamingModelParser::new())]
         model: Option<String>,
     },
     /// Print the title the namer would give a first message
@@ -1643,6 +1644,50 @@ impl clap::builder::TypedValueParser for DocsTopicParser {
         Some(Box::new(formless_core::docs::TOPICS.iter().map(
             |(name, _, description)| clap::builder::PossibleValue::new(*name).help(*description),
         )))
+    }
+}
+
+#[derive(Clone)]
+struct NamingModelParser(clap::builder::StringValueParser);
+
+impl NamingModelParser {
+    fn new() -> Self {
+        Self(clap::builder::StringValueParser::new())
+    }
+}
+
+impl clap::builder::TypedValueParser for NamingModelParser {
+    type Value = String;
+
+    fn parse_ref(
+        &self,
+        cmd: &clap::Command,
+        arg: Option<&clap::Arg>,
+        value: &std::ffi::OsStr,
+    ) -> Result<String, clap::Error> {
+        let value = self.0.parse_ref(cmd, arg, value)?;
+        if formless_core::namer::spec(&value).is_some() {
+            return Ok(value);
+        }
+        let choices = formless_core::namer::MODELS
+            .iter()
+            .map(|model| model.id)
+            .collect::<Vec<_>>()
+            .join(", ");
+        Err(cmd.clone().error(
+            clap::error::ErrorKind::InvalidValue,
+            format!("unknown naming model '{value}'; valid model IDs: {choices}"),
+        ))
+    }
+
+    fn possible_values(
+        &self,
+    ) -> Option<Box<dyn Iterator<Item = clap::builder::PossibleValue> + '_>> {
+        Some(Box::new(
+            formless_core::namer::MODELS
+                .iter()
+                .map(|model| clap::builder::PossibleValue::new(model.id)),
+        ))
     }
 }
 
