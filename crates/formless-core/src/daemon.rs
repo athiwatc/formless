@@ -3241,12 +3241,13 @@ impl Daemon {
                     .with_context(|| RequestFailure::not_found(format!("no artifact '{id}'")))?;
                 let source =
                     crate::attachment_access::read_artifact_record(&self.paths, &path, bytes)?;
-                let text = String::from_utf8_lossy(&source).into_owned();
-                let total = text.chars().count();
+                let text = String::from_utf8_lossy(&source);
                 let offset = offset.unwrap_or(0);
                 let length = length.unwrap_or(200_000).min(1_000_000);
-                let slice: String = text.chars().skip(offset).take(length).collect();
-                let end = offset + slice.chars().count();
+                let page = crate::artifact_text::page(&text, offset, length);
+                let total = page.total;
+                let slice = page.text;
+                let end = offset + page.selected;
                 // Never the filesystem path (SPEC §9.6).
                 Ok(json!({"id": id, "session_id": session, "bytes": bytes,
                           "total_chars": total, "offset": offset, "end": end, "text": slice}))
@@ -12282,23 +12283,24 @@ impl Daemon {
                 RequestFailure::not_found(format!("no artifact '{id}' in this session"))
             })?;
         let source = crate::attachment_access::read_artifact_record(&self.paths, &path, bytes)?;
-        let text = String::from_utf8_lossy(&source).into_owned();
+        let text = String::from_utf8_lossy(&source);
         if let Some(needle) = args["grep"].as_str().filter(|g| !g.is_empty()) {
             let needle = needle.to_lowercase();
             let hits: Vec<Value> = text
                 .lines()
                 .enumerate()
-                .filter(|(_, l)| l.to_lowercase().contains(&needle))
+                .filter(|(_, l)| crate::artifact_text::contains_lowercase(l, &needle))
                 .take(200)
                 .map(|(i, l)| json!({"line": i + 1, "text": l.chars().take(500).collect::<String>()}))
                 .collect();
             return Ok(json!({"id": id, "matches": hits}).to_string());
         }
-        let total = text.chars().count();
         let offset = args["offset"].as_u64().unwrap_or(0) as usize;
         let length = args["length"].as_u64().unwrap_or(20_000).min(100_000) as usize;
-        let slice: String = text.chars().skip(offset).take(length).collect();
-        let end = (offset + slice.chars().count()).min(total);
+        let page = crate::artifact_text::page(&text, offset, length);
+        let total = page.total;
+        let slice = page.text;
+        let end = (offset + page.selected).min(total);
         Ok(
             json!({"id": id, "offset": offset, "end": end, "total_chars": total, "text": slice})
                 .to_string(),
