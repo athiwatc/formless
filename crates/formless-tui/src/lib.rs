@@ -29,6 +29,8 @@ mod settings;
 mod text;
 mod text_history;
 mod theme;
+#[cfg(test)]
+mod toast_preview_tests;
 mod ui;
 mod user_commands_ui;
 mod vim;
@@ -12937,34 +12939,49 @@ fn draw_quit_confirm(f: &mut Frame, app: &App) {
 /// Recent notes as toasts in the top-right corner of `area`, newest at
 /// the bottom; errors in red until dismissed.
 fn draw_toasts(f: &mut Frame, area: Rect, app: &App) {
-    let live: Vec<&(String, Instant, bool)> = app.toasts.iter().rev().take(4).rev().collect();
-    if live.is_empty() || area.width < 20 || area.height < 4 {
+    if app.toasts.is_empty() || area.width < 20 || area.height < 4 {
         return;
     }
     let w = (area.width / 2).clamp(20, 64);
-    let lines: Vec<Line> = live
+    // The top offset and both borders consume three rows. Reserve one
+    // preview row for every retained toast before expanding any error.
+    let budget = area.height.saturating_sub(3) as usize;
+    let live: Vec<_> = app.toasts.iter().rev().take(4.min(budget)).rev().collect();
+    let mut shortened = app
+        .toasts
         .iter()
-        .map(|(text, _, error)| {
-            Line::styled(
-                truncate_chars(
-                    &if *error {
-                        ui::status_text(app.color, SemanticTone::Bad, text)
-                    } else {
-                        text.clone()
-                    },
-                    w as usize - 4,
-                ),
-                if *error {
-                    bold_fg(app.color, Color::Red)
-                } else {
-                    fg(app.color, Color::Gray)
-                },
-            )
-        })
-        .collect();
+        .rev()
+        .take(4)
+        .skip(live.len())
+        .any(|t| t.2);
+    let mut lines = Vec::new();
+    for (index, (text, _, error)) in live.iter().enumerate() {
+        let style = if *error {
+            bold_fg(app.color, Color::Red)
+        } else {
+            fg(app.color, Color::Gray)
+        };
+        if *error {
+            let cap = (budget - lines.len() - (live.len() - index - 1)).min(3);
+            let (rows, omitted) = toast_error_rows(
+                &ui::status_text(app.color, SemanticTone::Bad, text),
+                w as usize - 4,
+                cap,
+            );
+            shortened |= omitted;
+            lines.extend(rows.into_iter().map(|row| Line::styled(row, style)));
+        } else {
+            lines.push(Line::styled(truncate_chars(text, w as usize - 4), style));
+        }
+    }
     let any_error = live.iter().any(|t| t.2);
-    let h = (lines.len() as u16 + 2).min(area.height);
-    let rect = Rect::new(area.right().saturating_sub(w + 1), area.y + 1, w, h);
+    let h = lines.len() as u16 + 2;
+    let rect = Rect::new(
+        area.right().saturating_sub(w + 1).max(area.x),
+        area.y + 1,
+        w,
+        h,
+    );
     let mut block = ui::panel(
         " notes ",
         app.color,
@@ -12974,11 +12991,58 @@ fn draw_toasts(f: &mut Frame, area: Rect, app: &App) {
             Color::DarkGray
         },
     );
-    if any_error {
-        block = block.title_bottom(ui::hint("Esc dismisses", app.color));
+    if any_error || shortened {
+        let hint = if shortened {
+            ["Esc dismisses · /notes full text", "Esc · /notes", "/notes"]
+                .into_iter()
+                .find(|hint| text::width(hint) <= w as usize - 4)
+                .unwrap()
+        } else {
+            "Esc dismisses"
+        };
+        block = block.title_bottom(ui::hint(hint, app.color));
     }
     f.render_widget(Clear, rect);
     f.render_widget(Paragraph::new(lines).block(block), rect);
+}
+
+/// A bounded error preview, stopping at the row cap and between graphemes.
+/// Other than line breaks, text controls follow the existing toast policy.
+fn toast_error_rows(text: &str, width: usize, cap: usize) -> (Vec<String>, bool) {
+    use unicode_segmentation::UnicodeSegmentation;
+    let mut rows = vec![String::new()];
+    let mut omitted = false;
+    let mut clusters = text.graphemes(true).peekable();
+    while let Some(cluster) = clusters.next() {
+        if cluster == "\n" || cluster == "\r\n" {
+            if rows.len() == cap {
+                omitted |= clusters.peek().is_some();
+                break;
+            }
+            rows.push(String::new());
+            continue;
+        }
+        if text::width(rows.last().unwrap()) + text::width(cluster) > width {
+            if rows.len() == cap {
+                omitted = true;
+                break;
+            }
+            rows.push(String::new());
+        }
+        if text::width(cluster) > width {
+            rows.last_mut()
+                .unwrap()
+                .push_str(&text::truncate(cluster, width));
+            omitted = true;
+        } else {
+            rows.last_mut().unwrap().push_str(cluster);
+        }
+    }
+    if omitted {
+        let last = rows.last_mut().unwrap();
+        *last = text::truncate(&format!("{last}…"), width);
+    }
+    (rows, omitted)
 }
 
 /// Speaker groups: tool results belong to the assistant turn around them.
