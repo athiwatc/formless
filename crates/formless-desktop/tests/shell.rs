@@ -4438,3 +4438,171 @@ fn a_decoded_session_reply_becomes_the_open_sessions_timeline_and_no_other(
         );
     });
 }
+
+// ---- Full-output view -------------------------------------------------------
+
+/// Rows of the full-output view that are laid out now.
+fn viewer_rows_shown(window: &Window) -> Vec<usize> {
+    let shown: Vec<usize> = (0..100_000usize)
+        .filter(|index| window.try_find(("viewer-row", *index)).is_some())
+        .take(400)
+        .collect();
+    shown
+}
+
+#[gpui_kit::test]
+fn the_full_output_view_shows_a_long_block_whole_and_hands_focus_back(cx: &mut TestAppContext) {
+    let mut blocks = fixture::timeline(8);
+    // 3,000 short lines, then one line of 200 Thai characters.
+    let mut text: String = (0..3000).map(|line| format!("line {line}\n")).collect();
+    text.push_str(&"ก".repeat(200));
+    blocks.push(TimelineBlock::new(9, BlockKind::ToolSummary, text.clone()));
+    let (handle, shell) = open_blocks(cx, size(px(1440.), px(1200.)), blocks);
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        assert!(window
+            .find("block-9-top-window")
+            .label()
+            .unwrap()
+            .starts_with("Showing "));
+        tab_to(window, "block-9-top-view", cx);
+        window.press("enter", cx);
+        window.render_frame(cx);
+
+        let dialog = window.find("viewer");
+        assert_eq!(dialog.role(), Some(Role::Dialog));
+        assert_eq!(dialog.focused(), Some(true));
+        assert!(shell.read(cx).background_inert(window));
+        let rows = shell.read(cx).viewer_rows().expect("open");
+        let summary = window.find("viewer-summary").value().unwrap().to_string();
+        assert!(summary.starts_with("Tool block, "), "{summary}");
+        assert!(
+            summary.contains(&format!(", {rows} rows of up to ")),
+            "{summary}"
+        );
+        // 3,000 lines and the Thai line cut into rows of the view's width.
+        assert!(rows > 3000, "{rows}");
+
+        // Only what is on screen is laid out.
+        let shown = viewer_rows_shown(window);
+        assert_eq!(shown.first(), Some(&0));
+        assert!(shown.len() < 200, "{}", shown.len());
+        assert_eq!(window.find(("viewer-row", 0usize)).value(), Some("line 0"));
+
+        // End shows the last row; Home the first; Page Down moves on.
+        window.press("end", cx);
+        window.render_frame(cx);
+        window.render_frame(cx);
+        let last = window
+            .find(("viewer-row", rows - 1))
+            .value()
+            .unwrap()
+            .to_string();
+        assert!(!last.is_empty() && last.chars().all(|c| c == 'ก'), "{last}");
+        window.press("home", cx);
+        window.render_frame(cx);
+        window.render_frame(cx);
+        assert_eq!(viewer_rows_shown(window).first(), Some(&0));
+        window.press("pagedown", cx);
+        window.render_frame(cx);
+        window.render_frame(cx);
+        let first = *viewer_rows_shown(window).first().unwrap();
+        assert!(first > 10, "{first}");
+        window.press("up", cx);
+        window.render_frame(cx);
+        window.render_frame(cx);
+        assert_eq!(viewer_rows_shown(window).first(), Some(&(first - 1)));
+
+        // Copy all puts the whole block on the clipboard and says so.
+        window.click("viewer-copy", cx);
+        window.render_frame(cx);
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some(text.clone())
+        );
+        assert!(window
+            .find("viewer-summary")
+            .value()
+            .unwrap()
+            .ends_with("Copied to the clipboard."));
+
+        // F6 stays inside; Escape closes onto the control that opened it.
+        window.press("f6", cx);
+        assert_eq!(window.find("viewer").focused(), Some(true));
+        window.press("escape", cx);
+        assert!(window.try_find("viewer").is_none());
+        assert!(!shell.read(cx).background_inert(window));
+        assert_eq!(window.find("block-9-top-view").focused(), Some(true));
+    });
+}
+
+#[gpui_kit::test]
+fn a_block_still_arriving_cannot_be_viewed_whole(cx: &mut TestAppContext) {
+    let (handle, shell) = open_blocks(cx, size(px(1440.), px(1200.)), fixture::timeline(4));
+    step(cx, handle, |_, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.begin_stream(cx);
+            shell.push_stream_delta(&text_of(300 * 1024), cx);
+        });
+    });
+    cx.executor().advance_clock(Duration::from_millis(50));
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        let id = 5u64;
+        let button = window.find(gpui_kit::SharedString::from(format!("block-{id}-top-view")));
+        assert_eq!(button.disabled(), Some(true));
+        assert_eq!(
+            shell.update(cx, |shell, cx| shell.view_block(id, window, cx)),
+            Err("Available once the block has finished arriving")
+        );
+        assert!(window.try_find("viewer").is_none());
+        // Once it is complete, it can.
+        shell.update(cx, |shell, cx| shell.finish_stream(cx));
+        assert_eq!(
+            shell.update(cx, |shell, cx| shell.view_block(id, window, cx)),
+            Ok(())
+        );
+        window.render_frame(cx);
+        assert!(window.try_find("viewer").is_some());
+    });
+}
+
+#[gpui_kit::test]
+fn a_five_megabyte_line_is_viewed_as_short_rows_and_resizing_cuts_it_again(
+    cx: &mut TestAppContext,
+) {
+    let mut blocks = fixture::timeline(2);
+    let line = "x".repeat(5 * 1024 * 1024);
+    blocks.push(TimelineBlock::new(3, BlockKind::ToolSummary, line.clone()));
+    let (handle, shell) = open_blocks(cx, size(px(1440.), px(900.)), blocks);
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        let started = Instant::now();
+        shell
+            .update(cx, |shell, cx| shell.view_block(3, window, cx))
+            .unwrap();
+        window.render_frame(cx);
+        let opened = started.elapsed();
+        let wide = shell.read(cx).viewer_rows().unwrap();
+        let row = window.find(("viewer-row", 0usize)).value().unwrap().len();
+        assert_eq!(wide, line.len().div_ceil(row));
+        assert!(viewer_rows_shown(window).len() < 200);
+        // Bounded work, not a layout of five megabytes.
+        assert!(opened < Duration::from_secs(5), "{opened:?}");
+    });
+    cx.simulate_window_resize(handle.into(), size(px(800.), px(900.)));
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        let narrow = shell.read(cx).viewer_rows().unwrap();
+        let row = window.find(("viewer-row", 0usize)).value().unwrap().len();
+        assert_eq!(narrow, line.len().div_ceil(row));
+        assert!(narrow > line.len() / 200, "{narrow}");
+        // The dialog stays inside the window.
+        let viewport = Bounds::new(Point::default(), window.viewport_size());
+        let dialog = window.find("viewer").bounds();
+        assert!(dialog.right() <= viewport.right() && dialog.bottom() <= viewport.bottom());
+        assert!(window.find("viewer-close").bounds().right() <= viewport.right());
+    });
+}

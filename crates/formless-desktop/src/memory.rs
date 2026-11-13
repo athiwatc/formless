@@ -8,6 +8,7 @@
 //! | Recorded intent | No text at all | [`IntentRecord`] keeps sizes only. |
 //! | A timeline row | [`limits::BLOCK_PREVIEW_MAX_BYTES`] and [`limits::BLOCK_PREVIEW_MAX_LINES`] laid out | `timeline::TimelineBlock`. |
 //! | A timeline row's text for assistive technology | `timeline::ACCESSIBLE_MAX_BYTES` per row, only for a row asked for it since its window was last rebuilt | `timeline::TimelineBlock` keeps one plain text, of its current window, and lets go of it when the window is rebuilt. It is made only while an accessibility tree is built. Like the row's window itself it is kept per row, so all rows together keep at most the number of rows times the bound; nothing evicts it while the row's window is unchanged. |
+//! | The full-output view | Four bytes per display row: at most four times the viewed block's size, plus four bytes; one view open at a time | `full_view::row_starts`, made when the view opens or its width changes and dropped when it closes. Row text is a slice of the block, made only for the rows on screen. Copy all puts one copy of the block on the clipboard, on request. |
 //!
 //! Two limits on the composer bound are known and accepted:
 //!

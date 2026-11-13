@@ -1,11 +1,12 @@
 //! Optional native desktop client for Formless: Phase 0 spike of epic #1753.
 //!
-//! [`model`], [`commands`], [`replies`], [`memory`], [`timeline`] and [`fixture`] carry no
-//! GUI dependency. [`shell`] is the GPUI Kit view over them and is only built with the `gui`
-//! feature.
+//! [`model`], [`commands`], [`replies`], [`memory`], [`timeline`], [`full_view`] and
+//! [`fixture`] carry no GUI dependency. [`shell`] is the GPUI Kit view over them and is
+//! only built with the `gui` feature.
 
 pub mod commands;
 pub mod fixture;
+pub mod full_view;
 pub mod memory;
 pub mod model;
 pub mod replies;

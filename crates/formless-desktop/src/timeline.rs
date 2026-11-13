@@ -651,6 +651,11 @@ impl Timeline {
         &self.blocks
     }
 
+    /// The block with this id, if there is one.
+    pub fn block(&self, id: u64) -> Option<&TimelineBlock> {
+        self.blocks.iter().find(|block| block.id == id)
+    }
+
     pub fn len(&self) -> usize {
         self.blocks.len()
     }

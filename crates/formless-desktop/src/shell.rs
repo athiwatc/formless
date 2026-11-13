@@ -33,6 +33,7 @@ use gpui_kit::{
 };
 
 use crate::commands::{self, Command};
+use crate::full_view;
 use crate::memory::{
     edit_span, format_bytes, limits, paste_can_never_fit, snap_to_graphemes, within_composer_limit,
     IntentKind, IntentRecord, Rejections, UndoBudget,
@@ -69,6 +70,13 @@ gpui_kit::actions!(
         SelectNextCommand,
         RunSelectedCommand,
         ClosePalette,
+        ScrollViewerUp,
+        ScrollViewerDown,
+        ScrollViewerPageUp,
+        ScrollViewerPageDown,
+        ScrollViewerStart,
+        ScrollViewerEnd,
+        CloseViewer,
     ]
 );
 
@@ -76,6 +84,13 @@ const SESSION_LIST_CONTEXT: &str = "FormlessSessionList";
 const OVERLAY_CONTEXT: &str = "FormlessOverlay";
 const INSPECTOR_CONTEXT: &str = "FormlessInspector";
 const PALETTE_CONTEXT: &str = "FormlessPalette";
+const VIEWER_CONTEXT: &str = "FormlessViewer";
+const VIEWER_DESCRIPTION: &str =
+    "Modal. The whole block as plain text. Arrow, Page Up, Page Down, \
+     Home and End scroll; Escape closes and returns to where you were.";
+/// The smallest row width the full-output view cuts a block into, in
+/// characters, however narrow the window.
+const VIEWER_MIN_COLUMNS: usize = 20;
 /// The palette's search field. These bindings are more specific than the
 /// text input's own, so Up, Down, Enter and Escape there move through and
 /// run the list instead of moving a caret in a one-line field.
@@ -135,6 +150,13 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("enter", RunSelectedCommand, Some(PALETTE_INPUT_CONTEXT)),
         KeyBinding::new("escape", ClosePalette, Some(PALETTE_INPUT_CONTEXT)),
         KeyBinding::new("escape", ClosePalette, Some(PALETTE_CONTEXT)),
+        KeyBinding::new("up", ScrollViewerUp, Some(VIEWER_CONTEXT)),
+        KeyBinding::new("down", ScrollViewerDown, Some(VIEWER_CONTEXT)),
+        KeyBinding::new("pageup", ScrollViewerPageUp, Some(VIEWER_CONTEXT)),
+        KeyBinding::new("pagedown", ScrollViewerPageDown, Some(VIEWER_CONTEXT)),
+        KeyBinding::new("home", ScrollViewerStart, Some(VIEWER_CONTEXT)),
+        KeyBinding::new("end", ScrollViewerEnd, Some(VIEWER_CONTEXT)),
+        KeyBinding::new("escape", CloseViewer, Some(VIEWER_CONTEXT)),
     ]);
 }
 
@@ -144,6 +166,8 @@ pub fn bind_keys(cx: &mut App) {
 pub fn session_row_id(session_id: &str) -> ElementId {
     ElementId::from(SharedString::from(format!("session-row-{session_id}")))
 }
+
+const VIEWER_STREAMING: &str = "Available once the block has finished arriving";
 
 /// For a row that shows less than its whole block: what is missing on each
 /// side, and controls to move the window. `None` when the row shows it all.
@@ -194,6 +218,23 @@ fn block_window_line(
     };
     let has_earlier = block.hidden_before() > 0;
     let has_later = block.hidden_after() > 0;
+    // The whole block, in its own view; not while it is still arriving.
+    let view = {
+        let shell = shell.clone();
+        Button::new(SharedString::from(format!("block-{id}-{position}-view")))
+            .xsmall()
+            .ghost()
+            .label("View whole")
+            .disabled(streaming)
+            .tooltip(if streaming {
+                VIEWER_STREAMING
+            } else {
+                "Show the whole block as plain text"
+            })
+            .on_click(move |_, window, cx| {
+                shell.update(cx, |this, cx| this.view_block(id, window, cx).ok());
+            })
+    };
     // "End" also resumes following a block that is still being streamed.
     let can_follow = streaming && block.anchor() != Anchor::Tail;
     Some(
@@ -212,6 +253,7 @@ fn block_window_line(
             .child(button("Earlier", WindowMove::Earlier, has_earlier))
             .child(button("Later", WindowMove::Later, has_later))
             .child(button("End", WindowMove::End, has_later || can_follow))
+            .child(view)
             .into_any_element(),
     )
 }
@@ -292,6 +334,41 @@ fn tooltip(entry: &commands::Entry) -> String {
 enum Modal {
     Panel(Region),
     Palette,
+    /// The full-output view of one block.
+    Viewer,
+}
+
+/// The open full-output view: one block, as display rows.
+struct Viewer {
+    block_id: u64,
+    /// Where each row starts in the block ([`full_view::row_starts`]).
+    starts: Vec<u32>,
+    /// The row width `starts` was made for, in characters.
+    columns: usize,
+    scroll: gpui_kit::UniformListScrollHandle,
+    /// Set once the block has been copied, to say so.
+    copied: bool,
+}
+
+impl Viewer {
+    /// The row at the top of the list and how many rows it shows, from the
+    /// list's last layout: every row is as tall as the others. A move asked
+    /// for and not yet laid out counts as done.
+    fn top_and_page(&self) -> (usize, usize) {
+        let state = self.scroll.0.borrow();
+        let laid_out = state.last_item_size.and_then(|size| {
+            let row = size.contents.height / self.starts.len().max(1) as f32;
+            (row > px(0.)).then(|| {
+                let top = (-state.base_handle.offset().y / row).floor().max(0.) as usize;
+                (top, (size.item.height / row).floor().max(1.) as usize)
+            })
+        });
+        let (top, page) = laid_out.unwrap_or((0, 1));
+        match state.deferred_scroll_to_item {
+            Some(deferred) => (deferred.item_index, page),
+            None => (top, page),
+        }
+    }
 }
 
 /// The open command palette.
@@ -434,6 +511,8 @@ pub struct Shell {
     modal: Option<Modal>,
     palette: Option<Palette>,
     palette_focus: FocusHandle,
+    viewer: Option<Viewer>,
+    viewer_focus: FocusHandle,
     palette_scroll: ScrollHandle,
     /// What the commands depended on when the shell was last drawn; what
     /// its buttons show. Running a command reads it afresh.
@@ -516,6 +595,8 @@ impl Shell {
             },
             palette: None,
             palette_focus: cx.focus_handle(),
+            viewer: None,
+            viewer_focus: cx.focus_handle(),
             palette_scroll: ScrollHandle::new(),
             restore_focus: None,
             timeline,
@@ -841,6 +922,8 @@ impl Shell {
     fn current_modal(&self, layout: Layout) -> Option<Modal> {
         if self.palette.is_some() {
             Some(Modal::Palette)
+        } else if self.viewer.is_some() {
+            Some(Modal::Viewer)
         } else {
             layout.modal().map(Modal::Panel)
         }
@@ -1117,6 +1200,146 @@ impl Shell {
             .update(cx, |timeline, cx| timeline.reset(count, cx));
         cx.notify();
         Ok(())
+    }
+
+    /// Open the full-output view of a block: all of it, as plain text in
+    /// rows of the view's width, in a list that lays out only the rows on
+    /// screen. Not for a block still being streamed. Focus goes back where
+    /// it was when the view closes.
+    pub fn view_block(
+        &mut self,
+        block_id: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), &'static str> {
+        let columns = self.viewer_columns(window, cx);
+        let starts = {
+            let blocks = self.blocks.borrow();
+            let index = blocks
+                .blocks()
+                .iter()
+                .position(|block| block.id == block_id)
+                .ok_or("there is no such block")?;
+            if blocks.is_streaming() && index + 1 == blocks.len() {
+                return Err(VIEWER_STREAMING);
+            }
+            full_view::row_starts(blocks.blocks()[index].markdown(), columns)
+                .ok_or("the block is too large to show whole")?
+        };
+        self.prefs.close_overlays();
+        self.viewer = Some(Viewer {
+            block_id,
+            starts,
+            columns,
+            scroll: gpui_kit::UniformListScrollHandle::new(),
+            copied: false,
+        });
+        self.settle(window, cx);
+        Ok(())
+    }
+
+    fn close_viewer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.viewer.take().is_some() {
+            self.settle(window, cx);
+        }
+    }
+
+    /// The full-output view's dialog size: the window less a margin.
+    fn viewer_size(window: &Window) -> Size<Pixels> {
+        let viewport = window.viewport_size();
+        size(viewport.width - px(32.), viewport.height - px(32.))
+    }
+
+    /// How many characters of the monospace font fit across the view's
+    /// list, from the font's real advance.
+    fn viewer_columns(&self, window: &Window, cx: &App) -> usize {
+        let theme = cx.theme();
+        let font_size = theme.mono_font_size;
+        let text_system = window.text_system();
+        let font_id = text_system.resolve_font(&gpui_kit::font(theme.mono_font_family.clone()));
+        let advance = text_system
+            .ch_advance(font_id, font_size)
+            .unwrap_or(font_size * 0.6);
+        // The dialog's padding and the list's scrollbar.
+        let width = Self::viewer_size(window).width - px(48.);
+        ((f32::from(width) / f32::from(advance)).floor() as usize).max(VIEWER_MIN_COLUMNS)
+    }
+
+    /// Cut the open view's block again when the width it fits has changed
+    /// (a resize, a text size change), keeping the row at the top in view.
+    fn fit_viewer(&mut self, window: &Window, cx: &App) {
+        let columns = self.viewer_columns(window, cx);
+        let blocks = self.blocks.borrow();
+        let Some(viewer) = &mut self.viewer else {
+            return;
+        };
+        if viewer.columns == columns {
+            return;
+        }
+        let Some(block) = blocks.block(viewer.block_id) else {
+            return;
+        };
+        let Some(starts) = full_view::row_starts(block.markdown(), columns) else {
+            return;
+        };
+        let (top, _) = viewer.top_and_page();
+        let top = viewer.starts.get(top).copied().unwrap_or(0);
+        let row = starts
+            .partition_point(|start| *start <= top)
+            .saturating_sub(1);
+        viewer.starts = starts;
+        viewer.columns = columns;
+        viewer
+            .scroll
+            .scroll_to_item_strict(row, ScrollStrategy::Top);
+    }
+
+    /// Move the view by `rows` rows, a page (`rows` 0), or to an end.
+    fn scroll_viewer(&mut self, to: WindowMove, rows: isize, cx: &mut Context<Self>) {
+        let Some(viewer) = &self.viewer else {
+            return;
+        };
+        let last = viewer.starts.len().saturating_sub(1);
+        let (top, page) = viewer.top_and_page();
+        let target = match to {
+            WindowMove::Start => 0,
+            WindowMove::End => last,
+            WindowMove::Earlier | WindowMove::Later => {
+                // A page keeps one row of the last page in view.
+                let step = if rows == 0 {
+                    (page as isize - 1).max(1)
+                } else {
+                    rows
+                };
+                let step = if to == WindowMove::Earlier {
+                    -step
+                } else {
+                    step
+                };
+                (top as isize + step).clamp(0, last as isize) as usize
+            }
+        };
+        viewer
+            .scroll
+            .scroll_to_item_strict(target, ScrollStrategy::Top);
+        cx.notify();
+    }
+
+    fn copy_viewed_block(&mut self, cx: &mut Context<Self>) {
+        let Some(viewer) = &mut self.viewer else {
+            return;
+        };
+        let blocks = self.blocks.borrow();
+        if let Some(block) = blocks.block(viewer.block_id) {
+            cx.write_to_clipboard(ClipboardItem::new_string(block.markdown().to_string()));
+            viewer.copied = true;
+        }
+        cx.notify();
+    }
+
+    /// How many rows the open full-output view has, for tests.
+    pub fn viewer_rows(&self) -> Option<usize> {
+        self.viewer.as_ref().map(|viewer| viewer.starts.len())
     }
 
     /// Start a streamed assistant block at the tail of the timeline.
@@ -1600,13 +1823,19 @@ impl Shell {
                 }
                 cx.notify();
             }
+            Modal::Viewer => {
+                window.focus(&self.viewer_focus, cx);
+                cx.notify();
+            }
         }
     }
 
     fn cycle_region(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
-        // The palette traps the cycle too: its search field is the only stop.
-        if self.palette.is_some() {
-            self.focus_modal(Modal::Palette, window, cx);
+        // The palette and the full-output view trap the cycle too.
+        if let Some(modal @ (Modal::Palette | Modal::Viewer)) =
+            self.current_modal(self.layout(window))
+        {
+            self.focus_modal(modal, window, cx);
             return;
         }
         let next = self
@@ -2546,6 +2775,7 @@ impl Shell {
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.commands = self.command_state(window, cx);
+        self.fit_viewer(window, cx);
         let layout = self.layout(window);
         let reflowed = self.fit(window) == Fit::Reflowed;
         v_flex()
@@ -2596,6 +2826,9 @@ impl Render for Shell {
                         .child(self.render_body(layout, window, cx))
                         .child(self.render_status(layout, false, window, cx))
                 }
+            })
+            .when(self.viewer.is_some(), |shell| {
+                shell.child(self.render_viewer(window, cx))
             })
             // On top of everything, a panel overlay included.
             .when(self.palette.is_some(), |shell| {
@@ -2816,5 +3049,165 @@ impl Shell {
                     .pt(margin)
                     .child(dialog),
             )
+    }
+}
+
+impl Shell {
+    /// The full-output view: a modal dialog with what the block is, Copy
+    /// and Close, and the block's rows in a list that lays out only what is
+    /// on screen. Each row is a line of text to assistive technology.
+    fn render_viewer(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let viewer = self.viewer.as_ref().expect("the viewer is open");
+        let dialog_size = Self::viewer_size(window);
+        let (kind, bytes) = {
+            let blocks = self.blocks.borrow();
+            blocks
+                .block(viewer.block_id)
+                .map(|block| (Some(block.kind), block.markdown().len()))
+                .unwrap_or((None, 0))
+        };
+        let count = if kind.is_some() {
+            viewer.starts.len()
+        } else {
+            0
+        };
+        let mut summary = match kind {
+            Some(kind) => format!(
+                "{} block, {}, {count} rows of up to {} characters.",
+                kind.label(),
+                format_bytes(bytes),
+                viewer.columns
+            ),
+            None => "This block is no longer in the timeline.".to_string(),
+        };
+        if viewer.copied {
+            summary.push_str(" Copied to the clipboard.");
+        }
+        let rows = gpui_kit::uniform_list(
+            "viewer-rows",
+            count,
+            cx.processor(|this, range: Range<usize>, _, _| {
+                let blocks = this.blocks.borrow();
+                let Some(viewer) = this.viewer.as_ref() else {
+                    return Vec::new();
+                };
+                let Some(block) = blocks.block(viewer.block_id) else {
+                    return Vec::new();
+                };
+                range
+                    .filter(|index| *index < viewer.starts.len())
+                    .map(|index| {
+                        let text = full_view::row(block.markdown(), &viewer.starts, index);
+                        let text = SharedString::from(text.to_string());
+                        div()
+                            .id(("viewer-row", index))
+                            .test_support()
+                            .role(Role::Label)
+                            .aria_value(text.clone())
+                            .whitespace_nowrap()
+                            .overflow_hidden()
+                            // An empty row is as tall as any other.
+                            .child(if text.is_empty() { " ".into() } else { text })
+                    })
+                    .collect()
+            }),
+        )
+        .track_scroll(&viewer.scroll)
+        .flex_1()
+        .min_h_0()
+        .font_family(cx.theme().mono_font_family.clone())
+        .text_size(cx.theme().mono_font_size);
+        let dialog = v_flex()
+            .id("viewer-dialog")
+            .test_support()
+            .role(Role::Dialog)
+            .aria_label("Whole block")
+            .aria_description(VIEWER_DESCRIPTION)
+            .map(modal_dialog)
+            .key_context(VIEWER_CONTEXT)
+            .on_action(cx.listener(|this, _: &ScrollViewerUp, _, cx| {
+                this.scroll_viewer(WindowMove::Earlier, 1, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ScrollViewerDown, _, cx| {
+                this.scroll_viewer(WindowMove::Later, 1, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ScrollViewerPageUp, _, cx| {
+                this.scroll_viewer(WindowMove::Earlier, 0, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ScrollViewerPageDown, _, cx| {
+                this.scroll_viewer(WindowMove::Later, 0, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ScrollViewerStart, _, cx| {
+                this.scroll_viewer(WindowMove::Start, 0, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ScrollViewerEnd, _, cx| {
+                this.scroll_viewer(WindowMove::End, 0, cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &CloseViewer, window, cx| this.close_viewer(window, cx)),
+            )
+            .w(dialog_size.width)
+            .h(dialog_size.height)
+            .p_2()
+            .gap_2()
+            .bg(cx.theme().popover)
+            .text_color(cx.theme().popover_foreground)
+            .border_1()
+            .border_color(cx.theme().border)
+            .rounded_lg()
+            .shadow_lg()
+            .occlude()
+            .child(
+                h_flex()
+                    .flex_wrap()
+                    .gap_2()
+                    .child(
+                        announced(div().id("viewer-summary"))
+                            .test_support()
+                            .role(Role::Label)
+                            .aria_value(summary.clone())
+                            .flex_1()
+                            .min_w_0()
+                            .text_sm()
+                            .child(summary),
+                    )
+                    .child(
+                        Button::new("viewer-copy")
+                            .small()
+                            .label("Copy all")
+                            .tooltip("Copy the whole block to the clipboard")
+                            .disabled(kind.is_none())
+                            .on_click(cx.listener(|this, _, _, cx| this.copy_viewed_block(cx))),
+                    )
+                    .child(
+                        Button::new("viewer-close")
+                            .small()
+                            .label("Close")
+                            .tooltip("Close (Escape)")
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.close_viewer(window, cx)),
+                            ),
+                    ),
+            )
+            .child(rows)
+            .focus_trap("viewer", &self.viewer_focus);
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .child(
+                div()
+                    .id("viewer-backdrop")
+                    .test_support()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .bg(cx.theme().overlay)
+                    .occlude()
+                    .on_click(cx.listener(|this, _, window, cx| this.close_viewer(window, cx))),
+            )
+            .child(div().absolute().top(px(16.)).left(px(16.)).child(dialog))
     }
 }
