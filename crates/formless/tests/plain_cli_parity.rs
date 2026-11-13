@@ -109,6 +109,7 @@ impl Fixture {
             .env("FORMLESS_DATA_DIR", self.root.join("d"))
             .env("FORMLESS_CONFIG_DIR", self.root.join("c"))
             .env("FORMLESS_API_KEY", "private-offline-fake-daemon")
+            .env_remove("NO_COLOR")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -191,6 +192,10 @@ fn shipped_grouped_usage_sends_one_read_and_keeps_all_daemon_values() {
                 let text = String::from_utf8(out.stdout).unwrap();
                 assert!(text.find("日本語").unwrap() < text.find("ไทย").unwrap());
                 assert!(text.contains('-') && text.contains("0.125"));
+                assert!(
+                    !text.contains('\x1b'),
+                    "redirected usage must be plain: {text:?}"
+                );
             }
             let requests = fixture.requests.lock().unwrap();
             let [Request::UsageByDay { since, by }] = &requests[..] else {

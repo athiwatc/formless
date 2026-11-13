@@ -85,7 +85,7 @@ pub(super) fn write_report(
         write!(
             out,
             "{}",
-            human(&value, terminal, table::color_allowed(), width)?
+            human(&value, terminal, terminal && table::color_allowed(), width)?
         )?;
     }
     Ok(())
