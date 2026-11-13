@@ -24,6 +24,8 @@ struct Fixture {
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
     requests: Arc<Mutex<Vec<Request>>>,
+    invocations: Arc<Mutex<Value>>,
+    invocation_error: Arc<AtomicBool>,
     connections: Arc<AtomicUsize>,
 }
 impl Fixture {
@@ -51,6 +53,10 @@ impl Fixture {
         let stopped = stop.clone();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let seen = requests.clone();
+        let invocations = Arc::new(Mutex::new(json!([])));
+        let invocation_reply = invocations.clone();
+        let invocation_error = Arc::new(AtomicBool::new(false));
+        let fail_invocations = invocation_error.clone();
         let connections = Arc::new(AtomicUsize::new(0));
         let connected = connections.clone();
         let thread = std::thread::spawn(move || {
@@ -71,7 +77,20 @@ impl Fixture {
                 let mut line = String::new();
                 while reader.read_line(&mut line).unwrap_or(0) > 0 {
                     let envelope: RequestEnvelope = serde_json::from_str(&line).unwrap();
+                    seen.lock().unwrap().push(envelope.request.clone());
+                    if matches!(&envelope.request, Request::ListInvocations)
+                        && fail_invocations.load(Ordering::SeqCst)
+                    {
+                        let reply = json!({"kind":"response","id":envelope.id,"ok":false,"error":"fixture invocation failure"});
+                        if writeln!(socket, "{reply}").is_err() {
+                            break;
+                        }
+                        line.clear();
+                        continue;
+                    }
                     let result = match &envelope.request {
+                        Request::Subscribe { .. } => json!({"conn":1}),
+                        Request::ListInvocations => invocation_reply.lock().unwrap().clone(),
                         Request::ListSessions => json!([
                             {"id":"abc-one","name":"First","created_at":"","updated_at":""},
                             {"id":"abc-two","name":"Second","created_at":"","updated_at":""},
@@ -142,7 +161,6 @@ impl Fixture {
                         }
                         _ => None,
                     };
-                    seen.lock().unwrap().push(envelope.request);
                     let reply = if let Some(message) = failure {
                         serde_json::to_value(formless_protocol::ServerMessage::err_code(
                             envelope.id,
@@ -165,6 +183,8 @@ impl Fixture {
             stop,
             thread: Some(thread),
             requests,
+            invocations,
+            invocation_error,
             connections,
         }
     }
@@ -182,6 +202,8 @@ impl Fixture {
             .env("FORMLESS_DATA_DIR", self.root.join("d"))
             .env("FORMLESS_CONFIG_DIR", self.root.join("c"))
             .env("FORMLESS_API_KEY", "private-offline-fake-daemon")
+            .env("COLUMNS", "20")
+            .env("NO_COLOR", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -219,6 +241,99 @@ impl Fixture {
             stderr: err.join().unwrap(),
         }
     }
+}
+
+#[test]
+fn shipped_live_invocations_preserve_snapshot_values_and_reject_limits_before_contact() {
+    let fixture = Fixture::new();
+    let entries = json!([
+        {"handle":"handle-first-very-long-unclipped-1234567890","invocation_id":"invocation-full-id","tool_name":"日本語\u{1b}[31m","session_id":"session\nfull","elapsed_ms":1234,"silent_ms":0,"stalled":true,"abandoned":false,"last_fraction":0,"last_label":null},
+        {"handle":"handle-second-very-long-unclipped-1234567890","invocation_id":null,"tool_name":"second","session_id":"session-two","elapsed_ms":86400001_u64,"silent_ms":60001,"stalled":false,"abandoned":true,"last_fraction":null,"last_label":"label only\tไทย"}
+    ]);
+    *fixture.invocations.lock().unwrap() = entries.clone();
+    for args in [
+        vec!["runs", "running"],
+        vec!["runs", "running", "--json"],
+        vec!["runs", "--json", "running"],
+    ] {
+        fixture.requests.lock().unwrap().clear();
+        let out = fixture.run(&args);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        if args.contains(&"--json") {
+            assert_eq!(
+                serde_json::from_slice::<Value>(&out.stdout).unwrap(),
+                entries
+            );
+        } else {
+            let text = String::from_utf8(out.stdout).unwrap();
+            assert!(
+                text.starts_with("Live Invocations (one snapshot)\n"),
+                "{text}"
+            );
+            assert!(
+                text.find(entries[0]["handle"].as_str().unwrap()).unwrap()
+                    < text.find(entries[1]["handle"].as_str().unwrap()).unwrap()
+            );
+            for expected in [
+                "Invocation ID: invocation-full-id",
+                "Elapsed: 1.234s",
+                "Silent: 0.000s",
+                "Elapsed: 86400.001s",
+                "Silent: 60.001s",
+                "Stalled: yes",
+                "Stalled: no",
+                "Abandoned: no",
+                "Abandoned: yes — no longer awaited; may still finish",
+                "Progress fraction: 0",
+                "Progress label: label only\\u{9}ไทย",
+                "日本語\\u{1b}[31m",
+                "Session: session\\u{a}full",
+            ] {
+                assert!(text.contains(expected), "missing {expected:?}: {text}");
+            }
+            assert_eq!(text.matches("Progress fraction:").count(), 1);
+            assert_eq!(text.matches("Progress label:").count(), 1);
+            assert!(!text.contains('\u{1b}'));
+        }
+        let requests = fixture.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2, "{requests:?}");
+        assert!(matches!(&requests[0], Request::Subscribe { .. }));
+        assert!(matches!(&requests[1], Request::ListInvocations));
+    }
+    *fixture.invocations.lock().unwrap() = json!([]);
+    let empty = fixture.run(&["runs", "running"]);
+    assert!(empty.status.success());
+    assert!(String::from_utf8(empty.stdout)
+        .unwrap()
+        .contains("No live Invocations."));
+    let empty = fixture.run(&["runs", "running", "--json"]);
+    assert!(empty.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&empty.stdout).unwrap(),
+        json!([])
+    );
+    fixture.invocation_error.store(true, Ordering::SeqCst);
+    let failed = fixture.run(&["runs", "running"]);
+    assert!(!failed.status.success());
+    assert!(failed.stdout.is_empty());
+    assert!(String::from_utf8(failed.stderr)
+        .unwrap()
+        .contains("fixture invocation failure"));
+    let before = fixture.connections.load(Ordering::SeqCst);
+    for args in [
+        vec!["runs", "--limit", "20", "running"],
+        vec!["runs", "--limit", "0", "running"],
+        vec!["runs", "running", "--limit", "20"],
+    ] {
+        let invalid = fixture.run(&args);
+        assert_eq!(invalid.status.code(), Some(2));
+        assert!(invalid.stdout.is_empty());
+    }
+    assert_eq!(fixture.connections.load(Ordering::SeqCst), before);
 }
 impl Drop for Fixture {
     fn drop(&mut self) {

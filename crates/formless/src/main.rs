@@ -250,14 +250,14 @@ enum Cmd {
     },
     /// Recent Runs and their outcomes: steps, tool calls, tokens (SPEC §8.7)
     #[command(
-        after_help = "Examples:\n  formless runs --limit 10\n  formless runs show RUN_ID --json"
+        after_help = "Examples:\n  formless runs --limit 10\n  formless runs show RUN_ID --json\n  formless runs running --json"
     )]
     Runs {
         #[command(subcommand)]
         action: Option<cli_attach::RunsAction>,
-        /// Maximum number of recent Runs to list
-        #[arg(long, default_value_t = 20)]
-        limit: usize,
+        /// Maximum number of recent Runs to list (default: 20)
+        #[arg(long)]
+        limit: Option<usize>,
         /// Print machine-readable JSON instead of human-readable output
         #[arg(long)]
         json: bool,
@@ -1820,6 +1820,7 @@ fn validate_mcp_prompt_args(cli: &Cli) -> Result<()> {
 }
 
 fn run_cli(cli: Cli) -> Result<()> {
+    cli_attach::validate_runs_limit(&cli)?;
     // The TUI's own flags mean nothing to other commands (#897).
     if !matches!(cli.cmd, None | Some(Cmd::Tui)) && (cli.plain || cli.continue_last || cli.new) {
         return Err(usage(
@@ -2147,7 +2148,7 @@ fn run_cli(cli: Cli) -> Result<()> {
             action,
         }) => match action {
             Some(action) => cli_attach::runs(&paths, action, json),
-            None => runs_cmd(paths, limit, json),
+            None => runs_cmd(paths, limit.unwrap_or(20), json),
         },
         Some(Cmd::Jobs { action }) => jobs_cmd(paths, action),
         Some(Cmd::Routing { json }) => {
