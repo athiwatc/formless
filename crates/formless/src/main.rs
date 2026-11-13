@@ -277,7 +277,7 @@ enum Cmd {
     },
     /// Check for a newer release, show what changed, and how to upgrade
     #[command(
-        after_help = "Examples:\n  formless update check\n  formless update --check\n  formless update check --json\n\nJSON: {installed, status, newer_releases: [{tag, url, notes}]}. Status is update_available, up_to_date (within the fetched page), or release_check_unavailable (the existing 404-text heuristic). Checks never execute an updater."
+        after_help = "Examples:\n  formless update check\n  formless update --check\n  formless update check --json\n\nJSON: {installed, status, newer_releases: [{tag, url, notes}]}. Status is update_available, up_to_date (within the fetched page), or release_check_unavailable (HTTP 404 status). Checks never execute an updater."
     )]
     Update {
         #[command(subcommand)]

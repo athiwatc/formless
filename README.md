@@ -648,10 +648,11 @@ object: `{installed, status, newer_releases: [{tag, url, notes}]}`. Notes retain
 the existing trimmed body and oldest-first order; `installed` has no `v` prefix.
 `update_available` means the fetched page contains newer stable releases;
 `up_to_date` means none in that single 50-release response, without pagination.
-`release_check_unavailable` maps to the existing fetch-error text containing
-"404", not verified absence of releases. Completed checks exit 0; other fetch
-or JSON parse failures remain errors with no success JSON. Human output stays
-unchanged, and the JSON form never runs an updater.
+`release_check_unavailable` maps to an actual HTTP 404 response,
+not verified absence of releases. Error text alone never selects this status.
+Completed checks exit 0; other fetch or JSON parse failures remain errors with
+no success JSON. Human output stays unchanged, and the JSON form never runs
+an updater.
 
 #### Root and global flags
 

@@ -31,7 +31,7 @@ pub(super) fn report(
 ) -> Result<()> {
     let body = match fetch() {
         Ok(body) => body,
-        Err(error) if error.to_string().contains("404") => {
+        Err(error) if update_http::is_not_found(&error) => {
             if json {
                 return json_report(out, current, "release_check_unavailable", &[]);
             }
@@ -140,7 +140,7 @@ mod tests {
     }
     #[test]
     fn unavailable_page_scope_and_failures_preserve_output_and_exit_semantics() {
-        for (body,status) in [(Ok("[]".into()),"up_to_date"),(Ok(serde_json::json!([{"tag_name":"v0.9.0"},{"tag_name":"v9.0.0","prerelease":true}]).to_string()),"up_to_date"),(Err(anyhow::anyhow!("HTTP 404 from fixture")),"release_check_unavailable")] {
+        for (body,status) in [(Ok("[]".into()),"up_to_date"),(Ok(serde_json::json!([{"tag_name":"v0.9.0"},{"tag_name":"v9.0.0","prerelease":true}]).to_string()),"up_to_date"),(Err(update_http::fixture_not_found_error()),"release_check_unavailable")] {
             let mut out=Vec::new();
             report(&mut out,true,true,"1.0.0","never executed",||body).unwrap();
             assert_eq!(serde_json::from_slice::<Value>(&out).unwrap(),serde_json::json!({"installed":"1.0.0","status":status,"newer_releases":[]}));
@@ -156,6 +156,49 @@ mod tests {
             assert!(out.is_empty());
         }
     }
+    #[test]
+    fn unrelated_404_text_fails_without_output_in_human_and_json_reports() {
+        for check in [false, true] {
+            for json in [false, true] {
+                let mut out = Vec::new();
+                let error = report(&mut out, check, json, "1.0.0", "never executed", || {
+                    Err(anyhow::anyhow!("unrelated transport error mentioning 404"))
+                })
+                .unwrap_err();
+                assert_eq!(exit_code(&error), 1);
+                assert_eq!(
+                    error.to_string(),
+                    "unrelated transport error mentioning 404"
+                );
+                assert!(out.is_empty(), "check={check}, json={json}: {out:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn contextual_typed_404_preserves_the_unavailable_report_in_both_formats() {
+        for check in [false, true] {
+            for json in [false, true] {
+                let mut out = Vec::new();
+                report(&mut out, check, json, "1.0.0", "never executed", || {
+                    Err(update_http::fixture_not_found_error().context("release lookup failed"))
+                })
+                .unwrap();
+                if json {
+                    assert_eq!(
+                        serde_json::from_slice::<Value>(&out).unwrap(),
+                        serde_json::json!({"installed":"1.0.0","status":"release_check_unavailable","newer_releases":[]})
+                    );
+                } else {
+                    assert_eq!(
+                        out,
+                        b"installed: v1.0.0\nlatest:    (no published releases yet)\n"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn human_reports_keep_all_pre_change_bytes_including_full_notes_and_footers() {
         let notes="latest:    v1.2.0  (url-two)\n\n── v1.1.0 ──\n日本語\n\nFirst notes\n\n── v1.2.0 ──\nnewest ไทย\ninstalled: decorative notes\n\n";
@@ -178,7 +221,7 @@ mod tests {
         for (body, expected) in [
             (Ok("[]".into()), "installed: v1.0.0\nup to date\n"),
             (
-                Err(anyhow::anyhow!("HTTP 404")),
+                Err(update_http::fixture_not_found_error()),
                 "installed: v1.0.0\nlatest:    (no published releases yet)\n",
             ),
         ] {
