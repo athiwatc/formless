@@ -191,3 +191,108 @@ fn search_relevance_still_precedes_newer_timestamps_and_rowids() {
     drop(store);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn identifier_adjacency_is_a_prefix_ranking_tier_without_removing_scattered_hits() {
+    for (query, adjacent, words) in [
+        ("http_get_text", "http_get_text", "http get text"),
+        (
+            "provider.tool_mode",
+            "provider.tool_mode",
+            "provider tool mode",
+        ),
+        ("search_fts.rs", "search_fts.rs", "search fts rs"),
+        ("src/read-file.rs", "src/read-file.rs", "src read file rs"),
+        (
+            "http_get_text",
+            "httprequest_getter_textual",
+            "http get text",
+        ),
+        ("café_mode", "cafe\u{301}_mode", "cafe mode"),
+        ("cafe\u{301}_mode", "café_mode", "cafe mode"),
+    ] {
+        let root = std::env::temp_dir().join(format!("fl-search-adj-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("data.db");
+        let store = Store::open(&db).unwrap();
+        let session = store.create_session(Some("ไทย 日本語".into())).unwrap().id;
+        let a = store.append_message(&session, "user", adjacent).unwrap();
+        let scattered = words
+            .split_whitespace()
+            .map(|word| format!("{word} filler filler"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let scattered = format!("{scattered} ").repeat(20);
+        let b = store
+            .append_message(&session, "assistant", &scattered)
+            .unwrap();
+        let old = store.search_sessions(words, 10).unwrap();
+        assert_eq!(
+            old[0].message_id, b.id,
+            "fixture must favor scattered terms under raw BM25: {query}"
+        );
+        let hits = store.search_sessions(query, 10).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].message_id, a.id, "{query}");
+        assert_eq!(hits[1].message_id, b.id);
+        assert_eq!(store.search_sessions(query, 1).unwrap()[0].message_id, a.id);
+        assert_eq!(
+            hits[0].snippet, adjacent,
+            "original Unicode snippet remains data"
+        );
+        assert_eq!(hits[0].session_name, "ไทย 日本語");
+        assert_eq!(hits[0].role, "user");
+        assert_eq!(hits[0].seq, a.seq);
+        // All membership/fields except the query-dependent snippet agree
+        // with the original prefix-AND path; only identifier rank changes.
+        for hit in &hits {
+            let prior = old
+                .iter()
+                .find(|prior| prior.message_id == hit.message_id)
+                .unwrap();
+            assert_eq!(
+                (
+                    &hit.session_id,
+                    &hit.session_name,
+                    hit.seq,
+                    &hit.role,
+                    &hit.created_at
+                ),
+                (
+                    &prior.session_id,
+                    &prior.session_name,
+                    prior.seq,
+                    &prior.role,
+                    &prior.created_at
+                )
+            );
+        }
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        for query in [
+            words,
+            "http get text",
+            "provider:tool:mode",
+            "it's",
+            "\"http_get_text\"",
+            "needle",
+        ] {
+            let Some(fts) = fts_query(query) else {
+                continue;
+            };
+            let expected:Vec<String>=conn.prepare("SELECT m.id FROM messages_fts f JOIN messages m ON m.rowid=f.rowid WHERE messages_fts MATCH ?1 ORDER BY bm25(messages_fts),m.created_at DESC,m.rowid DESC LIMIT 10").unwrap().query_map([fts],|row|row.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+            assert_eq!(
+                store
+                    .search_sessions(query, 10)
+                    .unwrap()
+                    .into_iter()
+                    .map(|hit| hit.message_id)
+                    .collect::<Vec<_>>(),
+                expected,
+                "unchanged non-identifier query {query}"
+            );
+        }
+        drop(conn);
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
