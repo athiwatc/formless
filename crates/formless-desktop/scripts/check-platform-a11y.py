@@ -16,6 +16,7 @@ script started) and counts as a failure, as does a nonzero exit status or a
 missing or unreadable tree.
 """
 import json
+import math
 import os
 import re
 import subprocess
@@ -49,10 +50,14 @@ class Checker:
                 sys.exit(f"{existing} exists; use a fresh output directory")
         with open(self.path(name, ".stdout"), "wb") as stdout, \
                 open(self.path(name, ".stderr"), "wb") as stderr:
-            proc = subprocess.Popen(
-                [self.binary, "--background", "--lifetime", str(LIFETIME), "--sessions", "200",
-                 "--blocks", "40", *args, "--dump-platform-a11y", tree, "--dump-a11y", gpui],
-                stdout=stdout, stderr=stderr)
+            try:
+                proc = subprocess.Popen(
+                    [self.binary, "--background", "--lifetime", str(LIFETIME), "--sessions", "200",
+                     "--blocks", "40", *args, "--dump-platform-a11y", tree, "--dump-a11y", gpui],
+                    stdout=stdout, stderr=stderr)
+            except OSError as error:
+                self.check(f"{name}: the run starts", False, f"{type(error).__name__}: {error}")
+                return None
             try:
                 code = proc.wait(timeout=self.timeout)
             except subprocess.TimeoutExpired:
@@ -156,7 +161,12 @@ def main(argv):
     timeout = LIFETIME + 14
     if "--timeout" in args:
         index = args.index("--timeout")
-        timeout = float(args[index + 1])
+        try:
+            timeout = float(args[index + 1])
+        except (IndexError, ValueError):
+            timeout = None
+        if timeout is None or not math.isfinite(timeout) or timeout <= 0:
+            sys.exit(f"--timeout needs a positive number of seconds\n\n{__doc__}")
         del args[index:index + 2]
     if len(args) != 2:
         sys.exit(__doc__)
