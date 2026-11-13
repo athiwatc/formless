@@ -195,3 +195,55 @@ test('Setext incremental tails settle to the same completed blocks', () => {
     }
   }
 });
+
+
+test('lazy quote continuations retain literal Setext-like text through nested containers', () => {
+  const c=fixture();
+  for(const [source,text] of [
+    ['> Foo\n===','Foo==='],['> Foo\nbar\n===','Foobar==='],
+    ['> > Foo\n===','Foo==='],['> > Foo\n> ===','Foo==='],
+    ['> [!NOTE]\n> Foo\n===','ℹ NoteFoo==='],
+    ['- > Foo\n  ===','Foo==='],
+  ]) {
+    const root=c.markdown(source);
+    assert.equal(all(root).some(n=>/^h[1-6]$/.test(n.tag)||n.attrs?.role==='heading'),false,source);
+    assert.equal(plain(root),text,source);
+  }
+  for(const source of ['> Foo\n> ===','> Foo\nbar\n> ===','> > Foo\n> > ===','- > Foo\n  > ===']) {
+    const heading=all(c.markdown(source)).find(n=>n.tag===c.markdown('# Foo').children[0].tag);
+    assert.ok(heading,source);assert.ok(plain(heading).startsWith('Foo'),source);
+    assert.equal(plain(heading).includes('==='),false,source);
+  }
+});
+
+test('Setext list underlines require the item content indentation', () => {
+  const c=fixture();
+  for(const source of ['- Foo\n===','- Foo\n ===','10. Foo\n   ===','> - Foo\n> ===','> - Foo\n===','- Foo\nbar\n===']) {
+    const root=c.markdown(source);
+    assert.equal(all(root).some(n=>/^h[1-6]$/.test(n.tag)||n.attrs?.role==='heading'),false,source);
+    assert.ok(plain(root).endsWith('==='),source);
+  }
+  for(const [source,atx] of [
+    ['- Foo\n  ===','# Foo'],['- Foo\n  ---','## Foo'],
+    ['10. Foo\n    ===','# Foo'],['- Foo\nbar\n  ===','# Foo'],
+    ['> - Foo\n>   ===','# Foo'],
+  ]) {
+    const heading=all(c.markdown(source)).find(n=>n.tag===c.markdown(atx).children[0].tag);
+    assert.ok(heading,source);assert.equal(plain(heading).includes('==='),false,source);
+  }
+  assert.deepEqual(c.markdown('- Foo\n---').children.map(n=>n.tag),['ul','hr']);
+});
+
+test('lazy and marked container underlines converge across streamed prefixes', () => {
+  const c=fixture();
+  for(const source of ['> Foo\n===','> > Foo\n===','> Foo\nbar\n> ===','- Foo\n ===','- Foo\n  ===','- > Foo\n  ===','> [!NOTE]\n> Foo\n===']) {
+    for(let end=0;end<=source.length;end++) {
+      const prefix='Earlier paragraph\n\n'+source.slice(0,end);
+      const [stable,tail]=c.splitStreaming(prefix);
+      assert.deepEqual([...c.markdown(stable).children,...c.markdown(tail).children].map(shape),c.markdown(prefix).children.map(shape),prefix);
+    }
+    const completed='Earlier paragraph\n\n'+source+'\n\nFinal paragraph';
+    const [stable,tail]=c.splitStreaming(completed);
+    assert.deepEqual([...c.markdown(stable).children,...c.markdown(tail).children].map(shape),c.markdown(completed).children.map(shape),completed);
+  }
+});

@@ -1687,8 +1687,8 @@
     return s.split(/(?<!\\)\|/).map((c) => c.trim().replace(/\\\|/g, "|"));
   }
 
-  /** Append the block structure of `lines` to `root`. */
-  function blocks(lines, root, depth = 0) {
+  /** Append blocks, retaining which lines were lazy container continuations. */
+  function blocks(lines, root, depth = 0, lazy = []) {
     if (depth >= MD_DEPTH) { root.append(h("pre", { class: "md-plain" }, lines.join("\n"))); return root; }
     let i = 0;
     while (i < lines.length) {
@@ -1739,23 +1739,25 @@
         continue;
       }
       if (QUOTE.test(line)) {
-        const buf = [];
+        const buf = [], bufLazy = [];
         while (i < lines.length && (QUOTE.test(lines[i]) || (lines[i].trim() && buf.length && !startsBlock(lines, i)))) {
+          bufLazy.push(lazy[i] || !QUOTE.test(lines[i]));
           buf.push(lines[i++].replace(/^\s{0,3}>\s?/, ""));
         }
         const alert = buf[0] && buf[0].trim().match(/^\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\]$/i);
         const q = h("blockquote", { class: alert ? "callout " + alert[1].toLowerCase() : null });
-        if (alert) { buf.shift(); q.append(h("div", { class: "callout-title" }, ALERTS[alert[1].toUpperCase()])); }
-        blocks(buf, q, depth + 1);
+        if (alert) { buf.shift(); bufLazy.shift(); q.append(h("div", { class: "callout-title" }, ALERTS[alert[1].toUpperCase()])); }
+        blocks(buf, q, depth + 1, bufLazy);
         root.append(q);
         continue;
       }
-      if (ITEM.test(line)) { i = list(lines, i, root, depth); continue; }
+      if (ITEM.test(line)) { i = list(lines, i, root, depth, lazy); continue; }
       const content = [...inline(line.trim())];
       let level = null;
       i++;
       while (i < lines.length && lines[i].trim()) {
-        const underline = lines[i].match(SETEXT);
+        // Lazy container continuations are paragraph text, not underlines.
+        const underline = !lazy[i] && lines[i].match(SETEXT);
         if (underline) { level = underline[1][0] === "=" ? 1 : 2; i++; break; }
         if (startsBlock(lines, i)) break;
         content.push(h("br"), ...inline(lines[i++].trim()));
@@ -1766,7 +1768,7 @@
   }
 
   /** A (possibly nested) list starting at lines[i]; returns the next index. */
-  function list(lines, i, root, depth = 0) {
+  function list(lines, i, root, depth = 0, lazy = []) {
     const first = lines[i].match(ITEM);
     const base = indentOf(first[1]);
     const ordered = /\d/.test(first[2]);
@@ -1777,14 +1779,14 @@
       const m = lines[i].match(ITEM);
       if (!m || indentOf(m[1]) !== base || /\d/.test(m[2]) !== ordered) break;
       const contentIndent = base + m[2].length + Math.max(1, Math.min(4, m[3].length));
-      const body = [m[4]];
+      const body = [m[4]], bodyLazy = [lazy[i]];
       i++;
       while (i < lines.length) {
         const l = lines[i];
         if (!l.trim()) {
           let j = i + 1;
           while (j < lines.length && !lines[j].trim()) j++;
-          if (j < lines.length && indentOf(lines[j]) > base) { body.push(""); loose = loose || !ITEM.test(lines[j]); i++; continue; }
+          if (j < lines.length && indentOf(lines[j]) > base) { body.push(""); bodyLazy.push(false); loose = loose || !ITEM.test(lines[j]); i++; continue; }
           const sibling = j < lines.length && lines[j].match(ITEM);
           if (sibling && !RULE.test(lines[j]) && indentOf(sibling[1]) === base && /\d/.test(sibling[2]) === ordered) {
             loose = true;
@@ -1793,8 +1795,12 @@
           break;
         }
         const ind = indentOf(l);
-        if (ind > base) { body.push(" ".repeat(Math.max(0, ind - contentIndent)) + l.trim()); i++; continue; }
+        if (ind > base) {
+          bodyLazy.push(lazy[i] || ind < contentIndent);
+          body.push(" ".repeat(Math.max(0, ind - contentIndent)) + l.trim()); i++; continue;
+        }
         if (ITEM.test(l) || startsBlock(lines, i) || !body[body.length - 1].trim()) break;
+        bodyLazy.push(true);
         body.push(l.trim()); // lazy continuation
         i++;
       }
@@ -1805,7 +1811,7 @@
         li.className = "task";
         li.append(h("input", { type: "checkbox", disabled: true, checked: task[1] !== " ", "aria-label": task[1] !== " " ? "done" : "not done" }));
       }
-      blocks(body, li, depth + 1);
+      blocks(body, li, depth + 1, bodyLazy);
       el.append(li);
     }
     if (loose) el.classList.add("loose");
