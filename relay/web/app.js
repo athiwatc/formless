@@ -1655,6 +1655,9 @@
 
   const FENCE = /^(\s*)(`{3,}|~{3,})\s*([^\s`{,]*)/;
   const HEADING = /^\s{0,3}(#{1,6})\s+(.*?)(?:\s+#+\s*)?$/;
+  const SETEXT = /^ {0,3}(=+|-+)[ \t]*$/;
+  // Both syntaxes share the current logical-level mapping (#1559).
+  const markdownHeading = (level, content) => h("h" + Math.min(6, level + 1), null, content);
   const RULE = /^\s{0,3}([-*_])(?:\s*\1){2,}\s*$/;
   const ITEM = /^(\s*)([-*+]|\d{1,9}[.)])(\s+|$)(.*)$/;
   const QUOTE = /^\s{0,3}>/;
@@ -1720,7 +1723,7 @@
         continue;
       }
       const head = line.match(HEADING);
-      if (head) { root.append(h("h" + Math.min(6, head[1].length + 1), null, inline(head[2]))); i++; continue; }
+      if (head) { root.append(markdownHeading(head[1].length, inline(head[2]))); i++; continue; }
       if (RULE.test(line)) { root.append(h("hr")); i++; continue; }
       if (tableStart(lines, i)) {
         const header = splitRow(line);
@@ -1748,11 +1751,16 @@
         continue;
       }
       if (ITEM.test(line)) { i = list(lines, i, root, depth); continue; }
-      const p = h("p");
-      p.append(...inline(line.trim()));
+      const content = [...inline(line.trim())];
+      let level = null;
       i++;
-      while (i < lines.length && lines[i].trim() && !startsBlock(lines, i)) { p.append(h("br"), ...inline(lines[i++].trim())); }
-      root.append(p);
+      while (i < lines.length && lines[i].trim()) {
+        const underline = lines[i].match(SETEXT);
+        if (underline) { level = underline[1][0] === "=" ? 1 : 2; i++; break; }
+        if (startsBlock(lines, i)) break;
+        content.push(h("br"), ...inline(lines[i++].trim()));
+      }
+      root.append(level ? markdownHeading(level, content) : h("p", null, content));
     }
     return root;
   }

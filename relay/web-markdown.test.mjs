@@ -155,3 +155,43 @@ test('streamed table prefixes use the same predicate and completed block shapes'
     assert.deepEqual([...c.markdown(stable).children,...c.markdown(tail).children].map(shape),c.markdown(text).children.map(shape));
   }
 });
+
+test('Setext paragraphs share logical levels with ATX and retain multiline inline content', () => {
+  const c=fixture();
+  for(const [underline,atx] of [['===','#'],['---','##'],['=','#'],['-','##']]) {
+    const title='ไทย **Title** [link](https://example.invalid)';
+    assert.deepEqual(shape(c.markdown(title+'\n'+underline).children[0]),shape(c.markdown(atx+' '+title).children[0]));
+    const heading=c.markdown('First line\n'+title+'\n  '+underline+'  ').children[0];
+    assert.equal(heading.tag,c.markdown(atx+' title').children[0].tag);
+    assert.equal(plain(heading),'First line'+title);
+    assert.ok(heading.children.some(child=>child.tag==='br'));
+  }
+});
+
+test('Setext precedence preserves standalone rules, fences, tables and nested block handling', () => {
+  const c=fixture();
+  assert.deepEqual(c.markdown('Title\n\n---').children.map(n=>n.tag),['p','hr']);
+  assert.deepEqual(c.markdown('---').children.map(n=>n.tag),['hr']);
+  assert.deepEqual(c.markdown('```text\nTitle\n===\n```').children.map(n=>n.tag),['pre']);
+  assert.equal(plain(c.markdown('```text\nTitle\n---\n```')),'Title\n---');
+  assert.equal(all(c.markdown('A | B\n--- | ---')).some(n=>n.tag==='table'),true);
+  const rejected=c.markdown('A | B\n---');
+  assert.equal(rejected.children[0].tag,c.markdown('## title').children[0].tag);
+  assert.equal(plain(rejected),'A | B');
+  assert.equal(c.markdown('Title\n    ===').children[0].tag,'p','four-space underline is not Setext');
+  const quote=c.markdown('> Quoted title\n> ===').children[0];
+  assert.equal(quote.tag,'blockquote');assert.equal(quote.children[0].tag,c.markdown('# title').children[0].tag);
+  const list=c.markdown('- item\n  title\n  ===').children[0];
+  assert.equal(list.tag,'ul');assert.ok(all(list).some(n=>n.tag===c.markdown('# title').children[0].tag));
+});
+
+test('Setext incremental tails settle to the same completed blocks', () => {
+  const c=fixture();
+  for(const text of ['Title\n===','First line\nSecond line\n---','A | B\n---','A | B\n--- | ---\nx | y']) {
+    for(let end=0;end<=text.length;end++) {
+      const prefix='Earlier paragraph\n\n'+text.slice(0,end);
+      const [stable,tail]=c.splitStreaming(prefix);
+      assert.deepEqual([...c.markdown(stable).children,...c.markdown(tail).children].map(shape),c.markdown(prefix).children.map(shape),prefix);
+    }
+  }
+});
