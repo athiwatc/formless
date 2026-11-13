@@ -710,6 +710,8 @@ pub enum BlockKind {
     Assistant,
     ToolSummary,
     RunRecap,
+    /// A note the daemon adds to a transcript (role `system-note`).
+    Note,
 }
 
 impl BlockKind {
@@ -719,6 +721,7 @@ impl BlockKind {
             BlockKind::Assistant => "Formless",
             BlockKind::ToolSummary => "Tool",
             BlockKind::RunRecap => "Run recap",
+            BlockKind::Note => "Note",
         }
     }
 }

@@ -16,6 +16,7 @@ use formless_desktop::commands::{self, Command};
 use formless_desktop::fixture;
 use formless_desktop::memory::{limits, IntentKind, IntentRecord};
 use formless_desktop::model::{tokens, BlockKind, Destination, Fit, TextScale};
+use formless_desktop::replies;
 use formless_desktop::shell::{self, session_row_id, PageSection, Shell};
 use formless_desktop::timeline::{self, TimelineBlock};
 use formless_protocol::SendMode;
@@ -4365,5 +4366,75 @@ fn at_200_percent_in_the_smallest_window_the_palette_fits_and_every_row_is_reach
             );
             assert!(palette_status(window).starts_with(&format!("{} of {count} ", index + 1)));
         }
+    });
+}
+
+// ---- Decoded daemon replies -------------------------------------------------
+
+#[gpui_kit::test]
+fn a_decoded_session_reply_becomes_the_open_sessions_timeline_and_no_other(
+    cx: &mut TestAppContext,
+) {
+    let (handle, shell) = open(cx, WIDE, 200, 40);
+    let message = |seq: i64, role: &str, content: &str| {
+        serde_json::json!({
+            "id": format!("m{seq}"), "session_id": "x", "seq": seq, "role": role,
+            "content": content, "created_at": "2026-11-14T00:00:00Z",
+        })
+    };
+    let reply = |session: &str| {
+        serde_json::json!({
+            "session": {"id": session},
+            "running": false,
+            "pending_events": [],
+            "messages": [
+                message(10, "user", "สวัสดี **bold**"),
+                message(11, "assistant", ""),
+                message(12, "assistant", "- [x] done\n- [ ] 日本語"),
+                message(13, "system-note", "Model changed"),
+            ],
+        })
+    };
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        let open = shell.read(cx).sidebar().active_id().unwrap().to_string();
+        let other = shell.read(cx).sidebar().rows()[1].id.clone();
+        assert_ne!(open, other);
+
+        // Another Session's reply changes nothing.
+        let theirs = replies::session_snapshot(&other, &reply(&other)).unwrap();
+        assert_eq!(
+            shell.update(cx, |shell, cx| shell.show_session_snapshot(theirs, cx)),
+            Err("the snapshot is not for the open Session")
+        );
+        window.render_frame(cx);
+        assert_eq!(window.find("block-count").value(), Some("40 blocks"));
+
+        // A stream in progress is replaced by the whole transcript.
+        shell.update(cx, |shell, cx| {
+            shell.begin_stream(cx);
+            shell.push_stream_delta("partial", cx);
+        });
+        let ours = replies::session_snapshot(&open, &reply(&open)).unwrap();
+        assert_eq!(ours.hidden, 1);
+        shell
+            .update(cx, |shell, cx| shell.show_session_snapshot(ours, cx))
+            .unwrap();
+        window.render_frame(cx);
+        assert_eq!(window.find("block-count").value(), Some("3 blocks"));
+        let block = |id: usize| window.find(("block", id));
+        assert_eq!(block(10).label(), Some("You"));
+        assert_eq!(block(12).label(), Some("Formless"));
+        assert_eq!(block(13).label(), Some("Note"));
+        assert!(window.try_find(("block", 11usize)).is_none());
+        // Read as plain text, as any other block.
+        assert_eq!(
+            window.find(("block-text", 10usize)).value(),
+            Some("สวัสดี bold")
+        );
+        assert_eq!(
+            window.find(("block-text", 12usize)).value(),
+            Some("☑ done\n☐ 日本語")
+        );
     });
 }

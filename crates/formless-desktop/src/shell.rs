@@ -41,6 +41,7 @@ use crate::model::{
     send_mode_label, tokens, BlockKind, ComposerActions, Destination, Drafts, Fit, InspectorMode,
     Intent, Layout, PanelPrefs, Region, RunState, Sidebar, SidebarMode, TextScale,
 };
+use crate::replies::SessionSnapshot;
 use crate::timeline::{
     Anchor, Coalescer, StreamWork, Timeline, TimelineBlock, WindowMove, FLUSH_INTERVAL_MS,
 };
@@ -1092,6 +1093,30 @@ impl Shell {
             timeline.remeasure_items(index..index + 1, cx);
         });
         cx.notify();
+    }
+
+    /// Show a decoded `GetSession` reply ([`crate::replies`]) as the open
+    /// Session's timeline, in place of what it showed, a stream in progress
+    /// included: the reply is the daemon's whole, current transcript.
+    ///
+    /// A snapshot for any Session but the open one is refused and nothing
+    /// changes, so a late reply never puts one Session's transcript under
+    /// another's name. Run state is not taken from it: the Session list and
+    /// Run events own that (findings §6).
+    pub fn show_session_snapshot(
+        &mut self,
+        snapshot: SessionSnapshot,
+        cx: &mut Context<Self>,
+    ) -> Result<(), &'static str> {
+        if self.sidebar.active_id() != Some(snapshot.session_id.as_str()) {
+            return Err("the snapshot is not for the open Session");
+        }
+        let count = snapshot.blocks.len();
+        *self.blocks.borrow_mut() = Timeline::new(snapshot.blocks);
+        self.timeline
+            .update(cx, |timeline, cx| timeline.reset(count, cx));
+        cx.notify();
+        Ok(())
     }
 
     /// Start a streamed assistant block at the tail of the timeline.

@@ -1894,6 +1894,8 @@ dependencies = [
  "markdown",
  "objc",
  "raw-window-handle",
+ "serde",
+ "serde_json",
  "unicode-segmentation",
 ]
 
