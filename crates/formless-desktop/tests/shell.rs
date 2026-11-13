@@ -4478,7 +4478,7 @@ fn the_full_output_view_shows_a_long_block_whole_and_hands_focus_back(cx: &mut T
         let summary = window.find("viewer-summary").value().unwrap().to_string();
         assert!(summary.starts_with("Tool block, "), "{summary}");
         assert!(
-            summary.contains(&format!(", {rows} rows of up to ")),
+            summary.contains(&format!(", {rows} rows fitted to the view.")),
             "{summary}"
         );
         // 3,000 lines and the Thai line cut into rows of the view's width.
@@ -4525,7 +4525,7 @@ fn the_full_output_view_shows_a_long_block_whole_and_hands_focus_back(cx: &mut T
             .find("viewer-summary")
             .value()
             .unwrap()
-            .ends_with("Copied to the clipboard."));
+            .starts_with("Copied to the clipboard."));
 
         // F6 stays inside; Escape closes onto the control that opened it.
         window.press("f6", cx);
@@ -4604,5 +4604,201 @@ fn a_five_megabyte_line_is_viewed_as_short_rows_and_resizing_cuts_it_again(
         let dialog = window.find("viewer").bounds();
         assert!(dialog.right() <= viewport.right() && dialog.bottom() <= viewport.bottom());
         assert!(window.find("viewer-close").bounds().right() <= viewport.right());
+    });
+}
+
+#[gpui_kit::test]
+fn replacing_a_viewed_source_closes_stale_offsets_and_copy_uses_the_new_revision(
+    cx: &mut TestAppContext,
+) {
+    let (handle, shell) = open_blocks(
+        cx,
+        WIDE,
+        vec![TimelineBlock::new(
+            3,
+            BlockKind::ToolSummary,
+            "a".repeat(1200),
+        )],
+    );
+    let snapshot = |session: &str, text: &str| {
+        replies::session_snapshot(
+            session,
+            &serde_json::json!({
+                "session": {"id": session}, "running": false,
+                "messages": [{"id": "m3", "session_id": session, "seq": 3,
+                    "role": "tool", "content": text, "created_at": "now"}],
+            }),
+        )
+        .unwrap()
+    };
+    for replacement in ["ก".to_string(), "漢".repeat(400)] {
+        step(cx, handle, |window, cx| {
+            let open = shell.read(cx).sidebar().active_id().unwrap().to_string();
+            shell
+                .update(cx, |shell, cx| {
+                    shell.show_session_snapshot(snapshot(&open, &"a".repeat(1200)), cx)
+                })
+                .unwrap();
+            window.render_frame(cx);
+            shell
+                .update(cx, |shell, cx| shell.view_block(3, window, cx))
+                .unwrap();
+            window.render_frame(cx);
+            assert!(shell.read(cx).viewer_rows().unwrap() > 1);
+            window.press("end", cx);
+            window.render_frame(cx);
+            // A foreign reply must not dismiss or change the current view.
+            assert!(shell
+                .update(cx, |shell, cx| shell
+                    .show_session_snapshot(snapshot("foreign", "not ours"), cx))
+                .is_err());
+            assert!(shell.read(cx).viewer_rows().is_some());
+            // Both shorter text and same-byte-length, different UTF-8 text
+            // invalidate the index even with identical sequence id/width.
+            shell
+                .update(cx, |shell, cx| {
+                    shell.show_session_snapshot(snapshot(&open, &replacement), cx)
+                })
+                .unwrap();
+            assert_eq!(shell.read(cx).viewer_rows(), None);
+            window.render_frame(cx);
+            assert!(window.try_find("viewer").is_none());
+            assert!(!shell.read(cx).background_inert(window));
+            assert_eq!(window.find_by_label("Message").focused(), Some(true));
+            shell
+                .update(cx, |shell, cx| shell.view_block(3, window, cx))
+                .unwrap();
+            window.render_frame(cx);
+            window.click("viewer-copy", cx);
+            assert_eq!(
+                cx.read_from_clipboard().and_then(|item| item.text()),
+                Some(replacement.clone())
+            );
+            window.press("escape", cx);
+            window.render_frame(cx);
+        });
+    }
+}
+
+#[gpui_kit::test]
+fn an_unrenderable_grapheme_has_an_explanation_and_copy_all_not_clipped_rows(
+    cx: &mut TestAppContext,
+) {
+    let text = "e".to_string() + &"\u{301}".repeat(formless_desktop::full_view::MEASURE_MAX_BYTES);
+    let (handle, shell) = open_blocks(
+        cx,
+        WIDE,
+        vec![TimelineBlock::new(1, BlockKind::ToolSummary, text.clone())],
+    );
+    step(cx, handle, |window, cx| {
+        shell
+            .update(cx, |shell, cx| shell.view_block(1, window, cx))
+            .unwrap();
+        window.render_frame(cx);
+        assert_eq!(shell.read(cx).viewer_rows(), Some(0));
+        assert!(window
+            .find("viewer-summary")
+            .value()
+            .unwrap()
+            .contains("too large to lay out safely"));
+        assert!(window.try_find(("viewer-row", 0usize)).is_none());
+        for key in ["end", "home", "pagedown", "pageup", "up", "down"] {
+            window.press(key, cx);
+        }
+        window.render_frame(cx);
+        window.click("viewer-copy", cx);
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some(text.clone())
+        );
+    });
+    cx.simulate_window_resize(handle.into(), size(px(800.), px(700.)));
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        assert_eq!(shell.read(cx).viewer_rows(), Some(0));
+        window.press("escape", cx);
+        window.render_frame(cx);
+        assert!(window.try_find("viewer").is_none());
+    });
+}
+
+#[gpui_kit::test]
+fn a_font_size_change_at_the_same_viewport_reindexes_the_whole_output(cx: &mut TestAppContext) {
+    let text = "ab漢字👩🏽‍💻".repeat(100);
+    let (handle, shell) = open_blocks(
+        cx,
+        WIDE,
+        vec![TimelineBlock::new(1, BlockKind::ToolSummary, text.clone())],
+    );
+    step(cx, handle, |window, cx| {
+        shell
+            .update(cx, |shell, cx| shell.view_block(1, window, cx))
+            .unwrap();
+        window.render_frame(cx);
+        let before = shell.read(cx).viewer_rows().unwrap();
+        let viewport = window.viewport_size();
+        let theme = gpui_kit::component::Theme::global_mut(cx);
+        theme.mono_font_size *= 2.;
+        window.render_frame(cx);
+        assert_eq!(window.viewport_size(), viewport);
+        assert!(shell.read(cx).viewer_rows().unwrap() > before);
+        window.click("viewer-copy", cx);
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some(text.clone())
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn the_whole_output_view_and_its_error_controls_fit_the_minimum_window_at_200_percent(
+    cx: &mut TestAppContext,
+) {
+    let oversized =
+        "e".to_string() + &"\u{301}".repeat(formless_desktop::full_view::MEASURE_MAX_BYTES);
+    let blocks = vec![
+        TimelineBlock::new(1, BlockKind::ToolSummary, "漢字👩🏽‍💻".repeat(1000)),
+        TimelineBlock::new(2, BlockKind::ToolSummary, oversized),
+    ];
+    let (handle, shell) = open_blocks(cx, size(px(480.), px(360.)), blocks);
+    step(cx, handle, |window, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.set_text_scale(TextScale::from_percent(200), window, cx)
+        });
+        for id in [1, 2] {
+            shell
+                .update(cx, |shell, cx| shell.view_block(id, window, cx))
+                .unwrap();
+            window.render_frame(cx);
+            let viewport = Bounds::new(Point::default(), window.viewport_size());
+            for copied in [false, true] {
+                if copied {
+                    window.click("viewer-copy", cx);
+                    window.render_frame(cx);
+                }
+                for control in ["viewer", "viewer-summary", "viewer-copy", "viewer-close"] {
+                    let bounds = window.find(control).bounds();
+                    assert!(
+                        bounds.left() >= viewport.left()
+                            && bounds.top() >= viewport.top()
+                            && bounds.right() <= viewport.right()
+                            && bounds.bottom() <= viewport.bottom(),
+                        "{control} at {bounds:?}, copied={copied}"
+                    );
+                }
+            }
+            tab_to(window, "viewer-summary", cx);
+            assert_eq!(window.find("viewer-summary").focused(), Some(true));
+            for key in ["end", "pageup", "pagedown", "home"] {
+                window.press(key, cx);
+                window.render_frame(cx);
+            }
+            tab_to(window, "viewer-close", cx);
+            if id == 1 {
+                assert!(window.try_find(("viewer-row", 0usize)).is_some());
+            }
+            window.press("escape", cx);
+            window.render_frame(cx);
+        }
     });
 }

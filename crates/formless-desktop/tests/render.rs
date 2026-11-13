@@ -19,8 +19,9 @@ mod render {
     use std::sync::Arc;
 
     use formless_desktop::fixture;
-    use formless_desktop::model::{Fit, TextScale};
+    use formless_desktop::model::{BlockKind, Fit, TextScale};
     use formless_desktop::shell::{self, PageSection, Shell};
+    use formless_desktop::timeline::TimelineBlock;
     use gpui_kit::assets::Assets;
     use gpui_kit::component::{ActiveTheme as _, Theme, ThemeMode};
     use gpui_kit::test::TestWindowExt as _;
@@ -39,6 +40,7 @@ mod render {
         percent: u16,
         click: Option<&'static str>,
         fit: Fit,
+        viewer: bool,
     }
 
     const fn state(
@@ -58,7 +60,13 @@ mod render {
             percent,
             click,
             fit,
+            viewer: false,
         }
+    }
+
+    const fn viewer_state(mut state: State) -> State {
+        state.viewer = true;
+        state
     }
 
     const LIGHT: ThemeMode = ThemeMode::Light;
@@ -66,7 +74,7 @@ mod render {
     const WHOLE: Fit = Fit::Whole;
     const REFLOWED: Fit = Fit::Reflowed;
 
-    const STATES: [State; 21] = [
+    const STATES: [State; 23] = [
         state("wide-light", 1440., 900., LIGHT, 100, None, WHOLE),
         state("wide-dark", 1440., 900., DARK, 100, None, WHOLE),
         state("medium-light", 1100., 900., LIGHT, 100, None, WHOLE),
@@ -198,6 +206,24 @@ mod render {
             None,
             REFLOWED,
         ),
+        viewer_state(state(
+            "wide-whole-output-light",
+            1440.,
+            900.,
+            LIGHT,
+            100,
+            None,
+            WHOLE,
+        )),
+        viewer_state(state(
+            "minimum-whole-output-dark-200pct",
+            480.,
+            360.,
+            DARK,
+            200,
+            None,
+            REFLOWED,
+        )),
     ];
 
     /// Controls that must be whole and inside the window, all at once, where
@@ -365,6 +391,7 @@ mod render {
             percent,
             click,
             fit,
+            viewer,
         }: State,
         keep: Option<&str>,
         sizes: &mut ControlSizes,
@@ -382,7 +409,21 @@ mod render {
                 Theme::change(mode, None, cx);
                 let sessions = fixture::sessions(200);
                 let running = fixture::running(&sessions);
-                let blocks = fixture::timeline(40);
+                let blocks = if viewer {
+                    // Wide fallback glyphs, joined emoji, combining marks,
+                    // bidi, tabs, long lines and CRLF. Copy stays verbatim.
+                    let text = [
+                        "漢字".repeat(200),
+                        "👩🏽‍💻🇹🇭".repeat(100),
+                        "ก้่ำ e\u{301} ".repeat(100),
+                        "العربية עברית ".repeat(100),
+                        "a\tb\t".repeat(100),
+                    ]
+                    .join("\r\n");
+                    vec![TimelineBlock::new(41, BlockKind::ToolSummary, text)]
+                } else {
+                    fixture::timeline(40)
+                };
                 let options = WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(Bounds {
                         origin: Default::default(),
@@ -496,7 +537,7 @@ mod render {
                     }
                 })
                 .expect("offscreen window is open");
-                if click.is_none() {
+                if click.is_none() && !viewer {
                     capture(&mut cx, &format!("-{label}"));
                 }
             }
@@ -547,7 +588,30 @@ mod render {
             cx.run_until_parked();
         }
 
-        if let Some(control) = click {
+        if viewer {
+            cx.update_window(any, |_, window, cx| {
+                shell
+                    .update(cx, |shell, cx| shell.view_block(41, window, cx))
+                    .unwrap();
+                window.render_frame(cx);
+            })
+            .expect("offscreen window is open");
+            cx.run_until_parked();
+            cx.update_window(any, |_, window, cx| {
+                window.render_frame(cx);
+                check_viewer(name, &shell, window, cx, false);
+            })
+            .expect("offscreen window is open");
+            capture(&mut cx, "-start");
+            cx.update_window(any, |_, window, cx| {
+                window.press("end", cx);
+                window.render_frame(cx);
+                window.render_frame(cx);
+                check_viewer(name, &shell, window, cx, true);
+            })
+            .expect("offscreen window is open");
+            capture(&mut cx, "-end");
+        } else if let Some(control) = click {
             cx.update_window(any, |_, window, cx| {
                 window.render_frame(cx);
                 window.click(control, cx);
@@ -577,6 +641,43 @@ mod render {
             capture(&mut cx, "");
         }
         captures
+    }
+
+    /// Actual font advances of the visible rows fit the list, not just a
+    /// count of graphemes. These assertions still need a working native
+    /// offscreen runtime; compiling them is not a real-font pass.
+    fn check_viewer(name: &str, shell: &Entity<Shell>, window: &mut Window, cx: &App, end: bool) {
+        let count = shell.read(cx).viewer_rows().expect("viewer is open");
+        assert!(count > 1, "{name}: no fitted rows");
+        let dialog = window.find("viewer").bounds();
+        let available = dialog.size.width - px(48.);
+        let mut style = window.text_style();
+        style.font_family = cx.theme().mono_font_family.clone();
+        let size = cx.theme().mono_font_size;
+        let first_or_last = if end { count - 1 } else { 0 };
+        assert!(
+            window.try_find(("viewer-row", first_or_last)).is_some(),
+            "{name}: expected end row not visible"
+        );
+        for index in (0..256).chain(std::iter::once(count - 1)) {
+            let Some(query) = window.try_find(("viewer-row", index)) else {
+                continue;
+            };
+            let text = query.value().expect("row has plain text").to_string();
+            let measured = window
+                .text_system()
+                .shape_line(text.clone().into(), size, &[style.to_run(text.len())], None)
+                .width();
+            assert!(
+                measured <= available,
+                "{name}: row {index} is {measured:?}, only {available:?} available"
+            );
+            let bounds = query.bounds();
+            assert!(
+                bounds.left() >= dialog.left() && bounds.right() <= dialog.right(),
+                "{name}: row outside dialog"
+            );
+        }
     }
 
     pub fn run() {

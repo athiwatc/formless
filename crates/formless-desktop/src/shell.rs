@@ -8,7 +8,7 @@
 //! destination shows a notice saying so.
 
 use std::cell::{Ref, RefCell};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::rc::Rc;
 use std::time::Duration;
@@ -86,11 +86,13 @@ const INSPECTOR_CONTEXT: &str = "FormlessInspector";
 const PALETTE_CONTEXT: &str = "FormlessPalette";
 const VIEWER_CONTEXT: &str = "FormlessViewer";
 const VIEWER_DESCRIPTION: &str =
-    "Modal. The whole block as plain text. Arrow, Page Up, Page Down, \
-     Home and End scroll; Escape closes and returns to where you were.";
-/// The smallest row width the full-output view cuts a block into, in
-/// characters, however narrow the window.
-const VIEWER_MIN_COLUMNS: usize = 20;
+    "Modal. The whole block as plain text. Tab reaches the summary and controls. \
+     Arrow, Page Up, Page Down, Home and End scroll the focused text; \
+     Escape closes and returns to where you were.";
+/// Temporary font-layout retention while indexing a whole block: never
+/// shape its rows through the window's per-frame cache.
+const VIEWER_MEASURE_BATCH: usize = 64;
+const VIEWER_WIDTH_CACHE: usize = 128;
 /// The palette's search field. These bindings are more specific than the
 /// text input's own, so Up, Down, Enter and Escape there move through and
 /// run the list instead of moving a caret in a one-line field.
@@ -341,13 +343,23 @@ enum Modal {
 /// The open full-output view: one block, as display rows.
 struct Viewer {
     block_id: u64,
-    /// Where each row starts in the block ([`full_view::row_starts`]).
-    starts: Vec<u32>,
-    /// The row width `starts` was made for, in characters.
-    columns: usize,
+    /// Where each width-checked row starts in the block.
+    starts: Box<[u32]>,
+    layout: ViewerLayout,
+    error: Option<full_view::RowError>,
+    summary_scroll: ScrollHandle,
+    summary_focus: FocusHandle,
     scroll: gpui_kit::UniformListScrollHandle,
     /// Set once the block has been copied, to say so.
     copied: bool,
+}
+
+/// Reindex on exact pixel width or font changes, not rounded ASCII columns.
+#[derive(Clone, PartialEq)]
+struct ViewerLayout {
+    width: Pixels,
+    font_size: Pixels,
+    font: gpui_kit::Font,
 }
 
 impl Viewer {
@@ -1194,6 +1206,13 @@ impl Shell {
         if self.sidebar.active_id() != Some(snapshot.session_id.as_str()) {
             return Err("the snapshot is not for the open Session");
         }
+        // Byte offsets belong to this exact source revision, not merely
+        // its sequence id or length. The next render restores modal focus.
+        if self.viewer.take().is_some() {
+            // Its originating row may have vanished too. Use the normal
+            // visible-region fallback, never an orphaned row focus handle.
+            self.restore_focus = None;
+        }
         let count = snapshot.blocks.len();
         *self.blocks.borrow_mut() = Timeline::new(snapshot.blocks);
         self.timeline
@@ -1212,8 +1231,8 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<(), &'static str> {
-        let columns = self.viewer_columns(window, cx);
-        let starts = {
+        let layout = self.viewer_layout(window, cx);
+        let (starts, error) = {
             let blocks = self.blocks.borrow();
             let index = blocks
                 .blocks()
@@ -1223,14 +1242,16 @@ impl Shell {
             if blocks.is_streaming() && index + 1 == blocks.len() {
                 return Err(VIEWER_STREAMING);
             }
-            full_view::row_starts(blocks.blocks()[index].markdown(), columns)
-                .ok_or("the block is too large to show whole")?
+            Self::measure_viewer(blocks.blocks()[index].markdown(), &layout, cx)
         };
         self.prefs.close_overlays();
         self.viewer = Some(Viewer {
             block_id,
             starts,
-            columns,
+            layout,
+            error,
+            summary_scroll: ScrollHandle::new(),
+            summary_focus: cx.focus_handle().tab_stop(true),
             scroll: gpui_kit::UniformListScrollHandle::new(),
             copied: false,
         });
@@ -1250,56 +1271,128 @@ impl Shell {
         size(viewport.width - px(32.), viewport.height - px(32.))
     }
 
-    /// How many characters of the monospace font fit across the view's
-    /// list, from the font's real advance.
-    fn viewer_columns(&self, window: &Window, cx: &App) -> usize {
-        let theme = cx.theme();
-        let font_size = theme.mono_font_size;
-        let text_system = window.text_system();
-        let font_id = text_system.resolve_font(&gpui_kit::font(theme.mono_font_family.clone()));
-        let advance = text_system
-            .ch_advance(font_id, font_size)
-            .unwrap_or(font_size * 0.6);
-        // The dialog's padding and the list's scrollbar.
-        let width = Self::viewer_size(window).width - px(48.);
-        ((f32::from(width) / f32::from(advance)).floor() as usize).max(VIEWER_MIN_COLUMNS)
+    fn viewer_layout(&self, window: &Window, cx: &App) -> ViewerLayout {
+        let mut font = window.text_style().font();
+        font.family = cx.theme().mono_font_family.clone();
+        ViewerLayout {
+            // Padding, border, scrollbar and a little glyph-overhang room.
+            width: (Self::viewer_size(window).width - px(48.)).max(px(1.)),
+            font_size: cx.theme().mono_font_size,
+            font,
+        }
+    }
+
+    fn measure_viewer(
+        text: &str,
+        layout: &ViewerLayout,
+        cx: &App,
+    ) -> (Box<[u32]>, Option<full_view::RowError>) {
+        let mut measurer = gpui_kit::WindowTextSystem::new(cx.text_system().clone());
+        let font_id = measurer.resolve_font(&layout.font);
+        let advance = measurer
+            .ch_advance(font_id, layout.font_size)
+            .unwrap_or(layout.font_size * 0.6);
+        let columns = (f32::from(layout.width) / f32::from(advance)).floor() as usize;
+        let mut run = gpui_kit::TextRun {
+            font: layout.font.clone(),
+            ..Default::default()
+        };
+        let mut queries = 0;
+        // Borrowed keys, no second copy of transcript text. Repeated rows
+        // (e.g. a 5 MiB line of x) need only one font measurement.
+        let mut widths = HashMap::new();
+        let result = full_view::measured_row_starts(text, columns, |row| {
+            if let Some(fits) = widths.get(row) {
+                return *fits;
+            }
+            if queries == VIEWER_MEASURE_BATCH {
+                measurer = gpui_kit::WindowTextSystem::new(cx.text_system().clone());
+                queries = 0;
+            }
+            run.len = row.len();
+            let fits = measurer
+                .shape_line(
+                    row.to_string().into(),
+                    layout.font_size,
+                    &[run.clone()],
+                    None,
+                )
+                .width()
+                <= layout.width;
+            queries += 1;
+            if widths.len() < VIEWER_WIDTH_CACHE {
+                widths.insert(row, fits);
+            }
+            fits
+        });
+        match result {
+            Ok(starts) => (starts, None),
+            Err(error) => (Box::default(), Some(error)),
+        }
     }
 
     /// Cut the open view's block again when the width it fits has changed
     /// (a resize, a text size change), keeping the row at the top in view.
     fn fit_viewer(&mut self, window: &Window, cx: &App) {
-        let columns = self.viewer_columns(window, cx);
+        let layout = self.viewer_layout(window, cx);
         let blocks = self.blocks.borrow();
         let Some(viewer) = &mut self.viewer else {
             return;
         };
-        if viewer.columns == columns {
+        if viewer.layout == layout {
             return;
         }
         let Some(block) = blocks.block(viewer.block_id) else {
             return;
         };
-        let Some(starts) = full_view::row_starts(block.markdown(), columns) else {
-            return;
-        };
+        let (starts, error) = Self::measure_viewer(block.markdown(), &layout, cx);
         let (top, _) = viewer.top_and_page();
         let top = viewer.starts.get(top).copied().unwrap_or(0);
         let row = starts
             .partition_point(|start| *start <= top)
             .saturating_sub(1);
         viewer.starts = starts;
-        viewer.columns = columns;
-        viewer
-            .scroll
-            .scroll_to_item_strict(row, ScrollStrategy::Top);
+        viewer.layout = layout;
+        viewer.error = error;
+        viewer.summary_scroll.set_offset(point(px(0.), px(0.)));
+        if !viewer.starts.is_empty() {
+            viewer
+                .scroll
+                .scroll_to_item_strict(row, ScrollStrategy::Top);
+        }
     }
 
     /// Move the view by `rows` rows, a page (`rows` 0), or to an end.
-    fn scroll_viewer(&mut self, to: WindowMove, rows: isize, cx: &mut Context<Self>) {
+    fn scroll_viewer(
+        &mut self,
+        to: WindowMove,
+        rows: isize,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(viewer) = &self.viewer else {
             return;
         };
-        let last = viewer.starts.len().saturating_sub(1);
+        if viewer.summary_focus.is_focused(window) || viewer.starts.is_empty() {
+            let scroll = &viewer.summary_scroll;
+            let line = cx.theme().font_size * 1.5;
+            let step = if rows == 0 {
+                (scroll.bounds().size.height - line).max(line)
+            } else {
+                line * rows.unsigned_abs() as f32
+            };
+            let max = scroll.max_offset().y;
+            let y = match to {
+                WindowMove::Start => px(0.),
+                WindowMove::End => -max,
+                WindowMove::Earlier => (scroll.offset().y + step).min(px(0.)),
+                WindowMove::Later => (scroll.offset().y - step).max(-max),
+            };
+            scroll.set_offset(point(px(0.), y));
+            cx.notify();
+            return;
+        }
+        let last = viewer.starts.len() - 1;
         let (top, page) = viewer.top_and_page();
         let target = match to {
             WindowMove::Start => 0,
@@ -1333,6 +1426,7 @@ impl Shell {
         if let Some(block) = blocks.block(viewer.block_id) {
             cx.write_to_clipboard(ClipboardItem::new_string(block.markdown().to_string()));
             viewer.copied = true;
+            viewer.summary_scroll.set_offset(point(px(0.), px(0.)));
         }
         cx.notify();
     }
@@ -1703,6 +1797,10 @@ impl Shell {
     fn activate_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let previous = self.sidebar.active_id().map(str::to_string);
         if self.sidebar.activate_selected() {
+            // A full-output view must never outlive its Session/source.
+            if self.viewer.take().is_some() {
+                self.restore_focus = None;
+            }
             if let Some(previous) = previous {
                 // What the composer holds at this moment is not always the
                 // user's draft:
@@ -2774,6 +2872,11 @@ impl Shell {
 
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Snapshot replacement has no Window parameter. Finish the modal
+        // dismissal/focus fallback here, before stale rows can be drawn.
+        if self.modal == Some(Modal::Viewer) && self.viewer.is_none() {
+            self.settle(window, cx);
+        }
         self.commands = self.command_state(window, cx);
         self.fit_viewer(window, cx);
         let layout = self.layout(window);
@@ -3071,17 +3174,22 @@ impl Shell {
         } else {
             0
         };
-        let mut summary = match kind {
-            Some(kind) => format!(
-                "{} block, {}, {count} rows of up to {} characters.",
+        let mut summary = match (kind, viewer.error) {
+            (Some(kind), Some(error)) => format!(
+                "{} block, {}. {}",
                 kind.label(),
                 format_bytes(bytes),
-                viewer.columns
+                error.notice()
             ),
-            None => "This block is no longer in the timeline.".to_string(),
+            (Some(kind), None) => format!(
+                "{} block, {}, {count} rows fitted to the view.",
+                kind.label(),
+                format_bytes(bytes)
+            ),
+            (None, _) => "This block is no longer in the timeline.".to_string(),
         };
         if viewer.copied {
-            summary.push_str(" Copied to the clipboard.");
+            summary.insert_str(0, "Copied to the clipboard. ");
         }
         let rows = gpui_kit::uniform_list(
             "viewer-rows",
@@ -3125,23 +3233,23 @@ impl Shell {
             .aria_description(VIEWER_DESCRIPTION)
             .map(modal_dialog)
             .key_context(VIEWER_CONTEXT)
-            .on_action(cx.listener(|this, _: &ScrollViewerUp, _, cx| {
-                this.scroll_viewer(WindowMove::Earlier, 1, cx)
+            .on_action(cx.listener(|this, _: &ScrollViewerUp, window, cx| {
+                this.scroll_viewer(WindowMove::Earlier, 1, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &ScrollViewerDown, _, cx| {
-                this.scroll_viewer(WindowMove::Later, 1, cx)
+            .on_action(cx.listener(|this, _: &ScrollViewerDown, window, cx| {
+                this.scroll_viewer(WindowMove::Later, 1, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &ScrollViewerPageUp, _, cx| {
-                this.scroll_viewer(WindowMove::Earlier, 0, cx)
+            .on_action(cx.listener(|this, _: &ScrollViewerPageUp, window, cx| {
+                this.scroll_viewer(WindowMove::Earlier, 0, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &ScrollViewerPageDown, _, cx| {
-                this.scroll_viewer(WindowMove::Later, 0, cx)
+            .on_action(cx.listener(|this, _: &ScrollViewerPageDown, window, cx| {
+                this.scroll_viewer(WindowMove::Later, 0, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &ScrollViewerStart, _, cx| {
-                this.scroll_viewer(WindowMove::Start, 0, cx)
+            .on_action(cx.listener(|this, _: &ScrollViewerStart, window, cx| {
+                this.scroll_viewer(WindowMove::Start, 0, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &ScrollViewerEnd, _, cx| {
-                this.scroll_viewer(WindowMove::End, 0, cx)
+            .on_action(cx.listener(|this, _: &ScrollViewerEnd, window, cx| {
+                this.scroll_viewer(WindowMove::End, 0, window, cx)
             }))
             .on_action(
                 cx.listener(|this, _: &CloseViewer, window, cx| this.close_viewer(window, cx)),
@@ -3158,34 +3266,48 @@ impl Shell {
             .shadow_lg()
             .occlude()
             .child(
-                h_flex()
-                    .flex_wrap()
+                // The summary gets the full width. Beside two buttons it
+                // became a tall sliver at 480x360/200%, escaping the dialog.
+                v_flex()
                     .gap_2()
                     .child(
                         announced(div().id("viewer-summary"))
                             .test_support()
                             .role(Role::Label)
                             .aria_value(summary.clone())
-                            .flex_1()
+                            .w_full()
                             .min_w_0()
+                            // Keep Copy/Close inside even at 200% after
+                            // a long notice or copied-state update.
+                            .max_h(dialog_size.height * 0.5)
+                            .overflow_y_scroll()
+                            .track_scroll(&viewer.summary_scroll)
+                            .track_focus(&viewer.summary_focus)
+                            .vertical_scrollbar(&viewer.summary_scroll)
                             .text_sm()
                             .child(summary),
                     )
                     .child(
-                        Button::new("viewer-copy")
-                            .small()
-                            .label("Copy all")
-                            .tooltip("Copy the whole block to the clipboard")
-                            .disabled(kind.is_none())
-                            .on_click(cx.listener(|this, _, _, cx| this.copy_viewed_block(cx))),
-                    )
-                    .child(
-                        Button::new("viewer-close")
-                            .small()
-                            .label("Close")
-                            .tooltip("Close (Escape)")
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.close_viewer(window, cx)),
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                Button::new("viewer-copy")
+                                    .small()
+                                    .label("Copy all")
+                                    .tooltip("Copy the whole block to the clipboard")
+                                    .disabled(kind.is_none())
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.copy_viewed_block(cx)),
+                                    ),
+                            )
+                            .child(
+                                Button::new("viewer-close")
+                                    .small()
+                                    .label("Close")
+                                    .tooltip("Close (Escape)")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.close_viewer(window, cx)
+                                    })),
                             ),
                     ),
             )

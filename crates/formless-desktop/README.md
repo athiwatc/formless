@@ -25,7 +25,7 @@ not see GPUI. Run every command below from this directory.
 | `src/commands.rs` | Typed shell command registry and palette search | none |
 | `src/replies.rs` | Read-only, validated `ListSessions` / `GetSession` decoding | none |
 | `src/transcript.rs` | Pure transcript event application, canonical completion replacement and sticky reload-needed state; not connected to the shell or a transport yet | none |
-| `src/full_view.rs` | Grapheme-safe row index for the full-output view | none |
+| `src/full_view.rs` | Grapheme-safe, measured-width row index with bounded shaping candidates for the full-output view | none |
 | `src/memory.rs` | Memory policy: composer limit, whole-edit rejection bookkeeping, undo accounting, text-free intent records | none |
 | `src/timeline.rs` | Timeline blocks, a bounded movable window onto each long block, streamed tails rebuilt when shown and update coalescing | none |
 | `examples/stream_model.rs` | Replays the synthetic stream into the model with no window and prints what keeping the streamed row up to date cost | none |
@@ -34,7 +34,7 @@ not see GPUI. Run every command below from this directory.
 | `src/shell.rs` | The GPUI Kit window over the model | `gui` feature |
 | `src/main.rs` | `formless-desktop` binary | `gui` feature |
 | `tests/shell.rs` | Headless tests of the real shell view. The test window has no real fonts: every character is the same width | `test-support` feature |
-| `tests/render.rs` | Offscreen render of nineteen shell states through GPUI's real renderer, and measurements that need real fonts (macOS, Linux) | `test-support` feature |
+| `tests/render.rs` | Offscreen render of twenty-three shell states through GPUI's real renderer, and measurements that need real fonts (macOS, Linux) | `test-support` feature |
 
 ## Commands
 
@@ -102,7 +102,12 @@ Up/Down to choose, Enter to run, Escape to close; a command that cannot run
 says why. Every button, shortcut and palette row runs through one typed
 registry (`src/commands.rs`). A row that shows only part of a long block has
 a View whole control: the whole block as plain text, scrolled with the arrow,
-page, Home and End keys, with Copy all. The text is always the
+page, Home and End keys, with Copy all. Rows are fitted using the actual
+monospace/fallback font advances, not a count of ASCII-width characters.
+If one character cannot fit the window or safe layout bound, the view
+explains the limit and keeps Copy all available. A new Session snapshot
+closes the old view rather than applying old byte offsets to new text.
+The text is always the
 size asked for. A window smaller than that size needs (480 x 360 times the
 size) is reflowed: every part is as wide as the window, the parts stack,
 and the shell scrolls up and down as one page, with focus bringing each

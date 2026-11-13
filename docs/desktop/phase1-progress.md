@@ -15,7 +15,8 @@ and the crate still optional (detached workspace, not a default build).
 | Command palette | `a92ab626` | Cmd/Ctrl+Shift+P or the header Commands button. Modal, focus-trapped, background out of the accessibility tree, focus returned to the opening control; filter, arrows, Enter/click, unavailable commands say why; input-method composition in the search field is never turned into a run or a close; fits 480x360 at 200%. | 7 shell, 2 render states (real fonts) |
 | Typed reply decoding | `1470342d` | `src/replies.rs` (no GPUI, no I/O): `ListSessions` into `SessionInfo`s; `GetSession` into a `SessionSnapshot` (Session id, `running`, timeline blocks in sequence order, hidden empty assistant turns). The TUI's role mapping (`user`, `tool`, `system-note` as a new `Note` block, anything else the assistant's). A reply for another Session, a missing or malformed field, a negative or repeated sequence number is a named error, never an empty list. `Shell::show_session_snapshot` replaces the open Session's timeline (a stream in progress included) and refuses a snapshot for any other Session. Run state is not taken from it. `serde` and `serde_json` became direct dependencies (already locked; two lockfile edges, no new package). | 6 model, 1 shell (mutation-checked: removing the Session guard fails it) |
 | Full-output view | `ad722cf8` | A "View whole" control on every row that shows less than its block opens a modal, focus-trapped view of the whole block as plain monospace rows in a list that lays out only what is on screen, with Copy all. `src/full_view.rs` cuts the block at line breaks and at the row width (from the font's real advance), never inside a character; only row starts are kept (four bytes a row, dropped on close; in the memory policy table). Arrow, page, Home, End; Escape back to the control. Not for a block still arriving. | 5 model, 3 shell |
-| Transcript events | This slice | `src/transcript.rs` (no GPUI or I/O): applies the protocol's `MessageAppended`, `MessageDelta`, `MessageComplete`, `MessagesEdited`, `DeltasDropped` and `StreamRestarted` to a decoded snapshot. The first delta starts a provisional row with an id outside the persisted sequence range; canonical assistant text replaces it. Tools/notes can arrive during it. Foreign Sessions are ignored, exact duplicates do not erase a newer partial answer, invalid/misordered text or a conflicting live Run requests reload instead of being combined. Edits, transcript-scoped/legacy/global gap warnings and restarts latch an explicit reload-needed state until a new snapshot. Snapshot decoding now validates each message's Session and retains the highest sequence even for hidden tool-only turns. Still not wired to the shell or a transport; snapshot/event generation ordering and Run lifecycle handling remain future client work. | 14 event-model, 2 reply-model; independent read-only review |
+| Transcript events | `1e86a5e6` | `src/transcript.rs` (no GPUI or I/O): applies the protocol's `MessageAppended`, `MessageDelta`, `MessageComplete`, `MessagesEdited`, `DeltasDropped` and `StreamRestarted` to a decoded snapshot. The first delta starts a provisional row with an id outside the persisted sequence range; canonical assistant text replaces it. Tools/notes can arrive during it. Foreign Sessions are ignored, exact duplicates do not erase a newer partial answer, invalid/misordered text or a conflicting live Run requests reload instead of being combined. Edits, transcript-scoped/legacy/global gap warnings and restarts latch an explicit reload-needed state until a new snapshot. Snapshot decoding now validates each message's Session and retains the highest sequence even for hidden tool-only turns. Still not wired to the shell or a transport; snapshot/event generation ordering and Run lifecycle handling remain future client work. | 14 event-model, 2 reply-model; independent read-only review |
+| Width-checked full output and source invalidation | This slice | `full_view::measured_row_starts` checks the actual shaped advance of each candidate, then shortens on grapheme boundaries; an ASCII count is only a hint. Each measurement is at most 8 KiB/256 graphemes, uses a separate short-lived GPUI text system (64 queries per batch), and has a 128-entry borrowed-key fit memo, so the window's frame cache does not retain a layout of the whole transcript. An oversized/too-wide indivisible character gets an explanation and Copy all instead of silent clipping. Exact pixel width/full font changes reindex the view. A new snapshot or Session invalidates it, so old offsets cannot slice shorter or different UTF-8 text, even at the same id and byte length. The summary is a bounded, focusable scroll region above pinned buttons, after a 480x360/200% test exposed overflow before and after copying. Retained offsets are boxed, with no spare vector capacity. | 6 model, 4 shell; 2 real-font states added and compiled, not run |
 
 One deliberate behaviour change came with the registry: while an input
 method is composing in the composer, Send/Steer/Queue are unavailable
@@ -50,6 +51,31 @@ session was interrupted and is not counted as a full pass. No foreground
 window, daemon, transport or network was used. No OS/session restriction
 was bypassed to try to reach the renderer.
 
+Full-output follow-up evidence (local, git-ignored):
+`.screenshots/gpui-1753-phase0/p1-sol-viewer-run2/`. The final offline
+checks passed: fmt, the four clippy configurations, GUI-free model tests
+(112), feature-enabled model tests (117), shell tests (88), Python checker
+tests (8), and doc tests. The width model
+reproduces the character-count failure with double-width CJK/emoji, and
+covers graphemes, tabs, bidi, CRLF/bare CR, nonmonotonic shaped prefixes,
+tiny widths, oversized clusters and a heterogeneous 5 MiB line. The shell
+checks shorter/same-byte-length snapshot replacement, foreign snapshots,
+exact copy of the new revision, font changes at a fixed viewport, error
+copy/close, and 480x360 at 200% before and after copying, with keyboard
+access to the scrollable summary and controls. `p1-sol-viewer-run1/` is
+kept as failed: the copied-state notice pushed a button outside the window;
+that regression was fixed before run 2. Independent
+read-only review found no blocking issue.
+
+**Real-font pixels remain unverified.** No renderer retry was made after
+the pasteboard/XPC startup failure above, and no OS/session restriction was
+bypassed. The two new native render states exercise mixed CJK/emoji/Thai,
+combining marks, bidi, tabs and CRLF at wide/100% and minimum/200%, checking
+visible-row advances and start/end reachability and saving captures when
+the renderer works. Clippy compiles these states but does not run them.
+This is not a claim about glyph ink overhang, real-font startup cost or
+Phase 0 acceptance; those still need the native runtime and visual review.
+
 ## Not done, and what each needs
 
 ### Phase 0 gates (still open; nothing in Phase 1 closes them)
@@ -75,21 +101,18 @@ was bypassed to try to reach the renderer.
 | Transcript paging | Not possible without a protocol change | Daemon work outside this epic (§5.3) |
 | Destinations other than Chat (Sessions, Tools, Metrics, Proposals, Settings, Search) | Scaffold notices only | The client layer for real data; UI-only versions possible over fixtures |
 | Approvals, questions, credentials, setup | Not examined, by instruction | Explicit scope from the user |
-| Full-output view of a long block (§12.1) | Done (above); not in the command palette (it needs a target block), and no real-font render state covers it yet | Nothing |
+| Full-output view of a long block (§12.1) | Done (above), now width-checked and source-invalidated; not in the command palette (it needs a target block). Real-font render states exist but remain unrun | Native offscreen runtime; visual review |
 | Thai line breaking wired in (§11.6, §5.1) | Study only | Decision §5.1 |
 | Live-region and accessible-text performance (§16.10) | Measured, not changed | Budgets |
 | Parity with the TUI (§6) | Inventory only | All of the above |
 
 ## Next slice
 
-**Full-output view with real fonts.** Add real-font offscreen render
-states at wide and narrow/200% sizes. In particular, check CJK, emoji,
-combining marks and long lines against the actual row width: the current
-viewer chooses a grapheme count from a monospace ASCII advance, which is
-not evidence that fallback glyphs of other widths fit without clipping.
-This is a suspected gap, not a verified failure yet.
+**UI-only Sessions and Search destinations over the fixture.** No transport,
+backend writes, auth or security-control changes. In parallel, the
+full-output view's new real-font states need a working native runtime;
+the existing pasteboard/XPC restriction must not be bypassed to run them.
 
-After that: UI-only Sessions and Search destinations over the fixture.
 The transcript model still needs a shell/client boundary that displays its
 reload-needed state and reconciles request generations before a transport
-is connected. No Phase 0 acceptance gate is closed by the pure model.
+is connected. No Phase 0 acceptance gate is closed by these model/UI slices.
