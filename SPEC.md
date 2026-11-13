@@ -1205,7 +1205,12 @@ pasting paths.
   The web composer has a 📎 file picker and accepts pasted images.
 - **`@` mentions:** typing `@` in the input opens a completion popup of
   files under the client's working directory (TUI) or the daemon's (web),
-  fuzzy-matched on the path. `ListFiles {root?, query, limit?}` walks the
+  fuzzy-matched on the path. Ranking prepares the full and basename queries
+  once, folds each path once, and scores its basename from a rebased folded
+  suffix without highlight allocation. Bounded selection keeps score-descending,
+  UTF-8-byte-length-ascending, path-ascending order and stable input order for
+  duplicate ties; directory completion and the Unicode fold stay unchanged.
+  `ListFiles {root?, query, limit?}` walks the
   root once and caches it for 30 s. The walk respects `.gitignore`, skips
   hidden directories and `target`, `node_modules`, `dist`, `build`,
   `__pycache__` and `venv`, and stops at 200,000 entries. Directory

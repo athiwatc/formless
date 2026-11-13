@@ -2,9 +2,10 @@
 //! respects `.gitignore`, skips hidden and build directories, and stops
 //! at `MAX_WALK` entries so huge trees stay responsive.
 
-use crate::fuzzy::fuzzy_match;
+use crate::fuzzy::{fold, PreparedQuery};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::{cmp::Ordering, collections::BinaryHeap};
 
 /// Most entries one walk collects.
 pub const MAX_WALK: usize = 200_000;
@@ -113,25 +114,74 @@ pub fn search<'a>(entries: &'a [FileEntry], query: &str, limit: usize) -> Vec<&'
         kids.truncate(limit);
         return kids;
     }
-    let base_query = query.rsplit('/').next().unwrap_or(query);
-    let mut scored: Vec<(i64, &FileEntry)> = entries
-        .iter()
-        .filter_map(|e| {
-            let (mut score, _) = fuzzy_match(query, &e.path)?;
-            let name = e.path.rsplit('/').next().unwrap_or(&e.path);
-            if let Some((s, _)) = fuzzy_match(base_query, name) {
-                score += 10 + s;
-            }
-            Some((score, e))
-        })
-        .collect();
-    scored.sort_by(|a, b| {
-        b.0.cmp(&a.0)
-            .then(a.1.path.len().cmp(&b.1.path.len()))
-            .then(a.1.path.cmp(&b.1.path))
-    });
-    scored.into_iter().take(limit).map(|(_, e)| e).collect()
+    if limit == 0 {
+        return Vec::new();
+    }
+    let full_query = PreparedQuery::new(query);
+    let base_query = PreparedQuery::new(query.rsplit('/').next().unwrap_or(query));
+    let mut selected = BinaryHeap::new();
+    let keep = limit.min(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        let folded = fold(&entry.path);
+        let Some(mut score) = full_query.score_folded(&folded) else {
+            continue;
+        };
+        // Fold is per source scalar. Original indices let a basename slice
+        // preserve dropped marks/expansions while scoring from its own start.
+        let name_start = entry
+            .path
+            .rsplit_once('/')
+            .map_or(0, |(prefix, _)| prefix.chars().count() + 1);
+        let folded_start = folded.partition_point(|(original, _)| *original < name_start);
+        if let Some(name_score) = base_query.score_folded(&folded[folded_start..]) {
+            score += 10 + name_score;
+        }
+        let ranked = Ranked {
+            score,
+            index,
+            entry,
+        };
+        if selected.len() < keep {
+            selected.push(ranked);
+        } else if selected.peek().is_some_and(|worst| ranked < *worst) {
+            *selected.peek_mut().expect("nonempty bounded selection") = ranked;
+        }
+    }
+    selected
+        .into_sorted_vec()
+        .into_iter()
+        .map(|ranked| ranked.entry)
+        .collect()
 }
+
+/// Greater means worse, so the heap exposes the entry to evict. Input index
+/// reproduces stable sorting even when duplicate paths carry different data.
+struct Ranked<'a> {
+    score: i64,
+    index: usize,
+    entry: &'a FileEntry,
+}
+impl Ord for Ranked<'_> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .score
+            .cmp(&self.score)
+            .then(self.entry.path.len().cmp(&other.entry.path.len()))
+            .then(self.entry.path.cmp(&other.entry.path))
+            .then(self.index.cmp(&other.index))
+    }
+}
+impl PartialOrd for Ranked<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl PartialEq for Ranked<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+impl Eq for Ranked<'_> {}
 
 /// `@path` mentions in a message: an `@` at the start or after whitespace,
 /// followed by a non-empty path (trailing punctuation dropped).
