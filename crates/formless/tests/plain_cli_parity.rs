@@ -63,6 +63,7 @@ impl Fixture {
                 while reader.read_line(&mut line).unwrap_or(0) > 0 {
                     let envelope: RequestEnvelope = serde_json::from_str(&line).unwrap();
                     let result = match &envelope.request {
+                        Request::ListTools => tool_filter_rows(),
                         Request::ListSessions => json!([
                             {"id":"abc-one","name":"First","created_at":"","updated_at":""},
                             {"id":"abc-two","name":"Second","created_at":"","updated_at":""}
@@ -145,6 +146,96 @@ impl Fixture {
             stderr: err.join().unwrap(),
         }
     }
+}
+
+fn tool_filter_rows() -> Value {
+    serde_json::from_str(include_str!("fixtures/tool-filter-list.json")).unwrap()
+}
+
+#[test]
+fn shipped_tool_filters_keep_default_pipe_bytes_and_apply_the_same_json_selection() {
+    let fixture = Fixture::new();
+    let default = fixture.run(&["tools", "list"]);
+    assert!(
+        default.status.success(),
+        "{}",
+        String::from_utf8_lossy(&default.stderr)
+    );
+    assert_eq!(
+        default.stdout,
+        include_bytes!("fixtures/tool-list-default.txt")
+    );
+    let pinned = fixture.run(&["tools", "list", "--show-pinned"]);
+    assert!(pinned.status.success());
+    let text = String::from_utf8(pinned.stdout).unwrap();
+    assert!(text.contains("PINNED") && text.contains("yes") && text.contains("no"));
+    for (flags, expected) in [
+        (
+            vec!["--filter", "not-retired"],
+            vec!["Alpha", "Beta", "Delta"],
+        ),
+        (vec!["--filter", "failing"], vec!["Beta", "Gamma"]),
+        (
+            vec!["--filter", "pinned", "--tag", "#WORK"],
+            vec!["Alpha", "Gamma"],
+        ),
+        (vec!["--filter", "off", "--tag", "work"], vec![]),
+    ] {
+        for json in [false, true] {
+            fixture.requests.lock().unwrap().clear();
+            let mut args = vec!["tools", "list"];
+            args.extend(flags.iter().copied());
+            if json {
+                args.push("--json");
+            }
+            let out = fixture.run(&args);
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            if json {
+                let rows: Value = serde_json::from_slice(&out.stdout).unwrap();
+                assert_eq!(
+                    rows.as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|row| row["name"].as_str().unwrap())
+                        .collect::<Vec<_>>(),
+                    expected
+                );
+                for row in rows.as_array().unwrap() {
+                    let original: formless_protocol::ToolInfo = serde_json::from_value(
+                        tool_filter_rows()
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .find(|old| old["id"] == row["id"])
+                            .unwrap()
+                            .clone(),
+                    )
+                    .unwrap();
+                    assert_eq!(row, &serde_json::to_value(original).unwrap());
+                }
+            } else {
+                let text = String::from_utf8(out.stdout).unwrap();
+                if expected.is_empty() {
+                    assert!(text.contains("No Tools match --filter off and --tag \"work\""));
+                    assert!(!text.contains("no tools yet"));
+                }
+                for name in ["Alpha", "Beta", "Gamma", "Delta"] {
+                    assert_eq!(text.contains(name), expected.contains(&name), "{text}");
+                }
+            }
+            assert!(matches!(
+                &fixture.requests.lock().unwrap()[..],
+                [Request::ListTools]
+            ));
+        }
+    }
+    let invalid = fixture.run(&["tools", "list", "--filter", "active"]);
+    assert_eq!(invalid.status.code(), Some(2));
+    assert!(invalid.stdout.is_empty());
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
