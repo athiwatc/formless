@@ -1879,7 +1879,16 @@ impl Store {
         // FTS5 (bm25, then newest): every word as a prefix term. A query
         // with no word characters falls back to a substring scan.
         let fts = fts_query(query);
-        let sql = if fts.is_some() {
+        let phrase = identifier_prefix_phrase(query);
+        let sql = if phrase.is_some() {
+            "SELECT m.session_id, s.name, m.id, m.seq, m.role, m.content, m.created_at \
+             FROM messages_fts f JOIN messages m ON m.rowid = f.rowid \
+             JOIN sessions s ON s.id = m.session_id AND s.deleted_at IS NULL \
+             WHERE messages_fts MATCH ?1 \
+             ORDER BY CASE WHEN m.rowid IN \
+               (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?3) \
+               THEN 0 ELSE 1 END, bm25(messages_fts), m.created_at DESC, m.rowid DESC LIMIT ?2"
+        } else if fts.is_some() {
             "SELECT m.session_id, s.name, m.id, m.seq, m.role, m.content, m.created_at \
              FROM messages_fts f JOIN messages m ON m.rowid = f.rowid \
              JOIN sessions s ON s.id = m.session_id AND s.deleted_at IS NULL \
@@ -1893,7 +1902,11 @@ impl Store {
         };
         let mut stmt = self.ps(sql)?;
         let arg = fts.unwrap_or_else(|| query.to_string());
-        let rows = stmt.query_map(params![arg, limit], |r| {
+        let mut args = vec![rusqlite::types::Value::from(arg), limit.into()];
+        if let Some(phrase) = phrase {
+            args.push(phrase.into());
+        }
+        let rows = stmt.query_map(rusqlite::params_from_iter(args), |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
@@ -7020,6 +7033,24 @@ pub fn provider_message(m: &MessageInfo) -> Value {
         msg["thinking_blocks"] = meta["thinking_blocks"].clone();
     }
     msg
+}
+
+/// An adjacency tier only for supported separator-joined identifiers.
+/// Every segment remains a prefix, including non-final segments. This asks
+/// for adjacent indexed tokens, not literal punctuation or identifier equality.
+fn identifier_prefix_phrase(text: &str) -> Option<String> {
+    let separator = |c| matches!(c, '_' | '.' | '-' | '/');
+    if !text.chars().any(separator)
+        || text.chars().any(|c| {
+            !c.is_alphanumeric()
+                && !unicode_normalization::char::is_combining_mark(c)
+                && !separator(c)
+        })
+    {
+        return None;
+    }
+    let terms = fts_query(text)?;
+    terms.contains(' ').then(|| terms.replace(' ', " + "))
 }
 
 /// An FTS5 query from free text: each word quoted as a prefix term, all
