@@ -18,6 +18,7 @@ mod links;
 mod lists;
 mod markdown;
 mod mermaid;
+mod metrics_tools;
 mod notify;
 mod picker;
 pub mod plain;
@@ -497,6 +498,7 @@ enum Click {
     /// A row of the Sessions, Tools or Proposals list (visible index).
     Session(usize),
     Tool(usize),
+    MetricsTool(String),
     Proposal(usize),
     /// A persisted tool call's header in the chat.
     Call(String),
@@ -1659,6 +1661,7 @@ struct App {
     /// The Proposal shown in the pager for review (`a`/`r` decide).
     reviewing: Option<String>,
     metrics_range: usize,
+    metrics_tools: std::cell::RefCell<metrics_tools::State>,
     range_tools: HashMap<String, (i64, Option<f64>)>,
     /// Token use in the range: breakdown (`USAGE_BY`) and its rows.
     usage_by: usize,
@@ -2023,6 +2026,7 @@ impl App {
             tool_filter: lists::ListFilter::default(),
             tool_detail: None,
             metrics_range: 0,
+            metrics_tools: Default::default(),
             reviewing: None,
             usage_by: 0,
             usage_rows: Vec::new(),
@@ -9683,7 +9687,12 @@ impl App {
                 _ => {}
             },
             View::Metrics => {
-                if key.code == KeyCode::Char('r') {
+                if key.code == KeyCode::Enter {
+                    let rows = self.metrics_rows();
+                    if let Some(index) = self.metrics_selection(&rows) {
+                        self.request_tool(rows[index].id.clone());
+                    }
+                } else if key.code == KeyCode::Char('r') {
                     self.metrics_range = (self.metrics_range + 1) % METRIC_RANGES.len();
                     self.load_metrics();
                 } else if key.code == KeyCode::Char('b') {
@@ -10459,9 +10468,15 @@ impl App {
     /// Vim-style movement in every list view (SPEC §10.5): j/k, g/G (or
     /// Home/End) and Ctrl+D/Ctrl+U by half a page; true when used.
     fn list_nav_key(&mut self, key: &KeyEvent) -> bool {
+        let metrics = (self.view == View::Metrics).then(|| self.metrics_rows());
+        let mut metrics_index = metrics
+            .as_ref()
+            .and_then(|rows| self.metrics_selection(rows))
+            .unwrap_or(0);
         let len = match self.view {
             View::Sessions => self.visible_sessions().len(),
-            View::Tools | View::Metrics => self.visible_tools().len(),
+            View::Tools => self.visible_tools().len(),
+            View::Metrics => metrics.as_ref().unwrap().len(),
             View::Proposals => self.visible_proposals().len(),
             _ => return false,
         };
@@ -10469,6 +10484,7 @@ impl App {
         let idx = match self.view {
             View::Sessions => &mut self.session_idx,
             View::Proposals => &mut self.proposal_idx,
+            View::Metrics => &mut metrics_index,
             _ => &mut self.tool_idx,
         };
         let last = len.saturating_sub(1);
@@ -10485,6 +10501,9 @@ impl App {
             KeyCode::Up if self.view == View::Metrics => idx.saturating_sub(1),
             _ => return false,
         };
+        if let Some(rows) = metrics {
+            self.select_metrics_row(&rows, metrics_index);
+        }
         true
     }
 
@@ -13807,6 +13826,15 @@ impl App {
                     self.key(enter);
                 }
             }
+            Click::MetricsTool(id) => {
+                let rows = self.metrics_rows();
+                if let Some(index) = rows.iter().position(|tool| tool.id == id) {
+                    self.select_metrics_row(&rows, index);
+                    if double {
+                        self.key(enter);
+                    }
+                }
+            }
             Click::Proposal(i) => self.proposal_idx = i,
             Click::Call(id) => {
                 if !self.expanded_calls.remove(&id) {
@@ -16323,7 +16351,13 @@ fn table_header(cols: &[&'static str], color: bool) -> Row<'static> {
 }
 
 fn draw_metrics(f: &mut Frame, area: Rect, app: &App) {
-    let detail_h = if app.tool_detail.is_some() { 5 } else { 0 };
+    let tools = app.metrics_rows();
+    let selected = app.metrics_selection(&tools);
+    let detail = app
+        .tool_detail
+        .as_ref()
+        .filter(|detail| selected.is_some_and(|index| tools[index].id == detail.tool.id));
+    let detail_h = if tools.is_empty() { 0 } else { 5 };
     let routing_h = if app.model_stats.is_empty() {
         0
     } else {
@@ -16418,24 +16452,7 @@ fn draw_metrics(f: &mut Frame, area: Rect, app: &App) {
             parts[4],
         );
     }
-    // In a range, each Tool's calls and success rate within it.
-    let ranged = !app.metrics_range.is_multiple_of(METRIC_RANGES.len());
-    let tools: Vec<ToolInfo> = app
-        .tools
-        .iter()
-        .map(|t| {
-            let mut t = t.clone();
-            if ranged {
-                let (n, rate) = app.range_tools.get(&t.id).copied().unwrap_or((0, None));
-                t.invocations = n;
-                t.success_rate = rate;
-            }
-            t
-        })
-        .collect();
-    let mut sorted: Vec<&ToolInfo> = tools.iter().collect();
-    sorted.sort_by_key(|t| std::cmp::Reverse(t.invocations));
-    let rows: Vec<Row> = sorted
+    let rows: Vec<Row> = tools
         .iter()
         .map(|t| {
             let mut row_cells = tool_cells(t, app.color);
@@ -16469,7 +16486,8 @@ fn draw_metrics(f: &mut Frame, area: Rect, app: &App) {
             parts[0],
         );
     } else {
-        f.render_widget(
+        let mut state = app.metrics_tools.borrow_mut();
+        f.render_stateful_widget(
             Table::new(
                 rows,
                 [
@@ -16485,11 +16503,29 @@ fn draw_metrics(f: &mut Frame, area: Rect, app: &App) {
                 app.color,
             ))
             .column_spacing(2)
+            .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+            .highlight_symbol("› ")
             .block(block),
             parts[0],
+            &mut state.table,
         );
+        let offset = state.table.offset();
+        drop(state);
+        let height = parts[0].height.saturating_sub(3) as usize;
+        for (index, tool) in tools.iter().enumerate().skip(offset).take(height) {
+            clickable(
+                app,
+                Rect::new(
+                    parts[0].x + 1,
+                    parts[0].y + 2 + (index - offset) as u16,
+                    parts[0].width.saturating_sub(2),
+                    1,
+                ),
+                Click::MetricsTool(tool.id.clone()),
+            );
+        }
     }
-    if let Some(d) = &app.tool_detail {
+    if let Some(d) = detail {
         let m = &d.metrics;
         let pct = |r: Option<f64>| {
             r.map(|r| format!("{:.1}%", r * 100.0))
@@ -16538,13 +16574,23 @@ fn draw_metrics(f: &mut Frame, area: Rect, app: &App) {
         f.render_widget(
             Paragraph::new(lines).block(ui::panel(
                 if d.tool.title.is_empty() {
-                    format!(" {} ", d.tool.name)
+                    format!(" {} · all time ", d.tool.name)
                 } else {
-                    format!(" {} · {} ", d.tool.title, d.tool.name)
+                    format!(" {} · {} · all time ", d.tool.title, d.tool.name)
                 },
                 app.color,
                 Color::Yellow,
             )),
+            parts[1],
+        );
+    } else if let Some(index) = selected {
+        f.render_widget(
+            Paragraph::new(format!(
+                "Enter loads detail for {} (all time).",
+                tools[index].name
+            ))
+            .wrap(Wrap { trim: false })
+            .block(ui::panel(" Tool detail ", app.color, Color::Yellow)),
             parts[1],
         );
     }
@@ -18615,6 +18661,7 @@ mod tests {
             tool_filter: lists::ListFilter::default(),
             tool_detail: None,
             metrics_range: 0,
+            metrics_tools: Default::default(),
             reviewing: None,
             usage_by: 0,
             usage_rows: Vec::new(),
@@ -23477,19 +23524,27 @@ mod tests {
                 author: "agent".into(),
             })
             .collect();
+        let selected = |app: &App| {
+            if app.view == View::Metrics {
+                let rows = app.metrics_rows();
+                rows[app.metrics_selection(&rows).unwrap()].name.clone()
+            } else {
+                app.selected_tool().unwrap().name.clone()
+            }
+        };
         for view in [View::Tools, View::Metrics] {
             app.view = view;
             app.tool_idx = 0;
             app.key(key(KeyCode::Char('j')));
             app.key(key(KeyCode::Char('j')));
             app.key(key(KeyCode::Char('k')));
-            assert_eq!(app.selected_tool().unwrap().name, "t01", "{view:?}");
+            assert_eq!(selected(&app), "t01", "{view:?}");
             app.key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
-            assert_eq!(app.selected_tool().unwrap().name, "t11");
+            assert_eq!(selected(&app), "t11");
             app.key(key(KeyCode::Char('G')));
-            assert_eq!(app.selected_tool().unwrap().name, "t29");
+            assert_eq!(selected(&app), "t29");
             app.key(key(KeyCode::Char('g')));
-            assert_eq!(app.selected_tool().unwrap().name, "t00");
+            assert_eq!(selected(&app), "t00");
         }
         // In Proposals, g is "top" now; n generates.
         app.view = View::Proposals;
