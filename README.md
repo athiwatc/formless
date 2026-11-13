@@ -651,7 +651,7 @@ The table covers every visible root command, including Clap's generated
 | `formless tui` | No action | Launch the full-screen terminal client; also the default with no command. |
 | `formless uninstall` | `--keep-data`, `--keep-binary`, `--yes` (alias `--force`) | Remove Formless, optionally retaining data or the binary. |
 | `formless usage` | `--by GROUP`, `--since DURATION`, `--json` | Read full-range grouped tokens and currently computed cost estimates. |
-| `formless update` | No action, `check`, or `--check` | Show newer release notes and the applicable upgrade command; never rewrite the binary. |
+| `formless update` | No action, `check`, or `--check`; `--json` | Show newer release notes and the applicable upgrade command; never rewrite the binary. |
 | `formless web` | `--port`, `--no-open`, `--stop` | Open, print a link for, or stop the local browser UI. |
 
 `formless sessions list --pinned --tag WORK --json` selects active pinned Sessions
@@ -767,6 +767,16 @@ the **entire** stored tag list, and `--clear` explicitly replaces it with an emp
 list (conflicting with positional tags). Tags reach storage unchanged for its
 existing normalization; confirmation shows returned stored values. These three
 actions accept `--json` for the selected/returned Session object.
+
+`update --json`, `update check --json`, and `update --check --json` emit one
+object: `{installed, status, newer_releases: [{tag, url, notes}]}`. Notes retain
+the existing trimmed body and oldest-first order; `installed` has no `v` prefix.
+`update_available` means the fetched page contains newer stable releases;
+`up_to_date` means none in that single 50-release response, without pagination.
+`release_check_unavailable` maps to the existing typed HTTP 404 response,
+not verified absence of releases. Completed checks exit 0; other fetch
+or JSON parse failures remain errors with no success JSON. Human output stays
+unchanged, and the JSON form never runs an updater.
 
 #### Root and global flags
 
