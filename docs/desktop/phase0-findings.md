@@ -209,8 +209,8 @@ typical developer build.
 | Command | Result |
 |---|---|
 | `cargo test --no-default-features --lib --locked` | 61 passed (model, memory, timeline and fixture); no GPUI crate in its dependency graph |
-| `cargo test --features test-support --locked` | 61 passed, 66 passed (headless shell), 19 offscreen render states passed (37 captures) |
-| `cargo test --features test-support,thai-breaks --locked` | 66 passed, 66 passed, 19 render states and the real-text Thai measurement passed |
+| `cargo test --features test-support --locked` | 61 passed, 67 passed (headless shell), 19 offscreen render states passed (37 captures) |
+| `cargo test --features test-support,thai-breaks --locked` | 66 passed, 67 passed, 19 render states and the real-text Thai measurement passed |
 | `cargo fmt --check`, `cargo clippy --all-targets --locked` with and without `thai-breaks` | clean |
 
 These are the counts at the last code commit (§12). The first checkpoint
@@ -1401,7 +1401,8 @@ offscreen captures.
   and a refusal notice are in the tree and are not pushed. (Partly
   addressed in §16.7, unobserved.)
 - **The page behind a dialog** is still in the tree. (The dialogs are
-  modal since §16.7; the page is still there.)
+  modal since §16.7, and the page is out of the tree while one is open
+  since §16.8.)
 - **Windows and Linux.** Not run.
 
 Next checks, in order of use: a person with VoiceOver reading the window
@@ -1463,6 +1464,43 @@ Neither flag shows in the kit's test tree, so no headless test covers
 them. The modal flag is covered by the real-window before-and-after walk
 (`macos-real-window/dialogs-before/` and `dialogs-after/`); the live flag
 by nothing but the source.
+
+### 16.8 The page out of the tree while a dialog is open
+
+Local commit `e0a131d`. Asked for by independent review of `37d43a2`.
+
+**How.** AccessKit has a hidden flag. It is inherited by every
+descendant, and AccessKit's shared filter, which every platform adapter
+uses, leaves a hidden subtree out of what it exposes unless the node holds
+focus. The pinned GPUI has no setter for it, so, like the modal flag, it
+is set on the node GPUI builds. While a Sessions or Context dialog is open
+it is set on every other part of the window: the header (now a banner
+landmark, so its controls have one node to carry it), a docked panel
+beside the other panel's dialog, the main region, the composer where it is
+its own page part (now a group named "Composer"), and the status line.
+Layout, painting, pointer and keyboard handling do not depend on it.
+
+**Checked in real windows**, before (`2045368`) and after (`e0a131d`),
+each dialog opened and closed by its shortcut and Escape as synthetic key
+events, every distinct state of the in-process platform walk kept
+(`macos-real-window/inert-*`):
+
+| Window | Before, dialog open | After, dialog open | After, closed again |
+|---|---|---|---|
+| 480 x 360 at 200%, Sessions | The page's 10 parts beside the dialog | Only the dialog: modal, focused, contents intact | Header, conversation, composer, status line back; focus in Message |
+| 480 x 360 at 200%, Context | The same | Only the dialog | The same |
+| 1100 x 900, Context beside the docked sidebar | The page's parts and the docked sidebar beside the dialog | Only the dialog | Header, docked sidebar, conversation, status line back; focus in Message |
+
+**Headless.** The kit's test tree does not show the hidden flag. The new
+test checks the shell's own account of when it is set (exactly while a
+dialog is open, in both layouts, for both dialogs, through Escape and
+through the header's toggle with the pointer), that the parts carrying it
+have their own nodes, that focus and the draft are restored, and that the
+docked panel behind the dialog is still laid out. 67 shell tests.
+
+**Not known.** Whether VoiceOver keeps to the dialog now that nothing else
+is offered, and what it says when the dialog closes and the page comes
+back. No screen reader ran.
 
 ## 17. Windows: no first frame from `--smoke`
 
