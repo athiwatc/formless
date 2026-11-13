@@ -23,7 +23,7 @@ def expose(route):
     end = source.rfind('\n})();')
     assert end > 0
     hook = '''
-    window.__sidebar={S,renderChrome,openSidebar,closeSidebar,setView,COMMANDS};
+    window.__sidebar={S,renderChrome,openSidebar,closeSidebar,setView,COMMANDS,modal,h};
     act=async()=>[];request=async()=>[];
     '''
     route.fulfill(status=200, content_type='text/javascript', body=source[:end] + hook + source[end:])
@@ -59,6 +59,15 @@ try:
             state(page, False)
             page.locator('#menu-btn').focus()
             page.keyboard.press('Enter')
+            state(page, True, 'new-session')
+            # Modal inertness does not change the expanded drawer's CSS visibility.
+            page.evaluate('()=>{__sidebar.modal("Drawer regression",__sidebar.h("p",null,"Fixture"));}')
+            assert page.locator('#app').evaluate('e=>e.inert')
+            page.evaluate('window.dispatchEvent(new Event("offline"))')
+            assert page.locator('#menu-btn').get_attribute('aria-expanded') == 'true'
+            assert page.locator('#sidebar').is_visible()
+            assert page.evaluate('document.activeElement.closest(".backdrop")!==null')
+            page.keyboard.press('Escape')
             state(page, True, 'new-session')
             # A nonmodal drawer permits intentional focus outside itself.
             page.locator('#input').focus()

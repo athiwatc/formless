@@ -6171,11 +6171,12 @@
   let sidebarLastFocus = null;
   function syncSidebar() {
     const sidebar = $("sidebar"), menu = $("menu-btn");
-    const visible = focusVisible(sidebar);
+    const visible = !!(sidebar.getClientRects().length
+      && !sidebar.closest(".hidden, [hidden]") && getComputedStyle(sidebar).visibility !== "hidden");
     menu.setAttribute("aria-expanded", String(visible));
     const focused = document.activeElement;
     const previous = focused === document.body ? sidebarLastFocus : focused;
-    if (!visible && sidebar.contains(previous)) focusReturn(menu);
+    if (!focusVisible(sidebar) && sidebar.contains(previous)) focusReturn(menu);
     else if (!focusVisible(menu) && previous === menu) focusReturn(visible ? $("new-session") : null);
   }
   function setSidebar(open, { focus = false } = {}) {
