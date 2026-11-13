@@ -26,7 +26,7 @@ snapshot() {
     if $ci_duplicate; then continue; fi
     ci_seen+=("$ci_physical")
     printf 'storage %s: ' "${ci_labels[$ci_index]}"
-    du -sk "$ci_path"
+    du -sk "$ci_physical"
   done
 }
 
