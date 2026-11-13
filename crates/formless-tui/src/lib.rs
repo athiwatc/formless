@@ -10877,6 +10877,7 @@ impl App {
     /// Scroll to the previous/next user message (SPEC §10.2); past the
     /// last one, follow the live bottom again.
     fn jump_user_message(&mut self, forward: bool) {
+        self.search_jump = None;
         let max_top = self.chat_line_count.saturating_sub(self.chat_view_height);
         let top = self.chat_scroll_top.unwrap_or(max_top);
         let target = if forward {
@@ -11255,7 +11256,10 @@ impl App {
             KeyCode::Down if ctrl => self.jump_user_message(true),
             KeyCode::Char('{') if empty => self.jump_user_message(false),
             KeyCode::Char('}') if empty => self.jump_user_message(true),
-            KeyCode::Home if empty => self.chat_scroll_top = Some(0),
+            KeyCode::Home if empty => {
+                self.search_jump = None;
+                self.chat_scroll_top = Some(0);
+            }
             KeyCode::PageUp => self.scroll_chat_up(page),
             KeyCode::PageDown => self.scroll_chat_down(page),
             KeyCode::Up if !self.input.on_first_line() => self.input.vertical(false),

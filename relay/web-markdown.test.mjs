@@ -110,3 +110,48 @@ test('math and fence state follow parser precedence and closing-length rules', (
   const languageLikeClose='```js\ncode\n```js\n\nnot closed';
   assert.equal(c.splitStreaming(languageLikeClose)[0],'');
 });
+
+test('table recognition shares logical header and delimiter cell counts with lookahead', () => {
+  const c=fixture();
+  for(const source of ['A | B\n---','| a | b |\n|---|','a | b\n--- | --- | ---','a | b\n---\\|---']) {
+    c.caseLines=source.split('\n');
+    assert.equal(vm.runInContext('tableStart(caseLines,0)',c),false,source);
+    assert.equal(vm.runInContext('startsBlock(caseLines,0)',c),false,source);
+    assert.equal(all(c.markdown(source)).some(n=>n.tag==='table'),false,source);
+    const following=c.markdown('Leading paragraph\n'+source);
+    assert.equal(all(following).some(n=>n.tag==='table'),false,source);
+    assert.ok(plain(following.children[0]).includes('Leading paragraph'));
+    assert.ok(plain(following.children[0]).includes(source.split('\n')[0]),'lookahead must not split at a rejected table');
+  }
+});
+
+test('valid tables keep edge pipes, escaped header pipes, alignment and body padding', () => {
+  const c=fixture();
+  for(const [header,delimiter] of [
+    ['a | b','--- | :---:'],['| a | b |','|:---|---:|'],
+    ['a\\|b | c','--- | ---'],['| a\\|b | c |','|---|---|'],
+  ]) {
+    c.caseLines=[header,delimiter];
+    assert.equal(vm.runInContext('tableStart(caseLines,0)',c),true);
+    assert.equal(vm.runInContext('startsBlock(caseLines,0)',c),true);
+    const root=c.markdown(header+'\n'+delimiter+'\none |\nleft | right | extra');
+    const table=all(root).find(n=>n.tag==='table');assert.ok(table);
+    const rows=all(table).filter(n=>n.tag==='tbody')[0].children;
+    assert.equal(rows[0].children.length,2);assert.equal(plain(rows[0].children[1]),'');
+    assert.equal(rows[1].children.length,2);assert.equal(plain(rows[1]),'leftright');
+  }
+});
+
+test('streamed table prefixes use the same predicate and completed block shapes', () => {
+  const c=fixture();
+  for(const source of ['A | B\n---','A | B\n--- | ---\na | b','a\\|b | c\n--- | ---']) {
+    for(let end=0;end<=source.length;end++) {
+      const prefix=source.slice(0,end);c.caseLines=prefix.split('\n');
+      const recognized=vm.runInContext('tableStart(caseLines,0)',c);
+      assert.equal(all(c.markdown(prefix)).some(n=>n.tag==='table'),recognized,prefix);
+    }
+    const text='Earlier paragraph\n\n'+source+'\n\nFinal paragraph';
+    const [stable,tail]=c.splitStreaming(text);
+    assert.deepEqual([...c.markdown(stable).children,...c.markdown(tail).children].map(shape),c.markdown(text).children.map(shape));
+  }
+});
