@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Offline process checks for eval argument validation; never call a provider."""
 import os
+import signal
+import time
+import shutil
 from pathlib import Path
 import subprocess
 import tempfile
@@ -95,6 +98,75 @@ fi
         result, _ = self.run_eval({"RUNS": "1", "EVAL_MODE": "no_tools"}, expect_valid=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("0/4 Runs used find_tools/create_tool (0%); failed 0/4 attempted", result.stdout)
+
+
+class EvalCleanup(unittest.TestCase):
+    def fixture(self, root, mode):
+        binary = root / "formless"
+        binary.write_text("""#!/usr/bin/env python3
+import os, pathlib, subprocess, sys, time
+root = pathlib.Path(os.environ["EVAL_ROOT"])
+data = pathlib.Path(os.environ["FORMLESS_DATA_DIR"])
+if sys.argv[1] == "run":
+    (root / "profile").write_text(str(data))
+    (data / "daemon.lock").touch()
+    (data / "daemon.sock").touch()
+    if os.environ["EVAL_MODE"] == "signal":
+        time.sleep(60)
+    print('{"type":"run_finished","status":"completed"}')
+else:
+    with (root / "stops").open("a") as f: f.write("stop\\n")
+    if os.environ["EVAL_MODE"] != "stuck":
+        subprocess.Popen([sys.executable, "-c", 'import pathlib,sys,time; time.sleep(0.15); p=pathlib.Path(sys.argv[1]); (p/"daemon.lock").unlink(missing_ok=True); (p/"daemon.sock").unlink(missing_ok=True)', str(data)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+""")
+        binary.chmod(0o700)
+        return {**os.environ, "FORMLESS": str(binary), "FORMLESS_API_KEY": "offline",
+                "RUNS": "1", "NUDGE": "true", "EVAL_ROOT": str(root), "EVAL_MODE": mode}
+
+    def test_delayed_shutdown_is_awaited(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            started = time.monotonic()
+            result = subprocess.run([str(SCRIPT), "https://fixture.invalid", "fixture"],
+                                    env=self.fixture(root, "delay"), capture_output=True, text=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertGreater(time.monotonic() - started, 0.6)
+            self.assertEqual(len((root / "stops").read_text().splitlines()), 4)
+            self.assertFalse(Path((root / "profile").read_text()).parent.exists())
+
+    def test_successful_stop_without_endpoint_release_retains_profile(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            result = subprocess.run([str(SCRIPT), "https://fixture.invalid", "fixture"],
+                                    env=self.fixture(root, "stuck"), capture_output=True, text=True, timeout=20)
+            data = Path((root / "profile").read_text())
+            try:
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("shutdown unverified; retained", result.stderr)
+                self.assertTrue((data / "daemon.lock").exists())
+                self.assertEqual(len((root / "stops").read_text().splitlines()), 2)
+            finally:
+                shutil.rmtree(data.parent)
+
+    def test_sigterm_during_active_run_stops_daemon_and_removes_profile(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            process = subprocess.Popen([str(SCRIPT), "https://fixture.invalid", "fixture"],
+                                       env=self.fixture(root, "signal"), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            try:
+                deadline = time.monotonic() + 5
+                while not (root / "profile").exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue((root / "profile").exists())
+                process.send_signal(signal.SIGTERM)
+                _, stderr = process.communicate(timeout=5)
+                self.assertEqual(process.returncode, 143, stderr)
+                self.assertEqual((root / "stops").read_text().splitlines(), ["stop"])
+                self.assertFalse(Path((root / "profile").read_text()).parent.exists())
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.communicate()
 
 
 if __name__ == "__main__":
