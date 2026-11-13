@@ -209,6 +209,25 @@ fn readable(id: impl Into<ElementId>, text: impl Into<SharedString>) -> impl Int
         .child(text)
 }
 
+/// Mark an element's accessibility node as a polite live region: when its
+/// value changes, or it appears, the platform is asked to announce the new
+/// value without interrupting. The pinned GPUI has no setter for this, so it
+/// is set on the node itself after GPUI has built it.
+fn announced<E: StatefulInteractiveElement>(element: E) -> E {
+    element.a11y_synthetic_children(|builder| {
+        builder
+            .parent_node()
+            .set_live(gpui_kit::accesskit::Live::Polite)
+    })
+}
+
+/// Mark a dialog's accessibility node as modal, so assistive technology
+/// that honours it keeps to the dialog. The pinned GPUI has no setter for
+/// this either.
+fn modal_dialog<E: StatefulInteractiveElement>(element: E) -> E {
+    element.a11y_synthetic_children(|builder| builder.parent_node().set_modal())
+}
+
 /// A region's border colour: the focus ring while the region itself holds
 /// focus, its ordinary border otherwise.
 fn region_border(focused: bool, idle: Hsla, cx: &App) -> Hsla {
@@ -1390,7 +1409,9 @@ impl Shell {
                 Role::Navigation
             })
             .aria_label("Sessions")
-            .when(modal, |panel| panel.aria_description(MODAL_DESCRIPTION))
+            .when(modal, |panel| {
+                modal_dialog(panel.aria_description(MODAL_DESCRIPTION))
+            })
             .key_context(SESSION_LIST_CONTEXT)
             .on_action(cx.listener(|this, _: &SelectNextSession, _, cx| this.move_selection(1, cx)))
             .on_action(
@@ -1782,9 +1803,9 @@ impl Shell {
                     })
                     .w_full(),
             )
+            // A refusal or a change to the draft is announced as it appears.
             .children(self.composer_notice.clone().map(|notice| {
-                div()
-                    .id("composer-notice")
+                announced(div().id("composer-notice"))
                     .test_support()
                     .role(Role::Label)
                     .aria_value(notice.clone())
@@ -1867,7 +1888,9 @@ impl Shell {
                 Role::Complementary
             })
             .aria_label("Context")
-            .when(modal, |panel| panel.aria_description(MODAL_DESCRIPTION))
+            .when(modal, |panel| {
+                modal_dialog(panel.aria_description(MODAL_DESCRIPTION))
+            })
             .key_context(INSPECTOR_CONTEXT)
             .on_action(cx.listener(|this, _: &ScrollInspectorUp, _, cx| {
                 this.scroll_inspector(-1., false, cx)
@@ -1990,7 +2013,16 @@ impl Shell {
             "status-fixture",
             "Synthetic fixture: no Daemon Core connection",
         );
-        let intent = readable("status-intent", intent);
+        // What the last composer action did. It changes only when the user
+        // acts, so it is announced.
+        let intent = announced(
+            div()
+                .id("status-intent")
+                .test_support()
+                .role(Role::Label)
+                .aria_value(intent.clone())
+                .child(intent),
+        );
         let status = div()
             .id("status")
             .test_support()
