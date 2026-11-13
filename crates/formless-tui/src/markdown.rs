@@ -582,7 +582,7 @@ impl Renderer {
             .saturating_sub(2 + if numbers { num_w + 1 } else { 0 })
             .max(8);
         for (n, raw) in body.split('\n').enumerate() {
-            let raw = raw.replace('\t', "    ");
+            let raw = expand_code_tabs(raw);
             let spans = if let Some(h) = &mut hl {
                 h.line(&raw)
             } else {
@@ -992,6 +992,24 @@ fn truncate_spans(spans: Vec<Span<'static>>, max: usize) -> Vec<Span<'static>> {
     out
 }
 
+/// Ordinary code blocks use four-column tab stops measured from the code
+/// origin, before its border/gutter/prefix and before syntax highlighting.
+fn expand_code_tabs(raw: &str) -> String {
+    let mut output = String::with_capacity(raw.len());
+    let mut column = 0;
+    for cluster in raw.graphemes(true) {
+        if cluster == "\t" {
+            let spaces = 4 - column % 4;
+            output.extend(std::iter::repeat_n(' ', spaces));
+            column += spaces;
+        } else {
+            output.push_str(cluster);
+            column += cluster.width();
+        }
+    }
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1182,6 +1200,61 @@ mod tests {
         assert!(w[1] > w[2] && w.iter().sum::<usize>() <= 35, "{w:?}");
         let tiny = fit_widths(&[30, 30], 8);
         assert!(tiny.iter().all(|&x| x >= MIN_COL), "{tiny:?}");
+    }
+
+    #[test]
+    fn code_tabs_advance_to_four_display_column_stops() {
+        for (source, expected) in [
+            ("a\tb", "a   b"),
+            ("ab\tc", "ab  c"),
+            ("abc\td", "abc d"),
+            ("\t\tZ", "        Z"),
+            ("ab\t\tZ", "ab      Z"),
+            ("界\tZ", "界  Z"),
+            ("e\u{301}\tZ", "e\u{301}   Z"),
+            ("👩🏽‍💻\tZ", "👩🏽‍💻  Z"),
+            ("界界a\tZ", "界界a   Z"),
+            ("plain ไทย 👩🏽‍💻 e\u{301}", "plain ไทย 👩🏽‍💻 e\u{301}"),
+        ] {
+            assert_eq!(expand_code_tabs(source), expected);
+        }
+        let source = "```rust\nlet\tx = 1;\n```";
+        let original = source.to_string();
+        assert_eq!(
+            render(source, true, "", 80),
+            render("```rust\nlet x = 1;\n```", true, "", 80)
+        );
+        assert_eq!(source, original);
+        for numbers in [false, true] {
+            for (nested, prefix) in [(false, ""), (false, "  "), (true, "")] {
+                let md = if nested {
+                    "> - ```unknown\n>   a\tb\n>   界\tZ\n>   e\u{301}\tW\n>   ```"
+                } else {
+                    "```unknown\na\tb\n界\tZ\ne\u{301}\tW\n```"
+                };
+                set_line_numbers(numbers);
+                let out = render(md, true, prefix, 80);
+                set_line_numbers(false);
+                let lines: Vec<String> = out
+                    .iter()
+                    .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+                    .collect();
+                for (index, expected) in ["a   b", "界  Z", "e\u{301}   W"].into_iter().enumerate()
+                {
+                    let expected = if numbers {
+                        format!("{} {expected}", index + 1)
+                    } else {
+                        expected.into()
+                    };
+                    assert!(
+                        lines.iter().any(|line| line
+                            .rsplit_once("│ ")
+                            .is_some_and(|(_, body)| body == expected)),
+                        "{numbers}/{nested}/{prefix:?}: {lines:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
