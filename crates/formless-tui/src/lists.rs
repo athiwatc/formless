@@ -132,7 +132,9 @@ pub fn tools(tools: &[ToolInfo], f: &ListFilter) -> Vec<usize> {
             };
             // `#git` filters by tag; anything else also matches tags.
             let text = match f.query.trim().strip_prefix('#') {
-                Some(tag) => t.tags.iter().any(|g| g.starts_with(&tag.to_lowercase())),
+                Some(tag) => {
+                    tag.is_empty() || t.tags.iter().any(|g| g.starts_with(&tag.to_lowercase()))
+                }
                 None => f.hit(&[&t.name, &t.title, &t.description, &t.tags.join(" ")]),
             };
             quick && text
@@ -297,6 +299,60 @@ mod tests {
             recent: String::new(),
             author: "agent".into(),
         }
+    }
+
+    #[test]
+    fn bare_tool_tag_prefix_keeps_untagged_tools_under_every_quick_filter() {
+        let mut items = vec![
+            tool("plain", Some(0.7), 1, false),
+            tool("tagged", Some(0.9), 2, false),
+            tool("retired", None, 3, true),
+        ];
+        items[0].needs_attention = true;
+        items[1].tags = vec!["work".into()];
+        items[2].tags = vec!["workshop".into()];
+        for quick in 0..TOOL_QUICK.len() {
+            for sort in 0..TOOL_SORTS.len() {
+                let empty = ListFilter {
+                    quick,
+                    sort,
+                    ..Default::default()
+                };
+                let bare = ListFilter {
+                    query: " # ".into(),
+                    ..empty.clone()
+                };
+                assert_eq!(tools(&items, &bare), tools(&items, &empty));
+            }
+        }
+        assert_eq!(
+            tools(
+                &items,
+                &ListFilter {
+                    query: "#WOrK".into(),
+                    ..Default::default()
+                }
+            ),
+            vec![2, 1]
+        );
+        assert!(tools(
+            &items,
+            &ListFilter {
+                query: "#missing".into(),
+                ..Default::default()
+            }
+        )
+        .is_empty());
+        assert_eq!(
+            tools(
+                &items,
+                &ListFilter {
+                    query: "pl".into(),
+                    ..Default::default()
+                }
+            ),
+            vec![0]
+        );
     }
 
     #[test]
