@@ -3221,8 +3221,10 @@ pub fn execute(req: &ExecRequest, ops: Arc<dyn HostOps>) -> Result<ExecOutcome, 
                         Ok(v) => json!({"ok": true, "value": v}),
                         Err(e) => json!({"ok": false, "error": e}),
                     };
-                    ctx.eval::<(), _>(format!("__settleCall({id}, {r})"))
-                        .map_err(|e| err(&e))?;
+                    let settle: Function =
+                        ctx.globals().get("__settleCall").map_err(|e| err(&e))?;
+                    let value = ctx.json_parse(r.to_string()).map_err(|e| err(&e))?;
+                    settle.call::<_, ()>((id, value)).map_err(|e| err(&e))?;
                 }
                 Ok(())
             })?;
@@ -3755,6 +3757,91 @@ mod tests {
             overlay: None,
             activity: None,
             modules: Arc::new(Vec::new()),
+        }
+    }
+
+    /// A real callee serializes a value constructed with JSON.parse, so
+    /// __proto__ is already an own data key before nested settlement begins.
+    struct JsonCalleeOps;
+    impl HostOps for JsonCalleeOps {
+        fn call_tool(&self, _: &str, input: Value) -> Result<Value, String> {
+            let mut req = live("function run(input) { return JSON.parse(input.json); }");
+            req.input = input;
+            execute(&req, Arc::new(NoHostOps))
+                .map(|out| out.output)
+                .map_err(|e| e.message)
+        }
+    }
+
+    #[test]
+    fn nested_json_settlement_retains_own_proto_data_after_callee_and_caller_serialization() {
+        let mut req = live(
+            r#"async function run(input) {
+            const v=await tools.call('json_callee',input);
+            const again=JSON.parse(JSON.stringify(v));
+            return {value:v,own:Object.prototype.hasOwnProperty.call(v,'__proto__'),
+                plain:Object.getPrototypeOf(v)===Object.prototype,
+                inheritedX:'x' in v,againOwn:Object.prototype.hasOwnProperty.call(again,'__proto__'),again};
+        }"#,
+        );
+        req.input = json!({"json":r#"{"__proto__":{"x":1},"y":2}"#});
+        let out = execute(&req, Arc::new(JsonCalleeOps)).unwrap();
+        let expected: Value = serde_json::from_str(r#"{"__proto__":{"x":1},"y":2}"#).unwrap();
+        assert_eq!(
+            out.output,
+            json!({"value":expected,"own":true,"plain":true,"inheritedX":false,"againOwn":true,"again":expected})
+        );
+    }
+
+    #[test]
+    fn nested_json_settlement_preserves_arrays_primitives_and_all_proto_value_types() {
+        for raw in [
+            r#"{"__proto__":null,"y":2}"#,
+            r#"{"__proto__":7,"y":2}"#,
+            r#"{"__proto__":"日本語","y":2}"#,
+            r#"{"__proto__":false,"y":2}"#,
+            r#"[{"__proto__":{"x":1}},{"deep":{"__proto__":null}},[true,42.25,"ไทย"]]"#,
+            r#"{"nested":{"__proto__":{"__proto__":{"x":1}}},"y":2}"#,
+            "null",
+            "true",
+            "false",
+            "42.25",
+            r#""ไทย\n__settleCall(1, {})""#,
+        ] {
+            let mut req = live(
+                r#"async function run(input) {
+                const value=await tools.call('json_callee',input);
+                function normal(v) {
+                    if(v===null || typeof v!=='object') return true;
+                    if(Object.getPrototypeOf(v)!==(Array.isArray(v)?Array.prototype:Object.prototype)) return false;
+                    return Object.keys(v).every(k=>normal(v[k]));
+                }
+                return {value,serialized:JSON.stringify(value),normal:normal(value)};
+            }"#,
+            );
+            req.input = json!({"json":raw});
+            let out = execute(&req, Arc::new(JsonCalleeOps)).unwrap();
+            let expected: Value = serde_json::from_str(raw).unwrap();
+            assert_eq!(out.output["value"], expected, "{raw}");
+            assert_eq!(
+                serde_json::from_str::<Value>(out.output["serialized"].as_str().unwrap()).unwrap(),
+                expected,
+                "{raw}"
+            );
+            assert_eq!(out.output["normal"], true, "{raw}");
+        }
+    }
+
+    #[test]
+    fn nested_settlement_lookup_and_call_failures_surface_as_exec_errors() {
+        for setup in [
+            "globalThis.__settleCall=null;",
+            "globalThis.__settleCall=()=>{throw new Error('settlement failure');};",
+            "Object.defineProperty(globalThis,'__settleCall',{get(){throw new Error('settlement lookup failure');}});",
+        ] {
+            let req=live(&format!("async function run() {{ {setup} return await tools.call('json_callee',{{json:'7'}}); }}"));
+            let error=execute(&req,Arc::new(JsonCalleeOps)).unwrap_err();
+            assert!(!error.message.contains("never settled"),"{}",error.message);
         }
     }
 

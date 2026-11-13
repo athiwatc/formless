@@ -2676,6 +2676,11 @@ Decision: [ADR 0005](docs/adr/0005-run-script-orchestration.md).
     when the nested Invocation ends (§7.5). Each call runs on its own
     thread (§6.1), so `Promise.all` really runs them in parallel. This is
     the same `tools.call` every Tool has.
+    Nested return values retain JSON data semantics, including own `__proto__`
+    properties through callee and caller serialization. Settlement parses the
+    result envelope as JSON and calls the context's settlement function; parse,
+    lookup and call failures use the existing execution-error path.
+
   - At most `scripts.max_parallel` (8) calls per sandbox are in flight;
     the rest queue.
   - A script that returns while a call is still pending fails, as a Tool
