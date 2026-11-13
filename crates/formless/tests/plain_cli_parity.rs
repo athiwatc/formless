@@ -67,6 +67,16 @@ impl Fixture {
                             {"id":"abc-one","name":"First","created_at":"","updated_at":""},
                             {"id":"abc-two","name":"Second","created_at":"","updated_at":""}
                         ]),
+                        Request::ListSubagents { session_id } => {
+                            assert_eq!(session_id, "abc-one");
+                            json!([
+                                {"id":"subagent-ไทย-full-reusable-id","session_id":"abc-one","run_id":"run-one","task":"Task 日本語","depth":1,"model":"role · model","status":"running","steps":2,"result":null,"created_at":"first","updated_at":"last","future":7},
+                                {"id":"second-subagent","session_id":"abc-one","run_id":"run-two","task":"Second","depth":2,"model":"model","status":"completed","steps":3,"result":"","created_at":"second","updated_at":"last"}
+                            ])
+                        }
+                        Request::GetSubagent { id } => {
+                            json!({"subagent":{"id":id,"session_id":"abc-one","run_id":"run-one","task":"Task 日本語","depth":1,"model":"role · model","status":"running","steps":2,"result":null,"created_at":"first","updated_at":"last"},"messages":[{"provider-special":{"part":["🦀",3]},"role":"assistant"},{"unknown":"ไทย"}],"future":7})
+                        }
                         Request::RunFiles { session_id, run_id } => {
                             assert_eq!(session_id, "abc-one");
                             json!({"run_id":run_id.as_deref().unwrap_or("latest"), "files":[{"path":"dir/a.txt","status":"modified","revertible":true,"diff":"- old\n+ new"}], "untracked_writes_possible":true})
@@ -77,9 +87,18 @@ impl Fixture {
                         }
                         _ => panic!("unexpected private RPC: {:?}", envelope.request),
                     };
+                    let failed = matches!(&envelope.request,Request::GetSubagent{id} if id=="fixture-not-found");
                     seen.lock().unwrap().push(envelope.request);
-                    let reply =
-                        json!({"kind":"response", "id":envelope.id, "ok":true, "result":result});
+                    let reply = if failed {
+                        serde_json::to_value(formless_protocol::ServerMessage::err_code(
+                            envelope.id,
+                            formless_protocol::codes::NOT_FOUND,
+                            "sub-agent fixture missing".into(),
+                        ))
+                        .unwrap()
+                    } else {
+                        json!({"kind":"response", "id":envelope.id, "ok":true, "result":result})
+                    };
                     if writeln!(socket, "{reply}").is_err() {
                         break;
                     }
@@ -208,5 +227,84 @@ fn shipped_files_and_rewind_use_owned_rpc_prefix_resolution_and_json_contract() 
             .filter(|r| matches!(r, Request::RewindRun { .. }))
             .count(),
         1
+    );
+}
+
+#[test]
+fn shipped_subagent_reports_preserve_session_resolution_exact_ids_and_provider_json() {
+    let fixture = Fixture::new();
+    for selector in ["abc-one", "abc-o", "First"] {
+        let output = fixture.run(&["sessions", "subagents", selector, "--json"]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value[0]["result"], Value::Null);
+        assert_eq!(value[1]["result"], "");
+        assert_eq!(value[0]["future"], 7);
+    }
+    let inventory = fixture.run(&["sessions", "subagents", "First"]);
+    assert!(inventory.status.success());
+    let text = String::from_utf8(inventory.stdout).unwrap();
+    assert!(text.contains("subagent-ไทย-full-reusable-id"));
+    assert!(text.contains("Result: null"));
+    assert!(text.contains("Result: \"\""));
+    let before = fixture.requests.lock().unwrap().len();
+    for selector in ["abc", "missing"] {
+        let output = fixture.run(&["sessions", "subagents", selector]);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+    }
+    assert!(fixture.requests.lock().unwrap()[before..]
+        .iter()
+        .all(|req| matches!(req, Request::ListSessions)));
+    let exact = "subagent-ไทย-full-reusable-id";
+    for json in [false, true] {
+        let mut args = vec!["sessions", "subagent", exact];
+        if json {
+            args.push("--json");
+        }
+        let output = fixture.run(&args);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: Value = if json {
+            serde_json::from_slice(&output.stdout).unwrap()
+        } else {
+            let text = String::from_utf8(output.stdout).unwrap();
+            let (_, messages) = text
+                .split_once("Messages (unpaged transcript returned by daemon):\n")
+                .unwrap();
+            json!({"messages":serde_json::from_str::<Value>(messages).unwrap()})
+        };
+        assert_eq!(
+            value["messages"],
+            json!([{"provider-special":{"part":["🦀",3]},"role":"assistant"},{"unknown":"ไทย"}])
+        );
+        if json {
+            assert_eq!(value["future"], 7);
+        }
+    }
+    let output = fixture.run(&["sessions", "subagent", "fixture-not-found", "--json"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("sub-agent fixture missing"));
+    let seen = fixture.requests.lock().unwrap();
+    assert!(
+        seen.iter().all(|req| matches!(
+            req,
+            Request::ListSessions | Request::ListSubagents { .. } | Request::GetSubagent { .. }
+        )),
+        "{seen:?}"
+    );
+    assert_eq!(
+        seen.iter()
+            .filter(|req| matches!(req,Request::GetSubagent{id} if id==exact))
+            .count(),
+        2
     );
 }

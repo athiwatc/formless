@@ -4,6 +4,7 @@ mod cli_commands;
 mod cli_help_tests;
 mod cli_pipeline;
 mod cli_run_identity;
+mod cli_subagents;
 mod cli_tool_success;
 #[cfg(test)]
 mod session_export_tests;
@@ -42,7 +43,7 @@ fn parse_profile_name(value: &str) -> std::result::Result<String, String> {
     name = "formless",
     version,
     about = "General-purpose agent harness (SPEC.md)",
-    after_help = "Examples:\n  formless\n  formless chat --new\n  formless run \"Summarize README.md\" --estimate\n  formless sessions list --json"
+    after_help = "Examples:\n  formless\n  formless chat --new\n  formless run \"Summarize README.md\" --estimate\n  formless sessions list --json\n  formless sessions subagents SESSION --json\n  formless sessions subagent EXACT_SUBAGENT_ID"
 )]
 struct Cli {
     /// Isolated profile (separate daemon + data dir)
@@ -5310,6 +5311,26 @@ fn write_session_export(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
 
 #[derive(Subcommand)]
 enum SessionsAction {
+    /// Inventory stored sub-agents for a resolved Session
+    Subagents {
+        /// Session id, unambiguous prefix or name
+        id: String,
+        /// Preserve the complete daemon sub-agent array as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Read a stored sub-agent and its unpaged returned transcript
+    #[command(
+        long_about = "Read a stored sub-agent by its full exact id, with the unpaged provider-shaped messages returned by the existing daemon handler. Malformed stored JSON rows may be skipped by that handler; this is not a dump of every stored row or a separate integrity check. No Run starts or Session changes."
+    )]
+    Subagent {
+        /// Full exact sub-agent id reported by the inventory (no prefix lookup)
+        id: String,
+        /// Preserve the complete daemon record/messages object as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Fork stored history without starting a Run
     Fork {
         /// Session ID or unambiguous prefix
@@ -5611,6 +5632,13 @@ fn sessions_cmd(paths: Paths, action: SessionsAction) -> Result<()> {
             let s: SessionInfo =
                 serde_json::from_value(daemon(Request::ImportSession { bundle })?)?;
             println!("imported {}  ({})", s.name, s.id);
+        }
+        SessionsAction::Subagents { id, json } => {
+            let session = find_session(&paths, &id)?;
+            cli_subagents::list(session.id, json, daemon, &mut std::io::stdout().lock())?;
+        }
+        SessionsAction::Subagent { id, json } => {
+            cli_subagents::detail(id, json, daemon, &mut std::io::stdout().lock())?;
         }
         SessionsAction::Search { query, limit, json } => {
             let hits: Vec<formless_protocol::SearchHit> =
