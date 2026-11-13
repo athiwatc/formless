@@ -50,8 +50,8 @@ fn lifetime() { let _: &'static str = "not assert!(true) }"; }
 fn fixtures() { let _ = r###"{ panic!("fixture") }"###; /* } */ let _ = b'}'; }
 ''')
         self.assertNotIn(": escapes\n", report)
-        self.assertIn("crates/x/a.rs:5: lifetime", report)
-        self.assertIn("crates/x/a.rs:7: fixtures", report)
+        self.assertIn("crates/x/a.rs:4: lifetime", report)
+        self.assertIn("crates/x/a.rs:6: fixtures", report)
         self.assertIn("2 test(s)", report)
 
 
