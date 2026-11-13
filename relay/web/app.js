@@ -3178,7 +3178,7 @@
       ? h("span", { class: "banner-text" }, "⏸ " + x.message,
         x.action ? h("span", { class: "muted" }, " " + x.action + ".") : null,
         h("details", null, h("summary", null, "details"), h("code", null, u.error || x.details)))
-      : h("span", null, "⏸ The last Run was " + u.status + (u.error ? ": " + truncate(u.error, 200) : ""));
+      : h("span", { class: "banner-text" }, "⏸ The last Run was " + u.status + (u.error ? ": " + truncate(u.error, 200) : ""));
     box.replaceChildren(
       text,
       h("button", { class: "btn small primary", type: "button", onclick: async () => {
