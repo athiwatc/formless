@@ -208,9 +208,9 @@ typical developer build.
 
 | Command | Result |
 |---|---|
-| `cargo test --no-default-features --lib --locked` | 64 passed (model, memory, timeline and fixture); no GPUI crate in its dependency graph |
-| `cargo test --features test-support --locked` | 64 passed, 68 passed (headless shell), 19 offscreen render states passed (37 captures) |
-| `cargo test --features test-support,thai-breaks --locked` | 69 passed, 68 passed, 19 render states and the real-text Thai measurement passed |
+| `cargo test --no-default-features --lib --locked` | 65 passed (model, memory, timeline and fixture); no GPUI crate in its dependency graph |
+| `cargo test --features test-support --locked` | 65 passed, 68 passed (headless shell), 19 offscreen render states passed (37 captures) |
+| `cargo test --features test-support,thai-breaks --locked` | 70 passed, 68 passed, 19 render states and the real-text Thai measurement passed |
 | `cargo fmt --check`, `cargo clippy --all-targets --locked` with and without `thai-breaks` | clean |
 
 These are the counts at the last code commit (§12). The first checkpoint
@@ -1568,6 +1568,59 @@ the markers or boxes, so the markers are taken from the kit's source, not
 from paint, and the fixture has none of these constructs, so no real window
 showed them. ☑ and ☐ stand for the drawn boxes; what a screen reader says
 for them is not known.
+
+### 16.10 What accessible text costs while streaming
+
+Local commits `cc87aae` and `51bdfe8`: measurement only, no behaviour
+change. Evidence in `a11y-stream/` and `stream-model/a11y-baseline.log`.
+
+**How it was measured.** A process-wide counter of the plain texts made
+for assistive technology, their time and their input
+(`timeline::accessible_text_stats`). The replay compares the ordinary path
+with the accessibility-active path, for plain words and for markdown with
+lists, task items, quotes and code. The binary reports the same figures on
+its stream line, and can start GPUI's accessibility tree the way a screen
+reader would, by one walk of the window (`--activate-a11y`).
+
+**Replay, no window:** with accessibility active, 55 to 82 ms of
+conversion per second of stream at 100 and 1,000 deltas a second, 1.1 to
+1.3 ms per conversion on average; a full 32 KiB markdown-rich window,
+about 5 ms. The ordinary path makes none.
+
+**Real windows, two interleaved rounds:**
+
+| Stream | Accessibility | Conversions | Conversion time | User CPU |
+|---|---|---:|---:|---:|
+| Words, 100/s, 90 s | inactive | 0 | 0 | 15.4, 15.5 s |
+| | active | 2,688, 2,689 | 5.32, 5.21 s | 18.9, 18.8 s |
+| Markdown, 100/s, 30 s | inactive | 0 | 0 | 8.3, 8.1 s |
+| | active | 883, 882 | 1.19, 1.18 s | 8.1, 8.0 s |
+
+Conversions follow drawn frames, not deltas: about one per frame while the
+streamed row changes. Every run ended with the newest text shown.
+
+**What this cannot show.** Every window was opened in the background, so
+it was inactive, and GPUI draws an inactive window at most once per
+33.3 ms; every run on either path sat on that cap, so the frame figures
+say nothing about the cost. A frontmost window, drawing at 120 Hz, would
+convert up to about four times as often; it was not measured, as that
+would mean bringing the window to the front. Whether a screen reader
+needs the text that often is not known either.
+
+**Provisional threshold, not accepted by anyone:** making accessible text
+should take no more than 1 ms per drawn frame at a full window, so that it
+uses at most an eighth of a 120 Hz frame. A full 32 KiB markdown window
+takes about five times that today, so by this measure it is a bottleneck
+in a frontmost window with a screen reader on, and not one on the
+ordinary path.
+
+**Not optimised, and why.** Every way found to make it cheaper changes
+what is given or when: converting only the block that changed is not
+equivalent markdown (a later reference definition, a lazy continuation or
+an open fence changes earlier text); converting off the main thread or
+less often leaves the accessible text behind the visible tail; a faster
+parser is not in the dependency graph. Each is a follow-up that needs its
+own proof of equal output, or a decision that some lag is acceptable.
 
 ## 17. Windows: no first frame from `--smoke`
 
