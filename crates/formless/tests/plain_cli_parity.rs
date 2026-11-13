@@ -89,6 +89,7 @@ impl Fixture {
                         continue;
                     }
                     let result = match &envelope.request {
+                        Request::ProposalDiff { id } => proposal_comparison(id),
                         Request::Subscribe { .. } => json!({"conn":1}),
                         Request::ListInvocations => invocation_reply.lock().unwrap().clone(),
                         Request::ListSessions => json!([
@@ -150,6 +151,9 @@ impl Fixture {
                         _ => panic!("unexpected private RPC: {:?}", envelope.request),
                     };
                     let failure = match &envelope.request {
+                        Request::ProposalDiff { id } if id == "missing" => {
+                            Some("proposal not found")
+                        }
                         Request::GetMcpPrompt { name, .. } if name == "fixture-failure" => {
                             Some("server fixture failure")
                         }
@@ -334,6 +338,57 @@ fn shipped_live_invocations_preserve_snapshot_values_and_reject_limits_before_co
         assert!(invalid.stdout.is_empty());
     }
     assert_eq!(fixture.connections.load(Ordering::SeqCst), before);
+}
+fn proposal_comparison(id: &str) -> Value {
+    json!({"target":if id=="memory" {"memory"} else {"learned guidance"},"applied":id=="memory","diff":[["-","old 日本語"],["+","ไทย long full line ".repeat(80)],[" ",""]],"future":{"preserved":true}})
+}
+
+#[test]
+fn shipped_proposal_diff_is_read_only_and_preserves_the_complete_comparison() {
+    let fixture = Fixture::new();
+    for id in ["guidance", "memory"] {
+        for json in [false, true] {
+            fixture.requests.lock().unwrap().clear();
+            let mut args = vec!["prompts", "diff", id];
+            if json {
+                args.push("--json");
+            }
+            let out = fixture.run(&args);
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let expected = proposal_comparison(id);
+            if json {
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&out.stdout).unwrap(),
+                    expected
+                );
+            } else {
+                let text = String::from_utf8(out.stdout).unwrap();
+                assert!(text.contains(&format!("Target: {}", expected["target"].as_str().unwrap())));
+                assert!(text.contains(if id == "memory" {
+                    "Already applied: yes"
+                } else {
+                    "Already applied: no"
+                }));
+                assert!(text.ends_with(&format!(
+                    "-old 日本語\n+{}\n \n",
+                    "ไทย long full line ".repeat(80)
+                )));
+            }
+            let requests = fixture.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1, "{requests:?}");
+            assert!(matches!(&requests[0],Request::ProposalDiff{id:actual} if actual==id));
+        }
+    }
+    let missing = fixture.run(&["prompts", "diff", "missing"]);
+    assert_eq!(missing.status.code(), Some(2));
+    assert!(missing.stdout.is_empty());
+    assert!(String::from_utf8(missing.stderr)
+        .unwrap()
+        .contains("proposal not found"));
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
