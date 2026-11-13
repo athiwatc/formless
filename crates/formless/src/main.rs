@@ -4,6 +4,7 @@ mod cli_commands;
 mod cli_help_tests;
 mod cli_pipeline;
 mod cli_run_identity;
+mod cli_tool_detail;
 mod cli_tool_success;
 #[cfg(test)]
 mod session_export_tests;
@@ -285,7 +286,7 @@ enum Cmd {
     },
     /// Tool registry inspection/transfer (SPEC §7.8, §12)
     #[command(
-        after_help = "Examples:\n  formless tools list\n  formless tools show TOOL_NAME --json\n  formless tools export TOOL_NAME --output tool.json"
+        after_help = "Examples:\n  formless tools list\n  formless tools show TOOL_NAME --json\n  formless tools show TOOL_NAME --code\n  formless tools export TOOL_NAME --output tool.json"
     )]
     Tools {
         #[command(subcommand)]
@@ -636,6 +637,9 @@ enum ToolsAction {
         /// The full detail as JSON
         #[arg(long)]
         json: bool,
+        /// Write only the current version's exact source
+        #[arg(long, conflicts_with = "json")]
+        code: bool,
     },
     /// Retire a Tool: hidden from the agent, kept with its history
     Retire {
@@ -7204,10 +7208,14 @@ fn tools_cmd(paths: Paths, action: ToolsAction) -> Result<()> {
             }
             Ok(())
         }
-        ToolsAction::Show { name, json } => {
+        ToolsAction::Show { name, json, code } => {
             let tool = find_tool(&paths, &name)?;
             let d: formless_protocol::ToolDetail =
                 serde_json::from_value(request_once(&paths, Request::GetTool { id: tool.id })?)?;
+            if code {
+                std::io::stdout().write_all(cli_tool_detail::current_source(&d)?.as_bytes())?;
+                return Ok(());
+            }
             if json {
                 println!("{}", serde_json::to_string_pretty(&d)?);
                 return Ok(());
@@ -7637,6 +7645,7 @@ fn print_tool_detail(d: &formless_protocol::ToolDetail) {
         "active"
     };
     println!("{} v{}  [{status}]", t.name, t.current_version);
+    println!("pinned:       {}", if t.pinned { "yes" } else { "no" });
     if !t.title.is_empty() {
         println!("{}", t.title);
     }
@@ -7699,19 +7708,7 @@ fn print_tool_detail(d: &formless_protocol::ToolDetail) {
     for reason in &d.attention {
         println!("attention:    {reason}");
     }
-    println!(
-        "versions:     {}",
-        d.versions
-            .iter()
-            .map(|v| format!(
-                "v{} {} {}",
-                v.version,
-                v.author,
-                v.created_at.get(..10).unwrap_or(&v.created_at)
-            ))
-            .collect::<Vec<_>>()
-            .join(" · ")
-    );
+    print!("{}", cli_tool_detail::history(d));
     if let Some(v) = d.versions.iter().find(|v| v.version == t.current_version) {
         let pretty = |s: &str| {
             serde_json::from_str::<serde_json::Value>(s)
