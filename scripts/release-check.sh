@@ -5,7 +5,19 @@
 set -eu
 tag="${1:?usage: release-check.sh TAG [Cargo.toml]}"
 manifest="${2:-$(dirname "$0")/../Cargo.toml}"
-version="$(awk '/^\[workspace.package\]/{p=1; next} /^\[/{p=0} p && /^version *=/{gsub(/[" ]/, "", $0); sub(/^version=/, ""); print; exit}' "$manifest")"
+version="$(awk '
+  /^[[:space:]]*\[workspace.package\][[:space:]]*(#.*)?$/ { p=1; next }
+  /^[[:space:]]*\[/ { p=0 }
+  p && /^[[:space:]]*version[[:space:]]*=/ {
+    sub(/^[^=]*=[[:space:]]*/, "")
+    quote=substr($0, 1, 1)
+    if (quote != "\"" && quote != "\047") exit
+    value=substr($0, 2)
+    end=index(value, quote)
+    if (end) print substr(value, 1, end-1)
+    exit
+  }
+' "$manifest")"
 [ -n "$version" ] || { echo "error: no [workspace.package] version in $manifest" >&2; exit 1; }
 if [ "$tag" != "v$version" ]; then
   echo "error: tag $tag does not match Cargo.toml version $version (expected v$version); bump the version or fix the tag" >&2
