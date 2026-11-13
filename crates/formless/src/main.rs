@@ -400,6 +400,9 @@ enum Cmd {
         /// List what would be freed without removing anything
         #[arg(long)]
         dry_run: bool,
+        /// Print the complete reported GC result as one JSON value
+        #[arg(long)]
+        json: bool,
     },
     /// Back up the database now (kept with the daily ones in <data>/backups)
     #[command(
@@ -2289,7 +2292,7 @@ fn run_cli(cli: Cli) -> Result<()> {
         }) => uninstall_cmd(&paths, keep_data, keep_binary, yes),
         Some(Cmd::Storage { json }) => storage_cmd(&paths, json),
         Some(Cmd::Docs { topic, print, keys }) => docs_cmd(topic.as_deref(), print, keys),
-        Some(Cmd::Gc { dry_run }) => gc_cmd(&paths, dry_run),
+        Some(Cmd::Gc { dry_run, json }) => gc_cmd(&paths, dry_run, json),
         Some(Cmd::Backup { action }) => match action {
             None => backup_cmd(&paths),
             Some(BackupAction::List { json }) => {
@@ -3621,8 +3624,8 @@ fn storage_cmd(paths: &Paths, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// `formless gc [--dry-run]`.
-fn gc_cmd(paths: &Paths, dry_run: bool) -> Result<()> {
+/// `formless gc [--dry-run] [--json]`.
+fn gc_cmd(paths: &Paths, dry_run: bool, json: bool) -> Result<()> {
     use formless_core::housekeeping::human_bytes;
     let r = if daemon_reachable(paths) {
         formless_tui::client::request_once(paths, Request::Gc { dry_run })?
@@ -3630,6 +3633,10 @@ fn gc_cmd(paths: &Paths, dry_run: bool) -> Result<()> {
         let store = formless_core::Store::open(&paths.db_file())?;
         formless_core::housekeeping::gc(paths, &store, &Config::load(paths)?, dry_run)?
     };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&r)?);
+        return Ok(());
+    }
     let mut tbl = Table::new(&["KIND", "ITEMS", "FREES", "WHAT"]);
     for k in r["kinds"].as_array().into_iter().flatten() {
         tbl.row(vec![
