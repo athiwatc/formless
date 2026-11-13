@@ -275,3 +275,35 @@ fn final_line_register_put_before_next_line_preserves_separators_and_undo() {
         }
     }
 }
+
+#[test]
+fn eof_linewise_put_retains_copied_blank_lines_without_rewriting_the_register() {
+    for surface in [Surface::Composer, Surface::Editor] {
+        for (source, copy, put, expected) in [
+            ("a\n\nz", "2yy", "Gp", "a\n\nz\na\n"),
+            ("a\n\n\nz", "3yy", "Gp", "a\n\n\nz\na\n\n"),
+            ("a\nz", "yy", "Gp", "a\nz\na"),
+            ("\n\nz", "2yy", "Gp", "\n\nz\n\n"),
+            ("\nz", "yy", "Gp", "\nz\n"),
+            ("x\ny\nlast", "Gyy", "Gp", "x\ny\nlast\nlast"),
+            ("a\n\nz", "2yy", "G2p", "a\n\nz\na\n\na\n"),
+            ("a\n\nz", "2yy", "ggP", "a\n\na\n\nz"),
+            ("a\n\ny\nz", "2yy", "ggjp", "a\n\na\n\ny\nz"),
+        ] {
+            let (mut vim, mut line) = normal(source);
+            keys(&mut vim, &mut line, copy, surface);
+            let register = vim.register.clone();
+            let literal = vim.register_literal;
+            keys(&mut vim, &mut line, &put[..put.len() - 1], surface);
+            let before = line.to_string();
+            keys(&mut vim, &mut line, &put[put.len() - 1..], surface);
+            assert_eq!(&*line, expected, "{copy}/{put} {surface:?}");
+            assert_eq!(vim.register, register);
+            assert_eq!(vim.register_literal, literal);
+            assert!(vim.register_linewise);
+            assert!(line.undo());
+            assert_eq!(&*line, before);
+            assert_eq!(vim.register, register);
+        }
+    }
+}
