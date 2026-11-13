@@ -324,6 +324,13 @@ name the file and reason; typo suggestions include local and shadowed templates.
 Diagnostics are announced once while present and can be announced again after
 a repaired file becomes invalid again.
 
+TUI file completion quotes spaced or delimited names, for example
+`@"my notes/report.md"`. Inside that reserved form, only `\"` and `\\`
+are escapes; whitespace is literal. Unclosed or invalid quoted mentions stay
+plain text and attach no first-word fragment. Directory completion keeps the
+cursor before its closing quote for child completion. Chips, forecast and
+submission all decode the same path; existing file eligibility rules apply.
+
 `formless commands list` shows the available metadata, diagnostics and shadowed
 files; `formless commands list --json` returns the same shared metadata projection
 used by the TUI. Listing is read-only: it does not start a daemon, create a

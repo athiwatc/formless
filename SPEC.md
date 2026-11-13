@@ -1219,8 +1219,20 @@ pasting paths.
   loops are skipped. Linked directories have size zero and their
   in-root children can be completed through the link's path. An empty query
   lists the top level, and `dir/` lists that directory, so paths complete
-  step by step. Tab or Enter inserts `@path`. On send, each `@path`
-  mention that names an existing file or directory goes through
+  step by step. Tab or Enter inserts `@path`, or `@"my notes/report.md"`
+  when a path needs delimiters. The `@"..."` form is reserved for quoted
+  paths: whitespace inside is literal, and only `\"` (quote) and `\\`
+  (backslash) are escapes. A complete token ends at its closing quote,
+  followed by whitespace, ordinary trailing mention punctuation, or end
+  of input. Invalid escapes, missing closing quotes and attached word
+  suffixes remain plain text on submission; they never attach a first-word
+  fragment. Directory completion retains the existing `/` marker and places
+  the cursor before a quoted directory's closing quote, so child completion
+  replaces the whole token. Exact indexed leading-space directory spellings
+  take priority before hand-typed query trimming. Extraction, chips, forecast
+  input and submission use the same decoded original paths without case or
+  filesystem normalization. On send, each complete mention that names an
+  existing file or directory goes through
   `AttachPath {session_id, path, root?}` before the message is sent:
   - text files up to 256 KB and images, WAV/MP3 audio and PDFs up to 8 MB are attached as below;
   - larger files and directories go as a reference line,
