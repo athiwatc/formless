@@ -37,6 +37,8 @@ fn render(value: &Value, json: bool) -> Result<String> {
                     "samples",
                     "good_rate",
                     "avg_ms",
+                    "avg_tokens",
+                    "usd_per_success",
                     "score",
                     "cost",
                     "qualified",
@@ -107,6 +109,27 @@ mod tests {
             render(&json!([]), false).unwrap(),
             "No decisions are currently available in this daemon report."
         );
+    }
+
+    #[test]
+    fn human_report_shows_current_policy_cost_and_token_figures() {
+        let reply = json!([{"picked":"priced", "candidates":[
+            {"model":"priced","samples":10,"good_rate":0.9,"avg_ms":150,
+             "avg_tokens":42.5,"usd_per_success":0.0125,"qualified":true},
+            {"model":"unpriced","avg_tokens":0,"usd_per_success":null},
+            {"model":"unknown"}
+        ]}]);
+        let report = render(&reply, false).unwrap();
+        for text in [
+            "avg_tokens: 42.5",
+            "usd_per_success: 0.0125",
+            "avg_tokens: 0",
+            "usd_per_success: null",
+            "avg_tokens: unknown (not reported)",
+            "usd_per_success: unknown (not reported)",
+        ] {
+            assert!(report.contains(text), "{text}: {report}");
+        }
     }
 
     #[test]
