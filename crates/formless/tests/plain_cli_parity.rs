@@ -94,6 +94,7 @@ impl Fixture {
                         continue;
                     }
                     let result = match &envelope.request {
+                        Request::GetTool { id } => detail_report(id),
                         Request::UsageByDay { .. } => grouped_usage(),
                         Request::ListTools => tool_reply.lock().unwrap().clone(),
                         Request::ExportTool { id } => {
@@ -732,6 +733,82 @@ fn shipped_tool_filters_keep_default_pipe_bytes_and_apply_the_same_json_selectio
     let invalid = fixture.run(&["tools", "list", "--filter", "active"]);
     assert_eq!(invalid.status.code(), Some(2));
     assert!(invalid.stdout.is_empty());
+}
+fn detail_tool(id: &str, name: &str, current: i64) -> Value {
+    json!({"id":id,"name":name,"pinned":true,"description":"fixture","retired":false,"current_version":current,"capabilities":[],"memory_mb":16,"invocations":0,"success_rate":null,"needs_attention":false,"created_at":"","updated_at":""})
+}
+fn detail_report(id: &str) -> Value {
+    let (name, current) = match id {
+        "tool-no-newline" => ("reader-no-newline", 2),
+        "tool-missing-current" => ("reader-missing", 99),
+        _ => ("reader", 1),
+    };
+    json!({"tool":detail_tool(id,name,current),"versions":[
+        {"version":2,"author":"agent","created_at":"second","capabilities":[],"memory_mb":16,"input_schema":"{}","output_schema":"{}","code":"// source ไทย"},
+        {"version":1,"author":"user","created_at":"first","capabilities":[],"memory_mb":16,"input_schema":"{}","output_schema":"{}","code":"// source 日本語\n"}
+    ],"metrics":formless_protocol::ToolMetricsInfo::default(),"recent_calls":[{"id":"call-one","version":1,"status":"failed","input":"PrivateCallInputSentinel","output":"PrivateCallOutputSentinel","error":"fixture call failed","duration_ms":12,"created_at":"call-time"}]})
+}
+
+#[test]
+fn shipped_tool_detail_source_mode_is_exact_and_human_history_is_readable() {
+    let fixture = Fixture::new();
+    *fixture.tool_rows.lock().unwrap() = json!([
+        detail_tool("tool-newline", "reader", 1),
+        detail_tool("tool-no-newline", "reader-no-newline", 2),
+        detail_tool("tool-missing-current", "reader-missing", 99)
+    ]);
+    for (name, expected) in [
+        ("reader", "// source 日本語\n"),
+        ("reader-no-newline", "// source ไทย"),
+    ] {
+        fixture.requests.lock().unwrap().clear();
+        let out = fixture.run(&["tools", "show", name, "--code"]);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(out.stdout, expected.as_bytes());
+        assert!(matches!(
+            &fixture.requests.lock().unwrap()[..],
+            [Request::ListTools, Request::GetTool { .. }]
+        ));
+    }
+    let missing = fixture.run(&["tools", "show", "reader-missing", "--code"]);
+    assert_eq!(missing.status.code(), Some(2));
+    assert!(missing.stdout.is_empty());
+    let human = fixture.run(&["tools", "show", "reader"]);
+    assert!(human.status.success());
+    let text = String::from_utf8(human.stdout).unwrap();
+    for expected in [
+        "pinned:       yes",
+        "versions (newest first):",
+        "v2 · agent · second",
+        "v1 · user · first",
+        "call-time · v1 · failed · 12ms · fixture call failed",
+    ] {
+        assert!(text.contains(expected), "{text}");
+    }
+    for private in [
+        "PrivateCallInputSentinel",
+        "PrivateCallOutputSentinel",
+        "// source",
+    ] {
+        assert!(!text.contains(private));
+    }
+    let json = fixture.run(&["tools", "show", "reader", "--json"]);
+    assert!(json.status.success());
+    let expected: formless_protocol::ToolDetail =
+        serde_json::from_value(detail_report("tool-newline")).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&json.stdout).unwrap(),
+        serde_json::to_value(expected).unwrap()
+    );
+    fixture.requests.lock().unwrap().clear();
+    let conflict = fixture.run(&["tools", "show", "reader", "--code", "--json"]);
+    assert_eq!(conflict.status.code(), Some(2));
+    assert!(conflict.stdout.is_empty());
+    assert!(fixture.requests.lock().unwrap().is_empty());
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
