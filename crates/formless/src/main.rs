@@ -4,6 +4,7 @@ mod cli_commands;
 mod cli_help_tests;
 mod cli_mcp_prompts;
 mod cli_metrics;
+mod cli_modules;
 mod cli_pipeline;
 mod cli_proposal_diff;
 mod cli_routing;
@@ -166,6 +167,14 @@ enum Cmd {
     Skills {
         #[command(subcommand)]
         action: SkillsAction,
+    },
+    /// Read the module inventory, metadata and stored source versions
+    #[command(
+        after_help = "Examples:\n  formless modules list --json\n  formless modules show MODULE_NAME\n  formless modules show MODULE_NAME --version 1"
+    )]
+    Modules {
+        #[command(subcommand)]
+        action: cli_modules::Action,
     },
     /// Open the web UI from this machine's daemon on 127.0.0.1 (SPEC §12)
     Web {
@@ -2152,6 +2161,7 @@ fn run_cli(cli: Cli) -> Result<()> {
         Some(Cmd::BugReport { output }) => bug_report(&paths, output),
         Some(Cmd::Mcp { action }) => mcp_cmd(paths, action),
         Some(Cmd::Skills { action }) => skills_cmd(paths, action),
+        Some(Cmd::Modules { action }) => cli_modules::run(&paths, action),
         Some(Cmd::Memory { action }) => memory_cmd(paths, action),
         Some(Cmd::Runs {
             limit,

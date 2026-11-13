@@ -89,6 +89,8 @@ impl Fixture {
                         continue;
                     }
                     let result = match &envelope.request {
+                        Request::ListModules => module_list(),
+                        Request::GetModule { .. } => module_detail(),
                         Request::ProposalDiff { id } => proposal_comparison(id),
                         Request::Subscribe { .. } => json!({"conn":1}),
                         Request::ListInvocations => invocation_reply.lock().unwrap().clone(),
@@ -151,6 +153,7 @@ impl Fixture {
                         _ => panic!("unexpected private RPC: {:?}", envelope.request),
                     };
                     let failure = match &envelope.request {
+                        Request::GetModule { id } if id == "missing" => Some("module not found"),
                         Request::ProposalDiff { id } if id == "missing" => {
                             Some("proposal not found")
                         }
@@ -389,6 +392,130 @@ fn shipped_proposal_diff_is_read_only_and_preserves_the_complete_comparison() {
     assert!(String::from_utf8(missing.stderr)
         .unwrap()
         .contains("proposal not found"));
+}
+fn module_list() -> Value {
+    json!([
+        {"id":"full-module-id","name":"日本語 module","description":"完整 description","current_version":2,"retired":false,"created_at":"first","updated_at":"last","future":7},
+        {"id":"retired-id","name":"retired module","description":"retired description","current_version":4,"retired":true,"created_at":"first","updated_at":"last"}
+    ])
+}
+fn module_detail() -> Value {
+    json!({"module":module_list()[0],"versions":[
+        {"version":1,"author":"user","created_at":"first","code":"// source 日本語\n"},
+        {"version":2,"author":"agent","created_at":"last","code":"// source ไทย"}
+    ],"used_by":["alpha","日本語 tool"],"future":{"preserved":true}})
+}
+
+#[test]
+fn shipped_module_reports_preserve_json_exact_source_and_read_only_requests() {
+    let fixture = Fixture::new();
+    for json in [false, true] {
+        fixture.requests.lock().unwrap().clear();
+        let args = if json {
+            vec!["modules", "list", "--json"]
+        } else {
+            vec!["modules", "list"]
+        };
+        let out = fixture.run(&args);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        if json {
+            assert_eq!(
+                serde_json::from_slice::<Value>(&out.stdout).unwrap(),
+                module_list()
+            );
+        } else {
+            let text = String::from_utf8(out.stdout).unwrap();
+            for expected in [
+                "日本語 module",
+                "retired module",
+                "active",
+                "retired",
+                "完整 description",
+            ] {
+                assert!(text.contains(expected), "{text}");
+            }
+        }
+        assert!(matches!(
+            &fixture.requests.lock().unwrap()[..],
+            [Request::ListModules]
+        ));
+    }
+    for selector in ["日本語 module", "full-module-id"] {
+        for json in [false, true] {
+            fixture.requests.lock().unwrap().clear();
+            let mut args = vec!["modules", "show", selector];
+            if json {
+                args.push("--json");
+            }
+            let out = fixture.run(&args);
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            if json {
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&out.stdout).unwrap(),
+                    module_detail()
+                );
+            } else {
+                let text = String::from_utf8(out.stdout).unwrap();
+                for expected in [
+                    "Module: 日本語 module",
+                    "ID: full-module-id",
+                    "Current version: 2",
+                    "完整 description",
+                    "v1 · user · first",
+                    "v2 · agent · last",
+                    "alpha",
+                    "日本語 tool",
+                ] {
+                    assert!(text.contains(expected), "{text}");
+                }
+                assert!(!text.contains("// source"));
+            }
+            assert!(
+                matches!(&fixture.requests.lock().unwrap()[..],[Request::GetModule{id}] if id==selector)
+            );
+        }
+    }
+    for (version, expected) in [("1", "// source 日本語\n"), ("2", "// source ไทย")] {
+        let out = fixture.run(&["modules", "show", "full-module-id", "--version", version]);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(out.stdout, expected.as_bytes());
+    }
+    for (selector, version, message) in [
+        ("missing", None, "module not found"),
+        ("full-module-id", Some("99"), "no stored version 99"),
+    ] {
+        let mut args = vec!["modules", "show", selector];
+        if let Some(version) = version {
+            args.extend(["--version", version]);
+        }
+        let out = fixture.run(&args);
+        assert_eq!(out.status.code(), Some(2));
+        assert!(out.stdout.is_empty());
+        assert!(String::from_utf8(out.stderr).unwrap().contains(message));
+    }
+    let before = fixture.connections.load(Ordering::SeqCst);
+    for args in [
+        vec!["modules", "show", "name", "--version", "1", "--json"],
+        vec!["modules", "show", "name", "--version", "0"],
+        vec!["modules", "show", "name", "--version", "bad"],
+    ] {
+        let out = fixture.run(&args);
+        assert_eq!(out.status.code(), Some(2));
+        assert!(out.stdout.is_empty());
+    }
+    assert_eq!(fixture.connections.load(Ordering::SeqCst), before);
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
