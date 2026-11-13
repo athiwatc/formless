@@ -445,7 +445,7 @@ none of them can be closed by anything measured so far.
 
 | Gate | Why the current evidence does not cover it |
 |---|---|
-| Windows build, tests and launch | Only dependency resolution was done for Windows here. The native Windows run is being done separately and is not duplicated or inferred in this document. |
+| Windows build, tests and launch | Done separately, at `d34fab9`, on the user's Windows PC: native build, 22 model tests, 16 shell tests and fmt passed. `--smoke` did not print its first-frame line within 60 s and was stopped. Root cause not established; code-level hypotheses in §17. **Windows rendering is not accepted.** |
 | Linux build and launch | Only dependency resolution was done. |
 | Real OS IME composition (Thai, CJK, dead keys) | The harness types finished text, and finished Thai and Chinese characters were posted to a real window as key events (§16.4). No input method composed anything. |
 | VoiceOver (and NVDA on Windows) | No screen reader ran. The real macOS window's platform accessibility tree was read and acted on (§16): that shows what is exposed, and it was not what the tests implied. What is spoken, and in what order, is unknown. The kit cannot mark an element modal, so the page behind a dialog stays in the tree. |
@@ -1341,7 +1341,8 @@ read.
   window cuts it short.
 - The Sessions list is a list box. Each row is an option named by its
   title and read with its status, with its selected state and its place
-  among all the Sessions.
+  among all the Sessions, in the tree GPUI hands the adapter. Not all of
+  that reaches macOS: see §16.6.
 - The conversation is the main landmark. Each block on screen is an
   article named by who it is from, holding the text its row lays out.
 - The status line is a status region, so focus on it has a name.
@@ -1410,3 +1411,137 @@ Accessibility Inspector's audit.
 
 Still open, unchanged otherwise: Windows (done elsewhere), Linux,
 performance budgets, parity, packaging. Phase 1 is not started.
+
+### 16.6 What macOS is given for a Session option
+
+Independent review of `df0feea` pointed out that the platform tree shows
+each Session option as `AXStaticText`. Checked against the pinned adapter
+source (`accesskit_macos` 0.26.3) and against a walk of a real window with
+the extended diagnostic (`6e968ce`; evidence in
+`macos-real-window/attrs-wide/`, binary `formless-desktop-ax-dump-attrs`):
+
+| Property | In GPUI's tree | What macOS is given | How known |
+|---|---|---|---|
+| Role | list box option | `AXStaticText`, role description "text" | Adapter maps `ListBoxOption` to static text; seen in the walk |
+| Name and value | title; title with status | `AXTitle` and `AXValue` | Seen in the walk |
+| Selected | yes, on the open Session | `isAccessibilitySelected` true on that one row, false on the 17 others; the list's selected rows and selected children are 1 | Seen in the walk; the adapter allows it because an option is item-like and has a selected state |
+| Actions | click | press, pick, set selected | Seen in the walk; press opened a Session (§16.4) |
+| Position and set size | 1 to 18, of 196 | **Not given at all.** The list reports 18 rows, the ones that exist as elements, not 196 | The pinned macOS adapter has no reference to position or set size anywhere; the Windows and Linux adapters do |
+
+So on macOS a Session row is a selectable, pressable piece of text inside a
+list, not a list row, and nothing tells assistive technology how many
+Sessions there are or where a row stands among them. Whether VoiceOver
+announces it as a row, reads the selected state, or lets the list be
+navigated row by row is not known: no screen reader ran. "Pressed through
+the accessibility API" in §16.4 is an `AXPress` action, which is how
+assistive technology activates a control; it says nothing of what a person
+using VoiceOver would hear or do. Ways to close this, none tried: a
+different role the macOS adapter maps to a row, a count in the list's
+name, or a change in the adapter.
+
+## 17. Windows: no first frame from `--smoke`
+
+### 17.1 What is known
+
+From the separate Windows run at `d34fab9` (evidence on that PC,
+`SUMMARY.txt`): the build, 22 model tests, 16 shell tests and fmt passed.
+`formless-desktop --smoke` did not print its `smoke:` line within 60
+seconds, and the runner stopped the process tree. Its stderr held only two
+lines, both
+
+```
+ICU4X data error: No segmentation model for complex script: Thai
+```
+
+Nothing below was run on Windows. It is read from the source of the pinned
+crates and from this crate at `d34fab9`, and separates what that source
+proves from what it only suggests. The native debugging is being done
+separately.
+
+### 17.2 Proven from source
+
+- **When the `smoke:` line is printed.** At `d34fab9` it is printed from a
+  next-frame callback, registered after the window is open and after
+  `cx.activate(true)`; nothing else is printed before it. In the pinned
+  GPUI, next-frame callbacks run at the start of a platform frame request.
+  On Windows a frame request happens only when `WM_PAINT` reaches the
+  window procedure's draw path; the window's `schedule_frame` does
+  nothing there, and the only source of `WM_PAINT` while idle is a
+  `VSyncProvider` thread that invalidates every window after each vsync
+  (`DwmFlush`, falling back to sleeping one interval when that returns at
+  once). Windows sends `WM_PAINT` only to a window that is visible. So no
+  line means one of: the process never got as far as registering the
+  callback, or after it did, no `WM_PAINT` reached the draw path, or the
+  first frame request after it never finished.
+- **Frames are not throttled away.** A window that is not active is
+  limited to one frame per 33 ms by default; that cannot account for 60 s.
+- **The process did lay out Thai text.** The ICU4X line comes from GPUI's
+  own line wrapper, which breaks lines with
+  `LineSegmenter::new_for_non_complex_scripts` and so has no Thai model by
+  design: it reports that each time it is asked to wrap Thai. The fixture
+  is full of Thai. Text is wrapped only while a window is laid out, so at
+  least one layout of the window ran.
+- **The Windows binary had debug assertions on.** ICU4X prints that line
+  with `eprintln!` only when its `logging` feature is off (it is, in this
+  graph) and `debug_assertions` are on; otherwise it says nothing. Every
+  macOS `--smoke` log here is from a release build and has none of these
+  lines. The Windows run was therefore of a debug build, or a release
+  profile with debug assertions, so its timings would not be comparable
+  with any macOS figure here.
+- **Nothing is logged.** This crate installs no logger, so GPUI's own
+  `log::debug!` and `log::warn!` messages, including those about deferred
+  draws and device loss, went nowhere. A panic would have been printed;
+  none was.
+
+### 17.3 Hypotheses, not proven
+
+In rough order of how well they fit:
+
+1. **No `WM_PAINT` reached the window.** For example because the process
+   ran where its window is never shown or composited: a service or
+   scheduled task, a remote session that was disconnected, or a desktop
+   that was locked. Fits a process that lays out but never paints. Told
+   apart by running the same binary from a console on the unlocked
+   desktop, and by whether a window appears.
+2. **The first frame request after the callback never returned.** For
+   example presentation blocking in DirectX or the compositor in such a
+   session. A stack of the main thread and of `VSyncProvider` after ten
+   seconds would show it.
+3. **A slow debug build with the large fixture.** `--smoke` defaults to
+   10,000 Sessions and 10,000 blocks. Only rows near the viewport are laid
+   out, which makes 60 s unlikely, but no debug figure exists. Told apart
+   by a release build, and by `--sessions 20 --blocks 40`.
+4. **Text shaping on Windows.** DirectWrite font fallback for Thai, CJK,
+   emoji, Arabic and Hebrew on a first layout. Unmeasured. Told apart by a
+   fixture without those scripts, which does not exist yet.
+
+The ICU4X lines themselves are not a cause: they are printed on macOS too
+by any debug build that lays out Thai (the shell and render tests show
+them), where everything works.
+
+### 17.4 What would settle it, for the Windows debugging
+
+1. Say whether the binary was a debug or a release build.
+2. Run the release binary with `--smoke` from a console on the logged-in,
+   unlocked desktop, and again with `--sessions 20 --blocks 40`.
+3. If it still hangs, take stacks of the main thread and of the
+   `VSyncProvider` thread after ten seconds.
+4. Note whether a window appeared, and whether it was minimised.
+
+A later build of this crate could print a line when the window opens and
+when the first frame request runs, and install a logger for GPUI's own
+messages. That needs a build, which is waiting until there is disk space.
+
+### 17.5 Thai
+
+This is the same gap as §5.1 and §11.6, seen from another side. GPUI's
+line wrapper asks ICU4X for breaks with a segmenter that has no Thai
+model, so it finds none inside a run of Thai, and wraps Thai only where it
+must, inside words. The study in §11.6 gives the same segmenter family a
+Thai dictionary and puts break opportunities between words; it is not
+wired in. Nothing about the Windows run changes that study, and nothing in
+it suggests the study's approach would affect the hang.
+
+Still open, unchanged: Windows rendering (and everything after it on
+Windows), Linux, a screen reader, a person's input, performance budgets,
+parity, packaging. Phase 1 is not started.
