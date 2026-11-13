@@ -796,5 +796,29 @@ fn naming_pull_metadata_and_validation_share_the_model_registry() {
     let bash = String::from_utf8(bash).unwrap();
     for model in formless_core::namer::MODELS {
         assert!(bash.contains(model.id));
+
+fn session_list_organization_filters_parse_together_without_dispatch() {
+    let cli = super::Cli::try_parse_from([
+        "formless",
+        "sessions",
+        "list",
+        "--archived",
+        "--pinned",
+        "--tag",
+        "WoRK",
+        "--json",
+    ])
+    .unwrap();
+    assert!(
+        matches!(cli.cmd, Some(super::Cmd::Sessions {action:super::SessionsAction::List {
+        archived:true,pinned:true,tag:Some(ref tag),json:true}}) if tag=="WoRK")
+    );
+    assert!(super::Cli::try_parse_from(["formless", "sessions", "list", "--tag"]).is_err());
+    let help = super::Cli::try_parse_from(["formless", "sessions", "list", "--help"])
+        .err()
+        .unwrap()
+        .to_string();
+    for expected in ["--pinned", "--tag", "lowercasing", "leading #"] {
+        assert!(normalized(&help).contains(expected));
     }
 }

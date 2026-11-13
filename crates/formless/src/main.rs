@@ -5405,6 +5405,12 @@ enum SessionsAction {
         /// List archived Sessions instead of active Sessions
         #[arg(long)]
         archived: bool,
+        /// Keep only pinned Sessions (client-side, combined with other filters)
+        #[arg(long)]
+        pinned: bool,
+        /// Exact stored tag after lowercasing TAG; a leading # is not stripped
+        #[arg(long)]
+        tag: Option<String>,
         /// One JSON array of SessionInfo
         #[arg(long)]
         json: bool,
@@ -5555,16 +5561,47 @@ fn sessions_cmd(paths: Paths, action: SessionsAction) -> Result<()> {
             }
         }
         SessionsAction::Compare { .. } => unreachable!("handled before daemon startup"),
-        SessionsAction::List { archived, json } => {
+        SessionsAction::List {
+            archived,
+            pinned,
+            tag,
+            json,
+        } => {
             let list: Vec<SessionInfo> = serde_json::from_value(daemon(Request::ListSessions)?)?;
+            let normalized_tag = tag.as_ref().map(|tag| tag.to_lowercase());
+            let shown: Vec<&SessionInfo> = list
+                .iter()
+                .filter(|session| {
+                    session.archived == archived
+                        && (!pinned || session.pinned)
+                        && normalized_tag
+                            .as_ref()
+                            .is_none_or(|tag| session.tags.contains(tag))
+                })
+                .collect();
             if json {
-                let shown: Vec<&SessionInfo> =
-                    list.iter().filter(|s| s.archived == archived).collect();
                 println!("{}", serde_json::to_string_pretty(&shown)?);
                 return Ok(());
             }
+            if shown.is_empty() && !list.is_empty() && (pinned || tag.is_some()) {
+                let mut filters = Vec::new();
+                if archived {
+                    filters.push("--archived".to_string());
+                }
+                if pinned {
+                    filters.push("--pinned".to_string());
+                }
+                if let Some(tag) = tag {
+                    filters.push(format!("--tag {}", comparison_terminal_text(&tag)));
+                }
+                println!(
+                    "no Sessions match {} (formless sessions list)",
+                    filters.join(" ")
+                );
+                return Ok(());
+            }
             let mut tbl = Table::new(&["ID", "UPDATED", "MSGS", "NAME", "LAST MESSAGE"]);
-            for s in list.iter().filter(|s| s.archived == archived) {
+            for s in shown {
                 tbl.row(vec![
                     t(&s.id[..8.min(s.id.len())], Tone::Dim),
                     c(s.updated_at.get(..16).unwrap_or(&s.updated_at)),
