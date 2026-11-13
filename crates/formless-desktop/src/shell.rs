@@ -1265,9 +1265,15 @@ impl Shell {
         }
         // Byte offsets belong to this exact source revision, not merely
         // its sequence id or length. The next render restores modal focus.
-        if self.viewer.take().is_some() {
-            // Its originating row may have vanished too. Use the normal
-            // visible-region fallback, never an orphaned row focus handle.
+        let had_viewer = self.viewer.take().is_some();
+        let row_origin = self
+            .restore_focus
+            .as_ref()
+            .is_some_and(|origin| origin.region == Some(Region::Conversation));
+        if had_viewer || row_origin {
+            // A palette can have replaced the viewer while still retaining
+            // its originating row. Snapshot replacement can remove that
+            // control too: use a visible fallback, never an orphaned handle.
             self.restore_focus = None;
         }
         self.transcript_source = TranscriptSource::Snapshot;
@@ -1710,6 +1716,9 @@ impl Shell {
                 cx.notify();
             }
         });
+        // Replace the full-output modal, as we replace panel overlays:
+        // never leave a second dialog behind the command palette.
+        self.viewer = None;
         self.prefs.close_overlays();
         self.palette = Some(Palette {
             query,
@@ -1934,6 +1943,9 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.viewer.take().is_some() {
+            self.restore_focus = None;
+        }
         let previous = self.destination;
         self.destination = destination;
         self.prefs.close_overlays();

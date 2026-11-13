@@ -98,7 +98,8 @@ docks when the window is wide enough (944 px for Sessions, 1280 px for
 Context) and otherwise opens as a modal overlay that Escape or a click
 outside dismisses. Cmd/Ctrl with =, - and 0 change the text size between
 100% and 200% and ask the window to grow to fit. Cmd/Ctrl+Shift+P, or the
-Commands button in the header, opens the command palette: type to filter,
+Commands button in the header, opens the command palette (replacing an
+open full-output viewer): type to filter,
 Up/Down to choose, Enter to run, Escape to close; a command that cannot run
 says why. Every button, shortcut and palette row runs through one typed
 registry (`src/commands.rs`). A row that shows only part of a long block has

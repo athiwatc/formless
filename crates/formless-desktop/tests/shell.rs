@@ -5129,3 +5129,98 @@ fn keyboard_back_from_the_directory_does_not_open_the_selected_neighbor(cx: &mut
         assert_eq!(shell.read(cx).sidebar().active_id(), before.as_deref());
     });
 }
+
+#[gpui_kit::test]
+fn commands_replace_the_whole_output_modal_and_navigation_cannot_leave_hidden_focus(
+    cx: &mut TestAppContext,
+) {
+    let (handle, shell) = open_blocks(
+        cx,
+        WIDE,
+        vec![TimelineBlock::new(
+            1,
+            BlockKind::ToolSummary,
+            "line\n".repeat(1000),
+        )],
+    );
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        shell
+            .update(cx, |shell, cx| shell.view_block(1, window, cx))
+            .unwrap();
+        window.render_frame(cx);
+        assert!(window.try_find("viewer").is_some());
+        shell.update(cx, |shell, cx| shell.open_palette(window, cx));
+        window.render_frame(cx);
+        assert_eq!(shell.read(cx).viewer_rows(), None);
+        assert!(window.try_find("viewer").is_none());
+        assert!(window.try_find("palette").is_some());
+        window.input("go sessions", cx);
+    });
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        window.press("enter", cx);
+        window.render_frame(cx);
+        assert_eq!(shell.read(cx).destination(), Destination::Sessions);
+        assert!(window.try_find("viewer").is_none());
+        assert!(window.try_find("palette").is_none());
+        assert_eq!(
+            window.find_by_label("Filter Sessions").focused(),
+            Some(true)
+        );
+        assert!(!shell.read(cx).background_inert(window));
+        window.press("escape", cx);
+        window.render_frame(cx);
+        shell
+            .update(cx, |shell, cx| shell.view_block(1, window, cx))
+            .unwrap();
+        window.render_frame(cx);
+        shell.update(cx, |shell, cx| {
+            shell.run_command(Command::GoTo(Destination::Tools), window, cx)
+        });
+        window.render_frame(cx);
+        assert!(window.try_find("viewer").is_none());
+        assert_eq!(window.find("region-conversation").focused(), Some(true));
+        assert!(!shell.read(cx).background_inert(window));
+    });
+}
+
+#[gpui_kit::test]
+fn a_snapshot_replacing_a_palette_origin_restores_visible_focus_not_an_old_row(
+    cx: &mut TestAppContext,
+) {
+    let (handle, shell) = open_blocks(
+        cx,
+        WIDE,
+        vec![TimelineBlock::new(
+            1,
+            BlockKind::ToolSummary,
+            "a".repeat(64 * 1024),
+        )],
+    );
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        tab_to(window, "block-1-top-view", cx);
+        window.press("enter", cx);
+        window.render_frame(cx);
+        shell.update(cx, |shell, cx| shell.open_palette(window, cx));
+        window.render_frame(cx);
+        let id = shell.read(cx).sidebar().active_id().unwrap().to_string();
+        let snapshot = replies::session_snapshot(&id, &serde_json::json!({
+            "session": {"id": id}, "running": false,
+            "messages": [{"id": "m1", "session_id": id, "seq": 1, "role": "tool", "content": "short", "created_at": "now"}],
+        })).unwrap();
+        shell
+            .update(cx, |shell, cx| shell.show_session_snapshot(snapshot, cx))
+            .unwrap();
+        window.render_frame(cx);
+        window.press("escape", cx);
+        window.render_frame(cx);
+        assert!(window.try_find("viewer").is_none());
+        assert!(window.try_find("palette").is_none());
+        assert!(window.try_find("block-1-top-view").is_none());
+        assert_eq!(window.find_by_label("Message").focused(), Some(true));
+        assert!(!shell.read(cx).background_inert(window));
+    });
+}
