@@ -8,7 +8,7 @@ use std::{
     os::unix::net::UnixListener,
     process::{Command, Stdio},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     time::{Duration, Instant},
@@ -19,6 +19,7 @@ struct Fixture {
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
     requests: Arc<Mutex<Vec<Request>>>,
+    connections: Arc<AtomicUsize>,
 }
 impl Fixture {
     fn new() -> Self {
@@ -45,6 +46,8 @@ impl Fixture {
         let stopped = stop.clone();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let seen = requests.clone();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let connected = connections.clone();
         let thread = std::thread::spawn(move || {
             while !stopped.load(Ordering::SeqCst) {
                 let (mut socket, _) = match listener.accept() {
@@ -55,6 +58,7 @@ impl Fixture {
                     }
                     Err(e) => panic!("{e}"),
                 };
+                connected.fetch_add(1, Ordering::SeqCst);
                 socket
                     .set_read_timeout(Some(Duration::from_secs(2)))
                     .unwrap();
@@ -71,6 +75,12 @@ impl Fixture {
                             {"id":"sel-q","name":"Archived","created_at":"","updated_at":"","pinned":true,"archived":true,"tags":["work"]},
                             {"id":"sel-b","name":"Gamma","created_at":"","updated_at":"","pinned":true,"tags":["work"]}
                         ]),
+                        Request::ListMcpPrompts => json!([
+                            {"server":"server-日本語","name":"prompt-ไทย","description":"first line\nsecond line","arguments":[{"name":"topic","required":true}],"future":["🦀",3]}
+                        ]),
+                        Request::GetMcpPrompt { arguments, .. } => {
+                            json!({"text":arguments.get("text").and_then(Value::as_str).unwrap_or("rendered 日本語\n\n"),"future":"preserved"})
+                        }
                         Request::RunFiles { session_id, run_id } => {
                             assert_eq!(session_id, "abc-one");
                             json!({"run_id":run_id.as_deref().unwrap_or("latest"), "files":[{"path":"dir/a.txt","status":"modified","revertible":true,"diff":"- old\n+ new"}], "untracked_writes_possible":true})
@@ -81,9 +91,18 @@ impl Fixture {
                         }
                         _ => panic!("unexpected private RPC: {:?}", envelope.request),
                     };
+                    let failed = matches!(&envelope.request, Request::GetMcpPrompt {name,..} if name=="fixture-failure");
                     seen.lock().unwrap().push(envelope.request);
-                    let reply =
-                        json!({"kind":"response", "id":envelope.id, "ok":true, "result":result});
+                    let reply = if failed {
+                        serde_json::to_value(formless_protocol::ServerMessage::err_code(
+                            envelope.id,
+                            formless_protocol::codes::NOT_FOUND,
+                            "server fixture failure".into(),
+                        ))
+                        .unwrap()
+                    } else {
+                        json!({"kind":"response", "id":envelope.id, "ok":true, "result":result})
+                    };
                     if writeln!(socket, "{reply}").is_err() {
                         break;
                     }
@@ -96,6 +115,7 @@ impl Fixture {
             stop,
             thread: Some(thread),
             requests,
+            connections,
         }
     }
     fn command(&self, args: &[&str]) -> Command {
@@ -288,4 +308,107 @@ fn session_list_selectors_preserve_order_and_use_only_the_existing_read_request(
         .unwrap()
         .iter()
         .all(|request| matches!(request, Request::ListSessions)));
+}
+
+#[test]
+fn shipped_mcp_prompt_commands_preserve_text_json_named_args_and_errors() {
+    let fixture = Fixture::new();
+    for args in [
+        vec!["mcp", "prompt", "s", "p", "--arg", "missing"],
+        vec!["mcp", "prompt", "s", "p", "--arg", "=empty"],
+        vec!["mcp", "prompt", "s", "p", "--arg", "x=1", "--arg", "x=2"],
+    ] {
+        let output = fixture.run(&args);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+    }
+    std::thread::sleep(Duration::from_millis(20));
+    assert_eq!(
+        fixture.connections.load(Ordering::SeqCst),
+        0,
+        "usage errors must precede any daemon contact"
+    );
+    assert!(fixture.requests.lock().unwrap().is_empty());
+    let list = fixture.run(&["mcp", "prompts", "--json"]);
+    assert!(
+        list.status.success(),
+        "{}",
+        String::from_utf8_lossy(&list.stderr)
+    );
+    let value: Value = serde_json::from_slice(&list.stdout).unwrap();
+    assert_eq!(value[0]["future"], json!(["🦀", 3]));
+    let list = fixture.run(&["mcp", "prompts"]);
+    assert!(list.status.success());
+    let text = String::from_utf8(list.stdout).unwrap();
+    assert!(text.contains("server-日本語"));
+    assert!(text.contains("prompt-ไทย"));
+    assert!(text.contains("may be incomplete"));
+    assert!(!text.contains("second line"));
+    for text in ["", "no trailing newline", "Unicode ไทย = value\n\n"] {
+        let arg = format!("text={text}");
+        for json in [false, true] {
+            let mut args = vec![
+                "mcp",
+                "prompt",
+                "server-日本語",
+                "prompt-ไทย",
+                "--arg",
+                &arg,
+                "--arg",
+                "empty=",
+                "--arg",
+                "nested=a=b",
+            ];
+            if json {
+                args.push("--json");
+            }
+            let output = fixture.run(&args);
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if json {
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+                    json!({"text":text,"future":"preserved"})
+                );
+            } else {
+                assert_eq!(output.stdout, text.as_bytes());
+            }
+        }
+    }
+    for json in [false, true] {
+        let mut args = vec!["mcp", "prompt", "server-日本語", "fixture-failure"];
+        if json {
+            args.push("--json");
+        }
+        let output = fixture.run(&args);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("server fixture failure"));
+    }
+    let seen = fixture.requests.lock().unwrap();
+    assert!(
+        seen.iter()
+            .all(|req| matches!(req, Request::ListMcpPrompts | Request::GetMcpPrompt { .. })),
+        "no Session/Run/configuration request: {seen:?}"
+    );
+    for req in seen.iter() {
+        if let Request::GetMcpPrompt {
+            server,
+            name,
+            arguments,
+            positional,
+        } = req
+        {
+            assert_eq!(server, "server-日本語");
+            assert!(positional.is_empty());
+            if name == "prompt-ไทย" {
+                assert_eq!(arguments["empty"], "");
+                assert_eq!(arguments["nested"], "a=b");
+                assert!(arguments["text"].is_string());
+            }
+        }
+    }
 }
