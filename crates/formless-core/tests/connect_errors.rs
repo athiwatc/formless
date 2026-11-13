@@ -67,3 +67,33 @@ fn someone_elses_socket_is_permission_denied() {
         std::fs::remove_dir_all(dir).unwrap();
     });
 }
+
+#[test]
+fn startup_timeout_explains_the_daemon_independent_config_remedy() {
+    let (dir, paths) = paths();
+    std::fs::write(paths.config_file(), "[daemon]\nstart_timeout_secs = 1\n").unwrap();
+    std::fs::write(paths.log_file(), "fixture daemon still starting\n").unwrap();
+    // Model another launcher already starting the daemon: hold ownership,
+    // but never open a socket or spawn a process against a user's profile.
+    let owner = formless_core::profile_lock::ProfileLock::owner(&paths).unwrap();
+    let err = formless_core::daemon::ensure_daemon(&paths)
+        .unwrap_err()
+        .to_string();
+    drop(owner);
+    std::fs::remove_dir_all(dir).unwrap();
+    assert!(
+        err.contains("within 1s (daemon.start_timeout_secs)"),
+        "{err}"
+    );
+    assert!(err.contains("formless config edit"), "{err}");
+    assert!(
+        err.contains("start_timeout_secs = 180 in [daemon]"),
+        "{err}"
+    );
+    assert!(
+        err.contains("`formless config set` cannot change this key"),
+        "{err}"
+    );
+    assert!(err.contains("fixture daemon still starting"), "{err}");
+    assert!(!err.contains("using the default 60s"), "{err}");
+}

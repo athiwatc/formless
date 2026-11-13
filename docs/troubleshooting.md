@@ -10,7 +10,19 @@ collects both (with secrets removed) for an issue.
 
 - **"daemon did not accept connections within Ns"**: the first start after
   an upgrade may migrate and back up a large database. Wait and retry, or
-  raise `daemon.start_timeout_secs`. `formless logs` shows where it is.
+  run `formless config edit` and raise `start_timeout_secs` in the existing
+  `[daemon]` section (or add that section if absent):
+
+  ```toml
+  [daemon]
+  start_timeout_secs = 180
+  ```
+
+  `config edit` works while the daemon is down. `formless config set` needs
+  the daemon and cannot change this key. If the timeout error says the
+  config could not be loaded, repair it with `formless config edit`; that
+  start attempt used the default 60 seconds. `formless logs` shows the
+  daemon's log.
 - **Another version is running**: `formless daemon restart` (it waits for
   running Runs; `--force` interrupts them). The TUI's `/restart-daemon`
   does the same.
