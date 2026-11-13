@@ -11,17 +11,32 @@ use unicode_normalization::UnicodeNormalization;
 pub fn fold(s: &str) -> Vec<(usize, char)> {
     let mut out = Vec::with_capacity(s.len());
     for (i, ch) in s.chars().enumerate() {
-        for base in std::iter::once(ch).nfd().filter(|c| !is_combining_mark(*c)) {
-            for lower in base.to_lowercase() {
-                if lower == 'ß' {
-                    out.extend([(i, 's'), (i, 's')]);
-                } else {
-                    out.push((i, lower));
-                }
-            }
-        }
+        out.extend(fold_char(ch).map(|c| (i, c)));
     }
     out
+}
+
+/// Streaming search keys with the same folding as [`fold`], without
+/// allocating a folded copy of each candidate string.
+pub fn fold_chars(s: &str) -> impl Iterator<Item = char> + '_ {
+    s.chars().flat_map(fold_char)
+}
+
+fn fold_char(ch: char) -> impl Iterator<Item = char> {
+    std::iter::once(ch)
+        .nfd()
+        .filter(|c| !is_combining_mark(*c))
+        .flat_map(char::to_lowercase)
+        .flat_map(|lower| {
+            match lower {
+                'ß' => [Some('s'), Some('s')],
+                // Both lowercase sigmas refer to the same uppercase letter.
+                'ς' => [Some('σ'), None],
+                c => [Some(c), None],
+            }
+            .into_iter()
+            .flatten()
+        })
 }
 
 /// The char range of `s` where folded `needle` first occurs.
@@ -123,6 +138,30 @@ fn match_from(q: &[char], c: &[char], start: usize) -> Option<(i64, Vec<usize>)>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn streaming_fold_agrees_with_positioned_keys() {
+        for text in [
+            "café",
+            "cafe\u{301}",
+            "Straße",
+            "STRAẞE",
+            "ΟΣ ος",
+            "İ",
+            "ไทย",
+            "前文",
+        ] {
+            assert_eq!(
+                fold_chars(text).collect::<Vec<_>>(),
+                fold(text).into_iter().map(|(_, c)| c).collect::<Vec<_>>()
+            );
+        }
+        assert_eq!(
+            fold_chars("café STRAẞE ος").collect::<String>(),
+            "cafe strasse οσ"
+        );
+        assert_eq!(find_folded("ΟΣ ος", "οσ"), Some(0..2));
+    }
 
     #[test]
     fn sharp_s_matching_preserves_original_glyphs() {
