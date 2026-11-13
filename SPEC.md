@@ -4965,7 +4965,7 @@ the TUI. Command-specific arguments and defaults are available through
 | `formless routing` | `--json` | Read currently available daemon routing decisions and returned candidate figures without starting a model request. |
 | `formless runs` | No action: list; `show`, `cancel` | List recent Runs, inspect one by ID/prefix, or cancel that exact Run. |
 | `formless security` | `status` | Inspect the daemon's grants, denials, trusted resources, and exposed interfaces. |
-| `formless sessions` | `fork`, `compare`, `list`, `show`, `files`, `rewind`, `rename`, `rm`, `restore`, `import`, `search`, `archive`, `unarchive`, `export` | Manage stored Sessions, follow a Run with `show --follow`, or inspect tracked files. `list --pinned --tag TAG` filters the fetched reply; selectors combine with `--archived`, preserving reply order. |
+| `formless sessions` | `subagents`, `subagent`, `fork`, `compare`, `list`, `show`, `files`, `rewind`, `rename`, `rm`, `restore`, `import`, `search`, `archive`, `unarchive`, `export` | Manage stored Sessions, follow a Run with `show --follow`, or inspect tracked files. `list --pinned --tag TAG` filters the fetched reply; selectors combine with `--archived`, preserving reply order. |
 | `formless skills` | `reviews`, `add`, `remove`, `list`, `enable`, `disable`, `show`, `export`, `import` | Inspect and manage Skills and their retained description reviews. |
 | `formless storage` | `--json` | Report disk usage by data category. |
 | `formless tools` | `reviews`, `list`, `disable`, `enable`, `undo`, `pin`, `unpin`, `tag`, `show`, `retire`, `restore`, `rollback`, `purge`, `run`, `export`, `import` | Inspect, manage, run, or transfer registry Tools. |
@@ -4997,6 +4997,21 @@ retain ordinary exit behavior without a partial report.
 ```sh
 formless memory used --session SESSION --json
 formless memory used --run exact-run-id
+```
+
+`formless sessions subagents SESSION [--json]` inventories stored sub-agents
+using normal Session exact-id/prefix/name resolution. Full sub-agent ids can
+be passed unchanged to `formless sessions subagent SUBAGENT_ID [--json]`,
+which uses exact ids with no prefix lookup. Inventory order and null versus
+empty results are retained. Human detail labels the record and pretty-prints
+the entire returned provider-shaped messages array; JSON preserves the full
+daemon report. This is the existing unpaged transcript projection, whose
+handler skips malformed stored JSON rows, with no extra integrity check,
+Run start or Session mutation. Request failures produce no partial report.
+
+```sh
+formless sessions subagents SESSION --json
+formless sessions subagent exact-subagent-id
 ```
 
 ### Root and global flags
