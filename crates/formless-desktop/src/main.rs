@@ -162,6 +162,33 @@ mod platform_a11y {
         (!utf8.is_null()).then(|| CStr::from_ptr(utf8).to_string_lossy().into_owned())
     }
 
+    /// Whether the element says the selector applies to it. The platform
+    /// adapter's elements all implement every selector and say which ones
+    /// are meant through `isAccessibilitySelectorAllowed:`; an attribute
+    /// read without asking that would be an answer nobody is given.
+    unsafe fn allowed(object: *mut Object, selector: Sel) -> bool {
+        if !responds(object, selector) {
+            return false;
+        }
+        if !responds(object, sel!(isAccessibilitySelectorAllowed:)) {
+            return true;
+        }
+        let allowed: BOOL = msg_send![object, isAccessibilitySelectorAllowed: selector];
+        allowed != NO
+    }
+
+    /// How many elements an array-valued attribute holds, if it applies.
+    unsafe fn count(object: *mut Object, selector: Sel) -> Option<usize> {
+        if !allowed(object, selector) {
+            return None;
+        }
+        let array: *mut Object = (*object).send_message(selector, ()).ok()?;
+        if array.is_null() {
+            return None;
+        }
+        Some(msg_send![array, count])
+    }
+
     unsafe fn flag(object: *mut Object, selector: Sel) -> Option<bool> {
         if !responds(object, selector) {
             return None;
@@ -201,6 +228,45 @@ mod platform_a11y {
             if let Some(value) = flag(element, selector) {
                 let _ = write!(out, " {name}={value}");
             }
+        }
+        // Only where the element says the attribute applies to it.
+        if let Some(description) = text(element, sel!(accessibilityRoleDescription)) {
+            let _ = write!(out, " roledescription={description:?}");
+        }
+        for (name, selector) in [
+            ("selected", sel!(isAccessibilitySelected)),
+            ("modal", sel!(isAccessibilityModal)),
+        ] {
+            if allowed(element, selector) {
+                if let Some(value) = flag(element, selector) {
+                    let _ = write!(out, " {name}={value}");
+                }
+            }
+        }
+        for (name, selector) in [
+            ("rows", sel!(accessibilityRows)),
+            ("selected_rows", sel!(accessibilitySelectedRows)),
+            ("selected_children", sel!(accessibilitySelectedChildren)),
+        ] {
+            if let Some(number) = count(element, selector) {
+                let _ = write!(out, " {name}={number}");
+            }
+        }
+        let can: Vec<&str> = [
+            ("press", sel!(accessibilityPerformPress)),
+            ("pick", sel!(accessibilityPerformPick)),
+            ("set_selected", sel!(setAccessibilitySelected:)),
+            ("set_focused", sel!(setAccessibilityFocused:)),
+            ("set_value", sel!(setAccessibilityValue:)),
+        ]
+        .into_iter()
+        .filter(|(_, selector)| {
+            responds(element, sel!(isAccessibilitySelectorAllowed:)) && allowed(element, *selector)
+        })
+        .map(|(name, _)| name)
+        .collect();
+        if !can.is_empty() {
+            let _ = write!(out, " can=[{}]", can.join(","));
         }
         out.push('\n');
         if !responds(element, sel!(accessibilityChildren)) {
