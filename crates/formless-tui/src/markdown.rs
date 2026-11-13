@@ -81,6 +81,7 @@ struct Renderer {
     /// Styles opened by inline HTML tags (`<kbd>`, `<b>`…), innermost last.
     html: Vec<(String, Style)>,
     need_gap: bool,
+    heading: bool,
     /// Code blocks so far, so each is labelled `[n]` like `/copy code n`.
     code_index: usize,
 }
@@ -256,7 +257,10 @@ impl Renderer {
             return;
         }
         let spans = std::mem::take(&mut self.spans);
-        let avail = self.width.saturating_sub(self.prefix_width()).max(8);
+        let avail = self
+            .width
+            .saturating_sub(self.prefix_width())
+            .max(if self.heading { 1 } else { 8 });
         for row in wrap(spans, avail) {
             self.emit(row);
         }
@@ -322,6 +326,19 @@ impl Renderer {
                     _ => Style::default().add_modifier(Modifier::BOLD),
                 };
                 self.styles.push(style);
+                let depth = match level {
+                    HeadingLevel::H1 => 1,
+                    HeadingLevel::H2 => 2,
+                    HeadingLevel::H3 => 3,
+                    HeadingLevel::H4 => 4,
+                    HeadingLevel::H5 => 5,
+                    HeadingLevel::H6 => 6,
+                };
+                self.prefixes.push(Prefix {
+                    first: Some(vec![Span::styled(format!("H{depth} "), style)]),
+                    rest: vec![Span::raw("   ")],
+                });
+                self.heading = true;
             }
             Tag::BlockQuote(kind) => {
                 self.flush();
@@ -439,7 +456,13 @@ impl Renderer {
                 self.need_gap = true;
             }
             TagEnd::Heading(_) => {
-                self.flush();
+                if self.spans.is_empty() {
+                    self.emit(Vec::new());
+                } else {
+                    self.flush();
+                }
+                self.prefixes.pop();
+                self.heading = false;
                 self.styles.pop();
                 self.need_gap = true;
             }
@@ -1004,6 +1027,114 @@ mod tests {
     }
 
     #[test]
+    fn heading_depths_have_noncolor_labels_and_keep_inline_content() {
+        let source = (1..=6)
+            .map(|depth| {
+                format!(
+                    "{} Level {depth} _italic_ `code` ไทย 日本語\n\n",
+                    "#".repeat(depth)
+                )
+            })
+            .collect::<String>()
+            + "**ordinary strong paragraph**";
+        for color in [false, true] {
+            let out = render(&source, color, "", 24);
+            let text = out
+                .iter()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>();
+            for depth in 1..=6 {
+                let label = format!("H{depth} ");
+                let start = text
+                    .iter()
+                    .position(|line| line.starts_with(&label))
+                    .unwrap();
+                let end = text[start + 1..]
+                    .iter()
+                    .position(|line| line.is_empty())
+                    .map_or(text.len(), |index| start + 1 + index);
+                let body = text[start..end]
+                    .iter()
+                    .enumerate()
+                    .map(|(index, line)| {
+                        if index == 0 {
+                            &line[3..]
+                        } else {
+                            assert!(line.starts_with("   "), "{text:?}");
+                            &line[3..]
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("");
+                assert_eq!(
+                    body.split_whitespace().collect::<String>(),
+                    format!("Level{depth}italiccodeไทย日本語")
+                );
+                assert!(out[start..end]
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .any(|span| span.content.contains("italic")
+                        && span.style.add_modifier.contains(Modifier::ITALIC)));
+                if !color {
+                    assert!(out[start].spans.iter().all(|span| span.style.fg.is_none()));
+                }
+            }
+            assert!(text.iter().any(|line| line.starts_with("ordinary strong")));
+            assert!(text.iter().all(|line| line.width() <= 24), "{text:?}");
+        }
+        let empty = render("###\n", false, "", 16);
+        assert!(empty
+            .iter()
+            .any(|line| line.spans.iter().any(|span| span.content == "H3 ")));
+    }
+
+    #[test]
+    fn nested_heading_continuations_budget_their_depth_prefix() {
+        let source =
+            "> - ### Long heading 日本語 👩🏽‍💻 with enough content to wrap across several lines";
+        for width in [18, 24, 80] {
+            let out = render(source, false, "  ", width);
+            let lines = out
+                .iter()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<String>()
+                })
+                .filter(|line| line.trim() != "│" && !line.trim().is_empty())
+                .collect::<Vec<_>>();
+            assert!(lines[0].starts_with("  │ • H3 "), "{lines:?}");
+            for line in &lines[1..] {
+                assert!(line.starts_with("  │      "), "{lines:?}");
+            }
+            assert!(
+                lines.iter().all(|line| line.width() <= width),
+                "{width}: {lines:?}"
+            );
+            let content = lines
+                .iter()
+                .map(|line| {
+                    if let Some((_, body)) = line.split_once("H3 ") {
+                        body
+                    } else {
+                        line.strip_prefix("  │      ").unwrap()
+                    }
+                })
+                .collect::<String>();
+            assert_eq!(
+                content.split_whitespace().collect::<String>(),
+                "Longheading日本語👩🏽‍💻withenoughcontenttowrapacrossseverallines"
+            );
+        }
+    }
+
+    #[test]
     fn strips_markers_and_styles_spans() {
         let out = render(
             "# Title\nThe **bold** and `code` and ~~gone~~.",
@@ -1015,7 +1146,7 @@ mod tests {
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect();
-        assert_eq!(text, ["  Title", "", "  The bold and code and gone."]);
+        assert_eq!(text, ["  H1 Title", "", "  The bold and code and gone."]);
         let find = |s: &str| out[2].spans.iter().find(|x| x.content == s).unwrap().style;
         assert!(find("bold").add_modifier.contains(Modifier::BOLD));
         assert_eq!(find("code").fg, Some(Color::Yellow));
