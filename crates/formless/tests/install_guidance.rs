@@ -391,3 +391,40 @@ case "$url" in *.sha256) cp "$MOCK_ARCHIVE.sha256" "$output";; *) cp "$MOCK_ARCH
         assert_eq!(std::fs::read_to_string(block).unwrap(), "not a directory");
     }
 }
+
+#[test]
+fn zsh_discovery_hint_is_quoted_and_omitted_for_known_fpath() {
+    let fixture = Fixture::new();
+    let completion_dir = fixture.prefix.join("share/zsh/site-functions");
+    let text = fixture.success(
+        fixture
+            .command(Some("/bin/zsh"))
+            .env("FPATH", fixture.dir.join("unrelated"))
+            .output()
+            .unwrap(),
+    );
+    assert!(
+        text.contains("before compinit") && text.contains("fpath=("),
+        "{text}"
+    );
+    assert!(
+        text.contains("quote'\\''s"),
+        "literal single quote must be escaped: {text}"
+    );
+    let text = fixture.success(
+        fixture
+            .command(Some("/bin/zsh"))
+            .env(
+                "FPATH",
+                format!("/other:{}:/more", completion_dir.display()),
+            )
+            .output()
+            .unwrap(),
+    );
+    assert!(
+        !text.contains("fpath=("),
+        "directory is already discoverable: {text}"
+    );
+    let text = fixture.success(fixture.command(Some("/bin/bash")).output().unwrap());
+    assert!(text.contains("XDG_DATA_HOME/XDG_DATA_DIRS"), "{text}");
+}
