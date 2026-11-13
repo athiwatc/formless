@@ -16287,8 +16287,12 @@ struct UsageRow {
 
 /// `12.3k`, `4.5M`.
 fn short_count(n: i64) -> String {
+    // Compact labels are separate from locale-aware full counts. Promote
+    // before a one-decimal lower unit would round to 1000.0; B is the highest
+    // unit even for larger totals. Negative/zero counts retain exact spelling.
     match n {
-        1_000_000.. => format!("{:.1}M", n as f64 / 1e6),
+        999_950_000.. => format!("{:.1}B", n as f64 / 1e9),
+        999_950.. => format!("{:.1}M", n as f64 / 1e6),
         1_000.. => format!("{:.1}k", n as f64 / 1e3),
         _ => n.to_string(),
     }
@@ -18690,19 +18694,12 @@ pub fn run_with(paths: Paths, start: Option<&str>) -> Result<()> {
 
 /// "3 steps · 12.3k in / 1.2k out · 40% cached · $0.021" (SPEC §10.6).
 fn usage_text(u: &formless_protocol::UsageInfo) -> String {
-    fn k(n: i64) -> String {
-        if n >= 1000 {
-            format!("{:.1}k", n as f64 / 1000.0)
-        } else {
-            n.to_string()
-        }
-    }
     let mut s = format!(
         "{} step{} · {} in / {} out",
         u.steps,
         if u.steps == 1 { "" } else { "s" },
-        k(u.prompt_tokens),
-        k(u.completion_tokens)
+        short_count(u.prompt_tokens),
+        short_count(u.completion_tokens)
     );
     if u.prompt_tokens > 0 && u.cached_tokens > 0 {
         s.push_str(&format!(
@@ -18711,7 +18708,10 @@ fn usage_text(u: &formless_protocol::UsageInfo) -> String {
         ));
     }
     if u.cache_write_tokens > 0 {
-        s.push_str(&format!(" · {} written to cache", k(u.cache_write_tokens)));
+        s.push_str(&format!(
+            " · {} written to cache",
+            short_count(u.cache_write_tokens)
+        ));
     }
     match u.cost {
         Some(c) => s.push_str(&format!(" · ${c:.3}")),
@@ -25266,6 +25266,82 @@ mod tests {
         assert!(screen.contains("24h (r)"), "{screen}");
         assert!(screen.contains("4 invocations"), "{screen}");
         assert!(screen.contains("50%"), "{screen}");
+    }
+
+    #[test]
+    fn compact_usage_units_promote_without_changing_exact_counts_cost_or_percentages() {
+        for (count, expected) in [
+            (i64::MIN, "-9223372036854775808"),
+            (-1000, "-1000"),
+            (0, "0"),
+            (999, "999"),
+            (1000, "1.0k"),
+            (999_949, "999.9k"),
+            (999_950, "1.0M"),
+            (999_999, "1.0M"),
+            (1_000_000, "1.0M"),
+            (12_345_678, "12.3M"),
+            (999_949_999, "999.9M"),
+            (999_950_000, "1.0B"),
+            (1_000_000_000, "1.0B"),
+            (12_345_678_901, "12.3B"),
+            (i64::MAX, "9223372036.9B"),
+        ] {
+            assert_eq!(short_count(count), expected, "{count}");
+        }
+        for count in [-5000, -1, 0, 1, 999, 1000, 12345, 999_900, 999_949] {
+            let prior = if count >= 1000 {
+                format!("{:.1}k", count as f64 / 1000.0)
+            } else {
+                count.to_string()
+            };
+            assert_eq!(short_count(count), prior);
+        }
+        let usage = UsageInfo {
+            steps: 3,
+            prompt_tokens: 999_999,
+            completion_tokens: 12_345_678,
+            cached_tokens: 400_000,
+            cache_write_tokens: 1_000_000,
+            cost: Some(1.23456),
+            memories: 2,
+            ..Default::default()
+        };
+        let expected="3 steps · 1.0M in / 12.3M out · 40% cached · 1.0M written to cache · $1.235 · used 2 memories (/memory used)";
+        assert_eq!(usage_text(&usage), expected);
+        let mut app = test_app();
+        app.current = Some("s1".into());
+        app.run_usage.insert("s1".into(), usage.clone());
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(300, 1)).unwrap();
+        terminal
+            .draw(|frame| draw_status(frame, frame.area(), &app))
+            .unwrap();
+        let status = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(status.contains(expected), "{status}");
+        let (client, sent) = DaemonClient::recording();
+        let (tx, inbox) = mpsc::channel();
+        app.client = Some(client);
+        app.inbox = Some(inbox);
+        app.slash("usage");
+        let request: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert!(matches!(request.request, Request::SessionUsage { .. }));
+        tx.send(ServerMessage::Response {
+            id: request.id,
+            ok: true,
+            result: Some(serde_json::json!({"last_run":usage,"total":usage,"runs":2})),
+            error: None,
+        })
+        .unwrap();
+        app.drain_daemon();
+        assert!(app.notes.contains(&format!("last Run: {expected}")));
+        assert!(app.notes.contains(&format!("session (2 Runs): {expected}")));
+        assert_eq!(app.run_usage["s1"], usage);
     }
 
     #[test]

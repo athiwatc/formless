@@ -4724,7 +4724,12 @@ undo, redo and replacements invalidate prior asynchronous editor previews.
     prompt, completion and cached tokens, and the estimated cost.
   - The TUI status line and the web status bar show it for the current
     Session, for example `3 steps · 12.3k in / 1.2k out · 40% cached ·
-    $0.021`.
+    $0.021`. The TUI uses one compact count rule for prompt/completion/cache
+    writes in that status and both `/usage` notes: k, M, then B, with promotion
+    at 999,950 and 999,950,000 so the lower one-decimal unit never reaches
+    1000.0. B remains the highest unit for larger totals; counts below 1,000,
+    including zero/negative inputs, retain their existing exact spelling.
+    Locale-aware full counts and recorded accounting values stay separate.
   - `SessionUsage` returns the last Run and Session totals: TUI and web
     `/usage`, and the web status-bar tooltip.
   - Cost is what the provider billed when it reports it (OpenRouter's
