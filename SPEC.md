@@ -794,7 +794,7 @@ task, with quality as a gate**.
   candidate's samples, good rate, average time, score or relative cost,
   whether it passed the quality gate, and the rule that decided
   (exploring, nothing qualified yet, or the cheapest qualified).
-  `RoutingDecisions`; TUI `/routing` (pager), web `/routing` (dialog).
+  `RoutingDecisions`; CLI `formless routing [--json]`, TUI `/routing` (pager), web `/routing` (dialog). The CLI preserves report order and returned figures; this wrapper does not change attribution or the report limitations tracked in #1052.
 
 ## 5. Agent loop, Sessions, and Runs
 
@@ -4937,6 +4937,7 @@ the TUI. Command-specific arguments and defaults are available through
 | `formless restore` | `FILE` | Replace the database from a backup, preserving the current database. |
 | `formless roles` | `list`, `add`, `rm` | Map named purposes to a provider and model. |
 | `formless run` | `TASK`; `--estimate`, `--session`, `--output`, `--attach` and other Run options | Run one headless task, or print its local forecast without starting it. |
+| `formless routing` | `--json` | Read currently available daemon routing decisions and returned candidate figures without starting a model request. |
 | `formless runs` | No action: list; `show`, `cancel` | List recent Runs, inspect one by ID/prefix, or cancel that exact Run. |
 | `formless security` | `status` | Inspect the daemon's grants, denials, trusted resources, and exposed interfaces. |
 | `formless sessions` | `fork`, `compare`, `list`, `show`, `files`, `rewind`, `rename`, `rm`, `restore`, `import`, `search`, `archive`, `unarchive`, `export` | Manage stored Sessions, follow a Run with `show --follow`, or inspect tracked files. |
