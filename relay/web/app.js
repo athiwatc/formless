@@ -1662,10 +1662,13 @@
   const TABLE_SEP = /^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$/;
   const ALERTS = { NOTE: "ℹ Note", TIP: "★ Tip", IMPORTANT: "‼ Important", WARNING: "⚠ Warning", CAUTION: "✖ Caution" };
   const indentOf = (l) => l.match(/^\s*/)[0].replace(/\t/g, "    ").length;
+  const tableStart = (lines, i) => i + 1 < lines.length && lines[i].includes("|")
+    && TABLE_SEP.test(lines[i + 1])
+    && splitRow(lines[i]).length === splitRow(lines[i + 1]).length;
   const startsBlock = (lines, i) => {
     const l = lines[i];
     return FENCE.test(l) || HEADING.test(l) || RULE.test(l) || ITEM.test(l) || QUOTE.test(l) || MATH_BLOCK.test(l)
-      || (l.includes("|") && i + 1 < lines.length && TABLE_SEP.test(lines[i + 1]) && lines[i + 1].includes("-"));
+      || tableStart(lines, i);
   };
   // Shared delimiter rules keep persisted and streamed block boundaries aligned.
   function fenceCloses(line, marker) {
@@ -1719,7 +1722,7 @@
       const head = line.match(HEADING);
       if (head) { root.append(h("h" + Math.min(6, head[1].length + 1), null, inline(head[2]))); i++; continue; }
       if (RULE.test(line)) { root.append(h("hr")); i++; continue; }
-      if (line.includes("|") && i + 1 < lines.length && TABLE_SEP.test(lines[i + 1]) && lines[i + 1].includes("-")) {
+      if (tableStart(lines, i)) {
         const header = splitRow(line);
         const aligns = splitRow(lines[i + 1]).map((c) => (/^:-+:$/.test(c) ? "center" : /-:$/.test(c) ? "right" : null));
         const cell = (tag, text, k) => h(tag, { class: aligns[k] ? "al-" + aligns[k] : null }, inline(text));
