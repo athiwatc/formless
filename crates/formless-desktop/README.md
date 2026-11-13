@@ -92,7 +92,11 @@ Sessions sidebar, Cmd/Ctrl+Alt+B toggles the Context inspector. Each panel
 docks when the window is wide enough (944 px for Sessions, 1280 px for
 Context) and otherwise opens as a modal overlay that Escape or a click
 outside dismisses. Cmd/Ctrl with =, - and 0 change the text size between
-100% and 200% and ask the window to grow to fit. The text is always the
+100% and 200% and ask the window to grow to fit. Cmd/Ctrl+Shift+P, or the
+Commands button in the header, opens the command palette: type to filter,
+Up/Down to choose, Enter to run, Escape to close; a command that cannot run
+says why. Every button, shortcut and palette row runs through one typed
+registry (`src/commands.rs`). The text is always the
 size asked for. A window smaller than that size needs (480 x 360 times the
 size) is reflowed: every part is as wide as the window, the parts stack,
 and the shell scrolls up and down as one page, with focus bringing each

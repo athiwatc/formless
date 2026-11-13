@@ -66,7 +66,7 @@ mod render {
     const WHOLE: Fit = Fit::Whole;
     const REFLOWED: Fit = Fit::Reflowed;
 
-    const STATES: [State; 19] = [
+    const STATES: [State; 21] = [
         state("wide-light", 1440., 900., LIGHT, 100, None, WHOLE),
         state("wide-dark", 1440., 900., DARK, 100, None, WHOLE),
         state("medium-light", 1100., 900., LIGHT, 100, None, WHOLE),
@@ -142,6 +142,25 @@ mod render {
             Some("toggle-inspector"),
             REFLOWED,
         ),
+        // The command palette, opened from its header button.
+        state(
+            "wide-palette-light",
+            1440.,
+            900.,
+            LIGHT,
+            100,
+            Some("show-commands"),
+            WHOLE,
+        ),
+        state(
+            "minimum-dark-200pct-palette",
+            480.,
+            360.,
+            DARK,
+            200,
+            Some("show-commands"),
+            REFLOWED,
+        ),
         state(
             "minimum-light-150pct",
             480.,
@@ -183,10 +202,11 @@ mod render {
 
     /// Controls that must be whole and inside the window, all at once, where
     /// the shell is whole.
-    const ALWAYS_REACHABLE: [&str; 6] = [
+    const ALWAYS_REACHABLE: [&str; 7] = [
         "toggle-sidebar",
         "toggle-inspector",
         "toggle-theme",
+        "show-commands",
         "composer-stop",
         "composer-primary",
         "status",
@@ -206,6 +226,7 @@ mod render {
                 "toggle-sidebar",
                 "toggle-inspector",
                 "toggle-theme",
+                "show-commands",
             ],
         ),
         (
@@ -265,10 +286,15 @@ mod render {
     ) {
         // Nothing is wider than the window or starts outside it, so the
         // page never needs to scroll sideways.
-        let ids = PAGE_PARTS
-            .iter()
-            .chain(MEASURED.iter())
-            .chain(["toggle-inspector", "toggle-theme", "run-status"].iter());
+        let ids = PAGE_PARTS.iter().chain(MEASURED.iter()).chain(
+            [
+                "toggle-inspector",
+                "toggle-theme",
+                "show-commands",
+                "run-status",
+            ]
+            .iter(),
+        );
         for id in ids {
             let bounds = window.find(*id).bounds();
             assert!(
@@ -297,10 +323,15 @@ mod render {
             );
         }
         // The header's controls do not overlap each other either.
-        let controls: Vec<Bounds<Pixels>> = ["toggle-sidebar", "toggle-inspector", "toggle-theme"]
-            .into_iter()
-            .map(|id| window.find(id).bounds())
-            .collect();
+        let controls: Vec<Bounds<Pixels>> = [
+            "toggle-sidebar",
+            "toggle-inspector",
+            "toggle-theme",
+            "show-commands",
+        ]
+        .into_iter()
+        .map(|id| window.find(id).bounds())
+        .collect();
         for (index, a) in controls.iter().enumerate() {
             for b in &controls[index + 1..] {
                 assert!(
@@ -530,6 +561,7 @@ mod render {
                     window.render_frame(cx);
                     let panel = match control {
                         "toggle-sidebar" => "region-sidebar",
+                        "show-commands" => "palette",
                         _ => "region-inspector",
                     };
                     assert!(

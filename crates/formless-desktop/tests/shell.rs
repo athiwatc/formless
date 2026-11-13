@@ -4014,3 +4014,356 @@ fn nothing_is_recorded_while_an_input_method_is_composing(cx: &mut TestAppContex
         assert_eq!(record.content_chars, "ส่ง 日本語".chars().count());
     });
 }
+
+// ---- Command palette ------------------------------------------------------
+
+fn row_id(index: usize) -> gpui_kit::SharedString {
+    format!("palette-row-{index}").into()
+}
+
+fn palette_key() -> &'static str {
+    commands::keys(Command::ShowCommands)[0]
+}
+
+fn palette_status(window: &Window) -> String {
+    window
+        .find("palette-status")
+        .value()
+        .expect("the palette status has a value")
+        .to_string()
+}
+
+fn palette_titles(window: &Window) -> Vec<String> {
+    (0..)
+        .map_while(|index| window.try_find(row_id(index)))
+        .map(|row| row.label().unwrap_or_default().to_string())
+        .collect()
+}
+
+#[gpui_kit::test]
+fn the_palette_finds_and_runs_a_command_then_hands_focus_back(cx: &mut TestAppContext) {
+    let (handle, shell) = open(cx, WIDE, 200, 40);
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find_by_label("Message").focused(), Some(true));
+        assert!(!shell.read(cx).background_inert(window));
+
+        window.press(palette_key(), cx);
+        window.render_frame(cx);
+        assert_eq!(window.find("palette").role(), Some(Role::Dialog));
+        assert_eq!(
+            window.find_by_label("Search commands").focused(),
+            Some(true)
+        );
+        // Everything else is out of the accessibility tree meanwhile.
+        assert!(shell.read(cx).background_inert(window));
+        let all = palette_titles(window);
+        assert!(all.len() >= 15, "{all:?}");
+        assert!(!all.iter().any(|title| title == "Show all commands"));
+        assert!(palette_status(window).starts_with(&format!("1 of {} commands: ", all.len())));
+
+        window.input("larger", cx);
+        window.render_frame(cx);
+        assert_eq!(palette_titles(window), ["Larger text"]);
+        assert_eq!(window.find("palette-row-0").selected(), Some(true));
+        let shortcut = commands::shortcut_text(commands::keys(Command::IncreaseTextSize)[0]);
+        assert_eq!(
+            palette_status(window),
+            format!("1 of 1 commands: Larger text, {shortcut}.")
+        );
+
+        window.press("enter", cx);
+        window.render_frame(cx);
+        assert!(window.try_find("palette").is_none());
+        assert_eq!(shell.read(cx).text_scale(), TextScale::DEFAULT.larger());
+        assert!(!shell.read(cx).background_inert(window));
+        assert_eq!(window.find_by_label("Message").focused(), Some(true));
+    });
+}
+
+#[gpui_kit::test]
+fn arrows_choose_a_row_and_an_unavailable_command_says_why(cx: &mut TestAppContext) {
+    let (handle, shell) = open(cx, WIDE, 200, 40);
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        window.press(palette_key(), cx);
+        window.input("text size", cx);
+        window.render_frame(cx);
+        assert_eq!(
+            palette_titles(window),
+            ["Larger text", "Smaller text", "Default text size"]
+        );
+        // Up at the top stays there; Down moves one row and no further
+        // than the last.
+        window.press("up", cx);
+        window.render_frame(cx);
+        assert!(palette_status(window).starts_with("1 of 3 commands: Larger text"));
+        window.press("down", cx);
+        window.render_frame(cx);
+        assert_eq!(window.find("palette-row-1").selected(), Some(true));
+        assert_eq!(window.find("palette-row-0").selected(), Some(false));
+        assert!(palette_status(window).starts_with("2 of 3 commands: Smaller text"));
+        assert!(palette_status(window).ends_with(&format!("unavailable: {}.", commands::SMALLEST)));
+        assert_eq!(
+            window.find("palette-row-1").description(),
+            Some(format!("Unavailable: {}", commands::SMALLEST).as_str())
+        );
+        for _ in 0..5 {
+            window.press("down", cx);
+        }
+        window.render_frame(cx);
+        assert!(palette_status(window).starts_with("3 of 3 commands: Default text size"));
+
+        // Enter on an unavailable command: nothing runs, the palette stays
+        // and says why.
+        window.press("enter", cx);
+        window.render_frame(cx);
+        assert!(window.try_find("palette").is_some());
+        assert_eq!(
+            palette_status(window),
+            format!(
+                "Default text size is unavailable: {}.",
+                commands::DEFAULT_SIZE
+            )
+        );
+        assert_eq!(shell.read(cx).text_scale(), TextScale::DEFAULT);
+
+        // A click runs a row too.
+        window.click("palette-row-0", cx);
+        window.render_frame(cx);
+        assert!(window.try_find("palette").is_none());
+        assert_eq!(shell.read(cx).text_scale(), TextScale::DEFAULT.larger());
+
+        // Nothing matches: the status says so and Enter does nothing.
+        window.press(palette_key(), cx);
+        window.input("zzz", cx);
+        window.render_frame(cx);
+        assert!(palette_titles(window).is_empty());
+        assert_eq!(
+            palette_status(window),
+            "No command matches \u{201c}zzz\u{201d}."
+        );
+        window.press("enter", cx);
+        assert!(window.try_find("palette").is_some());
+    });
+}
+
+#[gpui_kit::test]
+fn escape_the_backdrop_and_the_shortcut_close_the_palette_onto_the_control_that_opened_it(
+    cx: &mut TestAppContext,
+) {
+    let (handle, shell) = open(cx, WIDE, 200, 40);
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        tab_to(window, "show-commands", cx);
+        window.press("enter", cx);
+        window.render_frame(cx);
+        assert_eq!(
+            window.find_by_label("Search commands").focused(),
+            Some(true)
+        );
+        let entry = command_entry(&shell, Command::ShowCommands, window, cx);
+        assert_eq!(entry.checked, Some(true));
+
+        window.press("escape", cx);
+        assert!(window.try_find("palette").is_none());
+        assert_eq!(window.find("show-commands").focused(), Some(true));
+
+        window.press("enter", cx);
+        window.render_frame(cx);
+        window.click_at("palette-backdrop", point(px(20.), px(800.)), cx);
+        assert!(window.try_find("palette").is_none());
+        assert_eq!(window.find("show-commands").focused(), Some(true));
+
+        // The shortcut closes it as well, from inside the search field.
+        window.press("enter", cx);
+        window.press(palette_key(), cx);
+        assert!(window.try_find("palette").is_none());
+        assert_eq!(window.find("show-commands").focused(), Some(true));
+        assert_eq!(
+            command_entry(&shell, Command::ShowCommands, window, cx).checked,
+            Some(false)
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn f6_stays_in_the_palette_and_a_panel_overlay_gives_way_to_it(cx: &mut TestAppContext) {
+    let (handle, shell) = open(cx, WIDE, 200, 40);
+    cx.simulate_window_resize(handle.into(), size(px(800.), px(900.)));
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        // A Sessions overlay, opened from the composer.
+        window.press(TOGGLE_SIDEBAR, cx);
+        assert_eq!(window.find("region-sidebar").focused(), Some(true));
+        // The palette replaces it: one modal at a time.
+        window.press(palette_key(), cx);
+        window.render_frame(cx);
+        assert!(window.try_find("region-sidebar").is_none());
+        assert_eq!(
+            window.find_by_label("Search commands").focused(),
+            Some(true)
+        );
+        for key in ["f6", "shift-f6"] {
+            window.press(key, cx);
+            assert_eq!(
+                window.find_by_label("Search commands").focused(),
+                Some(true),
+                "{key}"
+            );
+        }
+        assert!(shell.read(cx).background_inert(window));
+        // Closing goes back to where focus was before either modal.
+        window.press("escape", cx);
+        assert!(window.try_find("palette").is_none());
+        assert_eq!(window.find_by_label("Message").focused(), Some(true));
+
+        // A panel command from the palette opens the overlay as its
+        // toggle would, with focus in it, and Escape then returns to the
+        // composer.
+        window.press(palette_key(), cx);
+        window.input("show sessions", cx);
+        window.press("enter", cx);
+        window.render_frame(cx);
+        assert_eq!(window.find("region-sidebar").focused(), Some(true));
+        window.press("escape", cx);
+        assert_eq!(window.find_by_label("Message").focused(), Some(true));
+    });
+}
+
+#[gpui_kit::test]
+fn sending_from_the_palette_records_the_draft_with_focus_back_in_the_composer(
+    cx: &mut TestAppContext,
+) {
+    let (handle, shell) = open(cx, WIDE, 200, 40);
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        window.input("สวัสดี", cx);
+        window.press(palette_key(), cx);
+        window.input("send", cx);
+        window.render_frame(cx);
+        assert_eq!(
+            palette_titles(window).first().map(String::as_str),
+            Some("Send")
+        );
+        window.press("enter", cx);
+        let record = shell.read(cx).last_intent().cloned().expect("recorded");
+        assert_eq!(record.kind, IntentKind::Send(SendMode::Send));
+        assert_eq!(record.content_chars, "สวัสดี".chars().count());
+        assert_eq!(window.find_by_label("Message").focused(), Some(true));
+        // The draft stays, as for the Send button.
+        assert_eq!(shell.read(cx).draft(cx).as_ref(), "สวัสดี");
+    });
+}
+
+#[gpui_kit::test]
+fn the_palette_search_field_keeps_an_input_method_composition(cx: &mut TestAppContext) {
+    let (handle, shell) = open(cx, WIDE, 200, 40);
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        window.press(palette_key(), cx);
+        window.render_frame(cx);
+    });
+    let ime = |cx: &mut TestAppContext, act: &dyn Fn(&mut TestInput, &mut App)| {
+        step(cx, handle, |window, cx| {
+            let bounds = window.find_by_label("Search commands").bounds();
+            let query = shell.read(cx).palette_query().expect("open").clone();
+            act(
+                &mut TestInput::new(ElementInputHandler::new(bounds, query), window),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+    };
+    let marked = |cx: &mut TestAppContext| {
+        step(cx, handle, |window, cx| {
+            let query = shell.read(cx).palette_query().expect("open").clone();
+            query.update(cx, |query, cx| {
+                gpui_kit::EntityInputHandler::marked_text_range(query, window, cx).is_some()
+            })
+        })
+    };
+    ime(cx, &|input, cx| {
+        input.compose_text(None, "てきすと", None, cx)
+    });
+    assert!(marked(cx));
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        let before = palette_status(window);
+        // The arrows, Enter and Escape belong to the input method while it
+        // composes: nothing is chosen, run or closed.
+        window.press("down", cx);
+        window.render_frame(cx);
+        assert_eq!(palette_status(window), before);
+        window.press("enter", cx);
+        assert!(window.try_find("palette").is_some());
+        assert_eq!(shell.read(cx).text_scale(), TextScale::DEFAULT);
+    });
+    // Enter ended the composition and kept its text.
+    assert!(!marked(cx));
+    ime(cx, &|input, cx| input.compose_text(None, "か", None, cx));
+    step(cx, handle, |window, cx| {
+        window.press("escape", cx);
+        assert!(window.try_find("palette").is_some());
+    });
+    assert!(!marked(cx));
+    step(cx, handle, |window, cx| {
+        window.press("escape", cx);
+        assert!(window.try_find("palette").is_none());
+        assert_eq!(window.find_by_label("Message").focused(), Some(true));
+        assert_eq!(shell.read(cx).last_intent(), None);
+    });
+}
+
+#[gpui_kit::test]
+fn at_200_percent_in_the_smallest_window_the_palette_fits_and_every_row_is_reachable(
+    cx: &mut TestAppContext,
+) {
+    let (handle, shell) = open(cx, WIDE, 200, 40);
+    let smallest = size(px(tokens::MIN_WINDOW_WIDTH), px(tokens::MIN_WINDOW_HEIGHT));
+    step(cx, handle, |window, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.set_text_scale(TextScale::LARGEST, window, cx)
+        });
+    });
+    cx.simulate_window_resize(handle.into(), smallest);
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        assert_eq!(shell.read(cx).fit(window), Fit::Reflowed);
+        window.press(palette_key(), cx);
+        window.render_frame(cx);
+        let viewport = Bounds::new(Point::default(), window.viewport_size());
+        let dialog = window.find("palette").bounds();
+        assert!(
+            dialog.left() >= viewport.left()
+                && dialog.right() <= viewport.right()
+                && dialog.top() >= viewport.top()
+                && dialog.bottom() <= viewport.bottom(),
+            "{dialog:?} in {viewport:?}"
+        );
+        assert!(window.find_by_label("Search commands").bounds().bottom() <= viewport.bottom());
+        let count = palette_titles(window).len();
+        let list = window.find("palette-list").bounds();
+        for index in 0..count {
+            if index > 0 {
+                window.press("down", cx);
+            }
+            // The scroll lands on the next frame.
+            window.render_frame(cx);
+            window.render_frame(cx);
+            let row = window.find(row_id(index)).bounds();
+            let starts_inside = row.top() >= list.top() - px(1.);
+            let fits = row.bottom() <= list.bottom() + px(1.);
+            // A row taller than the list (an unavailable command's reason
+            // wraps here) starts at the list's top; the rest of it scrolls,
+            // and the status line holds its whole text.
+            let taller_and_at_top =
+                row.size.height > list.size.height && row.top() <= list.top() + px(1.);
+            assert!(
+                starts_inside && (fits || taller_and_at_top),
+                "row {index} {row:?} not shown in {list:?}"
+            );
+            assert!(palette_status(window).starts_with(&format!("{} of {count} ", index + 1)));
+        }
+    });
+}

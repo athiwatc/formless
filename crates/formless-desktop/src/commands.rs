@@ -30,6 +30,8 @@ pub enum Command {
     FocusNextRegion,
     FocusPreviousRegion,
     GoTo(Destination),
+    /// Open the command palette, or close it if it is open.
+    ShowCommands,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,6 +71,7 @@ pub struct State {
     pub dark: bool,
     pub text_scale: TextScale,
     pub destination: Destination,
+    pub palette_open: bool,
 }
 
 /// One command as it stands in one [`State`].
@@ -142,6 +145,7 @@ pub fn keys(command: Command) -> &'static [&'static str] {
         Command::ResetTextSize => &[primary!("0")],
         Command::FocusNextRegion => &["f6"],
         Command::FocusPreviousRegion => &["shift-f6"],
+        Command::ShowCommands => &[primary!("shift-p")],
         Command::Send
         | Command::SendSecondary
         | Command::Stop
@@ -151,7 +155,7 @@ pub fn keys(command: Command) -> &'static [&'static str] {
 }
 
 /// Every command that has a global shortcut.
-pub const GLOBAL: [Command; 7] = [
+pub const GLOBAL: [Command; 8] = [
     Command::ToggleSessions,
     Command::ToggleContext,
     Command::IncreaseTextSize,
@@ -159,6 +163,7 @@ pub const GLOBAL: [Command; 7] = [
     Command::ResetTextSize,
     Command::FocusNextRegion,
     Command::FocusPreviousRegion,
+    Command::ShowCommands,
 ];
 
 /// A GPUI keystroke as people write it: `cmd-shift-p` is `⌘⇧P` on macOS and
@@ -200,7 +205,8 @@ pub fn shortcut_text(key: &str) -> String {
     }
 }
 
-/// The commands the palette lists, in order.
+/// The commands the palette lists, in order. The palette itself is not
+/// one of them.
 pub fn palette(state: &State) -> Vec<Entry> {
     let mut commands = vec![Command::Send];
     if state.has_composer && state.composer.secondary.is_some() {
@@ -374,6 +380,14 @@ pub fn entry(command: Command, state: &State) -> Entry {
             Some(state.destination == destination),
             None,
         ),
+        Command::ShowCommands => (
+            "Commands",
+            "Show all commands".to_string(),
+            Group::Navigation,
+            "Search for a command and run it",
+            Some(state.palette_open),
+            None,
+        ),
     };
     Entry {
         command,
@@ -401,6 +415,7 @@ mod tests {
             dark: false,
             text_scale: TextScale::DEFAULT,
             destination: Destination::Chat,
+            palette_open: false,
         }
     }
 
@@ -504,15 +519,20 @@ mod tests {
             entry(Command::GoTo(Destination::Tools), &s).hint,
             "Scaffold: this destination has no view yet"
         );
+        assert_eq!(entry(Command::ShowCommands, &s).checked, Some(false));
+        s.palette_open = true;
+        assert_eq!(entry(Command::ShowCommands, &s).checked, Some(true));
+        assert!(entry(Command::ShowCommands, &s).shortcut().is_some());
     }
 
     #[test]
-    fn the_palette_lists_every_command_once() {
+    fn the_palette_lists_every_command_but_itself_once() {
         let running = state(RunState::Running, false);
         let listed: Vec<Command> = palette(&running).iter().map(|e| e.command).collect();
+        assert!(!listed.contains(&Command::ShowCommands));
         let unique: std::collections::HashSet<_> = listed.iter().collect();
         assert_eq!(unique.len(), listed.len());
-        for command in GLOBAL {
+        for command in GLOBAL.into_iter().filter(|c| *c != Command::ShowCommands) {
             assert!(listed.contains(&command), "{command:?}");
         }
         for destination in Destination::NAVIGATION {

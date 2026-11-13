@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use formless_protocol::SessionInfo;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{InputEvent, Textarea, TextareaState, Undo};
+use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState, Undo};
 use gpui_kit::component::label::Label;
 use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
 use gpui_kit::component::scroll::ScrollableElement as _;
@@ -63,12 +63,24 @@ gpui_kit::actions!(
         ScrollInspectorDown,
         ScrollInspectorPageUp,
         ScrollInspectorPageDown,
+        ShowCommands,
+        SelectPreviousCommand,
+        SelectNextCommand,
+        RunSelectedCommand,
+        ClosePalette,
     ]
 );
 
 const SESSION_LIST_CONTEXT: &str = "FormlessSessionList";
 const OVERLAY_CONTEXT: &str = "FormlessOverlay";
 const INSPECTOR_CONTEXT: &str = "FormlessInspector";
+const PALETTE_CONTEXT: &str = "FormlessPalette";
+/// The palette's search field. These bindings are more specific than the
+/// text input's own, so Up, Down, Enter and Escape there move through and
+/// run the list instead of moving a caret in a one-line field.
+const PALETTE_INPUT_CONTEXT: &str = "FormlessPalette > Input";
+const PALETTE_DESCRIPTION: &str = "Modal. Type to search, Up and Down to choose, Enter to run, \
+     Escape to close and return to where you were.";
 /// Read out with a modal panel's name. The kit has no "modal" accessibility
 /// property to set, so the behaviour is also stated in words.
 const MODAL_DESCRIPTION: &str =
@@ -97,6 +109,7 @@ pub fn bind_keys(cx: &mut App) {
                 Command::ResetTextSize => KeyBinding::new(key, ResetTextSize, None),
                 Command::FocusNextRegion => KeyBinding::new(key, FocusNextRegion, None),
                 Command::FocusPreviousRegion => KeyBinding::new(key, FocusPreviousRegion, None),
+                Command::ShowCommands => KeyBinding::new(key, ShowCommands, None),
                 Command::Send
                 | Command::SendSecondary
                 | Command::Stop
@@ -116,6 +129,11 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("down", ScrollInspectorDown, Some(INSPECTOR_CONTEXT)),
         KeyBinding::new("pageup", ScrollInspectorPageUp, Some(INSPECTOR_CONTEXT)),
         KeyBinding::new("pagedown", ScrollInspectorPageDown, Some(INSPECTOR_CONTEXT)),
+        KeyBinding::new("up", SelectPreviousCommand, Some(PALETTE_INPUT_CONTEXT)),
+        KeyBinding::new("down", SelectNextCommand, Some(PALETTE_INPUT_CONTEXT)),
+        KeyBinding::new("enter", RunSelectedCommand, Some(PALETTE_INPUT_CONTEXT)),
+        KeyBinding::new("escape", ClosePalette, Some(PALETTE_INPUT_CONTEXT)),
+        KeyBinding::new("escape", ClosePalette, Some(PALETTE_CONTEXT)),
     ]);
 }
 
@@ -267,6 +285,25 @@ fn tooltip(entry: &commands::Entry) -> String {
     }
 }
 
+/// What holds the window modally: a panel shown as an overlay, or the
+/// command palette.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Modal {
+    Panel(Region),
+    Palette,
+}
+
+/// The open command palette.
+struct Palette {
+    query: Entity<InputState>,
+    /// Index into the commands that match the query.
+    selected: usize,
+    /// Why the last chosen command did not run, until the query changes or
+    /// another command is chosen.
+    notice: Option<SharedString>,
+    _changes: Subscription,
+}
+
 /// The control that had focus when a modal overlay came up, so dismissing the
 /// overlay can hand focus back to exactly that control.
 struct FocusOrigin {
@@ -392,8 +429,11 @@ pub struct Shell {
     undo_budget: UndoBudget,
     /// Why the composer refused or changed something, shown under it.
     composer_notice: Option<SharedString>,
-    /// The overlay that held the window modally at the last settle.
-    modal: Option<Region>,
+    /// What held the window modally at the last settle.
+    modal: Option<Modal>,
+    palette: Option<Palette>,
+    palette_focus: FocusHandle,
+    palette_scroll: ScrollHandle,
     /// What the commands depended on when the shell was last drawn; what
     /// its buttons show. Running a command reads it afresh.
     commands: commands::State,
@@ -411,6 +451,7 @@ pub struct Shell {
     sidebar_toggle_focus: FocusHandle,
     inspector_toggle_focus: FocusHandle,
     theme_toggle_focus: FocusHandle,
+    commands_toggle_focus: FocusHandle,
     /// The status line is a tab stop on a reflowed page, where it can be
     /// off screen and holds nothing else that focus could bring into view.
     status_focus: FocusHandle,
@@ -470,7 +511,11 @@ impl Shell {
                 dark: false,
                 text_scale: TextScale::default(),
                 destination: Destination::Chat,
+                palette_open: false,
             },
+            palette: None,
+            palette_focus: cx.focus_handle(),
+            palette_scroll: ScrollHandle::new(),
             restore_focus: None,
             timeline,
             composer,
@@ -482,6 +527,7 @@ impl Shell {
             sidebar_toggle_focus: cx.focus_handle(),
             inspector_toggle_focus: cx.focus_handle(),
             theme_toggle_focus: cx.focus_handle(),
+            commands_toggle_focus: cx.focus_handle(),
             status_focus: cx.focus_handle().tab_stop(true),
             composer_subscriptions,
             _subscriptions: subscriptions,
@@ -737,6 +783,12 @@ impl Shell {
         &self.composer
     }
 
+    /// The open palette's search field, for driving its input handler
+    /// directly.
+    pub fn palette_query(&self) -> Option<&Entity<InputState>> {
+        self.palette.as_ref().map(|palette| &palette.query)
+    }
+
     /// The composer's selection as byte offsets into the draft.
     pub fn composer_selection(&self, cx: &App) -> Range<usize> {
         self.composer.read(cx).selected_range()
@@ -780,7 +832,17 @@ impl Shell {
     /// Whether everything but the open dialog is out of the accessibility
     /// tree: true exactly while a Sessions or Context overlay is open.
     pub fn background_inert(&self, window: &Window) -> bool {
-        self.layout(window).modal().is_some()
+        self.current_modal(self.layout(window)).is_some()
+    }
+
+    /// What holds the window modally in `layout`: the palette, which is
+    /// always on top, or a panel overlay.
+    fn current_modal(&self, layout: Layout) -> Option<Modal> {
+        if self.palette.is_some() {
+            Some(Modal::Palette)
+        } else {
+            layout.modal().map(Modal::Panel)
+        }
     }
 
     /// How the shell is fitted into the window as it is now.
@@ -906,6 +968,7 @@ impl Shell {
             &self.sidebar_toggle_focus,
             &self.inspector_toggle_focus,
             &self.theme_toggle_focus,
+            &self.commands_toggle_focus,
         ]
         .into_iter()
         .any(|handle| handle.is_focused(window))
@@ -1168,6 +1231,7 @@ impl Shell {
             dark: cx.theme().is_dark(),
             text_scale: self.text_scale,
             destination: self.destination,
+            palette_open: self.palette.is_some(),
         }
     }
 
@@ -1219,8 +1283,148 @@ impl Shell {
             Command::FocusNextRegion => self.cycle_region(true, window, cx),
             Command::FocusPreviousRegion => self.cycle_region(false, window, cx),
             Command::GoTo(destination) => self.set_destination(destination, window, cx),
+            Command::ShowCommands => {
+                if self.palette.is_some() {
+                    self.close_palette(window, cx)
+                } else {
+                    self.open_palette(window, cx)
+                }
+            }
         }
         None
+    }
+
+    /// Open the command palette over everything, with focus in its search
+    /// field. A panel overlay that is open closes: one modal at a time.
+    /// Focus goes back to where it was when the palette closes.
+    pub fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.palette.is_some() {
+            return;
+        }
+        let query = cx.new(|cx| InputState::new(window, cx).placeholder("Type to search commands"));
+        let changes = cx.subscribe_in(&query, window, |this, _, event: &InputEvent, _, cx| {
+            if let (InputEvent::Change, Some(palette)) = (event, &mut this.palette) {
+                palette.selected = 0;
+                palette.notice = None;
+                this.palette_scroll.scroll_to_item(0);
+                cx.notify();
+            }
+        });
+        self.prefs.close_overlays();
+        self.palette = Some(Palette {
+            query,
+            selected: 0,
+            notice: None,
+            _changes: changes,
+        });
+        self.settle(window, cx);
+    }
+
+    fn close_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.palette.take().is_some() {
+            self.settle(window, cx);
+        }
+    }
+
+    /// Whether an input method is composing in the palette's search field.
+    fn palette_composing(&self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        self.palette.as_ref().is_some_and(|palette| {
+            palette.query.update(cx, |query, cx| {
+                query.marked_text_range(window, cx).is_some()
+            })
+        })
+    }
+
+    /// End a composition in the search field the way the field itself would
+    /// (its text is kept). Returns whether there was one, in which case the
+    /// key that asked for it does nothing else.
+    fn finish_palette_composition(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if !self.palette_composing(window, cx) {
+            return false;
+        }
+        if let Some(palette) = &self.palette {
+            palette
+                .query
+                .update(cx, |query, cx| query.unmark_text(window, cx));
+        }
+        true
+    }
+
+    /// The commands the palette shows now, for its query.
+    fn palette_entries(&self, cx: &App) -> Vec<commands::Entry> {
+        let Some(palette) = &self.palette else {
+            return Vec::new();
+        };
+        let query = palette.query.read(cx).value();
+        commands::palette(&self.commands)
+            .into_iter()
+            .filter(|entry| entry.matches(&query))
+            .collect()
+    }
+
+    fn move_palette_selection(
+        &mut self,
+        delta: isize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // A composing input method may use the arrows itself.
+        if self.palette_composing(window, cx) {
+            return;
+        }
+        let count = self.palette_entries(cx).len();
+        let Some(palette) = &mut self.palette else {
+            return;
+        };
+        if count == 0 {
+            return;
+        }
+        let last = count as isize - 1;
+        palette.selected = (palette.selected as isize + delta).clamp(0, last) as usize;
+        palette.notice = None;
+        self.palette_scroll.scroll_to_item(palette.selected);
+        cx.notify();
+    }
+
+    fn run_selected_command(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.finish_palette_composition(window, cx) {
+            return;
+        }
+        self.commands = self.command_state(window, cx);
+        let entries = self.palette_entries(cx);
+        if let Some(index) = self.palette_choice(entries.len()) {
+            self.run_from_palette(entries[index].command, window, cx);
+        }
+    }
+
+    /// The chosen row among `count`, kept inside the list: the list can get
+    /// shorter while the palette is open (Queue goes when a Run ends), and
+    /// what is shown, said and run must be the same row.
+    fn palette_choice(&self, count: usize) -> Option<usize> {
+        let palette = self.palette.as_ref()?;
+        (count > 0).then(|| palette.selected.min(count - 1))
+    }
+
+    /// Run a command chosen in the palette: the palette closes first, so
+    /// focus is back where it was and the command acts there. A command
+    /// that cannot run leaves the palette open and says why.
+    fn run_from_palette(&mut self, command: Command, window: &mut Window, cx: &mut Context<Self>) {
+        let entry = commands::entry(command, &self.command_state(window, cx));
+        if let Some(reason) = entry.disabled_reason {
+            if let Some(palette) = &mut self.palette {
+                palette.notice = Some(format!("{} is unavailable: {reason}.", entry.title).into());
+            }
+            cx.notify();
+            return;
+        }
+        self.close_palette(window, cx);
+        self.run_command(command, window, cx);
+    }
+
+    fn dismiss_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.finish_palette_composition(window, cx) {
+            self.close_palette(window, cx);
+        }
     }
 
     /// A listener that runs `command`, for a button or an action.
@@ -1360,7 +1564,26 @@ impl Shell {
         cx.notify();
     }
 
+    fn focus_modal(&mut self, modal: Modal, window: &mut Window, cx: &mut Context<Self>) {
+        match modal {
+            Modal::Panel(region) => self.focus_region(region, window, cx),
+            Modal::Palette => {
+                if let Some(palette) = &self.palette {
+                    palette
+                        .query
+                        .update(cx, |query, cx| query.focus(window, cx));
+                }
+                cx.notify();
+            }
+        }
+    }
+
     fn cycle_region(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        // The palette traps the cycle too: its search field is the only stop.
+        if self.palette.is_some() {
+            self.focus_modal(Modal::Palette, window, cx);
+            return;
+        }
         let next = self
             .current_region(window, cx)
             .cycle(self.layout(window), forward);
@@ -1379,7 +1602,8 @@ impl Shell {
         self.prefs.settle(self.effective_width(window));
         let layout = self.layout(window);
         let focused = self.focused_region(window, cx);
-        let before = std::mem::replace(&mut self.modal, layout.modal());
+        let modal = self.current_modal(layout);
+        let before = std::mem::replace(&mut self.modal, modal);
         let fallback = if layout.composer {
             Region::Composer
         } else {
@@ -1393,7 +1617,7 @@ impl Shell {
                         region: focused,
                     });
                 }
-                self.focus_region(modal, window, cx);
+                self.focus_modal(modal, window, cx);
             }
             (Some(_), None) => match self.restore_focus.take() {
                 Some(origin) if origin.region.is_none_or(|region| region.is_visible(layout)) => {
@@ -1486,6 +1710,11 @@ impl Shell {
                 Command::ToggleTheme,
                 &self.theme_toggle_focus,
             ),
+            (
+                "show-commands",
+                Command::ShowCommands,
+                &self.commands_toggle_focus,
+            ),
         ]
         .map(|(id, command, focus)| {
             let entry = commands::entry(command, &self.commands);
@@ -1505,7 +1734,7 @@ impl Shell {
             .test_support()
             .role(Role::Banner)
             .aria_label("Header")
-            .map(|header| inert_while(header, layout.modal().is_some()))
+            .map(|header| inert_while(header, self.current_modal(layout).is_some()))
             .flex()
             .flex_shrink_0()
             .px_3()
@@ -2281,7 +2510,7 @@ impl Shell {
                     .child(self.render_header(layout, true, cx))
                     .child(main)
                     .when(chat, |page| {
-                        page.child(self.render_composer(layout.modal().is_some(), cx))
+                        page.child(self.render_composer(self.current_modal(layout).is_some(), cx))
                     })
                     .child(self.render_status(layout, true, window, cx)),
             )
@@ -2328,6 +2557,7 @@ impl Render for Shell {
                 Command::ResetTextSize,
                 cx,
             ))
+            .on_action(Self::on_command::<ShowCommands>(Command::ShowCommands, cx))
             .map(|shell| {
                 if reflowed {
                     shell
@@ -2341,6 +2571,10 @@ impl Render for Shell {
                         .child(self.render_body(layout, window, cx))
                         .child(self.render_status(layout, false, window, cx))
                 }
+            })
+            // On top of everything, a panel overlay included.
+            .when(self.palette.is_some(), |shell| {
+                shell.child(self.render_palette(window, cx))
             })
     }
 }
@@ -2376,5 +2610,186 @@ impl Shell {
             .when_some(layout.modal(), |body, region| {
                 body.child(self.render_overlay(region, window, cx))
             })
+    }
+}
+
+impl Shell {
+    /// What the palette's status line says: why a command did not run, how
+    /// many commands match and which is chosen. It is a polite live region,
+    /// so a screen reader hears the choice as it moves even where the
+    /// platform does not follow the chosen row as focus.
+    fn palette_status(&self, entries: &[commands::Entry], cx: &App) -> String {
+        let Some(palette) = &self.palette else {
+            return String::new();
+        };
+        if let Some(notice) = &palette.notice {
+            return notice.to_string();
+        }
+        let Some(index) = self.palette_choice(entries.len()) else {
+            let query = palette.query.read(cx).value();
+            return format!("No command matches \u{201c}{query}\u{201d}.");
+        };
+        let entry = &entries[index];
+        let mut status = format!(
+            "{} of {} commands: {}",
+            index + 1,
+            entries.len(),
+            entry.title
+        );
+        if let Some(shortcut) = entry.shortcut() {
+            status.push_str(&format!(", {shortcut}"));
+        }
+        if let Some(reason) = entry.disabled_reason {
+            status.push_str(&format!(", unavailable: {reason}"));
+        }
+        status.push('.');
+        status
+    }
+
+    /// The command palette: a modal dialog with a search field, the
+    /// commands that match it and a status line. Focus stays in the search
+    /// field; Up and Down choose a row, Enter or a click runs it.
+    fn render_palette(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let palette = self.palette.as_ref().expect("the palette is open");
+        let entries = self.palette_entries(cx);
+        let selected = self.palette_choice(entries.len());
+        let status = self.palette_status(&entries, cx);
+        let viewport = window.viewport_size();
+        let margin = px(16.);
+        let width = self.scaled(560.).min(viewport.width - margin * 2.);
+        let muted = cx.theme().muted_foreground;
+        let rows = entries.into_iter().enumerate().map(|(index, entry)| {
+            let chosen = Some(index) == selected;
+            let command = entry.command;
+            let shortcut = entry.shortcut();
+            let description = match (entry.disabled_reason, &shortcut) {
+                (Some(reason), _) => format!("Unavailable: {reason}"),
+                (None, Some(shortcut)) => format!("{}, {shortcut}", entry.group.label()),
+                (None, None) => entry.group.label().to_string(),
+            };
+            // The group and the shortcut go under the title, not beside it,
+            // so a narrow window at a large text size does not squeeze the
+            // title into a tall column.
+            let meta = match &shortcut {
+                Some(shortcut) => format!("{} \u{b7} {shortcut}", entry.group.label()),
+                None => entry.group.label().to_string(),
+            };
+            v_flex()
+                .id(SharedString::from(format!("palette-row-{index}")))
+                .test_support()
+                .role(Role::ListBoxOption)
+                .aria_label(entry.title.clone())
+                .aria_selected(chosen)
+                .aria_description(description)
+                .when_some(shortcut.clone(), |row, shortcut| {
+                    row.aria_keyshortcuts(shortcut)
+                })
+                .when(chosen, |row| row.aria_active_descendant())
+                .w_full()
+                .px_3()
+                .py_1()
+                .rounded_md()
+                .cursor_pointer()
+                .when(chosen, |row| {
+                    row.bg(cx.theme().accent)
+                        .text_color(cx.theme().accent_foreground)
+                })
+                .child(div().text_sm().child(entry.title.clone()))
+                .child(div().text_xs().child(meta))
+                .when_some(entry.disabled_reason, |row, reason| {
+                    row.child(div().text_xs().child(reason))
+                })
+                .when(!chosen, |row| row.text_color(muted))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.run_from_palette(command, window, cx)
+                }))
+        });
+        let dialog = v_flex()
+            .id("palette-dialog")
+            .test_support()
+            .role(Role::Dialog)
+            .aria_label("Commands")
+            .aria_description(PALETTE_DESCRIPTION)
+            .map(modal_dialog)
+            .key_context(PALETTE_CONTEXT)
+            .on_action(cx.listener(|this, _: &SelectPreviousCommand, window, cx| {
+                this.move_palette_selection(-1, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SelectNextCommand, window, cx| {
+                this.move_palette_selection(1, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &RunSelectedCommand, window, cx| {
+                this.run_selected_command(window, cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &ClosePalette, window, cx| this.dismiss_palette(window, cx)),
+            )
+            .w(width)
+            .max_h(viewport.height - margin * 2.)
+            .p_2()
+            .gap_2()
+            .bg(cx.theme().popover)
+            .text_color(cx.theme().popover_foreground)
+            .border_1()
+            .border_color(cx.theme().border)
+            .rounded_lg()
+            .shadow_lg()
+            .occlude()
+            .child(Input::new(&palette.query).aria_label("Search commands"))
+            .child(
+                announced(div().id("palette-status"))
+                    .test_support()
+                    .role(Role::Label)
+                    .aria_value(status.clone())
+                    // One line on screen, so a short window keeps its room
+                    // for the list; the whole text is the node's value.
+                    .w_full()
+                    .flex_shrink_0()
+                    .truncate()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(status),
+            )
+            .child(
+                v_flex()
+                    .id("palette-list")
+                    .test_support()
+                    .role(Role::ListBox)
+                    .aria_label("Commands")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.palette_scroll)
+                    .children(rows),
+            )
+            .focus_trap("palette", &self.palette_focus);
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .child(
+                div()
+                    .id("palette-backdrop")
+                    .test_support()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .bg(cx.theme().overlay)
+                    .occlude()
+                    .on_click(cx.listener(|this, _, window, cx| this.close_palette(window, cx))),
+            )
+            .child(
+                h_flex()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .justify_center()
+                    .items_start()
+                    .pt(margin)
+                    .child(dialog),
+            )
     }
 }
