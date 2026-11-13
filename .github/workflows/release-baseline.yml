@@ -27,17 +27,15 @@ jobs:
   # Limits remain provisional until the first green Cargo-cold run per runner.
   # Compare job started_at/completed_at (not queue time), then ceil(2x seconds/60).
   build:
-    if: ${{ inputs.job_family == 'all' || inputs.job_family == 'native' }}
+    if: ${{ github.ref == 'refs/heads/main' && (inputs.job_family == 'all' || inputs.job_family == 'native') }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         include:
-          # macos-14 retires 2026-11-02; use its supported ARM successor.
-          # https://github.blog/changelog/2026-10-01-github-actions-macos-14-runner-image-retirement/
-          - os: macos-15
+          - os: [self-hosted, macOS, ARM64]
             target: aarch64-apple-darwin
-          - os: macos-15-intel
+          - os: [self-hosted, macOS, X64]
             target: x86_64-apple-darwin
           - os: windows-latest
             target: x86_64-pc-windows-msvc
@@ -143,9 +141,9 @@ jobs:
       # is no distribution upload; local extracted smoke is included in timing.
 
   linux:
-    if: ${{ inputs.job_family == 'all' || inputs.job_family == 'linux' }}
+    if: ${{ github.ref == 'refs/heads/main' && (inputs.job_family == 'all' || inputs.job_family == 'linux') }}
     timeout-minutes: 60
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     container: rust:1-bullseye
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"
@@ -251,14 +249,14 @@ jobs:
         run: bash scripts/ci-storage-budget.sh snapshot job-finished
 
   linux-install-test:
-    if: ${{ inputs.job_family == 'all' || inputs.job_family == 'linux' }}
+    if: ${{ github.ref == 'refs/heads/main' && (inputs.job_family == 'all' || inputs.job_family == 'linux') }}
     timeout-minutes: 30
     needs: linux
     strategy:
       fail-fast: false
       matrix:
         image: ["debian:bookworm", "ubuntu:22.04", "rockylinux:9"]
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     container: ${{ matrix.image }}
     env:
       BASELINE_IMAGE: ${{ matrix.image }}
@@ -303,10 +301,11 @@ jobs:
           }
 
   docker:
-    if: ${{ inputs.job_family == 'all' || inputs.job_family == 'docker' }}
+    if: ${{ github.ref == 'refs/heads/main' && (inputs.job_family == 'all' || inputs.job_family == 'docker') }}
     timeout-minutes: 30
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     env:
+      BASELINE_IMAGE_TAG: formless:baseline-${{ github.run_id }}-${{ github.run_attempt }}
       BASELINE_CONTAINER: formless-baseline-${{ github.run_id }}-${{ github.run_attempt }}
       DOCKER_BUILD_RECORD_UPLOAD: "false"
       DOCKER_BUILD_SUMMARY: "false"
@@ -332,7 +331,7 @@ jobs:
           pull: true
           provenance: false
           sbom: false
-          tags: formless:baseline
+          tags: ${{ env.BASELINE_IMAGE_TAG }}
       - name: Record exact build toolchain
         shell: bash
         run: |
@@ -342,8 +341,8 @@ jobs:
       - name: Smoke private container with positive RPC proof
         shell: bash
         run: |
-          docker run --rm --network none formless:baseline --version
-          docker run -d --network none --name "$BASELINE_CONTAINER" formless:baseline
+          docker run --rm --network none "$BASELINE_IMAGE_TAG" --version
+          docker run -d --network none --name "$BASELINE_CONTAINER" "$BASELINE_IMAGE_TAG"
           python3 - <<'PY'
           import json, os, subprocess, time
           name = os.environ["BASELINE_CONTAINER"]
@@ -374,11 +373,13 @@ jobs:
             docker logs "$BASELINE_CONTAINER" || true
             docker rm -fv "$BASELINE_CONTAINER"
           fi
+          if docker image inspect "$BASELINE_IMAGE_TAG" >/dev/null 2>&1; then
+            docker image rm "$BASELINE_IMAGE_TAG"
+          fi
 
-  # Matches windows.yml's targeted test job, independently Cargo-cold. The
-  # pending inventory UTF-8 fix must be merged before dispatching this baseline.
+  # Windows pipe baseline remains manual; the standalone windows.yml is removed.
   pipe:
-    if: ${{ inputs.job_family == 'all' || inputs.job_family == 'pipe' }}
+    if: ${{ github.ref == 'refs/heads/main' && (inputs.job_family == 'all' || inputs.job_family == 'pipe') }}
     timeout-minutes: 22
     runs-on: windows-latest
     env:

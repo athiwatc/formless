@@ -1,8 +1,6 @@
 name: docs
 
 on:
-  pull_request:
-    paths: ['README.md', 'SPEC.md', 'GLOSSARY.md', 'docs/adr/**', '.github/workflows/docs.yml']
   push:
     branches: [main]
     paths: ['README.md', 'SPEC.md', 'GLOSSARY.md', 'docs/adr/**', '.github/workflows/docs.yml']
@@ -13,16 +11,22 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: true
+
+# Only reviewed main content runs on a persistent runner; no PR checkout.
 jobs:
   links:
-    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Check documentation links and anchors
         uses: lycheeverse/lychee-action@v2
         with:
           args: --include-fragments --accept 200,206,429 --max-retries 2 --timeout 20 README.md SPEC.md GLOSSARY.md 'docs/adr/**/*.md'
           fail: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

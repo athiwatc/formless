@@ -4,8 +4,13 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 permissions:
-  contents: write
-  packages: write
+  contents: read
+
+# Never cancel a release halfway through publication.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   # No release workflow runs exist as of 2026-10-31, so build (60m) and
   # smoke/install (30m) limits are provisional, not measured 2x baselines.
@@ -14,9 +19,13 @@ jobs:
   # Before any build (#842): the tag must name the Cargo.toml version, or
   # the binaries would report another version than their release.
   version-check:
-    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main'
+    timeout-minutes: 5
+    runs-on: [self-hosted, Linux, X64]
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Tag matches Cargo.toml
         if: startsWith(github.ref, 'refs/tags/v')
         run: scripts/release-check.sh "$GITHUB_REF_NAME"
@@ -27,14 +36,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # macos-14 retires 2026-11-02; use its supported ARM successor.
-          # https://github.blog/changelog/2026-10-01-github-actions-macos-14-runner-image-retirement/
-          - os: macos-15
+          - os: [self-hosted, macOS, ARM64]
             target: aarch64-apple-darwin
             suffix: tar.gz
-          # macos-13 retired; supported Intel successor through August 2027.
-          # https://github.com/actions/runner-images/issues/13045
-          - os: macos-15-intel
+          - os: [self-hosted, macOS, X64]
             target: x86_64-apple-darwin
             suffix: tar.gz
           - os: windows-latest
@@ -47,6 +52,17 @@ jobs:
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Create job-local Cargo and application directories
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/formless-release-cargo"
+          {
+            echo "CARGO_HOME=$RUNNER_TEMP/formless-release-cargo"
+            echo "FORMLESS_DATA_DIR=$RUNNER_TEMP/formless-release-data"
+            echo "FORMLESS_CONFIG_DIR=$RUNNER_TEMP/formless-release-config"
+          } >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -94,7 +110,7 @@ jobs:
             formless-*.tar.gz
             formless-*.zip
             formless-*.sha256
-          if-no-files-found: ignore
+          if-no-files-found: error
       - name: Final storage (including failed phases)
         if: always()
         shell: bash
@@ -105,7 +121,7 @@ jobs:
   linux:
     timeout-minutes: 60
     needs: version-check
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     container: rust:1-bullseye
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"
@@ -113,6 +129,18 @@ jobs:
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Create job-local Cargo and application directories
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/formless-release-cargo"
+          {
+            echo "CARGO_HOME=$RUNNER_TEMP/formless-release-cargo"
+            echo "FORMLESS_DATA_DIR=$RUNNER_TEMP/formless-release-data"
+            echo "FORMLESS_CONFIG_DIR=$RUNNER_TEMP/formless-release-config"
+          } >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/formless-release-cargo/bin" >> "$GITHUB_PATH"
       - name: Build dependencies
         run: apt-get update && apt-get install -y --no-install-recommends libdbus-1-dev pkg-config
       - name: Storage before workspace tests
@@ -164,7 +192,7 @@ jobs:
       fail-fast: false
       matrix:
         image: ["debian:bookworm", "ubuntu:22.04", "rockylinux:9"]
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     container: ${{ matrix.image }}
     steps:
       - uses: actions/download-artifact@v4
@@ -184,33 +212,55 @@ jobs:
   # ghcr.io/athiwatc/formless (docs/docker.md): built, run and checked
   # before anything is pushed. linux/amd64 only (docs/docker.md).
   docker:
+    permissions:
+      contents: read
+      packages: write
+    env:
+      RELEASE_IMAGE: formless:release-${{ github.run_id }}-${{ github.run_attempt }}
+      RELEASE_CONTAINER: formless-release-${{ github.run_id }}-${{ github.run_attempt }}
     timeout-minutes: 30
     if: startsWith(github.ref, 'refs/tags/v')
     needs: version-check
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: docker/setup-buildx-action@v3
       - name: Build
         uses: docker/build-push-action@v6
         with:
           context: .
           load: true
-          tags: formless:test
+          tags: ${{ env.RELEASE_IMAGE }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-      - name: Smoke test
+      - name: Smoke private container with positive RPC proof
+        shell: bash
         run: |
-          docker run --rm formless:test --version
-          docker run -d --name smoke formless:test
-          for i in $(seq 1 30); do
-            if ! docker exec smoke formless daemon status | grep -q 'not running'; then break; fi
-            sleep 1
-          done
-          docker exec smoke formless daemon status
-          ! docker exec smoke formless daemon status | grep -q 'not running'
-          docker exec smoke formless doctor || true
-          docker rm -f smoke
+          docker run --rm --network none "$RELEASE_IMAGE" --version
+          docker run -d --network none --name "$RELEASE_CONTAINER" "$RELEASE_IMAGE"
+          python3 - <<'PY'
+          import json, os, subprocess, time
+          name = os.environ["RELEASE_CONTAINER"]
+          deadline = time.monotonic() + 30
+          last = "no response"
+          while time.monotonic() < deadline:
+              remaining = deadline - time.monotonic()
+              try:
+                  response = subprocess.run(["docker", "exec", name, "formless", "daemon", "status", "--json"], capture_output=True, text=True, timeout=min(3, remaining))
+                  last = response.stderr or response.stdout
+                  if response.returncode == 0:
+                      status = json.loads(response.stdout)
+                      if type(status.get("pid")) is int and status["pid"] > 0 and status.get("version"):
+                          print(response.stdout)
+                          break
+              except (subprocess.TimeoutExpired, json.JSONDecodeError) as error:
+                  last = str(error)
+              time.sleep(min(0.2, max(0, deadline - time.monotonic())))
+          else:
+              raise SystemExit("private container daemon never answered status within 30s: " + last)
+          PY
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -225,12 +275,27 @@ jobs:
           tags: |
             ghcr.io/athiwatc/formless:${{ github.ref_name }}
             ghcr.io/athiwatc/formless:latest
+      - name: Always remove owned smoke fixture
+        if: always()
+        shell: bash
+        run: |
+          if docker container inspect "$RELEASE_CONTAINER" >/dev/null 2>&1; then
+            docker rm -fv "$RELEASE_CONTAINER"
+          fi
+          if docker image inspect "$RELEASE_IMAGE" >/dev/null 2>&1; then
+            docker image rm "$RELEASE_IMAGE"
+          fi
   publish:
+    permissions:
+      contents: write
+    timeout-minutes: 15
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [build, linux, linux-install-test, docker]
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
           path: assets
