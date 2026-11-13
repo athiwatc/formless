@@ -12367,7 +12367,11 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App, show_cursor: bool) {
     if let Some(forecast) = &app.forecast.hint {
         title.push_str(&format!(" · {} ", truncate_chars(&forecast.hint, 100)));
     }
-    let flashing = app.target_flash.is_some_and(|t| Instant::now() < t);
+    if let Some(notice) = app.input.kill_notice() {
+        title = format!(" {notice} ");
+    }
+    let flashing =
+        app.input.kill_notice().is_some() || app.target_flash.is_some_and(|t| Instant::now() < t);
     let mut block = ui::panel(
         title,
         app.color,
@@ -18131,6 +18135,8 @@ fn draw_editor(f: &mut Frame, ed: &EditorState, app: &App) {
     };
     let hints = if ed.confirm_exit {
         " Discard unsaved edit? y discard · n/Esc keep".to_owned()
+    } else if let Some(notice) = ed.draft.as_ref().and_then(input::InputLine::kill_notice) {
+        notice.to_owned()
     } else {
         format!("{hints} · Ctrl+G external editor · Ctrl+_ undo · Alt+/ redo")
     };
@@ -21283,6 +21289,52 @@ mod tests {
         ed.apply_modal_line(line);
         assert_eq!(ed.cursor, 0);
         assert_eq!(ed.text(), replacement);
+    }
+
+    #[test]
+    fn unavailable_cut_is_visible_and_ordinary_yank_cannot_restore_an_older_cut() {
+        let mut app = test_app();
+        app.input.set("older ไทย");
+        app.input.kill_to_start();
+        app.input.set(&"x".repeat(1024 * 1024 + 1));
+        app.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert!(app.input.is_empty());
+        let screen = render(&mut app, 120, 24);
+        assert!(
+            screen.contains("Cut unavailable for Yank (1 MiB limit)"),
+            "{screen}"
+        );
+        assert!(screen.contains("Alt+Y older cuts"), "{screen}");
+        app.key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL));
+        assert!(app.input.is_empty());
+        app.key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::ALT));
+        assert_eq!(app.input, "older ไทย");
+        assert!(!render(&mut app, 120, 24).contains("Cut unavailable for Yank"));
+        let mut line = input::InputLine::from("older editor 🦀");
+        line.kill_to_start();
+        line.set(&"x".repeat(1024 * 1024 + 1));
+        line.kill_to_start();
+        app.editor = Some(EditorState {
+            draft: Some(line),
+            original: None,
+            confirm_exit: false,
+            review_base_version: None,
+            vim: vim::Vim::default(),
+            tool_id: "fixture".into(),
+            name: "fixture".into(),
+            chars: Vec::new(),
+            cursor: 0,
+            mode: EditMode::Code,
+        });
+        let screen = render(&mut app, 120, 24);
+        assert!(
+            screen.contains("Cut unavailable for Yank (1 MiB limit)"),
+            "{screen}"
+        );
+        app.key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL));
+        assert_eq!(app.editor.as_ref().unwrap().text(), "");
+        app.key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::ALT));
+        assert_eq!(app.editor.as_ref().unwrap().text(), "older editor 🦀");
     }
 
     #[test]
