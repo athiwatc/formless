@@ -3,6 +3,7 @@ mod cli_commands;
 #[cfg(test)]
 mod cli_help_tests;
 mod cli_pipeline;
+mod cli_routing;
 mod cli_run_identity;
 mod cli_tool_success;
 #[cfg(test)]
@@ -68,6 +69,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Read the daemon's currently available routing decisions without a model call
+    Routing {
+        /// Print the complete daemon reply as one JSON value
+        #[arg(long)]
+        json: bool,
+    },
     /// Launch the TUI (default)
     Tui,
     /// Manage the background daemon and its login service
@@ -1997,6 +2004,12 @@ fn run_cli(cli: Cli) -> Result<()> {
             None => runs_cmd(paths, limit, json),
         },
         Some(Cmd::Jobs { action }) => jobs_cmd(paths, action),
+        Some(Cmd::Routing { json }) => {
+            formless_core::daemon::ensure_daemon(&paths)?;
+            cli_routing::write_report(&mut std::io::stdout().lock(), json, |request| {
+                formless_tui::client::request_once(&paths, request)
+            })
+        }
         Some(Cmd::Security {
             action: SecurityAction::Status { json },
         }) => {
@@ -2390,7 +2403,7 @@ fn update_cmd(check: bool) -> Result<()> {
         "https://api.github.com/repos/athiwatc/formless/releases?per_page=50",
     ) {
         Ok(b) => b,
-        Err(e) if e.to_string().contains("404") => {
+        Err(e) if update_http::is_not_found(&e) => {
             println!("installed: v{current}");
             println!("latest:    (no published releases yet)");
             return Ok(());

@@ -4,6 +4,7 @@
 
 use formless_tui::{colorblind_rgb, tone_marker, SemanticTone};
 use std::cell::Cell;
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 thread_local! { static COLORBLIND: Cell<bool> = const { Cell::new(false) }; }
@@ -213,17 +214,38 @@ pub fn color_allowed() -> bool {
 
 /// `text` cut to `w` columns with an ellipsis.
 fn fit(text: &str, w: usize) -> String {
-    if text.width() <= w {
+    let measured_width = text.width();
+    if measured_width <= w {
         return text.to_string();
     }
-    let mut out = String::new();
-    for c in text.chars() {
-        if out.width() + unicode_width::UnicodeWidthChar::width(c).unwrap_or(0) + 1 > w {
-            break;
+    // Most cells have additive grapheme widths. Measure each cluster once so
+    // joined emoji, modifiers and variation selectors keep their string width.
+    let mut used = 0;
+    let mut end = 0;
+    let mut sum = 0;
+    for (start, cluster) in text.grapheme_indices(true) {
+        let width = cluster.width();
+        sum += width;
+        if end == start && used + width < w {
+            used += width;
+            end = start + cluster.len();
         }
-        out.push(c);
     }
-    out + "…"
+    if sum != measured_width {
+        // Script ligatures can cross grapheme boundaries (e.g. Arabic Lam-Alef).
+        // Retain full-prefix measurement for those exceptional cells. Prefix
+        // widths can decrease when a ligature completes, so binary search is
+        // not valid here. Ordinary cells still use the linear path above.
+        end = 0;
+        for (start, cluster) in text.grapheme_indices(true) {
+            let next = start + cluster.len();
+            if text[..next].width() >= w {
+                break;
+            }
+            end = next;
+        }
+    }
+    format!("{}…", &text[..end])
 }
 
 /// A plain cell.
@@ -239,6 +261,34 @@ pub fn t(text: impl Into<String>, tone: Tone) -> (String, Tone) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_mixed_width_cells_clip_within_the_requested_columns() {
+        let input = "ascii ไทย 中文 ".repeat(10_000);
+        for width in [1, 2, 7, 40, 200] {
+            let clipped = fit(&input, width);
+            assert!(clipped.ends_with('…'));
+            assert!(clipped.width() <= width, "{width}: {clipped:?}");
+        }
+        assert_eq!(fit("a中ไทยtail", 4), "a中…");
+        assert_eq!(fit("ไทย", 10), "ไทย");
+    }
+
+    #[test]
+    fn clipping_preserves_sequence_aware_widths() {
+        for (input, width, expected) in [
+            ("👩‍💻abcdefg", 8, "👩‍💻abcde…"),
+            ("👩🏽‍💻abcdefg", 8, "👩🏽‍💻abcde…"),
+            ("❤\u{fe0f}abcdefg", 8, "❤\u{fe0f}abcde…"),
+            ("🇹🇭abcdefg", 8, "🇹🇭abcde…"),
+            ("لاabcdefghi", 8, "لاabcdef…"),
+            ("e\u{301}abcdefghi", 8, "e\u{301}abcdef…"),
+        ] {
+            let clipped = fit(input, width);
+            assert_eq!(clipped, expected);
+            assert_eq!(clipped.width(), width);
+        }
+    }
 
     #[test]
     fn piped_status_cells_preserve_the_original_whitespace_fields() {
