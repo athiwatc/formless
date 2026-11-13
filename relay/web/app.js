@@ -1656,8 +1656,10 @@
   const FENCE = /^(\s*)(`{3,}|~{3,})\s*([^\s`{,]*)/;
   const HEADING = /^\s{0,3}(#{1,6})\s+(.*?)(?:\s+#+\s*)?$/;
   const SETEXT = /^ {0,3}(=+|-+)[ \t]*$/;
-  // Both syntaxes share the current logical-level mapping (#1559).
-  const markdownHeading = (level, content) => h("h" + Math.min(6, level + 1), null, content);
+  // Message headings nest below the Session title (h2). ARIA levels preserve
+  // depths beyond HTML's h6; source-depth classes control readable styling.
+  const markdownHeading = (level, content) => h(level <= 4 ? "h" + (level + 2) : "div",
+    { class: "md-heading md-heading-" + level, role: "heading", "aria-level": level + 2, "data-heading-level": level }, content);
   const RULE = /^\s{0,3}([-*_])(?:\s*\1){2,}\s*$/;
   const ITEM = /^(\s*)([-*+]|\d{1,9}[.)])(\s+|$)(.*)$/;
   const QUOTE = /^\s{0,3}>/;
