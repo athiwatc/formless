@@ -49,10 +49,18 @@ pub fn is_transient(raw: &str) -> bool {
 }
 
 fn status(raw: &str) -> Option<u16> {
-    raw.split(|c: char| !c.is_ascii_digit())
-        .filter(|w| w.len() == 3)
-        .filter_map(|w| w.parse::<u16>().ok())
-        .find(|s| (400..600).contains(s))
+    // A displayed HTTP status starts an error clause: a bare status, an
+    // anyhow/provider context after ':', or reqwest's parenthesized status.
+    // Do not scan arbitrary digit runs: parser coordinates (and URL ports,
+    // sizes, request IDs, etc.) are diagnostic data, not HTTP evidence.
+    raw.split([':', '(', '\n']).find_map(|clause| {
+        let word = clause.split_ascii_whitespace().next()?;
+        let code = word.trim_end_matches(')');
+        if code.len() != 3 {
+            return None;
+        }
+        code.parse::<u16>().ok().filter(|s| (400..600).contains(s))
+    })
 }
 
 /// `(retry after 30s)` as added by the provider client.
@@ -262,6 +270,83 @@ mod tests {
             base_url: base,
             model: "gpt-x",
             alternatives: vec![],
+        }
+    }
+
+    #[test]
+    fn parser_coordinates_do_not_change_error_advice_or_transience() {
+        use formless_runtime::structured_output::JsonOutputSchema;
+
+        let schema = JsonOutputSchema::compile(serde_json::json!({})).unwrap();
+        let context = ctx("https://private.invalid/v1");
+        let baseline = explain("structured output is not one complete JSON value", &context);
+        // Exercise every HTTP-shaped position, on both axes, through the real
+        // parser and Display contract rather than fabricated diagnostics.
+        for position in 400..600 {
+            for input in [
+                format!("{}?", " ".repeat(position - 1)),
+                format!("{}?", "\n".repeat(position - 1)),
+            ] {
+                let diagnostic = schema.parse_and_validate(&input).unwrap_err().to_string();
+                for raw in [
+                    diagnostic.clone(),
+                    format!("schema: final answer still mismatches after one repair: {diagnostic}"),
+                    format!("llm.complete failed: {diagnostic}"),
+                ] {
+                    let explained = explain(&raw, &context);
+                    assert_eq!(explained.category, "other", "{raw}");
+                    assert_eq!(explained.message, baseline.message, "{raw}");
+                    assert_eq!(explained.action, baseline.action, "{raw}");
+                    assert_eq!(explained.details, raw);
+                    assert!(!is_transient(&raw), "{raw}");
+                    assert_eq!(
+                        explain_with_previous(&raw, Some(&raw), &context).category,
+                        "other",
+                        "{raw}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn diagnostic_numbers_are_not_http_statuses() {
+        for raw in [
+            "parse response: expected value at line 503 column 401",
+            "provider error: request id 429 failed validation",
+            "response size 500 bytes was invalid",
+            "error sending request for url (https://private.invalid:503/v1)",
+        ] {
+            assert_eq!(status(raw), None, "{raw}");
+        }
+        assert_eq!(status("HTTP status error (503)"), Some(503));
+    }
+
+    #[test]
+    fn genuine_http_statuses_keep_their_categories_and_retry_policy() {
+        let context = ctx("https://private.invalid/v1");
+        for (status_text, category, transient) in [
+            ("400 Bad Request", "request", false),
+            ("401 Unauthorized", "auth", false),
+            ("403 Forbidden", "auth", false),
+            ("404 Not Found", "endpoint", false),
+            ("408 Request Timeout", "other", true),
+            ("429 Too Many Requests", "rate_limit", true),
+            ("500 Internal Server Error", "server", true),
+            ("503 Service Unavailable", "server", true),
+            ("599 <unknown status code>", "server", true),
+        ] {
+            for raw in [
+                status_text.to_string(),
+                format!("provider error: {status_text}: {{}}"),
+                format!("provider request failed after retries: {status_text}"),
+                format!("POST /chat/completions failed: {status_text}"),
+                format!("outer context: HTTP status error ({status_text}) for url (https://private.invalid/v1)"),
+                format!("provider error: {status_text}: structured output is not one complete JSON value (parser: syntax, line 429, column 503)"),
+            ] {
+                assert_eq!(explain(&raw, &context).category, category, "{raw}");
+                assert_eq!(is_transient(&raw), transient, "{raw}");
+            }
         }
     }
 
