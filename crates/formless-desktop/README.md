@@ -96,7 +96,9 @@ outside dismisses. Cmd/Ctrl with =, - and 0 change the text size between
 Commands button in the header, opens the command palette: type to filter,
 Up/Down to choose, Enter to run, Escape to close; a command that cannot run
 says why. Every button, shortcut and palette row runs through one typed
-registry (`src/commands.rs`). The text is always the
+registry (`src/commands.rs`). A row that shows only part of a long block has
+a View whole control: the whole block as plain text, scrolled with the arrow,
+page, Home and End keys, with Copy all. The text is always the
 size asked for. A window smaller than that size needs (480 x 360 times the
 size) is reflowed: every part is as wide as the window, the parts stack,
 and the shell scrolls up and down as one page, with focus bringing each
