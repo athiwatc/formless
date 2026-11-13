@@ -117,6 +117,40 @@ pub fn stream_delta(index: usize) -> &'static str {
     }
 }
 
+/// The `index`th delta of a synthetic stream of markdown: words with
+/// emphasis, inline code and links, paragraph breaks, and every so often an
+/// ordered list, a task list, a quote and a fenced code block, so the plain
+/// text made for assistive technology has real markdown to work through.
+pub fn stream_markdown_delta(index: usize) -> &'static str {
+    const PIECES: [&str; 24] = [
+        "The ",
+        "**stream** ",
+        "keeps ",
+        "`going` ",
+        "ต่อไป ",
+        "続く ",
+        "and ",
+        "[on](https://example.invalid). ",
+        "\n\n",
+        "1. first\n",
+        "2. second\n",
+        "\n",
+        "- [x] done\n",
+        "- [ ] to do\n",
+        "\n",
+        "> a quoted ",
+        "_line_\n",
+        "\n",
+        "```rust\n",
+        "fn main() {}\n",
+        "```\n",
+        "\n",
+        "Emoji 👩🏽‍💻 ",
+        "end.\n\n",
+    ];
+    PIECES[index % PIECES.len()]
+}
+
 /// One fenced code block of about `bytes` bytes: the "five-megabyte output"
 /// of the epic's stress case. Every line is distinct so a truncated preview
 /// can be told from the whole.

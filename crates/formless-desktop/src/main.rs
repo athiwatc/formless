@@ -26,6 +26,12 @@
 //!   process and write them to PATH, one per line. This is what the
 //!   platform adapter exposes to any assistive technology, read without
 //!   one. The first walk is itself the request that starts the adapter.
+//! - `--activate-a11y` (macOS, `ax-dump` feature): walk the window's
+//!   accessibility elements once, half a second in, which starts the
+//!   platform adapter and GPUI's accessibility tree, as a screen reader
+//!   would; for measuring what that costs while streaming.
+//! - `--stream-markdown`: stream markdown (lists, task items, quotes, code)
+//!   instead of plain words.
 //! - `--smoke`: print startup timings up to the first rendered frame, quit.
 //! - `--stream-seconds S` (with `--stream-rate R`, default 100 deltas per
 //!   second; 0 streams nothing and measures the idle window): stream into
@@ -59,6 +65,8 @@ struct Options {
     lifetime_seconds: usize,
     dump_a11y: Option<String>,
     dump_platform_a11y: Option<String>,
+    activate_a11y: bool,
+    stream_markdown: bool,
     smoke: bool,
     stream_seconds: usize,
     stream_rate: usize,
@@ -79,6 +87,8 @@ fn parse_options() -> Result<Options, String> {
         smoke: false,
         stream_seconds: 0,
         stream_rate: 100,
+        activate_a11y: false,
+        stream_markdown: false,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -115,6 +125,8 @@ fn parse_options() -> Result<Options, String> {
             "--smoke" => options.smoke = true,
             "--stream-seconds" => options.stream_seconds = count("--stream-seconds")?,
             "--stream-rate" => options.stream_rate = count("--stream-rate")?,
+            "--activate-a11y" => options.activate_a11y = true,
+            "--stream-markdown" => options.stream_markdown = true,
             other => return Err(format!("unknown option {other:?}")),
         }
     }
@@ -425,7 +437,15 @@ fn percentile(sorted: &[f64], fraction: f64) -> f64 {
 
 /// Stream into the tail for `seconds` at `rate` deltas per second, then
 /// print how frames were delivered meanwhile and quit.
-fn run_stream(window: &Window, shell: Entity<Shell>, seconds: usize, rate: usize, cx: &mut App) {
+fn run_stream(
+    window: &Window,
+    shell: Entity<Shell>,
+    seconds: usize,
+    rate: usize,
+    markdown: bool,
+    cx: &mut App,
+) {
+    let handle = window.window_handle();
     const TICK: Duration = Duration::from_millis(10);
     let frames = Rc::new(RefCell::new(Vec::new()));
     let running = Rc::new(RefCell::new(true));
@@ -447,7 +467,12 @@ fn run_stream(window: &Window, shell: Entity<Shell>, seconds: usize, rate: usize
                 cx.update(|cx| {
                     shell.update(cx, |shell, cx| {
                         for index in sent..due {
-                            shell.push_stream_delta(fixture::stream_delta(index), cx);
+                            let delta = if markdown {
+                                fixture::stream_markdown_delta(index)
+                            } else {
+                                fixture::stream_delta(index)
+                            };
+                            shell.push_stream_delta(delta, cx);
                         }
                     })
                 });
@@ -472,6 +497,17 @@ fn run_stream(window: &Window, shell: Entity<Shell>, seconds: usize, rate: usize
             let (tail_bytes, tail_before, tail_after) =
                 shell.read(cx).last_block_window().unwrap_or_default();
             let work = shell.read(cx).stream_work();
+            // Whether GPUI was building an accessibility tree, and what
+            // making the rows' plain text cost meanwhile.
+            let a11y_active = cx
+                .update_window(handle, |_, window, _| window.is_a11y_active())
+                .unwrap_or(false);
+            let (builds, nanos, bytes) = formless_desktop::timeline::accessible_text_stats();
+            println!(
+                "a11y: active={a11y_active} accessible_text_builds={builds} \
+                 accessible_text_ms={:.1} accessible_text_bytes={bytes} markdown_stream={markdown}",
+                nanos as f64 / 1e6
+            );
             println!(
                 "stream: seconds={seconds} rate={rate} deltas_sent={sent} deltas_received={deltas} \
                  view_updates={flushes} frames={} frame_interval_ms p50={:.1} p95={:.1} p99={:.1} \
@@ -579,6 +615,26 @@ fn main() {
             })
             .detach();
         }
+        if options.activate_a11y {
+            // One walk of the window's accessibility elements, half a second
+            // in, then nothing: asking is what starts the platform adapter
+            // and so GPUI's accessibility tree, without a walk every half
+            // second adding its own cost to what is measured.
+            let handle = window;
+            cx.spawn(async move |cx| {
+                cx.background_executor()
+                    .timer(Duration::from_millis(500))
+                    .await;
+                let walked = cx.update(|cx| {
+                    cx.update_window(handle, |_, window, _| platform_a11y::walk(window).len())
+                });
+                println!(
+                    "a11y: activated by one walk ({} bytes)",
+                    walked.unwrap_or(0)
+                );
+            })
+            .detach();
+        }
         if let Some(path) = options.dump_platform_a11y.clone() {
             let handle = window;
             cx.spawn(async move |cx| loop {
@@ -629,6 +685,7 @@ fn main() {
                                 shell,
                                 options.stream_seconds,
                                 options.stream_rate,
+                                options.stream_markdown,
                                 cx,
                             );
                         } else {

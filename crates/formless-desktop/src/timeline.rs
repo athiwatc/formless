@@ -12,7 +12,26 @@
 
 use std::cell::OnceCell;
 use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
+
+/// Plain texts made for assistive technology in this process, the time they
+/// took and the markdown they were made from, for measuring that cost.
+static ACCESSIBLE_BUILDS: AtomicU64 = AtomicU64::new(0);
+static ACCESSIBLE_NANOS: AtomicU64 = AtomicU64::new(0);
+static ACCESSIBLE_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// How many plain texts [`TimelineBlock::accessible_text`] has made in this
+/// process, how many nanoseconds that took in all, and how many bytes of
+/// markdown they were made from.
+pub fn accessible_text_stats() -> (u64, u64, u64) {
+    (
+        ACCESSIBLE_BUILDS.load(Ordering::Relaxed),
+        ACCESSIBLE_NANOS.load(Ordering::Relaxed),
+        ACCESSIBLE_BYTES.load(Ordering::Relaxed),
+    )
+}
 
 use crate::memory::limits;
 use crate::model::BlockKind;
@@ -462,7 +481,14 @@ impl TimelineBlock {
     /// row does not parse it again.
     pub fn accessible_text(&self) -> Arc<str> {
         self.accessible
-            .get_or_init(|| Arc::from(plain_text(&self.preview)))
+            .get_or_init(|| {
+                let started = Instant::now();
+                let text = Arc::from(plain_text(&self.preview));
+                ACCESSIBLE_BUILDS.fetch_add(1, Ordering::Relaxed);
+                ACCESSIBLE_NANOS.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                ACCESSIBLE_BYTES.fetch_add(self.preview.len() as u64, Ordering::Relaxed);
+                text
+            })
             .clone()
     }
 
@@ -1459,6 +1485,19 @@ mod tests {
         let before = b.accessible_text();
         b.show_start();
         assert!(!Arc::ptr_eq(&before, &b.accessible_text()));
+    }
+
+    #[test]
+    fn making_a_rows_accessible_text_is_counted_once_per_rebuild() {
+        let b = block("**one** and `two`\n\n- [x] three");
+        let (builds, _, bytes) = accessible_text_stats();
+        assert_eq!(&*b.accessible_text(), "one and two\n☑ three");
+        b.accessible_text();
+        let (builds_after, _, bytes_after) = accessible_text_stats();
+        // Other tests make accessible text at the same time, so this
+        // checks that this row added at least its one build and its bytes.
+        assert!(builds_after > builds);
+        assert!(bytes_after >= bytes + b.preview().len() as u64);
     }
 
     #[test]

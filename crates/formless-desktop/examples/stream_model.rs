@@ -55,16 +55,29 @@ const SCENARIOS: [Scenario; 5] = [
     },
 ];
 
-/// What the view reads when it is brought up to date.
-fn show(timeline: &mut Timeline) {
+/// What the view reads when it is brought up to date. With `accessible`,
+/// also what assistive technology is given for the row, as the shell makes
+/// it while an accessibility tree is being built.
+fn show(timeline: &mut Timeline, accessible: bool) {
     timeline.settle();
     let row = timeline.blocks().last().expect("a streamed block");
     black_box((row.preview().len(), row.hidden_before(), row.hidden_after()));
+    if accessible {
+        black_box(row.accessible_text());
+    }
 }
 
 /// One whole stream. Returns the timeline and how many times the view was
 /// brought up to date.
 fn replay(scenario: &Scenario) -> (Timeline, u64) {
+    replay_with(scenario, fixture::stream_delta, false)
+}
+
+fn replay_with(
+    scenario: &Scenario,
+    delta: fn(usize) -> &'static str,
+    accessible: bool,
+) -> (Timeline, u64) {
     let mut timeline = Timeline::default();
     timeline.begin_stream(BlockKind::Assistant);
     let mut flushes = 0;
@@ -75,15 +88,15 @@ fn replay(scenario: &Scenario) -> (Timeline, u64) {
             .checked_div(scenario.rate)
             .unwrap_or(0);
         if flush_due.is_some_and(|due| due <= now) {
-            show(&mut timeline);
+            show(&mut timeline, accessible);
             flushes += 1;
             flush_due = None;
         }
-        timeline.push_delta(fixture::stream_delta(index));
+        timeline.push_delta(delta(index));
         flush_due.get_or_insert(now + FLUSH_INTERVAL_MS * 1_000);
     }
     timeline.finish_stream();
-    show(&mut timeline);
+    show(&mut timeline, accessible);
     (timeline, flushes + 1)
 }
 
@@ -127,5 +140,53 @@ fn main() {
             per_delta(nanos[0]),
             per_delta(nanos[TRIALS / 2]),
         );
+    }
+    accessibility_paths();
+}
+
+/// The same replay with the row's accessible text made at every flush, as
+/// the shell does while an accessibility tree is built, against the
+/// ordinary path, for plain words and for markdown. Fewer trials: the
+/// accessible path is slow on purpose to measure.
+fn accessibility_paths() {
+    const PATH_TRIALS: usize = 5;
+    let cases: [(&str, fn(usize) -> &'static str); 2] = [
+        ("words", fixture::stream_delta),
+        ("markdown", fixture::stream_markdown_delta),
+    ];
+    for scenario in [&SCENARIOS[1], &SCENARIOS[2]] {
+        for (content, delta) in cases {
+            for accessible in [false, true] {
+                let mut nanos: Vec<u128> = (0..PATH_TRIALS)
+                    .map(|_| {
+                        let started = Instant::now();
+                        black_box(replay_with(scenario, delta, accessible));
+                        started.elapsed().as_nanos()
+                    })
+                    .collect();
+                nanos.sort_unstable();
+                let before = formless_desktop::timeline::accessible_text_stats();
+                let (timeline, flushes) = replay_with(scenario, delta, accessible);
+                let after = formless_desktop::timeline::accessible_text_stats();
+                let row = timeline.blocks().last().expect("a streamed block");
+                let builds = after.0 - before.0;
+                let build_ms = (after.1 - before.1) as f64 / 1e6;
+                let seconds = scenario.deltas as f64 / scenario.rate as f64;
+                println!(
+                    "model-a11y: scenario={} content={content} path={} flushes={flushes} \
+                     accessible_text_builds={builds} accessible_text_ms={build_ms:.1} \
+                     accessible_ms_per_stream_second={:.2} window_bytes={} \
+                     accessible_text_digest={:016x} trials={PATH_TRIALS} \
+                     whole_stream_ms min={:.1} median={:.1}",
+                    scenario.name,
+                    if accessible { "accessible" } else { "ordinary" },
+                    build_ms / seconds,
+                    row.preview().len(),
+                    digest(&row.accessible_text()),
+                    nanos[0] as f64 / 1e6,
+                    nanos[PATH_TRIALS / 2] as f64 / 1e6,
+                );
+            }
+        }
     }
 }
