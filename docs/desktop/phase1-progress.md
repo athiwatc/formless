@@ -18,6 +18,8 @@ and the crate still optional (detached workspace, not a default build).
 | Transcript events | `1e86a5e6` | `src/transcript.rs` (no GPUI or I/O): applies the protocol's `MessageAppended`, `MessageDelta`, `MessageComplete`, `MessagesEdited`, `DeltasDropped` and `StreamRestarted` to a decoded snapshot. The first delta starts a provisional row with an id outside the persisted sequence range; canonical assistant text replaces it. Tools/notes can arrive during it. Foreign Sessions are ignored, exact duplicates do not erase a newer partial answer, invalid/misordered text or a conflicting live Run requests reload instead of being combined. Edits, transcript-scoped/legacy/global gap warnings and restarts latch an explicit reload-needed state until a new snapshot. Snapshot decoding now validates each message's Session and retains the highest sequence even for hidden tool-only turns. Still not wired to the shell or a transport; snapshot/event generation ordering and Run lifecycle handling remain future client work. | 14 event-model, 2 reply-model; independent read-only review |
 | Width-checked full output and source invalidation | `1b960542` | `full_view::measured_row_starts` checks the actual shaped advance of each candidate, then shortens on grapheme boundaries; an ASCII count is only a hint. Each measurement is at most 8 KiB/256 graphemes, uses a separate short-lived GPUI text system (64 queries per batch), and has a 128-entry borrowed-key fit memo, so the window's frame cache does not retain a layout of the whole transcript. An oversized/too-wide indivisible character gets an explanation and Copy all instead of silent clipping. Exact pixel width/full font changes reindex the view. A new snapshot or Session invalidates it, so old offsets cannot slice shorter or different UTF-8 text, even at the same id and byte length. The summary is a bounded, focusable scroll region above pinned buttons, after a 480x360/200% test exposed overflow before and after copying. Retained offsets are boxed, with no spare vector capacity. | 6 model, 4 shell; 2 real-font states added and compiled, not run |
 | Fixture Sessions directory | `8ec921ee` | A virtualized, read-only Sessions destination over the existing unarchived sidebar projection. All-word, case-insensitive title/preview/ID filter; processed queries capped at 256 Unicode scalar values; bounded visual labels; selection retained by ID without activation, and kept in view after filtering. Arrows/Enter work in the filter or after F6 enters the region; Escape/Back returns to Chat. Enter/Escape during input-method composition only commit it. Activation revalidates the ID and uses the existing draft lifecycle. A decoded snapshot is cleared on Session change instead of relabeled; loaded empty and not-yet-loaded states are distinct. The fixture explicitly shares synthetic content; no rename/archive/delete, transport or backend action exists. | 4 model, 9 shell; 2 native render states added and compiled only |
+| Modal navigation and stale focus | `eb9d4913` | Commands replaces an open whole-output view; explicit navigation also dismisses it. Snapshot replacement drops obsolete conversation-row restore origins even when Commands has already replaced the viewer. | 2 shell; independent read-only review |
+| Loaded-text Search | This change | Commands → Go to Search opens a virtualized, read-only literal, case-sensitive, non-overlapping search over finished text already loaded in this window, including Markdown source. Explicit fixture/loaded-Session/unloaded scope; 256-scalar accepted query, 200 results, 4 MiB source-prefix and 4096-block scan bounds; partial and live-tail notices. Visible snippets have bounded grapheme context and a named preview limit. Result activation revalidates the captured corpus revision, current query, block identity and exact UTF-8 range before opening whole output at the match. Snapshot/Session/stream boundaries invalidate results, but live deltas do not rescan. Back preserves drafts and the Sessions filter; IME composition commits without activation/navigation. No I/O, history loading or backend actions. | 8 model, 11 shell; 2 native render states compiled only; independent read-only review |
 
 One deliberate behaviour change came with the registry: while an input
 method is composing in the composer, Send/Steer/Queue are unavailable
@@ -111,6 +113,35 @@ configurations, 116 GUI-free/121 feature-enabled model tests, 99 shell
 tests, 8 Python tests and doc tests passed offline. Native rendering is
 still not run. Independent read-only review found no blocker.
 
+
+Search evidence (local, git-ignored):
+`.screenshots/gpui-1753-phase0/p1-sol-search-run1/`. The final offline
+checks passed: fmt, all four clippy configurations, GUI-free model tests
+(124), feature-enabled model tests (129), shell tests (110), Python checker
+tests (8), and doc tests. Model tests cover literal Unicode byte ranges,
+exactly-full versus truncated result sets, UTF-8/empty-block scan limits,
+source revisions, live-tail omission and a giant combining cluster that
+cannot safely produce a bounded preview. Shell tests cover Commands
+reachability, a deep match in a 2 MiB block opening in view, exact copying,
+old-query/old-snapshot queued actions, unloaded versus loaded-empty
+snapshots, stream completion, composition, repeated entry, keyboard Back,
+draft/filter preservation, 480x360 at 200% and a queued activation behind
+Commands. The kit's click helper repaints before clicking, so stale-frame
+regressions invoke the same action boundary with the revision captured
+by the old row. Independent read-only source review found no blocker.
+The preliminary focused Search run passed 11 tests (including the existing
+palette composition test); a later modal-queue regression is included in
+the final 110-test shell suite.
+
+The scan limits are not a CPU-time or process-memory guarantee. Search
+retains positions rather than transcript copies, makes previews only for
+visible rows and excludes the unfinished tail. Input undo/IME and font
+caches remain outside its accounting. No foreground window, daemon,
+transport or network was used. The two added native render states were
+compiled, not run; the earlier pasteboard/XPC restriction was not retried
+or bypassed. Real-font pixels, native assistive-technology behavior and
+actual input methods remain open acceptance work.
+
 ## Not done, and what each needs
 
 ### Phase 0 gates (still open; nothing in Phase 1 closes them)
@@ -119,8 +150,8 @@ still not run. Independent read-only review found no blocker.
 |---|---|
 | Windows build, render, input and accessibility at the current head | The Windows worker (separately owned; not duplicated here) |
 | Linux build and render | The Linux worker (separately owned) |
-| Real input methods (Thai, Japanese, dead keys) in the composer and now the palette search field | A person at the Mac |
-| VoiceOver over regions, overlays, the palette, and whether it follows the palette's active-descendant row | A person at the Mac |
+| Real input methods (Thai, Japanese, dead keys) in the composer, palette, Sessions filter and loaded-text Search | A person at the Mac |
+| VoiceOver over regions, overlays, the palette, Sessions/Search and whether it follows each active-descendant row | A person at the Mac |
 | 200% and display scaling looked at by a person | A person at the Mac |
 | Performance budgets | A decision by the user (§11.4, §14, §16.10) |
 | Packaging and supported platform tier | A decision by the user |
@@ -134,7 +165,7 @@ still not run. Independent read-only review found no blocker.
 | Typed decoding of daemon replies into the presentation model | `ListSessions`, `GetSession` and pure transcript-event application done (above); Run events and shell/client integration not started | Snapshot/event ordering and client reconciliation before transport integration |
 | Client transport (connect, reconnect, version check, idempotent send) | Not started | Decision §5.2: extract `formless-client` or depend on `formless-tui` |
 | Transcript paging | Not possible without a protocol change | Daemon work outside this epic (§5.3) |
-| Destinations other than Chat | Sessions has a read-only fixture directory; Tools, Metrics, Proposals, Settings and Search remain scaffold notices | The client layer for real data; further UI-only slices can use fixtures |
+| Destinations other than Chat | Sessions has a read-only fixture directory and Search covers finished loaded text only; Tools, Metrics, Proposals and Settings remain scaffold notices | The client layer for real data; further UI-only slices can use fixtures |
 | Approvals, questions, credentials, setup | Not examined, by instruction | Explicit scope from the user |
 | Full-output view of a long block (§12.1) | Done (above), now width-checked and source-invalidated; not in the command palette (it needs a target block). Real-font render states exist but remain unrun | Native offscreen runtime; visual review |
 | Thai line breaking wired in (§11.6, §5.1) | Study only | Decision §5.1 |
@@ -143,16 +174,16 @@ still not run. Independent read-only review found no blocker.
 
 ## Next slice
 
-**Search the loaded transcript, not global history.** A separate,
-read-only slice: explicit fixture/loaded-Session scope, bounded query,
-results and scanning work; literal matches with source-safe byte ranges;
-bounded snippets; revalidation against the exact source revision on
-activation; invalidation on snapshot/Session/stream changes. No transport,
-backend writes, auth or security-control changes. This must not imply that
-unloaded history has been searched or silently reuse results from another
-Session. The native full-output and directory render states still need a
-working runtime; the existing restriction must not be bypassed to run them.
+**Client reconciliation before transport.** The pure transcript model
+still needs a shell/client boundary that visibly reports its sticky
+reload-needed state and reconciles snapshot request generations before a
+transport is connected. Run lifecycle events and the extraction-versus-TUI
+client decision remain separate work. No backend writes, auth or
+security-control changes are implied by the completed fixture/loaded-text
+UI slices. Do not present an unloaded Session as searched or reuse source
+positions after replacement.
 
-The transcript model still needs a shell/client boundary that displays its
-reload-needed state and reconciles request generations before a transport
-is connected. No Phase 0 acceptance gate is closed by these model/UI slices.
+The native full-output, directory and Search render states still need a
+working runtime and visual review; the existing restriction must not be
+bypassed to run them. No Phase 0 acceptance gate is closed by these
+model/UI slices.

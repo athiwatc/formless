@@ -11,6 +11,7 @@ pub mod full_view;
 pub mod memory;
 pub mod model;
 pub mod replies;
+pub mod search;
 #[cfg(feature = "gui")]
 pub mod shell;
 #[cfg(feature = "thai-breaks")]

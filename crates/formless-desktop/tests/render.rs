@@ -75,7 +75,7 @@ mod render {
     const WHOLE: Fit = Fit::Whole;
     const REFLOWED: Fit = Fit::Reflowed;
 
-    const STATES: [State; 25] = [
+    const STATES: [State; 27] = [
         state("wide-light", 1440., 900., LIGHT, 100, None, WHOLE),
         state("wide-dark", 1440., 900., DARK, 100, None, WHOLE),
         state("medium-light", 1100., 900., LIGHT, 100, None, WHOLE),
@@ -241,6 +241,24 @@ mod render {
             DARK,
             200,
             Some("open-directory"),
+            REFLOWED,
+        ),
+        state(
+            "wide-loaded-search-light",
+            1440.,
+            900.,
+            LIGHT,
+            100,
+            Some("open-search"),
+            WHOLE,
+        ),
+        state(
+            "minimum-loaded-search-dark-200pct",
+            480.,
+            360.,
+            DARK,
+            200,
+            Some("open-search"),
             REFLOWED,
         ),
     ];
@@ -637,6 +655,12 @@ mod render {
                     shell.update(cx, |shell, cx| {
                         shell.run_command(Command::GoTo(Destination::Sessions), window, cx)
                     });
+                } else if control == "open-search" {
+                    shell.update(cx, |shell, cx| {
+                        shell.run_command(Command::GoTo(Destination::Search), window, cx)
+                    });
+                    let query = shell.read(cx).search_query().clone();
+                    query.update(cx, |query, cx| query.set_value("ข้อความ", window, cx));
                 } else {
                     window.click(control, cx);
                 }
@@ -651,7 +675,7 @@ mod render {
                     let panel = match control {
                         "toggle-sidebar" => "region-sidebar",
                         "show-commands" => "palette",
-                        "open-directory" => "region-conversation",
+                        "open-directory" | "open-search" => "region-conversation",
                         _ => "region-inspector",
                     };
                     assert!(

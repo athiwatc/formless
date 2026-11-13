@@ -17,7 +17,9 @@ use formless_desktop::fixture;
 use formless_desktop::memory::{limits, IntentKind, IntentRecord};
 use formless_desktop::model::{tokens, BlockKind, Destination, Fit, TextScale};
 use formless_desktop::replies;
-use formless_desktop::shell::{self, directory_row_id, session_row_id, PageSection, Shell};
+use formless_desktop::shell::{
+    self, directory_row_id, search_row_id, session_row_id, PageSection, Shell,
+};
 use formless_desktop::timeline::{self, TimelineBlock};
 use formless_protocol::SendMode;
 use gpui_kit::base::test_support::texts;
@@ -656,9 +658,9 @@ fn other_destinations_show_a_scaffold_notice_instead_of_the_conversation(cx: &mu
             painted.iter().any(|text| text == "Tools: not built"),
             "{painted:?}"
         );
-        assert!(painted
-            .iter()
-            .any(|text| text.contains("This Phase 0 scaffold has Chat and fixture Sessions only")));
+        assert!(painted.iter().any(|text| text.contains(
+            "This Phase 0 scaffold has Chat, fixture Sessions and loaded-text Search only"
+        )));
 
         // The region cycle skips the composer that is not there.
         window.press("f6", cx);
@@ -957,9 +959,9 @@ fn every_place_focus_can_rest_on_a_reflowed_page_has_an_accessibility_node(
         let notice = window.find("region-conversation");
         assert_eq!(notice.role(), Some(Role::Main));
         assert_eq!(notice.label(), Some("Tools: not built"));
-        assert!(notice
-            .description()
-            .is_some_and(|text| text.contains("has Chat and fixture Sessions only")));
+        assert!(notice.description().is_some_and(
+            |text| text.contains("has Chat, fixture Sessions and loaded-text Search only")
+        ));
     });
 }
 
@@ -5222,5 +5224,493 @@ fn a_snapshot_replacing_a_palette_origin_restores_visible_focus_not_an_old_row(
         assert!(window.try_find("block-1-top-view").is_none());
         assert_eq!(window.find_by_label("Message").focused(), Some(true));
         assert!(!shell.read(cx).background_inert(window));
+    });
+}
+
+#[gpui_kit::test]
+fn search_is_reachable_from_commands_and_opens_the_chosen_literal_match_without_losing_drafts(
+    cx: &mut TestAppContext,
+) {
+    let blocks = vec![
+        TimelineBlock::new(1, BlockKind::User, "alpha needle".into()),
+        TimelineBlock::new(2, BlockKind::ToolSummary, "Needle caps".into()),
+        TimelineBlock::new(3, BlockKind::Assistant, "prefix needle second".into()),
+    ];
+    let (handle, shell) = open_blocks(cx, WIDE, blocks);
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        window.input("draft kept", cx);
+        shell.update(cx, |shell, cx| shell.open_palette(window, cx));
+        window.render_frame(cx);
+        window.input("go search", cx);
+    });
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        window.press("enter", cx);
+        window.render_frame(cx);
+        assert_eq!(shell.read(cx).destination(), Destination::Search);
+        assert_eq!(
+            window.find_by_label("Search loaded transcript").focused(),
+            Some(true)
+        );
+        assert!(window.try_find("region-composer").is_none());
+        assert!(window
+            .find("search-status")
+            .value()
+            .unwrap()
+            .contains("case-sensitive"));
+        window.input("needle", cx);
+    });
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        assert_eq!(shell.read(cx).search_hits().len(), 2); // not uppercase Needle
+        let second = shell.read(cx).search_hits()[1];
+        window.press("down", cx);
+        window.render_frame(cx);
+        assert_eq!(window.find(search_row_id(second)).selected(), Some(true));
+        window.press("enter", cx);
+        window.render_frame(cx);
+        window.render_frame(cx);
+        assert!(window.try_find("viewer").is_some());
+        assert!(window
+            .find(("viewer-row", 0usize))
+            .value()
+            .unwrap()
+            .contains("needle"));
+        window.click("viewer-copy", cx);
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("prefix needle second".into())
+        );
+        window.press("escape", cx);
+        window.render_frame(cx);
+        assert_eq!(
+            window.find_by_label("Search loaded transcript").focused(),
+            Some(true)
+        );
+        window.press("escape", cx);
+        window.render_frame(cx);
+        assert_eq!(shell.read(cx).destination(), Destination::Chat);
+        assert_eq!(shell.read(cx).draft(cx).as_ref(), "draft kept");
+        assert_eq!(shell.read(cx).last_intent(), None);
+    });
+}
+
+#[gpui_kit::test]
+fn a_search_hit_deep_in_a_long_block_is_visible_when_opened(cx: &mut TestAppContext) {
+    let text = "x".repeat(2 * 1024 * 1024) + "needle";
+    let (handle, shell) = open_blocks(
+        cx,
+        WIDE,
+        vec![TimelineBlock::new(7, BlockKind::ToolSummary, text)],
+    );
+    step(cx, handle, |window, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.run_command(Command::GoTo(Destination::Search), window, cx)
+        });
+        window.render_frame(cx);
+        window.input("needle", cx);
+    });
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        assert_eq!(shell.read(cx).search_hits().len(), 1);
+        window.press("enter", cx);
+        window.render_frame(cx);
+        window.render_frame(cx);
+        assert!(shell.read(cx).viewer_rows().unwrap() > 200);
+        assert!(viewer_rows_shown(window).iter().any(|index| window
+            .find(("viewer-row", *index))
+            .value()
+            .unwrap()
+            .contains("needle")));
+    });
+}
+
+#[gpui_kit::test]
+fn search_limits_are_explicit_and_do_not_pretend_to_search_unloaded_or_truncated_text(
+    cx: &mut TestAppContext,
+) {
+    let text = "x".repeat(formless_desktop::search::MAX_SCAN_BYTES + 1024) + "needle";
+    let (handle, shell) = open_blocks(
+        cx,
+        WIDE,
+        vec![TimelineBlock::new(7, BlockKind::ToolSummary, text)],
+    );
+    step(cx, handle, |window, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.run_command(Command::GoTo(Destination::Search), window, cx)
+        });
+        window.render_frame(cx);
+        window.input("needle", cx);
+    });
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        assert!(shell.read(cx).search_hits().is_empty());
+        assert!(window
+            .find("search-status")
+            .value()
+            .unwrap()
+            .starts_with("Partial:"));
+        window.press("enter", cx);
+        assert_eq!(shell.read(cx).viewer_rows(), None);
+        window.press(&chord("a"), cx);
+        window.input("xxxx", cx);
+    });
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        assert_eq!(shell.read(cx).search_hits().len(), 200);
+        assert!(window
+            .find("search-status")
+            .value()
+            .unwrap()
+            .contains("first 200 results only"));
+    });
+}
+
+#[gpui_kit::test]
+fn a_search_row_from_an_old_snapshot_cannot_open_a_same_id_replacement(cx: &mut TestAppContext) {
+    let (handle, shell) = open_blocks(
+        cx,
+        WIDE,
+        vec![TimelineBlock::new(
+            1,
+            BlockKind::User,
+            "prefix needle old".into(),
+        )],
+    );
+    step(cx, handle, |window, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.run_command(Command::GoTo(Destination::Search), window, cx)
+        });
+        window.render_frame(cx);
+        window.input("needle", cx);
+    });
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        let hit = shell.read(cx).search_hits()[0];
+        let revision = shell.read(cx).search_results_revision();
+        let id = shell.read(cx).sidebar().active_id().unwrap().to_string();
+        let snapshot = replies::session_snapshot(&id, &serde_json::json!({"session":{"id":id},"running":false,
+            "messages":[{"id":"m1","session_id":id,"seq":1,"role":"user","content":"prefix needle NEW","created_at":"now"}]})).unwrap();
+        shell
+            .update(cx, |shell, cx| shell.show_session_snapshot(snapshot, cx))
+            .unwrap();
+        // Invoke the action captured by the old row. The kit's click helper
+        // repaints first, so it cannot simulate a queued stale-frame action.
+        shell.update(cx, |shell, cx| {
+            shell.open_search_hit(hit, revision, window, cx)
+        });
+        assert_eq!(shell.read(cx).viewer_rows(), None);
+        window.render_frame(cx);
+        assert!(window
+            .find("search-status")
+            .value()
+            .unwrap()
+            .contains("Results changed"));
+        window.click(search_row_id(hit), cx);
+        window.render_frame(cx);
+        assert!(window.try_find("viewer").is_some());
+        window.click("viewer-copy", cx);
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("prefix needle NEW".into())
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn search_distinguishes_unloaded_sessions_from_loaded_empty_snapshots(cx: &mut TestAppContext) {
+    let (handle, shell) = open(cx, WIDE, 200, 40);
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        let id = shell.read(cx).sidebar().active_id().unwrap().to_string();
+        let snapshot = replies::session_snapshot(
+            &id,
+            &serde_json::json!({"session":{"id":id},"running":false,"messages":[]}),
+        )
+        .unwrap();
+        shell
+            .update(cx, |shell, cx| shell.show_session_snapshot(snapshot, cx))
+            .unwrap();
+        window.render_frame(cx);
+        window.click(session_row_id("fixture-session-7"), cx);
+        window.render_frame(cx);
+        shell.update(cx, |shell, cx| {
+            shell.run_command(Command::GoTo(Destination::Search), window, cx)
+        });
+        window.render_frame(cx);
+        window.input("needle", cx);
+    });
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        assert!(window
+            .find("search-status")
+            .value()
+            .unwrap()
+            .contains("No transcript loaded"));
+        assert!(shell.read(cx).search_hits().is_empty());
+        let id = shell.read(cx).sidebar().active_id().unwrap().to_string();
+        let snapshot = replies::session_snapshot(
+            &id,
+            &serde_json::json!({"session":{"id":id},"running":false,"messages":[]}),
+        )
+        .unwrap();
+        shell
+            .update(cx, |shell, cx| shell.show_session_snapshot(snapshot, cx))
+            .unwrap();
+        window.render_frame(cx);
+        let status = window.find("search-status").value().unwrap().to_string();
+        assert!(status.contains("No case-sensitive matches"));
+        assert!(!status.contains("No transcript loaded"));
+        window.press("enter", cx);
+        assert_eq!(shell.read(cx).viewer_rows(), None);
+    });
+}
+
+#[gpui_kit::test]
+fn search_excludes_live_text_then_refreshes_once_the_stream_finishes(cx: &mut TestAppContext) {
+    let (handle, shell) = open_blocks(
+        cx,
+        WIDE,
+        vec![TimelineBlock::new(1, BlockKind::User, "needle".into())],
+    );
+    step(cx, handle, |window, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.begin_stream(cx);
+            shell.push_stream_delta("needle", cx);
+            shell.run_command(Command::GoTo(Destination::Search), window, cx);
+        });
+        window.render_frame(cx);
+        window.input("needle", cx);
+    });
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        assert_eq!(shell.read(cx).search_hits().len(), 1);
+        assert!(window
+            .find("search-status")
+            .value()
+            .unwrap()
+            .contains("Live tail excluded"));
+        shell.update(cx, |shell, cx| shell.push_stream_delta("needle", cx));
+        window.render_frame(cx);
+        assert_eq!(shell.read(cx).search_hits().len(), 1);
+        shell.update(cx, |shell, cx| shell.finish_stream(cx));
+        window.render_frame(cx);
+        assert_eq!(shell.read(cx).search_hits().len(), 3);
+        assert!(!window
+            .find("search-status")
+            .value()
+            .unwrap()
+            .contains("Live tail excluded"));
+    });
+}
+
+#[gpui_kit::test]
+fn search_composition_does_not_open_a_match_or_navigate_back(cx: &mut TestAppContext) {
+    let (handle, shell) = open_blocks(
+        cx,
+        WIDE,
+        vec![TimelineBlock::new(1, BlockKind::User, "にほんご".into())],
+    );
+    step(cx, handle, |window, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.run_command(Command::GoTo(Destination::Search), window, cx)
+        });
+        window.render_frame(cx);
+    });
+    for key in ["enter", "escape"] {
+        step(cx, handle, |window, cx| {
+            let query = shell.read(cx).search_query().clone();
+            let bounds = window.find_by_label("Search loaded transcript").bounds();
+            TestInput::new(ElementInputHandler::new(bounds, query), window).compose_text(
+                None,
+                "にほんご",
+                None,
+                cx,
+            );
+            window.press(key, cx);
+            window.render_frame(cx);
+            assert_eq!(shell.read(cx).destination(), Destination::Search);
+            assert_eq!(shell.read(cx).viewer_rows(), None);
+            assert_eq!(shell.read(cx).last_intent(), None);
+        });
+        cx.run_until_parked();
+    }
+}
+
+#[gpui_kit::test]
+fn repeated_search_entry_and_keyboard_back_restore_the_prior_destination_without_opening_a_match(
+    cx: &mut TestAppContext,
+) {
+    let (handle, shell) = open_blocks(
+        cx,
+        WIDE,
+        vec![TimelineBlock::new(
+            1,
+            BlockKind::User,
+            "needle needle".into(),
+        )],
+    );
+    step(cx, handle, |window, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.run_command(Command::GoTo(Destination::Sessions), window, cx)
+        });
+        window.render_frame(cx);
+        window.input("invoice", cx);
+    });
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.run_command(Command::GoTo(Destination::Search), window, cx);
+            shell.run_command(Command::GoTo(Destination::Search), window, cx);
+        });
+        window.render_frame(cx);
+        window.input("needle", cx);
+    });
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        window.press("down", cx);
+        window.render_frame(cx);
+        tab_to(window, "search-back", cx);
+        window.press("enter", cx);
+        window.render_frame(cx);
+        assert_eq!(shell.read(cx).destination(), Destination::Sessions);
+        assert_eq!(
+            shell.read(cx).directory_query().read(cx).value().as_ref(),
+            "invoice"
+        );
+        assert_eq!(
+            window.find_by_label("Filter Sessions").focused(),
+            Some(true)
+        );
+        assert_eq!(shell.read(cx).viewer_rows(), None);
+        window.press("escape", cx);
+        window.render_frame(cx);
+        shell.update(cx, |shell, cx| {
+            shell.run_command(Command::GoTo(Destination::Search), window, cx)
+        });
+        window.render_frame(cx);
+        window.press("escape", cx);
+        window.render_frame(cx);
+        assert_eq!(shell.read(cx).destination(), Destination::Chat);
+    });
+}
+
+#[gpui_kit::test]
+fn search_controls_and_a_match_fit_the_minimum_window_at_200_percent(cx: &mut TestAppContext) {
+    let (handle, shell) = open(cx, size(px(480.), px(360.)), 200, 40);
+    step(cx, handle, |window, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.set_text_scale(TextScale::from_percent(200), window, cx);
+            shell.run_command(Command::GoTo(Destination::Search), window, cx);
+        });
+        settle_frames(window, cx);
+        window.input("ข้อความ", cx);
+    });
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| {
+        settle_frames(window, cx);
+        let viewport = Bounds::new(Point::default(), window.viewport_size());
+        let hit = shell.read(cx).search_hits()[0];
+        for bounds in [
+            window.find_by_label("Search loaded transcript").bounds(),
+            window.find("search-back").bounds(),
+            window.find("search-status").bounds(),
+            window.find(search_row_id(hit)).bounds(),
+        ] {
+            assert!(
+                bounds.top() >= viewport.top()
+                    && bounds.bottom() <= viewport.bottom()
+                    && bounds.left() >= viewport.left()
+                    && bounds.right() <= viewport.right(),
+                "{bounds:?}"
+            );
+        }
+        window.press("f6", cx);
+        assert_eq!(window.find("region-conversation").focused(), Some(true));
+        window.press("enter", cx);
+        window.render_frame(cx);
+        assert!(window.try_find("viewer").is_some());
+    });
+}
+
+#[gpui_kit::test]
+fn an_old_search_row_cannot_activate_after_the_query_changes_before_repaint(
+    cx: &mut TestAppContext,
+) {
+    let (handle, shell) = open_blocks(
+        cx,
+        WIDE,
+        vec![TimelineBlock::new(1, BlockKind::User, "alpha beta".into())],
+    );
+    step(cx, handle, |window, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.run_command(Command::GoTo(Destination::Search), window, cx)
+        });
+        window.render_frame(cx);
+        window.input("alpha", cx);
+    });
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        let old = shell.read(cx).search_hits()[0];
+        let revision = shell.read(cx).search_results_revision();
+        window.press(&chord("a"), cx);
+        window.input("beta", cx);
+        shell.update(cx, |shell, cx| {
+            shell.open_search_hit(old, revision, window, cx)
+        });
+        assert_eq!(shell.read(cx).viewer_rows(), None);
+        window.render_frame(cx);
+        assert!(window
+            .find("search-status")
+            .value()
+            .unwrap()
+            .contains("changed"));
+    });
+}
+
+#[gpui_kit::test]
+fn a_queued_search_activation_cannot_stack_a_viewer_over_commands(cx: &mut TestAppContext) {
+    let (handle, shell) = open_blocks(
+        cx,
+        WIDE,
+        vec![TimelineBlock::new(1, BlockKind::User, "needle".into())],
+    );
+    step(cx, handle, |window, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.run_command(Command::GoTo(Destination::Search), window, cx)
+        });
+        window.render_frame(cx);
+        window.input("needle", cx);
+    });
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        let hit = shell.read(cx).search_hits()[0];
+        let revision = shell.read(cx).search_results_revision();
+        shell.update(cx, |shell, cx| {
+            shell.run_command(Command::ShowCommands, window, cx);
+            shell.open_search_hit(hit, revision, window, cx);
+        });
+        window.render_frame(cx);
+        assert!(window.try_find("palette").is_some());
+        assert_eq!(shell.read(cx).viewer_rows(), None);
+        window.press("escape", cx);
+        window.render_frame(cx);
+        assert!(window.try_find("palette").is_none());
+        assert_eq!(shell.read(cx).viewer_rows(), None);
+        window.click(search_row_id(hit), cx);
+        window.render_frame(cx);
+        assert!(window.try_find("viewer").is_some());
     });
 }

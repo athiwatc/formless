@@ -218,6 +218,7 @@ pub fn palette(state: &State) -> Vec<Entry> {
         Command::ToggleContext,
     ]);
     commands.extend(Destination::NAVIGATION.map(Command::GoTo));
+    commands.push(Command::GoTo(Destination::Search));
     commands.extend([
         Command::FocusNextRegion,
         Command::FocusPreviousRegion,
@@ -376,6 +377,8 @@ pub fn entry(command: Command, state: &State) -> Entry {
                 "Open the conversation"
             } else if destination == Destination::Sessions {
                 "Browse and filter fixture Sessions (archived Sessions excluded)"
+            } else if destination == Destination::Search {
+                "Find literal, case-sensitive text in the loaded transcript only"
             } else {
                 "Scaffold: this destination has no view yet"
             },

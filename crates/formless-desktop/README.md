@@ -4,8 +4,8 @@ An optional native desktop shell for Formless built on
 [GPUI Kit](https://github.com/longbridge/gpui-kit) 0.9.1. It is the Phase 0
 compatibility and design spike of epic #1753. It is a scaffold, not a usable
 client: it renders a synthetic fixture, never starts, contacts or configures
-a Daemon Core. Chat and a read-only fixture Sessions directory have views.
-The other destinations still show a "not built" notice.
+a Daemon Core. Chat, a read-only fixture Sessions directory and loaded-text
+Search have views. The other destinations still show a "not built" notice.
 
 Findings, measurements, the parity inventory and the open blockers are in
 [docs/desktop/phase0-findings.md](../../docs/desktop/phase0-findings.md).
@@ -23,6 +23,7 @@ not see GPUI. Run every command below from this directory.
 |---|---|---|
 | `src/model.rs` | Presentation model: destinations, Run state, composer actions, layout breakpoints and modal overlays, focus regions, Session list selection, text size, drafts bounded by count and bytes | none |
 | `src/directory.rs` | Read-only filtering over the existing unarchived Session projection, selection by ID and bounded visual labels | none |
+| `src/search.rs` | Bounded literal matches in finished loaded text, byte-range results, source-revision validation and bounded grapheme-safe snippets | none |
 | `src/commands.rs` | Typed shell command registry and palette search | none |
 | `src/replies.rs` | Read-only, validated `ListSessions` / `GetSession` decoding | none |
 | `src/transcript.rs` | Pure transcript event application, canonical completion replacement and sticky reload-needed state; not connected to the shell or a transport yet | none |
@@ -35,7 +36,7 @@ not see GPUI. Run every command below from this directory.
 | `src/shell.rs` | The GPUI Kit window over the model | `gui` feature |
 | `src/main.rs` | `formless-desktop` binary | `gui` feature |
 | `tests/shell.rs` | Headless tests of the real shell view. The test window has no real fonts: every character is the same width | `test-support` feature |
-| `tests/render.rs` | Offscreen render of twenty-five shell states through GPUI's real renderer, and measurements that need real fonts (macOS, Linux) | `test-support` feature |
+| `tests/render.rs` | Offscreen render of twenty-seven shell states through GPUI's real renderer, and measurements that need real fonts (macOS, Linux) | `test-support` feature |
 
 ## Commands
 
@@ -131,4 +132,30 @@ archived Sessions remain excluded. Each fixture Session shares the synthetic
 transcript. Once a decoded snapshot has been shown, changing Session clears
 that transcript rather than relabeling it; an empty loaded snapshot is kept
 distinct from an unloaded one. No rename, archive, delete or daemon request
-is performed. Search remains a separate future slice.
+is performed.
+
+Commands → Go to Search searches only finished text already loaded in this
+window, including Markdown source. It is literal, case-sensitive and
+non-overlapping, not a global-history or daemon search. The scope says
+shared synthetic fixture, loaded Session or not loaded. A query has at
+most 256 Unicode scalar values. At most 200 result positions are retained,
+and matching examines at most a 4 MiB source prefix and 4096 finished
+blocks. Partial results and an omitted live tail are labelled. Those are
+source-scan bounds, not a CPU or peak-memory budget. Live deltas do not
+rescan the excluded tail; finishing a stream refreshes the results.
+Only visible rows make bounded snippets; an unusually complex grapheme
+gets a named preview limitation rather than unbounded context scanning.
+Up/Down choose, Enter/click opens the whole block at the match, and
+Escape/Back returns to the previous destination without losing drafts or
+the Sessions filter. Enter/Escape first commit input-method composition.
+Activation rechecks the query, source revision, block identity and exact
+UTF-8 range; stale queued actions cannot open replacement text or stack
+a viewer over a newer modal. Search never loads history or sends a request.
+
+The final Search checks were run offline and separately from the native
+renderer: GUI-free and feature model tests, headless shell tests, fmt,
+four clippy configurations, Python checker tests and doc tests. The two
+new real-font Search states compile but remain unrun after the earlier
+native pasteboard/XPC startup failure. This is not a Phase 0 acceptance
+or screen-reader, real-IME, Windows/Linux or visual-render pass. See the
+Phase 1 progress page for exact evidence and remaining gates.

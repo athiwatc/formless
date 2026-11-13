@@ -5,7 +5,7 @@
 //! [`crate::fixture`] only and has no Daemon Core connection: composer
 //! actions are recorded as [`Intent`]s and shown in the status line, never
 //! sent, and the draft stays in place. Chat and the read-only fixture
-//! Sessions directory have views; the other destinations are notices.
+//! Sessions directory and loaded-text Search have views; the other destinations are notices.
 
 use std::cell::{Ref, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -44,6 +44,7 @@ use crate::model::{
     Intent, Layout, PanelPrefs, Region, RunState, Sidebar, SidebarMode, TextScale,
 };
 use crate::replies::SessionSnapshot;
+use crate::search::{self, Hit as SearchHit, Search as TranscriptSearch};
 use crate::timeline::{
     Anchor, Coalescer, StreamWork, Timeline, TimelineBlock, WindowMove, FLUSH_INTERVAL_MS,
 };
@@ -81,6 +82,10 @@ gpui_kit::actions!(
         DirectoryPrevious,
         DirectoryOpen,
         DirectoryBack,
+        SearchNext,
+        SearchPrevious,
+        SearchOpen,
+        SearchBack,
         CloseViewer,
     ]
 );
@@ -101,6 +106,8 @@ const VIEWER_WIDTH_CACHE: usize = 128;
 /// The palette's search field. These bindings are more specific than the
 /// text input's own, so Up, Down, Enter and Escape there move through and
 /// run the list instead of moving a caret in a one-line field.
+const SEARCH_CONTEXT: &str = "FormlessSearch";
+const SEARCH_INPUT_CONTEXT: &str = "FormlessSearch > Input";
 const DIRECTORY_CONTEXT: &str = "FormlessDirectory";
 const DIRECTORY_INPUT_CONTEXT: &str = "FormlessDirectory > Input";
 const PALETTE_INPUT_CONTEXT: &str = "FormlessPalette > Input";
@@ -144,6 +151,14 @@ pub fn bind_keys(cx: &mut App) {
     });
     cx.bind_keys(global.collect::<Vec<_>>());
     cx.bind_keys([
+        KeyBinding::new("down", SearchNext, Some(SEARCH_CONTEXT)),
+        KeyBinding::new("up", SearchPrevious, Some(SEARCH_CONTEXT)),
+        KeyBinding::new("enter", SearchOpen, Some(SEARCH_CONTEXT)),
+        KeyBinding::new("escape", SearchBack, Some(SEARCH_CONTEXT)),
+        KeyBinding::new("down", SearchNext, Some(SEARCH_INPUT_CONTEXT)),
+        KeyBinding::new("up", SearchPrevious, Some(SEARCH_INPUT_CONTEXT)),
+        KeyBinding::new("enter", SearchOpen, Some(SEARCH_INPUT_CONTEXT)),
+        KeyBinding::new("escape", SearchBack, Some(SEARCH_INPUT_CONTEXT)),
         KeyBinding::new("down", DirectoryNext, Some(DIRECTORY_CONTEXT)),
         KeyBinding::new("up", DirectoryPrevious, Some(DIRECTORY_CONTEXT)),
         KeyBinding::new("enter", DirectoryOpen, Some(DIRECTORY_CONTEXT)),
@@ -175,6 +190,14 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("end", ScrollViewerEnd, Some(VIEWER_CONTEXT)),
         KeyBinding::new("escape", CloseViewer, Some(VIEWER_CONTEXT)),
     ]);
+}
+
+pub fn search_row_id(hit: SearchHit) -> ElementId {
+    SharedString::from(format!(
+        "search-row-{}-{}-{}",
+        hit.block_id, hit.start, hit.end
+    ))
+    .into()
 }
 
 pub fn directory_row_id(session_id: &str) -> ElementId {
@@ -563,6 +586,12 @@ pub struct Shell {
     directory: Directory,
     directory_query: Entity<InputState>,
     directory_scroll: gpui_kit::UniformListScrollHandle,
+    search: TranscriptSearch,
+    search_query: Entity<InputState>,
+    search_scroll: gpui_kit::UniformListScrollHandle,
+    search_revision: u64,
+    search_return: Destination,
+    search_notice: Option<&'static str>,
     composer: Entity<TextareaState>,
     session_scroll: VirtualListScrollHandle,
     session_sizes: Rc<Vec<Size<Pixels>>>,
@@ -622,6 +651,20 @@ impl Shell {
                 }
             },
         ));
+        let search_query = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Literal, case-sensitive text")
+                .validate(|text, _| search::valid_query(text))
+        });
+        subscriptions.push(cx.subscribe_in(
+            &search_query,
+            window,
+            |this, _, event: &InputEvent, _, cx| {
+                if matches!(event, InputEvent::Change) && this.destination == Destination::Search {
+                    this.refresh_search(cx);
+                }
+            },
+        ));
         let mut directory = Directory::default();
         directory.rebuild(sidebar.rows(), "");
         composer.update(cx, |composer, cx| composer.focus(window, cx));
@@ -669,6 +712,12 @@ impl Shell {
             directory,
             directory_query,
             directory_scroll: gpui_kit::UniformListScrollHandle::new(),
+            search: TranscriptSearch::default(),
+            search_query,
+            search_scroll: gpui_kit::UniformListScrollHandle::new(),
+            search_revision: 0,
+            search_return: Destination::Chat,
+            search_notice: None,
             composer,
             session_scroll: VirtualListScrollHandle::new(),
             session_sizes,
@@ -1281,6 +1330,7 @@ impl Shell {
         *self.blocks.borrow_mut() = Timeline::new(snapshot.blocks);
         self.timeline
             .update(cx, |timeline, cx| timeline.reset(count, cx));
+        self.invalidate_search(cx);
         cx.notify();
         Ok(())
     }
@@ -1503,6 +1553,7 @@ impl Shell {
     /// Start a streamed assistant block at the tail of the timeline.
     pub fn begin_stream(&mut self, cx: &mut Context<Self>) {
         self.blocks.borrow_mut().begin_stream(BlockKind::Assistant);
+        self.invalidate_search(cx);
         self.request_flush(cx);
     }
 
@@ -1518,6 +1569,7 @@ impl Shell {
     /// End the stream and show its final state without waiting.
     pub fn finish_stream(&mut self, cx: &mut Context<Self>) {
         self.blocks.borrow_mut().finish_stream();
+        self.invalidate_search(cx);
         self.stream.request();
         self.flush_stream(cx);
     }
@@ -1862,9 +1914,13 @@ impl Shell {
     /// the outgoing draft, restore the incoming one and return the timeline
     /// to its tail. An overlay that was used to pick it closes.
     fn activate_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let from_directory = self.destination == Destination::Sessions;
+        let from_browser = matches!(
+            self.destination,
+            Destination::Sessions | Destination::Search
+        );
         let previous = self.sidebar.active_id().map(str::to_string);
-        if self.sidebar.activate_selected() {
+        let changed = self.sidebar.activate_selected();
+        if changed {
             // A full-output view must never outlive its Session/source.
             if self.viewer.take().is_some() {
                 self.restore_focus = None;
@@ -1930,10 +1986,21 @@ impl Shell {
             self.last_intent = None;
         }
         self.destination = Destination::Chat;
+        if changed {
+            self.invalidate_search(cx);
+        }
         self.prefs.close_overlays();
         self.settle(window, cx);
-        if from_directory {
+        if from_browser {
             self.focus_region(Region::Composer, window, cx);
+        }
+    }
+
+    fn browse_query(&self, destination: Destination) -> Option<&Entity<InputState>> {
+        match destination {
+            Destination::Sessions => Some(&self.directory_query),
+            Destination::Search => Some(&self.search_query),
+            _ => None,
         }
     }
 
@@ -1947,19 +2014,27 @@ impl Shell {
             self.restore_focus = None;
         }
         let previous = self.destination;
+        if destination == Destination::Search && previous != Destination::Search {
+            self.search_return = previous;
+        }
         self.destination = destination;
         self.prefs.close_overlays();
+        if destination == Destination::Search {
+            self.refresh_search(cx);
+        }
         self.settle(window, cx);
-        if destination == Destination::Sessions {
-            self.directory_query
-                .update(cx, |query, cx| query.focus(window, cx));
+        if let Some(query) = self.browse_query(destination).cloned() {
+            query.update(cx, |query, cx| query.focus(window, cx));
             self.revealed = None;
             let shell = cx.entity().downgrade();
             window.on_next_frame(move |window, cx| {
                 shell
                     .update(cx, |this, cx| {
-                        if this.destination == Destination::Sessions
-                            && this.directory_query.focus_handle(cx).is_focused(window)
+                        let focused = this
+                            .browse_query(destination)
+                            .is_some_and(|query| query.focus_handle(cx).is_focused(window));
+                        if this.destination == destination
+                            && focused
                             && this.current_modal(this.layout(window)).is_none()
                         {
                             this.revealed = None;
@@ -1968,7 +2043,7 @@ impl Shell {
                     })
                     .ok();
             });
-        } else if previous == Destination::Sessions {
+        } else if matches!(previous, Destination::Sessions | Destination::Search) {
             self.focus_region(
                 if destination == Destination::Chat {
                     Region::Composer
@@ -2572,6 +2647,305 @@ impl Shell {
         }
     }
 
+    pub fn search_query(&self) -> &Entity<InputState> {
+        &self.search_query
+    }
+    pub fn search_hits(&self) -> &[SearchHit] {
+        self.search.hits()
+    }
+    pub fn search_results_revision(&self) -> u64 {
+        self.search.revision()
+    }
+
+    fn refresh_search(&mut self, cx: &mut Context<Self>) {
+        let query = self.search_query.read(cx).value();
+        self.search.run(
+            &self.blocks.borrow(),
+            &query,
+            self.search_revision,
+            self.transcript_source != TranscriptSource::NotLoaded,
+        );
+        self.search_notice = None;
+        if self.search.choice().is_some() {
+            self.search_scroll
+                .scroll_to_item_strict(0, ScrollStrategy::Top);
+        }
+        cx.notify();
+    }
+
+    /// Only changes to the indexed finished corpus invalidate hits. Live
+    /// deltas modify the excluded tail and do not rescan on every chunk.
+    fn invalidate_search(&mut self, cx: &mut Context<Self>) {
+        self.search_revision = self.search_revision.wrapping_add(1);
+        self.search.clear(self.search_revision);
+        self.search_notice = None;
+        if self.destination == Destination::Search {
+            self.refresh_search(cx);
+        }
+    }
+
+    fn search_navigation_focused(&self, window: &Window, cx: &App) -> bool {
+        self.conversation_focus.is_focused(window)
+            || self.search_query.focus_handle(cx).is_focused(window)
+    }
+
+    fn finish_search_composition(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let composing = self.search_query.update(cx, |query, cx| {
+            query.marked_text_range(window, cx).is_some()
+        });
+        if composing {
+            self.search_query
+                .update(cx, |query, cx| query.unmark_text(window, cx));
+        }
+        composing
+    }
+
+    fn move_search(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.search_navigation_focused(window, cx) {
+            cx.propagate();
+            return;
+        }
+        let composing = self.search_query.update(cx, |query, cx| {
+            query.marked_text_range(window, cx).is_some()
+        });
+        if composing {
+            return;
+        }
+        self.search.move_selection(delta);
+        self.search_notice = None;
+        if let Some(index) = self.search.choice() {
+            self.search_scroll
+                .scroll_to_item_strict(index, ScrollStrategy::Top);
+        }
+        cx.notify();
+    }
+
+    fn open_search_choice(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.search_navigation_focused(window, cx) {
+            cx.propagate();
+            return;
+        }
+        if self.finish_search_composition(window, cx) {
+            return;
+        }
+        if let Some(hit) = self
+            .search
+            .choice()
+            .and_then(|index| self.search.hits().get(index))
+            .copied()
+        {
+            self.open_search_hit(hit, self.search.revision(), window, cx);
+        }
+    }
+
+    /// Activate a result using the revision captured when its row was
+    /// drawn. Queued actions must not open a same-ID replacement source.
+    pub fn open_search_hit(
+        &mut self,
+        hit: SearchHit,
+        revision: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.destination != Destination::Search
+            || self.current_modal(self.layout(window)).is_some()
+        {
+            return;
+        }
+        if self.finish_search_composition(window, cx) {
+            return;
+        }
+        if self.search_query.read(cx).value().as_ref() != self.search.query() {
+            self.refresh_search(cx);
+            self.search_notice = Some("The query changed; select a current match.");
+            cx.notify();
+            return;
+        }
+        if revision != self.search_revision
+            || !self
+                .search
+                .valid_hit(&self.blocks.borrow(), self.search_revision, hit)
+        {
+            self.search_notice = Some("Results changed; select a current match.");
+            cx.notify();
+            return;
+        }
+        match self.view_block(hit.block_id, window, cx) {
+            Ok(()) => {
+                self.search_notice = None;
+                if let Some(viewer) = &self.viewer {
+                    if !viewer.starts.is_empty() {
+                        let row = viewer
+                            .starts
+                            .partition_point(|start| *start as usize <= hit.start)
+                            .saturating_sub(1);
+                        viewer
+                            .scroll
+                            .scroll_to_item_strict(row, ScrollStrategy::Top);
+                    }
+                }
+            }
+            Err(reason) => self.search_notice = Some(reason),
+        }
+        cx.notify();
+    }
+
+    fn search_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.finish_search_composition(window, cx) {
+            self.set_destination(self.search_return, window, cx);
+        }
+    }
+
+    fn search_status(&self) -> String {
+        let scope = match self.transcript_source {
+            TranscriptSource::Fixture => {
+                "Shared synthetic fixture only; no global history".to_string()
+            }
+            TranscriptSource::Snapshot => self
+                .sidebar
+                .active_row()
+                .map(|row| {
+                    format!(
+                        "Loaded Session {} ({}) only",
+                        directory::visual_text(&row.title),
+                        directory::visual_text(&row.id)
+                    )
+                })
+                .unwrap_or_else(|| "Loaded transcript only".into()),
+            TranscriptSource::NotLoaded => {
+                "Current Session not loaded; no history lookup".to_string()
+            }
+        };
+        let detail = match self.search.state() {
+            search::State::EmptyQuery => {
+                "Type literal, case-sensitive text to search finished loaded blocks.".to_string()
+            }
+            search::State::QueryTooLong => format!(
+                "Query too long; use at most {} characters.",
+                search::QUERY_MAX_CHARS
+            ),
+            search::State::NoSource => "No transcript loaded for this Session.".to_string(),
+            search::State::Results => {
+                let mut detail = if let Some(index) = self.search.choice() {
+                    let hit = self.search.hits()[index];
+                    format!(
+                        "{} of {} matches · block {}, byte {} · case-sensitive.",
+                        index + 1,
+                        self.search.hits().len(),
+                        hit.block_id,
+                        hit.start
+                    )
+                } else {
+                    "No case-sensitive matches in the searched finished text.".to_string()
+                };
+                if self.search.hit_limited {
+                    detail.insert_str(0, "Partial: first 200 results only. ");
+                }
+                if self.search.scan_limited {
+                    detail.insert_str(0, "Partial: search limited to 4 MiB/4096 blocks. ");
+                }
+                if self.search.live_tail_omitted {
+                    detail.push_str(" Live tail excluded.");
+                }
+                detail
+            }
+        };
+        format!(
+            "{}{} {scope}.",
+            self.search_notice
+                .map(|notice| format!("{notice} "))
+                .unwrap_or_default(),
+            detail
+        )
+    }
+
+    fn render_search(
+        &self,
+        page_height: Option<Pixels>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let status = self.search_status();
+        let count = self.search.hits().len();
+        let list = gpui_kit::uniform_list(
+            "search-results-list",
+            count,
+            cx.processor(|this, range: Range<usize>, _, cx| {
+                let blocks = this.blocks.borrow();
+                range
+                    .filter_map(|index| {
+                        let hit = *this.search.hits().get(index)?;
+                        if !this.search.valid_hit(&blocks, this.search_revision, hit) {
+                            return None;
+                        }
+                        let block = blocks.blocks().get(hit.block_index)?;
+                        let title = format!(
+                            "{} block {} · bytes {}..{}",
+                            block.kind.label(),
+                            hit.block_id,
+                            hit.start,
+                            hit.end
+                        );
+                        let snippet = TranscriptSearch::snippet(&blocks, hit)
+                            .unwrap_or_else(|| "Match no longer available".into());
+                        let selected = this.search.choice() == Some(index);
+                        let revision = this.search.revision();
+                        Some(
+                            v_flex()
+                                .id(search_row_id(hit))
+                                .test_support()
+                                .role(Role::ListBoxOption)
+                                .aria_label(title.clone())
+                                .aria_description(snippet.clone())
+                                .aria_selected(selected)
+                                .aria_position_in_set(index + 1)
+                                .aria_size_of_set(this.search.hits().len())
+                                .when(selected, |row| {
+                                    row.aria_active_descendant().bg(cx.theme().accent)
+                                })
+                                .h(this.scaled(64.))
+                                .w_full()
+                                .px_2()
+                                .justify_center()
+                                .cursor_pointer()
+                                .child(div().text_xs().truncate().child(title))
+                                .child(div().text_sm().truncate().child(snippet))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.open_search_hit(hit, revision, window, cx)
+                                })),
+                        )
+                    })
+                    .collect()
+            }),
+        )
+        .track_scroll(&self.search_scroll)
+        .flex_1()
+        .min_h_0();
+        v_flex().id("region-conversation").test_support().role(Role::Main)
+            .aria_label("Loaded-text Search")
+            .aria_description("Literal, case-sensitive, non-overlapping matches in finished text loaded in this window only, including Markdown source. Never global or unloaded history. Live tail excluded. At most 200 results, 4 MiB and 4096 blocks; partial results are labelled. Arrows choose, Enter opens the whole block at the match, Escape returns. Finish input-method composition before activating or leaving.")
+            .track_focus(&self.conversation_focus)
+            .map(|region| inert_while(region, self.background_inert(window)))
+            .map(|region| Self::main_size(region, page_height))
+            .when_some(page_height, |region, height| region.h(height))
+            .p_2().gap_2().border_1()
+            .border_color(region_border(self.conversation_focus.contains_focused(window, cx), cx.theme().background, cx))
+            .key_context(SEARCH_CONTEXT)
+            .on_action(cx.listener(|this, _: &SearchNext, window, cx| this.move_search(1, window, cx)))
+            .on_action(cx.listener(|this, _: &SearchPrevious, window, cx| this.move_search(-1, window, cx)))
+            .on_action(cx.listener(|this, _: &SearchOpen, window, cx| this.open_search_choice(window, cx)))
+            .on_action(cx.listener(|this, _: &SearchBack, window, cx| this.search_back(window, cx)))
+            .child(h_flex().gap_2()
+                .child(readable("search-title", "Search loaded text").flex_1().min_w_0().truncate())
+                .child(Button::new("search-back").small().label(format!("Back to {}", self.search_return.label()))
+                    .on_click(cx.listener(|this, _, window, cx| this.search_back(window, cx)))))
+            .child(Input::new(&self.search_query).small().aria_label("Search loaded transcript"))
+            .child(announced(div().id("search-status")).test_support().role(Role::Label)
+                .aria_value(status.clone()).text_xs().truncate().child(directory::visual_text(&status)))
+            .child(v_flex().id("search-results").test_support().role(Role::ListBox)
+                .aria_label("Matches in finished loaded text").flex_1().min_h_0().child(list))
+    }
+
     pub fn directory_query(&self) -> &Entity<InputState> {
         &self.directory_query
     }
@@ -2783,7 +3157,7 @@ impl Shell {
             .text_sm()
             .text_color(cx.theme().muted_foreground)
             .child(Label::new(format!(
-                "This Phase 0 scaffold has Chat and fixture Sessions only. {name} has no screen, \
+                "This Phase 0 scaffold has Chat, fixture Sessions and loaded-text Search only. {name} has no screen, \
                  data or actions here, and this notice is not a preview of one."
             )));
         let back = Button::new("back-to-chat")
@@ -2799,7 +3173,7 @@ impl Shell {
             .aria_label(format!("{name}: not built"))
             .map(|region| inert_while(region, self.background_inert(window)))
             .aria_description(format!(
-                "This Phase 0 scaffold has Chat and fixture Sessions only. {name} has no screen, data or \
+                "This Phase 0 scaffold has Chat, fixture Sessions and loaded-text Search only. {name} has no screen, data or \
                  actions here, and this notice is not a preview of one."
             ))
             .track_focus(&self.conversation_focus)
@@ -3057,7 +3431,10 @@ impl Shell {
             },
             None => "No intent recorded".to_string(),
         };
-        let destination = if matches!(self.destination, Destination::Chat | Destination::Sessions) {
+        let destination = if matches!(
+            self.destination,
+            Destination::Chat | Destination::Sessions | Destination::Search
+        ) {
             self.destination.label().to_string()
         } else {
             format!("{} (scaffold: no view)", self.destination.label())
@@ -3147,7 +3524,10 @@ impl Shell {
             .height
             .min(self.scaled(tokens::REFLOW_CONVERSATION_MIN));
         let chat = self.destination == Destination::Chat;
-        let main = if self.destination == Destination::Sessions {
+        let main = if self.destination == Destination::Search {
+            self.render_search(Some(height), window, cx)
+                .into_any_element()
+        } else if self.destination == Destination::Sessions {
             self.render_directory(Some(height), window, cx)
                 .into_any_element()
         } else if chat {
@@ -3260,7 +3640,9 @@ impl Shell {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let main = if self.destination == Destination::Sessions {
+        let main = if self.destination == Destination::Search {
+            self.render_search(None, window, cx).into_any_element()
+        } else if self.destination == Destination::Sessions {
             self.render_directory(None, window, cx).into_any_element()
         } else if self.destination == Destination::Chat {
             self.render_conversation(None, window, cx)
