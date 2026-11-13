@@ -248,3 +248,131 @@ async fn read_tool_diff_from_names_the_invalid_argument_without_executing_tools(
     drop(daemon);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[tokio::test]
+async fn tool_example_inputs_are_bounded_previews_on_detail_export_and_read_surfaces() {
+    let _env = crate::credential_env::EnvGuard::isolated();
+    let root = std::env::temp_dir().join(format!("fl-example-cap-{}", uuid::Uuid::new_v4()));
+    let paths = Paths::from_dirs(root.join("data"), root.join("config")).unwrap();
+    let mut config = Config::default();
+    config.provider.base_url = "http://127.0.0.1:9/v1".into();
+    config.provider.model = "private-unused".into();
+    config.naming.enabled = false;
+    config.save(&paths).unwrap();
+    let daemon = Daemon::new(paths).unwrap();
+    let (session, tool) = daemon
+        .with_store(|st| {
+            let session = st.create_session(None)?.id;
+            let (tool, _) = st.create_tool_version(
+                "example_target",
+                "private fixture",
+                "{}",
+                "{}",
+                "function run(i){return i}",
+                &Capabilities::default(),
+                64,
+                "agent",
+            )?;
+            assert!(st.tool_example(&tool.id)?.is_none());
+            Ok((session, tool.id))
+        })
+        .unwrap();
+    let exact = serde_json::to_string(&json!({"x":"a".repeat(3992)})).unwrap();
+    assert_eq!(exact.len(), 4000);
+    let multibyte = format!("{{\"x\":\"{}日\"}}", "a".repeat(3993));
+    let clipped_multibyte = format!("{{\"x\":\"{}… (cut)", "a".repeat(3993));
+    for (input, output, expected_input, expected_output) in [
+        (
+            r#"{"text":"ไทย"}"#.to_owned(),
+            "{}".to_owned(),
+            r#"{"text":"ไทย"}"#.to_owned(),
+            "{}".to_owned(),
+        ),
+        (exact.clone(), "{}".into(), exact, "{}".into()),
+        (
+            "a".repeat(4001),
+            "b".repeat(4001),
+            format!("{}… (cut)", "a".repeat(4000)),
+            format!("{}… (cut)", "b".repeat(4000)),
+        ),
+        (
+            multibyte,
+            "日".repeat(1340),
+            clipped_multibyte,
+            format!("{}… (cut)", "日".repeat(1333)),
+        ),
+    ] {
+        let id = daemon
+            .with_store(|st| {
+                st.record_invocation(
+                    &tool, 1, None, None, None, "success", "fixture", &input, &output, "", 1, 100,
+                )
+            })
+            .unwrap();
+        let conn = rusqlite::Connection::open(daemon.paths.db_file()).unwrap();
+        conn.execute(
+            "UPDATE invocations SET created_at='2026-01-01T00:00:00Z' WHERE tool_id=?1",
+            [&tool],
+        )
+        .unwrap();
+        // A later failure with the same timestamp cannot replace success.
+        daemon
+            .with_store(|st| {
+                st.record_invocation(
+                    &tool, 1, None, None, None, "failure", "fixture", "wrong", "wrong", "fixture",
+                    1, 100,
+                )
+            })
+            .unwrap();
+        conn.execute(
+            "UPDATE invocations SET created_at='2026-01-01T00:00:00Z' WHERE tool_id=?1",
+            [&tool],
+        )
+        .unwrap();
+        let example = daemon
+            .with_reader(|st| st.tool_example(&tool))
+            .unwrap()
+            .unwrap();
+        assert_eq!(example.input, expected_input);
+        assert_eq!(example.output, expected_output);
+        assert_eq!(example.created_at, "2026-01-01T00:00:00Z");
+        assert_eq!(example.version, 1);
+        for field in [&example.input, &example.output] {
+            assert!(field.len() <= 4000 + "… (cut)".len());
+            if field.ends_with("… (cut)") {
+                assert_eq!(field.matches("… (cut)").count(), 1);
+            }
+        }
+        let detail = daemon
+            .with_reader(|st| st.tool_detail(&tool))
+            .unwrap()
+            .unwrap();
+        assert_eq!(detail.example.unwrap(), example);
+        let parse = |text: &str| serde_json::from_str::<Value>(text).unwrap_or(json!(text));
+        let bundle = daemon.export_tool_bundle(&tool).unwrap().unwrap();
+        let read: Value = serde_json::from_str(
+            &daemon
+                .read_tool_impl(&session, &json!({"name":"example_target"}))
+                .unwrap(),
+        )
+        .unwrap();
+        for value in [&bundle, &read] {
+            assert_eq!(value["example"]["input"], parse(&expected_input));
+            assert_eq!(value["example"]["output"], parse(&expected_output));
+        }
+        let stored: (String, String) = conn
+            .query_row(
+                "SELECT input,output FROM invocations WHERE id=?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            stored,
+            (input, output),
+            "presentation must not rewrite recorded calls"
+        );
+    }
+    drop(daemon);
+    std::fs::remove_dir_all(root).unwrap();
+}
