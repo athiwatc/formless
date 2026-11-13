@@ -87,58 +87,137 @@ pub const PREVIEW_MAX_BYTES: usize = limits::BLOCK_PREVIEW_MAX_BYTES + FENCE_OPE
 /// emphasis marks, quote markers, link targets). Blocks are on lines of
 /// their own. Raw HTML is left out, as the view does not render it.
 ///
+/// What the kit's markdown view draws that carries meaning is kept, as it
+/// draws it: an ordered list's numbers (letters in nested lists, as the
+/// view labels them), a task item's box as ☑ or ☐, an image's alt text,
+/// including an image given by reference. Bullets are left out. Code is
+/// kept exactly.
+///
 /// Markdown that does not parse is returned as it is.
 pub fn plain_text(source: &str) -> String {
-    use markdown::mdast::Node;
+    use markdown::mdast::{List, Node};
 
-    fn walk(node: &Node, out: &mut String) {
-        match node {
-            Node::Text(text) => out.push_str(&text.value),
-            Node::InlineCode(code) => out.push_str(&code.value),
-            Node::InlineMath(math) => out.push_str(&math.value),
-            Node::Break(_) => out.push('\n'),
-            Node::Image(image) => out.push_str(&image.alt),
-            Node::Html(_) => {}
-            Node::Code(code) => block(out, |out| out.push_str(&code.value)),
-            Node::Math(math) => block(out, |out| out.push_str(&math.value)),
-            Node::ThematicBreak(_) => {}
-            Node::Paragraph(_)
-            | Node::Heading(_)
-            | Node::ListItem(_)
-            | Node::TableRow(_)
-            | Node::Blockquote(_)
-            | Node::List(_)
-            | Node::Table(_) => block(out, |out| children(node, out)),
-            Node::TableCell(_) => {
-                if !out.ends_with('\n') && !out.is_empty() {
-                    out.push('\t');
-                }
-                children(node, out);
+    struct Writer {
+        out: String,
+        /// Lists the current node is inside, outermost first.
+        depth: usize,
+        /// A list item's marker has just been written: the item's first
+        /// block goes on the same line.
+        after_marker: bool,
+    }
+
+    impl Writer {
+        /// A block starts on a line of its own.
+        fn block(&mut self, inner: impl FnOnce(&mut Self)) {
+            if !std::mem::take(&mut self.after_marker)
+                && !self.out.is_empty()
+                && !self.out.ends_with('\n')
+            {
+                self.out.push('\n');
             }
-            _ => children(node, out),
+            inner(self);
         }
-    }
-    fn children(node: &Node, out: &mut String) {
-        for child in node.children().into_iter().flatten() {
-            walk(child, out);
+
+        fn children(&mut self, node: &Node) {
+            for child in node.children().into_iter().flatten() {
+                self.walk(child);
+            }
         }
-    }
-    /// A block starts on a line of its own.
-    fn block(out: &mut String, inner: impl FnOnce(&mut String)) {
-        if !out.is_empty() && !out.ends_with('\n') {
-            out.push('\n');
+
+        fn list(&mut self, list: &List) {
+            // The view draws no number or bullet in a list that has task
+            // items, only their boxes.
+            let todo = list
+                .children
+                .iter()
+                .any(|item| matches!(item, Node::ListItem(item) if item.checked.is_some()));
+            for (index, child) in list.children.iter().enumerate() {
+                let Node::ListItem(item) = child else {
+                    self.walk(child);
+                    continue;
+                };
+                self.block(|this| {
+                    if list.ordered && !todo {
+                        this.out
+                            .push_str(&ordered_label(list.start, index, this.depth));
+                    }
+                    match item.checked {
+                        Some(true) => this.out.push_str("☑ "),
+                        Some(false) => this.out.push_str("☐ "),
+                        None => {}
+                    }
+                    this.after_marker = !this.out.ends_with('\n') && !this.out.is_empty();
+                    this.depth += 1;
+                    this.children(child);
+                    this.depth -= 1;
+                    this.after_marker = false;
+                });
+            }
         }
-        inner(out);
+
+        fn walk(&mut self, node: &Node) {
+            match node {
+                Node::Text(text) => self.out.push_str(&text.value),
+                Node::InlineCode(code) => self.out.push_str(&code.value),
+                Node::InlineMath(math) => self.out.push_str(&math.value),
+                Node::Break(_) => self.out.push('\n'),
+                Node::Image(image) => self.out.push_str(&image.alt),
+                Node::ImageReference(image) => self.out.push_str(&image.alt),
+                Node::Html(_) | Node::Definition(_) | Node::ThematicBreak(_) => {}
+                Node::Code(code) => self.block(|this| this.out.push_str(&code.value)),
+                Node::Math(math) => self.block(|this| this.out.push_str(&math.value)),
+                Node::List(list) => self.list(list),
+                Node::Paragraph(_)
+                | Node::Heading(_)
+                | Node::ListItem(_)
+                | Node::TableRow(_)
+                | Node::Blockquote(_)
+                | Node::Table(_) => self.block(|this| this.children(node)),
+                Node::TableCell(_) => {
+                    if !self.out.ends_with('\n') && !self.out.is_empty() {
+                        self.out.push('\t');
+                    }
+                    self.children(node);
+                }
+                _ => self.children(node),
+            }
+        }
     }
 
     match markdown::to_mdast(source, &markdown::ParseOptions::gfm()) {
         Ok(root) => {
-            let mut out = String::with_capacity(source.len());
-            walk(&root, &mut out);
-            out
+            let mut writer = Writer {
+                out: String::with_capacity(source.len()),
+                depth: 0,
+                after_marker: false,
+            };
+            writer.walk(&root);
+            writer.out
         }
         Err(_) => source.to_string(),
     }
+}
+
+/// An ordered list item's label as the kit's markdown view draws it: the
+/// number at the top level, and letters in nested lists (A, B, ... then a,
+/// b, ...), except in a list that starts at 0.
+fn ordered_label(start: Option<u32>, index: usize, depth: usize) -> String {
+    let ordinal = start
+        .unwrap_or(1)
+        .saturating_add(u32::try_from(index).unwrap_or(u32::MAX));
+    if depth == 0 || start == Some(0) {
+        return format!("{ordinal}. ");
+    }
+    let first = if depth == 1 { b'A' } else { b'a' };
+    let mut remaining = ordinal;
+    let mut letters = Vec::new();
+    while remaining > 0 {
+        remaining -= 1;
+        letters.push(char::from(first + (remaining % 26) as u8));
+        remaining /= 26;
+    }
+    letters.reverse();
+    format!("{}. ", letters.into_iter().collect::<String>())
 }
 
 /// The fence a line opens or closes, by CommonMark's rule for fenced code:
@@ -1314,6 +1393,37 @@ mod tests {
                 "fn main() {}\nAfter.",
             ),
             ("- one\n- two", "one\ntwo"),
+            // Numbers are drawn and mean something; they are kept.
+            ("1. one\n2. two", "1. one\n2. two"),
+            ("7. seven\n8. eight", "7. seven\n8. eight"),
+            ("0. zero\n1. one", "0. zero\n1. one"),
+            // Nested ordered lists are lettered, as the view draws them.
+            (
+                "3. top\n   1. inner\n   2. next\n      1. deep",
+                "3. top\nA. inner\nB. next\na. deep",
+            ),
+            // Task boxes are drawn checked or not, and that is kept; a list
+            // with task items draws no numbers or bullets.
+            ("- [x] done\n- [ ] to do", "☑ done\n☐ to do"),
+            (
+                "1. [x] done\n2. [ ] to do\n3. plain",
+                "☑ done\n☐ to do\nplain",
+            ),
+            // References keep the words and the alt text; definitions are not
+            // shown.
+            (
+                "See [the guide][g] and ![a chart][c].\n\n[g]: https://example.invalid\n[c]: c.png",
+                "See the guide and a chart.",
+            ),
+            // An image reference with no definition is not an image at all;
+            // its text stays as written.
+            ("![missing][nowhere]", "![missing][nowhere]"),
+            // Code is kept exactly, markers and all.
+            (
+                "```\n- [x] not a task\n1. not a list\n```",
+                "- [x] not a task\n1. not a list",
+            ),
+            ("`**not bold**`", "**not bold**"),
             (
                 "See [the guide](https://example.invalid) now.",
                 "See the guide now.",

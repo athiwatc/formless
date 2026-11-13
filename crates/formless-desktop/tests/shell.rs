@@ -886,6 +886,38 @@ fn a_notice_and_a_cut_block_say_what_they_say_to_assistive_technology(cx: &mut T
 }
 
 #[gpui_kit::test]
+fn a_rows_accessible_text_keeps_what_the_markdown_view_draws(cx: &mut TestAppContext) {
+    // Drawn by the kit's own markdown view: list numbers from a list's
+    // start, and task boxes in place of numbers. The accessible text has to
+    // carry the same.
+    let blocks = vec![
+        TimelineBlock::new(1, BlockKind::Assistant, "7. seven\n8. eight".into()),
+        TimelineBlock::new(2, BlockKind::Assistant, "- [x] done\n- [ ] to do".into()),
+    ];
+    let (handle, _) = open_blocks(cx, size(px(1440.), px(1200.)), blocks);
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| {
+        window.draw(cx).clear(cx);
+        // The test window records the items' text but not the list
+        // markers or the boxes (the view draws those apart from its text),
+        // so the markers are taken from the kit's source
+        // (`render_list_item_row`), not from paint.
+        let painted = painted(window);
+        for text in ["seven", "eight", "done", "to do"] {
+            assert!(painted.iter().any(|painted| painted == text), "{painted:?}");
+        }
+        assert_eq!(
+            window.find(("block-text", 1usize)).value(),
+            Some("7. seven\n8. eight")
+        );
+        assert_eq!(
+            window.find(("block-text", 2usize)).value(),
+            Some("☑ done\n☐ to do")
+        );
+    });
+}
+
+#[gpui_kit::test]
 fn every_place_focus_can_rest_on_a_reflowed_page_has_an_accessibility_node(
     cx: &mut TestAppContext,
 ) {
