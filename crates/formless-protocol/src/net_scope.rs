@@ -29,6 +29,8 @@ struct Rules {
     exact: HashSet<String>,
     wildcard: HashSet<String>,
     exception: HashSet<String>,
+    // Bases whose proper children include at least one public suffix.
+    ancestors: HashSet<String>,
     invalid: bool,
 }
 fn rules() -> &'static Rules {
@@ -38,6 +40,7 @@ fn rules() -> &'static Rules {
             exact: HashSet::new(),
             wildcard: HashSet::new(),
             exception: HashSet::new(),
+            ancestors: HashSet::new(),
             invalid: false,
         };
         for line in include_str!("../data/public_suffix_list.dat")
@@ -63,6 +66,24 @@ fn rules() -> &'static Rules {
                 Err(_) => {
                     rules.invalid = true;
                 }
+            }
+        }
+        for domain in rules.exact.iter().filter(|d| !rules.exception.contains(*d)) {
+            let mut parent = domain.as_str();
+            while let Some((_, tail)) = parent.split_once('.') {
+                rules.ancestors.insert(tail.to_owned());
+                parent = tail;
+            }
+        }
+        for base in &rules.wildcard {
+            // *.base makes each non-excepted immediate child a suffix.
+            let mut parent = base.as_str();
+            loop {
+                rules.ancestors.insert(parent.to_owned());
+                let Some((_, tail)) = parent.split_once('.') else {
+                    break;
+                };
+                parent = tail;
             }
         }
         rules
@@ -122,6 +143,14 @@ pub fn scope_warning(spec: &str) -> Option<String> {
                 "This grant is exact only; it does not authorize its subdomains."
             }
         ))
+    } else if wildcard
+        && idna::domain_to_ascii(base.trim_end_matches('.'))
+            .is_ok_and(|base| rules().ancestors.contains(&base.to_ascii_lowercase()))
+    {
+        Some(format!(
+            "PUBLIC SUFFIX boundary: this wildcard includes public suffixes below {base} (ICANN/PRIVATE PSL). \
+             It grants every subdomain, including unrelated tenants; the apex itself is excluded."
+        ))
     } else if wildcard {
         Some(format!("Wildcard: every subdomain of {base}; the apex itself is excluded. Subdomain labels can carry data."))
     } else {
@@ -132,6 +161,37 @@ pub fn scope_warning(spec: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn wildcard_ancestors_warn_without_changing_exact_grants() {
+        for base in [
+            "kawasaki.jp",
+            "amazonaws.com",
+            "compute.amazonaws.com",
+            "AMAZONAWS.COM.",
+        ] {
+            let warning = scope_warning(&format!("net:*.{base}:443")).unwrap();
+            assert!(
+                warning.contains("PUBLIC SUFFIX boundary"),
+                "{base}: {warning}"
+            );
+            assert!(warning.contains("unrelated tenants"), "{base}: {warning}");
+            assert!(
+                scope_warning(&format!("net:{base}:443")).is_none(),
+                "{base}"
+            );
+        }
+        for base in [
+            "example.com",
+            "city.kawasaki.jp",
+            "www.ck",
+            "evil-amazonaws.com",
+        ] {
+            let warning = scope_warning(&format!("net:*.{base}")).unwrap();
+            assert!(warning.starts_with("Wildcard:"), "{base}: {warning}");
+            assert!(!warning.contains("PUBLIC SUFFIX"), "{base}: {warning}");
+        }
+    }
+
     #[test]
     fn exact_and_explicit_wildcard_authority_are_distinct() {
         assert!(host_covers("api.example.com", "api.example.com"));
