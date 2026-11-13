@@ -1884,12 +1884,12 @@ impl Store {
              FROM messages_fts f JOIN messages m ON m.rowid = f.rowid \
              JOIN sessions s ON s.id = m.session_id AND s.deleted_at IS NULL \
              WHERE messages_fts MATCH ?1 \
-             ORDER BY bm25(messages_fts), m.created_at DESC LIMIT ?2"
+             ORDER BY bm25(messages_fts), m.created_at DESC, m.rowid DESC LIMIT ?2"
         } else {
             "SELECT m.session_id, s.name, m.id, m.seq, m.role, m.content, m.created_at \
              FROM messages m JOIN sessions s ON s.id = m.session_id AND s.deleted_at IS NULL \
              WHERE instr(lower(m.content), lower(?1)) > 0 \
-             ORDER BY m.created_at DESC LIMIT ?2"
+             ORDER BY m.created_at DESC, m.rowid DESC LIMIT ?2"
         };
         let mut stmt = self.ps(sql)?;
         let arg = fts.unwrap_or_else(|| query.to_string());
