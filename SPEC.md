@@ -4937,7 +4937,7 @@ the TUI. Command-specific arguments and defaults are available through
 | `formless restore` | `FILE` | Replace the database from a backup, preserving the current database. |
 | `formless roles` | `list`, `add`, `rm` | Map named purposes to a provider and model. |
 | `formless run` | `TASK`; `--estimate`, `--session`, `--output`, `--attach` and other Run options | Run one headless task, or print its local forecast without starting it. |
-| `formless runs` | No action: list; `show`, `cancel` | List recent Runs, inspect one by ID/prefix, or cancel that exact Run. |
+| `formless runs` | No action: list; `show`, `cancel`, `running` | List recent Runs, inspect/cancel an exact Run, or read a live Invocation snapshot. |
 | `formless security` | `status` | Inspect the daemon's grants, denials, trusted resources, and exposed interfaces. |
 | `formless sessions` | `fork`, `compare`, `list`, `show`, `files`, `rewind`, `rename`, `rm`, `restore`, `import`, `search`, `archive`, `unarchive`, `export` | Manage stored Sessions, follow a Run with `show --follow`, or inspect tracked files. |
 | `formless skills` | `reviews`, `add`, `remove`, `list`, `enable`, `disable`, `show`, `export`, `import` | Inspect and manage Skills and their retained description reviews. |
@@ -6186,7 +6186,16 @@ Connection loss is an error.
 cancels only that exact active Run, never a later Run in the same Session. IDs
 accept unambiguous prefixes. Show uses the same terminal exit codes as follow;
 an active Run query exits 0, and cancel exits 0 when its request succeeds.
-Existing `runs --limit N --json` remains a list.
+Existing `runs --limit N --json` remains a list (default limit 20).
+`runs running [--json]` reads `ListInvocations` once through the existing
+CLI connection. It reports live Invocations, in daemon order, with full handles,
+Tool/Session identifiers, optional Invocation ID, elapsed/silent durations,
+returned stalled/abandoned flags and optional progress fraction/label.
+Abandoned means no longer awaited and may still finish. Human metadata is
+terminal-escaped; JSON retains the original array and millisecond values.
+Outer `runs --json running` is also supported. An explicitly supplied
+`--limit` conflicts with this unbounded snapshot and fails before connection.
+There is no polling or Invocation control action.
 `approvals pending [--json]` lists outstanding Tool capability requests.
 `approvals approve ID [--once|--session] [--yes] [--json]` defaults to Once;
 `approvals deny ID [--json]` declines without remembering a permanent denial.
