@@ -4,6 +4,7 @@ mod cli_commands;
 mod cli_help_tests;
 mod cli_pipeline;
 mod cli_run_identity;
+mod cli_run_report;
 mod cli_tool_success;
 #[cfg(test)]
 mod session_export_tests;
