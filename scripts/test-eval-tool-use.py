@@ -30,6 +30,7 @@ if [ "$1" = run ]; then
       count=$((count + 1)); printf '%s' "$count" > "$EVAL_ATTEMPTS"
       if [ "$((count % 2))" -eq 1 ]; then echo synthetic-provider-refused >&2; exit 9; fi
       ;;
+    long_stderr) head -c 1000000 /dev/zero | tr '\\000' x >&2; exit 9 ;;
     fail) echo synthetic-provider-refused >&2; exit 9 ;;
     unfinished) exit 0 ;;
     failed_status) printf '%s\\n' '{"type":"run_finished","status":"paused"}'; exit 0 ;;
@@ -93,6 +94,12 @@ fi
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("2/2 Runs used find_tools/create_tool (100%); failed 2/4 attempted", result.stdout)
         self.assertEqual(result.stderr.count("synthetic-provider-refused"), 1)
+
+    def test_first_failure_diagnostic_has_a_byte_limit(self):
+        result, _ = self.run_eval({"RUNS": "1", "EVAL_MODE": "long_stderr"}, expect_valid=True)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertLessEqual(len(result.stderr.encode()), 4300)
+        self.assertEqual(result.stderr.count("x"), 4097)  # 4096 bytes plus "exit"
 
     def test_success_without_tools_is_a_valid_zero_percent(self):
         result, _ = self.run_eval({"RUNS": "1", "EVAL_MODE": "no_tools"}, expect_valid=True)

@@ -98,7 +98,7 @@ while IFS= read -r task; do
     if [ "$run_status" -ne 0 ] || ! printf '%s\n' "$out" | grep -q '^{"type":"run_finished",.*"status":"completed"'; then
       if [ "$failures" -eq 0 ]; then
         echo "note: first eval failure (exit $run_status or no completed Run event):" >&2
-        if [ -s "$work/run.err" ]; then sed -n '1,20p' "$work/run.err" >&2; fi
+        if [ -s "$work/run.err" ]; then dd if="$work/run.err" bs=4096 count=1 2>/dev/null | sed -n '1,20p' >&2; fi
       fi
       failures=$((failures + 1)); task_failed=$((task_failed + 1))
       continue
