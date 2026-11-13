@@ -24,6 +24,7 @@ pub mod plain;
 #[cfg(test)]
 mod profile_context_tests;
 pub mod qr;
+mod query;
 mod session_ui;
 mod settings;
 mod text;
@@ -1773,6 +1774,8 @@ struct App {
     on_start: String,
     /// The Ctrl+K Session switcher: (query, selected row).
     switcher: Option<(String, usize)>,
+    switcher_page_rows: std::cell::Cell<usize>,
+    rollback_page_rows: std::cell::Cell<usize>,
     /// `/quit` while Runs are working asks first (SPEC §10.5).
     quit_confirm: bool,
     /// `?` in an approval: explain each capability under it.
@@ -2083,6 +2086,8 @@ impl App {
             approval_explain: false,
             quit_confirm: false,
             switcher: None,
+            switcher_page_rows: std::cell::Cell::new(10),
+            rollback_page_rows: std::cell::Cell::new(10),
             on_start: cfg.tui.on_start.clone(),
             approval_code: None,
             image_placed: Vec::new(),
@@ -4954,18 +4959,28 @@ impl App {
             d.tool.name.clone(),
             d.tool.current_version,
         );
+        if d.versions.is_empty() {
+            return;
+        }
+        let pick = RollbackPick {
+            idx: pick.idx.min(last),
+            ..pick
+        };
+        if let Some(index) = query::navigate(
+            &key,
+            pick.idx,
+            d.versions.len(),
+            self.rollback_page_rows.get(),
+        ) {
+            self.rollback_pick = Some(RollbackPick {
+                idx: index,
+                armed: false,
+                ..pick
+            });
+            return;
+        }
         let version = d.versions[pick.idx].version;
         let next = match key.code {
-            KeyCode::Up => Some(RollbackPick {
-                idx: pick.idx.saturating_sub(1),
-                armed: false,
-                ..pick
-            }),
-            KeyCode::Down => Some(RollbackPick {
-                idx: (pick.idx + 1).min(last),
-                armed: false,
-                ..pick
-            }),
             KeyCode::Enter if version == current => {
                 self.notes.push(format!("v{version} is already current"));
                 Some(pick)
@@ -8413,8 +8428,6 @@ impl App {
         }
         match key.code {
             KeyCode::Esc => self.model_overlay = None,
-            KeyCode::Up => o.picker.up(),
-            KeyCode::Down => o.picker.down(),
             KeyCode::Tab => o.effort_idx = (o.effort_idx + 1) % o.efforts().len().max(1),
             KeyCode::BackTab => {
                 let n = o.efforts().len().max(1);
@@ -8432,9 +8445,9 @@ impl App {
                     );
                 }
             }
-            KeyCode::Backspace => o.picker.backspace(),
-            KeyCode::Char(c) => o.picker.type_char(c),
-            _ => {}
+            _ => {
+                o.picker.key(&key);
+            }
         }
     }
 
@@ -8773,6 +8786,9 @@ impl App {
             };
             return;
         }
+        if w.step == WizardStep::PickModel && key.code != KeyCode::Enter && w.picker.key(&key) {
+            return;
+        }
         if ctrl {
             return;
         }
@@ -8836,15 +8852,13 @@ impl App {
                 _ => {}
             },
             WizardStep::PickModel => match key.code {
-                KeyCode::Up => w.picker.up(),
-                KeyCode::Down => w.picker.down(),
                 KeyCode::Enter if !w.model().trim().is_empty() => {
                     w.step = WizardStep::PickEffort;
                     w.status = "Pick reasoning effort.".into();
                 }
-                KeyCode::Char(c) => w.picker.type_char(c),
-                KeyCode::Backspace => w.picker.backspace(),
-                _ => {}
+                _ => {
+                    w.picker.key(&key);
+                }
             },
             WizardStep::PickEffort => match key.code {
                 KeyCode::Up => w.effort_idx = w.effort_idx.saturating_sub(1),
@@ -9644,7 +9658,7 @@ impl App {
             self.cycle_view(key.code == KeyCode::Tab);
             return;
         }
-        if self.list_filter_key(key.code) || self.list_nav_key(&key) {
+        if self.list_filter_key(&key) || self.list_nav_key(&key) {
             return;
         }
         match self.view {
@@ -10475,7 +10489,7 @@ impl App {
     }
 
     /// `/`, `s` and `v` in a list view (SPEC §10.4); true when used.
-    fn list_filter_key(&mut self, code: KeyCode) -> bool {
+    fn list_filter_key(&mut self, event: &KeyEvent) -> bool {
         use lists::*;
         let (filter, idx, sorts, quicks) = match self.view {
             View::Tools => (
@@ -10498,8 +10512,22 @@ impl App {
             ),
             _ => return false,
         };
-        let used = lists::key(filter, code, sorts.len(), quicks.len());
-        if used {
+        let before = (
+            filter.query.len(),
+            filter.sort,
+            filter.quick,
+            filter.editing,
+        );
+        let used = lists::key(filter, event, sorts.len(), quicks.len());
+        if used
+            && before
+                != (
+                    filter.query.len(),
+                    filter.sort,
+                    filter.quick,
+                    filter.editing,
+                )
+        {
             *idx = 0;
         }
         used
@@ -11513,6 +11541,13 @@ fn draw_rollback_picker(f: &mut Frame, app: &App, pick: &RollbackPick) {
     else {
         return;
     };
+    let area = f.area();
+    let rows = (area.height as usize).saturating_sub(6).max(1);
+    app.rollback_page_rows.set(rows);
+    let start = pick
+        .idx
+        .min(d.versions.len().saturating_sub(1))
+        .saturating_sub(rows - 1);
     let mut lines = vec![
         Line::raw(""),
         Line::styled(
@@ -11520,7 +11555,7 @@ fn draw_rollback_picker(f: &mut Frame, app: &App, pick: &RollbackPick) {
             ui::dim(app.color),
         ),
     ];
-    for (i, v) in d.versions.iter().enumerate() {
+    for (i, v) in d.versions.iter().enumerate().skip(start).take(rows) {
         let m = d
             .version_metrics
             .iter()
@@ -11552,11 +11587,10 @@ fn draw_rollback_picker(f: &mut Frame, app: &App, pick: &RollbackPick) {
         if pick.armed {
             "  Enter again to confirm · Esc cancel"
         } else {
-            "  ↑/↓ choose · Enter roll back · Esc cancel"
+            "  ↑/↓ PgUp/PgDn Home/End · Enter roll back · Esc cancel"
         },
         ui::dim(app.color),
     ));
-    let area = f.area();
     let w = 64.min(area.width.saturating_sub(2)).max(1);
     let h = (lines.len() as u16 + 2).min(area.height);
     let rect = Rect {
@@ -11579,10 +11613,15 @@ fn draw_rollback_picker(f: &mut Frame, app: &App, pick: &RollbackPick) {
 /// The model list with the filter line, matched chars highlighted and
 /// the selection kept on screen.
 fn picker_lines(p: &picker::ModelPicker, max_items: usize, color: bool) -> Vec<Line<'static>> {
+    p.set_page_rows(max_items);
     let mut out = vec![Line::from(vec![
         Span::styled("Filter   ", ui::dim(color)),
         Span::raw(format!("{}▏", p.query)),
     ])];
+    out.push(Line::styled(
+        "↑/↓ PgUp/PgDn Home/End · Ctrl+U clear · Ctrl+W word",
+        ui::dim(color),
+    ));
     if p.loading {
         out.push(Line::styled("  loading models…", ui::dim(color)));
         return out;
@@ -12617,6 +12656,7 @@ fn draw_switcher(f: &mut Frame, app: &App, query: &str, sel: usize) {
     let area = f.area();
     let matches = app.switcher_matches(query);
     let rows = (area.height as usize).saturating_sub(8).clamp(1, 12);
+    app.switcher_page_rows.set(rows);
     let sel = sel.min(matches.len().saturating_sub(1));
     let start = sel.saturating_sub(rows - 1);
     let mut lines = vec![Line::from(vec![
@@ -12661,7 +12701,15 @@ fn draw_switcher(f: &mut Frame, app: &App, query: &str, sel: usize) {
         ));
     }
     lines.push(Line::styled(
-        "Enter switch · Ctrl+N new Session named this · Esc close",
+        format!(
+            "{}/{} · Enter switch · Ctrl+N new Session named this · Esc close",
+            if matches.is_empty() { 0 } else { sel + 1 },
+            matches.len()
+        ),
+        ui::dim(app.color),
+    ));
+    lines.push(Line::styled(
+        "PgUp/PgDn Home/End · Ctrl+U clear · Ctrl+W word",
         ui::dim(app.color),
     ));
     let w = 90.min(area.width.saturating_sub(2)).max(1);
@@ -14435,7 +14483,7 @@ impl App {
             return;
         };
         let matches = self.switcher_matches(&query);
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let ctrl = key.modifiers == KeyModifiers::CONTROL;
         match key.code {
             KeyCode::Esc => self.switcher = None,
             KeyCode::Char('n') if ctrl => {
@@ -14452,17 +14500,18 @@ impl App {
                     self.view = View::Chat;
                 }
             }
-            KeyCode::Up => self.switcher = Some((query, sel.saturating_sub(1))),
-            KeyCode::Down => {
-                self.switcher = Some((query, (sel + 1).min(matches.len().saturating_sub(1))))
+            _ => {
+                let mut query = query;
+                if let Some(changed) = query::edit(&mut query, &key) {
+                    if changed {
+                        self.switcher = Some((query, 0));
+                    }
+                } else if let Some(selected) =
+                    query::navigate(&key, sel, matches.len(), self.switcher_page_rows.get())
+                {
+                    self.switcher = Some((query, selected));
+                }
             }
-            KeyCode::Backspace => {
-                let mut q = query;
-                q.pop();
-                self.switcher = Some((q, 0));
-            }
-            KeyCode::Char(c) if !ctrl => self.switcher = Some((format!("{query}{c}"), 0)),
-            _ => {}
         }
     }
 
@@ -18629,6 +18678,8 @@ mod tests {
             approval_explain: false,
             quit_confirm: false,
             switcher: None,
+            switcher_page_rows: std::cell::Cell::new(10),
+            rollback_page_rows: std::cell::Cell::new(10),
             on_start: "last".into(),
             approval_code: None,
             image_placed: Vec::new(),
