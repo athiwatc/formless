@@ -24,6 +24,7 @@ struct Fixture {
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
     requests: Arc<Mutex<Vec<Request>>>,
+    usage_failure: Arc<AtomicUsize>,
     tool_rows: Arc<Mutex<Value>>,
     invocations: Arc<Mutex<Value>>,
     invocation_error: Arc<AtomicBool>,
@@ -54,6 +55,8 @@ impl Fixture {
         let stopped = stop.clone();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let seen = requests.clone();
+        let usage_failure = Arc::new(AtomicUsize::new(0));
+        let usage_fails = usage_failure.clone();
         let tool_rows = Arc::new(Mutex::new(
             json!([{"id":"full-tool-id","name":"FetchPage","description":"","retired":false,"current_version":1,"capabilities":[],"memory_mb":16,"invocations":0,"success_rate":null,"needs_attention":false,"created_at":"","updated_at":""}]),
         ));
@@ -93,7 +96,26 @@ impl Fixture {
                         line.clear();
                         continue;
                     }
+                    let usage_failed = match &envelope.request {
+                        Request::SessionUsage { .. } => usage_fails.load(Ordering::SeqCst) == 1,
+                        Request::ContextUsage { .. } => usage_fails.load(Ordering::SeqCst) == 2,
+                        _ => false,
+                    };
+                    if usage_failed {
+                        let reply = serde_json::to_value(formless_protocol::ServerMessage::err(
+                            envelope.id,
+                            "fixture usage read failure".into(),
+                        ))
+                        .unwrap();
+                        if writeln!(socket, "{reply}").is_err() {
+                            break;
+                        }
+                        line.clear();
+                        continue;
+                    }
                     let result = match &envelope.request {
+                        Request::SessionUsage { .. } => session_usage_report(),
+                        Request::ContextUsage { .. } => session_context_report(),
                         Request::GetTool { id } => detail_report(id),
                         Request::UsageByDay { .. } => grouped_usage(),
                         Request::ListTools => tool_reply.lock().unwrap().clone(),
@@ -202,6 +224,7 @@ impl Fixture {
             stop,
             thread: Some(thread),
             requests,
+            usage_failure,
             tool_rows,
             invocations,
             invocation_error,
@@ -809,6 +832,73 @@ fn shipped_tool_detail_source_mode_is_exact_and_human_history_is_readable() {
     assert_eq!(conflict.status.code(), Some(2));
     assert!(conflict.stdout.is_empty());
     assert!(fixture.requests.lock().unwrap().is_empty());
+}
+fn session_usage_report() -> Value {
+    let usage = json!({"steps":0,"prompt_tokens":10,"completion_tokens":2,"cached_tokens":0,"cache_write_tokens":1,"cost":null,"unpriced":["日本語 model"],"future":true});
+    json!({"runs":12,"total":usage,"last_run":null,"future":"retained"})
+}
+fn session_context_report() -> Value {
+    json!({"model":"モデル ไทย","used_tokens":99,"context_tokens":1000,"context_source":"configured","measured":false,"breakdown":{"system_prompt":10,"tool_schemas":11,"history":12,"attachments":3},"future":7})
+}
+
+#[test]
+fn shipped_session_usage_resolves_existing_selectors_buffers_both_reports_and_keeps_units() {
+    let fixture = Fixture::new();
+    for selector in ["abc-one", "abc-o", "First", " first "] {
+        for json in [false, true] {
+            fixture.requests.lock().unwrap().clear();
+            let mut args = vec!["sessions", "usage", selector];
+            if json {
+                args.push("--json");
+            }
+            let out = fixture.run(&args);
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            if json {
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&out.stdout).unwrap(),
+                    json!({"session_id":"abc-one","usage":session_usage_report(),"context":session_context_report()})
+                );
+            } else {
+                let text = String::from_utf8(out.stdout).unwrap();
+                for expected in [
+                    "Reported Run count: 12",
+                    "latest Run usage unavailable",
+                    "Estimated cost (USD): -",
+                    "Unpriced models: 日本語 model",
+                    "Used tokens (estimated): 99",
+                    "Attachment entries in stored message metadata: 3",
+                ] {
+                    assert!(text.contains(expected), "{text}");
+                }
+            }
+            assert!(
+                matches!(&fixture.requests.lock().unwrap()[..],[Request::ListSessions,Request::SessionUsage{session_id:a},Request::ContextUsage{session_id:b}] if a=="abc-one"&&b=="abc-one")
+            );
+        }
+    }
+    for selector in ["abc", "unknown"] {
+        fixture.requests.lock().unwrap().clear();
+        let out = fixture.run(&["sessions", "usage", selector]);
+        assert_eq!(out.status.code(), Some(2));
+        assert!(out.stdout.is_empty());
+        assert!(matches!(
+            &fixture.requests.lock().unwrap()[..],
+            [Request::ListSessions]
+        ));
+    }
+    for failure in [1, 2] {
+        fixture.usage_failure.store(failure, Ordering::SeqCst);
+        let out = fixture.run(&["sessions", "usage", "abc-one"]);
+        assert!(!out.status.success());
+        assert!(out.stdout.is_empty());
+        assert!(String::from_utf8(out.stderr)
+            .unwrap()
+            .contains("fixture usage read failure"));
+    }
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
