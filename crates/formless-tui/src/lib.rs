@@ -9641,7 +9641,11 @@ impl App {
             return;
         }
         if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
-            self.cycle_view(key.code == KeyCode::Tab);
+            if self.view == View::Settings && self.settings_form.is_some() {
+                self.settings_key(key);
+            } else {
+                self.cycle_view(key.code == KeyCode::Tab);
+            }
             return;
         }
         if self.list_filter_key(key.code) || self.list_nav_key(&key) {
@@ -21505,6 +21509,83 @@ mod tests {
             !screen.contains("**"),
             "markdown markers are rendered: {screen}"
         );
+    }
+
+    #[test]
+    fn active_settings_form_owns_tabs_after_overlays_without_hidden_form_capture() {
+        let mut app = test_app();
+        let (client, sent) = DaemonClient::recording();
+        app.client = Some(client);
+        app.view = View::Settings;
+        let mut form = settings::Form::provider(None);
+        form.fields[0].input.set("ไทย provider");
+        form.fields[1].input.set("https://例え.example");
+        let text = form
+            .fields
+            .iter()
+            .map(|field| field.input.to_string())
+            .collect::<Vec<_>>();
+        let cursors = form
+            .fields
+            .iter()
+            .map(|field| field.input.cursor_byte())
+            .collect::<Vec<_>>();
+        let count = form.fields.len();
+        app.settings_form = Some(form);
+        for index in 1..=count {
+            app.key(key(KeyCode::Tab));
+            assert_eq!(app.view, View::Settings);
+            assert_eq!(app.settings_form.as_ref().unwrap().idx, index % count);
+        }
+        app.key(key(KeyCode::BackTab));
+        assert_eq!(app.settings_form.as_ref().unwrap().idx, count - 1);
+        app.key(key(KeyCode::Tab));
+        assert_eq!(app.settings_form.as_ref().unwrap().idx, 0);
+        assert_eq!(
+            app.settings_form
+                .as_ref()
+                .unwrap()
+                .fields
+                .iter()
+                .map(|field| field.input.to_string())
+                .collect::<Vec<_>>(),
+            text
+        );
+        assert_eq!(
+            app.settings_form
+                .as_ref()
+                .unwrap()
+                .fields
+                .iter()
+                .map(|field| field.input.cursor_byte())
+                .collect::<Vec<_>>(),
+            cursors
+        );
+        app.pager = Some(Pager {
+            title: "overlay".into(),
+            lines: vec!["first".into()],
+            top: 0,
+            left: 0,
+            styled: Vec::new(),
+        });
+        app.key(key(KeyCode::Tab));
+        app.key(key(KeyCode::BackTab));
+        assert_eq!(app.settings_form.as_ref().unwrap().idx, 0);
+        assert!(app.pager.is_some());
+        assert_eq!(app.view, View::Settings);
+        assert!(
+            sent.try_recv().is_err(),
+            "field navigation and the pager send no requests"
+        );
+        app.pager = None;
+        app.view = View::Chat;
+        app.key(key(KeyCode::Tab));
+        assert_eq!(app.view, View::Sessions);
+        assert_eq!(app.settings_form.as_ref().unwrap().idx, 0);
+        app.view = View::Settings;
+        app.settings_form = None;
+        app.key(key(KeyCode::Tab));
+        assert_eq!(app.view, View::Chat);
     }
 
     #[test]
