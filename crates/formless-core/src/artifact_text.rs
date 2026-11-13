@@ -31,15 +31,9 @@ pub(crate) fn page(text: &str, offset: usize, length: usize) -> Page<'_> {
 /// The needle is already lowercased once by the caller. Unicode keeps the
 /// original whole-line lowercase semantics (including contextual mappings).
 pub(crate) fn contains_lowercase(line: &str, needle: &str) -> bool {
-    if line.is_ascii() && needle.is_ascii() {
-        needle.is_empty()
-            || line
-                .as_bytes()
-                .windows(needle.len())
-                .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
-    } else {
-        line.to_lowercase().contains(needle)
-    }
+    // Keep the standard library's efficient substring search for repeated
+    // prefixes; comparing a full byte window at each offset is quadratic.
+    line.to_lowercase().contains(needle)
 }
 
 #[cfg(test)]
@@ -76,6 +70,14 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn repeated_prefix_grep_remains_practical() {
+        let line = "A".repeat(1_000_000);
+        let needle = "a".repeat(10_000) + "b";
+        assert!(!contains_lowercase(&line, &needle));
+        assert!(contains_lowercase(&(line + "B"), &needle));
     }
 
     #[test]
