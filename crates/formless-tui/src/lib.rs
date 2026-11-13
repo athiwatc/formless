@@ -16755,6 +16755,13 @@ fn draw_proposals(f: &mut Frame, area: Rect, app: &App) {
         .map(|&i| &app.proposals[i])
         .map(|p| {
             let scores = match (p.baseline_score, p.candidate_score) {
+                (Some(b), Some(c)) if b.is_finite() && c.is_finite() && b == c => Line::from(vec![
+                    Span::styled(format!("{:.0}%", c * 100.0), ui::dim(app.color)),
+                    Span::styled(
+                        format!(" vs {:.0}% ({})", b * 100.0, p.eval_total),
+                        ui::dim(app.color),
+                    ),
+                ]),
                 (Some(b), Some(c)) => Line::from(vec![
                     Span::styled(
                         ui::status_text(
@@ -24821,6 +24828,69 @@ mod tests {
             .lines
             .iter()
             .any(|l| l.contains("\"title\": \"Example\"")));
+    }
+
+    #[test]
+    fn finite_proposal_score_ties_are_neutral_without_changing_status_or_rounding() {
+        for (theme_name, color) in [("dark", true), ("dark", false), ("colorblind", true)] {
+            let mut app = test_app();
+            let _theme = theme::test_theme(theme_name);
+            app.color = color;
+            app.view = View::Proposals;
+            for (candidate, baseline, expected) in [
+                (Some(0.5), Some(0.5), "50% vs 50%"),
+                (Some(0.50001), Some(0.5), "ok 50% vs 50%"),
+                (Some(0.49999), Some(0.5), "fail 50% vs 50%"),
+                (None, Some(0.5), "unmeasured"),
+                (
+                    Some(f64::INFINITY),
+                    Some(f64::INFINITY),
+                    "fail inf% vs inf%",
+                ),
+            ] {
+                app.proposals = vec![PromptProposalInfo {
+                    id: "fixture".into(),
+                    kind: "prompt".into(),
+                    content: "private proposal".into(),
+                    rationale: "เหตุผล 日本語".into(),
+                    status: "measured".into(),
+                    baseline_score: baseline,
+                    candidate_score: candidate,
+                    eval_total: 20,
+                    est_tokens: 1,
+                    created_at: String::new(),
+                    applied_at: None,
+                }];
+                let screen = render(&mut app, 160, 24);
+                let row = screen
+                    .lines()
+                    .find(|line| line.contains("private proposal"))
+                    .unwrap();
+                let row = row.split_whitespace().collect::<Vec<_>>().join(" ");
+                let redundant = theme::redundant(color);
+                assert_eq!(redundant, !color || theme_name == "colorblind");
+                let expected = if redundant {
+                    expected.to_owned()
+                } else {
+                    expected
+                        .trim_start_matches("ok ")
+                        .trim_start_matches("fail ")
+                        .to_owned()
+                };
+                assert!(row.contains(&expected), "{theme_name}/{color}: {row}");
+                if candidate == Some(0.5) && baseline == Some(0.5) {
+                    assert!(
+                        !row.contains("fail 50%") && !row.contains("ok 50%"),
+                        "{row}"
+                    );
+                }
+                assert!(
+                    row.contains("measured")
+                        && row.contains("เหตุผล")
+                        && row.replace(' ', "").contains("日本語")
+                );
+            }
+        }
     }
 
     #[test]
