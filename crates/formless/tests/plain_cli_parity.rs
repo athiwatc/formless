@@ -139,6 +139,8 @@ impl Fixture {
                         Request::GetModule { .. } => module_detail(),
                         Request::ProposalDiff { id } => proposal_comparison(id),
                         Request::Subscribe { .. } => json!({"conn":1}),
+                        Request::GetRun { run_id } => inspected_run(run_id),
+                        Request::CancelRunId { run_id } => cancellation_reply(run_id),
                         Request::ListInvocations => invocation_reply.lock().unwrap().clone(),
                         Request::ListSessions => json!([
                             {"id":"abc-one","name":"First","created_at":"","updated_at":""},
@@ -1035,6 +1037,102 @@ fn shipped_run_filters_send_resolved_scope_and_preserve_the_complete_report() {
         assert!(out.stdout.is_empty());
     }
     assert_eq!(fixture.connections.load(Ordering::SeqCst), before);
+}
+fn inspected_run(status: &str) -> Value {
+    let mut value = json!({"run_id":"full-run-日本語-id","session_id":"session-ไทย","status":status,"error":if status=="failed" {Some("failure\n\u{1b}[31mไทย")} else {None},"created_at":"stored-created","updated_at":"stored-updated","start_message_seq":0,"end_message_seq":null,"steps":2,"tool_calls":3,"prompt_tokens":0,"completion_tokens":0,"future":{"retained":true}});
+    if status == "paused" {
+        value["spend"] = json!({"known_usd":0.25,"total_usd":null,"usage_complete":false,"spend_complete":false,"unpriced":["モデル"]});
+    }
+    value
+}
+fn cancellation_reply(id: &str) -> Value {
+    json!({"run_id":"full-run-日本語-id","interrupted":id=="yes","future":7})
+}
+
+#[test]
+fn shipped_run_inspection_reports_precede_existing_exits_and_json_stays_complete() {
+    let fixture = Fixture::new();
+    for (status, exit) in [
+        ("running", 0),
+        ("completed", 0),
+        ("paused", 1),
+        ("failed", 1),
+        ("abandoned", 1),
+        ("interrupted", 130),
+        ("unknown", 0),
+    ] {
+        for mode in 0..3 {
+            fixture.requests.lock().unwrap().clear();
+            let args = match mode {
+                0 => vec!["runs", "show", status],
+                1 => vec!["runs", "show", status, "--json"],
+                _ => vec!["runs", "--json", "show", status],
+            };
+            let out = fixture.run(&args);
+            assert_eq!(
+                out.status.code(),
+                Some(exit),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            if mode > 0 {
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&out.stdout).unwrap(),
+                    inspected_run(status)
+                );
+            } else {
+                let text = String::from_utf8(out.stdout).unwrap();
+                assert!(
+                    text.contains("Run ID: full-run-日本語-id")
+                        && text.contains(&format!("Stored status: {status}"))
+                );
+                assert!(text.contains("Recorded prompt tokens: 0"));
+                if status == "failed" {
+                    assert!(!text.contains('\u{1b}'));
+                    assert!(text.contains("failure\\u{a}\\u{1b}[31mไทย"));
+                }
+                if status == "paused" {
+                    assert!(
+                        text.contains("Known USD subtotal: 0.25")
+                            && text.contains("Total USD: -")
+                            && text.contains("Spend complete: false")
+                    );
+                }
+            }
+            assert!(
+                matches!(&fixture.requests.lock().unwrap()[..],[Request::Subscribe{..},Request::GetRun{run_id}] if run_id==status)
+            );
+        }
+    }
+    for id in ["yes", "no"] {
+        for mode in 0..3 {
+            fixture.requests.lock().unwrap().clear();
+            let args = match mode {
+                0 => vec!["runs", "cancel", id],
+                1 => vec!["runs", "cancel", id, "--json"],
+                _ => vec!["runs", "--json", "cancel", id],
+            };
+            let out = fixture.run(&args);
+            assert!(out.status.success());
+            if mode > 0 {
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&out.stdout).unwrap(),
+                    cancellation_reply(id)
+                );
+            } else {
+                let text = String::from_utf8(out.stdout).unwrap();
+                assert!(text.contains(if id == "yes" {
+                    "Cancellation requested"
+                } else {
+                    "No active accepting Run"
+                }));
+                assert!(!text.contains("stopped") && !text.contains("finished"));
+            }
+            assert!(
+                matches!(&fixture.requests.lock().unwrap()[..],[Request::Subscribe{..},Request::CancelRunId{run_id}] if run_id==id)
+            );
+        }
+    }
 }
 impl Drop for Fixture {
     fn drop(&mut self) {

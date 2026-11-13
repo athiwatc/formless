@@ -741,6 +741,14 @@ summary describe that filtered, limited subset; JSON forecasts remain
 independently scoped and unchanged. With neither selector, request/output
 behavior is unchanged. Filters with any Runs subaction are usage errors before
 connection; unknown/ambiguous Sessions necessarily fail after ListSessions.
+Human `runs show` uses labeled stored identifiers, status/error, timestamps,
+message boundaries, counters and recorded token sums. Available spend is
+labeled as a report of estimates, with known subtotal, optional total and
+returned completeness flags; unavailable amounts are not invented as zero.
+Human `runs cancel` reports a cancellation request for a matching accepting
+controller, or that none was found; neither acknowledgment proves a terminal
+outcome. There is no polling or additional cancellation request. JSON and the
+existing status-based show exits remain unchanged.
 
 #### Root and global flags
 

@@ -10,6 +10,7 @@ mod cli_proposal_diff;
 mod cli_routing;
 mod cli_run_identity;
 mod cli_run_memories;
+mod cli_run_report;
 #[cfg(test)]
 mod cli_runs_filter_tests;
 mod cli_runs_list;

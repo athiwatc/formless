@@ -176,9 +176,13 @@ pub(super) fn runs(paths: &Paths, action: RunsAction, outer_json: bool) -> Resul
     } else if running {
         print!("{}", invocation_snapshot(&value)?);
     } else {
-        println!(
+        print!(
             "{}",
-            super::comparison_terminal_text(&serde_json::to_string_pretty(&value)?)
+            if inspect {
+                super::cli_run_report::show(&value)
+            } else {
+                super::cli_run_report::cancel(&value)
+            }
         );
     }
     if inspect {
