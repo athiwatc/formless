@@ -430,8 +430,8 @@ this table is implemented beyond what §3 lists.
 |---|---|
 | Pin kit release family, dependency graph, toolchain and platform requirements from release manifests | Done for macOS; Windows and Linux are resolution-only |
 | Build a disposable native shell on Mac | Done |
-| Build it on Windows | **Not done**, needs the Windows PC. **Required gate, open.** |
-| Verify kit input, virtualization, focus, Markdown and AccessKit with Thai/CJK text | Headless only, extended in §11 (overlay roles, input-method commit and composition through the kit's test bridge); no OS IME, no screen reader. **Required gate, open.** |
+| Build it on Windows | Built and tested at `d34fab9` on the Windows PC; `--smoke` passed under a console-only runner (§17.6). Latest code and rendering: assigned to another worker, not duplicated here. **Required gate, open.** |
+| Verify kit input, virtualization, focus, Markdown and AccessKit with Thai/CJK text | Headless (§11), offscreen with real fonts, and on macOS the real window's platform accessibility tree, read and acted on with synthetic events (§16) and checked automatically (§16.12). No OS input method, no screen reader, no person's input. **Required gate, open.** |
 | Inventory UI intents and data availability; name missing contracts | First pass in §6; approvals, credentials and setup not examined |
 | Original shell, composer and inspector tokens; narrow and wide mock states | Starting tokens and three width states exist in code and as offscreen captures; no visual review with users |
 | Performance fixtures, baseline measurements, accepted budgets | Synthetic fixtures including a 5 MiB block and a streamed tail; first-frame timing, peak RSS and frame-delivery intervals while streaming (§11.4); no key-to-paint, scroll, idle CPU or long-run memory; no budget accepted. **Required gate, open.** |
@@ -1719,6 +1719,50 @@ have. Phase 1 stays blocked on them.
 | Linux | A Linux machine | Not run |
 | Performance budgets, including the accessible-text cost in a frontmost window | A budget decision, and a frontmost window | Provisional thresholds only |
 | Parity, packaging, signing, licence notices | Product decisions and the real client layer | Not started |
+
+### 16.14 Merging the Phase 0 draft, and what is Phase 1
+
+Re-evaluated at `e0c676f`, against §7.
+
+**No further code-addressable gap was found.** The one candidate,
+Session position and count on macOS, has no safe fix in this crate: the
+pinned macOS adapter reads neither, a role change would be a guess, and
+putting "1 of 196" into a row's help text would repeat on Windows and
+Linux what their adapters already expose, for a VoiceOver behaviour nobody
+has heard. The count is already on screen and in the tree as the text
+"Sessions (196)" just before the list.
+
+**What merging the Phase 0 draft needs** (the work is a spike: it is a
+decision record, not a product):
+
+| Gate from §7 | Evidence that would close it | Who |
+|---|---|---|
+| Windows build and render at the latest code | The same native build, tests and `--smoke` at the head of this branch, and someone looking at the window | The Windows worker |
+| Linux build and render | The same on Linux | The Linux worker |
+| Kit input and AccessKit with Thai/CJK, for real | A Thai and a Japanese input method composing into the composer; VoiceOver reading the window, a Session row, a dialog and a status change | A person at the Mac |
+| Performance budgets | A decision on budgets, using §11.4, §14 and §16.10, the provisional thresholds there, and a frontmost-window run | The user |
+| Packaging and supported platform tier | A decision | The user |
+| Independent review of this branch | Review of `d34fab9..` | dot |
+
+Nothing in that table can be produced from this checkout without one of
+those people.
+
+**What is Phase 1, not Phase 0:** a real client layer and transport in
+place of the fixture (§5.2), every destination other than Chat, approval,
+credential and setup surfaces, Session position and count on macOS
+(through an adapter change), live-region and accessible-text performance
+work (§16.10), full-output viewing (§12.1), Thai line breaking wired in
+(§11.6), parity (§6), and packaging.
+
+**Publication.** This branch is 44 commits ahead of
+`origin/work/claude-gpui-1753` (still `d34fab9`), and nothing has been
+pushed from this session, as instructed. Read from local configuration
+only: `origin` is `https://github.com/athiwatc/formless.git`; credentials
+for github.com come from the GitHub CLI's credential helper, whose host
+entry is for user `athiwatc`. Whether that login is still valid was not
+checked, as checking contacts GitHub. Publishing is the reviewer's step:
+from this worktree, push `work/claude-gpui-1753` to `origin` and update
+draft PR 1776. Nothing here should be pushed or merged by this session.
 
 ## 17. Windows: no first frame from `--smoke`
 
