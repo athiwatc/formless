@@ -8,7 +8,7 @@ use std::{
     os::unix::net::UnixListener,
     process::{Command, Stdio},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     time::{Duration, Instant},
@@ -19,6 +19,7 @@ struct Fixture {
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
     requests: Arc<Mutex<Vec<Request>>>,
+    usage_failure: Arc<AtomicUsize>,
 }
 impl Fixture {
     fn new() -> Self {
@@ -45,6 +46,8 @@ impl Fixture {
         let stopped = stop.clone();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let seen = requests.clone();
+        let usage_failure = Arc::new(AtomicUsize::new(0));
+        let failure = usage_failure.clone();
         let thread = std::thread::spawn(move || {
             while !stopped.load(Ordering::SeqCst) {
                 let (mut socket, _) = match listener.accept() {
@@ -63,6 +66,8 @@ impl Fixture {
                 while reader.read_line(&mut line).unwrap_or(0) > 0 {
                     let envelope: RequestEnvelope = serde_json::from_str(&line).unwrap();
                     let result = match &envelope.request {
+                        Request::SessionUsage { .. } => session_usage_report(),
+                        Request::ContextUsage { .. } => session_context_report(),
                         Request::ListSessions => json!([
                             {"id":"abc-one","name":"First","created_at":"","updated_at":""},
                             {"id":"abc-two","name":"Second","created_at":"","updated_at":""}
@@ -77,9 +82,21 @@ impl Fixture {
                         }
                         _ => panic!("unexpected private RPC: {:?}", envelope.request),
                     };
+                    let fail = match &envelope.request {
+                        Request::SessionUsage { .. } => failure.load(Ordering::SeqCst) == 1,
+                        Request::ContextUsage { .. } => failure.load(Ordering::SeqCst) == 2,
+                        _ => false,
+                    };
+                    let reply = if fail {
+                        serde_json::to_value(formless_protocol::ServerMessage::err(
+                            envelope.id,
+                            "fixture usage read failure".into(),
+                        ))
+                        .unwrap()
+                    } else {
+                        json!({"kind":"response", "id":envelope.id, "ok":true, "result":result})
+                    };
                     seen.lock().unwrap().push(envelope.request);
-                    let reply =
-                        json!({"kind":"response", "id":envelope.id, "ok":true, "result":result});
                     if writeln!(socket, "{reply}").is_err() {
                         break;
                     }
@@ -92,6 +109,7 @@ impl Fixture {
             stop,
             thread: Some(thread),
             requests,
+            usage_failure,
         }
     }
     fn command(&self, args: &[&str]) -> Command {
@@ -144,6 +162,74 @@ impl Fixture {
             stdout: out.join().unwrap(),
             stderr: err.join().unwrap(),
         }
+    }
+}
+
+fn session_usage_report() -> Value {
+    let usage = json!({"steps":0,"prompt_tokens":10,"completion_tokens":2,"cached_tokens":0,"cache_write_tokens":1,"cost":null,"unpriced":["日本語 model"],"future":true});
+    json!({"runs":12,"total":usage,"last_run":null,"future":"retained"})
+}
+fn session_context_report() -> Value {
+    json!({"model":"モデル ไทย","used_tokens":99,"context_tokens":1000,"context_source":"configured","measured":false,"breakdown":{"system_prompt":10,"tool_schemas":11,"history":12,"attachments":3},"future":7})
+}
+
+#[test]
+fn shipped_session_usage_resolves_existing_selectors_buffers_both_reports_and_keeps_units() {
+    let fixture = Fixture::new();
+    for selector in ["abc-one", "abc-o", "First", " first "] {
+        for json in [false, true] {
+            fixture.requests.lock().unwrap().clear();
+            let mut args = vec!["sessions", "usage", selector];
+            if json {
+                args.push("--json");
+            }
+            let out = fixture.run(&args);
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            if json {
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&out.stdout).unwrap(),
+                    json!({"session_id":"abc-one","usage":session_usage_report(),"context":session_context_report()})
+                );
+            } else {
+                let text = String::from_utf8(out.stdout).unwrap();
+                for expected in [
+                    "Reported Run count: 12",
+                    "latest Run usage unavailable",
+                    "Estimated cost (USD): -",
+                    "Unpriced models: 日本語 model",
+                    "Used tokens (estimated): 99",
+                    "Attachment entries in stored message metadata: 3",
+                ] {
+                    assert!(text.contains(expected), "{text}");
+                }
+            }
+            assert!(
+                matches!(&fixture.requests.lock().unwrap()[..],[Request::ListSessions,Request::SessionUsage{session_id:a},Request::ContextUsage{session_id:b}] if a=="abc-one"&&b=="abc-one")
+            );
+        }
+    }
+    for selector in ["abc", "unknown"] {
+        fixture.requests.lock().unwrap().clear();
+        let out = fixture.run(&["sessions", "usage", selector]);
+        assert_eq!(out.status.code(), Some(2));
+        assert!(out.stdout.is_empty());
+        assert!(matches!(
+            &fixture.requests.lock().unwrap()[..],
+            [Request::ListSessions]
+        ));
+    }
+    for failure in [1, 2] {
+        fixture.usage_failure.store(failure, Ordering::SeqCst);
+        let out = fixture.run(&["sessions", "usage", "abc-one"]);
+        assert!(!out.status.success());
+        assert!(out.stdout.is_empty());
+        assert!(String::from_utf8(out.stderr)
+            .unwrap()
+            .contains("fixture usage read failure"));
     }
 }
 impl Drop for Fixture {

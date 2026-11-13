@@ -634,7 +634,7 @@ The table covers every visible root command, including Clap's generated
 | `formless run` | `TASK`; `--estimate`, `--session`, `--output`, `--attach` and other Run options | Run one headless task, or print its local forecast without starting it. |
 | `formless runs` | No action: list; `show`, `cancel` | List recent Runs, inspect one by ID/prefix, or cancel that exact Run. |
 | `formless security` | `status` | Inspect the daemon's grants, denials, trusted resources, and exposed interfaces. |
-| `formless sessions` | `fork`, `compare`, `list`, `show`, `files`, `rewind`, `rename`, `rm`, `restore`, `import`, `search`, `archive`, `unarchive`, `export` | Manage stored Sessions, follow a Run with `show --follow`, or inspect tracked files. |
+| `formless sessions` | `fork`, `compare`, `list`, `show`, `usage`, `files`, `rewind`, `rename`, `rm`, `restore`, `import`, `search`, `archive`, `unarchive`, `export` | Manage stored Sessions, follow a Run with `show --follow`, or inspect tracked files. |
 | `formless skills` | `reviews`, `add`, `remove`, `list`, `enable`, `disable`, `show`, `export`, `import` | Inspect and manage Skills and their retained description reviews. |
 | `formless storage` | `--json` | Report disk usage by data category. |
 | `formless tools` | `reviews`, `list`, `disable`, `enable`, `undo`, `pin`, `unpin`, `tag`, `show`, `retire`, `restore`, `rollback`, `purge`, `run`, `export`, `import` | Inspect, manage, run, or transfer registry Tools. |
@@ -642,6 +642,18 @@ The table covers every visible root command, including Clap's generated
 | `formless uninstall` | `--keep-data`, `--keep-binary`, `--yes` (alias `--force`) | Remove Formless, optionally retaining data or the binary. |
 | `formless update` | No action, `check`, or `--check` | Show newer release notes and the applicable upgrade command; never rewrite the binary. |
 | `formless web` | `--port`, `--no-open`, `--stop` | Open, print a link for, or stop the local browser UI. |
+
+`sessions usage SESSION [--json]` uses the existing Session selector and
+buffers SessionUsage plus ContextUsage before output. Human records label
+total/latest-Run counters, estimated USD cost, unpriced models and the current
+prompt/context estimates. Attachment entries count stored metadata-array
+entries, not tokens, unique files or pending attachments. A null latest report
+means usage unavailable, not no prior Runs or a completed-Run guarantee.
+JSON preserves both complete independent replies under `session_id`, `usage`
+and `context`; this is not a common-snapshot guarantee. Existing context-window
+discovery may contact the configured provider, so the command is not promised
+offline. Reported Run count retains the backend's newest-100,000 global-window
+limitation (#1458); aggregation/estimation/accounting behavior is unchanged.
 
 #### Root and global flags
 

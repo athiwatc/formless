@@ -4,6 +4,7 @@ mod cli_commands;
 mod cli_help_tests;
 mod cli_pipeline;
 mod cli_run_identity;
+mod cli_session_usage;
 mod cli_tool_success;
 #[cfg(test)]
 mod session_export_tests;
@@ -172,7 +173,7 @@ enum Cmd {
     },
     /// Sessions: list, show, search, rename, delete, export or import them
     #[command(
-        after_help = "Examples:\n  formless sessions list\n  formless sessions show SESSION_ID\n  formless sessions export SESSION_ID --format markdown"
+        after_help = "Examples:\n  formless sessions list\n  formless sessions show SESSION_ID\n  formless sessions usage SESSION_ID --json\n  formless sessions export SESSION_ID --format markdown"
     )]
     Sessions {
         #[command(subcommand)]
@@ -5310,6 +5311,14 @@ fn write_session_export(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
 
 #[derive(Subcommand)]
 enum SessionsAction {
+    /// Read recorded Session usage and the current prompt/context estimate
+    Usage {
+        /// Session selector, using the existing ID/prefix/name resolution
+        id: String,
+        /// Print both complete daemon reports as one JSON value
+        #[arg(long)]
+        json: bool,
+    },
     /// Fork stored history without starting a Run
     Fork {
         /// Session ID or unambiguous prefix
@@ -5464,6 +5473,15 @@ fn sessions_cmd(paths: Paths, action: SessionsAction) -> Result<()> {
     formless_core::daemon::ensure_daemon(&paths)?;
     let daemon = |r| formless_tui::client::request_once(&paths, r);
     match action {
+        SessionsAction::Usage { id, json } => {
+            let session = find_session(&paths, &id)?;
+            cli_session_usage::write_report(
+                &mut std::io::stdout().lock(),
+                &session.id,
+                json,
+                daemon,
+            )?;
+        }
         SessionsAction::Fork {
             id,
             name,
