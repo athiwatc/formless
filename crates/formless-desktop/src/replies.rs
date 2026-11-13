@@ -34,6 +34,8 @@ pub enum DecodeError {
     Malformed { field: &'static str, detail: String },
     /// The reply is for another Session than the one asked for.
     WrongSession { asked: String, got: String },
+    /// A message belongs to another Session than its envelope or snapshot.
+    WrongMessageSession { asked: String, got: String },
     /// A message's sequence number cannot be a block id.
     NegativeSeq(i64),
     /// Two messages share a sequence number.
@@ -49,6 +51,9 @@ impl fmt::Display for DecodeError {
             }
             DecodeError::WrongSession { asked, got } => {
                 write!(f, "asked for Session {asked}, the reply is for {got}")
+            }
+            DecodeError::WrongMessageSession { asked, got } => {
+                write!(f, "message in Session {asked} belongs to Session {got}")
             }
             DecodeError::NegativeSeq(seq) => write!(f, "a message has sequence number {seq}"),
             DecodeError::DuplicateSeq(seq) => {
@@ -71,6 +76,9 @@ pub struct SessionSnapshot {
     pub blocks: Vec<TimelineBlock>,
     /// Assistant messages left out because they hold no text.
     pub hidden: usize,
+    /// Highest persisted sequence, including assistant turns hidden above.
+    /// Event reconciliation must not mistake those turns for new messages.
+    pub last_seq: Option<u64>,
 }
 
 /// The block kind a message role is shown as. Matches the TUI's mapping.
@@ -145,20 +153,39 @@ pub fn session_snapshot(
             return Err(DecodeError::DuplicateSeq(message.seq));
         }
         previous = Some(message.seq);
-        let id = u64::try_from(message.seq).map_err(|_| DecodeError::NegativeSeq(message.seq))?;
-        let kind = block_kind(&message.role);
-        if kind == BlockKind::Assistant && message.content.trim().is_empty() {
-            hidden += 1;
-            continue;
+        match message_block(asked, message)? {
+            Some(block) => blocks.push(block),
+            None => hidden += 1,
         }
-        blocks.push(TimelineBlock::new(id, kind, message.content));
     }
     Ok(SessionSnapshot {
         session_id,
         running,
         blocks,
         hidden,
+        last_seq: previous.map(|seq| seq as u64),
     })
+}
+
+/// Validate a persisted message's Session and sequence before allocating
+/// its timeline block. Shared by snapshots and events.
+pub(crate) fn message_sequence(asked: &str, message: &MessageInfo) -> Result<u64, DecodeError> {
+    if message.session_id != asked {
+        return Err(DecodeError::WrongMessageSession {
+            asked: asked.to_string(),
+            got: message.session_id.clone(),
+        });
+    }
+    u64::try_from(message.seq).map_err(|_| DecodeError::NegativeSeq(message.seq))
+}
+
+fn message_block(asked: &str, message: MessageInfo) -> Result<Option<TimelineBlock>, DecodeError> {
+    let id = message_sequence(asked, &message)?;
+    let kind = block_kind(&message.role);
+    if kind == BlockKind::Assistant && message.content.trim().is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(TimelineBlock::new(id, kind, message.content)))
 }
 
 #[cfg(test)]
@@ -296,6 +323,33 @@ mod tests {
         assert_eq!(
             session_snapshot("s1", &twice),
             Err(DecodeError::DuplicateSeq(2))
+        );
+    }
+
+    #[test]
+    fn hidden_turns_still_advance_the_snapshot_sequence() {
+        let snapshot =
+            session_snapshot("s1", &reply("s1", false, &[message(7, "assistant", "")])).unwrap();
+        assert_eq!(snapshot.last_seq, Some(7));
+        assert!(snapshot.blocks.is_empty());
+        assert_eq!(
+            session_snapshot("s1", &reply("s1", false, &[]))
+                .unwrap()
+                .last_seq,
+            None
+        );
+    }
+
+    #[test]
+    fn a_snapshot_cannot_carry_another_sessions_message() {
+        let mut foreign = message(1, "user", "private to s2");
+        foreign.session_id = "s2".into();
+        assert_eq!(
+            session_snapshot("s1", &reply("s1", false, &[foreign])),
+            Err(DecodeError::WrongMessageSession {
+                asked: "s1".into(),
+                got: "s2".into()
+            })
         );
     }
 

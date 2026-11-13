@@ -4376,9 +4376,9 @@ fn a_decoded_session_reply_becomes_the_open_sessions_timeline_and_no_other(
     cx: &mut TestAppContext,
 ) {
     let (handle, shell) = open(cx, WIDE, 200, 40);
-    let message = |seq: i64, role: &str, content: &str| {
+    let message = |session: &str, seq: i64, role: &str, content: &str| {
         serde_json::json!({
-            "id": format!("m{seq}"), "session_id": "x", "seq": seq, "role": role,
+            "id": format!("m{seq}"), "session_id": session, "seq": seq, "role": role,
             "content": content, "created_at": "2026-11-14T00:00:00Z",
         })
     };
@@ -4388,10 +4388,10 @@ fn a_decoded_session_reply_becomes_the_open_sessions_timeline_and_no_other(
             "running": false,
             "pending_events": [],
             "messages": [
-                message(10, "user", "สวัสดี **bold**"),
-                message(11, "assistant", ""),
-                message(12, "assistant", "- [x] done\n- [ ] 日本語"),
-                message(13, "system-note", "Model changed"),
+                message(session, 10, "user", "สวัสดี **bold**"),
+                message(session, 11, "assistant", ""),
+                message(session, 12, "assistant", "- [x] done\n- [ ] 日本語"),
+                message(session, 13, "system-note", "Model changed"),
             ],
         })
     };

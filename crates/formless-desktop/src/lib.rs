@@ -1,6 +1,6 @@
 //! Optional native desktop client for Formless: Phase 0 spike of epic #1753.
 //!
-//! [`model`], [`commands`], [`replies`], [`memory`], [`timeline`], [`full_view`] and
+//! [`model`], [`commands`], [`replies`], [`transcript`], [`memory`], [`timeline`], [`full_view`] and
 //! [`fixture`] carry no GUI dependency. [`shell`] is the GPUI Kit view over them and is
 //! only built with the `gui` feature.
 
@@ -15,3 +15,4 @@ pub mod shell;
 #[cfg(feature = "thai-breaks")]
 pub mod thai;
 pub mod timeline;
+pub mod transcript;

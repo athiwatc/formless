@@ -22,6 +22,10 @@ not see GPUI. Run every command below from this directory.
 | Path | What it is | GUI dependency |
 |---|---|---|
 | `src/model.rs` | Presentation model: destinations, Run state, composer actions, layout breakpoints and modal overlays, focus regions, Session list selection, text size, drafts bounded by count and bytes | none |
+| `src/commands.rs` | Typed shell command registry and palette search | none |
+| `src/replies.rs` | Read-only, validated `ListSessions` / `GetSession` decoding | none |
+| `src/transcript.rs` | Pure transcript event application, canonical completion replacement and sticky reload-needed state; not connected to the shell or a transport yet | none |
+| `src/full_view.rs` | Grapheme-safe row index for the full-output view | none |
 | `src/memory.rs` | Memory policy: composer limit, whole-edit rejection bookkeeping, undo accounting, text-free intent records | none |
 | `src/timeline.rs` | Timeline blocks, a bounded movable window onto each long block, streamed tails rebuilt when shown and update coalescing | none |
 | `examples/stream_model.rs` | Replays the synthetic stream into the model with no window and prints what keeping the streamed row up to date cost | none |

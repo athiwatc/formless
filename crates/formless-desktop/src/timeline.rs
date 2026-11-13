@@ -675,11 +675,34 @@ impl Timeline {
     pub fn begin_stream(&mut self, kind: BlockKind) -> u64 {
         self.finish_stream();
         let id = self.blocks.last().map_or(1, |block| block.id + 1);
+        self.begin_stream_with_id(id, kind);
+        id
+    }
+
+    /// A live row with an explicitly ephemeral id, separate from persisted
+    /// message sequences. Used by transcript event reconciliation.
+    pub(crate) fn begin_stream_with_id(&mut self, id: u64, kind: BlockKind) {
+        debug_assert!(!self.streaming);
+        debug_assert!(self.block(id).is_none());
         let mut block = TimelineBlock::new(id, kind, String::new());
         block.show_end();
         self.blocks.push(block);
         self.streaming = true;
-        id
+    }
+
+    /// Discard a provisional answer, never a persisted block. Completion
+    /// replaces it with canonical text; restart must not keep its prefix.
+    pub(crate) fn discard_stream(&mut self) {
+        if self.streaming {
+            self.blocks.pop();
+            self.streaming = false;
+        }
+    }
+
+    /// Insert persisted text before the provisional tail, if one exists.
+    pub(crate) fn append_persisted(&mut self, block: TimelineBlock) {
+        let index = self.blocks.len() - usize::from(self.streaming);
+        self.blocks.insert(index, block);
     }
 
     /// Move the window of the block with this id. Returns the block's
