@@ -4,6 +4,7 @@ mod cli_commands;
 mod cli_help_tests;
 mod cli_pipeline;
 mod cli_run_identity;
+mod cli_session_report;
 mod cli_tool_success;
 #[cfg(test)]
 mod session_export_tests;
@@ -5497,20 +5498,12 @@ fn sessions_cmd(paths: Paths, action: SessionsAction) -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&shown)?);
                 return Ok(());
             }
-            let mut tbl = Table::new(&["ID", "UPDATED", "MSGS", "NAME", "LAST MESSAGE"]);
-            for s in list.iter().filter(|s| s.archived == archived) {
-                tbl.row(vec![
-                    t(&s.id[..8.min(s.id.len())], Tone::Dim),
-                    c(s.updated_at.get(..16).unwrap_or(&s.updated_at)),
-                    c(s.message_count.to_string()),
-                    t(
-                        format!("{}{}", if s.pinned { "★ " } else { "" }, s.name),
-                        Tone::Strong,
-                    ),
-                    t(s.preview.clone().unwrap_or_default(), Tone::Dim),
-                ]);
+            let shown: Vec<_> = list.iter().filter(|s| s.archived == archived).collect();
+            if shown.is_empty() {
+                println!("{}", cli_session_report::empty(&list, archived));
+            } else {
+                cli_session_report::list_table(&shown).print();
             }
-            tbl.print();
         }
         SessionsAction::Show { id, json, .. } => {
             let s = find_session(&paths, &id)?;
@@ -5536,6 +5529,7 @@ fn sessions_cmd(paths: Paths, action: SessionsAction) -> Result<()> {
                     .map(|c| format!(" · in {c}"))
                     .unwrap_or_default()
             );
+            print!("{}", cli_session_report::metadata(&s));
             let messages: Vec<formless_protocol::MessageInfo> =
                 serde_json::from_value(r["messages"].clone()).unwrap_or_default();
             for m in messages {
