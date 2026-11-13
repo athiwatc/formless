@@ -373,8 +373,10 @@ function __call(op, args) {
 function __formatValue(x) {
   try {
     if (typeof x === "string") return x;
+    if (typeof x === "number" && !Number.isFinite(x)) return String(x);
     const ancestors = [];
     const text = JSON.stringify(x, function (_key, value) {
+      if (typeof value === "number" && !Number.isFinite(value)) return String(value);
       if (typeof value === "bigint") return String(value) + "n";
       if (value === undefined) return "undefined";
       if (typeof value === "function" || typeof value === "symbol") return String(value);
@@ -3867,6 +3869,43 @@ mod tests {
         let req = live("function run() { return tools.call('t', {n: 1}); }");
         let out = execute(&req, Arc::new(SlowOps)).unwrap();
         assert_eq!(out.output["n"], 1);
+    }
+
+    #[test]
+    fn console_preserves_primitive_nonfinite_diagnostics_without_changing_return_json() {
+        let req = live(
+            r#"function run() {
+          const returns=[];
+          for(const method of ['log','info','warn','error']) {
+            returns.push(console[method](NaN,Infinity,-Infinity,null,1.5,-0,'ไทย 🦀'));
+            returns.push(console[method]({score:NaN,positive:Infinity,negative:-Infinity,actual:null,finite:1.5,zero:-0},[NaN,Infinity,-Infinity,null,1.5,-0]));
+          }
+          let calls=0;
+          console.log({toJSON(){calls++;return {custom:1.5};}});
+          console.log(new Number(Infinity));
+          return {calls,values:[NaN,Infinity,-Infinity,null,1.5,-0],returns};
+        }"#,
+        );
+        let out = execute(&req, Arc::new(NoHostOps)).unwrap();
+        assert_eq!(out.logs.len(), 10);
+        for pair in out.logs[..8].chunks_exact(2) {
+            assert_eq!(pair[0], "NaN Infinity -Infinity null 1.5 0 ไทย 🦀");
+            assert_eq!(
+                pair[1],
+                r#"{"score":"NaN","positive":"Infinity","negative":"-Infinity","actual":null,"finite":1.5,"zero":0} ["NaN","Infinity","-Infinity",null,1.5,0]"#
+            );
+        }
+        assert_eq!(out.logs[8], r#"{"custom":1.5}"#);
+        assert_eq!(out.logs[9], "null");
+        assert_eq!(out.output["calls"], 1);
+        assert_eq!(
+            out.output["values"],
+            json!([null, null, null, null, 1.5, 0])
+        );
+        assert_eq!(
+            out.output["returns"],
+            json!([null, null, null, null, null, null, null, null])
+        );
     }
 
     #[test]
