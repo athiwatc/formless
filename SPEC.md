@@ -6182,6 +6182,11 @@ stored message boundaries display a Note and the initial Session snapshot only;
 follow never invents a boundary or refreshes that legacy transcript without one.
 Connection loss is an error.
 
+Tool selectors use an exact name or full ID. After a miss, up to three
+ranked partial-name suggestions can help you retry with the original exact
+spelling; these use folded subsequence matching, not edit-distance spelling
+correction. A suggestion never selects or runs a Tool automatically.
+
 `runs show ID [--json]` inspects any stored Run; `runs cancel ID [--json]`
 cancels only that exact active Run, never a later Run in the same Session. IDs
 accept unambiguous prefixes. Show uses the same terminal exit codes as follow;

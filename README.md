@@ -643,6 +643,11 @@ The table covers every visible root command, including Clap's generated
 | `formless update` | No action, `check`, or `--check` | Show newer release notes and the applicable upgrade command; never rewrite the binary. |
 | `formless web` | `--port`, `--no-open`, `--stop` | Open, print a link for, or stop the local browser UI. |
 
+Tool selectors use an exact name or full ID. After a miss, up to three
+ranked partial-name suggestions can help you retry with the original exact
+spelling; these use folded subsequence matching, not edit-distance spelling
+correction. A suggestion never selects or runs a Tool automatically.
+
 #### Root and global flags
 
 | Flag | Short | Availability | Meaning |
