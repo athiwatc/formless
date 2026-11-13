@@ -24,6 +24,7 @@ struct Fixture {
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
     requests: Arc<Mutex<Vec<Request>>>,
+    run_filter_mode: Arc<AtomicBool>,
     usage_failure: Arc<AtomicUsize>,
     tool_rows: Arc<Mutex<Value>>,
     invocations: Arc<Mutex<Value>>,
@@ -55,6 +56,8 @@ impl Fixture {
         let stopped = stop.clone();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let seen = requests.clone();
+        let run_filter_mode = Arc::new(AtomicBool::new(false));
+        let filter_runs = run_filter_mode.clone();
         let usage_failure = Arc::new(AtomicUsize::new(0));
         let usage_fails = usage_failure.clone();
         let tool_rows = Arc::new(Mutex::new(
@@ -114,6 +117,15 @@ impl Fixture {
                         continue;
                     }
                     let result = match &envelope.request {
+                        Request::RunMetrics {
+                            limit,
+                            session_id,
+                            since,
+                        } if filter_runs.load(Ordering::SeqCst) => filtered_run_report(
+                            limit.unwrap_or(20),
+                            session_id.as_deref(),
+                            since.as_deref(),
+                        ),
                         Request::SessionUsage { .. } => session_usage_report(),
                         Request::ContextUsage { .. } => session_context_report(),
                         Request::GetTool { id } => detail_report(id),
@@ -224,6 +236,7 @@ impl Fixture {
             stop,
             thread: Some(thread),
             requests,
+            run_filter_mode,
             usage_failure,
             tool_rows,
             invocations,
@@ -899,6 +912,129 @@ fn shipped_session_usage_resolves_existing_selectors_buffers_both_reports_and_ke
             .unwrap()
             .contains("fixture usage read failure"));
     }
+}
+fn filtered_run_report(limit: usize, session: Option<&str>, since: Option<&str>) -> Value {
+    let rows = (0..40)
+        .map(|i| formless_protocol::RunMetricsInfo {
+            run_id: format!("run-{i:02}"),
+            session_id: if i < 25 { "abc-two" } else { "abc-one" }.into(),
+            status: "completed".into(),
+            outcome: "completed".into(),
+            rating: String::new(),
+            steps: 1,
+            tool_calls: 1,
+            prompt_tokens: 50,
+            completion_tokens: 10,
+            duration_ms: 1000,
+            created_at: format!(
+                "2026-11-{:02}T12:00:{:02}+00:00",
+                if i < 25 { 12 } else { 10 },
+                59 - i
+            ),
+        })
+        .filter(|row| {
+            session.is_none_or(|session| row.session_id == session)
+                && since.is_none_or(|since| row.created_at.as_str() >= since)
+        })
+        .take(limit)
+        .collect::<Vec<_>>();
+    json!({"summary":formless_core::runs::summarize(&rows),"runs":rows,"forecasts":{"independently_scoped":true},"future":"retained"})
+}
+
+#[test]
+fn shipped_run_filters_send_resolved_scope_and_preserve_the_complete_report() {
+    let fixture = Fixture::new();
+    fixture.run_filter_mode.store(true, Ordering::SeqCst);
+    for (args, session, limit) in [
+        (vec!["runs", "--json"], None, 20),
+        (
+            vec!["runs", "--session", "abc-o", "--json"],
+            Some("abc-one"),
+            20,
+        ),
+        (
+            vec!["runs", "--session", "First", "--limit", "7", "--json"],
+            Some("abc-one"),
+            7,
+        ),
+    ] {
+        fixture.requests.lock().unwrap().clear();
+        let out = fixture.run(&args);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let value: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(value, filtered_run_report(limit, session, None));
+        if session.is_some() {
+            assert_eq!(value["runs"][0]["run_id"], "run-25");
+            assert_eq!(value["summary"]["runs"], limit.min(15));
+        }
+        let requests = fixture.requests.lock().unwrap();
+        let last = requests.last().unwrap();
+        assert!(
+            matches!(last,Request::RunMetrics{limit:Some(actual),session_id,since:None} if *actual==limit&&session_id.as_deref()==session)
+        );
+        assert_eq!(requests.len(), if session.is_some() { 2 } else { 1 });
+        if session.is_some() {
+            assert!(matches!(&requests[0], Request::ListSessions));
+        }
+    }
+    let human = fixture.run(&["runs", "--session", "abc-o"]);
+    assert!(human.status.success());
+    let text = String::from_utf8(human.stdout).unwrap();
+    assert!(text.contains("run-25") && !text.contains("run-00"));
+    for selector in ["abc", "unknown"] {
+        fixture.requests.lock().unwrap().clear();
+        let out = fixture.run(&["runs", "--session", selector]);
+        assert_eq!(out.status.code(), Some(2));
+        assert!(out.stdout.is_empty());
+        assert!(matches!(
+            &fixture.requests.lock().unwrap()[..],
+            [Request::ListSessions]
+        ));
+    }
+    // Exercise the live CLI cutoff, without assuming a wall-clock test date.
+    fixture.requests.lock().unwrap().clear();
+    let out = fixture.run(&["runs", "--session", "abc-o", "--since", "24h", "--json"]);
+    assert!(out.status.success());
+    let requests = fixture.requests.lock().unwrap();
+    let [Request::ListSessions, Request::RunMetrics {
+        limit: Some(20),
+        session_id: Some(id),
+        since: Some(cutoff),
+    }] = &requests[..]
+    else {
+        panic!("{requests:?}")
+    };
+    assert_eq!(id, "abc-one");
+    assert!(chrono::DateTime::parse_from_rfc3339(cutoff).is_ok());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&out.stdout).unwrap(),
+        filtered_run_report(20, Some("abc-one"), Some(cutoff))
+    );
+    drop(requests);
+    // A fixed cutoff makes the fixture's filter-before-limit contract explicit.
+    assert_eq!(
+        filtered_run_report(20, Some("abc-two"), Some("2026-11-12T12:00:49+00:00"))["runs"]
+            .as_array()
+            .unwrap()
+            .len(),
+        11
+    );
+    let before = fixture.connections.load(Ordering::SeqCst);
+    for args in [
+        vec!["runs", "--session", "X", "show", "id"],
+        vec!["runs", "--since", "24h", "cancel", "id"],
+        vec!["runs", "--since", "18446744073709551615d"],
+        vec!["runs", "show", "id", "--session", "X"],
+    ] {
+        let out = fixture.run(&args);
+        assert_eq!(out.status.code(), Some(2));
+        assert!(out.stdout.is_empty());
+    }
+    assert_eq!(fixture.connections.load(Ordering::SeqCst), before);
 }
 impl Drop for Fixture {
     fn drop(&mut self) {

@@ -732,6 +732,16 @@ discovery may contact the configured provider, so the command is not promised
 offline. Reported Run count retains the backend's newest-100,000 global-window
 limitation (#1458); aggregation/estimation/accounting behavior is unchanged.
 
+`runs --session SESSION --since DURATION [--limit N] [--json]` sends the
+existing Session/time filters to RunMetrics before its newest-N limit. Each
+selector is optional; Session lookup keeps the existing exact-ID, unambiguous
+prefix and name rules. Durations use checked arithmetic and one UTC RFC3339
+cutoff in the existing stored TEXT representation. The returned runs and their
+summary describe that filtered, limited subset; JSON forecasts remain
+independently scoped and unchanged. With neither selector, request/output
+behavior is unchanged. Filters with any Runs subaction are usage errors before
+connection; unknown/ambiguous Sessions necessarily fail after ListSessions.
+
 #### Root and global flags
 
 | Flag | Short | Availability | Meaning |

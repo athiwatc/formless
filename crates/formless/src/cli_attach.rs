@@ -653,12 +653,14 @@ mod tests {
                 action: Some(RunsAction::Running { json }),
                 json: outer,
                 limit,
+                session,
+                since,
             }) = cli.cmd
             else {
                 panic!("wrong action")
             };
             assert_eq!(json || outer, args.contains(&"--json"));
-            assert!(limit.is_none());
+            assert!(limit.is_none() && session.is_none() && since.is_none());
         }
         for limit in ["0", "20", "100"] {
             let cli =
