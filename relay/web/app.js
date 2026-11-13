@@ -4325,29 +4325,62 @@
       }
       return null;
     }
+    let paintedText = null, lineData = [], previousPair = [], previousError = null;
+    function rowAt(position) {
+      let low = 0, high = lineData.length;
+      while (low < high) {
+        const mid = (low + high) >>> 1;
+        if (lineData[mid].start <= position) low = mid + 1;
+        else high = mid;
+      }
+      const row = low - 1, data = lineData[row];
+      return data && position < data.start + data.text.length ? row : null;
+    }
     function paint() {
       const text = area.value;
-      const nodes = highlight(text + "\n", "js");
-      hl.replaceChildren(...(nodes || [text + "\n"]));
-      // Marks: the same text, invisible, with backgrounds where it counts.
-      const lines = (text + "\n").split("\n");
-      const pair = bracketPair(text, area.selectionStart);
-      let offset = 0;
-      marks.replaceChildren(...lines.map((line, n) => {
-        const start = offset;
-        offset += line.length + 1;
-        const parts = [];
-        let at = 0;
-        for (const p of pair || []) {
-          if (p >= start && p < start + line.length) {
-            parts.push(line.slice(at, p - start), h("span", { class: "ed-bracket" }, line[p - start]));
-            at = p - start + 1;
+      if (text !== paintedText) {
+        const nodes = highlight(text + "\n", "js");
+        hl.replaceChildren(...(nodes || [text + "\n"]));
+        // Rebuild line structure only for a changed source, preserving the
+        // existing extra newline that aligns the textarea's final line.
+        const lines = (text + "\n").split("\n");
+        let offset = 0;
+        lineData = lines.map(line => {
+          const data = { text: line, start: offset, node: h("span", { class: "ed-line" }, line) };
+          offset += line.length + 1;
+          return data;
+        });
+        marks.replaceChildren(...lineData.flatMap((data, n) => n < lineData.length - 1 ? [data.node, "\n"] : [data.node]));
+        paintedText = text;
+        previousPair = [];
+        previousError = null;
+      }
+      const pair = bracketPair(text, area.selectionStart) || [];
+      if (pair.length !== previousPair.length || pair.some((position, i) => position !== previousPair[i])) {
+        const changed = new Set([...previousPair, ...pair].map(rowAt));
+        for (const row of changed) {
+          if (row === null) continue;
+          const data = lineData[row], parts = [];
+          let at = 0;
+          for (const position of pair) {
+            if (position >= data.start && position < data.start + data.text.length) {
+              parts.push(data.text.slice(at, position - data.start), h("span", { class: "ed-bracket" }, data.text[position - data.start]));
+              at = position - data.start + 1;
+            }
           }
+          parts.push(data.text.slice(at));
+          data.node.replaceChildren(...parts);
         }
-        parts.push(line.slice(at));
-        const el = h("span", { class: errLine === n + 1 ? "ed-line ed-err" : "ed-line" }, ...parts);
-        return n < lines.length - 1 ? [el, "\n"] : el;
-      }).flat());
+        previousPair = pair;
+      }
+      if (errLine !== previousError) {
+        // Keep bracket children intact when only the diagnostic moved.
+        for (const line of [previousError, errLine]) {
+          const node = Number.isInteger(line) && lineData[line - 1]?.node;
+          if (node) node.classList.toggle("ed-err", line === errLine);
+        }
+        previousError = errLine;
+      }
       sync();
     }
     function sync() {
