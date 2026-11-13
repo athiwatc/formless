@@ -11911,39 +11911,131 @@ fn draw_mention_popup(f: &mut Frame, input: Rect, m: &MentionPopup, color: bool)
     );
 }
 
+fn model_overlay_hints(width: usize, color: bool) -> Option<Vec<Line<'static>>> {
+    let actions = [
+        "Enter this Session",
+        "Ctrl+Enter/Alt+Enter/Ctrl+D global default",
+        "Ctrl+T test",
+        "Esc cancel",
+    ];
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for action in actions {
+        if text::width(action) > width {
+            return None;
+        }
+        if !current.is_empty() && text::width(&current) + 3 + text::width(action) > width {
+            lines.push(Line::styled(std::mem::take(&mut current), ui::dim(color)));
+        }
+        if !current.is_empty() {
+            current.push_str(" · ");
+        }
+        current.push_str(action);
+    }
+    if !current.is_empty() {
+        lines.push(Line::styled(current, ui::dim(color)));
+    }
+    Some(lines)
+}
+
 fn draw_model_overlay(f: &mut Frame, o: &ModelOverlay, color: bool) {
     let area = f.area();
-    let max_items = (area.height as usize).saturating_sub(10).clamp(3, 20);
-    let mut lines = picker_lines(&o.picker, max_items, color);
-    lines.push(Line::raw(""));
-    if o.efforts().len() <= 1 {
-        lines.push(Line::styled(
-            "Effort   has no effect for this model",
-            ui::dim(color),
-        ));
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let w = 84.min(area.width.saturating_sub(2)).max(1);
+    let inner_width = w.saturating_sub(2);
+    let fallback = |f: &mut Frame| {
+        let h = area.height.min(4);
+        let rect = Rect {
+            x: area.x + area.width.saturating_sub(w) / 2,
+            y: area.y + area.height.saturating_sub(h) / 3,
+            width: w,
+            height: h,
+        };
+        let messages = if h >= 4 {
+            vec!["Too small; resize", "Esc cancel"]
+        } else {
+            vec!["Resize"]
+        };
+        let lines: Vec<_> = messages
+            .into_iter()
+            .map(|message| Line::raw(text::truncate(message, inner_width as usize)))
+            .collect();
+        f.render_widget(Clear, rect);
+        f.render_widget(
+            Paragraph::new(lines).block(ui::panel(" Model ", color, Color::Cyan)),
+            rect,
+        );
+    };
+    let Some(hints) = model_overlay_hints(inner_width as usize, color) else {
+        fallback(f);
+        return;
+    };
+    let effort = if o.efforts().len() <= 1 {
+        Line::styled("Effort   has no effect for this model", ui::dim(color))
     } else {
-        lines.push(Line::from(vec![
+        Line::from(vec![
             Span::styled("Effort   ", ui::dim(color)),
             Span::raw(o.effort().unwrap_or("default (provider)")),
             Span::styled("  (Tab to change)", ui::dim(color)),
-        ]));
+        ])
+    };
+    let effort_height = Paragraph::new(effort.clone())
+        .wrap(Wrap { trim: false })
+        .line_count(inner_width);
+    let footer_height = 1 + effort_height + hints.len();
+    let body_height = (area.height as usize).saturating_sub(footer_height + 2);
+    if body_height < 2 {
+        fallback(f);
+        return;
     }
-    lines.push(Line::styled(
-        "Enter this Session · Ctrl+Enter/Alt+Enter/Ctrl+D global default · Ctrl+T test · Esc cancel",
-        ui::dim(color),
-    ));
-    let w = 84.min(area.width.saturating_sub(2)).max(1);
-    let h = (lines.len() as u16 + 2).min(area.height);
+    let mut max_items = body_height.saturating_sub(3).clamp(1, 20);
+    let mut lines = picker_lines(&o.picker, max_items, color);
+    while lines.len() > body_height && max_items > 1 {
+        max_items -= 1;
+        lines = picker_lines(&o.picker, max_items, color);
+    }
+    if lines.len() > body_height {
+        fallback(f);
+        return;
+    }
+    let body_lines = lines.len() as u16;
+    let hint_height = hints.len() as u16;
+    let h = body_lines + footer_height as u16 + 2;
     let rect = Rect {
         x: area.x + area.width.saturating_sub(w) / 2,
         y: area.y + area.height.saturating_sub(h) / 3,
         width: w,
         height: h,
     };
+    let block = ui::panel(" Model ", color, Color::Cyan);
+    let inner = block.inner(rect);
     f.render_widget(Clear, rect);
+    f.render_widget(block, rect);
     f.render_widget(
-        Paragraph::new(lines).block(ui::panel(" Model ", color, Color::Cyan)),
-        rect,
+        Paragraph::new(lines),
+        Rect {
+            height: body_lines,
+            ..inner
+        },
+    );
+    let footer_y = inner.y + body_lines + 1;
+    f.render_widget(
+        Paragraph::new(effort).wrap(Wrap { trim: false }),
+        Rect {
+            y: footer_y,
+            height: effort_height as u16,
+            ..inner
+        },
+    );
+    f.render_widget(
+        Paragraph::new(hints),
+        Rect {
+            y: footer_y + effort_height as u16,
+            height: hint_height,
+            ..inner
+        },
     );
 }
 
@@ -25157,6 +25249,71 @@ mod tests {
             .map(|s| s.content.to_string())
             .collect();
         assert_eq!(marked, vec!["@src/main.rs"]);
+    }
+
+    #[test]
+    fn model_overlay_reserves_complete_hints_and_keeps_unicode_selection_visible() {
+        let items = (0..40)
+            .map(|i| picker::ModelItem {
+                id: format!("模型-{i:02}"),
+                source: None,
+                recent: false,
+                detail: None,
+            })
+            .collect();
+        let mut picker = picker::ModelPicker::new(Vec::new());
+        picker.set_items(items, "模型-38");
+        let overlay = ModelOverlay {
+            picker,
+            meta: serde_json::json!({}),
+            effort_idx: 0,
+            default_only: false,
+        };
+        let render_overlay = |width, height| {
+            let mut terminal =
+                Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| draw_model_overlay(frame, &overlay, false))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            (0..height)
+                .map(|y| {
+                    (0..width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                        + "\n"
+                })
+                .collect::<String>()
+        };
+        for (width, height) in [(100, 30), (80, 24), (50, 16), (46, 12), (100, 12)] {
+            let painted = render_overlay(width, height);
+            for action in [
+                "Enter this Session",
+                "Ctrl+Enter/Alt+Enter/Ctrl+D global default",
+                "Ctrl+T test",
+                "Esc cancel",
+            ] {
+                assert!(
+                    painted.contains(action),
+                    "{width}x{height}: {action}: {painted}"
+                );
+            }
+            let selected = painted.lines().find(|line| line.contains('›')).unwrap();
+            assert!(
+                selected.contains('模') && selected.contains('型') && selected.contains("-38"),
+                "{selected}"
+            );
+        }
+        for (width, height) in [(25, 8), (46, 8)] {
+            let painted = render_overlay(width, height);
+            assert!(
+                painted.contains("resize") && painted.contains("Esc cancel"),
+                "{painted}"
+            );
+        }
+        for (width, height) in [(1, 1), (12, 3)] {
+            render_overlay(width, height);
+        }
     }
 
     #[test]
