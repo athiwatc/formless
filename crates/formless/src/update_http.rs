@@ -18,12 +18,70 @@ pub(super) fn get(url: &str) -> Result<String> {
 }
 
 fn fetch(client: &Client, url: &str) -> Result<String> {
-    let response = client
-        .get(url)
-        .send()
-        .and_then(reqwest::blocking::Response::error_for_status)
-        .map_err(lookup_error)?;
-    response.text().map_err(lookup_error)
+    let response = client.get(url).send().map_err(lookup_error)?;
+    let headers = response.headers();
+    if matches!(response.status().as_u16(), 403 | 429)
+        && (headers
+            .get("x-ratelimit-remaining")
+            .is_some_and(|v| v == "0")
+            || headers.contains_key(reqwest::header::RETRY_AFTER))
+    {
+        let when = retry_time(headers, chrono::Utc::now())
+            .map(|time| {
+                format!(
+                    "try again after {} (local time)",
+                    time.with_timezone(&chrono::Local)
+                        .format("%Y-%m-%d %H:%M:%S")
+                )
+            })
+            .unwrap_or_else(|| "try again later".into());
+        return Err(anyhow!(
+            "GitHub API rate limit reached; {when} or open {RELEASES_PAGE}"
+        ));
+    }
+    response
+        .error_for_status()
+        .map_err(lookup_error)?
+        .text()
+        .map_err(lookup_error)
+}
+
+pub(super) fn is_not_found(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<reqwest::Error>()
+        .is_some_and(|e| e.status() == Some(reqwest::StatusCode::NOT_FOUND))
+}
+
+fn retry_time(
+    headers: &reqwest::header::HeaderMap,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    let retry = headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok());
+    retry
+        .and_then(|value| {
+            value
+                .parse::<i64>()
+                .ok()
+                .filter(|seconds| *seconds >= 0)
+                .and_then(chrono::TimeDelta::try_seconds)
+                .and_then(|delay| now.checked_add_signed(delay))
+                .or_else(|| {
+                    chrono::DateTime::parse_from_rfc2822(value)
+                        .ok()
+                        .map(|time| time.with_timezone(&chrono::Utc))
+                })
+        })
+        .or_else(|| {
+            headers
+                .get("x-ratelimit-reset")?
+                .to_str()
+                .ok()?
+                .parse::<i64>()
+                .ok()
+                .and_then(|seconds| chrono::DateTime::from_timestamp(seconds, 0))
+        })
 }
 
 fn lookup_error(error: reqwest::Error) -> anyhow::Error {
@@ -240,6 +298,60 @@ mod tests {
 
     fn has_delimiter(bytes: &[u8]) -> bool {
         bytes.windows(4).any(|w| w == b"\r\n\r\n")
+    }
+
+    #[test]
+    fn release_rate_limits_explain_retry_and_preserve_other_statuses() {
+        for response in [
+            &b"HTTP/1.1 403 Forbidden\r\nx-ratelimit-remaining: 0\r\nx-ratelimit-reset: 4102444800\r\nContent-Length: 0\r\n\r\n"[..],
+            &b"HTTP/1.1 429 Too Many Requests\r\nretry-after: 60\r\nContent-Length: 0\r\n\r\n"[..],
+        ] {
+            let (result, _) = fixture(response);
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("GitHub API rate limit reached"), "{error}");
+            assert!(error.contains("try again after") && error.contains("local time"), "{error}");
+            assert!(error.contains(RELEASES_PAGE), "{error}");
+        }
+        let (result, _) = fixture(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n");
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("403"));
+        assert!(!error.to_string().contains("rate limit reached"));
+        let (result, _) = fixture(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+        assert!(is_not_found(&result.unwrap_err()));
+        assert!(!is_not_found(&anyhow!("unrelated text containing 404")));
+    }
+
+    #[test]
+    fn retry_headers_accept_seconds_dates_and_reset_fallback_without_overflow() {
+        let now = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-ratelimit-reset", "1700000120".parse().unwrap());
+        assert_eq!(
+            retry_time(&headers, now).unwrap().timestamp(),
+            1_700_000_120
+        );
+        headers.insert("retry-after", "60".parse().unwrap());
+        assert_eq!(
+            retry_time(&headers, now).unwrap().timestamp(),
+            1_700_000_060
+        );
+        headers.insert(
+            "retry-after",
+            "Tue, 14 Nov 2023 22:15:00 GMT".parse().unwrap(),
+        );
+        assert_eq!(
+            retry_time(&headers, now).unwrap().timestamp(),
+            1_700_000_100
+        );
+        for invalid in ["-1", "9223372036854775807", "nonsense"] {
+            headers.insert("retry-after", invalid.parse().unwrap());
+            assert_eq!(
+                retry_time(&headers, now).unwrap().timestamp(),
+                1_700_000_120
+            );
+        }
+        headers.remove("x-ratelimit-reset");
+        assert!(retry_time(&headers, now).is_none());
     }
 
     #[test]
