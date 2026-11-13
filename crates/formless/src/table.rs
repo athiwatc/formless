@@ -217,10 +217,13 @@ fn fit(text: &str, w: usize) -> String {
         return text.to_string();
     }
     let mut out = String::new();
+    let mut used = 0;
     for c in text.chars() {
-        if out.width() + unicode_width::UnicodeWidthChar::width(c).unwrap_or(0) + 1 > w {
+        let width = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+        if used + width + 1 > w {
             break;
         }
+        used += width;
         out.push(c);
     }
     out + "…"
@@ -239,6 +242,18 @@ pub fn t(text: impl Into<String>, tone: Tone) -> (String, Tone) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_mixed_width_cells_clip_within_the_requested_columns() {
+        let input = "ascii ไทย 中文 ".repeat(10_000);
+        for width in [1, 2, 7, 40, 200] {
+            let clipped = fit(&input, width);
+            assert!(clipped.ends_with('…'));
+            assert!(clipped.width() <= width, "{width}: {clipped:?}");
+        }
+        assert_eq!(fit("a中ไทยtail", 4), "a中…");
+        assert_eq!(fit("ไทย", 10), "ไทย");
+    }
 
     #[test]
     fn piped_status_cells_preserve_the_original_whitespace_fields() {
