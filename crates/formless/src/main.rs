@@ -8,6 +8,7 @@ mod cli_pipeline;
 mod cli_routing;
 mod cli_run_identity;
 mod cli_run_memories;
+mod cli_runs_list;
 mod cli_subagents;
 mod cli_tool_success;
 #[cfg(test)]
@@ -6732,24 +6733,16 @@ fn runs_cmd(paths: Paths, limit: usize, json: bool) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&v)?);
         return Ok(());
     }
-    let summary: formless_protocol::RunSummary = serde_json::from_value(v["summary"].clone())?;
-    println!("{}", formless_core::runs::summary_line(&summary));
-    for r in v["runs"].as_array().into_iter().flatten() {
-        println!(
-            "{}  {}  {:<11} {:>3} steps {:>3} tools {:>8} tokens {:>6.1}s",
-            r["run_id"].as_str().unwrap_or_default(),
-            r["created_at"]
-                .as_str()
-                .unwrap_or_default()
-                .get(..19)
-                .unwrap_or_default(),
-            r["outcome"].as_str().unwrap_or_default(),
-            r["steps"],
-            r["tool_calls"],
-            r["prompt_tokens"].as_i64().unwrap_or(0) + r["completion_tokens"].as_i64().unwrap_or(0),
-            r["duration_ms"].as_i64().unwrap_or(0) as f64 / 1000.0
-        );
-    }
+    use std::io::IsTerminal;
+    let width = std::io::stdout()
+        .is_terminal()
+        .then(|| {
+            crossterm::terminal::size()
+                .ok()
+                .map(|(width, _)| width as usize)
+        })
+        .flatten();
+    print!("{}", cli_runs_list::render(&v, width)?);
     Ok(())
 }
 
