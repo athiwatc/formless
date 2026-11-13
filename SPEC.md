@@ -794,7 +794,7 @@ task, with quality as a gate**.
   candidate's samples, good rate, average time, score or relative cost,
   whether it passed the quality gate, and the rule that decided
   (exploring, nothing qualified yet, or the cheapest qualified).
-  `RoutingDecisions`; TUI `/routing` (pager), web `/routing` (dialog).
+  `RoutingDecisions`; CLI `formless routing [--json]`, TUI `/routing` (pager), web `/routing` (dialog). The CLI preserves report order and returned figures; this wrapper does not change attribution or the report limitations tracked in #1052.
 
 ## 5. Agent loop, Sessions, and Runs
 
@@ -4962,6 +4962,7 @@ the TUI. Command-specific arguments and defaults are available through
 | `formless restore` | `FILE` | Replace the database from a backup, preserving the current database. |
 | `formless roles` | `list`, `add`, `rm` | Map named purposes to a provider and model. |
 | `formless run` | `TASK`; `--estimate`, `--session`, `--output`, `--attach` and other Run options | Run one headless task, or print its local forecast without starting it. |
+| `formless routing` | `--json` | Read currently available daemon routing decisions and returned candidate figures without starting a model request. |
 | `formless runs` | No action: list; `show`, `cancel` | List recent Runs, inspect one by ID/prefix, or cancel that exact Run. |
 | `formless security` | `status` | Inspect the daemon's grants, denials, trusted resources, and exposed interfaces. |
 | `formless sessions` | `fork`, `compare`, `list`, `show`, `files`, `rewind`, `rename`, `rm`, `restore`, `import`, `search`, `archive`, `unarchive`, `export` | Manage stored Sessions, follow a Run with `show --follow`, or inspect tracked files. |
@@ -5204,7 +5205,7 @@ previous headless Run's Session.
   an unapproved sensitive Invocation fails with a clear error
   (approve first in the TUI), unless `--yes` is passed (auto-approve for
   that Run only: each prompt is answered *once*, nothing is stored). Exit codes: `0` answered, `1` Run errored/paused, `2`
-  usage/config error, `130` interrupted.
+  usage/config error, `3` Run paused because schema validation failed (see `--schema` above), `124` Run timed out (see `--timeout` above), `130` interrupted.
 - `formless daemon start|stop|status` — daemon management (same lifecycle
   rules as §9.1).
 - `formless web [--port N] [--no-open] [--stop]` — the opt-in **local web
@@ -5252,11 +5253,13 @@ previous headless Run's Session.
   terminal you type the confirmation word; anywhere else `--force` is
   required (`--yes` is an alias where it was the old spelling), so piped
   input never confirms. Refusing is a usage error.
-- **Exit codes**, for every command: 0 success; 1 a failure (the daemon,
+- **Exit codes**, common to commands: 0 success; 1 a failure (the daemon,
   the provider, the Tool); 2 a usage mistake (an unknown id, a missing or
   conflicting flag, a bad value, malformed `--input`, a refused
   confirmation), checked before a daemon is started where the client can
-  tell; 124 `run --timeout`; 130 interrupted. Errors print as `error: …`
+  tell; 130 interrupted. Run-specific extensions: 3 Run paused because schema
+  validation failed (see `run --schema` above); 124 Run timed out (see
+  `run --timeout` above). Errors print as `error: …`
   on stderr. Flags that would silently override each other are refused by
   the parser (`run --json --output`, `export NAME --all`, `jobs add --cron
   --at`, `web --stop --port`, `approvals revoke … --all`), and the TUI's
