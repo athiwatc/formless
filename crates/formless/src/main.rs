@@ -2390,7 +2390,7 @@ fn update_cmd(check: bool) -> Result<()> {
         "https://api.github.com/repos/athiwatc/formless/releases?per_page=50",
     ) {
         Ok(b) => b,
-        Err(e) if e.to_string().contains("404") => {
+        Err(e) if update_http::is_not_found(&e) => {
             println!("installed: v{current}");
             println!("latest:    (no published releases yet)");
             return Ok(());

@@ -331,7 +331,12 @@ fn shipped_real_terminal_uses_shared_colorblind_rgb_and_no_color_keeps_identical
     }
     let ansi = regex::Regex::new(r"\x1b\[[0-9;]*m").unwrap();
     let visible = ansi.replace_all(&colored, "");
-    for no_color in ["1", ""] {
+    assert_eq!(
+        terminal(&f, Some("")),
+        colored,
+        "empty NO_COLOR keeps terminal colors"
+    );
+    for no_color in ["1", "0"] {
         let plain = terminal(&f, Some(no_color));
         assert!(!plain.contains('\x1b'));
         assert_eq!(

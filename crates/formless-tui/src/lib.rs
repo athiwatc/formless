@@ -100,7 +100,7 @@ pub(crate) fn pane_layout(multi_pane: bool, width: u16) -> bool {
 }
 
 fn colors_enabled() -> bool {
-    std::env::var_os("NO_COLOR").is_none()
+    std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty())
 }
 
 fn fg(enabled: bool, color: Color) -> Style {

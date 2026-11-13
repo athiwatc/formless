@@ -111,4 +111,3 @@ jobs:
         shell: bash
         run: |
           bash scripts/ci-storage-budget.sh snapshot forecast-job-finished
-          if [[ -d "$CARGO_TARGET_DIR" ]]; then du -sk "$CARGO_TARGET_DIR"; fi
