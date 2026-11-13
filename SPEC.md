@@ -6284,6 +6284,11 @@ GetModule still fetches every version's code even for metadata-only output;
 client projection does not reduce backend work (see #889). No module mutation
 is exposed by these commands.
 
+Tool selectors use an exact name or full ID. After a miss, up to three
+ranked partial-name suggestions can help you retry with the original exact
+spelling; these use folded subsequence matching, not edit-distance spelling
+correction. A suggestion never selects or runs a Tool automatically.
+
 `runs show ID [--json]` inspects any stored Run; `runs cancel ID [--json]`
 cancels only that exact active Run, never a later Run in the same Session. IDs
 accept unambiguous prefixes. Show uses the same terminal exit codes as follow;

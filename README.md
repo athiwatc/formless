@@ -693,6 +693,11 @@ formless sessions subagents SESSION --json
 formless sessions subagent exact-subagent-id
 ```
 
+Tool selectors use an exact name or full ID. After a miss, up to three
+ranked partial-name suggestions can help you retry with the original exact
+spelling; these use folded subsequence matching, not edit-distance spelling
+correction. A suggestion never selects or runs a Tool automatically.
+
 #### Root and global flags
 
 | Flag | Short | Availability | Meaning |
