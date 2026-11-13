@@ -73,11 +73,10 @@ fn replay(scenario: &Scenario) -> (Timeline, u64) {
     replay_with(scenario, fixture::stream_delta, false)
 }
 
-fn replay_with(
-    scenario: &Scenario,
-    delta: fn(usize) -> &'static str,
-    accessible: bool,
-) -> (Timeline, u64) {
+/// The text of the `index`th delta of a synthetic stream.
+type Delta = fn(usize) -> &'static str;
+
+fn replay_with(scenario: &Scenario, delta: Delta, accessible: bool) -> (Timeline, u64) {
     let mut timeline = Timeline::default();
     timeline.begin_stream(BlockKind::Assistant);
     let mut flushes = 0;
@@ -150,7 +149,7 @@ fn main() {
 /// accessible path is slow on purpose to measure.
 fn accessibility_paths() {
     const PATH_TRIALS: usize = 5;
-    let cases: [(&str, fn(usize) -> &'static str); 2] = [
+    let cases: [(&str, Delta); 2] = [
         ("words", fixture::stream_delta),
         ("markdown", fixture::stream_markdown_delta),
     ];
