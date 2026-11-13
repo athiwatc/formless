@@ -621,6 +621,7 @@ The table covers every visible root command, including Clap's generated
 | `formless jobs` | `list`, `add`, `run`, `history`, `enable`, `disable`, `rm` | Manage scheduled prompts and inspect their history. |
 | `formless logs` | `--follow`, `--level`, `--since`, `--lines` | Read or follow the daemon log and rotated files. |
 | `formless mcp` | `add`, `remove`, `list`, `test`, `login`, `logout`, `catalog`, `import`, `log`, `tools`, `tool` | Manage external MCP servers and inspect their tools/logs. |
+| `formless metrics` | `--since DURATION`, `--json` | Read recorded model, Tool and built-in statistics through independent reports at one cutoff. |
 | `formless memory` | `list`, `add`, `rm`, `edit` | Inspect or change saved user-memory notes. |
 | `formless naming` | `status`, `pull`, `test` | Inspect, install, or preview the embedded Session-naming model. |
 | `formless prices` | `import` | Import a model-price catalog for cost and spending limits. |
@@ -648,6 +649,11 @@ The table covers every visible root command, including Clap's generated
 whose stored tags contain exactly `work`. Only the tag argument is lowercased;
 a leading `#` is not stripped. Add `--archived` to select the archived partition.
 These selectors filter the existing reply on the client.
+
+`formless metrics --since 7d --json` reads the three existing metrics reports
+with one checked UTC cutoff. Omit `--since` for all history. Tool rows use stored
+`tool_id` values; reports retain their own row order and are independent reads,
+not a transactional snapshot. Runs and daily usage remain separate surfaces.
 
 #### Root and global flags
 
