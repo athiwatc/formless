@@ -709,3 +709,27 @@ fn help_check_rejects_blank_and_label_only_descriptions() {
         .iter()
         .any(|problem| problem.contains("fixture blank:")));
 }
+
+#[test]
+fn mcp_log_lines_exposes_and_enforces_the_existing_bounds() {
+    for lines in ["1", "50", "1000"] {
+        assert!(super::Cli::try_parse_from([
+            "formless", "mcp", "log", "fixture", "--lines", lines
+        ])
+        .is_ok());
+    }
+    for lines in ["0", "1001", "5000", "nonsense"] {
+        let error =
+            super::Cli::try_parse_from(["formless", "mcp", "log", "fixture", "--lines", lines])
+                .err()
+                .expect("expected argument/help error");
+        assert_eq!(error.exit_code(), 2);
+        assert!(error.to_string().contains("between 1 and 1000"));
+    }
+    let help = super::Cli::try_parse_from(["formless", "mcp", "log", "--help"])
+        .err()
+        .expect("expected argument/help error")
+        .to_string();
+    let help = normalized(&help);
+    assert!(help.contains("minimum 1, maximum 1000") && help.contains("default: 50"));
+}
