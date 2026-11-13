@@ -749,6 +749,12 @@ Human `runs cancel` reports a cancellation request for a matching accepting
 controller, or that none was found; neither acknowledgment proves a terminal
 outcome. There is no polling or additional cancellation request. JSON and the
 existing status-based show exits remain unchanged.
+Human Session lists label the last recorded Run status and show stored tags,
+retaining the pin star and existing message preview/count. Empty replies are
+reported separately from an empty archive selection, which names the alternate
+list command and count. Static human `sessions show` includes stored archived,
+pinned, tags and last recorded Run status metadata; absent status is "not
+recorded". JSON and `--follow` retain their existing contracts.
 
 #### Root and global flags
 

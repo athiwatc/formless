@@ -5065,6 +5065,12 @@ Run start or Session mutation. Request failures produce no partial report.
 formless sessions subagents SESSION --json
 formless sessions subagent exact-subagent-id
 ```
+Human Session lists label the last recorded Run status and show stored tags,
+retaining the pin star and existing message preview/count. Empty replies are
+reported separately from an empty archive selection, which names the alternate
+list command and count. Static human `sessions show` includes stored archived,
+pinned, tags and last recorded Run status metadata; absent status is "not
+recorded". JSON and `--follow` retain their existing contracts.
 
 ### Root and global flags
 
