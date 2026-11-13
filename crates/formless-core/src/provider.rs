@@ -2470,7 +2470,7 @@ impl Provider {
     ) {
         if matches!(
             error,
-            StructuredOutputError::InvalidJson | StructuredOutputError::SchemaViolation
+            StructuredOutputError::InvalidJson { .. } | StructuredOutputError::SchemaViolation
         ) {
             if let Some(routing) = routing {
                 routing.claim_contract(crate::routing_observation::Identity::new(
