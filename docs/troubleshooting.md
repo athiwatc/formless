@@ -73,8 +73,11 @@ tests it), and that a proxy is set if you need one (`provider.proxy` or
 
 ## Ctrl+Enter doesn't queue
 
-Many terminals send Ctrl+Enter as plain Enter. Use **Ctrl+J** or
-**Alt+Enter**, which work everywhere, or set `tui.queue_key`.
+Many terminals send Ctrl+Enter as plain Enter. Formless can distinguish
+**Ctrl+Enter** only when the terminal supports the kitty keyboard protocol.
+Use **Ctrl+J** or **Alt+Enter** otherwise; the TUI footer shows the binding
+that works in the current terminal. `tui.queue_key` is kept only for
+compatibility and does not change these bindings.
 
 ## Still stuck?
 
