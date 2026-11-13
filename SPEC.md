@@ -5315,7 +5315,7 @@ previous headless Run's Session.
   an unapproved sensitive Invocation fails with a clear error
   (approve first in the TUI), unless `--yes` is passed (auto-approve for
   that Run only: each prompt is answered *once*, nothing is stored). Exit codes: `0` answered, `1` Run errored/paused, `2`
-  usage/config error, `130` interrupted.
+  usage/config error, `3` Run paused because schema validation failed (see `--schema` above), `124` Run timed out (see `--timeout` above), `130` interrupted.
 - `formless daemon start|stop|status` — daemon management (same lifecycle
   rules as §9.1).
 - `formless web [--port N] [--no-open] [--stop]` — the opt-in **local web
@@ -5363,11 +5363,13 @@ previous headless Run's Session.
   terminal you type the confirmation word; anywhere else `--force` is
   required (`--yes` is an alias where it was the old spelling), so piped
   input never confirms. Refusing is a usage error.
-- **Exit codes**, for every command: 0 success; 1 a failure (the daemon,
+- **Exit codes**, common to commands: 0 success; 1 a failure (the daemon,
   the provider, the Tool); 2 a usage mistake (an unknown id, a missing or
   conflicting flag, a bad value, malformed `--input`, a refused
   confirmation), checked before a daemon is started where the client can
-  tell; 124 `run --timeout`; 130 interrupted. Errors print as `error: …`
+  tell; 130 interrupted. Run-specific extensions: 3 Run paused because schema
+  validation failed (see `run --schema` above); 124 Run timed out (see
+  `run --timeout` above). Errors print as `error: …`
   on stderr. Flags that would silently override each other are refused by
   the parser (`run --json --output`, `export NAME --all`, `jobs add --cron
   --at`, `web --stop --port`, `approvals revoke … --all`), and the TUI's
