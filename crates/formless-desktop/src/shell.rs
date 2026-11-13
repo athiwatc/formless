@@ -228,6 +228,21 @@ fn modal_dialog<E: StatefulInteractiveElement>(element: E) -> E {
     element.a11y_synthetic_children(|builder| builder.parent_node().set_modal())
 }
 
+/// Take an element, and everything inside it, out of the accessibility tree
+/// while `inert` holds: what is behind a modal dialog. AccessKit's hidden
+/// flag is inherited by every descendant, and its shared filter leaves a
+/// hidden subtree out of what every platform adapter exposes, unless the
+/// node holds focus. The pinned GPUI has no setter for it either. Layout,
+/// painting, pointer and keyboard handling are not affected: only what
+/// assistive technology is given.
+fn inert_while<E: StatefulInteractiveElement>(element: E, inert: bool) -> E {
+    if inert {
+        element.a11y_synthetic_children(|builder| builder.parent_node().set_hidden())
+    } else {
+        element
+    }
+}
+
 /// A region's border colour: the focus ring while the region itself holds
 /// focus, its ordinary border otherwise.
 fn region_border(focused: bool, idle: Hsla, cx: &App) -> Hsla {
@@ -724,6 +739,12 @@ impl Shell {
     /// than the window it covers.
     fn panel_width(&self, token: f32, window: &Window) -> Pixels {
         self.scaled(token).min(window.viewport_size().width)
+    }
+
+    /// Whether everything but the open dialog is out of the accessibility
+    /// tree: true exactly while a Sessions or Context overlay is open.
+    pub fn background_inert(&self, window: &Window) -> bool {
+        self.layout(window).modal().is_some()
     }
 
     /// How the shell is fitted into the window as it is now.
@@ -1352,9 +1373,14 @@ impl Shell {
                     Theme::change(next, Some(window), cx);
                 }),
         ];
+        // A banner landmark, so the header's controls have one node that can
+        // be taken out of the tree behind a dialog.
         let header = div()
             .id("header")
             .test_support()
+            .role(Role::Banner)
+            .aria_label("Header")
+            .map(|header| inert_while(header, layout.modal().is_some()))
             .flex()
             .flex_shrink_0()
             .px_3()
@@ -1411,6 +1437,10 @@ impl Shell {
             .aria_label("Sessions")
             .when(modal, |panel| {
                 modal_dialog(panel.aria_description(MODAL_DESCRIPTION))
+            })
+            // Docked beside another panel's dialog: behind it.
+            .when(!modal, |panel| {
+                inert_while(panel, self.background_inert(window))
             })
             .key_context(SESSION_LIST_CONTEXT)
             .on_action(cx.listener(|this, _: &SelectNextSession, _, cx| this.move_selection(1, cx)))
@@ -1607,6 +1637,7 @@ impl Shell {
             .test_support()
             .role(Role::Main)
             .aria_label("Conversation")
+            .map(|region| inert_while(region, self.background_inert(window)))
             .track_focus(&self.conversation_focus)
             .map(|region| Self::main_size(region, page_height))
             .border_1()
@@ -1643,7 +1674,9 @@ impl Shell {
                     .when(reflowed, |area| area.child(self.wheel_to_page(cx)))
                     .child(timeline),
             )
-            .when(!reflowed, |region| region.child(self.render_composer(cx)))
+            .when(!reflowed, |region| {
+                region.child(self.render_composer(false, cx))
+            })
     }
 
     /// Hands the wheel on from the timeline to the reflowed page around it.
@@ -1741,6 +1774,7 @@ impl Shell {
             .test_support()
             .role(Role::Main)
             .aria_label(format!("{name}: not built"))
+            .map(|region| inert_while(region, self.background_inert(window)))
             .aria_description(format!(
                 "This Phase 0 scaffold only has a Chat view. {name} has no screen, data or \
                  actions here, and this notice is not a preview of one."
@@ -1762,7 +1796,10 @@ impl Shell {
         }
     }
 
-    fn render_composer(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The composer. `inert` takes it out of the accessibility tree; it is
+    /// needed only where the composer is not inside the conversation (a
+    /// reflowed page), since the conversation's flag covers what is in it.
+    fn render_composer(&self, inert: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let actions = self.composer_actions(cx);
         let disabled = actions.disabled_reason.is_some();
         let primary = Button::new("composer-primary")
@@ -1789,6 +1826,9 @@ impl Shell {
         v_flex()
             .id("region-composer")
             .test_support()
+            .role(Role::Group)
+            .aria_label("Composer")
+            .map(|composer| inert_while(composer, inert))
             .flex_shrink_0()
             .p_3()
             .gap_2()
@@ -1890,6 +1930,9 @@ impl Shell {
             .aria_label("Context")
             .when(modal, |panel| {
                 modal_dialog(panel.aria_description(MODAL_DESCRIPTION))
+            })
+            .when(!modal, |panel| {
+                inert_while(panel, self.background_inert(window))
             })
             .key_context(INSPECTOR_CONTEXT)
             .on_action(cx.listener(|this, _: &ScrollInspectorUp, _, cx| {
@@ -2028,6 +2071,7 @@ impl Shell {
             .test_support()
             .role(Role::Status)
             .aria_label("Status")
+            .map(|status| inert_while(status, self.background_inert(window)))
             .flex()
             .flex_shrink_0()
             .px_3()
@@ -2102,7 +2146,9 @@ impl Shell {
                     .track_scroll(&self.page_scroll)
                     .child(self.render_header(layout, true, cx))
                     .child(main)
-                    .when(chat, |page| page.child(self.render_composer(cx)))
+                    .when(chat, |page| {
+                        page.child(self.render_composer(layout.modal().is_some(), cx))
+                    })
                     .child(self.render_status(layout, true, window, cx)),
             )
             .vertical_scrollbar(&self.page_scroll)

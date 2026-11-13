@@ -923,6 +923,80 @@ fn every_place_focus_can_rest_on_a_reflowed_page_has_an_accessibility_node(
     });
 }
 
+// While a dialog is open, everything else is taken out of the accessibility
+// tree (AccessKit's hidden flag, inherited). The kit's test tree does not
+// show that flag, so these check the shell's own account of it and that
+// nothing else about the shell changes; the real window's platform tree was
+// read before and after (see the findings).
+
+#[gpui_kit::test]
+fn the_background_is_inert_exactly_while_a_dialog_is_open(cx: &mut TestAppContext) {
+    // 1100 px: the sidebar docks and the Context panel is an overlay, so a
+    // docked panel sits behind the dialog.
+    let (handle, shell) = open(cx, size(px(1100.), px(900.)), 200, 40);
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        window.input("draft", cx);
+        // The parts that are taken out each have a node of their own.
+        assert_eq!(window.find("header").role(), Some(Role::Banner));
+        assert_eq!(window.find("header").label(), Some("Header"));
+        assert_eq!(window.find("region-composer").role(), Some(Role::Group));
+        assert_eq!(window.find("region-composer").label(), Some("Composer"));
+        assert_eq!(window.find("region-sidebar").role(), Some(Role::Navigation));
+        assert!(!shell.read(cx).background_inert(window));
+
+        window.press(TOGGLE_INSPECTOR, cx);
+        window.render_frame(cx);
+        assert!(shell.read(cx).background_inert(window));
+        let dialog = window.find("region-inspector");
+        assert_eq!(dialog.role(), Some(Role::Dialog));
+        assert_eq!(dialog.focused(), Some(true));
+        // The docked sidebar is still laid out and drawn behind it.
+        assert!(window.find("region-sidebar").visible());
+
+        window.press("escape", cx);
+        window.render_frame(cx);
+        assert!(!shell.read(cx).background_inert(window));
+        assert_eq!(window.find_by_label("Message").focused(), Some(true));
+        assert_eq!(shell.read(cx).draft(cx).as_ref(), "draft");
+
+        // The header's toggle still closes the dialog with the pointer: the
+        // flag changes what assistive technology is given, not input.
+        window.press(TOGGLE_INSPECTOR, cx);
+        window.render_frame(cx);
+        assert!(shell.read(cx).background_inert(window));
+        window.click("toggle-inspector", cx);
+        window.render_frame(cx);
+        assert!(window.try_find("region-inspector").is_none());
+        assert!(!shell.read(cx).background_inert(window));
+    });
+
+    // A reflowed page: both dialogs, each closed with Escape, each giving
+    // focus back to the composer, in view.
+    let (small, small_shell) = open(cx, MINIMUM, 200, 40);
+    set_text_scale(cx, small, &small_shell, 200);
+    step(cx, small, |window, cx| {
+        settle_frames(window, cx);
+        window.input("draft", cx);
+        for (keys, dialog) in [
+            (TOGGLE_SIDEBAR, "region-sidebar"),
+            (TOGGLE_INSPECTOR, "region-inspector"),
+        ] {
+            assert!(!small_shell.read(cx).background_inert(window), "{dialog}");
+            window.press(keys, cx);
+            settle_frames(window, cx);
+            assert!(small_shell.read(cx).background_inert(window), "{dialog}");
+            assert_eq!(window.find(dialog).role(), Some(Role::Dialog));
+            assert_eq!(window.find(dialog).focused(), Some(true));
+            window.press("escape", cx);
+            settle_frames(window, cx);
+            assert!(!small_shell.read(cx).background_inert(window), "{dialog}");
+            assert_composer_in_view(window, MINIMUM, dialog);
+        }
+        assert_eq!(small_shell.read(cx).draft(cx).as_ref(), "draft");
+    });
+}
+
 #[gpui_kit::test]
 fn panels_expose_landmark_roles_docked_and_named_dialogs_as_overlays(cx: &mut TestAppContext) {
     let (handle, _) = open(cx, WIDE, 200, 40);
