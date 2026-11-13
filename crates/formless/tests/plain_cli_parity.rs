@@ -163,7 +163,27 @@ impl Fixture {
                         line.clear();
                         continue;
                     }
+                    if matches!(&envelope.request, Request::RestartMcpServer{name} if name=="request-failure")
+                    {
+                        let reply =
+                            serde_json::to_value(formless_protocol::ServerMessage::err_code(
+                                envelope.id,
+                                formless_protocol::codes::NOT_FOUND,
+                                "fixture MCP request missing".into(),
+                            ))
+                            .unwrap();
+                        if writeln!(socket, "{reply}").is_err() {
+                            break;
+                        }
+                        line.clear();
+                        continue;
+                    }
                     let result = match &envelope.request {
+                        Request::RestartMcpServer { name } => mcp_test_report(name),
+                        Request::AddMcpServer { .. } => {
+                            json!({"added":"fixture-add","tools":null,"error":"fixture embedded add error"})
+                        }
+
                         Request::Gc { dry_run } => gc_report(*dry_run),
                         Request::RunMetrics {
                             limit,
@@ -1695,6 +1715,109 @@ fn shipped_gc_json_works_offline_and_dry_run_keeps_owned_cleanup_data() {
         .sum();
     assert_eq!(value["total_bytes"], total);
     assert!(fixture.requests.lock().unwrap().is_empty());
+}
+
+fn mcp_test_report(name: &str) -> Value {
+    match name {
+        "bad-shape" => json!({"future":true}),
+        "wrong-name" => json!({"restarted":"other","tools":0,"error":null}),
+        _ => {
+            json!({"restarted":name,"tools":match name {"ok"=>json!(3),"zero"=>json!(0),_=>Value::Null},"error":match name {"failed"|"missing"=>json!("fixture restart error 日本語"),"empty-error"=>json!(""),"bad-error"=>json!(false),_=>Value::Null},"future":{"retained":true}})
+        }
+    }
+}
+
+#[test]
+fn shipped_mcp_test_reports_verdict_after_full_output_and_leaves_add_behavior_alone() {
+    let fixture = Fixture::new();
+    for (name, code) in [
+        ("ok", 0),
+        ("zero", 0),
+        ("failed", 1),
+        ("missing", 1),
+        ("empty-error", 1),
+        ("bad-tools", 1),
+        ("bad-error", 1),
+        ("bad-shape", 1),
+        ("wrong-name", 1),
+    ] {
+        for json_mode in [false, true] {
+            fixture.requests.lock().unwrap().clear();
+            let mut args = vec!["mcp", "test", name];
+            if json_mode {
+                args.push("--json");
+            }
+            let out = fixture.run(&args);
+            assert_eq!(
+                out.status.code(),
+                Some(code),
+                "{name}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            if json_mode {
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&out.stdout).unwrap(),
+                    mcp_test_report(name)
+                );
+            } else {
+                let text = String::from_utf8(out.stdout).unwrap();
+                assert!(text.starts_with(&format!("server:  {name}\n")));
+                if name == "ok" {
+                    assert_eq!(text, "server:  ok\ntools:   3\n");
+                }
+                if name == "zero" {
+                    assert_eq!(text, "server:  zero\ntools:   0\n");
+                }
+                if name == "failed" {
+                    assert!(text.contains("fixture restart error 日本語"));
+                }
+            }
+            if ["ok", "zero", "failed", "missing", "empty-error"].contains(&name) {
+                assert!(
+                    out.stderr.is_empty(),
+                    "{}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            } else {
+                assert!(String::from_utf8_lossy(&out.stderr).contains("invalid MCP restart reply"));
+            }
+            assert!(
+                matches!(&fixture.requests.lock().unwrap()[..],[Request::RestartMcpServer{name:actual}] if actual==name)
+            );
+        }
+    }
+    for json_mode in [false, true] {
+        let mut args = vec!["mcp", "test", "request-failure"];
+        if json_mode {
+            args.push("--json");
+        }
+        let out = fixture.run(&args);
+        assert_eq!(out.status.code(), Some(2));
+        assert!(out.stdout.is_empty());
+        assert!(String::from_utf8(out.stderr)
+            .unwrap()
+            .contains("fixture MCP request missing"));
+    }
+    fixture.requests.lock().unwrap().clear();
+    let out = fixture.run(&[
+        "mcp",
+        "add",
+        "fixture-add",
+        "--",
+        "owned-not-executed",
+        "argument",
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8(out.stdout)
+        .unwrap()
+        .contains("fixture embedded add error"));
+    assert!(
+        matches!(&fixture.requests.lock().unwrap()[..],[Request::AddMcpServer{name,..}] if name=="fixture-add")
+    );
 }
 
 impl Drop for Fixture {

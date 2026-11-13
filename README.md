@@ -784,6 +784,13 @@ unchanged, and the JSON form never runs an updater.
 not a promise of exact physical space reclaimed. JSON changes only presentation;
 retention, side effects, errors and human output remain unchanged.
 
+`mcp test NAME [--json]` restarts the server and prints the full report before
+returning its verdict: exit 0 for a successful reply (including zero tools),
+exit 1 for an embedded restart error. JSON preserves the reply as one value
+without an extra generic error line for that reported failure. Request failures
+keep their existing error mapping; unexpected replies are errors. `--json` does
+not make the restart read-only. `mcp add` retains its existing behavior.
+
 #### Root and global flags
 
 | Flag | Short | Availability | Meaning |
