@@ -3677,9 +3677,9 @@ impl Daemon {
             }
             Request::ExportSkills => {
                 let skills = self.with_reader(|st| {
-                    st.list_skills()?
+                    st.skill_names()?
                         .iter()
-                        .map(|s| crate::skills::export(st, &s.name))
+                        .map(|name| crate::skills::export(st, name))
                         .collect::<Result<Vec<_>>>()
                 })?;
                 Ok(json!({"format": "formless.skills/1", "skills": skills}))
@@ -8990,9 +8990,9 @@ impl Daemon {
                 .collect::<Result<Vec<_>>>()
         })?;
         let skills = self.with_reader(|st| {
-            st.list_skills()?
+            st.skill_names()?
                 .iter()
-                .map(|s| crate::skills::export(st, &s.name))
+                .map(|name| crate::skills::export(st, name))
                 .collect::<Result<Vec<_>>>()
         })?;
         let memories: Vec<Value> = self
@@ -10159,7 +10159,7 @@ impl Daemon {
             .map(|m| json!({"name": m.name, "description": m.description, "version": m.current_version}))
             .collect();
         let skills: Vec<Value> = self
-            .with_store(|st| st.list_skills())?
+            .with_store(|st| st.skill_summaries())?
             .into_iter()
             .filter(|s| s.enabled && !s.retired)
             .filter(|s| {
@@ -10375,7 +10375,7 @@ impl Daemon {
             })
             .collect();
         let skills: Vec<Value> = self
-            .with_reader(|st| st.list_skills())?
+            .with_reader(|st| st.skill_summaries())?
             .into_iter()
             .map(|s| json!({"name": s.name, "enabled": s.enabled, "description": s.description}))
             .collect();
@@ -18810,3 +18810,7 @@ mod read_metrics_limit_tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "skill_projection_daemon_tests.rs"]
+mod skill_projection_tests;
