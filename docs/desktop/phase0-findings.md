@@ -209,8 +209,8 @@ typical developer build.
 | Command | Result |
 |---|---|
 | `cargo test --no-default-features --lib --locked` | 64 passed (model, memory, timeline and fixture); no GPUI crate in its dependency graph |
-| `cargo test --features test-support --locked` | 64 passed, 67 passed (headless shell), 19 offscreen render states passed (37 captures) |
-| `cargo test --features test-support,thai-breaks --locked` | 69 passed, 67 passed, 19 render states and the real-text Thai measurement passed |
+| `cargo test --features test-support --locked` | 64 passed, 68 passed (headless shell), 19 offscreen render states passed (37 captures) |
+| `cargo test --features test-support,thai-breaks --locked` | 69 passed, 68 passed, 19 render states and the real-text Thai measurement passed |
 | `cargo fmt --check`, `cargo clippy --all-targets --locked` with and without `thai-breaks` | clean |
 
 These are the counts at the last code commit (§12). The first checkpoint
@@ -1544,6 +1544,30 @@ blocks on lines of their own and raw HTML left out.
   it too; the real-window walk showed an empty "Last message:" that no
   longer matched the screen, and that part was reverted before the commit.
 - **Not known.** How VoiceOver reads the plain text, including code.
+
+**What the view draws and means, kept (`7dea08a`).** Independent review of
+`dc3fdd6` found that the first version dropped list numbers and task-item
+state, treating them as markup. Read against the kit's own drawing code
+(`render_list_item_row` and `list_item_prefix` in `gpui-base` 0.9.1), the
+plain text now keeps what the view draws:
+
+| Markdown | The view draws | Plain text |
+|---|---|---|
+| `7. seven` / `8. eight` | "7." and "8." beside the items | `7. seven` / `8. eight` |
+| A nested ordered list | "A.", "B." one level down, "a." two levels down; numbers in a list starting at 0 | The same labels |
+| `- [x] done` / `- [ ] to do` | A checked and an empty box, no bullet; no numbers in a list that has task items | `☑ done` / `☐ to do` |
+| `![a chart][c]` with `[c]` defined | The image, with "a chart" as its alt text | `a chart` |
+| A reference with no definition | The text as written | The text as written |
+| A bullet list | Bullets | No bullets: decorative |
+| Code | Exactly, markers and all | Exactly |
+
+Each of the three changes fails its regression cases when removed
+(`mutation-check/plain-text-lists-removed.log`). A shell test checks that
+rows carry these values. The test window records the items' text but not
+the markers or boxes, so the markers are taken from the kit's source, not
+from paint, and the fixture has none of these constructs, so no real window
+showed them. ☑ and ☐ stand for the drawn boxes; what a screen reader says
+for them is not known.
 
 ## 17. Windows: no first frame from `--smoke`
 
