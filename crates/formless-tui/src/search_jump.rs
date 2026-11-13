@@ -13,6 +13,19 @@ pub(super) struct Target {
 
 impl App {
     pub(super) fn start_search_jump(&mut self, hit: SearchHit) {
+        // A newer destination supersedes earlier transcript reads for this
+        // Session. Retire their identities now, so late replies cannot reset
+        // the viewport or replace the transcript after the jump is consumed.
+        let superseded: Vec<_> = self
+            .run_state_reads
+            .iter()
+            .filter_map(|(&request, (session, _))| (session == &hit.session_id).then_some(request))
+            .collect();
+        for request in superseded {
+            self.pending.remove(&request);
+            self.pending_since.remove(&request);
+            self.run_state_reads.remove(&request);
+        }
         self.search_jump = Some(Target {
             session: hit.session_id,
             message: hit.message_id,
@@ -182,8 +195,11 @@ mod tests {
         let second = open(&mut app, &sent, hit("m20", 20));
         reply(&mut app, &tx, first, messages());
         assert!(!app.search_jump.as_ref().unwrap().ready);
-        let screen = render(&mut app);
-        assert!(screen.contains("message-099"));
+        assert!(
+            app.messages.is_empty(),
+            "superseded payload must be ignored"
+        );
+        assert!(!render(&mut app).contains("message-099"));
         reply(&mut app, &tx, second, messages());
         assert!(render(&mut app).contains("message-020"));
         let stale = open(&mut app, &sent, hit("m10", 10));
@@ -198,6 +214,26 @@ mod tests {
         reply(&mut app, &tx, abandoned, messages());
         assert!(render(&mut app).contains("message-099"));
     }
+    #[test]
+    fn superseded_reply_after_the_selected_hit_is_drawn_cannot_reset_its_viewport() {
+        let (mut app, sent, tx) = app();
+        let first = open(&mut app, &sent, hit("m10", 10));
+        let second = open(&mut app, &sent, hit("m20", 20));
+        assert!(!app.pending.contains_key(&first));
+        assert!(!app.pending_since.contains_key(&first));
+        assert!(!app.run_state_reads.contains_key(&first));
+        reply(&mut app, &tx, second, messages());
+        assert!(render(&mut app).contains("message-020"));
+        assert!(app.search_jump.is_none());
+        let top = app.chat_scroll_top;
+        let mut stale = messages();
+        stale[20].content = "obsolete response content".into();
+        reply(&mut app, &tx, first, stale);
+        assert_eq!(app.chat_scroll_top, top);
+        assert!(render(&mut app).contains("message-020"));
+        assert_eq!(app.messages[20].content, "message-020\nextra body 20");
+    }
+
     #[test]
     fn every_manual_scroll_key_abandons_a_pending_search_jump() {
         for (code, modifiers) in [
