@@ -11,7 +11,11 @@ import re
 def erase_literals(source):
     # Keep positions/newlines, so braces and assertion words inside fixtures do
     # not count. Rust raw strings permit arbitrary matching # delimiters.
-    pattern = re.compile(r'r(?P<hashes>\#*)".*?"(?P=hashes)|"(?:\\.|[^"\\])*"|//[^\n]*|/\*.*?\*/', re.S)
+    pattern = re.compile(
+        r"b?'(?:\\(?:x[0-9a-fA-F]{2}|u\{[0-9a-fA-F_]+\}|.)|[^'\\\n])'|"
+        r'r(?P<hashes>\#*)".*?"(?P=hashes)|"(?:\\.|[^"\\])*"|//[^\n]*|/\*.*?\*/',
+        re.S,
+    )
     return pattern.sub(lambda m: re.sub(r'[^\n]', ' ', m.group()), source)
 
 
