@@ -101,6 +101,14 @@ const FENCE_OPENER_MAX_BYTES: usize = 3 + FENCE_RUN_MAX + FENCE_INFO_MAX + 1;
 /// The longest text a row lays out, whatever the block holds.
 pub const PREVIEW_MAX_BYTES: usize = limits::BLOCK_PREVIEW_MAX_BYTES + FENCE_OPENER_MAX_BYTES;
 
+/// The longest plain text a row keeps for assistive technology. Plain text
+/// drops markup, so it is no longer than its window, except that an
+/// ordered list's label can be longer than the marker written in the
+/// source (an item written `1.` in a list counting from 999999999 is
+/// labelled `1000000000.`): at most 16 bytes more for each line of the
+/// window.
+pub const ACCESSIBLE_MAX_BYTES: usize = PREVIEW_MAX_BYTES + 16 * limits::BLOCK_PREVIEW_MAX_LINES;
+
 /// The text a person reads in rendered markdown, for assistive technology:
 /// the words and code, without the syntax that marks them up (fences,
 /// emphasis marks, quote markers, link targets). Blocks are on lines of
@@ -492,6 +500,14 @@ impl TimelineBlock {
             .clone()
     }
 
+    /// Bytes of plain text this row keeps for assistive technology now: the
+    /// text of its current window if it has been asked for since the
+    /// window was last rebuilt, none otherwise. At most
+    /// [`ACCESSIBLE_MAX_BYTES`].
+    pub fn accessible_retained_bytes(&self) -> usize {
+        self.accessible.get().map_or(0, |text| text.len())
+    }
+
     pub fn anchor(&self) -> Anchor {
         self.anchor
     }
@@ -706,6 +722,14 @@ impl Timeline {
         self.work.rebuilds += 1;
         self.work.bytes_copied += copied as u64;
         true
+    }
+
+    /// Bytes of plain text all rows keep for assistive technology now.
+    pub fn accessible_retained_bytes(&self) -> usize {
+        self.blocks
+            .iter()
+            .map(TimelineBlock::accessible_retained_bytes)
+            .sum()
     }
 
     /// Work done so far to keep streamed rows up to date.
@@ -1498,6 +1522,113 @@ mod tests {
         // checks that this row added at least its one build and its bytes.
         assert!(builds_after > builds);
         assert!(bytes_after >= bytes + b.preview().len() as u64);
+    }
+
+    #[test]
+    fn a_rows_plain_text_never_exceeds_its_bound() {
+        // Plain text drops markup, so it is shorter, except where a list
+        // label is longer than the marker in the source. The worst case: a
+        // full window of one-character items, each written "1." in a list
+        // counting from 999999999, nested so that labels are letters too.
+        let mut worst = String::from("999999999. a\n");
+        while worst.len() < BYTES {
+            worst.push_str("1. a\n");
+        }
+        let nested = format!("1. top\n{}", "   999999999. a\n".repeat(LINES));
+        for source in [worst.as_str(), nested.as_str(), &numbered_lines(2_000)] {
+            let mut b = block(source);
+            for to in [WindowMove::Start, WindowMove::Later, WindowMove::End] {
+                match to {
+                    WindowMove::Start => b.show_start(),
+                    WindowMove::Later => b.show_later(),
+                    _ => b.show_end(),
+                }
+                let text = b.accessible_text();
+                assert!(text.len() <= ACCESSIBLE_MAX_BYTES, "{}", text.len());
+                assert_eq!(b.accessible_retained_bytes(), text.len());
+            }
+        }
+        // What the worst case comes to, for the record.
+        let mut b = block(&worst);
+        b.show_start();
+        println!(
+            "EVIDENCE accessible_bound: window {} bytes, plain text {} bytes, bound {}",
+            b.preview().len(),
+            b.accessible_text().len(),
+            ACCESSIBLE_MAX_BYTES
+        );
+    }
+
+    #[test]
+    fn moving_a_window_keeps_one_plain_text_not_one_per_move() {
+        let mut b = block(&numbered_lines(5_000));
+        assert_eq!(b.accessible_retained_bytes(), 0, "nothing until asked");
+        let mut largest = 0;
+        for round in 0..200 {
+            match round % 4 {
+                0 => b.show_later(),
+                1 => b.show_later(),
+                2 => b.show_earlier(),
+                _ => b.show_end(),
+            }
+            // A move that rebuilds the window lets go of the old text at
+            // once; one that changes nothing (Later at the end) keeps the
+            // text of the window it still shows. Never more than one.
+            let kept = b.accessible_retained_bytes();
+            assert!(
+                kept == 0 || kept == plain_text(b.preview()).len(),
+                "round {round}: {kept}"
+            );
+            let text = b.accessible_text();
+            assert_eq!(b.accessible_retained_bytes(), text.len());
+            largest = largest.max(text.len());
+        }
+        assert!(largest <= ACCESSIBLE_MAX_BYTES);
+    }
+
+    #[test]
+    fn a_streamed_row_keeps_the_plain_text_of_its_current_window_only() {
+        let mut timeline = Timeline::default();
+        timeline.begin_stream(BlockKind::Assistant);
+        for index in 0..20_000 {
+            timeline.push_delta(fixture::stream_markdown_delta(index));
+            if index % 7 == 0 {
+                timeline.settle();
+                timeline.blocks()[0].accessible_text();
+            }
+        }
+        timeline.finish_stream();
+        let tail = &timeline.blocks()[0];
+        // The text it keeps is the text of the window it shows now: not
+        // behind the tail, and nothing from earlier windows.
+        let text = tail.accessible_text();
+        assert_eq!(&*text, plain_text(tail.preview()));
+        assert_eq!(tail.hidden_after(), 0);
+        assert_eq!(timeline.accessible_retained_bytes(), text.len());
+    }
+
+    #[test]
+    fn plain_text_kept_for_a_whole_transcript_is_bounded_by_its_rows() {
+        // Every row of a large transcript read once by assistive
+        // technology, as scrolling through it all with a screen reader on
+        // would do. Nothing is let go of until a row's window is rebuilt,
+        // so this is the most it can keep.
+        let mut blocks = fixture::timeline(10_000);
+        blocks.push(fixture::huge_block(10_001, 5 * 1024 * 1024));
+        let timeline = Timeline::new(blocks);
+        let previews: usize = timeline.blocks().iter().map(|b| b.preview().len()).sum();
+        for b in timeline.blocks() {
+            b.accessible_text();
+        }
+        let kept = timeline.accessible_retained_bytes();
+        for b in timeline.blocks() {
+            assert!(b.accessible_retained_bytes() <= ACCESSIBLE_MAX_BYTES);
+        }
+        assert!(kept <= timeline.len() * ACCESSIBLE_MAX_BYTES);
+        println!(
+            "EVIDENCE accessible_retained: {} rows, previews {previews} bytes, plain text kept {kept} bytes",
+            timeline.len()
+        );
     }
 
     #[test]

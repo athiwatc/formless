@@ -7,6 +7,7 @@
 //! | Composer undo and redo history | **No bound is claimed.** What the kit retains was not measured and is excluded from every figure here. | Mitigation only: [`UndoBudget`] adds up what every edit removed and inserted, and when the sum passes [`limits::UNDO_EDIT_BUDGET_BYTES`] the shell rebuilds the composer, which is the only way to drop the kit's history. The kit also caps undo at 1,000 transactions, by count, not size. |
 //! | Recorded intent | No text at all | [`IntentRecord`] keeps sizes only. |
 //! | A timeline row | [`limits::BLOCK_PREVIEW_MAX_BYTES`] and [`limits::BLOCK_PREVIEW_MAX_LINES`] laid out | `timeline::TimelineBlock`. |
+//! | A timeline row's text for assistive technology | `timeline::ACCESSIBLE_MAX_BYTES` per row, only for a row asked for it since its window was last rebuilt | `timeline::TimelineBlock` keeps one plain text, of its current window, and lets go of it when the window is rebuilt. It is made only while an accessibility tree is built. Like the row's window itself it is kept per row, so all rows together keep at most the number of rows times the bound; nothing evicts it while the row's window is unchanged. |
 //!
 //! Two limits on the composer bound are known and accepted:
 //!

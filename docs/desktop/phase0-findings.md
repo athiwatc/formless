@@ -208,9 +208,9 @@ typical developer build.
 
 | Command | Result |
 |---|---|
-| `cargo test --no-default-features --lib --locked` | 65 passed (model, memory, timeline and fixture); no GPUI crate in its dependency graph |
-| `cargo test --features test-support --locked` | 65 passed, 68 passed (headless shell), 19 offscreen render states passed (37 captures) |
-| `cargo test --features test-support,thai-breaks --locked` | 70 passed, 68 passed, 19 render states and the real-text Thai measurement passed |
+| `cargo test --no-default-features --lib --locked` | 69 passed (model, memory, timeline and fixture); no GPUI crate in its dependency graph |
+| `cargo test --features test-support --locked` | 69 passed, 68 passed (headless shell), 19 offscreen render states passed (37 captures) |
+| `cargo test --features test-support,thai-breaks --locked` | 74 passed, 68 passed, 19 render states and the real-text Thai measurement passed |
 | `cargo fmt --check`, `cargo clippy --all-targets --locked` with and without `thai-breaks` | clean |
 
 These are the counts at the last code commit (§12). The first checkpoint
@@ -1621,6 +1621,44 @@ an open fence changes earlier text); converting off the main thread or
 less often leaves the accessible text behind the visible tail; a faster
 parser is not in the dependency graph. Each is a follow-up that needs its
 own proof of equal output, or a decision that some lag is acceptable.
+
+### 16.11 What the plain-text caches keep
+
+Asked for by independent review of `75f7988`. Measured first; no defect
+found, so the change is accounting and tests only.
+
+**What is kept.** Each row keeps at most one plain text, of its current
+window, made the first time it is asked for after the window was rebuilt,
+and only while an accessibility tree is built. Rebuilding the window, by a
+move or by streaming, lets go of it at once. Nothing evicts it while the
+window is unchanged, so a row scrolled out of view keeps its text, exactly
+as it keeps its window. Changing Sessions does not touch it: every Session
+shows the same synthetic timeline here.
+
+**Bound.** Plain text drops markup, so it is no longer than its window,
+except that an ordered list's label can be longer than the marker in the
+source: an item written `1.` in a list counting from 999999999 is labelled
+`1000000000.`. So the bound is the window's bound plus 16 bytes for each
+of its at most 400 lines, `timeline::ACCESSIBLE_MAX_BYTES`, 39,268 bytes.
+The worst case found, a full window of one-character items in such a list,
+comes to 5,598 bytes of plain text from a 2,008-byte window.
+
+**Measured.** All 10,001 rows of a transcript of 10,000 fixture blocks
+and a 5 MiB block, each asked for its text once, as scrolling through it
+all with a screen reader on would: 1,654,616 bytes kept, against
+1,819,625 bytes of row windows already kept.
+
+**Tests.** The bound, at each window position, for the worst case, a
+nested list and ordinary lines; 200 window moves keeping one text at most;
+a 20,000-delta stream keeping only the text of its current window, which is
+the text of the visible tail; the whole transcript within rows times the
+bound. With the release on rebuild removed, two of them fail
+(`mutation-check/accessible-retention-removed.log`). The policy table in
+`src/memory.rs` now has the row.
+
+**Not covered.** What GPUI and the platform adapter keep of the values
+they are given: not measured, as before for everything outside this
+crate.
 
 ## 17. Windows: no first frame from `--smoke`
 
