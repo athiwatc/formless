@@ -295,10 +295,19 @@ impl Renderer {
                 } else {
                     ("☐ ", dim(color))
                 };
-                // GitHub shows the checkbox instead of the bullet.
+                // Ordered tasks keep their sequence number; unordered tasks
+                // use the checkbox in place of the bullet. The final marker
+                // determines both wrapping and the hanging indent.
+                let ordered = matches!(self.lists.last(), Some(Some(_)));
                 match self.prefixes.last_mut() {
                     Some(p) if p.first.is_some() => {
-                        p.first = Some(vec![Span::styled(mark, style)]);
+                        let first = p.first.as_mut().unwrap();
+                        if !ordered {
+                            first.clear();
+                        }
+                        first.push(Span::styled(mark, style));
+                        let width = first.iter().map(|span| span.content.width()).sum();
+                        p.rest = vec![Span::raw(" ".repeat(width))];
                     }
                     _ => self.push_text(mark, style),
                 }
@@ -1001,6 +1010,113 @@ mod tests {
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect()
+    }
+
+    #[test]
+    fn ordered_tasks_keep_numbers_check_state_and_final_hanging_indent() {
+        for start in [1, 10, 100] {
+            let source = format!("{start}. [ ] Task _italic_ 日本語 with enough text to wrap\n{}. [x] Finished `code` with more wrapped content", start + 1);
+            for color in [false, true] {
+                let out = render(&source, color, "", 24);
+                let text = out
+                    .iter()
+                    .map(|line| {
+                        line.spans
+                            .iter()
+                            .map(|span| span.content.as_ref())
+                            .collect::<String>()
+                    })
+                    .collect::<Vec<_>>();
+                let first = format!("{start}. ☐ ");
+                let next = format!("{}. ☑ ", start + 1);
+                let split = text
+                    .iter()
+                    .position(|line| line.starts_with(&next))
+                    .unwrap();
+                for (rows, marker, expected) in [
+                    (
+                        &text[..split],
+                        first.as_str(),
+                        "Taskitalic日本語withenoughtexttowrap",
+                    ),
+                    (
+                        &text[split..],
+                        next.as_str(),
+                        "Finishedcodewithmorewrappedcontent",
+                    ),
+                ] {
+                    assert!(rows[0].starts_with(marker), "{text:?}");
+                    let indent = " ".repeat(marker.width());
+                    let content = rows
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, line)| !line.is_empty())
+                        .map(|(index, line)| {
+                            if index == 0 {
+                                line.strip_prefix(marker).unwrap()
+                            } else {
+                                line.strip_prefix(&indent).unwrap()
+                            }
+                        })
+                        .collect::<String>();
+                    assert_eq!(content.split_whitespace().collect::<String>(), expected);
+                }
+                assert!(text.iter().all(|line| line.width() <= 24), "{text:?}");
+                assert!(out
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .any(|span| span.content == "italic"
+                        && span.style.add_modifier.contains(Modifier::ITALIC)));
+            }
+        }
+    }
+
+    #[test]
+    fn task_prefixes_align_inside_quotes_and_nested_lists() {
+        for (source, first, rest) in [
+            (
+                "> 10. [x] Long task with Unicode 日本語 and wrapped content",
+                "  │ 10. ☑ ",
+                "  │       ",
+            ),
+            (
+                "- [ ] Long task with Unicode 日本語 and wrapped content",
+                "  ☐ ",
+                "    ",
+            ),
+            (
+                "- parent\n\n  10. [ ] Long task with Unicode 日本語 and wrapped content",
+                "    10. ☐ ",
+                "          ",
+            ),
+        ] {
+            let out = lines(source, 24);
+            let start = out
+                .iter()
+                .position(|line| line.starts_with(first))
+                .unwrap_or_else(|| panic!("missing {first:?}: {out:?}"));
+            let rows = out[start..]
+                .iter()
+                .filter(|line| !line.trim().is_empty() && line.trim() != "│")
+                .collect::<Vec<_>>();
+            assert!(rows.len() > 1, "{out:?}");
+            for row in &rows[1..] {
+                assert!(row.starts_with(rest), "{out:?}");
+            }
+            assert!(out.iter().all(|line| line.width() <= 24), "{out:?}");
+            let content = rows
+                .iter()
+                .enumerate()
+                .map(|(index, line)| {
+                    line.strip_prefix(if index == 0 { first } else { rest })
+                        .unwrap()
+                })
+                .collect::<String>();
+            assert_eq!(
+                content.split_whitespace().collect::<String>(),
+                "LongtaskwithUnicode日本語andwrappedcontent"
+            );
+        }
     }
 
     #[test]
