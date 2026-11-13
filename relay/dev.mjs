@@ -20,6 +20,7 @@ import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { extname, join, normalize, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { parseArgs } from "node:util";
 import { DevStorage } from "./dev-storage.mjs";
 import { httpBoundary, upgradeBoundary } from "./dev-errors.mjs";
 import { LIMITS } from "./web/transport.mjs";
@@ -31,11 +32,24 @@ import worker, { RelayRoom, SECURITY_HEADERS } from "./worker.js";
 const DEV_CSP = SECURITY_HEADERS["content-security-policy"]
   .replace("connect-src 'self'", "connect-src 'self' ws://127.0.0.1:* ws://localhost:*");
 
-const args = process.argv.slice(2);
-const portIndex = args.indexOf("--port");
-const port = portIndex < 0 ? 8787 : Number(args[portIndex + 1]);
-if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error("invalid port");
-const mock = args.includes("--mock-provider");
+const main = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+let options;
+try {
+  ({ values: options } = parseArgs({
+    args: main ? process.argv.slice(2) : [],
+    strict: true,
+    options: { port: { type: "string", default: "8787" }, "mock-provider": { type: "boolean", default: false } },
+  }));
+  if (!/^\d+$/.test(options.port) || Number(options.port) > 65535) {
+    throw new Error("port must be an integer between 0 and 65535");
+  }
+} catch (error) {
+  console.error("formless dev relay: " + error.message);
+  console.error("Usage: node relay/dev.mjs [--port 8787] [--mock-provider]");
+  process.exit(2);
+}
+const port = Number(options.port);
+const mock = options["mock-provider"];
 const webRoot = fileURLToPath(new URL("./web/", import.meta.url));
 const TYPES = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".mjs": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".png": "image/png", ".webmanifest": "application/manifest+json" };
 
@@ -292,6 +306,14 @@ async function handleUpgrade(req, socket) {
 }
 export const server = createServer((req, res) => { void httpBoundary(req, res, handleHttp); });
 server.on("upgrade", (req, socket) => { void upgradeBoundary(req, socket, handleUpgrade); });
-if(process.argv[1]&&resolve(process.argv[1])===fileURLToPath(import.meta.url))server.listen(port, "127.0.0.1", () => {
-  console.log("formless dev relay on http://127.0.0.1:" + server.address().port + (mock ? " (mock provider at /mock/v1)" : ""));
-});
+if (main) {
+  server.on("error", (error) => {
+    console.error("formless dev relay: " + (error.code === "EADDRINUSE"
+      ? `port ${port} is already in use; pass --port <other>`
+      : `could not listen on port ${port}: ${error.message}`));
+    process.exit(1);
+  });
+  server.listen(port, "127.0.0.1", () => {
+    console.log("formless dev relay on http://127.0.0.1:" + server.address().port + (mock ? " (mock provider at /mock/v1)" : ""));
+  });
+}
