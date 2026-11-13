@@ -12704,6 +12704,97 @@ fn is_error_note(note: &str) -> bool {
 /// How long an ordinary toast stays.
 const TOAST_SECS: u64 = 6;
 
+/// One bounded switcher row; matching/scoring stays in `switcher_matches`.
+fn switcher_session_line(
+    session: &SessionInfo,
+    query: &str,
+    width: usize,
+    selected: bool,
+    color: bool,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Line<'static> {
+    let clip = |value: &str, width| {
+        if width == 0 {
+            String::new()
+        } else {
+            truncate_chars(value, width)
+        }
+    };
+    let tag_parts: Vec<_> = session.tags.iter().map(|tag| format!("#{tag}")).collect();
+    let tags = tag_parts.join(" ");
+    let tag_only = !query.trim().is_empty()
+        && formless_core::fuzzy::fuzzy_match(query, &session.name).is_none()
+        && formless_core::fuzzy::fuzzy_match(query, session.preview.as_deref().unwrap_or(""))
+            .is_none();
+    let priority = if tag_only {
+        formless_core::fuzzy::fuzzy_match(query, &tags)
+            .and_then(|(_, positions)| positions.first().copied())
+            .and_then(|position| {
+                let mut start = 0;
+                tag_parts.iter().position(|tag| {
+                    let end = start + tag.chars().count();
+                    let hit = position >= start && position < end;
+                    start = end + 1;
+                    hit
+                })
+            })
+    } else {
+        None
+    };
+    let tags = priority.map_or(tags, |priority| {
+        std::iter::once(tag_parts[priority].as_str())
+            .chain(
+                tag_parts
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| *index != priority)
+                    .map(|(_, tag)| tag.as_str()),
+            )
+            .collect::<Vec<_>>()
+            .join(" ")
+    });
+    let marker = clip(if selected { "› " } else { "  " }, width);
+    let available = width.saturating_sub(text::width(&marker));
+    let tag_budget = text::width(&tags).min(if tag_only {
+        available.saturating_sub((available / 3).min(12) + 2)
+    } else {
+        (available / 3).min(24)
+    });
+    let name_budget = available
+        .saturating_sub(tag_budget + if tag_budget > 0 { 2 } else { 0 })
+        .min(40);
+    let name = clip(&session.name, name_budget);
+    let tags = clip(&tags, tag_budget);
+    let tag_text = if tags.is_empty() {
+        String::new()
+    } else {
+        format!("  {tags}")
+    };
+    let used = text::width(&marker) + text::width(&name) + text::width(&tag_text);
+    let metadata = format!(
+        "  {}{}",
+        ui::relative_time(&session.updated_at, now),
+        session
+            .preview
+            .as_deref()
+            .map(|preview| format!(" · “{preview}”"))
+            .unwrap_or_default()
+    );
+    let metadata = clip(&metadata, width.saturating_sub(used));
+    Line::from(vec![
+        Span::styled(
+            format!("{marker}{name}"),
+            if selected {
+                bold_fg(color, Color::Green)
+            } else {
+                Style::default()
+            },
+        ),
+        Span::styled(tag_text, ui::dim(color)),
+        Span::styled(metadata, ui::dim(color)),
+    ])
+}
+
 /// The Ctrl+K Session switcher.
 fn draw_switcher(f: &mut Frame, app: &App, query: &str, sel: usize) {
     let area = f.area();
@@ -12716,35 +12807,16 @@ fn draw_switcher(f: &mut Frame, app: &App, query: &str, sel: usize) {
         Span::raw(format!("{query}▏")),
     ])];
     let now = chrono::Utc::now();
+    let w = 90.min(area.width.saturating_sub(2)).max(1);
     for (k, &i) in matches.iter().enumerate().skip(start).take(rows) {
-        let s = &app.sessions[i];
-        let here = k == sel;
-        let style = if here {
-            bold_fg(app.color, Color::Green)
-        } else {
-            Style::default()
-        };
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!(
-                    "{} {}",
-                    if here { "›" } else { " " },
-                    truncate_chars(&s.name, 40)
-                ),
-                style,
-            ),
-            Span::styled(
-                format!(
-                    "  {}{}",
-                    ui::relative_time(&s.updated_at, now),
-                    s.preview
-                        .as_deref()
-                        .map(|p| format!(" · “{}”", truncate_chars(p, 50)))
-                        .unwrap_or_default()
-                ),
-                ui::dim(app.color),
-            ),
-        ]));
+        lines.push(switcher_session_line(
+            &app.sessions[i],
+            query,
+            w.saturating_sub(2) as usize,
+            k == sel,
+            app.color,
+            now,
+        ));
     }
     if matches.is_empty() {
         lines.push(Line::styled(
@@ -12756,7 +12828,6 @@ fn draw_switcher(f: &mut Frame, app: &App, query: &str, sel: usize) {
         "Enter switch · Ctrl+N new Session named this · Esc close",
         ui::dim(app.color),
     ));
-    let w = 90.min(area.width.saturating_sub(2)).max(1);
     let h = (lines.len() as u16 + 2).min(area.height);
     let rect = Rect::new(
         area.x + area.width.saturating_sub(w) / 2,
@@ -25057,6 +25128,60 @@ mod tests {
         let at = app.jump_to.take().unwrap();
         app.focus_call_at(&at);
         assert_eq!(app.call_focus.as_deref(), Some("call_9"));
+    }
+
+    #[test]
+    fn switcher_tag_only_matches_keep_bounded_grapheme_context_visible() {
+        use unicode_segmentation::UnicodeSegmentation;
+        let mut app = test_app();
+        let session: SessionInfo = serde_json::from_value(serde_json::json!({
+            "id":"fixture", "name":"Long unrelated name ".repeat(20),
+            "created_at":"", "updated_at":"2026-01-01", "preview":"unrelated preview ".repeat(30),
+            "tags":["aaa-unrelated-tag-with-long-text", "café👩‍💻日本語"]
+        }))
+        .unwrap();
+        app.sessions = vec![session.clone()];
+        let query = "cafe";
+        let before = app.switcher_matches(query);
+        assert_eq!(before, vec![0]);
+        for width in [0, 1, 2, 8, 20, 38, 58, 88] {
+            let line =
+                switcher_session_line(&session, query, width, true, false, chrono::Utc::now());
+            let text = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>();
+            assert!(crate::text::width(&text) <= width, "{width}: {text}");
+            if width >= 38 {
+                assert!(text.contains("#café👩‍💻日本語"), "{width}: {text}");
+            }
+            // Each clipped field ends at a complete cluster from its source.
+            let tag_span = line.spans[1].content.trim_start().trim_end_matches('…');
+            let source = "#café👩‍💻日本語";
+            if !tag_span.is_empty() && source.starts_with(tag_span) {
+                assert!(
+                    source
+                        .grapheme_indices(true)
+                        .any(|(index, _)| index == tag_span.len())
+                        || tag_span.len() == source.len()
+                );
+            }
+        }
+        for (width, height) in [(100, 24), (60, 18), (40, 12), (12, 6)] {
+            app.switcher = Some((query.into(), 0));
+            let output = render(&mut app, width, height);
+            if width >= 40 {
+                // TestBackend prints an empty trailing cell after each wide glyph.
+                assert!(
+                    output.replace(' ', "").contains("#café👩‍💻日本語"),
+                    "{width}: {output}"
+                );
+            }
+        }
+        assert_eq!(app.switcher_matches(query), before);
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.switcher.is_none());
     }
 
     #[test]
