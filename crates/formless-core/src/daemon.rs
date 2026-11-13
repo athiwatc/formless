@@ -15883,10 +15883,13 @@ pub fn ensure_daemon(paths: &Paths) -> Result<()> {
     if daemon_reachable(paths) {
         return Ok(());
     }
-    let timeout = Config::load(paths)
-        .map(|c| c.daemon.start_timeout_secs)
-        .unwrap_or(60)
-        .max(1);
+    let (timeout, timeout_note) = match Config::load(paths) {
+        Ok(config) => (config.daemon.start_timeout_secs.max(1), ""),
+        Err(_) => (
+            60,
+            "; using the default 60s because config.toml could not be loaded",
+        ),
+    };
     let _launcher =
         crate::profile_lock::ProfileLock::launcher(paths, std::time::Duration::from_secs(timeout))?;
     if daemon_reachable(paths) {
@@ -15928,8 +15931,10 @@ pub fn ensure_daemon(paths: &Paths) -> Result<()> {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     Err(anyhow!(
-        "daemon did not accept connections within {timeout}s (daemon.start_timeout_secs); \
-         last log lines from {}:\n{}",
+        "daemon did not accept connections within {timeout}s (daemon.start_timeout_secs){timeout_note}; \
+         raise it with `formless config edit` (set start_timeout_secs = 180 in [daemon]; \
+         `formless config set` cannot change this key). \
+         Last log lines from {}:\n{}",
         paths.log_file().display(),
         log_tail(paths, 10)
     ))
