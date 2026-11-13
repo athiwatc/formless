@@ -128,6 +128,11 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: "0"
       CARGO_INCREMENTAL: "0"
     steps:
+      - name: Record runner workspace owner before container writes
+        shell: bash
+        run: |
+          test ! -L "$GITHUB_WORKSPACE"
+          echo "CI_WORKSPACE_OWNER=$(stat -c '%u:%g' "$GITHUB_WORKSPACE")" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
@@ -185,6 +190,25 @@ jobs:
         shell: bash
         run: bash scripts/ci-storage-budget.sh snapshot job-finished
   # Install each package in a clean system and run it.
+      - name: Restore runner ownership of generated files
+        if: always()
+        shell: bash
+        run: |
+          # Container root must not strand files that the host checkout cannot clean.
+          # Do not follow symlinks, change modes, or touch paths outside this job.
+          test ! -L "$GITHUB_WORKSPACE"
+          [[ "${CI_WORKSPACE_OWNER:-}" =~ ^[0-9]+:[0-9]+$ ]]
+          chown -hRP "$CI_WORKSPACE_OWNER" "$GITHUB_WORKSPACE"
+          for owned in "${CARGO_HOME:-}" "${FORMLESS_DATA_DIR:-}" "${FORMLESS_CONFIG_DIR:-}" "${INSTALL_FIXTURES:-}"; do
+            case "$owned" in
+              "$RUNNER_TEMP"/*)
+                if [[ -e "$owned" || -L "$owned" ]]; then
+                  chown -hRP "$CI_WORKSPACE_OWNER" "$owned"
+                fi
+                ;;
+            esac
+          done
+
   linux-install-test:
     timeout-minutes: 30
     needs: linux
@@ -195,22 +219,52 @@ jobs:
     runs-on: [self-hosted, Linux, X64]
     container: ${{ matrix.image }}
     steps:
+      - name: Record runner workspace owner before container writes
+        shell: bash
+        run: |
+          test ! -L "$GITHUB_WORKSPACE"
+          echo "CI_WORKSPACE_OWNER=$(stat -c '%u:%g' "$GITHUB_WORKSPACE")" >> "$GITHUB_ENV"
+      - name: Allocate fresh install fixtures
+        shell: bash
+        run: |
+          fixtures=$(mktemp -d "$RUNNER_TEMP/formless-install.XXXXXX")
+          echo "INSTALL_FIXTURES=$fixtures" >> "$GITHUB_ENV"
       - uses: actions/download-artifact@v4
         with:
           name: formless-linux
-          path: pkgs
+          path: ${{ env.INSTALL_FIXTURES }}
       - name: Install and run
         shell: bash
+        working-directory: ${{ env.INSTALL_FIXTURES }}
         run: |
           if command -v apt-get >/dev/null; then
-            apt-get update && apt-get install -y ./pkgs/*.deb
+            apt-get update && apt-get install -y ./*.deb
           else
-            dnf install -y ./pkgs/*.rpm
+            dnf install -y ./*.rpm
           fi
           formless --version
           test -f /usr/share/doc/formless/copyright || test -f /usr/share/licenses/formless/LICENSE
   # ghcr.io/athiwatc/formless (docs/docker.md): built, run and checked
   # before anything is pushed. linux/amd64 only (docs/docker.md).
+      - name: Restore runner ownership of generated files
+        if: always()
+        shell: bash
+        run: |
+          # Container root must not strand files that the host checkout cannot clean.
+          # Do not follow symlinks, change modes, or touch paths outside this job.
+          test ! -L "$GITHUB_WORKSPACE"
+          [[ "${CI_WORKSPACE_OWNER:-}" =~ ^[0-9]+:[0-9]+$ ]]
+          chown -hRP "$CI_WORKSPACE_OWNER" "$GITHUB_WORKSPACE"
+          for owned in "${CARGO_HOME:-}" "${FORMLESS_DATA_DIR:-}" "${FORMLESS_CONFIG_DIR:-}" "${INSTALL_FIXTURES:-}"; do
+            case "$owned" in
+              "$RUNNER_TEMP"/*)
+                if [[ -e "$owned" || -L "$owned" ]]; then
+                  chown -hRP "$CI_WORKSPACE_OWNER" "$owned"
+                fi
+                ;;
+            esac
+          done
+
   docker:
     permissions:
       contents: read
