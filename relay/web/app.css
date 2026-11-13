@@ -680,7 +680,7 @@ mark.find { background: var(--accent-soft); color: inherit; border-radius: 0.187
    direction from its own first strong letter, so an Arabic or Hebrew
    answer is right-aligned and an English one beside it stays left; names
    in lists are isolated so they never reorder the time next to them. */
-.bubble, .md p, .md li, .md h1, .md h2, .md h3, .md h4, .md blockquote, .md td, .md th {
+.bubble, .md p, .md li, .md h1, .md h2, .md h3, .md h4, .md .md-heading, .md blockquote, .md td, .md th {
   unicode-bidi: plaintext;
   text-align: start;
 }
