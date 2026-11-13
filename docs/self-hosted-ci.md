@@ -42,7 +42,9 @@ status checks at inspection time; no existing protection was removed.
 - Documentation cancels superseded runs; release publication is not canceled
   halfway through a run.
 - Build/test jobs have read-only repository tokens and checkout does not persist
-  credentials. Only Docker publishing receives package-write and release
+  credentials. Docker client configuration is job-local; Homebrew tap access
+  uses a temporary askpass helper, never a token-bearing remote URL. Only Docker
+  publishing receives package-write and release
   publishing receives contents-write permissions.
 - Missing native release artifacts fail instead of silently passing.
 - Docker smoke checks require a successful JSON status with a positive PID and

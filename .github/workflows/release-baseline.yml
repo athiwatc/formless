@@ -313,6 +313,11 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - name: Isolate Docker client configuration
+        shell: bash
+        run: |
+          docker_config=$(mktemp -d "$RUNNER_TEMP/formless-docker-config.XXXXXX")
+          echo "DOCKER_CONFIG=$docker_config" >> "$GITHUB_ENV"
       - uses: docker/setup-buildx-action@v3
       - name: Record source and runner
         run: |

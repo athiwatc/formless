@@ -226,6 +226,11 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - name: Isolate Docker client configuration
+        shell: bash
+        run: |
+          docker_config=$(mktemp -d "$RUNNER_TEMP/formless-docker-config.XXXXXX")
+          echo "DOCKER_CONFIG=$docker_config" >> "$GITHUB_ENV"
       - uses: docker/setup-buildx-action@v3
       - name: Build
         uses: docker/build-push-action@v6
@@ -328,7 +333,20 @@ jobs:
           TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         if: env.TAP_TOKEN != ''
         run: |
-          git clone "https://x-access-token:${TAP_TOKEN}@github.com/athiwatc/homebrew-tap.git" tap
+          # Never persist the tap token in .git/config on a self-hosted runner.
+          askpass=$(mktemp "$RUNNER_TEMP/formless-tap-askpass.XXXXXX")
+          trap 'rm -f -- "$askpass"' EXIT
+          cat > "$askpass" <<'ASKPASS'
+          #!/bin/sh
+          case "$1" in
+            *Username*) printf '%s\n' x-access-token ;;
+            *Password*) printf '%s\n' "$TAP_TOKEN" ;;
+            *) exit 1 ;;
+          esac
+          ASKPASS
+          chmod 700 "$askpass"
+          export GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0
+          git -c credential.helper= clone https://github.com/athiwatc/homebrew-tap.git tap
           mkdir -p tap/Formula
           cp packaging-out/homebrew/formless.rb tap/Formula/formless.rb
           cd tap
@@ -338,7 +356,7 @@ jobs:
           # A re-run with nothing new is fine.
           if git diff --cached --quiet; then echo "tap already up to date"; exit 0; fi
           git commit -m "formless ${GITHUB_REF_NAME}"
-          git push
+          git -c credential.helper= push
       - name: Submit to winget
         id: winget
         continue-on-error: true
