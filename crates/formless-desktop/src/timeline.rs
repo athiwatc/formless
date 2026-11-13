@@ -1651,6 +1651,124 @@ mod tests {
         );
     }
 
+    /// Deterministic pseudo-random text built from pieces that stress the
+    /// window, fence and plain-text code: multi-byte and combining
+    /// characters, CRLF, fences of both kinds and lengths, list and task
+    /// markers, quotes, emphasis and long lines.
+    fn mixed_text(seed: u64, pieces: usize) -> String {
+        const PIECES: [&str; 22] = [
+            "ข้อความไทย ",
+            "👩🏽‍💻",
+            "é",
+            "漢字",
+            "\r\n",
+            "\n",
+            "\n\n",
+            "```",
+            "~~~~ py\n",
+            "```rust\n",
+            "````\n",
+            "- [x] ",
+            "- [ ] ",
+            "1. ",
+            "999999999. ",
+            "   2. ",
+            "> ",
+            "**b** ",
+            "_i_ ",
+            "`c` ",
+            "[l](u) ",
+            "x",
+        ];
+        let mut state = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let mut text = String::new();
+        for _ in 0..pieces {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let piece = PIECES[(state >> 33) as usize % PIECES.len()];
+            if (state >> 20).is_multiple_of(50) {
+                // Now and then a line far longer than a window.
+                text.push_str(&"ก".repeat(20_000));
+            }
+            text.push_str(piece);
+        }
+        text
+    }
+
+    #[test]
+    fn mixed_text_keeps_every_bound_and_boundary_in_every_window() {
+        // Fewer in a debug build, where making plain text is slow.
+        let seeds = if cfg!(debug_assertions) { 4 } else { 24 };
+        for seed in 0..seeds {
+            let text = mixed_text(seed, 4_000);
+            let mut b = block(&text);
+            for step in 0..40 {
+                match step % 5 {
+                    0 => b.show_start(),
+                    1 | 2 => b.show_later(),
+                    3 => b.show_earlier(),
+                    _ => b.show_end(),
+                }
+                let window = b.window();
+                assert!(
+                    text.is_char_boundary(window.start),
+                    "seed {seed} step {step}"
+                );
+                assert!(text.is_char_boundary(window.end), "seed {seed} step {step}");
+                assert!(window.len() <= BYTES, "seed {seed} step {step}");
+                assert!(
+                    b.preview().len() <= PREVIEW_MAX_BYTES,
+                    "seed {seed} step {step}"
+                );
+                assert!(b.preview().ends_with(&text[window.clone()]));
+                assert!(
+                    b.accessible_text().len() <= ACCESSIBLE_MAX_BYTES,
+                    "seed {seed}"
+                );
+                assert_eq!(b.markdown(), text);
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_text_streamed_in_any_pieces_ends_where_the_whole_text_does() {
+        let seeds = if cfg!(debug_assertions) { 3 } else { 12 };
+        for seed in 0..seeds {
+            let text = mixed_text(seed, 3_000);
+            let whole = {
+                let mut b = block(&text);
+                b.show_end();
+                (b.window(), b.preview().clone(), b.accessible_text())
+            };
+            for size in [1usize, 3, 7, 64, 1_000] {
+                let mut timeline = Timeline::default();
+                timeline.begin_stream(BlockKind::Assistant);
+                let mut sent = 0;
+                while sent < text.len() {
+                    let mut end = (sent + size).min(text.len());
+                    while !text.is_char_boundary(end) {
+                        end += 1;
+                    }
+                    timeline.push_delta(&text[sent..end]);
+                    sent = end;
+                    if sent.is_multiple_of(5) {
+                        timeline.settle();
+                    }
+                }
+                timeline.finish_stream();
+                let tail = &timeline.blocks()[0];
+                assert_eq!(tail.markdown(), text, "seed {seed} size {size}");
+                assert_eq!(tail.window(), whole.0, "seed {seed} size {size}");
+                assert_eq!(tail.preview(), &whole.1, "seed {seed} size {size}");
+                assert_eq!(tail.accessible_text(), whole.2, "seed {seed} size {size}");
+                assert_eq!(tail.hidden_after(), 0);
+            }
+        }
+    }
+
     #[test]
     fn a_burst_of_requests_schedules_one_flush() {
         let mut coalescer = Coalescer::default();

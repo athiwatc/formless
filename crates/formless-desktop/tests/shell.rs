@@ -1143,6 +1143,27 @@ fn focus_falls_back_when_the_originating_control_is_gone(cx: &mut TestAppContext
     });
 }
 
+#[gpui_kit::test]
+fn a_session_chosen_in_the_overlay_returns_focus_to_the_new_composer(cx: &mut TestAppContext) {
+    let (handle, shell) = open(cx, WIDE, 200, 40);
+    cx.simulate_window_resize(handle.into(), size(px(800.), px(900.)));
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find_by_label("Message").focused(), Some(true));
+        let before = shell.read(cx).composer().entity_id();
+        // Opened from the composer; choosing a Session inside the overlay
+        // swaps in a fresh composer before the overlay closes, so the
+        // control focus was taken from no longer exists.
+        window.press(TOGGLE_SIDEBAR, cx);
+        window.click(session_row_id("fixture-session-7"), cx);
+        let composer = shell.read(cx).composer().clone();
+        assert_ne!(composer.entity_id(), before);
+        assert!(window.try_find("region-sidebar").is_none());
+        assert!(gpui_kit::Focusable::focus_handle(&composer, cx).is_focused(window));
+        assert_eq!(window.find_by_label("Message").focused(), Some(true));
+    });
+}
+
 // ---- Memory policy and stress -------------------------------------------
 
 #[cfg(target_os = "macos")]
