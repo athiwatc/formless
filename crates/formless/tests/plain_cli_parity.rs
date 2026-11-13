@@ -19,6 +19,7 @@ struct Fixture {
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
     requests: Arc<Mutex<Vec<Request>>>,
+    session_rows: Arc<Mutex<Value>>,
 }
 impl Fixture {
     fn new() -> Self {
@@ -45,6 +46,11 @@ impl Fixture {
         let stopped = stop.clone();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let seen = requests.clone();
+        let session_rows = Arc::new(Mutex::new(json!([
+            {"id":"abc-one","name":"First","created_at":"","updated_at":""},
+            {"id":"abc-two","name":"Second","created_at":"","updated_at":""}
+        ])));
+        let sessions = session_rows.clone();
         let thread = std::thread::spawn(move || {
             while !stopped.load(Ordering::SeqCst) {
                 let (mut socket, _) = match listener.accept() {
@@ -63,10 +69,10 @@ impl Fixture {
                 while reader.read_line(&mut line).unwrap_or(0) > 0 {
                     let envelope: RequestEnvelope = serde_json::from_str(&line).unwrap();
                     let result = match &envelope.request {
-                        Request::ListSessions => json!([
-                            {"id":"abc-one","name":"First","created_at":"","updated_at":""},
-                            {"id":"abc-two","name":"Second","created_at":"","updated_at":""}
-                        ]),
+                        Request::ListSessions => sessions.lock().unwrap().clone(),
+                        Request::GetSession { id } => {
+                            json!({"session_id":id,"messages":[],"future":true})
+                        }
                         Request::RunFiles { session_id, run_id } => {
                             assert_eq!(session_id, "abc-one");
                             json!({"run_id":run_id.as_deref().unwrap_or("latest"), "files":[{"path":"dir/a.txt","status":"modified","revertible":true,"diff":"- old\n+ new"}], "untracked_writes_possible":true})
@@ -92,6 +98,7 @@ impl Fixture {
             stop,
             thread: Some(thread),
             requests,
+            session_rows,
         }
     }
     fn command(&self, args: &[&str]) -> Command {
@@ -146,6 +153,74 @@ impl Fixture {
         }
     }
 }
+#[test]
+fn shipped_ambiguous_session_selectors_show_ids_and_never_dispatch_an_action() {
+    let fixture = Fixture::new();
+    let rows:Vec<Value>=(0..12).map(|n|json!({"id":format!("12345678-common-full-{n:02}"),"name":"日本語\u{1b}[31m\nไทย","archived":n%2==1,"created_at":"","updated_at":""})).collect();
+    *fixture.session_rows.lock().unwrap() = json!(rows);
+    for args in [
+        vec!["sessions", "show", "12345678", "--json"],
+        vec!["sessions", "archive", "12345678"],
+        vec!["sessions", "files", "12345678"],
+    ] {
+        fixture.requests.lock().unwrap().clear();
+        let out = fixture.run(&args);
+        assert_eq!(out.status.code(), Some(2));
+        assert!(out.stdout.is_empty());
+        let text = String::from_utf8(out.stderr).unwrap();
+        for row in rows.iter().take(10) {
+            assert!(text.contains(row["id"].as_str().unwrap()), "{text}");
+        }
+        assert!(!text.contains(rows[10]["id"].as_str().unwrap()));
+        for expected in [
+            "Session ID prefix",
+            "give more of the ID",
+            "matches 12 Sessions",
+            "2 more matching Sessions omitted",
+            "[archived]",
+            "[active]",
+            "日本語\\u{1b}[31m\\u{a}ไทย",
+            "sessions list --archived",
+        ] {
+            assert!(text.contains(expected), "{text}");
+        }
+        assert!(!text.contains('\u{1b}'));
+        assert!(matches!(
+            &fixture.requests.lock().unwrap()[..],
+            [Request::ListSessions]
+        ));
+    }
+    *fixture.session_rows.lock().unwrap() = json!([
+        {"id":"id-first","name":"Same 日本語","created_at":"","updated_at":""},
+        {"id":"id-second","name":"same 日本語","archived":true,"created_at":"","updated_at":""}
+    ]);
+    let out = fixture.run(&["sessions", "show", "  SAME 日本語 "]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    let text = String::from_utf8(out.stderr).unwrap();
+    for expected in [
+        "Session name",
+        "choose one of the displayed IDs",
+        "id-first",
+        "id-second",
+        "[archived]",
+    ] {
+        assert!(text.contains(expected), "{text}");
+    }
+    for id in ["id-first", "id-second"] {
+        fixture.requests.lock().unwrap().clear();
+        let out = fixture.run(&["sessions", "show", id, "--json"]);
+        assert!(out.status.success());
+        assert_eq!(
+            serde_json::from_slice::<Value>(&out.stdout).unwrap(),
+            json!({"session_id":id,"messages":[],"future":true})
+        );
+        assert!(
+            matches!(&fixture.requests.lock().unwrap()[..],[Request::ListSessions,Request::GetSession{id:requested}] if requested==id)
+        );
+    }
+}
+
 impl Drop for Fixture {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
