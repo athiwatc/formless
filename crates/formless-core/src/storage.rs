@@ -4071,6 +4071,29 @@ impl Store {
         Ok(rows)
     }
 
+    /// Agent read projection: all metadata, only the selected code body.
+    /// Unrequested code is intentionally absent; selected code still decodes
+    /// as required text, preserving its conversion failures.
+    pub(crate) fn module_versions_for_read(
+        &self,
+        module_id: &str,
+        selected: i64,
+    ) -> Result<Vec<(i64, Option<String>, String, String)>> {
+        let mut stmt = self.ps("SELECT version, CASE WHEN version=?2 THEN code ELSE NULL END, author, created_at FROM module_versions WHERE module_id=?1 ORDER BY version")?;
+        let rows = stmt
+            .query_map(params![module_id, selected], |row| {
+                let version: i64 = row.get(0)?;
+                let code = if version == selected {
+                    Some(row.get::<_, String>(1)?)
+                } else {
+                    None
+                };
+                Ok((version, code, row.get(2)?, row.get(3)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
     /// Active Tools whose current code requires the module (by name).
     pub fn module_dependents(&self, name: &str) -> Result<Vec<String>> {
         let lower = name.to_lowercase();
