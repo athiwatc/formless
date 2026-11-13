@@ -1660,6 +1660,56 @@ bound. With the release on rebuild removed, two of them fail
 they are given: not measured, as before for everything outside this
 crate.
 
+### 16.12 The platform tree, checked automatically
+
+**Why this gap.** Every statement in §16.2 to §16.11 about what macOS is
+given came from hand-run inspection. It is the one acceptance claim here
+that could be made reproducible on this Mac with no screen reader, no
+person's input, no other platform and no budget decision.
+
+**What was added.** `scripts/check-platform-a11y.py` opens the release
+binary (built with `--features ax-dump`) three times in the background,
+never brought to the front and with nothing typed or clicked, lets it walk
+its own window's accessibility elements in process, and checks the walk.
+A new `--open-panel sessions|context` option opens a panel at start, as
+its toggle would, so a dialog can be checked without any input. It checks:
+the banner, navigation, main and status landmarks; the title as a heading;
+Session rows as pressable, selectable options with exactly one selected;
+blocks as named articles holding plain text with no markdown syntax; no
+dialog on the page; and, for the Sessions dialog at 480 x 360 and 200% and
+the Context dialog beside a docked sidebar at 1,100 x 900, that the dialog
+is the window's only child, is modal, has its contents, and holds GPUI's
+focus.
+
+**What it proves.** That this build's platform adapter, on this Mac,
+exposes those things. It ran clean against this build (18 checks), and
+failed against the `e0a131d` build, which gives markdown source and has no
+`--open-panel` (evidence `platform-check-*`). It does not prove anything
+about what VoiceOver says or does.
+
+**Limit found.** None of these windows reports focus to the platform:
+a window that has never been made key reports none, and these are never
+brought to the front. Focus is therefore checked in GPUI's own tree. The
+earlier hand-run walks showed platform focus only after key events had
+reached the window.
+
+### 16.13 What is left, and what each needs
+
+Nothing below can be closed here without something this checkout does not
+have. Phase 1 stays blocked on them.
+
+| Gate | Needs | State |
+|---|---|---|
+| What a screen reader says: rows, dialogs, live regions, plain text, task boxes | A person with VoiceOver on, and NVDA on Windows | Not run |
+| Session position and count on macOS | An AccessKit macOS adapter that exposes them, then VoiceOver | Blocked by the pinned adapter |
+| Keyboard, pointer, trackpad, a window brought to the front, menus | A person at the Mac | Only synthetic events to background windows |
+| Input methods (Thai, Japanese, dead keys) | A person with an input method | Not run |
+| 200% text seen by a person | A person | Captures and platform tree only |
+| Windows rendering and every Windows check after launch | The Windows PC, being done separately | Not accepted |
+| Linux | A Linux machine | Not run |
+| Performance budgets, including the accessible-text cost in a frontmost window | A budget decision, and a frontmost window | Provisional thresholds only |
+| Parity, packaging, signing, licence notices | Product decisions and the real client layer | Not started |
+
 ## 17. Windows: no first frame from `--smoke`
 
 Superseded in part by §17.6: the same binary has since passed under a

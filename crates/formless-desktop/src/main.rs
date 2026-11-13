@@ -32,6 +32,9 @@
 //!   would; for measuring what that costs while streaming.
 //! - `--stream-markdown`: stream markdown (lists, task items, quotes, code)
 //!   instead of plain words.
+//! - `--open-panel sessions|context`: open that panel at start, as its
+//!   toggle would (a modal dialog where the window is too narrow to dock
+//!   it), so a window's accessibility tree can be checked with no input.
 //! - `--smoke`: print startup timings up to the first rendered frame, quit.
 //! - `--stream-seconds S` (with `--stream-rate R`, default 100 deltas per
 //!   second; 0 streams nothing and measures the idle window): stream into
@@ -61,6 +64,7 @@ struct Options {
     text_scale: usize,
     window: (f32, f32),
     keep_window: bool,
+    open_panel: Option<bool>,
     background: bool,
     lifetime_seconds: usize,
     dump_a11y: Option<String>,
@@ -80,6 +84,7 @@ fn parse_options() -> Result<Options, String> {
         text_scale: 100,
         window: (1440., 900.),
         keep_window: false,
+        open_panel: None,
         background: false,
         lifetime_seconds: 0,
         dump_a11y: None,
@@ -111,6 +116,17 @@ fn parse_options() -> Result<Options, String> {
                     .ok_or(format!("--window: {value:?} is not WIDTHxHEIGHT"))?;
             }
             "--keep-window" => options.keep_window = true,
+            "--open-panel" => {
+                options.open_panel = match args.next().as_deref() {
+                    Some("sessions") => Some(true),
+                    Some("context") => Some(false),
+                    other => {
+                        return Err(format!(
+                            "--open-panel: {other:?} is not sessions or context"
+                        ))
+                    }
+                };
+            }
             "--background" => options.background = true,
             "--lifetime" => options.lifetime_seconds = count("--lifetime")?,
             "--dump-platform-a11y" => {
@@ -579,6 +595,9 @@ fn main() {
                     shell.set_text_scale(scale, window, cx)
                 } else {
                     shell.set_text_scale_growing_window(scale, window, cx)
+                }
+                if let Some(sessions) = options.open_panel {
+                    shell.open_panel(sessions, window, cx);
                 }
             });
             shell

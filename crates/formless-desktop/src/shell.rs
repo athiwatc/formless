@@ -1290,6 +1290,24 @@ impl Shell {
         cx.notify();
     }
 
+    /// Open the Sessions or the Context panel, as its toggle does: docked
+    /// where the window is wide enough, otherwise as a modal dialog. For
+    /// checking a real window's accessibility tree with no input at all.
+    pub fn open_panel(&mut self, sessions: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let region = if sessions {
+            Region::Sidebar
+        } else {
+            Region::Inspector
+        };
+        let open = match region {
+            Region::Sidebar => self.layout(window).sidebar != SidebarMode::Collapsed,
+            _ => self.layout(window).inspector != InspectorMode::Hidden,
+        };
+        if !open {
+            self.toggle_panel(region, window, cx);
+        }
+    }
+
     fn toggle_panel(&mut self, region: Region, window: &mut Window, cx: &mut Context<Self>) {
         let width = self.effective_width(window);
         match region {

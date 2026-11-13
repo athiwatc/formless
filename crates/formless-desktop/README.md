@@ -69,6 +69,11 @@ cargo run --release --locked -- --stream-seconds 30 --stream-rate 100
 # The model's share of that work alone: no window, no GPUI in the build.
 cargo run --release --no-default-features --locked --example stream_model
 
+# Check what a real macOS window gives assistive technology: three windows in
+# the background, nothing typed or clicked; exit 0 when every check holds.
+cargo build --release --locked --features ax-dump
+python3 scripts/check-platform-a11y.py "$CARGO_TARGET_DIR/release/formless-desktop" /tmp/a11y-check
+
 # For looking at a real window from outside: open it without coming to the
 # front, quit after ten minutes, and write out the accessibility tree GPUI
 # hands the platform and (macOS, `ax-dump` feature) the one the platform
