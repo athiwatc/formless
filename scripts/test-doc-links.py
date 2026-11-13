@@ -40,6 +40,33 @@ class LinkChecks(unittest.TestCase):
     def test_empty_releases_index_valid(self):
         links.validate_repository_url(ROOT + "/releases", lambda p: [])
 
+    def test_changelog_release_and_comparison(self):
+        for suffix, expected in [
+            ("/releases/tag/v0.1.0", "/releases/tags/v0.1.0"),
+            ("/compare/v0.1.0...HEAD", "/compare/v0.1.0...HEAD"),
+        ]:
+            calls = []
+            links.validate_repository_url(ROOT + suffix, lambda p: calls.append(p) or {})
+            self.assertEqual(calls, [expected])
+
+    def test_missing_changelog_targets_fail(self):
+        def missing(path):
+            raise ValueError("HTTP 404")
+        for suffix in ["/releases/tag/missing", "/compare/missing...HEAD"]:
+            with self.subTest(suffix=suffix), self.assertRaises(ValueError):
+                links.validate_repository_url(ROOT + suffix, missing)
+
+    def test_unsafe_changelog_forms_fail_before_api(self):
+        def unexpected(path):
+            self.fail("unexpected API request: " + path)
+        for suffix in ["/releases/tag/../secret", "/releases/tag/v1?x=1",
+                       "/releases/tag/v1%2fother", "/compare/...HEAD",
+                       "/compare/base...", "/compare/base....HEAD",
+                       "/compare/base...HEAD?x=1", "/compare/base...HEAD#unknown",
+                       "/compare/base...other/repo", "/compare/base%2f..%2f...HEAD"]:
+            with self.subTest(suffix=suffix), self.assertRaises(ValueError):
+                links.validate_repository_url(ROOT + suffix, unexpected)
+
     def test_issue_navigation(self):
         for suffix in ["/issues", "/issues/new?labels=bug", "/issues/new?labels=enhancement"]:
             links.validate_repository_url(ROOT + suffix, lambda p: {"has_issues": True})
