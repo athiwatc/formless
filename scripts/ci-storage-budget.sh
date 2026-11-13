@@ -11,8 +11,22 @@ snapshot() {
   echo "=== CI storage: $1 ==="
   echo "dev.debug=${CARGO_PROFILE_DEV_DEBUG:-default} test.debug=${CARGO_PROFILE_TEST_DEBUG:-default} incremental=${CARGO_INCREMENTAL:-default}"
   df -Pk "$ci_root" "${RUNNER_TEMP:?}"
-  for ci_path in "$ci_root/target" "${CARGO_HOME:-$HOME/.cargo}" "${ci_tool_target:-}"; do
-    if [[ -n "$ci_path" && -d "$ci_path" ]]; then du -sk "$ci_path"; fi
+  local -a ci_paths=("$ci_root/target" "${CARGO_TARGET_DIR:-}" "${CARGO_HOME:-$HOME/.cargo}" "${ci_tool_target:-}")
+  local -a ci_labels=("checkout target" "CARGO_TARGET_DIR" "Cargo home" "packaging tool target")
+  local -a ci_seen=()
+  local ci_index ci_path ci_physical ci_prior ci_duplicate
+  for ci_index in "${!ci_paths[@]}"; do
+    ci_path=${ci_paths[$ci_index]}
+    [[ -n "$ci_path" && -d "$ci_path" ]] || continue
+    ci_physical=$(cd "$ci_path" && pwd -P)
+    ci_duplicate=false
+    for ci_prior in "${ci_seen[@]-}"; do
+      if [[ "$ci_prior" = "$ci_physical" ]]; then ci_duplicate=true; break; fi
+    done
+    if $ci_duplicate; then continue; fi
+    ci_seen+=("$ci_physical")
+    printf 'storage %s: ' "${ci_labels[$ci_index]}"
+    du -sk "$ci_path"
   done
 }
 
