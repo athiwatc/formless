@@ -1298,7 +1298,10 @@ impl Shell {
 
     /// Show a decoded `GetSession` reply ([`crate::replies`]) as the open
     /// Session's timeline, in place of what it showed, a stream in progress
-    /// included: the reply is the daemon's whole, current transcript.
+    /// included. This is a low-level fixture/view seam, not a client reply
+    /// handler: it checks the Session id, not request age or event ordering.
+    /// A future client must establish those before calling it. The unwired
+    /// `snapshot_guard` provides local ownership/overlap checks only.
     ///
     /// A snapshot for any Session but the open one is refused and nothing
     /// changes, so a late reply never puts one Session's transcript under

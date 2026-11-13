@@ -27,6 +27,7 @@ not see GPUI. Run every command below from this directory.
 | `src/commands.rs` | Typed shell command registry and palette search | none |
 | `src/replies.rs` | Read-only, validated `ListSessions` / `GetSession` decoding | none |
 | `src/transcript.rs` | Pure transcript event application, canonical completion replacement and sticky reload-needed state; not connected to the shell or a transport yet | none |
+| `src/snapshot_guard.rs` | Unwired local Session/attachment/request ownership guard; stale replies refused before decoding, observed event overlap requests retry, no transport-ordering guarantee | none |
 | `src/full_view.rs` | Grapheme-safe, measured-width row index with bounded shaping candidates for the full-output view | none |
 | `src/memory.rs` | Memory policy: composer limit, whole-edit rejection bookkeeping, undo accounting, text-free intent records | none |
 | `src/timeline.rs` | Timeline blocks, a bounded movable window onto each long block, streamed tails rebuilt when shown and update coalescing | none |

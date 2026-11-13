@@ -14,6 +14,7 @@ pub mod replies;
 pub mod search;
 #[cfg(feature = "gui")]
 pub mod shell;
+pub mod snapshot_guard;
 #[cfg(feature = "thai-breaks")]
 pub mod thai;
 pub mod timeline;

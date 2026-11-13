@@ -9,14 +9,41 @@
 //!
 //! Gaps are explicit and sticky until a new snapshot replaces the state.
 //! This layer does not request that snapshot or alter Run/composer state.
-//! Snapshot/event ordering, reconnect generations and request identity
-//! still belong to the future transport; this is not a replay protocol.
+//! `snapshot_guard` separately rejects retired local request/context tags
+//! and observed snapshot/event overlap. Protocol ordering and recovery still
+//! belong to the future client/transport; neither module is a replay protocol.
 
 use formless_protocol::{DroppedEventKind, Event, MessageInfo};
 
 use crate::model::BlockKind;
 use crate::replies::{block_kind, message_sequence, DecodeError, SessionSnapshot};
 use crate::timeline::{Timeline, TimelineBlock};
+
+/// Shared relevance classification for transcript application and snapshot
+/// ordering. This does not decode messages or prove that an event is valid.
+/// An unscoped transcript/legacy/unknown drop warning affects every Session.
+pub(crate) fn affects_transcript(event: &Event, session_id: &str) -> bool {
+    if event.session_id().is_some_and(|id| id != session_id) {
+        return false;
+    }
+    match event {
+        Event::MessageAppended { .. }
+        | Event::MessageDelta { .. }
+        | Event::MessageComplete { .. }
+        | Event::MessagesEdited { .. }
+        | Event::StreamRestarted { .. } => true,
+        Event::DeltasDropped { kinds, .. } => {
+            kinds.is_empty()
+                || kinds.iter().any(|kind| {
+                    matches!(
+                        kind,
+                        DroppedEventKind::MessageDelta | DroppedEventKind::Unknown
+                    )
+                })
+        }
+        _ => false,
+    }
+}
 
 /// Persisted sequences are nonnegative i64s, so this id cannot collide
 /// with one. It lives only until the partial answer is replaced/discarded.
@@ -175,7 +202,7 @@ impl Transcript {
     pub fn apply(&mut self, event: &Event) -> Change {
         // Only an unscoped DeltasDropped warning can affect this Session
         // without naming it. Unrelated global/Run/security events do not.
-        if event.session_id().is_some_and(|id| id != self.session_id) {
+        if !affects_transcript(event, &self.session_id) {
             return Change::default();
         }
         match event {
@@ -214,15 +241,7 @@ impl Transcript {
                 change.timeline_changed = self.discard_stream();
                 change
             }
-            Event::DeltasDropped { kinds, run_id, .. }
-                if kinds.is_empty()
-                    || kinds.iter().any(|kind| {
-                        matches!(
-                            kind,
-                            DroppedEventKind::MessageDelta | DroppedEventKind::Unknown
-                        )
-                    }) =>
-            {
+            Event::DeltasDropped { run_id, .. } => {
                 // An old Run's warning cannot erase this Run's partial
                 // text. It still marks a gap in this Session's history.
                 let discard = run_id.is_empty() || !self.different_run(run_id);

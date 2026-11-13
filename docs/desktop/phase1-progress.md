@@ -19,7 +19,8 @@ and the crate still optional (detached workspace, not a default build).
 | Width-checked full output and source invalidation | `1b960542` | `full_view::measured_row_starts` checks the actual shaped advance of each candidate, then shortens on grapheme boundaries; an ASCII count is only a hint. Each measurement is at most 8 KiB/256 graphemes, uses a separate short-lived GPUI text system (64 queries per batch), and has a 128-entry borrowed-key fit memo, so the window's frame cache does not retain a layout of the whole transcript. An oversized/too-wide indivisible character gets an explanation and Copy all instead of silent clipping. Exact pixel width/full font changes reindex the view. A new snapshot or Session invalidates it, so old offsets cannot slice shorter or different UTF-8 text, even at the same id and byte length. The summary is a bounded, focusable scroll region above pinned buttons, after a 480x360/200% test exposed overflow before and after copying. Retained offsets are boxed, with no spare vector capacity. | 6 model, 4 shell; 2 real-font states added and compiled, not run |
 | Fixture Sessions directory | `8ec921ee` | A virtualized, read-only Sessions destination over the existing unarchived sidebar projection. All-word, case-insensitive title/preview/ID filter; processed queries capped at 256 Unicode scalar values; bounded visual labels; selection retained by ID without activation, and kept in view after filtering. Arrows/Enter work in the filter or after F6 enters the region; Escape/Back returns to Chat. Enter/Escape during input-method composition only commit it. Activation revalidates the ID and uses the existing draft lifecycle. A decoded snapshot is cleared on Session change instead of relabeled; loaded empty and not-yet-loaded states are distinct. The fixture explicitly shares synthetic content; no rename/archive/delete, transport or backend action exists. | 4 model, 9 shell; 2 native render states added and compiled only |
 | Modal navigation and stale focus | `eb9d4913` | Commands replaces an open whole-output view; explicit navigation also dismisses it. Snapshot replacement drops obsolete conversation-row restore origins even when Commands has already replaced the viewer. | 2 shell; independent read-only review |
-| Loaded-text Search | This change | Commands → Go to Search opens a virtualized, read-only literal, case-sensitive, non-overlapping search over finished text already loaded in this window, including Markdown source. Explicit fixture/loaded-Session/unloaded scope; 256-scalar accepted query, 200 results, 4 MiB source-prefix and 4096-block scan bounds; partial and live-tail notices. Visible snippets have bounded grapheme context and a named preview limit. Result activation revalidates the captured corpus revision, current query, block identity and exact UTF-8 range before opening whole output at the match. Snapshot/Session/stream boundaries invalidate results, but live deltas do not rescan. Back preserves drafts and the Sessions filter; IME composition commits without activation/navigation. No I/O, history loading or backend actions. | 8 model, 11 shell; 2 native render states compiled only; independent read-only review |
+| Loaded-text Search | `ca612b32` | Commands → Go to Search opens a virtualized, read-only literal, case-sensitive, non-overlapping search over finished text already loaded in this window, including Markdown source. Explicit fixture/loaded-Session/unloaded scope; 256-scalar accepted query, 200 results, 4 MiB source-prefix and 4096-block scan bounds; partial and live-tail notices. Visible snippets have bounded grapheme context and a named preview limit. Result activation revalidates the captured corpus revision, current query, block identity and exact UTF-8 range before opening whole output at the match. Snapshot/Session/stream boundaries invalidate results, but live deltas do not rescan. Back preserves drafts and the Sessions filter; IME composition commits without activation/navigation. No I/O, history loading or backend actions. | 8 model, 11 shell; 2 native render states compiled only; independent read-only review |
+| Snapshot request ownership guard | This change | `src/snapshot_guard.rs` (no GPUI/I/O): opaque per-attachment and per-request tickets, one current pending request, no event buffer or transcript copy. New Session/connection contexts retire old work even for A→B→A or same-id reattachment; stale, duplicate and cancelled replies are refused before decoding. Relevant events observed during a request require retry rather than speculative replay. Shared event relevance classification with the transcript model. Still unwired: success proves local ownership/no observed overlap, not a server cutoff or recovered client. | 10 model; independent read-only review |
 
 One deliberate behaviour change came with the registry: while an input
 method is composing in the composer, Send/Steer/Queue are unavailable
@@ -142,6 +143,35 @@ compiled, not run; the earlier pasteboard/XPC restriction was not retried
 or bypassed. Real-font pixels, native assistive-technology behavior and
 actual input methods remain open acceptance work.
 
+
+Snapshot ownership follow-up evidence (local, git-ignored):
+`.screenshots/gpui-1753-phase0/p1-sol-snapshot-guard-run1/`. The final offline
+checks passed: fmt, all four clippy configurations, GUI-free model tests
+(134), feature-enabled model tests (139), shell tests (110), Python checker
+tests (8), and doc tests. Ten added model tests cover supersession,
+one-shot tickets, wrong-guard ownership, A→B→A, same-Session reattachment,
+retired events, cancellation/detach, named decoding errors, foreign replies,
+non-transcript versus transcript/global gap events, counter exhaustion and
+retaining live text when an overlapping reply is rejected. The preliminary
+focused run caught a test expecting the wrong existing decoder error for a
+null result; its expected named `Malformed` error was corrected, not the
+decoder. Independent read-only review found no code blocker and required
+the ordering limitation below to be explicit.
+
+**This guard is not snapshot/event linearization.** `GetSession` currently
+has no event watermark (`formless-protocol`'s request/response and event
+shapes; `formless-core/src/daemon.rs`'s snapshot reply). A reply with no
+observed interleaving may still be followed by a delayed event already in
+it. Future integration must establish the server/transport ordering and
+serialize event observation/application with resolve plus snapshot
+installation, or revalidate queued work. Only then can it safely clear
+recovery/gap state. The conservative observed-overlap policy can require
+repeated retries during active streaming; no automatic retry cadence,
+reconnect behavior, Run-state restoration or socket code was added.
+`Shell::show_session_snapshot` remains a low-level fixture/view seam that
+checks the Session id, not request freshness, and must not be connected
+directly to unguarded asynchronous replies. No native renderer was run.
+
 ## Not done, and what each needs
 
 ### Phase 0 gates (still open; nothing in Phase 1 closes them)
@@ -162,7 +192,7 @@ actual input methods remain open acceptance work.
 |---|---|---|
 | Command registry and palette | Done (above) | |
 | Header toggles exposed as toggle buttons (pressed state) | Not done: the kit's `Button::toggled` would change their platform role, which the macOS tree check (§16.12) would need to re-baseline | A real-window check run in the background |
-| Typed decoding of daemon replies into the presentation model | `ListSessions`, `GetSession` and pure transcript-event application done (above); Run events and shell/client integration not started | Snapshot/event ordering and client reconciliation before transport integration |
+| Typed decoding of daemon replies into the presentation model | `ListSessions`, `GetSession`, pure transcript-event application and a local snapshot ownership guard done (above); Run events and ordered shell/client integration not started | Snapshot/event ordering and client reconciliation before transport integration |
 | Client transport (connect, reconnect, version check, idempotent send) | Not started | Decision §5.2: extract `formless-client` or depend on `formless-tui` |
 | Transcript paging | Not possible without a protocol change | Daemon work outside this epic (§5.3) |
 | Destinations other than Chat | Sessions has a read-only fixture directory and Search covers finished loaded text only; Tools, Metrics, Proposals and Settings remain scaffold notices | The client layer for real data; further UI-only slices can use fixtures |
@@ -176,8 +206,9 @@ actual input methods remain open acceptance work.
 
 **Client reconciliation before transport.** The pure transcript model
 still needs a shell/client boundary that visibly reports its sticky
-reload-needed state and reconciles snapshot request generations before a
-transport is connected. Run lifecycle events and the extraction-versus-TUI
+reload-needed state and installs snapshots/events in a characterized
+order. The local ownership guard does not supply that protocol ordering.
+It must be integrated before a transport is connected. Run lifecycle events and the extraction-versus-TUI
 client decision remain separate work. No backend writes, auth or
 security-control changes are implied by the completed fixture/loaded-text
 UI slices. Do not present an unloaded Session as searched or reuse source
