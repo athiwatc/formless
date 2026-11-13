@@ -24,8 +24,37 @@ case "$nudge" in true|false) ;; *) echo "NUDGE must be true or false (got '$nudg
 
 # Short paths: the daemon's socket path must fit in sun_path.
 work="$(mktemp -d /tmp/fl-eval.XXXX)"
-trap 'FORMLESS_DATA_DIR="$work/d" FORMLESS_CONFIG_DIR="$work/c" "$bin" daemon stop >/dev/null 2>&1 || true; rm -rf "$work"' EXIT
-mkdir -p "$work/d" "$work/c" "$work/repo/src"
+active_data=""
+run_pid=""
+stop_active() {
+  [ -n "$active_data" ] || return 0
+  FORMLESS_DATA_DIR="$active_data" FORMLESS_CONFIG_DIR="$work/c" "$bin" daemon stop >/dev/null 2>&1 || return 1
+  # These short private data roots always use the local Unix socket. The
+  # daemon removes its ownership lock and endpoint only during shutdown.
+  tries=0
+  while [ -e "$active_data/daemon.lock" ] || [ -e "$active_data/daemon.sock" ]; do
+    tries=$((tries + 1))
+    [ "$tries" -lt 50 ] || return 1
+    sleep 0.1
+  done
+  active_data=""
+}
+cleanup() {
+  if [ -n "$run_pid" ]; then
+    kill "$run_pid" 2>/dev/null || true
+    wait "$run_pid" 2>/dev/null || true
+  fi
+  if ! stop_active; then
+    echo "error: eval daemon shutdown unverified; retained $work" >&2
+    return
+  fi
+  rm -rf "$work"
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+mkdir -p "$work/c" "$work/repo/src"
 printf 'fn main() {\n    // TODO: parse args\n    // TODO: print help\n}\n' > "$work/repo/src/main.rs"
 printf '# TODO: write docs\n' > "$work/repo/README.md"
 cat > "$work/c/config.toml" <<EOF
@@ -38,19 +67,31 @@ enabled = false
 [skills]
 auto_create = false
 EOF
-export FORMLESS_DATA_DIR="$work/d" FORMLESS_CONFIG_DIR="$work/c"
+export FORMLESS_CONFIG_DIR="$work/c"
 
 tasks="Count the TODO comments in $work/repo and tell me the number.
 Fetch https://example.com and tell me the page title.
 List the files under $work/repo with their sizes in bytes.
 How many lines does $work/repo/src/main.rs have?"
 
-total=0; hits=0
+total=0; hits=0; task_index=0
 while IFS= read -r task; do
+  task_index=$((task_index + 1))
   n=0; ok=0
   while [ "$n" -lt "$runs" ]; do
     n=$((n + 1))
-    out="$("$bin" run --yes --json --answer "no" "$task" 2>/dev/null || true)"
+    active_data="$work/d.$task_index.$n"
+    mkdir -p "$active_data"
+    export FORMLESS_DATA_DIR="$active_data"
+    "$bin" run --yes --json --answer "no" "$task" >"$work/run.out" 2>/dev/null &
+    run_pid=$!
+    wait "$run_pid" || true
+    run_pid=""
+    out="$(cat "$work/run.out")"
+    if ! stop_active; then
+      echo "error: could not stop the eval daemon for task $task_index Run $n" >&2
+      exit 1
+    fi
     if printf '%s\n' "$out" | grep -q '"type":"tool_call_started".*"tool_name":"\(find_tools\|create_tool\)"'; then
       ok=$((ok + 1))
     fi
