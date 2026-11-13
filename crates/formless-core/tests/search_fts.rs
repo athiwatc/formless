@@ -76,3 +76,118 @@ fn existing_messages_are_indexed_on_upgrade() {
     let store = Store::open(&db).unwrap();
     assert_eq!(store.search_sessions("invoice", 10).unwrap().len(), 1);
 }
+
+#[test]
+fn tied_search_results_follow_recording_order_in_both_sql_paths() {
+    let root = std::env::temp_dir().join(format!("fl-search-order-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let db = root.join("data.db");
+    let store = Store::open(&db).unwrap();
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let session = store.create_session(Some("ไทย 日本語".into())).unwrap().id;
+    let mut ids = Vec::new();
+    for _ in 0..3 {
+        let message = store
+            .append_message(&session, "user", "ไทย needle ?? 日本語")
+            .unwrap();
+        conn.execute(
+            "UPDATE messages SET created_at='2026-01-02T00:00:00Z' WHERE id=?1",
+            [&message.id],
+        )
+        .unwrap();
+        ids.push(message.id);
+    }
+    for query in ["needle", "??"] {
+        let hits = store.search_sessions(query, 10).unwrap();
+        assert_eq!(
+            hits.iter().map(|h| &h.message_id).collect::<Vec<_>>(),
+            ids.iter().rev().collect::<Vec<_>>()
+        );
+        for limit in [0, 1] {
+            assert_eq!(
+                store.search_sessions(query, limit).unwrap()[0].message_id,
+                ids[2]
+            );
+        }
+        assert!(hits.iter().all(|hit| hit.session_id == session
+            && hit.session_name == "ไทย 日本語"
+            && hit.role == "user"
+            && hit.snippet.contains("日本語")));
+    }
+    // The timestamp key still dominates row insertion order in both paths.
+    conn.execute(
+        "UPDATE messages SET created_at='2026-01-03T00:00:00Z' WHERE id=?1",
+        [&ids[0]],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE messages SET created_at='2026-01-01T00:00:00Z' WHERE id=?1",
+        [&ids[2]],
+    )
+    .unwrap();
+    for query in ["needle", "??"] {
+        assert_eq!(
+            store
+                .search_sessions(query, 10)
+                .unwrap()
+                .iter()
+                .map(|h| &h.message_id)
+                .collect::<Vec<_>>(),
+            ids.iter().collect::<Vec<_>>()
+        );
+    }
+    for _ in 0..205 {
+        store
+            .append_message(&session, "assistant", "ไทย needle ?? 日本語")
+            .unwrap();
+    }
+    assert_eq!(
+        store.search_sessions("needle", usize::MAX).unwrap().len(),
+        200
+    );
+    assert_eq!(store.search_sessions("??", 201).unwrap().len(), 200);
+    assert!(store.search_sessions("", 10).unwrap().is_empty());
+    assert!(store
+        .search_sessions("no_matching_token", 10)
+        .unwrap()
+        .is_empty());
+    drop(conn);
+    drop(store);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn search_relevance_still_precedes_newer_timestamps_and_rowids() {
+    let root = std::env::temp_dir().join(format!("fl-search-score-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let db = root.join("data.db");
+    let store = Store::open(&db).unwrap();
+    let session = store.create_session(None).unwrap().id;
+    let repeated = store
+        .append_message(&session, "user", "needle needle needle needle needle")
+        .unwrap();
+    let newer = store
+        .append_message(&session, "assistant", "needle and several unrelated words")
+        .unwrap();
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute(
+        "UPDATE messages SET created_at=?2 WHERE id=?1",
+        rusqlite::params![repeated.id, "2026-01-01T00:00:00Z"],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE messages SET created_at=?2 WHERE id=?1",
+        rusqlite::params![newer.id, "2026-01-03T00:00:00Z"],
+    )
+    .unwrap();
+    let rows: Vec<(String,f64)>=conn.prepare("SELECT m.id,bm25(messages_fts) FROM messages_fts f JOIN messages m ON m.rowid=f.rowid WHERE messages_fts MATCH '\"needle\"*' ORDER BY bm25(messages_fts),m.created_at DESC").unwrap().query_map([],|row|Ok((row.get(0)?,row.get(1)?))).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+    assert!(rows[0].1 < rows[1].1);
+    assert_eq!(rows[0].0, repeated.id);
+    assert_eq!(
+        store.search_sessions("needle", 1).unwrap()[0].message_id,
+        repeated.id
+    );
+    drop(conn);
+    drop(store);
+    std::fs::remove_dir_all(root).unwrap();
+}
