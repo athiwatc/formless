@@ -36,6 +36,7 @@ rm -f "$probe"
 # Shell completions under $PREFIX/share, where bash-completion, zsh (with
 # $PREFIX/share/zsh/site-functions on fpath) and fish look for them.
 install_completion() {
+  mkdir -p "$(dirname "$2")" 2>/dev/null || return 1
   completion_tmp=$(mktemp "$(dirname "$2")/.formless-completion.XXXXXX") || return 1
   if "$bin" completions "$1" > "$completion_tmp" && [ -s "$completion_tmp" ] &&
       chmod 644 "$completion_tmp" && mv -f "$completion_tmp" "$2"; then
@@ -47,8 +48,6 @@ install_completion() {
 
 install_completions() {
   bin="$PREFIX/bin/formless"
-  mkdir -p "$PREFIX/share/bash-completion/completions" "$PREFIX/share/zsh/site-functions" \
-    "$PREFIX/share/fish/vendor_completions.d"
   completion_failed=""
   for completion_shell in bash zsh fish; do
     case "$completion_shell" in
@@ -193,8 +192,12 @@ fetch "$RELEASES/$version/$asset.sha256" "$tmp/$asset.sha256" || die "could not 
 tar -xzf "$tmp/$asset" -C "$tmp"
 install_file "$tmp/formless-$version-$target/formless" "$PREFIX/bin/formless" 755
 if [ -f "$tmp/formless-$version-$target/formless.1" ]; then
-  mkdir -p "$PREFIX/share/man/man1"
-  install_file "$tmp/formless-$version-$target/formless.1" "$PREFIX/share/man/man1/formless.1" 644
+  if mkdir -p "$PREFIX/share/man/man1" 2>/dev/null &&
+      (install_file "$tmp/formless-$version-$target/formless.1" "$PREFIX/share/man/man1/formless.1" 644) 2>/dev/null; then
+    :
+  else
+    echo "note: could not install the optional man page in $PREFIX/share/man/man1" >&2
+  fi
 fi
 printf 'installed: %s/bin/formless (%s)\n' "$PREFIX" "$version"
 install_completions
