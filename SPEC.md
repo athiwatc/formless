@@ -2337,6 +2337,25 @@ are unchanged.
 
 ### 7.9 External MCP servers
 
+`formless mcp prompts [--json]` reports prompts from reachable enabled servers,
+in daemon order. Discovery can start configured servers and silently skips
+connection/list failures, so results may be incomplete. `formless mcp prompt
+SERVER NAME --arg key=value [--arg empty=] [--json]` sends named string values
+to the selected server. Values preserve spaces, additional equals and empty
+strings; missing separators, empty keys and duplicate keys are usage errors
+before daemon contact. Human output is the returned text verbatim, including
+its trailing-newline state. The daemon projects `content.text` strings joined
+with blank lines; roles and non-text parts are absent. JSON preserves the full
+discovery array or daemon text report, not raw MCP messages. These commands do
+not submit to a Session or change server configuration; server/daemon errors
+retain their ordinary exit behavior, without promised local required/unknown
+argument checks.
+
+```sh
+formless mcp prompts --json
+formless mcp prompt docs summarize --arg 'topic=Unicode notes' --arg suffix=
+```
+
 Formless can use the tools of external MCP servers alongside its own.
 None ship by default (principle 1).
 
@@ -4925,7 +4944,7 @@ the TUI. Command-specific arguments and defaults are available through
 | `formless import-all` | `FILE` | Add a portable setup bundle without overwriting existing entries. |
 | `formless jobs` | `list`, `add`, `run`, `history`, `enable`, `disable`, `rm` | Manage scheduled prompts and inspect their history. |
 | `formless logs` | `--follow`, `--level`, `--since`, `--lines` | Read or follow the daemon log and rotated files. |
-| `formless mcp` | `add`, `remove`, `list`, `test`, `login`, `logout`, `catalog`, `import`, `log`, `tools`, `tool` | Manage external MCP servers and inspect their tools/logs. |
+| `formless mcp` | `add`, `remove`, `list`, `test`, `login`, `logout`, `catalog`, `import`, `log`, `tools`, `tool`, `prompts`, `prompt` | Manage external MCP servers and inspect their tools/logs. |
 | `formless memory` | `list`, `add`, `rm`, `edit` | Inspect or change saved user-memory notes. |
 | `formless naming` | `status`, `pull`, `test` | Inspect, install, or preview the embedded Session-naming model. |
 | `formless prices` | `import` | Import a model-price catalog for cost and spending limits. |
