@@ -35,15 +35,36 @@ rm -f "$probe"
 
 # Shell completions under $PREFIX/share, where bash-completion, zsh (with
 # $PREFIX/share/zsh/site-functions on fpath) and fish look for them.
+install_completion() {
+  completion_tmp=$(mktemp "$(dirname "$2")/.formless-completion.XXXXXX") || return 1
+  if "$bin" completions "$1" > "$completion_tmp" && [ -s "$completion_tmp" ] &&
+      chmod 644 "$completion_tmp" && mv -f "$completion_tmp" "$2"; then
+    return 0
+  fi
+  rm -f "$completion_tmp"
+  return 1
+}
+
 install_completions() {
   bin="$PREFIX/bin/formless"
   mkdir -p "$PREFIX/share/bash-completion/completions" "$PREFIX/share/zsh/site-functions" \
     "$PREFIX/share/fish/vendor_completions.d"
-  "$bin" completions bash > "$PREFIX/share/bash-completion/completions/formless" &&
-    "$bin" completions zsh > "$PREFIX/share/zsh/site-functions/_formless" &&
-    "$bin" completions fish > "$PREFIX/share/fish/vendor_completions.d/formless.fish" &&
-    echo "completions: $PREFIX/share/{bash-completion,zsh/site-functions,fish/vendor_completions.d}" ||
-    echo "note: could not install shell completions (formless completions <shell> prints them)" >&2
+  completion_failed=""
+  for completion_shell in bash zsh fish; do
+    case "$completion_shell" in
+      bash) completion_dest="$PREFIX/share/bash-completion/completions/formless" ;;
+      zsh) completion_dest="$PREFIX/share/zsh/site-functions/_formless" ;;
+      fish) completion_dest="$PREFIX/share/fish/vendor_completions.d/formless.fish" ;;
+    esac
+    if ! install_completion "$completion_shell" "$completion_dest"; then
+      completion_failed="$completion_failed $completion_shell"
+    fi
+  done
+  if [ -z "$completion_failed" ]; then
+    echo "completions: $PREFIX/share/{bash-completion,zsh/site-functions,fish/vendor_completions.d}"
+  else
+    echo "note: could not install completions for:$completion_failed (formless completions <shell> prints them)" >&2
+  fi
 }
 
 # Quote literal paths, including spaces, quotes, dollars and backslashes.

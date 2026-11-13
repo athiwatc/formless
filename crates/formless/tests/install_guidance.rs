@@ -263,3 +263,59 @@ fn unsupported_arm_linux_names_prerequisites_before_any_download() {
     assert!(!fixture.dir.join("install-calls").exists());
     assert!(!fixture.dir.join("binary-calls").exists());
 }
+
+#[test]
+fn failed_or_empty_completions_keep_old_files_and_try_every_shell() {
+    for mode in ["failure", "empty"] {
+        let fixture = Fixture::new();
+        let paths = [
+            "share/bash-completion/completions/formless",
+            "share/zsh/site-functions/_formless",
+            "share/fish/vendor_completions.d/formless.fish",
+        ];
+        for path in paths {
+            let path = fixture.prefix.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "old completion\n").unwrap();
+        }
+        executable(
+            &fixture.dir.join("mock-formless"),
+            r#"#!/bin/sh
+printf '%s %s\n' "$1" "${2:-}" >> "$BINARY_CALLS"
+if [ "$2" = zsh ]; then
+  if [ "$FAIL_MODE" = failure ]; then printf 'partial output'; exit 9; fi
+  exit 0
+fi
+printf '# updated %s completion\n' "$2"
+"#,
+        );
+        let output = fixture
+            .command(Some("/bin/sh"))
+            .env("FAIL_MODE", mode)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("for: zsh"));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("Next: run formless"));
+        for (index, path) in paths.iter().enumerate() {
+            let path = fixture.prefix.join(path);
+            let text = std::fs::read_to_string(&path).unwrap();
+            if index == 1 {
+                assert_eq!(text, "old completion\n");
+            } else {
+                assert!(text.starts_with("# updated"));
+            }
+            assert_eq!(
+                std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+                1,
+                "temporary file leaked"
+            );
+        }
+        let calls = std::fs::read_to_string(fixture.dir.join("binary-calls")).unwrap();
+        assert!(
+            calls.contains("completions bash")
+                && calls.contains("completions zsh")
+                && calls.contains("completions fish")
+        );
+    }
+}
