@@ -247,3 +247,76 @@ test('lazy and marked container underlines converge across streamed prefixes', (
     assert.deepEqual([...c.markdown(stable).children,...c.markdown(tail).children].map(shape),c.markdown(completed).children.map(shape),completed);
   }
 });
+
+
+test('a completed quoted Setext heading ends lazy continuation of that paragraph', () => {
+  const c=fixture();
+  for(const source of [
+    '> Foo\n> ===\nOutside','> Foo\n> ---\nOutside',
+    '> Foo\nbar\n> ===\nOutside','> > Foo\n> > ===\nOutside',
+    '> [!NOTE]\n> Foo\n> ===\nOutside','> - Foo\n>   ===\nOutside',
+  ]) {
+    const root=c.markdown(source);
+    assert.deepEqual(root.children.map(n=>n.tag),['blockquote','p'],source);
+    assert.equal(plain(root.children[1]),'Outside',source);
+    assert.equal(plain(root.children[0]).includes('Outside'),false,source);
+  }
+  for(const source of ['> Foo\n===\nOutside','> ===\nOutside','> Foo\n> ===\n> Bar\nOutside','> Foo\n> ===\n> ===\nOutside']) {
+    const root=c.markdown(source);
+    assert.equal(root.children.length,1,source);
+    assert.ok(plain(root.children[0]).endsWith('Outside'),source);
+  }
+  const nested=c.markdown('> > Foo\n> > ===\n> Outside');
+  assert.equal(nested.children.length,1);
+  assert.deepEqual(nested.children[0].children.map(n=>n.tag),['blockquote','p']);
+  assert.equal(plain(nested.children[0].children[1]),'Outside');
+});
+
+test('a completed list Setext heading returns subsequent lazy text outside the item', () => {
+  const c=fixture();
+  for(const [source,tag] of [
+    ['- Foo\n  ===\nOutside','ul'],['- Foo\n  ---\nOutside','ul'],
+    ['10. Foo\n    ===\nOutside','ol'],['- > Foo\n  > ===\nOutside','ul'],
+    ['- Foo\n  ===\n Outside','ul'],['- Foo\n  ===\nOutside\n\n- Next','ul'],
+  ]) {
+    const root=c.markdown(source);
+    assert.equal(root.children[0].tag,tag,source);
+    assert.equal(root.children[1]?.tag,'p',source);
+    assert.equal(plain(root.children[1]),'Outside',source);
+    assert.equal(plain(root.children[0]).includes('Outside'),false,source);
+  }
+  for(const source of ['- Foo\n===\nOutside','- Foo\n  ===\n  Bar\nOutside','- ===\nOutside']) {
+    const root=c.markdown(source);
+    assert.equal(root.children.length,1,source);
+    assert.ok(plain(root.children[0]).endsWith('Outside'),source);
+  }
+});
+
+test('Setext container exits agree across streamed prefixes and completed blocks', () => {
+  const c=fixture();
+  for(const source of ['> Foo\n> ===\nOutside','- Foo\n  ===\nOutside','> > Foo\n> > ===\nOutside','- > Foo\n  > ===\nOutside','- Foo\n  ===\nOutside\n\n- Next']) {
+    for(let end=0;end<=source.length;end++) {
+      const prefix='Before\n\n'+source.slice(0,end);
+      const [stable,tail]=c.splitStreaming(prefix);
+      assert.deepEqual([...c.markdown(stable).children,...c.markdown(tail).children].map(shape),c.markdown(prefix).children.map(shape),prefix);
+    }
+    const text='Before\n\n'+source+'\n\nAfter\n\n';
+    const [stable,tail]=c.splitStreaming(text);
+    assert.deepEqual([...c.markdown(stable).children,...c.markdown(tail).children].map(shape),c.markdown(text).children.map(shape),text);
+  }
+});
+
+
+test('repeated Setext quote exits retain nested structure and each callout title', () => {
+  const c=fixture(), count=128;
+  for(const block of ['> Foo\n> ===\nOutside\n','> > Foo\n> > ===\nOutside\n','> [!NOTE]\n> Foo\n> ===\nOutside\n']) {
+    const root=c.markdown(block.repeat(count));
+    assert.equal(root.children.length,count*2,block);
+    for(let i=0;i<count;i++) {
+      const quote=root.children[i*2],outside=root.children[i*2+1];
+      assert.equal(quote.tag,'blockquote');assert.equal(outside.tag,'p');
+      assert.equal(plain(outside),'Outside');
+      assert.equal(plain(quote),block.includes('[!NOTE]')?'ℹ NoteFoo':'Foo');
+    }
+  }
+});

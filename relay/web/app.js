@@ -1656,6 +1656,8 @@
   const FENCE = /^(\s*)(`{3,}|~{3,})\s*([^\s`{,]*)/;
   const HEADING = /^\s{0,3}(#{1,6})\s+(.*?)(?:\s+#+\s*)?$/;
   const SETEXT = /^ {0,3}(=+|-+)[ \t]*$/;
+  // Reuse collected quote spans when a Setext heading returns an outer tail.
+  const quoteBuffers = new WeakMap();
   // Both syntaxes share the current logical-level mapping (#1559).
   const markdownHeading = (level, content) => h("h" + Math.min(6, level + 1), null, content);
   const RULE = /^\s{0,3}([-*_])(?:\s*\1){2,}\s*$/;
@@ -1687,10 +1689,10 @@
     return s.split(/(?<!\\)\|/).map((c) => c.trim().replace(/\\\|/g, "|"));
   }
 
-  /** Append blocks, retaining which lines were lazy container continuations. */
-  function blocks(lines, root, depth = 0, lazy = []) {
-    if (depth >= MD_DEPTH) { root.append(h("pre", { class: "md-plain" }, lines.join("\n"))); return root; }
-    let i = 0;
+  /** Append blocks and return the next line index (lazy Setext tails remain outside). */
+  function blocks(lines, root, depth = 0, lazy = [], start = 0) {
+    if (depth >= MD_DEPTH) { root.append(h("pre", { class: "md-plain" }, lines.slice(start).join("\n"))); return lines.length; }
+    let i = start;
     while (i < lines.length) {
       const line = lines[i];
       if (!line.trim()) { i++; continue; }
@@ -1739,19 +1741,33 @@
         continue;
       }
       if (QUOTE.test(line)) {
-        const buf = [], bufLazy = [];
-        while (i < lines.length && (QUOTE.test(lines[i]) || (lines[i].trim() && buf.length && !startsBlock(lines, i)))) {
-          bufLazy.push(lazy[i] || !QUOTE.test(lines[i]));
-          buf.push(lines[i++].replace(/^\s{0,3}>\s?/, ""));
+        let quote = quoteBuffers.get(lines);
+        if (!quote || i < quote.start || i >= quote.end) {
+          const begin = i, buf = [], bufLazy = [];
+          let end = i;
+          while (end < lines.length && (QUOTE.test(lines[end]) || (lines[end].trim() && buf.length && !startsBlock(lines, end)))) {
+            bufLazy.push(lazy[end] || !QUOTE.test(lines[end]));
+            buf.push(lines[end++].replace(/^\s{0,3}>\s?/, ""));
+          }
+          quote = { start: begin, end, lines: buf, lazy: bufLazy };
+          quoteBuffers.set(lines, quote);
         }
-        const alert = buf[0] && buf[0].trim().match(/^\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\]$/i);
+        const from = i - quote.start;
+        const alert = quote.lines[from].trim().match(/^\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\]$/i);
         const q = h("blockquote", { class: alert ? "callout " + alert[1].toLowerCase() : null });
-        if (alert) { buf.shift(); bufLazy.shift(); q.append(h("div", { class: "callout-title" }, ALERTS[alert[1].toUpperCase()])); }
-        blocks(buf, q, depth + 1, bufLazy);
+        if (alert) q.append(h("div", { class: "callout-title" }, ALERTS[alert[1].toUpperCase()]));
+        const consumed = blocks(quote.lines, q, depth + 1, quote.lazy, from + (alert ? 1 : 0));
         root.append(q);
+        i = quote.start + consumed;
+        if (i < quote.end && lazy[i]) return i;
         continue;
       }
-      if (ITEM.test(line)) { i = list(lines, i, root, depth, lazy); continue; }
+      if (ITEM.test(line)) {
+        const result = list(lines, i, root, depth, lazy);
+        i = result.next;
+        if (result.stopped && lazy[i]) return i;
+        continue;
+      }
       const content = [...inline(line.trim())];
       let level = null;
       i++;
@@ -1763,19 +1779,23 @@
         content.push(h("br"), ...inline(lines[i++].trim()));
       }
       root.append(level ? markdownHeading(level, content) : h("p", null, content));
+      // A heading closes its paragraph; the following lazy line belongs outside.
+      if (level && lazy[i]) return i;
     }
-    return root;
+    return lines.length;
   }
 
-  /** A (possibly nested) list starting at lines[i]; returns the next index. */
+  /** A list plus its next index and whether a Setext heading ended lazy collection. */
   function list(lines, i, root, depth = 0, lazy = []) {
     const first = lines[i].match(ITEM);
     const base = indentOf(first[1]);
     const ordered = /\d/.test(first[2]);
     const el = h(ordered ? "ol" : "ul");
     if (ordered && parseInt(first[2], 10) !== 1) el.setAttribute("start", String(parseInt(first[2], 10)));
-    let loose = false;
+    let loose = false, stopped = false;
     while (i < lines.length) {
+      const itemStart = i;
+      let looseAfter = Infinity;
       const m = lines[i].match(ITEM);
       if (!m || indentOf(m[1]) !== base || /\d/.test(m[2]) !== ordered) break;
       const contentIndent = base + m[2].length + Math.max(1, Math.min(4, m[3].length));
@@ -1786,10 +1806,13 @@
         if (!l.trim()) {
           let j = i + 1;
           while (j < lines.length && !lines[j].trim()) j++;
-          if (j < lines.length && indentOf(lines[j]) > base) { body.push(""); bodyLazy.push(false); loose = loose || !ITEM.test(lines[j]); i++; continue; }
+          if (j < lines.length && indentOf(lines[j]) > base) {
+            if (!ITEM.test(lines[j])) looseAfter = Math.min(looseAfter, body.length + 1);
+            body.push(""); bodyLazy.push(false); i++; continue;
+          }
           const sibling = j < lines.length && lines[j].match(ITEM);
           if (sibling && !RULE.test(lines[j]) && indentOf(sibling[1]) === base && /\d/.test(sibling[2]) === ordered) {
-            loose = true;
+            looseAfter = Math.min(looseAfter, body.length);
             i = j;
           }
           break;
@@ -1811,19 +1834,23 @@
         li.className = "task";
         li.append(h("input", { type: "checkbox", disabled: true, checked: task[1] !== " ", "aria-label": task[1] !== " " ? "done" : "not done" }));
       }
-      blocks(body, li, depth + 1, bodyLazy);
+      const consumed = blocks(body, li, depth + 1, bodyLazy);
+      // Ignore blank separators collected beyond a heading's rejected lazy tail.
+      if (looseAfter <= consumed) loose = true;
       el.append(li);
+      if (consumed < body.length) { i = itemStart + consumed; stopped = true; break; }
     }
     if (loose) el.classList.add("loose");
     root.append(el);
-    return i;
+    return { next: i, stopped };
   }
 
   function markdown(text) {
     text = String(text || "");
     const root = h("div", { class: "md bubble" });
     if (text.length > MD_FORMAT_CHARS) { root.append(h("pre", { class: "md-plain" }, text)); return root; }
-    return blocks(text.replace(/\r\n?/g, "\n").split("\n"), root);
+    blocks(text.replace(/\r\n?/g, "\n").split("\n"), root);
+    return root;
   }
 
   // ------------------------------------------------------------- chat
