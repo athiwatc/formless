@@ -7049,8 +7049,8 @@
     try { atts = JSON.parse(m.meta || "{}").attachments || []; } catch (_) {}
     if (!atts.length) return [];
     return [h("div", { class: "muted sent-from" }, ...atts.map((a) => h("span", { class: "tag attach-chip" },
-      a.reference ? "↗ " : (a.mime || "").startsWith("image/") ? "🖼 " : "📄 ", a.name || "attachment",
-      a.expired ? " · expired" : "")))];
+      h("span", { class: "attach-icon" }, a.reference ? "↗" : (a.mime || "").startsWith("image/") ? "🖼" : "📄"),
+      h("span", { class: "attach-name" }, a.name || "attachment", a.expired ? " · expired" : ""))))];
   }
   /** The current Session's pending attachments, each removable (×). */
   function renderChips() {
@@ -7058,7 +7058,8 @@
     const list = S.chips[S.current] || [];
     box.classList.toggle("hidden", !list.length);
     box.replaceChildren(...list.map((a) => h("span", { class: "tag attach-chip", title: (a.mime || "file") + " · " + Math.max(1, Math.round(a.bytes / 1024)) + " KB" },
-      (a.mime || "").startsWith("image/") ? "🖼 " : "📄 ", a.name,
+      h("span", { class: "attach-icon" }, (a.mime || "").startsWith("image/") ? "🖼" : "📄"),
+      h("span", { class: "attach-name" }, a.name),
       h("button", { class: "btn ghost small", type: "button", "aria-label": "Remove " + a.name, onclick: async () => {
         const sid = S.current;
         // A referenced file (too big to attach) is named by its path.
