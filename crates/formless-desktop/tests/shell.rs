@@ -747,7 +747,8 @@ fn the_shells_text_and_rows_are_in_the_accessibility_tree(cx: &mut TestAppContex
         assert_eq!(
             text.value(),
             Some(
-                "Done. 3 files changed, 2 Tools created, 1 Invocation still pending.\n\n_block 40_"
+                // The text a reader sees, not its markdown source.
+                "Done. 3 files changed, 2 Tools created, 1 Invocation still pending.\nblock 40"
             )
         );
 
@@ -857,7 +858,12 @@ fn a_notice_and_a_cut_block_say_what_they_say_to_assistive_technology(cx: &mut T
             "{}",
             value.len()
         );
-        assert_eq!(value, shell.read(cx).last_block_preview());
+        // The window as plain text: the fence and its opening line are
+        // markdown, not words.
+        let preview = shell.read(cx).last_block_preview();
+        assert!(preview.starts_with("```text\n"));
+        assert_eq!(value, timeline::plain_text(&preview));
+        assert!(!value.contains("```"));
 
         // A refusal is text too.
         let paste = "x".repeat(limits::COMPOSER_MAX_BYTES + 1);

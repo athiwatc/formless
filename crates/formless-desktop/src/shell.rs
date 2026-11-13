@@ -1578,7 +1578,7 @@ impl Shell {
         let reading_width = self.scaled(tokens::READING_MAX);
         let focused = self.conversation_focus.is_focused(window);
         let timeline = MessageScroller::new("timeline", self.timeline.clone(), {
-            move |index, _, cx| {
+            move |index, window, cx| {
                 // A frame drawn between two flushes still shows the newest
                 // text: the streamed row is brought up to date when a row
                 // is built, at most once however many deltas arrived.
@@ -1618,14 +1618,27 @@ impl Shell {
                     .child({
                         // The kit's markdown view gives assistive technology
                         // nothing, so its container carries the text it
-                        // lays out: the row's bounded window, as markdown
-                        // source.
+                        // lays out: the row's bounded window, as the plain
+                        // text a reader sees, not its markdown source.
+                        //
+                        // Making the plain text of a full window costs
+                        // milliseconds, and a streamed row's window is
+                        // rebuilt every frame, so it is made only while
+                        // assistive technology is reading the window (GPUI
+                        // builds no accessibility tree otherwise), and in
+                        // the test harness, which has no platform to ask.
                         let text = SharedString::from(block.preview().clone());
+                        let read = window.is_a11y_active() || cfg!(feature = "test-support");
+                        let accessible: SharedString = if read {
+                            block.accessible_text().into()
+                        } else {
+                            text.clone()
+                        };
                         div()
                             .id(("block-text", id))
                             .test_support()
                             .role(Role::Label)
-                            .aria_value(text.clone())
+                            .aria_value(accessible)
                             .child(TextView::markdown(("markdown", id), text).selectable(true))
                     })
                     .children(below)
@@ -1913,6 +1926,8 @@ impl Shell {
                 "Run",
                 self.run_state().label().to_string(),
             ))
+            // Shown as it is, not rendered as markdown, so it is read as it
+            // is too: what is on screen and what is read must match.
             .child(detail(
                 "inspector-last-message",
                 "Last message",

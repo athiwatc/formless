@@ -10,6 +10,7 @@
 //! only when the view asks ([`Timeline::settle`]): once for each time the
 //! row is shown, however many deltas arrived since the last time.
 
+use std::cell::OnceCell;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -80,6 +81,65 @@ const FENCE_OPENER_MAX_BYTES: usize = 3 + FENCE_RUN_MAX + FENCE_INFO_MAX + 1;
 
 /// The longest text a row lays out, whatever the block holds.
 pub const PREVIEW_MAX_BYTES: usize = limits::BLOCK_PREVIEW_MAX_BYTES + FENCE_OPENER_MAX_BYTES;
+
+/// The text a person reads in rendered markdown, for assistive technology:
+/// the words and code, without the syntax that marks them up (fences,
+/// emphasis marks, quote markers, link targets). Blocks are on lines of
+/// their own. Raw HTML is left out, as the view does not render it.
+///
+/// Markdown that does not parse is returned as it is.
+pub fn plain_text(source: &str) -> String {
+    use markdown::mdast::Node;
+
+    fn walk(node: &Node, out: &mut String) {
+        match node {
+            Node::Text(text) => out.push_str(&text.value),
+            Node::InlineCode(code) => out.push_str(&code.value),
+            Node::InlineMath(math) => out.push_str(&math.value),
+            Node::Break(_) => out.push('\n'),
+            Node::Image(image) => out.push_str(&image.alt),
+            Node::Html(_) => {}
+            Node::Code(code) => block(out, |out| out.push_str(&code.value)),
+            Node::Math(math) => block(out, |out| out.push_str(&math.value)),
+            Node::ThematicBreak(_) => {}
+            Node::Paragraph(_)
+            | Node::Heading(_)
+            | Node::ListItem(_)
+            | Node::TableRow(_)
+            | Node::Blockquote(_)
+            | Node::List(_)
+            | Node::Table(_) => block(out, |out| children(node, out)),
+            Node::TableCell(_) => {
+                if !out.ends_with('\n') && !out.is_empty() {
+                    out.push('\t');
+                }
+                children(node, out);
+            }
+            _ => children(node, out),
+        }
+    }
+    fn children(node: &Node, out: &mut String) {
+        for child in node.children().into_iter().flatten() {
+            walk(child, out);
+        }
+    }
+    /// A block starts on a line of its own.
+    fn block(out: &mut String, inner: impl FnOnce(&mut String)) {
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        inner(out);
+    }
+
+    match markdown::to_mdast(source, &markdown::ParseOptions::gfm()) {
+        Ok(root) => {
+            let mut out = String::with_capacity(source.len());
+            walk(&root, &mut out);
+            out
+        }
+        Err(_) => source.to_string(),
+    }
+}
 
 /// The fence a line opens or closes, by CommonMark's rule for fenced code:
 /// up to three spaces, then at least three backticks or tildes. Returns the
@@ -257,6 +317,9 @@ pub struct TimelineBlock {
     anchor: Anchor,
     window: Range<usize>,
     preview: Arc<str>,
+    /// The window's text as plain text, made the first time it is asked
+    /// for after the window is rebuilt.
+    accessible: OnceCell<Arc<str>>,
     /// How long `markdown` was when the window was last rebuilt.
     settled_len: usize,
 }
@@ -271,6 +334,7 @@ impl TimelineBlock {
             anchor: Anchor::Head,
             window: 0..0,
             preview: Arc::from(""),
+            accessible: OnceCell::new(),
             settled_len: 0,
         };
         block.fences.extend(&block.markdown);
@@ -298,6 +362,7 @@ impl TimelineBlock {
             None => Arc::from(shown),
         };
         self.settled_len = text.len();
+        self.accessible = OnceCell::new();
     }
 
     /// The whole block, exactly as received. Copying must use this.
@@ -310,6 +375,16 @@ impl TimelineBlock {
     /// [`PREVIEW_MAX_BYTES`]. Cheap to clone.
     pub fn preview(&self) -> &Arc<str> {
         &self.preview
+    }
+
+    /// What assistive technology is given for the row: [`Self::preview`]
+    /// as plain text ([`plain_text`]). Made once for each rebuild of the
+    /// window, when first asked for, so a frame that redraws an unchanged
+    /// row does not parse it again.
+    pub fn accessible_text(&self) -> Arc<str> {
+        self.accessible
+            .get_or_init(|| Arc::from(plain_text(&self.preview)))
+            .clone()
     }
 
     pub fn anchor(&self) -> Anchor {
@@ -1226,6 +1301,74 @@ mod tests {
         }
         assert_eq!(timeline.stream_work().rebuilds, before);
         assert_eq!(timeline.blocks()[0].preview(), &head);
+    }
+
+    #[test]
+    fn plain_text_keeps_the_words_and_drops_the_markup() {
+        let cases = [
+            ("**bold** and _em_ and `code`", "bold and em and code"),
+            ("# Title\n\nBody", "Title\nBody"),
+            ("> ข้อความอ้างอิง\n\nต่อ", "ข้อความอ้างอิง\nต่อ"),
+            (
+                "```rust\nfn main() {}\n```\n\nAfter.",
+                "fn main() {}\nAfter.",
+            ),
+            ("- one\n- two", "one\ntwo"),
+            (
+                "See [the guide](https://example.invalid) now.",
+                "See the guide now.",
+            ),
+            ("![a chart](x.png)", "a chart"),
+            ("line one  \nline two", "line one\nline two"),
+            ("a <b>raw</b> tag", "a raw tag"),
+            ("| a | b |\n|---|---|\n| 1 | 2 |", "a\tb\n1\t2"),
+            ("👩🏽‍💻 🇹🇭 é", "👩🏽‍💻 🇹🇭 é"),
+            ("", ""),
+        ];
+        for (source, expected) in cases {
+            assert_eq!(plain_text(source), expected, "{source:?}");
+        }
+    }
+
+    #[test]
+    fn a_rows_accessible_text_is_its_window_as_plain_text_made_once() {
+        let mut b = block("Intro.\n\n```rust\nfn main() {}\n```\n\n_done_");
+        assert_eq!(&*b.accessible_text(), "Intro.\nfn main() {}\ndone");
+        // The same text object until the window is rebuilt.
+        assert!(Arc::ptr_eq(&b.accessible_text(), &b.accessible_text()));
+        // A window that starts inside a fence is given a short opening
+        // line for layout; the accessible text has no fence in it.
+        let code = numbered_lines(1_500);
+        b = block(&format!("```rust\n{code}```\n"));
+        b.show_later();
+        assert!(b.preview().starts_with("```rust\n"));
+        let text = b.accessible_text();
+        assert!(!text.contains("```"), "{}", &text[..40]);
+        assert!(text.starts_with("line "), "{}", &text[..40]);
+        // Rebuilding the window makes it again.
+        let before = b.accessible_text();
+        b.show_start();
+        assert!(!Arc::ptr_eq(&before, &b.accessible_text()));
+    }
+
+    #[test]
+    fn plain_text_of_a_full_window_is_quick_enough_to_make_once_a_frame() {
+        // The largest window a row lays out, streamed text with marks in it.
+        let mut source = String::new();
+        while source.len() < BYTES {
+            source.push_str("**ย่อหน้า** with `code` and _emphasis_ 👩🏽‍💻.\n\n");
+        }
+        let started = std::time::Instant::now();
+        let rounds = 20;
+        for _ in 0..rounds {
+            std::hint::black_box(plain_text(&source));
+        }
+        let each = started.elapsed() / rounds;
+        println!(
+            "EVIDENCE plain_text: {} bytes in {:?} each (this build, this machine)",
+            source.len(),
+            each
+        );
     }
 
     #[test]
