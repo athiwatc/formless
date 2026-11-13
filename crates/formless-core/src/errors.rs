@@ -173,9 +173,12 @@ pub fn explain(raw: &str, ctx: &ErrorContext) -> ErrorExplained {
         || t.contains("error sending request")
         || t.contains("timed out")
     {
-        let hint = if host.contains(":11434") {
+        let port = reqwest::Url::parse(ctx.base_url)
+            .ok()
+            .and_then(|url| url.port_or_known_default());
+        let hint = if port == Some(11434) {
             "Is Ollama running? Start it with `ollama serve`, then /resume"
-        } else if host.contains(":1234") {
+        } else if port == Some(1234) {
             "Is LM Studio's server running? Start it, then /resume"
         } else if local {
             "Start the local server, then /resume"
@@ -321,6 +324,21 @@ mod tests {
             .action
             .unwrap()
             .contains("/resume"));
+    }
+
+    #[test]
+    fn local_server_hints_match_exact_ports_instead_of_prefixes() {
+        for (url, expected) in [
+            ("http://localhost:1234/v1", "LM Studio"),
+            ("http://localhost:12345/v1", "Start the local server"),
+            ("http://localhost:11434/v1", "ollama serve"),
+            ("http://[::1]:1234/v1", "LM Studio"),
+            ("http://localhost:12349/v1", "Start the local server"),
+        ] {
+            let explained = explain("connection refused", &ctx(url));
+            assert_eq!(explained.category, "unreachable");
+            assert!(explained.action.unwrap().contains(expected), "{url}");
+        }
     }
 
     #[test]
