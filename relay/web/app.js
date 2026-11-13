@@ -1519,6 +1519,7 @@
   let mermaidReady = null;
   let mermaidQueue = Promise.resolve();
   let mermaidSeq = 0;
+  const diagramStates = new WeakMap();
   const darkScheme = window.matchMedia("(prefers-color-scheme: dark)");
   const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
   let configuredAnimations = true;
@@ -1569,24 +1570,40 @@
     prefs.set("theme", e.target.value);
     applyTheme(e.target.value);
     mermaidCache.clear();
-    renderAll();
+    refreshDiagrams();
   });
   darkScheme.addEventListener("change", () => {
     if (document.documentElement.dataset.theme) return;
     applyTheme("auto");
     mermaidCache.clear();
-    renderAll();
+    refreshDiagrams();
   });
+  function mermaidLoadError(message) {
+    return Object.assign(new Error(message), { retryableMermaidLoad: true });
+  }
   function loadMermaid() {
     if (!mermaidReady) {
-      mermaidReady = new Promise((resolve, reject) => {
-        const s = h("script", { src: MERMAID_SRC });
-        s.onload = () => (window.mermaid ? resolve(window.mermaid) : reject(new Error("mermaid missing")));
-        s.onerror = () => { mermaidReady = null; reject(new Error("could not load " + MERMAID_SRC)); };
-        document.head.append(s);
+      const script = h("script", { src: MERMAID_SRC });
+      const job = new Promise((resolve, reject) => {
+        script.onload = () => {
+          const mermaid = window.mermaid;
+          if (mermaid && ["initialize", "parse", "render"].every((key) => typeof mermaid[key] === "function")) resolve(mermaid);
+          else reject(mermaidLoadError("mermaid missing"));
+        };
+        script.onerror = () => reject(mermaidLoadError("could not load " + MERMAID_SRC));
       });
+      mermaidReady = job;
+      job.catch(() => {
+        if (mermaidReady === job) mermaidReady = null;
+        script.remove();
+      });
+      document.head.append(script);
     }
     return mermaidReady;
+  }
+  const mermaidTheme = () => isDark() ? "dark" : "default";
+  function refreshDiagrams(root = document) {
+    for (const box of root.querySelectorAll(".diagram")) diagramStates.get(box)?.refresh();
   }
   /** Pie slices in the app palette (mermaid's dark pie is near-black). */
   function pieColors() {
@@ -1596,16 +1613,16 @@
     ["accent", "user", "warn", "think", "err", "muted"].forEach((n, i) => { vars["pie" + (i + 1)] = v(n); });
     return vars;
   }
-  function renderMermaid(src) {
-    const theme = isDark() ? "dark" : "default";
+  function renderMermaid(src, theme = mermaidTheme()) {
     const key = theme + "\n" + src;
     if (!mermaidCache.has(key)) {
+      const colors = pieColors();
       const job = mermaidQueue.then(async () => {
         const mermaid = await loadMermaid();
         mermaid.initialize({
           startOnLoad: false, securityLevel: "strict", theme, htmlLabels: false,
           flowchart: { htmlLabels: false }, fontFamily: MERMAID_FONT, fontSize: 16,
-          themeVariables: pieColors(),
+          themeVariables: colors,
         });
         if (!(await mermaid.parse(src, { suppressErrors: true }))) throw new Error("not a valid Mermaid diagram");
         const id = "mmd-" + ++mermaidSeq;
@@ -1617,13 +1634,16 @@
         try {
           const { svg } = await mermaid.render(id, src, measure);
           const vb = svg.match(/viewBox="[-\d.]+ [-\d.]+ ([\d.]+) ([\d.]+)"/);
-          return { url: "data:image/svg+xml;charset=utf-8," + encodeURIComponent(svg), svg, theme, width: vb ? Math.ceil(+vb[1]) : 0 };
+          return { url: "data:image/svg+xml;charset=utf-8," + encodeURIComponent(svg), svg, theme, width: vb ? Math.ceil(+vb[1]) : 0, height: vb ? Math.ceil(+vb[2]) : 0 };
         } finally {
           measure.replaceChildren();
         }
       });
       mermaidQueue = job.catch(() => {});
       mermaidCache.set(key, job);
+      job.catch((error) => {
+        if (error?.retryableMermaidLoad && mermaidCache.get(key) === job) mermaidCache.delete(key);
+      });
       if (mermaidCache.size > 200) mermaidCache.delete(mermaidCache.keys().next().value);
     }
     return mermaidCache.get(key);
@@ -1632,24 +1652,70 @@
     const code = h("pre", { class: "diagram-src" }, h("code", null, src));
     const view = h("div", { class: "diagram-view" }, h("span", { class: "muted" }, closed ? "Rendering diagram…" : "Waiting for the diagram to finish…"));
     const box = h("div", { class: "codeblock diagram" });
-    const toggle = h("button", { class: "btn ghost small", type: "button", onclick: () => setSource(!box.classList.contains("show-src")) }, "Source");
-    const save = h("button", { class: "btn ghost small", type: "button", hidden: true }, "SVG");
+    const errorMessage = h("div", { class: "diagram-error error", role: "status", hidden: true });
+    let wantedSource = !closed;
+    let generation = 0, theme = null, pending = false;
     const setSource = (on) => { box.classList.toggle("show-src", on); toggle.textContent = on ? "Diagram" : "Source"; };
-    box.append(h("div", { class: "lang" }, h("span", null, "mermaid"), h("span", { class: "spacer" }), toggle, save, copyButton(src)), view, code);
-    if (!closed) { setSource(true); return box; }
-    renderMermaid(src).then((d) => {
-      const img = h("img", { src: d.url, alt: "Mermaid diagram", class: "diagram-img", "data-theme": d.theme, title: "Click to zoom" });
-      if (d.width) img.style.width = d.width + "px";
-      img.addEventListener("click", () => box.classList.toggle("zoom"));
-      img.addEventListener("load", () => { if ($("transcript").contains(img)) scrollToBottom(); }, { once: true });
-      const update = () => { view.replaceChildren(img); save.hidden = false; };
-      if ($("transcript").contains(view)) withTranscriptLayout(update);
-      else update();
-      save.onclick = () => downloadBlob("diagram.svg", new Blob([d.svg], { type: "image/svg+xml" }));
-    }, (e) => {
-      view.replaceChildren(h("span", { class: "error" }, "Diagram not rendered: " + (e && e.message ? e.message : e)));
-      setSource(true);
-    });
+    const toggle = h("button", { class: "btn ghost small", type: "button", onclick: () => { wantedSource = !box.classList.contains("show-src"); setSource(wantedSource); } }, "Source");
+    const save = h("button", { class: "btn ghost small", type: "button", hidden: true }, "SVG");
+    const retry = h("button", { class: "btn ghost small", type: "button", hidden: true, onclick: () => { if (!pending) render(true); } }, "Retry");
+    const update = (change) => {
+      if ($("transcript").contains(box)) withTranscriptLayout(change);
+      else change();
+    };
+    const retryState = (visible) => {
+      if (!visible && document.activeElement === retry) toggle.focus({ preventScroll: true });
+      retry.hidden = !visible;
+      retry.textContent = "Retry";
+      retry.removeAttribute("aria-disabled");
+    };
+    const render = (force = false) => {
+      const nextTheme = mermaidTheme();
+      if (!closed || (!force && theme === nextTheme)) return;
+      theme = nextTheme;
+      const attempt = ++generation;
+      const current = () => attempt === generation && theme === nextTheme && mermaidTheme() === nextTheme;
+      pending = true;
+      view.setAttribute("aria-busy", "true");
+      if (!retry.hidden) { retry.textContent = "Retrying…"; retry.setAttribute("aria-disabled", "true"); }
+      renderMermaid(src, nextTheme).then((d) => {
+        if (!current()) return;
+        const img = h("img", { src: d.url, alt: "Mermaid diagram", class: "diagram-img", "data-theme": d.theme, title: "Click to zoom" });
+        if (d.width) img.style.width = d.width + "px";
+        if (d.width && d.height) { img.width = d.width; img.height = d.height; }
+        img.addEventListener("click", () => box.classList.toggle("zoom"));
+        img.addEventListener("load", () => {
+          if (current() && $("transcript").contains(img)) withTranscriptLayout(() => {});
+        }, { once: true });
+        update(() => {
+          view.replaceChildren(img);
+          errorMessage.hidden = true;
+          view.removeAttribute("aria-busy");
+          save.hidden = false;
+          save.onclick = () => downloadBlob("diagram.svg", new Blob([d.svg], { type: "image/svg+xml" }));
+          retryState(false);
+          setSource(wantedSource);
+        });
+        pending = false;
+      }, (error) => {
+        if (!current()) return;
+        update(() => {
+          view.replaceChildren();
+          errorMessage.textContent = "Diagram not rendered: " + (error?.message || error);
+          errorMessage.hidden = false;
+          view.removeAttribute("aria-busy");
+          if (document.activeElement === save) toggle.focus({ preventScroll: true });
+          save.hidden = true;
+          retryState(!!error?.retryableMermaidLoad);
+          setSource(true);
+        });
+        pending = false;
+      });
+    };
+    box.append(h("div", { class: "lang" }, h("span", null, "mermaid"), h("span", { class: "spacer" }), toggle, save, retry, copyButton(src)), errorMessage, view, code);
+    diagramStates.set(box, { refresh: () => render() });
+    if (!closed) setSource(true);
+    else render();
     return box;
   }
 
@@ -2297,6 +2363,7 @@
       }
       node.messageSignature = signature;
     }
+    refreshDiagrams(node);
     return node;
   }
   function copy(text, what) {
