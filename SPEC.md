@@ -4634,6 +4634,15 @@ undo, redo and replacements invalidate prior asynchronous editor previews.
   switcher over Session names, tags and last messages from any view,
   newest first until you type. Enter opens the Session; Ctrl+N (Ctrl/⌘+
   Enter on the web) starts a new Session named after the typed text.
+  TUI model/wizard queries, list filters and the Session switcher share
+  Ctrl+U clear and Ctrl+W/Alt+Backspace previous-word deletion. Only unmodified
+  or Shift-modified characters enter queries; other Ctrl/Alt character chords
+  are ignored except for the picker's explicit actions. Ctrl+S/Ctrl+V do not
+  cycle list filters. Model, switcher and rollback result pickers support
+  PgUp/PgDn and Home/End, clamped to matches, using their rendered row count
+  (ten rows before the first draw). Rollback navigation disarms confirmation
+  and keeps its selected version visible. General main-list paging is separate
+  (#1468).
 - **Command palette.** Typing `/` at the start of the input opens a popup
   of commands with one-line descriptions, filtered fuzzily (exact prefixes
   first). ↑/↓ select, Tab completes, Enter runs. A command that still
