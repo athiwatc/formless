@@ -374,6 +374,8 @@ pub fn entry(command: Command, state: &State) -> Entry {
             Group::Navigation,
             if destination == Destination::Chat {
                 "Open the conversation"
+            } else if destination == Destination::Sessions {
+                "Browse and filter fixture Sessions (archived Sessions excluded)"
             } else {
                 "Scaffold: this destination has no view yet"
             },

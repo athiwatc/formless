@@ -18,8 +18,9 @@ mod render {
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
 
+    use formless_desktop::commands::Command;
     use formless_desktop::fixture;
-    use formless_desktop::model::{BlockKind, Fit, TextScale};
+    use formless_desktop::model::{BlockKind, Destination, Fit, TextScale};
     use formless_desktop::shell::{self, PageSection, Shell};
     use formless_desktop::timeline::TimelineBlock;
     use gpui_kit::assets::Assets;
@@ -74,7 +75,7 @@ mod render {
     const WHOLE: Fit = Fit::Whole;
     const REFLOWED: Fit = Fit::Reflowed;
 
-    const STATES: [State; 23] = [
+    const STATES: [State; 25] = [
         state("wide-light", 1440., 900., LIGHT, 100, None, WHOLE),
         state("wide-dark", 1440., 900., DARK, 100, None, WHOLE),
         state("medium-light", 1100., 900., LIGHT, 100, None, WHOLE),
@@ -224,6 +225,24 @@ mod render {
             None,
             REFLOWED,
         )),
+        state(
+            "wide-sessions-directory-light",
+            1440.,
+            900.,
+            LIGHT,
+            100,
+            Some("open-directory"),
+            WHOLE,
+        ),
+        state(
+            "minimum-sessions-directory-dark-200pct",
+            480.,
+            360.,
+            DARK,
+            200,
+            Some("open-directory"),
+            REFLOWED,
+        ),
     ];
 
     /// Controls that must be whole and inside the window, all at once, where
@@ -614,7 +633,13 @@ mod render {
         } else if let Some(control) = click {
             cx.update_window(any, |_, window, cx| {
                 window.render_frame(cx);
-                window.click(control, cx);
+                if control == "open-directory" {
+                    shell.update(cx, |shell, cx| {
+                        shell.run_command(Command::GoTo(Destination::Sessions), window, cx)
+                    });
+                } else {
+                    window.click(control, cx);
+                }
             })
             .expect("offscreen window is open");
             cx.run_until_parked();
@@ -626,6 +651,7 @@ mod render {
                     let panel = match control {
                         "toggle-sidebar" => "region-sidebar",
                         "show-commands" => "palette",
+                        "open-directory" => "region-conversation",
                         _ => "region-inspector",
                     };
                     assert!(

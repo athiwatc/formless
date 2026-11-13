@@ -4,8 +4,8 @@
 //! This is a scaffold, not a client. It renders the synthetic
 //! [`crate::fixture`] only and has no Daemon Core connection: composer
 //! actions are recorded as [`Intent`]s and shown in the status line, never
-//! sent, and the draft stays in place. Only Chat has a view; every other
-//! destination shows a notice saying so.
+//! sent, and the draft stays in place. Chat and the read-only fixture
+//! Sessions directory have views; the other destinations are notices.
 
 use std::cell::{Ref, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -33,6 +33,7 @@ use gpui_kit::{
 };
 
 use crate::commands::{self, Command};
+use crate::directory::{self, Directory};
 use crate::full_view;
 use crate::memory::{
     edit_span, format_bytes, limits, paste_can_never_fit, snap_to_graphemes, within_composer_limit,
@@ -76,6 +77,10 @@ gpui_kit::actions!(
         ScrollViewerPageDown,
         ScrollViewerStart,
         ScrollViewerEnd,
+        DirectoryNext,
+        DirectoryPrevious,
+        DirectoryOpen,
+        DirectoryBack,
         CloseViewer,
     ]
 );
@@ -96,6 +101,8 @@ const VIEWER_WIDTH_CACHE: usize = 128;
 /// The palette's search field. These bindings are more specific than the
 /// text input's own, so Up, Down, Enter and Escape there move through and
 /// run the list instead of moving a caret in a one-line field.
+const DIRECTORY_CONTEXT: &str = "FormlessDirectory";
+const DIRECTORY_INPUT_CONTEXT: &str = "FormlessDirectory > Input";
 const PALETTE_INPUT_CONTEXT: &str = "FormlessPalette > Input";
 const PALETTE_DESCRIPTION: &str = "Modal. Type to search, Up and Down to choose, Enter to run, \
      Escape to close and return to where you were.";
@@ -137,6 +144,14 @@ pub fn bind_keys(cx: &mut App) {
     });
     cx.bind_keys(global.collect::<Vec<_>>());
     cx.bind_keys([
+        KeyBinding::new("down", DirectoryNext, Some(DIRECTORY_CONTEXT)),
+        KeyBinding::new("up", DirectoryPrevious, Some(DIRECTORY_CONTEXT)),
+        KeyBinding::new("enter", DirectoryOpen, Some(DIRECTORY_CONTEXT)),
+        KeyBinding::new("escape", DirectoryBack, Some(DIRECTORY_CONTEXT)),
+        KeyBinding::new("down", DirectoryNext, Some(DIRECTORY_INPUT_CONTEXT)),
+        KeyBinding::new("up", DirectoryPrevious, Some(DIRECTORY_INPUT_CONTEXT)),
+        KeyBinding::new("enter", DirectoryOpen, Some(DIRECTORY_INPUT_CONTEXT)),
+        KeyBinding::new("escape", DirectoryBack, Some(DIRECTORY_INPUT_CONTEXT)),
         KeyBinding::new("escape", DismissOverlay, Some(OVERLAY_CONTEXT)),
         KeyBinding::new("down", SelectNextSession, Some(SESSION_LIST_CONTEXT)),
         KeyBinding::new("up", SelectPreviousSession, Some(SESSION_LIST_CONTEXT)),
@@ -160,6 +175,10 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("end", ScrollViewerEnd, Some(VIEWER_CONTEXT)),
         KeyBinding::new("escape", CloseViewer, Some(VIEWER_CONTEXT)),
     ]);
+}
+
+pub fn directory_row_id(session_id: &str) -> ElementId {
+    SharedString::from(format!("directory-row-{session_id}")).into()
 }
 
 /// Element id of a Session's sidebar row. It is derived from the Session id,
@@ -338,6 +357,13 @@ enum Modal {
     Palette,
     /// The full-output view of one block.
     Viewer,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TranscriptSource {
+    Fixture,
+    Snapshot,
+    NotLoaded,
 }
 
 /// The open full-output view: one block, as display rows.
@@ -532,6 +558,11 @@ pub struct Shell {
     /// What had focus when the current overlay came up.
     restore_focus: Option<FocusOrigin>,
     timeline: Entity<MessageScrollerState>,
+    /// A loaded empty snapshot is different from a Session not loaded yet.
+    transcript_source: TranscriptSource,
+    directory: Directory,
+    directory_query: Entity<InputState>,
+    directory_scroll: gpui_kit::UniformListScrollHandle,
     composer: Entity<TextareaState>,
     session_scroll: VirtualListScrollHandle,
     session_sizes: Rc<Vec<Size<Pixels>>>,
@@ -569,8 +600,30 @@ impl Shell {
         let (composer, composer_subscriptions) = Self::build_composer("", window, cx);
         // A resize can end an overlay (the panel docks again) or hide the
         // panel that holds focus.
-        let subscriptions =
+        let mut subscriptions =
             vec![cx.observe_window_bounds(window, |this, window, cx| this.settle(window, cx))];
+        let directory_query = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Filter title, preview or ID")
+                .validate(|text, _| directory::valid_filter(text))
+        });
+        subscriptions.push(cx.subscribe_in(
+            &directory_query,
+            window,
+            |this, _, event: &InputEvent, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    let query = this.directory_query.read(cx).value();
+                    this.directory.rebuild(this.sidebar.rows(), &query);
+                    if let Some(index) = this.directory.choice(this.sidebar.rows()) {
+                        this.directory_scroll
+                            .scroll_to_item_strict(index, ScrollStrategy::Top);
+                    }
+                    cx.notify();
+                }
+            },
+        ));
+        let mut directory = Directory::default();
+        directory.rebuild(sidebar.rows(), "");
         composer.update(cx, |composer, cx| composer.focus(window, cx));
 
         let session_sizes = Self::row_sizes(sidebar.rows().len(), TextScale::default());
@@ -612,6 +665,10 @@ impl Shell {
             palette_scroll: ScrollHandle::new(),
             restore_focus: None,
             timeline,
+            transcript_source: TranscriptSource::Fixture,
+            directory,
+            directory_query,
+            directory_scroll: gpui_kit::UniformListScrollHandle::new(),
             composer,
             session_scroll: VirtualListScrollHandle::new(),
             session_sizes,
@@ -1213,6 +1270,7 @@ impl Shell {
             // visible-region fallback, never an orphaned row focus handle.
             self.restore_focus = None;
         }
+        self.transcript_source = TranscriptSource::Snapshot;
         let count = snapshot.blocks.len();
         *self.blocks.borrow_mut() = Timeline::new(snapshot.blocks);
         self.timeline
@@ -1795,6 +1853,7 @@ impl Shell {
     /// the outgoing draft, restore the incoming one and return the timeline
     /// to its tail. An overlay that was used to pick it closes.
     fn activate_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let from_directory = self.destination == Destination::Sessions;
         let previous = self.sidebar.active_id().map(str::to_string);
         if self.sidebar.activate_selected() {
             // A full-output view must never outlive its Session/source.
@@ -1850,6 +1909,12 @@ impl Shell {
             // A fresh composer, not a new value in the old one: the old one's
             // undo history holds the other Session's text.
             self.rebuild_composer(&restored, None, window, cx);
+            if self.transcript_source != TranscriptSource::Fixture {
+                // A decoded transcript belongs to the Session just left,
+                // never to the new title. A future client must load it.
+                *self.blocks.borrow_mut() = Timeline::new(Vec::new());
+                self.transcript_source = TranscriptSource::NotLoaded;
+            }
             let count = self.blocks.borrow().len();
             self.timeline
                 .update(cx, |timeline, cx| timeline.reset(count, cx));
@@ -1858,6 +1923,9 @@ impl Shell {
         self.destination = Destination::Chat;
         self.prefs.close_overlays();
         self.settle(window, cx);
+        if from_directory {
+            self.focus_region(Region::Composer, window, cx);
+        }
     }
 
     fn set_destination(
@@ -1866,9 +1934,39 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let previous = self.destination;
         self.destination = destination;
         self.prefs.close_overlays();
         self.settle(window, cx);
+        if destination == Destination::Sessions {
+            self.directory_query
+                .update(cx, |query, cx| query.focus(window, cx));
+            self.revealed = None;
+            let shell = cx.entity().downgrade();
+            window.on_next_frame(move |window, cx| {
+                shell
+                    .update(cx, |this, cx| {
+                        if this.destination == Destination::Sessions
+                            && this.directory_query.focus_handle(cx).is_focused(window)
+                            && this.current_modal(this.layout(window)).is_none()
+                        {
+                            this.revealed = None;
+                            cx.notify();
+                        }
+                    })
+                    .ok();
+            });
+        } else if previous == Destination::Sessions {
+            self.focus_region(
+                if destination == Destination::Chat {
+                    Region::Composer
+                } else {
+                    Region::Conversation
+                },
+                window,
+                cx,
+            );
+        }
     }
 
     /// The region holding focus, or `None` when focus is in the header or
@@ -2126,7 +2224,7 @@ impl Shell {
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.set_destination(destination, window, cx)
                 }));
-            if destination == Destination::Chat {
+            if matches!(destination, Destination::Chat | Destination::Sessions) {
                 button
             } else {
                 button.tooltip("Scaffold: this destination has no view yet")
@@ -2462,7 +2560,201 @@ impl Shell {
         }
     }
 
-    /// Every destination but Chat. It takes the conversation's place and
+    pub fn directory_query(&self) -> &Entity<InputState> {
+        &self.directory_query
+    }
+
+    fn directory_composing(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        self.directory_query.update(cx, |query, cx| {
+            query.marked_text_range(window, cx).is_some()
+        })
+    }
+
+    fn finish_directory_composition(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.directory_composing(window, cx) {
+            return false;
+        }
+        self.directory_query
+            .update(cx, |query, cx| query.unmark_text(window, cx));
+        true
+    }
+
+    fn directory_navigation_focused(&self, window: &Window, cx: &App) -> bool {
+        self.conversation_focus.is_focused(window)
+            || self.directory_query.focus_handle(cx).is_focused(window)
+    }
+
+    fn move_directory(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
+        // Do not steal a button's raw arrow/key behavior through the
+        // region binding. In particular Enter belongs to Back when focused.
+        if !self.directory_navigation_focused(window, cx) {
+            cx.propagate();
+            return;
+        }
+        if self.directory_composing(window, cx) {
+            return;
+        }
+        self.directory.move_selection(self.sidebar.rows(), delta);
+        if let Some(index) = self.directory.choice(self.sidebar.rows()) {
+            self.directory_scroll
+                .scroll_to_item_strict(index, ScrollStrategy::Top);
+        }
+        cx.notify();
+    }
+
+    fn open_directory_choice(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.directory_navigation_focused(window, cx) {
+            cx.propagate();
+            return;
+        }
+        if self.finish_directory_composition(window, cx) {
+            return;
+        }
+        if let Some(id) = self
+            .directory
+            .chosen_id(self.sidebar.rows())
+            .map(str::to_string)
+        {
+            self.open_directory_id(&id, window, cx);
+        }
+    }
+
+    fn open_directory_id(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.destination != Destination::Sessions
+            || self.finish_directory_composition(window, cx)
+            || !self.directory.contains(self.sidebar.rows(), id)
+        {
+            return;
+        }
+        self.sidebar.select_id(id);
+        self.activate_selected(window, cx);
+    }
+
+    fn directory_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.finish_directory_composition(window, cx) {
+            self.set_destination(Destination::Chat, window, cx);
+        }
+    }
+
+    fn render_directory(
+        &self,
+        page_height: Option<Pixels>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let count = self.directory.matches().len();
+        let status = if self.directory.too_long() {
+            format!(
+                "Filter too long. Use at most {} characters.",
+                directory::FILTER_MAX_CHARS
+            )
+        } else if let Some(index) = self.directory.choice(self.sidebar.rows()) {
+            let row = &self.sidebar.rows()[self.directory.matches()[index]];
+            format!(
+                "{} of {count}: {}, {} · {}",
+                index + 1,
+                row.title,
+                row.group.label(),
+                row.run_state.label()
+            )
+        } else {
+            "No matching Sessions. Clear or change the filter.".to_string()
+        };
+        let list = gpui_kit::uniform_list(
+            "directory-list",
+            count,
+            cx.processor(|this, range: Range<usize>, _, cx| {
+                range
+                    .filter_map(|index| {
+                        let source = *this.directory.matches().get(index)?;
+                        let row = this.sidebar.rows().get(source)?;
+                        let id = row.id.clone();
+                        let selected = this.directory.choice(this.sidebar.rows()) == Some(index);
+                        let meta = format!(
+                            "{} · {}{}{}",
+                            row.group.label(),
+                            row.run_state.label(),
+                            if this.sidebar.active_id() == Some(row.id.as_str()) {
+                                " · Open"
+                            } else {
+                                ""
+                            },
+                            if this.drafts.has(&row.id) {
+                                " · Draft"
+                            } else {
+                                ""
+                            }
+                        );
+                        Some(
+                            v_flex()
+                                .id(directory_row_id(&id))
+                                .test_support()
+                                .role(Role::ListBoxOption)
+                                .aria_label(row.title.clone())
+                                .aria_description(meta.clone())
+                                .aria_selected(selected)
+                                .aria_position_in_set(index + 1)
+                                .aria_size_of_set(this.directory.matches().len())
+                                .when(selected, |row| {
+                                    row.aria_active_descendant().bg(cx.theme().accent)
+                                })
+                                .h(this.scaled(72.))
+                                .w_full()
+                                .px_2()
+                                .justify_center()
+                                .cursor_pointer()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .truncate()
+                                        .child(directory::visual_text(&row.title)),
+                                )
+                                .child(div().text_xs().truncate().child(meta))
+                                .child(div().text_xs().truncate().child(directory::visual_text(
+                                    row.preview.as_deref().unwrap_or(""),
+                                )))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.open_directory_id(&id, window, cx)
+                                })),
+                        )
+                    })
+                    .collect()
+            }),
+        )
+        .track_scroll(&self.directory_scroll)
+        .flex_1()
+        .min_h_0();
+        let focused = self.conversation_focus.contains_focused(window, cx);
+        v_flex().id("region-conversation").test_support().role(Role::Main)
+            .aria_label("Fixture Sessions")
+            .aria_description("Read-only fixture Sessions; archived Sessions excluded. Filter title, preview or ID, up to 256 characters. Arrows choose, Enter opens, Escape returns to Chat. Shared synthetic transcript only; no daemon connection or Session management actions.")
+            .track_focus(&self.conversation_focus)
+            .map(|region| inert_while(region, self.background_inert(window)))
+            .map(|region| Self::main_size(region, page_height))
+            .when_some(page_height, |region, height| region.h(height))
+            .p_2().gap_2().border_1()
+            .border_color(region_border(focused, cx.theme().background, cx))
+            .key_context(DIRECTORY_CONTEXT)
+            .on_action(cx.listener(|this, _: &DirectoryNext, window, cx| this.move_directory(1, window, cx)))
+            .on_action(cx.listener(|this, _: &DirectoryPrevious, window, cx| this.move_directory(-1, window, cx)))
+            .on_action(cx.listener(|this, _: &DirectoryOpen, window, cx| this.open_directory_choice(window, cx)))
+            .on_action(cx.listener(|this, _: &DirectoryBack, window, cx| this.directory_back(window, cx)))
+            .child(h_flex().gap_2()
+                .child(readable("directory-title", "Fixture Sessions").flex_1().min_w_0().truncate())
+                .child(Button::new("back-to-chat").small().label("Back to Chat")
+                    .on_click(cx.listener(|this, _, window, cx| this.directory_back(window, cx)))))
+            .child(Input::new(&self.directory_query).small().aria_label("Filter Sessions"))
+            .child(announced(div().id("directory-status")).test_support().role(Role::Label)
+                .aria_value(status.clone()).text_xs().truncate().child(directory::visual_text(&status)))
+            .child(v_flex().id("directory-results").test_support().role(Role::ListBox)
+                .aria_label("Filtered fixture Sessions").flex_1().min_h_0().child(list))
+    }
+
+    /// The destinations other than Chat/Sessions. It takes the conversation's place and
     /// says plainly that nothing is here, so a working navigation button is
     /// never mistaken for a working page.
     fn render_scaffold_notice(
@@ -2479,7 +2771,7 @@ impl Shell {
             .text_sm()
             .text_color(cx.theme().muted_foreground)
             .child(Label::new(format!(
-                "This Phase 0 scaffold only has a Chat view. {name} has no screen, \
+                "This Phase 0 scaffold has Chat and fixture Sessions only. {name} has no screen, \
                  data or actions here, and this notice is not a preview of one."
             )));
         let back = Button::new("back-to-chat")
@@ -2495,7 +2787,7 @@ impl Shell {
             .aria_label(format!("{name}: not built"))
             .map(|region| inert_while(region, self.background_inert(window)))
             .aria_description(format!(
-                "This Phase 0 scaffold only has a Chat view. {name} has no screen, data or \
+                "This Phase 0 scaffold has Chat and fixture Sessions only. {name} has no screen, data or \
                  actions here, and this notice is not a preview of one."
             ))
             .track_focus(&self.conversation_focus)
@@ -2753,8 +3045,8 @@ impl Shell {
             },
             None => "No intent recorded".to_string(),
         };
-        let destination = if self.destination == Destination::Chat {
-            "Chat".to_string()
+        let destination = if matches!(self.destination, Destination::Chat | Destination::Sessions) {
+            self.destination.label().to_string()
         } else {
             format!("{} (scaffold: no view)", self.destination.label())
         };
@@ -2769,7 +3061,11 @@ impl Shell {
         );
         let fixture = readable(
             "status-fixture",
-            "Synthetic fixture: no Daemon Core connection",
+            match self.transcript_source {
+                TranscriptSource::Fixture => "Synthetic fixture: no Daemon Core connection",
+                TranscriptSource::Snapshot => "Decoded snapshot · no daemon connection",
+                TranscriptSource::NotLoaded => "Transcript not loaded · no daemon connection",
+            },
         );
         // What the last composer action did. It changes only when the user
         // acts, so it is announced.
@@ -2839,7 +3135,10 @@ impl Shell {
             .height
             .min(self.scaled(tokens::REFLOW_CONVERSATION_MIN));
         let chat = self.destination == Destination::Chat;
-        let main = if chat {
+        let main = if self.destination == Destination::Sessions {
+            self.render_directory(Some(height), window, cx)
+                .into_any_element()
+        } else if chat {
             self.render_conversation(Some(height), window, cx)
                 .into_any_element()
         } else {
@@ -2949,7 +3248,9 @@ impl Shell {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let main = if self.destination == Destination::Chat {
+        let main = if self.destination == Destination::Sessions {
+            self.render_directory(None, window, cx).into_any_element()
+        } else if self.destination == Destination::Chat {
             self.render_conversation(None, window, cx)
                 .into_any_element()
         } else {

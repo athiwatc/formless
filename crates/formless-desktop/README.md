@@ -4,8 +4,8 @@ An optional native desktop shell for Formless built on
 [GPUI Kit](https://github.com/longbridge/gpui-kit) 0.9.1. It is the Phase 0
 compatibility and design spike of epic #1753. It is a scaffold, not a usable
 client: it renders a synthetic fixture, never starts, contacts or configures
-a Daemon Core, and only Chat has a view. The other destinations show a "not
-built" notice.
+a Daemon Core. Chat and a read-only fixture Sessions directory have views.
+The other destinations still show a "not built" notice.
 
 Findings, measurements, the parity inventory and the open blockers are in
 [docs/desktop/phase0-findings.md](../../docs/desktop/phase0-findings.md).
@@ -22,6 +22,7 @@ not see GPUI. Run every command below from this directory.
 | Path | What it is | GUI dependency |
 |---|---|---|
 | `src/model.rs` | Presentation model: destinations, Run state, composer actions, layout breakpoints and modal overlays, focus regions, Session list selection, text size, drafts bounded by count and bytes | none |
+| `src/directory.rs` | Read-only filtering over the existing unarchived Session projection, selection by ID and bounded visual labels | none |
 | `src/commands.rs` | Typed shell command registry and palette search | none |
 | `src/replies.rs` | Read-only, validated `ListSessions` / `GetSession` decoding | none |
 | `src/transcript.rs` | Pure transcript event application, canonical completion replacement and sticky reload-needed state; not connected to the shell or a transport yet | none |
@@ -34,7 +35,7 @@ not see GPUI. Run every command below from this directory.
 | `src/shell.rs` | The GPUI Kit window over the model | `gui` feature |
 | `src/main.rs` | `formless-desktop` binary | `gui` feature |
 | `tests/shell.rs` | Headless tests of the real shell view. The test window has no real fonts: every character is the same width | `test-support` feature |
-| `tests/render.rs` | Offscreen render of twenty-three shell states through GPUI's real renderer, and measurements that need real fonts (macOS, Linux) | `test-support` feature |
+| `tests/render.rs` | Offscreen render of twenty-five shell states through GPUI's real renderer, and measurements that need real fonts (macOS, Linux) | `test-support` feature |
 
 ## Commands
 
@@ -118,3 +119,15 @@ there is more. In the Sessions list, Up/Down move
 the selection and Enter opens it. In the composer, Enter is the primary
 action, Shift+Enter adds a line, Cmd/Ctrl+Enter is Queue during a Run.
 Composer actions are recorded in the status line and never sent.
+
+
+The Sessions destination is a read-only fixture directory, not Session
+management. Filter title, preview or ID (all words, case-insensitive; up to
+256 Unicode scalar values), use Up/Down to choose and Enter/click to open,
+or Escape/Back to Chat to leave. Input-method composition is committed
+without also activating or leaving. Only visible result rows are laid out;
+archived Sessions remain excluded. Each fixture Session shares the synthetic
+transcript. Once a decoded snapshot has been shown, changing Session clears
+that transcript rather than relabeling it; an empty loaded snapshot is kept
+distinct from an unloaded one. No rename, archive, delete or daemon request
+is performed. Search remains a separate future slice.

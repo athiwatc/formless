@@ -17,7 +17,7 @@ use formless_desktop::fixture;
 use formless_desktop::memory::{limits, IntentKind, IntentRecord};
 use formless_desktop::model::{tokens, BlockKind, Destination, Fit, TextScale};
 use formless_desktop::replies;
-use formless_desktop::shell::{self, session_row_id, PageSection, Shell};
+use formless_desktop::shell::{self, directory_row_id, session_row_id, PageSection, Shell};
 use formless_desktop::timeline::{self, TimelineBlock};
 use formless_protocol::SendMode;
 use gpui_kit::base::test_support::texts;
@@ -658,7 +658,7 @@ fn other_destinations_show_a_scaffold_notice_instead_of_the_conversation(cx: &mu
         );
         assert!(painted
             .iter()
-            .any(|text| text.contains("This Phase 0 scaffold only has a Chat view")));
+            .any(|text| text.contains("This Phase 0 scaffold has Chat and fixture Sessions only")));
 
         // The region cycle skips the composer that is not there.
         window.press("f6", cx);
@@ -959,7 +959,7 @@ fn every_place_focus_can_rest_on_a_reflowed_page_has_an_accessibility_node(
         assert_eq!(notice.label(), Some("Tools: not built"));
         assert!(notice
             .description()
-            .is_some_and(|text| text.contains("only has a Chat view")));
+            .is_some_and(|text| text.contains("has Chat and fixture Sessions only")));
     });
 }
 
@@ -4800,5 +4800,332 @@ fn the_whole_output_view_and_its_error_controls_fit_the_minimum_window_at_200_pe
             window.press("escape", cx);
             window.render_frame(cx);
         }
+    });
+}
+
+#[gpui_kit::test]
+fn the_sessions_directory_filters_and_opens_explicitly_without_losing_drafts(
+    cx: &mut TestAppContext,
+) {
+    let (handle, shell) = open(cx, WIDE, 200, 40);
+    let original = step(cx, handle, |_, cx| {
+        shell.read(cx).sidebar().active_id().unwrap().to_string()
+    });
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        window.input("draft A", cx);
+        window.click("destination-Sessions", cx);
+        window.render_frame(cx);
+        assert_eq!(shell.read(cx).destination(), Destination::Sessions);
+        assert_eq!(
+            window.find("region-conversation").label(),
+            Some("Fixture Sessions")
+        );
+        assert!(window.try_find("region-composer").is_none());
+        assert_eq!(
+            window.find_by_label("Filter Sessions").focused(),
+            Some(true)
+        );
+        window.input("fixture-session-7", cx);
+    });
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            shell.read(cx).sidebar().active_id(),
+            Some(original.as_str())
+        );
+        window.press("down", cx);
+        window.render_frame(cx);
+        assert_eq!(
+            shell.read(cx).sidebar().active_id(),
+            Some(original.as_str())
+        );
+        window.press("up", cx);
+        window.press("enter", cx);
+        window.render_frame(cx);
+        assert_eq!(shell.read(cx).destination(), Destination::Chat);
+        assert_eq!(
+            shell.read(cx).sidebar().active_id(),
+            Some("fixture-session-7")
+        );
+        assert_eq!(window.find_by_label("Message").focused(), Some(true));
+        assert_eq!(shell.read(cx).draft(cx).as_ref(), "");
+        window.input("draft B", cx);
+        window.click("destination-Sessions", cx);
+        window.render_frame(cx);
+        window.press(&chord("a"), cx);
+        window.input(&original, cx);
+    });
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        window.press("enter", cx);
+        window.render_frame(cx);
+        assert_eq!(
+            shell.read(cx).sidebar().active_id(),
+            Some(original.as_str())
+        );
+        assert_eq!(shell.read(cx).draft(cx).as_ref(), "draft A");
+        assert!(shell.read(cx).has_stored_draft("fixture-session-7"));
+        assert_eq!(shell.read(cx).last_intent(), None);
+    });
+}
+
+#[gpui_kit::test]
+fn directory_empty_results_never_open_a_neighbor_and_escape_preserves_the_draft(
+    cx: &mut TestAppContext,
+) {
+    let (handle, shell) = open(cx, WIDE, 200, 40);
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        window.input("keep me", cx);
+        window.click("destination-Sessions", cx);
+        window.render_frame(cx);
+        window.input("no such session 123456789", cx);
+    });
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        let before = shell.read(cx).sidebar().active_id().map(str::to_string);
+        assert!(window
+            .find("directory-status")
+            .value()
+            .unwrap()
+            .starts_with("No matching Sessions"));
+        for key in ["up", "down", "enter"] {
+            window.press(key, cx);
+        }
+        assert_eq!(shell.read(cx).destination(), Destination::Sessions);
+        assert_eq!(shell.read(cx).sidebar().active_id(), before.as_deref());
+        window.press("escape", cx);
+        window.render_frame(cx);
+        assert_eq!(shell.read(cx).destination(), Destination::Chat);
+        assert_eq!(window.find_by_label("Message").focused(), Some(true));
+        assert_eq!(shell.read(cx).draft(cx).as_ref(), "keep me");
+        // A focused Back button must use its own Enter action, not the
+        // directory's Enter-to-open binding (even with no chosen result).
+        window.click("destination-Sessions", cx);
+        window.render_frame(cx);
+        tab_to(window, "back-to-chat", cx);
+        window.press("enter", cx);
+        window.render_frame(cx);
+        assert_eq!(shell.read(cx).destination(), Destination::Chat);
+        assert_eq!(shell.read(cx).sidebar().active_id(), before.as_deref());
+        assert_eq!(shell.read(cx).draft(cx).as_ref(), "keep me");
+    });
+}
+
+#[gpui_kit::test]
+fn the_directory_virtualizes_ten_thousand_sessions_and_rejects_an_over_limit_filter(
+    cx: &mut TestAppContext,
+) {
+    let (handle, shell) = open(cx, WIDE, 10_000, 40);
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        window.click("destination-Sessions", cx);
+        window.render_frame(cx);
+        let rows = shell.read(cx).sidebar().rows();
+        let materialized = rows
+            .iter()
+            .filter(|row| window.try_find(directory_row_id(&row.id)).is_some())
+            .count();
+        assert!(materialized > 0 && materialized < 200, "{materialized}");
+        assert!(window
+            .try_find(directory_row_id("fixture-session-40"))
+            .is_none()); // archived
+        window.input(&"a".repeat(257), cx);
+        assert_eq!(shell.read(cx).directory_query().read(cx).value().len(), 256);
+        window.press(&chord("a"), cx);
+        window.input(&"a".repeat(256), cx);
+        assert_eq!(shell.read(cx).directory_query().read(cx).value().len(), 256);
+    });
+}
+
+#[gpui_kit::test]
+fn directory_enter_and_escape_do_not_activate_or_leave_during_composition(cx: &mut TestAppContext) {
+    let (handle, shell) = open(cx, WIDE, 200, 40);
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        window.click("destination-Sessions", cx);
+        window.render_frame(cx);
+    });
+    for key in ["enter", "escape"] {
+        step(cx, handle, |window, cx| {
+            let query = shell.read(cx).directory_query().clone();
+            let bounds = window.find_by_label("Filter Sessions").bounds();
+            let before = shell.read(cx).sidebar().active_id().map(str::to_string);
+            TestInput::new(ElementInputHandler::new(bounds, query), window).compose_text(
+                None,
+                "にほんご",
+                None,
+                cx,
+            );
+            window.press(key, cx);
+            window.render_frame(cx);
+            assert_eq!(shell.read(cx).destination(), Destination::Sessions);
+            assert_eq!(shell.read(cx).sidebar().active_id(), before.as_deref());
+            assert_eq!(shell.read(cx).last_intent(), None);
+        });
+        cx.run_until_parked();
+    }
+}
+
+#[gpui_kit::test]
+fn decoded_transcripts_are_cleared_instead_of_relabelled_when_a_directory_session_opens(
+    cx: &mut TestAppContext,
+) {
+    let (handle, shell) = open(cx, WIDE, 200, 40);
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        let id = shell.read(cx).sidebar().active_id().unwrap().to_string();
+        let empty = serde_json::json!({"session": {"id": id}, "running": false, "messages": []});
+        let empty = replies::session_snapshot(&id, &empty).unwrap();
+        shell
+            .update(cx, |shell, cx| shell.show_session_snapshot(empty, cx))
+            .unwrap();
+        window.render_frame(cx);
+        assert_eq!(window.find("block-count").value(), Some("0 blocks"));
+        assert!(window
+            .find("status-fixture")
+            .value()
+            .unwrap()
+            .starts_with("Decoded snapshot"));
+        let reply = serde_json::json!({"session": {"id": id}, "running": false,
+            "messages": [{"id": "m1", "session_id": id, "seq": 1, "role": "user", "content": "private old transcript", "created_at": "now"}]});
+        let snapshot = replies::session_snapshot(&id, &reply).unwrap();
+        shell
+            .update(cx, |shell, cx| shell.show_session_snapshot(snapshot, cx))
+            .unwrap();
+        window.render_frame(cx);
+        assert_eq!(window.find("block-count").value(), Some("1 blocks"));
+        window.click("destination-Sessions", cx);
+        window.render_frame(cx);
+        window.click(directory_row_id("fixture-session-7"), cx);
+        window.render_frame(cx);
+        assert_eq!(
+            shell.read(cx).sidebar().active_id(),
+            Some("fixture-session-7")
+        );
+        assert_eq!(window.find("block-count").value(), Some("0 blocks"));
+        assert!(window
+            .find("status-fixture")
+            .value()
+            .unwrap()
+            .contains("Transcript not loaded"));
+        assert!(window.try_find(("block", 1usize)).is_none());
+    });
+}
+
+#[gpui_kit::test]
+fn the_sessions_directory_filter_and_back_control_fit_at_200_percent_in_the_minimum_window(
+    cx: &mut TestAppContext,
+) {
+    let (handle, shell) = open(cx, size(px(480.), px(360.)), 10_000, 40);
+    step(cx, handle, |window, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.set_text_scale(TextScale::from_percent(200), window, cx);
+            shell.run_command(Command::GoTo(Destination::Sessions), window, cx);
+        });
+        settle_frames(window, cx);
+        assert_eq!(
+            window.find_by_label("Filter Sessions").focused(),
+            Some(true)
+        );
+        let viewport = Bounds::new(Point::default(), window.viewport_size());
+        for query in [
+            window.find_by_label("Filter Sessions"),
+            window.find("back-to-chat"),
+            window.find("directory-status"),
+        ] {
+            let b = query.bounds();
+            assert!(
+                b.top() >= viewport.top()
+                    && b.bottom() <= viewport.bottom()
+                    && b.left() >= viewport.left()
+                    && b.right() <= viewport.right(),
+                "{b:?}"
+            );
+        }
+        window.press("down", cx);
+        window.press("enter", cx);
+        settle_frames(window, cx);
+        assert_eq!(shell.read(cx).destination(), Destination::Chat);
+        assert_eq!(window.find_by_label("Message").focused(), Some(true));
+    });
+}
+
+#[gpui_kit::test]
+fn a_filter_change_keeps_the_preserved_directory_selection_in_view(cx: &mut TestAppContext) {
+    let (handle, shell) = open(cx, WIDE, 10_000, 40);
+    let target = step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        window.click("destination-Sessions", cx);
+        window.render_frame(cx);
+        for _ in 0..100 {
+            window.press("down", cx);
+        }
+        window.render_frame(cx);
+        let target = shell.read(cx).sidebar().rows()[100].id.clone();
+        assert_eq!(
+            window.find(directory_row_id(&target)).selected(),
+            Some(true)
+        );
+        window.input("fixture-session-", cx);
+        target
+    });
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+        assert_eq!(
+            window.find(directory_row_id(&target)).selected(),
+            Some(true)
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn f6_into_the_directory_keeps_arrow_and_enter_navigation_working(cx: &mut TestAppContext) {
+    let (handle, shell) = open(cx, WIDE, 200, 40);
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        window.click("destination-Sessions", cx);
+        window.render_frame(cx);
+        let before = shell.read(cx).sidebar().active_id().map(str::to_string);
+        for _ in 0..3 {
+            window.press("f6", cx);
+        }
+        assert_eq!(window.find("region-conversation").focused(), Some(true));
+        window.press("down", cx);
+        assert_eq!(shell.read(cx).sidebar().active_id(), before.as_deref());
+        window.press("enter", cx);
+        window.render_frame(cx);
+        assert_eq!(shell.read(cx).destination(), Destination::Chat);
+        assert_ne!(shell.read(cx).sidebar().active_id(), before.as_deref());
+    });
+}
+
+#[gpui_kit::test]
+fn keyboard_back_from_the_directory_does_not_open_the_selected_neighbor(cx: &mut TestAppContext) {
+    let (handle, shell) = open(cx, WIDE, 200, 40);
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        let before = shell.read(cx).sidebar().active_id().map(str::to_string);
+        window.click("destination-Sessions", cx);
+        window.render_frame(cx);
+        window.press("down", cx);
+        window.render_frame(cx);
+        let neighbor = shell.read(cx).sidebar().rows()[1].id.clone();
+        assert_ne!(Some(neighbor.as_str()), before.as_deref());
+        assert_eq!(
+            window.find(directory_row_id(&neighbor)).selected(),
+            Some(true)
+        );
+        tab_to(window, "back-to-chat", cx);
+        window.press("enter", cx);
+        window.render_frame(cx);
+        assert_eq!(shell.read(cx).destination(), Destination::Chat);
+        assert_eq!(shell.read(cx).sidebar().active_id(), before.as_deref());
     });
 }
