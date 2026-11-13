@@ -8,7 +8,7 @@
 
 <p>
   <a href="https://github.com/athiwatc/formless/blob/main/Cargo.toml"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License: Apache-2.0"></a>
-  <a href="https://github.com/athiwatc/formless/releases/latest"><img src="https://img.shields.io/github/v/release/athiwatc/formless?sort=semver" alt="Latest release"></a>
+  <a href="https://github.com/athiwatc/formless/releases"><img src="https://img.shields.io/github/v/release/athiwatc/formless?sort=semver" alt="Releases"></a>
   <a href="#32-install"><img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg" alt="Platforms: macOS, Linux, Windows"></a>
   <a href="#10-security-and-privacy"><img src="https://img.shields.io/badge/telemetry-none-success.svg" alt="Telemetry: none"></a>
 </p>
@@ -407,7 +407,7 @@ usage, errors and coverage; interrupted or incomplete usage stays unknown.
 
 Piped stdin is read only when stdin isn't a terminal; from a script that leaves stdin open without writing to it, add `< /dev/null`.
 
-Approvals are **opt-in**: by default (`security.secure = false`) Tools run without asking, and each sensitive call is recorded in the audit log (`tool.run_unasked`). With approvals on (`formless --secure`, or `security.secure = true` in `config.toml`), they are not skipped by scripting: without `--yes` a sensitive Invocation **fails closed** with a clear error instead of being silently granted. `--timeout 10m` (also `90s`, `1h30m`) interrupts a Run that takes too long. Exit codes: `0` answered, `1` Run errored/paused, `2` usage/config error, `124` timed out, `130` interrupted.
+Approvals are **opt-in**: by default (`security.secure = false`) Tools run without asking, and each sensitive call is recorded in the audit log (`tool.run_unasked`). With approvals on (`formless --secure`, or `security.secure = true` in `config.toml`), they are not skipped by scripting: without `--yes` a sensitive Invocation **fails closed** with a clear error instead of being silently granted. `--timeout 10m` (also `90s`, `1h30m`) interrupts a Run that takes too long. Exit codes: `0` answered, `1` Run errored/paused, `2` usage/config error, `3` Run paused because schema validation failed (see `--schema` above), `124` Run timed out (see `--timeout` above), `130` interrupted.
 
 ### Sessions from the command line
 
@@ -639,6 +639,7 @@ The table covers every visible root command, including Clap's generated
 | `formless restore` | `FILE` | Replace the database from a backup, preserving the current database. |
 | `formless roles` | `list`, `add`, `rm` | Map named purposes to a provider and model. |
 | `formless run` | `TASK`; `--estimate`, `--session`, `--output`, `--attach` and other Run options | Run one headless task, or print its local forecast without starting it. |
+| `formless routing` | `--json` | Read currently available daemon routing decisions and returned candidate figures without starting a model request. |
 | `formless runs` | No action: list; `show`, `cancel` | List recent Runs, inspect one by ID/prefix, or cancel that exact Run. |
 | `formless security` | `status` | Inspect the daemon's grants, denials, trusted resources, and exposed interfaces. |
 | `formless sessions` | `fork`, `compare`, `list`, `show`, `files`, `rewind`, `rename`, `rm`, `restore`, `import`, `search`, `archive`, `unarchive`, `export` | Manage stored Sessions, follow a Run with `show --follow`, or inspect tracked files. |
