@@ -12,6 +12,7 @@ mod cli_run_identity;
 mod cli_run_memories;
 mod cli_runs_list;
 mod cli_subagents;
+mod cli_tool_filters;
 mod cli_tool_lookup;
 mod cli_tool_success;
 mod cli_usage;
@@ -340,7 +341,7 @@ enum Cmd {
     },
     /// Tool registry inspection/transfer (SPEC §7.8, §12)
     #[command(
-        after_help = "Examples:\n  formless tools list\n  formless tools show TOOL_NAME --json\n  formless tools export TOOL_NAME --output tool.json"
+        after_help = "Examples:\n  formless tools list\n  formless tools list --filter not-retired --tag work --show-pinned\n  formless tools show TOOL_NAME --json\n  formless tools export TOOL_NAME --output tool.json"
     )]
     Tools {
         #[command(subcommand)]
@@ -683,6 +684,12 @@ enum ToolsAction {
         /// Only Tools with this tag
         #[arg(long)]
         tag: Option<String>,
+        /// Select a stored-state predicate, combined with the exact tag by AND
+        #[arg(long, value_enum)]
+        filter: Option<cli_tool_filters::Filter>,
+        /// Add a PINNED column to human output (changes the displayed layout)
+        #[arg(long)]
+        show_pinned: bool,
     },
     /// Switch a Tool off: hidden from the agent and uncallable, nothing else changes
     Disable {
@@ -7447,21 +7454,28 @@ fn tools_cmd(paths: Paths, action: ToolsAction) -> Result<()> {
         ToolsAction::Reviews { name, kind, json } => {
             description_reviews_cmd(&paths, kind, name, json)
         }
-        ToolsAction::List { json, tag } => {
+        ToolsAction::List {
+            json,
+            tag,
+            filter,
+            show_pinned,
+        } => {
             let v = request_once(&paths, Request::ListTools)?;
             let mut tools: Vec<formless_protocol::ToolInfo> = serde_json::from_value(v)?;
-            if let Some(tag) = tag {
-                let tag = tag.trim_start_matches('#').to_lowercase();
-                tools.retain(|t| t.tags.contains(&tag));
-            }
+            let original_count = tools.len();
+            cli_tool_filters::select(&mut tools, filter, tag.as_deref());
             if json {
                 println!("{}", serde_json::to_string_pretty(&tools)?);
                 return Ok(());
             }
             if tools.is_empty() {
-                println!("(no tools yet - the agent builds them via create_tool)");
+                println!(
+                    "{}",
+                    cli_tool_filters::empty_message(original_count, filter, tag.as_deref())
+                );
+                return Ok(());
             }
-            let mut tbl = Table::new(&[
+            let mut headers = vec![
                 "TOOL",
                 "TITLE",
                 "TAGS",
@@ -7470,7 +7484,11 @@ fn tools_cmd(paths: Paths, action: ToolsAction) -> Result<()> {
                 "SUCCESS",
                 "STATUS",
                 "CAPABILITIES",
-            ]);
+            ];
+            if show_pinned {
+                headers.push("PINNED");
+            }
+            let mut tbl = Table::new(&headers);
             for tool in tools {
                 let status = if tool.retired {
                     t("retired", Tone::Dim)
@@ -7483,7 +7501,7 @@ fn tools_cmd(paths: Paths, action: ToolsAction) -> Result<()> {
                 };
                 let rate = tool.success_rate;
                 let (success_label, success_tone) = cli_tool_success::tool_success_cell(rate);
-                tbl.row(vec![
+                let mut cells = vec![
                     t(tool.name, Tone::Strong),
                     c(tool.title),
                     t(tool.tags.join(" "), Tone::Dim),
@@ -7492,7 +7510,11 @@ fn tools_cmd(paths: Paths, action: ToolsAction) -> Result<()> {
                     t(success_label, success_tone),
                     status,
                     t(tool.capabilities.join(", "), Tone::Dim),
-                ]);
+                ];
+                if show_pinned {
+                    cells.push(c(if tool.pinned { "yes" } else { "no" }));
+                }
+                tbl.row(cells);
             }
             if !tbl.is_empty() {
                 tbl.print();

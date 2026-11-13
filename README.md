@@ -699,6 +699,16 @@ ranked partial-name suggestions can help you retry with the original exact
 spelling; these use folded subsequence matching, not edit-distance spelling
 correction. A suggestion never selects or runs a Tool automatically.
 
+`tools list --filter FILTER` selects one stored-state predicate: `not-retired`
+(including disabled Tools), `retired`, `failing` (known success rate below 0.8),
+`needs-attention`, `off` (disabled) or `pinned`. It combines by AND with
+`--tag TAG`, retaining exact stored-tag matching after the existing argument
+lowercasing/leading-# removal. Unknown rates do not count as failing; states
+may overlap. JSON uses the same selection and existing ToolInfo schema.
+Human output distinguishes an empty registry from no matching rows and names
+the flags to clear. `--show-pinned` adds a human PINNED yes/no column; default
+piped cells and row order remain unchanged. These flags never mutate a Tool.
+
 #### Root and global flags
 
 | Flag | Short | Availability | Meaning |
