@@ -24,6 +24,7 @@ pub mod plain;
 #[cfg(test)]
 mod profile_context_tests;
 pub mod qr;
+mod search_jump;
 mod session_ui;
 mod settings;
 mod text;
@@ -1850,6 +1851,7 @@ struct App {
     /// shown before saving (SPEC §10.4).
     editor_review: Option<EditorReview>,
     search_hits: Vec<SearchHit>,
+    search_jump: Option<search_jump::Target>,
     search_idx: usize,
     search_mode: bool,
     editing_id: Option<String>,
@@ -2124,6 +2126,7 @@ impl App {
             editor: None,
             editor_review: None,
             search_hits: Vec::new(),
+            search_jump: None,
             search_idx: 0,
             search_mode: false,
             editing_id: None,
@@ -2696,6 +2699,14 @@ impl App {
                 _ => None,
             };
             let id = c.send(req);
+            if let Some(target) = self.search_jump.as_mut().filter(|target| {
+                target.request.is_none()
+                    && state_read
+                        .as_ref()
+                        .is_some_and(|(session, _)| session == &target.session)
+            }) {
+                target.request = Some(id);
+            }
             if let Some(read) = state_read {
                 self.run_state_reads.insert(id, read);
             }
@@ -2713,6 +2724,7 @@ impl App {
             .map(|(id, _)| *id)
             .collect();
         for id in late {
+            self.failed_search_jump(id);
             self.pending_since.remove(&id);
             self.run_state_reads.remove(&id);
             let Some(kind) = self.pending.remove(&id) else {
@@ -2948,6 +2960,9 @@ impl App {
                     }
                     self.pending_since.remove(&id);
                     let state_read = self.run_state_reads.remove(&id);
+                    if !ok {
+                        self.failed_search_jump(id);
+                    }
                     let Some(kind) = self.pending.remove(&id) else {
                         continue;
                     };
@@ -4855,7 +4870,10 @@ impl App {
                                             call.status == "running" && call.handle.is_some()
                                         });
                                     }
+                                    let search_jump = self.search_jump.take();
                                     self.follow_chat_bottom();
+                                    self.search_jump = search_jump;
+                                    self.loaded_search_jump(id);
                                 }
                             }
                             self.run_banner = result["unfinished_run"].as_object().map(|r| {
@@ -5262,12 +5280,14 @@ impl App {
     }
 
     fn scroll_chat_up(&mut self, lines: usize) {
+        self.search_jump = None;
         let max_top = self.chat_max_top();
         let cur = self.chat_scroll_top.unwrap_or(max_top);
         self.chat_scroll_top = Some(cur.saturating_sub(lines));
     }
 
     fn scroll_chat_down(&mut self, lines: usize) {
+        self.search_jump = None;
         if let Some(top) = self.chat_scroll_top {
             let next = top + lines;
             self.chat_scroll_top = if next >= self.chat_max_top() {
@@ -5279,6 +5299,7 @@ impl App {
     }
 
     fn follow_chat_bottom(&mut self) {
+        self.search_jump = None;
         self.chat_scroll_top = None;
     }
 
@@ -7263,6 +7284,9 @@ impl App {
 
     /// Switch view and fetch what it shows.
     fn open_view(&mut self, view: View) {
+        if view != View::Chat {
+            self.search_jump = None;
+        }
         self.view = view;
         match view {
             View::Sessions => self.request(Pending::ListSessions, Request::ListSessions),
@@ -9658,10 +9682,18 @@ impl App {
                 KeyCode::Enter => {
                     if let Some(hit) = self.search_hits.get(self.search_idx).cloned() {
                         self.switch_session(hit.session_id.clone());
+                        self.start_search_jump(hit.clone());
                         self.request(
                             Pending::GetSession,
                             Request::GetSession { id: hit.session_id },
                         );
+                        if self
+                            .search_jump
+                            .as_ref()
+                            .is_some_and(|target| target.request.is_none())
+                        {
+                            self.search_jump = None;
+                        }
                         self.view = View::Chat;
                     }
                 }
@@ -15180,6 +15212,8 @@ fn tool_call_block(
 struct ChatRender {
     lines: Vec<Line<'static>>,
     focus_line: Option<usize>,
+    search_line: Option<usize>,
+    search_nearby: bool,
     user_lines: Vec<usize>,
     image_lines: Vec<(usize, String)>,
     /// Persisted tool calls' header lines, for clicks.
@@ -15189,6 +15223,12 @@ struct ChatRender {
 fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
     let mut lines: Vec<Line> = Vec::new();
     let mut focus_line = None;
+    let mut search_line = None;
+    let mut search_nearby = false;
+    let search_target = app
+        .search_jump
+        .as_ref()
+        .filter(|target| target.ready && app.is_current(&target.session));
     let mut user_lines = Vec::new();
     // Rows reserved for image thumbnails: (first line, file).
     let mut image_lines: Vec<(usize, String)> = Vec::new();
@@ -15241,6 +15281,7 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
             }
             day = Some(d);
         }
+        let first_line = lines.len();
         match m.role.as_str() {
             "user" => {
                 user_lines.push(lines.len());
@@ -15338,8 +15379,27 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
                 }
             }
         }
+        if search_target
+            .is_some_and(|target| target.session == m.session_id && target.message == m.id)
+        {
+            if lines.len() > first_line {
+                search_line = Some(first_line);
+            } else {
+                search_line = first_line.checked_sub(1);
+                search_nearby = true;
+            }
+        }
         if let Some(footer) = footers.get(&mi) {
             lines.push(Line::styled(format!("  {footer}"), ui::dim(app.color)));
+        }
+    }
+    if search_line.is_none() {
+        if let Some(call) = search_target.and_then(|target| target.call.as_ref()) {
+            search_line = call_lines
+                .iter()
+                .find(|(_, id)| id == call)
+                .map(|(line, _)| *line);
+            search_nearby = search_line.is_some();
         }
     }
     // Live call tree (persisted lines above keep the history): running
@@ -15539,6 +15599,8 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
     ChatRender {
         lines,
         focus_line,
+        search_line,
+        search_nearby,
         user_lines,
         image_lines,
         call_lines,
@@ -15555,6 +15617,8 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
     let ChatRender {
         mut lines,
         focus_line,
+        search_line,
+        search_nearby,
         user_lines,
         image_lines,
         call_lines,
@@ -15611,6 +15675,27 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
         find.rows = match_lines.iter().map(|&i| line_rows[i]).collect();
     }
     // Bring a newly focused tool call into view (rows before it, wrapped).
+    let search_ready = app
+        .search_jump
+        .as_ref()
+        .is_some_and(|target| target.ready && app.is_current(&target.session));
+    let search_row = search_ready
+        .then(|| search_line.and_then(|line| line_rows.get(line).copied()))
+        .flatten();
+    if search_ready {
+        app.search_jump = None;
+        if search_row.is_none() {
+            app.follow_chat_bottom();
+            app.notes.push(
+                "Search hit could not be shown in this view; following the Session bottom.".into(),
+            );
+        } else if search_nearby {
+            app.notes.push(
+                "Search hit is grouped with other content; showing its nearest visible context."
+                    .into(),
+            );
+        }
+    }
     let focus_row = focus_line
         .filter(|_| std::mem::take(&mut app.scroll_to_focus))
         .map(|i| line_rows[i]);
@@ -15628,7 +15713,7 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
             find_row = f.rows.get(f.current).copied();
         }
     }
-    if let Some(row) = focus_row.or(find_row) {
+    if let Some(row) = search_row.or(focus_row).or(find_row) {
         let top = app.chat_scroll_top.unwrap_or(max_top);
         if row < top || row >= top + height {
             app.chat_scroll_top = Some(row.saturating_sub(height / 3).min(max_top));
@@ -18671,6 +18756,7 @@ mod tests {
             editor: None,
             editor_review: None,
             search_hits: Vec::new(),
+            search_jump: None,
             search_idx: 0,
             search_mode: false,
             editing_id: None,
