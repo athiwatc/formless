@@ -73,6 +73,8 @@ cargo run --release --no-default-features --locked --example stream_model
 # the background, nothing typed or clicked; exit 0 when every check holds.
 cargo build --release --locked --features ax-dump
 python3 scripts/check-platform-a11y.py "$CARGO_TARGET_DIR/release/formless-desktop" /tmp/a11y-check
+# Its own failure paths, with stub commands; starts no real application.
+python3 scripts/test_check_platform_a11y.py
 
 # For looking at a real window from outside: open it without coming to the
 # front, quit after ten minutes, and write out the accessibility tree GPUI

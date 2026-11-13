@@ -1681,8 +1681,18 @@ the Context dialog beside a docked sidebar at 1,100 x 900, that the dialog
 is the window's only child, is modal, has its contents, and holds GPUI's
 focus.
 
+**Bounded, and failures reported** (after review of `660326a`). Each run
+must exit by itself within 20 s (`--timeout`); one that does not is
+terminated, only the process the script started, and fails. A nonzero exit
+status fails even if a tree was written. Each run's stdout and stderr are
+kept beside its tree. A missing tree, or a GPUI tree that cannot be read,
+is a failed check, not a traceback. `scripts/test_check_platform_a11y.py`
+covers those paths with stub commands in place of the shell (a hang, a
+nonzero exit after writing a tree, malformed JSON, no tree, a clean run);
+no real application is started by it.
+
 **What it proves.** That this build's platform adapter, on this Mac,
-exposes those things. It ran clean against this build (18 checks), and
+exposes those things. It ran clean against this build (19 checks with the run checks), and
 failed against the `e0a131d` build, which gives markdown source and has no
 `--open-panel` (evidence `platform-check-*`). It does not prove anything
 about what VoiceOver says or does.
