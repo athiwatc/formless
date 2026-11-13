@@ -208,9 +208,9 @@ typical developer build.
 
 | Command | Result |
 |---|---|
-| `cargo test --no-default-features --lib --locked` | 61 passed (model, memory, timeline and fixture); no GPUI crate in its dependency graph |
-| `cargo test --features test-support --locked` | 61 passed, 67 passed (headless shell), 19 offscreen render states passed (37 captures) |
-| `cargo test --features test-support,thai-breaks --locked` | 66 passed, 67 passed, 19 render states and the real-text Thai measurement passed |
+| `cargo test --no-default-features --lib --locked` | 64 passed (model, memory, timeline and fixture); no GPUI crate in its dependency graph |
+| `cargo test --features test-support --locked` | 64 passed, 67 passed (headless shell), 19 offscreen render states passed (37 captures) |
+| `cargo test --features test-support,thai-breaks --locked` | 69 passed, 67 passed, 19 render states and the real-text Thai measurement passed |
 | `cargo fmt --check`, `cargo clippy --all-targets --locked` with and without `thai-breaks` | clean |
 
 These are the counts at the last code commit (§12). The first checkpoint
@@ -1501,6 +1501,49 @@ docked panel behind the dialog is still laid out. 67 shell tests.
 **Not known.** Whether VoiceOver keeps to the dialog now that nothing else
 is offered, and what it says when the dialog closes and the page comes
 back. No screen reader ran.
+
+### 16.9 Session position and count; block text as plain text
+
+Local commit `795571b`. Asked for by independent review of `c370524`.
+
+**Position and set size: not possible on macOS with the pinned adapter.**
+GPUI's tree already gives each Session option its position and the set
+size (1 to 18 of 196, §16.6), and the Windows and Linux adapters
+(`accesskit_windows` 0.34.0, `accesskit_atspi_common` 0.19.1) read both.
+The macOS adapter, `accesskit_macos` 0.26.3, has no code that reads them,
+and no index, row count or column count either: a search of its source
+finds none. Nothing the shell can set reaches macOS as a position or a
+count, short of changing the role (which the review ruled out as a guess)
+or the adapter. The count is on screen as text above the list ("Sessions
+(196)"). This stays open: it needs an adapter change, or a newer adapter,
+checked against VoiceOver.
+
+**Instead, a defect the real tree showed: block text read as markdown
+source.** Each block's accessible value was the markdown of its row
+window, so a reader would meet code fences, backticks, underscores and
+quote markers before the words. It is now the text the row renders to,
+made with the markdown crate the kit already uses (`markdown` 1.0.0; no
+new package in the lockfile, no GPUI crate in the GUI-free build), with
+blocks on lines of their own and raw HTML left out.
+
+- **Cost.** A full 32 KiB window takes about 5 ms in a release build and
+  about 100 ms in the debug test build. A streamed row's window is rebuilt
+  every frame, so the text is made only while assistive technology is
+  reading the window (GPUI builds no accessibility tree otherwise) and
+  under the test harness, once for each rebuild of the window. While a
+  screen reader is on and a long block is streaming, that is up to one
+  conversion a frame; not measured in that state.
+- **Checked.** Model tests for the conversion (emphasis, headings, quotes,
+  fences, lists, links, images, hard breaks, raw HTML, tables, emoji) and
+  for the caching; two shell tests updated to expect plain text. In a real
+  window (`macos-real-window/plain-*`): before, the block values held
+  fences, backticks, a quote marker and `_block 40_`; after, none of the
+  block values holds any markdown syntax.
+- **Not changed.** The Context panel's "Last message" is drawn as raw
+  text, not rendered, so it is read as raw text. A first version converted
+  it too; the real-window walk showed an empty "Last message:" that no
+  longer matched the screen, and that part was reverted before the commit.
+- **Not known.** How VoiceOver reads the plain text, including code.
 
 ## 17. Windows: no first frame from `--smoke`
 
