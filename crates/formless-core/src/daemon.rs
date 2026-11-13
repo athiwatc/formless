@@ -12341,6 +12341,17 @@ impl Daemon {
             .with_context(|| {
                 RequestFailure::not_found(format!("'{name}' has no version {want}"))
             })?;
+        if let Some(from) = args["diff_from"].as_i64() {
+            if !detail
+                .versions
+                .iter()
+                .any(|version| version.version == from)
+            {
+                bail!(RequestFailure::not_found(format!(
+                    "diff_from: '{name}' has no version {from}"
+                )));
+            }
+        }
         let failures = self.with_store(|st| st.recent_failures(&info.id, 5))?;
         let example = self.with_reader(|st| st.tool_example(&info.id))?;
         let parse = |s: &str| serde_json::from_str::<Value>(s).unwrap_or(json!(s));

@@ -154,3 +154,97 @@ async fn schema_save_flag_is_required_despite_forged_author_and_reports_reach_re
     drop(daemon);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[tokio::test]
+async fn read_tool_diff_from_names_the_invalid_argument_without_executing_tools() {
+    let _env = crate::credential_env::EnvGuard::isolated();
+    let root = std::env::temp_dir().join(format!("fl-read-version-{}", uuid::Uuid::new_v4()));
+    let paths = Paths::from_dirs(root.join("data"), root.join("config")).unwrap();
+    let mut config = Config::default();
+    config.provider.base_url = "http://127.0.0.1:9/v1".into();
+    config.provider.model = "private-unused".into();
+    config.naming.enabled = false;
+    config.save(&paths).unwrap();
+    let daemon = Daemon::new(paths).unwrap();
+    let name = "เครื่องมือ_日本語";
+    let (session, id) = daemon
+        .with_store(|st| {
+            let session = st.create_session(None)?.id;
+            let mut id = String::new();
+            for code in ["function run(){return 1}", "function run(){return 2}"] {
+                id = st
+                    .create_tool_version(
+                        name,
+                        "private fixture",
+                        "{}",
+                        "{}",
+                        code,
+                        &Capabilities::default(),
+                        64,
+                        "agent",
+                    )?
+                    .0
+                    .id;
+            }
+            Ok((session, id))
+        })
+        .unwrap();
+    let missing = daemon
+        .read_tool_impl(&session, &json!({"name":name,"diff_from":999}))
+        .unwrap_err();
+    assert_eq!(
+        missing.to_string(),
+        format!("diff_from: '{name}' has no version 999")
+    );
+    assert!(missing.downcast_ref::<RequestFailure>().is_some());
+    let read = |args: Value| -> Value {
+        serde_json::from_str(&daemon.read_tool_impl(&session, &args).unwrap()).unwrap()
+    };
+    let omitted = read(json!({"name":name}));
+    assert_eq!(omitted["version"], 2);
+    assert!(omitted["diff"].is_null());
+    let expected = daemon
+        .with_reader(|st| st.tool_version_schema_report(&id, 2))
+        .unwrap();
+    assert_eq!(
+        omitted["schema_compatibility"],
+        serde_json::to_value(expected).unwrap()
+    );
+    let detail = daemon
+        .with_store(|st| st.tool_detail(&id))
+        .unwrap()
+        .unwrap();
+    for from in [1, 2] {
+        let result = read(json!({"name":name,"diff_from":from}));
+        assert_eq!(result["name"], name);
+        assert_eq!(
+            result["diff"],
+            crate::diff::version_diff(&detail.versions[(from - 1) as usize], &detail.versions[1])
+        );
+        let expected = daemon
+            .with_reader(|st| {
+                st.schema_change_report_from_version(
+                    &id,
+                    from,
+                    &detail.versions[1].input_schema,
+                    &detail.versions[1].output_schema,
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            result["schema_compatibility"],
+            serde_json::to_value(expected).unwrap()
+        );
+    }
+    let invalid_version = daemon
+        .read_tool_impl(&session, &json!({"name":name,"version":999}))
+        .unwrap_err();
+    assert_eq!(
+        invalid_version.to_string(),
+        format!("'{name}' has no version 999")
+    );
+    assert_eq!(read(json!({"name":name})), omitted);
+    assert_eq!(omitted["metrics"]["invocations"], 0);
+    drop(daemon);
+    std::fs::remove_dir_all(root).unwrap();
+}
