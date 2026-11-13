@@ -63,6 +63,19 @@ def validate_repository_url(url, get):
         get("/releases?per_page=1")  # An empty list is a valid releases index.
     elif path == "/releases/latest" and not query:
         get("/releases/latest")  # Must actually exist; never accept repo alone.
+    elif path.startswith("/releases/tag/") and not query:
+        tag = path[len("/releases/tag/"):]
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", tag):
+            raise ValueError("unsupported release tag")
+        get("/releases/tags/" + quote(tag, safe=""))
+    elif path.startswith("/compare/") and not query:
+        comparison = path[len("/compare/"):]
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*\.\.\.[A-Za-z0-9][A-Za-z0-9._-]*", comparison):
+            raise ValueError("unsupported comparison")
+        base, head = comparison.split("...", 1)
+        if ".." in base or ".." in head or base.endswith(".") or head.startswith("."):
+            raise ValueError("invalid comparison refs")
+        get("/compare/" + quote(base, safe="") + "..." + quote(head, safe=""))
     elif path.startswith("/blob/main/") and not query:
         file_path = path[len("/blob/main/"):]
         if not file_path or any(p in (".", "..", "") for p in file_path.split("/")):
