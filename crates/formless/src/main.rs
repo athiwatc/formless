@@ -1051,9 +1051,15 @@ enum McpAction {
         json: bool,
     },
     /// Restart a server and list its tools again
+    #[command(
+        after_help = "Restarts the server. Prints the complete report, then exits 0 for success (including zero tools), or 1 for a reported restart error. Request failures retain their existing exit mapping."
+    )]
     Test {
         /// Configured MCP server name
         name: String,
+        /// Print the complete restart reply as one JSON value
+        #[arg(long)]
+        json: bool,
     },
     /// Authorize Formless with a remote (http) MCP server via OAuth
     Login {
@@ -6943,10 +6949,25 @@ fn mcp_cmd(paths: Paths, action: McpAction) -> Result<()> {
             })?;
             println!("{name}: {tool} is {}", if on { "on" } else { "off" });
         }
-        McpAction::Test { name } => {
+        McpAction::Test { name, json } => {
             let r = daemon(Request::RestartMcpServer { name: name.clone() })?;
-            println!("server:  {name}");
-            report(&r);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&r)?);
+            } else {
+                println!("server:  {name}");
+                report(&r);
+            }
+            std::io::stdout().flush()?;
+            match r.get("error") {
+                Some(Value::String(_)) => std::process::exit(1),
+                Some(Value::Null)
+                    if r["restarted"].as_str() == Some(name.as_str())
+                        && r["tools"].as_u64().is_some() => {}
+                _ => bail!(
+                    "invalid MCP restart reply for '{}'",
+                    comparison_terminal_text(&name)
+                ),
+            }
         }
         McpAction::Login { server } => {
             let scfg = cfg

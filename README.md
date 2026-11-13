@@ -643,6 +643,13 @@ The table covers every visible root command, including Clap's generated
 | `formless update` | No action, `check`, or `--check` | Show newer release notes and the applicable upgrade command; never rewrite the binary. |
 | `formless web` | `--port`, `--no-open`, `--stop` | Open, print a link for, or stop the local browser UI. |
 
+`mcp test NAME [--json]` restarts the server and prints the full report before
+returning its verdict: exit 0 for a successful reply (including zero tools),
+exit 1 for an embedded restart error. JSON preserves the reply as one value
+without an extra generic error line for that reported failure. Request failures
+keep their existing error mapping; unexpected replies are errors. `--json` does
+not make the restart read-only. `mcp add` retains its existing behavior.
+
 #### Root and global flags
 
 | Flag | Short | Availability | Meaning |
