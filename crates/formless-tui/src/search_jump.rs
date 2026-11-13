@@ -199,6 +199,28 @@ mod tests {
         assert!(render(&mut app).contains("message-099"));
     }
     #[test]
+    fn every_manual_scroll_key_abandons_a_pending_search_jump() {
+        for (code, modifiers) in [
+            (KeyCode::Home, KeyModifiers::NONE),
+            (KeyCode::Up, KeyModifiers::CONTROL),
+            (KeyCode::Down, KeyModifiers::CONTROL),
+            (KeyCode::Char('{'), KeyModifiers::NONE),
+            (KeyCode::Char('}'), KeyModifiers::NONE),
+        ] {
+            let (mut app, sent, tx) = app();
+            let request = open(&mut app, &sent, hit("m10", 10));
+            // Exercise navigation in a transcript while a replacement load is pending.
+            app.messages = messages();
+            render(&mut app);
+            app.chat_scroll_top = Some(100);
+            app.key(KeyEvent::new(code, modifiers));
+            assert!(app.search_jump.is_none(), "{code:?} {modifiers:?}");
+            reply(&mut app, &tx, request, messages());
+            assert!(render(&mut app).contains("message-099"), "{code:?}");
+        }
+    }
+
+    #[test]
     fn missing_identity_falls_back_and_sequence_fallback_is_checked_within_the_session() {
         let (mut app, sent, tx) = app();
         let request = open(&mut app, &sent, hit("deleted-id", 10));
