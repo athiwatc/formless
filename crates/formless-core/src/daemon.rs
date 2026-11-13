@@ -14600,7 +14600,10 @@ impl Daemon {
             memory.mark_started();
         }
         let mut reader = BufReader::new(read_half);
+        let mut relay_controls = tokio::task::JoinSet::new();
         loop {
+            // Completed control handles must not accumulate on a long-lived CID.
+            while relay_controls.try_join_next().is_some() {}
             let (line, mut input_lease) = tokio::select! {
                 _ = kick.cancelled() => break,
                 r = async {
@@ -14702,7 +14705,7 @@ impl Daemon {
                         let held = input_lease.take();
                         let (this, tx, who, kick) =
                             (self.clone(), tx.clone(), client(), kick.clone());
-                        tokio::spawn(async move {
+                        let control = async move {
                             let _permit = permit;
                             let _input_lease = held;
                             let result = tokio::select! {
@@ -14717,7 +14720,12 @@ impl Daemon {
                                 _ = kick.cancelled() => {}
                                 _ = tx.send(resp) => {}
                             }
-                        });
+                        };
+                        if relay_memory.is_some() {
+                            relay_controls.spawn(control);
+                        } else {
+                            tokio::spawn(control);
+                        }
                         continue;
                     } else {
                         let queued = tokio::select! {
@@ -14772,6 +14780,9 @@ impl Daemon {
             worker.abort();
         }
         let _ = worker.await;
+        // Keep the same control/cancellation behavior, but wait for each relay
+        // task to drop its input/output leases before reporting teardown done.
+        while relay_controls.join_next().await.is_some() {}
         self.sent_keys
             .locked()
             .retain(|(client, _, _), _| *client != Some(conn));
