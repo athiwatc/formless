@@ -24,8 +24,15 @@ case "$nudge" in true|false) ;; *) echo "NUDGE must be true or false (got '$nudg
 
 # Short paths: the daemon's socket path must fit in sun_path.
 work="$(mktemp -d /tmp/fl-eval.XXXX)"
-trap 'FORMLESS_DATA_DIR="$work/d" FORMLESS_CONFIG_DIR="$work/c" "$bin" daemon stop >/dev/null 2>&1 || true; rm -rf "$work"' EXIT
-mkdir -p "$work/d" "$work/c" "$work/repo/src"
+active_data=""
+cleanup() {
+  if [ -n "$active_data" ]; then
+    FORMLESS_DATA_DIR="$active_data" FORMLESS_CONFIG_DIR="$work/c" "$bin" daemon stop >/dev/null 2>&1 || true
+  fi
+  rm -rf "$work"
+}
+trap cleanup EXIT
+mkdir -p "$work/c" "$work/repo/src"
 printf 'fn main() {\n    // TODO: parse args\n    // TODO: print help\n}\n' > "$work/repo/src/main.rs"
 printf '# TODO: write docs\n' > "$work/repo/README.md"
 cat > "$work/c/config.toml" <<EOF
@@ -38,19 +45,28 @@ enabled = false
 [skills]
 auto_create = false
 EOF
-export FORMLESS_DATA_DIR="$work/d" FORMLESS_CONFIG_DIR="$work/c"
+export FORMLESS_CONFIG_DIR="$work/c"
 
 tasks="Count the TODO comments in $work/repo and tell me the number.
 Fetch https://example.com and tell me the page title.
 List the files under $work/repo with their sizes in bytes.
 How many lines does $work/repo/src/main.rs have?"
 
-total=0; hits=0
+total=0; hits=0; task_index=0
 while IFS= read -r task; do
+  task_index=$((task_index + 1))
   n=0; ok=0
   while [ "$n" -lt "$runs" ]; do
     n=$((n + 1))
+    active_data="$work/d.$task_index.$n"
+    mkdir -p "$active_data"
+    export FORMLESS_DATA_DIR="$active_data"
     out="$("$bin" run --yes --json --answer "no" "$task" 2>/dev/null || true)"
+    if ! "$bin" daemon stop >/dev/null 2>&1; then
+      echo "error: could not stop the eval daemon for task $task_index Run $n" >&2
+      exit 1
+    fi
+    active_data=""
     if printf '%s\n' "$out" | grep -q '"type":"tool_call_started".*"tool_name":"\(find_tools\|create_tool\)"'; then
       ok=$((ok + 1))
     fi

@@ -18,12 +18,15 @@ class EvalArguments(unittest.TestCase):
             binary.write_text('''#!/bin/sh
 printf '%s\\n' "$1" >> "$EVAL_CALLS"
 if [ "$1" = run ]; then
+  printf '%s\\n' "$FORMLESS_DATA_DIR" >> "$EVAL_PROFILES"
+  [ ! -e "$FORMLESS_DATA_DIR/learned-tool" ] || exit 9
+  : > "$FORMLESS_DATA_DIR/learned-tool"
   printf '%s\\n' '{"type":"tool_call_started","tool_name":"find_tools"}'
 fi
 ''')
             binary.chmod(0o700)
             env = {**os.environ, "FORMLESS": str(binary), "EVAL_CALLS": str(calls),
-                   "FORMLESS_API_KEY": "synthetic-offline-key"}
+                   "FORMLESS_API_KEY": "synthetic-offline-key", "EVAL_PROFILES": str(root / "profiles")}
             env.pop("RUNS", None)
             env.pop("NUDGE", None)
             env.update(overrides)
@@ -36,6 +39,11 @@ fi
                 self.assertEqual(result.stdout, "")
                 self.assertNotIn("division by zero", result.stderr)
                 self.assertNotIn("integer expression", result.stderr)
+            if expect_valid:
+                profiles = (root / "profiles").read_text().splitlines()
+                self.assertEqual(len(profiles), commands.count("run"))
+                self.assertEqual(len(profiles), len(set(profiles)), "each Run must have a fresh data root")
+                self.assertEqual(commands.count("daemon"), commands.count("run"), "each Run daemon must stop")
             return result, commands
 
     def test_invalid_runs_fail_before_profile_or_daemon_work(self):
