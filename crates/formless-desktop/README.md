@@ -26,7 +26,7 @@ not see GPUI. Run every command below from this directory.
 | `src/search.rs` | Bounded literal matches in finished loaded text, byte-range results, source-revision validation and bounded grapheme-safe snippets | none |
 | `src/commands.rs` | Typed shell command registry and palette search | none |
 | `src/replies.rs` | Read-only, validated `ListSessions` / `GetSession` decoding | none |
-| `src/transcript.rs` | Pure transcript event application, canonical completion replacement and sticky reload-needed state; not connected to the shell or a transport yet | none |
+| `src/transcript.rs` | Pure transcript event application, canonical completion replacement and sticky reload-needed state; a trusted in-memory shell seam uses it, with no transport | none |
 | `src/snapshot_guard.rs` | Unwired local Session/attachment/request ownership guard; stale replies refused before decoding, observed event overlap requests retry, no transport-ordering guarantee | none |
 | `src/full_view.rs` | Grapheme-safe, measured-width row index with bounded shaping candidates for the full-output view | none |
 | `src/memory.rs` | Memory policy: composer limit, whole-edit rejection bookkeeping, undo accounting, text-free intent records | none |
@@ -37,7 +37,7 @@ not see GPUI. Run every command below from this directory.
 | `src/shell.rs` | The GPUI Kit window over the model | `gui` feature |
 | `src/main.rs` | `formless-desktop` binary | `gui` feature |
 | `tests/shell.rs` | Headless tests of the real shell view. The test window has no real fonts: every character is the same width | `test-support` feature |
-| `tests/render.rs` | Offscreen render of twenty-seven shell states through GPUI's real renderer, and measurements that need real fonts (macOS, Linux) | `test-support` feature |
+| `tests/render.rs` | Offscreen render of twenty-nine shell states through GPUI's real renderer, and measurements that need real fonts (macOS, Linux) | `test-support` feature |
 
 ## Commands
 
@@ -160,3 +160,25 @@ new real-font Search states compile but remain unrun after the earlier
 native pasteboard/XPC startup failure. This is not a Phase 0 acceptance
 or screen-reader, real-IME, Windows/Linux or visual-render pass. See the
 Phase 1 progress page for exact evidence and remaining gates.
+
+
+The trusted in-memory event view boundary (`Shell::apply_transcript_event`)
+now uses the same reducer as the GUI-free `Transcript` model, after a decoded
+snapshot. Metadata is moved apart from the existing shared timeline, not a
+second transcript copy. Deltas are coalesced; tools/notes can precede the
+live tail; persisted assistant text replaces it canonically. Structural
+changes splice the changed suffix to preserve an earlier reading anchor,
+and invalidate old source views/Search results.
+A missed, edited, restarted or conflicting transcript gets a sticky reload
+notice in Chat, Search and whole output. Later events do not clear it; only
+a trusted replacement snapshot does. Foreign Sessions are ignored and
+switching Session drops the reducer. Synthetic fixture-stream callbacks
+cannot write into decoded or unloaded Sessions. Run/composer state and
+outgoing intents are not taken from transcript events.
+
+These are fixture/view seams, not socket callbacks. The separate snapshot
+guard is still unwired; it only proves local ownership and no observed
+overlap, not protocol ordering or recovered state. Neither seam should be
+connected directly to asynchronous replies/events. The client transport
+choice, event/snapshot ordering, native acceptance and platform gates remain
+open. The two new native gap-notice states compile but have not been run.

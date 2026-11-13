@@ -13,7 +13,7 @@ use std::ops::Range;
 use std::rc::Rc;
 use std::time::Duration;
 
-use formless_protocol::SessionInfo;
+use formless_protocol::{Event, SessionInfo};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState, Undo};
 use gpui_kit::component::label::Label;
@@ -48,6 +48,7 @@ use crate::search::{self, Hit as SearchHit, Search as TranscriptSearch};
 use crate::timeline::{
     Anchor, Coalescer, StreamWork, Timeline, TimelineBlock, WindowMove, FLUSH_INTERVAL_MS,
 };
+use crate::transcript::{Change as TranscriptChange, ReloadReason, Transcript, TranscriptState};
 
 gpui_kit::actions!(
     formless_desktop,
@@ -583,6 +584,7 @@ pub struct Shell {
     timeline: Entity<MessageScrollerState>,
     /// A loaded empty snapshot is different from a Session not loaded yet.
     transcript_source: TranscriptSource,
+    transcript_state: Option<TranscriptState>,
     directory: Directory,
     directory_query: Entity<InputState>,
     directory_scroll: gpui_kit::UniformListScrollHandle,
@@ -709,6 +711,7 @@ impl Shell {
             restore_focus: None,
             timeline,
             transcript_source: TranscriptSource::Fixture,
+            transcript_state: None,
             directory,
             directory_query,
             directory_scroll: gpui_kit::UniformListScrollHandle::new(),
@@ -1315,27 +1318,100 @@ impl Shell {
         if self.sidebar.active_id() != Some(snapshot.session_id.as_str()) {
             return Err("the snapshot is not for the open Session");
         }
-        // Byte offsets belong to this exact source revision, not merely
-        // its sequence id or length. The next render restores modal focus.
+        self.invalidate_source_view();
+        self.transcript_source = TranscriptSource::Snapshot;
+        let (state, blocks) = Transcript::new(snapshot).into_parts();
+        self.transcript_state = Some(state);
+        let count = blocks.len();
+        *self.blocks.borrow_mut() = blocks;
+        self.timeline
+            .update(cx, |timeline, cx| timeline.reset(count, cx));
+        self.invalidate_search(cx);
+        cx.notify();
+        Ok(())
+    }
+
+    /// Byte offsets and row restore handles belong to the exact source.
+    /// The next render settles any dismissed modal to a visible fallback.
+    fn invalidate_source_view(&mut self) {
         let had_viewer = self.viewer.take().is_some();
         let row_origin = self
             .restore_focus
             .as_ref()
             .is_some_and(|origin| origin.region == Some(Region::Conversation));
         if had_viewer || row_origin {
-            // A palette can have replaced the viewer while still retaining
-            // its originating row. Snapshot replacement can remove that
-            // control too: use a visible fallback, never an orphaned handle.
             self.restore_focus = None;
         }
-        self.transcript_source = TranscriptSource::Snapshot;
-        let count = snapshot.blocks.len();
-        *self.blocks.borrow_mut() = Timeline::new(snapshot.blocks);
-        self.timeline
-            .update(cx, |timeline, cx| timeline.reset(count, cx));
-        self.invalidate_search(cx);
-        cx.notify();
-        Ok(())
+    }
+
+    pub fn transcript_reload_needed(&self) -> Option<&ReloadReason> {
+        self.transcript_state
+            .as_ref()
+            .and_then(TranscriptState::reload_needed)
+    }
+
+    /// Trusted, in-memory view seam after a decoded snapshot, not a socket
+    /// callback. The future client must validate attachment/request ownership
+    /// and order events + snapshot installation before calling these seams.
+    /// This applies transcript text only, never Run/composer/approval state.
+    pub fn apply_transcript_event(
+        &mut self,
+        event: &Event,
+        cx: &mut Context<Self>,
+    ) -> Result<TranscriptChange, &'static str> {
+        let (change, was_streaming, is_streaming, unchanged_prefix) = {
+            let state = self
+                .transcript_state
+                .as_mut()
+                .ok_or("no decoded transcript is loaded for event application")?;
+            if self.sidebar.active_id() != Some(state.session_id()) {
+                return Err("the loaded transcript is not for the open Session");
+            }
+            let mut blocks = self.blocks.borrow_mut();
+            let was_streaming = blocks.is_streaming();
+            // The reducer only appends persisted messages or replaces /
+            // discards the provisional last row. Earlier rows survive.
+            let unchanged_prefix = blocks.len().saturating_sub(usize::from(was_streaming));
+            let change = state.apply(&mut blocks, event);
+            (
+                change,
+                was_streaming,
+                blocks.is_streaming(),
+                unchanged_prefix,
+            )
+        };
+        if change.reload_changed {
+            self.invalidate_source_view();
+        }
+        if change.timeline_changed {
+            if matches!(event, Event::MessageDelta { .. }) && !change.reload_changed {
+                // Only the excluded tail changed. Refresh Search on its
+                // first appearance, not once per token/chunk.
+                if was_streaming != is_streaming {
+                    self.invalidate_search(cx);
+                }
+                self.request_flush(cx);
+            } else {
+                // Tools can be inserted before the provisional tail, and
+                // canonical completion can remove it. Splice the changed
+                // suffix, preserving an earlier reading anchor. A full
+                // reset would incorrectly force tail-following.
+                self.invalidate_source_view();
+                let count = self.blocks.borrow().len();
+                self.timeline.update(cx, |timeline, cx| {
+                    // A coalesced first delta may not have reached the list
+                    // yet, so its known prefix can be shorter than the model.
+                    let known = timeline.item_count();
+                    let prefix = unchanged_prefix.min(known);
+                    timeline.splice(prefix..known, count - prefix, cx);
+                });
+                self.invalidate_search(cx);
+                cx.notify();
+            }
+        } else if change.reload_changed {
+            cx.notify();
+        }
+        Ok(change)
     }
 
     /// Open the full-output view of a block: all of it, as plain text in
@@ -1553,8 +1629,12 @@ impl Shell {
         self.viewer.as_ref().map(|viewer| viewer.starts.len())
     }
 
-    /// Start a streamed assistant block at the tail of the timeline.
+    /// Fixture-only synthetic stream. Decoded transcripts must use typed
+    /// events so their sequence/Run metadata cannot be bypassed.
     pub fn begin_stream(&mut self, cx: &mut Context<Self>) {
+        if self.transcript_source != TranscriptSource::Fixture {
+            return;
+        }
         self.blocks.borrow_mut().begin_stream(BlockKind::Assistant);
         self.invalidate_search(cx);
         self.request_flush(cx);
@@ -1564,6 +1644,9 @@ impl Shell {
     /// is told at most once per flush interval, and the row is rebuilt only
     /// when it is next shown.
     pub fn push_stream_delta(&mut self, text: &str, cx: &mut Context<Self>) {
+        if self.transcript_source != TranscriptSource::Fixture {
+            return;
+        }
         if self.blocks.borrow_mut().push_delta(text) {
             self.request_flush(cx);
         }
@@ -1571,6 +1654,9 @@ impl Shell {
 
     /// End the stream and show its final state without waiting.
     pub fn finish_stream(&mut self, cx: &mut Context<Self>) {
+        if self.transcript_source != TranscriptSource::Fixture {
+            return;
+        }
         self.blocks.borrow_mut().finish_stream();
         self.invalidate_search(cx);
         self.stream.request();
@@ -1977,6 +2063,7 @@ impl Shell {
             // A fresh composer, not a new value in the old one: the old one's
             // undo history holds the other Session's text.
             self.rebuild_composer(&restored, None, window, cx);
+            self.transcript_state = None;
             if self.transcript_source != TranscriptSource::Fixture {
                 // A decoded transcript belongs to the Session just left,
                 // never to the new title. A future client must load it.
@@ -2570,6 +2657,20 @@ impl Shell {
                             .text_color(cx.theme().muted_foreground),
                     ),
             )
+            .when_some(self.transcript_reload_needed(), |region, reason| {
+                region.child(
+                    announced(div().id("transcript-reload"))
+                        .test_support()
+                        .role(Role::Status)
+                        .aria_label("Transcript needs reload")
+                        .aria_value(reason.notice())
+                        .px_2()
+                        .py_1()
+                        .flex_shrink_0()
+                        .text_xs()
+                        .child(Label::new(reason.notice())),
+                )
+            })
             .child(
                 div()
                     .id("timeline-area")
@@ -2854,7 +2955,10 @@ impl Shell {
             }
         };
         format!(
-            "{}{} {scope}.",
+            "{}{}{} {scope}.",
+            self.transcript_reload_needed()
+                .map(|reason| format!("Reload needed: {} ", reason.notice()))
+                .unwrap_or_default(),
             self.search_notice
                 .map(|notice| format!("{notice} "))
                 .unwrap_or_default(),
@@ -3886,6 +3990,9 @@ impl Shell {
             ),
             (None, _) => "This block is no longer in the timeline.".to_string(),
         };
+        if let Some(reason) = self.transcript_reload_needed() {
+            summary.insert_str(0, &format!("Reload needed: {} ", reason.notice()));
+        }
         if viewer.copied {
             summary.insert_str(0, "Copied to the clipboard. ");
         }

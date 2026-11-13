@@ -5714,3 +5714,462 @@ fn a_queued_search_activation_cannot_stack_a_viewer_over_commands(cx: &mut TestA
         assert!(window.try_find("viewer").is_some());
     });
 }
+
+// ---- Trusted typed-event view boundary (no transport) --------------------
+
+fn event_snapshot(id: &str, text: &str) -> replies::SessionSnapshot {
+    replies::session_snapshot(
+        id,
+        &serde_json::json!({
+            "session":{"id":id}, "running":false, "messages":[{
+                "id":"m1", "session_id":id, "seq":1, "role":"user",
+                "content":text, "created_at":"now"
+            }]
+        }),
+    )
+    .unwrap()
+}
+
+fn load_event_snapshot(shell: &Entity<Shell>, text: &str, cx: &mut App) -> String {
+    let id = shell.read(cx).sidebar().active_id().unwrap().to_string();
+    shell
+        .update(cx, |shell, cx| {
+            shell.show_session_snapshot(event_snapshot(&id, text), cx)
+        })
+        .unwrap();
+    id
+}
+
+fn typed_delta(id: &str, text: &str) -> formless_protocol::Event {
+    formless_protocol::Event::MessageDelta {
+        session_id: id.into(),
+        run_id: "r".into(),
+        delta: text.into(),
+    }
+}
+
+fn typed_message(id: &str, seq: i64, role: &str, text: &str) -> formless_protocol::MessageInfo {
+    formless_protocol::MessageInfo {
+        id: format!("m{seq}"),
+        session_id: id.into(),
+        seq,
+        role: role.into(),
+        content: text.into(),
+        created_at: "now".into(),
+        meta: None,
+    }
+}
+
+fn typed_complete(id: &str, seq: i64, text: &str) -> formless_protocol::Event {
+    formless_protocol::Event::MessageComplete {
+        session_id: id.into(),
+        run_id: "r".into(),
+        message: typed_message(id, seq, "assistant", text),
+    }
+}
+
+fn typed_gap(id: &str) -> formless_protocol::Event {
+    formless_protocol::Event::DeltasDropped {
+        session_id: id.into(),
+        run_id: "r".into(),
+        kinds: vec![formless_protocol::DroppedEventKind::MessageDelta],
+        handle: None,
+        model: None,
+    }
+}
+
+#[gpui_kit::test]
+fn typed_transcript_updates_replace_the_live_tail_without_changing_run_or_draft(
+    cx: &mut TestAppContext,
+) {
+    let (handle, shell) = open(cx, WIDE, 20, 40);
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        window.input("keep this draft", cx);
+    });
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| {
+        let id = load_event_snapshot(&shell, "question", cx);
+        window.render_frame(cx);
+        let run = window.find("run-status").value().unwrap().to_string();
+        shell.update(cx, |shell, cx| {
+            for _ in 0..100 {
+                shell
+                    .apply_transcript_event(&typed_delta(&id, "partial "), cx)
+                    .unwrap();
+            }
+            shell
+                .apply_transcript_event(
+                    &formless_protocol::Event::MessageAppended {
+                        session_id: id.clone(),
+                        message: typed_message(&id, 2, "tool", "tool result"),
+                    },
+                    cx,
+                )
+                .unwrap();
+            assert_eq!(shell.block_count(), 3);
+            shell
+                .apply_transcript_event(&typed_complete(&id, 3, "canonical answer"), cx)
+                .unwrap();
+        });
+        window.render_frame(cx);
+        assert_eq!(shell.read(cx).block_count(), 3);
+        assert_eq!(shell.read(cx).last_block_preview(), "canonical answer");
+        assert!(window.try_find(("block", usize::MAX)).is_none());
+        assert_eq!(
+            window.find(("block-text", 2usize)).value(),
+            Some("tool result")
+        );
+        assert_eq!(
+            window.find(("block-text", 3usize)).value(),
+            Some("canonical answer")
+        );
+        assert_eq!(window.find("run-status").value(), Some(run.as_str()));
+        assert_eq!(shell.read(cx).draft(cx).as_ref(), "keep this draft");
+        assert_eq!(shell.read(cx).last_intent(), None);
+        shell
+            .update(cx, |shell, cx| shell.view_block(3, window, cx))
+            .unwrap();
+        window.render_frame(cx);
+        window.click("viewer-copy", cx);
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("canonical answer".into())
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn typed_transcript_events_need_a_decoded_source_and_foreign_events_are_ignored(
+    cx: &mut TestAppContext,
+) {
+    let (handle, shell) = open(cx, WIDE, 20, 40);
+    step(cx, handle, |window, cx| {
+        let fixture_count = shell.read(cx).block_count();
+        assert!(shell
+            .update(cx, |shell, cx| shell
+                .apply_transcript_event(&typed_delta("foreign", "text"), cx))
+            .is_err());
+        assert_eq!(shell.read(cx).block_count(), fixture_count);
+        let id = load_event_snapshot(&shell, "question", cx);
+        let before = shell.read(cx).stream_stats();
+        let change = shell
+            .update(cx, |shell, cx| {
+                shell.apply_transcript_event(&typed_delta("foreign", "not ours"), cx)
+            })
+            .unwrap();
+        assert_eq!(change, formless_desktop::transcript::Change::default());
+        shell
+            .update(cx, |shell, cx| {
+                shell.apply_transcript_event(
+                    &formless_protocol::Event::RunStarted {
+                        session_id: id.clone(),
+                        run_id: "r".into(),
+                    },
+                    cx,
+                )
+            })
+            .unwrap();
+        assert_eq!(shell.read(cx).block_count(), 1);
+        assert_eq!(shell.read(cx).stream_stats(), before);
+        assert_eq!(shell.read(cx).transcript_reload_needed(), None);
+        shell
+            .update(cx, |shell, cx| {
+                shell.apply_transcript_event(
+                    &formless_protocol::Event::MessageAppended {
+                        session_id: id,
+                        message: typed_message("foreign", 2, "user", "wrong nested Session"),
+                    },
+                    cx,
+                )
+            })
+            .unwrap();
+        window.render_frame(cx);
+        assert_eq!(shell.read(cx).block_count(), 1);
+        assert!(window
+            .find("transcript-reload")
+            .value()
+            .unwrap()
+            .contains("could not be reconciled"));
+    });
+}
+
+#[gpui_kit::test]
+fn typed_transcript_gap_notices_stay_visible_until_a_trusted_snapshot_replaces_them(
+    cx: &mut TestAppContext,
+) {
+    let (handle, shell) = open(cx, WIDE, 20, 40);
+    step(cx, handle, |window, cx| {
+        let id = load_event_snapshot(&shell, "needle question", cx);
+        shell
+            .update(cx, |shell, cx| shell.view_block(1, window, cx))
+            .unwrap();
+        shell.update(cx, |shell, cx| {
+            shell
+                .apply_transcript_event(&typed_delta(&id, "missed partial"), cx)
+                .unwrap();
+            shell.apply_transcript_event(&typed_gap(&id), cx).unwrap();
+            shell
+                .apply_transcript_event(
+                    &formless_protocol::Event::MessagesEdited {
+                        session_id: id.clone(),
+                    },
+                    cx,
+                )
+                .unwrap();
+            shell
+                .apply_transcript_event(&typed_complete(&id, 2, "needle canonical"), cx)
+                .unwrap();
+        });
+        window.render_frame(cx);
+        assert_eq!(shell.read(cx).viewer_rows(), None);
+        assert_eq!(
+            shell.read(cx).transcript_reload_needed(),
+            Some(&formless_desktop::transcript::ReloadReason::DeltasDropped)
+        );
+        assert!(window
+            .find("transcript-reload")
+            .value()
+            .unwrap()
+            .contains("live text was missed"));
+        shell.update(cx, |shell, cx| {
+            shell.run_command(Command::GoTo(Destination::Search), window, cx)
+        });
+        window.render_frame(cx);
+        window.input("needle", cx);
+    });
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        assert!(window
+            .find("search-status")
+            .value()
+            .unwrap()
+            .starts_with("Reload needed:"));
+        window.press("enter", cx);
+        window.render_frame(cx);
+        assert!(window
+            .find("viewer-summary")
+            .value()
+            .unwrap()
+            .starts_with("Reload needed:"));
+        assert!(shell
+            .update(cx, |shell, cx| shell
+                .show_session_snapshot(event_snapshot("foreign", "wrong"), cx))
+            .is_err());
+        assert!(shell.read(cx).transcript_reload_needed().is_some());
+        let id = shell.read(cx).sidebar().active_id().unwrap().to_string();
+        shell
+            .update(cx, |shell, cx| {
+                shell.show_session_snapshot(event_snapshot(&id, "fresh needle"), cx)
+            })
+            .unwrap();
+        window.render_frame(cx);
+        assert_eq!(shell.read(cx).transcript_reload_needed(), None);
+        assert_eq!(shell.read(cx).viewer_rows(), None);
+        assert!(!window
+            .find("search-status")
+            .value()
+            .unwrap()
+            .contains("Reload needed:"));
+    });
+}
+
+#[gpui_kit::test]
+fn typed_transcript_search_refreshes_at_source_boundaries_not_per_delta(cx: &mut TestAppContext) {
+    let (handle, shell) = open(cx, WIDE, 20, 40);
+    step(cx, handle, |window, cx| {
+        load_event_snapshot(&shell, "needle question", cx);
+        shell.update(cx, |shell, cx| {
+            shell.run_command(Command::GoTo(Destination::Search), window, cx)
+        });
+        window.render_frame(cx);
+        window.input("needle", cx);
+    });
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| {
+        let id = shell.read(cx).sidebar().active_id().unwrap().to_string();
+        assert_eq!(shell.read(cx).search_hits().len(), 1);
+        shell
+            .update(cx, |shell, cx| {
+                shell.apply_transcript_event(&typed_delta(&id, "needle"), cx)
+            })
+            .unwrap();
+        let revision = shell.read(cx).search_results_revision();
+        let hit = shell.read(cx).search_hits()[0];
+        shell.update(cx, |shell, cx| {
+            for _ in 0..100 {
+                shell
+                    .apply_transcript_event(&typed_delta(&id, " needle"), cx)
+                    .unwrap();
+            }
+        });
+        assert_eq!(shell.read(cx).search_results_revision(), revision);
+        assert_eq!(shell.read(cx).search_hits().len(), 1);
+        window.render_frame(cx);
+        assert!(window
+            .find("search-status")
+            .value()
+            .unwrap()
+            .contains("Live tail excluded"));
+        shell
+            .update(cx, |shell, cx| {
+                shell.apply_transcript_event(&typed_complete(&id, 2, "needle final"), cx)
+            })
+            .unwrap();
+        assert_eq!(shell.read(cx).search_hits().len(), 2);
+        shell.update(cx, |shell, cx| {
+            shell.open_search_hit(hit, revision, window, cx)
+        });
+        assert_eq!(shell.read(cx).viewer_rows(), None);
+        window.render_frame(cx);
+        assert!(!window
+            .find("search-status")
+            .value()
+            .unwrap()
+            .contains("Live tail excluded"));
+    });
+}
+
+#[gpui_kit::test]
+fn typed_transcript_reducer_is_dropped_when_the_open_session_changes(cx: &mut TestAppContext) {
+    let (handle, shell) = open(cx, WIDE, 20, 40);
+    step(cx, handle, |window, cx| {
+        let id = load_event_snapshot(&shell, "old Session", cx);
+        shell
+            .update(cx, |shell, cx| {
+                shell.apply_transcript_event(&typed_gap(&id), cx)
+            })
+            .unwrap();
+        window.render_frame(cx);
+        let next = shell.read(cx).sidebar().rows()[1].id.clone();
+        assert_ne!(id, next);
+        window.click(session_row_id(&next), cx);
+        window.render_frame(cx);
+        assert_eq!(shell.read(cx).sidebar().active_id(), Some(next.as_str()));
+        assert_eq!(shell.read(cx).block_count(), 0);
+        assert_eq!(shell.read(cx).transcript_reload_needed(), None);
+        assert!(window.try_find("transcript-reload").is_none());
+        assert!(shell
+            .update(cx, |shell, cx| shell
+                .apply_transcript_event(&typed_delta(&id, "late old text"), cx))
+            .is_err());
+        shell.update(cx, |shell, cx| {
+            shell.begin_stream(cx);
+            shell.push_stream_delta("late synthetic producer", cx);
+            shell.finish_stream(cx);
+        });
+        assert_eq!(shell.read(cx).block_count(), 0);
+    });
+}
+
+#[gpui_kit::test]
+fn typed_transcript_reload_notice_fits_reflow_and_fixture_streams_cannot_bypass_the_reducer(
+    cx: &mut TestAppContext,
+) {
+    let (handle, shell) = open(cx, size(px(480.), px(360.)), 20, 40);
+    step(cx, handle, |window, cx| {
+        let id = load_event_snapshot(&shell, "unchanged source", cx);
+        shell.update(cx, |shell, cx| {
+            shell.set_text_scale(TextScale::from_percent(200), window, cx);
+            shell.begin_stream(cx);
+            shell.push_stream_delta("untyped corruption", cx);
+            shell.finish_stream(cx);
+            shell.apply_transcript_event(&typed_gap(&id), cx).unwrap();
+        });
+        settle_frames(window, cx);
+        assert_eq!(shell.read(cx).block_count(), 1);
+        assert_eq!(shell.read(cx).last_block_preview(), "unchanged source");
+        shell.update(cx, |shell, cx| {
+            shell.focus_section(PageSection::Conversation, window, cx)
+        });
+        settle_frames(window, cx);
+        let notice = window.find("transcript-reload");
+        let region = window.find("region-conversation").bounds();
+        assert!(
+            notice.bounds().left() >= region.left() && notice.bounds().right() <= region.right()
+        );
+        let viewport = Bounds::new(Point::default(), window.viewport_size());
+        assert!(
+            notice.bounds().top() >= viewport.top()
+                && notice.bounds().bottom() <= viewport.bottom(),
+            "{:?}",
+            notice.bounds()
+        );
+        assert!(notice.bounds().size.height > px(0.));
+        assert_eq!(
+            notice.value(),
+            Some(formless_desktop::transcript::ReloadReason::DeltasDropped.notice())
+        );
+        assert_eq!(shell.read(cx).last_intent(), None);
+    });
+}
+
+#[gpui_kit::test]
+fn typed_transcript_structural_updates_preserve_a_scrolled_up_reading_anchor(
+    cx: &mut TestAppContext,
+) {
+    let (handle, shell) = open(cx, WIDE, 20, 40);
+    step(cx, handle, |window, cx| {
+        let id = shell.read(cx).sidebar().active_id().unwrap().to_string();
+        let messages: Vec<_> = (1..=100)
+            .map(|seq| {
+                typed_message(
+                    &id,
+                    seq,
+                    "user",
+                    &format!("message {seq}\nline two\nline three\nline four"),
+                )
+            })
+            .collect();
+        let snapshot = replies::session_snapshot(
+            &id,
+            &serde_json::json!({"session":{"id":id},"running":false,"messages":messages}),
+        )
+        .unwrap();
+        shell
+            .update(cx, |shell, cx| shell.show_session_snapshot(snapshot, cx))
+            .unwrap();
+        settle_frames(window, cx);
+        window.scroll(
+            "timeline-area",
+            ScrollDelta::Pixels(point(px(0.), px(1600.))),
+            cx,
+        );
+        settle_frames(window, cx);
+        let area = window.find("timeline-area").bounds();
+        let reading = (1..=100usize)
+            .find(|seq| {
+                window.try_find(("block", *seq)).is_some_and(|row| {
+                    row.bounds().top() >= area.top() && row.bounds().bottom() <= area.bottom()
+                })
+            })
+            .expect("a visible older row");
+        assert!(
+            reading < 90,
+            "the test must scroll away from the tail: {reading}"
+        );
+        let top = window.find(("block", reading)).bounds().top();
+        shell.update(cx, |shell, cx| {
+            shell
+                .apply_transcript_event(&typed_delta(&id, "partial"), cx)
+                .unwrap();
+            // The delta has not reached the virtual list yet.
+            shell
+                .apply_transcript_event(
+                    &formless_protocol::Event::MessageAppended {
+                        session_id: id.clone(),
+                        message: typed_message(&id, 101, "tool", "interleaved tool"),
+                    },
+                    cx,
+                )
+                .unwrap();
+            shell
+                .apply_transcript_event(&typed_complete(&id, 102, "canonical"), cx)
+                .unwrap();
+        });
+        settle_frames(window, cx);
+        assert_eq!(window.find(("block", reading)).bounds().top(), top);
+        assert_eq!(shell.read(cx).block_count(), 102);
+    });
+}

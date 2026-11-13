@@ -15,12 +15,13 @@ and the crate still optional (detached workspace, not a default build).
 | Command palette | `a92ab626` | Cmd/Ctrl+Shift+P or the header Commands button. Modal, focus-trapped, background out of the accessibility tree, focus returned to the opening control; filter, arrows, Enter/click, unavailable commands say why; input-method composition in the search field is never turned into a run or a close; fits 480x360 at 200%. | 7 shell, 2 render states (real fonts) |
 | Typed reply decoding | `1470342d` | `src/replies.rs` (no GPUI, no I/O): `ListSessions` into `SessionInfo`s; `GetSession` into a `SessionSnapshot` (Session id, `running`, timeline blocks in sequence order, hidden empty assistant turns). The TUI's role mapping (`user`, `tool`, `system-note` as a new `Note` block, anything else the assistant's). A reply for another Session, a missing or malformed field, a negative or repeated sequence number is a named error, never an empty list. `Shell::show_session_snapshot` replaces the open Session's timeline (a stream in progress included) and refuses a snapshot for any other Session. Run state is not taken from it. `serde` and `serde_json` became direct dependencies (already locked; two lockfile edges, no new package). | 6 model, 1 shell (mutation-checked: removing the Session guard fails it) |
 | Full-output view | `ad722cf8` | A "View whole" control on every row that shows less than its block opens a modal, focus-trapped view of the whole block as plain monospace rows in a list that lays out only what is on screen, with Copy all. `src/full_view.rs` cuts the block at line breaks and at the row width (from the font's real advance), never inside a character; only row starts are kept (four bytes a row, dropped on close; in the memory policy table). Arrow, page, Home, End; Escape back to the control. Not for a block still arriving. | 5 model, 3 shell |
-| Transcript events | `1e86a5e6` | `src/transcript.rs` (no GPUI or I/O): applies the protocol's `MessageAppended`, `MessageDelta`, `MessageComplete`, `MessagesEdited`, `DeltasDropped` and `StreamRestarted` to a decoded snapshot. The first delta starts a provisional row with an id outside the persisted sequence range; canonical assistant text replaces it. Tools/notes can arrive during it. Foreign Sessions are ignored, exact duplicates do not erase a newer partial answer, invalid/misordered text or a conflicting live Run requests reload instead of being combined. Edits, transcript-scoped/legacy/global gap warnings and restarts latch an explicit reload-needed state until a new snapshot. Snapshot decoding now validates each message's Session and retains the highest sequence even for hidden tool-only turns. Still not wired to the shell or a transport; snapshot/event generation ordering and Run lifecycle handling remain future client work. | 14 event-model, 2 reply-model; independent read-only review |
+| Transcript events | `1e86a5e6` | `src/transcript.rs` (no GPUI or I/O): applies the protocol's `MessageAppended`, `MessageDelta`, `MessageComplete`, `MessagesEdited`, `DeltasDropped` and `StreamRestarted` to a decoded snapshot. The first delta starts a provisional row with an id outside the persisted sequence range; canonical assistant text replaces it. Tools/notes can arrive during it. Foreign Sessions are ignored, exact duplicates do not erase a newer partial answer, invalid/misordered text or a conflicting live Run requests reload instead of being combined. Edits, transcript-scoped/legacy/global gap warnings and restarts latch an explicit reload-needed state until a new snapshot. Snapshot decoding now validates each message's Session and retains the highest sequence even for hidden tool-only turns. Trusted shell wiring is described below; transport snapshot/event ordering and Run lifecycle handling remain future client work. | 14 event-model, 2 reply-model; independent read-only review |
 | Width-checked full output and source invalidation | `1b960542` | `full_view::measured_row_starts` checks the actual shaped advance of each candidate, then shortens on grapheme boundaries; an ASCII count is only a hint. Each measurement is at most 8 KiB/256 graphemes, uses a separate short-lived GPUI text system (64 queries per batch), and has a 128-entry borrowed-key fit memo, so the window's frame cache does not retain a layout of the whole transcript. An oversized/too-wide indivisible character gets an explanation and Copy all instead of silent clipping. Exact pixel width/full font changes reindex the view. A new snapshot or Session invalidates it, so old offsets cannot slice shorter or different UTF-8 text, even at the same id and byte length. The summary is a bounded, focusable scroll region above pinned buttons, after a 480x360/200% test exposed overflow before and after copying. Retained offsets are boxed, with no spare vector capacity. | 6 model, 4 shell; 2 real-font states added and compiled, not run |
 | Fixture Sessions directory | `8ec921ee` | A virtualized, read-only Sessions destination over the existing unarchived sidebar projection. All-word, case-insensitive title/preview/ID filter; processed queries capped at 256 Unicode scalar values; bounded visual labels; selection retained by ID without activation, and kept in view after filtering. Arrows/Enter work in the filter or after F6 enters the region; Escape/Back returns to Chat. Enter/Escape during input-method composition only commit it. Activation revalidates the ID and uses the existing draft lifecycle. A decoded snapshot is cleared on Session change instead of relabeled; loaded empty and not-yet-loaded states are distinct. The fixture explicitly shares synthetic content; no rename/archive/delete, transport or backend action exists. | 4 model, 9 shell; 2 native render states added and compiled only |
 | Modal navigation and stale focus | `eb9d4913` | Commands replaces an open whole-output view; explicit navigation also dismisses it. Snapshot replacement drops obsolete conversation-row restore origins even when Commands has already replaced the viewer. | 2 shell; independent read-only review |
 | Loaded-text Search | `ca612b32` | Commands → Go to Search opens a virtualized, read-only literal, case-sensitive, non-overlapping search over finished text already loaded in this window, including Markdown source. Explicit fixture/loaded-Session/unloaded scope; 256-scalar accepted query, 200 results, 4 MiB source-prefix and 4096-block scan bounds; partial and live-tail notices. Visible snippets have bounded grapheme context and a named preview limit. Result activation revalidates the captured corpus revision, current query, block identity and exact UTF-8 range before opening whole output at the match. Snapshot/Session/stream boundaries invalidate results, but live deltas do not rescan. Back preserves drafts and the Sessions filter; IME composition commits without activation/navigation. No I/O, history loading or backend actions. | 8 model, 11 shell; 2 native render states compiled only; independent read-only review |
-| Snapshot request ownership guard | This change | `src/snapshot_guard.rs` (no GPUI/I/O): opaque per-attachment and per-request tickets, one current pending request, no event buffer or transcript copy. New Session/connection contexts retire old work even for A→B→A or same-id reattachment; stale, duplicate and cancelled replies are refused before decoding. Relevant events observed during a request require retry rather than speculative replay. Shared event relevance classification with the transcript model. Still unwired: success proves local ownership/no observed overlap, not a server cutoff or recovered client. | 10 model; independent read-only review |
+| Snapshot request ownership guard | `63838034` | `src/snapshot_guard.rs` (no GPUI/I/O): opaque per-attachment and per-request tickets, one current pending request, no event buffer or transcript copy. New Session/connection contexts retire old work even for A→B→A or same-id reattachment; stale, duplicate and cancelled replies are refused before decoding. Relevant events observed during a request require retry rather than speculative replay. Shared event relevance classification with the transcript model. Still unwired: success proves local ownership/no observed overlap, not a server cutoff or recovered client. | 10 model; independent read-only review |
+| Trusted typed-event shell view boundary | This change | The shell applies the existing pure transcript reducer after a decoded snapshot. Reducer metadata moves separately from the one shared timeline, without cloning the transcript; the GUI-free owned wrapper keeps its API. Deltas use the existing coalescer, while structural/canonical changes splice only the changed suffix to preserve an earlier reading anchor, and invalidate stale source views and Search results. First tail appearance refreshes Search; subsequent deltas do not. Sticky reload notices appear in Chat/Search/whole output and only a trusted replacement clears them. Session change drops reducer state. Synthetic stream methods require fixture provenance, including after leaving a decoded Session. No Run/composer state changes, socket code, automatic reload or recovery guarantee. | 7 shell; 2 native gap states compiled only; independent read-only review |
 
 One deliberate behaviour change came with the registry: while an input
 method is composing in the composer, Send/Steer/Queue are unavailable
@@ -172,6 +173,59 @@ reconnect behavior, Run-state restoration or socket code was added.
 checks the Session id, not request freshness, and must not be connected
 directly to unguarded asynchronous replies. No native renderer was run.
 
+
+Typed-event view-boundary evidence (local, git-ignored):
+`.screenshots/gpui-1753-phase0/p1-sol-event-view-run2/`. Final offline
+checks passed: fmt, all four clippy configurations, GUI-free model tests
+(134), feature-enabled model tests (139), shell tests (117), Python checker
+tests (8), and doc tests. Seven new shell cases cover provisional/canonical
+replacement with interleaved tools, exact canonical copying, unchanged
+Run/draft/intent state, no-source and foreign/invalid events, sticky gap
+warnings through later events and rejected foreign snapshots, warning
+visibility in Search/viewer, clearing by trusted replacement, Search source
+revisions versus per-delta stability, Session-switch ownership, late
+synthetic producers, an unchanged scrolled-up reading anchor and
+minimum-window 200% notice layout. The existing
+GUI-free transcript tests still pass after splitting reducer metadata from
+its owned timeline. Preliminary compile checks caught field/API
+adaptation errors; those were corrected before the final suite.
+Independent review identified a real provenance hole in an early guard:
+checking only reducer presence allowed synthetic callbacks after Session
+change to an unloaded source. All three synthetic APIs now require fixture
+provenance, and the Session-switch regression exercises that exact flow.
+The initial full run 1 passed its then-six new tests, but a later toolkit
+source check found that `MessageScrollerState::reset` forces tail-following.
+Structural event updates now use its anchor-preserving `splice` for only
+the changed suffix, including when a coalesced live row has not reached the
+virtual list yet. The seventh regression keeps an older row at the exact
+same position across a delta, interleaved tool and canonical completion.
+Only explicit snapshot replacement still resets the full list. Two native
+gap-notice states were added/compiled, not run. There was no foreground,
+daemon, network or denied renderer access.
+
+### Ordering characterization (source evidence, not a protocol guarantee)
+
+- `formless-core/src/daemon.rs::handle_conn_output`: a normal local socket
+  has one output writer fed by the connection queue. The request worker
+  awaits the handler, then enqueues its response. `send_all` independently
+  enqueues matching broadcast events through the subscriber sender.
+- `Request::GetSession` reads Session/messages and sampled Run state in a
+  store read transaction, but that transaction is not an output-queue
+  barrier or a sequence watermark. Sampling state and enqueuing its response
+  are separate operations. Queue order alone does not identify which
+  transcript updates are already represented in the reply.
+- `formless-tui/src/client.rs` reads frames into one receiver, while
+  `App::apply_reconnect_snapshot` has its own reconciliation behavior.
+  Reusing only the socket reader is not equivalent to porting that state
+  logic. Relay ordering has not been characterized here.
+
+Therefore the new shell entry points remain **trusted serialized view
+seams**, not network callbacks. Request/context ownership, delayed-event
+handling, snapshot installation ordering and visible recovery state still
+belong to a future client boundary. This slice neither selects/extracts the
+transport nor treats a quiet guarded reply as proof of recovery. The local
+snapshot guard and its ordering limitation above are unchanged.
+
 ## Not done, and what each needs
 
 ### Phase 0 gates (still open; nothing in Phase 1 closes them)
@@ -192,7 +246,7 @@ directly to unguarded asynchronous replies. No native renderer was run.
 |---|---|---|
 | Command registry and palette | Done (above) | |
 | Header toggles exposed as toggle buttons (pressed state) | Not done: the kit's `Button::toggled` would change their platform role, which the macOS tree check (§16.12) would need to re-baseline | A real-window check run in the background |
-| Typed decoding of daemon replies into the presentation model | `ListSessions`, `GetSession`, pure transcript-event application and a local snapshot ownership guard done (above); Run events and ordered shell/client integration not started | Snapshot/event ordering and client reconciliation before transport integration |
+| Typed decoding of daemon replies into the presentation model | `ListSessions`, `GetSession`, pure transcript-event application, trusted shell projection and a local snapshot ownership guard done (above); Run events and ordered client/transport integration not started | Snapshot/event ordering and client reconciliation before transport integration |
 | Client transport (connect, reconnect, version check, idempotent send) | Not started | Decision §5.2: extract `formless-client` or depend on `formless-tui` |
 | Transcript paging | Not possible without a protocol change | Daemon work outside this epic (§5.3) |
 | Destinations other than Chat | Sessions has a read-only fixture directory and Search covers finished loaded text only; Tools, Metrics, Proposals and Settings remain scaffold notices | The client layer for real data; further UI-only slices can use fixtures |
@@ -204,17 +258,16 @@ directly to unguarded asynchronous replies. No native renderer was run.
 
 ## Next slice
 
-**Client reconciliation before transport.** The pure transcript model
-still needs a shell/client boundary that visibly reports its sticky
-reload-needed state and installs snapshots/events in a characterized
-order. The local ownership guard does not supply that protocol ordering.
-It must be integrated before a transport is connected. Run lifecycle events and the extraction-versus-TUI
-client decision remain separate work. No backend writes, auth or
-security-control changes are implied by the completed fixture/loaded-text
-UI slices. Do not present an unloaded Session as searched or reuse source
-positions after replacement.
+**Ordered client ownership before transport.** The trusted shell boundary
+now exposes sticky transcript gaps, but it does not establish source
+freshness. Integrate request/context ownership and characterize delayed
+snapshot/event ordering before connecting a transport or clearing recovery.
+The local snapshot guard supplies no protocol cutoff. Run lifecycle events
+and the extraction-versus-TUI client decision remain separate work. No
+backend writes, auth or security-control changes are implied by the
+completed fixture/loaded-text UI slices.
 
-The native full-output, directory and Search render states still need a
-working runtime and visual review; the existing restriction must not be
-bypassed to run them. No Phase 0 acceptance gate is closed by these
-model/UI slices.
+The native full-output, directory, Search and gap-notice render states
+still need a working runtime and visual review; the existing restriction
+must not be bypassed to run them. No Phase 0 acceptance gate is closed by
+these model/UI slices.

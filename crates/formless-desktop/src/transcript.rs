@@ -85,20 +85,18 @@ pub struct Change {
 }
 
 #[derive(Debug)]
-pub struct Transcript {
+pub(crate) struct TranscriptState {
     session_id: String,
-    timeline: Timeline,
     last_seq: Option<u64>,
     stream_run: Option<String>,
     reload: Option<ReloadReason>,
 }
 
-impl Transcript {
-    pub fn new(snapshot: SessionSnapshot) -> Self {
+impl TranscriptState {
+    fn new(session_id: String, last_seq: Option<u64>) -> Self {
         Self {
-            session_id: snapshot.session_id,
-            timeline: Timeline::new(snapshot.blocks),
-            last_seq: snapshot.last_seq,
+            session_id,
+            last_seq,
             stream_run: None,
             reload: None,
         }
@@ -108,30 +106,8 @@ impl Transcript {
         &self.session_id
     }
 
-    pub fn timeline(&self) -> &Timeline {
-        &self.timeline
-    }
-
-    /// Rebuild the bounded preview at a view's cadence, not on every delta.
-    pub fn settle(&mut self) -> bool {
-        self.timeline.settle()
-    }
-
     pub fn reload_needed(&self) -> Option<&ReloadReason> {
         self.reload.as_ref()
-    }
-
-    /// The whole current transcript clears partial text and any gap. A
-    /// delayed reply for another Session changes nothing.
-    pub fn replace_snapshot(&mut self, snapshot: SessionSnapshot) -> Result<(), DecodeError> {
-        if snapshot.session_id != self.session_id {
-            return Err(DecodeError::WrongSession {
-                asked: self.session_id.clone(),
-                got: snapshot.session_id,
-            });
-        }
-        *self = Self::new(snapshot);
-        Ok(())
     }
 
     fn need_reload(&mut self, reason: ReloadReason) -> Change {
@@ -145,9 +121,9 @@ impl Transcript {
         }
     }
 
-    fn discard_stream(&mut self) -> bool {
-        let had_stream = self.timeline.is_streaming();
-        self.timeline.discard_stream();
+    fn discard_stream(&mut self, timeline: &mut Timeline) -> bool {
+        let had_stream = timeline.is_streaming();
+        timeline.discard_stream();
         self.stream_run = None;
         had_stream
     }
@@ -156,7 +132,12 @@ impl Transcript {
         self.stream_run.as_deref().is_some_and(|run| run != run_id)
     }
 
-    fn persisted(&mut self, message: &MessageInfo, run: Option<&str>) -> Change {
+    fn persisted(
+        &mut self,
+        timeline: &mut Timeline,
+        message: &MessageInfo,
+        run: Option<&str>,
+    ) -> Change {
         // Validate before changing the partial answer, sequence or timeline.
         let seq = match message_sequence(&self.session_id, message) {
             Ok(seq) => seq,
@@ -165,7 +146,7 @@ impl Transcript {
         let kind = block_kind(&message.role);
         let hidden = kind == BlockKind::Assistant && message.content.trim().is_empty();
         if self.last_seq.is_some_and(|last| seq <= last) {
-            let old = self.timeline.block(seq);
+            let old = timeline.block(seq);
             // Exact duplicate events are idempotent, including an old
             // completion delivered while a newer step is streaming.
             let same = match old {
@@ -183,14 +164,13 @@ impl Transcript {
         }
         let assistant = kind == BlockKind::Assistant;
         let mut changed = if assistant || run.is_some() {
-            self.discard_stream()
+            self.discard_stream(timeline)
         } else {
             false
         };
         self.last_seq = Some(seq);
         if !hidden {
-            self.timeline
-                .append_persisted(TimelineBlock::new(seq, kind, message.content.clone()));
+            timeline.append_persisted(TimelineBlock::new(seq, kind, message.content.clone()));
             changed = true;
         }
         Change {
@@ -199,17 +179,17 @@ impl Transcript {
         }
     }
 
-    pub fn apply(&mut self, event: &Event) -> Change {
+    pub(crate) fn apply(&mut self, timeline: &mut Timeline, event: &Event) -> Change {
         // Only an unscoped DeltasDropped warning can affect this Session
         // without naming it. Unrelated global/Run/security events do not.
         if !affects_transcript(event, &self.session_id) {
             return Change::default();
         }
         match event {
-            Event::MessageAppended { message, .. } => self.persisted(message, None),
+            Event::MessageAppended { message, .. } => self.persisted(timeline, message, None),
             Event::MessageComplete {
                 run_id, message, ..
-            } => self.persisted(message, Some(run_id)),
+            } => self.persisted(timeline, message, Some(run_id)),
             Event::MessageDelta { run_id, delta, .. } => {
                 if self.different_run(run_id) {
                     return self.need_reload(ReloadReason::DifferentRun);
@@ -217,12 +197,11 @@ impl Transcript {
                 if delta.is_empty() {
                     return Change::default();
                 }
-                if !self.timeline.is_streaming() {
-                    self.timeline
-                        .begin_stream_with_id(LIVE_BLOCK_ID, BlockKind::Assistant);
+                if !timeline.is_streaming() {
+                    timeline.begin_stream_with_id(LIVE_BLOCK_ID, BlockKind::Assistant);
                     self.stream_run = Some(run_id.clone());
                 }
-                self.timeline.push_delta(delta);
+                timeline.push_delta(delta);
                 Change {
                     timeline_changed: true,
                     ..Change::default()
@@ -230,7 +209,7 @@ impl Transcript {
             }
             Event::MessagesEdited { .. } => {
                 let mut change = self.need_reload(ReloadReason::MessagesEdited);
-                change.timeline_changed = self.discard_stream();
+                change.timeline_changed = self.discard_stream(timeline);
                 change
             }
             Event::StreamRestarted { run_id, .. } => {
@@ -238,7 +217,7 @@ impl Transcript {
                     return self.need_reload(ReloadReason::DifferentRun);
                 }
                 let mut change = self.need_reload(ReloadReason::StreamRestarted);
-                change.timeline_changed = self.discard_stream();
+                change.timeline_changed = self.discard_stream(timeline);
                 change
             }
             Event::DeltasDropped { run_id, .. } => {
@@ -247,12 +226,70 @@ impl Transcript {
                 let discard = run_id.is_empty() || !self.different_run(run_id);
                 let mut change = self.need_reload(ReloadReason::DeltasDropped);
                 if discard {
-                    change.timeline_changed = self.discard_stream();
+                    change.timeline_changed = self.discard_stream(timeline);
                 }
                 change
             }
             _ => Change::default(),
         }
+    }
+}
+
+/// Owned model for GUI-free use. The shell moves it into state + its
+/// existing shared timeline without cloning the transcript. Only the reducer
+/// mutates message content; preview-window moves remain view-only.
+#[derive(Debug)]
+pub struct Transcript {
+    state: TranscriptState,
+    timeline: Timeline,
+}
+
+impl Transcript {
+    pub fn new(snapshot: SessionSnapshot) -> Self {
+        Self {
+            state: TranscriptState::new(snapshot.session_id, snapshot.last_seq),
+            timeline: Timeline::new(snapshot.blocks),
+        }
+    }
+
+    pub fn session_id(&self) -> &str {
+        self.state.session_id()
+    }
+
+    pub fn timeline(&self) -> &Timeline {
+        &self.timeline
+    }
+
+    /// Rebuild the bounded preview at a view's cadence, not on every delta.
+    pub fn settle(&mut self) -> bool {
+        self.timeline.settle()
+    }
+
+    pub fn reload_needed(&self) -> Option<&ReloadReason> {
+        self.state.reload_needed()
+    }
+
+    /// A trusted replacement snapshot clears partial text and any gap. A
+    /// future client must establish freshness and event ordering first.
+    /// A delayed reply for another Session changes nothing.
+    pub fn replace_snapshot(&mut self, snapshot: SessionSnapshot) -> Result<(), DecodeError> {
+        if snapshot.session_id != self.session_id() {
+            return Err(DecodeError::WrongSession {
+                asked: self.session_id().to_string(),
+                got: snapshot.session_id,
+            });
+        }
+        *self = Self::new(snapshot);
+        Ok(())
+    }
+
+    pub fn apply(&mut self, event: &Event) -> Change {
+        self.state.apply(&mut self.timeline, event)
+    }
+
+    #[cfg(feature = "gui")]
+    pub(crate) fn into_parts(self) -> (TranscriptState, Timeline) {
+        (self.state, self.timeline)
     }
 }
 
@@ -394,7 +431,7 @@ mod tests {
         t.apply(&appended(2, "assistant", " \n"));
         assert_eq!(t.timeline().len(), 1);
         assert!(!t.timeline().is_streaming());
-        assert_eq!(t.last_seq, Some(2));
+        assert_eq!(t.state.last_seq, Some(2));
         t.apply(&complete("r1", 3, "without any deltas"));
         assert_eq!(t.timeline().len(), 2);
     }
@@ -457,7 +494,7 @@ mod tests {
                 Some(ReloadReason::InvalidMessage(_))
             ));
             assert_eq!(shown(&t)[1].2, "keep");
-            assert_eq!(t.last_seq, Some(1));
+            assert_eq!(t.state.last_seq, Some(1));
         }
     }
 
@@ -629,7 +666,7 @@ mod tests {
     #[test]
     fn hidden_snapshot_turns_and_max_persisted_sequence_never_collide_with_live_id() {
         let mut t = Transcript::new(snapshot(&[message(i64::MAX, "assistant", "")]));
-        assert_eq!(t.last_seq, Some(i64::MAX as u64));
+        assert_eq!(t.state.last_seq, Some(i64::MAX as u64));
         assert_eq!(
             t.apply(&appended(i64::MAX, "assistant", "")),
             Change::default()

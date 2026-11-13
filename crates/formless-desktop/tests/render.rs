@@ -75,7 +75,7 @@ mod render {
     const WHOLE: Fit = Fit::Whole;
     const REFLOWED: Fit = Fit::Reflowed;
 
-    const STATES: [State; 27] = [
+    const STATES: [State; 29] = [
         state("wide-light", 1440., 900., LIGHT, 100, None, WHOLE),
         state("wide-dark", 1440., 900., DARK, 100, None, WHOLE),
         state("medium-light", 1100., 900., LIGHT, 100, None, WHOLE),
@@ -259,6 +259,24 @@ mod render {
             DARK,
             200,
             Some("open-search"),
+            REFLOWED,
+        ),
+        state(
+            "wide-transcript-gap-light",
+            1440.,
+            900.,
+            LIGHT,
+            100,
+            Some("open-transcript-gap"),
+            WHOLE,
+        ),
+        state(
+            "minimum-transcript-gap-dark-200pct",
+            480.,
+            360.,
+            DARK,
+            200,
+            Some("open-transcript-gap"),
             REFLOWED,
         ),
     ];
@@ -661,6 +679,31 @@ mod render {
                     });
                     let query = shell.read(cx).search_query().clone();
                     query.update(cx, |query, cx| query.set_value("ข้อความ", window, cx));
+                } else if control == "open-transcript-gap" {
+                    let id = shell.read(cx).sidebar().active_id().unwrap().to_string();
+                    let snapshot = formless_desktop::replies::session_snapshot(
+                        &id,
+                        &serde_json::json!({
+                            "session":{"id":id},"running":false,"messages":[]
+                        }),
+                    )
+                    .unwrap();
+                    shell.update(cx, |shell, cx| {
+                        shell.show_session_snapshot(snapshot, cx).unwrap();
+                        shell
+                            .apply_transcript_event(
+                                &formless_protocol::Event::DeltasDropped {
+                                    session_id: id,
+                                    run_id: String::new(),
+                                    kinds: vec![],
+                                    handle: None,
+                                    model: None,
+                                },
+                                cx,
+                            )
+                            .unwrap();
+                        shell.focus_section(PageSection::Conversation, window, cx);
+                    });
                 } else {
                     window.click(control, cx);
                 }
@@ -675,7 +718,9 @@ mod render {
                     let panel = match control {
                         "toggle-sidebar" => "region-sidebar",
                         "show-commands" => "palette",
-                        "open-directory" | "open-search" => "region-conversation",
+                        "open-directory" | "open-search" | "open-transcript-gap" => {
+                            "region-conversation"
+                        }
                         _ => "region-inspector",
                     };
                     assert!(
