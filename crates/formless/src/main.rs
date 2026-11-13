@@ -4,6 +4,7 @@ mod cli_commands;
 mod cli_help_tests;
 mod cli_pipeline;
 mod cli_run_identity;
+mod cli_run_memories;
 mod cli_tool_success;
 #[cfg(test)]
 mod session_export_tests;
@@ -239,7 +240,9 @@ enum Cmd {
         json: bool,
     },
     /// User memory: notes the agent keeps about your preferences (SPEC §7.11)
-    #[command(after_help = "Examples:\n  formless memory list\n  formless memory list --json")]
+    #[command(
+        after_help = "Examples:\n  formless memory list\n  formless memory list --json\n  formless memory used --session SESSION --json\n  formless memory used --run RUN_ID"
+    )]
     Memory {
         #[command(subcommand)]
         action: MemoryAction,
@@ -969,6 +972,22 @@ enum SecurityAction {
 
 #[derive(Subcommand)]
 enum MemoryAction {
+    /// Report current memory notes associated with a Run selector
+    #[command(
+        long_about = "Report current note fields associated with an exact Run id or a Session's latest Run (which may still be running). Associations can survive a deleted Run; empty or partial results do not establish prompt absence or a historical snapshot. This does not validate Run existence or change memory attribution."
+    )]
+    Used {
+        /// Session id, unambiguous prefix or name for its latest-Run report
+        #[arg(long, required_unless_present = "run", conflicts_with = "run")]
+        session: Option<String>,
+        /// Exact Run id sent unchanged, including unmatched or retained associations
+        #[arg(long, required_unless_present = "session")]
+        run: Option<String>,
+        /// Preserve the complete daemon MemoryInfo array as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
     /// List notes with id, scope and source
     List {
         /// Print JSON (for export)
@@ -6527,6 +6546,25 @@ fn memory_cmd(paths: Paths, action: MemoryAction) -> Result<()> {
         )
     };
     match action {
+        MemoryAction::Used { session, run, json } => {
+            let selector = match (session, run) {
+                (Some(session), None) => {
+                    formless_core::daemon::ensure_daemon(&paths)?;
+                    let resolved = find_session(&paths, &session)?;
+                    cli_run_memories::Selector::Session {
+                        id: resolved.id,
+                        name: resolved.name,
+                    }
+                }
+                (None, Some(run)) => cli_run_memories::Selector::Run(run),
+                _ => {
+                    return Err(usage(
+                        "memory used requires exactly one of --session or --run",
+                    ))
+                }
+            };
+            cli_run_memories::used(selector, json, daemon, &mut std::io::stdout().lock())?;
+        }
         MemoryAction::List { json } => {
             let list = daemon(Request::ListMemories)?;
             if json {
