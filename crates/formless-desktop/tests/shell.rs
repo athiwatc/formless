@@ -12,6 +12,7 @@
 
 use std::time::{Duration, Instant};
 
+use formless_desktop::commands::{self, Command};
 use formless_desktop::fixture;
 use formless_desktop::memory::{limits, IntentKind, IntentRecord};
 use formless_desktop::model::{tokens, BlockKind, Destination, Fit, TextScale};
@@ -1663,13 +1664,11 @@ fn a_multi_code_point_character_is_never_inserted_in_part(cx: &mut TestAppContex
     step(cx, handle, |window, cx| {
         assert_eq!(shell.read(cx).draft(cx).len(), nearly.len() + 12);
         assert_eq!(shell.read(cx).composer_notice(), None);
-        // Over-limit text is not handed on even in this state.
+        // Nothing is handed on while the input method owns the text, over
+        // the limit or not: Send is unavailable until the composition ends.
+        assert_eq!(window.find("composer-primary").disabled(), Some(true));
         window.click("composer-primary", cx);
         assert_eq!(shell.read(cx).last_intent(), None);
-        assert!(shell
-            .read(cx)
-            .composer_notice()
-            .is_some_and(|notice| notice.starts_with("Not sent")));
     });
     // Ending the composition in place makes its text part of the draft, and
     // the kit gives no signal at all when that happens (no event, no
@@ -1680,6 +1679,11 @@ fn a_multi_code_point_character_is_never_inserted_in_part(cx: &mut TestAppContex
         assert_eq!(shell.read(cx).draft(cx).len(), nearly.len() + 12);
         window.click("composer-primary", cx);
         assert_eq!(shell.read(cx).last_intent(), None);
+        // Over-limit text is not handed on even in this state.
+        assert!(shell
+            .read(cx)
+            .composer_notice()
+            .is_some_and(|notice| notice.starts_with("Not sent: the message is over")));
         // The next change of any kind, here a caret move, is when it is
         // judged, and it is taken back whole.
         window.click_at("region-composer", point(px(40.), px(20.)), cx);
@@ -3811,5 +3815,202 @@ fn word_wise_caret_movement_over_thai_is_recorded(cx: &mut TestAppContext) {
         // boundaries.
         assert_eq!(stops.last(), Some(&0));
         assert!(stops.iter().all(|stop| sentence.is_char_boundary(*stop)));
+    });
+}
+
+// ---- Command registry -----------------------------------------------------
+
+/// The shell's command state, read the way it is read for running one.
+fn command_entry(
+    shell: &Entity<Shell>,
+    command: Command,
+    window: &mut Window,
+    cx: &mut App,
+) -> commands::Entry {
+    shell.update(cx, |shell, cx| {
+        commands::entry(command, &shell.command_state(window, cx))
+    })
+}
+
+#[gpui_kit::test]
+fn header_buttons_show_their_registry_entry_and_shortcuts_run_the_same_command(
+    cx: &mut TestAppContext,
+) {
+    let (handle, shell) = open(cx, WIDE, 200, 40);
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        for (id, command) in [
+            ("toggle-sidebar", Command::ToggleSessions),
+            ("toggle-inspector", Command::ToggleContext),
+            ("toggle-theme", Command::ToggleTheme),
+        ] {
+            let entry = command_entry(&shell, command, window, cx);
+            assert_eq!(window.find(id).label(), Some(entry.label), "{id}");
+        }
+        // Each panel's shortcuts and its button run the same command, and
+        // the entry says whether the panel is shown.
+        for (command, panel, button) in [
+            (Command::ToggleSessions, "region-sidebar", "toggle-sidebar"),
+            (
+                Command::ToggleContext,
+                "region-inspector",
+                "toggle-inspector",
+            ),
+        ] {
+            let shown = |window: &mut Window, cx: &mut App| {
+                window.render_frame(cx);
+                let checked = command_entry(&shell, command, window, cx).checked;
+                assert_eq!(checked, Some(window.try_find(panel).is_some()), "{panel}");
+                checked
+            };
+            assert_eq!(shown(window, cx), Some(true));
+            for key in commands::keys(command) {
+                window.press(key, cx);
+                assert_eq!(shown(window, cx), Some(false), "{key}");
+                window.press(key, cx);
+                assert_eq!(shown(window, cx), Some(true), "{key}");
+            }
+            window.click(button, cx);
+            assert_eq!(shown(window, cx), Some(false), "{button}");
+            window.click(button, cx);
+            assert_eq!(shown(window, cx), Some(true), "{button}");
+        }
+        // The theme button is a command too.
+        let dark = command_entry(&shell, Command::ToggleTheme, window, cx).label;
+        window.click("toggle-theme", cx);
+        window.render_frame(cx);
+        assert_ne!(window.find("toggle-theme").label(), Some(dark));
+    });
+}
+
+#[gpui_kit::test]
+fn every_text_size_shortcut_runs_its_command_and_stops_at_the_limits(cx: &mut TestAppContext) {
+    let (handle, shell) = open(cx, WIDE, 200, 40);
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        let run = |command, window: &mut Window, cx: &mut App| {
+            shell.update(cx, |shell, cx| shell.run_command(command, window, cx))
+        };
+        assert_eq!(
+            run(Command::DecreaseTextSize, window, cx),
+            Some(commands::SMALLEST)
+        );
+        assert_eq!(
+            run(Command::ResetTextSize, window, cx),
+            Some(commands::DEFAULT_SIZE)
+        );
+        for key in commands::keys(Command::IncreaseTextSize) {
+            let before = shell.read(cx).text_scale();
+            window.press(key, cx);
+            assert_eq!(shell.read(cx).text_scale(), before.larger(), "{key}");
+        }
+        while run(Command::IncreaseTextSize, window, cx).is_none() {}
+        assert_eq!(shell.read(cx).text_scale(), TextScale::LARGEST);
+        assert_eq!(
+            run(Command::IncreaseTextSize, window, cx),
+            Some(commands::LARGEST)
+        );
+        window.press(commands::keys(Command::DecreaseTextSize)[0], cx);
+        assert_eq!(shell.read(cx).text_scale(), TextScale::LARGEST.smaller());
+        window.press(commands::keys(Command::ResetTextSize)[0], cx);
+        assert_eq!(shell.read(cx).text_scale(), TextScale::DEFAULT);
+    });
+}
+
+#[gpui_kit::test]
+fn composer_buttons_take_label_and_availability_from_the_registry(cx: &mut TestAppContext) {
+    let (handle, shell) = open(cx, WIDE, 200, 40);
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        let check = |window: &mut Window, cx: &mut App| {
+            window.render_frame(cx);
+            for (id, command) in [
+                ("composer-primary", Command::Send),
+                ("composer-secondary", Command::SendSecondary),
+                ("composer-stop", Command::Stop),
+            ] {
+                let entry = command_entry(&shell, command, window, cx);
+                match window.try_find(id) {
+                    Some(button) => {
+                        assert_eq!(button.label(), Some(entry.label), "{id}");
+                        // The kit reports `disabled` only when it is set.
+                        assert_eq!(button.disabled() == Some(true), !entry.enabled(), "{id}");
+                    }
+                    // Only the second action is ever left out, while idle.
+                    None => assert_eq!(entry.disabled_reason, Some(commands::NO_SECONDARY)),
+                }
+            }
+        };
+        check(window, cx);
+        assert_eq!(
+            shell.update(cx, |shell, cx| shell.run_command(Command::Stop, window, cx)),
+            Some(commands::NO_RUN)
+        );
+        window.click(session_row_id("fixture-session-7"), cx);
+        check(window, cx);
+        window.click_at("region-composer", point(px(40.), px(20.)), cx);
+        window.input("ok", cx);
+        check(window, cx);
+        // Somewhere without a composer, none of them can run.
+        window.click("destination-Tools", cx);
+        for command in [Command::Send, Command::SendSecondary, Command::Stop] {
+            assert_eq!(
+                shell.update(cx, |shell, cx| shell.run_command(command, window, cx)),
+                Some(commands::NO_COMPOSER)
+            );
+        }
+        assert_eq!(shell.read(cx).last_intent(), None);
+    });
+}
+
+#[gpui_kit::test]
+fn nothing_is_recorded_while_an_input_method_is_composing(cx: &mut TestAppContext) {
+    let (handle, shell) = open(cx, WIDE, 200, 40);
+    let ime = |cx: &mut TestAppContext, act: &dyn Fn(&mut TestInput, &mut App)| {
+        step(cx, handle, |window, cx| {
+            let bounds = window.find_by_label("Message").bounds();
+            let composer = shell.read(cx).composer().clone();
+            act(
+                &mut TestInput::new(ElementInputHandler::new(bounds, composer), window),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+    };
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        window.input("ส่ง ", cx);
+    });
+    ime(cx, &|input, cx| {
+        input.compose_text(None, "にほんご", None, cx)
+    });
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        let send = command_entry(&shell, Command::Send, window, cx);
+        assert_eq!(send.disabled_reason, Some(commands::COMPOSING));
+        assert_eq!(window.find("composer-primary").disabled(), Some(true));
+        // Enter that reaches the shell mid-composition records nothing and
+        // says why; the composed text is left exactly as it is.
+        assert_eq!(
+            shell.update(cx, |shell, cx| shell.run_command(Command::Send, window, cx)),
+            Some(commands::COMPOSING)
+        );
+        assert_eq!(shell.read(cx).last_intent(), None);
+        assert_eq!(
+            shell.read(cx).composer_notice(),
+            Some("Not sent: Finish composing text first.")
+        );
+        assert_eq!(shell.read(cx).draft(cx).as_ref(), "ส่ง にほんご");
+    });
+    ime(cx, &|input, cx| input.commit_text("日本語", cx));
+    step(cx, handle, |window, cx| {
+        assert_eq!(
+            command_entry(&shell, Command::Send, window, cx).disabled_reason,
+            None
+        );
+        window.click("composer-primary", cx);
+        let record = shell.read(cx).last_intent().cloned().expect("recorded");
+        assert_eq!(record.kind, IntentKind::Send(SendMode::Send));
+        assert_eq!(record.content_chars, "ส่ง 日本語".chars().count());
     });
 }

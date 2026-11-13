@@ -32,6 +32,7 @@ use gpui_kit::{
     Subscription, TestSupportExt as _, Window,
 };
 
+use crate::commands::{self, Command};
 use crate::memory::{
     edit_span, format_bytes, limits, paste_can_never_fit, snap_to_graphemes, within_composer_limit,
     IntentKind, IntentRecord, Rejections, UndoBudget,
@@ -80,27 +81,31 @@ const INSPECTOR_LINE: f32 = 40.0;
 /// The kit theme's default font sizes, which 100% text size maps to.
 const BASE_FONT_SIZE: f32 = 16.0;
 const BASE_MONO_FONT_SIZE: f32 = 13.0;
-/// Region and panel shortcuts. F6 / Shift+F6 move between regions; nothing
-/// here binds a bare printable key, so typing in the composer is untouched.
+/// The global shortcuts come from [`commands::keys`], so a shortcut, the
+/// button that shows it and the command palette never disagree. None of
+/// them is a bare printable key, so typing in the composer is untouched.
+/// The rest are keys that only mean something inside one part of the window.
 pub fn bind_keys(cx: &mut App) {
-    #[cfg(target_os = "macos")]
-    const PANEL_KEYS: [&str; 2] = ["cmd-b", "cmd-alt-b"];
-    #[cfg(not(target_os = "macos"))]
-    const PANEL_KEYS: [&str; 2] = ["ctrl-b", "ctrl-alt-b"];
-    #[cfg(target_os = "macos")]
-    const TEXT_SIZE_KEYS: [&str; 4] = ["cmd-=", "cmd-+", "cmd--", "cmd-0"];
-    #[cfg(not(target_os = "macos"))]
-    const TEXT_SIZE_KEYS: [&str; 4] = ["ctrl-=", "ctrl-+", "ctrl--", "ctrl-0"];
-
+    let global = commands::GLOBAL.into_iter().flat_map(|command| {
+        commands::keys(command)
+            .iter()
+            .map(move |key| match command {
+                Command::ToggleSessions => KeyBinding::new(key, ToggleSidebar, None),
+                Command::ToggleContext => KeyBinding::new(key, ToggleInspector, None),
+                Command::IncreaseTextSize => KeyBinding::new(key, IncreaseTextSize, None),
+                Command::DecreaseTextSize => KeyBinding::new(key, DecreaseTextSize, None),
+                Command::ResetTextSize => KeyBinding::new(key, ResetTextSize, None),
+                Command::FocusNextRegion => KeyBinding::new(key, FocusNextRegion, None),
+                Command::FocusPreviousRegion => KeyBinding::new(key, FocusPreviousRegion, None),
+                Command::Send
+                | Command::SendSecondary
+                | Command::Stop
+                | Command::ToggleTheme
+                | Command::GoTo(_) => unreachable!("{command:?} has no global shortcut"),
+            })
+    });
+    cx.bind_keys(global.collect::<Vec<_>>());
     cx.bind_keys([
-        KeyBinding::new("f6", FocusNextRegion, None),
-        KeyBinding::new("shift-f6", FocusPreviousRegion, None),
-        KeyBinding::new(PANEL_KEYS[0], ToggleSidebar, None),
-        KeyBinding::new(PANEL_KEYS[1], ToggleInspector, None),
-        KeyBinding::new(TEXT_SIZE_KEYS[0], IncreaseTextSize, None),
-        KeyBinding::new(TEXT_SIZE_KEYS[1], IncreaseTextSize, None),
-        KeyBinding::new(TEXT_SIZE_KEYS[2], DecreaseTextSize, None),
-        KeyBinding::new(TEXT_SIZE_KEYS[3], ResetTextSize, None),
         KeyBinding::new("escape", DismissOverlay, Some(OVERLAY_CONTEXT)),
         KeyBinding::new("down", SelectNextSession, Some(SESSION_LIST_CONTEXT)),
         KeyBinding::new("up", SelectPreviousSession, Some(SESSION_LIST_CONTEXT)),
@@ -253,6 +258,15 @@ fn region_border(focused: bool, idle: Hsla, cx: &App) -> Hsla {
     }
 }
 
+/// A command's tooltip: why it cannot run, or what it does and its shortcut.
+fn tooltip(entry: &commands::Entry) -> String {
+    match (entry.disabled_reason, entry.shortcut()) {
+        (Some(reason), _) => reason.to_string(),
+        (None, Some(shortcut)) => format!("{} ({shortcut})", entry.hint),
+        (None, None) => entry.hint.to_string(),
+    }
+}
+
 /// The control that had focus when a modal overlay came up, so dismissing the
 /// overlay can hand focus back to exactly that control.
 struct FocusOrigin {
@@ -380,6 +394,9 @@ pub struct Shell {
     composer_notice: Option<SharedString>,
     /// The overlay that held the window modally at the last settle.
     modal: Option<Region>,
+    /// What the commands depended on when the shell was last drawn; what
+    /// its buttons show. Running a command reads it afresh.
+    commands: commands::State,
     /// What had focus when the current overlay came up.
     restore_focus: Option<FocusOrigin>,
     timeline: Entity<MessageScrollerState>,
@@ -444,6 +461,16 @@ impl Shell {
             undo_budget: UndoBudget::default(),
             composer_notice: None,
             modal: None,
+            commands: commands::State {
+                composer: ComposerActions::for_state(RunState::Idle, true),
+                has_composer: true,
+                composing: false,
+                sessions_shown: true,
+                context_shown: true,
+                dark: false,
+                text_scale: TextScale::default(),
+                destination: Destination::Chat,
+            },
             restore_focus: None,
             timeline,
             composer,
@@ -475,18 +502,27 @@ impl Shell {
                 .placeholder("Message Formless")
                 .default_value(text.to_string())
         });
-        let events = cx.subscribe_in(&composer, window, |this, _, event: &InputEvent, _, cx| {
-            // Plain Enter is the primary action; the secondary chord is
-            // the secondary one (Queue during a Run). Shift+Enter also
-            // reports PressEnter, but it has already inserted a newline.
-            if let InputEvent::PressEnter {
-                secondary,
-                shift: false,
-            } = event
-            {
-                this.submit(*secondary, cx)
-            }
-        });
+        let events = cx.subscribe_in(
+            &composer,
+            window,
+            |this, _, event: &InputEvent, window, cx| {
+                // Plain Enter is the primary action; the secondary chord is
+                // the secondary one (Queue during a Run). Shift+Enter also
+                // reports PressEnter, but it has already inserted a newline.
+                if let InputEvent::PressEnter {
+                    secondary,
+                    shift: false,
+                } = event
+                {
+                    let command = if *secondary {
+                        Command::SendSecondary
+                    } else {
+                        Command::Send
+                    };
+                    this.run_command(command, window, cx);
+                }
+            },
+        );
         // The limit is checked whenever the composer changes in any way, not
         // on its Change event: ending an input-method composition makes its
         // text part of the draft without emitting one.
@@ -1117,6 +1153,89 @@ impl Shell {
         }
     }
 
+    /// What the commands depend on now.
+    pub fn command_state(&self, window: &mut Window, cx: &mut Context<Self>) -> commands::State {
+        let layout = self.layout(window);
+        let composing = self.composer.update(cx, |composer, cx| {
+            composer.marked_text_range(window, cx).is_some()
+        });
+        commands::State {
+            composer: self.composer_actions(cx),
+            has_composer: layout.composer,
+            composing,
+            sessions_shown: layout.sidebar != SidebarMode::Collapsed,
+            context_shown: layout.inspector != InspectorMode::Hidden,
+            dark: cx.theme().is_dark(),
+            text_scale: self.text_scale,
+            destination: self.destination,
+        }
+    }
+
+    /// Run a command if it is available now; otherwise return why not.
+    /// Every button, shortcut and palette row runs its command through
+    /// here, so availability is judged in one place, at the moment of
+    /// running, not from what was last drawn.
+    pub fn run_command(
+        &mut self,
+        command: Command,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<&'static str> {
+        let state = self.command_state(window, cx);
+        if let Some(reason) = commands::entry(command, &state).disabled_reason {
+            // Other refusals are as silent as they always were, but a
+            // composition can start without the shell being redrawn, so a
+            // Send button or Enter can still be pressed while it runs: the
+            // composer says why nothing was recorded.
+            if reason == commands::COMPOSING {
+                self.composer_notice = Some(format!("Not sent: {reason}.").into());
+                cx.notify();
+            }
+            return Some(reason);
+        }
+        match command {
+            Command::Send => self.submit(false, cx),
+            Command::SendSecondary => self.submit(true, cx),
+            Command::Stop => self.stop(cx),
+            Command::ToggleSessions => self.toggle_panel(Region::Sidebar, window, cx),
+            Command::ToggleContext => self.toggle_panel(Region::Inspector, window, cx),
+            Command::ToggleTheme => {
+                let next = if cx.theme().is_dark() {
+                    ThemeMode::Light
+                } else {
+                    ThemeMode::Dark
+                };
+                Theme::change(next, Some(window), cx);
+            }
+            Command::IncreaseTextSize => {
+                self.set_text_scale_growing_window(self.text_scale.larger(), window, cx)
+            }
+            Command::DecreaseTextSize => {
+                self.set_text_scale_growing_window(self.text_scale.smaller(), window, cx)
+            }
+            Command::ResetTextSize => {
+                self.set_text_scale_growing_window(TextScale::DEFAULT, window, cx)
+            }
+            Command::FocusNextRegion => self.cycle_region(true, window, cx),
+            Command::FocusPreviousRegion => self.cycle_region(false, window, cx),
+            Command::GoTo(destination) => self.set_destination(destination, window, cx),
+        }
+        None
+    }
+
+    /// A listener that runs `command`, for a button or an action.
+    fn on_command<E: 'static>(
+        command: Command,
+        cx: &mut Context<Self>,
+    ) -> impl Fn(&E, &mut Window, &mut App) + 'static {
+        let shell = cx.entity().downgrade();
+        move |_, window, cx| {
+            shell
+                .update(cx, |this, cx| this.run_command(command, window, cx))
+                .ok();
+        }
+    }
+
     fn move_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
         self.sidebar.move_selection(delta);
         if let Some(index) = self.sidebar.selected_index() {
@@ -1352,45 +1471,33 @@ impl Shell {
             .truncate()
             .child(title);
         let controls = [
-            Button::new("toggle-sidebar")
+            (
+                "toggle-sidebar",
+                Command::ToggleSessions,
+                &self.sidebar_toggle_focus,
+            ),
+            (
+                "toggle-inspector",
+                Command::ToggleContext,
+                &self.inspector_toggle_focus,
+            ),
+            (
+                "toggle-theme",
+                Command::ToggleTheme,
+                &self.theme_toggle_focus,
+            ),
+        ]
+        .map(|(id, command, focus)| {
+            let entry = commands::entry(command, &self.commands);
+            Button::new(id)
                 .small()
                 .ghost()
-                .label("Sessions")
-                .tooltip("Show or hide the Sessions sidebar")
-                .track_focus(&self.sidebar_toggle_focus)
-                .selected(layout.sidebar != SidebarMode::Collapsed)
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.toggle_panel(Region::Sidebar, window, cx)
-                })),
-            Button::new("toggle-inspector")
-                .small()
-                .ghost()
-                .label("Context")
-                .tooltip("Show or hide the Context inspector")
-                .track_focus(&self.inspector_toggle_focus)
-                .selected(layout.inspector != InspectorMode::Hidden)
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.toggle_panel(Region::Inspector, window, cx)
-                })),
-            Button::new("toggle-theme")
-                .small()
-                .ghost()
-                .label(if cx.theme().is_dark() {
-                    "Light"
-                } else {
-                    "Dark"
-                })
-                .tooltip("Switch between the light and dark theme")
-                .track_focus(&self.theme_toggle_focus)
-                .on_click(|_, window, cx| {
-                    let next = if cx.theme().is_dark() {
-                        ThemeMode::Light
-                    } else {
-                        ThemeMode::Dark
-                    };
-                    Theme::change(next, Some(window), cx);
-                }),
-        ];
+                .label(entry.label)
+                .tooltip(tooltip(&entry))
+                .track_focus(focus)
+                .selected(entry.checked == Some(true))
+                .on_click(Self::on_command(command, cx))
+        });
         // A banner landmark, so the header's controls have one node that can
         // be taken out of the tree behind a dialog.
         let header = div()
@@ -1831,29 +1938,23 @@ impl Shell {
     /// needed only where the composer is not inside the conversation (a
     /// reflowed page), since the conversation's flag covers what is in it.
     fn render_composer(&self, inert: bool, cx: &mut Context<Self>) -> impl IntoElement {
-        let actions = self.composer_actions(cx);
-        let disabled = actions.disabled_reason.is_some();
-        let primary = Button::new("composer-primary")
-            .primary()
-            .label(send_mode_label(actions.primary))
-            .disabled(disabled)
-            .when_some(actions.disabled_reason, |button, reason| {
-                button.tooltip(reason)
-            })
-            .on_click(cx.listener(|this, _, _, cx| this.submit(false, cx)));
-        let secondary = actions.secondary.map(|mode| {
-            Button::new("composer-secondary")
-                .outline()
-                .label(send_mode_label(mode))
-                .disabled(disabled)
-                .on_click(cx.listener(|this, _, _, cx| this.submit(true, cx)))
-        });
+        let button = |id: &'static str, command: Command, cx: &mut Context<Self>| {
+            let entry = commands::entry(command, &self.commands);
+            Button::new(id)
+                .label(entry.label)
+                .disabled(!entry.enabled())
+                .tooltip(tooltip(&entry))
+                .on_click(Self::on_command(command, cx))
+        };
+        let primary = button("composer-primary", Command::Send, cx).primary();
+        // The second action exists only while a Run is going.
+        let secondary = self
+            .commands
+            .composer
+            .secondary
+            .map(|_| button("composer-secondary", Command::SendSecondary, cx).outline());
         // Stop keeps its own fixed slot, apart from the primary action.
-        let stop = Button::new("composer-stop")
-            .danger()
-            .label("Stop")
-            .disabled(!actions.stop_enabled)
-            .on_click(cx.listener(|this, _, _, cx| this.stop(cx)));
+        let stop = button("composer-stop", Command::Stop, cx).danger();
         v_flex()
             .id("region-composer")
             .test_support()
@@ -2190,6 +2291,7 @@ impl Shell {
 
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.commands = self.command_state(window, cx);
         let layout = self.layout(window);
         let reflowed = self.fit(window) == Fit::Reflowed;
         v_flex()
@@ -2198,27 +2300,34 @@ impl Render for Shell {
             .size_full()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
-            .on_action(cx.listener(|this, _: &FocusNextRegion, window, cx| {
-                this.cycle_region(true, window, cx)
-            }))
-            .on_action(cx.listener(|this, _: &FocusPreviousRegion, window, cx| {
-                this.cycle_region(false, window, cx)
-            }))
-            .on_action(cx.listener(|this, _: &ToggleSidebar, window, cx| {
-                this.toggle_panel(Region::Sidebar, window, cx)
-            }))
-            .on_action(cx.listener(|this, _: &ToggleInspector, window, cx| {
-                this.toggle_panel(Region::Inspector, window, cx)
-            }))
-            .on_action(cx.listener(|this, _: &IncreaseTextSize, window, cx| {
-                this.set_text_scale_growing_window(this.text_scale.larger(), window, cx)
-            }))
-            .on_action(cx.listener(|this, _: &DecreaseTextSize, window, cx| {
-                this.set_text_scale_growing_window(this.text_scale.smaller(), window, cx)
-            }))
-            .on_action(cx.listener(|this, _: &ResetTextSize, window, cx| {
-                this.set_text_scale_growing_window(TextScale::DEFAULT, window, cx)
-            }))
+            .on_action(Self::on_command::<FocusNextRegion>(
+                Command::FocusNextRegion,
+                cx,
+            ))
+            .on_action(Self::on_command::<FocusPreviousRegion>(
+                Command::FocusPreviousRegion,
+                cx,
+            ))
+            .on_action(Self::on_command::<ToggleSidebar>(
+                Command::ToggleSessions,
+                cx,
+            ))
+            .on_action(Self::on_command::<ToggleInspector>(
+                Command::ToggleContext,
+                cx,
+            ))
+            .on_action(Self::on_command::<IncreaseTextSize>(
+                Command::IncreaseTextSize,
+                cx,
+            ))
+            .on_action(Self::on_command::<DecreaseTextSize>(
+                Command::DecreaseTextSize,
+                cx,
+            ))
+            .on_action(Self::on_command::<ResetTextSize>(
+                Command::ResetTextSize,
+                cx,
+            ))
             .map(|shell| {
                 if reflowed {
                     shell
