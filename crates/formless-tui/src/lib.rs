@@ -12367,11 +12367,11 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App, show_cursor: bool) {
     if let Some(forecast) = &app.forecast.hint {
         title.push_str(&format!(" · {} ", truncate_chars(&forecast.hint, 100)));
     }
-    if let Some(notice) = app.input.kill_notice() {
+    if let Some(notice) = app.input.edit_notice() {
         title = format!(" {notice} ");
     }
     let flashing =
-        app.input.kill_notice().is_some() || app.target_flash.is_some_and(|t| Instant::now() < t);
+        app.input.edit_notice().is_some() || app.target_flash.is_some_and(|t| Instant::now() < t);
     let mut block = ui::panel(
         title,
         app.color,
@@ -18135,7 +18135,7 @@ fn draw_editor(f: &mut Frame, ed: &EditorState, app: &App) {
     };
     let hints = if ed.confirm_exit {
         " Discard unsaved edit? y discard · n/Esc keep".to_owned()
-    } else if let Some(notice) = ed.draft.as_ref().and_then(input::InputLine::kill_notice) {
+    } else if let Some(notice) = ed.draft.as_ref().and_then(input::InputLine::edit_notice) {
         notice.to_owned()
     } else {
         format!("{hints} · Ctrl+G external editor · Ctrl+_ undo · Alt+/ redo")
@@ -21289,6 +21289,52 @@ mod tests {
         ed.apply_modal_line(line);
         assert_eq!(ed.cursor, 0);
         assert_eq!(ed.text(), replacement);
+    }
+
+    #[test]
+    fn oversized_history_refusal_is_visible_for_composer_and_editor() {
+        let mut app = test_app();
+        app.input.set("small");
+        app.input.paste(&"x".repeat(16 * 1024 * 1024 + 1));
+        let visible = app.input.to_string();
+        let expanded = app.input.expanded();
+        app.key(KeyEvent::new(KeyCode::Char('_'), KeyModifiers::CONTROL));
+        assert_eq!(&*app.input, visible);
+        assert_eq!(app.input.expanded(), expanded);
+        let screen = render(&mut app, 120, 24);
+        assert!(
+            screen.contains("Undo refused: current draft exceeds the 16 MiB history limit"),
+            "{screen}"
+        );
+        app.editor = Some(EditorState {
+            draft: Some(app.input.clone()),
+            original: None,
+            confirm_exit: false,
+            review_base_version: None,
+            vim: vim::Vim::default(),
+            tool_id: "fixture".into(),
+            name: "fixture".into(),
+            chars: visible.chars().collect(),
+            cursor: visible.chars().count(),
+            mode: EditMode::Code,
+        });
+        app.key(KeyEvent::new(KeyCode::Char('_'), KeyModifiers::CONTROL));
+        let screen = render(&mut app, 120, 24);
+        assert!(
+            screen.contains("Undo refused: current draft exceeds the 16 MiB history limit"),
+            "{screen}"
+        );
+        assert_eq!(app.editor.as_ref().unwrap().text(), visible);
+        assert_eq!(
+            app.editor
+                .as_ref()
+                .unwrap()
+                .draft
+                .as_ref()
+                .unwrap()
+                .expanded(),
+            expanded
+        );
     }
 
     #[test]
