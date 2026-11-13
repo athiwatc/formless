@@ -81,6 +81,20 @@ impl Fixture {
                         Request::GetMcpPrompt { arguments, .. } => {
                             json!({"text":arguments.get("text").and_then(Value::as_str).unwrap_or("rendered 日本語\n\n"),"future":"preserved"})
                         }
+                        Request::RunMemories { run_id, session_id } => {
+                            assert!(run_id.is_some() != session_id.is_some());
+                            if let Some(session) = session_id {
+                                assert_eq!(session, "abc-one");
+                            }
+                            if run_id.as_deref() == Some("unmatched-run") {
+                                json!([])
+                            } else {
+                                json!([
+                                    {"id":"disabled-first","text":"ไทย\ncurrent text","scope":"project:/日本語","enabled":false,"author":"agent","session_id":"source-日本語","last_used":"different-run-time","future":{"x":1}},
+                                    {"id":"enabled-second","text":"second note","scope":"global","enabled":true,"author":"user","session_id":null}
+                                ])
+                            }
+                        }
                         Request::RunFiles { session_id, run_id } => {
                             assert_eq!(session_id, "abc-one");
                             json!({"run_id":run_id.as_deref().unwrap_or("latest"), "files":[{"path":"dir/a.txt","status":"modified","revertible":true,"diff":"- old\n+ new"}], "untracked_writes_possible":true})
@@ -91,13 +105,21 @@ impl Fixture {
                         }
                         _ => panic!("unexpected private RPC: {:?}", envelope.request),
                     };
-                    let failed = matches!(&envelope.request, Request::GetMcpPrompt {name,..} if name=="fixture-failure");
+                    let failure = match &envelope.request {
+                        Request::GetMcpPrompt { name, .. } if name == "fixture-failure" => {
+                            Some("server fixture failure")
+                        }
+                        Request::RunMemories {
+                            run_id: Some(id), ..
+                        } if id == "fixture-failure" => Some("daemon fixture failure"),
+                        _ => None,
+                    };
                     seen.lock().unwrap().push(envelope.request);
-                    let reply = if failed {
+                    let reply = if let Some(message) = failure {
                         serde_json::to_value(formless_protocol::ServerMessage::err_code(
                             envelope.id,
                             formless_protocol::codes::NOT_FOUND,
-                            "server fixture failure".into(),
+                            message.into(),
                         ))
                         .unwrap()
                     } else {
@@ -411,4 +433,86 @@ fn shipped_mcp_prompt_commands_preserve_text_json_named_args_and_errors() {
             }
         }
     }
+}
+
+#[test]
+fn shipped_memory_used_preserves_exact_selectors_current_notes_and_qualified_empty_reports() {
+    let fixture = Fixture::new();
+    for args in [
+        vec!["memory", "used"],
+        vec!["memory", "used", "--session", "abc-one", "--run", "exact"],
+    ] {
+        let output = fixture.run(&args);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+    }
+    std::thread::sleep(Duration::from_millis(20));
+    assert_eq!(fixture.connections.load(Ordering::SeqCst), 0);
+    assert!(fixture.requests.lock().unwrap().is_empty());
+    for selector in ["abc-one", "abc-o", "First"] {
+        let output = fixture.run(&["memory", "used", "--session", selector]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(text.contains("Latest-Run memory report for Session First (abc-one)"));
+        assert!(text.contains("ไทย\ncurrent text"));
+        assert!(text.contains("off"));
+        assert!(text.contains("source-日本語"));
+        assert!(!text.contains("different-run-time"));
+    }
+    let before = fixture.requests.lock().unwrap().len();
+    for selector in ["abc", "missing"] {
+        let output = fixture.run(&["memory", "used", "--session", selector, "--json"]);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+    }
+    assert!(fixture.requests.lock().unwrap()[before..]
+        .iter()
+        .all(|req| matches!(req, Request::ListSessions)));
+    for id in ["retained-missing-run", "unmatched-run"] {
+        for json in [false, true] {
+            let mut args = vec!["memory", "used", "--run", id];
+            if json {
+                args.push("--json");
+            }
+            let output = fixture.run(&args);
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if json {
+                let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+                if id == "unmatched-run" {
+                    assert_eq!(value, json!([]));
+                } else {
+                    assert_eq!(value[0]["future"], json!({"x":1}));
+                    assert_eq!(value[0]["enabled"], false);
+                    assert_eq!(value[1]["id"], "enabled-second");
+                }
+            } else {
+                let text = String::from_utf8(output.stdout).unwrap();
+                assert!(text.contains(&format!("requested Run id {id}")));
+                if id == "unmatched-run" {
+                    assert!(text.contains("no carried memories reported for this selector"));
+                } else {
+                    assert!(text.contains("ไทย\ncurrent text"));
+                }
+            }
+        }
+    }
+    let output = fixture.run(&["memory", "used", "--run", "fixture-failure", "--json"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("daemon fixture failure"));
+    let seen = fixture.requests.lock().unwrap();
+    assert!(
+        seen.iter()
+            .all(|req| matches!(req, Request::ListSessions | Request::RunMemories { .. })),
+        "{seen:?}"
+    );
+    assert_eq!(seen.iter().filter(|req|matches!(req,Request::RunMemories{run_id:Some(id),session_id:None} if id=="retained-missing-run")).count(),2);
 }
