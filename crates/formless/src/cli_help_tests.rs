@@ -796,7 +796,10 @@ fn naming_pull_metadata_and_validation_share_the_model_registry() {
     let bash = String::from_utf8(bash).unwrap();
     for model in formless_core::namer::MODELS {
         assert!(bash.contains(model.id));
+    }
+}
 
+#[test]
 fn session_list_organization_filters_parse_together_without_dispatch() {
     let cli = super::Cli::try_parse_from([
         "formless",
