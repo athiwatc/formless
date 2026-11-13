@@ -445,7 +445,7 @@ none of them can be closed by anything measured so far.
 
 | Gate | Why the current evidence does not cover it |
 |---|---|
-| Windows build, tests and launch | Done separately, at `d34fab9`, on the user's Windows PC: native build, 22 model tests, 16 shell tests and fmt passed. `--smoke` did not print its first-frame line within 60 s and was stopped. Root cause not established; code-level hypotheses in §17. **Windows rendering is not accepted.** |
+| Windows build, tests and launch | Done separately, at `d34fab9`, on the user's Windows PC: native build, 22 model tests, 16 shell tests and fmt passed. `--smoke` timed out under a runner that started the process hidden, and the same binary then passed under a runner that hides only its console (first frame 731 ms with 10,000 Sessions and blocks; §17.6). Why the first run failed is not established; the runner comparison continues there. No Windows code change was made for it. Nobody looked at the window, and no Windows accessibility, input, scaling or streaming check has run. **Windows rendering is not accepted.** |
 | Linux build and launch | Only dependency resolution was done. |
 | Real OS IME composition (Thai, CJK, dead keys) | The harness types finished text, and finished Thai and Chinese characters were posted to a real window as key events (§16.4). No input method composed anything. |
 | VoiceOver (and NVDA on Windows) | No screen reader ran. The real macOS window's platform accessibility tree was read and acted on (§16): that shows what is exposed, and it was not what the tests implied. What is spoken, and in what order, is unknown. The kit cannot mark an element modal, so the page behind a dialog stays in the tree. |
@@ -1441,6 +1441,9 @@ name, or a change in the adapter.
 
 ## 17. Windows: no first frame from `--smoke`
 
+Superseded in part by §17.6: the same binary has since passed under a
+different runner. §17.1 to §17.5 are kept as written.
+
 ### 17.1 What is known
 
 From the separate Windows run at `d34fab9` (evidence on that PC,
@@ -1542,6 +1545,42 @@ Thai dictionary and puts break opportunities between words; it is not
 wired in. Nothing about the Windows run changes that study, and nothing in
 it suggests the study's approach would affect the hang.
 
-Still open, unchanged: Windows rendering (and everything after it on
-Windows), Linux, a screen reader, a person's input, performance budgets,
-parity, packaging. Phase 1 is not started.
+### 17.6 Update: the same binary passes under another runner
+
+From the separate Windows work, not run here: a native debug worker ran
+the same `d34fab9` binary with `--smoke` and it passed, exit 0, with
+10,000 Sessions and 10,000 blocks: app ready 334 ms, fixture 12 ms, first
+frame 731 ms. The two ICU4X Thai lines were printed on that successful
+run too. The runner differed:
+
+| | Runner | Result |
+|---|---|---|
+| First run | `Start-Process` with a hidden window style, which hides the GUI window | No first-frame line in 60 s |
+| Later run | `ProcessStartInfo` with `UseShellExecute=false`, `CreateNoWindow=true`, which hides only a console; private profile; 30 s bound | Passed, first frame 731 ms |
+
+What follows from that, and what does not:
+
+- **The Thai lines are not the cause.** They appear on the passing run.
+  This settles what §17.3 already argued from source.
+- **The code is not shown to hang.** The same binary drew its first frame.
+- **Hypothesis 1 in §17.3 fits and is not proven.** A window started
+  hidden is not visible, Windows does not send `WM_PAINT` to a window that
+  is not visible, and on Windows that is the only way the first-frame line
+  can print (§17.2). That would explain the first run. It has not been
+  confirmed: the controlled comparison of the two runners on the same
+  binary is still going on there.
+- **Debug build.** The ICU4X lines print only with debug assertions on
+  (ICU4X's `logging` feature is off in this graph for the Windows target
+  as well, checked with `cargo tree --target x86_64-pc-windows-msvc`), so
+  the 731 ms figure is presumably from a build with debug assertions. It
+  is not comparable with the macOS release figures.
+- **No code change.** Nothing in this crate was changed for the timeout,
+  and none is proposed. If it turns out the binary must cope with being
+  started hidden, that is a decision for after the comparison.
+
+The `--background` option added in §16 does not bear on this: it only
+leaves the application inactive, and the window is still shown.
+
+Still open, unchanged: Windows rendering accepted by a person (and every
+Windows check after launch), Linux, a screen reader, a person's input,
+performance budgets, parity, packaging. Phase 1 is not started.
