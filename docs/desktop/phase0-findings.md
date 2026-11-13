@@ -1398,8 +1398,10 @@ offscreen captures.
   the viewport do not exist as elements, in the Sessions list or the
   timeline.
 - **Live regions.** Nothing is marked as one. A new block, a status change
-  and a refusal notice are in the tree and are not pushed.
-- **The page behind a dialog** is still in the tree.
+  and a refusal notice are in the tree and are not pushed. (Partly
+  addressed in §16.7, unobserved.)
+- **The page behind a dialog** is still in the tree. (The dialogs are
+  modal since §16.7; the page is still there.)
 - **Windows and Linux.** Not run.
 
 Next checks, in order of use: a person with VoiceOver reading the window
@@ -1438,6 +1440,29 @@ assistive technology activates a control; it says nothing of what a person
 using VoiceOver would hear or do. Ways to close this, none tried: a
 different role the macOS adapter maps to a row, a count in the list's
 name, or a change in the adapter.
+
+### 16.7 Modal dialogs and live regions
+
+Local commit `2045368`. The pinned GPUI has no setter for either flag, so
+both are set on the node GPUI builds, through its hook for adding to an
+element's own node.
+
+- **The Sessions and Context overlays are modal.** Checked in real windows
+  (480 x 360 at 200%, each dialog opened with its shortcut as a synthetic
+  key event, the platform tree walked in process): before the change both
+  reported `isAccessibilityModal` false; after it, true. The page's own
+  elements are still in the tree beside the dialog. Whether VoiceOver keeps
+  to the dialog is not known.
+- **The intent line and the composer notice are polite live regions.** The
+  macOS adapter asks the system to announce a live node's value when the
+  node appears or its value changes. That request is made inside the
+  adapter and leaves no attribute to read back, so it has not been
+  observed; only a screen reader would show whether it is spoken.
+
+Neither flag shows in the kit's test tree, so no headless test covers
+them. The modal flag is covered by the real-window before-and-after walk
+(`macos-real-window/dialogs-before/` and `dialogs-after/`); the live flag
+by nothing but the source.
 
 ## 17. Windows: no first frame from `--smoke`
 
