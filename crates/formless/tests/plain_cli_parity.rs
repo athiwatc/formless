@@ -24,6 +24,7 @@ struct Fixture {
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
     requests: Arc<Mutex<Vec<Request>>>,
+    organization_failure: Arc<AtomicBool>,
     session_rows: Arc<Mutex<Value>>,
     run_filter_mode: Arc<AtomicBool>,
     usage_failure: Arc<AtomicUsize>,
@@ -57,6 +58,8 @@ impl Fixture {
         let stopped = stop.clone();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let seen = requests.clone();
+        let organization_failure = Arc::new(AtomicBool::new(false));
+        let fail_organization = organization_failure.clone();
         let session_rows = Arc::new(Mutex::new(json!([
             {"id":"abc-one","name":"First","created_at":"","updated_at":""},
             {"id":"abc-two","name":"Second","created_at":"","updated_at":""},
@@ -126,6 +129,23 @@ impl Fixture {
                         line.clear();
                         continue;
                     }
+                    if fail_organization.load(Ordering::SeqCst)
+                        && matches!(
+                            &envelope.request,
+                            Request::SetSessionPinned { .. } | Request::SetSessionTags { .. }
+                        )
+                    {
+                        let reply = serde_json::to_value(formless_protocol::ServerMessage::err(
+                            envelope.id,
+                            "fixture organization failure".into(),
+                        ))
+                        .unwrap();
+                        if writeln!(socket, "{reply}").is_err() {
+                            break;
+                        }
+                        line.clear();
+                        continue;
+                    }
                     let result = match &envelope.request {
                         Request::RunMetrics {
                             limit,
@@ -152,6 +172,12 @@ impl Fixture {
                         Request::GetRun { run_id } => inspected_run(run_id),
                         Request::CancelRunId { run_id } => cancellation_reply(run_id),
                         Request::ListInvocations => invocation_reply.lock().unwrap().clone(),
+                        Request::SetSessionPinned { id, pinned } => {
+                            organization_reply(id, Some(!pinned), false)
+                        }
+                        Request::SetSessionTags { id, tags } => {
+                            organization_reply(id, None, tags.is_empty())
+                        }
                         Request::ListSessions => sessions.lock().unwrap().clone(),
                         Request::GetSession { id } => {
                             let rows = sessions.lock().unwrap();
@@ -251,6 +277,7 @@ impl Fixture {
             stop,
             thread: Some(thread),
             requests,
+            organization_failure,
             session_rows,
             run_filter_mode,
             usage_failure,
@@ -1362,6 +1389,159 @@ fn shipped_ambiguous_session_selectors_show_ids_and_never_dispatch_an_action() {
         assert!(
             matches!(&fixture.requests.lock().unwrap()[..],[Request::ListSessions,Request::GetSession{id:requested}] if requested==id)
         );
+    }
+}
+
+fn organization_reply(id: &str, pinned: Option<bool>, clear: bool) -> Value {
+    json!({"id":id,"name":"Stored 日本語","created_at":"","updated_at":"","pinned":pinned.unwrap_or(false),"tags":if clear {json!([])} else {json!(["normalized","ไทย\u{1b}[31m"])},"future":{"kept":true}})
+}
+
+#[test]
+fn shipped_session_organization_uses_exact_mutations_and_returned_stored_state() {
+    let fixture = Fixture::new();
+    for (verb, requested) in [("pin", true), ("unpin", false)] {
+        for json_mode in [false, true] {
+            fixture.requests.lock().unwrap().clear();
+            let mut args = vec!["sessions", verb, "abc-o"];
+            if json_mode {
+                args.push("--json");
+            }
+            let out = fixture.run(&args);
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            if json_mode {
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&out.stdout).unwrap(),
+                    organization_reply("abc-one", Some(!requested), false)
+                );
+            } else {
+                assert_eq!(
+                    String::from_utf8(out.stdout).unwrap(),
+                    format!(
+                        "Session ID: abc-one\nStored pinned: {}\n",
+                        if requested { "no" } else { "yes" }
+                    )
+                );
+            }
+            assert!(
+                matches!(&fixture.requests.lock().unwrap()[..],[Request::ListSessions,Request::SetSessionPinned{id,pinned}] if id=="abc-one" && *pinned==requested)
+            );
+        }
+    }
+    for json_mode in [false, true] {
+        fixture.requests.lock().unwrap().clear();
+        let mut args = vec!["sessions", "tag", "First"];
+        if json_mode {
+            args.push("--json");
+        }
+        let out = fixture.run(&args);
+        assert!(out.status.success());
+        if json_mode {
+            let value: Value = serde_json::from_slice(&out.stdout).unwrap();
+            assert_eq!(value["id"], "abc-one");
+            assert_eq!(value["tags"], json!([]));
+        } else {
+            assert_eq!(out.stdout, b"Session ID: abc-one\nStored tags: none\n");
+        }
+        assert!(matches!(
+            &fixture.requests.lock().unwrap()[..],
+            [Request::ListSessions]
+        ));
+    }
+    for clear in [false, true] {
+        for json_mode in [false, true] {
+            fixture.requests.lock().unwrap().clear();
+            let mut args = if clear {
+                vec!["sessions", "tag", "abc-one", "--clear"]
+            } else {
+                vec!["sessions", "tag", "abc-one", " #Work ", "ไทย", "#WORK"]
+            };
+            if json_mode {
+                args.push("--json");
+            }
+            let out = fixture.run(&args);
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            if json_mode {
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&out.stdout).unwrap(),
+                    organization_reply("abc-one", None, clear)
+                );
+            } else {
+                let text = String::from_utf8(out.stdout).unwrap();
+                assert!(text.contains("Stored tags (replacement result):"));
+                assert!(text.contains(if clear {
+                    "none"
+                } else {
+                    "normalized, ไทย\\u{1b}[31m"
+                }));
+                assert!(!text.contains('\u{1b}'));
+            }
+            let seen = fixture.requests.lock().unwrap();
+            assert!(
+                matches!(&seen[..],[Request::ListSessions,Request::SetSessionTags{id,..}] if id=="abc-one")
+            );
+            let Request::SetSessionTags { tags, .. } = &seen[1] else {
+                panic!()
+            };
+            assert_eq!(
+                tags,
+                &if clear {
+                    vec![]
+                } else {
+                    vec![
+                        " #Work ".to_string(),
+                        "ไทย".to_string(),
+                        "#WORK".to_string(),
+                    ]
+                }
+            );
+        }
+    }
+    fixture.requests.lock().unwrap().clear();
+    let out = fixture.run(&["sessions", "tag", "abc-one", "--clear", "work"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty() && fixture.requests.lock().unwrap().is_empty());
+    for selector in ["abc", "missing"] {
+        fixture.requests.lock().unwrap().clear();
+        let out = fixture.run(&["sessions", "pin", selector]);
+        assert_eq!(out.status.code(), Some(2));
+        assert!(out.stdout.is_empty());
+        assert!(matches!(
+            &fixture.requests.lock().unwrap()[..],
+            [Request::ListSessions]
+        ));
+    }
+    fixture.organization_failure.store(true, Ordering::SeqCst);
+    for args in [
+        vec!["sessions", "pin", "abc-one"],
+        vec!["sessions", "unpin", "abc-one", "--json"],
+        vec!["sessions", "tag", "abc-one", "replacement"],
+        vec!["sessions", "tag", "abc-one", "--clear", "--json"],
+    ] {
+        let out = fixture.run(&args);
+        assert!(!out.status.success() && out.stdout.is_empty());
+        assert!(String::from_utf8(out.stderr)
+            .unwrap()
+            .contains("fixture organization failure"));
+    }
+    let out = fixture.run(&["sessions", "tag", "--help"]);
+    assert!(out.status.success());
+    let text = String::from_utf8(out.stdout).unwrap();
+    for expected in [
+        "replace the entire stored tag list",
+        "read only",
+        "replace all tags",
+        "--clear",
+        "--json",
+    ] {
+        assert!(text.contains(expected), "{text}");
     }
 }
 

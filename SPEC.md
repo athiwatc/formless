@@ -5016,7 +5016,7 @@ the TUI. Command-specific arguments and defaults are available through
 | `formless routing` | `--json` | Read currently available daemon routing decisions and returned candidate figures without starting a model request. |
 | `formless runs` | No action: list; `show`, `cancel`, `running` | List recent Runs, inspect/cancel an exact Run, or read a live Invocation snapshot. |
 | `formless security` | `status` | Inspect the daemon's grants, denials, trusted resources, and exposed interfaces. |
-| `formless sessions` | `subagents`, `subagent`, `fork`, `compare`, `list`, `show`, `usage`, `files`, `rewind`, `rename`, `rm`, `restore`, `import`, `search`, `archive`, `unarchive`, `export` | Manage stored Sessions, follow a Run with `show --follow`, or inspect tracked files. `list --pinned --tag TAG` filters the fetched reply; selectors combine with `--archived`, preserving reply order. |
+| `formless sessions` | `subagents`, `subagent`, `fork`, `compare`, `list`, `show`, `usage`, `files`, `rewind`, `rename`, `rm`, `restore`, `import`, `search`, `archive`, `unarchive`, `pin`, `unpin`, `tag`, `export` | Manage stored Sessions, follow a Run with `show --follow`, or inspect tracked files. `list --pinned --tag TAG` filters the fetched reply; selectors combine with `--archived`, preserving reply order. |
 | `formless skills` | `reviews`, `add`, `remove`, `list`, `enable`, `disable`, `show`, `export`, `import` | Inspect and manage Skills and their retained description reviews. |
 | `formless storage` | `--json` | Report disk usage by data category. |
 | `formless tools` | `reviews`, `list`, `disable`, `enable`, `undo`, `pin`, `unpin`, `tag`, `show`, `retire`, `restore`, `rollback`, `purge`, `run`, `export`, `import` | Inspect, manage, run, or transfer registry Tools. |
@@ -5076,6 +5076,13 @@ matching full IDs, bounded names and archive labels. Extra matches are counted,
 with commands for both archive states. Prefix errors suggest extending the ID;
 name errors suggest a displayed ID. Exact-ID priority, prefix-before-name
 resolution and trimmed ASCII-case-insensitive full-name matching are unchanged.
+
+`sessions pin ID` and `sessions unpin ID` display the stored pin state returned
+by the daemon. `sessions tag ID` only reads tags; adding positional tags replaces
+the **entire** stored tag list, and `--clear` explicitly replaces it with an empty
+list (conflicting with positional tags). Tags reach storage unchanged for its
+existing normalization; confirmation shows returned stored values. These three
+actions accept `--json` for the selected/returned Session object.
 
 ### Root and global flags
 
