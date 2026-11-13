@@ -63,6 +63,15 @@ impl fmt::Display for JsonParserCategory {
     }
 }
 
+/// Fixed evidence retained only at existing incomplete-response exits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IncompleteReason {
+    Unknown,
+    OutputLimit,
+    ContextWindow,
+    Truncated,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StructuredOutputError {
     SchemaLimit(&'static str),
@@ -75,14 +84,19 @@ pub enum StructuredOutputError {
         column: usize,
     },
     SchemaViolation,
-    IncompleteResponse,
+    IncompleteResponse(IncompleteReason),
     RefusedResponse,
 }
 
 impl fmt::Display for StructuredOutputError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::IncompleteResponse => f.write_str("structured output response was incomplete"),
+            Self::IncompleteResponse(reason) => f.write_str(match reason {
+                IncompleteReason::Unknown => "structured output response was incomplete",
+                IncompleteReason::OutputLimit => "structured output response was incomplete (output limit reached)",
+                IncompleteReason::ContextWindow => "structured output response was incomplete (model context window exceeded)",
+                IncompleteReason::Truncated => "structured output response was incomplete (response was truncated)",
+            }),
             Self::RefusedResponse => f.write_str("structured output request was refused"),
             Self::SchemaLimit(limit) => write!(f, "structured output schema exceeds {limit} limit"),
             Self::UnsupportedSchema(reason) => {
