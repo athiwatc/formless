@@ -82,6 +82,7 @@ try:
                     for button in buttons.all():
                         button.focus()
                         assert button.evaluate("el => el === document.activeElement")
+                        assert button.evaluate("el => {const r=el.getBoundingClientRect();return r.top >= 0 && r.bottom <= innerHeight;}"), "keyboard focus brings each action into the visible viewport"
                     if width == 900 and font == 16 and index == 2:
                         assert abs(geometry["text"]["top"] - geometry["buttons"][0]["top"]) < 10, "short text shares the row on wide screens"
                     page.screenshot(path=str(args.out / f"banner-{width}-{font}-{index}.png"))
