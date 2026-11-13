@@ -12,7 +12,14 @@
 set -eu
 [ $# -eq 2 ] || { echo "usage: $0 BASE_URL MODEL" >&2; exit 2; }
 base_url="$1"; model="$2"
-runs="${RUNS:-5}"; nudge="${NUDGE:-true}"; bin="${FORMLESS:-formless}"
+runs="${RUNS-5}"; nudge="${NUDGE-true}"; bin="${FORMLESS:-formless}"
+runs_input="$runs"
+invalid_runs() { echo "RUNS must be a positive integer (got '$runs_input')" >&2; exit 2; }
+case "$runs" in ''|*[!0-9]*) invalid_runs ;; esac
+# Normalize leading zeroes so shell arithmetic cannot interpret octal values.
+while [ "${runs#0}" != "$runs" ]; do runs="${runs#0}"; done
+[ -n "$runs" ] && [ "$runs" -gt 0 ] 2>/dev/null || invalid_runs
+case "$nudge" in true|false) ;; *) echo "NUDGE must be true or false (got '$nudge')" >&2; exit 2 ;; esac
 : "${FORMLESS_API_KEY:?set FORMLESS_API_KEY}"
 
 # Short paths: the daemon's socket path must fit in sun_path.
@@ -53,5 +60,6 @@ while IFS= read -r task; do
 done <<EOF
 $tasks
 EOF
+[ "$total" -gt 0 ] || { echo "error: no Runs were evaluated" >&2; exit 1; }
 printf 'model %s, nudge %s: %d/%d Runs used find_tools/create_tool (%d%%)\n' \
   "$model" "$nudge" "$hits" "$total" "$((hits * 100 / total))"
