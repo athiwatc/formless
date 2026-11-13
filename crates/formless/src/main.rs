@@ -1007,6 +1007,14 @@ enum MemoryAction {
     },
 }
 
+fn parse_mcp_log_lines(value: &str) -> std::result::Result<usize, String> {
+    value
+        .parse::<usize>()
+        .ok()
+        .filter(|lines| (1..=1000).contains(lines))
+        .ok_or_else(|| "--lines must be between 1 and 1000".into())
+}
+
 #[derive(Subcommand)]
 enum McpAction {
     /// Add a server: `add NAME -- COMMAND [ARGS]` (stdio), `add NAME --url
@@ -1081,8 +1089,8 @@ enum McpAction {
     Log {
         /// Configured MCP server name
         name: String,
-        /// Maximum number of recent stderr log lines to show
-        #[arg(long, default_value_t = 50)]
+        /// Recent stderr log lines to show (minimum 1, maximum 1000)
+        #[arg(long, default_value_t = 50, value_parser = parse_mcp_log_lines)]
         lines: usize,
     },
     /// A server's tools, on or off, with their token cost
