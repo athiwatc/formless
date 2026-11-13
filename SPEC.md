@@ -4946,6 +4946,7 @@ the TUI. Command-specific arguments and defaults are available through
 | `formless tools` | `reviews`, `list`, `disable`, `enable`, `undo`, `pin`, `unpin`, `tag`, `show`, `retire`, `restore`, `rollback`, `purge`, `run`, `export`, `import` | Inspect, manage, run, or transfer registry Tools. |
 | `formless tui` | No action | Launch the full-screen terminal client; also the default with no command. |
 | `formless uninstall` | `--keep-data`, `--keep-binary`, `--yes` (alias `--force`) | Remove Formless, optionally retaining data or the binary. |
+| `formless usage` | `--by GROUP`, `--since DURATION`, `--json` | Read full-range grouped tokens and currently computed cost estimates. |
 | `formless update` | No action, `check`, or `--check` | Show newer release notes and the applicable upgrade command; never rewrite the binary. |
 | `formless web` | `--port`, `--no-open`, `--stop` | Open, print a link for, or stop the local browser UI. |
 
@@ -6187,6 +6188,19 @@ An already terminal Run exits after replay. Historical terminal Runs without
 stored message boundaries display a Note and the initial Session snapshot only;
 follow never invents a boundary or refreshes that legacy transcript without one.
 Connection loss is an error.
+
+`usage [--by day|model|provider|purpose|role|session] [--since DURATION] [--json]`
+reads the existing full-range UsageByDay aggregation once, independently of
+the bounded recent Run list. Default/explicit day sends no group key and keeps
+the daemon's oldest-first day order; other groups keep its descending total-token
+order. No since means all history; durations use the shared checked parser
+and one UTC RFC3339 cutoff matching the existing stored TEXT representation.
+Human tables fit terminal columns and show unknown cost as `-`; JSON preserves
+the complete array and null costs. Cost is the daemon's current estimate, not a
+billing guarantee. Session grouping currently uses display names and merges
+equal-named Sessions (#1585); this caller cannot recover missing identities.
+Unknown grouping keys and invalid/overflowing/unrepresentable durations fail
+before contact. Aggregation, pricing and recording remain unchanged.
 
 `runs show ID [--json]` inspects any stored Run; `runs cancel ID [--json]`
 cancels only that exact active Run, never a later Run in the same Session. IDs

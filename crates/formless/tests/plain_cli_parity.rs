@@ -63,6 +63,7 @@ impl Fixture {
                 while reader.read_line(&mut line).unwrap_or(0) > 0 {
                     let envelope: RequestEnvelope = serde_json::from_str(&line).unwrap();
                     let result = match &envelope.request {
+                        Request::UsageByDay { .. } => grouped_usage(),
                         Request::ListSessions => json!([
                             {"id":"abc-one","name":"First","created_at":"","updated_at":""},
                             {"id":"abc-two","name":"Second","created_at":"","updated_at":""}
@@ -145,6 +146,78 @@ impl Fixture {
             stderr: err.join().unwrap(),
         }
     }
+}
+
+fn grouped_usage() -> Value {
+    json!([
+        {"key":"日本語","prompt_tokens":7,"completion_tokens":8,"cached_tokens":2,"cost":null,"future":true},
+        {"key":"ไทย","prompt_tokens":3,"completion_tokens":4,"cached_tokens":1,"cost":0.125}
+    ])
+}
+
+#[test]
+fn shipped_grouped_usage_sends_one_read_and_keeps_all_daemon_values() {
+    let fixture = Fixture::new();
+    for group in [
+        None,
+        Some("day"),
+        Some("model"),
+        Some("provider"),
+        Some("purpose"),
+        Some("role"),
+        Some("session"),
+    ] {
+        for json in [false, true] {
+            fixture.requests.lock().unwrap().clear();
+            let mut args = vec!["usage"];
+            if let Some(group) = group {
+                args.extend(["--by", group]);
+            }
+            if json {
+                args.push("--json");
+            }
+            let out = fixture.run(&args);
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            if json {
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&out.stdout).unwrap(),
+                    grouped_usage()
+                );
+            } else {
+                let text = String::from_utf8(out.stdout).unwrap();
+                assert!(text.find("日本語").unwrap() < text.find("ไทย").unwrap());
+                assert!(text.contains('-') && text.contains("0.125"));
+            }
+            let requests = fixture.requests.lock().unwrap();
+            let [Request::UsageByDay { since, by }] = &requests[..] else {
+                panic!("{requests:?}")
+            };
+            assert!(since.is_none());
+            assert_eq!(by.as_deref(), group.filter(|value| *value != "day"));
+        }
+    }
+    fixture.requests.lock().unwrap().clear();
+    let earliest = chrono::Utc::now() - chrono::Duration::days(30);
+    let out = fixture.run(&["usage", "--since", "30d", "--json"]);
+    let latest = chrono::Utc::now() - chrono::Duration::days(30);
+    assert!(out.status.success());
+    let requests = fixture.requests.lock().unwrap();
+    let [Request::UsageByDay {
+        since: Some(since),
+        by: None,
+    }] = &requests[..]
+    else {
+        panic!("{requests:?}")
+    };
+    let cutoff = chrono::DateTime::parse_from_rfc3339(since)
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    assert!(cutoff >= earliest && cutoff <= latest);
+    assert_eq!(since, &cutoff.to_rfc3339());
 }
 impl Drop for Fixture {
     fn drop(&mut self) {

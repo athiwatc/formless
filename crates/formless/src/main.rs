@@ -6,6 +6,7 @@ mod cli_metrics;
 mod cli_pipeline;
 mod cli_run_identity;
 mod cli_tool_success;
+mod cli_usage;
 #[cfg(test)]
 mod session_export_tests;
 mod table;
@@ -78,6 +79,21 @@ enum Cmd {
         #[arg(long, value_name = "DURATION", value_parser = parse_since_cutoff)]
         since: Option<String>,
         /// Print all three complete replies as one JSON object
+        #[arg(long)]
+        json: bool,
+    },
+    /// Read grouped token totals and the daemon's current cost estimates
+    #[command(
+        after_help = "Examples:\n  formless usage --by model --since 30d\n  formless usage --json"
+    )]
+    Usage {
+        /// Group totals by day, model, provider, purpose, role or Session name
+        #[arg(long, value_enum, default_value = "day")]
+        by: cli_usage::Group,
+        /// Only usage since this duration ago; omitted: all history
+        #[arg(long,value_name="DURATION",value_parser=parse_since_cutoff)]
+        since: Option<String>,
+        /// Print the complete grouped usage array as JSON
         #[arg(long)]
         json: bool,
     },
@@ -2013,6 +2029,12 @@ fn run_cli(cli: Cli) -> Result<()> {
         Some(Cmd::Metrics { since, json }) => {
             formless_core::daemon::ensure_daemon(&paths)?;
             cli_metrics::write_report(&mut std::io::stdout().lock(), since, json, |request| {
+                formless_tui::client::request_once(&paths, request)
+            })
+        }
+        Some(Cmd::Usage { by, since, json }) => {
+            formless_core::daemon::ensure_daemon(&paths)?;
+            cli_usage::write_report(&mut std::io::stdout().lock(), by, since, json, |request| {
                 formless_tui::client::request_once(&paths, request)
             })
         }
