@@ -19,6 +19,7 @@ struct Fixture {
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
     requests: Arc<Mutex<Vec<Request>>>,
+    gc_failure: Arc<AtomicBool>,
 }
 impl Fixture {
     fn new() -> Self {
@@ -45,6 +46,8 @@ impl Fixture {
         let stopped = stop.clone();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let seen = requests.clone();
+        let gc_failure = Arc::new(AtomicBool::new(false));
+        let fail_gc = gc_failure.clone();
         let thread = std::thread::spawn(move || {
             while !stopped.load(Ordering::SeqCst) {
                 let (mut socket, _) = match listener.accept() {
@@ -62,7 +65,23 @@ impl Fixture {
                 let mut line = String::new();
                 while reader.read_line(&mut line).unwrap_or(0) > 0 {
                     let envelope: RequestEnvelope = serde_json::from_str(&line).unwrap();
+                    seen.lock().unwrap().push(envelope.request.clone());
+                    if fail_gc.load(Ordering::SeqCst)
+                        && matches!(&envelope.request, Request::Gc { .. })
+                    {
+                        let reply = serde_json::to_value(formless_protocol::ServerMessage::err(
+                            envelope.id,
+                            "fixture GC failure".into(),
+                        ))
+                        .unwrap();
+                        if writeln!(socket, "{reply}").is_err() {
+                            break;
+                        }
+                        line.clear();
+                        continue;
+                    }
                     let result = match &envelope.request {
+                        Request::Gc { dry_run } => gc_report(*dry_run),
                         Request::ListSessions => json!([
                             {"id":"abc-one","name":"First","created_at":"","updated_at":""},
                             {"id":"abc-two","name":"Second","created_at":"","updated_at":""}
@@ -77,7 +96,6 @@ impl Fixture {
                         }
                         _ => panic!("unexpected private RPC: {:?}", envelope.request),
                     };
-                    seen.lock().unwrap().push(envelope.request);
                     let reply =
                         json!({"kind":"response", "id":envelope.id, "ok":true, "result":result});
                     if writeln!(socket, "{reply}").is_err() {
@@ -92,6 +110,7 @@ impl Fixture {
             stop,
             thread: Some(thread),
             requests,
+            gc_failure,
         }
     }
     fn command(&self, args: &[&str]) -> Command {
@@ -146,6 +165,139 @@ impl Fixture {
         }
     }
 }
+fn gc_report(dry_run: bool) -> Value {
+    json!({"dry_run":dry_run,"total_bytes":9_007_199_254_740_999_u64,"kinds":[{"kind":"MCP logs","items":2,"bytes":1_234_567,"detail":"รายละเอียด 日本語","verification_error":null,"retained":8},{"kind":"artifacts","items":0,"bytes":9_007_199_253_506_432_u64,"detail":"stored metadata","future":{"kept":true}}],"future":{"unmodified":true}})
+}
+
+#[test]
+fn shipped_gc_json_preserves_the_complete_single_daemon_report_and_human_bytes() {
+    let fixture = Fixture::new();
+    for dry_run in [false, true] {
+        for json_mode in [false, true] {
+            fixture.requests.lock().unwrap().clear();
+            let mut args = vec!["gc"];
+            if dry_run {
+                args.push("--dry-run");
+            }
+            if json_mode {
+                args.push("--json");
+            }
+            let out = fixture.run(&args);
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            if json_mode {
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&out.stdout).unwrap(),
+                    gc_report(dry_run)
+                );
+            } else {
+                assert_eq!(
+                    out.stdout,
+                    if dry_run {
+                        include_bytes!("fixtures/gc-human-dry.txt").as_slice()
+                    } else {
+                        include_bytes!("fixtures/gc-human-real.txt").as_slice()
+                    }
+                );
+            }
+            assert!(
+                matches!(&fixture.requests.lock().unwrap()[..],[Request::Gc{dry_run:actual}] if *actual==dry_run)
+            );
+        }
+    }
+    fixture.gc_failure.store(true, Ordering::SeqCst);
+    for dry_run in [false, true] {
+        fixture.requests.lock().unwrap().clear();
+        let mut args = vec!["gc", "--json"];
+        if dry_run {
+            args.push("--dry-run");
+        }
+        let out = fixture.run(&args);
+        assert!(!out.status.success() && out.stdout.is_empty());
+        assert!(String::from_utf8(out.stderr)
+            .unwrap()
+            .contains("fixture GC failure"));
+        assert!(
+            matches!(&fixture.requests.lock().unwrap()[..],[Request::Gc{dry_run:actual}] if *actual==dry_run)
+        );
+    }
+}
+
+#[test]
+fn shipped_gc_json_works_offline_and_dry_run_keeps_owned_cleanup_data() {
+    let mut fixture = Fixture::new();
+    fixture.stop.store(true, Ordering::SeqCst);
+    fixture.thread.take().unwrap().join().unwrap();
+    let paths = Paths {
+        data_dir: fixture.root.join("d/p"),
+        config_dir: fixture.root.join("c/p"),
+        profile: "p".into(),
+    };
+    std::fs::remove_file(paths.socket_path()).unwrap();
+    let mcp = paths.data_dir.join("mcp");
+    std::fs::create_dir_all(&mcp).unwrap();
+    let log = mcp.join("owned-test.log");
+    let bytes = vec![b'x'; 1_001_234];
+    std::fs::write(&log, &bytes).unwrap();
+    let store = formless_core::Store::open(&paths.db_file()).unwrap();
+    let expected =
+        formless_core::housekeeping::gc(&paths, &store, &formless_core::Config::default(), true)
+            .unwrap();
+    drop(store);
+    let out = fixture.run(&["gc", "--dry-run", "--json"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value, expected);
+    assert_eq!(std::fs::read(&log).unwrap(), bytes);
+    let row = value["kinds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["kind"] == "MCP logs")
+        .unwrap();
+    assert_eq!(row["items"], 1);
+    assert_eq!(row["bytes"], 1234);
+    let human = fixture.run(&["gc", "--dry-run"]);
+    assert!(human.status.success());
+    let text = String::from_utf8(human.stdout).unwrap();
+    assert!(
+        text.contains("MCP logs") && text.contains("1.2 KB") && text.contains("would free about")
+    );
+    assert_eq!(std::fs::read(&log).unwrap(), bytes);
+    let out = fixture.run(&["gc", "--json"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["dry_run"], false);
+    let row = value["kinds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["kind"] == "MCP logs")
+        .unwrap();
+    assert_eq!(row["items"], 1);
+    assert_eq!(row["bytes"], 1234);
+    assert_eq!(std::fs::metadata(&log).unwrap().len(), 1_000_000);
+    let total: u64 = value["kinds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["bytes"].as_u64().unwrap())
+        .sum();
+    assert_eq!(value["total_bytes"], total);
+    assert!(fixture.requests.lock().unwrap().is_empty());
+}
+
 impl Drop for Fixture {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
