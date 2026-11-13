@@ -255,6 +255,7 @@ impl InputLine {
         self.remove(range.start, range.end);
         self.cursor = range.start;
         self.insert_raw(replacement);
+        self.anchor = None;
         self.search = None;
         true
     }

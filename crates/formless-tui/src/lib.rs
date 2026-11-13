@@ -25165,6 +25165,33 @@ mod tests {
     }
 
     #[test]
+    fn mention_completion_clears_backward_selection_before_typing() {
+        use formless_core::files::FileEntry;
+        for (before, path, dir) in [
+            ("read @very_long_path_name", "a", false),
+            ("read @x", "ไทย notes/report.md", false),
+            ("read @very_long_directory_name", "a b", true),
+        ] {
+            let mut app = test_app();
+            app.input.set(before);
+            app.key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
+            assert!(app.input.selection().is_some());
+            app.update_mention();
+            app.mention.as_mut().unwrap().files = vec![FileEntry {
+                path: path.into(),
+                dir,
+                bytes: 0,
+            }];
+            assert!(app.mention_key(&key(KeyCode::Tab)));
+            assert!(app.input.selection().is_none());
+            let mut expected = app.input.to_string();
+            expected.insert(app.input.cursor_byte(), 'z');
+            app.key(key(KeyCode::Char('z')));
+            assert_eq!(&*app.input, expected);
+        }
+    }
+
+    #[test]
     fn quoted_mentions_share_full_paths_for_chips_forecast_and_submit() {
         let mut app = test_app();
         let root = app
