@@ -6,7 +6,7 @@ set -eu
 tag="${1:?usage: release-check.sh TAG [Cargo.toml]}"
 manifest="${2:-$(dirname "$0")/../Cargo.toml}"
 version="$(awk '
-  /^[[:space:]]*\[workspace.package\][[:space:]]*(#.*)?$/ { p=1; next }
+  /^[[:space:]]*\[workspace\.package\][[:space:]]*(#.*)?$/ { p=1; next }
   /^[[:space:]]*\[/ { p=0 }
   p && /^[[:space:]]*version[[:space:]]*=/ {
     sub(/^[^=]*=[[:space:]]*/, "")

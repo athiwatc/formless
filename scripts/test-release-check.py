@@ -29,7 +29,7 @@ class ReleaseVersion(unittest.TestCase):
         result = self.check('[workspace.package]\nversion="0.2.0"\n', tag="v0.3.0")
         self.assertEqual(result.returncode, 1)
         self.assertIn("does not match", result.stderr)
-        for manifest in ['[package]\nversion="0.2.0"\n', '[workspace.package]\n[dependencies]\nversion="0.2.0"\n']:
+        for manifest in ['[workspaceXpackage]\nversion="0.2.0"\n', '[package]\nversion="0.2.0"\n', '[workspace.package]\n[dependencies]\nversion="0.2.0"\n']:
             result = self.check(manifest)
             self.assertEqual(result.returncode, 1)
             self.assertIn("no [workspace.package] version", result.stderr)
