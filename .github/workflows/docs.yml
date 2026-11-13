@@ -3,7 +3,7 @@ name: docs
 on:
   push:
     branches: [main]
-    paths: ['README.md', 'SPEC.md', 'GLOSSARY.md', 'docs/adr/**', '.github/workflows/docs.yml']
+    paths: ['README.md', 'SPEC.md', 'GLOSSARY.md', 'docs/adr/**', '.github/workflows/docs.yml', 'scripts/check-doc-links.py', 'scripts/test-doc-links.py']
   schedule:
     - cron: '17 8 * * 1'
   workflow_dispatch:
@@ -27,6 +27,8 @@ jobs:
           persist-credentials: false
       - name: Check documentation links and anchors (native Apple Silicon)
         shell: bash
+        env:
+          FORMLESS_LINK_GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           test "$(uname -s)" = Darwin
@@ -48,6 +50,6 @@ jobs:
           test "${#binaries[@]}" -eq 1
           binary="${binaries[0]}"
           test -x "$binary"
-          "$binary" --version
-          "$binary" --no-progress --include-fragments --accept 200,206,429 \
-            --max-retries 2 --timeout 20 README.md SPEC.md GLOSSARY.md 'docs/adr/**/*.md'
+          env -u FORMLESS_LINK_GITHUB_TOKEN "$binary" --version
+          python3 scripts/test-doc-links.py
+          python3 scripts/check-doc-links.py "$binary" README.md SPEC.md GLOSSARY.md 'docs/adr/**/*.md'
