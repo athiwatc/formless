@@ -7,12 +7,16 @@ runner is registered normally:
 
 | Jobs | Required labels | Prerequisites |
 | --- | --- | --- |
-| Documentation, Linux packages/install checks, Docker, publication | `self-hosted`, `Linux`, `X64` | Git, Bash, Docker, Python 3; normal action/toolchain dependencies |
+| Documentation | `self-hosted`, `macOS`, `ARM64` | Git, Bash, curl, tar, shasum; native pinned lychee downloaded into job temp |
+| Linux packages/install checks, Docker, publication | `self-hosted`, `Linux`, `X64` | Git, Bash, Docker, Python 3; normal action/toolchain dependencies |
 | Native Apple Silicon release/baseline | `self-hosted`, `macOS`, `ARM64` | Git, Bash, Rust toolchain prerequisites, Xcode command-line tools; PowerShell for cold-baseline instrumentation |
 | Native Intel Mac release/baseline | `self-hosted`, `macOS`, `X64` | Same Mac prerequisites |
 
-The runner inventory could not be read through the available GitHub connector.
-These are required labels, not a claim that all three runner types are online.
+On 2026-11-13, the GitHub runner settings UI showed one idle runner:
+`Athiwats-MacBook-Pro`, labelled `self-hosted`, `macOS`, `ARM64`. Documentation
+checks use this observed platform. No Linux/X64 or Intel Mac runner was listed;
+those release/baseline jobs still require their correct platforms and will queue
+until matching runners are available. Do not relabel a Mac as Linux to unblock them.
 Jobs queue if a matching runner is absent. Verify labels, free disk space and
 Docker availability before dispatching a release or baseline. A registered
 self-hosted runner is not automatically an isolated or disposable machine.
