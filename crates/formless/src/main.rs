@@ -14,6 +14,7 @@ mod cli_run_report;
 #[cfg(test)]
 mod cli_runs_filter_tests;
 mod cli_runs_list;
+mod cli_session_lookup;
 mod cli_session_report;
 mod cli_session_usage;
 mod cli_subagents;
@@ -6147,7 +6148,8 @@ fn find_session_in(list: &[SessionInfo], id: &str) -> Result<SessionInfo> {
         .filter(|s| s.id.starts_with(id))
         .cloned()
         .collect();
-    if matches.is_empty() {
+    let by_name = matches.is_empty();
+    if by_name {
         matches = list
             .iter()
             .filter(|s| s.name.eq_ignore_ascii_case(id.trim()))
@@ -6157,9 +6159,7 @@ fn find_session_in(list: &[SessionInfo], id: &str) -> Result<SessionInfo> {
     match matches.len() {
         1 => Ok(matches.remove(0)),
         0 => Err(usage(format!("no Session '{id}' (formless sessions list)"))),
-        n => Err(usage(format!(
-            "'{id}' matches {n} Sessions; give more of the id"
-        ))),
+        _ => Err(usage(cli_session_lookup::ambiguous(id, &matches, by_name))),
     }
 }
 

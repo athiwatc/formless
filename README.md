@@ -755,6 +755,11 @@ reported separately from an empty archive selection, which names the alternate
 list command and count. Static human `sessions show` includes stored archived,
 pinned, tags and last recorded Run status metadata; absent status is "not
 recorded". JSON and `--follow` retain their existing contracts.
+Ambiguous Session prefixes/names remain usage errors and display up to ten
+matching full IDs, bounded names and archive labels. Extra matches are counted,
+with commands for both archive states. Prefix errors suggest extending the ID;
+name errors suggest a displayed ID. Exact-ID priority, prefix-before-name
+resolution and trimmed ASCII-case-insensitive full-name matching are unchanged.
 
 #### Root and global flags
 
