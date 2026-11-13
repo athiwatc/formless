@@ -890,7 +890,8 @@ task, with quality as a gate**.
   Search uses an FTS5 index over message content (schema v24, with
   `unicode61` tokens and diacritics folded). Triggers keep the index
   current through inserts, edits and deletes. Every query word must match
-  as a word prefix, and results are ranked by bm25, then newest. A query
+  as a word prefix. Within each tier, results rank by bm25, then newest
+  timestamp and recording order. A query
   with no word characters falls back to a substring scan. Search runs on a
   reader connection and never takes the store lock.
 
