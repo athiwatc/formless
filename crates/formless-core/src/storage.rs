@@ -7774,11 +7774,13 @@ mod user_naming_text_tests {
             ],
         );
         let got = assert_same(&store, &mixed, "mixed").unwrap();
-        assert_eq!(got, substantive);
+        // The first uncertain short request is now substantive, even when
+        // it consists of eleven combining graphemes.
+        assert_eq!(got, eleven);
         assert!(!got.contains("ASSISTANT_ONLY"));
         assert!(!got.contains("TOOL_ONLY"));
         assert!(!got.contains("LATE_ONLY"));
-        assert!(!got.contains('\u{0301}'));
+        assert!(got.contains('\u{0301}'));
 
         let later = "summarise the quarterly notes in one page";
         let earliest = "please convert this csv export into json";
@@ -7838,16 +7840,16 @@ mod user_naming_text_tests {
                 ("assistant", &assistant),
             ],
         );
-        let got = assert_same(&store, &graphemes, "12 graphemes").unwrap();
-        assert_eq!(got, thai12);
-        assert!(!got.contains('\u{0301}'));
+        let got = assert_same(&store, &graphemes, "short combining request").unwrap();
+        assert_eq!(got, eleven);
+        assert!(got.contains('\u{0301}'));
         assert!(!got.contains("LATE_ONLY"));
 
         let short_nl = transcript(
             &store,
             &[
                 ("tool", &tool),
-                ("user", "yo"),
+                ("user", "hi"),
                 ("user", "go\non"),
                 ("user", &late),
             ],
@@ -7856,6 +7858,22 @@ mod user_naming_text_tests {
             assert_same(&store, &short_nl, "short newline").as_deref(),
             Some("go\non")
         );
+    }
+
+    #[test]
+    fn user_naming_text_retains_uncertain_short_requests_before_later_logs() {
+        let store = Store::open_in_memory().unwrap();
+        let late = marked("LATE_ONLY");
+        for request in ["yo", "ab", "Fix the CI", "修复登录错误", "กกก", "e\u{0301}"] {
+            let id = transcript(
+                &store,
+                &[("user", "hi"), ("user", request), ("user", &late)],
+            );
+            assert_eq!(
+                assert_same(&store, &id, "short request").as_deref(),
+                Some(request)
+            );
+        }
     }
 
     #[test]
@@ -7877,16 +7895,14 @@ mod user_naming_text_tests {
         );
         assert_eq!(assert_same(&store, &whitespace, "whitespace users"), None);
 
-        let eleven = "e\u{0301}".repeat(11);
         let trivial = transcript(
             &store,
             &[
                 ("user", blank),
                 ("user", "  hi  "),
-                ("user", "\nab\n"),
-                ("user", &eleven),
-                ("user", "\u{200B}"),
-                ("user", &cluster),
+                ("user", "ok"),
+                ("user", "thank you"),
+                ("user", "!!!"),
                 ("user", "hello"),
                 ("tool", &tool),
             ],
@@ -7916,7 +7932,7 @@ mod user_naming_text_tests {
                 ("tool", &tool),
             ],
         );
-        let got = assert_same(&store, &only_cluster, "huge trivial grapheme").unwrap();
+        let got = assert_same(&store, &only_cluster, "huge single grapheme").unwrap();
         assert_head_tail(&got, &cluster);
     }
 
@@ -7975,12 +7991,11 @@ mod user_naming_text_tests {
     fn user_naming_text_stops_before_irrelevant_late_rows() {
         assert_eq!(scanned(&[], 0, 1), None);
 
-        let cluster = huge_grapheme();
         let all_trivial = vec![
             " \u{00A0}\u{3000}\n".to_string(),
             "  hi  ".to_string(),
-            "\nab\n".to_string(),
-            cluster,
+            "ok".to_string(),
+            "!!!".to_string(),
         ];
         assert_eq!(
             scanned(&all_trivial, all_trivial.len(), all_trivial.len() + 1).as_deref(),
@@ -7997,11 +8012,13 @@ mod user_naming_text_tests {
             twelve.clone(),
             late.clone(),
         ];
-        let got = scanned(&graphemes, 3, 4).unwrap();
-        assert_eq!(got, twelve);
+        let got = scanned(&graphemes, 1, 2).unwrap();
+        assert_eq!(got, "e\u{0301}".repeat(11));
         assert!(!got.contains("LATE_ONLY"));
 
-        let multiline = vec!["yo".to_string(), "go\non".to_string(), late.clone()];
+        let short = vec!["yo".to_string(), late.clone()];
+        assert_eq!(scanned(&short, 0, 1).as_deref(), Some("yo"));
+        let multiline = vec!["hi".to_string(), "go\non".to_string(), late.clone()];
         assert_eq!(scanned(&multiline, 1, 2).as_deref(), Some("go\non"));
 
         let long = long_multibyte();
