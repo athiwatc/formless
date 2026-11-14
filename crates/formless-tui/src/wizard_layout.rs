@@ -115,9 +115,14 @@ pub(super) fn draw(
         top -= height;
         start += 1;
     }
-    // Oversized preceding logical lines cannot require an unrepresentable
-    // Paragraph offset: jump to the selected/input row's beginning instead.
-    if top > u16::MAX as usize {
+    // Pinned Paragraph adds scroll + height and area.top + logical row
+    // in u16 arithmetic. Bound both intermediates, not only the offset.
+    // Jump to the selected/input row's beginning if either could overflow.
+    if top
+        .saturating_add(body_h as usize)
+        .saturating_add(inner.y as usize)
+        > u16::MAX as usize
+    {
         start = focus;
         top = 0;
     }
@@ -325,5 +330,43 @@ mod tests {
                 && text.contains("Entercontinue"),
             "{text}"
         );
+    }
+    fn boundary_fixture(prefix_rows: usize, y: u16) {
+        let mut terminal = Terminal::with_options(
+            TestBackend::new(40, 20),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(Rect::new(0, y, 40, 12)),
+            },
+        )
+        .unwrap();
+        terminal
+            .draw(|f| {
+                draw(
+                    f,
+                    vec![
+                        Line::raw("x".repeat(38 * prefix_rows)),
+                        Line::raw("› selected"),
+                    ],
+                    Line::raw("footer"),
+                    "fixture".into(),
+                    false,
+                )
+            })
+            .unwrap();
+        let text = flat(terminal.backend().buffer());
+        assert!(
+            text.contains("›selected") && text.contains("footer"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn wizard_boundary_residual_offset_plus_height_must_not_overflow() {
+        boundary_fixture(65_535, 0);
+    }
+
+    #[test]
+    fn wizard_boundary_shifted_viewport_coordinates_must_not_overflow() {
+        boundary_fixture(65_534, 3);
     }
 }
