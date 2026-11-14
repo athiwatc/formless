@@ -406,16 +406,26 @@ mod tests {
 
     #[test]
     fn urls_use_the_matched_scheme_minimum() {
-        for url in ["http://a", "http://a/", "https://a", "https://a/", "http://é"] {
+        for url in [
+            "http://a",
+            "http://a/",
+            "https://a",
+            "https://a/",
+            "http://é",
+        ] {
             let text = format!("日本 ({url}). next");
-            assert_eq!(find_urls(&text), vec![(4, 4 + url.chars().count(), url.into())]);
+            assert_eq!(
+                find_urls(&text),
+                vec![(4, 4 + url.chars().count(), url.into())]
+            );
         }
         for bare in ["http://", "https://", "http://.", "https://."] {
             assert!(find_urls(bare).is_empty(), "{bare}");
         }
-        assert_eq!(find_urls("http://a https://b"), vec![
-            (0, 8, "http://a".into()), (9, 18, "https://b".into())
-        ]);
+        assert_eq!(
+            find_urls("http://a https://b"),
+            vec![(0, 8, "http://a".into()), (9, 18, "https://b".into())]
+        );
     }
 
     #[test]
