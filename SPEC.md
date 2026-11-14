@@ -3829,7 +3829,9 @@ run_tool = "network_policy"     # a registry Tool, or…
   `/open path FILE[:LINE]`
   opens one in `$VISUAL`/`$EDITOR` at that line: `+LINE` for terminal
   editors (which get the terminal until they exit), `FILE:LINE` for
-  Helix, and `-g` for VS Code and its forks.
+  Helix/Sublime/Zed, `-g FILE:LINE` for VS Code and its forks,
+  `-l LINE FILE` for TextMate, `+LINE FILE` for gedit, and
+  `--line LINE FILE` for Kate.
 - **Inline images (TUI).** Image attachments the TUI can read get an
   8-row thumbnail under their message. After each draw, thumbnails whose
   rows are all on screen are sent with the terminal's own protocol, which
@@ -4557,7 +4559,10 @@ programs: Unix shell-style quoting, Windows double-quote/backslash command-line
 quoting. No variable, tilde, wildcard or pipeline expansion occurs. An explicit
 configured shell is the owner's command. Known GUI editors use a wait option for
 composition (Code-family --wait, Sublime/Mate/Zed/Gedit --wait, Kate --block,
-GVim/MacVim --nofork). Other GUI commands must themselves wait until this file
+GVim/MacVim --nofork). The captured 1-based cursor line uses the same
+editor-specific location arguments as `/open path`, independently of the wait
+option. With no line or an unknown editor, the file path is passed unchanged.
+Other GUI commands must themselves wait until this file
 closes; detaching file-open launchers are refused. Ordinary `/open path` keeps
 its existing nonblocking GUI behavior.
 
