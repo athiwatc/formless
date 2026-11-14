@@ -3547,7 +3547,11 @@ refresh a cache, nightly cleanup.
     names such as `JAN-MAR` and `MON,WED,FRI`, including in ranges/lists/steps;
     Sunday is `SUN`, 0 or 7). Aliases are `@hourly`, `@daily`/`@midnight`,
     `@weekly`, `@monthly`, and `@yearly`/`@annually` (January 1 at midnight).
-    When both day fields are restricted, either may match. Invalid field
+    Day fields follow Cronie: if either starts with `*` (including `*/N`
+    or `*,…`), both parsed day sets must match; otherwise either may match.
+    A later wildcard (`1,*`) or an explicit full range does not set that
+    leading-wildcard flag. For example, `0 9 */2 * 1` runs on Mondays
+    with odd day-of-month numbers, rather than every 48 hours. Invalid field
     values and range endpoints identify their field in both entry points.
     `at` is RFC 3339, `YYYY-MM-DD HH:MM` or `in 30m|2h|1d`.
   - The user uses `AddJob` or `formless jobs add PROMPT --every … |
