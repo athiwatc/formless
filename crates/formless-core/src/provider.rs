@@ -4740,7 +4740,9 @@ fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
     let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
     if let Some(v) = header("retry-after") {
         if let Ok(secs) = v.trim().parse::<f64>() {
-            return Some(Duration::from_secs_f64(secs.max(0.0)));
+            if let Some(wait) = retry_seconds(secs) {
+                return Some(wait);
+            }
         }
         if let Ok(at) = chrono::DateTime::parse_from_rfc2822(v.trim()) {
             let wait = at.signed_duration_since(chrono::Utc::now());
@@ -4753,11 +4755,20 @@ fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
         .max()
 }
 
+// Finite negatives retain the zero-wait behavior. Non-finite or overflowing
+// hints are unavailable, allowing other headers or ordinary backoff to apply.
+fn retry_seconds(seconds: f64) -> Option<Duration> {
+    if !seconds.is_finite() {
+        return None;
+    }
+    Duration::try_from_secs_f64(seconds.max(0.0)).ok()
+}
+
 /// `"1m30s"`, `"6m0s"`, `"20ms"`, `"0.5s"`, or bare seconds.
 fn parse_reset_duration(text: &str) -> Option<Duration> {
     let text = text.trim();
     if let Ok(secs) = text.parse::<f64>() {
-        return Some(Duration::from_secs_f64(secs.max(0.0)));
+        return retry_seconds(secs);
     }
     let mut total = 0.0;
     let mut rest = text;
@@ -4780,7 +4791,7 @@ fn parse_reset_duration(text: &str) -> Option<Duration> {
             };
         rest = &rest[unit_len..];
     }
-    Some(Duration::from_secs_f64(total))
+    retry_seconds(total)
 }
 
 /// Whether a 400 body rejects the reasoning-effort parameter itself (and
@@ -5770,6 +5781,71 @@ mod tests {
             provider_http_error(reqwest::StatusCode::BAD_REQUEST, "invalid", None),
             "400 Bad Request: invalid"
         );
+    }
+
+    #[test]
+    fn retry_hints_ignore_nonfinite_and_unrepresentable_durations() {
+        use reqwest::header::{HeaderMap, HeaderValue};
+        for invalid in [
+            "inf",
+            "+inf",
+            "-inf",
+            "NaN",
+            "1e100",
+            "18446744073709551616",
+        ] {
+            assert_eq!(parse_reset_duration(invalid), None, "{invalid}");
+            let mut headers = HeaderMap::new();
+            headers.insert("retry-after", HeaderValue::from_str(invalid).unwrap());
+            headers.insert(
+                "x-ratelimit-reset-requests",
+                HeaderValue::from_static("1e100"),
+            );
+            headers.insert("x-ratelimit-reset-tokens", HeaderValue::from_static("3s"));
+            assert_eq!(
+                retry_after(&headers),
+                Some(Duration::from_secs(3)),
+                "{invalid}"
+            );
+        }
+        for invalid in [
+            format!("{}h", "9".repeat(400)),
+            "10000000000000000000h".into(),
+            "10000000000000000000s10000000000000000000s".into(),
+        ] {
+            assert_eq!(parse_reset_duration(&invalid), None, "{invalid}");
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ratelimit-reset-requests", HeaderValue::from_static("5s"));
+        headers.insert("x-ratelimit-reset-tokens", HeaderValue::from_static("2s"));
+        assert_eq!(retry_after(&headers), Some(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn retry_hints_preserve_valid_ranges_precedence_and_negative_clamping() {
+        use reqwest::header::{HeaderMap, HeaderValue};
+        for (text, expected) in [
+            ("0.5", Duration::from_millis(500)),
+            ("-2.5", Duration::ZERO),
+            ("20ms", Duration::from_millis(20)),
+            ("1h30m", Duration::from_secs(5400)),
+            (
+                "18446744073709549568",
+                Duration::from_secs(18_446_744_073_709_549_568),
+            ),
+        ] {
+            assert_eq!(parse_reset_duration(text), Some(expected), "{text}");
+        }
+        for (value, expected) in [
+            ("0.5", Duration::from_millis(500)),
+            ("-2", Duration::ZERO),
+            ("Sun, 06 Nov 1994 08:49:37 GMT", Duration::ZERO),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert("retry-after", HeaderValue::from_static(value));
+            headers.insert("x-ratelimit-reset-tokens", HeaderValue::from_static("9s"));
+            assert_eq!(retry_after(&headers), Some(expected), "{value}");
+        }
     }
 
     #[test]
