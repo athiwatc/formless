@@ -69,3 +69,20 @@ fn topic_mistakes_exit_two_and_explain_unknown_or_ambiguous_input() {
     );
     assert!(!root.exists());
 }
+
+#[test]
+fn task_topics_print_the_user_guides_without_creating_a_profile() {
+    for topic in ["mcp", "skills", "jobs"] {
+        let (root, output) = docs(&["docs", topic, "--print"]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim(),
+            format!("https://github.com/athiwatc/formless/blob/main/docs/{topic}.md")
+        );
+        assert!(!root.exists(), "docs should not create a profile");
+    }
+}

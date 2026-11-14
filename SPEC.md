@@ -4947,8 +4947,10 @@ undo, redo and replacements invalidate prior asynchronous editor previews.
 ### 10.9 Guides
 
 - The user guides live in `docs/`: a gallery of example tasks, the
-  Capabilities in plain words, the main keys and every command, troubleshooting,
-  and Docker. `/docs [topic]` (TUI and web) and `formless docs [topic]
+  Capabilities in plain words, task-oriented MCP/Skills/Jobs how-to guides,
+  the main keys and every command, troubleshooting, and Docker. The `mcp`,
+  `skills` and `jobs` topics open `docs/mcp.md`, `docs/skills.md` and
+  `docs/jobs.md`; each links to its full specification section. `/docs [topic]` (TUI and web) and `formless docs [topic]
   [--print]` open one (`gallery`, `capabilities`, `approvals`, `keys`,
   `troubleshooting`, `mcp`, `skills`, `jobs`, `spec`; a unique prefix works;
   none opens the gallery). `formless doctor` prints the troubleshooting link, and
