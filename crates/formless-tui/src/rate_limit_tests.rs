@@ -1,3 +1,52 @@
+// The accept loop is nonblocking, but request parsing below uses bounded,
+// blocking reads. Accepted streams do not inherit listener flags portably.
+fn configure_rate_limit_fixture_socket(socket: &std::net::TcpStream) -> std::io::Result<()> {
+    socket.set_nonblocking(false)?;
+    let timeout = Some(std::time::Duration::from_secs(5));
+    socket.set_read_timeout(timeout)?;
+    socket.set_write_timeout(timeout)
+}
+
+#[test]
+fn rate_limit_fixture_reads_a_delayed_request_from_an_inherited_nonblocking_socket() {
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::time::Duration;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let mut client = TcpStream::connect_timeout(&listener.local_addr().unwrap(), Duration::from_secs(5)).unwrap();
+    client.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut socket = loop {
+        match listener.accept() {
+            Ok((socket, _)) => break socket,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(std::time::Instant::now() < deadline, "delayed client never connected");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => panic!("{error}"),
+        }
+    };
+    // Linux does not inherit O_NONBLOCK. Model the inherited state explicitly
+    // so this regression exercises the same precondition on every platform.
+    socket.set_nonblocking(true).unwrap();
+    let mut probe = [0];
+    assert_eq!(socket.read(&mut probe).unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+    configure_rate_limit_fixture_socket(&socket).unwrap();
+    assert_eq!(socket.read_timeout().unwrap(), Some(Duration::from_secs(5)));
+    assert_eq!(socket.write_timeout().unwrap(), Some(Duration::from_secs(5)));
+    let writer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(50));
+        client.write_all(b"request").unwrap();
+    });
+    let mut request = [0; 7];
+    let read = socket.read_exact(&mut request);
+    writer.join().unwrap();
+    read.expect("fixture waits for the delayed request within its timeout");
+    assert_eq!(&request, b"request");
+}
+
 // Real HTTP headers -> Provider observation -> wire response -> /usage note.
 #[test]
 fn rate_limits_vendor_headers_reach_the_tui_and_status_line() {
@@ -26,7 +75,7 @@ fn rate_limits_vendor_headers_reach_the_tui_and_status_line() {
                     Err(e) => panic!("{e}"),
                 }
             };
-            socket.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            configure_rate_limit_fixture_socket(&socket).unwrap();
             let mut received = Vec::new();
             loop {
                 let mut buf = [0; 4096];
