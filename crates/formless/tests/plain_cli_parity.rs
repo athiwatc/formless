@@ -1,5 +1,7 @@
 //! Shipped file commands against an owned, provider-free fake daemon.
 #![cfg(unix)]
+#[path = "support/unix_fixture_io.rs"]
+mod unix_fixture_io;
 use formless_core::Paths;
 use formless_protocol::{Request, RequestEnvelope};
 use serde_json::{json, Value};
@@ -13,6 +15,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
+use unix_fixture_io::FixtureStream;
 
 fn run_report() -> Value {
     let rows=[1,10,100,1000].into_iter().enumerate().map(|(i,n)|json!({"run_id":format!("full-run-日本語-{i}"),"created_at":"2026-11-01T12:34:56Z","outcome":if i==1 {"longer-than-eleven-outcome"} else {"completed"},"steps":n,"tool_calls":n,"prompt_tokens":10,"completion_tokens":5,"duration_ms":1200})).collect::<Vec<_>>();
@@ -52,7 +55,7 @@ impl Fixture {
         let seen = requests.clone();
         let thread = std::thread::spawn(move || {
             while !stopped.load(Ordering::SeqCst) {
-                let (mut socket, _) = match listener.accept() {
+                let (socket, _) = match listener.accept() {
                     Ok(pair) => pair,
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         std::thread::sleep(Duration::from_millis(2));
@@ -60,9 +63,13 @@ impl Fixture {
                     }
                     Err(e) => panic!("{e}"),
                 };
-                socket
-                    .set_read_timeout(Some(Duration::from_secs(2)))
-                    .unwrap();
+                let mut socket = FixtureStream::new(
+                    socket,
+                    stopped.clone(),
+                    Instant::now() + Duration::from_secs(15),
+                    Duration::from_secs(2),
+                )
+                .unwrap();
                 let mut reader = BufReader::new(socket.try_clone().unwrap());
                 let mut line = String::new();
                 while reader.read_line(&mut line).unwrap_or(0) > 0 {
