@@ -5659,7 +5659,10 @@ during its snapshot fetch, deduplicated by message id.
   path, zip or git URL on the daemon's machine, or a bundle uploaded from
   the browser); and New job: a task, a schedule from presets (every day,
   every weekday, every week at a time, hourly, once) or cron, previewed in
-  words, and a target Session; a top-bar theme switch, Auto (the system's)
+  words (hourly schedules name the minute without a bare colon, midnight
+  aliases match daily labels, and January 1 yearly schedules name the date;
+  unsupported shapes retain the cron text), and a target Session; a
+  top-bar theme switch, Auto (the system's)
   / Light / Dark, remembered per browser) — over the
   same daemon protocol, decrypted in the browser. `GetSettings` returns a
   read-only configuration summary for remote clients and never includes

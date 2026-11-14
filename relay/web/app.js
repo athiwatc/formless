@@ -5547,16 +5547,22 @@
   /** A 5-field cron in words where it's a common shape, else as is. */
   function describeCron(expr) {
     const e = expr.trim();
-    const named = { "@hourly": "every hour", "@daily": "every day at 0:00", "@weekly": "every Sunday at 0:00", "@monthly": "on the 1st of each month at 0:00" };
+    const named = {
+      "@hourly": "every hour", "@daily": "every day at 0:00", "@midnight": "every day at 0:00",
+      "@weekly": "every Sunday at 0:00", "@monthly": "on the 1st of each month at 0:00",
+      "@yearly": "every year on January 1 at 0:00", "@annually": "every year on January 1 at 0:00",
+    };
     if (named[e]) return named[e];
     const f = e.split(/\s+/);
     if (f.length !== 5) return e;
     const [m, hr, dom, mon, dow] = f;
     const step = m.match(/^\*\/(\d+)$/);
     if (step && hr === "*" && dom === "*" && mon === "*" && dow === "*") return "every " + step[1] + " minutes";
-    if (/^\d+$/.test(m) && hr === "*" && dom === "*" && mon === "*" && dow === "*") return "every hour at :" + m.padStart(2, "0");
-    if (!/^\d+$/.test(m) || !/^\d+$/.test(hr) || mon !== "*") return e;
+    if (/^\d+$/.test(m) && hr === "*" && dom === "*" && mon === "*" && dow === "*") return Number(m) === 0 ? "every hour" : "every hour at minute " + m.padStart(2, "0");
+    if (!/^\d+$/.test(m) || !/^\d+$/.test(hr)) return e;
     const time = hr + ":" + m.padStart(2, "0");
+    if (dom === "1" && mon === "1" && dow === "*") return "every year on January 1 at " + time;
+    if (mon !== "*") return e;
     if (dom === "*" && dow === "*") return "every day at " + time;
     if (dom === "*" && dow === "1-5") return "every weekday at " + time;
     if (dom === "*" && /^[0-7](,[0-7])*$/.test(dow)) return "every " + dow.split(",").map((d) => DAYS[Number(d) % 7]).join(", ") + " at " + time;
