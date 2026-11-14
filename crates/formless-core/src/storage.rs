@@ -1702,6 +1702,19 @@ impl Store {
         Ok(rows)
     }
 
+    /// One Session-scoped message, using the same row/metadata conversion as
+    /// transcript reads. Unrelated rows are deliberately not decoded here.
+    pub fn get_message(&self, session_id: &str, message_id: &str) -> Result<Option<MessageInfo>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT * FROM messages WHERE session_id=?1 AND id=?2",
+                params![session_id, message_id],
+                Self::row_msg,
+            )
+            .optional()?)
+    }
+
     /// Messages with `seq > after`, in order (incremental context builds).
     pub fn list_messages_after(&self, session_id: &str, after: i64) -> Result<Vec<MessageInfo>> {
         let mut stmt = self
@@ -1947,10 +1960,7 @@ impl Store {
         message_id: &str,
         content: &str,
     ) -> Result<Option<MessageInfo>> {
-        let found = self
-            .list_messages(session_id)?
-            .into_iter()
-            .find(|m| m.id == message_id);
+        let found = self.get_message(session_id, message_id)?;
         let Some(mut msg) = found else {
             return Ok(None);
         };
@@ -6835,6 +6845,10 @@ pub fn estimate_tokens(text: &str) -> usize {
 }
 
 pub type BuiltContext = (Vec<Value>, bool, i64);
+
+#[cfg(test)]
+#[path = "targeted_message_lookup_tests.rs"]
+mod targeted_message_lookup_tests;
 
 /// Build provider context (OpenAI message objects) from checkpoint +
 /// post-checkpoint messages. Tool-call/tool messages are reconstructed from
