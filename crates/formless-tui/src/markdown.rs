@@ -868,11 +868,49 @@ fn wrap(spans: Vec<InlineSpan>, avail: usize) -> Vec<Vec<Span<'static>>> {
         }
         flush_word(&mut word, &mut pieces);
     }
+    // Representative CJK line-edge policy, not a complete UAX #14 or
+    // locale-specific typography implementation. Keep opening brackets with
+    // what follows and closing/trailing marks with what precedes. Apply this
+    // to boundaries after tokenization so styles cannot introduce a break.
+    // An oversized punctuation group still uses the grapheme hard-wrap below.
+    let opening = |c| "（［｛〈《「『【〔〖〘〚".contains(c);
+    let closing = |c| "、。，．：；？！）］｝〉》」』】〕〗〙〛".contains(c);
+    let mut grouped: Vec<Piece> = Vec::with_capacity(pieces.len());
+    let mut iter = pieces.into_iter().peekable();
+    while let Some(piece) = iter.next() {
+        if matches!(piece, Piece::Soft) {
+            let after_open = match grouped.last() {
+                Some(Piece::Word(parts, _)) => parts
+                    .iter()
+                    .rev()
+                    .find_map(|span| span.content.chars().last())
+                    .is_some_and(opening),
+                _ => false,
+            };
+            let before_close = match iter.peek() {
+                Some(Piece::Word(parts, _)) => parts
+                    .iter()
+                    .find_map(|span| span.content.chars().next())
+                    .is_some_and(closing),
+                _ => false,
+            };
+            if after_open || before_close {
+                continue;
+            }
+        }
+        match (grouped.last_mut(), piece) {
+            (Some(Piece::Word(previous, previous_width)), Piece::Word(parts, width)) => {
+                previous.extend(parts);
+                *previous_width += width;
+            }
+            (_, piece) => grouped.push(piece),
+        }
+    }
     let mut rows: Vec<Vec<Span<'static>>> = Vec::new();
     let mut row: Vec<Span<'static>> = Vec::new();
     let mut row_w = 0;
     let mut space: Option<Style> = None;
-    for p in pieces {
+    for p in grouped {
         match p {
             Piece::Break => {
                 rows.push(std::mem::take(&mut row));
@@ -1445,6 +1483,124 @@ mod tests {
 
     /// Thai and Chinese wrap within the width, never starting a row with a
     /// mark or cutting an emoji sequence (#786).
+    #[test]
+    fn cjk_wrap_keeps_representative_punctuation_with_its_neighbor() {
+        for (source, width, expected) in [
+            ("中文。", 4, vec!["中", "文。"]),
+            ("中（文", 4, vec!["中", "（文"]),
+            ("中文，字", 4, vec!["中", "文，", "字"]),
+            ("「中文」", 6, vec!["「中", "文」"]),
+        ] {
+            let rows = wrap(
+                vec![InlineSpan {
+                    content: source.into(),
+                    style: Style::default(),
+                    literal: false,
+                }],
+                width,
+            );
+            let actual: Vec<_> = rows
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|span| span.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect();
+            assert_eq!(actual, expected, "{source}, width {width}");
+        }
+    }
+
+    #[test]
+    fn cjk_wrap_respects_styles_newlines_and_oversized_groups() {
+        let span = |text: &str, style| InlineSpan {
+            content: text.into(),
+            style,
+            literal: false,
+        };
+        let bold = Style::default().add_modifier(Modifier::BOLD);
+        let italic = Style::default().add_modifier(Modifier::ITALIC);
+        let rows = wrap(
+            vec![
+                span("中", Style::default()),
+                span("（", bold),
+                span("文", italic),
+            ],
+            4,
+        );
+        let texts: Vec<String> = rows
+            .iter()
+            .map(|row| row.iter().map(|span| span.content.as_ref()).collect())
+            .collect();
+        assert_eq!(texts, ["中", "（文"]);
+        assert_eq!(rows[1][0].style, bold);
+        assert_eq!(rows[1][1].style, italic);
+        for source in [
+            "中文，继续。",
+            "中文「日本語」文章。",
+            "日本語【文章】です！",
+        ] {
+            for width in [4, 6, 8] {
+                let rows = wrap(vec![span(source, Style::default())], width);
+                let texts: Vec<String> = rows
+                    .iter()
+                    .map(|row| row.iter().map(|span| span.content.as_ref()).collect())
+                    .collect();
+                assert_eq!(texts.concat(), source);
+                for row in texts {
+                    assert!(row.width() <= width, "{row}");
+                    assert!(
+                        !row.starts_with(['、', '。', '，', '」', '】', '！']),
+                        "{row}"
+                    );
+                    assert!(!row.ends_with(['「', '【']), "{row}");
+                }
+            }
+        }
+        let rows = wrap(vec![span("中\n。文", bold)], 4);
+        assert_eq!(
+            rows.iter()
+                .map(|row| row
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>())
+                .collect::<Vec<_>>(),
+            ["中", "。文"]
+        );
+        for width in [1, 2, 4] {
+            let rows = wrap(vec![span("（文）", bold)], width);
+            assert_eq!(
+                rows.iter()
+                    .flat_map(|row| row.iter())
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>(),
+                "（文）"
+            );
+            assert!(rows.iter().all(|row| row
+                .iter()
+                .map(|span| span.content.width())
+                .sum::<usize>()
+                <= width.max(2)));
+        }
+        for source in ["กขคง", "ກຂຄງ", "កខគឃ", "ကခဂဃ"] {
+            let rows = wrap(vec![span(source, bold)], 2);
+            let text_rows = |rows: Vec<Vec<Span<'static>>>| {
+                rows.into_iter()
+                    .map(|row| {
+                        row.into_iter()
+                            .map(|span| span.content.into_owned())
+                            .collect::<String>()
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert!(rows.iter().flatten().all(|span| span.style == bold));
+            assert_eq!(
+                text_rows(rows),
+                text_rows(hard_wrap(vec![Span::styled(source, bold)], 2))
+            );
+        }
+    }
+
     #[test]
     fn unspaced_scripts_wrap_between_clusters() {
         let marks = |c: char| matches!(c as u32, 0x0E31 | 0x0E34..=0x0E3A | 0x0E47..=0x0E4E);
