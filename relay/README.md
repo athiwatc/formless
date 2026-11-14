@@ -254,6 +254,42 @@ and the push service learn nothing about any Session; the notification
 just says something is waiting. `dev.mjs` reads the same variables from
 its environment.
 
+#### Push endpoint allowlist
+
+Normal push endpoints must use HTTPS and a trusted hostname. The built-in list
+in `push.mjs` allows `fcm.googleapis.com`,
+`updates.push.services.mozilla.com`, subdomains of `push.apple.com`, and
+subdomains of `notify.windows.com`.
+
+`PUSH_HOSTS` adds comma-separated hostnames to that list; it does not replace
+the built-ins. An entry such as `push.example.com` matches exactly that host.
+A leading-dot entry such as `.push.example.com` matches its subdomains
+(for example `eu.push.example.com`), but **not** the apex `push.example.com`.
+Use narrow, trusted hosts: adding entries expands where the relay may send
+push requests.
+
+For a self-hosted Worker, add the variable to `relay/wrangler.toml` (merge
+into an existing `[vars]` table if present), then use the deployment steps above:
+
+```toml
+[vars]
+PUSH_HOSTS = "push.example.com,.push.example.com"
+```
+
+For local development, pass it in the process environment:
+
+```sh
+PUSH_HOSTS='push.example.com,.push.example.com' node relay/dev.mjs --port 8797
+```
+
+The Worker also recognizes `ALLOW_LOCAL_PUSH=1`, which permits HTTP endpoints
+only when the parsed hostname is the literal `127.0.0.1`; `localhost` and
+`[::1]` do not qualify. This exception bypasses the host allowlist for that
+loopback HTTP endpoint. Reserve it for local fixtures/development and leave it
+unset in production. `dev.mjs` already sets `ALLOW_LOCAL_PUSH` to `"1"` for its
+local test push service, regardless of the process environment. Subscription
+key validation and size limits still apply.
+
 ## Vendored Mermaid
 
 `web/vendor/mermaid.min.js` is Mermaid 11.4.1 (MIT, see
