@@ -4971,7 +4971,7 @@ the TUI. Command-specific arguments and defaults are available through
 | `formless naming` | `status`, `pull`, `test` | Inspect, install, or preview the embedded Session-naming model. |
 | `formless prices` | `import` | Import a model-price catalog for cost and spending limits. |
 | `formless profiles` | `list`, `rm` | List or remove isolated profiles. |
-| `formless prompts` | `list`, `generate`, `apply`, `reject`, `rollback` | Inspect and manage measured prompt/memory proposals. |
+| `formless prompts` | `list`, `diff`, `generate`, `apply`, `reject`, `rollback` | Inspect existing proposal comparisons and manage measured prompt/memory proposals. |
 | `formless providers` | `list`, `add`, `remove`, `test` | Manage named model providers and test a connection. |
 | `formless relay` | `enable`, `disable`, `status` | Manage encrypted browser access through the relay. |
 | `formless reset` | `--force` | Wipe configuration, credentials, and the current profile's data. |
@@ -6241,6 +6241,13 @@ An already terminal Run exits after replay. Historical terminal Runs without
 stored message boundaries display a Note and the initial Session snapshot only;
 follow never invents a boundary or refreshes that legacy transcript without one.
 Connection loss is an error.
+
+`prompts diff ID [--json]` reads the existing daemon proposal comparison:
+target, already-applied state and ordered operation/line pairs. Human output
+does not fit or clip lines to terminal width; JSON preserves the complete
+response. This is a hypothetical without/with comparison, not an application
+dry run or guarantee of permission/success. It performs no proposal evaluation
+or decision; unknown IDs retain the standard not-found usage error.
 
 `runs show ID [--json]` inspects any stored Run; `runs cancel ID [--json]`
 cancels only that exact active Run, never a later Run in the same Session. IDs

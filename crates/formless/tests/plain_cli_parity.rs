@@ -75,6 +75,7 @@ impl Fixture {
                 while reader.read_line(&mut line).unwrap_or(0) > 0 {
                     let envelope: RequestEnvelope = serde_json::from_str(&line).unwrap();
                     let result = match &envelope.request {
+                        Request::ProposalDiff { id } => proposal_comparison(id),
                         Request::ListSessions => json!([
                             {"id":"abc-one","name":"First","created_at":"","updated_at":""},
                             {"id":"abc-two","name":"Second","created_at":"","updated_at":""}
@@ -99,9 +100,18 @@ impl Fixture {
                         }
                         _ => panic!("unexpected private RPC: {:?}", envelope.request),
                     };
+                    let reply = if matches!(&envelope.request,Request::ProposalDiff{id} if id=="missing")
+                    {
+                        serde_json::to_value(formless_protocol::ServerMessage::err_code(
+                            envelope.id,
+                            formless_protocol::codes::NOT_FOUND,
+                            "proposal not found".into(),
+                        ))
+                        .unwrap()
+                    } else {
+                        json!({"kind":"response", "id":envelope.id, "ok":true, "result":result})
+                    };
                     seen.lock().unwrap().push(envelope.request);
-                    let reply =
-                        json!({"kind":"response", "id":envelope.id, "ok":true, "result":result});
                     if writeln!(socket, "{reply}").is_err() {
                         break;
                     }
@@ -167,6 +177,58 @@ impl Fixture {
             stderr: err.join().unwrap(),
         }
     }
+}
+
+fn proposal_comparison(id: &str) -> Value {
+    json!({"target":if id=="memory" {"memory"} else {"learned guidance"},"applied":id=="memory","diff":[["-","old 日本語"],["+","ไทย long full line ".repeat(80)],[" ",""]],"future":{"preserved":true}})
+}
+
+#[test]
+fn shipped_proposal_diff_is_read_only_and_preserves_the_complete_comparison() {
+    let fixture = Fixture::new();
+    for id in ["guidance", "memory"] {
+        for json in [false, true] {
+            fixture.requests.lock().unwrap().clear();
+            let mut args = vec!["prompts", "diff", id];
+            if json {
+                args.push("--json");
+            }
+            let out = fixture.run(&args);
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let expected = proposal_comparison(id);
+            if json {
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&out.stdout).unwrap(),
+                    expected
+                );
+            } else {
+                let text = String::from_utf8(out.stdout).unwrap();
+                assert!(text.contains(&format!("Target: {}", expected["target"].as_str().unwrap())));
+                assert!(text.contains(if id == "memory" {
+                    "Already applied: yes"
+                } else {
+                    "Already applied: no"
+                }));
+                assert!(text.ends_with(&format!(
+                    "-old 日本語\n+{}\n \n",
+                    "ไทย long full line ".repeat(80)
+                )));
+            }
+            let requests = fixture.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1, "{requests:?}");
+            assert!(matches!(&requests[0],Request::ProposalDiff{id:actual} if actual==id));
+        }
+    }
+    let missing = fixture.run(&["prompts", "diff", "missing"]);
+    assert_eq!(missing.status.code(), Some(2));
+    assert!(missing.stdout.is_empty());
+    assert!(String::from_utf8(missing.stderr)
+        .unwrap()
+        .contains("proposal not found"));
 }
 impl Drop for Fixture {
     fn drop(&mut self) {

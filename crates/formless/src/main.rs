@@ -4,6 +4,7 @@ mod cli_commands;
 mod cli_help_tests;
 mod cli_metrics;
 mod cli_pipeline;
+mod cli_proposal_diff;
 mod cli_routing;
 mod cli_run_identity;
 mod cli_runs_list;
@@ -291,7 +292,9 @@ enum Cmd {
         action: RelayAction,
     },
     /// Prompt/memory self-optimisation proposals
-    #[command(after_help = "Examples:\n  formless prompts list\n  formless prompts list --json")]
+    #[command(
+        after_help = "Examples:\n  formless prompts list\n  formless prompts list --json\n  formless prompts diff PROPOSAL_ID --json"
+    )]
     Prompts {
         #[command(subcommand)]
         action: PromptsAction,
@@ -601,6 +604,14 @@ enum UpdateAction {
 
 #[derive(Subcommand)]
 enum PromptsAction {
+    /// Show the existing proposal comparison without applying it
+    Diff {
+        /// ID of the prompt or memory proposal to compare
+        id: String,
+        /// Print the complete daemon response as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// List proposals with eval scores
     List {
         /// One JSON value instead of a table
@@ -2515,6 +2526,7 @@ fn prompts_cmd(paths: Paths, action: PromptsAction) -> Result<()> {
     use formless_tui::client::request_once;
     formless_core::daemon::ensure_daemon(&paths)?;
     match action {
+        PromptsAction::Diff { id, json } => cli_proposal_diff::show(&paths, id, json),
         PromptsAction::List { json } => {
             let v = request_once(&paths, Request::ListProposals)?;
             if json {

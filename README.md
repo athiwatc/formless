@@ -626,7 +626,7 @@ The table covers every visible root command, including Clap's generated
 | `formless naming` | `status`, `pull`, `test` | Inspect, install, or preview the embedded Session-naming model. |
 | `formless prices` | `import` | Import a model-price catalog for cost and spending limits. |
 | `formless profiles` | `list`, `rm` | List or remove isolated profiles. |
-| `formless prompts` | `list`, `generate`, `apply`, `reject`, `rollback` | Inspect and manage measured prompt/memory proposals. |
+| `formless prompts` | `list`, `diff`, `generate`, `apply`, `reject`, `rollback` | Inspect existing proposal comparisons and manage measured prompt/memory proposals. |
 | `formless providers` | `list`, `add`, `remove`, `test` | Manage named model providers and test a connection. |
 | `formless relay` | `enable`, `disable`, `status` | Manage encrypted browser access through the relay. |
 | `formless reset` | `--force` | Wipe configuration, credentials, and the current profile's data. |
