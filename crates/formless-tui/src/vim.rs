@@ -33,11 +33,17 @@ enum Command {
     Delete(usize),
 }
 #[derive(Debug, Clone)]
+enum InsertEdit {
+    Key(KeyEvent),
+    /// Bracketed paste is one insertion, including during dot/count replay.
+    Paste(String),
+}
+#[derive(Debug, Clone)]
 struct Change {
     edited: bool,
     literal: bool,
     command: Command,
-    edits: Vec<KeyEvent>,
+    edits: Vec<InsertEdit>,
 }
 #[derive(Debug, Default, Clone)]
 pub(crate) struct Vim {
@@ -65,25 +71,23 @@ impl Vim {
         if self.mode == Mode::Normal {
             self.apply(line, Command::Insert('i', 1));
         }
-        for c in text.replace("\r\n", "\n").replace('\r', "\n").chars() {
-            let key = if c == '\n' {
-                KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)
-            } else {
-                KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
-            };
-            let changed = insert_key(line, key, Surface::Editor).unwrap_or(false);
-            self.inserting
-                .get_or_insert(Change {
-                    edited: false,
-                    literal: line.is_literal(),
-                    command: Command::Insert('i', 1),
-                    edits: vec![],
-                })
-                .edits
-                .push(key);
-            self.inserting.as_mut().unwrap().literal = line.is_literal();
-            self.inserting.as_mut().unwrap().edited |= changed;
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        if text.is_empty() {
+            return;
         }
+        let changed = line.selection().is_none_or(|range| &line[range] != text);
+        // Snapping after each scalar can cross an existing neighbor joined by
+        // a Prepend/ZWJ/RI character and reorder later pasted characters.
+        line.insert_modal_paste(&text);
+        let change = self.inserting.get_or_insert(Change {
+            edited: false,
+            literal: line.is_literal(),
+            command: Command::Insert('i', 1),
+            edits: Vec::new(),
+        });
+        change.edits.push(InsertEdit::Paste(text));
+        change.literal = line.is_literal();
+        change.edited |= changed;
     }
 
     pub(crate) fn key(&mut self, line: &mut InputLine, key: KeyEvent, surface: Surface) -> Outcome {
@@ -134,7 +138,7 @@ impl Vim {
                         edits: Vec::new(),
                     })
                     .edits
-                    .push(key);
+                    .push(InsertEdit::Key(key));
                 self.inserting.as_mut().unwrap().literal = line.is_literal();
                 self.inserting.as_mut().unwrap().edited |= changed;
                 return Outcome::Handled;
@@ -476,8 +480,13 @@ fn replay_edits(line: &mut InputLine, change: &Change, surface: Surface, skip_fi
                 open_line(line, kind);
             }
         }
-        for key in &change.edits {
-            let _ = insert_key(line, *key, surface);
+        for edit in &change.edits {
+            match edit {
+                InsertEdit::Key(key) => {
+                    let _ = insert_key(line, *key, surface);
+                }
+                InsertEdit::Paste(text) => line.insert_modal_paste(text),
+            }
         }
     }
 }
@@ -1303,6 +1312,74 @@ mod tests {
             l.is_empty(),
             "yank must not replace the previous delete for dot repeat"
         );
+    }
+
+    #[test]
+    fn bracketed_paste_and_replay_preserve_atomic_unicode_and_literal_controls() {
+        use unicode_segmentation::UnicodeSegmentation;
+        for surface in [Surface::Composer, Surface::Editor] {
+            for (original, at, pasted) in [
+                ("ab", 1, "\u{0600}X"),
+                ("👩💻", "👩".len(), "\u{200d}X"),
+                ("🇦🇧", 0, "🇨X"),
+                ("ab", 1, "dw\r\n\tX\rY"),
+            ] {
+                let (mut vim, mut line) = normal(original);
+                line.set_literal(surface == Surface::Editor);
+                line.set_modal_cursor(at);
+                let expected = format!(
+                    "{}{}{}",
+                    &original[..at],
+                    pasted.replace("\r\n", "\n").replace('\r', "\n"),
+                    &original[at..]
+                );
+                vim.paste(&mut line, pasted);
+                assert_eq!(&*line, expected, "{surface:?}: {pasted:?}");
+                assert!(
+                    line.cursor_byte() == line.len()
+                        || line
+                            .grapheme_indices(true)
+                            .any(|(at, _)| at == line.cursor_byte())
+                );
+                vim.key(
+                    &mut line,
+                    KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                    surface,
+                );
+                vim.key(&mut line, key('u'), surface);
+                assert_eq!(&*line, original);
+                line.set_modal_cursor(at);
+                vim.key(&mut line, key('.'), surface);
+                assert_eq!(&*line, expected, "replay {surface:?}: {pasted:?}");
+                vim.key(&mut line, key('u'), surface);
+                assert_eq!(&*line, original);
+            }
+        }
+    }
+
+    #[test]
+    fn atomic_paste_keeps_surrounding_insert_keys_in_undo_and_dot() {
+        for surface in [Surface::Composer, Surface::Editor] {
+            let (mut vim, mut line) = normal("ab");
+            line.set_modal_cursor(1);
+            vim.key(&mut line, key('i'), surface);
+            vim.key(&mut line, key('L'), surface);
+            vim.paste(&mut line, "\u{0600}X");
+            vim.key(&mut line, key('R'), surface);
+            vim.key(
+                &mut line,
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                surface,
+            );
+            assert_eq!(&*line, "aL\u{0600}XRb");
+            vim.key(&mut line, key('u'), surface);
+            assert_eq!(&*line, "ab");
+            line.set_modal_cursor(1);
+            vim.key(&mut line, key('.'), surface);
+            assert_eq!(&*line, "aL\u{0600}XRb");
+            vim.key(&mut line, key('u'), surface);
+            assert_eq!(&*line, "ab");
+        }
     }
 
     #[test]

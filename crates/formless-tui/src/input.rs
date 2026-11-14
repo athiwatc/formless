@@ -405,6 +405,20 @@ impl InputLine {
         self.insert_raw(s);
     }
 
+    /// One Vim bracketed-paste operation, coalescing with insert keys and
+    /// counted/dot replay while snapping only after the complete payload.
+    pub(crate) fn insert_modal_paste(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        if self.selection().is_some() {
+            self.break_edit_group();
+        }
+        self.before_edit(true);
+        self.remove_selection();
+        self.insert_raw(text);
+    }
+
     fn insert_raw(&mut self, s: &str) {
         self.text.insert_str(self.cursor, s);
         self.cursor += s.len();
