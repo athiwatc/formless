@@ -6160,7 +6160,9 @@ configuration interface): `FORMLESS_DOCS_OPENER_FIXTURE`,
 `FORMLESS_TEST_MAINTENANCE_CONFIG`, `FORMLESS_TEST_MAINTENANCE_DATA`,
 `FORMLESS_TEST_MAINTENANCE_ISOLATION`, `FORMLESS_TEST_MAINTENANCE_OPERATION`,
 `FORMLESS_TEST_OWNERSHIP_CONFIG`, `FORMLESS_TEST_OWNERSHIP_DATA`,
-`FORMLESS_TEST_PANIC_MARKER`.
+`FORMLESS_TEST_PANIC_MARKER`, and `FORMLESS_TEST_DOCTOR_ARGS` (JSON CLI arguments
+for the test-only doctor subprocess, which installs an in-memory credential
+backend before read-only dispatch; the shipped binary does not read this variable).
 
 `FORMLESS_EXPORT_DESCRIPTOR_FIXTURE` is a Linux-only export test hook pointing
 to an owned redirected-stdout alias; it verifies that descriptor output preserves
