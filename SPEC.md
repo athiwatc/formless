@@ -5848,7 +5848,7 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
 | `provider.max_retries` | 5 | Bounded backoff attempts (§4.4) |
 | `provider.cache_control` | `auto` | Prompt-cache breakpoints (`cache_control`) on the system prompt and last stable message: `auto` for Claude models, `on`, `off`. Decided per model tried, so a fallback that isn't Claude gets plain content; applied to one-shot completions (compaction, `llm.complete`) too; a 400 naming `cache_control` resends once without them (§4.2) |
 | `provider.cache_key` | `session` | Send a per-Session `prompt_cache_key` for better cache routing (`off` never sends it; dropped automatically if the endpoint rejects it) |
-| `provider.max_backoff_secs` | 30 | Cap for exponential backoff with full jitter; a server's `Retry-After` / `x-ratelimit-reset-*` is honoured instead (up to 5 min) |
+| `provider.max_backoff_secs` | 30 | Cap for exponential backoff with full jitter; a server's `Retry-After` / `x-ratelimit-reset-*` is honoured instead (up to 5 min); reset durations accept ms/s/m/h/d units, contiguous or separated by whitespace |
 | `provider.tool_use_nudge` | true | Push models to build Tools: a GPT-family system-prompt addendum, and one nudge per step when an answer refuses for lack of access before using any Tool (§5.2) |
 | `provider.stall_notice_secs` | 120 | Flag an open stream that sent no bytes for this many seconds (`ProviderStalled`; `/resend` re-sends); 0 = never |
 | `provider.first_byte_timeout_secs` | 0 | Auto re-send when no first byte arrives in time (up to `max_retries`); 0 = off |
