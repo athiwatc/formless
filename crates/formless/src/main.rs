@@ -145,7 +145,7 @@ enum Cmd {
     },
     /// Settings: get, set (validated by the daemon), edit or locate config.toml
     #[command(
-        after_help = "Examples:\n  formless config path\n  formless config get provider.model"
+        after_help = "Examples:\n  formless config path\n  formless config get provider.model\n  formless config get provider.model --json"
     )]
     Config {
         #[command(subcommand)]
@@ -5928,10 +5928,13 @@ fn sessions_cmd(paths: Paths, action: SessionsAction) -> Result<()> {
 enum ConfigAction {
     /// Print where config.toml is
     Path,
-    /// Print a setting's value (with FORMLESS_* overrides applied)
+    /// Print a locally loaded setting (with FORMLESS_* overrides applied)
     Get {
         /// Dotted setting name, for example provider.model
         key: String,
+        /// Encode the value as compact JSON, preserving its type
+        #[arg(long)]
+        json: bool,
     },
     /// Set a setting through the daemon: validated, audited and applied at
     /// once. VALUE is JSON when it parses as JSON (5, true, ["a"]), else text
@@ -5948,12 +5951,22 @@ enum ConfigAction {
     Edit,
 }
 
+/// Single-value encoding only; callers retain key lookup and error semantics.
+fn config_get_output(value: &serde_json::Value, json: bool) -> serde_json::Result<String> {
+    if json {
+        serde_json::to_string(value)
+    } else if let serde_json::Value::String(text) = value {
+        Ok(text.clone())
+    } else {
+        serde_json::to_string_pretty(value)
+    }
+}
+
 fn config_cmd(paths: Paths, action: ConfigAction) -> Result<()> {
     match action {
         ConfigAction::Path => println!("{}", paths.config_file().display()),
-        ConfigAction::Get { key } => match Config::load(&paths)?.setting_value(&key)? {
-            Some(serde_json::Value::String(s)) => println!("{s}"),
-            Some(v) => println!("{}", serde_json::to_string_pretty(&v)?),
+        ConfigAction::Get { key, json } => match Config::load(&paths)?.setting_value(&key)? {
+            Some(value) => println!("{}", config_get_output(&value, json)?),
             None => {
                 eprintln!("no setting '{key}' (see SPEC §13, or `formless config edit`)");
                 std::process::exit(2);
@@ -9598,3 +9611,63 @@ mod session_search_tests;
 #[cfg(test)]
 #[path = "tui_start_cli_tests.rs"]
 mod tui_start_cli_tests;
+
+#[cfg(test)]
+mod config_get_json_tests {
+    use super::*;
+    use serde_json::{json, Value};
+
+    #[test]
+    fn config_get_json_preserves_value_type_content_and_flag_defaults() {
+        for value in [
+            json!("true"),
+            json!("ไทย \"quoted\"\nnext"),
+            json!("{\"x\":true}"),
+            json!(true),
+            json!(1),
+            json!([1, "x"]),
+            json!({"key": true}),
+            Value::Null,
+        ] {
+            let encoded = config_get_output(&value, true).unwrap();
+            assert_eq!(serde_json::from_str::<Value>(&encoded).unwrap(), value);
+            if let Value::String(text) = &value {
+                assert_eq!(config_get_output(&value, false).unwrap(), *text);
+            } else {
+                assert_eq!(
+                    config_get_output(&value, false).unwrap(),
+                    serde_json::to_string_pretty(&value).unwrap()
+                );
+            }
+        }
+        for (args, expected) in [
+            (vec!["formless", "config", "get", "provider.model"], false),
+            (
+                vec!["formless", "config", "get", "provider.model", "--json"],
+                true,
+            ),
+        ] {
+            let parsed = Cli::try_parse_from(args).unwrap();
+            assert!(
+                matches!(parsed.cmd, Some(Cmd::Config { action: ConfigAction::Get { json, .. } }) if json == expected)
+            );
+        }
+    }
+
+    #[test]
+    fn config_get_json_string_survives_existing_typed_setting_validation() {
+        for text in ["true", "ไทย \"quoted\"\nnext", "{\"x\":true}"] {
+            let value = json!(text);
+            let output = config_get_output(&value, true).unwrap();
+            let parsed =
+                serde_json::from_str(&output).unwrap_or_else(|_| Value::String(output.clone()));
+            let mut config = Config::default();
+            config.set_key("provider.model", parsed).unwrap();
+            assert_eq!(config.provider.model, text);
+            assert_eq!(config.setting_value("provider.model").unwrap(), Some(value));
+        }
+        assert!(Config::default()
+            .set_key("provider.model", json!(true))
+            .is_err());
+    }
+}

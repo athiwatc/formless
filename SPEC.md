@@ -5641,6 +5641,11 @@ during its snapshot fetch, deduplicated by message id.
   a null `override_source`. Both setting operations return `effective_value`.
   The CLI names the saved and effective values and source. Its own environment
   is independent of the daemon's; `config get` uses the client's environment.
+  `config get KEY --json` emits the same locally loaded effective value as one
+  compact JSON value followed by a newline, preserving string quoting and
+  other JSON types. Human output and unknown-key errors are unchanged. This
+  is neither the daemon's current snapshot nor a whole-config backup; Set's
+  supported-key validation, optional/null and map merge/replace rules remain.
   Credentials, `base_url`, `extra_headers`, auth, the relay, MCP servers and
   hooks are never settable this way, locally or over the relay. The TUI
   (`/panes`) and the web Settings view (Edit) use `SetSetting`.

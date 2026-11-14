@@ -492,9 +492,18 @@ formless completions zsh > ~/.zfunc/_formless      # also bash, fish, powershell
 ```bash
 formless config path                       # where config.toml is
 formless config get tools.inline_limit     # effective value (env overrides applied)
+formless config get provider.model --json # one JSON value, with its type preserved
 formless config set tui.notify_min_secs 30 # validated, audited, applied at once
 formless config edit                       # $EDITOR; saved only if it still parses
 ```
+
+`config get KEY` reads locally loaded effective configuration, including this
+client's applicable environment overrides. Add `--json` for one compact JSON
+value followed by a newline; strings remain quoted, including text such as
+`true`, quotes and newlines. The default human output is unchanged. This is
+not a snapshot of the running daemon or a whole-configuration backup. JSON
+encoding preserves the selected value's type; Set still applies its supported
+key validation, optional/null behavior and map merge or `--replace` rules.
 
 Map settings (`provider.prices`, `provider.model_context_tokens`,
 `provider.model_audio_input`, `provider.model_pdf_input`, `tui.colors`) merge
