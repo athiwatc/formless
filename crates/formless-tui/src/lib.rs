@@ -26,6 +26,7 @@ pub mod plain;
 mod profile_context_tests;
 pub mod qr;
 mod query;
+mod review_wrap;
 mod session_ui;
 mod settings;
 mod text;
@@ -18387,12 +18388,31 @@ fn draw_editor_review(
         .partition_point(|&start| start <= top)
         .saturating_sub(1);
     let offset = top.saturating_sub(starts.get(first).copied().unwrap_or(0));
-    f.render_widget(
-        Paragraph::new(lines.into_iter().skip(first).collect::<Vec<_>>())
-            .wrap(Wrap { trim: false })
-            .scroll((offset.min(u16::MAX as usize) as u16, 0)),
-        inner,
-    );
+    if offset <= u16::MAX as usize {
+        f.render_widget(
+            Paragraph::new(lines.into_iter().skip(first).collect::<Vec<_>>())
+                .wrap(Wrap { trim: false })
+                .scroll((offset as u16, 0)),
+            inner,
+        );
+    } else {
+        // One logical line can itself exceed Paragraph's u16 scroll range.
+        // Reflow only this rare visible window with its matching word wrapper,
+        // retaining usize row positions and the original grapheme styles.
+        let mut visible = Vec::new();
+        for (index, line) in lines.iter().enumerate().skip(first) {
+            if visible.len() >= height {
+                break;
+            }
+            visible.extend(review_wrap::window(
+                line,
+                inner.width,
+                if index == first { offset } else { 0 },
+                height - visible.len(),
+            ));
+        }
+        f.render_widget(review_wrap::Rows(visible), inner);
+    }
     f.render_widget(
         Paragraph::new(Line::styled(
             if r.ok {
@@ -22988,6 +23008,19 @@ mod tests {
         app.key(key(KeyCode::End));
         let screen = render(&mut app, 80, 12);
         assert!(screen.contains("last beyond u16"), "{screen}");
+        app.editor_review.as_mut().unwrap().diff = format!("+{}Z\n+Q", "x ".repeat(70_000));
+        render(&mut app, 4, 12);
+        assert!(app.editor_review.as_ref().unwrap().scroll.get().rows > u16::MAX as usize);
+        app.key(key(KeyCode::End));
+        let screen = render(&mut app, 4, 12);
+        assert!(
+            screen.contains('Z'),
+            "single wrapped logical line must reach its tail: {screen}"
+        );
+        assert!(
+            screen.contains('Q'),
+            "later logical lines remain visible: {screen}"
+        );
     }
 
     #[test]
