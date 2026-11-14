@@ -228,6 +228,43 @@ fn valid_name(name: &str) -> bool {
             byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
         })
 }
+// This parser supports a bounded scalar subset, not arbitrary YAML. Only
+// whitespace-separated hashes outside an actual quoted scalar start comments.
+// Block content is consumed separately and must never pass through this helper.
+fn scalar_without_comment(value: &str) -> &str {
+    if let Some(quote) = value.chars().next().filter(|c| *c == '"' || *c == '\'') {
+        let mut chars = value.char_indices().skip(1).peekable();
+        while let Some((index, c)) = chars.next() {
+            if quote == '"' && c == '\\' {
+                chars.next();
+            } else if c == quote {
+                if quote == '\'' && chars.peek().is_some_and(|(_, next)| *next == '\'') {
+                    chars.next();
+                    continue;
+                }
+                let end = index + c.len_utf8();
+                let after = &value[end..];
+                return if after.starts_with([' ', '\t'])
+                    && after.trim_start_matches([' ', '\t']).starts_with('#')
+                {
+                    &value[..end]
+                } else {
+                    value
+                };
+            }
+        }
+    } else {
+        let mut separated = true;
+        for (index, c) in value.char_indices() {
+            if c == '#' && separated {
+                return value[..index].trim_end();
+            }
+            separated = matches!(c, ' ' | '\t');
+        }
+    }
+    value
+}
+
 fn parse(text: &str) -> Result<(String, String), &'static str> {
     if text.contains('\0') {
         return Err("Template contains a NUL byte");
@@ -257,7 +294,7 @@ fn parse(text: &str) -> Result<(String, String), &'static str> {
         while index < header.len() {
             let line = header[index];
             index += 1;
-            if line.trim().is_empty() || line.starts_with('#') {
+            if line.trim().is_empty() || line.trim_start().starts_with('#') {
                 continue;
             }
             let Some(value) = line.strip_prefix("description:") else {
@@ -267,7 +304,7 @@ fn parse(text: &str) -> Result<(String, String), &'static str> {
                 return Err("Duplicate frontmatter description");
             }
             found = true;
-            let value = value.trim();
+            let value = scalar_without_comment(value.trim());
             description = if matches!(value, ">" | "|" | ">-" | "|-") {
                 let mut parts = Vec::new();
                 while index < header.len()
@@ -1155,6 +1192,73 @@ mod tests {
             assert!(parse(text).is_err(), "{text:?}");
         }
     }
+    #[test]
+    fn frontmatter_comments_preserve_scalar_text_and_command_discovery() {
+        for (header, expected) in [
+            (
+                " # review helper\n  # another note\ndescription: Review the diff",
+                "Review the diff",
+            ),
+            ("description: Review the diff # why", "Review the diff"),
+            ("description: \"Review the diff\" # why", "Review the diff"),
+            ("description: 'Review the diff' # why", "Review the diff"),
+            ("description: \"hash # stays\" # annotation", "hash # stays"),
+            (
+                "description: 'It''s # useful' # annotation",
+                "It's # useful",
+            ),
+            (
+                r#"description: "Say \"hi\" # text" # annotation"#,
+                "Say \"hi\" # text",
+            ),
+            ("description: Bob's notes # annotation", "Bob's notes"),
+            (
+                "description: https://example.test/#anchor # annotation",
+                "https://example.test/#anchor",
+            ),
+            ("description: C# helpers # annotation", "C# helpers"),
+            (
+                "description: |- # header annotation\n  literal # content",
+                "literal # content",
+            ),
+            (
+                "description: >- # header annotation\n  first\n  second",
+                "first second",
+            ),
+            ("\t# note\r\ndescription: Simple\t# comment", "Simple"),
+        ] {
+            let source = format!("---\n{header}\n---\n# Body stays literal\n$ARGUMENTS_PATH\n");
+            let (description, body) = parse(&source).unwrap_or_else(|e| panic!("{header}: {e}"));
+            assert_eq!(description, expected, "{header}");
+            assert_eq!(body, "# Body stays literal\n$ARGUMENTS_PATH\n");
+            let fixture = Fixture::new();
+            fixture.global("review.md", &source);
+            let snapshot = fixture.load(&[]);
+            assert!(
+                snapshot.diagnostics.is_empty(),
+                "{header}: {:?}",
+                snapshot.diagnostics
+            );
+            assert_eq!(snapshot.find("review").unwrap().description, expected);
+            assert_eq!(snapshot.projection().commands[0].description, expected);
+        }
+        for header in [
+            "description: \"unfinished # still quoted",
+            "description: 'unfinished # still quoted",
+            "description: \"fine\" trailing # invalid",
+            "description: 'fine' trailing # invalid",
+            "description: # only comment",
+            "description: \"\" # empty",
+            "description: first # comment\ndescription: second",
+            " # note\nother: unsupported",
+        ] {
+            assert!(
+                parse(&format!("---\n{header}\n---\nBody")).is_err(),
+                "{header}"
+            );
+        }
+    }
+
     #[test]
     fn discovery_limits_oversized_and_excess_entries_without_attachment_reads() {
         let fixture = Fixture::new();

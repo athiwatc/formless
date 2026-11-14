@@ -4756,6 +4756,10 @@ undo, redo and replacements invalidate prior asynchronous editor previews.
   reparse points, symlinks, hardlinked files and unsupported namespaces. Each
   directory is bounded to 256 entries and 128 Markdown templates; files are at
   most 64 KiB, combined template bytes 1 MiB, and diagnostics at most 64.
+  Description frontmatter permits indented comment lines and trailing
+  whitespace-separated `#` comments outside quoted values. Literal hashes in
+  quoted or block scalar content and URL fragments remain description text;
+  malformed quotes, unsupported fields and duplicate descriptions still fail.
   Expansion is a single literal pass: `$ARGUMENTS` preserves the text after the
   invocation's first separator; `$1` through `$9` select Unicode-whitespace
   separated positions. `$$` emits one literal `$`, so `$$1`, `$$5` and
