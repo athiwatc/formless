@@ -17,6 +17,6 @@ class Formless < Formula
   end
 
   test do
-    assert_match "formless", shell_output("#{bin}/formless --version")
+    assert_equal "formless #{version}", shell_output("#{bin}/formless --version").strip
   end
 end
