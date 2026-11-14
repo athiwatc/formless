@@ -8,6 +8,7 @@ mod cli_metrics;
 mod cli_models;
 mod cli_modules;
 mod cli_pipeline;
+mod cli_price_import;
 mod cli_proposal_diff;
 mod cli_routing;
 mod cli_run_identity;
@@ -6364,18 +6365,8 @@ fn prices_cmd(paths: Paths, action: PricesAction) -> Result<()> {
             continue;
         }
         let old = target.prices.get(&model);
-        let same = old.is_some_and(|o| {
-            o.input == price.input
-                && o.output == price.output
-                && o.cached_input == price.cached_input
-        });
-        if !same {
-            changed.push(format!(
-                "{model}: ${:.4} in / ${:.4} out per 1M tokens{}",
-                price.input,
-                price.output,
-                if old.is_some() { " (updated)" } else { "" }
-            ));
+        if let Some(change) = cli_price_import::change(&model, old, &price) {
+            changed.push(change);
             if !dry_run {
                 target.prices.insert(model, price);
             }
