@@ -4725,9 +4725,15 @@ undo, redo and replacements invalidate prior asynchronous editor previews.
     plain-language meaning; the next line answers it (y, o or n).
     Questions list numbered options and are answered the same way, one at
     a time.
-  - Commands: `/new`, `/sessions`, `/switch N`, `/stop`, `/help`, `/quit`.
-    Anything else is a message (a steer while a Run is active). It opens
-    the most recent Session.
+  - Commands: `/new`, `/sessions`, `/switch N`, `/stop`, `/files [RUN]`,
+    `/rewind [PATH]`, `/recap`, `/docs [topic]`, `/help`, `/quit` (alias
+    `/exit`). `/files` shows tracked changes, `/rewind` attempts restoration,
+    `/recap` shows the recorded recap, and `/docs` prints guide addresses.
+    `/quit` and `/exit` leave Runs going in the daemon. Ordinary text is a
+    message (a steer while a Run is active); unknown slash commands are
+    reported locally. Begin with `//` to send a literal leading slash.
+    The client opens the most recent Session. See [the plain-client
+    reference](docs/plain.md) for launch forms and current command usage.
   - `formless chat [--session ID | --new]` is the same line-mode client
     as its own command, a REPL between the full-screen TUI and one-shot
     `run`, for dumb terminals and SSH sessions with poor TERM support. It
@@ -4973,6 +4979,13 @@ builder and normal command work. It keeps TUI/clipboard operations on the
 original main thread. Verification hash buffers live on the heap; correctness
 checks run through actual CLI child processes without test-stack overrides.
 
+
+### Session selectors
+
+CLI Session lookup resolves an exact ID first, then a unique ID prefix.
+If no ID prefix matches, it looks for a unique ASCII-case-insensitive
+Session name. Unknown or ambiguous selectors return an error;
+`formless sessions list` shows the stored Sessions.
 
 ### Root command inventory
 

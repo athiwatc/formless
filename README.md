@@ -357,6 +357,16 @@ a separate preference. See [SPEC §10.8](SPEC.md#108-language) for details.
 
 Approvals for broad Capabilities appear as a modal — the request names the exact host, path or binary, and the agent waits. Purging a Tool's code and history is user-only and lives in the Tools view ([§5.3](#53-lifecycle-and-versioning)).
 
+#### Plain terminals and screen readers
+
+After first-run setup, `formless --plain` opens a line-oriented client with
+no alternate screen, redraws or spinners. `formless chat` opens the same
+client as its own command; use `formless chat --new` for a fresh Session or
+`formless chat --session ID` to select one. This suits screen readers, dumb
+terminals and SSH sessions with limited terminal support. Events print in
+order, and approvals and questions are answered on the next line. See the
+[plain-client commands](docs/plain.md), or type `/help` in that client.
+
 ### 3.5 Headless runs (no TUI)
 
 `formless run` is the scriptable entry point: it starts the daemon if needed, streams the answer to stdout, and exits.

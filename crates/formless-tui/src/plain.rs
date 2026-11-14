@@ -1,4 +1,4 @@
-//! Plain, line-oriented mode for screen readers (SPEC §10.7): no
+//! Plain, line-oriented mode for screen readers (SPEC §10.5): no
 //! alternate screen, redraws, spinners or borders. New messages and events
 //! are printed once, in order, and approvals and questions become plain
 //! prompts answered on the next line.
@@ -786,7 +786,7 @@ pub enum ChatStart {
 }
 
 /// The line-oriented client: the TUI's `--plain`/screen-reader mode and
-/// `formless chat` (SPEC §10.7).
+/// `formless chat` (SPEC §10.5).
 pub fn run_with(paths: Paths, start: ChatStart, label: &str) -> Result<()> {
     let cfg = Config::load(&paths)?;
     if !cfg.provider.is_configured() {
