@@ -1020,7 +1020,7 @@ enum JobsAction {
             required_unless_present = "at"
         )]
         cron: Option<String>,
-        /// Once: "in 30m", "tomorrow at 9am" or a time
+        /// Once: relative offset ("in 30m", "2h"), local YYYY-MM-DD HH:MM, or RFC 3339
         #[arg(long)]
         at: Option<String>,
         /// Run in this Session (default: a new Session each time)
