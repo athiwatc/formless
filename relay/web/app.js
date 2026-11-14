@@ -1284,35 +1284,39 @@
     const tagged = (s) => !S.tagFilter || (s.tags || []).includes(S.tagFilter);
     // Archived Sessions sit in their own collapsible group at the end.
     const archived = S.sessions.filter((s) => s.archived && tagged(s));
-    const shown = S.sessions.filter((s) => tagged(s) && (!s.archived || S.showArchived));
-    for (const row of sessionRows(S.sessions, shown, !!S.sessionTree)) {
-      const s = row.session;
-      const menu = h("button", {
-        class: "icon-btn menu", type: "button", "aria-label": "Session actions", "aria-haspopup": "menu",
-        onkeydown: (e) => menuTriggerKey(e, (last) => sessionMenu(menu, s, last)),
-        onclick: (e) => { e.stopPropagation(); sessionMenu(menu, s); },
-      }, "⋯");
-      list.append(h("li", {
-        class: "session" + (s.id === S.current ? " active" : ""),
-        tabindex: 0,
-        onclick: () => openSession(s.id),
-        onkeydown: (e) => { if (e.key === "Enter") openSession(s.id); },
-      },
-      h("input", { type: "checkbox", class: "mark", "aria-label": "Select " + s.name, checked: S.marked.has(s.id),
-        onclick: (e) => { e.stopPropagation(); if (e.target.checked) S.marked.add(s.id); else S.marked.delete(s.id); renderSessions(); } }),
-      S.running.has(s.id) ? h("span", { class: "running", title: "running" })
-        : s.last_run_status === "paused" ? h("span", { class: "state", title: "paused" }, "⏸") : null,
-      h("span", { class: "name", title: s.name, style: "padding-inline-start:" + (row.depth * 0.75) + "rem" }, s.pinned ? "★ " : null, row.depth ? "↳ " : null, s.name,
-        row.note ? h("span", { class: "muted lineage", title: row.note }, " · " + row.note) : null,
-        s.preview ? h("span", { class: "preview", title: s.preview }, s.preview) : null),
-      h("span", { class: "when", title: (s.message_count || 0) + " messages" + (s.model ? " · " + s.model : "") }, relTime(s.updated_at)),
-      menu));
-    }
+    const active = S.sessions.filter((s) => !s.archived && tagged(s));
+    const appendRows = (visible) => {
+      for (const row of sessionRows(S.sessions, visible, !!S.sessionTree)) {
+        const s = row.session;
+        const menu = h("button", {
+          class: "icon-btn menu", type: "button", "aria-label": "Session actions", "aria-haspopup": "menu",
+          onkeydown: (e) => menuTriggerKey(e, (last) => sessionMenu(menu, s, last)),
+          onclick: (e) => { e.stopPropagation(); sessionMenu(menu, s); },
+        }, "⋯");
+        list.append(h("li", {
+          class: "session" + (s.id === S.current ? " active" : ""),
+          tabindex: 0,
+          onclick: () => openSession(s.id),
+          onkeydown: (e) => { if (e.key === "Enter") openSession(s.id); },
+        },
+        h("input", { type: "checkbox", class: "mark", "aria-label": "Select " + s.name, checked: S.marked.has(s.id),
+          onclick: (e) => { e.stopPropagation(); if (e.target.checked) S.marked.add(s.id); else S.marked.delete(s.id); renderSessions(); } }),
+        S.running.has(s.id) ? h("span", { class: "running", title: "running" })
+          : s.last_run_status === "paused" ? h("span", { class: "state", title: "paused" }, "⏸") : null,
+        h("span", { class: "name", title: s.name, style: "padding-inline-start:" + (row.depth * 0.75) + "rem" }, s.pinned ? "★ " : null, row.depth ? "↳ " : null, s.name,
+          row.note ? h("span", { class: "muted lineage", title: row.note }, " · " + row.note) : null,
+          s.preview ? h("span", { class: "preview", title: s.preview }, s.preview) : null),
+        h("span", { class: "when", title: (s.message_count || 0) + " messages" + (s.model ? " · " + s.model : "") }, relTime(s.updated_at)),
+        menu));
+      }
+    };
+    appendRows(active);
     if (archived.length) {
-      list.append(h("li", { class: "session archived-toggle muted", tabindex: 0,
+      list.append(h("li", { class: "session archived-toggle muted", tabindex: 0, role: "button", "aria-expanded": String(!!S.showArchived),
         onclick: () => { S.showArchived = !S.showArchived; renderSessions(); },
-        onkeydown: (e) => { if (e.key === "Enter") { S.showArchived = !S.showArchived; renderSessions(); } } },
+        onkeydown: (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); S.showArchived = !S.showArchived; renderSessions(); } } },
       (S.showArchived ? "▾ " : "▸ ") + "Archived (" + archived.length + ")"));
+      if (S.showArchived) appendRows(archived);
     }
   }
 
