@@ -294,3 +294,14 @@ real vendored load/retry checks plus controlled theme/queue/layout races in
 Chromium. It also checks source/zoom/focus, SVG downloads, retained messages,
 paused reading anchors and cached/recreated blocks. This uses owned local UI
 fixtures; no daemon, provider, deployment or physical screen-reader is involved.
+
+### Job history browser checks
+
+Run `python relay/web-job-history.browser-test.py /tmp/formless-job-history`
+with Python Playwright and `/usr/bin/chromium`. The complete frontend uses
+local fixture replies to check failed/timed-out reads, retry and empty states,
+semantic columns, full row data, Session navigation, queued dialogs and late
+replies. Chromium layout checks cover 320/480/900px viewports at 16/32px root
+text sizes and keep wide tables inside their own scrolling wrapper. These
+checks do not exercise job execution, a live daemon, native screen readers or
+other browser engines.

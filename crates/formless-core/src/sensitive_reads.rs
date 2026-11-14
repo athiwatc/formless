@@ -50,22 +50,65 @@ pub(crate) fn policy(
 pub(crate) fn credential_file_paths() -> Result<Vec<std::path::PathBuf>, String> {
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     std::env::vars_os()
-        .filter(|(name, _)| {
-            name.to_str().is_some_and(|name| {
-                #[cfg(windows)]
-                let name = name.to_ascii_uppercase();
-                name == "FORMLESS_API_KEY_FILE"
-                    || name
-                        .strip_prefix("FORMLESS_API_KEY_")
-                        .and_then(|name| name.strip_suffix("_FILE"))
-                        .is_some_and(|name| {
-                            name.bytes()
-                                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-                        })
-            })
+        .filter(|(name, path)| {
+            !path.is_empty()
+                && name.to_str().is_some_and(|name| {
+                    #[cfg(windows)]
+                    let name = name.to_ascii_uppercase();
+                    name == "FORMLESS_API_KEY_FILE"
+                        || name
+                            .strip_prefix("FORMLESS_API_KEY_")
+                            .and_then(|name| name.strip_suffix("_FILE"))
+                            .is_some_and(|name| {
+                                name.bytes()
+                                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+                            })
+                })
         })
         .map(|(_, path)| {
             formless_runtime::caps::lexical_absolute(&cwd, std::path::Path::new(&path))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_credential_file_overrides_are_unset_without_weakening_nonempty_paths() {
+        let env = crate::credential_env::EnvGuard::isolated();
+        for name in ["FORMLESS_API_KEY_FILE", "FORMLESS_API_KEY_FIXTURE_FILE"] {
+            env.set(name, "");
+        }
+        assert!(credential_file_paths().unwrap().is_empty());
+        for name in ["FORMLESS_API_KEY_FILE", "FORMLESS_API_KEY_FIXTURE_FILE"] {
+            assert!(crate::config::key_from_file_env(name).is_none());
+        }
+        struct Owned(std::path::PathBuf);
+        impl Drop for Owned {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = std::env::temp_dir().join(format!("fl-empty-key-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let _owned = Owned(root.clone());
+        let key = root.join("synthetic-key");
+        std::fs::write(&key, "synthetic-fixture-key").unwrap();
+        env.set("FORMLESS_API_KEY_FILE", &key);
+        assert!(credential_file_paths().unwrap().contains(&key));
+        assert_eq!(
+            crate::config::key_from_file_env("FORMLESS_API_KEY_FILE")
+                .unwrap()
+                .unwrap(),
+            "synthetic-fixture-key"
+        );
+        let missing = root.join("missing");
+        env.set("FORMLESS_API_KEY_FILE", &missing);
+        assert!(credential_file_paths().unwrap().contains(&missing));
+        assert!(crate::config::key_from_file_env("FORMLESS_API_KEY_FILE")
+            .unwrap()
+            .is_err());
+    }
 }
