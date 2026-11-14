@@ -72,25 +72,41 @@ fn parse_applescript_data(text: &str) -> Option<Vec<u8>> {
     bytes.and_then(|b| non_empty(b).ok())
 }
 
-/// A pasted (dragged-in) file path, unquoted and unescaped, if it names an
-/// existing file. Terminals paste drops as `'/a b.png'`, `/a\ b.png` or
-/// `file:///a%20b.png`.
+/// A single existing absolute file, pasted literally, as a local file URL,
+/// or with terminal shell quoting. Parsing never expands or executes text.
+/// Prefer an exact literal filename before interpreting backslashes/quotes.
 pub fn dropped_file(pasted: &str) -> Option<std::path::PathBuf> {
-    let t = pasted.trim();
-    if t.is_empty() || t.contains('\n') {
+    let source = pasted.trim_matches(['\r', '\n']);
+    if source.trim().is_empty() || source.contains(['\r', '\n', '\0']) {
         return None;
     }
-    let unquoted = t
-        .strip_prefix('\'')
-        .and_then(|s| s.strip_suffix('\''))
-        .or_else(|| t.strip_prefix('"').and_then(|s| s.strip_suffix('"')))
-        .unwrap_or(t);
-    let p = if unquoted.starts_with("file://") {
-        url::Url::parse(unquoted).ok()?.to_file_path().ok()?
-    } else {
-        std::path::PathBuf::from(unquoted.replace("\\ ", " "))
+    let existing = |text: &str| {
+        let path = if text.starts_with("file://") {
+            url::Url::parse(text).ok()?.to_file_path().ok()?
+        } else {
+            std::path::PathBuf::from(text)
+        };
+        (path.is_absolute() && path.is_file()).then_some(path)
     };
-    (p.is_absolute() && p.is_file()).then_some(p)
+    if let Some(path) = existing(source).or_else(|| existing(source.trim())) {
+        return Some(path);
+    }
+    // Windows terminal drops quote native paths without shell-escaping their
+    // backslashes. Preserve them before trying POSIX terminal shell quoting.
+    #[cfg(windows)]
+    if let Some(path) = source
+        .trim()
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .and_then(existing)
+    {
+        return Some(path);
+    }
+    let words = shlex::split(source)?;
+    match words.as_slice() {
+        [word] => existing(word),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -107,6 +123,77 @@ mod tests {
         assert!(parse_applescript_data("hello").is_none());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn dropped_paths_decode_shell_quoting_without_rewriting_literal_files() {
+        let dir = std::env::temp_dir().join(format!("fl-drop-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        for name in [
+            "shot (1).png",
+            "shot & '$;*#?[]`\"|<> ไทย.png",
+            "slash\\ space.png",
+            "tail.png ",
+        ] {
+            let file = dir.join(name);
+            std::fs::write(&file, b"x").unwrap();
+            let plain = file.to_str().unwrap();
+            // Terminal/iTerm-style escaping, including backslash parity.
+            let escaped: String = plain
+                .chars()
+                .flat_map(|c| {
+                    let escape = " \\()&'\"$;*#?[]`|<>".contains(c);
+                    if escape {
+                        vec!['\\', c]
+                    } else {
+                        vec![c]
+                    }
+                })
+                .collect();
+            let single = format!("'{}'", plain.replace('\'', "'\\''"));
+            let double = format!(
+                "\"{}\"",
+                plain
+                    .replace('\\', "\\\\")
+                    .replace('"', "\\\"")
+                    .replace('$', "\\$")
+                    .replace('`', "\\`")
+            );
+            for input in [plain.to_owned(), escaped, single, double] {
+                assert_eq!(dropped_file(&input), Some(file.clone()), "{input:?}");
+            }
+        }
+        let file = dir.join("literal\\ space.png");
+        std::fs::write(&file, b"literal").unwrap();
+        std::fs::write(dir.join("literal space.png"), b"different").unwrap();
+        assert_eq!(dropped_file(file.to_str().unwrap()), Some(file));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn dropped_paths_reject_incomplete_or_multiple_shell_words() {
+        let dir = std::env::temp_dir().join(format!("fl-drop-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let first = dir.join("first.png");
+        let second = dir.join("second.png");
+        std::fs::write(&first, b"x").unwrap();
+        std::fs::write(&second, b"x").unwrap();
+        let quoted = format!("'{}'", first.display());
+        for input in [
+            format!("{quoted} '{}'", second.display()),
+            format!("'{}", first.display()),
+            format!("{}\\", first.display()),
+            format!("{quoted}\n{}", second.display()),
+            format!("{quoted}; echo hello"),
+            "relative.png".into(),
+            "$HOME/first.png".into(),
+            "~/first.png".into(),
+            dir.display().to_string(),
+        ] {
+            assert!(dropped_file(&input).is_none(), "{input:?}");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn recognises_dropped_paths() {
         let dir = std::env::temp_dir().join(format!("fl drop {}", std::process::id()));
@@ -115,6 +202,7 @@ mod tests {
         std::fs::write(&file, b"x").unwrap();
         let plain = file.to_string_lossy().to_string();
         assert_eq!(dropped_file(&format!("'{plain}'")).as_ref(), Some(&file));
+        assert_eq!(dropped_file(&format!("\"{plain}\"")).as_ref(), Some(&file));
         assert_eq!(
             dropped_file(&plain.replace(' ', "\\ ")).as_ref(),
             Some(&file)

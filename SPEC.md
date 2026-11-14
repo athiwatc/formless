@@ -1212,6 +1212,10 @@ pasting paths.
     Wayland, `xclip` on X11, PowerShell on Windows.
   - A file dragged into the terminal (pasted as an absolute path, quoted,
     `\`-escaped or `file://`) is attached instead of typed.
+    Exact literal files take precedence; otherwise a single shell-quoted word
+    is decoded (including escaped metacharacters, quotes and backslashes).
+    No variables, globs or commands are expanded or executed; relative,
+    incomplete, multiple-path or multiline inputs remain composer text.
     File URLs preserve native drive/UNC paths and percent-encode reserved
     characters; dropping the URL resolves back to the same local file.
   - Attaching an image when the current model doesn't look vision-capable
