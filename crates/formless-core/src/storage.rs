@@ -4239,12 +4239,17 @@ impl Store {
     }
 
     pub fn applied_proposals(&self) -> Result<Vec<PromptProposalInfo>> {
-        Ok(self
-            .list_proposals()?
-            .into_iter()
-            .filter(|p| p.status == "applied")
-            .rev()
-            .collect())
+        // Oldest first, as with the reversed full-history read. Equal timestamps
+        // previously had no SQL tie guarantee; explicitly retain the reversed
+        // table-insertion order observed by that read, independent of query plan.
+        // Non-applied content/rationale are intentionally not decoded here.
+        let mut stmt = self.ps(
+            "SELECT id,kind,content,rationale,status,baseline_score,candidate_score,eval_total,est_tokens,created_at,applied_at FROM prompt_proposals WHERE status='applied' ORDER BY created_at ASC, rowid DESC",
+        )?;
+        let rows = stmt
+            .query_map([], Self::proposal_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     pub fn update_proposal_eval(
@@ -6654,6 +6659,10 @@ pub fn estimate_tokens(text: &str) -> usize {
 }
 
 pub type BuiltContext = (Vec<Value>, bool, i64);
+
+#[cfg(test)]
+#[path = "applied_proposal_read_tests.rs"]
+mod applied_proposal_read_tests;
 
 /// Build provider context (OpenAI message objects) from checkpoint +
 /// post-checkpoint messages. Tool-call/tool messages are reconstructed from
