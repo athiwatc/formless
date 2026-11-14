@@ -15,13 +15,16 @@ struct Fixture {
 }
 impl Fixture {
     fn new(create: bool) -> Self {
+        // The macOS wall clock can return identical timestamps for successive calls.
+        static NEXT_FIXTURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let name = format!(
-            "branches-{}-{}",
+            "branches-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            NEXT_FIXTURE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         );
         let root = std::env::temp_dir().join(&name);
         std::fs::create_dir(&root).unwrap();
@@ -72,6 +75,21 @@ impl Drop for Fixture {
         let _ = std::fs::remove_dir_all(&self.root);
     }
 }
+#[test]
+fn fixture_roots_are_distinct_when_created_concurrently() {
+    let fixtures: Vec<_> = std::thread::scope(|scope| {
+        let threads: Vec<_> = (0..16)
+            .map(|_| scope.spawn(|| Fixture::new(false)))
+            .collect();
+        threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect()
+    });
+    let roots: std::collections::HashSet<_> = fixtures.iter().map(|f| &f.root).collect();
+    assert_eq!(roots.len(), fixtures.len());
+}
+
 fn output(mut command: Command) -> Output {
     let mut child = command.spawn().unwrap();
     let mut stdout = child.stdout.take().unwrap();
