@@ -1217,7 +1217,10 @@ pasting paths.
     Native Windows separators are retained when decoding the legacy
     backslash-space form, after exact-file checks.
     No variables, globs or commands are expanded or executed; relative,
-    incomplete, multiple-path or multiline inputs remain composer text.
+    incomplete, multiple-path or multiline inputs remain composer text. A
+    shell-style trailing comment also keeps the complete paste as text; no
+    instructions are discarded to recognize one file. Quoted/escaped hashes
+    and hashes within a filename remain literal, with exact-file precedence.
     File URLs preserve native drive/UNC paths and percent-encode reserved
     characters; dropping the URL resolves back to the same local file.
   - Attaching an image when the current model doesn't look vision-capable
