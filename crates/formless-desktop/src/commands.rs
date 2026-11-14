@@ -42,6 +42,7 @@ pub enum Command {
 pub enum Group {
     Composer,
     Run,
+    Session,
     Panels,
     Navigation,
     Focus,
@@ -54,6 +55,7 @@ impl Group {
         match self {
             Group::Composer => "Composer",
             Group::Run => "Run",
+            Group::Session => "Session",
             Group::Panels => "Panels",
             Group::Navigation => "Go to",
             Group::Focus => "Focus",
@@ -347,7 +349,7 @@ pub fn entry(command: Command, state: &State) -> Entry {
         Command::SessionDetails => (
             "Session details",
             "Edit Session name, tags or pin".into(),
-            Group::Navigation,
+            Group::Session,
             "Edit the chosen Sessions-list entry, or the open Session outside that list",
             None,
             if state.composing {
