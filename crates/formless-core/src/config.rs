@@ -1099,7 +1099,8 @@ pub struct ProviderCfg {
     #[serde(default)]
     pub auth: AuthCfg,
     /// Send attached images to the model as image parts. Unset: guessed
-    /// from the model name (see `provider::is_vision_model`).
+    /// from the model name with known text-only variant exceptions
+    /// (see `provider::is_vision_model`). An explicit value overrides the guess.
     #[serde(default)]
     pub vision: Option<bool>,
     /// Explicit provider defaults for native media. Unset defaults are limited
