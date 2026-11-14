@@ -2167,13 +2167,14 @@ impl Store {
         threshold: usize,
         limit: usize,
     ) -> Result<Vec<(usize, Vec<String>, String)>> {
-        let mut stmt = self.ps(
-            "SELECT count(DISTINCT session_id) AS n, \
-                    (SELECT uses FROM scripts l WHERE l.hash=s.hash ORDER BY created_at DESC LIMIT 1), \
-                    (SELECT source FROM scripts l WHERE l.hash=s.hash ORDER BY created_at DESC LIMIT 1) \
-             FROM scripts s WHERE status='success' GROUP BY hash \
-             HAVING n>=?1 AND max(saved_tool)='' ORDER BY n DESC LIMIT ?2",
-        )?;
+        let mut stmt = self.ps("SELECT eligible.n, latest.uses, latest.source \
+             FROM (SELECT hash, count(DISTINCT session_id) AS n \
+                   FROM scripts WHERE status='success' GROUP BY hash \
+                   HAVING n>=?1 AND max(saved_tool)='' ORDER BY n DESC LIMIT ?2) eligible \
+             JOIN scripts latest ON latest.rowid=( \
+                 SELECT rowid FROM scripts candidate WHERE candidate.hash=eligible.hash \
+                 ORDER BY created_at DESC, rowid DESC LIMIT 1) \
+             ORDER BY eligible.n DESC")?;
         let rows = stmt.query_map(params![threshold as i64, limit as i64], |r| {
             Ok((
                 r.get::<_, i64>(0)? as usize,
@@ -6645,6 +6646,186 @@ impl Store {
             )?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod recurring_script_projection_tests {
+    use super::*;
+
+    fn record(
+        store: &Store,
+        identity: (&str, &str, &str),
+        source: &str,
+        uses: &[&str],
+        state: (&str, &str),
+    ) -> String {
+        let uses: Vec<String> = uses.iter().map(|name| (*name).to_owned()).collect();
+        let hash = crate::scripts::recurrence_key(source, &uses);
+        store
+            .record_script(
+                identity.0,
+                identity.1,
+                "fixture-run",
+                &hash,
+                source,
+                &uses,
+                state.0,
+                "",
+                1,
+                state.1,
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE scripts SET created_at=?2 WHERE id=?1",
+                params![identity.0, identity.2],
+            )
+            .unwrap();
+        hash
+    }
+
+    #[test]
+    fn recurring_script_preview_selects_both_fields_from_one_ordered_row() {
+        let store = Store::open_in_memory().unwrap();
+        let first = "const path = 'old'; return tools.read({path});";
+        let second = "const path = 'new'; return tools.read({path});";
+        let third = "const path = 'ล่าสุด'; return tools.read({path});";
+        let early_hash = record(
+            &store,
+            ("one", "s1", "2026-01-01"),
+            first,
+            &["z", "a", "z"],
+            ("success", ""),
+        );
+        let late_hash = record(
+            &store,
+            ("two", "s2", "2026-01-01"),
+            second,
+            &["a", "z"],
+            ("success", ""),
+        );
+        assert_eq!(
+            early_hash, late_hash,
+            "fixture uses the current normalized recurrence key"
+        );
+        assert_eq!(
+            store.recurring_scripts(2, 5).unwrap(),
+            vec![(2, vec!["a".into(), "z".into()], second.into())]
+        );
+        record(
+            &store,
+            ("failure", "s3", "2026-01-02"),
+            third,
+            &["z", "a", "z"],
+            ("failure", "saved-on-failure"),
+        );
+        assert_eq!(
+            store.recurring_scripts(2, 5).unwrap(),
+            vec![(2, vec!["z".into(), "a".into(), "z".into()], third.into())]
+        );
+        record(
+            &store,
+            ("older-recorded-later", "s4", "2025-01-01"),
+            first,
+            &["a", "z"],
+            ("failure", ""),
+        );
+        assert_eq!(store.recurring_scripts(2, 5).unwrap()[0].2, third);
+        record(
+            &store,
+            ("latest-tie", "s5", "2026-01-02"),
+            second,
+            &["a", "z"],
+            ("failure", ""),
+        );
+        assert_eq!(
+            store.recurring_scripts(2, 5).unwrap(),
+            vec![(2, vec!["a".into(), "z".into()], second.into())]
+        );
+    }
+
+    #[test]
+    fn recurring_script_group_scopes_limits_and_malformed_uses_are_preserved() {
+        let store = Store::open_in_memory().unwrap();
+        let many = "return tools.alpha({x:1});";
+        let few = "return tools.beta({x:1});";
+        for (id, session) in [
+            ("many1", "s1"),
+            ("many2", "s2"),
+            ("many3", "s3"),
+            ("many-duplicate-session", "s3"),
+        ] {
+            record(
+                &store,
+                (id, session, "2026-01-01"),
+                many,
+                &["alpha"],
+                ("success", ""),
+            );
+        }
+        for (id, session) in [("few1", "s1"), ("few2", "s2")] {
+            record(
+                &store,
+                (id, session, "2026-01-01"),
+                few,
+                &["beta"],
+                ("success", ""),
+            );
+        }
+        record(
+            &store,
+            ("below", "s1", "2026-01-01"),
+            "return tools.gamma({x:1});",
+            &["gamma"],
+            ("success", ""),
+        );
+        for (id, session, saved) in [("saved1", "s1", "promoted"), ("saved2", "s2", "")] {
+            record(
+                &store,
+                (id, session, "2026-01-01"),
+                "return tools.saved({x:1});",
+                &["saved"],
+                ("success", saved),
+            );
+        }
+        for (id, session) in [("bad1", "s1"), ("bad2", "s2")] {
+            record(
+                &store,
+                (id, session, "2026-01-01"),
+                "return tools.failed({x:1});",
+                &["failed"],
+                ("failure", ""),
+            );
+        }
+        let latest = "return tools.alpha({x:99});";
+        let key = record(
+            &store,
+            ("malformed", "s4", "2026-01-02"),
+            latest,
+            &["alpha"],
+            ("failure", "ignored-failed-save"),
+        );
+        assert_eq!(key, crate::scripts::recurrence_key(many, &["alpha".into()]));
+        store
+            .conn
+            .execute(
+                "UPDATE scripts SET uses='{invalid' WHERE id='malformed'",
+                [],
+            )
+            .unwrap();
+        let rows = store.recurring_scripts(2, 10).unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (3, vec![], latest.into()),
+                (2, vec!["beta".into()], few.into())
+            ]
+        );
+        assert_eq!(store.recurring_scripts(2, 1).unwrap(), rows[..1]);
+        assert!(store.recurring_scripts(2, 0).unwrap().is_empty());
+        assert!(store.recurring_scripts(4, 10).unwrap().is_empty());
     }
 }
 
