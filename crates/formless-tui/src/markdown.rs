@@ -27,13 +27,17 @@ pub(crate) fn set_line_numbers(on: bool) {
     LINE_NUMBERS.with(|l| l.set(on));
 }
 
-pub(crate) fn render(text: &str, color: bool, indent: &str, width: usize) -> Vec<Line<'static>> {
-    let opts = Options::ENABLE_TABLES
+fn parser_options() -> Options {
+    Options::ENABLE_TABLES
         | Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_TASKLISTS
         | Options::ENABLE_GFM
         | Options::ENABLE_FOOTNOTES
-        | Options::ENABLE_MATH;
+        | Options::ENABLE_MATH
+}
+
+pub(crate) fn render(text: &str, color: bool, indent: &str, width: usize) -> Vec<Line<'static>> {
+    let opts = parser_options();
     let mut r = Renderer {
         color,
         width: width.max(indent.width() + 16),
@@ -45,6 +49,76 @@ pub(crate) fn render(text: &str, color: bool, indent: &str, width: usize) -> Vec
     }
     r.flush();
     r.out
+}
+
+/// A parsed table, with containers already interpreted by the same parser as
+/// chat rendering. Keep inline events and alignments instead of slicing raw
+/// source and guessing how much list/blockquote indentation to remove.
+pub(crate) struct ParsedTable<'a> {
+    events: Vec<Event<'a>>,
+}
+
+impl ParsedTable<'_> {
+    pub(crate) fn render(&self, color: bool, width: usize) -> Vec<Line<'static>> {
+        let mut renderer = Renderer {
+            color,
+            width: width.max(16),
+            ..Default::default()
+        };
+        for event in &self.events {
+            renderer.event(event.clone());
+        }
+        renderer.flush();
+        renderer.out
+    }
+}
+
+pub(crate) fn tables(text: &str) -> Vec<ParsedTable<'_>> {
+    let mut out = Vec::new();
+    let mut current = None;
+    for event in Parser::new_ext(text, parser_options()) {
+        if matches!(event, Event::Start(Tag::Table(_))) {
+            current = Some(Vec::new());
+        }
+        let end = matches!(event, Event::End(TagEnd::Table));
+        if let Some(events) = &mut current {
+            events.push(event);
+        }
+        if end {
+            if let Some(events) = current.take() {
+                out.push(ParsedTable { events });
+            }
+        }
+    }
+    out
+}
+
+/// Copy/pager contract: retain parsed code text, removing exactly the one
+/// final newline removed for chat presentation. Other whitespace stays.
+fn code_body(body: &str) -> &str {
+    body.strip_suffix('\n').unwrap_or(body)
+}
+
+pub(crate) fn code_blocks(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = None;
+    for event in Parser::new_ext(text, parser_options()) {
+        match event {
+            Event::Start(Tag::CodeBlock(_)) => current = Some(String::new()),
+            Event::Text(text) => {
+                if let Some(body) = &mut current {
+                    body.push_str(&text);
+                }
+            }
+            Event::End(TagEnd::CodeBlock) => {
+                if let Some(body) = current.take() {
+                    out.push(code_body(&body).to_owned());
+                }
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 /// A line prefix contributed by an enclosing block.
@@ -560,7 +634,7 @@ impl Renderer {
     fn code_block(&mut self, lang: &str, body: &str) {
         let color = self.color;
         let avail = self.width.saturating_sub(self.prefix_width());
-        let body = body.strip_suffix('\n').unwrap_or(body);
+        let body = code_body(body);
         self.code_index += 1;
         let index = self.code_index;
         if lang.eq_ignore_ascii_case("mermaid") {
@@ -1392,6 +1466,77 @@ mod tests {
                 "Longheading日本語👩🏽‍💻withenoughcontenttowrapacrossseverallines"
             );
         }
+    }
+
+    #[test]
+    fn parsed_tables_preserve_cells_alignment_and_styles_without_containers() {
+        let table = "Name | Value\n:--- | ---:\n**ไทย** | `x\\|y`\n~~old~~ | a\\|b";
+        let expected = render(table, true, "", 100_000);
+        for source in [
+            table.to_owned(),
+            table
+                .lines()
+                .map(|line| format!("> {line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            format!(
+                "- item\n\n{}",
+                table
+                    .lines()
+                    .map(|line| format!("  {line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+            format!(
+                "> - item\n>\n{}",
+                table
+                    .lines()
+                    .map(|line| format!(">   {line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+        ] {
+            let selected = tables(&source);
+            assert_eq!(selected.len(), 1, "{source}");
+            assert_eq!(selected[0].render(true, 100_000), expected, "{source}");
+        }
+        let source = format!("| prose one\n| prose two\n\n~~~\n| fake | table |\n| --- | --- |\n~~~\n\n    | indented | code |\n    | --- | --- |\n\n{table}\n\n| Next | Value |\n| --- | --- |\n| 日本語 | 2 |");
+        let selected = tables(&source);
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].render(true, 100_000), expected);
+        assert!(selected[1]
+            .render(false, 100_000)
+            .iter()
+            .any(|line| line.to_string().contains("日本語")));
+    }
+
+    #[test]
+    fn parsed_code_blocks_preserve_order_containers_and_newline_contract() {
+        let source = "~~~sh\ntilde\n~~~\n\n    indented\n    next\n\n````text\nliteral\n```\nstill code\n````\n\n> - item\n>\n>   ```rust\n>     nested\n>   ```\n\n```mermaid\ngraph LR\nA --> B\n```\n\n```text\nunclosed";
+        assert_eq!(
+            code_blocks(source),
+            [
+                "tilde",
+                "indented\nnext",
+                "literal\n```\nstill code",
+                "  nested",
+                "graph LR\nA --> B",
+                "unclosed"
+            ]
+        );
+        let displayed = render(source, false, "", 200)
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        for label in ["sh [1]", "text [3]", "rust [4]", "text [6]"] {
+            assert!(displayed.contains(label), "{displayed}");
+        }
+        assert!(displayed.contains("mermaid"));
+        assert_eq!(code_blocks("~~~\r\nline\r\n\r\n~~~\r\n"), ["line\n"]);
+        assert_eq!(code_blocks("~~~\n  \n~~~"), ["  "]);
+        assert_eq!(code_blocks("~~~\n~~~"), [""]);
+        assert_eq!(code_blocks("~~~\nline\n\n"), ["line\n"]);
     }
 
     #[test]
