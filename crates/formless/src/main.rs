@@ -513,14 +513,36 @@ enum AuthAction {
 
 /// The pairing link as a terminal QR code, for a phone's camera; only on a
 /// terminal (it holds the secret, so it never goes into a pipe or a log).
+fn pairing_qr_columns(lines: &[String]) -> usize {
+    use unicode_width::UnicodeWidthStr;
+    lines.iter().map(|line| line.width()).max().unwrap_or(0)
+}
+
+fn pairing_qr_fits(lines: &[String], width: Option<u16>) -> bool {
+    !lines.is_empty() && width.is_some_and(|width| pairing_qr_columns(lines) <= width as usize)
+}
+
 fn print_pairing_qr(url: &str) {
     use std::io::IsTerminal;
     if !std::io::stdout().is_terminal() || !table::color_allowed() {
         return;
     }
-    if let Some(code) = formless_tui::qr::ansi(url) {
+    if let Some(lines) = formless_tui::qr::lines(url) {
+        let width = crossterm::terminal::size().ok().map(|(width, _)| width);
+        if !pairing_qr_fits(&lines, width) {
+            if width.is_some() {
+                println!("Widen the terminal to at least {} columns to show the pairing QR code, or open the link above.", pairing_qr_columns(&lines));
+            } else {
+                println!(
+                    "Open the link above; terminal width is unavailable for the pairing QR code."
+                );
+            }
+            return;
+        }
         println!();
-        print!("{code}");
+        for line in lines {
+            println!("\x1b[97;40m{line}\x1b[0m");
+        }
         println!("            Scan with your phone. This code contains the pairing secret:");
         println!(
             "            anyone who sees it can use your daemon. Rotate with --rotate if it leaks."
@@ -9150,3 +9172,32 @@ mod tests {
 #[cfg(test)]
 #[path = "log_cli_tests.rs"]
 mod log_cli_tests;
+
+#[cfg(test)]
+mod pairing_qr_width_tests {
+    #[test]
+    fn pairing_qr_fit_counts_display_columns_and_includes_the_quiet_zone() {
+        use unicode_width::UnicodeWidthStr;
+        let lines = formless_tui::qr::lines("https://example.invalid/#k=private-fixture").unwrap();
+        let required = super::pairing_qr_columns(&lines);
+        assert_eq!(required, lines[0].width());
+        assert!(
+            required < lines[0].len(),
+            "block glyph bytes must not count as columns"
+        );
+        assert!(super::pairing_qr_fits(
+            &lines,
+            Some(required.try_into().unwrap())
+        ));
+        assert!(super::pairing_qr_fits(
+            &lines,
+            Some((required + 1).try_into().unwrap())
+        ));
+        assert!(!super::pairing_qr_fits(
+            &lines,
+            Some((required - 1).try_into().unwrap())
+        ));
+        assert!(!super::pairing_qr_fits(&lines, None));
+        assert!(!super::pairing_qr_fits(&[], Some(80)));
+    }
+}
