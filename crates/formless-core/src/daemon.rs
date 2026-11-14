@@ -13735,23 +13735,22 @@ impl Daemon {
         let preview: String = text.chars().take(cap).collect();
         // The stored copy outlives the Run: secrets in it are redacted (#709).
         if std::fs::write(&path, crate::secrets::redact(&text).0).is_ok() {
-            let id = self
-                .with_store(|st| {
-                    st.save_artifact(
-                        Some(session_id),
-                        &path.to_string_lossy(),
-                        &preview,
-                        text.len() as i64,
-                    )
-                })
-                .unwrap_or_default();
-            // No filesystem path: transcripts reach remote clients too.
-            return format!(
-                "{preview}\n[full output ({} bytes) stored as artifact {id}; read it with read_artifact]",
-                text.len()
-            );
+            if let Ok(id) = self.with_store(|st| {
+                st.save_artifact(
+                    Some(session_id),
+                    &path.to_string_lossy(),
+                    &preview,
+                    text.len() as i64,
+                )
+            }) {
+                // No filesystem path: transcripts reach remote clients too.
+                return format!(
+                    "{preview}\n[full output ({} bytes) stored as artifact {id}; read it with read_artifact]",
+                    text.len()
+                );
+            }
         }
-        preview
+        format!("{preview}\n[output truncated to {cap} characters (Unicode scalar values); full output ({} UTF-8 bytes) could not be stored as an artifact]", text.len())
     }
 
     /// Execute one registry Tool and record the Invocation. Boxed to break
@@ -18800,3 +18799,7 @@ mod module_read_projection_tests;
 #[cfg(test)]
 #[path = "summary_search_handler_tests.rs"]
 mod summary_search_handler_tests;
+
+#[cfg(test)]
+#[path = "model_text_failure_tests.rs"]
+mod model_text_failure_tests;
