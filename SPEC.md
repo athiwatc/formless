@@ -1214,6 +1214,8 @@ pasting paths.
     `\`-escaped or `file://`) is attached instead of typed.
     Exact literal files take precedence; otherwise a single shell-quoted word
     is decoded (including escaped metacharacters, quotes and backslashes).
+    Native Windows separators are retained when decoding the legacy
+    backslash-space form, after exact-file checks.
     No variables, globs or commands are expanded or executed; relative,
     incomplete, multiple-path or multiline inputs remain composer text.
     File URLs preserve native drive/UNC paths and percent-encode reserved

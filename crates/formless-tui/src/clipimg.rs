@@ -76,31 +76,55 @@ fn parse_applescript_data(text: &str) -> Option<Vec<u8>> {
 /// or with terminal shell quoting. Parsing never expands or executes text.
 /// Prefer an exact literal filename before interpreting backslashes/quotes.
 pub fn dropped_file(pasted: &str) -> Option<std::path::PathBuf> {
-    let source = pasted.trim_matches(['\r', '\n']);
-    if source.trim().is_empty() || source.contains(['\r', '\n', '\0']) {
-        return None;
-    }
-    let existing = |text: &str| {
+    dropped_file_with(pasted, cfg!(windows), |text| {
         let path = if text.starts_with("file://") {
             url::Url::parse(text).ok()?.to_file_path().ok()?
         } else {
             std::path::PathBuf::from(text)
         };
         (path.is_absolute() && path.is_file()).then_some(path)
-    };
+    })
+}
+
+fn dropped_file_with(
+    pasted: &str,
+    windows: bool,
+    existing: impl Fn(&str) -> Option<std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
+    let source = pasted.trim_matches(['\r', '\n']);
+    if source.trim().is_empty() || source.contains(['\r', '\n', '\0']) {
+        return None;
+    }
     if let Some(path) = existing(source).or_else(|| existing(source.trim())) {
         return Some(path);
     }
-    // Windows terminal drops quote native paths without shell-escaping their
-    // backslashes. Preserve them before trying POSIX terminal shell quoting.
-    #[cfg(windows)]
-    if let Some(path) = source
-        .trim()
-        .strip_prefix('"')
-        .and_then(|s| s.strip_suffix('"'))
-        .and_then(existing)
-    {
-        return Some(path);
+    // Native Windows paths are not POSIX words: their ordinary backslashes
+    // are separators. After exact-file checks, support the legacy escaped
+    // space form without consuming any other backslash.
+    if windows {
+        let native = source.trim();
+        let native = native
+            .strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'))
+            .unwrap_or(native);
+        if let Some(path) = existing(native) {
+            return Some(path);
+        }
+        if native.contains("\\ ") {
+            let mut decoded = String::with_capacity(native.len());
+            let mut chars = native.chars().peekable();
+            while let Some(c) = chars.next() {
+                if c == '\\' && chars.peek() == Some(&' ') {
+                    chars.next();
+                    decoded.push(' ');
+                } else {
+                    decoded.push(c);
+                }
+            }
+            if let Some(path) = existing(&decoded) {
+                return Some(path);
+            }
+        }
     }
     let words = shlex::split(source)?;
     match words.as_slice() {
@@ -191,6 +215,55 @@ mod tests {
         ] {
             assert!(dropped_file(&input).is_none(), "{input:?}");
         }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn windows_drop_dispatch_keeps_drive_and_unc_separators() {
+        // Exercise the Windows dispatch on Linux too; filesystem validity is
+        // supplied explicitly, not inferred from Linux's Path rules.
+        for (input, expected) in [
+            (r"C:\Temp\shot\ (1).png", r"C:\Temp\shot (1).png"),
+            (
+                r"\\server\share\shot\ (1).png",
+                r"\\server\share\shot (1).png",
+            ),
+            (r#""C:\Temp\shot\ (1).png""#, r"C:\Temp\shot (1).png"),
+        ] {
+            let result = dropped_file_with(input, true, |candidate| {
+                (candidate == expected).then(|| expected.into())
+            });
+            assert_eq!(result, Some(expected.into()), "{input}");
+        }
+        let literal = r"C:\Temp\literal\ space.png";
+        let sibling = r"C:\Temp\literal space.png";
+        assert_eq!(
+            dropped_file_with(literal, true, |candidate| {
+                [literal, sibling]
+                    .contains(&candidate)
+                    .then(|| candidate.into())
+            }),
+            Some(literal.into())
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_native_drops_keep_separators_and_exact_file_precedence() {
+        let dir = std::env::temp_dir().join(format!("fl drop {}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let file = dir.join("shot (1).png");
+        std::fs::write(&file, b"x").unwrap();
+        let plain = file.to_str().unwrap();
+        let escaped = plain.replace(' ', "\\ ");
+        for input in [plain.to_owned(), escaped.clone(), format!("\"{escaped}\"")] {
+            assert_eq!(dropped_file(&input), Some(file.clone()));
+        }
+        std::fs::create_dir(dir.join("literal")).unwrap();
+        let exact = dir.join("literal").join(" space.png");
+        std::fs::write(&exact, b"exact").unwrap();
+        std::fs::write(dir.join("literal space.png"), b"other").unwrap();
+        assert_eq!(dropped_file(exact.to_str().unwrap()), Some(exact));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
