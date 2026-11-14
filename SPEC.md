@@ -6255,6 +6255,11 @@ response. This is a hypothetical without/with comparison, not an application
 dry run or guarantee of permission/success. It performs no proposal evaluation
 or decision; unknown IDs retain the standard not-found usage error.
 
+Tool selectors use an exact name or full ID. After a miss, up to three
+ranked partial-name suggestions can help you retry with the original exact
+spelling; these use folded subsequence matching, not edit-distance spelling
+correction. A suggestion never selects or runs a Tool automatically.
+
 `modules list [--json]` reads all ModuleInfo rows, including retired modules.
 `modules show NAME_OR_ID [--json] [--version N]` uses the daemon's existing
 name/full-ID resolution. Default human detail shows metadata, version summaries

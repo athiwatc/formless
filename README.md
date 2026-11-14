@@ -656,6 +656,11 @@ whose stored tags contain exactly `work`. Only the tag argument is lowercased;
 a leading `#` is not stripped. Add `--archived` to select the archived partition.
 These selectors filter the existing reply on the client.
 
+Tool selectors use an exact name or full ID. After a miss, up to three
+ranked partial-name suggestions can help you retry with the original exact
+spelling; these use folded subsequence matching, not edit-distance spelling
+correction. A suggestion never selects or runs a Tool automatically.
+
 `update --json`, `update check --json`, and `update --check --json` emit one
 object: `{installed, status, newer_releases: [{tag, url, notes}]}`. Notes retain
 the existing trimmed body and oldest-first order; `installed` has no `v` prefix.
