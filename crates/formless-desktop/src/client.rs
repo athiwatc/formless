@@ -149,8 +149,17 @@ enum Pending {
     Sessions,
     Snapshot { session_id: String, generation: u64 },
     Page(Destination),
-    Action(String),
+    Action(Action),
     Create,
+}
+
+/// Transport request ids restart on reconnect. Each mutation needs a separate
+/// identity so an ACK for Stop (or another connection) cannot resolve an
+/// earlier Send whose outcome is still unknown.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct Action {
+    id: uuid::Uuid,
+    session_id: String,
 }
 
 /// Pure, connection-local correlation and invalidation state. The worker
@@ -284,6 +293,7 @@ impl Engine {
                 self.request(Request::CreateSession { name: None }, Pending::Create)
             }
             Command::Intent(intent) if self.ready => {
+                let action_id = uuid::Uuid::new_v4();
                 let (session_id, request) = match intent {
                     Intent::SendMessage {
                         session_id,
@@ -293,7 +303,7 @@ impl Engine {
                         if self
                             .pending
                             .values()
-                            .any(|p| matches!(p, Pending::Action(id) if id == &session_id))
+                            .any(|p| matches!(p, Pending::Action(action) if action.session_id == session_id))
                         {
                             self.updates.push(Update::Notice("Wait for the previous action's acknowledgement; the draft was kept.".into()));
                             return;
@@ -304,7 +314,7 @@ impl Engine {
                                 session_id,
                                 content,
                                 mode,
-                                client_msg_id: Some(uuid::Uuid::new_v4().to_string()),
+                                client_msg_id: Some(action_id.to_string()),
                             },
                         )
                     }
@@ -312,7 +322,13 @@ impl Engine {
                         (session_id.clone(), Request::InterruptRun { session_id })
                     }
                 };
-                self.request(request, Pending::Action(session_id));
+                self.request(
+                    request,
+                    Pending::Action(Action {
+                        id: action_id,
+                        session_id,
+                    }),
+                );
             }
             Command::Intent(_) | Command::CreateSession => self.updates.push(Update::Notice(
                 "Not connected; the action was not sent. The draft was kept.".into(),
@@ -454,11 +470,11 @@ impl Engine {
                 destination,
                 result,
             }),
-            Pending::Action(session_id) => {
+            Pending::Action(action) => {
                 self.dirty_session = true;
                 self.dirty_list = true;
                 self.updates.push(Update::Action {
-                    session_id,
+                    session_id: action.session_id,
                     result: result.map(|_| ()),
                 });
             }
@@ -557,7 +573,7 @@ fn deliver(tx: &SyncSender<Update>, engine: &mut Engine) -> Result<(), String> {
 struct Retained {
     active: (Option<String>, u64),
     page: Option<Destination>,
-    uncertain: HashSet<String>,
+    uncertain: HashSet<Action>,
 }
 
 async fn connected<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
@@ -596,8 +612,8 @@ async fn connected<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
         // Mutations with no definite response are never replayed. Record
         // them before attempting a write, which may partially succeed.
         uncertain.extend(engine.pending.values().filter_map(|p| {
-            if let Pending::Action(id) = p {
-                Some(id.clone())
+            if let Pending::Action(action) = p {
+                Some(action.clone())
             } else {
                 None
             }
@@ -614,14 +630,14 @@ async fn connected<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
                 Some(Command::Reconnect) => return Err("Reconnecting at the user's request; actions are not retried.".into()),
                 Some(Command::Select { session_id, generation }) => { *active = (session_id.clone(), generation); engine.select(session_id, generation); }
                 Some(Command::Page(destination)) => { *page = Some(destination); engine.load_page(destination); }
-                Some(Command::Intent(Intent::SendMessage { session_id, .. })) if uncertain.contains(&session_id) && !engine.pending.values().any(|p| matches!(p, Pending::Action(id) if id == &session_id)) => {
+                Some(Command::Intent(Intent::SendMessage { session_id, .. })) if uncertain.iter().any(|action| action.session_id == session_id && !engine.pending.values().any(|p| matches!(p, Pending::Action(pending) if pending == action))) => {
                     engine.updates.push(Update::Notice("A previous action's outcome is unknown. It was not retried: deduplication does not survive reconnect. Check this Session in the TUI before sending again.".into()));
                 }
                 Some(command) => engine.command(command),
             },
             message = reader.next() => match message.map_err(|e| e.to_string())? {
                 Some(message) => {
-                    let answered = match &message { ServerMessage::Response { id, .. } => match engine.pending.get(id) { Some(Pending::Action(id)) => Some(id.clone()), _ => None }, _ => None };
+                    let answered = match &message { ServerMessage::Response { id, .. } => match engine.pending.get(id) { Some(Pending::Action(action)) => Some(action.clone()), _ => None }, _ => None };
                     engine.receive(message)?;
                     ready.store(engine.ready, Ordering::Release);
                     if let Some(id) = answered { uncertain.remove(&id); }
@@ -982,8 +998,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn eof_after_a_send_preserves_unknown_outcome_without_replay() {
+    async fn disconnect_after_unacknowledged_send() -> Retained {
         let (stream, server) = tokio::io::duplex(8192);
         let (command_tx, mut commands) = queue::channel(QUEUE);
         let _keep_commands_open = command_tx.clone();
@@ -1047,7 +1062,176 @@ mod tests {
         .unwrap();
         assert!(result.unwrap_err().contains("disconnected"));
         peer.await.unwrap();
-        assert!(retained.uncertain.contains("a"));
+        assert!(retained
+            .uncertain
+            .iter()
+            .any(|action| action.session_id == "a"));
+        retained
+    }
+
+    #[tokio::test]
+    async fn eof_after_a_send_preserves_unknown_outcome_without_replay() {
+        disconnect_after_unacknowledged_send().await;
+    }
+
+    #[tokio::test]
+    async fn reconnect_stop_acknowledgements_do_not_clear_an_unknown_send() {
+        let mut retained = disconnect_after_unacknowledged_send().await;
+        let original_unknown = retained.uncertain.clone();
+        for stop_succeeded in [true, false] {
+            let (stream, server) = tokio::io::duplex(8192);
+            let (command_tx, mut commands) = queue::channel(QUEUE);
+            let _keep_commands_open = command_tx.clone();
+            let (updates, rx) = mpsc::sync_channel(QUEUE);
+            let (_stop, mut cancelled) = watch::channel(false);
+            let ready = AtomicBool::new(false);
+            let peer = tokio::spawn(async move {
+                let mut server = BufReader::new(server);
+                let mut snapshots = 0;
+                let mut other_session_sent = false;
+                let mut other_session_acknowledged = false;
+                loop {
+                    let mut line = String::new();
+                    server.read_line(&mut line).await.unwrap();
+                    let request: RequestEnvelope = serde_json::from_str(&line).unwrap();
+                    let result = match request.request {
+                        Request::Ping => json!({"min_protocol":1,"max_protocol":1}),
+                        Request::Subscribe { .. } => json!({"subscribed":true}),
+                        Request::ListSessions => json!([]),
+                        Request::GetSession { .. } => {
+                            snapshots += 1;
+                            if snapshots == 1 {
+                                command_tx
+                                    .send(Command::Intent(Intent::InterruptRun {
+                                        session_id: "a".into(),
+                                    }))
+                                    .await
+                                    .unwrap();
+                            } else if rx.try_iter().any(|update| {
+                                matches!(update,
+                                    Update::Notice(notice) if notice.contains("outcome is unknown")
+                                )
+                            }) {
+                                if other_session_acknowledged {
+                                    // Observe the retry's rejection after both the
+                                    // Stop ACK and another Session's Send ACK.
+                                    // A poll alone does not prove it was processed.
+                                    let line = format!(
+                                        "{}\n",
+                                        serde_json::to_string(&ServerMessage::ok(
+                                            request.id,
+                                            snapshot("a", "confirmed")
+                                        ))
+                                        .unwrap()
+                                    );
+                                    server.get_mut().write_all(line.as_bytes()).await.unwrap();
+                                    break;
+                                }
+                                assert!(!other_session_sent);
+                                other_session_sent = true;
+                                command_tx
+                                    .send(Command::Intent(Intent::SendMessage {
+                                        session_id: "b".into(),
+                                        content: "new action in another Session".into(),
+                                        mode: SendMode::Send,
+                                    }))
+                                    .await
+                                    .unwrap();
+                            }
+                            snapshot("a", "confirmed")
+                        }
+                        Request::InterruptRun { session_id } => {
+                            assert_eq!(session_id, "a");
+                            let response = if stop_succeeded {
+                                ServerMessage::ok(request.id, json!({"interrupted":true}))
+                            } else {
+                                ServerMessage::err(request.id, "already stopped".into())
+                            };
+                            let line = format!("{}\n", serde_json::to_string(&response).unwrap());
+                            server.get_mut().write_all(line.as_bytes()).await.unwrap();
+                            // Observe processing of this exact Stop reply before
+                            // submitting another Send; socket write order alone
+                            // would not establish that the ACK was applied.
+                            loop {
+                                if rx
+                                    .try_iter()
+                                    .any(|update| matches!(update, Update::Action { .. }))
+                                {
+                                    break;
+                                }
+                                tokio::task::yield_now().await;
+                            }
+                            command_tx
+                                .send(Command::Intent(Intent::SendMessage {
+                                    session_id: "a".into(),
+                                    content: "one action".into(),
+                                    mode: SendMode::Send,
+                                }))
+                                .await
+                                .unwrap();
+                            command_tx.send(Command::Refresh).await.unwrap();
+                            continue;
+                        }
+                        Request::SendMessage { session_id, .. } => {
+                            assert_eq!(session_id, "b",
+                                "an unrelated response allowed retrying an unacknowledged Send across connections");
+                            assert!(other_session_sent && !other_session_acknowledged);
+                            let line = format!(
+                                "{}\n",
+                                serde_json::to_string(&ServerMessage::ok(
+                                    request.id,
+                                    json!({"sent":true})
+                                ))
+                                .unwrap()
+                            );
+                            server.get_mut().write_all(line.as_bytes()).await.unwrap();
+                            loop {
+                                if rx.try_iter().any(|update| matches!(update,
+                                    Update::Action { session_id, result: Ok(()) } if session_id == "b"
+                                )) { break; }
+                                tokio::task::yield_now().await;
+                            }
+                            other_session_acknowledged = true;
+                            command_tx
+                                .send(Command::Intent(Intent::SendMessage {
+                                    session_id: "a".into(),
+                                    content: "one action".into(),
+                                    mode: SendMode::Send,
+                                }))
+                                .await
+                                .unwrap();
+                            command_tx.send(Command::Refresh).await.unwrap();
+                            continue;
+                        }
+                        other => panic!("unexpected request {other:?}"),
+                    };
+                    let line = format!(
+                        "{}\n",
+                        serde_json::to_string(&ServerMessage::ok(request.id, result)).unwrap()
+                    );
+                    server.get_mut().write_all(line.as_bytes()).await.unwrap();
+                }
+                // Keep the update consumer alive until connected() observes
+                // EOF; dropping it first would test queue failure instead.
+                rx
+            });
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let result = connected(
+                    stream,
+                    &mut commands,
+                    &updates,
+                    &mut cancelled,
+                    &mut retained,
+                    &ready,
+                )
+                .await;
+                peer.await.unwrap();
+                assert!(result.unwrap_err().contains("disconnected"));
+            })
+            .await
+            .expect("reconnect/Stop/retry regression timed out");
+            assert_eq!(retained.uncertain, original_unknown);
+        }
     }
 
     #[tokio::test]

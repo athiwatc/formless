@@ -159,6 +159,53 @@ Windows job log returned BlobNotFound. The cause is not established by these
 results. They provide no Windows/Linux build or test evidence. The Code Review
 diagnostics tool also required local Desktop access unavailable to this task.
 
+## Independent review follow-up
+
+Review of published head `76f15463372b432e761727d942c5f8a1ea0ec7d2`
+found that an unrelated Stop reply could clear the Session-keyed unknown-Send
+guard after reconnect. A duplex-transport regression reproduced an actual
+second Send frame on the old code. The initial failing run is preserved in
+`review-76f15463-unknown-send-failure.log`.
+
+Each mutation now has a unique operation identity, retained separately from
+the connection-local request number. A definite reply resolves only its exact
+operation. A pending or acknowledged Stop cannot exempt an earlier unknown Send
+from the retry guard. No mutation is automatically retried.
+
+The adversarial test disconnects without acknowledging a Send, reconnects,
+waits until the Stop reply is applied, attempts the original Send, successfully
+sends and acknowledges a different Session's message, then attempts the original
+again. Both retries remain off the wire and the original unknown operation is
+retained. It covers both successful and rejected Stop replies. The test observes
+the retry-rejection notice before completing its refresh barrier, rather than
+treating an unrelated periodic read as proof that the command was processed.
+An intermediate fixture failure dropped the update consumer before EOF; its log
+is preserved separately as `review-unknown-send-fixed.log`. The final regression
+passes in `review-unknown-send-final-regression.log`.
+
+The review also examined attention scope and withdrew that concern: the daemon's
+`pending_events` list is Profile-wide and the UI explicitly directs the user to
+the TUI for Profile decisions. That behavior is unchanged. This follow-up changes
+transport state and tests; it does not add new native input/IME acceptance.
+
+Fresh follow-up gates passed: formatting, 148 GUI-free model tests, 153 model
+tests with the Thai study, 122 shell tests, doc tests, strict clippy in all four
+GUI configurations, and the real daemon/fake-provider integration plus strict
+fixture clippy. Exact commands and exit codes are in `review-fix-checks.json`;
+the separate integration logs are `review-fix-daemon.log` and
+`review-fix-clippy-daemon.log` (the same 26 pre-existing core warnings remain).
+The shell and native render test source are unchanged from the reviewed head.
+
+The already-installed `x86_64-pc-windows-gnu` target also passed
+`cargo check --no-default-features --all-targets --target x86_64-pc-windows-gnu`
+with `--offline --locked`. This compiles the GUI-free Windows-specific Rust and
+test code; it does not link or run a Windows executable, compile GPUI for
+Windows, or establish named-pipe cancellation, native input or accessibility
+behavior. Its log is `review-fix-windows-cross-check.log`. The only other
+installed Rust target is this Mac's `aarch64-apple-darwin`; no Linux native
+execution was available. No toolchain, OS permission or Computer Use approval
+was changed for these checks.
+
 ## Remaining acceptance
 
 - Foreground native keyboard input, text selection, real Thai/Japanese/dead-key
