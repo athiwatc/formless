@@ -413,7 +413,10 @@ without redesign.
   `supported_parameters`), else a built-in table for well-known families
   (GPT-5, o-series, GPT-4o/4.1, Claude, Gemini, reasoning-only models).
   The TUI and web pickers show it on each row (`200k ctx · $3/$15 per M ·
-  vision · tools`). Context labels retain exact token counts: decimal multiples
+  vision · tools`). TUI model prices retain the metadata's thousandths of
+  USD per million tokens (0.075/0.007/0.001), trimming unused trailing zeros;
+  an actual zero and whole-dollar prices remain distinct and unpadded.
+  Context labels retain exact token counts: decimal multiples
   keep k/M units (200000 → 200k, 1500000 → 1.5M); other exact binary multiples
   use explicit Ki/Mi (131072 → 128Ki, 65536 → 64Ki). Smaller or irregular
   windows use exact decimal fractions only when no longer than the whole count,

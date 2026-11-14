@@ -62,7 +62,10 @@ pub fn model_detail(meta: &serde_json::Value, test: &serde_json::Value) -> Optio
             if v.fract() == 0.0 {
                 format!("{v:.0}")
             } else {
-                format!("{v:.2}")
+                format!("{v:.3}")
+                    .trim_end_matches('0')
+                    .trim_end_matches('.')
+                    .to_string()
             }
         };
         parts.push(format!("${}/${} per M", fmt(i), fmt(o)));
@@ -282,6 +285,30 @@ mod tests {
             .is_none());
         }
         assert_eq!(model_detail(&serde_json::json!({"context":131072,"input_price":3,"output_price":15,"vision":true,"tools":true}), &serde_json::json!({"ok":true})).as_deref(), Some("128Ki ctx · $3/$15 per M · vision · tools · ✓ tested"));
+    }
+    #[test]
+    fn model_prices_keep_the_metadata_thousandths() {
+        for (input, output, expected) in [
+            ("0.000000075", "0.000000001", "$0.075/$0.001 per M"),
+            ("0.000000007", "0.000003", "$0.007/$3 per M"),
+            ("0", "0.000015", "$0/$15 per M"),
+            ("0.0000012", "0.00000123", "$1.2/$1.23 per M"),
+        ] {
+            let meta = formless_core::provider::parse_model_meta(
+                &serde_json::json!({"data":[{"id":"fixture-price","pricing":{"prompt":input,"completion":output}}]}),
+            );
+            assert_eq!(
+                model_detail(&meta["fixture-price"], &serde_json::Value::Null).as_deref(),
+                Some(expected)
+            );
+        }
+        assert!(model_detail(
+            &serde_json::json!({"input_price":0.001}),
+            &serde_json::Value::Null
+        )
+        .is_none());
+        assert!(model_detail(&serde_json::Value::Null, &serde_json::Value::Null).is_none());
+        assert_eq!(model_detail(&serde_json::json!({"input_price":0.001,"output_price":0.075,"vision":true,"tools":true}), &serde_json::json!({"ok":true})).as_deref(), Some("$0.001/$0.075 per M · vision · tools · ✓ tested"));
     }
     #[test]
     fn transient_model_failures_explain_the_manual_retry() {
