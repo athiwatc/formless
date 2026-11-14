@@ -126,11 +126,55 @@ fn dropped_file_with(
             }
         }
     }
+    // shlex discards shell comments. A paste is data, so declining the path
+    // is safer than attaching one word and silently losing the remaining text.
+    if has_shell_comment(source) {
+        return None;
+    }
     let words = shlex::split(source)?;
     match words.as_slice() {
         [word] => existing(word),
         _ => None,
     }
+}
+
+/// Match shlex's comment boundary without interpreting the path: only an
+/// unquoted, unescaped # at the start of a word starts a shell comment.
+fn has_shell_comment(source: &str) -> bool {
+    let mut quote = None;
+    let mut word = false;
+    let mut chars = source.chars();
+    while let Some(c) = chars.next() {
+        match quote {
+            Some('\'') => {
+                if c == '\'' {
+                    quote = None;
+                }
+            }
+            Some('"') => match c {
+                '\\' => {
+                    chars.next();
+                }
+                '"' => quote = None,
+                _ => {}
+            },
+            None => match c {
+                '\\' => {
+                    chars.next();
+                    word = true;
+                }
+                '\'' | '"' => {
+                    quote = Some(c);
+                    word = true;
+                }
+                ' ' | '\t' | '\n' => word = false,
+                '#' if !word => return true,
+                _ => word = true,
+            },
+            _ => unreachable!("only shell quote characters are stored"),
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -264,6 +308,34 @@ mod tests {
         std::fs::write(&exact, b"exact").unwrap();
         std::fs::write(dir.join("literal space.png"), b"other").unwrap();
         assert_eq!(dropped_file(exact.to_str().unwrap()), Some(exact));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn dropped_paths_do_not_discard_shell_comment_tails() {
+        let dir = std::env::temp_dir().join(format!("fl-drop-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let file = dir.join("notes.txt");
+        std::fs::write(&file, b"fixture").unwrap();
+        for input in [
+            format!("'{}' # keep these instructions", file.display()),
+            format!("{} # instructions", file.display()),
+            format!("\"{}\" \t# instructions", file.display()),
+        ] {
+            assert!(dropped_file(&input).is_none(), "{input}");
+        }
+        let hash = dir.join("has space#tail.txt");
+        std::fs::write(&hash, b"hash").unwrap();
+        let plain = hash.to_str().unwrap();
+        for input in [
+            plain.to_owned(),
+            format!("'{plain}'"),
+            format!("\"{plain}\""),
+            plain.replace(' ', "\\ "),
+            plain.replace(' ', "\\ ").replace('#', "\\#"),
+        ] {
+            assert_eq!(dropped_file(&input), Some(hash.clone()), "{input}");
+        }
         std::fs::remove_dir_all(dir).unwrap();
     }
 
