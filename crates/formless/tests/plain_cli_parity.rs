@@ -78,7 +78,11 @@ impl Fixture {
                         Request::ProposalDiff { id } => proposal_comparison(id),
                         Request::ListSessions => json!([
                             {"id":"abc-one","name":"First","created_at":"","updated_at":""},
-                            {"id":"abc-two","name":"Second","created_at":"","updated_at":""}
+                            {"id":"abc-two","name":"Second","created_at":"","updated_at":""},
+                            {"id":"sel-z","name":"ไทย 日本語","preview":"ข้อความ 日本語","created_at":"","updated_at":"","pinned":true,"tags":["work","ไทย"]},
+                            {"id":"sel-a","name":"Alpha","created_at":"","updated_at":"","tags":["workshop"]},
+                            {"id":"sel-q","name":"Archived","created_at":"","updated_at":"","pinned":true,"archived":true,"tags":["work"]},
+                            {"id":"sel-b","name":"Gamma","created_at":"","updated_at":"","pinned":true,"tags":["work"]}
                         ]),
                         Request::RunMetrics {
                             limit,
@@ -293,6 +297,81 @@ fn shipped_files_and_rewind_use_owned_rpc_prefix_resolution_and_json_contract() 
             .count(),
         1
     );
+}
+
+#[test]
+fn session_list_selectors_preserve_order_and_use_only_the_existing_read_request() {
+    let fixture = Fixture::new();
+    let base = fixture.run(&["sessions", "list", "--json"]);
+    assert!(base.status.success(), "{base:?}");
+    let original: Vec<Value> = serde_json::from_slice(&base.stdout).unwrap();
+    assert_eq!(
+        original
+            .iter()
+            .map(|s| s["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["abc-one", "abc-two", "sel-z", "sel-a", "sel-b"]
+    );
+    for (flags, ids) in [
+        (vec!["--pinned"], vec!["sel-z", "sel-b"]),
+        (vec!["--tag", "WoRK"], vec!["sel-z", "sel-b"]),
+        (
+            vec!["--archived", "--tag", "work", "--pinned"],
+            vec!["sel-q"],
+        ),
+        (vec!["--tag", "ไทย"], vec!["sel-z"]),
+        (vec!["--tag", "wor"], vec![]),
+        (vec!["--tag", "#work"], vec![]),
+    ] {
+        let mut args = vec!["sessions", "list"];
+        args.extend(flags.clone());
+        let human = fixture.run(&args);
+        assert!(human.status.success(), "{human:?}");
+        let text = String::from_utf8(human.stdout).unwrap();
+        if ids.is_empty() {
+            assert!(
+                text.contains("no Sessions match --tag") && text.contains(flags[1]),
+                "{text}"
+            );
+        } else {
+            let positions: Vec<_> = ids.iter().map(|id| text.find(id).unwrap()).collect();
+            assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+            if ids.contains(&"sel-z") {
+                assert!(text.contains("★ ไทย 日本語") && text.contains("ข้อความ 日本語"));
+            }
+            for excluded in ["abc-one", "abc-two", "sel-z", "sel-a", "sel-q", "sel-b"]
+                .into_iter()
+                .filter(|id| !ids.contains(id))
+            {
+                assert!(!text.contains(excluded), "excluded {excluded}: {text}");
+            }
+        }
+        args.push("--json");
+        let out = fixture.run(&args);
+        assert!(out.status.success(), "{out:?}");
+        let rows: Vec<Value> = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|s| s["id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ids
+        );
+        for row in rows.iter().filter(|row| row["archived"] == false) {
+            assert_eq!(
+                row,
+                original
+                    .iter()
+                    .find(|original| original["id"] == row["id"])
+                    .unwrap()
+            );
+        }
+    }
+    assert!(fixture
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|request| matches!(request, Request::ListSessions)));
 }
 
 #[test]

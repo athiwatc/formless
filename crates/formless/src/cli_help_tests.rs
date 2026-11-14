@@ -711,6 +711,33 @@ fn help_check_rejects_blank_and_label_only_descriptions() {
 }
 
 #[test]
+fn session_list_organization_filters_parse_together_without_dispatch() {
+    let cli = super::Cli::try_parse_from([
+        "formless",
+        "sessions",
+        "list",
+        "--archived",
+        "--pinned",
+        "--tag",
+        "WoRK",
+        "--json",
+    ])
+    .unwrap();
+    assert!(
+        matches!(cli.cmd, Some(super::Cmd::Sessions {action:super::SessionsAction::List {
+        archived:true,pinned:true,tag:Some(ref tag),json:true}}) if tag=="WoRK")
+    );
+    assert!(super::Cli::try_parse_from(["formless", "sessions", "list", "--tag"]).is_err());
+    let help = super::Cli::try_parse_from(["formless", "sessions", "list", "--help"])
+        .err()
+        .unwrap()
+        .to_string();
+    for expected in ["--pinned", "--tag", "lowercasing", "leading #"] {
+        assert!(normalized(&help).contains(expected));
+    }
+}
+
+#[test]
 fn mcp_log_lines_exposes_and_enforces_the_existing_bounds() {
     for lines in ["1", "50", "1000"] {
         assert!(super::Cli::try_parse_from([

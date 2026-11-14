@@ -4981,7 +4981,7 @@ the TUI. Command-specific arguments and defaults are available through
 | `formless routing` | `--json` | Read currently available daemon routing decisions and returned candidate figures without starting a model request. |
 | `formless runs` | No action: list; `show`, `cancel` | List recent Runs, inspect one by ID/prefix, or cancel that exact Run. |
 | `formless security` | `status` | Inspect the daemon's grants, denials, trusted resources, and exposed interfaces. |
-| `formless sessions` | `fork`, `compare`, `list`, `show`, `files`, `rewind`, `rename`, `rm`, `restore`, `import`, `search`, `archive`, `unarchive`, `export` | Manage stored Sessions, follow a Run with `show --follow`, or inspect tracked files. |
+| `formless sessions` | `fork`, `compare`, `list`, `show`, `files`, `rewind`, `rename`, `rm`, `restore`, `import`, `search`, `archive`, `unarchive`, `export` | Manage stored Sessions, follow a Run with `show --follow`, or inspect tracked files. `list --pinned --tag TAG` filters the fetched reply; selectors combine with `--archived`, preserving reply order. |
 | `formless skills` | `reviews`, `add`, `remove`, `list`, `enable`, `disable`, `show`, `export`, `import` | Inspect and manage Skills and their retained description reviews. |
 | `formless storage` | `--json` | Report disk usage by data category. |
 | `formless tools` | `reviews`, `list`, `disable`, `enable`, `undo`, `pin`, `unpin`, `tag`, `show`, `retire`, `restore`, `rollback`, `purge`, `run`, `export`, `import` | Inspect, manage, run, or transfer registry Tools. |
@@ -4994,6 +4994,11 @@ the TUI. Command-specific arguments and defaults are available through
 with one checked UTC cutoff. Omit `--since` for all history. Tool rows use stored
 `tool_id` values; reports retain their own row order and are independent reads,
 not a transactional snapshot. Runs and daily usage remain separate surfaces.
+
+`formless sessions list --pinned --tag WORK --json` selects active pinned Sessions
+whose stored tags contain exactly `work`. Only the tag argument is lowercased;
+a leading `#` is not stripped. Add `--archived` to select the archived partition.
+These selectors filter the existing reply on the client.
 
 `update --json`, `update check --json`, and `update --check --json` emit one
 object: `{installed, status, newer_releases: [{tag, url, notes}]}`. Notes retain
