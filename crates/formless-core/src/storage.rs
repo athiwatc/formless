@@ -4484,12 +4484,15 @@ impl Store {
             )
             .optional()?;
         Ok(row.map(|mut ex| {
-            if ex.output.len() > MAX {
-                let mut end = MAX;
-                while !ex.output.is_char_boundary(end) {
-                    end -= 1;
+            for field in [&mut ex.input, &mut ex.output] {
+                if field.len() > MAX {
+                    let mut end = MAX;
+                    while !field.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    field.truncate(end);
+                    field.push_str("… (cut)");
                 }
-                ex.output = format!("{}… (cut)", &ex.output[..end]);
             }
             ex
         }))
