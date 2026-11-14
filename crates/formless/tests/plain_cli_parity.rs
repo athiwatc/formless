@@ -434,15 +434,6 @@ fn shipped_proposal_diff_is_read_only_and_preserves_the_complete_comparison() {
         .unwrap()
         .contains("proposal not found"));
 }
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
-        if let Some(thread) = self.thread.take() {
-            thread.join().unwrap();
-        }
-        let _ = std::fs::remove_dir_all(&self.root);
-    }
-}
 
 #[test]
 fn shipped_files_and_rewind_use_owned_rpc_prefix_resolution_and_json_contract() {
