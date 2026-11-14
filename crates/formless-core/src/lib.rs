@@ -17,6 +17,7 @@ pub mod dupes;
 pub mod errors;
 pub mod files;
 pub mod forecast;
+mod frontmatter;
 pub mod fuzzy;
 pub mod hooks;
 pub mod housekeeping;
