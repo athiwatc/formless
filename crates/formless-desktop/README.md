@@ -61,6 +61,7 @@ Findings, measurements, the parity inventory and the open blockers are in
 [docs/desktop/phase0-findings.md](../../docs/desktop/phase0-findings.md).
 
 Current continuation evidence and remaining acceptance are recorded in
+[the stream-ordering report](../../docs/desktop/stream-ordering-20261114.md),
 [the forecast report](../../docs/desktop/forecast-confirmation-20261114.md),
 [the recovery/packaging report](../../docs/desktop/recovery-and-packaging-20261114.md)
 and [the live-client report](../../docs/desktop/live-client-20261114.md). Later

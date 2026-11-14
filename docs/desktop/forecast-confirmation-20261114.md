@@ -1,5 +1,8 @@
 # Native forecast confirmation continuation
 
+Later real provider retry/Tool-turn characterization and remaining streaming
+contract are recorded in [the ordering report](stream-ordering-20261114.md).
+
 Draft PR #2081 continues epic #1753. This increment implements native forecast
 consent; it does not complete the epic. The earlier transport/recovery and
 packaging reports remain historical evidence. This report supersedes their
