@@ -419,6 +419,27 @@ impl InputLine {
         self.insert_raw(text);
     }
 
+    /// Replace only bytes owned by a recorded modal insertion. Its trailing
+    /// boundary can now lie inside a cluster joined with an existing neighbor;
+    /// keep that neighbor and restore a full-text cursor boundary afterward.
+    pub(crate) fn replace_modal_inserted(
+        &mut self,
+        range: std::ops::Range<usize>,
+        expected: &str,
+        replacement: &str,
+    ) -> bool {
+        if self.text.get(range.clone()) != Some(expected) {
+            return false;
+        }
+        self.before_edit(true);
+        self.text.replace_range(range.clone(), replacement);
+        self.cursor = range.start + replacement.len();
+        self.anchor = None;
+        self.snap_after_insert();
+        self.browsing = None;
+        true
+    }
+
     fn insert_raw(&mut self, s: &str) {
         self.text.insert_str(self.cursor, s);
         self.cursor += s.len();
@@ -1000,6 +1021,25 @@ fn find_back(history: &[impl AsRef<str>], query: &str, before: usize) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn modal_insert_range_replacement_preserves_joined_neighbor_and_refuses_stale_bytes() {
+        let mut line = InputLine::from("ab");
+        line.set_modal_cursor(1);
+        line.insert_modal_paste("X\u{0600}");
+        let before = line.to_string();
+        let cursor = line.cursor_byte();
+        assert!(!line.replace_modal_inserted(1..4, "stale", "replacement"));
+        assert!(!line.replace_modal_inserted(1..3, "X\u{0600}", "replacement"));
+        assert_eq!(&*line, before);
+        assert_eq!(line.cursor_byte(), cursor);
+        let repeated = "X\u{0600}".repeat(3);
+        assert!(line.replace_modal_inserted(1..4, "X\u{0600}", &repeated));
+        assert_eq!(&*line, format!("a{repeated}b"));
+        assert_eq!(line.cursor_byte(), line.len());
+        assert!(line.undo());
+        assert_eq!(&*line, "ab");
+    }
 
     #[test]
     fn composer_joining_insertions_keep_full_grapheme_boundaries() {

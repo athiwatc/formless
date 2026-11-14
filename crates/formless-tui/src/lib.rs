@@ -28476,6 +28476,32 @@ mod tests {
     }
 
     #[test]
+    fn vim_counted_paste_keeps_trailing_prepend_repetitions_before_neighbors() {
+        let mut app = test_app();
+        app.vim_mode = true;
+        app.input.set("ab");
+        app.input.set_modal_cursor(1);
+        app.vim_input.mode = vim::Mode::Normal;
+        app.key(key(KeyCode::Char('3')));
+        app.key(key(KeyCode::Char('i')));
+        app.paste("X\u{0600}");
+        app.key(key(KeyCode::Esc));
+        let expected = format!("a{}b", "X\u{0600}".repeat(3));
+        assert_eq!(&*app.input, expected);
+        app.key(key(KeyCode::Char('u')));
+        assert_eq!(&*app.input, "ab");
+        app.key(key(KeyCode::Char('.')));
+        assert_eq!(&*app.input, expected);
+        app.key(key(KeyCode::Char('u')));
+        assert_eq!(&*app.input, "ab");
+        app.key(key(KeyCode::Char('2')));
+        app.key(key(KeyCode::Char('.')));
+        assert_eq!(&*app.input, format!("a{}b", "X\u{0600}".repeat(2)));
+        app.key(key(KeyCode::Char('u')));
+        assert_eq!(&*app.input, "ab");
+    }
+
+    #[test]
     fn vim_bracketed_paste_keeps_prepend_order_through_undo_count_and_dot() {
         let mut app = test_app();
         app.vim_mode = true;
