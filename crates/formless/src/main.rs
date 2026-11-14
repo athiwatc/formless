@@ -5582,8 +5582,8 @@ enum SessionsAction {
     Search {
         /// Text to find in stored Session messages
         query: String,
-        /// Maximum number of matching messages to return
-        #[arg(long, default_value_t = 20)]
+        /// Maximum matching messages (1–200; default 20)
+        #[arg(long, default_value_t = 20, value_parser = parse_session_search_limit)]
         limit: usize,
         /// Print machine-readable JSON instead of human-readable output
         #[arg(long)]
@@ -5828,18 +5828,7 @@ fn sessions_cmd(paths: Paths, action: SessionsAction) -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&hits)?);
                 return Ok(());
             }
-            if hits.is_empty() {
-                println!("no messages match '{query}'");
-            }
-            for h in hits {
-                println!(
-                    "{}  {}  [{}] {}",
-                    &h.session_id[..8.min(h.session_id.len())],
-                    h.session_name,
-                    h.role,
-                    h.snippet.replace('\n', " ")
-                );
-            }
+            print!("{}", session_search_text(&query, limit, &hits));
         }
         SessionsAction::Archive { id } => set_archived(&paths, &id, true)?,
         SessionsAction::Unarchive { id } => set_archived(&paths, &id, false)?,
@@ -6009,6 +5998,59 @@ fn config_edit(paths: &Paths) -> Result<()> {
 }
 
 /// The Session with this id or id prefix.
+fn parse_session_search_limit(value: &str) -> std::result::Result<usize, String> {
+    value
+        .parse::<usize>()
+        .ok()
+        .filter(|limit| (1..=200).contains(limit))
+        .ok_or_else(|| "search limit must be an integer from 1 to 200".into())
+}
+
+fn session_search_text(query: &str, limit: usize, hits: &[formless_protocol::SearchHit]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    if hits.is_empty() {
+        if query.trim().is_empty() {
+            out.push_str("empty search query\n");
+        } else {
+            let _ = writeln!(
+                out,
+                "no messages match '{}'",
+                comparison_terminal_text(query)
+            );
+        }
+        return out;
+    }
+    for hit in hits {
+        // Same boundary-safe stored date/time presentation as other CLI rows.
+        let time = hit
+            .created_at
+            .get(..16)
+            .unwrap_or(&hit.created_at)
+            .replace('T', " ");
+        let short_id: String = hit.session_id.chars().take(8).collect();
+        let _ = writeln!(
+            out,
+            "{}  {}  #{} {} [{}] {}",
+            comparison_terminal_text(&short_id),
+            comparison_terminal_text(&hit.session_name),
+            hit.seq,
+            comparison_terminal_text(&time),
+            comparison_terminal_text(&hit.role),
+            comparison_terminal_text(&hit.snippet.replace('\n', " "))
+        );
+    }
+    if hits.len() >= limit {
+        let _ = writeln!(out, "Result limit {limit} reached; more matches may exist.");
+        if limit < 200 {
+            out.push_str("Increase --limit up to 200, or narrow the query.\n");
+        } else {
+            out.push_str("Narrow the query to find other matches.\n");
+        }
+    }
+    out
+}
+
 fn find_session(paths: &Paths, id: &str) -> Result<SessionInfo> {
     let list: Vec<SessionInfo> = serde_json::from_value(formless_tui::client::request_once(
         paths,
@@ -9479,3 +9521,7 @@ mod pairing_qr_width_tests {
         assert!(!super::pairing_qr_fits(&[], Some(80)));
     }
 }
+
+#[cfg(test)]
+#[path = "session_search_tests.rs"]
+mod session_search_tests;
