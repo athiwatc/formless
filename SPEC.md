@@ -2621,6 +2621,13 @@ Tools fill capability gaps; skills say how to use them well.
   version, starts **disabled**: the user reviews the body and files
   (`GetSkill`, `formless skills show`) and enables it. Skills that bundle
   scripts are flagged.
+- **Source selection:** existing local folders always copy working files,
+  even when their name ends in `.git`; use an explicit `file://` URL to clone
+  a local repository. Existing local ZIP files are extracted. Git URL schemes
+  `http`, `https`, `ssh`, `git` and `file` are recognized case-insensitively,
+  lowercasing only the scheme for transport lookup; other URL bytes and recorded
+  source stay as supplied. Existing `git@` and `.git` source spellings remain
+  delegated to native Git validation and transport policy.
 - **Progressive disclosure:** only enabled skills' `name: description`
   lines go into the system prompt, as a sorted "Skills" block that is part
   of the per-Session prompt snapshot (§11), so installing or enabling a
