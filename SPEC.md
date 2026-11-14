@@ -3921,7 +3921,13 @@ run_tool = "network_policy"     # a registry Tool, or…
     forward. Ctrl+U and Ctrl+K delete to the start and end of the line.
   - Shift+Enter, where the terminal reports it, or `\` + Enter inserts a
     newline. The box grows to 8 rows.
-  - ↑/↓ move between lines. On the first or last line they walk the
+  - In the non-Vim composer, ↑/↓ move between visual rows, including soft
+    wraps and explicit newlines, keeping a preferred display column across
+    shorter rows. Shift+↑/↓ extend selection across the same rows. Width comes
+    from the drawn composer after its prompt/border; resizing resets the
+    preferred-column basis. Vim and shared Tool-editor movement retain their
+    existing logical-line behavior. On the first or last visual row, ordinary
+    non-Vim arrows walk the
     current Session's earlier messages, and Down past the newest returns
     the draft. Ctrl+R searches that history. History entries are borrowed from
     the selected Session; typing/searching does not copy every message's text
