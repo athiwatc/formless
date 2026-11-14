@@ -4078,8 +4078,8 @@ run_tool = "network_policy"     # a registry Tool, or…
 - **Path scope.** Each new `fs:read:`/`fs:write:` path on a prompt can
   be granted wider: the path itself (default), its folder, or the
   repository it lies in (the nearest folder holding `.git` (a folder or
-  a file, so worktrees count), `.hg`, `.jj`, `.svn`, `.pijul`, `_darcs`
-  or `.fossil`), else the project (`Cargo.toml`, `package.json`,
+  a file, so worktrees count), `.hg`, `.jj`, `.svn`, `.pijul`, `_darcs`,
+  `.fslckout` or `_FOSSIL_`), else the project (`Cargo.toml`, `package.json`,
   `pyproject.toml`, `go.mod`). `ApprovalRequested.path_options` lists
   them; the answer's `paths` maps a requested spec to the chosen folder.
   - **Read and write apart:** each Capability has its own pick (TUI: `r`
