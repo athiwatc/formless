@@ -75,7 +75,7 @@ impl Vim {
         if text.is_empty() {
             return;
         }
-        let changed = line.selection().is_none_or(|range| &line[range] != text);
+        let changed = line.selection().is_none_or(|range| line[range] != text);
         // Snapping after each scalar can cross an existing neighbor joined by
         // a Prepend/ZWJ/RI character and reorder later pasted characters.
         line.insert_modal_paste(&text);
