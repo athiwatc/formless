@@ -1,5 +1,9 @@
 # Native forecast confirmation continuation
 
+Later native Profile question forms, current full checks and a fresh clean
+development bundle are recorded in [the question report](native-questions-20261114.md).
+Security approvals still require Formless TUI.
+
 Later real provider retry/Tool-turn characterization and remaining streaming
 contract are recorded in [the ordering report](stream-ordering-20261114.md).
 

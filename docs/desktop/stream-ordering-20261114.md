@@ -1,5 +1,9 @@
 # Stream ordering: measured boundaries and remaining contract
 
+Later native question forms and the four-case daemon suite are documented in
+[the question continuation](native-questions-20261114.md). The ordering cases
+below remain characterization; streaming display is still disabled.
+
 This continues draft #2081 / epic #1753 after independent review of
 `6372d587d1975aff103fbf3ff0784c64acd2adc4`. Streaming display remains disabled.
 This increment adds actual IPC/provider characterization, not a new daemon
