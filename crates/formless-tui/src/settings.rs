@@ -80,7 +80,7 @@ impl Row {
     }
 }
 
-const EFFORTS: &[&str] = &["", "low", "medium", "high"];
+const EFFORTS: &[&str] = &["", "minimal", "low", "medium", "high"];
 
 fn on(b: bool) -> String {
     if b { "on" } else { "off" }.into()
@@ -922,8 +922,42 @@ mod tests {
     }
 
     #[test]
+    fn minimal_effort_is_selected_and_cycles_without_clearing_the_default() {
+        let paths = formless_core::Paths {
+            data_dir: "/d".into(),
+            config_dir: "/c".into(),
+            profile: "p".into(),
+        };
+        let mut cfg = Config::default();
+        cfg.provider.reasoning_effort = Some("minimal".into());
+        let all = rows(&cfg, &json!({}), false, &paths);
+        let effort = all
+            .iter()
+            .find(|row| row.key == "provider.reasoning_effort")
+            .unwrap();
+        assert_eq!(effort.value, "minimal");
+        let Kind::Choice(choices) = &effort.kind else {
+            panic!("effort choice");
+        };
+        assert!(choices.contains(&"minimal"));
+        assert_eq!(next_choice(choices, &effort.value), json!("low"));
+        assert_eq!(next_choice(choices, ""), json!("minimal"));
+        assert_eq!(next_choice(choices, "low"), json!("medium"));
+        assert_eq!(next_choice(choices, "medium"), json!("high"));
+        assert_eq!(next_choice(choices, "high"), Value::Null);
+        let existing =
+            json!({"provider":"default", "description":"Original", "reasoning_effort":"minimal"});
+        let mut form = Form::role(Some("fast"), Some(&existing));
+        form.fields[3].input.set("Changed description");
+        let Request::UpsertRole { role, .. } = form.request().unwrap() else {
+            panic!("role request");
+        };
+        assert_eq!(role["reasoning_effort"], "minimal");
+    }
+
+    #[test]
     fn choices_cycle_through_unset() {
-        assert_eq!(next_choice(EFFORTS, ""), json!("low"));
+        assert_eq!(next_choice(EFFORTS, ""), json!("minimal"));
         assert_eq!(next_choice(EFFORTS, "high"), Value::Null);
         assert_eq!(
             next_choice(&["chat", "responses"], "responses"),
