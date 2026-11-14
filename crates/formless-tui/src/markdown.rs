@@ -1063,6 +1063,9 @@ fn wrap(spans: Vec<InlineSpan>, avail: usize) -> Vec<Vec<Span<'static>>> {
 
 /// Split spans into rows of at most `avail` columns, ignoring words.
 fn hard_wrap(spans: Vec<Span<'static>>, avail: usize) -> Vec<Vec<Span<'static>>> {
+    if avail == 0 {
+        return Vec::new();
+    }
     let mut rows = vec![Vec::new()];
     let mut w = 0;
     for span in spans {
@@ -1070,6 +1073,7 @@ fn hard_wrap(spans: Vec<Span<'static>>, avail: usize) -> Vec<Vec<Span<'static>>>
         // By cluster, so a mark never starts a row and an emoji sequence
         // is never cut (#786).
         for g in span.content.graphemes(true) {
+            let g = if g.width() > avail { "…" } else { g };
             let cw = g.width();
             if w + cw > avail && w > 0 {
                 if !buf.is_empty() {
@@ -1750,13 +1754,13 @@ mod tests {
                     .flat_map(|row| row.iter())
                     .map(|span| span.content.as_ref())
                     .collect::<String>(),
-                "（文）"
+                if width == 1 { "………" } else { "（文）" }
             );
             assert!(rows.iter().all(|row| row
                 .iter()
                 .map(|span| span.content.width())
                 .sum::<usize>()
-                <= width.max(2)));
+                <= width));
         }
         for source in ["กขคง", "ກຂຄງ", "កខគឃ", "ကခဂဃ"] {
             let rows = wrap(vec![span(source, bold)], 2);
@@ -1775,6 +1779,94 @@ mod tests {
                 text_rows(hard_wrap(vec![Span::styled(source, bold)], 2))
             );
         }
+    }
+
+    #[test]
+    fn hard_wrap_replaces_clusters_wider_than_the_row_budget() {
+        let span = |text: &str, style| InlineSpan {
+            content: text.into(),
+            style,
+            literal: false,
+        };
+        let bold = Style::default().add_modifier(Modifier::BOLD);
+        let family = "👨\u{200d}👩\u{200d}👧\u{200d}👦";
+        for source in ["界", family, "a界b", "界界", "a\u{301}界b"] {
+            let expected = source
+                .graphemes(true)
+                .map(|g| if g.width() > 1 { "…" } else { g })
+                .collect::<String>();
+            let rows = hard_wrap(vec![Span::styled(source.to_string(), bold)], 1);
+            assert!(
+                rows.iter()
+                    .all(|r| r.iter().map(|s| s.content.width()).sum::<usize>() <= 1),
+                "{rows:?}"
+            );
+            assert_eq!(
+                rows.iter()
+                    .flatten()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>(),
+                expected
+            );
+            assert!(rows.iter().flatten().all(|s| s.style == bold));
+            assert!(hard_wrap(vec![Span::styled(source.to_string(), bold)], 0).is_empty());
+            let rows = wrap(vec![span(source, bold)], 1);
+            assert!(
+                rows.iter()
+                    .all(|r| r.iter().map(|s| s.content.width()).sum::<usize>() <= 1),
+                "{rows:?}"
+            );
+        }
+        let rows = hard_wrap(vec![Span::styled("a", bold), Span::raw("界b")], 1);
+        assert_eq!(
+            rows.iter()
+                .flatten()
+                .map(|s| s.content.as_ref())
+                .collect::<String>(),
+            "a…b"
+        );
+        assert_eq!(rows[0][0].style, bold);
+        assert_eq!(rows[1][0].style, Style::default());
+        let rows = hard_wrap(vec![Span::raw(format!("{family}界"))], 2);
+        assert_eq!(
+            rows.iter()
+                .flatten()
+                .map(|s| s.content.as_ref())
+                .collect::<String>(),
+            format!("{family}界")
+        );
+    }
+
+    #[test]
+    fn narrow_table_record_values_keep_wide_clusters_inside_the_body() {
+        let source =
+            "| Key | Value |\n|---|---|\n| 界界界界界 | 👨\u{200d}👩\u{200d}👧\u{200d}👦界 |";
+        // Exercise the table renderer with a five-column body budget, as
+        // can remain after reserving enclosing prefixes and indentation.
+        let mut renderer = Renderer {
+            width: 5,
+            ..Default::default()
+        };
+        for event in Parser::new_ext(source, parser_options()) {
+            renderer.event(event);
+        }
+        renderer.flush();
+        let rows = renderer.out;
+        // Scope the assertion to wrapped values: the existing fixed row
+        // heading has its own minimum width and is outside hard wrapping.
+        let values: Vec<_> = rows
+            .iter()
+            .filter(|row| row.spans.first().is_some_and(|s| s.content == "    "))
+            .collect();
+        assert!(!values.is_empty());
+        assert!(values.iter().all(|row| row.width() <= 5), "{values:?}");
+        assert!(
+            values
+                .iter()
+                .flat_map(|row| &row.spans)
+                .any(|s| s.content.contains('…')),
+            "{rows:?}"
+        );
     }
 
     #[test]
