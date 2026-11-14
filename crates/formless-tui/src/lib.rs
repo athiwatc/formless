@@ -11825,35 +11825,58 @@ fn picker_lines(p: &picker::ModelPicker, max_items: usize, color: bool) -> Vec<L
     out
 }
 
-/// Highlight case-insensitive `query` matches in a line's spans; `style`
-/// gets each match's index in the line. Returns the line and its match
-/// count (matches across span boundaries are not found).
+/// Highlight folded `query` matches in one displayed logical line, including
+/// matches crossing styled spans. The callback receives the logical match index.
 fn highlight_matches(
-    line: Line<'static>,
+    mut line: Line<'static>,
     query: &str,
     style: impl Fn(usize) -> Style,
 ) -> (Line<'static>, usize) {
     if formless_core::fuzzy::fold(query).is_empty() {
         return (line, 0);
     }
-    let mut found = 0;
+    let text: String = line
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect();
+    let ranges = formless_core::fuzzy::folded_match_ranges(&text, query);
+    if ranges.is_empty() {
+        return (line, 0);
+    }
+    let marks: Vec<_> = (0..ranges.len()).map(style).collect();
     let mut spans = Vec::new();
-    for span in line.spans {
+    let mut offset = 0;
+    let mut match_index = 0;
+    for span in std::mem::take(&mut line.spans) {
         let chars: Vec<char> = span.content.chars().collect();
+        let end = offset + chars.len();
         let mut start = 0;
-        for range in formless_core::fuzzy::folded_match_ranges(&span.content, query) {
-            if range.start > start {
+        while let Some(range) = ranges.get(match_index) {
+            if range.start >= end {
+                break;
+            }
+            if range.end <= offset {
+                match_index += 1;
+                continue;
+            }
+            let local_start = range.start.saturating_sub(offset);
+            let local_end = range.end.min(end) - offset;
+            if local_start > start {
                 spans.push(Span::styled(
-                    chars[start..range.start].iter().collect::<String>(),
+                    chars[start..local_start].iter().collect::<String>(),
                     span.style,
                 ));
             }
             spans.push(Span::styled(
-                chars[range.clone()].iter().collect::<String>(),
-                style(found),
+                chars[local_start..local_end].iter().collect::<String>(),
+                span.style.patch(marks[match_index]),
             ));
-            found += 1;
-            start = range.end;
+            start = local_end;
+            if range.end > end {
+                break;
+            }
+            match_index += 1;
         }
         if start == 0 {
             spans.push(span);
@@ -11863,8 +11886,10 @@ fn highlight_matches(
                 span.style,
             ));
         }
+        offset = end;
     }
-    (Line::from(spans).style(line.style), found)
+    line.spans = spans;
+    (line, ranges.len())
 }
 
 /// A user-message line with `@path` mentions highlighted.
@@ -23547,9 +23572,9 @@ mod tests {
                 id: format!("m{i}"),
                 session_id: "s".into(),
                 seq: i,
-                role: if i % 2 == 0 { "user" } else { "assistant" }.into(),
+                role: if i % 4 == 0 { "user" } else { "assistant" }.into(),
                 content: if i == 2 || i == 6 {
-                    "the Postgres decision".into()
+                    "the **Postgres** decision".into()
                 } else {
                     "filler\n\n".repeat(10)
                 },
@@ -23559,7 +23584,7 @@ mod tests {
             .collect();
         render(&mut app, 80, 16);
         app.key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
-        for c in "postgres".chars() {
+        for c in "the postgres".chars() {
             app.key(key(KeyCode::Char(c)));
         }
         // The first draw finds the matches; the next shows the count.
@@ -23579,6 +23604,69 @@ mod tests {
         assert!(app.find.is_none() && app.chat_scroll_top.is_none());
         let (line, n) = highlight_matches(Line::raw("Aa aA"), "aa", |_| Style::default());
         assert_eq!((n, line.spans.len()), (2, 3));
+    }
+
+    #[test]
+    fn find_across_styles_preserves_text_styles_and_match_order() {
+        let bold = Style::default().add_modifier(Modifier::BOLD);
+        let italic = Style::default().add_modifier(Modifier::ITALIC);
+        let highlight = Style::default().bg(Color::Yellow);
+        let source = Line::from(vec![
+            Span::styled("prefix alpha ", italic),
+            Span::styled("beta", bold),
+            Span::raw("; alpha "),
+            Span::styled("beta", bold),
+            Span::styled(" suffix", italic),
+        ])
+        .style(Style::default().fg(Color::Cyan));
+        let (lit, count) = highlight_matches(source.clone(), "alpha beta", |index| {
+            highlight.fg(if index == 0 { Color::Red } else { Color::Green })
+        });
+        assert_eq!(count, 2);
+        assert_eq!(lit.to_string(), source.to_string());
+        assert_eq!(lit.style, source.style);
+        assert_eq!(lit.spans.first().unwrap().style, italic);
+        assert_eq!(lit.spans.last().unwrap().style, italic);
+        let matches: Vec<_> = lit
+            .spans
+            .iter()
+            .filter(|s| s.style.bg == Some(Color::Yellow))
+            .collect();
+        assert_eq!(
+            matches
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<Vec<_>>(),
+            vec!["alpha ", "beta", "alpha ", "beta"]
+        );
+        assert!(matches[1].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(matches[0].style.fg, Some(Color::Red));
+        assert_eq!(matches[1].style.fg, Some(Color::Red));
+        assert_eq!(matches[2].style.fg, Some(Color::Green));
+        let (unchanged, count) = highlight_matches(source.clone(), "absent", |_| highlight);
+        assert_eq!(count, 0);
+        assert_eq!(unchanged, source);
+    }
+
+    #[test]
+    fn find_cross_span_combining_sequences_keep_original_text() {
+        let marked = Style::default().add_modifier(Modifier::REVERSED);
+        let line = Line::from(vec![
+            Span::raw("ca"),
+            Span::raw("fe"),
+            Span::raw("\u{301}!"),
+        ]);
+        let (lit, count) = highlight_matches(line, "CAFÉ", |_| marked);
+        assert_eq!(count, 1);
+        assert_eq!(lit.to_string(), "cafe\u{301}!");
+        assert_eq!(
+            lit.spans
+                .iter()
+                .filter(|s| s.style == marked)
+                .map(|s| s.content.as_ref())
+                .collect::<String>(),
+            "cafe"
+        );
     }
 
     #[test]
@@ -23606,7 +23694,7 @@ mod tests {
         assert_eq!(line.to_string(), "İ cafe\u{301} café");
         let source = Line::from(vec![Span::raw("stra"), Span::raw("ße")]);
         let (line, count) = highlight_matches(source, "strasse", |_| marked);
-        assert_eq!(count, 0, "span-boundary behavior remains unchanged");
+        assert_eq!(count, 1, "one phrase crosses the styled span boundary");
         assert_eq!(line.to_string(), "straße");
         let (_, count) = highlight_matches(Line::raw("straße"), "\u{301}", |_| marked);
         assert_eq!(count, 0);
