@@ -268,6 +268,11 @@ h3 { font-size: 0.9375rem; margin: 1.375rem 0 0.5rem; }
 .chip[open] summary::before { content: "▾"; }
 .chip .tname { font-family: var(--mono); font-weight: 650; color: var(--warn); white-space: nowrap; }
 .chip .targs { font-family: var(--mono); color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+/* Historical calls keep full names; argument previews remain finite/ellipsized. */
+.chip.tool-call > summary { flex-wrap: wrap; }
+.chip.tool-call > summary::before { flex: 0 0 1em; }
+.chip.tool-call > summary .tname { min-width: 0; max-width: calc(100% - 1em - 0.5rem); white-space: normal; overflow-wrap: anywhere; }
+.chip.tool-call > summary .targs { flex: 1 1 auto; max-width: 100%; }
 .chip .tstat { margin-left: auto; white-space: nowrap; color: var(--muted); }
 .chip pre { margin: 0; padding: 0.5rem 0.75rem; border-top: 1px solid var(--line); max-height: 22.5rem; overflow: auto; font-size: 0.75rem; white-space: pre-wrap; word-break: break-all; }
 .chip.result .tname { color: var(--accent); }

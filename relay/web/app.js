@@ -1978,7 +1978,7 @@
 
   function toolCallChip(call) {
     const f = call.function || {};
-    return h("details", { class: "chip" },
+    return h("details", { class: "chip tool-call" },
       h("summary", null, h("span", { class: "tname" }, "⚙ " + (f.name || "tool")), h("span", { class: "targs" }, summarizeArgs(f.arguments || ""))),
       payload(f.arguments || ""));
   }
