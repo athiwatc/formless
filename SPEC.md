@@ -2607,8 +2607,12 @@ Tools fill capability gaps; skills say how to use them well.
 
 - **Format:** the Agent Skills `SKILL.md` convention: YAML frontmatter with
   `name` (1-64 lowercase letters, digits, `-`) and `description` (1-1024
-  chars), a Markdown body, and optional extra files. Existing skills
-  install as-is.
+  chars), a Markdown body, and optional extra files. Header comments outside
+  scalar content are ignored; whitespace-separated inline `#` comments leave
+  quoted hashes and URL fragments intact. Only a complete quoted scalar is
+  decoded (JSON-compatible double-quote escapes or doubled single quotes);
+  literal quote fragments and block content retain their characters. Existing
+  skills install as-is; historical installed metadata is not rewritten.
 - **Install:** from a folder, a git URL (`--ref`, `--subdir`) or a
   `.zip`; validated, then stored versioned under
   `<data>/skills/<name>/v<N>/` (10 MB max). A `.zip` is extracted
@@ -5548,8 +5552,11 @@ Web approval and promotion decisions remain pending locally until the daemon
 confirms resolution; failures report that the decision was not delivered and
 remain answerable. Recap and rating controls are rebuilt from current Run state
 outside the cached message body, so live completion and rating changes appear
-immediately and only the current last answer has controls. Markdown formatting
-is limited to 32 nesting levels, 4096 characters per inline parse, and 128 KiB
+immediately and only the current last answer has controls. Web Markdown
+recognizes HTTP(S) schemes case-insensitively in bare and angle autolinks,
+and MAILTO in angle autolinks. URL text and mail-address case are retained;
+existing safe-target filtering and trailing-punctuation behavior still apply.
+Markdown formatting is limited to 32 nesting levels, 4096 characters per inline parse, and 128 KiB
 per formatted message. Content beyond these limits is displayed verbatim as
 plain text, preserving access to persisted messages without recursive parsing.
 

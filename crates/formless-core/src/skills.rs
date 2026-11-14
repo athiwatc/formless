@@ -21,6 +21,24 @@ pub struct SkillMeta {
     pub body: String,
 }
 
+// Decode one complete quoted scalar. Literal quote fragments in the
+// permissive Skill metadata format remain text instead of losing characters.
+fn quoted_scalar(value: &str) -> Option<String> {
+    if value.starts_with('"') {
+        return serde_json::from_str::<String>(value).ok();
+    }
+    let inner = value.strip_prefix('\'')?.strip_suffix('\'')?;
+    let mut chars = inner.chars();
+    let mut decoded = String::new();
+    while let Some(c) = chars.next() {
+        if c == '\'' && chars.next() != Some('\'') {
+            return None;
+        }
+        decoded.push(c);
+    }
+    Some(decoded)
+}
+
 /// Parse `SKILL.md`: `---` frontmatter with `name` and `description`
 /// (plain, quoted, or folded `>`/`|` values), then the body.
 pub fn parse_skill_md(text: &str) -> Result<SkillMeta> {
@@ -38,13 +56,16 @@ pub fn parse_skill_md(text: &str) -> Result<SkillMeta> {
     while i < lines.len() {
         let line = lines[i];
         i += 1;
-        if line.starts_with(char::is_whitespace) || line.trim().is_empty() {
+        if line.starts_with(char::is_whitespace)
+            || line.trim().is_empty()
+            || line.trim_start().starts_with('#')
+        {
             continue;
         }
         let Some((key, value)) = line.split_once(':') else {
             continue;
         };
-        let mut value = value.trim().to_string();
+        let mut value = crate::frontmatter::scalar_without_comment(value.trim()).to_string();
         if value.is_empty() || value == ">" || value == "|" || value == ">-" || value == "|-" {
             // Folded/literal block: the indented lines that follow.
             let mut parts = Vec::new();
@@ -55,8 +76,9 @@ pub fn parse_skill_md(text: &str) -> Result<SkillMeta> {
                 i += 1;
             }
             value = parts.join(" ").trim().to_string();
+        } else if let Some(decoded) = quoted_scalar(&value) {
+            value = decoded;
         }
-        let value = value.trim_matches(|c| c == '"' || c == '\'').to_string();
         fields.insert(key.trim().to_string(), value);
     }
     let name = fields.remove("name").unwrap_or_default();
