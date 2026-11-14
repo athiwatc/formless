@@ -3,6 +3,7 @@
 //! `__host(op, argsJson)` bridge, checked against declared Capabilities.
 
 pub mod caps;
+mod clipboard_diagnostics;
 mod dns;
 mod process_executable;
 mod processes;
@@ -2732,6 +2733,15 @@ fn scoped_model<'a>(
 }
 
 fn run_capture(cmd: &str, args: &[&str], stdin_text: Option<&str>) -> Result<String, String> {
+    run_capture_impl(cmd, args, stdin_text, false)
+}
+
+fn run_capture_impl(
+    cmd: &str,
+    args: &[&str],
+    stdin_text: Option<&str>,
+    detailed: bool,
+) -> Result<String, String> {
     use std::io::Write;
     let mut child = std::process::Command::new(cmd)
         .args(args)
@@ -2739,14 +2749,34 @@ fn run_capture(cmd: &str, args: &[&str], stdin_text: Option<&str>) -> Result<Str
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .map_err(|e| format!("{cmd}: {e}"))?;
+        .map_err(|e| {
+            if detailed {
+                clipboard_diagnostics::failure(cmd, "could not spawn", &e.to_string(), stdin_text)
+            } else {
+                format!("{cmd}: {e}")
+            }
+        })?;
     if let Some(text) = stdin_text {
         if let Some(mut stdin) = child.stdin.take() {
             let _ = stdin.write_all(text.as_bytes());
         }
     }
-    let out = child.wait_with_output().map_err(|e| e.to_string())?;
+    let out = child.wait_with_output().map_err(|e| {
+        if detailed {
+            clipboard_diagnostics::failure(cmd, "could not wait", &e.to_string(), stdin_text)
+        } else {
+            e.to_string()
+        }
+    })?;
     if !out.status.success() {
+        if detailed {
+            return Err(clipboard_diagnostics::failure(
+                cmd,
+                &format!("exited unsuccessfully ({})", out.status),
+                &String::from_utf8_lossy(&out.stderr),
+                stdin_text,
+            ));
+        }
         return Err(format!(
             "{cmd} failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
@@ -2770,9 +2800,7 @@ fn clipboard_read() -> Result<String, String> {
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        run_capture("wl-paste", &[], None)
-            .or_else(|_| run_capture("xclip", &["-selection", "clipboard", "-o"], None))
-            .or_else(|_| run_capture("xsel", &["--clipboard", "--output"], None))
+        clipboard_diagnostics::read()
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -2797,10 +2825,7 @@ pub fn clipboard_write(text: &str) -> Result<(), String> {
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        run_capture("wl-copy", &[], Some(text))
-            .or_else(|_| run_capture("xclip", &["-selection", "clipboard"], Some(text)))
-            .or_else(|_| run_capture("xsel", &["--clipboard", "--input"], Some(text)))
-            .map(|_| ())
+        clipboard_diagnostics::write(text)
     }
     #[cfg(not(any(unix, windows)))]
     {
