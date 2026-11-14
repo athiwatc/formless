@@ -12306,16 +12306,17 @@ impl Daemon {
         let (info, _) = self
             .with_store(|st| st.get_module_by_name(name))?
             .with_context(|| RequestFailure::not_found(format!("no module named '{name}'")))?;
+        let want = args["version"].as_i64().unwrap_or(info.current_version);
         let (versions, dependents) = self.with_store(|st| {
             Ok((
-                st.module_versions(&info.id)?,
+                st.module_versions_for_read(&info.id, want)?,
                 st.module_dependents(&info.name)?,
             ))
         })?;
-        let want = args["version"].as_i64().unwrap_or(info.current_version);
         let (version, code, ..) = versions.iter().find(|v| v.0 == want).with_context(|| {
             RequestFailure::not_found(format!("module '{name}' has no version {want}"))
         })?;
+        let code = code.as_ref().context("selected module code is missing")?;
         Ok(json!({
             "name": info.name,
             "description": info.description,
@@ -18662,3 +18663,7 @@ mod provider_error_guidance_tests;
 #[cfg(test)]
 #[path = "job_state_daemon_tests.rs"]
 mod job_state_daemon_tests;
+
+#[cfg(test)]
+#[path = "module_read_projection_tests.rs"]
+mod module_read_projection_tests;
