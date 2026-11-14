@@ -275,6 +275,13 @@ impl Vim {
         }
         let motion = rest.to_string();
         self.pending.clear();
+        if motion == "j" || motion == "k" {
+            for _ in 0..count {
+                line.vertical(motion == "j");
+            }
+            normal_cursor(line);
+            return Outcome::Handled;
+        }
         if let Some((target, _, _)) =
             motion_target(line, line.cursor_byte(), &motion, count, explicit_count)
         {
@@ -572,7 +579,7 @@ fn normal_cursor(line: &mut InputLine) {
     let start = line_start(line, at);
     let end = line_end(line, at);
     if at == end && end > start {
-        line.set_modal_cursor(prev(line, end))
+        line.clamp_modal_cursor(prev(line, end))
     }
 }
 fn kind(g: &str, big: bool) -> u8 {
@@ -950,6 +957,32 @@ mod tests {
         vim.mode = Mode::Normal;
         (vim, line)
     }
+    #[test]
+    fn composer_vim_vertical_goal_survives_separate_and_counted_motions() {
+        for (text, goal) in [
+            ("abcd\nx\nabcd", 3),
+            ("ab\n界界\nab", 1),
+            ("abcd\n\nabcd", 3),
+        ] {
+            for keys in ["jj", "2j"] {
+                let (mut vim, mut line) = normal(text);
+                line.set_modal_cursor(goal);
+                commands(&mut vim, &mut line, keys);
+                assert_eq!(
+                    line.cursor_byte(),
+                    text.rfind('\n').unwrap() + 1 + goal,
+                    "{keys} {text:?}"
+                );
+                commands(&mut vim, &mut line, "kk");
+                assert_eq!(line.cursor_byte(), goal);
+            }
+        }
+        let (mut vim, mut line) = normal("abcd\nx\nabcd");
+        line.set_modal_cursor(3);
+        commands(&mut vim, &mut line, "jhj");
+        assert_eq!(line.cursor_byte(), 7);
+    }
+
     #[test]
     fn counted_line_motion_unicode_and_operator_forms_keep_boundaries() {
         let (mut v, mut l) = normal("👩‍💻\ne\u{301}\n中\n");
