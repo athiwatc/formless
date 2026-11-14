@@ -112,3 +112,12 @@ test('closing first, or newer status text, is never overwritten by a late failur
   t.calls[1].resolve(null); await tick();
   assert.equal(t.status().textContent, '✗ free: test did not complete');
 });
+
+test('temporary model-test failures name the explicit retry without changing legacy labels',async()=>{
+  const c=fixture();
+  assert.match(c.modelDetail({}, {ok:false,transient:true}),/temporary test failure \(use Test to retry\)/);
+  assert.equal(c.modelDetail({}, {ok:false}),'✗ test failed');
+  assert.equal(c.modelDetail({}, {ok:false,transient:'false'}),'✗ test failed');
+  assert.equal(c.modelDetail({}, {ok:true,transient:true}),'✓ tested');
+  c.calls[0].resolve(null); await c.done;
+});

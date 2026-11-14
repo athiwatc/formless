@@ -467,10 +467,16 @@ an empty listing just asks for one.
   the answer streamed, whether reasoning streamed, and whether tool calls
   work (natively, or only through the prompt-based fallback). Results are
   kept per (endpoint, model) in `<data>/model_tests.json` and shown in the
-  pickers (`✓ tested` / `✗ test failed`). Choosing a model does not start a
+  pickers (`✓ tested` / `✗ test failed`; temporary failures name the manual
+  retry action). Results include a backward-compatible `transient` flag for
+  transport, rate/server and logical-deadline failures. Choosing a model does not start a
   paid test by default. `provider.auto_test_models = true` opts into testing
   previously untested selected models in the background; explicit Test actions
-  stay available without this setting. Background tests deduplicate concurrent
+  stay available without this setting. Within this opt-in path, a later
+  selection may retry a transient failure after five minutes or another
+  failure after 24 hours, based on `tested_at`. Successes stay cached.
+  Unknown records or unreadable timestamps retain manual-Test-only behavior;
+  future timestamps wait rather than causing repeated background probes. Background tests deduplicate concurrent
   picks by endpoint/model and release their reservation on completion or abort.
   Result merges are serialized and written privately through a synced temporary
   file and atomic replacement; save failures are reported, never silently lost.
@@ -5711,7 +5717,7 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
 | `provider.model` / `reasoning_effort` | — (wizard) | Daemon-wide defaults (§4.2) |
 | `provider.context_tokens` (per model) | 128000 | Compaction trigger basis (§4.2, §11) |
 | `provider.model_context_tokens` | {} | Context size per model id, overriding the endpoint-reported size and `context_tokens` for that model (§4.2, §11) |
-| `provider.auto_test_models` | false | Opt into background testing when choosing a previously untested model; tests can spend paid tokens. Explicit Test actions remain available when off (§4.3) |
+| `provider.auto_test_models` | false | Opt into background testing of untested or retry-eligible failed selected models; tests can spend paid tokens. Explicit Test actions remain available when off (§4.3) |
 | `provider.max_retries` | 5 | Bounded backoff attempts (§4.4) |
 | `provider.cache_control` | `auto` | Prompt-cache breakpoints (`cache_control`) on the system prompt and last stable message: `auto` for Claude models, `on`, `off`. Decided per model tried, so a fallback that isn't Claude gets plain content; applied to one-shot completions (compaction, `llm.complete`) too; a 400 naming `cache_control` resends once without them (§4.2) |
 | `provider.cache_key` | `session` | Send a per-Session `prompt_cache_key` for better cache routing (`off` never sends it; dropped automatically if the endpoint rejects it) |
