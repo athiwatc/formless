@@ -52,6 +52,13 @@ pub(super) fn is_not_found(error: &anyhow::Error) -> bool {
         .is_some_and(|e| e.status() == Some(reqwest::StatusCode::NOT_FOUND))
 }
 
+#[cfg(test)]
+pub(super) fn fixture_not_found_error() -> anyhow::Error {
+    tests::fixture(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+        .0
+        .unwrap_err()
+}
+
 fn retry_time(
     headers: &reqwest::header::HeaderMap,
     now: chrono::DateTime<chrono::Utc>,
@@ -245,7 +252,7 @@ mod tests {
 
     // The socket and thread have independent deadlines even if the client
     // fails before connecting. No global env changes or public endpoint.
-    fn fixture(response: &'static [u8]) -> (Result<String>, Duration) {
+    pub(super) fn fixture(response: &'static [u8]) -> (Result<String>, Duration) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         listener.set_nonblocking(true).unwrap();

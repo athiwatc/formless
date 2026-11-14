@@ -6,6 +6,7 @@ mod cli_pipeline;
 mod cli_routing;
 mod cli_run_identity;
 mod cli_tool_success;
+mod cli_update;
 #[cfg(test)]
 mod session_export_tests;
 mod table;
@@ -282,13 +283,18 @@ enum Cmd {
         action: PromptsAction,
     },
     /// Check for a newer release, show what changed, and how to upgrade
-    #[command(after_help = "Examples:\n  formless update check\n  formless update --check")]
+    #[command(
+        after_help = "Examples:\n  formless update check\n  formless update --check\n  formless update check --json\n\nJSON: {installed, status, newer_releases: [{tag, url, notes}]}. Status is update_available, up_to_date (within the fetched page), or release_check_unavailable (HTTP 404 status). Checks never execute an updater."
+    )]
     Update {
         #[command(subcommand)]
         action: Option<UpdateAction>,
         /// Only report (same as `update check`)
         #[arg(long)]
         check: bool,
+        /// One JSON report with installed version, response status and ordered release notes
+        #[arg(long, global = true)]
+        json: bool,
     },
     /// Tool registry inspection/transfer (SPEC §7.8, §12)
     #[command(
@@ -2044,9 +2050,11 @@ fn run_cli(cli: Cli) -> Result<()> {
         Some(Cmd::Auth { action }) => auth_cmd(paths, action),
         Some(Cmd::Relay { action }) => relay_cmd(paths, action),
         Some(Cmd::Prompts { action }) => prompts_cmd(paths, action),
-        Some(Cmd::Update { action, check }) => {
-            update_cmd(check || matches!(action, Some(UpdateAction::Check)))
-        }
+        Some(Cmd::Update {
+            action,
+            check,
+            json,
+        }) => update_cmd(check || matches!(action, Some(UpdateAction::Check)), json),
         Some(Cmd::Tools { action }) => tools_cmd(paths, action),
         Some(Cmd::Naming { action }) => naming_cmd(paths, action),
         Some(Cmd::Reset { force }) => reset_cmd(paths, force),
@@ -2397,49 +2405,15 @@ const INSTALL_COMMAND: &str = concat!(
 
 /// `formless update`: what's newer than this build and what changed in
 /// each release, then how to upgrade (`--check` stops after the report).
-fn update_cmd(check: bool) -> Result<()> {
-    let current = env!("CARGO_PKG_VERSION");
-    let body = match update_http::get(
-        "https://api.github.com/repos/athiwatc/formless/releases?per_page=50",
-    ) {
-        Ok(b) => b,
-        Err(e) if update_http::is_not_found(&e) => {
-            println!("installed: v{current}");
-            println!("latest:    (no published releases yet)");
-            return Ok(());
-        }
-        Err(e) => return Err(e),
-    };
-    let releases: Value = serde_json::from_str(&body).context("parse releases")?;
-    let newer = newer_releases(&releases, current);
-    println!("installed: v{current}");
-    let Some((latest, _, url)) = newer.last() else {
-        println!("up to date");
-        return Ok(());
-    };
-    println!("latest:    {latest}  ({url})");
-    println!();
-    for (tag, notes, _) in &newer {
-        println!("── {tag} ──");
-        println!(
-            "{}",
-            if notes.is_empty() {
-                "(no release notes)"
-            } else {
-                notes
-            }
-        );
-        println!();
-    }
-    if check {
-        println!(
-            "{} newer release(s); `formless update` shows how to upgrade.",
-            newer.len()
-        );
-    } else {
-        println!("To upgrade to {latest}:\n  {}", upgrade_command());
-    }
-    Ok(())
+fn update_cmd(check: bool, json: bool) -> Result<()> {
+    cli_update::report(
+        &mut std::io::stdout().lock(),
+        check,
+        json,
+        env!("CARGO_PKG_VERSION"),
+        upgrade_command(),
+        || update_http::get("https://api.github.com/repos/athiwatc/formless/releases?per_page=50"),
+    )
 }
 
 fn prompts_cmd(paths: Paths, action: PromptsAction) -> Result<()> {
