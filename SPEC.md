@@ -4761,7 +4761,9 @@ undo, redo and replacements invalidate prior asynchronous editor previews.
   quoted or block scalar content and URL fragments remain description text;
   malformed quotes, unsupported fields and duplicate descriptions still fail.
   Expansion is a single literal pass: `$ARGUMENTS` preserves the text after the
-  invocation's first separator; `$1` through `$9` select Unicode-whitespace
+  invocation's first separator only when no ASCII letter, digit or underscore
+  immediately follows its name; `$ARGUMENTS_PATH` and `$ARGUMENTS2` remain
+  literal, while `$ARGUMENTS.` still expands. `$1` through `$9` select Unicode-whitespace
   separated positions. `$$` emits one literal `$`, so `$$1`, `$$5` and
   `$$9.99` preserve shell examples or prices. Escaped dollars and inserted
   arguments are not re-expanded. Missing referenced positions stop expansion
