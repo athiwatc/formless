@@ -9,7 +9,7 @@ pub(super) enum Kind {
 }
 
 fn count(range: &str) -> Option<usize> {
-    let (start, count) = range.split_once(',').map_or((range, "1"), |pair| pair);
+    let (start, count) = range.split_once(',').unwrap_or((range, "1"));
     start.parse::<usize>().ok()?;
     count.parse().ok()
 }
