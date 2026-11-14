@@ -1,15 +1,17 @@
-//! Optional native desktop client for Formless: Phase 0 spike of epic #1753.
+//! Optional native desktop client for Formless, with a preserved Phase 0 fixture.
 //!
 //! [`model`], [`commands`], [`directory`], [`replies`], [`transcript`], [`memory`], [`timeline`], [`full_view`] and
 //! [`fixture`] carry no GUI dependency. [`shell`] is the GPUI Kit view over them and is
 //! only built with the `gui` feature.
 
+pub mod client;
 pub mod commands;
 pub mod directory;
 pub mod fixture;
 pub mod full_view;
 pub mod memory;
 pub mod model;
+pub mod pages;
 pub mod replies;
 pub mod search;
 #[cfg(feature = "gui")]

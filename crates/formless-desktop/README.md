@@ -1,11 +1,50 @@
-# formless-desktop (Phase 0 spike)
+# formless-desktop (optional native client)
 
 An optional native desktop shell for Formless built on
-[GPUI Kit](https://github.com/longbridge/gpui-kit) 0.9.1. It is the Phase 0
-compatibility and design spike of epic #1753. It is a scaffold, not a usable
-client: it renders a synthetic fixture, never starts, contacts or configures
-a Daemon Core. Chat, a read-only fixture Sessions directory and loaded-text
-Search have views. The other destinations still show a "not built" notice.
+[GPUI Kit](https://github.com/longbridge/gpui-kit) 0.9.1. Without `--connect`,
+it preserves the synthetic Phase 0 prototype of epic #1753. With `--connect`,
+it connects to an existing local Daemon Core using the protocol's native
+socket or named pipe. This is an incremental client, **not epic completion**.
+
+## Local daemon mode
+
+Start the daemon through the existing CLI/setup path, then pass its Profile's
+socket path (or full Windows named pipe name):
+
+```sh
+cargo run --locked -- --connect /path/to/profile/daemon.sock
+# Private-profile real daemon + local fake HTTP provider; no GUI or paid API.
+cargo test --no-default-features --features daemon-tests --test daemon --locked
+```
+
+This mode loads real Sessions, supports New Session and Send/Steer/Queue/Stop,
+and displays read-only Tools, recorded Run Metrics, Proposals and Settings.
+Arrow keys browse resource entries; Copy details copies all returned fields
+as JSON. Loaded-text Search keeps its explicit Session scope. Existing pending
+decisions are reported from events and snapshots, with a handoff to the TUI;
+native decision forms are not implemented. The desktop never starts a daemon
+or reads its database, credentials or configuration files.
+
+The current protocol has no snapshot watermark or token offset. This client
+therefore subscribes with deltas disabled and refreshes canonical snapshots:
+completion text appears when the daemon persists it, rather than streaming
+token by token. Events invalidate snapshots; they are never replayed onto
+snapshot text. A relevant overlapping event schedules another read. Requests
+carry window selection generations, including A→B→A navigation. An unchanged
+snapshot leaves the reading anchor and open source viewer alone.
+
+Reconnect reloads state without replaying mutations. Sending is disabled until
+a current Session snapshot arrives. Drafts are kept after acknowledgement,
+rejection, transport failure and navigation. Send deduplication in the daemon
+is connection-scoped: after an unacknowledged action, the client blocks another
+send for that Session until the user reconciles it through the existing TUI.
+Restarting the app is not a safe retry mechanism. OS pipe-write cancellation
+and native Windows/Linux behavior still require platform validation.
+
+The optional `daemon-tests` feature links the daemon only into the test build.
+The normal desktop graph does not embed the daemon or depend on the TUI.
+The remaining sections document the preserved fixture and its diagnostics;
+their synthetic-only behavior applies when `--connect` is omitted.
 
 Findings, measurements, the parity inventory and the open blockers are in
 [docs/desktop/phase0-findings.md](../../docs/desktop/phase0-findings.md).

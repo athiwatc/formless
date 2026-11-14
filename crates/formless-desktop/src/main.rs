@@ -1,8 +1,9 @@
-//! `formless-desktop`: opens the Phase 0 shell over a synthetic fixture.
+//! `formless-desktop`: optional local daemon client or Phase 0 fixture shell.
 //!
-//! It never starts, contacts or configures a Daemon Core.
+//! `--connect` contacts an existing daemon; it never starts or configures one.
 //!
 //! Options:
+//! - `--connect PATH`: use a local daemon socket or full Windows pipe name.
 //! - `--sessions N`, `--blocks N`: size the fixture.
 //! - `--huge-block-mb N`: add one N MiB output block at the tail.
 //! - `--text-scale P`: start at P percent text size (100 to 200).
@@ -51,13 +52,14 @@ use formless_desktop::{fixture, shell};
 use gpui_kit::prelude::*;
 use gpui_kit::{px, size, App, Bounds, Entity, Window, WindowBounds, WindowOptions};
 
-const USAGE: &str = "usage: formless-desktop [--sessions N] [--blocks N] [--huge-block-mb N] \
+const USAGE: &str = "usage: formless-desktop [--connect LOCAL_SOCKET_OR_PIPE] [--sessions N] [--blocks N] [--huge-block-mb N] \
                      [--text-scale P] [--window WxH] [--keep-window] \
                      [--background] [--lifetime S] [--dump-a11y PATH] \
                      [--dump-platform-a11y PATH] \
                      [--smoke] [--stream-seconds S [--stream-rate R]]";
 
 struct Options {
+    connect: Option<std::path::PathBuf>,
     sessions: usize,
     blocks: usize,
     huge_block_mb: usize,
@@ -78,6 +80,7 @@ struct Options {
 
 fn parse_options() -> Result<Options, String> {
     let mut options = Options {
+        connect: None,
         sessions: 10_000,
         blocks: 10_000,
         huge_block_mb: 0,
@@ -104,6 +107,13 @@ fn parse_options() -> Result<Options, String> {
                 .map_err(|_| format!("{name}: {value:?} is not a number"))
         };
         match arg.as_str() {
+            "--connect" => {
+                options.connect = Some(
+                    args.next()
+                        .ok_or("--connect needs a local socket or named pipe path")?
+                        .into(),
+                )
+            }
             "--sessions" => options.sessions = count("--sessions")?,
             "--blocks" => options.blocks = count("--blocks")?,
             "--huge-block-mb" => options.huge_block_mb = count("--huge-block-mb")?,
@@ -145,6 +155,11 @@ fn parse_options() -> Result<Options, String> {
             "--stream-markdown" => options.stream_markdown = true,
             other => return Err(format!("unknown option {other:?}")),
         }
+    }
+    if options.connect.is_some() && (options.stream_seconds > 0 || options.huge_block_mb > 0) {
+        return Err(
+            "--connect cannot be combined with synthetic streaming or huge-block fixtures".into(),
+        );
     }
     Ok(options)
 }
@@ -566,10 +581,18 @@ fn main() {
         shell::bind_keys(cx);
 
         let app_ready = started.elapsed();
-        let sessions = fixture::sessions(options.sessions);
+        let sessions = if options.connect.is_some() {
+            Vec::new()
+        } else {
+            fixture::sessions(options.sessions)
+        };
         let running = fixture::running(&sessions);
-        let mut blocks = fixture::timeline(options.blocks);
-        if options.huge_block_mb > 0 {
+        let mut blocks = if options.connect.is_some() {
+            Vec::new()
+        } else {
+            fixture::timeline(options.blocks)
+        };
+        if options.huge_block_mb > 0 && options.connect.is_none() {
             blocks.push(fixture::huge_block(
                 blocks.len() as u64 + 1,
                 options.huge_block_mb * 1024 * 1024,
@@ -587,10 +610,17 @@ fn main() {
             ..Default::default()
         };
         let (window, shell) = gpui_kit::open_window(window_options, cx, |window, cx| {
-            window.set_window_title("Formless (Phase 0 spike)");
+            window.set_window_title(if options.connect.is_some() {
+                "Formless"
+            } else {
+                "Formless (Phase 0 spike)"
+            });
             let shell = cx.new(|cx| shell::Shell::new(&sessions, &running, blocks, window, cx));
             let scale = TextScale::from_percent(options.text_scale.min(1_000) as u16);
             shell.update(cx, |shell, cx| {
+                if let Some(endpoint) = options.connect.clone() {
+                    shell.connect_daemon(formless_desktop::client::Endpoint(endpoint), cx);
+                }
                 if options.keep_window {
                     shell.set_text_scale(scale, window, cx)
                 } else {
@@ -603,6 +633,24 @@ fn main() {
             shell
         })
         .expect("failed to open the shell window");
+        if options.connect.is_some() {
+            let handle = window;
+            let shell = shell.downgrade();
+            cx.spawn(async move |cx| loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(33))
+                    .await;
+                let result = cx.update(|cx| {
+                    cx.update_window(handle, |_, window, cx| {
+                        shell.update(cx, |shell, cx| shell.poll_client(window, cx))
+                    })
+                });
+                if !matches!(result, Ok(Ok(()))) {
+                    break;
+                }
+            })
+            .detach();
+        }
         if !options.background {
             cx.activate(true);
         }

@@ -36,6 +36,291 @@ const WIDE: Size<Pixels> = Size {
     height: px(900.),
 };
 
+// Tests of the serialized view boundary. This endpoint deliberately does
+// not exist; transport behavior is exercised separately by tests/daemon.rs.
+fn daemon_view(
+    cx: &mut TestAppContext,
+    handle: WindowHandle<Root>,
+    shell: &Entity<Shell>,
+) -> Vec<formless_protocol::SessionInfo> {
+    let sessions = fixture::sessions(3);
+    step(cx, handle, |window, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.connect_daemon(
+                formless_desktop::client::Endpoint(
+                    std::env::temp_dir().join(format!("absent-{}", uuid::Uuid::new_v4())),
+                ),
+                cx,
+            );
+            shell.apply_client_update(
+                formless_desktop::client::Update::Connection {
+                    ready: true,
+                    notice: "Connected fixture boundary".into(),
+                },
+                window,
+                cx,
+            );
+            shell.apply_client_update(
+                formless_desktop::client::Update::Sessions(sessions.clone()),
+                window,
+                cx,
+            );
+        });
+    });
+    sessions
+}
+
+#[gpui_kit::test]
+fn daemon_view_revalidates_queued_snapshot_generations_and_disables_stale_sends(
+    cx: &mut TestAppContext,
+) {
+    use formless_desktop::client::Update;
+    let (handle, shell) = open(cx, WIDE, 0, 0);
+    let sessions = daemon_view(cx, handle, &shell);
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        window.click(session_row_id(&sessions[0].id), cx);
+        let id = shell.read(cx).sidebar().active_id().unwrap().to_string();
+        let generation = shell.read(cx).client_generation();
+        let snapshot = || {
+            replies::session_snapshot(&id, &serde_json::json!({"session":{"id":id}, "running":false,"messages":[typed_message(&id, 1, "assistant", "canonical desktop")]})).unwrap()
+        };
+        shell.update(cx, |shell, cx| {
+            shell.apply_client_update(
+                Update::Snapshot {
+                    generation: generation - 1,
+                    snapshot: snapshot(),
+                },
+                window,
+                cx,
+            )
+        });
+        assert_eq!(shell.read(cx).block_count(), 0);
+        shell.update(cx, |shell, cx| {
+            shell.apply_client_update(
+                Update::Snapshot {
+                    generation,
+                    snapshot: snapshot(),
+                },
+                window,
+                cx,
+            )
+        });
+        assert_eq!(shell.read(cx).block_count(), 1);
+        window.render_frame(cx);
+        window.click_at("region-composer", point(px(40.), px(20.)), cx);
+        window.input("unsent ไทย 😀", cx);
+        window.render_frame(cx);
+        assert_eq!(window.find("composer-primary").disabled(), None);
+        shell.update(cx, |shell, cx| {
+            shell.apply_client_update(
+                Update::SnapshotError {
+                    generation,
+                    session_id: id.clone(),
+                    error: "stale Session fixture".into(),
+                },
+                window,
+                cx,
+            )
+        });
+        window.render_frame(cx);
+        assert_eq!(window.find("composer-primary").disabled(), Some(true));
+        assert_eq!(shell.read(cx).draft(cx).as_ref(), "unsent ไทย 😀");
+        shell.update(cx, |shell, cx| {
+            shell.apply_client_update(
+                Update::Snapshot {
+                    generation,
+                    snapshot: snapshot(),
+                },
+                window,
+                cx,
+            )
+        });
+        shell.update(cx, |shell, cx| {
+            shell.apply_client_update(
+                Update::Connection {
+                    ready: false,
+                    notice: "Disconnected; unknown Run state".into(),
+                },
+                window,
+                cx,
+            )
+        });
+        window.render_frame(cx);
+        assert_eq!(window.find("composer-primary").disabled(), Some(true));
+        assert_eq!(shell.read(cx).block_count(), 1);
+        assert_eq!(shell.read(cx).draft(cx).as_ref(), "unsent ไทย 😀");
+    });
+}
+
+#[gpui_kit::test]
+fn daemon_resources_are_keyboard_browsable_and_copy_exact_json(cx: &mut TestAppContext) {
+    use formless_desktop::client::Update;
+    let (handle, shell) = open(cx, WIDE, 0, 0);
+    daemon_view(cx, handle, &shell);
+    step(cx, handle, |window, cx| {
+        let value = serde_json::json!([{"id":"first","name":"Tool A"},{"id":"second","name":"Tool B","description":"ไทย 😀"}]);
+        shell.update(cx, |shell, cx| {
+            shell.apply_client_update(
+                Update::Page {
+                    destination: Destination::Tools,
+                    result: Ok(value.clone()),
+                },
+                window,
+                cx,
+            );
+            shell.run_command(Command::GoTo(Destination::Tools), window, cx);
+            shell.focus_section(PageSection::Conversation, window, cx);
+        });
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("region-conversation").label(),
+            Some("Tools · daemon data")
+        );
+        window.press("down", cx);
+        window.render_frame(cx);
+        assert_eq!(window.find("resource-selected").value(), Some("Tool B"));
+        window.click("copy-resource", cx);
+        let copied = cx.read_from_clipboard().unwrap().text().unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&copied).unwrap(),
+            value[1]
+        );
+        for _ in 0..3 {
+            shell.update(cx, |shell, cx| {
+                shell.run_command(Command::GoTo(Destination::Settings), window, cx);
+                shell.run_command(Command::GoTo(Destination::Tools), window, cx);
+            });
+            window.render_frame(cx);
+            assert!(window.find("resource-back").visible());
+        }
+    });
+}
+
+#[gpui_kit::test]
+fn daemon_resource_error_and_status_reflow_at_200_percent(cx: &mut TestAppContext) {
+    use formless_desktop::client::Update;
+    let (handle, shell) = open(cx, size(px(480.), px(360.)), 0, 0);
+    daemon_view(cx, handle, &shell);
+    step(cx, handle, |window, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.set_text_scale(TextScale::LARGEST, window, cx);
+            shell.apply_client_update(
+                Update::Page {
+                    destination: Destination::Metrics,
+                    result: Err("Metrics unavailable".into()),
+                },
+                window,
+                cx,
+            );
+            shell.run_command(Command::GoTo(Destination::Metrics), window, cx);
+            shell.focus_section(PageSection::Conversation, window, cx);
+        });
+        settle_frames(window, cx);
+        assert!(window
+            .find("resource-notice")
+            .value()
+            .unwrap()
+            .contains("Metrics unavailable"));
+        for id in ["region-conversation", "resource-notice", "resource-detail"] {
+            assert!(window.find(id).bounds().size.width <= px(480.), "{id}");
+        }
+        shell.update(cx, |shell, cx| {
+            shell.focus_section(PageSection::Status, window, cx)
+        });
+        settle_frames(window, cx);
+        assert!(shell.read(cx).page_metrics().is_inside(PageSection::Status));
+    });
+}
+
+#[gpui_kit::test]
+fn daemon_attachment_clears_a_previously_populated_virtual_sidebar(cx: &mut TestAppContext) {
+    use formless_desktop::client::{Endpoint, Update};
+    let (handle, shell) = open(cx, WIDE, 200, 40);
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        window.scroll(
+            "session-list",
+            ScrollDelta::Pixels(point(px(0.), px(-4000.))),
+            cx,
+        );
+        window.render_frame(cx);
+        shell.update(cx, |shell, cx| {
+            shell.connect_daemon(
+                Endpoint(std::env::temp_dir().join(format!("absent-{}", uuid::Uuid::new_v4()))),
+                cx,
+            )
+        });
+        settle_frames(window, cx);
+        assert!(shell.read(cx).sidebar().rows().is_empty());
+        assert_eq!(window.find("session-count").value(), Some("Sessions (0)"));
+        let sessions = fixture::sessions(3);
+        shell.update(cx, |shell, cx| {
+            shell.apply_client_update(Update::Sessions(sessions.clone()), window, cx)
+        });
+        settle_frames(window, cx);
+        assert_eq!(shell.read(cx).sidebar().rows().len(), 3);
+        assert!(sessions
+            .iter()
+            .any(|session| window.try_find(session_row_id(&session.id)).is_some()));
+        shell.update(cx, |shell, cx| {
+            shell.apply_client_update(Update::Sessions(Vec::new()), window, cx)
+        });
+        settle_frames(window, cx);
+        assert_eq!(window.find("session-count").value(), Some("Sessions (0)"));
+    });
+}
+
+#[gpui_kit::test]
+fn daemon_attention_survives_navigation_and_rejects_retired_updates(cx: &mut TestAppContext) {
+    use formless_desktop::client::Update;
+    let (handle, shell) = open(cx, size(px(480.), px(360.)), 0, 0);
+    daemon_view(cx, handle, &shell);
+    step(cx, handle, |window, cx| {
+        let generation = shell.read(cx).client_generation();
+        shell.update(cx, |shell, cx| {
+            shell.set_text_scale(TextScale::LARGEST, window, cx);
+            shell.apply_client_update(
+                Update::Attention {
+                    generation,
+                    pending: true,
+                },
+                window,
+                cx,
+            );
+            shell.run_command(Command::GoTo(Destination::Tools), window, cx);
+            shell.apply_client_update(
+                Update::Attention {
+                    generation: generation + 1,
+                    pending: false,
+                },
+                window,
+                cx,
+            );
+            shell.focus_section(PageSection::Status, window, cx);
+        });
+        settle_frames(window, cx);
+        assert!(window
+            .find("status-pending-attention")
+            .value()
+            .unwrap()
+            .contains("Formless TUI"));
+        assert!(shell.read(cx).page_metrics().is_inside(PageSection::Status));
+        shell.update(cx, |shell, cx| {
+            shell.apply_client_update(
+                Update::Attention {
+                    generation,
+                    pending: false,
+                },
+                window,
+                cx,
+            )
+        });
+        window.render_frame(cx);
+        assert!(window.try_find("status-pending-attention").is_none());
+    });
+}
+
 fn open(
     cx: &mut TestAppContext,
     window_size: Size<Pixels>,

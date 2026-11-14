@@ -75,7 +75,7 @@ mod render {
     const WHOLE: Fit = Fit::Whole;
     const REFLOWED: Fit = Fit::Reflowed;
 
-    const STATES: [State; 29] = [
+    const STATES: [State; 31] = [
         state("wide-light", 1440., 900., LIGHT, 100, None, WHOLE),
         state("wide-dark", 1440., 900., DARK, 100, None, WHOLE),
         state("medium-light", 1100., 900., LIGHT, 100, None, WHOLE),
@@ -277,6 +277,24 @@ mod render {
             DARK,
             200,
             Some("open-transcript-gap"),
+            REFLOWED,
+        ),
+        state(
+            "daemon-tools-light",
+            1440.,
+            900.,
+            LIGHT,
+            100,
+            Some("open-daemon-tools"),
+            WHOLE,
+        ),
+        state(
+            "minimum-daemon-tools-dark-200pct",
+            480.,
+            360.,
+            DARK,
+            200,
+            Some("open-daemon-tools"),
             REFLOWED,
         ),
     ];
@@ -669,7 +687,19 @@ mod render {
         } else if let Some(control) = click {
             cx.update_window(any, |_, window, cx| {
                 window.render_frame(cx);
-                if control == "open-directory" {
+                if control == "open-daemon-tools" {
+                    use formless_desktop::client::{Endpoint, Update};
+                    shell.update(cx, |shell, cx| {
+                        shell.connect_daemon(Endpoint(std::env::temp_dir().join(format!("absent-{}", uuid::Uuid::new_v4()))), cx);
+                        shell.apply_client_update(Update::Connection { ready: true, notice: "Connected · canonical messages · live token streaming unavailable".into() }, window, cx);
+                        shell.apply_client_update(Update::Page { destination: Destination::Tools, result: Ok(serde_json::json!([
+                            {"id":"tool-a","name":"Tool ไทย 漢字 😀","description":"Unicode data from the daemon view boundary"},
+                            {"id":"tool-b","name":"Second Tool","schema":{"type":"object"}}
+                        ])) }, window, cx);
+                        shell.run_command(Command::GoTo(Destination::Tools), window, cx);
+                        shell.focus_section(PageSection::Conversation, window, cx);
+                    });
+                } else if control == "open-directory" {
                     shell.update(cx, |shell, cx| {
                         shell.run_command(Command::GoTo(Destination::Sessions), window, cx)
                     });
@@ -710,7 +740,7 @@ mod render {
             })
             .expect("offscreen window is open");
             cx.run_until_parked();
-            if fit == Fit::Reflowed {
+            if fit == Fit::Reflowed && control != "open-daemon-tools" {
                 // The overlay panel is inside the window, edge to edge at
                 // most, whatever the page under it was scrolled to.
                 cx.update_window(any, |_, window, cx| {

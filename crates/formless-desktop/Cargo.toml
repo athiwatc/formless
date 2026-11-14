@@ -23,6 +23,9 @@ gui = ["dep:gpui-kit"]
 # than a dev-dependency: dev-dependencies cannot be optional, and one on the
 # kit would compile GPUI even for the model tests.
 test-support = ["gui", "gpui-kit/test-support"]
+# Private-profile daemon/provider integration tests; never linked into the
+# desktop binary or the normal model build.
+daemon-tests = ["dep:formless-core", "dep:axum", "tokio/rt-multi-thread"]
 # Feasibility study, off by default and not wired into the shell: Thai word
 # boundaries from ICU's dictionary, for giving GPUI's line breaker somewhere
 # to break. See src/thai.rs and the findings document.
@@ -55,10 +58,14 @@ required-features = ["test-support"]
 
 [dependencies]
 formless-protocol = { path = "../formless-protocol" }
+formless-core = { path = "../formless-core", default-features = false, optional = true }
+axum = { version = "0.8", optional = true }
 # Daemon replies carry their result as a JSON value (src/replies.rs). Both
 # are already in the lockfile through formless-protocol.
 serde = "1"
 serde_json = "1"
+tokio = { version = "1", features = ["rt", "net", "io-util", "sync", "time", "macros"] }
+uuid = { version = "1", features = ["v4"] }
 # Grapheme boundaries, so a restored selection never lands inside a
 # character the user sees as one. Already in the graph through the kit.
 unicode-segmentation = "1"

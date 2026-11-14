@@ -212,7 +212,7 @@ impl RunState {
             RunState::Idle => "Idle",
             RunState::Running => "Running",
             RunState::Paused => "Paused",
-            RunState::Unknown => "Not connected",
+            RunState::Unknown => "Run state unknown",
         }
     }
 }
@@ -258,10 +258,8 @@ impl ComposerActions {
     }
 }
 
-/// A typed request the shell would hand to the client layer. Phase 0 has no
-/// client layer: the shell notes that the intent happened (a
-/// `memory::IntentRecord`, which holds no message text), drops the intent,
-/// and leaves the draft in place.
+/// A typed request for the optional client layer. Fixture mode records its
+/// metadata without sending. Both modes retain the draft.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Intent {
     SendMessage {
@@ -522,6 +520,13 @@ impl Sidebar {
 
     pub fn active_row(&self) -> Option<&SessionRow> {
         self.rows.get(self.index_of(self.active.as_deref()?)?)
+    }
+
+    /// A canonical daemon snapshot confirms only this Session's Run state.
+    pub fn set_run_state(&mut self, id: &str, state: RunState) {
+        if let Some(index) = self.index_of(id) {
+            self.rows[index].run_state = state;
+        }
     }
 
     fn index_of(&self, id: &str) -> Option<usize> {

@@ -1,0 +1,55 @@
+name: Optional desktop
+
+on:
+  pull_request:
+    paths:
+      - 'crates/formless-desktop/**'
+      - 'crates/formless-protocol/**'
+      - '.github/workflows/desktop.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  desktop:
+    name: Desktop build and portable tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+        working-directory: crates/formless-desktop
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_BUILD_JOBS: '2'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Linux native dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev pkg-config libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libx11-xcb-dev libxcb1-dev libxcb-xinput-dev libxcb-xkb-dev libxcb-cursor-dev libfontconfig1-dev libfreetype6-dev libvulkan-dev
+      - name: Formatting
+        run: cargo fmt -- --check
+      - name: GUI-free model and transport tests
+        run: cargo test --no-default-features --lib --locked
+      - name: Private daemon and fake provider integration
+        run: cargo test --no-default-features --features daemon-tests --test daemon --locked
+      - name: Native build
+        run: cargo build --locked
+      - name: Native shell layout and keyboard dispatch tests
+        run: cargo test --features test-support --test shell --locked
+      - name: Scope of evidence
+        run: echo 'Build, model, daemon/provider and headless layout coverage only. Actual OS IME, screen-reader use, foreground input and 200% visual acceptance remain separate native gates.' >> "$GITHUB_STEP_SUMMARY"

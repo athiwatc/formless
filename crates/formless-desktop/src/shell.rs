@@ -1,11 +1,9 @@
 //! The Phase 0 shell: one window laid out as sidebar, conversation with
 //! composer, context inspector and status line, built from GPUI Kit controls.
 //!
-//! This is a scaffold, not a client. It renders the synthetic
-//! [`crate::fixture`] only and has no Daemon Core connection: composer
-//! actions are recorded as [`Intent`]s and shown in the status line, never
-//! sent, and the draft stays in place. Chat and the read-only fixture
-//! Sessions directory and loaded-text Search have views; the other destinations are notices.
+//! With a client attached it consumes serialized canonical daemon updates and
+//! emits typed intents. Without one, the preserved synthetic fixture records
+//! intents without sending them and shows scaffold notices for resource pages.
 
 use std::cell::{Ref, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -32,6 +30,7 @@ use gpui_kit::{
     Subscription, TestSupportExt as _, Window,
 };
 
+use crate::client::{self, Client, Command as ClientCommand, Update as ClientUpdate};
 use crate::commands::{self, Command};
 use crate::directory::{self, Directory};
 use crate::full_view;
@@ -88,6 +87,8 @@ gpui_kit::actions!(
         SearchOpen,
         SearchBack,
         CloseViewer,
+        ResourceNext,
+        ResourcePrevious,
     ]
 );
 
@@ -96,6 +97,7 @@ const OVERLAY_CONTEXT: &str = "FormlessOverlay";
 const INSPECTOR_CONTEXT: &str = "FormlessInspector";
 const PALETTE_CONTEXT: &str = "FormlessPalette";
 const VIEWER_CONTEXT: &str = "FormlessViewer";
+const RESOURCE_CONTEXT: &str = "FormlessResource";
 const VIEWER_DESCRIPTION: &str =
     "Modal. The whole block as plain text. Tab reaches the summary and controls. \
      Arrow, Page Up, Page Down, Home and End scroll the focused text; \
@@ -190,6 +192,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("home", ScrollViewerStart, Some(VIEWER_CONTEXT)),
         KeyBinding::new("end", ScrollViewerEnd, Some(VIEWER_CONTEXT)),
         KeyBinding::new("escape", CloseViewer, Some(VIEWER_CONTEXT)),
+        KeyBinding::new("down", ResourceNext, Some(RESOURCE_CONTEXT)),
+        KeyBinding::new("up", ResourcePrevious, Some(RESOURCE_CONTEXT)),
     ]);
 }
 
@@ -528,6 +532,16 @@ impl PageMetrics {
 }
 
 pub struct Shell {
+    client: Option<Client>,
+    client_connected: bool,
+    client_snapshot_ready: bool,
+    client_generation: u64,
+    client_status: String,
+    client_attention: bool,
+    client_sessions: Vec<SessionInfo>,
+    resource_pages: HashMap<Destination, crate::pages::Page>,
+    resource_scroll: gpui_kit::UniformListScrollHandle,
+    resource_revision: u64,
     sidebar: Sidebar,
     /// Shared with the timeline's row renderer.
     blocks: Rc<RefCell<Timeline>>,
@@ -673,6 +687,16 @@ impl Shell {
 
         let session_sizes = Self::row_sizes(sidebar.rows().len(), TextScale::default());
         Self {
+            client: None,
+            client_connected: false,
+            client_snapshot_ready: false,
+            client_generation: 0,
+            client_status: String::new(),
+            client_attention: false,
+            client_sessions: Vec::new(),
+            resource_pages: HashMap::new(),
+            resource_scroll: gpui_kit::UniformListScrollHandle::new(),
+            resource_revision: 0,
             sidebar,
             blocks: Rc::new(RefCell::new(Timeline::new(blocks))),
             stream: Coalescer::default(),
@@ -1280,10 +1304,245 @@ impl Shell {
         (self.stream.requests(), self.stream.flushes())
     }
 
-    /// Hand an intent on. There is no client layer to hand it to yet, so it
-    /// is dropped here; only its record stays.
+    /// Fixture mode records intents. Connected mode hands them to the
+    /// bounded worker queue; a draft is kept until a definite outcome.
     fn emit(&mut self, intent: Intent, cx: &mut Context<Self>) {
         self.last_intent = Some(IntentRecord::from(&intent));
+        if self.client.is_some() {
+            self.composer_notice =
+                Some("Action queued; waiting for daemon acknowledgement. Draft kept.".into());
+            self.client_request(ClientCommand::Intent(intent), cx);
+        }
+        cx.notify();
+    }
+
+    pub fn connect_daemon(&mut self, endpoint: client::Endpoint, cx: &mut Context<Self>) {
+        self.client = Some(Client::start(endpoint));
+        self.client_connected = false;
+        self.client_snapshot_ready = false;
+        self.client_status = "Connecting to the local Daemon Core…".into();
+        self.client_attention = false;
+        self.invalidate_source_view();
+        self.transcript_source = TranscriptSource::NotLoaded;
+        self.transcript_state = None;
+        self.sidebar.replace(&[], &HashSet::new(), false);
+        self.session_sizes = Self::row_sizes(0, self.text_scale);
+        self.directory.rebuild(self.sidebar.rows(), "");
+        self.client_sessions.clear();
+        self.resource_pages.clear();
+        *self.blocks.borrow_mut() = Timeline::new(Vec::new());
+        self.timeline
+            .update(cx, |timeline, cx| timeline.reset(0, cx));
+        self.invalidate_search(cx);
+        cx.notify();
+    }
+
+    fn client_request(&mut self, command: ClientCommand, cx: &mut Context<Self>) {
+        if let Some(client) = &self.client {
+            if let Err(error) = client.send(command) {
+                self.client_status = error.into();
+                self.composer_notice = Some(format!("{error} Draft kept.").into());
+            }
+        }
+        cx.notify();
+    }
+
+    fn client_select(&mut self, cx: &mut Context<Self>) {
+        self.client_snapshot_ready = false;
+        self.client_generation = self
+            .client_generation
+            .checked_add(1)
+            .expect("window selection generation exhausted");
+        self.client_request(
+            ClientCommand::Select {
+                session_id: self.sidebar.active_id().map(str::to_string),
+                generation: self.client_generation,
+            },
+            cx,
+        );
+    }
+
+    pub fn client_generation(&self) -> u64 {
+        self.client_generation
+    }
+
+    /// Drained on the UI thread, outside render. Selection is checked again
+    /// here because a reply can already be queued when navigation happens.
+    pub fn poll_client(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let updates: Vec<_> = self
+            .client
+            .as_ref()
+            .map(|client| client.drain().collect())
+            .unwrap_or_default();
+        for update in updates {
+            self.apply_client_update(update, window, cx);
+        }
+        if self.client_connected
+            && self
+                .client
+                .as_ref()
+                .is_some_and(|client| !client.is_ready())
+        {
+            self.apply_client_update(ClientUpdate::Connection { ready: false, notice: "Daemon connection lost; Run state unknown. Reconnecting without retrying actions.".into() }, window, cx);
+        }
+    }
+
+    pub fn apply_client_update(
+        &mut self,
+        update: ClientUpdate,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match update {
+            ClientUpdate::Connection { ready, notice } => {
+                self.client_connected = ready;
+                self.client_status = notice;
+                if !ready {
+                    self.client_snapshot_ready = false;
+                    self.sidebar
+                        .replace(&self.client_sessions, &HashSet::new(), false);
+                }
+            }
+            ClientUpdate::Sessions(sessions) => {
+                let previous = self.sidebar.active_id().map(str::to_string);
+                let previous_state = self.run_state();
+                let vanished = previous.as_ref().is_some_and(|id| {
+                    !sessions
+                        .iter()
+                        .any(|session| &session.id == id && !session.archived)
+                });
+                if vanished {
+                    let evicted = previous
+                        .as_ref()
+                        .map(|id| self.drafts.set(id, &self.accepted_draft))
+                        .unwrap_or_default();
+                    self.rebuild_composer("", None, window, cx);
+                    self.composer_notice = Some(format!("The open Session is no longer available. Its unsent draft was kept for this window. {} older drafts were evicted by the draft retention limit.", evicted.len()).into());
+                }
+                self.client_sessions = sessions;
+                self.sidebar
+                    .replace(&self.client_sessions, &HashSet::new(), false);
+                if let Some(id) = &previous {
+                    self.sidebar.set_run_state(id, previous_state);
+                }
+                self.session_sizes = Self::row_sizes(self.sidebar.rows().len(), self.text_scale);
+                let query = self.directory_query.read(cx).value();
+                self.directory.rebuild(self.sidebar.rows(), &query);
+                if vanished {
+                    self.invalidate_source_view();
+                    self.transcript_state = None;
+                    self.transcript_source = TranscriptSource::NotLoaded;
+                    *self.blocks.borrow_mut() = Timeline::new(Vec::new());
+                    self.timeline
+                        .update(cx, |timeline, cx| timeline.reset(0, cx));
+                    self.client_select(cx);
+                    self.invalidate_search(cx);
+                }
+            }
+            ClientUpdate::Snapshot {
+                generation,
+                snapshot,
+            } => {
+                if generation != self.client_generation
+                    || self.sidebar.active_id() != Some(snapshot.session_id.as_str())
+                    || !self.client_connected
+                {
+                    return;
+                }
+                let state = if snapshot.running {
+                    RunState::Running
+                } else {
+                    self.client_sessions
+                        .iter()
+                        .find(|s| s.id == snapshot.session_id)
+                        .map_or(RunState::Idle, |s| RunState::of(s, &HashSet::new(), true))
+                };
+                self.sidebar.set_run_state(&snapshot.session_id, state);
+                if !self.client_snapshot_ready {
+                    self.client_status =
+                        "Connected · canonical messages · live token streaming unavailable".into();
+                }
+                self.client_snapshot_ready = true;
+                let prefix = self
+                    .blocks
+                    .borrow()
+                    .blocks()
+                    .iter()
+                    .zip(&snapshot.blocks)
+                    .take_while(|(old, new)| old == new)
+                    .count();
+                let old_count = self.blocks.borrow().len();
+                let count = snapshot.blocks.len();
+                if prefix != old_count
+                    || prefix != count
+                    || self.transcript_source != TranscriptSource::Snapshot
+                {
+                    self.invalidate_source_view();
+                    let (state, blocks) = Transcript::new(snapshot).into_parts();
+                    self.transcript_state = Some(state);
+                    self.transcript_source = TranscriptSource::Snapshot;
+                    *self.blocks.borrow_mut() = blocks;
+                    self.timeline.update(cx, |timeline, cx| {
+                        let known = timeline.item_count();
+                        let prefix = prefix.min(known);
+                        timeline.splice(prefix..known, count - prefix, cx);
+                    });
+                    self.invalidate_search(cx);
+                }
+            }
+            ClientUpdate::SnapshotError {
+                generation,
+                session_id,
+                error,
+            } => {
+                if generation != self.client_generation
+                    || self.sidebar.active_id() != Some(session_id.as_str())
+                {
+                    return;
+                }
+                self.client_snapshot_ready = false;
+                self.sidebar.set_run_state(&session_id, RunState::Unknown);
+                self.client_status = format!("Could not refresh this Session: {error}. The displayed transcript may be stale; sending is disabled until it reloads.");
+            }
+            ClientUpdate::Page {
+                destination,
+                result,
+            } => {
+                let mut page =
+                    match result.and_then(|value| crate::pages::Page::decode(destination, value)) {
+                        Ok(page) => page,
+                        Err(error) => crate::pages::Page {
+                            notice: format!(
+                                "Could not load {}: {error}. Refresh to retry.",
+                                destination.label()
+                            ),
+                            ..Default::default()
+                        },
+                    };
+                self.resource_revision = self
+                    .resource_revision
+                    .checked_add(1)
+                    .expect("resource revision exhausted");
+                page.revision = self.resource_revision;
+                self.resource_pages.insert(destination, page);
+            }
+            ClientUpdate::Action { session_id, result } => {
+                let notice = match result { Ok(()) => "Daemon acknowledged the action. Draft kept; edit or clear it before the next message.".to_string(), Err(error) => format!("Daemon rejected the action: {error}. Draft kept.") };
+                if self.sidebar.active_id() == Some(session_id.as_str()) {
+                    self.composer_notice = Some(notice.clone().into());
+                }
+                self.client_status = notice;
+            }
+            ClientUpdate::Attention {
+                generation,
+                pending,
+            } => {
+                if generation == self.client_generation {
+                    self.client_attention = pending;
+                }
+            }
+            ClientUpdate::Notice(notice) => self.client_status = notice,
+        }
         cx.notify();
     }
 
@@ -1706,13 +1965,21 @@ impl Shell {
     }
 
     fn run_state(&self) -> RunState {
+        if self.client.is_some() && (!self.client_connected || !self.client_snapshot_ready) {
+            return RunState::Unknown;
+        }
         self.sidebar
             .active_row()
             .map_or(RunState::Idle, |row| row.run_state)
     }
 
     fn composer_actions(&self, cx: &App) -> ComposerActions {
-        ComposerActions::for_state(self.run_state(), self.draft(cx).trim().is_empty())
+        let mut actions =
+            ComposerActions::for_state(self.run_state(), self.draft(cx).trim().is_empty());
+        if self.client.is_some() && self.client_connected && !self.client_snapshot_ready {
+            actions.disabled_reason = Some("Waiting for a current Session snapshot");
+        }
+        actions
     }
 
     /// Record what the composer would ask for. Without a client layer the
@@ -2078,6 +2345,9 @@ impl Shell {
         self.destination = Destination::Chat;
         if changed {
             self.invalidate_search(cx);
+            if self.client.is_some() {
+                self.client_select(cx);
+            }
         }
         self.prefs.close_overlays();
         self.settle(window, cx);
@@ -2108,6 +2378,9 @@ impl Shell {
             self.search_return = previous;
         }
         self.destination = destination;
+        if self.client.is_some() {
+            self.client_request(ClientCommand::Page(destination), cx);
+        }
         self.prefs.close_overlays();
         if destination == Destination::Search {
             self.refresh_search(cx);
@@ -2306,9 +2579,16 @@ impl Shell {
             .sidebar
             .active_row()
             .map_or_else(|| "No Session".into(), |row| row.title.clone());
-        let profile = readable("header-profile", "Fixture Profile /")
-            .text_sm()
-            .text_color(cx.theme().muted_foreground);
+        let profile = readable(
+            "header-profile",
+            if self.client.is_some() {
+                "Local Daemon /"
+            } else {
+                "Fixture Profile /"
+            },
+        )
+        .text_sm()
+        .text_color(cx.theme().muted_foreground);
         // The whole title is the heading's name even where the window is
         // too narrow to show all of it.
         let title = div()
@@ -2401,7 +2681,9 @@ impl Shell {
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.set_destination(destination, window, cx)
                 }));
-            if matches!(destination, Destination::Chat | Destination::Sessions) {
+            if self.client.is_some()
+                || matches!(destination, Destination::Chat | Destination::Sessions)
+            {
                 button
             } else {
                 button.tooltip("Scaffold: this destination has no view yet")
@@ -2463,6 +2745,7 @@ impl Shell {
                             self.session_sizes.clone(),
                             |this, range, _, cx| {
                                 range
+                                    .take_while(|index| *index < this.sidebar.rows().len())
                                     .map(|index| this.render_session_row(index, cx))
                                     .collect::<Vec<_>>()
                             },
@@ -2671,6 +2954,18 @@ impl Shell {
                         .child(Label::new(reason.notice())),
                 )
             })
+            .when(self.client.is_some() && self.client_attention, |region| region.child(
+                readable("daemon-pending-attention", "This Profile has pending decisions. Review and answer them in the Formless TUI.").text_sm().px_2().py_1()
+            ))
+            .when(self.client.is_some() && !self.client_snapshot_ready, |region| region.child(
+                readable("daemon-session-state", if self.sidebar.active_id().is_none() {
+                    "Choose a Session from the sidebar or open Sessions to create one."
+                } else if self.transcript_source == TranscriptSource::NotLoaded {
+                    "Loading the selected Session. Sending is unavailable until a canonical snapshot arrives."
+                } else {
+                    "This is the last confirmed transcript. Current Run state is unknown; sending is unavailable until this Session reloads."
+                }).text_sm().px_2().py_1()
+            ))
             .child(
                 div()
                     .id("timeline-area")
@@ -3223,8 +3518,8 @@ impl Shell {
         .min_h_0();
         let focused = self.conversation_focus.contains_focused(window, cx);
         v_flex().id("region-conversation").test_support().role(Role::Main)
-            .aria_label("Fixture Sessions")
-            .aria_description("Read-only fixture Sessions; archived Sessions excluded. Filter title, preview or ID, up to 256 characters. Arrows choose, Enter opens, Escape returns to Chat. Shared synthetic transcript only; no daemon connection or Session management actions.")
+            .aria_label(if self.client.is_some() { "Daemon Sessions" } else { "Fixture Sessions" })
+            .aria_description(if self.client.is_some() { "Daemon Sessions; archived Sessions excluded. Arrows choose, Enter opens, Escape returns to Chat. Refresh reloads the list. New Session creates a Session in the connected daemon." } else { "Read-only fixture Sessions; archived Sessions excluded. Filter title, preview or ID, up to 256 characters. Arrows choose, Enter opens, Escape returns to Chat. Shared synthetic transcript only; no daemon connection or Session management actions." })
             .track_focus(&self.conversation_focus)
             .map(|region| inert_while(region, self.background_inert(window)))
             .map(|region| Self::main_size(region, page_height))
@@ -3237,14 +3532,19 @@ impl Shell {
             .on_action(cx.listener(|this, _: &DirectoryOpen, window, cx| this.open_directory_choice(window, cx)))
             .on_action(cx.listener(|this, _: &DirectoryBack, window, cx| this.directory_back(window, cx)))
             .child(h_flex().gap_2()
-                .child(readable("directory-title", "Fixture Sessions").flex_1().min_w_0().truncate())
+                .child(readable("directory-title", if self.client.is_some() { "Daemon Sessions" } else { "Fixture Sessions" }).flex_1().min_w_0().truncate())
+                .when(self.client.is_some(), |header| header
+                    .child(Button::new("new-daemon-session").small().label("New Session").disabled(!self.client_connected)
+                        .on_click(cx.listener(|this, _, _, cx| this.client_request(ClientCommand::CreateSession, cx))))
+                    .child(Button::new("refresh-daemon-sessions").small().label("Refresh").disabled(!self.client_connected)
+                        .on_click(cx.listener(|this, _, _, cx| this.client_request(ClientCommand::Refresh, cx)))))
                 .child(Button::new("back-to-chat").small().label("Back to Chat")
                     .on_click(cx.listener(|this, _, window, cx| this.directory_back(window, cx)))))
             .child(Input::new(&self.directory_query).small().aria_label("Filter Sessions"))
             .child(announced(div().id("directory-status")).test_support().role(Role::Label)
                 .aria_value(status.clone()).text_xs().truncate().child(directory::visual_text(&status)))
             .child(v_flex().id("directory-results").test_support().role(Role::ListBox)
-                .aria_label("Filtered fixture Sessions").flex_1().min_h_0().child(list))
+                .aria_label(if self.client.is_some() { "Filtered daemon Sessions" } else { "Filtered fixture Sessions" }).flex_1().min_h_0().child(list))
     }
 
     /// The destinations other than Chat/Sessions. It takes the conversation's place and
@@ -3255,7 +3555,10 @@ impl Shell {
         page_height: Option<Pixels>,
         window: &Window,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> AnyElement {
+        if self.client.is_some() {
+            return self.render_resource_page(page_height, window, cx);
+        }
         let focused = self.conversation_focus.is_focused(window);
         let reflowed = page_height.is_some();
         let name = self.destination.label();
@@ -3294,9 +3597,169 @@ impl Shell {
             // From the top, with the way back before the explanation: the
             // notice can be taller than the window, and its top is what
             // focus brings into view.
-            notice.p_3().child(back).child(explanation)
+            notice
+                .p_3()
+                .child(back)
+                .child(explanation)
+                .into_any_element()
         } else {
-            notice.justify_center().p_6().child(explanation).child(back)
+            notice
+                .justify_center()
+                .p_6()
+                .child(explanation)
+                .child(back)
+                .into_any_element()
+        }
+    }
+
+    fn render_resource_page(
+        &self,
+        page_height: Option<Pixels>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let destination = self.destination;
+        let page = self.resource_pages.get(&destination);
+        let count = page.map_or(0, |page| page.rows.len());
+        let notice = page.map_or("Loading from the Daemon Core…".to_string(), |page| {
+            page.notice.clone()
+        });
+        let list = gpui_kit::uniform_list(
+            "daemon-resource-list",
+            count,
+            cx.processor(|this, range: Range<usize>, _, cx| {
+                range
+                    .filter_map(|index| {
+                        let page = this.resource_pages.get(&this.destination)?;
+                        let row = page.rows.get(index)?;
+                        let selected = page.selected == Some(index);
+                        let revision = page.revision;
+                        let destination = this.destination;
+                        Some(
+                            Button::new(("resource-row", index))
+                                .small()
+                                .w_full()
+                                .label(directory::visual_text(&row.label))
+                                .selected(selected)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if let Some(page) = this.resource_pages.get_mut(&destination) {
+                                        if this.destination != destination
+                                            || page.revision != revision
+                                        {
+                                            return;
+                                        }
+                                        page.selected = Some(index);
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                    })
+                    .collect()
+            }),
+        )
+        .h(self.scaled(220.))
+        .track_scroll(&self.resource_scroll);
+        let selected = page.and_then(|page| page.selected.and_then(|index| page.rows.get(index)));
+        let label = selected.map_or("Select an entry".into(), |row| {
+            directory::visual_text(&row.label)
+        });
+        let detail = selected.map_or(String::new(), |row| {
+            format!(
+                "{}{}",
+                row.preview,
+                if row.preview_truncated {
+                    "\nPreview limited to 500 characters. Copy details for all returned fields."
+                } else {
+                    ""
+                }
+            )
+        });
+        v_flex()
+            .id("region-conversation")
+            .test_support()
+            .role(Role::Main)
+            .aria_label(format!("{} · daemon data", destination.label()))
+            .aria_description("Read-only daemon data. Up and Down choose entries; Tab reaches Refresh, Back and Copy details.")
+            .map(|region| inert_while(region, self.background_inert(window)))
+            .track_focus(&self.conversation_focus)
+            .key_context(RESOURCE_CONTEXT)
+            .on_action(
+                cx.listener(|this, _: &ResourceNext, window, cx| this.move_resource(1, window, cx)),
+            )
+            .on_action(cx.listener(|this, _: &ResourcePrevious, window, cx| {
+                this.move_resource(-1, window, cx)
+            }))
+            .map(|region| Self::main_size(region, page_height))
+            .when_some(page_height, |region, height| region.h(height))
+            .child(
+                v_flex()
+                    .w_full()
+                    .h_full()
+                    .p_3()
+                    .gap_3()
+                    .overflow_y_scrollbar()
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .flex_wrap()
+                            .child(Label::new(destination.label()).flex_1())
+                            .child(
+                                Button::new("refresh-resource")
+                                    .small()
+                                    .label("Refresh")
+                                    .disabled(!self.client_connected)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.client_request(ClientCommand::Refresh, cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new("resource-back")
+                                    .small()
+                                    .label("Back to Chat")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.set_destination(Destination::Chat, window, cx)
+                                    })),
+                            ),
+                    )
+                    .child(readable("resource-notice", notice))
+                    .child(list)
+                    .child(readable("resource-selected", label))
+                    .child(readable("resource-detail", detail))
+                    .child(
+                        Button::new("copy-resource")
+                            .small()
+                            .label("Copy details")
+                            .disabled(selected.is_none())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(row) = this
+                                    .resource_pages
+                                    .get(&this.destination)
+                                    .and_then(|p| p.selected.and_then(|i| p.rows.get(i)))
+                                {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(
+                                        row.detail.clone(),
+                                    ));
+                                }
+                            })),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn move_resource(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(page) = self.resource_pages.get_mut(&self.destination) {
+            if !page.rows.is_empty() {
+                let selected = page
+                    .selected
+                    .unwrap_or(0)
+                    .saturating_add_signed(delta)
+                    .min(page.rows.len() - 1);
+                page.selected = Some(selected);
+                self.resource_scroll
+                    .scroll_to_item_strict(selected, ScrollStrategy::Top);
+                self.conversation_focus.focus(window, cx);
+                cx.notify();
+            }
         }
     }
 
@@ -3527,21 +3990,27 @@ impl Shell {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let intent = match &self.last_intent {
-            Some(record) => match record.kind {
-                IntentKind::Send(mode) => format!(
-                    "Recorded {} ({} characters), not sent",
-                    send_mode_label(mode),
-                    record.content_chars
-                ),
-                IntentKind::Stop => "Recorded Stop, not sent".to_string(),
-            },
-            None => "No intent recorded".to_string(),
+        let reflowed = reflowed || self.client.is_some();
+        let intent = if self.client.is_some() {
+            self.client_status.clone()
+        } else {
+            match &self.last_intent {
+                Some(record) => match record.kind {
+                    IntentKind::Send(mode) => format!(
+                        "Recorded {} ({} characters), not sent",
+                        send_mode_label(mode),
+                        record.content_chars
+                    ),
+                    IntentKind::Stop => "Recorded Stop, not sent".to_string(),
+                },
+                None => "No intent recorded".to_string(),
+            }
         };
         let destination = if matches!(
             self.destination,
             Destination::Chat | Destination::Sessions | Destination::Search
-        ) {
+        ) || self.client.is_some()
+        {
             self.destination.label().to_string()
         } else {
             format!("{} (scaffold: no view)", self.destination.label())
@@ -3557,10 +4026,18 @@ impl Shell {
         );
         let fixture = readable(
             "status-fixture",
-            match self.transcript_source {
-                TranscriptSource::Fixture => "Synthetic fixture: no Daemon Core connection",
-                TranscriptSource::Snapshot => "Decoded snapshot · no daemon connection",
-                TranscriptSource::NotLoaded => "Transcript not loaded · no daemon connection",
+            if self.client.is_some() {
+                if self.client_connected {
+                    "Local Daemon Core"
+                } else {
+                    "Daemon disconnected · Run state unknown"
+                }
+            } else {
+                match self.transcript_source {
+                    TranscriptSource::Fixture => "Synthetic fixture: no Daemon Core connection",
+                    TranscriptSource::Snapshot => "Decoded snapshot · no daemon connection",
+                    TranscriptSource::NotLoaded => "Transcript not loaded · no daemon connection",
+                }
             },
         );
         // What the last composer action did. It changes only when the user
@@ -3585,7 +4062,13 @@ impl Shell {
             .text_xs()
             .text_color(cx.theme().muted_foreground)
             .border_t_1()
-            .border_color(cx.theme().border);
+            .border_color(cx.theme().border)
+            .when(self.client.is_some() && self.client_attention, |status| {
+                status.child(readable(
+                    "status-pending-attention",
+                    "Decisions reported · review in the Formless TUI",
+                ))
+            });
         if reflowed {
             // One under the other, each wrapping to the window's width, so
             // nothing is cut off at the side.
