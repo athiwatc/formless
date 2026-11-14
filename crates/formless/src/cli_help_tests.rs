@@ -312,6 +312,58 @@ fn example_gate_rejects_removed_flags_and_preserves_shell_arguments() {
 }
 
 #[test]
+fn one_shot_job_help_quotes_only_supported_offsets() {
+    use chrono::TimeZone;
+    let root = command_tree();
+    let at = root
+        .find_subcommand("jobs")
+        .unwrap()
+        .find_subcommand("add")
+        .unwrap()
+        .get_arguments()
+        .find(|arg| arg.get_id() == "at")
+        .unwrap();
+    let help = at.get_help().unwrap().to_string();
+    let now = chrono::Local
+        .with_ymd_and_hms(2026, 1, 15, 12, 0, 0)
+        .unwrap();
+    let examples: Vec<_> = help.split('"').skip(1).step_by(2).collect();
+    assert!(!examples.is_empty(), "{help}");
+    for example in examples {
+        let cli = super::Cli::try_parse_from([
+            "formless",
+            "jobs",
+            "add",
+            "fixture prompt",
+            "--at",
+            example,
+        ])
+        .unwrap();
+        let Some(super::Cmd::Jobs {
+            action: super::JobsAction::Add {
+                at: Some(parsed), ..
+            },
+        }) = cli.cmd
+        else {
+            panic!("wrong command");
+        };
+        assert!(
+            formless_core::jobs::parse_at(&parsed, now).is_ok(),
+            "unsupported help example {parsed:?}: {help}"
+        );
+    }
+    assert!(
+        help.contains("YYYY-MM-DD HH:MM") && help.contains("RFC 3339"),
+        "{help}"
+    );
+    // These are documented format names, not relative-language promises.
+    for absolute in ["2030-01-02 09:00", "2030-01-02T09:00:00Z"] {
+        assert!(formless_core::jobs::parse_at(absolute, now).is_ok());
+    }
+    assert!(!help.contains("tomorrow"), "{help}");
+}
+
+#[test]
 fn docs_no_topic_help_matches_the_gallery_default() {
     let root = command_tree();
     let help = root
