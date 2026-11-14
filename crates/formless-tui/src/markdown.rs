@@ -54,11 +54,19 @@ struct Prefix {
     rest: Vec<Span<'static>>,
 }
 
+/// Layout provenance for parsed inline content, independent of its colors.
+#[derive(Clone)]
+struct InlineSpan {
+    content: String,
+    style: Style,
+    literal: bool,
+}
+
 struct Table {
     aligns: Vec<Alignment>,
-    rows: Vec<Vec<Vec<Span<'static>>>>,
-    row: Vec<Vec<Span<'static>>>,
-    cell: Vec<Span<'static>>,
+    rows: Vec<Vec<Vec<InlineSpan>>>,
+    row: Vec<Vec<InlineSpan>>,
+    cell: Vec<InlineSpan>,
     header_rows: usize,
 }
 
@@ -68,7 +76,7 @@ struct Renderer {
     width: usize,
     indent: String,
     out: Vec<Line<'static>>,
-    spans: Vec<Span<'static>>,
+    spans: Vec<InlineSpan>,
     styles: Vec<Style>,
     prefixes: Vec<Prefix>,
     lists: Vec<Option<u64>>,
@@ -107,7 +115,7 @@ impl Renderer {
             let spans = self.table.as_ref().map_or(&self.spans, |t| &t.cell);
             let text: String = spans[at.min(spans.len())..]
                 .iter()
-                .map(|s| s.content.as_ref())
+                .map(|s| s.content.as_str())
                 .collect();
             let bare = url.trim_start_matches("mailto:");
             if !url.is_empty() && text != url && text != bare && !url.starts_with('#') {
@@ -192,7 +200,15 @@ impl Renderer {
     }
 
     fn push_text(&mut self, text: impl Into<String>, extra: Style) {
-        let span = Span::styled(text.into(), self.style().patch(extra));
+        self.push_inline(text, extra, false);
+    }
+
+    fn push_inline(&mut self, text: impl Into<String>, extra: Style, literal: bool) {
+        let span = InlineSpan {
+            content: text.into(),
+            style: self.style().patch(extra),
+            literal,
+        };
         match &mut self.table {
             Some(t) => t.cell.push(span),
             None => self.spans.push(span),
@@ -278,7 +294,7 @@ impl Renderer {
                     self.push_text(t.to_string(), Style::default());
                 }
             }
-            Event::Code(t) => self.push_text(t.to_string(), fg(color, Color::Yellow)),
+            Event::Code(t) => self.push_inline(t.to_string(), fg(color, Color::Yellow), true),
             Event::InlineMath(t) | Event::DisplayMath(t) => self.push_text(
                 t.to_string(),
                 fg(color, Color::LightMagenta).add_modifier(Modifier::ITALIC),
@@ -640,7 +656,7 @@ impl Renderer {
         if cols == 0 {
             return;
         }
-        let cell_w = |c: &Vec<Span>| c.iter().map(|s| s.content.width()).sum::<usize>();
+        let cell_w = |c: &Vec<InlineSpan>| c.iter().map(|s| s.content.width()).sum::<usize>();
         let mut natural = vec![1usize; cols];
         for row in &t.rows {
             for (i, c) in row.iter().enumerate() {
@@ -680,7 +696,7 @@ impl Renderer {
                 let mut line = vec![Span::styled("│", dim(color))];
                 for (i, w) in widths.iter().enumerate() {
                     let cell = truncate_spans(cells[i].get(k).cloned().unwrap_or_default(), *w);
-                    let pad = w - cell_w(&cell);
+                    let pad = w - cell.iter().map(|span| span.content.width()).sum::<usize>();
                     let (l, r) = match t.aligns.get(i) {
                         Some(Alignment::Right) => (pad, 0),
                         Some(Alignment::Center) => (pad / 2, pad - pad / 2),
@@ -700,7 +716,7 @@ impl Renderer {
     /// A table too wide for the pane, as `key: value` records.
     fn table_records(&mut self, t: Table) {
         let color = self.color;
-        let headers: Vec<Vec<Span<'static>>> = if t.header_rows > 0 {
+        let headers: Vec<Vec<InlineSpan>> = if t.header_rows > 0 {
             t.rows[0].clone()
         } else {
             Vec::new()
@@ -792,7 +808,7 @@ fn fit_widths(natural: &[usize], room: usize) -> Vec<usize> {
 }
 
 /// Greedy word wrap of styled spans; `\n` inside a span forces a break.
-fn wrap(spans: Vec<Span<'static>>, avail: usize) -> Vec<Vec<Span<'static>>> {
+fn wrap(spans: Vec<InlineSpan>, avail: usize) -> Vec<Vec<Span<'static>>> {
     // Split into words (non-space runs, possibly multi-style) and spaces.
     enum Piece {
         Word(Vec<Span<'static>>, usize),
@@ -820,6 +836,13 @@ fn wrap(spans: Vec<Span<'static>>, avail: usize) -> Vec<Vec<Span<'static>>> {
                 _ => pieces.push(Piece::Word(vec![s], w)),
             }
         };
+        if span.literal {
+            // Keep parsed code as one literal run. Move it intact when it fits;
+            // otherwise hard-wrap by grapheme without discarding any spaces.
+            word.push_str(&span.content);
+            flush_word(&mut word, &mut pieces);
+            continue;
+        }
         for g in span.content.graphemes(true) {
             let ch = g.chars().next().unwrap_or(' ');
             if g == "\n" || g == "\r\n" {
@@ -1051,6 +1074,71 @@ mod tests {
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect()
+    }
+
+    #[test]
+    fn inline_code_retains_parser_spacing_in_paragraphs_and_tables() {
+        for color in [false, true] {
+            for source in [
+                "`echo \"a  b\"`",
+                "*`a  b`*",
+                "**`a  b`**",
+                "` foo  bar `",
+                "`a\nb`",
+                "`   `",
+            ] {
+                let code = Parser::new(source)
+                    .find_map(|event| match event {
+                        Event::Code(text) => Some(text.to_string()),
+                        _ => None,
+                    })
+                    .unwrap();
+                let out = render(source, color, "", 120);
+                assert_eq!(
+                    out.iter().map(Line::to_string).collect::<Vec<_>>().join(""),
+                    code,
+                    "{source:?} color={color}"
+                );
+            }
+            let out = render(
+                "| command | value |\n| --- | --- |\n| `a  b` | data |",
+                color,
+                "",
+                100,
+            );
+            assert!(out.iter().any(|line| line.to_string().contains("a  b")));
+            assert_eq!(render("a   b", color, "", 100)[0].to_string(), "a b");
+        }
+        let out = render("*`a  b`*", true, "", 100);
+        assert!(out[0]
+            .spans
+            .iter()
+            .filter(|s| !s.content.is_empty())
+            .all(|s| s.style.add_modifier.contains(Modifier::ITALIC)));
+    }
+
+    #[test]
+    fn narrow_inline_code_hard_wraps_without_dropping_literal_spaces() {
+        let code = "echo \"a  b\"   && printf ไทย_日本語";
+        for width in 16..40 {
+            let out = render(&format!("`{code}`"), true, "", width);
+            assert!(
+                out.iter().all(|line| line.width() <= width),
+                "width={width}"
+            );
+            assert_eq!(
+                out.iter()
+                    .flat_map(|line| &line.spans)
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>(),
+                code,
+                "width={width}"
+            );
+            assert!(out
+                .iter()
+                .flat_map(|line| &line.spans)
+                .all(|span| span.style.fg == Some(Color::Yellow)));
+        }
     }
 
     #[test]
