@@ -1626,6 +1626,8 @@ struct App {
     /// Absolute chat scroll top; `None` means follow the live bottom.
     chat_scroll_top: Option<usize>,
     chat_view_height: usize,
+    /// Text columns of the last drawn composer, after its prompt and border.
+    composer_text_width: std::cell::Cell<usize>,
     chat_line_count: usize,
     input: input::InputLine,
     /// When Ctrl+C was last pressed: a second press soon after detaches.
@@ -2008,6 +2010,7 @@ impl App {
             live_run: None,
             chat_scroll_top: None,
             chat_view_height: 10,
+            composer_text_width: std::cell::Cell::new(usize::MAX),
             chat_line_count: 0,
             input: input::InputLine::default(),
             ctrl_c_at: None,
@@ -11092,6 +11095,15 @@ impl App {
     fn input_key(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let wrapped_composer = !self.vim_mode
+            && self.view == View::Chat
+            && self.renaming.is_none()
+            && self.instructing.is_none()
+            && self.import_mode.is_none()
+            && self.bulk.is_none()
+            && !self.editing_step
+            && self.find.is_none()
+            && self.input.searching().is_none();
         if self.input.is_empty() && !ctrl && !alt && matches!(key.code, KeyCode::Char(_)) {
             self.input.set_literal(false);
         }
@@ -11111,6 +11123,18 @@ impl App {
             if let Some(text) = selected {
                 self.copy_text(&text, "selection");
             }
+            return;
+        }
+        if wrapped_composer
+            && !ctrl
+            && !alt
+            && key.modifiers.contains(KeyModifiers::SHIFT)
+            && matches!(key.code, KeyCode::Up | KeyCode::Down)
+        {
+            self.input.prepare_selection(true);
+            self.input
+                .vertical_wrapped(key.code == KeyCode::Down, self.composer_text_width.get());
+            self.update_mention();
             return;
         }
         if key.modifiers.contains(KeyModifiers::SHIFT)
@@ -11212,6 +11236,18 @@ impl App {
             KeyCode::Home if empty => self.chat_scroll_top = Some(0),
             KeyCode::PageUp => self.scroll_chat_up(page),
             KeyCode::PageDown => self.scroll_chat_down(page),
+            KeyCode::Up
+                if wrapped_composer
+                    && !alt
+                    && self
+                        .input
+                        .vertical_wrapped(false, self.composer_text_width.get()) => {}
+            KeyCode::Down
+                if wrapped_composer
+                    && !alt
+                    && self
+                        .input
+                        .vertical_wrapped(true, self.composer_text_width.get()) => {}
             KeyCode::Up if !self.input.on_first_line() => self.input.vertical(false),
             KeyCode::Down if !self.input.on_last_line() => self.input.vertical(true),
             KeyCode::Up => {
@@ -12318,6 +12354,7 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App, show_cursor: bool) {
     };
     let prompt_w = Span::raw(prompt).width();
     let avail = input_text_width(area.width, prompt);
+    app.composer_text_width.set(avail);
     let mut lines: Vec<Line> = Vec::new();
     let mut cursor = Some((0usize, 0usize));
     if let Some((query, found)) = app.input.searching() {
@@ -18895,6 +18932,7 @@ mod tests {
             live_run: None,
             chat_scroll_top: None,
             chat_view_height: 10,
+            composer_text_width: std::cell::Cell::new(usize::MAX),
             chat_line_count: 100,
             input: input::InputLine::default(),
             ctrl_c_at: None,
@@ -22181,6 +22219,45 @@ mod tests {
         app.paste(&big);
         assert_eq!(app.input, "[pasted 30 lines #1]");
         assert_eq!(app.input.take(), big);
+    }
+
+    #[test]
+    fn composer_arrows_follow_drawn_wrap_rows_before_history_and_extend_selection() {
+        let mut app = test_app();
+        app.messages.push(msg("user", "previous"));
+        render(&mut app, 30, 20);
+        let width = app.composer_text_width.get();
+        let draft = "x".repeat(width * 2 + 3);
+        app.input.set(&draft);
+        render(&mut app, 30, 20);
+        assert_eq!(app.input.layout(width).1, (2, 3));
+        app.key(key(KeyCode::Up));
+        assert_eq!(app.input.layout(width).1, (1, 3));
+        assert_eq!(&*app.input, draft);
+        app.key(KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT));
+        assert_eq!(app.input.layout(width).1, (0, 3));
+        assert_eq!(app.input.selected_text().unwrap().len(), width);
+        app.input.set_modal_cursor(0);
+        app.key(key(KeyCode::Up));
+        assert_eq!(&*app.input, "previous");
+        app.key(key(KeyCode::Down));
+        assert_eq!(&*app.input, draft);
+        render(&mut app, 45, 20);
+        let resized = app.composer_text_width.get();
+        assert_ne!(resized, width);
+        app.key(key(KeyCode::Up));
+        assert_eq!(&*app.input, draft);
+
+        app.vim_mode = true;
+        app.input.set("abcdefghijklmnop");
+        app.composer_text_width.set(5);
+        let cursor = app.input.cursor_byte();
+        app.key(key(KeyCode::Up));
+        assert_eq!(
+            app.input.cursor_byte(),
+            cursor,
+            "Vim Insert retains its logical-line arrow behavior"
+        );
     }
 
     #[test]

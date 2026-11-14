@@ -22,6 +22,8 @@ pub struct InputLine {
     history_notice: Option<&'static str>,
     /// Byte offset, always on a char boundary.
     cursor: usize,
+    /// Preferred display column for consecutive wrapped-row moves, by width.
+    visual_goal: Option<(usize, usize)>,
     /// Placeholder shown in `text` -> the pasted text it stands for.
     pastes: Vec<(String, String)>,
     /// Browsing history: (index into the history, the draft to restore).
@@ -113,6 +115,7 @@ impl InputLine {
         }
     }
     fn restore(&mut self, s: EditSnapshot) {
+        self.visual_goal = None;
         self.literal = s.literal;
         self.text = s.text;
         self.cursor = s.cursor;
@@ -124,6 +127,7 @@ impl InputLine {
         self.last_kill = false;
     }
     fn before_edit(&mut self, typing: bool) {
+        self.visual_goal = None;
         self.history_notice = None;
         if !self.history.coalesces(typing) {
             let current = self.snapshot();
@@ -133,6 +137,7 @@ impl InputLine {
         self.last_kill = false;
     }
     pub(crate) fn break_edit_group(&mut self) {
+        self.visual_goal = None;
         self.history.break_group();
         self.yank = None;
         self.last_kill = false;
@@ -256,6 +261,7 @@ impl InputLine {
 
     /// Modal editors use whole grapheme boundaries, not byte/char fragments.
     pub(crate) fn set_modal_cursor(&mut self, at: usize) {
+        self.visual_goal = None;
         self.cursor = self
             .text
             .grapheme_indices(true)
@@ -806,36 +812,92 @@ impl InputLine {
     /// both in screen columns: a wide CJK character takes two, a Thai mark
     /// none (#785).
     pub fn layout(&self, width: usize) -> (Vec<String>, (usize, usize)) {
-        let width = width.max(1);
         let mut rows = Vec::new();
+        let cursor = self.walk_layout(width, |row| rows.push(row.to_owned()), |_, _| {});
+        (rows, cursor)
+    }
+
+    /// Move through exactly the grapheme rows used by rendering. False means
+    /// there is no adjacent visual row, so ordinary arrows may browse history.
+    pub(crate) fn vertical_wrapped(&mut self, down: bool, width: usize) -> bool {
+        let width = width.max(1);
+        let mut points = Vec::new();
+        let cursor = self.walk_layout(
+            width,
+            |_| {},
+            |byte, position| points.push((byte, position)),
+        );
+        let goal = self
+            .visual_goal
+            .filter(|(previous, _)| *previous == width)
+            .map_or(cursor.1, |(_, column)| column);
+        self.break_edit_group();
+        self.visual_goal = Some((width, goal));
+        let target = if down {
+            cursor.0.checked_add(1)
+        } else {
+            cursor.0.checked_sub(1)
+        };
+        let Some(target) = target else {
+            return false;
+        };
+        let Some((byte, _)) = points
+            .into_iter()
+            .rev()
+            .find(|(_, (row, column))| *row == target && *column <= goal)
+        else {
+            return false;
+        };
+        self.cursor = byte;
+        true
+    }
+
+    fn walk_layout(
+        &self,
+        width: usize,
+        mut emit_row: impl FnMut(&str),
+        mut boundary: impl FnMut(usize, (usize, usize)),
+    ) -> (usize, usize) {
+        let width = width.max(1);
+        let mut row_index = 0;
         let mut cursor = (0, 0);
         let mut offset = 0;
         for line in self.text.split('\n') {
-            let mut row = String::new();
+            let mut row_start = 0;
             let mut col = 0;
             for (i, g) in line.grapheme_indices(true) {
                 let w = text::width(g);
                 if col + w > width && col > 0 {
-                    rows.push(std::mem::take(&mut row));
+                    emit_row(&line[row_start..i]);
+                    row_index += 1;
+                    row_start = i;
                     col = 0;
                 }
+                boundary(offset + i, (row_index, col));
                 if offset + i == self.cursor {
-                    cursor = (rows.len(), col);
+                    cursor = (row_index, col);
                 }
-                row.push_str(g);
                 col += w;
             }
             if offset + line.len() == self.cursor {
                 if col == width {
-                    rows.push(std::mem::take(&mut row));
+                    emit_row(&line[row_start..]);
+                    row_index += 1;
+                    row_start = line.len();
                     col = 0;
                 }
-                cursor = (rows.len(), col);
+                cursor = (row_index, col);
             }
-            rows.push(row);
+            // A full row's trailing boundary belongs to the next wrapped row;
+            // only a drawn end-of-input caret row may own it here.
+            if col < width || offset + line.len() == self.cursor {
+                boundary(offset + line.len(), (row_index, col));
+            }
+            emit_row(&line[row_start..]);
+            row_index += 1;
             offset += line.len() + 1;
         }
-        (rows, cursor)
+        cursor
     }
 }
 
@@ -1161,6 +1223,78 @@ mod tests {
             InputLine::default().layout(4),
             (vec![String::new()], (0, 0))
         );
+    }
+
+    #[test]
+    fn wrapped_vertical_moves_preserve_text_column_and_explicit_newline_rows() {
+        let mut input = InputLine::from("abcdefghijklmn");
+        assert_eq!(input.layout(5).1, (2, 4));
+        assert!(input.vertical_wrapped(false, 5));
+        assert_eq!(input.layout(5).1, (1, 4));
+        assert!(input.vertical_wrapped(false, 5));
+        assert_eq!(input.layout(5).1, (0, 4));
+        assert!(!input.vertical_wrapped(false, 5));
+        assert_eq!(&*input, "abcdefghijklmn");
+
+        let mut input = at("abcdef\nx\nuvwxyz", 5);
+        assert_eq!(input.layout(4).1, (1, 1));
+        assert!(input.vertical_wrapped(true, 4));
+        assert_eq!(input.layout(4).1, (2, 1));
+        assert!(input.vertical_wrapped(true, 4));
+        assert_eq!(input.layout(4).1, (3, 1));
+        assert!(input.vertical_wrapped(true, 4));
+        assert_eq!(input.layout(4).1, (4, 1));
+        assert_eq!(&*input, "abcdef\nx\nuvwxyz");
+    }
+
+    #[test]
+    fn wrapped_vertical_goal_survives_short_rows_and_resets_for_edit_move_and_resize() {
+        let mut input = at("abcdef\nx\nuvwxyz", 3);
+        assert!(input.vertical_wrapped(true, 6));
+        assert_eq!(input.layout(6).1, (1, 1));
+        assert!(input.vertical_wrapped(true, 6));
+        assert_eq!(input.layout(6).1, (2, 3));
+        input.left();
+        assert!(input.vertical_wrapped(false, 6));
+        assert!(input.vertical_wrapped(false, 6));
+        assert_eq!(input.layout(6).1, (0, 2));
+        input.insert_char('!');
+        assert!(input.visual_goal.is_none());
+        input.vertical_wrapped(true, 6);
+        input.vertical_wrapped(true, 4);
+        assert_eq!(input.visual_goal.unwrap().0, 4);
+        input.set("fresh");
+        assert!(input.visual_goal.is_none());
+    }
+
+    #[test]
+    fn wrapped_vertical_keeps_wide_and_joining_clusters_whole_including_exact_width_ends() {
+        for text in [
+            "表a表a表a",
+            "สวัสดีครับสวัสดีครับ",
+            "a👩🏽‍💻b👨‍👩‍👧‍👦c",
+            "abcd\n表e\u{301}z\n",
+        ] {
+            let boundaries: Vec<_> = text
+                .grapheme_indices(true)
+                .map(|(byte, _)| byte)
+                .chain(std::iter::once(text.len()))
+                .collect();
+            for width in [1, 2, 3, 4, 7] {
+                for &byte in &boundaries {
+                    for down in [false, true] {
+                        let mut input = at(text, byte);
+                        input.vertical_wrapped(down, width);
+                        assert!(boundaries.contains(&input.cursor), "{text:?} width={width}");
+                        assert_eq!(&*input, text);
+                    }
+                }
+            }
+        }
+        let mut input = InputLine::from("abcdefgh");
+        assert_eq!(input.layout(4).1, (2, 0));
+        assert!(input.vertical_wrapped(false, 4));
+        assert_eq!(input.layout(4).1, (1, 0));
     }
 
     /// Steps and deletions take whole clusters (#784).

@@ -287,7 +287,7 @@ Type a task at the bottom and press **Enter**. Formless starts with the built-in
 | `Tab` / `Shift+Tab` | cycle views (Chat, Sessions, Tools, Metrics, Proposals, Settings) — the bar at the top shows where you are |
 | `Shift+E` (Tools view) | edit the selected Tool's JS (open it with `Enter` first); `Ctrl+S` saves it as a new version through the smoke gate |
 | `PgUp` / `PgDn` | scroll the transcript |
-| `↑` / `↓` | earlier messages of this Session (on the input's first/last line); `Ctrl+R` searches them |
+| `↑` / `↓` | move through wrapped draft rows; earlier messages of this Session at the first/last row (non-Vim); `Ctrl+R` searches them |
 | `Shift+Enter` or `\` then `Enter` | new line in the message |
 | `←` `→` `Home` `End`, `Ctrl+A/E/W/U/K`, `Alt+B/F/D` | edit the message (readline keys) |
 | `Ctrl+C` | clear the typed message; press again within 2 s to detach (the daemon keeps running, nothing is lost) |
