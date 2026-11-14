@@ -104,6 +104,28 @@ install_guidance() {
       esac
       ;;
   esac
+  guidance_shell="${SHELL:-sh}"
+  case "${guidance_shell##*/}" in
+    zsh)
+      completion_dir="$PREFIX/share/zsh/site-functions"
+      completion_known=false
+      case ":${FPATH:-}:" in *":$completion_dir:"*) completion_known=true ;; esac
+      if ! $completion_known && command -v zsh >/dev/null 2>&1; then
+        # -f avoids loading user startup files just to inspect discovery paths.
+        completion_paths=$(zsh -fc 'print -rl -- $fpath' 2>/dev/null || true)
+        if printf '%s\n' "$completion_paths" | grep -Fqx "$completion_dir"; then completion_known=true; fi
+      fi
+      if ! $completion_known; then
+        printf '\nFor zsh completions, add this to %s/.zshrc before compinit:\n' "${ZDOTDIR:-${HOME:-~}}"
+        printf '  fpath=(%s $fpath)\n' "$(quote_path "$completion_dir")"
+      fi
+      ;;
+    bash)
+      if [ "$PREFIX" != "${HOME:-}/.local" ]; then
+        printf '\nBash completions are in %s/share; bash-completion discovers XDG_DATA_HOME/XDG_DATA_DIRS. Include this share directory there to load them.\n' "$PREFIX"
+      fi
+      ;;
+  esac
   printf '\nNext: run formless to start the setup wizard, or formless doctor to verify configuration.\n'
   printf 'Setup needs a provider API key or a local model endpoint.\n'
 }
