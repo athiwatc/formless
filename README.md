@@ -1030,7 +1030,8 @@ and Node 24, and verifies the runner's native Python. Cargo dependencies are cac
 use private temporary directories that are cleaned after the job. This workflow
 does not deploy or publish a release; release packaging remains in `release.yml`.
 Live external-link checks remain in `docs.yml`; Playwright browser checks in
-`relay/README.md` remain separate manual checks.
+`relay/README.md` remain separate manual checks. AUR packaging tests require
+Linux/GNU install and are outside this macOS workflow.
 
 ```bash
 cargo build --workspace                # debug build of the single binary

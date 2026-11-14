@@ -97,7 +97,8 @@ jobs:
       - name: Offline documentation and tooling tests
         run: |
           set -euo pipefail
-          for suite in scripts/test-doc-links.py scripts/test-inventory.py scripts/test-eval-tool-use.py scripts/test-aur-completions.py; do
+          # AUR packaging tests require GNU install and belong on Linux.
+          for suite in scripts/test-doc-links.py scripts/test-inventory.py scripts/test-eval-tool-use.py; do
             python3 "$suite" 2>&1 | tee "$CI_DIR/logs/$(basename "$suite").log"
           done
 
