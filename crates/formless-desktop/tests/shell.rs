@@ -154,6 +154,122 @@ fn daemon_view_revalidates_queued_snapshot_generations_and_disables_stale_sends(
 }
 
 #[gpui_kit::test]
+fn recovery_uses_current_snapshot_retains_draft_and_rejects_stale_commands(
+    cx: &mut TestAppContext,
+) {
+    use formless_desktop::client::Update;
+    let (handle, shell) = open(cx, WIDE, 0, 0);
+    let sessions = daemon_view(cx, handle, &shell);
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        window.click(session_row_id(&sessions[0].id), cx);
+        let id = sessions[0].id.clone();
+        let generation = shell.read(cx).client_generation();
+        let recovery = || {
+            replies::session_snapshot(&id, &serde_json::json!({
+            "session":{"id":id}, "running":false, "messages":[],
+            "unfinished_run":{"run_id":"interrupted-run","status":"interrupted","error":"Stopped before completion"}
+        })).unwrap()
+        };
+        shell.update(cx, |shell, cx| {
+            shell.apply_client_update(
+                Update::Snapshot {
+                    generation,
+                    snapshot: recovery(),
+                },
+                window,
+                cx,
+            )
+        });
+        window.render_frame(cx);
+        assert_eq!(window.find("run-resume").label(), Some("Resume Run"));
+        assert_eq!(window.find("run-resume").disabled(), None);
+        window.click_at("region-composer", point(px(40.), px(220.)), cx);
+        shell.update(cx, |shell, cx| {
+            shell.focus_section(PageSection::Composer, window, cx)
+        });
+        window.input("keep this draft ไทย", cx);
+        let draft = shell.read(cx).draft(cx).to_string();
+        assert_eq!(draft, "keep this draft ไทย");
+        window.render_frame(cx);
+        window.click("run-resume", cx);
+        assert_eq!(
+            shell.read(cx).last_intent().unwrap().kind,
+            IntentKind::Resume
+        );
+        assert_eq!(shell.read(cx).draft(cx).as_ref(), draft);
+        shell.update(cx, |shell, cx| {
+            shell.apply_client_update(
+                Update::SnapshotError {
+                    generation,
+                    session_id: id.clone(),
+                    error: "disconnected".into(),
+                },
+                window,
+                cx,
+            )
+        });
+        assert_eq!(
+            shell.update(cx, |shell, cx| shell.run_command(
+                Command::ResumeRun,
+                window,
+                cx
+            )),
+            Some(commands::NO_RECOVERY)
+        );
+        assert_eq!(
+            shell.update(cx, |shell, cx| shell.run_command(
+                Command::AbandonRun,
+                window,
+                cx
+            )),
+            Some(commands::NO_RECOVERY)
+        );
+        shell.update(cx, |shell, cx| {
+            shell.apply_client_update(
+                Update::Snapshot {
+                    generation,
+                    snapshot: recovery(),
+                },
+                window,
+                cx,
+            )
+        });
+        window.render_frame(cx);
+        window.click("run-abandon", cx);
+        assert_eq!(
+            shell.read(cx).last_intent().unwrap().kind,
+            IntentKind::Abandon
+        );
+        assert_eq!(shell.read(cx).draft(cx).as_ref(), draft);
+        window.click(session_row_id(&sessions[1].id), cx);
+        shell.update(cx, |shell, cx| {
+            shell.apply_client_update(
+                Update::Snapshot {
+                    generation,
+                    snapshot: recovery(),
+                },
+                window,
+                cx,
+            )
+        });
+        window.render_frame(cx);
+        assert!(
+            window.try_find("run-recovery").is_none(),
+            "a retired Session cannot restore recovery controls"
+        );
+        assert_eq!(
+            shell.update(cx, |shell, cx| shell.run_command(
+                Command::ResumeRun,
+                window,
+                cx
+            )),
+            Some(commands::NO_RECOVERY)
+        );
+    });
+}
+
+#[gpui_kit::test]
 fn daemon_resources_are_keyboard_browsable_and_copy_exact_json(cx: &mut TestAppContext) {
     use formless_desktop::client::Update;
     let (handle, shell) = open(cx, WIDE, 0, 0);

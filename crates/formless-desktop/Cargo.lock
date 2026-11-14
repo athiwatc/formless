@@ -2183,6 +2183,7 @@ dependencies = [
  "axum",
  "formless-core",
  "formless-protocol",
+ "futures-util",
  "gpui-kit",
  "icu_segmenter",
  "markdown",

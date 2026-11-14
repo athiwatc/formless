@@ -21,6 +21,8 @@ pub enum Command {
     /// The composer's second action: Queue, only while a Run is going.
     SendSecondary,
     Stop,
+    ResumeRun,
+    AbandonRun,
     ToggleSessions,
     ToggleContext,
     ToggleTheme,
@@ -37,6 +39,7 @@ pub enum Command {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Group {
     Composer,
+    Run,
     Panels,
     Navigation,
     Focus,
@@ -48,6 +51,7 @@ impl Group {
     pub fn label(self) -> &'static str {
         match self {
             Group::Composer => "Composer",
+            Group::Run => "Run",
             Group::Panels => "Panels",
             Group::Navigation => "Go to",
             Group::Focus => "Focus",
@@ -64,6 +68,8 @@ pub struct State {
     pub composer: ComposerActions,
     /// Whether the open destination has a composer (only Chat does).
     pub has_composer: bool,
+    /// A current, connected canonical snapshot has a recoverable last Run.
+    pub can_recover: bool,
     /// Whether an input method is composing text in the composer.
     pub composing: bool,
     pub sessions_shown: bool,
@@ -117,6 +123,7 @@ pub const NO_COMPOSER: &str = "Only Chat has a composer";
 pub const COMPOSING: &str = "Finish composing text first";
 pub const NO_SECONDARY: &str = "Queue is only available while a Run is in progress";
 pub const NO_RUN: &str = "No Run is in progress";
+pub const NO_RECOVERY: &str = "No confirmed paused or interrupted Run is available";
 pub const LARGEST: &str = "Text is already at its largest size";
 pub const SMALLEST: &str = "Text is already at its smallest size";
 pub const DEFAULT_SIZE: &str = "Text is already at its default size";
@@ -149,6 +156,8 @@ pub fn keys(command: Command) -> &'static [&'static str] {
         Command::Send
         | Command::SendSecondary
         | Command::Stop
+        | Command::ResumeRun
+        | Command::AbandonRun
         | Command::ToggleTheme
         | Command::GoTo(_) => &[],
     }
@@ -214,6 +223,8 @@ pub fn palette(state: &State) -> Vec<Entry> {
     }
     commands.extend([
         Command::Stop,
+        Command::ResumeRun,
+        Command::AbandonRun,
         Command::ToggleSessions,
         Command::ToggleContext,
     ]);
@@ -286,6 +297,33 @@ pub fn entry(command: Command, state: &State) -> Entry {
                 Some(NO_COMPOSER)
             } else if !state.composer.stop_enabled {
                 Some(NO_RUN)
+            } else {
+                None
+            },
+        ),
+        Command::ResumeRun | Command::AbandonRun => (
+            if command == Command::ResumeRun {
+                "Resume Run"
+            } else {
+                "Abandon Run"
+            },
+            if command == Command::ResumeRun {
+                "Resume paused or interrupted Run"
+            } else {
+                "Abandon paused or interrupted Run"
+            }
+            .to_string(),
+            Group::Run,
+            if command == Command::ResumeRun {
+                "Continue from the persisted transcript; existing daemon confirmation requirements apply"
+            } else {
+                "Give up the paused or interrupted Run without sending the draft"
+            },
+            None,
+            if !state.has_composer {
+                Some(NO_COMPOSER)
+            } else if !state.can_recover {
+                Some(NO_RECOVERY)
             } else {
                 None
             },
@@ -414,6 +452,7 @@ mod tests {
         State {
             composer: ComposerActions::for_state(run, draft_is_empty),
             has_composer: true,
+            can_recover: false,
             composing: false,
             sessions_shown: true,
             context_shown: false,
@@ -422,6 +461,25 @@ mod tests {
             destination: Destination::Chat,
             palette_open: false,
         }
+    }
+
+    #[test]
+    fn recovery_commands_require_confirmed_recovery_and_never_send_the_draft() {
+        let mut state = state(RunState::Paused, true);
+        for command in [Command::ResumeRun, Command::AbandonRun] {
+            assert_eq!(entry(command, &state).disabled_reason, Some(NO_RECOVERY));
+        }
+        state.can_recover = true;
+        for command in [Command::ResumeRun, Command::AbandonRun] {
+            assert!(entry(command, &state).enabled());
+            assert_eq!(entry(command, &state).group, Group::Run);
+            assert!(keys(command).is_empty());
+        }
+        state.has_composer = false;
+        assert_eq!(
+            entry(Command::ResumeRun, &state).disabled_reason,
+            Some(NO_COMPOSER)
+        );
     }
 
     #[test]

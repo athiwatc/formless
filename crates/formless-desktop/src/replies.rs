@@ -17,7 +17,7 @@
 //! timeline, as the TUI leaves it out of its transcript; it is counted.
 //!
 //! Only what the timeline and sidebar use is read. Pending events, queued
-//! items, plans and run state in a `GetSession` reply are not decoded here.
+//! items and plans in a `GetSession` reply are not decoded here.
 
 use std::fmt;
 
@@ -71,6 +71,8 @@ pub struct SessionSnapshot {
     pub session_id: String,
     /// Whether a Run is in progress, as the daemon says at reply time.
     pub running: bool,
+    /// Recovery state sampled by the daemon, never inferred from an old badge.
+    pub unfinished_run: Option<UnfinishedRun>,
     /// The timeline, in sequence order; each block's id is its message's
     /// sequence number.
     pub blocks: Vec<TimelineBlock>,
@@ -79,6 +81,20 @@ pub struct SessionSnapshot {
     /// Highest persisted sequence, including assistant turns hidden above.
     /// Event reconciliation must not mistake those turns for new messages.
     pub last_seq: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct UnfinishedRun {
+    pub run_id: String,
+    pub status: String,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+impl UnfinishedRun {
+    pub fn recoverable(&self) -> bool {
+        matches!(self.status.as_str(), "paused" | "interrupted")
+    }
 }
 
 /// The block kind a message role is shown as. Matches the TUI's mapping.
@@ -143,6 +159,20 @@ pub fn session_snapshot(
         });
     }
     let running: bool = field(result, "running", "running")?;
+    let unfinished_run: Option<UnfinishedRun> = result
+        .get("unfinished_run")
+        .filter(|value| !value.is_null())
+        .map(|_| field(result, "unfinished_run", "unfinished Run"))
+        .transpose()?;
+    if unfinished_run
+        .as_ref()
+        .is_some_and(|run| running || run.run_id.is_empty() || run.status.is_empty())
+    {
+        return Err(DecodeError::Malformed {
+            field: "unfinished Run",
+            detail: "missing identity/status or conflicts with a running Run".into(),
+        });
+    }
     let mut messages: Vec<MessageInfo> = field(result, "messages", "messages")?;
     messages.sort_by_key(|message| message.seq);
     let mut blocks = Vec::with_capacity(messages.len());
@@ -161,6 +191,7 @@ pub fn session_snapshot(
     Ok(SessionSnapshot {
         session_id,
         running,
+        unfinished_run,
         blocks,
         hidden,
         last_seq: previous.map(|seq| seq as u64),
@@ -192,6 +223,30 @@ fn message_block(asked: &str, message: MessageInfo) -> Result<Option<TimelineBlo
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn recovery_requires_a_valid_idle_snapshot_and_does_not_guess_unknown_statuses() {
+        let mut value = json!({"session":{"id":"s1"}, "running":false, "messages":[],
+            "unfinished_run":{"run_id":"r1","status":"interrupted","error":"stopped"}});
+        let snapshot = session_snapshot("s1", &value).unwrap();
+        assert!(snapshot.unfinished_run.unwrap().recoverable());
+        value["running"] = json!(true);
+        assert!(session_snapshot("s1", &value).is_err());
+        value["running"] = json!(false);
+        value["unfinished_run"]["status"] = json!("future-state");
+        assert!(!session_snapshot("s1", &value)
+            .unwrap()
+            .unfinished_run
+            .unwrap()
+            .recoverable());
+        value["unfinished_run"]["run_id"] = json!("");
+        assert!(session_snapshot("s1", &value).is_err());
+        value["unfinished_run"] = serde_json::Value::Null;
+        assert!(session_snapshot("s1", &value)
+            .unwrap()
+            .unfinished_run
+            .is_none());
+    }
 
     fn message(seq: i64, role: &str, content: &str) -> MessageInfo {
         MessageInfo {

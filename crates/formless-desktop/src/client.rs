@@ -293,33 +293,34 @@ impl Engine {
                 self.request(Request::CreateSession { name: None }, Pending::Create)
             }
             Command::Intent(intent) if self.ready => {
+                if intent.starts_work() && self.pending.values().any(|pending|
+                    matches!(pending, Pending::Action(action) if action.session_id == intent.session_id())) {
+                    self.updates.push(Update::Notice("Wait for the previous action's acknowledgement; the draft was kept.".into()));
+                    return;
+                }
                 let action_id = uuid::Uuid::new_v4();
                 let (session_id, request) = match intent {
                     Intent::SendMessage {
                         session_id,
                         content,
                         mode,
-                    } => {
-                        if self
-                            .pending
-                            .values()
-                            .any(|p| matches!(p, Pending::Action(action) if action.session_id == session_id))
-                        {
-                            self.updates.push(Update::Notice("Wait for the previous action's acknowledgement; the draft was kept.".into()));
-                            return;
-                        }
-                        (
-                            session_id.clone(),
-                            Request::SendMessage {
-                                session_id,
-                                content,
-                                mode,
-                                client_msg_id: Some(action_id.to_string()),
-                            },
-                        )
-                    }
+                    } => (
+                        session_id.clone(),
+                        Request::SendMessage {
+                            session_id,
+                            content,
+                            mode,
+                            client_msg_id: Some(action_id.to_string()),
+                        },
+                    ),
                     Intent::InterruptRun { session_id } => {
                         (session_id.clone(), Request::InterruptRun { session_id })
+                    }
+                    Intent::ResumeRun { session_id } => {
+                        (session_id.clone(), Request::ResumeRun { session_id })
+                    }
+                    Intent::AbandonRun { session_id } => {
+                        (session_id.clone(), Request::AbandonRun { session_id })
                     }
                 };
                 self.request(
@@ -630,8 +631,8 @@ async fn connected<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
                 Some(Command::Reconnect) => return Err("Reconnecting at the user's request; actions are not retried.".into()),
                 Some(Command::Select { session_id, generation }) => { *active = (session_id.clone(), generation); engine.select(session_id, generation); }
                 Some(Command::Page(destination)) => { *page = Some(destination); engine.load_page(destination); }
-                Some(Command::Intent(Intent::SendMessage { session_id, .. })) if uncertain.iter().any(|action| action.session_id == session_id && !engine.pending.values().any(|p| matches!(p, Pending::Action(pending) if pending == action))) => {
-                    engine.updates.push(Update::Notice("A previous action's outcome is unknown. It was not retried: deduplication does not survive reconnect. Check this Session in the TUI before sending again.".into()));
+                Some(Command::Intent(intent)) if intent.starts_work() && uncertain.iter().any(|action| action.session_id == intent.session_id() && !engine.pending.values().any(|p| matches!(p, Pending::Action(pending) if pending == action))) => {
+                    engine.updates.push(Update::Notice("A previous action's outcome is unknown. It was not retried: deduplication does not survive reconnect. Check this Session in the TUI before starting more work.".into()));
                 }
                 Some(command) => engine.command(command),
             },
@@ -1078,7 +1079,8 @@ mod tests {
     async fn reconnect_stop_acknowledgements_do_not_clear_an_unknown_send() {
         let mut retained = disconnect_after_unacknowledged_send().await;
         let original_unknown = retained.uncertain.clone();
-        for stop_succeeded in [true, false] {
+        for (stop_succeeded, resume) in [(true, false), (false, false), (true, true), (false, true)]
+        {
             let (stream, server) = tokio::io::duplex(8192);
             let (command_tx, mut commands) = queue::channel(QUEUE);
             let _keep_commands_open = command_tx.clone();
@@ -1086,6 +1088,19 @@ mod tests {
             let (_stop, mut cancelled) = watch::channel(false);
             let ready = AtomicBool::new(false);
             let peer = tokio::spawn(async move {
+                let retry = || {
+                    Command::Intent(if resume {
+                        Intent::ResumeRun {
+                            session_id: "a".into(),
+                        }
+                    } else {
+                        Intent::SendMessage {
+                            session_id: "a".into(),
+                            content: "one action".into(),
+                            mode: SendMode::Send,
+                        }
+                    })
+                };
                 let mut server = BufReader::new(server);
                 let mut snapshots = 0;
                 let mut other_session_sent = false;
@@ -1161,14 +1176,7 @@ mod tests {
                                 }
                                 tokio::task::yield_now().await;
                             }
-                            command_tx
-                                .send(Command::Intent(Intent::SendMessage {
-                                    session_id: "a".into(),
-                                    content: "one action".into(),
-                                    mode: SendMode::Send,
-                                }))
-                                .await
-                                .unwrap();
+                            command_tx.send(retry()).await.unwrap();
                             command_tx.send(Command::Refresh).await.unwrap();
                             continue;
                         }
@@ -1192,14 +1200,7 @@ mod tests {
                                 tokio::task::yield_now().await;
                             }
                             other_session_acknowledged = true;
-                            command_tx
-                                .send(Command::Intent(Intent::SendMessage {
-                                    session_id: "a".into(),
-                                    content: "one action".into(),
-                                    mode: SendMode::Send,
-                                }))
-                                .await
-                                .unwrap();
+                            command_tx.send(retry()).await.unwrap();
                             command_tx.send(Command::Refresh).await.unwrap();
                             continue;
                         }

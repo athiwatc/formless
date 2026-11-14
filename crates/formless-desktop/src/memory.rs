@@ -277,6 +277,8 @@ impl Rejections {
 pub enum IntentKind {
     Send(SendMode),
     Stop,
+    Resume,
+    Abandon,
 }
 
 /// What the shell keeps after handing an [`Intent`] on: enough to show what
@@ -304,6 +306,16 @@ impl From<&Intent> for IntentRecord {
             },
             Intent::InterruptRun { session_id } => Self {
                 kind: IntentKind::Stop,
+                session_id: session_id.clone(),
+                content_bytes: 0,
+                content_chars: 0,
+            },
+            Intent::ResumeRun { session_id } | Intent::AbandonRun { session_id } => Self {
+                kind: if matches!(intent, Intent::ResumeRun { .. }) {
+                    IntentKind::Resume
+                } else {
+                    IntentKind::Abandon
+                },
                 session_id: session_id.clone(),
                 content_bytes: 0,
                 content_chars: 0,

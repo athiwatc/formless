@@ -25,7 +25,7 @@ gui = ["dep:gpui-kit"]
 test-support = ["gui", "gpui-kit/test-support"]
 # Private-profile daemon/provider integration tests; never linked into the
 # desktop binary or the normal model build.
-daemon-tests = ["dep:formless-core", "dep:axum", "tokio/rt-multi-thread"]
+daemon-tests = ["dep:formless-core", "dep:axum", "dep:futures-util", "tokio/rt-multi-thread"]
 # Feasibility study, off by default and not wired into the shell: Thai word
 # boundaries from ICU's dictionary, for giving GPUI's line breaker somewhere
 # to break. See src/thai.rs and the findings document.
@@ -60,6 +60,7 @@ required-features = ["test-support"]
 formless-protocol = { path = "../formless-protocol" }
 formless-core = { path = "../formless-core", default-features = false, optional = true }
 axum = { version = "0.8", optional = true }
+futures-util = { version = "0.3", default-features = false, features = ["std"], optional = true }
 # Daemon replies carry their result as a JSON value (src/replies.rs). Both
 # are already in the lockfile through formless-protocol.
 serde = "1"

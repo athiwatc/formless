@@ -36,6 +36,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
       - name: Linux native dependencies
         if: runner.os == 'Linux'
         run: |
@@ -51,5 +54,14 @@ jobs:
         run: cargo build --locked
       - name: Native shell layout and keyboard dispatch tests
         run: cargo test --features test-support --test shell --locked
+      - name: Development package (no install, signing or launch)
+        run: python scripts/package-desktop.py --profile dev --output "$RUNNER_TEMP/formless-desktop-package"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: formless-desktop-development-${{ matrix.os }}
+          path: |
+            ${{ runner.temp }}/formless-desktop-package/*.zip
+            ${{ runner.temp }}/formless-desktop-package/SHA256SUMS
+          if-no-files-found: error
       - name: Scope of evidence
         run: echo 'Build, model, daemon/provider and headless layout coverage only. Actual OS IME, screen-reader use, foreground input and 200% visual acceptance remain separate native gates.' >> "$GITHUB_STEP_SUMMARY"

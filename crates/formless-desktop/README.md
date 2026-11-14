@@ -17,7 +17,8 @@ cargo run --locked -- --connect /path/to/profile/daemon.sock
 cargo test --no-default-features --features daemon-tests --test daemon --locked
 ```
 
-This mode loads real Sessions, supports New Session and Send/Steer/Queue/Stop,
+This mode loads real Sessions, supports New Session, Send/Steer/Queue/Stop and
+Resume/Abandon for a confirmed paused or interrupted Run,
 and displays read-only Tools, recorded Run Metrics, Proposals and Settings.
 Arrow keys browse resource entries; Copy details copies all returned fields
 as JSON. Loaded-text Search keeps its explicit Session scope. Existing pending
@@ -38,7 +39,9 @@ a current Session snapshot arrives. Drafts are kept after acknowledgement,
 rejection, transport failure and navigation. Send deduplication in the daemon
 is connection-scoped: after an unacknowledged action, the client blocks another
 send for that Session in this window. Review the outcome and continue through
-the existing TUI.
+the existing TUI. The same unknown-outcome guard blocks Resume. Resume uses the
+existing daemon admission path; if it requires a forecast confirmation, continue
+through the TUI. Recovery controls never send or clear the composer draft.
 Restarting the app is not a safe retry mechanism. OS pipe-write cancellation
 and native Windows/Linux behavior still require platform validation.
 
@@ -53,6 +56,32 @@ Findings, measurements, the parity inventory and the open blockers are in
 Current continuation evidence and remaining acceptance are recorded in
 [the live-client report](../../docs/desktop/live-client-20261114.md). Later
 fixture-only evidence notes below describe historical checkpoints.
+
+## Development packaging
+
+From this crate's directory, with tracked changes committed:
+
+```sh
+python3 scripts/package-desktop.py --profile dev --offline --output /new/path/formless-package
+```
+
+The standard-library-only helper (Python 3.9+) builds the optional binary with
+the locked dependencies, records the commit, build command and binary/lockfile
+hashes, gathers Cargo dependency notices, and verifies the ZIP's executable
+against the built bytes. It refuses an existing output directory. Use
+`--allow-dirty` only for an explicitly marked development inspection; the
+record then says `dirty: true`. Omit `--offline` if dependencies are not cached.
+
+macOS gets a `Formless Development.app`; Windows and Linux get a portable
+development directory. Each also gets a ZIP and SHA256SUMS. The helper never
+installs, signs, launches, configures a daemon or requests OS permissions. The
+default profile is release; `--profile dev` reuses the development cache when
+inspecting packaging. These are development artifacts, not signed installers
+or accepted native releases. Icons, distribution licensing (including assets
+and standard-library notices), signing/notarization, updates and clean-install
+OS acceptance remain release gates. BUILD.json explicitly records that limit.
+The optional desktop CI arranges the same packaging check on all three hosts;
+failed or unstarted hosted jobs do not establish platform support.
 
 ## Why it is outside the workspace
 

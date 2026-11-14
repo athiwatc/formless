@@ -148,6 +148,8 @@ pub fn bind_keys(cx: &mut App) {
                 Command::Send
                 | Command::SendSecondary
                 | Command::Stop
+                | Command::ResumeRun
+                | Command::AbandonRun
                 | Command::ToggleTheme
                 | Command::GoTo(_) => unreachable!("{command:?} has no global shortcut"),
             })
@@ -538,6 +540,7 @@ pub struct Shell {
     client_generation: u64,
     client_status: String,
     client_attention: bool,
+    client_recovery: Option<crate::replies::UnfinishedRun>,
     client_sessions: Vec<SessionInfo>,
     resource_pages: HashMap<Destination, crate::pages::Page>,
     resource_scroll: gpui_kit::UniformListScrollHandle,
@@ -620,6 +623,11 @@ pub struct Shell {
     inspector_toggle_focus: FocusHandle,
     theme_toggle_focus: FocusHandle,
     commands_toggle_focus: FocusHandle,
+    resume_focus: FocusHandle,
+    abandon_focus: FocusHandle,
+    resume_anchor: gpui_kit::ScrollAnchor,
+    abandon_anchor: gpui_kit::ScrollAnchor,
+    composer_anchor: gpui_kit::ScrollAnchor,
     /// The status line is a tab stop on a reflowed page, where it can be
     /// off screen and holds nothing else that focus could bring into view.
     status_focus: FocusHandle,
@@ -686,6 +694,7 @@ impl Shell {
         composer.update(cx, |composer, cx| composer.focus(window, cx));
 
         let session_sizes = Self::row_sizes(sidebar.rows().len(), TextScale::default());
+        let page_scroll = ScrollHandle::new();
         Self {
             client: None,
             client_connected: false,
@@ -693,6 +702,7 @@ impl Shell {
             client_generation: 0,
             client_status: String::new(),
             client_attention: false,
+            client_recovery: None,
             client_sessions: Vec::new(),
             resource_pages: HashMap::new(),
             resource_scroll: gpui_kit::UniformListScrollHandle::new(),
@@ -704,7 +714,10 @@ impl Shell {
             prefs: PanelPrefs::default(),
             text_scale: TextScale::default(),
             applied_scale: TextScale::default(),
-            page_scroll: ScrollHandle::new(),
+            resume_anchor: gpui_kit::ScrollAnchor::for_handle(page_scroll.clone()),
+            abandon_anchor: gpui_kit::ScrollAnchor::for_handle(page_scroll.clone()),
+            composer_anchor: gpui_kit::ScrollAnchor::for_handle(page_scroll.clone()),
+            page_scroll,
             reveal_frames: 0,
             inspector_scroll: ScrollHandle::new(),
             revealed: None,
@@ -719,6 +732,7 @@ impl Shell {
             commands: commands::State {
                 composer: ComposerActions::for_state(RunState::Idle, true),
                 has_composer: true,
+                can_recover: false,
                 composing: false,
                 sessions_shown: true,
                 context_shown: true,
@@ -755,6 +769,8 @@ impl Shell {
             inspector_toggle_focus: cx.focus_handle(),
             theme_toggle_focus: cx.focus_handle(),
             commands_toggle_focus: cx.focus_handle(),
+            resume_focus: cx.focus_handle(),
+            abandon_focus: cx.focus_handle(),
             status_focus: cx.focus_handle().tab_stop(true),
             composer_subscriptions,
             _subscriptions: subscriptions,
@@ -1187,7 +1203,10 @@ impl Shell {
     /// The part of a reflowed page that holds focus, if one does. Focus in
     /// an overlay panel is in none of them.
     pub fn focused_section(&self, window: &Window, cx: &App) -> Option<PageSection> {
-        if self.composer.focus_handle(cx).contains_focused(window, cx) {
+        if self.composer.focus_handle(cx).contains_focused(window, cx)
+            || self.resume_focus.is_focused(window)
+            || self.abandon_focus.is_focused(window)
+        {
             Some(PageSection::Composer)
         } else if self.conversation_focus.contains_focused(window, cx) {
             Some(PageSection::Conversation)
@@ -1220,7 +1239,7 @@ impl Shell {
     /// be, or nowhere. So the request is made for two frames running, and
     /// the second frame is asked for: the first lays the page out as it now
     /// is, the second scrolls to where the part really is.
-    fn reveal_focused(&mut self, window: &mut Window, cx: &App) {
+    fn reveal_focused(&mut self, window: &mut Window, cx: &mut App) {
         let reveal = Reveal {
             focused: window.focused(cx),
             section: self.focused_section(window, cx),
@@ -1235,6 +1254,24 @@ impl Shell {
             return;
         }
         self.reveal_frames -= 1;
+        // Recovery can make the composer taller than the viewport. Scroll to
+        // its focused descendant instead of trying to fit the whole section.
+        let anchor = if self.resume_focus.is_focused(window) {
+            Some(&self.resume_anchor)
+        } else if self.abandon_focus.is_focused(window) {
+            Some(&self.abandon_anchor)
+        } else if self.client_recovery.is_some()
+            && self.composer.focus_handle(cx).contains_focused(window, cx)
+        {
+            Some(&self.composer_anchor)
+        } else {
+            None
+        };
+        if let Some(anchor) = anchor {
+            anchor.scroll_to(window, cx);
+            window.request_animation_frame();
+            return;
+        }
         let section = self.revealed.as_ref().and_then(|reveal| reveal.section);
         let parts = PageSection::of_page(self.destination == Destination::Chat);
         if let Some(index) = parts.iter().position(|part| Some(*part) == section) {
@@ -1322,6 +1359,7 @@ impl Shell {
         self.client_snapshot_ready = false;
         self.client_status = "Connecting to the local Daemon Core…".into();
         self.client_attention = false;
+        self.client_recovery = None;
         self.invalidate_source_view();
         self.transcript_source = TranscriptSource::NotLoaded;
         self.transcript_state = None;
@@ -1349,6 +1387,7 @@ impl Shell {
 
     fn client_select(&mut self, cx: &mut Context<Self>) {
         self.client_snapshot_ready = false;
+        self.client_recovery = None;
         self.client_generation = self
             .client_generation
             .checked_add(1)
@@ -1441,7 +1480,7 @@ impl Shell {
             }
             ClientUpdate::Snapshot {
                 generation,
-                snapshot,
+                mut snapshot,
             } => {
                 if generation != self.client_generation
                     || self.sidebar.active_id() != Some(snapshot.session_id.as_str())
@@ -1451,6 +1490,12 @@ impl Shell {
                 }
                 let state = if snapshot.running {
                     RunState::Running
+                } else if snapshot
+                    .unfinished_run
+                    .as_ref()
+                    .is_some_and(|run| run.recoverable())
+                {
+                    RunState::Paused
                 } else {
                     self.client_sessions
                         .iter()
@@ -1458,6 +1503,14 @@ impl Shell {
                         .map_or(RunState::Idle, |s| RunState::of(s, &HashSet::new(), true))
                 };
                 self.sidebar.set_run_state(&snapshot.session_id, state);
+                if snapshot.unfinished_run.is_none()
+                    && (self.resume_focus.is_focused(window)
+                        || self.abandon_focus.is_focused(window))
+                {
+                    self.composer
+                        .update(cx, |composer, cx| composer.focus(window, cx));
+                }
+                self.client_recovery = snapshot.unfinished_run.take();
                 if !self.client_snapshot_ready {
                     self.client_status =
                         "Connected · canonical messages · live token streaming unavailable".into();
@@ -2039,6 +2092,12 @@ impl Shell {
         commands::State {
             composer: self.composer_actions(cx),
             has_composer: layout.composer,
+            can_recover: self.client_connected
+                && self.client_snapshot_ready
+                && self
+                    .client_recovery
+                    .as_ref()
+                    .is_some_and(|run| run.recoverable()),
             composing,
             sessions_shown: layout.sidebar != SidebarMode::Collapsed,
             context_shown: layout.inspector != InspectorMode::Hidden,
@@ -2075,6 +2134,18 @@ impl Shell {
             Command::Send => self.submit(false, cx),
             Command::SendSecondary => self.submit(true, cx),
             Command::Stop => self.stop(cx),
+            Command::ResumeRun | Command::AbandonRun => {
+                if let Some(session_id) = self.sidebar.active_id().map(str::to_string) {
+                    self.emit(
+                        if command == Command::ResumeRun {
+                            Intent::ResumeRun { session_id }
+                        } else {
+                            Intent::AbandonRun { session_id }
+                        },
+                        cx,
+                    );
+                }
+            }
             Command::ToggleSessions => self.toggle_panel(Region::Sidebar, window, cx),
             Command::ToggleContext => self.toggle_panel(Region::Inspector, window, cx),
             Command::ToggleTheme => {
@@ -2424,7 +2495,10 @@ impl Shell {
     fn focused_region(&self, window: &Window, cx: &App) -> Option<Region> {
         // The composer is drawn inside the conversation column, so it has to
         // be told apart from the conversation before the containment checks.
-        if self.composer.focus_handle(cx).contains_focused(window, cx) {
+        if self.composer.focus_handle(cx).contains_focused(window, cx)
+            || self.resume_focus.is_focused(window)
+            || self.abandon_focus.is_focused(window)
+        {
             Some(Region::Composer)
         } else if self.sidebar_focus.contains_focused(window, cx) {
             Some(Region::Sidebar)
@@ -3785,14 +3859,28 @@ impl Shell {
             .gap_2()
             .border_t_1()
             .border_color(cx.theme().border)
+            .children(self.client_recovery.as_ref().map(|run| {
+                v_flex().id("run-recovery").test_support().role(Role::Group)
+                    .aria_label("Run recovery").gap_2()
+                    .child(readable("unfinished-run", format!("Last Run: {} · {}", run.status, run.run_id)).text_sm())
+                    .children(run.error.as_ref().map(|error| {
+                        let mut chars = error.chars();
+                        let preview: String = chars.by_ref().take(500).collect();
+                        readable("unfinished-run-error", format!("{preview}{}", if chars.next().is_some() { "… (details in the TUI)" } else { "" })).text_sm()
+                    }))
+                    .child(readable("run-recovery-help", "Resume continues from the saved transcript. A cost confirmation may require the TUI. Abandon ends recovery without sending your draft.").text_sm())
+                    .child(h_flex().flex_wrap().gap_2()
+                        .child(div().id("resume-anchor").pt_1().anchor_scroll(Some(self.resume_anchor.clone())).child(button("run-resume", Command::ResumeRun, cx).outline().track_focus(&self.resume_focus)))
+                        .child(div().id("abandon-anchor").pt_1().anchor_scroll(Some(self.abandon_anchor.clone())).child(button("run-abandon", Command::AbandonRun, cx).outline().track_focus(&self.abandon_focus))))
+            }))
             .child(
-                Textarea::new(&self.composer)
+                div().id("composer-input-anchor").when(self.client_recovery.is_some(), |field| field.pt_1()).anchor_scroll(Some(self.composer_anchor.clone())).child(Textarea::new(&self.composer)
                     .aria_label("Message")
                     .on_paste({
                         let shell = cx.entity();
                         move |item, _, cx| shell.update(cx, |this, cx| this.paste_refused(item, cx))
                     })
-                    .w_full(),
+                    .w_full()),
             )
             // A refusal or a change to the draft is announced as it appears.
             .children(self.composer_notice.clone().map(|notice| {
@@ -3992,6 +4080,8 @@ impl Shell {
                         record.content_chars
                     ),
                     IntentKind::Stop => "Recorded Stop, not sent".to_string(),
+                    IntentKind::Resume => "Recorded Resume, not sent".to_string(),
+                    IntentKind::Abandon => "Recorded Abandon, not sent".to_string(),
                 },
                 None => "No intent recorded".to_string(),
             }

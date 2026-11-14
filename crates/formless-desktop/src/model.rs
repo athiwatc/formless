@@ -270,6 +270,29 @@ pub enum Intent {
     InterruptRun {
         session_id: String,
     },
+    ResumeRun {
+        session_id: String,
+    },
+    AbandonRun {
+        session_id: String,
+    },
+}
+
+impl Intent {
+    pub fn session_id(&self) -> &str {
+        match self {
+            Self::SendMessage { session_id, .. }
+            | Self::InterruptRun { session_id }
+            | Self::ResumeRun { session_id }
+            | Self::AbandonRun { session_id } => session_id,
+        }
+    }
+
+    /// These actions can start provider work. Unknown earlier outcomes must
+    /// block either one, even after unrelated acknowledgements on reconnect.
+    pub fn starts_work(&self) -> bool {
+        matches!(self, Self::SendMessage { .. } | Self::ResumeRun { .. })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

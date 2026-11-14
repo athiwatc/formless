@@ -75,7 +75,25 @@ mod render {
     const WHOLE: Fit = Fit::Whole;
     const REFLOWED: Fit = Fit::Reflowed;
 
-    const STATES: [State; 33] = [
+    const STATES: [State; 35] = [
+        state(
+            "daemon-recovery-light",
+            1440.,
+            900.,
+            LIGHT,
+            100,
+            Some("open-run-recovery"),
+            WHOLE,
+        ),
+        state(
+            "minimum-daemon-recovery-dark-200pct",
+            480.,
+            360.,
+            DARK,
+            200,
+            Some("open-run-recovery"),
+            REFLOWED,
+        ),
         state("wide-light", 1440., 900., LIGHT, 100, None, WHOLE),
         state("wide-dark", 1440., 900., DARK, 100, None, WHOLE),
         state("medium-light", 1100., 900., LIGHT, 100, None, WHOLE),
@@ -705,7 +723,29 @@ mod render {
         } else if let Some(control) = click {
             cx.update_window(any, |_, window, cx| {
                 window.render_frame(cx);
-                if control.starts_with("open-daemon-") {
+                if control == "open-run-recovery" {
+                    use formless_desktop::client::{Endpoint, Update};
+                    let sessions = fixture::sessions(3);
+                    shell.update(cx, |shell, cx| {
+                        shell.connect_daemon(Endpoint(std::env::temp_dir().join(format!("absent-{}", uuid::Uuid::new_v4()))), cx);
+                        shell.apply_client_update(Update::Connection { ready: true, notice: "Connected".into() }, window, cx);
+                        shell.apply_client_update(Update::Sessions(sessions.clone()), window, cx);
+                    });
+                    window.render_frame(cx);
+                    if window.try_find(shell::session_row_id(&sessions[0].id)).is_none() {
+                        window.click("toggle-sidebar", cx);
+                        window.render_frame(cx);
+                    }
+                    window.click(shell::session_row_id(&sessions[0].id), cx);
+                    let generation = shell.read(cx).client_generation();
+                    let snapshot = formless_desktop::replies::session_snapshot(&sessions[0].id,
+                        &serde_json::json!({"session":{"id":sessions[0].id},"running":false,"messages":[],
+                            "unfinished_run":{"run_id":"interrupted-run","status":"interrupted","error":"The provider request was stopped."}})).unwrap();
+                    shell.update(cx, |shell, cx| {
+                        shell.apply_client_update(Update::Snapshot { generation, snapshot }, window, cx);
+                        shell.focus_section(PageSection::Composer, window, cx);
+                    });
+                } else if control.starts_with("open-daemon-") {
                     use formless_desktop::client::{Endpoint, Update};
                     let destination = if control == "open-daemon-metrics" { Destination::Metrics } else { Destination::Tools };
                     let value = if destination == Destination::Metrics { serde_json::json!({"summary":{"recorded_runs":1,"prompt_tokens":10,"completion_tokens":20}, "runs":[{"run_id":"recorded-run","status":"completed","duration_ms":1250}]}) } else { serde_json::json!([
@@ -760,6 +800,44 @@ mod render {
             })
             .expect("offscreen window is open");
             cx.run_until_parked();
+            if control == "open-run-recovery" {
+                for id in ["run-resume", "run-abandon"] {
+                    cx.update_window(any, |_, window, cx| {
+                        for _ in 0..40 {
+                            window.render_frame(cx);
+                            if window.find(id).focused() == Some(true) {
+                                break;
+                            }
+                            window.press("tab", cx);
+                        }
+                        // Native anchors apply on the requested next frame.
+                        window.render_frame(cx);
+                        window.simulate_next_frame(cx);
+                        window.render_frame(cx);
+                        window.simulate_next_frame(cx);
+                    })
+                    .expect("offscreen window is open");
+                    cx.run_until_parked();
+                    cx.update_window(any, |_, window, cx| {
+                        window.render_frame(cx);
+                        assert_eq!(
+                            window.find(id).focused(),
+                            Some(true),
+                            "{name}: {id} is keyboard unreachable"
+                        );
+                        assert!(
+                            inside(window, id, viewport),
+                            "{name}: focused {id} outside viewport: {:?}",
+                            window.find(id).bounds()
+                        );
+                        assert!(
+                            window.find(id).bounds().top() >= px(4.),
+                            "{name}: {id} leaves no room for its focus ring"
+                        );
+                    })
+                    .expect("offscreen window is open");
+                }
+            }
             if control.starts_with("open-daemon-") {
                 cx.update_window(any, |_, window, cx| {
                     window.render_frame(cx);
@@ -773,7 +851,10 @@ mod render {
                 })
                 .expect("offscreen window is open");
             }
-            if fit == Fit::Reflowed && !control.starts_with("open-daemon-") {
+            if fit == Fit::Reflowed
+                && !control.starts_with("open-daemon-")
+                && control != "open-run-recovery"
+            {
                 // The overlay panel is inside the window, edge to edge at
                 // most, whatever the page under it was scrolled to.
                 cx.update_window(any, |_, window, cx| {

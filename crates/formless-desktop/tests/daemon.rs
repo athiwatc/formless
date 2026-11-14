@@ -8,10 +8,115 @@ mod credential_env;
 use formless_core::{Config, Paths};
 use formless_desktop::client::{Client, Command, Endpoint, Update};
 use formless_desktop::model::{Destination, Intent};
-use formless_protocol::{Request, SendMode};
+use formless_protocol::{
+    Event, Request, RequestEnvelope, SendMode, ServerMessage, PROTOCOL_VERSION,
+};
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+#[cfg(unix)]
+type LocalStream = tokio::net::UnixStream;
+#[cfg(windows)]
+type LocalStream = tokio::net::windows::named_pipe::NamedPipeClient;
+
+/// A second real IPC subscriber characterizes deltas independently of the
+/// desktop's canonical-only transport. No presentation seam supplies events.
+struct Observer {
+    socket: BufReader<LocalStream>,
+    id: u64,
+    events: Vec<Event>,
+}
+
+impl Observer {
+    async fn connect(endpoint: &Endpoint, session: &str) -> Self {
+        let stream = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                #[cfg(unix)]
+                let opened = LocalStream::connect(&endpoint.0).await;
+                #[cfg(windows)]
+                let opened =
+                    tokio::net::windows::named_pipe::ClientOptions::new().open(&endpoint.0);
+                match opened {
+                    Ok(stream) => break stream,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::NotFound
+                            || error.raw_os_error() == Some(231) =>
+                    {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(error) => panic!("observer connection: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("observer connection deadline");
+        let mut observer = Self {
+            socket: BufReader::new(stream),
+            id: 0,
+            events: Vec::new(),
+        };
+        observer
+            .request(Request::Subscribe {
+                sessions: Some(vec![session.into()]),
+                deltas: true,
+                client: Some("private stream characterization".into()),
+            })
+            .await;
+        observer
+    }
+
+    async fn next(&mut self) -> ServerMessage {
+        let mut line = String::new();
+        let count = tokio::time::timeout(Duration::from_secs(10), self.socket.read_line(&mut line))
+            .await
+            .expect("observer frame deadline")
+            .unwrap();
+        assert_ne!(count, 0, "observer IPC ended unexpectedly");
+        serde_json::from_str(&line).unwrap()
+    }
+
+    async fn request(&mut self, request: Request) -> Value {
+        self.id += 1;
+        let mut line = serde_json::to_vec(&RequestEnvelope {
+            id: self.id,
+            protocol: PROTOCOL_VERSION,
+            request,
+        })
+        .unwrap();
+        line.push(b'\n');
+        self.socket.get_mut().write_all(&line).await.unwrap();
+        loop {
+            match self.next().await {
+                ServerMessage::Event(event) => self.events.push(event),
+                ServerMessage::Response {
+                    id,
+                    ok,
+                    result,
+                    error,
+                } => {
+                    assert_eq!(id, self.id);
+                    assert!(ok, "observer request failed: {error:?}");
+                    return result.unwrap();
+                }
+            }
+        }
+    }
+
+    async fn until(&mut self, mut predicate: impl FnMut(&Event) -> bool) {
+        loop {
+            let ServerMessage::Event(event) = self.next().await else {
+                panic!("unsolicited observer response");
+            };
+            let found = predicate(&event);
+            self.events.push(event);
+            if found {
+                break;
+            }
+        }
+    }
+}
 
 async fn until(client: &Client, stage: &'static str, mut predicate: impl FnMut(Update) -> bool) {
     let deadline = Instant::now() + Duration::from_secs(20);
@@ -63,28 +168,43 @@ async fn real_daemon_provider_send_navigation_resources_and_reconnect() {
     let base_url = format!("http://{}", listener.local_addr().unwrap());
     let requests: Arc<Mutex<Vec<Value>>> = Arc::default();
     let first_answer = Arc::new(tokio::sync::Notify::new());
+    let finish_answer = Arc::new(tokio::sync::Notify::new());
+    let interrupt_answers = Arc::new(tokio::sync::Notify::new());
     let app = axum::Router::new()
         .route("/models", axum::routing::get(|| async { axum::Json(json!({"data":[{"id":"desktop-test-model"}]})) }))
         .route("/messages", axum::routing::post({
             let requests = requests.clone();
             let first_answer = first_answer.clone();
+            let finish_answer = finish_answer.clone();
+            let interrupt_answers = interrupt_answers.clone();
             move |axum::Json(body): axum::Json<Value>| {
                 let requests = requests.clone();
                 let first_answer = first_answer.clone();
+                let finish_answer = finish_answer.clone();
+                let interrupt_answers = interrupt_answers.clone();
                 async move {
-                    let first = { let mut requests = requests.lock().unwrap(); requests.push(body); requests.len() == 1 };
+                    let number = { let mut requests = requests.lock().unwrap(); requests.push(body); requests.len() };
+                    let first = number == 1;
                     if first { first_answer.notified().await; }
+                    else if matches!(number, 2 | 4) { interrupt_answers.notified().await; }
                     else { tokio::time::sleep(Duration::from_millis(300)).await; }
                     let events = [
                         json!({"type":"message_start","message":{"usage":{"input_tokens":1}}}),
                         json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
-                        json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Canonical provider reply ไทย 😀"}}),
+                        json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Canonical provider reply "}}),
+                        json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ไทย 😀"}}),
                         json!({"type":"content_block_stop","index":0}),
                         json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}),
                         json!({"type":"message_stop"}),
                     ];
-                    let body: String = events.iter().map(|event| format!("event: {}\ndata: {event}\n\n", event["type"].as_str().unwrap())).collect();
-                    axum::response::Response::builder().header("content-type", "text/event-stream").body(axum::body::Body::from(body)).unwrap()
+                    let encode = |events: &[Value]| -> String { events.iter().map(|event| format!("event: {}\ndata: {event}\n\n", event["type"].as_str().unwrap())).collect() };
+                    let chunks = std::collections::VecDeque::from([encode(&events[..3]), encode(&events[3..])]);
+                    let body = futures_util::stream::unfold((chunks, finish_answer), move |(mut chunks, gate)| async move {
+                        let chunk = chunks.pop_front()?;
+                        if first && chunks.is_empty() { gate.notified().await; }
+                        Some((Ok::<_, std::io::Error>(chunk), (chunks, gate)))
+                    });
+                    axum::response::Response::builder().header("content-type", "text/event-stream").body(axum::body::Body::from_stream(body)).unwrap()
                 }
             }
         }));
@@ -133,6 +253,7 @@ async fn real_daemon_provider_send_navigation_resources_and_reconnect() {
         matches!(u, Update::Connection { ready: true, .. })
     })
     .await;
+    let mut observer = Observer::connect(&endpoint, &a).await;
     client
         .send(Command::Select {
             session_id: Some(a.clone()),
@@ -174,6 +295,55 @@ async fn real_daemon_provider_send_navigation_resources_and_reconnect() {
         "the provider is still blocked during navigation"
     );
     first_answer.notify_one();
+    observer
+        .until(|event| {
+            matches!(event, Event::MessageDelta { session_id, delta, .. }
+        if session_id == &a && delta == "Canonical provider reply ")
+        })
+        .await;
+    let during = observer
+        .request(Request::GetSession { id: a.clone() })
+        .await;
+    assert_eq!(during["running"], true);
+    assert!(
+        !during["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| message["role"] == "assistant"),
+        "in-flight provider deltas are not part of a canonical snapshot"
+    );
+    finish_answer.notify_one();
+    observer
+        .until(|event| {
+            matches!(event, Event::MessageComplete { session_id, message, .. }
+        if session_id == &a && message.content == "Canonical provider reply ไทย 😀")
+        })
+        .await;
+    let live: String = observer
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            Event::MessageDelta {
+                session_id, delta, ..
+            } if session_id == &a => Some(delta.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(live, "Canonical provider reply ไทย 😀");
+    let completed = observer
+        .request(Request::GetSession { id: a.clone() })
+        .await;
+    assert_eq!(
+        completed["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["role"] == "assistant" && message["content"] == live)
+            .count(),
+        1
+    );
+    drop(observer);
     client
         .send(Command::Select {
             session_id: Some(a.clone()),
@@ -186,6 +356,73 @@ async fn real_daemon_provider_send_navigation_resources_and_reconnect() {
         1,
         "one user send caused one provider request"
     );
+    for abandon in [false, true] {
+        let request_count = if abandon { 4 } else { 2 };
+        client
+            .send(Command::Intent(Intent::SendMessage {
+                session_id: a.clone(),
+                content: "interrupt this private request".into(),
+                mode: SendMode::Send,
+            }))
+            .unwrap();
+        until(&client, "recovery-send-ack", |update| {
+            matches!(update, Update::Action { result: Ok(()), .. })
+        })
+        .await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while requests.lock().unwrap().len() < request_count {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("provider request did not reach its interruption gate");
+        client
+            .send(Command::Intent(Intent::InterruptRun {
+                session_id: a.clone(),
+            }))
+            .unwrap();
+        let mut stop_acknowledged = false;
+        let mut interrupted = false;
+        until(&client, "recovery-interrupted", |update| {
+            match update {
+                Update::Action { result: Ok(()), .. } => stop_acknowledged = true,
+                Update::Snapshot { snapshot, .. } => {
+                    interrupted = !snapshot.running
+                        && snapshot
+                            .unfinished_run
+                            .as_ref()
+                            .is_some_and(|run| run.status == "interrupted")
+                }
+                _ => {}
+            }
+            stop_acknowledged && interrupted
+        })
+        .await;
+        client
+            .send(Command::Intent(if abandon {
+                Intent::AbandonRun {
+                    session_id: a.clone(),
+                }
+            } else {
+                Intent::ResumeRun {
+                    session_id: a.clone(),
+                }
+            }))
+            .unwrap();
+        until(&client, "recovery-action-ack", |update| {
+            matches!(update, Update::Action { result: Ok(()), .. })
+        })
+        .await;
+        until(&client, "recovery-completed", |update| matches!(update,
+            Update::Snapshot { snapshot, .. } if !snapshot.running && snapshot.unfinished_run.is_none()
+        )).await;
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            if abandon { 4 } else { 3 },
+            "Resume starts one provider request; Abandon starts none"
+        );
+    }
+    interrupt_answers.notify_waiters();
     for destination in [
         Destination::Tools,
         Destination::Metrics,
@@ -242,10 +479,10 @@ async fn real_daemon_provider_send_navigation_resources_and_reconnect() {
         matches!(u, Update::Connection { ready: true, .. })
     })
     .await;
-    until(&client, "stage-10", |u| matches!(u, Update::Snapshot { generation: 3, snapshot } if snapshot.blocks.iter().filter(|block| block.markdown() == "Canonical provider reply ไทย 😀").count() == 1)).await;
+    until(&client, "stage-10", |u| matches!(u, Update::Snapshot { generation: 3, snapshot } if snapshot.blocks.iter().filter(|block| block.markdown() == "Canonical provider reply ไทย 😀").count() == 2)).await;
     assert_eq!(
         requests.lock().unwrap().len(),
-        1,
+        4,
         "reconnect did not replay a user mutation"
     );
     if let Ok(seconds) = std::env::var("FORMLESS_DESKTOP_NATIVE_HOLD_SECONDS") {
