@@ -1,9 +1,12 @@
 //! One table renderer for the CLI's lists (SPEC §12): aligned columns,
 //! secondary fields dimmed, colour only on a terminal and never with
-//! `NO_COLOR`, and the widest column cut to fit the terminal.
+//! `NO_COLOR`, and the widest column cut to fit the terminal. When readable
+//! aligned columns no longer fit, labelled records wrap every full field.
+//! Zero/one-column requests preserve whole graphemes as best effort.
 
 use formless_tui::{colorblind_rgb, tone_marker, SemanticTone};
 use std::cell::Cell;
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 thread_local! { static COLORBLIND: Cell<bool> = const { Cell::new(false) }; }
@@ -93,7 +96,8 @@ impl Table {
     }
 
     /// Terminal readers get accessible status markers when colour alone is
-    /// insufficient. Pipes retain the original cells, regardless of theme.
+    /// insufficient. Pipes omit semantic markers, regardless of theme;
+    /// both modes normalize cell whitespace and show input controls visibly.
     pub fn render(&self, terminal: bool, color: bool, width: Option<usize>) -> String {
         self.render_theme(terminal, color, width, COLORBLIND.with(Cell::get))
     }
@@ -105,20 +109,28 @@ impl Table {
         width: Option<usize>,
         colorblind: bool,
     ) -> String {
-        // Labels participate in width calculation before clipping/padding.
+        // Normalize before measuring, labeling or clipping. Input cells never
+        // contribute terminal escapes; only paint() below emits trusted styles.
+        let headers: Vec<_> = self.headers.iter().map(|h| cell_text(h)).collect();
         let rows: Vec<Vec<_>> = self
             .rows
             .iter()
             .map(|row| {
                 row.iter()
                     .map(|(text, tone)| {
-                        (tone.label(text, terminal && (!color || colorblind)), *tone)
+                        (
+                            tone.label(&cell_text(text), terminal && (!color || colorblind)),
+                            *tone,
+                        )
                     })
                     .collect()
             })
             .collect();
         let n = self.headers.len();
-        let mut widths: Vec<usize> = self.headers.iter().map(|h| h.width()).collect();
+        if n == 0 {
+            return String::new();
+        }
+        let mut widths: Vec<usize> = headers.iter().map(|h| h.width()).collect();
         for r in &rows {
             for (i, (text, _)) in r.iter().enumerate().take(n) {
                 widths[i] = widths[i].max(text.width());
@@ -143,6 +155,56 @@ impl Table {
             (true, Some(code)) if !text.is_empty() => format!("\x1b[{code}m{text}\x1b[0m"),
             _ => text.to_string(),
         };
+        if let Some(max) =
+            width.filter(|max| widths.iter().sum::<usize>() + 2 * n.saturating_sub(1) > *max)
+        {
+            // Below the readable aligned minimum, repeat labelled fields and
+            // wrap their full values. IDs are never silently shortened here.
+            // At zero/one columns, a full wide grapheme may exceed the budget;
+            // preserve it as best effort instead of dropping text or looping.
+            let max = max.max(1);
+            let mut out = String::new();
+            let labels = |out: &mut String, header: &str| {
+                for line in record_lines(&format!("{header}:"), max) {
+                    out.push_str(&paint(&line, Tone::Dim));
+                    out.push('\n');
+                }
+            };
+            if rows.is_empty() {
+                for header in &headers {
+                    labels(&mut out, header);
+                }
+            }
+            for (index, row) in rows.iter().enumerate() {
+                if index > 0 {
+                    out.push('\n');
+                }
+                for (column, header) in headers.iter().enumerate() {
+                    labels(&mut out, header);
+                    let (text, tone) = row
+                        .get(column)
+                        .map(|(text, tone)| (text.as_str(), *tone))
+                        .unwrap_or(("", Tone::Plain));
+                    let indent = if max >= 4
+                        && text
+                            .graphemes(true)
+                            .all(|cluster| cluster.width() <= max - 2)
+                    {
+                        "  "
+                    } else {
+                        ""
+                    };
+                    for line in record_lines(text, max - indent.len()) {
+                        if !line.is_empty() {
+                            out.push_str(indent);
+                            out.push_str(&paint(&line, tone));
+                        }
+                        out.push('\n');
+                    }
+                }
+            }
+            return out;
+        }
         let line = |cells: Vec<(String, Tone)>| -> String {
             let last = n - 1;
             let mut out = String::new();
@@ -152,7 +214,11 @@ impl Table {
                     .cloned()
                     .unwrap_or((String::new(), Tone::Plain));
                 let text = fit(&text, *w);
-                let pad = if i == last { 0 } else { w - text.width() };
+                let pad = if i == last {
+                    0
+                } else {
+                    w.saturating_sub(text.width())
+                };
                 out.push_str(&paint(&text, tone));
                 out.push_str(&" ".repeat(pad));
                 if i != last {
@@ -161,11 +227,7 @@ impl Table {
             }
             out.trim_end().to_string() + "\n"
         };
-        let header = self
-            .headers
-            .iter()
-            .map(|h| (h.to_string(), Tone::Dim))
-            .collect();
+        let header = headers.into_iter().map(|h| (h, Tone::Dim)).collect();
         let mut out = line(header);
         for r in &rows {
             out.push_str(&line(r.clone()));
@@ -174,24 +236,95 @@ impl Table {
     }
 }
 
-/// Colour is allowed unless `NO_COLOR` is set to anything (no-color.org).
+/// Full field contents for the narrow record layout. Measure whole strings
+/// so presentation sequences and cross-grapheme ligatures use display width.
+fn record_lines(text: &str, width: usize) -> Vec<String> {
+    let mut rows = Vec::new();
+    let mut row = String::new();
+    for cluster in text.graphemes(true) {
+        let mut candidate = row.clone();
+        candidate.push_str(cluster);
+        if !row.is_empty() && candidate.width() > width {
+            rows.push(std::mem::take(&mut row));
+        }
+        row.push_str(cluster);
+    }
+    rows.push(row);
+    rows
+}
+
+/// Controls already made visible in CLI comparison output. Keep the same
+/// policy for table cells: C0/C1, direction marks/overrides and isolates.
+pub(super) fn terminal_control(c: char) -> bool {
+    c.is_control()
+        || matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
+/// One visible line, with whitespace collapsed and input controls escaped.
+/// Apply this to piped text too: redirected tables may be displayed later.
+fn cell_text(text: &str) -> String {
+    let mut visible = String::with_capacity(text.len());
+    let mut space = false;
+    for c in text.chars() {
+        if c.is_whitespace() {
+            space = !visible.is_empty();
+            continue;
+        }
+        if space {
+            visible.push(' ');
+            space = false;
+        }
+        if terminal_control(c) {
+            visible.extend(c.escape_unicode());
+        } else {
+            visible.push(c);
+        }
+    }
+    visible
+}
+
+/// Colour is allowed unless `NO_COLOR` is nonempty (no-color.org).
 pub fn color_allowed() -> bool {
-    std::env::var_os("NO_COLOR").is_none()
+    std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty())
 }
 
 /// `text` cut to `w` columns with an ellipsis.
 fn fit(text: &str, w: usize) -> String {
-    if text.width() <= w {
+    if w == 0 {
+        return String::new();
+    }
+    let measured_width = text.width();
+    if measured_width <= w {
         return text.to_string();
     }
-    let mut out = String::new();
-    for c in text.chars() {
-        if out.width() + unicode_width::UnicodeWidthChar::width(c).unwrap_or(0) + 1 > w {
-            break;
+    // Most cells have additive grapheme widths. Measure each cluster once so
+    // joined emoji, modifiers and variation selectors keep their string width.
+    let mut used = 0;
+    let mut end = 0;
+    let mut sum = 0;
+    for (start, cluster) in text.grapheme_indices(true) {
+        let width = cluster.width();
+        sum += width;
+        if end == start && used + width < w {
+            used += width;
+            end = start + cluster.len();
         }
-        out.push(c);
     }
-    out + "…"
+    if sum != measured_width {
+        // Script ligatures can cross grapheme boundaries (e.g. Arabic Lam-Alef).
+        // Retain full-prefix measurement for those exceptional cells. Prefix
+        // widths can decrease when a ligature completes, so binary search is
+        // not valid here. Ordinary cells still use the linear path above.
+        end = 0;
+        for (start, cluster) in text.grapheme_indices(true) {
+            let next = start + cluster.len();
+            if text[..next].width() >= w {
+                break;
+            }
+            end = next;
+        }
+    }
+    format!("{}…", &text[..end])
 }
 
 /// A plain cell.
@@ -207,6 +340,34 @@ pub fn t(text: impl Into<String>, tone: Tone) -> (String, Tone) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_mixed_width_cells_clip_within_the_requested_columns() {
+        let input = "ascii ไทย 中文 ".repeat(10_000);
+        for width in [1, 2, 7, 40, 200] {
+            let clipped = fit(&input, width);
+            assert!(clipped.ends_with('…'));
+            assert!(clipped.width() <= width, "{width}: {clipped:?}");
+        }
+        assert_eq!(fit("a中ไทยtail", 4), "a中…");
+        assert_eq!(fit("ไทย", 10), "ไทย");
+    }
+
+    #[test]
+    fn clipping_preserves_sequence_aware_widths() {
+        for (input, width, expected) in [
+            ("👩‍💻abcdefg", 8, "👩‍💻abcde…"),
+            ("👩🏽‍💻abcdefg", 8, "👩🏽‍💻abcde…"),
+            ("❤\u{fe0f}abcdefg", 8, "❤\u{fe0f}abcde…"),
+            ("🇹🇭abcdefg", 8, "🇹🇭abcde…"),
+            ("لاabcdefghi", 8, "لاabcdef…"),
+            ("e\u{301}abcdefghi", 8, "e\u{301}abcdef…"),
+        ] {
+            let clipped = fit(input, width);
+            assert_eq!(clipped, expected);
+            assert_eq!(clipped.width(), width);
+        }
+    }
 
     #[test]
     fn piped_status_cells_preserve_the_original_whitespace_fields() {
@@ -237,6 +398,86 @@ mod tests {
     }
 
     #[test]
+    fn narrow_sessions_table_uses_full_labelled_records() {
+        let mut table = Table::new(&["ID", "UPDATED", "MSGS", "NAME", "LAST MESSAGE"]);
+        table.row(vec![
+            c("12345678"),
+            c("2026-11-14 12:34"),
+            c("1234"),
+            c("abcdefgh"),
+            c("message with full details"),
+        ]);
+        let out = table.render(true, false, Some(40));
+        assert!(out.lines().all(|line| line.width() <= 40), "{out}");
+        for text in [
+            "ID:",
+            "UPDATED:",
+            "MSGS:",
+            "NAME:",
+            "LAST MESSAGE:",
+            "12345678",
+            "2026-11-14 12:34",
+            "message with full details",
+        ] {
+            assert!(out.contains(text), "missing {text}: {out}");
+        }
+        assert!(!out.contains('…'), "record values stay complete: {out}");
+    }
+
+    #[test]
+    fn narrow_records_preserve_unicode_status_and_all_fields() {
+        let mut table = Table::new(&["ID", "STATE", "DESCRIPTION"]);
+        table.row(vec![
+            c("12345678"),
+            t("ready", Tone::Good),
+            c("❤\u{fe0f} 👩🏽‍💻 e\u{301} لا 中文"),
+        ]);
+        table.row(vec![
+            c("abcdef01"),
+            t("failed", Tone::Bad),
+            c("second record"),
+        ]);
+        for width in 0..=27 {
+            for color in [false, true] {
+                let out = table.render_theme(true, color, Some(width), true);
+                let plain = regex::Regex::new(r"\x1b\[[0-9;]*m")
+                    .unwrap()
+                    .replace_all(&out, "")
+                    .into_owned();
+                assert!(
+                    plain.lines().all(|line| line.width() <= width.max(2)),
+                    "width {width}: {plain}"
+                );
+                for value in [
+                    "12345678",
+                    "ok ready",
+                    "fail failed",
+                    "❤\u{fe0f} 👩🏽‍💻 e\u{301} لا 中文",
+                    "abcdef01",
+                    "second record",
+                ] {
+                    // Remove only the known indentation and inserted line breaks.
+                    let joined = plain
+                        .lines()
+                        .map(|line| line.strip_prefix("  ").unwrap_or(line))
+                        .collect::<String>();
+                    assert!(
+                        joined.contains(value),
+                        "missing {value}, width {width}: {plain}"
+                    );
+                }
+                assert!(!plain.contains('…'));
+            }
+        }
+        assert_eq!(fit("nonempty", 0), "");
+        assert_eq!(fit("❤\u{fe0f}tail", 1), "…");
+        assert_eq!(Table::new(&[]).render(true, false, Some(0)), "");
+        assert!(!Table::new(&["EMPTY"])
+            .render(true, false, Some(1))
+            .is_empty());
+    }
+
+    #[test]
     fn columns_align_and_fit_the_terminal() {
         let out = sample().render(false, false, None);
         let lines: Vec<&str> = out.lines().collect();
@@ -255,6 +496,63 @@ mod tests {
         assert!(
             coloured.contains("\x1b[2mUpper-case some text\x1b[0m"),
             "{coloured}"
+        );
+    }
+
+    #[test]
+    fn cells_are_single_line_and_controls_are_visible_before_layout() {
+        let mut table = Table::new(&["NAME", "TASK"]);
+        table.row(vec![c("first"), c("  a\nb\tc\r\n\x1b[31m\u{202e}  ")]);
+        table.row(vec![c("second"), c("ไทย 👩‍💻 e\u{301}  text")]);
+        let plain = table.render(false, false, None);
+        assert_eq!(plain.lines().count(), 3, "{plain:?}");
+        assert!(plain.contains(r"a b c \u{1b}[31m\u{202e}"), "{plain:?}");
+        assert!(!plain.contains('\x1b') && !plain.contains('\u{202e}'));
+        assert!(plain.contains("ไทย 👩‍💻 e\u{301} text"), "{plain:?}");
+        for color in [false, true] {
+            let out = table.render(true, color, Some(45));
+            let stripped = regex::Regex::new(r"\x1b\[[0-9;]*m")
+                .unwrap()
+                .replace_all(&out, "")
+                .into_owned();
+            assert_eq!(stripped.lines().count(), 3, "{out:?}");
+            assert!(stripped.lines().all(|line| line.width() <= 45), "{out:?}");
+            assert!(
+                !out.contains("\x1b[31m"),
+                "cell must not inject style: {out:?}"
+            );
+            assert!(
+                !stripped.chars().any(|c| c != '\n' && terminal_control(c)),
+                "{stripped:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn normalization_preserves_text_and_escapes_all_existing_control_classes() {
+        assert_eq!(
+            cell_text("\t  alpha\r\n\u{2028}\u{2029} beta\u{a0}\t"),
+            "alpha beta"
+        );
+        assert_eq!(cell_text("\n\t"), "");
+        let mut input = String::from("start");
+        for c in [
+            '\0', '\x08', '\x1b', '\x7f', '\u{80}', '\u{9f}', '\u{61c}', '\u{200e}', '\u{200f}',
+            '\u{202a}', '\u{202e}', '\u{2066}', '\u{2069}',
+        ] {
+            input.push(c);
+        }
+        let out = cell_text(&input);
+        assert!(out.starts_with("start\\u{0}\\u{8}\\u{1b}"), "{out:?}");
+        assert!(!out.chars().any(terminal_control), "{out:?}");
+        let mut table = Table::new(&[" HEAD\nER ", "EMPTY"]);
+        table.row(vec![t("\t\n ", Tone::Good), c("value")]);
+        let out = table.render(true, false, None);
+        assert_eq!(out.lines().count(), 2);
+        assert!(out.starts_with("HEAD ER"));
+        assert!(
+            !out.contains("ok"),
+            "empty normalized cells have no status label"
         );
     }
 

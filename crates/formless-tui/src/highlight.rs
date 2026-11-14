@@ -470,6 +470,7 @@ enum Tok {
 
 pub(crate) struct Highlighter {
     lang: &'static Lang,
+    rust_numbers: bool,
     color: bool,
     /// Open block comments (more than one only where they nest).
     in_block: usize,
@@ -477,10 +478,89 @@ pub(crate) struct Highlighter {
     in_str: Option<String>,
 }
 
+/// Rust-shaped literals only. A dot before another dot or an identifier
+/// belongs to range/member syntax, not the preceding number.
+fn rust_number_end(chars: &[char], start: usize) -> usize {
+    let mut end = start;
+    let radix = if chars.get(start) == Some(&'0') {
+        match chars.get(start + 1) {
+            Some('x' | 'X') => Some(16),
+            Some('o' | 'O') => Some(8),
+            Some('b' | 'B') => Some(2),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    if let Some(radix) = radix {
+        end += 2;
+        while chars
+            .get(end)
+            .is_some_and(|c| c.is_digit(radix) || *c == '_')
+        {
+            end += 1;
+        }
+    } else {
+        while chars
+            .get(end)
+            .is_some_and(|c| c.is_ascii_digit() || *c == '_')
+        {
+            end += 1;
+        }
+        if chars.get(end) == Some(&'.')
+            && chars
+                .get(end + 1)
+                .is_none_or(|c| *c != '.' && *c != '_' && !c.is_alphabetic())
+        {
+            end += 1;
+            while chars
+                .get(end)
+                .is_some_and(|c| c.is_ascii_digit() || *c == '_')
+            {
+                end += 1;
+            }
+        }
+        if matches!(chars.get(end), Some('e' | 'E')) {
+            let mut exponent = end + 1;
+            if matches!(chars.get(exponent), Some('+' | '-')) {
+                exponent += 1;
+            }
+            let mut digit = false;
+            while let Some(c) = chars
+                .get(exponent)
+                .filter(|c| c.is_ascii_digit() || **c == '_')
+            {
+                digit |= c.is_ascii_digit();
+                exponent += 1;
+            }
+            if digit {
+                end = exponent;
+            }
+        }
+    }
+    for suffix in [
+        "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32", "u64", "u128", "usize",
+        "f32", "f64",
+    ] {
+        let suffix_end = end + suffix.len();
+        if chars
+            .get(end..suffix_end)
+            .is_some_and(|slice| slice.iter().copied().eq(suffix.chars()))
+            && chars
+                .get(suffix_end)
+                .is_none_or(|c| !c.is_alphanumeric() && *c != '_')
+        {
+            return suffix_end;
+        }
+    }
+    end
+}
+
 impl Highlighter {
     pub(crate) fn new(name: &str, color: bool) -> Option<Self> {
         lang(name).map(|lang| Self {
             lang,
+            rust_numbers: matches!(name.to_ascii_lowercase().as_str(), "rust" | "rs"),
             color,
             in_block: 0,
             in_str: None,
@@ -702,11 +782,18 @@ impl Highlighter {
                 continue;
             }
             if c.is_ascii_digit() && word_start {
-                let mut j = i;
-                while j < chars.len()
-                    && (chars[j].is_ascii_alphanumeric() || "._".contains(chars[j]))
-                {
-                    j += 1;
+                let mut j = if self.rust_numbers {
+                    rust_number_end(&chars, i)
+                } else {
+                    i
+                };
+                if !self.rust_numbers {
+                    // Keep the existing policy for other language families.
+                    while j < chars.len()
+                        && (chars[j].is_ascii_alphanumeric() || "._".contains(chars[j]))
+                    {
+                        j += 1;
+                    }
                 }
                 push(Tok::Num, &chars[i..j]);
                 i = j;
@@ -769,18 +856,18 @@ impl Highlighter {
     }
 }
 
-/// Unified-diff colouring: additions, removals, hunks and file headers.
-pub(crate) fn diff_line(line: &str, color: bool) -> Span<'static> {
-    let style = if line.starts_with("+++") || line.starts_with("---") {
-        super::bold_fg(color, Color::White)
-    } else if line.starts_with('+') {
-        super::bold_fg(color, Color::Green)
-    } else if line.starts_with('-') {
-        super::bold_fg(color, Color::Red)
-    } else if line.starts_with("@@") {
-        fg(color, Color::Cyan)
-    } else {
-        Style::default()
+#[path = "diff_classification.rs"]
+mod diff_classification;
+use diff_classification::Kind as DiffKind;
+
+/// Render a line whose role has already been determined by the full walk.
+fn diff_line(line: &str, kind: DiffKind, color: bool) -> Span<'static> {
+    let style = match kind {
+        DiffKind::Header => super::bold_fg(color, Color::White),
+        DiffKind::Added => super::bold_fg(color, Color::Green),
+        DiffKind::Removed => super::bold_fg(color, Color::Red),
+        DiffKind::Hunk => fg(color, Color::Cyan),
+        DiffKind::Plain => Style::default(),
     };
     Span::styled(line.to_string(), style)
 }
@@ -804,19 +891,23 @@ pub(crate) fn is_unified_diff(text: &str) -> bool {
 /// `2 * CONTEXT` collapsed to their first and last `CONTEXT` lines.
 pub(crate) fn diff_lines(text: &str, color: bool) -> Vec<Vec<Span<'static>>> {
     const CONTEXT: usize = 3;
-    let lines: Vec<&str> = text.lines().collect();
+    let lines: Vec<_> = diff_classification::classify(text).collect();
     let mut out = Vec::new();
     let mut i = 0;
     while i < lines.len() {
-        let context = |l: &str| l.starts_with(' ') || l.is_empty();
-        if context(lines[i]) {
+        let context = |l: &(&str, DiffKind)| l.0.starts_with(' ') || l.0.is_empty();
+        if context(&lines[i]) {
             let start = i;
-            while i < lines.len() && context(lines[i]) {
+            while i < lines.len() && context(&lines[i]) {
                 i += 1;
             }
             let run = &lines[start..i];
             if run.len() > 2 * CONTEXT + 1 {
-                out.extend(run[..CONTEXT].iter().map(|l| vec![diff_line(l, color)]));
+                out.extend(
+                    run[..CONTEXT]
+                        .iter()
+                        .map(|&(line, kind)| vec![diff_line(line, kind, color)]),
+                );
                 out.push(vec![Span::styled(
                     format!(" ⋯ {} unchanged lines", run.len() - 2 * CONTEXT),
                     super::ui::dim(color),
@@ -824,13 +915,16 @@ pub(crate) fn diff_lines(text: &str, color: bool) -> Vec<Vec<Span<'static>>> {
                 out.extend(
                     run[run.len() - CONTEXT..]
                         .iter()
-                        .map(|l| vec![diff_line(l, color)]),
+                        .map(|&(line, kind)| vec![diff_line(line, kind, color)]),
                 );
             } else {
-                out.extend(run.iter().map(|l| vec![diff_line(l, color)]));
+                out.extend(
+                    run.iter()
+                        .map(|&(line, kind)| vec![diff_line(line, kind, color)]),
+                );
             }
         } else {
-            out.push(vec![diff_line(lines[i], color)]);
+            out.push(vec![diff_line(lines[i].0, lines[i].1, color)]);
             i += 1;
         }
     }
@@ -839,14 +933,10 @@ pub(crate) fn diff_lines(text: &str, color: bool) -> Vec<Vec<Span<'static>>> {
 
 /// `+added −removed` for a diff (file headers excluded).
 pub(crate) fn diff_stat(text: &str) -> (usize, usize) {
-    text.lines().fold((0, 0), |(a, r), l| {
-        if l.starts_with('+') && !l.starts_with("+++") {
-            (a + 1, r)
-        } else if l.starts_with('-') && !l.starts_with("---") {
-            (a, r + 1)
-        } else {
-            (a, r)
-        }
+    diff_classification::classify(text).fold((0, 0), |(added, removed), (_, kind)| match kind {
+        DiffKind::Added => (added + 1, removed),
+        DiffKind::Removed => (added, removed + 1),
+        _ => (added, removed),
     })
 }
 
@@ -884,6 +974,100 @@ mod tests {
             .into_iter()
             .map(|s| (s.content.to_string(), s.style.fg))
             .collect()
+    }
+
+    #[test]
+    fn rust_numbers_leave_ranges_members_and_suffix_boundaries_to_normal_tokens() {
+        let number = Some(Color::LightYellow);
+        let call = Some(Color::Blue);
+        for lang in ["rust", "rs", "RuSt"] {
+            for (source, numeric, names) in [
+                ("0..len", "0", vec![("len", None)]),
+                ("0..=len", "0", vec![("len", None)]),
+                ("1.max(x)", "1", vec![("max", call)]),
+                ("1_u32.max(x)", "1_u32", vec![("max", call)]),
+                ("0..n.min(k)", "0", vec![("n", None), ("min", call)]),
+            ] {
+                let tokens = toks(lang, source);
+                assert!(tokens.contains(&(numeric.into(), number)), "{tokens:?}");
+                for (name, style) in names {
+                    assert!(
+                        tokens
+                            .iter()
+                            .any(|(text, c)| text.contains(name) && *c == style),
+                        "{tokens:?}"
+                    );
+                }
+                assert!(
+                    !tokens.iter().any(|(text, c)| *c == number
+                        && (text.contains("..")
+                            || text.contains("max")
+                            || text.contains("min")
+                            || text.contains("len"))),
+                    "{tokens:?}"
+                );
+                assert_eq!(
+                    tokens
+                        .iter()
+                        .map(|(text, _)| text.as_str())
+                        .collect::<String>(),
+                    source
+                );
+            }
+        }
+        for literal in [
+            "3.14",
+            "1_000",
+            "0x1F",
+            "0xff_u32",
+            "0o7_55usize",
+            "0b10_01u8",
+            "1e3",
+            "1E-3",
+            "1e+3f64",
+            "3.14_f32",
+            "1.",
+            "1e_3_f64",
+            "10i128",
+            "10u128",
+            "10isize",
+        ] {
+            let tokens = toks("rust", literal);
+            assert_eq!(tokens, vec![(literal.into(), number)], "{literal}");
+        }
+        for source in ["1_u32more", "1e+name", "3.14f32suffix", "0b1usize_more"] {
+            let tokens = toks("rust", source);
+            assert_eq!(
+                tokens
+                    .iter()
+                    .map(|(text, _)| text.as_str())
+                    .collect::<String>(),
+                source
+            );
+            assert!(
+                tokens.iter().any(|(_, style)| *style != number),
+                "{tokens:?}"
+            );
+        }
+        for lang in ["js", "python", "go", "c", "json", "toml", "sql", "css"] {
+            assert_eq!(
+                toks(lang, "0..len"),
+                vec![("0..len".into(), number)],
+                "existing {lang} policy"
+            );
+        }
+        let source = "let 日本語 = 0..n.min(1_u32.max(3.14e-2f64)); // 🦀";
+        for color in [true, false] {
+            let mut highlighter = Highlighter::new("rust", color).unwrap();
+            assert_eq!(
+                highlighter
+                    .line(source)
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>(),
+                source
+            );
+        }
     }
 
     #[test]
@@ -1019,14 +1203,19 @@ mod tests {
             ("+added ไทย", crate::SemanticTone::Good),
             ("-removed العربية", crate::SemanticTone::Bad),
         ] {
-            let span = diff_line(text, true);
+            let kind = if text.starts_with('+') {
+                DiffKind::Added
+            } else {
+                DiffKind::Removed
+            };
+            let span = diff_line(text, kind, true);
             let (r, g, b) = crate::colorblind_rgb(tone);
             assert_eq!(span.style.fg, Some(Color::Rgb(r, g, b)));
             assert!(span
                 .style
                 .add_modifier
                 .contains(ratatui::style::Modifier::BOLD));
-            let plain = diff_line(text, false);
+            let plain = diff_line(text, kind, false);
             assert_eq!(span.content, plain.content);
             assert_eq!(plain.style.fg, None);
             assert!(plain
@@ -1036,3 +1225,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "diff_classification_tests.rs"]
+mod diff_classification_tests;

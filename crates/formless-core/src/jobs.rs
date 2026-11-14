@@ -6,7 +6,8 @@ use chrono::{DateTime, Datelike, Duration, Local, TimeZone, Timelike};
 
 /// A parsed 5-field cron expression: minute hour day-of-month month
 /// day-of-week (0 or 7 = Sunday). Supports `*`, numbers, `a-b`, lists
-/// and `/step`, plus `@hourly`, `@daily`, `@weekly`, `@monthly`.
+/// and `/step`, three-letter month/weekday names, plus `@hourly`,
+/// `@daily`, `@weekly`, `@monthly`, `@yearly` and `@annually`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Cron {
     minute: Vec<bool>,
@@ -19,8 +20,23 @@ pub struct Cron {
 }
 
 fn field(spec: &str, min: u32, max: u32, what: &str) -> Result<Vec<bool>> {
+    let names: &[&str] = match what {
+        "month" => &[
+            "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+        ],
+        "weekday" => &["sun", "mon", "tue", "wed", "thu", "fri", "sat"],
+        _ => &[],
+    };
     let mut set = vec![false; max as usize + 1];
     for part in spec.split(',') {
+        let value = |token: &str| -> Result<u32> {
+            names
+                .iter()
+                .position(|name| token.eq_ignore_ascii_case(name))
+                .map(|i| min + i as u32)
+                .or_else(|| token.parse::<u32>().ok())
+                .with_context(|| format!("bad {what}: {part}"))
+        };
         let (range, step) = match part.split_once('/') {
             Some((r, s)) => (
                 r,
@@ -34,11 +50,9 @@ fn field(spec: &str, min: u32, max: u32, what: &str) -> Result<Vec<bool>> {
         let (lo, hi) = if range == "*" {
             (min, max)
         } else if let Some((a, b)) = range.split_once('-') {
-            (a.parse()?, b.parse()?)
+            (value(a)?, value(b)?)
         } else {
-            let v: u32 = range
-                .parse()
-                .with_context(|| format!("bad {what}: {part}"))?;
+            let v = value(range)?;
             (v, if part.contains('/') { max } else { v })
         };
         if lo < min || hi > max || lo > hi {
@@ -58,6 +72,7 @@ impl Cron {
             "@daily" | "@midnight" => "0 0 * * *",
             "@weekly" => "0 0 * * 0",
             "@monthly" => "0 0 1 * *",
+            "@yearly" | "@annually" => "0 0 1 1 *",
             e => e,
         };
         let f: Vec<&str> = expr.split_whitespace().collect();
@@ -75,8 +90,9 @@ impl Cron {
             dom: field(dom, 1, 31, "day")?,
             month: field(mo, 1, 12, "month")?,
             dow: dow_set,
-            dom_any: *dom == "*",
-            dow_any: *dow == "*",
+            // Cronie flags depend on leading syntax, not the generated value set.
+            dom_any: dom.starts_with('*'),
+            dow_any: dow.starts_with('*'),
         })
     }
 
@@ -172,14 +188,21 @@ pub fn first_run(
 /// Returns the cron expression to store.
 pub fn to_cron(schedule: &str) -> Result<String> {
     let s = schedule.trim();
-    if Cron::parse(s).is_ok() {
-        return Ok(s.to_string());
+    let cron_error = match Cron::parse(s) {
+        Ok(_) => return Ok(s.to_string()),
+        Err(error) => error,
+    };
+    // Natural phrases can also contain five whitespace-separated words,
+    // e.g. "every weekday at 9 a.m.". Try them before reporting cron errors.
+    if let Some(cron) = natural_to_cron(s) {
+        return Ok(cron);
     }
-    natural_to_cron(s).with_context(|| {
-        format!(
-            "not a cron expression or a schedule like \"every weekday at 9am\", \"every 2 hours\", \"daily at 18:30\": {schedule}"
-        )
-    })
+    if s.starts_with('@') || s.split_whitespace().count() == 5 {
+        bail!("invalid cron expression: {cron_error}");
+    }
+    bail!(
+        "not a cron expression or a schedule like \"every weekday at 9am\", \"every 2 hours\", \"daily at 18:30\": {schedule}"
+    )
 }
 
 /// The next `n` run times of a cron expression after `now`.
@@ -209,17 +232,23 @@ const DAYS: [(&str, u32); 7] = [
     ("saturday", 6),
 ];
 
-/// "9am", "9:30 pm", "18:30", "noon", "midnight" → (hour, minute).
+/// "9am", "9:30 p.m.", "18:30", "noon", "midnight" → (hour, minute).
 fn parse_time(t: &str) -> Option<(u32, u32)> {
-    let t = t.trim().replace(' ', "");
+    let t = t.trim().replace(' ', "").to_ascii_lowercase();
     match t.as_str() {
         "noon" | "midday" => return Some((12, 0)),
         "midnight" => return Some((0, 0)),
         _ => {}
     }
-    let (body, pm) = if let Some(b) = t.strip_suffix("pm") {
+    let (body, pm) = if let Some(b) = ["p.m.", "p.m", "pm.", "pm"]
+        .into_iter()
+        .find_map(|suffix| t.strip_suffix(suffix))
+    {
         (b, Some(true))
-    } else if let Some(b) = t.strip_suffix("am") {
+    } else if let Some(b) = ["a.m.", "a.m", "am.", "am"]
+        .into_iter()
+        .find_map(|suffix| t.strip_suffix(suffix))
+    {
         (b, Some(false))
     } else {
         (t.as_str(), None)
@@ -277,6 +306,7 @@ fn natural_to_cron(s: &str) -> Option<String> {
         ["weekend"] | ["weekends"] => return Some(format!("{m} {h} * * 0,6")),
         ["week"] | ["weekly"] => return Some(format!("{m} {h} * * 1")),
         ["month"] | ["monthly"] => return Some(format!("{m} {h} 1 * *")),
+        ["year"] | ["yearly"] | ["annually"] => return Some(format!("{m} {h} 1 1 *")),
         _ => {}
     }
     // Named days: "monday", "monday and friday", "mon, wed, fri".
@@ -425,6 +455,90 @@ mod schedule_tests {
     use super::*;
 
     #[test]
+    fn leading_wildcard_steps_constrain_day_field_matches() {
+        let monday = Local.with_ymd_and_hms(2026, 1, 5, 9, 0, 0).unwrap();
+        let tuesday = Local.with_ymd_and_hms(2026, 1, 6, 9, 0, 0).unwrap();
+        let cron = Cron::parse("0 9 */1 * 1").unwrap();
+        assert!(cron.matches(&monday));
+        assert!(
+            !cron.matches(&tuesday),
+            "wildcard-step DOM must still require Monday"
+        );
+    }
+
+    #[test]
+    fn day_field_flags_follow_leading_syntax_not_value_coverage() {
+        for (expr, day, expected) in [
+            ("0 9 */2 * 1", 5, true),
+            ("0 9 */2 * 1", 12, false),
+            ("0 9 */2 * 1", 19, true),
+            ("0 9 15 * */1", 5, false),
+            ("0 9 15 * */1", 15, true),
+            ("0 9 15 * 1", 5, true),
+            ("0 9 15 * 1", 15, true),
+            ("0 9 15 * 1", 6, false),
+            ("0 9 1-31 * 1", 6, true),
+            ("0 9 15 * 0-7", 6, true),
+            ("0 9 */2,2 * 1", 2, false),
+            ("0 9 2,*/2 * 1", 2, true),
+            ("0 9 */2,2 * 1", 12, false),
+            ("0 9 2,*/2 * 1", 12, true),
+            ("0 9 *,1 * 1", 6, false),
+            ("0 9 1,* * 1", 6, true),
+            ("0 9 15 * *,1", 6, false),
+            ("0 9 15 * 1,*", 6, true),
+            ("0 9 15 * */2,MON", 5, false),
+            ("0 9 15 * MON,*/2", 5, true),
+            ("0 9 */2 * */2", 1, true),
+            ("0 9 */2 * */2", 5, false),
+            ("0 9 */2 * */2", 6, false),
+            ("0 9 * * 7", 4, true),
+            ("0 9 * * 0", 4, true),
+            ("0 9 */1 * MON", 5, true),
+            ("0 9 */1 * MON", 6, false),
+        ] {
+            let at = Local.with_ymd_and_hms(2026, 1, day, 9, 0, 0).unwrap();
+            assert_eq!(
+                Cron::parse(expr).unwrap().matches(&at),
+                expected,
+                "{expr}, January {day}"
+            );
+        }
+        for day in 1..=31 {
+            let at = Local.with_ymd_and_hms(2026, 1, day, 9, 0, 0).unwrap();
+            for (bare, step) in [
+                ("0 9 * * 1", "0 9 */1 * 1"),
+                ("0 9 15 * *", "0 9 15 * */1"),
+                ("0 9 * * *", "0 9 */1 * */1"),
+            ] {
+                assert_eq!(
+                    Cron::parse(bare).unwrap().matches(&at),
+                    Cron::parse(step).unwrap().matches(&at)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wildcard_step_first_run_and_previews_agree_without_rewriting_expression() {
+        let now = Local.with_ymd_and_hms(2026, 1, 4, 8, 0, 0).unwrap();
+        let expr = "0 9 */1 * 1";
+        assert_eq!(to_cron(expr).unwrap(), expr);
+        let runs = next_runs(expr, now, 3).unwrap();
+        assert_eq!(
+            runs.iter().map(|at| at.day()).collect::<Vec<_>>(),
+            [5, 12, 19]
+        );
+        let mut previous = now;
+        for expected in runs {
+            assert_eq!(first_run(Some(expr), None, previous).unwrap(), expected);
+            previous = expected;
+        }
+        let runs = next_runs("0 9 */2 * 1", now, 2).unwrap();
+        assert_eq!(runs.iter().map(|at| at.day()).collect::<Vec<_>>(), [5, 19]);
+    }
+
+    #[test]
     fn plain_english_schedules_become_cron() {
         for (text, cron) in [
             ("every weekday at 9am", "0 9 * * 1-5"),
@@ -454,3 +568,7 @@ mod schedule_tests {
         assert_eq!(missed_since("0 * * * *", due, now), 5);
     }
 }
+
+#[cfg(test)]
+#[path = "job_input_tests.rs"]
+mod input_schedule_tests;

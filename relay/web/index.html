@@ -35,7 +35,7 @@
 <!-- App -->
 <div id="app" class="app hidden">
   <header class="topbar">
-    <button class="icon-btn only-mobile" id="menu-btn" type="button" aria-label="Sessions">☰</button>
+    <button class="icon-btn only-mobile" id="menu-btn" type="button" aria-label="Sessions" aria-controls="sidebar" aria-expanded="false">☰</button>
     <div class="brand"><span class="mark" aria-hidden="true">◇</span> Formless</div>
     <nav class="tabs" id="tabs" aria-label="Views">
       <button type="button" data-view="chat">Chat</button>
@@ -92,10 +92,15 @@
           <div id="plan" class="plan hidden" aria-label="The agent's plan" aria-live="polite"></div>
           <div id="queue" class="queue hidden" aria-label="Messages queued for after this Run"></div>
           <div id="forecast-hint" class="muted" aria-live="polite"></div>
+          <details id="forecast-warnings" class="forecast-warnings muted" hidden>
+            <summary>Forecast warnings</summary>
+            <ul id="forecast-warning-list"></ul>
+          </details>
           <div id="compose-mode" class="compose-mode hidden"></div>
           <div id="attach-chips" class="attach-chips hidden" aria-label="Attachments for your next message"></div>
           <div class="compose-row">
-            <label class="btn ghost" id="attach-btn" title="Attach a file (or paste an image)">📎<input id="attach-input" type="file" multiple hidden></label>
+            <button class="btn ghost" id="attach-btn" type="button" aria-label="Attach a file" title="Attach a file (or paste an image)"><span aria-hidden="true">📎</span></button>
+            <input id="attach-input" type="file" multiple hidden>
             <textarea id="input" rows="1" placeholder="Message Formless…" aria-label="Message" aria-describedby="compose-hint" enterkeyhint="enter" inputmode="text"></textarea>
             <button class="btn danger" id="stop-btn" type="button" hidden>Stop</button>
             <button class="btn primary" id="send-btn" type="submit">Send</button>

@@ -312,6 +312,58 @@ fn example_gate_rejects_removed_flags_and_preserves_shell_arguments() {
 }
 
 #[test]
+fn one_shot_job_help_quotes_only_supported_offsets() {
+    use chrono::TimeZone;
+    let root = command_tree();
+    let at = root
+        .find_subcommand("jobs")
+        .unwrap()
+        .find_subcommand("add")
+        .unwrap()
+        .get_arguments()
+        .find(|arg| arg.get_id() == "at")
+        .unwrap();
+    let help = at.get_help().unwrap().to_string();
+    let now = chrono::Local
+        .with_ymd_and_hms(2026, 1, 15, 12, 0, 0)
+        .unwrap();
+    let examples: Vec<_> = help.split('"').skip(1).step_by(2).collect();
+    assert!(!examples.is_empty(), "{help}");
+    for example in examples {
+        let cli = super::Cli::try_parse_from([
+            "formless",
+            "jobs",
+            "add",
+            "fixture prompt",
+            "--at",
+            example,
+        ])
+        .unwrap();
+        let Some(super::Cmd::Jobs {
+            action: super::JobsAction::Add {
+                at: Some(parsed), ..
+            },
+        }) = cli.cmd
+        else {
+            panic!("wrong command");
+        };
+        assert!(
+            formless_core::jobs::parse_at(&parsed, now).is_ok(),
+            "unsupported help example {parsed:?}: {help}"
+        );
+    }
+    assert!(
+        help.contains("YYYY-MM-DD HH:MM") && help.contains("RFC 3339"),
+        "{help}"
+    );
+    // These are documented format names, not relative-language promises.
+    for absolute in ["2030-01-02 09:00", "2030-01-02T09:00:00Z"] {
+        assert!(formless_core::jobs::parse_at(absolute, now).is_ok());
+    }
+    assert!(!help.contains("tomorrow"), "{help}");
+}
+
+#[test]
 fn docs_no_topic_help_matches_the_gallery_default() {
     let root = command_tree();
     let help = root
@@ -327,6 +379,164 @@ fn docs_no_topic_help_matches_the_gallery_default() {
     assert!(formless_core::docs::resolve(None)
         .unwrap()
         .ends_with("docs/gallery.md"));
+}
+
+#[test]
+fn docs_topic_possible_values_match_the_topics_table() {
+    let root = command_tree();
+    let topic = root
+        .find_subcommand("docs")
+        .unwrap()
+        .get_arguments()
+        .find(|arg| arg.get_id() == "topic")
+        .unwrap();
+    let actual: Vec<_> = topic
+        .get_possible_values()
+        .into_iter()
+        .map(|value| {
+            (
+                value.get_name().to_owned(),
+                value.get_help().map(ToString::to_string),
+            )
+        })
+        .collect();
+    let expected: Vec<_> = formless_core::docs::TOPICS
+        .iter()
+        .map(|(name, _, description)| ((*name).to_owned(), Some((*description).to_owned())))
+        .collect();
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn docs_long_help_lists_every_topic_name_and_description() {
+    let root = command_tree();
+    let docs = root.find_subcommand("docs").unwrap();
+    assert_eq!(
+        docs.get_about().map(ToString::to_string).as_deref(),
+        Some("Open the guides in a browser")
+    );
+    let error = match super::Cli::try_parse_from(["formless", "docs", "--help"]) {
+        Err(error) => error,
+        Ok(_) => panic!("docs --help must stop before command dispatch"),
+    };
+    assert_eq!(error.kind(), ErrorKind::DisplayHelp);
+    let rendered = normalized(&error.to_string());
+    assert!(rendered.contains("Open the guides in a browser"));
+    for (name, _, description) in formless_core::docs::TOPICS {
+        assert!(
+            rendered.contains(name),
+            "rendered docs help missing topic {name}: {rendered}"
+        );
+        assert!(
+            rendered.contains(&normalized(description)),
+            "rendered docs help missing description for {name}: {rendered}"
+        );
+    }
+}
+
+fn parsed_docs(args: &[&str]) -> (Option<String>, bool, bool) {
+    let cli = super::Cli::try_parse_from(args).unwrap_or_else(|error| {
+        panic!("parser rejected {}: {error}", args.join(" "));
+    });
+    match cli.cmd {
+        Some(super::Cmd::Docs { topic, print, keys }) => (topic, print, keys),
+        _ => panic!("expected docs command"),
+    }
+}
+
+#[test]
+fn docs_topic_parser_accepts_prefix_case_blank_unknown_and_ambiguous() {
+    assert_eq!(
+        parsed_docs(&["formless", "docs", "--print", "cap"]),
+        (Some("cap".into()), true, false)
+    );
+    assert_eq!(
+        parsed_docs(&["formless", "docs", "--print", "Troubleshooting"]),
+        (Some("Troubleshooting".into()), true, false)
+    );
+    assert_eq!(
+        parsed_docs(&["formless", "docs", "--print", ""]),
+        (Some(String::new()), true, false)
+    );
+    assert_eq!(
+        parsed_docs(&["formless", "docs", "--print", "   "]),
+        (Some("   ".into()), true, false)
+    );
+    assert_eq!(
+        parsed_docs(&["formless", "docs", "--print", "nope"]),
+        (Some("nope".into()), true, false)
+    );
+    assert_eq!(
+        parsed_docs(&["formless", "docs", "--print", "s"]),
+        (Some("s".into()), true, false)
+    );
+    assert_eq!(parsed_docs(&["formless", "docs"]), (None, false, false));
+    assert_eq!(
+        parsed_docs(&["formless", "docs", "--keys"]),
+        (None, false, true)
+    );
+    for args in [
+        ["formless", "docs", "--keys", "--print"],
+        ["formless", "docs", "--keys", "gallery"],
+    ] {
+        match super::Cli::try_parse_from(args) {
+            Err(error) => assert_eq!(error.kind(), ErrorKind::ArgumentConflict, "{error}"),
+            Ok(_) => panic!("--keys must conflict with topic and --print"),
+        }
+    }
+    assert!(formless_core::docs::resolve(Some("cap"))
+        .unwrap()
+        .ends_with("docs/capabilities.md"));
+    assert!(formless_core::docs::resolve(Some("Troubleshooting"))
+        .unwrap()
+        .ends_with("troubleshooting.md"));
+    assert_eq!(
+        formless_core::docs::resolve(Some("")),
+        formless_core::docs::resolve(None)
+    );
+    assert_eq!(
+        formless_core::docs::resolve(Some("   ")),
+        formless_core::docs::resolve(None)
+    );
+    assert_eq!(
+        formless_core::docs::resolve(Some("nope")),
+        Err(formless_core::docs::TopicError::Unknown("nope".into()))
+    );
+    assert_eq!(
+        formless_core::docs::resolve(Some("s")),
+        Err(formless_core::docs::TopicError::Ambiguous {
+            input: "s".into(),
+            candidates: vec!["skills", "spec"],
+        })
+    );
+}
+
+#[test]
+fn docs_zsh_completions_offer_topic_names_from_the_table() {
+    let mut command = super::Cli::command();
+    let mut script = Vec::new();
+    clap_complete::generate(
+        clap_complete::Shell::Zsh,
+        &mut command,
+        "formless",
+        &mut script,
+    );
+    let script = String::from_utf8(script).expect("zsh completion script is utf-8");
+    // Test the docs command's positional suggestions, not repeated root words.
+    let docs = script
+        .split_once("(docs)")
+        .expect("docs completion branch")
+        .1;
+    let docs = docs.split_once(";;").expect("docs branch terminator").0;
+    for (name, _, description) in formless_core::docs::TOPICS {
+        assert!(docs.contains(name), "missing docs topic {name}: {docs}");
+        // Zsh escapes punctuation in its argument specifications.
+        let unescaped = docs.replace('\\', "");
+        assert!(
+            unescaped.contains(description),
+            "missing description for {name}: {docs}"
+        );
+    }
 }
 
 #[test]
@@ -550,4 +760,156 @@ fn help_check_rejects_blank_and_label_only_descriptions() {
     assert!(problems
         .iter()
         .any(|problem| problem.contains("fixture blank:")));
+}
+
+#[test]
+fn session_list_organization_filters_parse_together_without_dispatch() {
+    let cli = super::Cli::try_parse_from([
+        "formless",
+        "sessions",
+        "list",
+        "--archived",
+        "--pinned",
+        "--tag",
+        "WoRK",
+        "--json",
+    ])
+    .unwrap();
+    assert!(
+        matches!(cli.cmd, Some(super::Cmd::Sessions {action:super::SessionsAction::List {
+        archived:true,pinned:true,tag:Some(ref tag),json:true}}) if tag=="WoRK")
+    );
+    assert!(super::Cli::try_parse_from(["formless", "sessions", "list", "--tag"]).is_err());
+    let help = super::Cli::try_parse_from(["formless", "sessions", "list", "--help"])
+        .err()
+        .unwrap()
+        .to_string();
+    for expected in ["--pinned", "--tag", "lowercasing", "leading #"] {
+        assert!(normalized(&help).contains(expected));
+    }
+}
+
+#[test]
+fn mcp_log_lines_exposes_and_enforces_the_existing_bounds() {
+    for lines in ["1", "50", "1000"] {
+        assert!(super::Cli::try_parse_from([
+            "formless", "mcp", "log", "fixture", "--lines", lines
+        ])
+        .is_ok());
+    }
+    for lines in ["0", "1001", "5000", "nonsense"] {
+        let error =
+            super::Cli::try_parse_from(["formless", "mcp", "log", "fixture", "--lines", lines])
+                .err()
+                .expect("expected argument/help error");
+        assert_eq!(error.exit_code(), 2);
+        assert!(error.to_string().contains("between 1 and 1000"));
+    }
+    let help = super::Cli::try_parse_from(["formless", "mcp", "log", "--help"])
+        .err()
+        .expect("expected argument/help error")
+        .to_string();
+    let help = normalized(&help);
+    assert!(help.contains("minimum 1, maximum 1000") && help.contains("default: 50"));
+}
+
+#[test]
+fn naming_pull_metadata_and_validation_share_the_model_registry() {
+    let root = command_tree();
+    let pull = root
+        .find_subcommand("naming")
+        .unwrap()
+        .find_subcommand("pull")
+        .unwrap();
+    let model = pull
+        .get_arguments()
+        .find(|arg| arg.get_id() == "model")
+        .unwrap();
+    let choices: Vec<_> = model
+        .get_possible_values()
+        .into_iter()
+        .map(|v| v.get_name().to_owned())
+        .collect();
+    assert_eq!(
+        choices,
+        formless_core::namer::MODELS
+            .iter()
+            .map(|m| m.id.to_owned())
+            .collect::<Vec<_>>()
+    );
+    for spec in formless_core::namer::MODELS {
+        for raw in [
+            spec.id.to_owned(),
+            format!(" {} ", spec.id.to_ascii_uppercase()),
+        ] {
+            let parsed = super::Cli::try_parse_from(["formless", "naming", "pull", raw.as_str()])
+                .expect("valid model argument");
+            let Some(super::Cmd::Naming {
+                action: super::NamingAction::Pull { model },
+            }) = parsed.cmd
+            else {
+                panic!("wrong command");
+            };
+            assert_eq!(model.as_deref(), Some(raw.as_str()));
+        }
+    }
+    let parsed = super::Cli::try_parse_from(["formless", "naming", "pull"])
+        .expect("configured model remains optional");
+    let Some(super::Cmd::Naming {
+        action: super::NamingAction::Pull { model },
+    }) = parsed.cmd
+    else {
+        panic!("wrong command");
+    };
+    assert!(model.is_none());
+    let error = super::Cli::try_parse_from(["formless", "naming", "pull", "not-a-model"])
+        .err()
+        .expect("invalid explicit model");
+    assert_eq!(error.exit_code(), 2);
+    for model in formless_core::namer::MODELS {
+        assert!(error.to_string().contains(model.id));
+    }
+    let mut root = command_tree();
+    let mut bash = Vec::new();
+    clap_complete::generate(clap_complete::Shell::Bash, &mut root, "formless", &mut bash);
+    let bash = String::from_utf8(bash).unwrap();
+    for model in formless_core::namer::MODELS {
+        assert!(bash.contains(model.id));
+    }
+}
+
+#[test]
+fn task_guide_examples_parse_without_dispatch_and_schedule_examples_are_valid() {
+    use chrono::TimeZone;
+    let now = chrono::Local
+        .with_ymd_and_hms(2026, 1, 15, 12, 0, 0)
+        .unwrap();
+    for (topic, text) in [
+        ("mcp", include_str!("../../../docs/mcp.md")),
+        ("skills", include_str!("../../../docs/skills.md")),
+        ("jobs", include_str!("../../../docs/jobs.md")),
+    ] {
+        assert!(formless_core::docs::resolve(Some(topic))
+            .unwrap()
+            .ends_with(&format!("docs/{topic}.md")));
+        let problems = example_problems(&format!("Examples:\n{text}"));
+        assert!(problems.is_empty(), "{topic}: {problems:?}");
+        for line in text.lines() {
+            let Some(args) = example_args(line).unwrap() else {
+                continue;
+            };
+            let cli = super::Cli::try_parse_from(args).unwrap();
+            if let Some(super::Cmd::Jobs {
+                action: super::JobsAction::Add { at, cron, .. },
+            }) = cli.cmd
+            {
+                if let Some(at) = at {
+                    assert!(formless_core::jobs::parse_at(&at, now).is_ok(), "{line}");
+                }
+                if let Some(cron) = cron {
+                    assert!(formless_core::jobs::to_cron(&cron).is_ok(), "{line}");
+                }
+            }
+        }
+    }
 }

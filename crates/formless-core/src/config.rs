@@ -917,6 +917,7 @@ pub struct DaemonCfg {
     pub idle_grace_secs: u64,
     pub stall_warning_secs: u64,
     pub log_max_bytes: u64,
+    #[serde(deserialize_with = "deserialize_log_keep")]
     pub log_keep: usize,
     /// How long a client waits for an auto-started daemon to accept
     /// connections (a first start may migrate and back up a large DB).
@@ -931,6 +932,18 @@ pub struct DaemonCfg {
     /// Offline restore rehearsal after each daily backup (opt-in).
     pub backup_restore_drill: bool,
 }
+fn deserialize_log_keep<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<usize, D::Error> {
+    let value = usize::deserialize(d)?;
+    if value > crate::logs::MAX_LOG_KEEP {
+        return Err(serde::de::Error::custom(
+            "daemon.log_keep must be between 0 and 64",
+        ));
+    }
+    Ok(value)
+}
+
 impl Default for DaemonCfg {
     fn default() -> Self {
         Self {
@@ -1539,10 +1552,10 @@ pub struct ToolsCfg {
     /// How deep `tools.call` composition may nest (a cycle guard).
     #[serde(default = "default_max_tool_depth")]
     pub max_tool_depth: usize,
-    /// Longest single `sleep(ms)` inside a Tool, in seconds.
+    /// Longest single `sleep(ms)` inside a Tool, in seconds; excess is an error.
     #[serde(default = "default_max_sleep_secs")]
     pub max_sleep_secs: u64,
-    /// Largest `randomBytes(n)` a Tool may ask for.
+    /// Largest exact decoded `randomBytes(n)` result; excess is an error.
     #[serde(default = "default_max_random_bytes")]
     pub max_random_bytes: usize,
     /// Native caps outside the JS heap (#604): one `fs.read` or `fetch`
@@ -2121,6 +2134,9 @@ impl Config {
     /// comments, order and keys this build doesn't know survive, and
     /// replaced atomically so a crash mid-save leaves the old file.
     pub fn save(&self, paths: &Paths) -> Result<()> {
+        if self.daemon.log_keep > crate::logs::MAX_LOG_KEEP {
+            anyhow::bail!("daemon.log_keep must be between 0 and 64");
+        }
         let file = paths.config_file();
         if let Some(parent) = file.parent() {
             std::fs::create_dir_all(parent)?;
@@ -2318,11 +2334,14 @@ pub fn save_api_key(paths: &Paths, key: &str) -> Result<()> {
 }
 
 /// The key in the file a `*_FILE` variable names: None when the variable
-/// is unset, an error naming the variable and file when it can't be used
+/// is unset or empty, an error naming the variable and file when it can't be used
 /// (missing, unreadable, not UTF-8, empty). A BOM and surrounding
 /// whitespace are trimmed (#1083).
 pub fn key_from_file_env(var: &str) -> Option<std::result::Result<String, String>> {
     let path = std::env::var_os(var)?;
+    if path.is_empty() {
+        return None;
+    }
     let shown = std::path::Path::new(&path).display().to_string();
     Some(match std::fs::read(&path) {
         Err(e) => Err(format!("{var} names {shown}, which can't be read: {e}")),
@@ -2500,6 +2519,10 @@ fn merge_toml(old: &str, fresh: &str) -> Option<String> {
     };
     let base = meaning(&doc)?;
     let target = meaning(&new)?;
+    // Each removal probe must be relative to the unchanged original file.
+    // Cloning avoids repeated DocumentMut seed parses. A full document
+    // clone and Config/TOML/JSON semantic conversion remain for each probe.
+    let original = doc.clone();
     let mut path: Vec<String> = Vec::new();
     let mut inserted: Vec<Vec<String>> = Vec::new();
     merge_table(
@@ -2509,7 +2532,7 @@ fn merge_toml(old: &str, fresh: &str) -> Option<String> {
         &mut inserted,
         &mut |p: &[String]| {
             // Would dropping this old-only key change the parsed config?
-            let mut probe: toml_edit::DocumentMut = old.parse().ok()?;
+            let mut probe = original.clone();
             remove_path(probe.as_item_mut(), p)?;
             Some(meaning(&probe)? != base)
         },
@@ -2940,6 +2963,51 @@ later_key = \"kept\"\n";
         let bak = paths.config_file().with_extension("toml.bak");
         assert!(std::fs::read_to_string(bak).unwrap().contains("broken"));
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn merge_probes_keep_original_meaning_across_many_removals() {
+        for inline in [false, true] {
+            let mut old = String::from("# retained note\n");
+            if inline {
+                old.push_str("provider = { model = \"fixture\", prices = { ");
+                for n in 0..32 {
+                    old.push_str(&format!("old{n} = {{ input = 1, output = 2 }}, "));
+                }
+                old.push_str("keep = { input = 3, output = 4 } }, future_flag = \"preserve\" }\n");
+            } else {
+                old.push_str("[provider]\nmodel = \"fixture\"\nfuture_flag = \"preserve\"\n[provider.prices]\n");
+                for n in 0..32 {
+                    old.push_str(&format!(
+                        "old{n} = {{ input = 1, output = 2 }} # remove this value\n"
+                    ));
+                }
+                old.push_str("keep = { input = 3, output = 4 }\n");
+            }
+            old.push_str("\n# future hook property\n[[hooks]]\nevent = \"pre_tool\"\ncommand = [\"fixture-command\"]\nfuture_hook_key = \"ไทย\"\n");
+            let mut config: Config = toml::from_str(&old).unwrap();
+            config.provider.prices.retain(|name, _| name == "keep");
+            let fresh = toml::to_string_pretty(&config).unwrap();
+            let merged = merge_toml(&old, &fresh).unwrap();
+            let doc: toml_edit::DocumentMut = merged.parse().unwrap();
+            assert_eq!(doc["provider"]["future_flag"].as_str(), Some("preserve"));
+            assert_eq!(doc["hooks"][0]["future_hook_key"].as_str(), Some("ไทย"));
+            assert!(
+                merged.contains("# retained note") && merged.contains("# future hook property")
+            );
+            let actual: Config = toml::from_str(&merged).unwrap();
+            assert_eq!(
+                serde_json::to_value(actual).unwrap(),
+                serde_json::to_value(&config).unwrap()
+            );
+            assert_eq!(
+                merge_toml(&merged, &fresh).unwrap(),
+                merged,
+                "second merge is stable"
+            );
+        }
+        assert!(merge_toml("[broken", "").is_none());
+        assert!(merge_toml("", "[broken").is_none());
     }
 
     #[test]

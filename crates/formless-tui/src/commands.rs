@@ -469,6 +469,7 @@ pub const COMMANDS: &[Command] = &[
     cmd("memory rm", "ID", "delete a memory", Integrations),
     cmd("memory on", "ID", "use a memory again", Integrations),
     cmd("memory off", "ID", "stop using a memory", Integrations),
+    cmd("memory used", "", "memories reportedly carried by the latest Run", Integrations),
     cmd(
         "jobs",
         "[enable|disable|run|history|rm ID]",
@@ -648,6 +649,7 @@ const KEYS: &[(&str, &str)] = &[
         "Vim: d/c/y + motion or object",
         "iw/aw, iW/aW, quotes, ()/[]/{}/<>; dd/cc/yy for lines",
     ),
+    ("Vim: u", "undo the previous edit in Normal mode"),
     (
         "Vim: . / p / P",
         "repeat last change / paste private yank register (no OS clipboard)",
@@ -674,7 +676,8 @@ const KEYS: &[(&str, &str)] = &[
     ("Tool editor Esc / Ctrl+Q in Vim", "ask before discarding modified text; y discards, n/Esc keeps editing"),
     ("Ctrl+C", "clear the input; twice to detach"),
     ("Tab / Shift+Tab", "switch views"),
-    ("PgUp / PgDn, ↑ / ↓", "scroll the chat"),
+    ("PgUp / PgDn", "scroll the chat"),
+    ("↑ / ↓ (non-Vim composer)", "move within wrapped draft rows; browse Session history at the first/last row, including empty/one-line input"),
     (
         "j / k, g / G, Ctrl+D / Ctrl+U",
         "move in list views (Sessions, Tools, Metrics, Proposals)",
@@ -870,5 +873,27 @@ mod tests {
             .unwrap();
         assert!(session < attach && attach < run);
         assert!(help.iter().any(|l| l == "Keys"));
+    }
+
+    #[test]
+    fn memory_used_is_registered_and_visible() {
+        let used = COMMANDS
+            .iter()
+            .find(|c| c.name == "memory used")
+            .expect("/memory used is registered");
+        assert_eq!(used.args, "");
+        assert!(!used.needs_args());
+        assert_eq!(used.group, Group::Integrations);
+        assert_eq!(used.desc, "memories reportedly carried by the latest Run");
+        assert_eq!(used.usage(), "/memory used");
+        assert!(matches("memory").iter().any(|c| c.name == "memory used"));
+        let help = help_lines();
+        let integrations = help.iter().position(|l| l == "Integrations").unwrap();
+        let app = help.iter().position(|l| l == "App").unwrap();
+        let row = help
+            .iter()
+            .position(|l| l.contains("/memory used"))
+            .unwrap();
+        assert!(integrations < row && row < app);
     }
 }

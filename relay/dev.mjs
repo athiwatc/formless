@@ -20,7 +20,9 @@ import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { extname, join, normalize, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { parseArgs } from "node:util";
 import { DevStorage } from "./dev-storage.mjs";
+import { httpBoundary, upgradeBoundary } from "./dev-errors.mjs";
 import { LIMITS } from "./web/transport.mjs";
 import { verifyDaemonClaim } from "./daemon-claim.mjs";
 import worker, { RelayRoom, SECURITY_HEADERS } from "./worker.js";
@@ -30,11 +32,24 @@ import worker, { RelayRoom, SECURITY_HEADERS } from "./worker.js";
 const DEV_CSP = SECURITY_HEADERS["content-security-policy"]
   .replace("connect-src 'self'", "connect-src 'self' ws://127.0.0.1:* ws://localhost:*");
 
-const args = process.argv.slice(2);
-const portIndex = args.indexOf("--port");
-const port = portIndex < 0 ? 8787 : Number(args[portIndex + 1]);
-if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error("invalid port");
-const mock = args.includes("--mock-provider");
+const main = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+let options;
+try {
+  ({ values: options } = parseArgs({
+    args: main ? process.argv.slice(2) : [],
+    strict: true,
+    options: { port: { type: "string", default: "8787" }, "mock-provider": { type: "boolean", default: false } },
+  }));
+  if (!/^\d+$/.test(options.port) || Number(options.port) > 65535) {
+    throw new Error("port must be an integer between 0 and 65535");
+  }
+} catch (error) {
+  console.error("formless dev relay: " + error.message);
+  console.error("Usage: node relay/dev.mjs [--port 8787] [--mock-provider]");
+  process.exit(2);
+}
+const port = Number(options.port);
+const mock = options["mock-provider"];
 const webRoot = fileURLToPath(new URL("./web/", import.meta.url));
 const TYPES = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".mjs": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".png": "image/png", ".webmanifest": "application/manifest+json" };
 
@@ -46,7 +61,14 @@ const env = {
   ASSETS: {
     async fetch(request) {
       const path = new URL(request.url).pathname;
-      const rel = path === "/" ? "index.html" : normalize(decodeURIComponent(path)).replace(/^[/\\]+/, "");
+      let decoded;
+      try {
+        decoded = decodeURIComponent(path);
+      } catch (error) {
+        if (error instanceof URIError) return new Response("bad request", { status: 400 });
+        throw error;
+      }
+      const rel = path === "/" ? "index.html" : normalize(decoded).replace(/^[/\\]+/, "");
       const file = join(webRoot, rel);
       if (!file.startsWith(webRoot)) return new Response("not found", { status: 404 });
       try {
@@ -236,7 +258,7 @@ async function mockChat(body, res) {
 }
 
 // ---------------------------------------------------------------- server
-export const server = createServer(async (req, res) => {
+async function handleHttp(req, res) {
   const url = new URL(req.url, "http://localhost");
   if (mock && url.pathname.startsWith("/mock/v1/")) {
     if (url.pathname.endsWith("/models")) {
@@ -245,7 +267,18 @@ export const server = createServer(async (req, res) => {
     }
     let raw = "";
     for await (const chunk of req) raw += chunk;
-    return mockChat(JSON.parse(raw || "{}"), res);
+    let body;
+    try {
+      body = JSON.parse(raw || "{}");
+    } catch (error) {
+      if (!(error instanceof SyntaxError)) throw error;
+      return mockBadRequest(res, "Invalid JSON request body", "invalid_json");
+    }
+    if (body === null || typeof body !== "object" || Array.isArray(body)) {
+      return mockBadRequest(res, "Request body must be a JSON object", "invalid_request");
+    }
+    // Keep asynchronous mock failures within the awaited request handler.
+    return await mockChat(body, res);
   }
   // Everything else is the Worker's: /health, /push/key and the assets.
   const response = await worker.fetch(new Request("http://localhost" + req.url, { method: req.method, headers: req.headers }), env);
@@ -253,8 +286,12 @@ export const server = createServer(async (req, res) => {
   if (headers["content-security-policy"]) headers["content-security-policy"] = DEV_CSP;
   res.writeHead(response.status, headers);
   res.end(Buffer.from(await response.arrayBuffer()));
-});
-server.on("upgrade", async (req, socket) => {
+}
+function mockBadRequest(res, message, code) {
+  res.writeHead(400, { "content-type": "application/json; charset=utf-8" });
+  res.end(JSON.stringify({ error: { message, type: "invalid_request_error", param: null, code } }));
+}
+async function handleUpgrade(req, socket) {
   const url = new URL(req.url, "http://localhost");
   const m = url.pathname.match(/^\/relay\/([a-f0-9]{32})$/);
   if (!m) return socket.destroy();
@@ -266,7 +303,17 @@ server.on("upgrade", async (req, socket) => {
   if (url.searchParams.get("transport")!=="1"||(role==="daemon"&&url.searchParams.get("mux")!=="1")) {socket.end("HTTP/1.1 426 Upgrade Required\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");return;}
   if (socket.destroyed) return;
   joinRoom(m[1], role, url.searchParams.get("mux") === "1", req.headers["user-agent"] || "", req, socket);
-});
-if(process.argv[1]&&resolve(process.argv[1])===fileURLToPath(import.meta.url))server.listen(port, "127.0.0.1", () => {
-  console.log("formless dev relay on http://127.0.0.1:" + server.address().port + (mock ? " (mock provider at /mock/v1)" : ""));
-});
+}
+export const server = createServer((req, res) => { void httpBoundary(req, res, handleHttp); });
+server.on("upgrade", (req, socket) => { void upgradeBoundary(req, socket, handleUpgrade); });
+if (main) {
+  server.on("error", (error) => {
+    console.error("formless dev relay: " + (error.code === "EADDRINUSE"
+      ? `port ${port} is already in use; pass --port <other>`
+      : `could not listen on port ${port}: ${error.message}`));
+    process.exit(1);
+  });
+  server.listen(port, "127.0.0.1", () => {
+    console.log("formless dev relay on http://127.0.0.1:" + server.address().port + (mock ? " (mock provider at /mock/v1)" : ""));
+  });
+}

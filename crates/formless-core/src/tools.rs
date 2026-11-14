@@ -474,12 +474,12 @@ fn schedule_run_definition() -> Value {
         "type": "function",
         "function": {
             "name": SCHEDULE_RUN,
-            "description": "Schedule a prompt to run later (at) or periodically (cron, 5 fields, local time), e.g. to re-check a build or run nightly cleanup. Recurring jobs need the user's approval. Without session_id each run gets a new Session; \"current\" runs in this one.",
+            "description": "Schedule a prompt to run later (at) or periodically (cron, 5 fields, local time; case-insensitive three-letter month/weekday names such as JAN and MON-FRI, or @yearly/@annually), e.g. to re-check a build or run nightly cleanup. Recurring jobs need the user's approval. Without session_id each run gets a new Session; \"current\" runs in this one.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "prompt": {"type": "string", "description": "The task, self-contained"},
-                    "cron": {"type": "string", "description": "e.g. \"0 3 * * *\" (03:00 daily) or @hourly"},
+                    "cron": {"type": "string", "description": "e.g. \"0 3 * * *\" (03:00 daily), \"0 9 * * MON-FRI\" (weekdays), @hourly or @yearly"},
                     "at": {"type": "string", "description": "One-shot: RFC 3339, \"YYYY-MM-DD HH:MM\" or \"in 30m\""},
                     "session_id": {"type": "string"}
                 },
@@ -1165,7 +1165,9 @@ fn definitions(
             Some(s) => store.session_tool_ids(s)?,
             None => Default::default(),
         };
-        loaded.retain(|id| tools.iter().any(|t| &t.id == id));
+        let active_ids: std::collections::HashSet<&str> =
+            tools.iter().map(|tool| tool.id.as_str()).collect();
+        loaded.retain(|id| active_ids.contains(id.as_str()));
         let frozen = match session_id {
             Some(s) => store.session_has_filler(s)?,
             None => false,
@@ -1211,12 +1213,22 @@ fn definitions(
         .collect();
     let mut defs = builtin_definitions();
     let trusted_builtins = defs.len();
+    // Read after membership writes, and use keyed lookup only: shown still
+    // controls order. A failed batch must not make every snapshot look absent.
+    let mut pins = session_id.and_then(|session| {
+        let ids: Vec<&str> = shown.iter().map(|tool| tool.id.as_str()).collect();
+        store.pinned_definitions_for(session, &ids).ok()
+    });
     for info in shown {
         // A Session keeps the definition it first listed (a promotion or
         // rollback elsewhere must not rewrite its cached prefix); it picks
         // up the current one after find_tools/read_tool or compaction.
         if let Some(s) = session_id {
-            if let Some((_, def)) = store.pinned_definition(s, &info.id)? {
+            let pinned = match pins.as_mut() {
+                Some(pins) => pins.remove(&info.id),
+                None => store.pinned_definition(s, &info.id)?,
+            };
+            if let Some((_, def)) = pinned {
                 if let Ok(def) = serde_json::from_str(&def) {
                     defs.push(def);
                     continue;
@@ -1227,6 +1239,10 @@ fn definitions(
             let def = registry_definition(&info, &v);
             if let Some(s) = session_id.filter(|_| persist) {
                 store.pin_definition(s, &info.id, v.version, &def.to_string())?;
+                // Preserve legacy read/write ordering, including triggers or
+                // refreshes caused by a missing/invalid pin's fallback write.
+                // Fully pinned listings keep the bounded batch fast path.
+                pins = None;
             }
             defs.push(def);
         }

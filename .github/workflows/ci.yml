@@ -1,0 +1,199 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  build-test:
+    name: Build and test (${{ matrix.platform }})
+    # Never execute fork contributions on the persistent self-hosted machine.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macOS ARM64
+            runner: [self-hosted, macOS, ARM64]
+          - platform: Linux X64
+            runner: [self-hosted, Linux, X64]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - name: Ensure Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          if command -v cc >/dev/null && command -v python3 >/dev/null &&
+             command -v pkg-config >/dev/null && pkg-config --exists dbus-1; then
+            exit 0
+          fi
+          # Native jobs also support runners hosted inside a container, where
+          # sibling Docker jobs cannot resolve the runner's bind-mount paths.
+          command -v apt-get >/dev/null
+          ci_privilege=()
+          if [[ "$(id -u)" != 0 ]]; then
+            ci_privilege=(sudo -n)
+          fi
+          "${ci_privilege[@]}" apt-get update
+          "${ci_privilege[@]}" apt-get install -y --no-install-recommends build-essential libdbus-1-dev pkg-config python3
+
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Create private job directories
+        run: |
+          set -euo pipefail
+          if [[ "$RUNNER_OS" = macOS ]]; then
+            test "$(uname -s)" = Darwin
+            test "$(uname -m)" = arm64
+          else
+            test "$(uname -s)" = Linux
+            test "$(uname -m)" = x86_64
+          fi
+          ci_dir=$(mktemp -d "$RUNNER_TEMP/formless-ci.XXXXXX")
+          mkdir -p "$ci_dir/cargo" "$ci_dir/data" "$ci_dir/config" "$ci_dir/logs" "$ci_dir/dist"
+          {
+            echo "CI_DIR=$ci_dir"
+            echo "CARGO_HOME=$ci_dir/cargo"
+            echo "CARGO_TARGET_DIR=$GITHUB_WORKSPACE/target"
+            echo "FORMLESS_DATA_DIR=$ci_dir/data"
+            echo "FORMLESS_CONFIG_DIR=$ci_dir/config"
+          } >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Verify runner Python
+        # setup-python's macOS builds require /Users/runner permissions.
+        # Use the native Python already used by this runner's docs workflow.
+        run: python3 -c 'import sys; assert sys.version_info >= (3, 9), "Python 3.9+ is required"'
+
+      - name: Restore Cargo dependency cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.CARGO_HOME }}/registry
+            ${{ env.CARGO_HOME }}/git
+          key: ci-cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ci-cargo-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Record tool versions
+        run: |
+          rustc -Vv
+          cargo --version
+          node --version
+          python3 --version
+          bash scripts/ci-storage-budget.sh snapshot before-checks
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (all workspace targets)
+        run: cargo clippy --workspace --all-targets --locked 2>&1 | tee "$CI_DIR/logs/clippy.log"
+
+      - name: Relay and web regression tests
+        run: node --test relay/*.test.mjs 2>&1 | tee "$CI_DIR/logs/relay.log"
+
+      - name: Relay wire conformance
+        run: node relay/conformance.mjs 2>&1 | tee "$CI_DIR/logs/conformance.log"
+
+      - name: Offline documentation and tooling tests
+        run: |
+          set -euo pipefail
+          # AUR packaging tests require GNU install and belong on Linux.
+          for suite in scripts/test-doc-links.py scripts/test-inventory.py scripts/test-eval-tool-use.py; do
+            python3 "$suite" 2>&1 | tee "$CI_DIR/logs/$(basename "$suite").log"
+          done
+
+      - name: Linux AUR packaging regression tests
+        if: runner.os == 'Linux'
+        run: python3 scripts/test-aur-completions.py 2>&1 | tee "$CI_DIR/logs/aur-completions.log"
+
+      - name: Workspace unit, integration and doc tests
+        run: cargo test --workspace --locked --no-fail-fast 2>&1 | tee "$CI_DIR/logs/rust-tests.log"
+
+      - name: Reclaim completed debug artifacts
+        run: bash scripts/ci-storage-budget.sh clean-debug
+
+      - name: Build release workspace
+        run: cargo build --workspace --release --locked 2>&1 | tee "$CI_DIR/logs/release.log"
+
+      - name: Smoke test release binary and generated assets
+        run: |
+          set -euo pipefail
+          binary="$CARGO_TARGET_DIR/release/formless"
+          "$binary" --version
+          "$binary" --help > "$CI_DIR/dist/help.txt"
+          "$binary" man > "$CI_DIR/dist/formless.1"
+          for completion_shell in bash zsh fish; do
+            "$binary" completions "$completion_shell" > "$CI_DIR/dist/formless.$completion_shell"
+            test -s "$CI_DIR/dist/formless.$completion_shell"
+          done
+          test -s "$CI_DIR/dist/help.txt"
+          test -s "$CI_DIR/dist/formless.1"
+          cp "$binary" LICENSE "$CI_DIR/dist/"
+          cd "$CI_DIR/dist"
+          if [[ "$RUNNER_OS" = Linux ]]; then
+            sha256sum formless > formless.sha256
+            sha256sum -c formless.sha256
+          else
+            shasum -a 256 formless > formless.sha256
+            shasum -a 256 -c formless.sha256
+          fi
+
+      - name: Upload tested release binary and generated assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: formless-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
+          path: ${{ env.CI_DIR }}/dist/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload diagnostic logs
+        if: ${{ always() && env.CI_DIR != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-logs-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.CI_DIR }}/logs/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Final storage report
+        if: ${{ always() && env.CI_DIR != '' }}
+        run: bash scripts/ci-storage-budget.sh snapshot job-finished
+
+      - name: Clean private job directories
+        if: ${{ always() && env.CI_DIR != '' }}
+        run: |
+          case "$CI_DIR" in
+            "$RUNNER_TEMP"/formless-ci.*) rm -rf -- "$CI_DIR" ;;
+            *) echo 'Refusing cleanup outside the private CI directory' >&2; exit 1 ;;
+          esac

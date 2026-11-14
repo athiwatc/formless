@@ -62,13 +62,13 @@ fn ollama_origins(raw: Option<&str>) -> Result<Vec<String>, &'static str> {
             tail.strip_prefix(':')
                 .ok_or(invalid)?
                 .parse::<u16>()
-                .map_err(|_| invalid)?
+                .unwrap_or(default_port)
         };
         (host, port)
     } else if authority.parse::<IpAddr>().is_ok() {
         (authority, default_port)
     } else if let Some((host, port)) = authority.rsplit_once(':') {
-        (host, port.parse::<u16>().map_err(|_| invalid)?)
+        (host, port.parse::<u16>().unwrap_or(default_port))
     } else {
         (authority, default_port)
     };
@@ -221,16 +221,28 @@ pub fn discover() -> Vec<LocalServer> {
     discover_with_guidance().servers
 }
 
+// One `OLLAMA_HOST` snapshot yields both the probe origins and the hint.
+fn ollama_host(value: &Result<String, std::env::VarError>) -> Result<Vec<String>, &'static str> {
+    if matches!(value, Err(std::env::VarError::NotUnicode(_))) {
+        Err("OLLAMA_HOST is not a supported local address; add the provider manually.")
+    } else {
+        ollama_origins(value.as_deref().ok())
+    }
+}
+
+/// The setup hint discovery reports for an `OLLAMA_HOST` value, as returned
+/// by `std::env::var`, when that value is rejected before any probe. Pure:
+/// no I/O, no environment reads and no name resolution. Probe-dependent
+/// guidance from [`discover_with_guidance`] is not included.
+pub fn ollama_host_guidance(value: &Result<String, std::env::VarError>) -> Option<String> {
+    ollama_host(value).err().map(str::to_string)
+}
+
 pub fn discover_with_guidance() -> Discovery {
     let value = std::env::var("OLLAMA_HOST");
     let raw = value.as_deref().ok();
     let configured = raw.is_some_and(|s| !s.trim().trim_matches(['\'', '"']).is_empty());
-    let parsed = if matches!(&value, Err(std::env::VarError::NotUnicode(_))) {
-        Err("OLLAMA_HOST is not a supported local address; add the provider manually.")
-    } else {
-        ollama_origins(raw)
-    };
-    let (ollama, mut hint) = match parsed {
+    let (ollama, mut hint) = match ollama_host(&value) {
         Ok(origins) => (origins, None),
         Err(hint) => (Vec::new(), Some(hint.to_string())),
     };
@@ -397,6 +409,26 @@ mod tests {
             ("http://localhost", vec!["http://127.0.0.1", "http://[::1]"]),
             ("https://127.0.0.1", vec!["https://127.0.0.1"]),
             (
+                "localhost:",
+                vec!["http://127.0.0.1:11434", "http://[::1]:11434"],
+            ),
+            (
+                "localhost:65536",
+                vec!["http://127.0.0.1:11434", "http://[::1]:11434"],
+            ),
+            ("127.0.0.1:70000", vec!["http://127.0.0.1:11434"]),
+            (
+                "localhost:abc",
+                vec!["http://127.0.0.1:11434", "http://[::1]:11434"],
+            ),
+            ("[::1]:", vec!["http://[::1]:11434"]),
+            ("[::1]:70000", vec!["http://[::1]:11434"]),
+            (
+                "http://localhost:abc",
+                vec!["http://127.0.0.1", "http://[::1]"],
+            ),
+            ("https://[::1]:70000", vec!["https://[::1]"]),
+            (
                 " 'localhost:11500/prefix/' ",
                 vec!["http://127.0.0.1:11500/prefix", "http://[::1]:11500/prefix"],
             ),
@@ -419,7 +451,10 @@ mod tests {
             "http://localhost:11500/?token=secret",
             "http://localhost:11500/#secret",
             "ftp://127.0.0.1",
-            "localhost:65536",
+            "example.com:70000",
+            "192.168.1.2:",
+            "[2001:db8::1]:abc",
+            "[::1]garbage",
             "[::1",
             "local\nhost",
         ] {
@@ -427,10 +462,13 @@ mod tests {
         }
         let env = crate::credential_env::EnvGuard::isolated();
         env.set("OLLAMA_HOST", "http://user:secret@example.com:11500");
-        let report = discover_with_guidance();
-        assert!(report.servers.iter().all(|s| s.preset_id != "ollama"));
-        assert!(report.hint.as_ref().unwrap().contains("manually"));
-        assert!(!report.hint.unwrap().contains("secret"));
+        // The pure path discovery uses: no Ollama candidate, so no Ollama
+        // server can be reported, and no fixed-port LM Studio probe runs.
+        let value = std::env::var("OLLAMA_HOST");
+        assert!(ollama_host(&value).is_err());
+        let hint = ollama_host_guidance(&value);
+        assert!(hint.as_ref().unwrap().contains("manually"));
+        assert!(!hint.unwrap().contains("secret"));
     }
 
     #[test]

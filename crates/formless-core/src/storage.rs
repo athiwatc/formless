@@ -12,6 +12,10 @@ use std::path::{Path, PathBuf};
 #[path = "job_schedule_tests.rs"]
 mod job_schedule_tests;
 
+#[cfg(test)]
+#[path = "pin_batch_tests.rs"]
+mod pin_batch_tests;
+
 /// Token use for one key and model: (key, model, prompt, completion,
 /// cached, provider-reported USD when every request reported one).
 /// (key, provider, model, prompt, completion, cached, cache-write, reported cost).
@@ -1384,10 +1388,10 @@ impl Store {
     /// Sessions with a provisional name, most recent first: what the naming
     /// model renames once it is installed (#871).
     pub fn provisionally_named_sessions(&self, limit: usize) -> Result<Vec<String>> {
-        let mut stmt = self.ps("SELECT id FROM sessions WHERE name_source='heuristic'
-             ORDER BY updated_at DESC LIMIT ?1")?;
+        let mut stmt = self.ps("SELECT id FROM sessions WHERE deleted_at IS NULL
+             AND (name=?2 OR name_source='heuristic') ORDER BY updated_at DESC LIMIT ?1")?;
         let ids = stmt
-            .query_map(params![limit as i64], |r| r.get(0))?
+            .query_map(params![limit as i64, DEFAULT_SESSION_NAME], |r| r.get(0))?
             .collect::<rusqlite::Result<Vec<String>>>()?;
         Ok(ids)
     }
@@ -1702,6 +1706,30 @@ impl Store {
         Ok(rows)
     }
 
+    /// One Session-scoped message, using the same row/metadata conversion as
+    /// transcript reads. Unrelated rows are deliberately not decoded here.
+    pub fn get_message(&self, session_id: &str, message_id: &str) -> Result<Option<MessageInfo>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT * FROM messages WHERE session_id=?1 AND id=?2",
+                params![session_id, message_id],
+                Self::row_msg,
+            )
+            .optional()?)
+    }
+
+    /// Fork source prefix, decoded within the existing fork transaction.
+    fn list_messages_up_to(&self, session_id: &str, limit: i64) -> Result<Vec<MessageInfo>> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT * FROM messages WHERE session_id=?1 AND seq<=?2 ORDER BY seq")?;
+        let rows = statement
+            .query_map(params![session_id, limit], Self::row_msg)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// Messages with `seq > after`, in order (incremental context builds).
     pub fn list_messages_after(&self, session_id: &str, after: i64) -> Result<Vec<MessageInfo>> {
         let mut stmt = self
@@ -1722,6 +1750,39 @@ impl Store {
             |r| r.get(0),
         )?;
         Ok(n as usize)
+    }
+
+    /// Sum of top-level `attachments` array lengths for one Session.
+    ///
+    /// Selects only `meta` and steps one row at a time, so context usage
+    /// does not materialize transcript content. Unreadable metadata and
+    /// malformed JSON add nothing, matching `row_msg`. Any role counts.
+    pub(crate) fn attachment_entry_count(&self, session_id: &str) -> Result<usize> {
+        let mut statement =
+            self.ps("SELECT meta FROM messages WHERE session_id=?1 AND meta IS NOT NULL")?;
+        let mut rows = statement.query(params![session_id])?;
+        let mut total = 0usize;
+        while let Some(row) = rows.next()? {
+            // Same conversion as `row_msg`: unreadable metadata is absence.
+            let meta: Option<String> = row.get("meta").ok().flatten();
+            if let Some(meta) = meta {
+                if let Ok(value) = serde_json::from_str::<Value>(&meta) {
+                    total += value["attachments"].as_array().map_or(0, Vec::len);
+                }
+            }
+        }
+        Ok(total)
+    }
+
+    /// Auto-naming text from user `content` in `seq` order. The scan ends at
+    /// the first nontrivial row and keeps at most the first nonempty trimmed
+    /// fallback plus that row.
+    pub(crate) fn user_naming_text(&self, session_id: &str) -> Result<Option<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT content FROM messages WHERE session_id=?1 AND role='user' ORDER BY seq",
+        )?;
+        let rows = stmt.query_map(params![session_id], |row| row.get::<_, String>(0))?;
+        crate::namer::try_naming_text_from_contents(rows).map_err(Into::into)
     }
 
     pub fn list_checkpoints(&self, session_id: &str) -> Result<Vec<(String, i64)>> {
@@ -1787,12 +1848,13 @@ impl Store {
         if self.session_deleted(id)? {
             return Ok(None);
         }
-        let limit = up_to_seq.unwrap_or(i64::MAX);
-        let messages: Vec<MessageInfo> = self
-            .list_messages(id)?
-            .into_iter()
-            .filter(|m| m.seq <= limit)
-            .collect();
+        // Decode only the requested prefix, inside this same transaction.
+        // Conversion errors in excluded later rows no longer abort a bounded
+        // fork; included rows still use the ordinary row_msg contract.
+        let messages = match up_to_seq {
+            Some(limit) => self.list_messages_up_to(id, limit)?,
+            None => self.list_messages(id)?,
+        };
         let point = messages.last().map(|message| message.seq).unwrap_or(0);
         let checkpoints: Vec<(String, String, i64)> = self.ps(
             "SELECT id,summary,up_to_seq FROM checkpoints WHERE session_id=?1 AND up_to_seq<=?2 ORDER BY up_to_seq,rowid"
@@ -1846,21 +1908,34 @@ impl Store {
         // FTS5 (bm25, then newest): every word as a prefix term. A query
         // with no word characters falls back to a substring scan.
         let fts = fts_query(query);
-        let sql = if fts.is_some() {
+        let phrase = identifier_prefix_phrase(query);
+        let sql = if phrase.is_some() {
             "SELECT m.session_id, s.name, m.id, m.seq, m.role, m.content, m.created_at \
              FROM messages_fts f JOIN messages m ON m.rowid = f.rowid \
              JOIN sessions s ON s.id = m.session_id AND s.deleted_at IS NULL \
              WHERE messages_fts MATCH ?1 \
-             ORDER BY bm25(messages_fts), m.created_at DESC LIMIT ?2"
+             ORDER BY CASE WHEN m.rowid IN \
+               (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?3) \
+               THEN 0 ELSE 1 END, bm25(messages_fts), m.created_at DESC, m.rowid DESC LIMIT ?2"
+        } else if fts.is_some() {
+            "SELECT m.session_id, s.name, m.id, m.seq, m.role, m.content, m.created_at \
+             FROM messages_fts f JOIN messages m ON m.rowid = f.rowid \
+             JOIN sessions s ON s.id = m.session_id AND s.deleted_at IS NULL \
+             WHERE messages_fts MATCH ?1 \
+             ORDER BY bm25(messages_fts), m.created_at DESC, m.rowid DESC LIMIT ?2"
         } else {
             "SELECT m.session_id, s.name, m.id, m.seq, m.role, m.content, m.created_at \
              FROM messages m JOIN sessions s ON s.id = m.session_id AND s.deleted_at IS NULL \
              WHERE instr(lower(m.content), lower(?1)) > 0 \
-             ORDER BY m.created_at DESC LIMIT ?2"
+             ORDER BY m.created_at DESC, m.rowid DESC LIMIT ?2"
         };
         let mut stmt = self.ps(sql)?;
         let arg = fts.unwrap_or_else(|| query.to_string());
-        let rows = stmt.query_map(params![arg, limit], |r| {
+        let mut args = vec![rusqlite::types::Value::from(arg), limit.into()];
+        if let Some(phrase) = phrase {
+            args.push(phrase.into());
+        }
+        let rows = stmt.query_map(rusqlite::params_from_iter(args), |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
@@ -1901,10 +1976,7 @@ impl Store {
         message_id: &str,
         content: &str,
     ) -> Result<Option<MessageInfo>> {
-        let found = self
-            .list_messages(session_id)?
-            .into_iter()
-            .find(|m| m.id == message_id);
+        let found = self.get_message(session_id, message_id)?;
         let Some(mut msg) = found else {
             return Ok(None);
         };
@@ -2121,13 +2193,14 @@ impl Store {
         threshold: usize,
         limit: usize,
     ) -> Result<Vec<(usize, Vec<String>, String)>> {
-        let mut stmt = self.ps(
-            "SELECT count(DISTINCT session_id) AS n, \
-                    (SELECT uses FROM scripts l WHERE l.hash=s.hash ORDER BY created_at DESC LIMIT 1), \
-                    (SELECT source FROM scripts l WHERE l.hash=s.hash ORDER BY created_at DESC LIMIT 1) \
-             FROM scripts s WHERE status='success' GROUP BY hash \
-             HAVING n>=?1 AND max(saved_tool)='' ORDER BY n DESC LIMIT ?2",
-        )?;
+        let mut stmt = self.ps("SELECT eligible.n, latest.uses, latest.source \
+             FROM (SELECT hash, count(DISTINCT session_id) AS n \
+                   FROM scripts WHERE status='success' GROUP BY hash \
+                   HAVING n>=?1 AND max(saved_tool)='' ORDER BY n DESC LIMIT ?2) eligible \
+             JOIN scripts latest ON latest.rowid=( \
+                 SELECT rowid FROM scripts candidate WHERE candidate.hash=eligible.hash \
+                 ORDER BY created_at DESC, rowid DESC LIMIT 1) \
+             ORDER BY eligible.n DESC")?;
         let rows = stmt.query_map(params![threshold as i64, limit as i64], |r| {
             Ok((
                 r.get::<_, i64>(0)? as usize,
@@ -2381,10 +2454,20 @@ impl Store {
         Ok(())
     }
 
+    /// Pause a scheduler failure without consuming its due occurrence.
+    pub(crate) fn pause_job(&self, id: &str, status: &str) -> Result<()> {
+        self.ex(
+            "UPDATE jobs SET enabled=0, last_run=?2, last_status=?3 WHERE id=?1",
+            params![id, now(), status],
+        )?;
+        Ok(())
+    }
+
     /// A firing's Run ended: its outcome becomes the job's last status.
     pub fn job_ran_status(&self, id: &str, status: &str) -> Result<()> {
         self.ex(
-            "UPDATE jobs SET last_status=?2 WHERE id=?1",
+            "UPDATE jobs SET last_status=?2 WHERE id=?1
+             AND NOT (enabled=0 AND last_status LIKE 'paused: %')",
             params![id, status],
         )?;
         Ok(())
@@ -3391,10 +3474,27 @@ impl Store {
     /// Forget the Anthropic thinking stored on a Session's tool-call turns
     /// (the endpoint rejected it): it is not replayed again.
     pub fn drop_thinking_blocks(&self, session_id: &str) -> Result<usize> {
+        // Collect before any writes, in the original sequence order. Keep id
+        // conversion strict and meta conversion-to-missing like row_msg.
+        // Unused message columns (including corrupt content) are no longer
+        // decoded; this deliberately narrows the corrupt-row error surface.
+        let messages = {
+            let mut statement = self
+                .conn
+                .prepare("SELECT id, meta FROM messages WHERE session_id=?1 ORDER BY seq")?;
+            let rows = statement
+                .query_map(params![session_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1).ok().flatten(),
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
         let mut changed = 0;
-        for m in self.list_messages(session_id)? {
-            let Some(mut meta) = m
-                .meta
+        for (id, metadata) in messages {
+            let Some(mut meta) = metadata
                 .as_deref()
                 .and_then(|s| serde_json::from_str::<Value>(s).ok())
             else {
@@ -3407,7 +3507,7 @@ impl Store {
             {
                 changed += self.ex(
                     "UPDATE messages SET meta=?3 WHERE session_id=?1 AND id=?2",
-                    params![session_id, m.id, meta.to_string()],
+                    params![session_id, id, meta.to_string()],
                 )?;
             }
         }
@@ -4028,6 +4128,29 @@ impl Store {
         Ok(rows)
     }
 
+    /// Agent read projection: all metadata, only the selected code body.
+    /// Unrequested code is intentionally absent; selected code still decodes
+    /// as required text, preserving its conversion failures.
+    pub(crate) fn module_versions_for_read(
+        &self,
+        module_id: &str,
+        selected: i64,
+    ) -> Result<Vec<(i64, Option<String>, String, String)>> {
+        let mut stmt = self.ps("SELECT version, CASE WHEN version=?2 THEN code ELSE NULL END, author, created_at FROM module_versions WHERE module_id=?1 ORDER BY version")?;
+        let rows = stmt
+            .query_map(params![module_id, selected], |row| {
+                let version: i64 = row.get(0)?;
+                let code = if version == selected {
+                    Some(row.get::<_, String>(1)?)
+                } else {
+                    None
+                };
+                Ok((version, code, row.get(2)?, row.get(3)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
     /// Active Tools whose current code requires the module (by name).
     pub fn module_dependents(&self, name: &str) -> Result<Vec<String>> {
         let lower = name.to_lowercase();
@@ -4441,12 +4564,15 @@ impl Store {
             )
             .optional()?;
         Ok(row.map(|mut ex| {
-            if ex.output.len() > MAX {
-                let mut end = MAX;
-                while !ex.output.is_char_boundary(end) {
-                    end -= 1;
+            for field in [&mut ex.input, &mut ex.output] {
+                if field.len() > MAX {
+                    let mut end = MAX;
+                    while !field.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    field.truncate(end);
+                    field.push_str("… (cut)");
                 }
-                ex.output = format!("{}… (cut)", &ex.output[..end]);
             }
             ex
         }))
@@ -4647,6 +4773,49 @@ impl Store {
             .ok())
     }
 
+    /// Per-listing active snapshots for only the shown IDs. Decode errors in
+    /// an individual pin remain missing, like pinned_definition. SQL/iteration
+    /// errors propagate so the caller can retain the legacy per-Tool path.
+    pub(crate) fn pinned_definitions_for(
+        &self,
+        session_id: &str,
+        tool_ids: &[&str],
+    ) -> Result<std::collections::HashMap<String, (i64, String)>> {
+        let mut pins = std::collections::HashMap::new();
+        // Stay below SQLite's conservative parameter limit; no query for [].
+        for chunk in tool_ids.chunks(128) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql = format!(
+                "SELECT tool_id, pinned_version, pinned_def FROM session_tools
+                 WHERE session_id=? AND tool_id IN ({placeholders}) AND pinned_def IS NOT NULL"
+            );
+            let mut stmt = self.ps(&sql)?;
+            let rows = stmt.query_map(
+                rusqlite::params_from_iter(
+                    std::iter::once(session_id).chain(chunk.iter().copied()),
+                ),
+                |row| {
+                    let id: String = row.get(0)?;
+                    let pin = row
+                        .get::<_, i64>(1)
+                        .and_then(|version| {
+                            row.get::<_, String>(2)
+                                .map(|definition| (version, definition))
+                        })
+                        .ok();
+                    Ok((id, pin))
+                },
+            )?;
+            for row in rows {
+                let (id, pin) = row?;
+                if let Some(pin) = pin {
+                    pins.insert(id, pin);
+                }
+            }
+        }
+        Ok(pins)
+    }
+
     /// Pinned definitions of a Session's Tools that are no longer active
     /// (retired, e.g. an MCP server dropped them), as (tool id, definition).
     pub fn pinned_inactive(&self, session_id: &str) -> Result<Vec<(String, String)>> {
@@ -4723,8 +4892,9 @@ impl Store {
         tool_id: &str,
         limit: usize,
     ) -> Result<Vec<(i64, String, String, String)>> {
-        let mut stmt = self.ps("SELECT version, tag, input, error FROM invocations
-             WHERE tool_id=?1 AND status='failure' ORDER BY created_at DESC LIMIT ?2")?;
+        let mut stmt =
+            self.ps("SELECT version, tag, input, error FROM invocations
+             WHERE tool_id=?1 AND status='failure' ORDER BY created_at DESC, rowid DESC LIMIT ?2")?;
         let rows = stmt
             .query_map(params![tool_id, limit as i64], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
@@ -6565,12 +6735,196 @@ impl Store {
     }
 }
 
+#[cfg(test)]
+mod recurring_script_projection_tests {
+    use super::*;
+
+    fn record(
+        store: &Store,
+        identity: (&str, &str, &str),
+        source: &str,
+        uses: &[&str],
+        state: (&str, &str),
+    ) -> String {
+        let uses: Vec<String> = uses.iter().map(|name| (*name).to_owned()).collect();
+        let hash = crate::scripts::recurrence_key(source, &uses);
+        store
+            .record_script(
+                identity.0,
+                identity.1,
+                "fixture-run",
+                &hash,
+                source,
+                &uses,
+                state.0,
+                "",
+                1,
+                state.1,
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE scripts SET created_at=?2 WHERE id=?1",
+                params![identity.0, identity.2],
+            )
+            .unwrap();
+        hash
+    }
+
+    #[test]
+    fn recurring_script_preview_selects_both_fields_from_one_ordered_row() {
+        let store = Store::open_in_memory().unwrap();
+        let first = "const path = 'old'; return tools.read({path});";
+        let second = "const path = 'new'; return tools.read({path});";
+        let third = "const path = 'ล่าสุด'; return tools.read({path});";
+        let early_hash = record(
+            &store,
+            ("one", "s1", "2026-01-01"),
+            first,
+            &["z", "a", "z"],
+            ("success", ""),
+        );
+        let late_hash = record(
+            &store,
+            ("two", "s2", "2026-01-01"),
+            second,
+            &["a", "z"],
+            ("success", ""),
+        );
+        assert_eq!(
+            early_hash, late_hash,
+            "fixture uses the current normalized recurrence key"
+        );
+        assert_eq!(
+            store.recurring_scripts(2, 5).unwrap(),
+            vec![(2, vec!["a".into(), "z".into()], second.into())]
+        );
+        record(
+            &store,
+            ("failure", "s3", "2026-01-02"),
+            third,
+            &["z", "a", "z"],
+            ("failure", "saved-on-failure"),
+        );
+        assert_eq!(
+            store.recurring_scripts(2, 5).unwrap(),
+            vec![(2, vec!["z".into(), "a".into(), "z".into()], third.into())]
+        );
+        record(
+            &store,
+            ("older-recorded-later", "s4", "2025-01-01"),
+            first,
+            &["a", "z"],
+            ("failure", ""),
+        );
+        assert_eq!(store.recurring_scripts(2, 5).unwrap()[0].2, third);
+        record(
+            &store,
+            ("latest-tie", "s5", "2026-01-02"),
+            second,
+            &["a", "z"],
+            ("failure", ""),
+        );
+        assert_eq!(
+            store.recurring_scripts(2, 5).unwrap(),
+            vec![(2, vec!["a".into(), "z".into()], second.into())]
+        );
+    }
+
+    #[test]
+    fn recurring_script_group_scopes_limits_and_malformed_uses_are_preserved() {
+        let store = Store::open_in_memory().unwrap();
+        let many = "return tools.alpha({x:1});";
+        let few = "return tools.beta({x:1});";
+        for (id, session) in [
+            ("many1", "s1"),
+            ("many2", "s2"),
+            ("many3", "s3"),
+            ("many-duplicate-session", "s3"),
+        ] {
+            record(
+                &store,
+                (id, session, "2026-01-01"),
+                many,
+                &["alpha"],
+                ("success", ""),
+            );
+        }
+        for (id, session) in [("few1", "s1"), ("few2", "s2")] {
+            record(
+                &store,
+                (id, session, "2026-01-01"),
+                few,
+                &["beta"],
+                ("success", ""),
+            );
+        }
+        record(
+            &store,
+            ("below", "s1", "2026-01-01"),
+            "return tools.gamma({x:1});",
+            &["gamma"],
+            ("success", ""),
+        );
+        for (id, session, saved) in [("saved1", "s1", "promoted"), ("saved2", "s2", "")] {
+            record(
+                &store,
+                (id, session, "2026-01-01"),
+                "return tools.saved({x:1});",
+                &["saved"],
+                ("success", saved),
+            );
+        }
+        for (id, session) in [("bad1", "s1"), ("bad2", "s2")] {
+            record(
+                &store,
+                (id, session, "2026-01-01"),
+                "return tools.failed({x:1});",
+                &["failed"],
+                ("failure", ""),
+            );
+        }
+        let latest = "return tools.alpha({x:99});";
+        let key = record(
+            &store,
+            ("malformed", "s4", "2026-01-02"),
+            latest,
+            &["alpha"],
+            ("failure", "ignored-failed-save"),
+        );
+        assert_eq!(key, crate::scripts::recurrence_key(many, &["alpha".into()]));
+        store
+            .conn
+            .execute(
+                "UPDATE scripts SET uses='{invalid' WHERE id='malformed'",
+                [],
+            )
+            .unwrap();
+        let rows = store.recurring_scripts(2, 10).unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (3, vec![], latest.into()),
+                (2, vec!["beta".into()], few.into())
+            ]
+        );
+        assert_eq!(store.recurring_scripts(2, 1).unwrap(), rows[..1]);
+        assert!(store.recurring_scripts(2, 0).unwrap().is_empty());
+        assert!(store.recurring_scripts(4, 10).unwrap().is_empty());
+    }
+}
+
 /// Rough token estimate (chars/4). Used only for compaction triggering.
 pub fn estimate_tokens(text: &str) -> usize {
     crate::tokens::text(text)
 }
 
 pub type BuiltContext = (Vec<Value>, bool, i64);
+
+#[cfg(test)]
+#[path = "targeted_message_lookup_tests.rs"]
+mod targeted_message_lookup_tests;
 
 /// Build provider context (OpenAI message objects) from checkpoint +
 /// post-checkpoint messages. Tool-call/tool messages are reconstructed from
@@ -6979,6 +7333,24 @@ pub fn provider_message(m: &MessageInfo) -> Value {
     msg
 }
 
+/// An adjacency tier only for supported separator-joined identifiers.
+/// Every segment remains a prefix, including non-final segments. This asks
+/// for adjacent indexed tokens, not literal punctuation or identifier equality.
+fn identifier_prefix_phrase(text: &str) -> Option<String> {
+    let separator = |c| matches!(c, '_' | '.' | '-' | '/');
+    if !text.chars().any(separator)
+        || text.chars().any(|c| {
+            !c.is_alphanumeric()
+                && !unicode_normalization::char::is_combining_mark(c)
+                && !separator(c)
+        })
+    {
+        return None;
+    }
+    let terms = fts_query(text)?;
+    terms.contains(' ').then(|| terms.replace(' ', " + "))
+}
+
 /// An FTS5 query from free text: each word quoted as a prefix term, all
 /// required. None when the text has no word characters.
 pub fn fts_query(text: &str) -> Option<String> {
@@ -7300,6 +7672,10 @@ mod description_store_tests;
 #[path = "session_lineage_tests.rs"]
 mod session_lineage_tests;
 
+#[cfg(test)]
+#[path = "attachment_entry_count_tests.rs"]
+mod attachment_entry_count_tests;
+
 #[path = "session_comparison.rs"]
 mod session_comparison;
 pub(crate) use session_comparison::SessionComparisonFailure;
@@ -7524,3 +7900,426 @@ mod context_watermark_tests {
         assert_eq!(cache.last_included_seq(), unseen.seq);
     }
 }
+
+#[cfg(test)]
+mod user_naming_text_tests {
+    use super::*;
+    use crate::namer::{naming_text, try_naming_text_from_contents};
+    use std::cell::Cell;
+    use unicode_segmentation::UnicodeSegmentation;
+
+    const NAMING_TEXT_MAX_CHARS: usize = 800 + 3 + 400;
+
+    fn marked(token: &str) -> String {
+        format!("{token}{}", "x".repeat(16_384))
+    }
+
+    fn long_multibyte() -> String {
+        format!("{}ก{}", "a".repeat(799), "b".repeat(401))
+    }
+
+    fn huge_grapheme() -> String {
+        format!("a{}", "\u{0301}".repeat(5_000))
+    }
+
+    fn user_contents(store: &Store, session_id: &str) -> Vec<String> {
+        store
+            .list_messages(session_id)
+            .unwrap()
+            .into_iter()
+            .filter(|message| message.role == "user")
+            .map(|message| message.content)
+            .collect()
+    }
+
+    #[track_caller]
+    fn assert_same(store: &Store, session_id: &str, label: &str) -> Option<String> {
+        let got = store.user_naming_text(session_id).unwrap();
+        if let Some(text) = &got {
+            assert!(
+                text.chars().count() <= NAMING_TEXT_MAX_CHARS,
+                "{label} naming text is unbounded ({})",
+                text.chars().count()
+            );
+        }
+        assert_eq!(
+            got,
+            naming_text(&user_contents(store, session_id)),
+            "{label}"
+        );
+        got
+    }
+
+    #[track_caller]
+    fn assert_head_tail(got: &str, original: &str) {
+        let got: Vec<char> = got.chars().collect();
+        let original: Vec<char> = original.chars().collect();
+        assert!(original.len() > 1200);
+        assert_eq!(got.len(), NAMING_TEXT_MAX_CHARS);
+        assert_eq!(&got[..800], &original[..800]);
+        assert_eq!(&got[800..803], &['\n', '\u{2026}', '\n']);
+        assert_eq!(&got[803..], &original[original.len() - 400..]);
+    }
+
+    fn transcript(store: &Store, rows: &[(&str, &str)]) -> String {
+        let id = store.create_session(None).unwrap().id;
+        for (role, content) in rows {
+            store.append_message(&id, role, content).unwrap();
+        }
+        id
+    }
+
+    fn insert_user_at_seq(store: &Store, session_id: &str, seq: i64, content: &str) {
+        store
+            .conn
+            .execute(
+                "INSERT INTO messages(id,session_id,seq,role,content,created_at,meta) \
+                 VALUES(?1,?2,?3,'user',?4,'2020-01-01T00:00:00Z',NULL)",
+                rusqlite::params![uuid::Uuid::new_v4().to_string(), session_id, seq, content],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn user_naming_text_matches_naming_text_over_synthetic_rows() {
+        let store = Store::open_in_memory().unwrap();
+        let assistant = marked("ASSISTANT_ONLY");
+        let tool = marked("TOOL_ONLY");
+        let late = marked("LATE_ONLY");
+        let cluster = huge_grapheme();
+        let eleven = "e\u{0301}".repeat(11);
+        assert_eq!(cluster.graphemes(true).count(), 1);
+        assert!(cluster.chars().count() > 1200);
+        assert_eq!(eleven.graphemes(true).count(), 11);
+        assert!(eleven.chars().count() > 12);
+        let substantive = "convert this csv to json\nkeep the header row";
+        let mixed = transcript(
+            &store,
+            &[
+                ("assistant", &assistant),
+                ("tool", &tool),
+                ("user", " \u{00A0}\u{3000}\u{2003}\t\r\n"),
+                ("user", "  hi  "),
+                ("user", &eleven),
+                ("user", "\nab\n"),
+                ("user", "\u{200B}"),
+                ("user", &cluster),
+                ("user", substantive),
+                ("user", &late),
+                ("assistant", &assistant),
+            ],
+        );
+        let got = assert_same(&store, &mixed, "mixed").unwrap();
+        // The first uncertain short request is now substantive, even when
+        // it consists of eleven combining graphemes.
+        assert_eq!(got, eleven);
+        assert!(!got.contains("ASSISTANT_ONLY"));
+        assert!(!got.contains("TOOL_ONLY"));
+        assert!(!got.contains("LATE_ONLY"));
+        assert!(got.contains('\u{0301}'));
+
+        let later = "summarise the quarterly notes in one page";
+        let earliest = "please convert this csv export into json";
+        let ordered = store.create_session(None).unwrap().id;
+        store.append_message(&ordered, "user", later).unwrap();
+        store.append_message(&ordered, "user", &late).unwrap();
+        store
+            .append_message(&ordered, "assistant", &assistant)
+            .unwrap();
+        insert_user_at_seq(&store, &ordered, -1, " \u{00A0}\u{3000}\n");
+        insert_user_at_seq(&store, &ordered, 0, earliest);
+        let users = user_contents(&store, &ordered);
+        assert!(users[0].trim().is_empty());
+        assert_eq!(users[1], earliest);
+        assert_eq!(
+            assert_same(&store, &ordered, "seq order").as_deref(),
+            Some(earliest)
+        );
+
+        let long = long_multibyte();
+        assert_eq!(long.chars().count(), 1201);
+        let long_id = transcript(
+            &store,
+            &[
+                ("assistant", &assistant),
+                ("user", "  hey  "),
+                ("user", &long),
+                ("tool", &tool),
+                ("user", &late),
+            ],
+        );
+        let got = assert_same(&store, &long_id, "long").unwrap();
+        assert_head_tail(&got, &long);
+        assert!(!got.contains("LATE_ONLY"));
+        assert!(!got.contains("ASSISTANT_ONLY"));
+
+        let exact = "b".repeat(1200);
+        let exact_id = transcript(&store, &[("user", &exact), ("user", &late)]);
+        let got = assert_same(&store, &exact_id, "exact 1200").unwrap();
+        assert_eq!(got, exact);
+        assert!(!got.contains('\u{2026}'));
+
+        let thai11 = "ก".repeat(11);
+        let thai12 = "ก".repeat(12);
+        assert_eq!(thai11.graphemes(true).count(), 11);
+        assert_eq!(thai12.graphemes(true).count(), 12);
+        assert_eq!("hello there".graphemes(true).count(), 11);
+        let graphemes = transcript(
+            &store,
+            &[
+                ("user", " \u{00A0}\n"),
+                ("user", &eleven),
+                ("user", "hello there"),
+                ("user", &thai11),
+                ("user", &thai12),
+                ("user", &late),
+                ("assistant", &assistant),
+            ],
+        );
+        let got = assert_same(&store, &graphemes, "short combining request").unwrap();
+        assert_eq!(got, eleven);
+        assert!(got.contains('\u{0301}'));
+        assert!(!got.contains("LATE_ONLY"));
+
+        let short_nl = transcript(
+            &store,
+            &[
+                ("tool", &tool),
+                ("user", "hi"),
+                ("user", "go\non"),
+                ("user", &late),
+            ],
+        );
+        assert_eq!(
+            assert_same(&store, &short_nl, "short newline").as_deref(),
+            Some("go\non")
+        );
+    }
+
+    #[test]
+    fn user_naming_text_retains_uncertain_short_requests_before_later_logs() {
+        let store = Store::open_in_memory().unwrap();
+        let late = marked("LATE_ONLY");
+        for request in ["yo", "ab", "Fix the CI", "修复登录错误", "กกก", "e\u{0301}"] {
+            let id = transcript(
+                &store,
+                &[("user", "hi"), ("user", request), ("user", &late)],
+            );
+            assert_eq!(
+                assert_same(&store, &id, "short request").as_deref(),
+                Some(request)
+            );
+        }
+    }
+
+    #[test]
+    fn user_naming_text_none_and_all_trivial_users() {
+        let store = Store::open_in_memory().unwrap();
+        let assistant = marked("ASSISTANT_ONLY");
+        let tool = marked("TOOL_ONLY");
+        let cluster = huge_grapheme();
+        assert_eq!(cluster.graphemes(true).count(), 1);
+
+        let absent = transcript(&store, &[("assistant", &assistant), ("tool", &tool)]);
+        assert_eq!(assert_same(&store, &absent, "no users"), None);
+
+        let blank = " \u{00A0}\u{3000}\u{2003}\t\r\n";
+        assert!(blank.trim().is_empty());
+        let whitespace = transcript(
+            &store,
+            &[("user", ""), ("user", blank), ("assistant", &assistant)],
+        );
+        assert_eq!(assert_same(&store, &whitespace, "whitespace users"), None);
+
+        let trivial = transcript(
+            &store,
+            &[
+                ("user", blank),
+                ("user", "  hi  "),
+                ("user", "ok"),
+                ("user", "thank you"),
+                ("user", "!!!"),
+                ("user", "hello"),
+                ("tool", &tool),
+            ],
+        );
+        let got = assert_same(&store, &trivial, "all trivial").unwrap();
+        assert_eq!(got, "hi");
+        assert!(!got.contains('\u{0301}'));
+
+        let trimmed = transcript(&store, &[("user", "\nab\n"), ("assistant", &assistant)]);
+        assert_eq!(
+            assert_same(&store, &trimmed, "trimmed newline").as_deref(),
+            Some("ab")
+        );
+
+        let zwsp = transcript(&store, &[("user", "\u{200B}")]);
+        assert_eq!(
+            assert_same(&store, &zwsp, "zwsp").as_deref(),
+            Some("\u{200B}")
+        );
+
+        let only_cluster = transcript(
+            &store,
+            &[
+                ("assistant", &assistant),
+                ("user", blank),
+                ("user", &cluster),
+                ("tool", &tool),
+            ],
+        );
+        let got = assert_same(&store, &only_cluster, "huge single grapheme").unwrap();
+        assert_head_tail(&got, &cluster);
+    }
+
+    #[test]
+    fn user_naming_text_does_not_decode_discarded_rows_or_columns() {
+        let store = Store::open_in_memory().unwrap();
+        let text = "please summarise this synthetic document";
+        let id = transcript(
+            &store,
+            &[("assistant", "ignored"), ("user", text), ("user", "later")],
+        );
+        // Synthetic invalid values are read probes, never real session data.
+        // The old full-row decoder reads metadata and every later content.
+        store
+            .conn
+            .execute(
+                "UPDATE messages SET meta='not-json' WHERE session_id=?1 AND role='assistant'",
+                [&id],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE messages SET content=x'ff' WHERE session_id=?1 AND content='later'",
+                [&id],
+            )
+            .unwrap();
+        assert_eq!(store.user_naming_text(&id).unwrap().as_deref(), Some(text));
+        assert!(store.list_messages(&id).is_err());
+    }
+
+    /// `last_relevant` is the last index the selector may pull. `pulls` counts
+    /// the terminating `None` only when the scan exhausts the iterator.
+    #[track_caller]
+    fn scanned(rows: &[String], last_relevant: usize, pulls: usize) -> Option<String> {
+        let seen = Cell::new(0usize);
+        let got = try_naming_text_from_contents(std::iter::from_fn(|| {
+            let index = seen.get();
+            if index > last_relevant {
+                panic!("selector read user row {index}; last relevant index is {last_relevant}");
+            }
+            seen.set(index + 1);
+            rows.get(index)
+                .map(|row| Ok::<&str, &'static str>(row.as_str()))
+        }))
+        .expect("probe");
+        assert_eq!(seen.get(), pulls, "pulled user rows");
+        if let Some(text) = &got {
+            assert!(text.chars().count() <= NAMING_TEXT_MAX_CHARS);
+        }
+        assert_eq!(got, naming_text(rows));
+        got
+    }
+
+    #[test]
+    fn user_naming_text_stops_before_irrelevant_late_rows() {
+        assert_eq!(scanned(&[], 0, 1), None);
+
+        let all_trivial = vec![
+            " \u{00A0}\u{3000}\n".to_string(),
+            "  hi  ".to_string(),
+            "ok".to_string(),
+            "!!!".to_string(),
+        ];
+        assert_eq!(
+            scanned(&all_trivial, all_trivial.len(), all_trivial.len() + 1).as_deref(),
+            Some("hi")
+        );
+
+        let twelve = "ก".repeat(12);
+        assert_eq!(twelve.graphemes(true).count(), 12);
+        let late = marked("LATE_ONLY");
+        let graphemes = vec![
+            " \u{00A0}".to_string(),
+            "e\u{0301}".repeat(11),
+            "hello there".to_string(),
+            twelve.clone(),
+            late.clone(),
+        ];
+        let got = scanned(&graphemes, 1, 2).unwrap();
+        assert_eq!(got, "e\u{0301}".repeat(11));
+        assert!(!got.contains("LATE_ONLY"));
+
+        let short = vec!["yo".to_string(), late.clone()];
+        assert_eq!(scanned(&short, 0, 1).as_deref(), Some("yo"));
+        let multiline = vec!["hi".to_string(), "go\non".to_string(), late.clone()];
+        assert_eq!(scanned(&multiline, 1, 2).as_deref(), Some("go\non"));
+
+        let long = long_multibyte();
+        let shaped = vec!["  hey  ".to_string(), long.clone(), late];
+        let got = scanned(&shaped, 1, 2).unwrap();
+        assert_head_tail(&got, &long);
+        assert!(!got.contains("LATE_ONLY"));
+    }
+}
+
+#[cfg(test)]
+mod recent_failure_order_tests {
+    use super::*;
+
+    #[test]
+    fn recent_failures_break_timestamp_ties_by_recording_order() {
+        let store = Store::open_in_memory().unwrap();
+        let tool = store
+            .create_tool_version(
+                "failure_order",
+                "fixture",
+                "{}",
+                "{}",
+                "function run(i){return i}",
+                &Capabilities::default(),
+                64,
+                "agent",
+            )
+            .unwrap()
+            .0
+            .id;
+        let insert = |tag: &str, timestamp: &str, status: &str| {
+            store.conn.execute(
+                "INSERT INTO invocations(id,tool_id,version,status,tag,input,error,created_at) VALUES(?1,?2,1,?3,?1,?4,?5,?6)",
+                params![tag,tool,status,r#"{"text":"ไทย 日本語"}"#,"ผิดพลาด\n詳細",timestamp],
+            ).unwrap();
+        };
+        insert("first", "2026-01-02T00:00:00Z", "failure");
+        insert("second", "2026-01-02T00:00:00Z", "failure");
+        insert("third", "2026-01-02T00:00:00Z", "failure");
+        assert_eq!(store.recent_failures(&tool, 1).unwrap()[0].1, "third");
+        insert("older_recorded_later", "2026-01-01T00:00:00Z", "failure");
+        insert("success", "2026-01-04T00:00:00Z", "success");
+        insert("running", "2026-01-04T00:00:00Z", "running");
+        insert("newest", "2026-01-03T00:00:00Z", "failure");
+        let rows = store.recent_failures(&tool, 10).unwrap();
+        assert_eq!(
+            rows.iter().map(|row| row.1.as_str()).collect::<Vec<_>>(),
+            ["newest", "third", "second", "first", "older_recorded_later"]
+        );
+        assert_eq!(store.recent_failures(&tool, 3).unwrap(), rows[..3]);
+        assert!(store.recent_failures(&tool, 0).unwrap().is_empty());
+        assert!(store.recent_failures("other_tool", 10).unwrap().is_empty());
+        for (version, _, input, error) in rows {
+            assert_eq!(version, 1);
+            assert_eq!(input, r#"{"text":"ไทย 日本語"}"#);
+            assert_eq!(error, "ผิดพลาด\n詳細");
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "fork_projection_tests.rs"]
+mod fork_projection_tests;
+
+#[cfg(test)]
+#[path = "thinking_metadata_tests.rs"]
+mod thinking_metadata_tests;

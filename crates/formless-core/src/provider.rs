@@ -1,5 +1,7 @@
 use anyhow::{anyhow, bail, Context, Result};
-pub use formless_runtime::structured_output::{CompletionOptions, StructuredOutputError};
+pub use formless_runtime::structured_output::{
+    CompletionOptions, IncompleteReason, StructuredOutputError,
+};
 use formless_runtime::LockExt as _;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
@@ -15,7 +17,7 @@ use crate::Paths;
 /// bootstrap prompt and the optimiser so they never drift apart.
 macro_rules! host_api_doc {
     () => {
-        "Tool code is plain JavaScript defining `function run(input) { ... }` (or `async function run`) returning the output value. On failure, throw an Error: a returned {error: ...} is counted as a failure unless output_schema declares an error property, and swallowing errors hides broken Tools from measurement. Host API (all Capability-gated; data options take encoding \"utf8\" (default) or \"base64\" for binary): fetch(url, {method, headers, body, bodyEncoding, encoding}) -> {status, ok, url, headers, body, text(), json()} (redirects followed only within the granted hosts); fetchChunks(url, opts, size, cb) streams the body in chunks and returns status; fs.read(path, {encoding}), fs.write(path, data, {encoding}), fs.append(path, data, {encoding}), fs.exists(path), fs.stat(path) -> {type, size, modified_ms} or null, fs.list(dir, {details}) -> names or [{name, type, size}], fs.mkdir(path), fs.remove(path, {recursive}), fs.rename(from, to), fs.readChunks(path, size, cb, {encoding}), fs.readLines(path, cb); env.get(key); process.run(cmd, argsArray, {cwd, env, stdin, stdinEncoding, encoding, timeout_ms}) -> {code, signal, stdout, stderr, timed_out, killed, truncated} (no shell; optional timeout kills its group); process.spawn(cmd, argsArray, opts) takes the same options and returns a handle: read(size) -> {stream, data, eof} with stdout/stderr distinguishable, wait()/kill() -> {code, signal, timed_out, killed, truncated}, close(). Read chunks and emit them while work runs; wait discards unread output (truncated: true). Always wait or close in finally; handles cannot outlive this Invocation; tools.call(name, input) -> Promise of the Tool's output (always await it; several in Promise.all run in parallel, and a Tool that returns with a call still pending fails); clipboard.read(), clipboard.write(text); notify(title, body); harness.read() (providers, roles, MCP servers, skills, settings; never keys) and harness.call(op, args, reason) for mcp.add/remove, skills.add/remove/enable, models.set, providers.upsert/remove (no keys; upsert takes base_url or a preset: openai, anthropic, openrouter, gemini, groq, ollama, lmstudio), roles.upsert/delete, config.set: each change is shown to the user with your reason and needs their approval; store.get(key, {ns}), store.set(key, jsonValue, {ns}), store.delete(key, {ns}), store.list(prefix, {ns}) persist small state between Invocations (\"store\" = this Tool's own, \"store:<ns>\" = a shared namespace; 64 KB per value); llm.complete(prompt, {system, model, role, schema}) -> text without schema, or a parsed JSON value validated against schema; agents.run(task, {system, model, role}) -> text (role: a configured Role by name, see the Roles list; it picks the provider and model); requireModule(name) / modules.load(name), modules.list(); emit(chunk) streams large output to an artifact; progress(fraction, label) shows how far long work has got (fraction 0..1 or null; no Capability needed); console.log, sleep(ms), setTimeout/setInterval/clearTimeout (real timers; run() may await them), cryptoRandom(), randomBytes(n) -> base64. Nothing else exists: anything more (URL parsing, base64 decoding to bytes, hashing, compression, formats) you write in JS."
+        "Tool code is plain JavaScript defining `function run(input) { ... }` (or `async function run`) returning the output value. On failure, throw an Error: a returned {error: ...} is counted as a failure unless output_schema declares an error property, and swallowing errors hides broken Tools from measurement. Host API (all Capability-gated; data options take encoding \"utf8\" (default) or \"base64\" for binary): fetch(url, {method, headers, body, bodyEncoding, encoding}) -> {status, ok, url, headers, body, text(), json()} (redirects followed only within the granted hosts); fetchChunks(url, opts, size, cb) streams the body in chunks and returns status; fs.read(path, {encoding}), fs.write(path, data, {encoding}), fs.append(path, data, {encoding}), fs.exists(path), fs.stat(path) -> {type, size, modified_ms} or null, fs.list(dir, {details}) -> names or [{name, type, size}], fs.mkdir(path), fs.remove(path, {recursive}), fs.rename(from, to), fs.readChunks(path, size, cb, {encoding}), fs.readLines(path, cb); env.get(key); process.run(cmd, argsArray, {cwd, env, stdin, stdinEncoding, encoding, timeout_ms}) -> {code, signal, stdout, stderr, timed_out, killed, truncated} (no shell; optional timeout kills its group); process.spawn(cmd, argsArray, opts) takes the same options and returns a handle: read(size) -> {stream, data, eof} with stdout/stderr distinguishable, wait()/kill() -> {code, signal, timed_out, killed, truncated}, close(). Read chunks and emit them while work runs; wait discards unread output (truncated: true). Always wait or close in finally; handles cannot outlive this Invocation; tools.call(name, input) -> Promise of the Tool's output (always await it; several in Promise.all run in parallel, and a Tool that returns with a call still pending fails); clipboard.read(), clipboard.write(text); notify(title, body); harness.read() (providers, roles, MCP servers, skills, settings; never keys) and harness.call(op, args, reason) for mcp.add/remove, skills.add/remove/enable, models.set, providers.upsert/remove (no keys; upsert takes base_url or a preset: openai, anthropic, openrouter, gemini, groq, ollama, lmstudio), roles.upsert/delete, config.set: each change is shown to the user with your reason and needs their approval; store.get(key, {ns}), store.set(key, jsonValue, {ns}), store.delete(key, {ns}), store.list(prefix, {ns}) persist small state between Invocations (\"store\" = this Tool's own, \"store:<ns>\" = a shared namespace; 64 KB per value); llm.complete(prompt, {system, model, role, schema}) -> text without schema, or a parsed JSON value validated against schema; agents.run(task, {system, model, role}) -> text (role: a configured Role by name, see the Roles list; it picks the provider and model); requireModule(name) / modules.load(name), modules.list(); emit(chunk) streams large output to an artifact; progress(fraction, label) shows how far long work has got (fraction 0..1 or null; no Capability needed); console.log, sleep(ms), setTimeout/setInterval/clearTimeout (real timers; run() may await them), cryptoRandom(), randomBytes(n) -> base64 of exactly n bytes. sleep(ms) and randomBytes(n) require finite non-negative safe-integer numbers; invalid inputs and requests above tools.max_sleep_secs/tools.max_random_bytes throw instead of coercing or clamping. Nothing else exists: anything more (URL parsing, base64 decoding to bytes, hashing, compression, formats) you write in JS."
     };
 }
 pub(crate) use host_api_doc;
@@ -148,6 +150,10 @@ pub fn rate_limits() -> HashMap<String, Value> {
 pub struct ModelTest {
     pub model: String,
     pub ok: bool,
+    /// A temporary transport/rate/server/deadline failure, eligible for a
+    /// bounded background retry when the user already opted into auto tests.
+    #[serde(default)]
+    pub transient: bool,
     /// Time to the first streamed token, and to the end of the answer.
     pub first_token_ms: Option<u64>,
     pub total_ms: Option<u64>,
@@ -163,6 +169,110 @@ pub struct ModelTest {
     /// Reported counters across physical probe attempts; missing is unknown.
     #[serde(default)]
     pub probe_usage: Option<Value>,
+}
+
+fn model_test_failure_is_transient(test: &ModelTest, deadline: bool) -> bool {
+    !test.ok
+        && (test.transient
+            || deadline
+            || test
+                .error
+                .as_deref()
+                .is_some_and(crate::errors::is_transient))
+}
+
+#[cfg(test)]
+mod model_test_failure_tests {
+    use super::*;
+    #[test]
+    fn failure_classification_and_legacy_results_keep_their_meaning() {
+        for (error, expected) in [
+            ("provider error: 429 Too Many Requests", true),
+            ("provider error: 503 Unavailable", true),
+            ("connection reset", true),
+            ("request timed out", true),
+            ("provider error: 401 Unauthorized", false),
+            ("provider error: 400 Bad Request", false),
+            ("no tool call returned", false),
+        ] {
+            let test = ModelTest {
+                error: Some(error.into()),
+                ..Default::default()
+            };
+            assert_eq!(
+                model_test_failure_is_transient(&test, false),
+                expected,
+                "{error}"
+            );
+        }
+        let mut test = ModelTest::default();
+        assert!(model_test_failure_is_transient(&test, true));
+        test.transient = true;
+        assert!(model_test_failure_is_transient(&test, false));
+        test.ok = true;
+        assert!(!model_test_failure_is_transient(&test, true));
+        let mut legacy = serde_json::to_value(&test).unwrap();
+        legacy.as_object_mut().unwrap().remove("transient");
+        assert!(
+            !serde_json::from_value::<ModelTest>(legacy)
+                .unwrap()
+                .transient
+        );
+    }
+    #[tokio::test]
+    async fn actual_local_probes_classify_http_deadline_and_fallback_failures() {
+        use axum::response::IntoResponse;
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let env = crate::credential_env::EnvGuard::isolated();
+        env.set("NO_PROXY", "127.0.0.1,localhost");
+        for mode in [429u16, 401, 503] {
+            let count = Arc::new(AtomicUsize::new(0));
+            let app=axum::Router::new().route("/chat/completions",axum::routing::post({let count=count.clone();move || {let count=count.clone();async move {
+                let request=count.fetch_add(1,Ordering::SeqCst);
+                if mode==503 && request==0 {
+                    return ([("content-type","text/event-stream")], "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n").into_response();
+                }
+                if mode==503 && request==1 {
+                    return axum::Json(json!({"choices":[{"message":{"content":"no native tool call"}}]})).into_response();
+                }
+                (axum::http::StatusCode::from_u16(mode).unwrap(),axum::Json(json!({"error":{"message":"local fixture failure"}}))).into_response()
+            }}}));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut cfg = ProviderCfg::default();
+            cfg.base_url = format!("http://{}", listener.local_addr().unwrap());
+            cfg.max_retries = 0;
+            cfg.fallback_models.clear();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let provider = Provider::new(cfg, "local-test-key".into()).unwrap();
+            let deadline = provider
+                .test_model_scoped(
+                    "fixture",
+                    crate::probe_policy::ProbePolicy::limited(std::time::Duration::ZERO, 8),
+                )
+                .await;
+            assert!(!deadline.ok && deadline.transient, "{deadline:?}");
+            assert_eq!(count.load(Ordering::SeqCst), 0);
+            let test = provider
+                .test_model_scoped(
+                    "fixture",
+                    crate::probe_policy::ProbePolicy::limited(
+                        std::time::Duration::from_secs(10),
+                        8,
+                    ),
+                )
+                .await;
+            assert!(!test.ok);
+            assert_eq!(test.transient, mode != 401, "{test:?}");
+            assert_eq!(
+                count.load(Ordering::SeqCst),
+                if mode == 503 { 3 } else { 1 }
+            );
+            server.abort();
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -2043,7 +2153,10 @@ impl Provider {
             ..Default::default()
         });
         result.total_ms = Some(started.elapsed().as_millis() as u64);
-        result.probe_usage = Some(policy.report());
+        let usage = policy.report();
+        result.transient =
+            model_test_failure_is_transient(&result, usage["deadline_exceeded"] == true);
+        result.probe_usage = Some(usage);
         result
     }
 
@@ -2100,14 +2213,20 @@ impl Provider {
         match native {
             Ok(true) => t.tool_calling = true,
             other => {
-                if probe_prompt_tool_call(self, model, &tool)
-                    .await
-                    .unwrap_or(false)
-                {
+                let fallback = probe_prompt_tool_call(self, model, &tool).await;
+                if fallback.as_ref().is_ok_and(|called| *called) {
                     t.tool_calling = true;
                     t.prompt_fallback = true;
-                } else if let Err(e) = other {
-                    t.error = Some(format!("tool call: {e:#}"));
+                } else {
+                    // Preserve a temporary fallback failure even when the
+                    // native probe returned false without an error string.
+                    t.transient = fallback
+                        .as_ref()
+                        .err()
+                        .is_some_and(|error| crate::errors::is_transient(&format!("{error:#}")));
+                    if let Err(e) = other {
+                        t.error = Some(format!("tool call: {e:#}"));
+                    }
                 }
             }
         }
@@ -2470,7 +2589,7 @@ impl Provider {
     ) {
         if matches!(
             error,
-            StructuredOutputError::InvalidJson | StructuredOutputError::SchemaViolation
+            StructuredOutputError::InvalidJson { .. } | StructuredOutputError::SchemaViolation
         ) {
             if let Some(routing) = routing {
                 routing.claim_contract(crate::routing_observation::Identity::new(
@@ -2496,7 +2615,9 @@ impl Provider {
                 return Err(error.into());
             }
             if result.output_limited {
-                return Err(StructuredOutputError::IncompleteResponse.into());
+                return Err(
+                    StructuredOutputError::IncompleteResponse(IncompleteReason::Unknown).into(),
+                );
             }
             Some(schema.parse_and_validate(&result.text).map_err(|error| {
                 self.note_output_contract(routing.as_ref(), &result.model_used, &error);
@@ -2587,7 +2708,16 @@ impl Provider {
         } else if self.structured_output.is_some()
             && (output_limited || v["stop_reason"] == "model_context_window_exceeded")
         {
-            Some(StructuredOutputError::IncompleteResponse)
+            // The boolean also includes generic Responses incompleteness.
+            // Retain only evidence from the fields already used above; an
+            // output cutoff combined with a context stop is ambiguous.
+            let context_stop = v["stop_reason"] == "model_context_window_exceeded";
+            let reason = match (output_limited, context_stop) {
+                (true, false) if !self.cfg.responses() => IncompleteReason::OutputLimit,
+                (false, true) => IncompleteReason::ContextWindow,
+                _ => IncompleteReason::Unknown,
+            };
+            Some(StructuredOutputError::IncompleteResponse(reason))
         } else {
             None
         };
@@ -2801,10 +2931,7 @@ impl Provider {
                         let text = self.redact_native_diagnostic(&raw_text, &credential, Some(&b));
                         // Save every rejected response before any recovery can
                         // continue, including the final send at the resend cap.
-                        last_err = match server_wait {
-                            Some(w) => format!("{status} (retry after {}s): {text}", w.as_secs()),
-                            None => format!("{status}: {text}"),
-                        };
+                        last_err = provider_http_error(status, &text, server_wait);
                         // Recovery inspects protocol data, never display text:
                         // masking even a one-character synthetic credential can
                         // remove a keyword or numeric limit from the diagnostic.
@@ -3041,7 +3168,9 @@ impl Provider {
             .await?;
         if let Some(schema) = options.output_schema() {
             if result.truncated {
-                return Err(StructuredOutputError::IncompleteResponse.into());
+                return Err(
+                    StructuredOutputError::IncompleteResponse(IncompleteReason::Truncated).into(),
+                );
             }
             if result
                 .stop_reason
@@ -4418,8 +4547,9 @@ pub fn is_vision_model(model: &str) -> bool {
 /// listing's own fields (OpenRouter: `pricing`, `context_length`,
 /// `architecture.input_modalities`, `supported_parameters`), else the
 /// built-in table for well-known families. Prices are USD per million
-/// tokens; `efforts` lists the reasoning efforts it accepts ([] = effort
-/// has no effect; absent = unknown).
+/// tokens, stored only for a finite per-token value >= 0 whose scaled
+/// value is finite. `efforts` lists the reasoning efforts it
+/// accepts ([] = effort has no effect; absent = unknown).
 pub fn parse_model_meta(body: &Value) -> HashMap<String, Value> {
     let windows = parse_model_windows(body);
     body["data"]
@@ -4433,10 +4563,15 @@ pub fn parse_model_meta(body: &Value) -> HashMap<String, Value> {
                 meta["context"] = json!(c);
             }
             let per_m = |v: &Value| {
-                v.as_str()
+                let p = v
+                    .as_str()
                     .and_then(|s| s.parse::<f64>().ok())
-                    .or_else(|| v.as_f64())
-                    .map(|p| (p * 1_000_000.0 * 1000.0).round() / 1000.0)
+                    .or_else(|| v.as_f64())?;
+                if !(p.is_finite() && p >= 0.0) {
+                    return None;
+                }
+                let scaled = (p * 1_000_000.0 * 1000.0).round() / 1000.0;
+                scaled.is_finite().then_some(scaled)
             };
             if let Some(p) = per_m(&m["pricing"]["prompt"]) {
                 meta["input_price"] = json!(p);
@@ -4702,6 +4837,19 @@ pub fn is_model_error_text(t: &str) -> bool {
             || t.contains("invalid model"))
 }
 
+// Round display hints up without changing the provider's actual retry delay.
+fn provider_http_error(status: reqwest::StatusCode, text: &str, wait: Option<Duration>) -> String {
+    match wait {
+        Some(wait) => {
+            let seconds = wait
+                .as_secs()
+                .saturating_add(u64::from(wait.subsec_nanos() != 0));
+            format!("{status} (retry after {seconds}s): {text}")
+        }
+        None => format!("{status}: {text}"),
+    }
+}
+
 /// How long the server asked us to wait: `Retry-After` (seconds or an
 /// HTTP date), else the longest `x-ratelimit-reset-*` (`"1s"`, `"6m0s"`,
 /// `"20ms"`).
@@ -4709,7 +4857,9 @@ fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
     let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
     if let Some(v) = header("retry-after") {
         if let Ok(secs) = v.trim().parse::<f64>() {
-            return Some(Duration::from_secs_f64(secs.max(0.0)));
+            if let Some(wait) = retry_seconds(secs) {
+                return Some(wait);
+            }
         }
         if let Ok(at) = chrono::DateTime::parse_from_rfc2822(v.trim()) {
             let wait = at.signed_duration_since(chrono::Utc::now());
@@ -4722,11 +4872,20 @@ fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
         .max()
 }
 
+// Finite negatives retain the zero-wait behavior. Non-finite or overflowing
+// hints are unavailable, allowing other headers or ordinary backoff to apply.
+fn retry_seconds(seconds: f64) -> Option<Duration> {
+    if !seconds.is_finite() {
+        return None;
+    }
+    Duration::try_from_secs_f64(seconds.max(0.0)).ok()
+}
+
 /// `"1m30s"`, `"6m0s"`, `"20ms"`, `"0.5s"`, or bare seconds.
 fn parse_reset_duration(text: &str) -> Option<Duration> {
     let text = text.trim();
     if let Ok(secs) = text.parse::<f64>() {
-        return Some(Duration::from_secs_f64(secs.max(0.0)));
+        return retry_seconds(secs);
     }
     let mut total = 0.0;
     let mut rest = text;
@@ -4749,7 +4908,7 @@ fn parse_reset_duration(text: &str) -> Option<Duration> {
             };
         rest = &rest[unit_len..];
     }
-    Some(Duration::from_secs_f64(total))
+    retry_seconds(total)
 }
 
 /// Whether a 400 body rejects the reasoning-effort parameter itself (and
@@ -5292,6 +5451,278 @@ mod tests {
 
     use super::*;
 
+    // Finite per-token prices >= 0 whose
+    // `(p * 1_000_000.0 * 1000.0).round() / 1000.0` result is finite are
+    // stored. Every other price key stays absent. Import still
+    // keeps non-finite products and drops free, partial, and unparseable rows.
+    #[test]
+    fn model_meta_prices_keep_only_finite_non_negative_scaled_values() {
+        let scale_overflow = f64::MAX / 1e5;
+        let round_overflow = f64::MAX / 1e8;
+        let large_finite = f64::MAX / 1e12;
+        assert!(
+            scale_overflow.is_finite() && !(scale_overflow * 1_000_000.0).is_finite(),
+            "finite input whose per-million scaling overflows"
+        );
+        assert!(
+            round_overflow.is_finite()
+                && (round_overflow * 1_000_000.0).is_finite()
+                && !(round_overflow * 1_000_000.0 * 1000.0).is_finite(),
+            "finite per-million product that overflows the rounding multiply"
+        );
+        let large_scaled = (large_finite * 1_000_000.0 * 1000.0).round() / 1000.0;
+        assert!(large_finite.is_finite() && large_scaled.is_finite() && large_scaled >= 0.0);
+        let rows: Vec<(&str, Option<Value>, Option<f64>, Option<f64>)> = vec![
+            (
+                "厂商/字符串",
+                Some(json!({"prompt": "0.000003", "completion": "0.000015"})),
+                Some(3.0),
+                Some(15.0),
+            ),
+            (
+                "ベンダー/数値",
+                Some(json!({"prompt": 2, "completion": 5})),
+                Some(2_000_000.0),
+                Some(5_000_000.0),
+            ),
+            (
+                "модель/ноль",
+                Some(json!({"prompt": "0", "completion": "0.0"})),
+                Some(0.0),
+                Some(0.0),
+            ),
+            (
+                "модель/нуль",
+                Some(json!({"prompt": 0, "completion": 0.0})),
+                Some(0.0),
+                Some(0.0),
+            ),
+            (
+                "μοντέλο/μικρό",
+                Some(json!({"prompt": "1e-20", "completion": 1e-20})),
+                Some(0.0),
+                Some(0.0),
+            ),
+            (
+                "모델/음수",
+                Some(json!({"prompt": "-0.000003", "completion": -2})),
+                None,
+                None,
+            ),
+            (
+                "모델/한쪽",
+                Some(json!({"prompt": "0.000003", "completion": -0.000015})),
+                Some(3.0),
+                None,
+            ),
+            (
+                "μοντέλο/ναν",
+                Some(json!({"prompt": "NaN", "completion": "nan"})),
+                None,
+                None,
+            ),
+            (
+                "モデル/無限",
+                Some(json!({"prompt": "inf", "completion": "-Infinity"})),
+                None,
+                None,
+            ),
+            (
+                "モデル/正無限",
+                Some(json!({"prompt": "+inf", "completion": "Infinity"})),
+                None,
+                None,
+            ),
+            (
+                "模型/字面溢出",
+                Some(json!({"prompt": "1e309", "completion": "-1e309"})),
+                None,
+                None,
+            ),
+            ("模型/缺", None, None, None),
+            ("模型/空", Some(json!({})), None, None),
+            (
+                "模型/空值",
+                Some(json!({"prompt": null, "completion": null})),
+                None,
+                None,
+            ),
+            (
+                "模型/坏串",
+                Some(json!({"prompt": "nope", "completion": ""})),
+                None,
+                None,
+            ),
+            (
+                "模型/坏类型",
+                Some(json!({"prompt": true, "completion": []})),
+                None,
+                None,
+            ),
+            ("模型/非对象", Some(json!("0.000003")), None, None),
+            (
+                "模型/只输出",
+                Some(json!({"completion": 5})),
+                None,
+                Some(5_000_000.0),
+            ),
+            (
+                "模型/标度溢出",
+                Some(json!({"prompt": scale_overflow, "completion": scale_overflow})),
+                None,
+                None,
+            ),
+            (
+                "模型/舍入溢出",
+                Some(json!({"prompt": round_overflow, "completion": round_overflow})),
+                None,
+                None,
+            ),
+            (
+                "模型/大有限",
+                Some(json!({"prompt": large_finite, "completion": large_finite})),
+                Some(large_scaled),
+                Some(large_scaled),
+            ),
+        ];
+
+        fn row(id: &str, pricing: Option<&Value>) -> Value {
+            let mut model = json!({
+                "id": id,
+                "context_length": 131072,
+                "max_tokens": 8192,
+                "architecture": {"input_modalities": ["text", "image"]},
+                "supported_parameters": ["tools", "reasoning"]
+            });
+            if let Some(pricing) = pricing {
+                model["pricing"] = pricing.clone();
+            }
+            model
+        }
+
+        let with_pricing = parse_model_meta(&json!({
+            "data": rows
+                .iter()
+                .map(|(id, pricing, _, _)| row(id, pricing.as_ref()))
+                .collect::<Vec<_>>()
+        }));
+        let without_pricing = parse_model_meta(&json!({
+            "data": rows
+                .iter()
+                .map(|(id, _, _, _)| row(id, None))
+                .collect::<Vec<_>>()
+        }));
+        assert_eq!(with_pricing.len(), rows.len());
+        assert_eq!(without_pricing.len(), rows.len());
+        for (id, _, input, output) in &rows {
+            let got = &with_pricing[*id];
+            let plain = &without_pricing[*id];
+            match *input {
+                Some(price) => assert_eq!(got["input_price"], json!(price), "{id} input"),
+                None => assert!(got.get("input_price").is_none(), "{id} input"),
+            }
+            match *output {
+                Some(price) => assert_eq!(got["output_price"], json!(price), "{id} output"),
+                None => assert!(got.get("output_price").is_none(), "{id} output"),
+            }
+            let mut stripped = got.clone();
+            let fields = stripped.as_object_mut().unwrap();
+            fields.remove("input_price");
+            fields.remove("output_price");
+            assert_eq!(&stripped, plain, "{id}");
+            assert_eq!(plain.as_object().unwrap().len(), 5, "{id}");
+            assert_eq!(
+                (
+                    plain["context"].as_u64(),
+                    plain["max_output"].as_u64(),
+                    plain["vision"].as_bool(),
+                    plain["tools"].as_bool()
+                ),
+                (Some(131072), Some(8192), Some(true), Some(true)),
+                "{id}"
+            );
+            assert_eq!(plain["efforts"], json!(["low", "medium", "high"]), "{id}");
+            assert!(plain.get("input_price").is_none(), "{id}");
+            assert!(plain.get("output_price").is_none(), "{id}");
+        }
+
+        let retrieved = "2026-11-11T00:00:00Z";
+        let prices = parse_model_prices(
+            &json!({"data": [
+                {"id": "厂商/价格", "pricing": {
+                    "prompt": 2, "completion": 5,
+                    "input_cache_read": 3, "input_cache_write": 4
+                }},
+                {"id": "overflow-scale", "pricing": {"prompt": scale_overflow, "completion": 1}},
+                {"id": "overflow-round", "pricing": {"prompt": round_overflow, "completion": 1}},
+                {"id": "free/model", "pricing": {"prompt": "0", "completion": 0}},
+                {"id": "zero-input", "pricing": {"prompt": "0", "completion": 1}},
+                {"id": "厂商/无效", "pricing": {"prompt": "-0.000001", "completion": 1}},
+                {"id": "nan", "pricing": {"prompt": "NaN", "completion": "1"}},
+                {"id": "inf", "pricing": {"prompt": "inf", "completion": "1"}},
+                {"id": "one-sided", "pricing": {"prompt": 2}},
+                {"id": "no-pricing"},
+                {"id": "bad", "pricing": {"prompt": "nope", "completion": 1}}
+            ]}),
+            retrieved,
+        );
+        assert_eq!(
+            prices
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            [
+                "厂商/价格",
+                "overflow-scale",
+                "overflow-round",
+                "zero-input"
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<std::collections::BTreeSet<_>>()
+        );
+        let imported = &prices["厂商/价格"];
+        assert_eq!(
+            (
+                imported.input,
+                imported.output,
+                imported.cached_input,
+                imported.cache_write_input,
+                imported.retrieved_at.as_deref(),
+            ),
+            (
+                2_000_000.0,
+                5_000_000.0,
+                Some(3_000_000.0),
+                Some(4_000_000.0),
+                Some(retrieved),
+            )
+        );
+        let scaled = &prices["overflow-scale"];
+        assert!(!scaled.input.is_finite());
+        assert_eq!(scaled.output, 1_000_000.0);
+        assert_eq!(scaled.cached_input, None);
+        assert_eq!(scaled.cache_write_input, None);
+        assert_eq!(scaled.retrieved_at.as_deref(), Some(retrieved));
+        let rounded = &prices["overflow-round"];
+        assert_eq!(rounded.input, round_overflow * 1e6);
+        assert!(rounded.input.is_finite());
+        assert_eq!(rounded.output, 1_000_000.0);
+        assert_eq!(prices["zero-input"].input, 0.0);
+        assert_eq!(prices["zero-input"].output, 1_000_000.0);
+        for id in [
+            "free/model",
+            "厂商/无效",
+            "nan",
+            "inf",
+            "one-sided",
+            "no-pricing",
+            "bad",
+        ] {
+            assert!(!prices.contains_key(id), "{id}");
+        }
+    }
+
     #[test]
     fn usage_reads_reported_cost_and_cache_writes() {
         let _env = crate::credential_env::EnvGuard::isolated();
@@ -5426,6 +5857,111 @@ mod tests {
             "The page title is \"Example Domain\".",
         ] {
             assert!(!looks_like_access_refusal(t), "{t}");
+        }
+    }
+
+    #[test]
+    fn stored_retry_hints_round_up_and_explain_the_same_wait() {
+        let context = crate::errors::ErrorContext {
+            base_url: "https://provider.invalid/v1",
+            model: "fixture",
+            alternatives: vec![],
+        };
+        for (wait, seconds) in [
+            (Duration::ZERO, 0),
+            (Duration::from_millis(20), 1),
+            (Duration::from_millis(500), 1),
+            (Duration::from_millis(1900), 2),
+            (Duration::from_secs(30), 30),
+            (Duration::MAX, u64::MAX),
+        ] {
+            let stored = provider_http_error(
+                reqwest::StatusCode::TOO_MANY_REQUESTS,
+                "limited",
+                Some(wait),
+            );
+            assert!(
+                stored.contains(&format!("(retry after {seconds}s)")),
+                "{stored}"
+            );
+            let explained = crate::errors::explain(&stored, &context);
+            assert_eq!(explained.category, "rate_limit");
+            assert!(
+                explained
+                    .message
+                    .ends_with(&format!("Try again in {seconds}s.")),
+                "{}",
+                explained.message
+            );
+        }
+        assert_eq!(
+            provider_http_error(reqwest::StatusCode::BAD_REQUEST, "invalid", None),
+            "400 Bad Request: invalid"
+        );
+    }
+
+    #[test]
+    fn retry_hints_ignore_nonfinite_and_unrepresentable_durations() {
+        use reqwest::header::{HeaderMap, HeaderValue};
+        for invalid in [
+            "inf",
+            "+inf",
+            "-inf",
+            "NaN",
+            "1e100",
+            "18446744073709551616",
+        ] {
+            assert_eq!(parse_reset_duration(invalid), None, "{invalid}");
+            let mut headers = HeaderMap::new();
+            headers.insert("retry-after", HeaderValue::from_str(invalid).unwrap());
+            headers.insert(
+                "x-ratelimit-reset-requests",
+                HeaderValue::from_static("1e100"),
+            );
+            headers.insert("x-ratelimit-reset-tokens", HeaderValue::from_static("3s"));
+            assert_eq!(
+                retry_after(&headers),
+                Some(Duration::from_secs(3)),
+                "{invalid}"
+            );
+        }
+        for invalid in [
+            format!("{}h", "9".repeat(400)),
+            "10000000000000000000h".into(),
+            "10000000000000000000s10000000000000000000s".into(),
+        ] {
+            assert_eq!(parse_reset_duration(&invalid), None, "{invalid}");
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ratelimit-reset-requests", HeaderValue::from_static("5s"));
+        headers.insert("x-ratelimit-reset-tokens", HeaderValue::from_static("2s"));
+        assert_eq!(retry_after(&headers), Some(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn retry_hints_preserve_valid_ranges_precedence_and_negative_clamping() {
+        use reqwest::header::{HeaderMap, HeaderValue};
+        for (text, expected) in [
+            ("0.5", Duration::from_millis(500)),
+            ("-2.5", Duration::ZERO),
+            ("20ms", Duration::from_millis(20)),
+            ("1h30m", Duration::from_secs(5400)),
+            (
+                "18446744073709549568",
+                Duration::from_secs(18_446_744_073_709_549_568),
+            ),
+        ] {
+            assert_eq!(parse_reset_duration(text), Some(expected), "{text}");
+        }
+        for (value, expected) in [
+            ("0.5", Duration::from_millis(500)),
+            ("-2", Duration::ZERO),
+            ("Sun, 06 Nov 1994 08:49:37 GMT", Duration::ZERO),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert("retry-after", HeaderValue::from_static(value));
+            headers.insert("x-ratelimit-reset-tokens", HeaderValue::from_static("9s"));
+            assert_eq!(retry_after(&headers), Some(expected), "{value}");
         }
     }
 

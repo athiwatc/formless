@@ -10,7 +10,19 @@ collects both (with secrets removed) for an issue.
 
 - **"daemon did not accept connections within Ns"**: the first start after
   an upgrade may migrate and back up a large database. Wait and retry, or
-  raise `daemon.start_timeout_secs`. `formless logs` shows where it is.
+  run `formless config edit` and raise `start_timeout_secs` in the existing
+  `[daemon]` section (or add that section if absent):
+
+  ```toml
+  [daemon]
+  start_timeout_secs = 180
+  ```
+
+  `config edit` works while the daemon is down. `formless config set` needs
+  the daemon and cannot change this key. If the timeout error says the
+  config could not be loaded, repair it with `formless config edit`; that
+  start attempt used the default 60 seconds. `formless logs` shows the
+  daemon's log.
 - **Another version is running**: `formless daemon restart` (it waits for
   running Runs; `--force` interrupts them). The TUI's `/restart-daemon`
   does the same.
@@ -73,8 +85,27 @@ tests it), and that a proxy is set if you need one (`provider.proxy` or
 
 ## Ctrl+Enter doesn't queue
 
-Many terminals send Ctrl+Enter as plain Enter. Use **Ctrl+J** or
-**Alt+Enter**, which work everywhere, or set `tui.queue_key`.
+Many terminals send Ctrl+Enter as plain Enter. Formless can distinguish
+**Ctrl+Enter** only when the terminal supports the kitty keyboard protocol.
+Use **Ctrl+J** or **Alt+Enter** otherwise; the TUI footer shows the binding
+that works in the current terminal. `tui.queue_key` is kept only for
+compatibility and does not change these bindings.
+
+## Context pressure or failed compaction
+
+Inspect `/context` for the Session's context window and its contents. Automatic
+compaction runs near the model context limit. For on-demand compaction, wait
+until the Run ends, then use `/compact` or `/compact FOCUS`. It is unavailable
+while a Run is active and reports nothing to compact when no turns are new
+since the last checkpoint.
+
+For the ordinary daemon-side summarizer, an empty or output-limit-cut summary
+fails before saving a checkpoint; the turns remain. Read the reported failure
+and provider diagnostics before retrying. A successful summary is not lossless.
+Provider-side compaction is optional and endpoint-specific. See
+[README context guidance](../README.md#context-and-compaction),
+[the generated commands](keys.md#session), and
+[SPEC §11](../SPEC.md#11-compaction) for the existing contract.
 
 ## Still stuck?
 

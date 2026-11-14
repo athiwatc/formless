@@ -20,6 +20,7 @@ clap_mangen = "0.3"
 chrono.workspace = true
 crossterm = "0.28"
 unicode-width = "0.2"
+unicode-segmentation.workspace = true
 regex = "1"
 formless-core = { path = "../formless-core" }
 formless-protocol = { path = "../formless-protocol" }
@@ -49,6 +50,9 @@ extended-description = "Formless is an AI agent harness that builds the Tools it
 assets = [
     ["target/release/formless", "usr/bin/", "755"],
     ["../../target/formless.1", "usr/share/man/man1/formless.1", "644"],
+    ["../../target/completions/formless.bash", "usr/share/bash-completion/completions/formless", "644"],
+    ["../../target/completions/_formless", "usr/share/zsh/site-functions/_formless", "644"],
+    ["../../target/completions/formless.fish", "usr/share/fish/vendor_completions.d/formless.fish", "644"],
     ["../../README.md", "usr/share/doc/formless/README.md", "644"],
 ]
 
@@ -60,8 +64,14 @@ assets = [
     { source = "../../LICENSE", dest = "/usr/share/licenses/formless/LICENSE", mode = "644", doc = true },
     { source = "target/release/formless", dest = "/usr/bin/formless", mode = "755" },
     { source = "../../target/formless.1", dest = "/usr/share/man/man1/formless.1", mode = "644", doc = true },
+    { source = "../../target/completions/formless.bash", dest = "/usr/share/bash-completion/completions/formless", mode = "644" },
+    { source = "../../target/completions/_formless", dest = "/usr/share/zsh/site-functions/_formless", mode = "644" },
+    { source = "../../target/completions/formless.fish", dest = "/usr/share/fish/vendor_completions.d/formless.fish", mode = "644" },
     { source = "../../README.md", dest = "/usr/share/doc/formless/README.md", mode = "644", doc = true },
 ]
 
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Threading"] }

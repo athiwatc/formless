@@ -46,15 +46,15 @@ pub fn find_urls(text: &str) -> Vec<(usize, usize, String)> {
     let s: String = chars.iter().collect();
     let mut out = Vec::new();
     let mut from = 0;
-    while let Some(rel) = ["https://", "http://"]
+    while let Some((rel, prefix_len)) = ["https://", "http://"]
         .iter()
-        .filter_map(|p| s[byte_of(&chars, from)..].find(p))
-        .min()
+        .filter_map(|p| s[byte_of(&chars, from)..].find(p).map(|rel| (rel, p.len())))
+        .min_by_key(|(rel, _)| *rel)
     {
         let start = from + s[byte_of(&chars, from)..][..rel].chars().count();
         let end = url_end(&chars, start, run_end(&chars, start));
         let url: String = chars[start..end].iter().collect();
-        if url.len() > "https://".len() {
+        if url.len() > prefix_len {
             out.push((start, end, url));
         }
         from = end.max(start + 1);
@@ -403,6 +403,30 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn urls_use_the_matched_scheme_minimum() {
+        for url in [
+            "http://a",
+            "http://a/",
+            "https://a",
+            "https://a/",
+            "http://é",
+        ] {
+            let text = format!("日本 ({url}). next");
+            assert_eq!(
+                find_urls(&text),
+                vec![(4, 4 + url.chars().count(), url.into())]
+            );
+        }
+        for bare in ["http://", "https://", "http://.", "https://."] {
+            assert!(find_urls(bare).is_empty(), "{bare}");
+        }
+        assert_eq!(
+            find_urls("http://a https://b"),
+            vec![(0, 8, "http://a".into()), (9, 18, "https://b".into())]
+        );
+    }
 
     #[test]
     fn finds_urls_without_trailing_punctuation() {

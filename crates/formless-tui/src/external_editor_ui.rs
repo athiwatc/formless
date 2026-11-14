@@ -382,16 +382,342 @@ pub(super) fn draw_confirmation(f: &mut Frame, app: &App) {
         return;
     }
     let area = f.area();
+    render_confirmation(area, f.buffer_mut(), app.color);
+}
+
+const CONFIRM_TITLE: &str = " Clear edited buffer? ";
+const CONFIRM_HEAD: &str = "The editor returned an empty buffer.";
+const CONFIRM_KEYS: &str = "y: clear this buffer · n/Esc: keep original";
+const CONFIRM_ENTER: &str = "Enter does not clear.";
+/// Too-small fallback: same keys, one short line.
+const CONFIRM_COMPACT: &str = "Empty buffer. y: clear · n/Esc: keep · Enter does not clear.";
+/// Unbordered single row: keys first so clipping keeps y/n/Esc visible.
+const CONFIRM_LINE: &str = "y: clear · n/Esc: keep · Enter does not clear.";
+/// Rows used by `ui::panel` borders (top + bottom); same chrome as the
+/// other dialogs that size themselves as `lines + 2`.
+const PANEL_CHROME: u16 = 2;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConfirmLayout {
+    /// All four original lines, including the blank spacer.
+    Full,
+    /// The three sentences without the blank spacer.
+    NoSpacer,
+    /// Bordered panel with the one-line compact prompt (may wrap).
+    Compact,
+    /// No room for borders: a single unbordered row, clipped to the area.
+    Line,
+}
+
+fn confirmation_text(layout: ConfirmLayout) -> String {
+    match layout {
+        ConfirmLayout::Full => format!("{CONFIRM_HEAD}\n\n{CONFIRM_KEYS}\n{CONFIRM_ENTER}"),
+        ConfirmLayout::NoSpacer => format!("{CONFIRM_HEAD}\n{CONFIRM_KEYS}\n{CONFIRM_ENTER}"),
+        ConfirmLayout::Compact => CONFIRM_COMPACT.to_string(),
+        ConfirmLayout::Line => CONFIRM_LINE.to_string(),
+    }
+}
+
+/// Wrapped row count of `text` at `inner` columns, using the same wrapper
+/// the renderer uses (`Wrap { trim: false }`).
+fn wrapped_rows(text: &str, inner: u16) -> u16 {
+    let rows = Paragraph::new(text.to_string())
+        .wrap(Wrap { trim: false })
+        .line_count(inner);
+    u16::try_from(rows).unwrap_or(u16::MAX)
+}
+
+/// Pick the largest layout that fits `area` and return its rectangle,
+/// always contained in `area`. `None` when there is nothing to draw.
+fn confirmation_layout(area: Rect) -> Option<(ConfirmLayout, Rect)> {
+    if area.width == 0 || area.height == 0 {
+        return None;
+    }
     let width = 68.min(area.width.saturating_sub(2));
-    let height = 5.min(area.height);
-    let rect = Rect::new(
-        area.x + (area.width - width) / 2,
-        area.y + (area.height - height) / 2,
-        width,
-        height,
-    );
-    f.render_widget(Clear, rect);
-    f.render_widget(Paragraph::new("The editor returned an empty buffer.\n\ny: clear this buffer · n/Esc: keep original\nEnter does not clear.").wrap(Wrap{trim:false}).block(ui::panel(" Clear edited buffer? ",app.color,Color::Yellow)),rect);
+    let inner = width.saturating_sub(2);
+    let centered = |w: u16, h: u16| {
+        Rect::new(
+            area.x + (area.width - w) / 2,
+            area.y + (area.height - h) / 2,
+            w,
+            h,
+        )
+    };
+    if inner > 0 {
+        for layout in [
+            ConfirmLayout::Full,
+            ConfirmLayout::NoSpacer,
+            ConfirmLayout::Compact,
+        ] {
+            let height =
+                wrapped_rows(&confirmation_text(layout), inner).saturating_add(PANEL_CHROME);
+            if height <= area.height {
+                return Some((layout, centered(width, height)));
+            }
+        }
+    }
+    Some((ConfirmLayout::Line, centered(area.width, 1)))
+}
+
+fn render_confirmation(area: Rect, buf: &mut Buffer, color: bool) {
+    let Some((layout, rect)) = confirmation_layout(area.intersection(buf.area)) else {
+        return;
+    };
+    Clear.render(rect, buf);
+    let text = confirmation_text(layout);
+    match layout {
+        ConfirmLayout::Line => Paragraph::new(text)
+            .style(fg(color, Color::Yellow))
+            .render(rect, buf),
+        _ => Paragraph::new(text)
+            .wrap(Wrap { trim: false })
+            .block(ui::panel(CONFIRM_TITLE, color, Color::Yellow))
+            .render(rect, buf),
+    }
+}
+
+#[cfg(test)]
+mod confirmation_render_tests {
+    //! Renderer-only fixtures: synthetic buffers, no App, no editor, no clearing.
+    use super::*;
+
+    fn render(area: Rect, fill: &[&str]) -> (Buffer, Buffer) {
+        let mut buf = Buffer::empty(area);
+        for (i, line) in fill.iter().enumerate() {
+            let y = area.y + i as u16;
+            if y < area.bottom() && area.width > 0 {
+                buf.set_stringn(area.x, y, line, area.width as usize, Style::default());
+            }
+        }
+        let before = buf.clone();
+        render_confirmation(area, &mut buf, false);
+        (before, buf)
+    }
+    /// Text of each inner row of a bordered panel, right-trimmed.
+    fn inner_rows(buf: &Buffer, rect: Rect) -> Vec<String> {
+        (rect.y + 1..rect.bottom() - 1)
+            .map(|y| {
+                (rect.x + 1..rect.right() - 1)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+    fn row(buf: &Buffer, rect: Rect, y: u16) -> String {
+        (rect.x..rect.right())
+            .map(|x| buf[(x, y)].symbol())
+            .collect()
+    }
+    fn words(s: &str) -> String {
+        s.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+    fn contained(rect: Rect, area: Rect) -> bool {
+        rect.x >= area.x
+            && rect.y >= area.y
+            && rect.right() <= area.right()
+            && rect.bottom() <= area.bottom()
+    }
+
+    #[test]
+    fn original_sentences_are_kept_verbatim() {
+        assert_eq!(
+            confirmation_text(ConfirmLayout::Full),
+            "The editor returned an empty buffer.\n\ny: clear this buffer · n/Esc: keep original\nEnter does not clear."
+        );
+        assert_eq!(CONFIRM_TITLE, " Clear edited buffer? ");
+        for key in ["y:", "n/Esc", "Enter"] {
+            assert!(CONFIRM_COMPACT.contains(key), "{key}");
+            assert!(CONFIRM_LINE.contains(key), "{key}");
+        }
+    }
+
+    #[test]
+    fn eighty_columns_fit_all_four_lines_with_two_rows_of_chrome() {
+        let area = Rect::new(0, 0, 80, 24);
+        let (layout, rect) = confirmation_layout(area).unwrap();
+        assert_eq!(layout, ConfirmLayout::Full);
+        assert_eq!((rect.width, rect.height), (68, 6));
+        let (_, buf) = render(area, &[]);
+        assert_eq!(
+            inner_rows(&buf, rect),
+            [CONFIRM_HEAD, "", CONFIRM_KEYS, CONFIRM_ENTER]
+        );
+        assert!(row(&buf, rect, rect.y).contains("Clear edited buffer?"));
+        assert!(row(&buf, rect, rect.bottom() - 1).starts_with('╰'));
+    }
+
+    #[test]
+    fn forty_columns_wrap_the_action_line_and_keep_every_key_visible() {
+        let area = Rect::new(0, 0, 40, 24);
+        let (layout, rect) = confirmation_layout(area).unwrap();
+        assert_eq!(layout, ConfirmLayout::Full);
+        // inner 36: head 1 + spacer 1 + action 2 + enter 1, plus 2 chrome.
+        assert_eq!((rect.width, rect.height), (38, 7));
+        let (_, buf) = render(area, &[]);
+        let rows = inner_rows(&buf, rect);
+        assert_eq!(rows.len(), 5);
+        assert_eq!(rows[0], CONFIRM_HEAD);
+        assert_eq!(rows[1], "");
+        assert_eq!(rows[4], CONFIRM_ENTER);
+        assert_eq!(words(&rows[2..4].join(" ")), CONFIRM_KEYS);
+        let visible = rows.join(" ");
+        for key in [
+            "y: clear this buffer",
+            "n/Esc: keep",
+            "original",
+            "Enter does not clear.",
+        ] {
+            assert!(visible.contains(key), "{key}");
+        }
+    }
+
+    #[test]
+    fn short_terminals_drop_the_spacer_before_any_sentence_then_go_compact() {
+        let (layout, rect) = confirmation_layout(Rect::new(0, 0, 80, 6)).unwrap();
+        assert_eq!((layout, rect.height), (ConfirmLayout::Full, 6));
+
+        let area = Rect::new(0, 0, 80, 5);
+        let (layout, rect) = confirmation_layout(area).unwrap();
+        assert_eq!((layout, rect.height), (ConfirmLayout::NoSpacer, 5));
+        let (_, buf) = render(area, &[]);
+        assert_eq!(
+            inner_rows(&buf, rect),
+            [CONFIRM_HEAD, CONFIRM_KEYS, CONFIRM_ENTER]
+        );
+
+        let area = Rect::new(0, 0, 80, 4);
+        let (layout, rect) = confirmation_layout(area).unwrap();
+        assert_eq!((layout, rect.height), (ConfirmLayout::Compact, 3));
+        let (_, buf) = render(area, &[]);
+        assert_eq!(inner_rows(&buf, rect), [CONFIRM_COMPACT]);
+        assert!(row(&buf, rect, rect.y).contains("Clear edited buffer?"));
+
+        let area = Rect::new(0, 0, 80, 2);
+        let (layout, rect) = confirmation_layout(area).unwrap();
+        assert_eq!(layout, ConfirmLayout::Line);
+        assert_eq!(rect, Rect::new(0, 0, 80, 1));
+        let (_, buf) = render(area, &[]);
+        assert_eq!(row(&buf, rect, 0).trim_end(), CONFIRM_LINE);
+    }
+
+    #[test]
+    fn narrow_terminals_wrap_or_fall_back_without_losing_keys() {
+        let area = Rect::new(0, 0, 20, 30);
+        let (layout, rect) = confirmation_layout(area).unwrap();
+        assert_eq!(layout, ConfirmLayout::Full);
+        let inner = rect.width - 2;
+        assert_eq!(
+            rect.height,
+            wrapped_rows(&confirmation_text(layout), inner) + 2
+        );
+        assert!(contained(rect, area));
+        let (_, buf) = render(area, &[]);
+        let rows = inner_rows(&buf, rect);
+        assert_eq!(rows.last().map(|r| r.trim()), Some("clear."));
+        assert_eq!(words(&rows.join(" ")), words(&confirmation_text(layout)));
+
+        for area in [
+            Rect::new(0, 0, 20, 6),
+            Rect::new(0, 0, 12, 4),
+            Rect::new(0, 0, 30, 3),
+        ] {
+            let (layout, rect) = confirmation_layout(area).unwrap();
+            assert!(
+                matches!(layout, ConfirmLayout::Compact | ConfirmLayout::Line),
+                "{area:?} {layout:?}"
+            );
+            assert!(contained(rect, area), "{area:?} {rect:?}");
+            let (_, buf) = render(area, &[]);
+            if layout == ConfirmLayout::Compact {
+                assert_eq!(
+                    words(&inner_rows(&buf, rect).join(" ")),
+                    CONFIRM_COMPACT,
+                    "{area:?}"
+                );
+            } else {
+                let shown = row(&buf, rect, rect.y);
+                assert!(CONFIRM_LINE.starts_with(shown.trim_end()), "{area:?}");
+                assert!(shown.starts_with("y: clear"), "{area:?}");
+                if rect.width >= 16 {
+                    assert!(shown.contains("n/Esc"), "{area:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn zero_and_tiny_dimensions_never_panic_or_escape_the_area() {
+        for (w, h) in [
+            (0, 0),
+            (0, 5),
+            (5, 0),
+            (1, 1),
+            (2, 1),
+            (3, 3),
+            (4, 2),
+            (5, 3),
+            (6, 3),
+            (80, 1),
+            (1, 40),
+            (2, 40),
+            (3, 40),
+            (u16::MAX / 4, 1),
+        ] {
+            let area = Rect::new(3, 2, w, h);
+            match confirmation_layout(area) {
+                None => assert!(w == 0 || h == 0, "{w}x{h}"),
+                Some((_, rect)) => {
+                    assert!(w > 0 && h > 0);
+                    assert!(contained(rect, area), "{w}x{h} {rect:?}");
+                    assert!(rect.width > 0 && rect.height > 0);
+                }
+            }
+            if (w as u32) * (h as u32) <= 20_000 {
+                let (before, after) = render(area, &[]);
+                assert_eq!(before.area, after.area);
+            }
+        }
+        // A frame area larger than the buffer is clamped to the buffer.
+        let mut buf = Buffer::empty(Rect::new(0, 0, 10, 3));
+        render_confirmation(Rect::new(0, 0, 200, 100), &mut buf, true);
+        assert_eq!(buf.area, Rect::new(0, 0, 10, 3));
+    }
+
+    #[test]
+    fn unicode_surrounding_content_outside_the_panel_is_untouched() {
+        let fill = [
+            "漢字かなカナ 한국어 中文字符 漢字かなカナ 한국어 中文字符 漢字かなカナ 한국어",
+            "cafe\u{301} e\u{301}\u{302} a\u{308}o\u{308} combining cafe\u{301} e\u{301}\u{302} a\u{308}",
+            "👩\u{200d}👩\u{200d}👧 👨\u{200d}💻 🏳\u{fe0f}\u{200d}🌈 zwj 👩\u{200d}👩\u{200d}👧 👨\u{200d}💻 🏳\u{fe0f}\u{200d}🌈",
+        ];
+        let fill: Vec<&str> = (0..30).map(|i| fill[i % fill.len()]).collect();
+        for area in [
+            Rect::new(0, 0, 80, 24),
+            Rect::new(0, 0, 40, 24),
+            Rect::new(5, 3, 41, 9),
+            Rect::new(0, 0, 21, 5),
+            Rect::new(0, 0, 80, 2),
+        ] {
+            let (_, rect) = confirmation_layout(area).unwrap();
+            let (before, after) = render(area, &fill);
+            for y in area.top()..area.bottom() {
+                for x in area.left()..area.right() {
+                    let inside =
+                        x >= rect.x && x < rect.right() && y >= rect.y && y < rect.bottom();
+                    if !inside {
+                        assert_eq!(before[(x, y)], after[(x, y)], "{area:?} cell {x},{y}");
+                    }
+                }
+            }
+            let panel: String = (rect.y..rect.bottom())
+                .map(|y| row(&after, rect, y))
+                .collect();
+            assert!(panel.contains("y:") && panel.contains("Esc"), "{area:?}");
+            assert!(!panel.contains('漢') && !panel.contains('👩'), "{area:?}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -418,6 +744,7 @@ mod tests {
     }
     fn editor(text: &str, mode: EditMode) -> EditorState {
         EditorState {
+            viewport: Default::default(),
             draft: None,
             original: None,
             confirm_exit: false,
@@ -523,6 +850,7 @@ mod tests {
         ed.vim.mode = vim::Mode::Normal;
         app.editor = Some(ed);
         app.editor_review = Some(EditorReview {
+            scroll: Default::default(),
             diff: "valid old diff".into(),
             verdict: "valid checks".into(),
             ok: true,

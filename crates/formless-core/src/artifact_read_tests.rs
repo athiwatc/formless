@@ -74,6 +74,125 @@ impl Drop for Fixture {
 }
 
 #[tokio::test]
+async fn text_pages_preserve_both_reader_shapes_defaults_caps_and_grep() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let f = Fixture::new(&env);
+    let file = f.paths.data_dir.join("artifacts/nested/pages.txt");
+    for bytes in [
+        b"".as_slice(),
+        b"ASCII\r\nlast\n",
+        "ไทย 日本語 e\u{301} 🦀".as_bytes(),
+        b"a\xffb\xf0\x9f\x92",
+    ] {
+        std::fs::write(&file, bytes).unwrap();
+        let id = f.record(&file, bytes.len() as i64, Some(&f.session));
+        let text = String::from_utf8_lossy(bytes);
+        let total = text.chars().count();
+        for offset in [0, 1, total, total + 1, usize::MAX] {
+            for length in [0, 1, 3, usize::MAX] {
+                let client = f
+                    .daemon()
+                    .handle(Request::GetArtifact {
+                        id: id.clone(),
+                        offset: Some(offset),
+                        length: Some(length),
+                    })
+                    .await
+                    .unwrap();
+                let selected: String = text
+                    .chars()
+                    .skip(offset)
+                    .take(length.min(1_000_000))
+                    .collect();
+                assert_eq!(
+                    client,
+                    json!({"id":id,"session_id":f.session,"bytes":bytes.len(),"total_chars":total,"offset":offset,"end":offset+selected.chars().count(),"text":selected})
+                );
+                let agent: Value = serde_json::from_str(
+                    &f.daemon()
+                        .read_artifact_impl(
+                            &f.session,
+                            &json!({"id":id,"offset":offset,"length":length}),
+                        )
+                        .unwrap(),
+                )
+                .unwrap();
+                let selected: String = text
+                    .chars()
+                    .skip(offset)
+                    .take(length.min(100_000))
+                    .collect();
+                assert_eq!(
+                    agent,
+                    json!({"id":id,"total_chars":total,"offset":offset,"end":(offset+selected.chars().count()).min(total),"text":selected})
+                );
+            }
+        }
+        let empty_grep: Value = serde_json::from_str(
+            &f.daemon()
+                .read_artifact_impl(&f.session, &json!({"id":id,"grep":""}))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(empty_grep["text"], text.as_ref());
+        assert!(empty_grep.get("matches").is_none());
+    }
+    let source = "NeedLE\r\nİSTANBUL\nΟΣ\nος\n日本語\n".to_string()
+        + &"Needle🦀".repeat(600)
+        + "\n"
+        + &"needle\n".repeat(205);
+    std::fs::write(&file, &source).unwrap();
+    let id = f.record(&file, source.len() as i64, Some(&f.session));
+    for query in ["NEEDLE", "İ", "i\u{307}", "ΟΣ", "Σ", "日本", "missing"] {
+        let needle = query.to_lowercase();
+        let old: Vec<Value> = source
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| line.to_lowercase().contains(&needle))
+            .take(200)
+            .map(|(i, line)| json!({"line":i+1,"text":line.chars().take(500).collect::<String>()}))
+            .collect();
+        let got: Value = serde_json::from_str(
+            &f.daemon()
+                .read_artifact_impl(&f.session, &json!({"id":id,"grep":query}))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(got, json!({"id":id,"matches":old}));
+    }
+    let long = "x".repeat(1_000_010);
+    std::fs::write(&file, &long).unwrap();
+    let id = f.record(&file, long.len() as i64, Some(&f.session));
+    for (length, client_len, agent_len) in [
+        (None, 200_000, 20_000),
+        (Some(usize::MAX), 1_000_000, 100_000),
+    ] {
+        let client = f
+            .daemon()
+            .handle(Request::GetArtifact {
+                id: id.clone(),
+                offset: None,
+                length,
+            })
+            .await
+            .unwrap();
+        let args = if let Some(length) = length {
+            json!({"id":id,"length":length})
+        } else {
+            json!({"id":id})
+        };
+        let agent: Value =
+            serde_json::from_str(&f.daemon().read_artifact_impl(&f.session, &args).unwrap())
+                .unwrap();
+        for (value, selected) in [(client, client_len), (agent, agent_len)] {
+            assert_eq!(value["text"].as_str().unwrap().len(), selected);
+            assert_eq!(value["end"], selected);
+            assert_eq!(value["total_chars"], long.len());
+        }
+    }
+}
+
+#[tokio::test]
 async fn shared_readers_preserve_utf8_grep_and_exact_session_vs_global_client_authority() {
     let env = crate::credential_env::EnvGuard::isolated();
     let f = Fixture::new(&env);
