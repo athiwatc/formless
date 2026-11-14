@@ -51,13 +51,20 @@ impl ListFilter {
                 })
                 .max()
         };
-        identifiers(primary, 2)
-            .into_iter()
-            .chain(identifiers(secondary, 1))
-            .chain(prose.iter().filter_map(|field| {
+        // A lower tier cannot beat a matched identifier. In particular, do
+        // not fold a potentially large description after a name already won.
+        if let Some(score) = identifiers(primary, 2) {
+            return Some(score);
+        }
+        if let Some(score) = identifiers(secondary, 1) {
+            return Some(score);
+        }
+        prose
+            .iter()
+            .filter_map(|field| {
                 find_folded(field, query)
                     .map(|range| (0, true, -i64::try_from(range.start).unwrap_or(i64::MAX)))
-            }))
+            })
             .max()
     }
 
