@@ -3286,6 +3286,34 @@ pub fn execute_anyhow(req: &ExecRequest, ops: Arc<dyn HostOps>) -> Result<ExecOu
 mod tests {
     use super::*;
 
+    #[test]
+    fn structured_incomplete_reasons_keep_runtime_error_classification() {
+        use structured_output::{IncompleteReason, StructuredOutputError};
+        for (reason, expected) in [
+            (
+                IncompleteReason::Unknown,
+                "structured output response was incomplete",
+            ),
+            (
+                IncompleteReason::OutputLimit,
+                "structured output response was incomplete (output limit reached)",
+            ),
+            (
+                IncompleteReason::ContextWindow,
+                "structured output response was incomplete (model context window exceeded)",
+            ),
+            (
+                IncompleteReason::Truncated,
+                "structured output response was incomplete (response was truncated)",
+            ),
+        ] {
+            let text = StructuredOutputError::IncompleteResponse(reason).to_string();
+            assert_eq!(text, expected);
+            assert_eq!(classify(&text, false).kind, ExecErrorKind::Js);
+            assert_eq!(classify(&text, true).kind, ExecErrorKind::Cancelled);
+        }
+    }
+
     fn checked_address(
         url: &reqwest::Url,
         scope: &[String],

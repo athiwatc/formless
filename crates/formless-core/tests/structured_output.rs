@@ -4,7 +4,7 @@ mod credential_env;
 use axum::{response::IntoResponse, routing::post, Json, Router};
 use formless_core::{
     config::ProviderCfg,
-    provider::{CompletionOptions, Provider, StructuredOutputError},
+    provider::{CompletionOptions, IncompleteReason, Provider, StructuredOutputError},
 };
 use serde_json::{json, Value};
 use std::{
@@ -506,7 +506,13 @@ async fn paid_invalid_json_schema_refusal_and_cutoff_keep_one_physical_charge() 
                     },
                     "schema" => StructuredOutputError::SchemaViolation,
                     "refusal" => StructuredOutputError::RefusedResponse,
-                    _ => StructuredOutputError::IncompleteResponse,
+                    _ => StructuredOutputError::IncompleteResponse(if stream {
+                        IncompleteReason::Truncated
+                    } else if style == "responses" {
+                        IncompleteReason::Unknown
+                    } else {
+                        IncompleteReason::OutputLimit
+                    }),
                 };
                 assert_eq!(
                     error.downcast_ref::<StructuredOutputError>(),
@@ -522,6 +528,119 @@ async fn paid_invalid_json_schema_refusal_and_cutoff_keep_one_physical_charge() 
                 peer.close().await;
             }
         }
+    }
+}
+
+#[tokio::test]
+async fn incomplete_stop_diagnostics_use_fixed_evidence_and_keep_terminal_precedence() {
+    let env = credential_env::EnvGuard::isolated();
+    env.set("NO_PROXY", "127.0.0.1,localhost");
+    for (style, stop, finish, status, refused, expected) in [
+        (
+            "anthropic",
+            "max_tokens",
+            "stop",
+            "completed",
+            false,
+            Some(IncompleteReason::OutputLimit),
+        ),
+        (
+            "chat",
+            "private-provider-stop",
+            "length",
+            "completed",
+            false,
+            Some(IncompleteReason::OutputLimit),
+        ),
+        (
+            "anthropic",
+            "model_context_window_exceeded",
+            "stop",
+            "completed",
+            false,
+            Some(IncompleteReason::ContextWindow),
+        ),
+        (
+            "responses",
+            "private-provider-stop",
+            "stop",
+            "incomplete",
+            false,
+            Some(IncompleteReason::Unknown),
+        ),
+        (
+            "chat",
+            "model_context_window_exceeded",
+            "length",
+            "completed",
+            false,
+            Some(IncompleteReason::Unknown),
+        ),
+        (
+            "responses",
+            "model_context_window_exceeded",
+            "stop",
+            "incomplete",
+            false,
+            Some(IncompleteReason::Unknown),
+        ),
+        (
+            "chat",
+            "model_context_window_exceeded",
+            "length",
+            "completed",
+            true,
+            None,
+        ),
+        (
+            "responses",
+            "private-provider-stop",
+            "stop",
+            "incomplete",
+            true,
+            None,
+        ),
+    ] {
+        let peer = Peer::new(move |_, _| {
+            Json(json!({
+                "stop_reason": stop, "status": status,
+                "incomplete_details":{"reason":"private-provider-detail"},
+                "content":[{"type":"text","text":"private-response-body"}],
+                "choices":[{"message":{"content":"private-response-body","refusal":if refused {json!("private-refusal")} else {Value::Null}},"finish_reason":finish}],
+                "output":[{"type":"message","content":[if refused {json!({"type":"refusal","refusal":"private-refusal"})} else {json!({"type":"output_text","text":"private-response-body"})}]}],
+                "usage":{"prompt_tokens":11,"completion_tokens":3,"input_tokens":11,"output_tokens":3}
+            })).into_response()
+        }).await;
+        let charged = Arc::new(Mutex::new(Vec::new()));
+        let capture = charged.clone();
+        let provider = peer
+            .provider(style)
+            .with_usage_hook(Arc::new(move |_, _, usage| {
+                capture.lock().unwrap().push(*usage);
+                Ok(())
+            }));
+        let error = call(
+            &provider,
+            &CompletionOptions::json_schema(schema()).unwrap(),
+            false,
+        )
+        .await
+        .unwrap_err();
+        let expected = expected
+            .map(StructuredOutputError::IncompleteResponse)
+            .unwrap_or(StructuredOutputError::RefusedResponse);
+        assert_eq!(
+            error.downcast_ref::<StructuredOutputError>(),
+            Some(&expected)
+        );
+        assert_eq!(error.to_string(), expected.to_string());
+        for private in ["private-", "disclose private fixture credentials", "answer"] {
+            assert!(!error.to_string().contains(private), "{error}");
+        }
+        assert!(!formless_core::errors::is_transient(&error.to_string()));
+        assert_eq!(peer.seen.lock().unwrap().len(), 1);
+        assert_eq!(charged.lock().unwrap().len(), 1);
+        peer.close().await;
     }
 }
 
