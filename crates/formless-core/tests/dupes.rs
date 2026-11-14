@@ -167,3 +167,68 @@ fn acronym_name_similarity_retains_duplicate_threshold_and_reason() {
         assert_eq!(near_duplicates(&[a, b]).len(), 1);
     }
 }
+
+#[test]
+fn comment_only_tool_copies_keep_the_identical_code_verdict() {
+    for (left, right) in [
+        (
+            "function run(i) { // don't retry\n return i.value; }",
+            "function run(i){ // different comment\nreturn  i.value ;}",
+        ),
+        (
+            "function run() { /* version one */ return 42; }",
+            "function run(){/* version two's note */return 42;}",
+        ),
+        (
+            r"function run() { const re = /'/g; return re.test('x'); }",
+            r"function run(){const re=/'/g;return re.test('x');}",
+        ),
+        (
+            r#"function run() { const re = /[\"']/g; return re.test('x'); }"#,
+            r#"function run(){const re=/[\"']/g;return re.test('x');}"#,
+        ),
+    ] {
+        let a = tool("first", "unrelated alpha", "{}", left);
+        let b = tool("second", "unrelated beta", "{}", right);
+        assert_eq!(
+            similarity((&a.0, &a.1), (&b.0, &b.1)),
+            (1.0, "identical code".into()),
+            "{left}"
+        );
+        assert_eq!(near_duplicates(&[a, b])[0].reason, "identical code");
+    }
+}
+
+#[test]
+fn literal_and_line_break_changes_are_not_identical_tools() {
+    for (left, right) in [
+        (
+            "function run(){return 'a b';}",
+            "function run(){return 'ab';}",
+        ),
+        (
+            "function run(){return /a b/g;}",
+            "function run(){return /ab/g;}",
+        ),
+        (
+            "function run(){return /ab/g;}",
+            "function run(){return /ab/i;}",
+        ),
+        (
+            "function run(){return `a b`;}",
+            "function run(){return `ab`; }",
+        ),
+        ("function run(){return 1;}", "function run(){return 2;}"),
+        ("function run(){return\n1;}", "function run(){return 1;}"),
+        (
+            "function run(){let a=1,b=2; a\n++b; return [a,b];}",
+            "function run(){let a=1,b=2; a++\nb; return [a,b];}",
+        ),
+    ] {
+        let a = tool("alpha", "", "{}", left);
+        let b = tool("beta", "", "{}", right);
+        let (score, reason) = similarity((&a.0, &a.1), (&b.0, &b.1));
+        assert!(score < 1.0, "{left}: {reason}");
+        assert!(!reason.contains("identical code"));
+    }
+}

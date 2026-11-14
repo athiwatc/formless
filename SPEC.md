@@ -3118,7 +3118,14 @@ Generic-Tool guidance helps, but registries still collect near-duplicates
 such as `read_file`, `read_text_file` and `file_read`.
 
 - **Scoring:** a pair of active, non-MCP Tools scores 1.0 for identical
-  code, ignoring whitespace. Otherwise the score is 0.4 × the name-token
+  code tokens, ignoring comments and layout whitespace while retaining literal
+  spellings, token boundaries and restricted-production/postfix line breaks.
+  Strings, regexes and whole templates (including interpolations) remain
+  value-sensitive. Uncertain slash goals (e.g. after a closing parenthesis or
+  brace), unsupported syntax and unfinished literals conservatively compare
+  raw source; they can miss a duplicate rather than guess an identical-code
+  verdict. This exact key is separate from lossy script recurrence fingerprints.
+  Otherwise the score is 0.4 × the name-token
   overlap + 0.3 × the description-word overlap + 0.3 × the input-field
   overlap (all Jaccard, with simple plural folding). Pairs scoring at
   least 0.6 are flagged, with a reason.
