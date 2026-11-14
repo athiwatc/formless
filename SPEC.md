@@ -3960,7 +3960,9 @@ run_tool = "network_policy"     # a registry Tool, or…
   block comments (nested in Rust) and multi-line strings (Python `"""`,
   JS/Go backticks, Rust raw strings) across lines and tells a JS regex
   from a comment; `diff`/`patch` (any case) are coloured as diffs; other
-  languages are plain text in the default colour.
+  languages are plain text in the default colour. In both clients, Python
+  hash comments need no preceding whitespace; YAML/TOML/env values retain
+  semicolons, while INI/conf/properties keep semicolon comments.
   Each block's top border names its language and its index in the
   message (`╭─ rust [2]`), which is the number `/copy code 2` and
   `/pager code 2` use. `tui.code_line_numbers` adds dim line numbers.
@@ -4737,9 +4739,10 @@ undo, redo and replacements invalidate prior asynchronous editor previews.
   exposing template bodies. Names are 1–64 lowercase
   ASCII letters/digits/underscores/hyphens, starting with a letter. Optional
   frontmatter accepts only a nonempty `description` string (plain, quoted or
-  block text); malformed templates are excluded with a stable diagnostic, never
-  executed. Valid project templates override global templates. Built-in slash
-  roots always win, including their subcommands; `/help` groups custom commands
+  block text). The key may have leading spaces or tabs; block content must be
+  indented more deeply than its key, so sibling keys remain subject to validation.
+  Malformed templates are excluded with a stable diagnostic, never executed.
+  Valid project templates override global templates. Built-in slash roots always win, including their subcommands; `/help` groups custom commands
   under **Yours** and identifies shadowed files.
   The shared Core loader supplies the TUI palette/help, plain-client expansion/help and
   `formless commands list [--json]`. JSON contains command metadata, diagnostics
