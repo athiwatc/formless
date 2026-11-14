@@ -36,6 +36,15 @@ hook=r'''
   Object.defineProperty(navigator,'clipboard',{value:{writeText:async text=>{fixtureCopies.push(text);}}});
   window.__fixture={
     copies:fixtureCopies,
+    role(role,content){
+      const m={role,content,seq:1,id:'whitespace-fixture'};
+      const bubble=h('div',{class:'bubble'},content);
+      const node=h('div',{class:'turn '+role},bubble);
+      node.style.cssText='position:fixed;top:100px;left:50px;width:700px;z-index:2';document.body.append(node);
+      const btn=h('button',{},'Menu');node.append(btn);
+      messageMenu(btn,m,node);
+      return bubble.innerText;
+    },
     setup(){
       $('pair').classList.add('hidden');$('app').classList.remove('hidden');S.current='copy-fixture';S.daemonOnline=true;
       const content='Copy is literal prose.\n\n```js\nconst action = "Copy";\nconsole.log(action);\n```\n\nBetween blocks.\n\n```text\nCopy this code too.\n```\n\nFinal paragraph.';
@@ -62,5 +71,14 @@ def check(page):
     page.locator('#fixture-message .codeblock .copy').first.evaluate('(e)=>e.click()')
     assert page.evaluate('__fixture.copies[2]')=='const action = "Copy";\nconsole.log(action);', 'code copy remains exact'
     assert page.locator('#fixture-message .codeblock .copy').count()==2, 'live controls retained'
-    print('PASS plain text excludes generated controls, preserves literal Copy/line breaks; Markdown and code-copy unchanged')
+    failures=[]
+    original='first  line\n  indented second\n\nlast   line'
+    for role in ['user','system-note']:
+        rendered=page.evaluate('({role,text})=>__fixture.role(role,text)',{'role':role,'text':original})
+        assert rendered==original, ('fixture keeps original rendered whitespace',role,rendered)
+        page.get_by_role('menuitem',name='Copy',exact=True).click()
+        copied=page.evaluate('__fixture.copies.at(-1)')
+        if copied!=original: failures.append({'role':role,'expected':original,'copied':copied})
+    assert not failures, failures
+    print('PASS user/system-note whitespace and plain text excludes generated controls, preserves literal Copy/line breaks; Markdown and code-copy unchanged')
 run(Path(__file__).resolve().parent,hook,check,args.app)

@@ -2429,6 +2429,9 @@
     clone.inert = true;
     clone.setAttribute("aria-hidden", "true");
     clone.style.cssText += ";position:fixed;left:-100000px;top:0;opacity:0;pointer-events:none;width:" + source.getBoundingClientRect().width + "px";
+    // User/system-note ancestors supply pre-wrap; preserve the source's
+    // computed whitespace when the clone leaves that ancestor context.
+    clone.style.whiteSpace = getComputedStyle(source).whiteSpace;
     document.body.append(clone);
     try { return clone.innerText; }
     finally { clone.remove(); }
