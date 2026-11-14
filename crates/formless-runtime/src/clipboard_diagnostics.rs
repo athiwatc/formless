@@ -3,12 +3,11 @@
 const DETAIL_CHARS: usize = 256;
 
 pub(super) fn failure(cmd: &str, kind: &str, detail: &str, payload: Option<&str>) -> String {
-    // A write helper may echo its stdin in stderr. Remove the exact payload
-    // before limiting/context flattening, including multiline payloads.
-    let detail = match payload.filter(|text| !text.is_empty()) {
-        Some(text) => detail.replace(text, "[clipboard text]"),
-        None => detail.to_string(),
-    };
+    // Write stderr is untrusted: helpers can echo any fragment or encoding of
+    // stdin. Keep only the trusted program/failure status, even for empty input.
+    if payload.is_some() {
+        return format!("{cmd}: {kind}");
+    }
     let mut chars = detail.trim().chars();
     let context: String = chars
         .by_ref()
@@ -142,7 +141,7 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("exit status: 7"), "{error}");
         assert!(!error.contains("stdout clipboard sentinel") && !error.contains(secret));
-        assert!(error.contains("[clipboard text]"));
+        assert_eq!(error, "sh: exited unsuccessfully (exit status: 7)");
         let error =
             super::super::run_capture_impl("sh", &["-c", "exit 8"], None, true).unwrap_err();
         assert!(error.contains("exit status: 8"), "{error}");
@@ -154,6 +153,61 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("could not spawn"), "{error}");
+    }
+
+    #[test]
+    fn write_failures_omit_partial_escaped_and_empty_payload_context() {
+        let text = "private clipboard\nsecond line";
+        for detail in [
+            "invalid input: private clipboard".into(),
+            text.to_string(),
+            serde_json::to_string(text).unwrap(),
+            "private%20clipboard%0Asecond%20line".into(),
+            "invalid input: ไทย 日本語".into(),
+        ] {
+            for payload in [Some(text), Some(""), Some("ไทย 日本語")] {
+                assert_eq!(
+                    failure(
+                        "wl-copy",
+                        "exited unsuccessfully (exit status: 7)",
+                        &detail,
+                        payload
+                    ),
+                    "wl-copy: exited unsuccessfully (exit status: 7)"
+                );
+            }
+        }
+        let error = fallback(WRITE, |cmd, _| {
+            Err(failure(
+                cmd,
+                "exited unsuccessfully (exit status: 7)",
+                "invalid input: private clipboard",
+                Some(text),
+            ))
+        })
+        .unwrap_err();
+        assert_eq!(error, "clipboard helpers failed: wl-copy: exited unsuccessfully (exit status: 7); xclip: exited unsuccessfully (exit status: 7); xsel: exited unsuccessfully (exit status: 7)");
+    }
+
+    #[test]
+    fn subprocess_write_partial_echo_is_hidden_and_read_context_remains() {
+        let args = &[
+            "-c",
+            "printf 'stdout sentinel'; printf 'invalid input: private clipboard' >&2; exit 7",
+        ];
+        let error = super::super::run_capture_impl(
+            "sh",
+            args,
+            Some("private clipboard\nsecond line"),
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(error, "sh: exited unsuccessfully (exit status: 7)");
+        let error = super::super::run_capture_impl("sh", args, None, true).unwrap_err();
+        assert_eq!(
+            error,
+            "sh: exited unsuccessfully (exit status: 7): invalid input: private clipboard"
+        );
     }
 
     #[test]
