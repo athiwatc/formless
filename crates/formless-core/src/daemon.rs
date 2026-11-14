@@ -3509,7 +3509,12 @@ impl Daemon {
             }
             Request::JobRuns { id, limit } => {
                 Ok(serde_json::to_value(self.with_reader(|st| {
-                    st.job_runs(&id, limit.unwrap_or(20).clamp(1, 500))
+                    let runs = st.job_runs(&id, limit.unwrap_or(20).clamp(1, 500))?;
+                    if runs.is_empty() {
+                        st.get_job(&id)?
+                            .with_context(|| RequestFailure::not_found(format!("no job '{id}'")))?;
+                    }
+                    Ok(runs)
                 })?)?)
             }
             Request::SetJobOptions {
