@@ -10890,6 +10890,9 @@ impl App {
                 };
             }
             KeyCode::Enter => {}
+            // Find currently edits at the query's end, so forward Delete is
+            // a no-op. Consume it before ordinary hidden-draft editing.
+            KeyCode::Delete => return true,
             KeyCode::Backspace => {
                 find.query.pop();
                 find.current = usize::MAX;
@@ -23561,6 +23564,53 @@ mod tests {
         app.key(key(KeyCode::Char('}')));
         app.key(key(KeyCode::Char('}')));
         assert_eq!(app.chat_scroll_top, None);
+    }
+
+    #[test]
+    fn find_delete_cannot_edit_hidden_draft_or_selection() {
+        for selected in [false, true] {
+            let mut app = test_app();
+            app.input.set("private draft ไทย");
+            app.input.set_modal_cursor(8);
+            if selected {
+                app.input.mouse_cursor(13, true);
+            }
+            let before = (
+                app.input.expanded(),
+                app.input.cursor_byte(),
+                app.input.selection(),
+            );
+            app.key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+            app.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+            for modifiers in [
+                KeyModifiers::NONE,
+                KeyModifiers::SHIFT,
+                KeyModifiers::CONTROL,
+            ] {
+                app.key(KeyEvent::new(KeyCode::Delete, modifiers));
+                assert_eq!(
+                    (
+                        app.input.expanded(),
+                        app.input.cursor_byte(),
+                        app.input.selection()
+                    ),
+                    before
+                );
+                assert_eq!(app.find.as_ref().unwrap().query, "a");
+            }
+            app.key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+            assert!(app.find.as_ref().unwrap().query.is_empty());
+            app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+            assert!(app.find.is_none());
+            assert_eq!(
+                (
+                    app.input.expanded(),
+                    app.input.cursor_byte(),
+                    app.input.selection()
+                ),
+                before
+            );
+        }
     }
 
     #[test]
