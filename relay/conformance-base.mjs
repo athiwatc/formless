@@ -8,7 +8,7 @@ export function conformanceBase(value) {
   }
   // Check the supplied spelling too: URL parsing normalizes dot paths,
   // backslashes and whitespace that would otherwise hide ambiguous input.
-  if (!/^https?:\/\/[^/?#\\\s]+\/?$/i.test(value) || url.username || url.password) {
+  if (!/^https?:\/\/[^/?#@\\\s]+\/?$/i.test(value) || url.username || url.password) {
     throw new Error('BASE must be an origin with no credentials, path, query or fragment');
   }
   return {

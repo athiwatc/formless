@@ -26,6 +26,7 @@ test('reject unsupported, malformed and ambiguous BASE values before connecting'
     'http://127.0.0.1:1/..', 'http://127.0.0.1:1/%2e',
     'http://127.0.0.1:1?', 'http://127.0.0.1:1/#',
     'http://user:password@127.0.0.1:1',
+    'http://@127.0.0.1:1',
     'http://127.0.0.1:1\\', ' http://127.0.0.1:1', 'http://127.0.0.1:1\n',
   ]) {
     assert.throws(() => conformanceBase(input), /BASE must/);
