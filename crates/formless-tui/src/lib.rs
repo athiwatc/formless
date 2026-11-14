@@ -22855,7 +22855,10 @@ mod tests {
         app.key(key(KeyCode::Enter));
         assert_eq!(app.selected_tool().unwrap().name, "http_get");
         let screen = render(&mut app, 120, 30);
-        assert!(screen.contains("Tools · 1/3 · /http"), "{screen}");
+        assert!(
+            screen.contains("Tools · 1/3 · sort: relevance (ties: name) · /http"),
+            "{screen}"
+        );
         // Esc clears the filter, then a second Esc leaves the view.
         app.key(key(KeyCode::Esc));
         assert_eq!(app.visible_tools().len(), 3);
@@ -22870,6 +22873,24 @@ mod tests {
         app.key(key(KeyCode::Esc));
         app.key(key(KeyCode::Esc));
         assert_eq!(app.view, View::Chat);
+        // A real typed filter selects the primary name, even when the chosen
+        // calls sort favors a prose-only hit; scattered description letters
+        // cannot keep an unrelated Tool in the visible selection model.
+        app.view = View::Tools;
+        app.tool_filter = lists::ListFilter {
+            sort: 3,
+            ..Default::default()
+        };
+        app.tools[1].description = "rotate every answer daily".into();
+        app.tools[2].description = "read records".into();
+        for c in "/read".chars() {
+            app.key(key(KeyCode::Char(c)));
+        }
+        app.key(key(KeyCode::Enter));
+        assert_eq!(app.visible_tools().len(), 2);
+        assert_eq!(app.selected_tool().unwrap().name, "read_file");
+        app.key(key(KeyCode::Down));
+        assert_eq!(app.selected_tool().unwrap().name, "csv_sum");
     }
 
     #[test]
