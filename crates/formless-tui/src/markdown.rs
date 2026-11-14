@@ -27,6 +27,48 @@ pub(crate) fn set_line_numbers(on: bool) {
     LINE_NUMBERS.with(|l| l.set(on));
 }
 
+/// Read the first actual href, skipping other complete attributes so names
+/// in quoted values and data-href cannot become a destination. Values remain
+/// verbatim, as in the existing inline-HTML renderer.
+fn html_href(body: &str) -> Option<&str> {
+    let space = |c: char| matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0c');
+    let mut attrs = &body[body.find(space)?..];
+    loop {
+        attrs = attrs.trim_start_matches(space);
+        if attrs.is_empty() {
+            return None;
+        }
+        let end = attrs
+            .find(|c| space(c) || c == '=' || c == '/')
+            .unwrap_or(attrs.len());
+        if end == 0 {
+            return None;
+        }
+        let name = &attrs[..end];
+        attrs = attrs[end..].trim_start_matches(space);
+        let value = if let Some(after) = attrs.strip_prefix('=') {
+            attrs = after.trim_start_matches(space);
+            if let Some(quote) = attrs.chars().next().filter(|c| *c == '\'' || *c == '"') {
+                let after = &attrs[1..];
+                let end = after.find(quote)?;
+                let value = &after[..end];
+                attrs = &after[end + 1..];
+                value
+            } else {
+                let end = attrs.find(space).unwrap_or(attrs.len());
+                let value = &attrs[..end];
+                attrs = &attrs[end..];
+                value
+            }
+        } else {
+            ""
+        };
+        if name.eq_ignore_ascii_case("href") {
+            return Some(value);
+        }
+    }
+}
+
 fn parser_options() -> Options {
     Options::ENABLE_TABLES
         | Options::ENABLE_STRIKETHROUGH
@@ -250,18 +292,7 @@ impl Renderer {
                 "code" | "kbd" | "samp" => fg(color, Color::Yellow),
                 "sub" | "sup" | "span" | "small" | "mark" => Style::default(),
                 "a" => {
-                    let href = body
-                        .split("href=")
-                        .nth(1)
-                        .map(|v| {
-                            let q = v.chars().next().filter(|c| *c == '"' || *c == '\'');
-                            match q {
-                                Some(q) => v[1..].split(q).next().unwrap_or_default(),
-                                None => v.split_whitespace().next().unwrap_or_default(),
-                            }
-                        })
-                        .unwrap_or_default()
-                        .to_string();
+                    let href = html_href(body).unwrap_or_default().to_string();
                     if self.link.is_none() && !href.is_empty() {
                         self.link = Some((href, self.mark()));
                     }
@@ -1826,6 +1857,39 @@ mod tests {
             .find(|s| s.content == "bold")
             .unwrap();
         assert!(span.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn inline_html_anchor_attributes_preserve_destinations() {
+        for attrs in [
+            r#"HREF="https://Case.Example/A%2Fb?TokenAbC#Frag""#,
+            r#"href = 'https://Case.Example/A%2Fb?TokenAbC#Frag'"#,
+            "HrEf\t=\nhttps://Case.Example/A%2Fb?TokenAbC#Frag",
+            r#"title='a href=wrong' data-href="wrong" HREF = "https://Case.Example/A%2Fb?TokenAbC#Frag""#,
+            r#"disabled HREF="https://Case.Example/A%2Fb?TokenAbC#Frag" title="last""#,
+        ] {
+            let source = format!("see <A {attrs}>the docs</A> next");
+            let out = lines(&source, 160).join("\n");
+            assert_eq!(
+                out.trim(),
+                "see the docs (https://Case.Example/A%2Fb?TokenAbC#Frag) next",
+                "{source}"
+            );
+        }
+        for attrs in [
+            r#"data-href="https://wrong.test""#,
+            r#"title="href=https://wrong.test""#,
+            r#"href="" HREF="https://wrong.test""#,
+        ] {
+            let out = lines(&format!("see <a {attrs}>docs</a> next"), 160).join("\n");
+            assert_eq!(out.trim(), "see docs next", "{attrs}");
+        }
+        let out = lines(
+            "see <a HrEf='#local'>docs</a> and <a HREF='mailto:a@example.test'>a@example.test</a>",
+            160,
+        )
+        .join("\n");
+        assert_eq!(out.trim(), "see docs and a@example.test");
     }
 
     #[test]
