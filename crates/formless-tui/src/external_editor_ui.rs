@@ -850,6 +850,7 @@ mod tests {
         ed.vim.mode = vim::Mode::Normal;
         app.editor = Some(ed);
         app.editor_review = Some(EditorReview {
+            scroll: Default::default(),
             diff: "valid old diff".into(),
             verdict: "valid checks".into(),
             ok: true,

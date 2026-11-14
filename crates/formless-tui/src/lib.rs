@@ -1195,10 +1195,40 @@ struct Activity {
 }
 
 struct EditorReview {
+    scroll: std::cell::Cell<EditorReviewScroll>,
     diff: String,
     /// "Passes the syntax and smoke checks", or what fails.
     verdict: String,
     ok: bool,
+}
+
+#[derive(Clone, Copy, Default)]
+struct EditorReviewScroll {
+    top: usize,
+    rows: usize,
+    height: usize,
+}
+impl EditorReview {
+    fn scroll_key(&self, key: KeyEvent) -> bool {
+        if !key.modifiers.is_empty() {
+            return false;
+        }
+        let mut scroll = self.scroll.get();
+        let max_top = scroll.rows.saturating_sub(scroll.height);
+        scroll.top = scroll.top.min(max_top);
+        let page = scroll.height.saturating_sub(1).max(1);
+        scroll.top = match key.code {
+            KeyCode::Up => scroll.top.saturating_sub(1),
+            KeyCode::Down => scroll.top.saturating_add(1).min(max_top),
+            KeyCode::PageUp => scroll.top.saturating_sub(page),
+            KeyCode::PageDown => scroll.top.saturating_add(page).min(max_top),
+            KeyCode::Home => 0,
+            KeyCode::End => max_top,
+            _ => return false,
+        };
+        self.scroll.set(scroll);
+        true
+    }
 }
 
 struct EditorState {
@@ -3337,6 +3367,7 @@ impl App {
                             }
                             if self.editor.is_some() {
                                 self.editor_review = Some(EditorReview {
+                                    scroll: Default::default(),
                                     diff: result["diff"].as_str().unwrap_or_default().to_string(),
                                     verdict,
                                     ok,
@@ -9029,6 +9060,15 @@ impl App {
     }
 
     fn editor_key(&mut self, key: KeyEvent) {
+        if !self.vim_help
+            && !self.editor.as_ref().is_some_and(|ed| ed.confirm_exit)
+            && self
+                .editor_review
+                .as_ref()
+                .is_some_and(|review| review.scroll_key(key))
+        {
+            return;
+        }
         self.editor_generation = self.editor_generation.wrapping_add(1);
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if self.vim_help {
@@ -9118,7 +9158,7 @@ impl App {
             self.begin_tool_hunks();
             return;
         }
-        // Reviewing: Ctrl+S saves, anything else goes back to editing.
+        // Reviewing: navigation was handled above; Ctrl+S saves, other keys edit.
         if self.editor_review.is_some() && !(ctrl && key.code == KeyCode::Char('s')) {
             self.editor_review = None;
             return;
@@ -18323,15 +18363,35 @@ fn draw_editor_review(
             _ => Line::raw(l.to_string()),
         });
     }
+    let block = ui::panel(format!(" Review {} ", ed.name), color, Color::Yellow)
+        .title_bottom(ui::hint("↑↓ PgUp/PgDn Home/End scroll", color));
+    let inner = block.inner(body);
+    f.render_widget(block, body);
+    let mut starts = Vec::with_capacity(lines.len());
+    let mut rows = 0;
+    if inner.width > 0 {
+        for line in &lines {
+            starts.push(rows);
+            rows += Paragraph::new(line.clone())
+                .wrap(Wrap { trim: false })
+                .line_count(inner.width)
+                .max(1);
+        }
+    }
+    let height = inner.height as usize;
+    let top = r.scroll.get().top.min(rows.saturating_sub(height));
+    r.scroll.set(EditorReviewScroll { top, rows, height });
+    // Skip whole logical lines before the visible row, preserving styles and
+    // avoiding Paragraph's u16 scroll limit for long multi-line diffs.
+    let first = starts
+        .partition_point(|&start| start <= top)
+        .saturating_sub(1);
+    let offset = top.saturating_sub(starts.get(first).copied().unwrap_or(0));
     f.render_widget(
-        Paragraph::new(lines)
-            .block(ui::panel(
-                format!(" Review {} ", ed.name),
-                color,
-                Color::Yellow,
-            ))
-            .wrap(Wrap { trim: false }),
-        body,
+        Paragraph::new(lines.into_iter().skip(first).collect::<Vec<_>>())
+            .wrap(Wrap { trim: false })
+            .scroll((offset.min(u16::MAX as usize) as u16, 0)),
+        inner,
     );
     f.render_widget(
         Paragraph::new(Line::styled(
@@ -21494,6 +21554,7 @@ mod tests {
         let offsets = app.editor.as_ref().unwrap().viewport.get();
         assert!(offsets.0 > 0 && offsets.1 > 0);
         app.editor_review = Some(EditorReview {
+            scroll: Default::default(),
             diff: "unchanged preview".into(),
             verdict: "fixture".into(),
             ok: true,
@@ -22842,6 +22903,94 @@ mod tests {
     }
 
     #[test]
+    fn editor_review_pages_wrapped_rows_and_bounds_repeated_navigation() {
+        let mut app = test_app();
+        app.editor = Some(viewport_editor("function run() { return 1; }", 0));
+        let diff = (0..80)
+            .map(|i| format!("+ row {i:03} 表👩🏽‍💻 {}", "wrapped words ".repeat(8)))
+            .chain(std::iter::once("+ final-review-marker".into()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.editor_review = Some(EditorReview {
+            scroll: Default::default(),
+            diff,
+            verdict: "safe fixture verdict".into(),
+            ok: true,
+        });
+        let initial = render(&mut app, 60, 14);
+        let initial_state = app.editor_review.as_ref().unwrap().scroll.get();
+        assert!(initial_state.rows > 81);
+        assert!(initial.contains("safe fixture verdict") && initial.contains("PgUp/PgDn"));
+        let generation = app.editor_generation;
+        app.key(key(KeyCode::PageDown));
+        assert!(app.editor_review.is_some());
+        let screen = render(&mut app, 60, 14);
+        assert_ne!(initial, screen);
+        assert_eq!(
+            app.editor_review.as_ref().unwrap().scroll.get().top,
+            initial_state.height - 1
+        );
+        assert_eq!(
+            app.editor_generation, generation,
+            "scrolling does not edit or invalidate save review"
+        );
+        for _ in 0..1000 {
+            app.key(key(KeyCode::PageDown));
+        }
+        let screen = render(&mut app, 60, 14);
+        assert!(screen.contains("final-review-marker"), "{screen}");
+        let end = app.editor_review.as_ref().unwrap().scroll.get();
+        assert_eq!(end.top, end.rows - end.height);
+        app.key(key(KeyCode::Up));
+        assert_eq!(
+            app.editor_review.as_ref().unwrap().scroll.get().top,
+            end.top - 1
+        );
+        app.key(key(KeyCode::Home));
+        assert_eq!(app.editor_review.as_ref().unwrap().scroll.get().top, 0);
+        app.key(key(KeyCode::End));
+        let screen = render(&mut app, 100, 30);
+        let resized = app.editor_review.as_ref().unwrap().scroll.get();
+        assert_eq!(resized.top, resized.rows.saturating_sub(resized.height));
+        assert!(screen.contains("final-review-marker"), "{screen}");
+        assert_eq!(
+            app.editor.as_ref().unwrap().text(),
+            "function run() { return 1; }"
+        );
+        app.key(key(KeyCode::Char('x')));
+        assert!(
+            app.editor_review.is_none(),
+            "ordinary return-to-edit behavior remains"
+        );
+    }
+
+    #[test]
+    fn editor_review_short_tiny_and_large_logical_line_counts_stay_bounded() {
+        let mut app = test_app();
+        app.editor = Some(viewport_editor("function run() {}", 0));
+        app.editor_review = Some(EditorReview {
+            scroll: Default::default(),
+            diff: "+ short".into(),
+            verdict: "fixture".into(),
+            ok: false,
+        });
+        render(&mut app, 80, 24);
+        for code in [KeyCode::Down, KeyCode::PageDown, KeyCode::End, KeyCode::Up] {
+            app.key(key(code));
+        }
+        assert_eq!(app.editor_review.as_ref().unwrap().scroll.get().top, 0);
+        for (width, height) in [(1, 1), (2, 2), (4, 3), (10, 4), (80, 24)] {
+            render(&mut app, width, height);
+        }
+        let review = app.editor_review.as_mut().unwrap();
+        review.diff = format!("{}\n+ last beyond u16", "+ row\n".repeat(66_000));
+        render(&mut app, 80, 12);
+        app.key(key(KeyCode::End));
+        let screen = render(&mut app, 80, 12);
+        assert!(screen.contains("last beyond u16"), "{screen}");
+    }
+
+    #[test]
     fn the_code_editor_reviews_before_saving() {
         let mut app = test_app();
         app.editor = Some(EditorState {
@@ -22860,6 +23009,7 @@ mod tests {
         app.key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
         assert_eq!(app.notes.last().unwrap(), "checking the edit…");
         app.editor_review = Some(EditorReview {
+            scroll: Default::default(),
             diff: "@@ code (v1 → v2)\n-  return 1;\n+  return 2;".into(),
             verdict: "Passes the syntax and smoke checks".into(),
             ok: true,
