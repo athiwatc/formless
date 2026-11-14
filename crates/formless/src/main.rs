@@ -2,6 +2,7 @@ mod cli_attach;
 mod cli_commands;
 #[cfg(test)]
 mod cli_help_tests;
+mod cli_mcp_prompts;
 mod cli_metrics;
 mod cli_modules;
 mod cli_pipeline;
@@ -281,7 +282,7 @@ enum Cmd {
     },
     /// External MCP servers (SPEC §7.9)
     #[command(
-        after_help = "Examples:\n  formless mcp list\n  formless mcp catalog\n  formless mcp tools SERVER_NAME"
+        after_help = "Examples:\n  formless mcp list\n  formless mcp catalog\n  formless mcp tools SERVER_NAME\n  formless mcp prompts --json\n  formless mcp prompt SERVER NAME --arg key=value"
     )]
     Mcp {
         #[command(subcommand)]
@@ -1176,6 +1177,31 @@ enum McpAction {
         /// Configured MCP server name
         name: String,
     },
+    /// Report prompts from reachable enabled servers (discovery may be incomplete)
+    #[command(
+        long_about = "Report prompts through live daemon MCP connections. This can start configured servers; disabled or unreachable servers and discovery failures are skipped, so discovery may be incomplete."
+    )]
+    Prompts {
+        /// Preserve the full daemon discovery array as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Retrieve a live server prompt as the daemon's text projection (no Session submission)
+    #[command(
+        long_about = "Retrieve a live prompt through the daemon; this can start the configured server and sends named string arguments to it. Output is the daemon's text projection: content.text strings joined by blank lines, without roles or non-text parts. JSON preserves this text report, not raw MCP messages. Server/daemon errors are preserved; no local required/unknown argument check is promised."
+    )]
+    Prompt {
+        /// Configured MCP server name
+        server: String,
+        /// Complete prompt identifier reported by the server
+        name: String,
+        /// Named string argument KEY=VALUE (repeatable; empty values and extra equals are preserved)
+        #[arg(long = "arg", value_parser = cli_mcp_prompts::parse_arg)]
+        args: Vec<cli_mcp_prompts::NamedArg>,
+        /// Preserve the complete daemon text report as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Turn one of a server's tools on or off
     Tool {
         /// Configured MCP server name
@@ -1798,6 +1824,16 @@ fn main() {
     }
 }
 
+fn validate_mcp_prompt_args(cli: &Cli) -> Result<()> {
+    if let Some(Cmd::Mcp {
+        action: McpAction::Prompt { args, .. },
+    }) = &cli.cmd
+    {
+        cli_mcp_prompts::arguments(args)?;
+    }
+    Ok(())
+}
+
 fn run_cli(cli: Cli) -> Result<()> {
     // The TUI's own flags mean nothing to other commands (#897).
     if !matches!(cli.cmd, None | Some(Cmd::Tui)) && (cli.plain || cli.continue_last || cli.new) {
@@ -1808,6 +1844,7 @@ fn run_cli(cli: Cli) -> Result<()> {
     // Export usage errors must precede profile setup, Session lookup and any
     // daemon connection. sessions_cmd validates again for direct callers.
     validate_cli_export_format(&cli)?;
+    validate_mcp_prompt_args(&cli)?;
     // The daemon logs warnings and info to daemon.log (`formless logs`);
     // other commands only errors. RUST_LOG overrides both. Colour codes
     // only on a terminal, never into the log file.
@@ -6725,6 +6762,9 @@ fn memory_cmd(paths: Paths, action: MemoryAction) -> Result<()> {
 }
 
 fn mcp_cmd(paths: Paths, action: McpAction) -> Result<()> {
+    if let McpAction::Prompt { args, .. } = &action {
+        cli_mcp_prompts::arguments(args)?;
+    }
     let cfg = Config::load(&paths)?;
     let daemon = |req: Request| -> Result<serde_json::Value> {
         formless_core::daemon::ensure_daemon(&paths)?;
@@ -6863,6 +6903,24 @@ fn mcp_cmd(paths: Paths, action: McpAction) -> Result<()> {
         McpAction::Remove { name } => {
             let r = daemon(Request::RemoveMcpServer { name: name.clone() })?;
             println!("removed: {name} ({} tool(s) retired)", r["retired_tools"]);
+        }
+        McpAction::Prompts { json } => {
+            cli_mcp_prompts::list(json, daemon, &mut std::io::stdout().lock())?;
+        }
+        McpAction::Prompt {
+            server,
+            name,
+            args,
+            json,
+        } => {
+            cli_mcp_prompts::prompt(
+                server,
+                name,
+                cli_mcp_prompts::arguments(&args)?,
+                json,
+                daemon,
+                &mut std::io::stdout().lock(),
+            )?;
         }
         McpAction::List { json } => {
             let list = daemon(Request::ListMcpServers)?;
