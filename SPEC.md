@@ -3897,7 +3897,7 @@ run_tool = "network_policy"     # a registry Tool, or…
   buffer and undo history. Non-Vim editor Esc uses the same confirmation.
   Supported Normal commands: h/j/k/l, w/b/e and W/B/E, 0/$, gg/G; d/c/y with
   those motions, dd/cc/yy, iw/aw/iW/aW, single/double/backtick quotes and nested
-  ()/[]/{}/<> objects; i/a/I/A/o/O, x, p/P and dot repeat. Word/character and
+  ()/[]/{}/<> objects; i/a/I/A/o/O, x, bare u for undo, p/P and dot repeat. Word/character and
   operator counts are bounded to 999. Counts also apply to i/a/I/A/o/O,
   p/P and dot: insert edits repeat on Esc (open-line commands also repeat
   their new lines), puts repeat the register, and an explicit dot count
