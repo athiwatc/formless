@@ -62,15 +62,19 @@ async fn real_daemon_provider_send_navigation_resources_and_reconnect() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base_url = format!("http://{}", listener.local_addr().unwrap());
     let requests: Arc<Mutex<Vec<Value>>> = Arc::default();
+    let first_answer = Arc::new(tokio::sync::Notify::new());
     let app = axum::Router::new()
         .route("/models", axum::routing::get(|| async { axum::Json(json!({"data":[{"id":"desktop-test-model"}]})) }))
         .route("/messages", axum::routing::post({
             let requests = requests.clone();
+            let first_answer = first_answer.clone();
             move |axum::Json(body): axum::Json<Value>| {
                 let requests = requests.clone();
+                let first_answer = first_answer.clone();
                 async move {
-                    requests.lock().unwrap().push(body);
-                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    let first = { let mut requests = requests.lock().unwrap(); requests.push(body); requests.len() == 1 };
+                    if first { first_answer.notified().await; }
+                    else { tokio::time::sleep(Duration::from_millis(300)).await; }
                     let events = [
                         json!({"type":"message_start","message":{"usage":{"input_tokens":1}}}),
                         json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
@@ -161,6 +165,15 @@ async fn real_daemon_provider_send_navigation_resources_and_reconnect() {
         })
         .unwrap();
     until(&client, "stage-4", |u| matches!(u, Update::Snapshot { generation: 2, snapshot } if snapshot.session_id == b && snapshot.blocks.is_empty())).await;
+    assert_eq!(
+        daemon
+            .handle(Request::GetSession { id: a.clone() })
+            .await
+            .unwrap()["running"],
+        true,
+        "the provider is still blocked during navigation"
+    );
+    first_answer.notify_one();
     client
         .send(Command::Select {
             session_id: Some(a.clone()),
@@ -257,7 +270,15 @@ async fn real_daemon_provider_send_navigation_resources_and_reconnect() {
         .unwrap()
         .unwrap();
     provider.abort();
+    let retired = Arc::downgrade(&daemon2);
     drop(daemon2);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while retired.strong_count() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("fixture tasks retained the Profile lease during cleanup");
     // Keep private fixture evidence on panic; remove only this test's tree.
     std::fs::remove_dir_all(root).unwrap();
 }
