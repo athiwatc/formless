@@ -8,6 +8,7 @@ mod cli_proposal_diff;
 mod cli_routing;
 mod cli_run_identity;
 mod cli_runs_list;
+mod cli_tool_lookup;
 mod cli_tool_success;
 mod cli_update;
 #[cfg(test)]
@@ -7323,10 +7324,7 @@ fn tools_cmd(paths: Paths, action: ToolsAction) -> Result<()> {
                 // Resolve name -> id via the list.
                 let v = request_once(&paths, Request::ListTools)?;
                 let tools: Vec<formless_protocol::ToolInfo> = serde_json::from_value(v)?;
-                let tool = tools
-                    .iter()
-                    .find(|t| t.name == name || t.id == name)
-                    .ok_or_else(|| usage(format!("no tool '{name}'")))?;
+                let tool = cli_tool_lookup::resolve(&tools, &name)?;
                 request_once(
                     &paths,
                     Request::ExportTool {
@@ -7759,10 +7757,7 @@ fn find_tool(paths: &Paths, name: &str) -> Result<formless_protocol::ToolInfo> {
     let tools: Vec<formless_protocol::ToolInfo> = serde_json::from_value(
         formless_tui::client::request_once(paths, Request::ListTools)?,
     )?;
-    tools
-        .into_iter()
-        .find(|t| t.name == name || t.id == name)
-        .ok_or_else(|| usage(format!("no tool '{name}' (formless tools list)")))
+    cli_tool_lookup::resolve(&tools, name).cloned()
 }
 
 fn print_tool_detail(d: &formless_protocol::ToolDetail) {

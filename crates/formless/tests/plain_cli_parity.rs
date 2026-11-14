@@ -75,6 +75,13 @@ impl Fixture {
                 while reader.read_line(&mut line).unwrap_or(0) > 0 {
                     let envelope: RequestEnvelope = serde_json::from_str(&line).unwrap();
                     let result = match &envelope.request {
+                        Request::ListTools => {
+                            json!([{"id":"full-tool-id","name":"FetchPage","description":"","retired":false,"current_version":1,"capabilities":[],"memory_mb":16,"invocations":0,"success_rate":null,"needs_attention":false,"created_at":"","updated_at":""}])
+                        }
+                        Request::ExportTool { id } => {
+                            assert_eq!(id, "full-tool-id");
+                            json!({"fixture":"unchanged bundle"})
+                        }
                         Request::ProposalDiff { id } => proposal_comparison(id),
                         Request::ListSessions => json!([
                             {"id":"abc-one","name":"First","created_at":"","updated_at":""},
@@ -180,6 +187,50 @@ impl Fixture {
             stdout: out.join().unwrap(),
             stderr: err.join().unwrap(),
         }
+    }
+}
+
+#[test]
+fn shipped_tool_lookup_misses_never_continue_to_an_action_and_export_stays_exact() {
+    let fixture = Fixture::new();
+    for action in ["show", "disable", "export"] {
+        fixture.requests.lock().unwrap().clear();
+        let out = fixture.run(&["tools", action, "FP"]);
+        assert_eq!(out.status.code(), Some(2));
+        assert!(out.stdout.is_empty());
+        let error = String::from_utf8(out.stderr).unwrap();
+        assert!(
+            error.contains("Partial-name suggestions") && error.contains("\"FetchPage\""),
+            "{error}"
+        );
+        assert!(matches!(
+            &fixture.requests.lock().unwrap()[..],
+            [Request::ListTools]
+        ));
+    }
+    for query in ["full", "unknown", ""] {
+        let out = fixture.run(&["tools", "export", query]);
+        assert_eq!(out.status.code(), Some(2));
+        assert!(out.stdout.is_empty());
+        assert!(String::from_utf8(out.stderr)
+            .unwrap()
+            .contains("formless tools list"));
+    }
+    for query in ["FetchPage", "full-tool-id"] {
+        fixture.requests.lock().unwrap().clear();
+        let out = fixture.run(&["tools", "export", query]);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&out.stdout).unwrap(),
+            json!({"fixture":"unchanged bundle"})
+        );
+        assert!(
+            matches!(&fixture.requests.lock().unwrap()[..],[Request::ListTools,Request::ExportTool{id}] if id=="full-tool-id")
+        );
     }
 }
 
