@@ -86,4 +86,31 @@ mod tests {
             assert_eq!(expand(&snapshot, "/notpresent").unwrap(), None);
         }
     }
+    #[test]
+    fn plain_templates_report_missing_positions_and_keep_escaped_dollars_literal() {
+        let app = crate::tests::test_app();
+        let directory = app.paths.config_dir.join("commands");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("price.md"), "Cost $$5 or $$9.99; `echo $$1`").unwrap();
+        std::fs::write(directory.join("required.md"), "$1 then $2").unwrap();
+        let session: SessionInfo = serde_json::from_value(serde_json::json!({"id":"s","name":"Plain","created_at":"","updated_at":"","cwd":app.paths.data_dir})).unwrap();
+        let snapshot = load(&app.paths, &session);
+        assert_eq!(
+            expand(&snapshot, "/price").unwrap(),
+            Some("Cost $5 or $9.99; `echo $1`".into())
+        );
+        let error = expand(&snapshot, "/required private-argument").unwrap_err();
+        assert!(
+            error.contains("/required:")
+                && error.contains("required.md")
+                && error.contains("references $2")
+                && error.contains("write $$2"),
+            "{error}"
+        );
+        assert!(!error.contains("private-argument"), "{error}");
+        assert_eq!(
+            expand(&snapshot, "/required one two").unwrap(),
+            Some("one then two".into())
+        );
+    }
 }

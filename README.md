@@ -8,7 +8,7 @@
 
 <p>
   <a href="https://github.com/athiwatc/formless/blob/main/Cargo.toml"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License: Apache-2.0"></a>
-  <a href="https://github.com/athiwatc/formless/releases/latest"><img src="https://img.shields.io/github/v/release/athiwatc/formless?sort=semver" alt="Latest release"></a>
+  <a href="https://github.com/athiwatc/formless/releases"><img src="https://img.shields.io/github/v/release/athiwatc/formless?sort=semver" alt="Releases"></a>
   <a href="#32-install"><img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg" alt="Platforms: macOS, Linux, Windows"></a>
   <a href="#10-security-and-privacy"><img src="https://img.shields.io/badge/telemetry-none-success.svg" alt="Telemetry: none"></a>
 </p>
@@ -215,7 +215,7 @@ Prebuilt binaries need none of the toolchain requirements. On Linux a Secret Ser
 
 ### 3.2 Install
 
-**Prebuilt binary (macOS, Linux).** The installer resolves the latest GitHub release for your platform, downloads it, verifies the `.sha256` (with `sha256sum` or `shasum`) and puts `formless` in `$PREFIX/bin` (default `~/.local`). It checks that `$PREFIX/bin` is writable before downloading, and replaces the binary atomically (a temp file renamed into place), so an interrupted or failed install leaves the previous version working:
+**Prebuilt binary (macOS, Linux).** The installer resolves the latest GitHub release for your platform, downloads it, verifies the `.sha256` (with `sha256sum` or `shasum`) and puts `formless` in `$PREFIX/bin` (default `~/.local`). Each installer curl attempt has a 10-second connection and 120-second transfer limit, with three retries for transient errors; a timed-out lookup suggests pinning `FORMLESS_VERSION` or using a trusted mirror (`FORMLESS_LATEST_URL` / `FORMLESS_RELEASES_URL`). It checks that `$PREFIX/bin` is writable before downloading, and replaces the binary atomically (a temp file renamed into place), so an interrupted or failed install leaves the previous version working:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/athiwatc/formless/main/scripts/install.sh | sh
@@ -305,6 +305,12 @@ description: Review the proposed change
 Review $ARGUMENTS. Focus first on $1, and include @notes/review-checklist.md.
 ```
 
+Invoke `/workflow src/parser.rs` to supply its first argument. Use `$$` for a
+literal dollar: `$$5 per run`, `$$9.99`, and `echo $$1` become `$5 per run`,
+`$9.99`, and `echo $1`. A referenced `$1`–`$9` without enough arguments stops
+expansion with the filename, missing position and escape guidance before send;
+the message is not sent with text silently removed.
+
 New files and edits appear without restarting the TUI or plain client. `/help` lists them under
 **Yours**; project files override global files with the same name. Builtin
 commands always win, and shadowed files and malformed templates are reported.
@@ -322,6 +328,11 @@ a repaired file becomes invalid again.
 files; `formless commands list --json` returns the same shared metadata projection
 used by the TUI. Listing is read-only: it does not start a daemon, create a
 profile, expand a template or open its referenced attachments.
+TUI/plain `/help`, the TUI picker and `commands list` show required positions
+(for example `/workflow <arg1>`) and `[arguments…]` when `$ARGUMENTS` is used.
+Positions count whitespace-separated words; `$ARGUMENTS` may be empty. JSON
+metadata includes `max_position` and `uses_arguments`. Escaped `$$5` and literal
+multi-digit `$10` do not add required arguments.
 
 For red/green colour blindness, set `formless config set tui.theme colorblind`
 (or choose **colorblind** in Settings). The TUI and CLI share an Okabe–Ito-derived
@@ -394,7 +405,7 @@ usage, errors and coverage; interrupted or incomplete usage stays unknown.
 
 Piped stdin is read only when stdin isn't a terminal; from a script that leaves stdin open without writing to it, add `< /dev/null`.
 
-Approvals are **opt-in**: by default (`security.secure = false`) Tools run without asking, and each sensitive call is recorded in the audit log (`tool.run_unasked`). With approvals on (`formless --secure`, or `security.secure = true` in `config.toml`), they are not skipped by scripting: without `--yes` a sensitive Invocation **fails closed** with a clear error instead of being silently granted. `--timeout 10m` (also `90s`, `1h30m`) interrupts a Run that takes too long. Exit codes: `0` answered, `1` Run errored/paused, `2` usage/config error, `124` timed out, `130` interrupted.
+Approvals are **opt-in**: by default (`security.secure = false`) Tools run without asking, and each sensitive call is recorded in the audit log (`tool.run_unasked`). With approvals on (`formless --secure`, or `security.secure = true` in `config.toml`), they are not skipped by scripting: without `--yes` a sensitive Invocation **fails closed** with a clear error instead of being silently granted. `--timeout 10m` (also `90s`, `1h30m`) interrupts a Run that takes too long. Exit codes: `0` answered, `1` Run errored/paused, `2` usage/config error, `3` Run paused because schema validation failed (see `--schema` above), `124` Run timed out (see `--timeout` above), `130` interrupted.
 
 ### Sessions from the command line
 
@@ -403,10 +414,26 @@ formless sessions list                     # --archived, --json
 formless sessions show 3f9c                # the transcript (--json for scripts)
 formless sessions search "invoice"         # across every Session
 formless sessions rename 3f9c "Q3 report"
-formless sessions export 3f9c --format md -o q3.md
+formless sessions export 3f9c -o q3.md       # infer Markdown from the filename
 formless sessions import bundle.json
 formless sessions rm 3f9c                  # restorable for a short while: sessions restore <id>
 ```
+
+`--format` accepts `json`, `markdown` (alias `md`), or `html`. When omitted,
+`.md`/`.markdown`, `.html`/`.htm`, and `.json` output extensions select their
+matching format, ignoring extension case. Standard output and other extensions
+still default to JSON. An explicit format conflicting with a recognized output
+extension is a usage error before any Session lookup or daemon connection.
+On Unix, ordinary file output uses atomic replacement with existing mode bits
+applied before staging content; failed pre-commit writes leave the prior export
+intact. This does not claim extended ACL or xattr preservation.
+The Windows implementation uses verified user-private staging and preserves an
+existing file's DACL through replacement, without ignoring ACL merge failures.
+It remains pending native Windows acceptance. If an OS replacement failure
+retains private recovery files, the error identifies their directory for
+inspection before retrying; no destructive replacement fallback is used.
+Existing symbolic links keep writing through to their targets,
+and descriptor/device streams retain their existing direct-write behavior.
 
 ### Reporting a bug
 
@@ -598,28 +625,67 @@ The table covers every visible root command, including Clap's generated
 | `formless import-all` | `FILE` | Add a portable setup bundle without overwriting existing entries. |
 | `formless jobs` | `list`, `add`, `run`, `history`, `enable`, `disable`, `rm` | Manage scheduled prompts and inspect their history. |
 | `formless logs` | `--follow`, `--level`, `--since`, `--lines` | Read or follow the daemon log and rotated files. |
-| `formless mcp` | `add`, `remove`, `list`, `test`, `login`, `logout`, `catalog`, `import`, `log`, `tools`, `tool` | Manage external MCP servers and inspect their tools/logs. |
+| `formless mcp` | `add`, `remove`, `list`, `test`, `login`, `logout`, `catalog`, `import`, `log`, `tools`, `tool`, `prompts`, `prompt` | Manage external MCP servers and inspect their tools/logs. |
+| `formless metrics` | `--since DURATION`, `--json` | Read recorded model, Tool and built-in statistics through independent reports at one cutoff. |
 | `formless memory` | `list`, `add`, `rm`, `edit` | Inspect or change saved user-memory notes. |
+| `formless modules` | `list`, `show`; `show --version N` | Read all modules, inspect metadata/history/dependents, or emit an exact stored source version. |
 | `formless naming` | `status`, `pull`, `test` | Inspect, install, or preview the embedded Session-naming model. |
 | `formless prices` | `import` | Import a model-price catalog for cost and spending limits. |
 | `formless profiles` | `list`, `rm` | List or remove isolated profiles. |
-| `formless prompts` | `list`, `generate`, `apply`, `reject`, `rollback` | Inspect and manage measured prompt/memory proposals. |
+| `formless prompts` | `list`, `diff`, `generate`, `apply`, `reject`, `rollback` | Inspect existing proposal comparisons and manage measured prompt/memory proposals. |
 | `formless providers` | `list`, `add`, `remove`, `test` | Manage named model providers and test a connection. |
 | `formless relay` | `enable`, `disable`, `status` | Manage encrypted browser access through the relay. |
 | `formless reset` | `--force` | Wipe configuration, credentials, and the current profile's data. |
 | `formless restore` | `FILE` | Replace the database from a backup, preserving the current database. |
 | `formless roles` | `list`, `add`, `rm` | Map named purposes to a provider and model. |
 | `formless run` | `TASK`; `--estimate`, `--session`, `--output`, `--attach` and other Run options | Run one headless task, or print its local forecast without starting it. |
+| `formless routing` | `--json` | Read currently available daemon routing decisions and returned candidate figures without starting a model request. |
 | `formless runs` | No action: list; `show`, `cancel` | List recent Runs, inspect one by ID/prefix, or cancel that exact Run. |
 | `formless security` | `status` | Inspect the daemon's grants, denials, trusted resources, and exposed interfaces. |
-| `formless sessions` | `fork`, `compare`, `list`, `show`, `files`, `rewind`, `rename`, `rm`, `restore`, `import`, `search`, `archive`, `unarchive`, `export` | Manage stored Sessions, follow a Run with `show --follow`, or inspect tracked files. |
+| `formless sessions` | `fork`, `compare`, `list`, `show`, `files`, `rewind`, `rename`, `rm`, `restore`, `import`, `search`, `archive`, `unarchive`, `export` | Manage stored Sessions, follow a Run with `show --follow`, or inspect tracked files. `list --pinned --tag TAG` filters the fetched reply; selectors combine with `--archived`, preserving reply order. |
 | `formless skills` | `reviews`, `add`, `remove`, `list`, `enable`, `disable`, `show`, `export`, `import` | Inspect and manage Skills and their retained description reviews. |
 | `formless storage` | `--json` | Report disk usage by data category. |
 | `formless tools` | `reviews`, `list`, `disable`, `enable`, `undo`, `pin`, `unpin`, `tag`, `show`, `retire`, `restore`, `rollback`, `purge`, `run`, `export`, `import` | Inspect, manage, run, or transfer registry Tools. |
 | `formless tui` | No action | Launch the full-screen terminal client; also the default with no command. |
 | `formless uninstall` | `--keep-data`, `--keep-binary`, `--yes` (alias `--force`) | Remove Formless, optionally retaining data or the binary. |
-| `formless update` | No action, `check`, or `--check` | Show newer release notes and the applicable upgrade command; never rewrite the binary. |
+| `formless update` | No action, `check`, or `--check`; `--json` | Show newer release notes and the applicable upgrade command; never rewrite the binary. |
 | `formless web` | `--port`, `--no-open`, `--stop` | Open, print a link for, or stop the local browser UI. |
+
+`tools list --filter FILTER` selects one stored-state predicate: `not-retired`
+(including disabled Tools), `retired`, `failing` (known success rate below 0.8),
+`needs-attention`, `off` (disabled) or `pinned`. It combines by AND with
+`--tag TAG`, retaining exact stored-tag matching after the existing argument
+lowercasing/leading-# removal. Unknown rates do not count as failing; states
+may overlap. JSON uses the same selection and existing ToolInfo schema.
+Human output distinguishes an empty registry from no matching rows and names
+the flags to clear. `--show-pinned` adds a human PINNED yes/no column; default
+piped cells and row order remain unchanged. These flags never mutate a Tool.
+
+`formless metrics --since 7d --json` reads the three existing metrics reports
+with one checked UTC cutoff. Omit `--since` for all history. Tool rows use stored
+`tool_id` values; reports retain their own row order and are independent reads,
+not a transactional snapshot. Runs and daily usage remain separate surfaces.
+
+`formless sessions list --pinned --tag WORK --json` selects active pinned Sessions
+whose stored tags contain exactly `work`. Only the tag argument is lowercased;
+a leading `#` is not stripped. Add `--archived` to select the archived partition.
+These selectors filter the existing reply on the client.
+
+Tool selectors use an exact name or full ID. After a miss, up to three
+ranked partial-name suggestions can help you retry with the original exact
+spelling; these use folded subsequence matching, not edit-distance spelling
+correction. A suggestion never selects or runs a Tool automatically.
+
+`update --json`, `update check --json`, and `update --check --json` emit one
+object: `{installed, status, newer_releases: [{tag, url, notes}]}`. Notes retain
+the existing trimmed body and oldest-first order; `installed` has no `v` prefix.
+`update_available` means the fetched page contains newer stable releases;
+`up_to_date` means none in that single 50-release response, without pagination.
+`release_check_unavailable` maps to an actual HTTP 404 response,
+not verified absence of releases. Error text alone never selects this status.
+Completed checks exit 0; other fetch or JSON parse failures remain errors with
+no success JSON. Human output stays unchanged, and the JSON form never runs
+an updater.
 
 #### Root and global flags
 
@@ -654,7 +720,7 @@ formless help sessions show
 
 ### 3.12 Updating
 
-`formless update` lists every GitHub release newer than the running binary, oldest first, with its release notes, then prints the command that upgrades it the way it was installed (`brew upgrade formless`, `cargo install … --force`, or the install script). `formless update --check` (or `update check`) stops after the report. Neither downloads or replaces anything. Re-run `scripts/install.sh` (it fetches the latest release, or `FORMLESS_VERSION`, and verifies the checksum), or rebuild from source. Your data dir and Tools are untouched by an update — config is migrated automatically, with a backup taken first ([§4](#4-data-config-and-profiles)).
+`formless update` bounds its release lookup to 15 seconds overall (5 seconds to connect), including the response body, and reports an actionable timeout error. It lists every GitHub release newer than the running binary, oldest first, with its release notes, then prints the command that upgrades it the way it was installed (`brew upgrade formless`, `cargo install … --force`, or the install script). `formless update --check` (or `update check`) stops after the report. Neither downloads or replaces anything. Re-run `scripts/install.sh` (it fetches the latest release, or `FORMLESS_VERSION`, and verifies the checksum), or rebuild from source. Your data dir and Tools are untouched by an update — config is migrated automatically, with a backup taken first ([§4](#4-data-config-and-profiles)).
 
 ---
 
@@ -723,7 +789,7 @@ Everything else — the web, the filesystem, the shell, git, file formats, domai
 | `read_mcp_resource` | `server`, `uri` | Reads one of them; large contents become an artifact. |
 | `load_skill` | `name` | Loads an enabled [skill's](#skills) `SKILL.md` instructions before doing the kind of task it covers. |
 | `read_skill_file` | `name`, `path` | Reads one of that skill's extra files — reference docs, templates. |
-| `schedule_run` | `prompt`, `at` or `cron`, `session_id?` | Runs a prompt later or on a schedule (five-field cron, local time); recurring jobs need the user's approval. |
+| `schedule_run` | `prompt`, `at` or `cron`, `session_id?` | Runs a prompt later or on a schedule (five-field cron with month/weekday names or `@yearly`, local time); recurring jobs need the user's approval. |
 
 Built-ins lead every Session's Tool list, in a fixed order, and are never unloaded by `unload_tools`.
 
@@ -815,6 +881,25 @@ function run(input) {
 ---
 
 ### MCP servers
+
+`formless mcp prompts [--json]` reports prompts from reachable enabled servers,
+in daemon order. Discovery can start configured servers and silently skips
+connection/list failures, so results may be incomplete. `formless mcp prompt
+SERVER NAME --arg key=value [--arg empty=] [--json]` sends named string values
+to the selected server. Values preserve spaces, additional equals and empty
+strings; missing separators, empty keys and duplicate keys are usage errors
+before daemon contact. Human output is the returned text verbatim, including
+its trailing-newline state. The daemon projects `content.text` strings joined
+with blank lines; roles and non-text parts are absent. JSON preserves the full
+discovery array or daemon text report, not raw MCP messages. These commands do
+not submit to a Session or change server configuration; server/daemon errors
+retain their ordinary exit behavior, without promised local required/unknown
+argument checks.
+
+```sh
+formless mcp prompts --json
+formless mcp prompt docs summarize --arg 'topic=Unicode notes' --arg suffix=
+```
 
 Formless can also call the tools of external [MCP](https://modelcontextprotocol.io) servers. Add a stdio server to `config.toml`:
 
@@ -972,6 +1057,31 @@ formless/
 ---
 
 ## 12. Development
+
+The [CI workflow](.github/workflows/ci.yml) runs on self-hosted macOS ARM64 and Linux x64
+runners for pushes to `main`, same-repository pull requests targeting `main`, and
+manual dispatches. It checks Rust formatting and Clippy, runs workspace tests
+(including doc tests), relay/web Node tests, relay wire conformance and offline
+documentation/tooling tests, then builds the release workspace and smoke-tests
+the CLI, man page and shell completions. Tested binaries, generated assets and
+diagnostic logs are retained as workflow artifacts for seven days. Clippy uses
+the development command below; existing warnings are reported without being
+promoted to errors. Fork pull requests are skipped on the persistent runners.
+
+Runners need the standard `self-hosted` label plus `macOS`/`ARM64` or
+`Linux`/`X64`, and outbound access for GitHub Actions and dependency downloads.
+The Mac needs Xcode Command Line Tools, Git, Rustup and Python 3.9+. The Linux
+runner needs Git and a Debian/Ubuntu-compatible environment; CI verifies the C
+compiler, Python and D-Bus development headers/pkg-config, installing missing
+build dependencies through apt as root or with noninteractive sudo. Both
+platforms run native jobs, including Linux runners themselves hosted in Docker.
+CI installs stable Rust with rustfmt/Clippy and Node 24. Cargo dependencies are cached;
+application data/config and logs use private temporary directories cleaned after
+the job. Test debug artifacts are removed before release compilation to limit disk use.
+The workflow does not deploy or publish a release; release packaging remains in
+`release.yml`. Live external-link checks remain in `docs.yml`; Playwright browser
+checks in `relay/README.md` remain separate manual checks. AUR packaging tests
+run only in the Linux job because they require GNU install.
 
 ```bash
 cargo build --workspace                # debug build of the single binary

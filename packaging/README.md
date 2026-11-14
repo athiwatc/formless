@@ -26,8 +26,13 @@ platform app-dirs (SPEC §9.4).
      recognizes an existing directory and appends its metadata-derived package
      name, version, release and architecture filename; a missing directory path
      would instead be treated as a filename;
+   - generates Bash, Zsh and Fish completions from the just-built Linux binary
+     with `sh scripts/generate-package-completions.sh target/release/formless target/completions`
+     before packaging, refusing failed generators or empty output. Debian/RPM
+     packages install them in the standard system completion directories;
    - installs the packages in clean Debian, Ubuntu and Rocky containers
-     and runs `formless --version`;
+     and runs `formless --version`, checking that all three completion files
+     are nonempty, mode 644 and owned by the installed package;
    - builds the Docker image, runs it and checks the daemon answers, then
      pushes `ghcr.io/athiwatc/formless:<tag>` and `:latest` (`Dockerfile`,
      [docs/docker.md](../docs/docker.md)); nothing is published if that

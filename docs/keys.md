@@ -182,6 +182,7 @@ Type `/` in the TUI or the web composer; the same commands work in both (a few a
 | `/memory rm ID` | delete a memory |
 | `/memory on ID` | use a memory again |
 | `/memory off ID` | stop using a memory |
+| `/memory used` | memories reportedly carried by the latest Run |
 | `/jobs [enable\|disable\|run\|history\|rm ID]` | list scheduled jobs, or act on one |
 | `/jobs enable ID` | enable (approve) a job |
 | `/jobs disable ID` | pause a job |

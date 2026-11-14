@@ -45,6 +45,13 @@ assert.match(await vapidAuth("https://fcm.googleapis.com/x", pub, loaded.vapid.k
 const bad = async (e) => (await loadVapid(e)).state;
 assert.equal(await bad({ ...env, VAPID_PRIVATE_JWK: "{not json" }), "misconfigured");
 assert.equal(await bad({ VAPID_PUBLIC_KEY: pub }), "misconfigured");
+for (const name of ["VAPID_PUBLIC_KEY", "VAPID_PRIVATE_JWK"]) {
+  const prefixed = { ...env, [name]: name + "=" + env[name] };
+  const result = await loadVapid(prefixed);
+  assert.equal(result.state, "misconfigured");
+  assert.equal(result.reason, `${name} includes its '${name}=' prefix; store only the value`);
+  assert.ok(!result.reason.includes(env[name]), "diagnostic must not echo the secret");
+}
 const other = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
 const mismatched = { ...env, VAPID_PRIVATE_JWK: JSON.stringify(await crypto.subtle.exportKey("jwk", other.privateKey)) };
 assert.match((await loadVapid(mismatched)).reason, /does not match/);

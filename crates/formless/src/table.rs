@@ -4,6 +4,7 @@
 
 use formless_tui::{colorblind_rgb, tone_marker, SemanticTone};
 use std::cell::Cell;
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 thread_local! { static COLORBLIND: Cell<bool> = const { Cell::new(false) }; }
@@ -93,7 +94,8 @@ impl Table {
     }
 
     /// Terminal readers get accessible status markers when colour alone is
-    /// insufficient. Pipes retain the original cells, regardless of theme.
+    /// insufficient. Pipes omit semantic markers, regardless of theme;
+    /// both modes normalize cell whitespace and show input controls visibly.
     pub fn render(&self, terminal: bool, color: bool, width: Option<usize>) -> String {
         self.render_theme(terminal, color, width, COLORBLIND.with(Cell::get))
     }
@@ -105,20 +107,25 @@ impl Table {
         width: Option<usize>,
         colorblind: bool,
     ) -> String {
-        // Labels participate in width calculation before clipping/padding.
+        // Normalize before measuring, labeling or clipping. Input cells never
+        // contribute terminal escapes; only paint() below emits trusted styles.
+        let headers: Vec<_> = self.headers.iter().map(|h| cell_text(h)).collect();
         let rows: Vec<Vec<_>> = self
             .rows
             .iter()
             .map(|row| {
                 row.iter()
                     .map(|(text, tone)| {
-                        (tone.label(text, terminal && (!color || colorblind)), *tone)
+                        (
+                            tone.label(&cell_text(text), terminal && (!color || colorblind)),
+                            *tone,
+                        )
                     })
                     .collect()
             })
             .collect();
         let n = self.headers.len();
-        let mut widths: Vec<usize> = self.headers.iter().map(|h| h.width()).collect();
+        let mut widths: Vec<usize> = headers.iter().map(|h| h.width()).collect();
         for r in &rows {
             for (i, (text, _)) in r.iter().enumerate().take(n) {
                 widths[i] = widths[i].max(text.width());
@@ -161,11 +168,7 @@ impl Table {
             }
             out.trim_end().to_string() + "\n"
         };
-        let header = self
-            .headers
-            .iter()
-            .map(|h| (h.to_string(), Tone::Dim))
-            .collect();
+        let header = headers.into_iter().map(|h| (h, Tone::Dim)).collect();
         let mut out = line(header);
         for r in &rows {
             out.push_str(&line(r.clone()));
@@ -174,24 +177,75 @@ impl Table {
     }
 }
 
-/// Colour is allowed unless `NO_COLOR` is set to anything (no-color.org).
+/// Controls already made visible in CLI comparison output. Keep the same
+/// policy for table cells: C0/C1, direction marks/overrides and isolates.
+pub(super) fn terminal_control(c: char) -> bool {
+    c.is_control()
+        || matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
+/// One visible line, with whitespace collapsed and input controls escaped.
+/// Apply this to piped text too: redirected tables may be displayed later.
+fn cell_text(text: &str) -> String {
+    let mut visible = String::with_capacity(text.len());
+    let mut space = false;
+    for c in text.chars() {
+        if c.is_whitespace() {
+            space = !visible.is_empty();
+            continue;
+        }
+        if space {
+            visible.push(' ');
+            space = false;
+        }
+        if terminal_control(c) {
+            visible.extend(c.escape_unicode());
+        } else {
+            visible.push(c);
+        }
+    }
+    visible
+}
+
+/// Colour is allowed unless `NO_COLOR` is nonempty (no-color.org).
 pub fn color_allowed() -> bool {
-    std::env::var_os("NO_COLOR").is_none()
+    std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty())
 }
 
 /// `text` cut to `w` columns with an ellipsis.
 fn fit(text: &str, w: usize) -> String {
-    if text.width() <= w {
+    let measured_width = text.width();
+    if measured_width <= w {
         return text.to_string();
     }
-    let mut out = String::new();
-    for c in text.chars() {
-        if out.width() + unicode_width::UnicodeWidthChar::width(c).unwrap_or(0) + 1 > w {
-            break;
+    // Most cells have additive grapheme widths. Measure each cluster once so
+    // joined emoji, modifiers and variation selectors keep their string width.
+    let mut used = 0;
+    let mut end = 0;
+    let mut sum = 0;
+    for (start, cluster) in text.grapheme_indices(true) {
+        let width = cluster.width();
+        sum += width;
+        if end == start && used + width < w {
+            used += width;
+            end = start + cluster.len();
         }
-        out.push(c);
     }
-    out + "…"
+    if sum != measured_width {
+        // Script ligatures can cross grapheme boundaries (e.g. Arabic Lam-Alef).
+        // Retain full-prefix measurement for those exceptional cells. Prefix
+        // widths can decrease when a ligature completes, so binary search is
+        // not valid here. Ordinary cells still use the linear path above.
+        end = 0;
+        for (start, cluster) in text.grapheme_indices(true) {
+            let next = start + cluster.len();
+            if text[..next].width() >= w {
+                break;
+            }
+            end = next;
+        }
+    }
+    format!("{}…", &text[..end])
 }
 
 /// A plain cell.
@@ -207,6 +261,34 @@ pub fn t(text: impl Into<String>, tone: Tone) -> (String, Tone) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_mixed_width_cells_clip_within_the_requested_columns() {
+        let input = "ascii ไทย 中文 ".repeat(10_000);
+        for width in [1, 2, 7, 40, 200] {
+            let clipped = fit(&input, width);
+            assert!(clipped.ends_with('…'));
+            assert!(clipped.width() <= width, "{width}: {clipped:?}");
+        }
+        assert_eq!(fit("a中ไทยtail", 4), "a中…");
+        assert_eq!(fit("ไทย", 10), "ไทย");
+    }
+
+    #[test]
+    fn clipping_preserves_sequence_aware_widths() {
+        for (input, width, expected) in [
+            ("👩‍💻abcdefg", 8, "👩‍💻abcde…"),
+            ("👩🏽‍💻abcdefg", 8, "👩🏽‍💻abcde…"),
+            ("❤\u{fe0f}abcdefg", 8, "❤\u{fe0f}abcde…"),
+            ("🇹🇭abcdefg", 8, "🇹🇭abcde…"),
+            ("لاabcdefghi", 8, "لاabcdef…"),
+            ("e\u{301}abcdefghi", 8, "e\u{301}abcdef…"),
+        ] {
+            let clipped = fit(input, width);
+            assert_eq!(clipped, expected);
+            assert_eq!(clipped.width(), width);
+        }
+    }
 
     #[test]
     fn piped_status_cells_preserve_the_original_whitespace_fields() {
@@ -255,6 +337,63 @@ mod tests {
         assert!(
             coloured.contains("\x1b[2mUpper-case some text\x1b[0m"),
             "{coloured}"
+        );
+    }
+
+    #[test]
+    fn cells_are_single_line_and_controls_are_visible_before_layout() {
+        let mut table = Table::new(&["NAME", "TASK"]);
+        table.row(vec![c("first"), c("  a\nb\tc\r\n\x1b[31m\u{202e}  ")]);
+        table.row(vec![c("second"), c("ไทย 👩‍💻 e\u{301}  text")]);
+        let plain = table.render(false, false, None);
+        assert_eq!(plain.lines().count(), 3, "{plain:?}");
+        assert!(plain.contains(r"a b c \u{1b}[31m\u{202e}"), "{plain:?}");
+        assert!(!plain.contains('\x1b') && !plain.contains('\u{202e}'));
+        assert!(plain.contains("ไทย 👩‍💻 e\u{301} text"), "{plain:?}");
+        for color in [false, true] {
+            let out = table.render(true, color, Some(45));
+            let stripped = regex::Regex::new(r"\x1b\[[0-9;]*m")
+                .unwrap()
+                .replace_all(&out, "")
+                .into_owned();
+            assert_eq!(stripped.lines().count(), 3, "{out:?}");
+            assert!(stripped.lines().all(|line| line.width() <= 45), "{out:?}");
+            assert!(
+                !out.contains("\x1b[31m"),
+                "cell must not inject style: {out:?}"
+            );
+            assert!(
+                !stripped.chars().any(|c| c != '\n' && terminal_control(c)),
+                "{stripped:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn normalization_preserves_text_and_escapes_all_existing_control_classes() {
+        assert_eq!(
+            cell_text("\t  alpha\r\n\u{2028}\u{2029} beta\u{a0}\t"),
+            "alpha beta"
+        );
+        assert_eq!(cell_text("\n\t"), "");
+        let mut input = String::from("start");
+        for c in [
+            '\0', '\x08', '\x1b', '\x7f', '\u{80}', '\u{9f}', '\u{61c}', '\u{200e}', '\u{200f}',
+            '\u{202a}', '\u{202e}', '\u{2066}', '\u{2069}',
+        ] {
+            input.push(c);
+        }
+        let out = cell_text(&input);
+        assert!(out.starts_with("start\\u{0}\\u{8}\\u{1b}"), "{out:?}");
+        assert!(!out.chars().any(terminal_control), "{out:?}");
+        let mut table = Table::new(&[" HEAD\nER ", "EMPTY"]);
+        table.row(vec![t("\t\n ", Tone::Good), c("value")]);
+        let out = table.render(true, false, None);
+        assert_eq!(out.lines().count(), 2);
+        assert!(out.starts_with("HEAD ER"));
+        assert!(
+            !out.contains("ok"),
+            "empty normalized cells have no status label"
         );
     }
 

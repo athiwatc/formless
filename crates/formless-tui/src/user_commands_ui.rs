@@ -48,8 +48,8 @@ pub(super) fn help_lines(snapshot: &Snapshot) -> Vec<String> {
     }
     for command in &snapshot.commands {
         out.push(format!(
-            "  /{} [ARGUMENTS]  {}",
-            command.name,
+            "  {}  {}",
+            command.usage(),
             display_label(&command.description)
         ));
         out.push(format!(
@@ -371,7 +371,7 @@ impl App {
         rows.into_iter()
             .map(|(_, command)| PaletteItem {
                 insert: format!("/{} ", command.name),
-                label: format!("/{} [ARGUMENTS]", command.name),
+                label: command.usage(),
                 desc: command.description.clone(),
                 runnable: true,
             })
@@ -419,6 +419,26 @@ mod refresh_tests {
     fn expire(app: &App) {
         app.user_commands.borrow_mut().checked = Some(Instant::now() - Duration::from_millis(251));
     }
+    #[test]
+    fn help_and_palette_show_required_arguments_without_changing_inserted_command() {
+        let mut fixture = fixture();
+        let path = fixture.root.join("project/.formless/commands/workflow.md");
+        for (body, label) in [
+            ("$1 then $2", "/workflow <arg1> <arg2>"),
+            ("$$5 $10", "/workflow"),
+            ("$ARGUMENTS", "/workflow [arguments…]"),
+        ] {
+            std::fs::write(&path, body).unwrap();
+            let help = fixture.app.user_command_help();
+            assert!(help
+                .iter()
+                .any(|line| line == &format!("  {label}  User command")));
+            let rows = fixture.app.user_command_palette("work");
+            assert_eq!(rows[0].label, label);
+            assert_eq!(rows[0].insert, "/workflow ");
+        }
+    }
+
     #[test]
     fn unchanged_idle_templates_are_loaded_once_not_every_tick() {
         let mut fixture = fixture();
@@ -541,6 +561,39 @@ mod refresh_tests {
             "Other project"
         );
     }
+    #[test]
+    fn missing_template_argument_keeps_the_composer_and_stops_before_send() {
+        let mut fixture = fixture();
+        let path = fixture.root.join("project/.formless/commands/workflow.md");
+        std::fs::write(&path, "$1 then $2").unwrap();
+        let (client, sent) = crate::client::DaemonClient::recording();
+        fixture.app.client = Some(client);
+        fixture.app.input.set("/workflow private-argument");
+        fixture.app.submit_chat(false);
+        assert_eq!(fixture.app.input.expanded(), "/workflow private-argument");
+        assert!(!fixture.app.input.is_literal());
+        assert!(
+            sent.try_recv().is_err(),
+            "expansion failure sends no daemon request"
+        );
+        let note = fixture.app.notes.last().unwrap();
+        assert!(
+            note.contains("workflow.md")
+                && note.contains("references $2")
+                && note.contains("write $$2"),
+            "{note}"
+        );
+        assert!(!note.contains("private-argument"), "{note}");
+        std::fs::write(&path, "Cost $$5 and $$9.99; explain `echo $$1`").unwrap();
+        fixture.app.input.set("/workflow");
+        assert!(fixture.app.expand_user_command());
+        assert_eq!(
+            fixture.app.input.expanded(),
+            "Cost $5 and $9.99; explain `echo $1`"
+        );
+        assert!(fixture.app.input.is_literal());
+    }
+
     #[cfg(unix)]
     #[test]
     fn explicit_expansion_rechecks_core_file_guards_instead_of_using_cached_text() {

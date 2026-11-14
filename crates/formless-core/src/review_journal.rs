@@ -701,6 +701,60 @@ fn open_private(path: &Path, create: bool) -> Result<File> {
     }
 }
 
+/// Decode the SDDL text returned by
+/// `ConvertSecurityDescriptorToStringSecurityDescriptorW`.
+///
+/// Microsoft documents `StringSecurityDescriptorLen` as the size of the
+/// returned buffer in TCHARs. On Windows that value is the buffer capacity,
+/// not the string length, and the capacity may contain more than one trailing
+/// NUL. Only the units before the first NUL are decoded. Padding is ignored.
+/// A null pointer or a capacity outside `1..=32768` is rejected before a
+/// slice is created. A missing terminator, or invalid UTF-16 before it, fails
+/// closed.
+///
+/// # Safety
+/// For a non-null pointer with a valid capacity, the caller must provide an
+/// readable allocation of at least `capacity` UTF-16 units, initialized through
+/// the first terminator (or the entire capacity if no terminator exists).
+#[cfg(any(windows, test))]
+unsafe fn private_review_dacl_text(text: *const u16, capacity: u32) -> Result<String> {
+    if text.is_null() {
+        bail!("Private review DACL string is missing");
+    }
+    if capacity == 0 || capacity > 32768 {
+        bail!("Private review DACL exceeds its inspection limit");
+    }
+    let mut units = Vec::new();
+    for index in 0..capacity as usize {
+        // SAFETY: the caller guarantees readable initialized units through the
+        // first terminator; the checked capacity bounds every pointer offset.
+        let unit = unsafe { text.add(index).read() };
+        if unit == 0 {
+            return String::from_utf16(&units)
+                .context("Private review DACL string is not valid UTF-16");
+        }
+        units.push(unit);
+    }
+    bail!("Private review DACL string is missing its terminator")
+}
+
+/// Exact `(ACE)` spellings. The set comparison is unchanged: order does not
+/// matter, and a missing or unclosed ACE is rejected.
+#[cfg(any(windows, test))]
+fn private_review_dacl_aces(text: &str) -> Result<std::collections::BTreeSet<String>> {
+    let first = text
+        .find('(')
+        .context("Private review DACL has no explicit grants")?;
+    let mut aces = std::collections::BTreeSet::new();
+    let mut remaining = &text[first..];
+    while !remaining.is_empty() {
+        let end = remaining.find(')').context("Invalid private review DACL")?;
+        aces.insert(remaining[..=end].to_string());
+        remaining = &remaining[end + 1..];
+    }
+    Ok(aces)
+}
+
 #[cfg(windows)]
 pub(crate) fn windows_private(file: &File) -> Result<()> {
     use std::os::windows::io::AsRawHandle;
@@ -724,7 +778,7 @@ pub(crate) fn windows_private(file: &File) -> Result<()> {
             bail!("Private review storage has an inheritable DACL");
         }
         let mut text = std::ptr::null_mut();
-        let mut length = 0;
+        let mut length: u32 = 0;
         if unsafe {
             ConvertSecurityDescriptorToStringSecurityDescriptorW(
                 sd,
@@ -738,26 +792,18 @@ pub(crate) fn windows_private(file: &File) -> Result<()> {
             return Err(std::io::Error::last_os_error().into());
         }
         let allocation = Allocation(text.cast());
-        if length == 0 || length > 32768 {
-            bail!("Private review DACL exceeds its inspection limit");
-        }
-        let text =
-            String::from_utf16(unsafe { std::slice::from_raw_parts(text, length as usize - 1) })?;
+        // `allocation` drops on both failures below, so LocalFree runs before
+        // either error returns. The decoded string is owned and outlives it.
+        // SAFETY: successful Win32 conversion owns the reported allocation
+        // and returns a NUL-terminated UTF-16 string within that capacity.
+        let decoded = unsafe { private_review_dacl_text(text, length) }?;
+        let aces = private_review_dacl_aces(&decoded)?;
         drop(allocation);
-        let first = text
-            .find('(')
-            .context("Private review DACL has no explicit grants")?;
-        let mut aces = std::collections::BTreeSet::new();
-        let mut remaining = &text[first..];
-        while !remaining.is_empty() {
-            let end = remaining.find(')').context("Invalid private review DACL")?;
-            aces.insert(remaining[..=end].to_string());
-            remaining = &remaining[end + 1..];
-        }
         Ok(aces)
     }
     windows_identity(file)?;
-    let expected = crate::win_pipe::OwnerOnly::new()?;
+    // Pipes keep OwnerOnly::new (GA). A file or directory stores that mask as FA.
+    let expected = crate::win_pipe::OwnerOnly::persisted_file_dacl()?;
     let attrs = unsafe { &*expected.as_raw().cast::<SECURITY_ATTRIBUTES>() };
     let expected = dacl(attrs.lpSecurityDescriptor)?;
     let mut descriptor = std::ptr::null_mut();
@@ -1054,6 +1100,945 @@ mod tests {
             assert!(journal.read(&action.id).is_err(), "{key}");
             assert_eq!(std::fs::read(&target).unwrap(), b"post image remains exact");
         }
+    }
+    fn dacl_units(text: &str) -> Vec<u16> {
+        text.encode_utf16().collect()
+    }
+    fn dacl_capacity(units: &[u16]) -> u32 {
+        u32::try_from(units.len()).unwrap()
+    }
+    fn dacl_error<T: std::fmt::Debug>(result: Result<T>) -> String {
+        format!("{:#}", result.unwrap_err())
+    }
+    #[test]
+    fn private_dacl_padded_capacity_decodes_through_the_first_nul_only() {
+        let mut units = dacl_units("D:P(A;;GA;;;SY)");
+        units.push(0);
+        assert_eq!(
+            unsafe { private_review_dacl_text(units.as_ptr(), dacl_capacity(&units)) }.unwrap(),
+            "D:P(A;;GA;;;SY)"
+        );
+        units.push(0);
+        units.push(0);
+        units.extend(dacl_units("(A;;GA;;;WD)"));
+        units.push(0);
+        units.push(0xD800);
+        let text =
+            unsafe { private_review_dacl_text(units.as_ptr(), dacl_capacity(&units)) }.unwrap();
+        assert_eq!(text, "D:P(A;;GA;;;SY)");
+        let aces = private_review_dacl_aces(&text).unwrap();
+        assert_eq!(aces.len(), 1);
+        assert!(aces.contains("(A;;GA;;;SY)"));
+        assert!(!aces.contains("(A;;GA;;;WD)"));
+    }
+    #[test]
+    fn private_dacl_missing_terminator_fails_closed() {
+        let units = dacl_units("D:P(A;;GA;;;SY)");
+        let error =
+            dacl_error(unsafe { private_review_dacl_text(units.as_ptr(), dacl_capacity(&units)) });
+        assert!(error.contains("missing its terminator"), "{error}");
+    }
+    #[test]
+    fn private_dacl_invalid_utf16_before_terminator_fails_closed() {
+        let mut units = dacl_units("D:P(");
+        units.push(0xD800);
+        units.extend(dacl_units("A;;GA;;;SY)"));
+        units.push(0);
+        units.extend(dacl_units("(A;;GA;;;WD)"));
+        let error =
+            dacl_error(unsafe { private_review_dacl_text(units.as_ptr(), dacl_capacity(&units)) });
+        assert!(error.contains("not valid UTF-16"), "{error}");
+    }
+    #[test]
+    fn private_dacl_zero_capacity_fails_closed_before_slice() {
+        let units = [0u16];
+        let error = dacl_error(unsafe { private_review_dacl_text(units.as_ptr(), 0) });
+        assert!(error.contains("exceeds its inspection limit"), "{error}");
+    }
+    #[test]
+    fn private_dacl_oversize_capacity_fails_closed_before_slice() {
+        let units = [0u16];
+        let error = dacl_error(unsafe { private_review_dacl_text(units.as_ptr(), 32_769) });
+        assert!(error.contains("exceeds its inspection limit"), "{error}");
+        let bounded = vec![0u16; 32_768];
+        let decoded = unsafe { private_review_dacl_text(bounded.as_ptr(), 32_768) }.unwrap();
+        assert!(decoded.is_empty());
+    }
+    #[test]
+    fn private_dacl_null_pointer_fails_closed_before_slice() {
+        let error = dacl_error(unsafe { private_review_dacl_text(std::ptr::null(), 8) });
+        assert!(error.contains("string is missing"), "{error}");
+    }
+    #[test]
+    fn private_dacl_strict_aces_reject_missing_unclosed_and_interior_nul() {
+        assert!(dacl_error(private_review_dacl_aces("D:P")).contains("no explicit grants"));
+        let unclosed = dacl_error(private_review_dacl_aces("D:P(A;;GA;;;SY"));
+        assert!(
+            unclosed.contains("Invalid private review DACL"),
+            "{unclosed}"
+        );
+        let interior = dacl_error(private_review_dacl_aces("(A;;GA;;;SY)\u{0}"));
+        assert!(
+            interior.contains("Invalid private review DACL"),
+            "{interior}"
+        );
+        let trailing = dacl_error(private_review_dacl_aces("(A;;GA;;;SY) trailing"));
+        assert!(
+            trailing.contains("Invalid private review DACL"),
+            "{trailing}"
+        );
+    }
+    #[test]
+    fn private_dacl_exact_ace_set_ignores_order_and_rejects_extra_grant() {
+        let forward = private_review_dacl_aces("D:P(A;;GA;;;SY)(A;;GA;;;BA)").unwrap();
+        let reverse = private_review_dacl_aces("(A;;GA;;;BA)(A;;GA;;;SY)").unwrap();
+        assert_eq!(forward, reverse);
+        assert_eq!(forward.len(), 2);
+        assert!(forward.contains("(A;;GA;;;SY)"));
+        assert!(forward.contains("(A;;GA;;;BA)"));
+        let wider = private_review_dacl_aces("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;WD)").unwrap();
+        assert_ne!(forward, wider);
+    }
+
+    #[test]
+    fn private_dacl_comparator_rejects_extra_mask_without_reading_protection_prefix() {
+        let owner = private_review_dacl_aces("D:P(A;;FA;;;SY)(A;;FA;;;BA)").unwrap();
+        let extra =
+            private_review_dacl_aces("D:P(A;;0x011F01FF;;;SY)(A;;0x011F01FF;;;BA)").unwrap();
+        assert_ne!(owner, extra);
+        // ACE equality ignores D: versus D:P. windows_private still requires the protected bit.
+        let unprotected = private_review_dacl_aces("D:(A;;FA;;;SY)(A;;FA;;;BA)").unwrap();
+        assert_eq!(owner, unprotected);
+    }
+
+    #[cfg(windows)]
+    fn dacl_text_of(owner: &crate::win_pipe::OwnerOnly) -> String {
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertSecurityDescriptorToStringSecurityDescriptorW, SDDL_REVISION_1,
+        };
+        use windows_sys::Win32::Security::{DACL_SECURITY_INFORMATION, SECURITY_ATTRIBUTES};
+        let attrs = unsafe { &*owner.as_raw().cast::<SECURITY_ATTRIBUTES>() };
+        let mut text = std::ptr::null_mut();
+        let mut length = 0u32;
+        assert_ne!(
+            unsafe {
+                ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                    attrs.lpSecurityDescriptor,
+                    SDDL_REVISION_1,
+                    DACL_SECURITY_INFORMATION,
+                    &mut text,
+                    &mut length,
+                )
+            },
+            0
+        );
+        // Free the Win32 string if decoding panics. The owned String outlives it.
+        struct FreeWide(*mut std::ffi::c_void);
+        impl Drop for FreeWide {
+            fn drop(&mut self) {
+                unsafe { LocalFree(self.0) };
+            }
+        }
+        let allocation = FreeWide(text.cast());
+        let decoded = unsafe { private_review_dacl_text(text, length) }.unwrap();
+        drop(allocation);
+        decoded
+    }
+
+    #[cfg(windows)]
+    fn ace_fields(ace: &str) -> (String, String, String, String) {
+        let body = ace.trim_start_matches('(').trim_end_matches(')');
+        let parts: Vec<&str> = body.split(';').collect();
+        assert_eq!(parts.len(), 6);
+        assert!(parts[3].is_empty() && parts[4].is_empty());
+        (
+            parts[0].to_string(),
+            parts[1].to_string(),
+            parts[2].to_string(),
+            parts[5].to_string(),
+        )
+    }
+
+    #[cfg(windows)]
+    fn descriptor_masks(owner: &crate::win_pipe::OwnerOnly) -> Vec<(u8, u8, u32)> {
+        use windows_sys::Win32::Security::{
+            GetAce, GetSecurityDescriptorDacl, ACE_HEADER, SECURITY_ATTRIBUTES,
+        };
+        let attrs = unsafe { &*owner.as_raw().cast::<SECURITY_ATTRIBUTES>() };
+        let mut present = 0;
+        let mut defaulted = 0;
+        let mut dacl = std::ptr::null_mut();
+        assert_ne!(
+            unsafe {
+                GetSecurityDescriptorDacl(
+                    attrs.lpSecurityDescriptor,
+                    &mut present,
+                    &mut dacl,
+                    &mut defaulted,
+                )
+            },
+            0
+        );
+        assert_ne!(present, 0);
+        assert!(!dacl.is_null());
+        let mut masks = Vec::new();
+        for index in 0..unsafe { (*dacl).AceCount } {
+            let mut raw = std::ptr::null_mut();
+            assert_ne!(unsafe { GetAce(dacl, u32::from(index), &mut raw) }, 0);
+            let header = unsafe { raw.cast::<ACE_HEADER>().read_unaligned() };
+            let mask = unsafe { raw.cast::<u8>().add(4).cast::<u32>().read_unaligned() };
+            masks.push((header.AceType, header.AceFlags, mask));
+        }
+        masks
+    }
+
+    // Windows SID APIs require DWORD-aligned SID storage. Copies retain exact
+    // bytes from validated native descriptors without relying on Vec<u8> alignment.
+    #[cfg(windows)]
+    fn aligned_sid(bytes: &[u8]) -> Vec<u32> {
+        assert!((8..=68).contains(&bytes.len()));
+        assert_eq!(bytes.len() % 4, 0);
+        bytes
+            .chunks_exact(4)
+            .map(|chunk| u32::from_ne_bytes(chunk.try_into().unwrap()))
+            .collect()
+    }
+
+    #[cfg(windows)]
+    fn same_sid(left: &[u8], right: &[u8]) -> bool {
+        use windows_sys::Win32::Security::EqualSid;
+        // Win32 models input-only PSID as mutable; use owned aligned buffers.
+        let mut left = aligned_sid(left);
+        let mut right = aligned_sid(right);
+        unsafe { EqualSid(left.as_mut_ptr().cast(), right.as_mut_ptr().cast()) != 0 }
+    }
+
+    #[cfg(windows)]
+    fn token_user_sid() -> Vec<u8> {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::Security::{
+            GetLengthSid, GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER,
+        };
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+        unsafe {
+            let mut token = std::ptr::null_mut();
+            assert_ne!(
+                OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token),
+                0
+            );
+            let mut len = 0u32;
+            GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut len);
+            assert!(len as usize >= std::mem::size_of::<TOKEN_USER>());
+            let mut buf = vec![0usize; (len as usize).div_ceil(std::mem::size_of::<usize>())];
+            let ok = GetTokenInformation(token, TokenUser, buf.as_mut_ptr().cast(), len, &mut len);
+            CloseHandle(token);
+            assert_ne!(ok, 0);
+            let user = buf.as_ptr().cast::<TOKEN_USER>().read_unaligned();
+            let sid_len = GetLengthSid(user.User.Sid) as usize;
+            assert!((8..=68).contains(&sid_len));
+            std::slice::from_raw_parts(user.User.Sid.cast::<u8>(), sid_len).to_vec()
+        }
+    }
+
+    #[cfg(windows)]
+    fn local_system_sid() -> Vec<u8> {
+        use windows_sys::Win32::Security::{CreateWellKnownSid, WinLocalSystemSid};
+        let mut system = [0u64; 9];
+        let mut len = std::mem::size_of_val(&system) as u32;
+        assert_ne!(
+            unsafe {
+                CreateWellKnownSid(
+                    WinLocalSystemSid,
+                    std::ptr::null_mut(),
+                    system.as_mut_ptr().cast(),
+                    &mut len,
+                )
+            },
+            0
+        );
+        unsafe { std::slice::from_raw_parts(system.as_ptr().cast::<u8>(), len as usize) }.to_vec()
+    }
+
+    #[cfg(windows)]
+    fn descriptor_sids(owner: &crate::win_pipe::OwnerOnly) -> Vec<Vec<u8>> {
+        use windows_sys::Win32::Security::{
+            GetAce, GetSecurityDescriptorDacl, ACE_HEADER, SECURITY_ATTRIBUTES,
+        };
+        let attrs = unsafe { &*owner.as_raw().cast::<SECURITY_ATTRIBUTES>() };
+        let mut present = 0;
+        let mut defaulted = 0;
+        let mut dacl = std::ptr::null_mut();
+        assert_ne!(
+            unsafe {
+                GetSecurityDescriptorDacl(
+                    attrs.lpSecurityDescriptor,
+                    &mut present,
+                    &mut dacl,
+                    &mut defaulted,
+                )
+            },
+            0
+        );
+        assert_ne!(present, 0);
+        assert!(!dacl.is_null());
+        let mut sids = Vec::new();
+        for index in 0..unsafe { (*dacl).AceCount } {
+            let mut raw = std::ptr::null_mut();
+            assert_ne!(unsafe { GetAce(dacl, u32::from(index), &mut raw) }, 0);
+            let header = unsafe { raw.cast::<ACE_HEADER>().read_unaligned() };
+            assert_eq!(header.AceType, 0);
+            let ace_size = usize::from(header.AceSize);
+            assert!(ace_size >= 16 && ace_size % 4 == 0);
+            let bytes =
+                unsafe { std::slice::from_raw_parts(raw.cast::<u8>().add(8), ace_size - 8) };
+            assert_eq!(bytes[0], 1);
+            assert!(bytes[1] <= 15);
+            let sid_len = 8 + usize::from(bytes[1]) * 4;
+            assert!(sid_len <= bytes.len());
+            sids.push(bytes[..sid_len].to_vec());
+        }
+        sids
+    }
+
+    /// Canonical account text from the token SID. SDDL aliases and numeric
+    /// forms are not guessed; callers that need identity use `same_sid`.
+    #[cfg(windows)]
+    fn current_user_account() -> String {
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+        // Win32 models input-only PSID as mutable; this buffer is owned and aligned.
+        let mut sid = aligned_sid(&token_user_sid());
+        let mut wide = std::ptr::null_mut();
+        assert_ne!(
+            unsafe { ConvertSidToStringSidW(sid.as_mut_ptr().cast(), &mut wide) },
+            0
+        );
+        struct FreeWide(*mut std::ffi::c_void);
+        impl Drop for FreeWide {
+            fn drop(&mut self) {
+                unsafe { LocalFree(self.0) };
+            }
+        }
+        let allocation = FreeWide(wide.cast());
+        let mut len = 0usize;
+        unsafe {
+            while *wide.add(len) != 0 {
+                len += 1;
+            }
+            let text = String::from_utf16_lossy(std::slice::from_raw_parts(wide, len));
+            drop(allocation);
+            text
+        }
+    }
+
+    #[cfg(windows)]
+    fn inspect_access() -> u32 {
+        use windows_sys::Win32::Storage::FileSystem::{FILE_READ_ATTRIBUTES, SYNCHRONIZE};
+        0x0002_0000 | FILE_READ_ATTRIBUTES | SYNCHRONIZE
+    }
+
+    #[cfg(windows)]
+    fn create_production_object(path: &Path, directory: bool) -> File {
+        use std::os::windows::ffi::OsStrExt;
+        use std::os::windows::io::FromRawHandle;
+        use windows_sys::Win32::Foundation::{GENERIC_WRITE, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateDirectoryW, CreateFileW, CREATE_NEW, FILE_ATTRIBUTE_NORMAL,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+        };
+        let security = crate::win_pipe::OwnerOnly::new().unwrap();
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        if directory {
+            assert_ne!(
+                unsafe { CreateDirectoryW(wide.as_ptr(), security.as_raw().cast()) },
+                0,
+                "{}",
+                std::io::Error::last_os_error()
+            );
+            open_directory(path).unwrap()
+        } else {
+            let handle = unsafe {
+                CreateFileW(
+                    wide.as_ptr(),
+                    GENERIC_WRITE,
+                    0,
+                    security.as_raw().cast(),
+                    CREATE_NEW,
+                    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_ne!(
+                handle,
+                INVALID_HANDLE_VALUE,
+                "{}",
+                std::io::Error::last_os_error()
+            );
+            unsafe { File::from_raw_handle(handle) }
+        }
+    }
+
+    #[cfg(windows)]
+    fn create_sddl_object(path: &Path, sddl: &str, directory: bool, access: u32) -> File {
+        use std::os::windows::ffi::OsStrExt;
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::FromRawHandle;
+        use windows_sys::Win32::Foundation::{LocalFree, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+        };
+        use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateDirectoryW, CreateFileW, CREATE_NEW, FILE_ATTRIBUTE_NORMAL,
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+            FILE_SHARE_WRITE,
+        };
+        let wide_sddl: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut raw_sd = std::ptr::null_mut();
+        assert_ne!(
+            unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    wide_sddl.as_ptr(),
+                    SDDL_REVISION_1,
+                    &mut raw_sd,
+                    std::ptr::null_mut(),
+                )
+            },
+            0
+        );
+        struct Free(*mut std::ffi::c_void);
+        impl Drop for Free {
+            fn drop(&mut self) {
+                unsafe { LocalFree(self.0) };
+            }
+        }
+        let sd = Free(raw_sd.cast());
+        let attrs = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: sd.0,
+            bInheritHandle: 0,
+        };
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        if directory {
+            assert_ne!(
+                unsafe { CreateDirectoryW(wide.as_ptr(), &attrs) },
+                0,
+                "{}",
+                std::io::Error::last_os_error()
+            );
+            drop(attrs);
+            drop(sd);
+            let mut options = OpenOptions::new();
+            options
+                .access_mode(access)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+            options.open(path).unwrap()
+        } else {
+            let handle = unsafe {
+                CreateFileW(
+                    wide.as_ptr(),
+                    access,
+                    0,
+                    &attrs,
+                    CREATE_NEW,
+                    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_ne!(
+                handle,
+                INVALID_HANDLE_VALUE,
+                "{}",
+                std::io::Error::last_os_error()
+            );
+            drop(attrs);
+            drop(sd);
+            unsafe { File::from_raw_handle(handle) }
+        }
+    }
+
+    #[cfg(windows)]
+    fn create_owner_object(path: &Path, directory: bool, access: u32) -> File {
+        use std::os::windows::ffi::OsStrExt;
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::FromRawHandle;
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateDirectoryW, CreateFileW, CREATE_NEW, FILE_ATTRIBUTE_NORMAL,
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+            FILE_SHARE_WRITE,
+        };
+        let security = crate::win_pipe::OwnerOnly::new().unwrap();
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        if directory {
+            assert_ne!(
+                unsafe { CreateDirectoryW(wide.as_ptr(), security.as_raw().cast()) },
+                0,
+                "{}",
+                std::io::Error::last_os_error()
+            );
+            let mut options = OpenOptions::new();
+            options
+                .access_mode(access)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+            options.open(path).unwrap()
+        } else {
+            let handle = unsafe {
+                CreateFileW(
+                    wide.as_ptr(),
+                    access,
+                    0,
+                    security.as_raw().cast(),
+                    CREATE_NEW,
+                    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_ne!(
+                handle,
+                INVALID_HANDLE_VALUE,
+                "{}",
+                std::io::Error::last_os_error()
+            );
+            unsafe { File::from_raw_handle(handle) }
+        }
+    }
+
+    #[cfg(windows)]
+    fn replace_protected_dacl(file: &File, sddl: &str) {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+        };
+        use windows_sys::Win32::Security::{
+            SetKernelObjectSecurity, DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+        };
+        let wide: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut sd = std::ptr::null_mut();
+        assert_ne!(
+            unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    wide.as_ptr(),
+                    SDDL_REVISION_1,
+                    &mut sd,
+                    std::ptr::null_mut(),
+                )
+            },
+            0
+        );
+        struct FreeSd(*mut std::ffi::c_void);
+        impl Drop for FreeSd {
+            fn drop(&mut self) {
+                unsafe { LocalFree(self.0) };
+            }
+        }
+        let sd = FreeSd(sd.cast());
+        let status = unsafe {
+            SetKernelObjectSecurity(
+                file.as_raw_handle(),
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                sd.0.cast(),
+            )
+        };
+        assert_ne!(status, 0, "{}", std::io::Error::last_os_error());
+    }
+
+    /// Puts the captured owner DACL back while `file` still has WRITE_DAC.
+    /// Drop runs on assertion failure, before the handle and temp dir close.
+    #[cfg(windows)]
+    struct OwnerDaclRestore<'a> {
+        file: &'a File,
+        sd: *mut std::ffi::c_void,
+    }
+
+    #[cfg(windows)]
+    impl<'a> OwnerDaclRestore<'a> {
+        fn capture(file: &'a File) -> Self {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+            use windows_sys::Win32::Security::DACL_SECURITY_INFORMATION;
+            let mut sd = std::ptr::null_mut();
+            let status = unsafe {
+                GetSecurityInfo(
+                    file.as_raw_handle(),
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &mut sd,
+                )
+            };
+            assert_eq!(
+                status,
+                0,
+                "{}",
+                std::io::Error::from_raw_os_error(status as i32)
+            );
+            assert!(!sd.is_null());
+            Self { file, sd }
+        }
+    }
+
+    #[cfg(windows)]
+    impl OwnerDaclRestore<'_> {
+        fn restore(&mut self) -> std::io::Result<()> {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Foundation::LocalFree;
+            use windows_sys::Win32::Security::{
+                SetKernelObjectSecurity, DACL_SECURITY_INFORMATION,
+                PROTECTED_DACL_SECURITY_INFORMATION,
+            };
+            if self.sd.is_null() {
+                return Ok(());
+            }
+            let restored = unsafe {
+                SetKernelObjectSecurity(
+                    self.file.as_raw_handle(),
+                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                    self.sd.cast(),
+                )
+            };
+            if restored == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            unsafe {
+                LocalFree(self.sd);
+            }
+            self.sd = std::ptr::null_mut();
+            Ok(())
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for OwnerDaclRestore<'_> {
+        fn drop(&mut self) {
+            let _ = self.restore();
+            if !self.sd.is_null() {
+                unsafe {
+                    windows_sys::Win32::Foundation::LocalFree(self.sd);
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn persisted_dacl_text(file: &File) -> String {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertSecurityDescriptorToStringSecurityDescriptorW, GetSecurityInfo, SDDL_REVISION_1,
+            SE_FILE_OBJECT,
+        };
+        use windows_sys::Win32::Security::DACL_SECURITY_INFORMATION;
+        let mut sd = std::ptr::null_mut();
+        let status = unsafe {
+            GetSecurityInfo(
+                file.as_raw_handle(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut sd,
+            )
+        };
+        assert_eq!(
+            status,
+            0,
+            "{}",
+            std::io::Error::from_raw_os_error(status as i32)
+        );
+        struct Free(*mut std::ffi::c_void);
+        impl Drop for Free {
+            fn drop(&mut self) {
+                unsafe { LocalFree(self.0) };
+            }
+        }
+        let sd_allocation = Free(sd.cast());
+        let mut text = std::ptr::null_mut();
+        let mut length = 0u32;
+        assert_ne!(
+            unsafe {
+                ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                    sd,
+                    SDDL_REVISION_1,
+                    DACL_SECURITY_INFORMATION,
+                    &mut text,
+                    &mut length,
+                )
+            },
+            0
+        );
+        struct FreeWide(*mut std::ffi::c_void);
+        impl Drop for FreeWide {
+            fn drop(&mut self) {
+                unsafe { LocalFree(self.0) };
+            }
+        }
+        let text_allocation = FreeWide(text.cast());
+        let decoded = unsafe { private_review_dacl_text(text, length) }.unwrap();
+        drop(text_allocation);
+        drop(sd_allocation);
+        decoded
+    }
+
+    #[cfg(windows)]
+    fn rights_are_mask(rights: &str, mask: u32) -> bool {
+        let Some(hex) = rights
+            .strip_prefix("0x")
+            .or_else(|| rights.strip_prefix("0X"))
+        else {
+            return false;
+        };
+        u32::from_str_radix(hex, 16).ok() == Some(mask)
+    }
+
+    #[cfg(windows)]
+    fn assert_persisted_owner_dacl(file: &File) {
+        let persisted = persisted_dacl_text(file);
+        let aces = private_review_dacl_aces(&persisted).expect("persisted DACL");
+        assert!(
+            persisted.starts_with("D:P(")
+                && aces.len() == 2
+                && aces.iter().all(|ace| {
+                    let (kind, flags, rights, _) = ace_fields(ace);
+                    kind == "A" && flags.is_empty() && rights == "FA"
+                }),
+            "{persisted}"
+        );
+    }
+
+    #[cfg(windows)]
+    const OWNER_MISMATCH: &str =
+        "Private review storage grants access beyond the current owner and SYSTEM";
+
+    #[cfg(windows)]
+    fn assert_rejected(label: &str, sddl: &str, fragment: &str, adverse: impl Fn(&str) -> bool) {
+        let (dir, _) = fixture();
+        let access = inspect_access() | 0x0004_0000;
+        for directory in [false, true] {
+            let path = dir.0.join(format!(
+                "{label}-{}",
+                if directory { "dir" } else { "file" }
+            ));
+            let file = create_owner_object(&path, directory, access);
+            let mut owner_dacl = OwnerDaclRestore::capture(&file);
+            replace_protected_dacl(&file, sddl);
+            let persisted = persisted_dacl_text(&file);
+            let error = dacl_error(windows_private(&file));
+            owner_dacl
+                .restore()
+                .expect("restore synthetic owner DACL before cleanup");
+            assert_persisted_owner_dacl(&file);
+            windows_private(&file).expect("restored fixture owner DACL");
+            drop(owner_dacl);
+            assert!(
+                adverse(&persisted),
+                "{label} directory={directory}: {persisted}"
+            );
+            assert!(
+                error.contains(fragment) && !error.contains("inheritable DACL"),
+                "{label} directory={directory}: {error}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn private_review_persisted_dacl_maps_only_expected_generic_all() {
+        use windows_sys::Win32::Foundation::GENERIC_ALL;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
+        assert_eq!(GENERIC_ALL, 0x1000_0000);
+        assert_eq!(FILE_ALL_ACCESS, 0x001F_01FF);
+        let pipe = crate::win_pipe::OwnerOnly::new().unwrap();
+        let file = crate::win_pipe::OwnerOnly::persisted_file_dacl().unwrap();
+        let pipe_text = dacl_text_of(&pipe);
+        let file_text = dacl_text_of(&file);
+        assert!(pipe_text.starts_with("D:P(") && !pipe_text.contains("(A;;FA;;;"));
+        assert!(file_text.starts_with("D:P(") && !file_text.contains("(A;;GA;;;"));
+        let pipe_aces = private_review_dacl_aces(&pipe_text).unwrap();
+        let file_aces = private_review_dacl_aces(&file_text).unwrap();
+        assert_eq!(pipe_aces.len(), 2);
+        assert_eq!(file_aces.len(), 2);
+        let pipe_fields: Vec<_> = pipe_aces.iter().map(|ace| ace_fields(ace)).collect();
+        let file_fields: Vec<_> = file_aces.iter().map(|ace| ace_fields(ace)).collect();
+        assert!(pipe_fields
+            .iter()
+            .all(|(kind, flags, rights, _)| { kind == "A" && flags.is_empty() && rights == "GA" }));
+        assert!(file_fields
+            .iter()
+            .all(|(kind, flags, rights, _)| { kind == "A" && flags.is_empty() && rights == "FA" }));
+        let user = token_user_sid();
+        let system = local_system_sid();
+        assert!(!same_sid(&user, &system));
+        let pipe_sids = descriptor_sids(&pipe);
+        let file_sids = descriptor_sids(&file);
+        assert_eq!(pipe_sids.len(), 2);
+        assert_eq!(file_sids.len(), 2);
+        assert!(pipe_sids.iter().any(|sid| same_sid(sid, &user)));
+        assert!(pipe_sids.iter().any(|sid| same_sid(sid, &system)));
+        assert!(pipe_sids
+            .iter()
+            .all(|sid| { file_sids.iter().any(|other| same_sid(sid, other)) }));
+        assert!(file_sids
+            .iter()
+            .all(|sid| { pipe_sids.iter().any(|other| same_sid(sid, other)) }));
+        let pipe_masks = descriptor_masks(&pipe);
+        let file_masks = descriptor_masks(&file);
+        assert!(pipe_masks
+            .iter()
+            .all(|(kind, flags, mask)| { *kind == 0 && *flags == 0 && *mask == GENERIC_ALL }));
+        assert!(file_masks
+            .iter()
+            .all(|(kind, flags, mask)| { *kind == 0 && *flags == 0 && *mask == FILE_ALL_ACCESS }));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn private_review_persisted_dacl_accepts_fresh_file_and_directory() {
+        let (dir, _) = fixture();
+        for (name, directory) in [("owner-file", false), ("owner-dir", true)] {
+            let file = create_production_object(&dir.0.join(name), directory);
+            assert_persisted_owner_dacl(&file);
+            windows_private(&file).unwrap();
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn private_review_persisted_dacl_creation_normalizes_to_owner_dacl() {
+        let sid = current_user_account();
+        // 0x011F01FF and an unprotected D: are not what creation stores.
+        for (label, requested) in [
+            (
+                "extra-rights",
+                format!("D:P(A;;0x011F01FF;;;{sid})(A;;0x011F01FF;;;SY)"),
+            ),
+            ("unprotected", format!("D:(A;;FA;;;{sid})(A;;FA;;;SY)")),
+        ] {
+            let (dir, _) = fixture();
+            for directory in [false, true] {
+                let path = dir.0.join(format!(
+                    "{label}-{}",
+                    if directory { "dir" } else { "file" }
+                ));
+                let file = create_sddl_object(&path, &requested, directory, inspect_access());
+                assert_persisted_owner_dacl(&file);
+                windows_private(&file).expect("normalized creation is owner-only");
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn private_review_persisted_dacl_rejects_missing_rights() {
+        let sid = current_user_account();
+        // Clears FILE_READ_DATA / FILE_LIST_DIRECTORY. A subset of FA is not valid.
+        assert_rejected(
+            "missing-rights",
+            &format!("D:P(A;;0x001F01FE;;;{sid})(A;;FA;;;SY)"),
+            OWNER_MISMATCH,
+            |text| {
+                private_review_dacl_aces(text).map_or(false, |aces| {
+                    aces.iter()
+                        .any(|ace| rights_are_mask(&ace_fields(ace).2, 0x001F_01FE))
+                })
+            },
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn private_review_persisted_dacl_rejects_extra_principal() {
+        let sid = current_user_account();
+        assert_rejected(
+            "extra-principal",
+            &format!("D:P(A;;FA;;;{sid})(A;;FA;;;SY)(A;;FR;;;WD)"),
+            OWNER_MISMATCH,
+            |text| {
+                private_review_dacl_aces(text).map_or(false, |aces| {
+                    aces.len() == 3 && aces.iter().any(|ace| ace_fields(ace).3 == "WD")
+                })
+            },
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn private_review_persisted_dacl_rejects_missing_principal() {
+        let sid = current_user_account();
+        assert_rejected(
+            "missing-system",
+            &format!("D:P(A;;FA;;;{sid})"),
+            OWNER_MISMATCH,
+            |text| {
+                private_review_dacl_aces(text).map_or(false, |aces| {
+                    aces.len() == 1 && aces.iter().all(|ace| ace_fields(ace).3 != "SY")
+                })
+            },
+        );
+        assert_rejected("missing-user", "D:P(A;;FA;;;SY)", OWNER_MISMATCH, |text| {
+            private_review_dacl_aces(text).map_or(false, |aces| {
+                aces.len() == 1 && aces.iter().any(|ace| ace_fields(ace).3 == "SY")
+            })
+        });
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn private_review_persisted_dacl_rejects_inheritance() {
+        let sid = current_user_account();
+        assert_rejected(
+            "inherit-flags",
+            &format!("D:P(A;OICI;FA;;;{sid})(A;OICI;FA;;;SY)"),
+            OWNER_MISMATCH,
+            |text| {
+                private_review_dacl_aces(text).map_or(false, |aces| {
+                    aces.iter().any(|ace| {
+                        let flags = ace_fields(ace).1;
+                        flags.contains("OI") && flags.contains("CI")
+                    })
+                })
+            },
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn private_review_persisted_dacl_rejects_unsupported_ace() {
+        let sid = current_user_account();
+        // Deny only FILE_WRITE_DATA (0x2) to Anonymous. The fixture open asks
+        // for READ_CONTROL | FILE_READ_ATTRIBUTES | SYNCHRONIZE, so this
+        // unsupported deny is stored and windows_private sees the mismatch.
+        assert_rejected(
+            "deny-ace",
+            &format!("D:P(D;;0x00000002;;;AN)(A;;FA;;;{sid})(A;;FA;;;SY)"),
+            OWNER_MISMATCH,
+            |text| {
+                private_review_dacl_aces(text).map_or(false, |aces| {
+                    aces.iter().any(|ace| ace_fields(ace).0 == "D")
+                })
+            },
+        );
     }
 
     #[test]

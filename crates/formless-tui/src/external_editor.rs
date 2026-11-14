@@ -443,6 +443,56 @@ mod console_interrupt {
 #[cfg(windows)]
 pub(super) use console_interrupt::Guard as InterruptGuard;
 
+/// Upper bound, in UTF-16 units, on the SDDL buffer the Windows ACL test
+/// fixture will inspect. Matches the private review DACL bound from #1779.
+#[cfg(test)]
+const ACL_FIXTURE_TEXT_LIMIT: u32 = 32768;
+
+/// Decode the SDDL text returned to the Windows ACL test fixture by
+/// `ConvertSecurityDescriptorToStringSecurityDescriptorW`.
+///
+/// That API reports the size of the returned buffer in WCHARs. It is the
+/// buffer capacity, not the string length, and the capacity may extend past
+/// the terminator. This reads one unit at a time and stops at the first NUL,
+/// so units after it (padding) are never read and cannot affect the
+/// fingerprint. A null or misaligned pointer, or a capacity outside
+/// `1..=ACL_FIXTURE_TEXT_LIMIT`, is refused before any read. A missing
+/// terminator within the capacity, or invalid UTF-16 before it, fails closed.
+/// Test-only, and compiled on every platform so the synthetic tests run
+/// everywhere.
+///
+/// # Safety
+/// If `text` is non-null, aligned for `u16` and `capacity` is within
+/// `1..=ACL_FIXTURE_TEXT_LIMIT`, the caller must guarantee that `text` points
+/// to a single allocation valid for reads of `capacity` `u16` units, and that
+/// the units are initialized through the first NUL (or through the whole
+/// capacity if there is no NUL). The allocation must not be freed or written
+/// during the call. Units after the first NUL may be uninitialized.
+#[cfg(test)]
+unsafe fn acl_fixture_text(text: *const u16, capacity: u32) -> Result<String> {
+    if text.is_null() {
+        bail!("private ACL fixture string is missing");
+    }
+    if (text as usize) % std::mem::align_of::<u16>() != 0 {
+        bail!("private ACL fixture string is misaligned");
+    }
+    if capacity == 0 || capacity > ACL_FIXTURE_TEXT_LIMIT {
+        bail!("private ACL fixture string exceeds its inspection limit");
+    }
+    let mut units = Vec::new();
+    for index in 0..capacity as usize {
+        // SAFETY: `text` is non-null and aligned, `index < capacity`, and the
+        // caller guarantees `capacity` readable units initialized through the
+        // first NUL. The loop returns at that NUL, so no later unit is read.
+        let unit = unsafe { text.add(index).read() };
+        if unit == 0 {
+            return String::from_utf16(&units).context("invalid private ACL fixture string");
+        }
+        units.push(unit);
+    }
+    bail!("private ACL fixture string is missing its terminator")
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -934,6 +984,126 @@ pub(crate) mod tests {
         assert_eq!(fs::read(&target).unwrap(), b"MUST KEEP CONTENT AND ACL");
         assert_eq!(windows_private::acl_fingerprint(&handle).unwrap(), before);
     }
+
+    fn wide_units(text: &str) -> Vec<u16> {
+        text.encode_utf16().collect()
+    }
+    fn fixture_error(units: &[u16], capacity: u32) -> String {
+        assert!(capacity as usize <= units.len());
+        // SAFETY: `units` is a live, aligned Vec allocation of at least
+        // `capacity` initialized u16 values.
+        format!(
+            "{:#}",
+            unsafe { acl_fixture_text(units.as_ptr(), capacity) }.unwrap_err()
+        )
+    }
+    fn fixture_text(units: &[u16], capacity: u32) -> String {
+        assert!(capacity as usize <= units.len());
+        // SAFETY: as in `fixture_error`.
+        unsafe { acl_fixture_text(units.as_ptr(), capacity) }.unwrap()
+    }
+
+    #[test]
+    fn acl_fixture_text_stops_at_first_nul_and_ignores_hostile_padding() {
+        let sddl = "O:S-1-5-21-1D:P(A;;FA;;;OW)(A;;FA;;;SY)";
+        let mut units = wide_units(sddl);
+        let exact = units.len() as u32 + 1;
+        units.push(0);
+        // Hostile padding after the first NUL: extra NULs, lone high and low
+        // surrogates, an extra Everyone grant, and arbitrary garbage.
+        units.extend([0, 0, 0xD800, 0xDC00, 0xFFFF]);
+        units.extend(wide_units("(A;;FA;;;WD)garbage"));
+        units.extend([0xDBFF, 0x0041, 0]);
+        units.extend(wide_units("(A;;GA;;;BU)"));
+        let padded = units.len() as u32;
+        assert_eq!(fixture_text(&units, padded), sddl);
+        // The fingerprint depends only on the string, not the capacity.
+        assert_eq!(fixture_text(&units, exact), sddl);
+        assert!(!fixture_text(&units, padded).contains("WD"));
+    }
+
+    #[test]
+    fn acl_fixture_text_refuses_lone_high_surrogate_before_nul() {
+        let mut units = wide_units("D:P(A;;FA;;;OW)");
+        units.extend([0xD800, 0]);
+        assert!(fixture_error(&units, units.len() as u32)
+            .contains("invalid private ACL fixture string"));
+        // High surrogate followed directly by the terminator.
+        let units = [0x0044, 0xD800, 0];
+        assert!(fixture_error(&units, 3).contains("invalid private ACL fixture string"));
+    }
+
+    #[test]
+    fn acl_fixture_text_refuses_lone_low_surrogate_before_nul() {
+        let mut units = wide_units("D:P(A;;FA;;;OW)");
+        units.extend([0xDC00, 0x0041, 0]);
+        assert!(fixture_error(&units, units.len() as u32)
+            .contains("invalid private ACL fixture string"));
+    }
+
+    #[test]
+    fn acl_fixture_text_decodes_valid_surrogate_pair() {
+        // U+1F600 is the pair D83D DE00.
+        let units = [0x0044, 0xD83D, 0xDE00, 0x003A, 0, 0xD800];
+        assert_eq!(fixture_text(&units, 6), "D\u{1F600}:");
+    }
+
+    #[test]
+    fn acl_fixture_text_accepts_capacity_limit_and_refuses_one_more() {
+        assert_eq!(ACL_FIXTURE_TEXT_LIMIT, 32768);
+        // Exactly the limit, with the NUL in the final slot.
+        let mut units = vec![u16::from(b'A'); 32768];
+        units[32767] = 0;
+        assert_eq!(fixture_text(&units, 32768), "A".repeat(32767));
+        // One past the limit is refused before any read, even though the
+        // backing buffer is real and a NUL is present early.
+        let mut units = vec![u16::from(b'A'); 32769];
+        units[0] = 0;
+        assert!(fixture_error(&units, 32769).contains("exceeds its inspection limit"));
+    }
+
+    #[test]
+    fn acl_fixture_text_accepts_nul_in_final_slot() {
+        let units = [0x0044, 0x003A, 0x0050, 0];
+        assert_eq!(fixture_text(&units, 4), "D:P");
+        // Only a NUL: the empty string, at capacity one.
+        assert_eq!(fixture_text(&[0], 1), "");
+    }
+
+    #[test]
+    fn acl_fixture_text_refuses_missing_terminator() {
+        let units = wide_units("D:P(A;;FA;;;OW)");
+        assert!(fixture_error(&units, units.len() as u32).contains("missing its terminator"));
+        // A NUL just past the reported capacity is not read.
+        let mut units = wide_units("D:P");
+        units.push(0);
+        assert!(fixture_error(&units, 3).contains("missing its terminator"));
+    }
+
+    #[test]
+    fn acl_fixture_text_refuses_null_pointer() {
+        for capacity in [0, 1, 4, ACL_FIXTURE_TEXT_LIMIT, u32::MAX] {
+            // SAFETY: a null pointer is refused before any read.
+            let error = unsafe { acl_fixture_text(std::ptr::null(), capacity) }.unwrap_err();
+            assert!(format!("{error:#}").contains("string is missing"));
+        }
+    }
+
+    #[test]
+    fn acl_fixture_text_refuses_zero_capacity() {
+        let units = [0x0044, 0];
+        assert!(fixture_error(&units, 0).contains("exceeds its inspection limit"));
+    }
+
+    #[test]
+    fn acl_fixture_text_refuses_misaligned_pointer() {
+        let units = [0u16; 4];
+        // An odd address inside the buffer; refused before any read.
+        let misaligned = units.as_ptr().cast::<u8>().wrapping_add(1).cast::<u16>();
+        // SAFETY: the misaligned pointer is refused before any read.
+        let error = unsafe { acl_fixture_text(misaligned, 2) }.unwrap_err();
+        assert!(format!("{error:#}").contains("misaligned"));
+    }
 }
 
 #[cfg(windows)]
@@ -1125,8 +1295,12 @@ mod windows_private {
             } != 0,
             std::io::Error::last_os_error()
         );
+        // `_text` frees the buffer with LocalFree on every return below,
+        // including a decode error. The decoded string is owned.
         let _text = Local(text.cast());
-        String::from_utf16(unsafe { std::slice::from_raw_parts(text, len as usize) })
-            .context("invalid private ACL fixture string")
+        // SAFETY: a successful conversion returns a LocalAlloc buffer, which
+        // is suitably aligned for u16, holding `len` WCHARs with a
+        // NUL-terminated string. `_text` keeps it alive for this call.
+        unsafe { super::acl_fixture_text(text, len) }
     }
 }

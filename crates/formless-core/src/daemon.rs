@@ -3194,13 +3194,7 @@ impl Daemon {
                 let (defs, attachments) = self.with_store(|st| {
                     let defs =
                         toolreg::tool_definitions(st, Some(&session_id), cfg.tools.inline_limit)?;
-                    let attachments: usize = st
-                        .list_messages(&session_id)?
-                        .iter()
-                        .filter_map(|m| m.meta.as_deref())
-                        .filter_map(|m| serde_json::from_str::<Value>(m).ok())
-                        .map(|m| m["attachments"].as_array().map_or(0, Vec::len))
-                        .sum();
+                    let attachments = st.attachment_entry_count(&session_id)?;
                     Ok((defs, attachments))
                 })?;
                 let used = self.calibrated_prompt_tokens(&provider, &model, &ctx, &defs)?;
@@ -3247,12 +3241,13 @@ impl Daemon {
                     .with_context(|| RequestFailure::not_found(format!("no artifact '{id}'")))?;
                 let source =
                     crate::attachment_access::read_artifact_record(&self.paths, &path, bytes)?;
-                let text = String::from_utf8_lossy(&source).into_owned();
-                let total = text.chars().count();
+                let text = String::from_utf8_lossy(&source);
                 let offset = offset.unwrap_or(0);
                 let length = length.unwrap_or(200_000).min(1_000_000);
-                let slice: String = text.chars().skip(offset).take(length).collect();
-                let end = offset + slice.chars().count();
+                let page = crate::artifact_text::page(&text, offset, length);
+                let total = page.total;
+                let slice = page.text;
+                let end = offset + page.selected;
                 // Never the filesystem path (SPEC §9.6).
                 Ok(json!({"id": id, "session_id": session, "bytes": bytes,
                           "total_chars": total, "offset": offset, "end": end, "text": slice}))
@@ -3471,16 +3466,19 @@ impl Daemon {
                 let next =
                     crate::jobs::first_run(cron.as_deref(), at.as_deref(), chrono::Local::now())?;
                 let job = self.with_store(|st| {
-                    let job = st.create_job(
-                        &prompt,
-                        session_id.as_deref(),
-                        cron.as_deref(),
-                        &next.to_rfc3339(),
-                        true,
-                        "user",
-                    )?;
-                    st.set_job_options(&job.id, overlap.as_deref(), deliver.as_ref())?;
-                    Ok(st.get_job(&job.id)?.unwrap_or(job))
+                    st.transaction(|st| {
+                        Self::validate_job_target(st, session_id.as_deref())?;
+                        let job = st.create_job(
+                            &prompt,
+                            session_id.as_deref(),
+                            cron.as_deref(),
+                            &next.to_rfc3339(),
+                            true,
+                            "user",
+                        )?;
+                        st.set_job_options(&job.id, overlap.as_deref(), deliver.as_ref())?;
+                        Ok(st.get_job(&job.id)?.unwrap_or(job))
+                    })
                 })?;
                 let _ = self.with_store(|st| st.audit("user", "job.add", &job.id));
                 self.broadcast(Event::JobsChanged);
@@ -3502,14 +3500,22 @@ impl Daemon {
                 let job = self
                     .with_store(|st| st.get_job(&id))?
                     .with_context(|| RequestFailure::not_found(format!("no job '{id}'")))?;
-                let status = self.fire_job(&job, "manual", 0).await;
+                let status = self
+                    .fire_job(&job, "manual", 0)
+                    .await
+                    .unwrap_or_else(|e| e.to_string());
                 let _ = self.with_store(|st| st.audit("user", "job.run_now", &id));
                 self.broadcast(Event::JobsChanged);
                 Ok(json!({"id": id, "status": status}))
             }
             Request::JobRuns { id, limit } => {
                 Ok(serde_json::to_value(self.with_reader(|st| {
-                    st.job_runs(&id, limit.unwrap_or(20).clamp(1, 500))
+                    let runs = st.job_runs(&id, limit.unwrap_or(20).clamp(1, 500))?;
+                    if runs.is_empty() {
+                        st.get_job(&id)?
+                            .with_context(|| RequestFailure::not_found(format!("no job '{id}'")))?;
+                    }
+                    Ok(runs)
                 })?)?)
             }
             Request::SetJobOptions {
@@ -5912,22 +5918,13 @@ impl Daemon {
         }
         // The default name or a provisional (heuristic) one may change; a
         // user's or the model's name is final (#871).
-        let users = self.with_store(|st| {
+        let user = self.with_store(|st| {
             if !st.name_is_provisional(session_id)? {
-                return Ok(None);
+                return Ok(None::<String>);
             }
-            Ok(Some(
-                st.list_messages(session_id)?
-                    .into_iter()
-                    .filter(|m| m.role == "user")
-                    .map(|m| m.content)
-                    .collect::<Vec<_>>(),
-            ))
+            st.user_naming_text(session_id)
         });
-        let Ok(Some(users)) = users else {
-            return;
-        };
-        let Some(user) = namer::naming_text(&users) else {
+        let Ok(Some(user)) = user else {
             return;
         };
         let spec = cfg.naming.spec();
@@ -6566,7 +6563,7 @@ impl Daemon {
                             matches!(
                                 error.downcast_ref::<crate::provider::StructuredOutputError>(),
                                 Some(
-                                    crate::provider::StructuredOutputError::InvalidJson
+                                    crate::provider::StructuredOutputError::InvalidJson { .. }
                                         | crate::provider::StructuredOutputError::SchemaViolation
                                 )
                             )
@@ -10852,12 +10849,16 @@ impl Daemon {
                     json!({"actor": actor, "action": action, "detail": detail.chars().take(300).collect::<String>(), "at": at})
                 }).collect::<Vec<_>>()}))
             }
-            "models" => Ok(json!({"models": st.list_model_stats()?.into_iter().map(|m| json!({
-                "model": m.model, "calls": m.samples(), "success_rate": m.success_rate(),
-                "avg_ms": (m.samples() > 0).then(|| m.total_ms / m.samples()),
-            })).collect::<Vec<_>>()})),
+            "models" => {
+                let models = st.list_model_stats()?;
+                let total = models.len();
+                Ok(json!({"models": models.into_iter().take(limit).map(|m| json!({
+                    "model": m.model, "calls": m.samples(), "success_rate": m.success_rate(),
+                    "avg_ms": (m.samples() > 0).then(|| m.total_ms / m.samples()),
+                })).collect::<Vec<_>>(), "total": total}))
+            }
             "runs" => {
-                let runs = st.run_metrics(limit.max(50))?;
+                let runs = st.run_metrics(limit)?;
                 Ok(json!({"summary": crate::runs::summarize(&runs)}))
             }
             "builtins" => Ok(json!({"builtins": st.builtin_stats(None)?})),
@@ -11476,6 +11477,7 @@ impl Daemon {
             Some(s) if !s.is_empty() => Some(s.to_string()),
             _ => None,
         };
+        self.with_store(|st| Self::validate_job_target(st, target.as_deref()))?;
         let next = crate::jobs::first_run(cron, at, chrono::Local::now())?;
         let approved = match cron {
             None => true,
@@ -11507,14 +11509,17 @@ impl Daemon {
             next
         };
         let job = self.with_store(|st| {
-            st.create_job(
-                prompt,
-                target.as_deref(),
-                cron,
-                &next.to_rfc3339(),
-                approved,
-                "agent",
-            )
+            st.transaction(|st| {
+                Self::validate_job_target(st, target.as_deref())?;
+                st.create_job(
+                    prompt,
+                    target.as_deref(),
+                    cron,
+                    &next.to_rfc3339(),
+                    approved,
+                    "agent",
+                )
+            })
         })?;
         let _ = self.with_store(|st| st.audit("agent", "job.schedule", &job.id));
         self.broadcast(Event::JobsChanged);
@@ -11590,16 +11595,85 @@ impl Daemon {
                     .unwrap_or(0),
                 _ => 0,
             };
-            let next = job
-                .cron
-                .as_deref()
-                .and_then(|c| crate::jobs::Cron::parse(c).ok())
-                .and_then(|c| c.next_after(now))
-                .map(|t| t.to_rfc3339());
-            let status = self.fire_job(&job, "schedule", missed).await;
-            let _ = self.with_store(|st| st.job_ran(&job.id, &status, next.as_deref()));
-            self.broadcast(Event::JobsChanged);
+            let next = match job.cron.as_deref() {
+                None => None,
+                Some(cron) => match crate::jobs::Cron::parse(cron).and_then(|c| {
+                    c.next_after(now)
+                        .context("no next occurrence within the cron search window")
+                }) {
+                    Ok(next) => Some(next.to_rfc3339()),
+                    Err(error) => {
+                        self.pause_job(
+                            &job,
+                            "job.reschedule_failed",
+                            &format!("recurring schedule could not be rescheduled: {error}"),
+                            Some("schedule"),
+                        );
+                        continue;
+                    }
+                },
+            };
+            // Failed delivery already persisted a visible paused state. In
+            // particular, never consume a one-shot that did not deliver.
+            if let Ok(status) = self.fire_job(&job, "schedule", missed).await {
+                let _ = self.with_store(|st| st.job_ran(&job.id, &status, next.as_deref()));
+                self.broadcast(Event::JobsChanged);
+            }
         }
+    }
+
+    fn validate_job_target(st: &Store, target: Option<&str>) -> Result<()> {
+        if let Some(id) = target {
+            if st.get_session(id)?.is_none() || st.session_deleted(id)? {
+                return Err(RequestFailure::not_found(format!(
+                    "job target Session '{id}' does not exist or was deleted"
+                ))
+                .into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Preserve the due slot so failed delivery is distinguishable from
+    /// one-shot completion. The `paused:` prefix is a persisted scheduler
+    /// marker; a finishing older Run must not erase it (Store::job_ran_status).
+    fn pause_job(
+        &self,
+        job: &JobInfo,
+        action: &str,
+        detail: &str,
+        history_trigger: Option<&str>,
+    ) -> String {
+        let status = format!("paused: {detail}");
+        let notice = if let Err(error) = self.with_store(|st| {
+            st.transaction(|st| {
+                st.pause_job(&job.id, &status)?;
+                if let Some(trigger) = history_trigger {
+                    st.job_run_start(
+                        &job.id,
+                        job.session_id.as_deref(),
+                        trigger,
+                        "failed",
+                        &status,
+                    )?;
+                }
+                st.audit("daemon", action, &format!("{}: {status}", job.id))
+            })
+        }) {
+            tracing::error!(job_id = %job.id, %error, "could not persist paused job");
+            format!("error: could not persist job pause after {detail}: {error}")
+        } else {
+            status
+        };
+        self.broadcast(Event::Note {
+            session_id: None,
+            text: format!(
+                "Job {} {notice}; inspect its target/schedule and history before retrying",
+                job.id
+            ),
+        });
+        self.broadcast(Event::JobsChanged);
+        notice
     }
 
     /// Most job prompts one Session's queue holds; later firings are
@@ -11613,12 +11687,22 @@ impl Daemon {
         job: &formless_protocol::JobInfo,
         trigger: &str,
         missed: usize,
-    ) -> String {
+    ) -> Result<String> {
         let late = if missed > 0 {
             format!("ran late, {} firing(s) coalesced", missed + 1)
         } else {
             String::new()
         };
+        if let Err(error) =
+            self.with_store(|st| Self::validate_job_target(st, job.session_id.as_deref()))
+        {
+            return Err(anyhow!(self.pause_job(
+                job,
+                "job.target_missing",
+                &error.to_string(),
+                Some(trigger),
+            )));
+        }
         // This job's previous firing, in whichever Session it went to.
         let still_running = self
             .job_pending
@@ -11643,14 +11727,9 @@ impl Daemon {
                 )?;
                 st.audit("daemon", "job.skip", &format!("{}: {why}", job.id))
             });
-            return why;
+            return Ok(why);
         }
-        let session = match job.session_id.clone().filter(|s| {
-            self.with_store(|st| st.get_session(s))
-                .ok()
-                .flatten()
-                .is_some()
-        }) {
+        let session = match job.session_id.clone() {
             Some(s) => Ok(s),
             None => {
                 let name: String = job.prompt.chars().take(40).collect();
@@ -11664,10 +11743,12 @@ impl Daemon {
         let sid = match session {
             Ok(sid) => sid,
             Err(e) => {
-                let status = format!("error: {e}");
-                let _ = self
-                    .with_store(|st| st.job_run_start(&job.id, None, trigger, "failed", &status));
-                return status;
+                return Err(anyhow!(self.pause_job(
+                    job,
+                    "job.delivery_failed",
+                    &format!("could not create the job Session: {e}"),
+                    Some(trigger),
+                )));
             }
         };
         // Overlap: the previous firing still queued or running.
@@ -11693,7 +11774,7 @@ impl Daemon {
                 st.job_run_start(&job.id, Some(&sid), trigger, "skipped", &detail)?;
                 st.audit("daemon", "job.skip", &format!("{}: {why}", job.id))
             });
-            return why;
+            return Ok(why);
         }
         let run_row = self
             .with_store(|st| st.job_run_start(&job.id, Some(&sid), trigger, "running", &late))
@@ -11717,11 +11798,16 @@ impl Daemon {
             Err(e) => {
                 let _ = self
                     .with_store(|st| st.job_run_finish(&run_row, "failed", &e.to_string(), None));
-                format!("error: {e}")
+                return Err(anyhow!(self.pause_job(
+                    job,
+                    "job.delivery_failed",
+                    &format!("prompt delivery failed: {e}"),
+                    None,
+                )));
             }
         };
         let _ = self.with_store(|st| st.audit("daemon", "job.run", &job.id));
-        status
+        Ok(status)
     }
 
     /// A job's Run ended: finish its history row (outcome, cost), tell
@@ -12197,23 +12283,24 @@ impl Daemon {
                 RequestFailure::not_found(format!("no artifact '{id}' in this session"))
             })?;
         let source = crate::attachment_access::read_artifact_record(&self.paths, &path, bytes)?;
-        let text = String::from_utf8_lossy(&source).into_owned();
+        let text = String::from_utf8_lossy(&source);
         if let Some(needle) = args["grep"].as_str().filter(|g| !g.is_empty()) {
             let needle = needle.to_lowercase();
             let hits: Vec<Value> = text
                 .lines()
                 .enumerate()
-                .filter(|(_, l)| l.to_lowercase().contains(&needle))
+                .filter(|(_, l)| crate::artifact_text::contains_lowercase(l, &needle))
                 .take(200)
                 .map(|(i, l)| json!({"line": i + 1, "text": l.chars().take(500).collect::<String>()}))
                 .collect();
             return Ok(json!({"id": id, "matches": hits}).to_string());
         }
-        let total = text.chars().count();
         let offset = args["offset"].as_u64().unwrap_or(0) as usize;
         let length = args["length"].as_u64().unwrap_or(20_000).min(100_000) as usize;
-        let slice: String = text.chars().skip(offset).take(length).collect();
-        let end = (offset + slice.chars().count()).min(total);
+        let page = crate::artifact_text::page(&text, offset, length);
+        let total = page.total;
+        let slice = page.text;
+        let end = (offset + page.selected).min(total);
         Ok(
             json!({"id": id, "offset": offset, "end": end, "total_chars": total, "text": slice})
                 .to_string(),
@@ -12225,16 +12312,17 @@ impl Daemon {
         let (info, _) = self
             .with_store(|st| st.get_module_by_name(name))?
             .with_context(|| RequestFailure::not_found(format!("no module named '{name}'")))?;
+        let want = args["version"].as_i64().unwrap_or(info.current_version);
         let (versions, dependents) = self.with_store(|st| {
             Ok((
-                st.module_versions(&info.id)?,
+                st.module_versions_for_read(&info.id, want)?,
                 st.module_dependents(&info.name)?,
             ))
         })?;
-        let want = args["version"].as_i64().unwrap_or(info.current_version);
         let (version, code, ..) = versions.iter().find(|v| v.0 == want).with_context(|| {
             RequestFailure::not_found(format!("module '{name}' has no version {want}"))
         })?;
+        let code = code.as_ref().context("selected module code is missing")?;
         Ok(json!({
             "name": info.name,
             "description": info.description,
@@ -14504,7 +14592,10 @@ impl Daemon {
             memory.mark_started();
         }
         let mut reader = BufReader::new(read_half);
+        let mut relay_controls = tokio::task::JoinSet::new();
         loop {
+            // Completed control handles must not accumulate on a long-lived CID.
+            while relay_controls.try_join_next().is_some() {}
             let (line, mut input_lease) = tokio::select! {
                 _ = kick.cancelled() => break,
                 r = async {
@@ -14606,7 +14697,7 @@ impl Daemon {
                         let held = input_lease.take();
                         let (this, tx, who, kick) =
                             (self.clone(), tx.clone(), client(), kick.clone());
-                        tokio::spawn(async move {
+                        let control = async move {
                             let _permit = permit;
                             let _input_lease = held;
                             let result = tokio::select! {
@@ -14621,7 +14712,12 @@ impl Daemon {
                                 _ = kick.cancelled() => {}
                                 _ = tx.send(resp) => {}
                             }
-                        });
+                        };
+                        if relay_memory.is_some() {
+                            relay_controls.spawn(control);
+                        } else {
+                            tokio::spawn(control);
+                        }
                         continue;
                     } else {
                         let queued = tokio::select! {
@@ -14676,6 +14772,9 @@ impl Daemon {
             worker.abort();
         }
         let _ = worker.await;
+        // Keep the same control/cancellation behavior, but wait for each relay
+        // task to drop its input/output leases before reporting teardown done.
+        while relay_controls.join_next().await.is_some() {}
         self.sent_keys
             .locked()
             .retain(|(client, _, _), _| *client != Some(conn));
@@ -15807,10 +15906,13 @@ pub fn ensure_daemon(paths: &Paths) -> Result<()> {
     if daemon_reachable(paths) {
         return Ok(());
     }
-    let timeout = Config::load(paths)
-        .map(|c| c.daemon.start_timeout_secs)
-        .unwrap_or(60)
-        .max(1);
+    let (timeout, timeout_note) = match Config::load(paths) {
+        Ok(config) => (config.daemon.start_timeout_secs.max(1), ""),
+        Err(_) => (
+            60,
+            "; using the default 60s because config.toml could not be loaded",
+        ),
+    };
     let _launcher =
         crate::profile_lock::ProfileLock::launcher(paths, std::time::Duration::from_secs(timeout))?;
     if daemon_reachable(paths) {
@@ -15852,8 +15954,10 @@ pub fn ensure_daemon(paths: &Paths) -> Result<()> {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     Err(anyhow!(
-        "daemon did not accept connections within {timeout}s (daemon.start_timeout_secs); \
-         last log lines from {}:\n{}",
+        "daemon did not accept connections within {timeout}s (daemon.start_timeout_secs){timeout_note}; \
+         raise it with `formless config edit` (set start_timeout_secs = 180 in [daemon]; \
+         `formless config set` cannot change this key). \
+         Last log lines from {}:\n{}",
         paths.log_file().display(),
         log_tail(paths, 10)
     ))
@@ -16311,7 +16415,7 @@ impl HostOps for NestedOps {
         );
         if matches!(
             &value,
-            Err(crate::provider::StructuredOutputError::InvalidJson
+            Err(crate::provider::StructuredOutputError::InvalidJson { .. }
                 | crate::provider::StructuredOutputError::SchemaViolation)
         ) {
             routing_call.claim_contract(identity.clone());
@@ -18572,3 +18676,133 @@ mod role_reference_tests;
 #[cfg(test)]
 #[path = "provider_error_guidance_tests.rs"]
 mod provider_error_guidance_tests;
+
+#[cfg(test)]
+#[path = "job_state_daemon_tests.rs"]
+mod job_state_daemon_tests;
+
+#[cfg(test)]
+mod read_metrics_limit_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn model_and_run_reports_honor_limits_without_changing_arithmetic() {
+        let _env = crate::credential_env::EnvGuard::isolated();
+        let root = std::env::temp_dir().join(format!("fl-metrics-limits-{}", uuid::Uuid::new_v4()));
+        let paths = Paths::from_dirs(root.join("data"), root.join("config")).unwrap();
+        let mut config = Config::default();
+        config.provider.base_url = "http://127.0.0.1:9/v1".into();
+        config.provider.model = "private-unused".into();
+        config.naming.enabled = false;
+        config.save(&paths).unwrap();
+        let daemon = Daemon::new(paths).unwrap();
+        assert_eq!(
+            daemon
+                .read_metrics_impl(&json!({"kind":"models","limit":5}))
+                .unwrap(),
+            json!({"models":[],"total":0})
+        );
+        assert_eq!(
+            daemon
+                .read_metrics_impl(&json!({"kind":"runs","limit":10}))
+                .unwrap()["summary"]["runs"],
+            0
+        );
+        daemon
+            .with_store(|st| {
+                for index in (0..7).rev() {
+                    let model = format!("model-{index:02}-ไทย");
+                    st.record_model_outcome(&model, true, 3)?;
+                    st.record_model_outcome(&model, false, 4)?;
+                }
+                let session = st.create_session(None)?.id;
+                // Explicit timestamps determine the newest window independently
+                // of clock granularity, without any model or Tool execution.
+                let conn = rusqlite::Connection::open(daemon.paths.db_file())?;
+                for index in 0..60 {
+                    let run = st.create_run(&session)?;
+                    conn.execute(
+                        "UPDATE runs SET created_at=?2,status=?3,steps=?4 WHERE id=?1",
+                        rusqlite::params![
+                            run,
+                            format!("2026-01-01T00:{index:02}:00Z"),
+                            if index >= 50 {
+                                "interrupted"
+                            } else {
+                                "completed"
+                            },
+                            if index >= 50 { 11 } else { 1 }
+                        ],
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let models = daemon
+            .read_metrics_impl(&json!({"kind":"models","limit":5}))
+            .unwrap();
+        assert_eq!(models["total"], 7);
+        let rows = models["models"].as_array().unwrap();
+        assert_eq!(rows.len(), 5);
+        for (index, row) in rows.iter().enumerate() {
+            assert_eq!(row["model"], format!("model-{index:02}-ไทย"));
+            assert_eq!(row["calls"], 2);
+            assert_eq!(row["success_rate"], 0.5);
+            assert_eq!(
+                row["avg_ms"].as_i64(),
+                Some(3),
+                "integer latency representation is preserved"
+            );
+        }
+        assert_eq!(
+            daemon
+                .read_metrics_impl(&json!({"kind":"models","limit":0}))
+                .unwrap()["models"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            daemon.read_metrics_impl(&json!({"kind":"models"})).unwrap()["models"]
+                .as_array()
+                .unwrap()
+                .len(),
+            7
+        );
+        let ten = daemon
+            .read_metrics_impl(&json!({"kind":"runs","limit":10}))
+            .unwrap();
+        assert_eq!(ten["summary"]["runs"], 10);
+        assert_eq!(ten["summary"]["interrupted"], 1.0);
+        assert_eq!(ten["summary"]["avg_steps"], 11.0);
+        let default = daemon.read_metrics_impl(&json!({"kind":"runs"})).unwrap();
+        assert_eq!(default["summary"]["runs"], 50);
+        assert_eq!(default["summary"]["interrupted"], 0.2);
+        assert_eq!(default["summary"]["avg_steps"], 3.0);
+        assert_eq!(
+            daemon
+                .read_metrics_impl(&json!({"kind":"runs","limit":0}))
+                .unwrap()["summary"]["runs"],
+            1
+        );
+        assert_eq!(
+            daemon
+                .read_metrics_impl(&json!({"kind":"runs","limit":999}))
+                .unwrap()["summary"]["runs"],
+            60
+        );
+        assert_eq!(
+            daemon
+                .read_metrics_impl(&json!({"kind":"tools","limit":5}))
+                .unwrap(),
+            json!({"tools":[],"total":0})
+        );
+        drop(daemon);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+#[path = "module_read_projection_tests.rs"]
+mod module_read_projection_tests;
