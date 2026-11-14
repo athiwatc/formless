@@ -3855,7 +3855,9 @@ run_tool = "network_policy"     # a registry Tool, or…
   clickable in terminals that support OSC 8 hyperlinks. After each draw,
   the TUI repaints the visible URL cells wrapped in OSC 8, keeping their
   style, but only when the set of visible links changed
-  (`tui.hyperlinks`). A URL ends where its brackets balance
+  (`tui.hyperlinks`). HTTP(S) schemes are matched case-insensitively;
+  targets lowercase only the scheme while visible text and the remaining
+  URL keep their original spelling. A URL ends where its brackets balance
   (`…/f_(x))` keeps one `)`), and a long URL hard-wrapped across rows is
   one link on every fragment, never a link to its first piece. In the
   Markdown, an image inside a link shows both addresses, and inline HTML
