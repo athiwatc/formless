@@ -1446,8 +1446,11 @@ pasting paths.
   or unreadable state remains unknown. Versioned before-metadata binds the exact
   bytes and metadata with an integrity checksum (not a MAC). Newly captured
   deleted ordinary files can be rejected back to their original bytes, mode and
-  ownership, then explicitly undone back to absence. Unsupported ACLs/xattrs,
-  unverifiable Windows security and legacy missing metadata remain read-only.
+  ownership, then explicitly undone back to absence. Exact `user.*` maps can be
+  restored, and macOS `com.apple.provenance` is compared but never written,
+  removed, or adopted. Other ACLs/xattrs, nonzero BSD flags, hidden attribute
+  lists, unverifiable Windows security, and legacy missing metadata remain
+  read-only.
   Whole-file byte-only snapshots remain available for authorized regular files
   with hard links or unsupported metadata, including a legitimate symlink-parent
   alias: both the requested name and canonical target must pass path policy,
@@ -1509,8 +1512,11 @@ pasting paths.
   Symlinks/reparse points, multiple hard links, protected profile/credential
   paths, read-only/set-ID files, and permission metadata that cannot be preserved
   remain noneditable. Legacy deleted-file snapshots have no original metadata and
-  are therefore read-only. Unix UID/GID and mode are preserved; extended
-  attributes/ACLs are refused rather than silently discarded. Windows special
+  are therefore read-only. Unix UID/GID and mode are preserved. Exact `user.*`
+  attributes are restored on a private stage; `com.apple.provenance` is only
+  compared. Any other extended attribute, nonempty ACL, nonzero BSD flags, or
+  hidden Darwin attribute list is refused rather than discarded. Absence is not
+  a wildcard for an automatically stamped provenance. Windows special
   attributes, nondefault streams and unsupported access-control entries are
   refused. On Windows, ordinary existing-file inverse edits and Undo retain the
   same file object with an attribute-only HANDLE for the active review's existing
