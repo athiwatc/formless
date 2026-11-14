@@ -1,5 +1,9 @@
 # Recovery, stream characterization and development packaging
 
+Later native forecast confirmation and current evidence are recorded in
+[the forecast continuation](forecast-confirmation-20261114.md). The TUI-only
+forecast handoff described below is historical.
+
 This continues #1753 in draft PR #2081. It does not complete the epic or
 establish a supported native release. The original #1776 branch/worktree and
 writers remain untouched; its last verified head is

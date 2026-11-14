@@ -61,7 +61,9 @@ Findings, measurements, the parity inventory and the open blockers are in
 [docs/desktop/phase0-findings.md](../../docs/desktop/phase0-findings.md).
 
 Current continuation evidence and remaining acceptance are recorded in
-[the live-client report](../../docs/desktop/live-client-20261114.md). Later
+[the forecast report](../../docs/desktop/forecast-confirmation-20261114.md),
+[the recovery/packaging report](../../docs/desktop/recovery-and-packaging-20261114.md)
+and [the live-client report](../../docs/desktop/live-client-20261114.md). Later
 fixture-only evidence notes below describe historical checkpoints.
 
 ## Development packaging
