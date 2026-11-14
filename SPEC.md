@@ -883,10 +883,15 @@ task, with quality as a gate**.
     with Undo.
   - Tool purge: TUI `p` twice; web needs the Tool name typed.
   - `formless reset`: needs `reset` typed.
+  Whitespace-free identifiers joined with `_`, `.`, `-` or `/` rank adjacent
+  prefix tokens before scattered matches, retaining BM25, newest timestamp and
+  recording order within each tier. Every segment remains a prefix; indexed
+  adjacency does not imply literal punctuation or identifier equality.
   Search uses an FTS5 index over message content (schema v24, with
   `unicode61` tokens and diacritics folded). Triggers keep the index
   current through inserts, edits and deletes. Every query word must match
-  as a word prefix, and results are ranked by bm25, then newest. A query
+  as a word prefix. Within each tier, results rank by bm25, then newest
+  timestamp and recording order. A query
   with no word characters falls back to a substring scan. Search runs on a
   reader connection and never takes the store lock.
 
