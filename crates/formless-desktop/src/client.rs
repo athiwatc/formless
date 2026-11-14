@@ -253,6 +253,14 @@ impl Client {
         }
         commands
     }
+    #[cfg(feature = "test-support")]
+    pub fn retire_recording_connection(&self) {
+        assert!(
+            self.recorded.is_some(),
+            "only a serialized view fixture can retire its connection without I/O"
+        );
+        advance_epoch(&self.connection);
+    }
 }
 
 fn advance_epoch(epoch: &AtomicU64) {

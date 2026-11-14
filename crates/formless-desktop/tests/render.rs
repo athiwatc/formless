@@ -960,6 +960,16 @@ mod render {
                                 window.find(id.clone()).focused() == Some(true)
                             };
                             if focused {
+                                if input {
+                                    let input = shell.read(cx).question_answer_input().unwrap();
+                                    input.update(cx, |input, cx| {
+                                        input.set_value(
+                                            "one ไทย\ntwo 漢字\nthree 😀\nfour\nfive\nsix",
+                                            window,
+                                            cx,
+                                        )
+                                    });
+                                }
                                 break;
                             }
                             window.press("tab", cx);
@@ -989,6 +999,14 @@ mod render {
                             "{name}: focused {id:?} outside viewport: {:?}",
                             window.find(id.clone()).bounds()
                         );
+                        if input {
+                            let field = window.find(id.clone()).bounds();
+                            let body = window.find("questions-body").bounds();
+                            assert!(
+                                field.top() >= body.top() && field.bottom() <= body.bottom(),
+                                "{name}: input is clipped by the dialog body"
+                            );
+                        }
                         if id == ElementId::from(("question-option", 0usize)) {
                             window.press("space", cx);
                             window.render_frame(cx);

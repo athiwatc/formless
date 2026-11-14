@@ -1637,6 +1637,9 @@ impl Shell {
             ClientUpdate::Connection { ready, notice } => {
                 self.client_connected = ready;
                 self.client_status = notice;
+                if ready {
+                    self.questions_restored(window, cx);
+                }
                 if !ready {
                     self.questions_disconnected(cx);
                     self.forecast = None;
@@ -1653,6 +1656,7 @@ impl Shell {
                     .client
                     .as_ref()
                     .is_some_and(|client| client.connection() == state.connection)
+                    && self.client_questions != state
                 {
                     self.client_questions = state;
                     self.questions_restored(window, cx);

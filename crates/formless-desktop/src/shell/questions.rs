@@ -19,6 +19,9 @@ pub(super) struct Panel {
     disconnected: bool,
     revealed: Option<FocusHandle>,
     frames: u8,
+    connection: u64,
+    viewport: Option<Size<Pixels>>,
+    scale: TextScale,
     directory: Vec<(String, FocusHandle, gpui_kit::ScrollAnchor)>,
     saved_focus: FocusHandle,
     saved_anchor: gpui_kit::ScrollAnchor,
@@ -38,6 +41,12 @@ struct Form {
 }
 
 impl Shell {
+    #[cfg(feature = "test-support")]
+    pub fn retire_recording_question_connection(&self) -> u64 {
+        let client = self.client.as_ref().unwrap();
+        client.retire_recording_connection();
+        client.connection()
+    }
     #[cfg(feature = "test-support")]
     pub fn question_answer_input(&self) -> Option<Entity<TextareaState>> {
         self.question_panel
@@ -63,6 +72,9 @@ impl Shell {
             disconnected: false,
             revealed: None,
             frames: 0,
+            connection: self.client.as_ref().map_or(0, Client::connection),
+            viewport: None,
+            scale: self.text_scale,
             directory: Vec::new(),
             saved_focus: cx.focus_handle(),
             saved_anchor: gpui_kit::ScrollAnchor::for_handle(scroll),
@@ -78,7 +90,7 @@ impl Shell {
     ) -> (Entity<TextareaState>, Subscription) {
         let input = cx.new(|cx| {
             TextareaState::new(window, cx)
-                .auto_grow(2, 5)
+                .auto_grow(2, 2)
                 .submit_on_enter(false)
                 .placeholder("Your own answer (optional)")
                 .default_value(text.to_string())
@@ -115,6 +127,10 @@ impl Shell {
     }
 
     fn question_input_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(panel) = &mut self.question_panel {
+            panel.frames = 2;
+            cx.notify();
+        }
         let Some(form) = self
             .question_panel
             .as_ref()
@@ -185,6 +201,7 @@ impl Shell {
                 input.marked_text_range(window, cx).is_some()
             }) {
                 input.update(cx, |input, cx| input.unmark_text(window, cx));
+                self.question_input_changed(window, cx);
                 cx.notify();
                 return;
             }
@@ -420,6 +437,14 @@ impl Shell {
 
     pub(super) fn questions_restored(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(panel) = &mut self.question_panel {
+            panel.frames = 2;
+            if panel.connection != self.client_questions.connection {
+                panel.connection = self.client_questions.connection;
+                panel.disconnected = true;
+                if let Some(form) = &mut panel.form {
+                    form.waiting = None;
+                }
+            }
             let lost_focus = panel.directory.iter().any(|(id, focus, _)| {
                 !self
                     .client_questions
@@ -452,7 +477,9 @@ impl Shell {
             }
             if panel.disconnected {
                 panel.disconnected = false;
-                panel.notice=Some("Connected again. Review the question's current status before submitting; your answers were kept.".into());
+                panel.notice=Some(if panel.form.as_ref().is_some_and(|form|self.client_questions.blocked.contains(&form.question.id)) {
+                    "Answer outcome unknown. Do not retry; inspect its Session in the TUI. Text kept."
+                }else{"Connected again. Review the question's current status before submitting; your answers were kept."}.into());
             }
         }
         cx.notify();
@@ -463,8 +490,13 @@ impl Shell {
             return;
         };
         let focused = window.focused(cx);
-        if panel.revealed != focused {
+        if panel.revealed != focused
+            || panel.viewport != Some(window.viewport_size())
+            || panel.scale != self.text_scale
+        {
             panel.revealed = focused;
+            panel.viewport = Some(window.viewport_size());
+            panel.scale = self.text_scale;
             panel.frames = 2;
         }
         if panel.frames == 0 {
@@ -537,7 +569,7 @@ impl Shell {
                     .child(Textarea::new(&form.input).aria_label("Your answer").disabled(waiting).w_full().on_paste({let shell=cx.entity();move|item,_,cx|{
                         if item.text().is_some_and(|text|text.len()>MAX_TEXT_BYTES) {shell.update(cx,|this,cx|{if let Some(panel)=&mut this.question_panel{panel.notice=Some("Paste not added: answer text is limited to 64 KiB.".into());cx.notify();}});true}else{false}
                     }})))
-                .child(readable("question-empty-help","Empty fields are returned as unanswered. Enter inserts a line; Submit answers is an explicit button." ).text_sm());
+                .child(readable("question-empty-help","Blank fields are returned as unanswered. Enter inserts a line; Submit is an explicit button." ).text_sm());
         } else {
             body=body.child(readable("questions-scope","Questions belong to the Sessions shown below, across this Profile. Approvals still require the TUI."))
                 .when(self.client_questions.open.is_empty(),|body|body.child(readable("questions-empty","No pending questions loaded. Open a Session to restore existing questions; newly arriving questions appear here without changing focus.")))
@@ -671,7 +703,9 @@ impl Shell {
             body = body.child(actions);
             footer = footer.child(
                 Button::new("question-submit")
-                    .label("Submit answers")
+                    .label("Submit")
+                    .accessibility_label("Submit answers")
+                    .tooltip("Submit all answers to this question")
                     .primary()
                     .disabled(form.waiting.is_some() || !self.question_current(form))
                     .on_click(cx.listener(|this, _, window, cx| this.submit_question(window, cx))),

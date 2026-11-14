@@ -138,7 +138,7 @@ impl Open {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct State {
     pub connection: u64,
     pub open: Vec<Open>,

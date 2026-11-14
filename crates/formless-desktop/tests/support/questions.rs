@@ -83,6 +83,10 @@ fn native_question_answers_preserve_original_session_choices_and_exact_text(
     step(cx, handle, |window, cx| {
         window.render_frame(cx);
         window.click(session_row_id(&sessions[0].id), cx);
+        shell.update(cx, |shell, cx| {
+            shell.focus_section(PageSection::Composer, window, cx)
+        });
+        window.input("Unsent composer draft for another Session", cx);
         shell.update(cx, |shell, _| {
             shell.take_client_commands();
         });
@@ -204,6 +208,10 @@ fn native_question_answers_preserve_original_session_choices_and_exact_text(
         window.click("show-questions", cx);
         window.render_frame(cx);
         assert!(window.try_find("open-question-native-question").is_none());
+        assert_eq!(
+            shell.read(cx).draft(cx).as_ref(),
+            "Unsent composer draft for another Session"
+        );
         window.click("questions-copy-saved", cx);
         let saved: serde_json::Value =
             serde_json::from_str(&cx.read_from_clipboard().unwrap().text().unwrap()).unwrap();
@@ -342,5 +350,125 @@ fn oversized_question_edits_are_rejected_whole_before_submission(cx: &mut TestAp
                 .as_ref(),
             "keep"
         )
+    });
+}
+
+#[gpui_kit::test]
+fn question_input_stays_visible_across_repeated_resizes_and_text_scales(cx: &mut TestAppContext) {
+    let (handle, shell) = open(cx, WIDE, 0, 0);
+    let sessions = daemon_view(cx, handle, &shell);
+    show(cx, handle, &shell, definition(&sessions[0].id));
+    step(cx, handle, |window, cx| {
+        window.click_at("question-input-anchor", point(px(20.), px(15.)), cx);
+        window.input("one ไทย\ntwo 漢字\nthree 😀\nfour\nfive\nsix", cx);
+    });
+    for (width, height, percent) in [
+        (480., 360., 200),
+        (1440., 900., 100),
+        (800., 700., 150),
+        (480., 360., 200),
+    ] {
+        cx.simulate_window_resize(handle.into(), size(px(width), px(height)));
+        step(cx, handle, |window, cx| {
+            shell.update(cx, |shell, cx| {
+                shell.set_text_scale(TextScale::from_percent(percent), window, cx)
+            });
+            for _ in 0..4 {
+                window.render_frame(cx);
+                window.simulate_next_frame(cx);
+            }
+        });
+        cx.run_until_parked();
+        step(cx, handle, |window, cx| {
+            window.render_frame(cx);
+            let input = window.find_by_label("Your answer");
+            let body = window.find("questions-body").bounds();
+            let bounds = input.bounds();
+            assert_eq!(input.focused(), Some(true));
+            assert!(
+                bounds.top() >= body.top() && bounds.bottom() <= body.bottom(),
+                "focused input {bounds:?} clipped by body {body:?} at {percent}%"
+            );
+            assert!(shell
+                .read(cx)
+                .question_answer_input()
+                .unwrap()
+                .read(cx)
+                .value()
+                .contains("six"));
+        });
+    }
+}
+
+#[gpui_kit::test]
+fn a_new_connection_recovers_the_form_even_if_the_disconnect_update_was_lost(
+    cx: &mut TestAppContext,
+) {
+    let (handle, shell) = open(cx, WIDE, 0, 0);
+    let sessions = daemon_view(cx, handle, &shell);
+    let question = definition(&sessions[0].id);
+    show(cx, handle, &shell, question.clone());
+    step(cx, handle, |window, cx| {
+        window.click_at("question-input-anchor", point(px(20.), px(15.)), cx);
+        window.input("keep uncertain answer", cx);
+        window.click("question-submit", cx);
+        window.render_frame(cx);
+        let operation = shell
+            .update(cx, |shell, _| shell.take_client_commands())
+            .into_iter()
+            .find_map(|command| match command {
+                WireCommand::AnswerQuestion { operation, .. } => Some(operation),
+                _ => None,
+            })
+            .unwrap();
+        let connection = shell.read(cx).retire_recording_question_connection();
+        shell.update(cx, |shell, cx| {
+            shell.apply_client_update(
+                Update::Questions(State {
+                    connection,
+                    open: vec![question.clone()],
+                    blocked: std::collections::HashSet::from([question.id.clone()]),
+                    ..State::default()
+                }),
+                window,
+                cx,
+            );
+            shell.apply_client_update(
+                Update::QuestionAnswer {
+                    connection: connection - 1,
+                    operation,
+                    question_id: question.id.clone(),
+                    outcome: Outcome::Accepted,
+                },
+                window,
+                cx,
+            );
+            shell.apply_client_update(
+                Update::Questions(State {
+                    connection: connection - 1,
+                    open: vec![question],
+                    ..State::default()
+                }),
+                window,
+                cx,
+            );
+        });
+        window.render_frame(cx);
+        assert_eq!(window.find("question-submit").disabled(), Some(true));
+        assert_ne!(
+            window.find_by_label("Your answer").disabled(),
+            Some(true),
+            "old waiting state must be retired so text stays editable/copyable"
+        );
+        assert!(window
+            .find("questions-notice")
+            .value()
+            .unwrap()
+            .contains("outcome unknown"));
+        window.click("question-submit", cx);
+        assert!(!shell
+            .update(cx, |shell, _| shell.take_client_commands())
+            .iter()
+            .any(|command| matches!(command, WireCommand::AnswerQuestion { .. })));
     });
 }

@@ -22,8 +22,10 @@ Resume/Abandon for a confirmed paused or interrupted Run,
 and displays read-only Tools, recorded Run Metrics, Proposals and Settings.
 Arrow keys browse resource entries; Copy details copies all returned fields
 as JSON. Loaded-text Search keeps its explicit Session scope. Existing pending
-decisions are reported from events and snapshots, with a handoff to the TUI;
-native decision forms are not implemented. The desktop never starts a daemon
+questions are available in the Profile-wide Questions command/header entry,
+with structured single/multi-choice and multiline free text. Their Session
+identity stays explicit even while another Session is displayed. Existing
+approvals retain their TUI handoff. The desktop never starts a daemon
 or reads its database, credentials or configuration files.
 
 The current protocol has no snapshot watermark or token offset. This client
@@ -51,6 +53,18 @@ clear the composer draft. Recovery requests target the Session and cannot be
 conditioned on the displayed Run ID with the current protocol.
 Restarting the app is not a safe retry mechanism. OS pipe-write cancellation
 and native Windows/Linux behavior still require platform validation.
+
+Question answers require an explicit Submit and a positive `answered` reply.
+A closed question is not reported as accepted. Ambiguous replies or a
+disconnect after an answer write retain its unknown outcome and block retrying
+that question; another action's
+ACK cannot clear it or an unknown Send. Draft answers remain copyable after
+closure, bounded to 16 questions and 4 MiB in this window (not persisted).
+Each free-text field is limited to 64 KiB; oversized committed edits are
+rejected whole. Existing questions reload through a Session snapshot, so open
+a Session after connecting to restore them; new question events are global.
+Unsupported definitions and exhausted native recovery limits explicitly
+handoff to the TUI. These forms do not implement security approval semantics.
 
 The optional `daemon-tests` feature links the daemon only into the test build.
 The normal desktop graph does not embed the daemon or depend on the TUI.
@@ -110,6 +124,8 @@ not see GPUI. Run every command below from this directory.
 | `src/commands.rs` | Typed shell command registry and palette search | none |
 | `src/replies.rs` | Read-only, validated `ListSessions` / `GetSession` decoding | none |
 | `src/forecast.rs` | Validation and bounded presentation of daemon forecast quotes; estimates and consent remain daemon-owned | none |
+| `src/questions.rs` | Profile-wide question identity, validated answers and bounded close-event tombstones | none |
+| `src/shell/questions.rs` | Native question review, bounded answer drafts, input, focus and acknowledgement states | `gui` feature |
 | `src/transcript.rs` | Pure transcript event application, canonical completion replacement and sticky reload-needed state; a trusted in-memory shell seam uses it, with no transport | none |
 | `src/snapshot_guard.rs` | Unwired local Session/attachment/request ownership guard; stale replies refused before decoding, observed event overlap requests retry, no transport-ordering guarantee | none |
 | `src/full_view.rs` | Grapheme-safe, measured-width row index with bounded shaping candidates for the full-output view | none |
