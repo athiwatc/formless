@@ -1013,6 +1013,25 @@ formless/
 
 ## 12. Development
 
+The [CI workflow](.github/workflows/ci.yml) runs on the self-hosted macOS ARM64
+runner for pushes to `main`, same-repository pull requests targeting `main`, and
+manual dispatches. It checks Rust formatting and Clippy, runs workspace tests
+(including doc tests), relay/web Node tests, relay wire conformance and offline
+documentation/tooling tests, then builds the release workspace and smoke-tests
+the CLI, man page and shell completions. Tested binaries, generated assets and
+diagnostic logs are retained as workflow artifacts for seven days. Clippy uses
+the development command below; existing warnings are reported without being
+promoted to errors. Fork pull requests are skipped on the persistent runner.
+
+The runner needs the standard `self-hosted`, `macOS`, `ARM64` labels, Xcode
+Command Line Tools, Git, Rustup and outbound access for GitHub Actions, Cargo,
+Node and Python downloads. CI installs stable Rust with rustfmt/Clippy, Node 24
+and Python 3.12. Cargo dependencies are cached; application data/config and logs
+use private temporary directories that are cleaned after the job. This workflow
+does not deploy or publish a release; release packaging remains in `release.yml`.
+Live external-link checks remain in `docs.yml`; Playwright browser checks in
+`relay/README.md` remain separate manual checks.
+
 ```bash
 cargo build --workspace                # debug build of the single binary
 cargo test --workspace                 # unit + integration tests

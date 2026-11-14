@@ -1,0 +1,155 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  build-test:
+    name: Build and test (macOS ARM64)
+    # Never execute fork contributions on the persistent self-hosted machine.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Create private job directories
+        run: |
+          set -euo pipefail
+          test "$(uname -s)" = Darwin
+          test "$(uname -m)" = arm64
+          ci_dir=$(mktemp -d "$RUNNER_TEMP/formless-ci.XXXXXX")
+          mkdir -p "$ci_dir/cargo" "$ci_dir/data" "$ci_dir/config" "$ci_dir/logs" "$ci_dir/dist"
+          {
+            echo "CI_DIR=$ci_dir"
+            echo "CARGO_HOME=$ci_dir/cargo"
+            echo "CARGO_TARGET_DIR=$GITHUB_WORKSPACE/target"
+            echo "FORMLESS_DATA_DIR=$ci_dir/data"
+            echo "FORMLESS_CONFIG_DIR=$ci_dir/config"
+          } >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Restore Cargo dependency cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.CARGO_HOME }}/registry
+            ${{ env.CARGO_HOME }}/git
+          key: ci-cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ci-cargo-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Record tool versions
+        run: |
+          rustc -Vv
+          cargo --version
+          node --version
+          python3 --version
+          bash scripts/ci-storage-budget.sh snapshot before-checks
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (all workspace targets)
+        run: cargo clippy --workspace --all-targets --locked 2>&1 | tee "$CI_DIR/logs/clippy.log"
+
+      - name: Relay and web regression tests
+        run: node --test relay/*.test.mjs 2>&1 | tee "$CI_DIR/logs/relay.log"
+
+      - name: Relay wire conformance
+        run: node relay/conformance.mjs 2>&1 | tee "$CI_DIR/logs/conformance.log"
+
+      - name: Offline documentation and tooling tests
+        run: |
+          set -euo pipefail
+          for suite in scripts/test-doc-links.py scripts/test-inventory.py scripts/test-eval-tool-use.py scripts/test-aur-completions.py; do
+            python3 "$suite" 2>&1 | tee "$CI_DIR/logs/$(basename "$suite").log"
+          done
+
+      - name: Workspace unit, integration and doc tests
+        run: cargo test --workspace --locked --no-fail-fast 2>&1 | tee "$CI_DIR/logs/rust-tests.log"
+
+      - name: Reclaim completed debug artifacts
+        run: bash scripts/ci-storage-budget.sh clean-debug
+
+      - name: Build release workspace
+        run: cargo build --workspace --release --locked 2>&1 | tee "$CI_DIR/logs/release.log"
+
+      - name: Smoke test release binary and generated assets
+        run: |
+          set -euo pipefail
+          binary="$CARGO_TARGET_DIR/release/formless"
+          "$binary" --version
+          "$binary" --help > "$CI_DIR/dist/help.txt"
+          "$binary" man > "$CI_DIR/dist/formless.1"
+          for completion_shell in bash zsh fish; do
+            "$binary" completions "$completion_shell" > "$CI_DIR/dist/formless.$completion_shell"
+            test -s "$CI_DIR/dist/formless.$completion_shell"
+          done
+          test -s "$CI_DIR/dist/help.txt"
+          test -s "$CI_DIR/dist/formless.1"
+          cp "$binary" LICENSE "$CI_DIR/dist/"
+          (cd "$CI_DIR/dist" && shasum -a 256 formless > formless.sha256 && shasum -a 256 -c formless.sha256)
+
+      - name: Upload tested release binary and generated assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: formless-macos-arm64-${{ github.sha }}
+          path: ${{ env.CI_DIR }}/dist/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload diagnostic logs
+        if: ${{ always() && env.CI_DIR != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.CI_DIR }}/logs/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Final storage report
+        if: ${{ always() && env.CI_DIR != '' }}
+        run: bash scripts/ci-storage-budget.sh snapshot job-finished
+
+      - name: Clean private job directories
+        if: ${{ always() && env.CI_DIR != '' }}
+        run: |
+          case "$CI_DIR" in
+            "$RUNNER_TEMP"/formless-ci.*) rm -rf -- "$CI_DIR" ;;
+            *) echo 'Refusing cleanup outside the private CI directory' >&2; exit 1 ;;
+          esac
