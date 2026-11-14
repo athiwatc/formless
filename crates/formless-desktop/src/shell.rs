@@ -33,6 +33,7 @@ use gpui_kit::{
 use crate::client::{self, Client, Command as ClientCommand, Update as ClientUpdate};
 use crate::commands::{self, Command};
 use crate::directory::{self, Directory};
+use crate::forecast;
 use crate::full_view;
 use crate::memory::{
     edit_span, format_bytes, limits, paste_can_never_fit, snap_to_graphemes, within_composer_limit,
@@ -72,6 +73,7 @@ gpui_kit::actions!(
         SelectNextCommand,
         RunSelectedCommand,
         ClosePalette,
+        CloseForecast,
         ScrollViewerUp,
         ScrollViewerDown,
         ScrollViewerPageUp,
@@ -96,6 +98,7 @@ const SESSION_LIST_CONTEXT: &str = "FormlessSessionList";
 const OVERLAY_CONTEXT: &str = "FormlessOverlay";
 const INSPECTOR_CONTEXT: &str = "FormlessInspector";
 const PALETTE_CONTEXT: &str = "FormlessPalette";
+const FORECAST_CONTEXT: &str = "FormlessForecast";
 const VIEWER_CONTEXT: &str = "FormlessViewer";
 const RESOURCE_CONTEXT: &str = "FormlessResource";
 const VIEWER_DESCRIPTION: &str =
@@ -156,6 +159,13 @@ pub fn bind_keys(cx: &mut App) {
     });
     cx.bind_keys(global.collect::<Vec<_>>());
     cx.bind_keys([
+        KeyBinding::new("escape", CloseForecast, Some(FORECAST_CONTEXT)),
+        KeyBinding::new("up", ScrollViewerUp, Some(FORECAST_CONTEXT)),
+        KeyBinding::new("down", ScrollViewerDown, Some(FORECAST_CONTEXT)),
+        KeyBinding::new("pageup", ScrollViewerPageUp, Some(FORECAST_CONTEXT)),
+        KeyBinding::new("pagedown", ScrollViewerPageDown, Some(FORECAST_CONTEXT)),
+        KeyBinding::new("home", ScrollViewerStart, Some(FORECAST_CONTEXT)),
+        KeyBinding::new("end", ScrollViewerEnd, Some(FORECAST_CONTEXT)),
         KeyBinding::new("down", SearchNext, Some(SEARCH_CONTEXT)),
         KeyBinding::new("up", SearchPrevious, Some(SEARCH_CONTEXT)),
         KeyBinding::new("enter", SearchOpen, Some(SEARCH_CONTEXT)),
@@ -387,6 +397,14 @@ enum Modal {
     Palette,
     /// The full-output view of one block.
     Viewer,
+    Forecast,
+}
+
+struct ForecastDialog {
+    prepared: Box<forecast::Prepared>,
+    summary: Vec<String>,
+    details: String,
+    waiting: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -542,6 +560,11 @@ pub struct Shell {
     client_attention: bool,
     client_recovery: Option<crate::replies::UnfinishedRun>,
     client_sessions: Vec<SessionInfo>,
+    forecast: Option<ForecastDialog>,
+    forecast_composing: bool,
+    forecast_focus: FocusHandle,
+    forecast_cancel_focus: FocusHandle,
+    forecast_scroll: ScrollHandle,
     resource_pages: HashMap<Destination, crate::pages::Page>,
     resource_scroll: gpui_kit::UniformListScrollHandle,
     resource_revision: u64,
@@ -704,6 +727,11 @@ impl Shell {
             client_attention: false,
             client_recovery: None,
             client_sessions: Vec::new(),
+            forecast: None,
+            forecast_composing: false,
+            forecast_focus: cx.focus_handle(),
+            forecast_cancel_focus: cx.focus_handle(),
+            forecast_scroll: ScrollHandle::new(),
             resource_pages: HashMap::new(),
             resource_scroll: gpui_kit::UniformListScrollHandle::new(),
             resource_revision: 0,
@@ -834,6 +862,7 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.invalidate_forecast(cx);
         let had_focus = self.composer.focus_handle(cx).contains_focused(window, cx);
         let (composer, subscriptions) = Self::build_composer(text, window, cx);
         self.composer = composer;
@@ -875,6 +904,13 @@ impl Shell {
             return;
         }
         let draft = self.draft(cx);
+        let composing = self.composer.update(cx, |composer, cx| {
+            composer.marked_text_range(window, cx).is_some()
+        });
+        if draft != self.accepted_draft || composing != self.forecast_composing {
+            self.invalidate_forecast(cx);
+        }
+        self.forecast_composing = composing;
         if draft == self.accepted_draft {
             return;
         }
@@ -884,9 +920,6 @@ impl Shell {
         // Text still being composed by an input method is not judged: taking
         // it back mid-composition would fight the input method. It is judged
         // the moment the composition ends, committed or not.
-        let composing = self.composer.update(cx, |composer, cx| {
-            composer.marked_text_range(window, cx).is_some()
-        });
         if composing {
             return;
         }
@@ -1081,7 +1114,9 @@ impl Shell {
     /// What holds the window modally in `layout`: the palette, which is
     /// always on top, or a panel overlay.
     fn current_modal(&self, layout: Layout) -> Option<Modal> {
-        if self.palette.is_some() {
+        if self.forecast.is_some() {
+            Some(Modal::Forecast)
+        } else if self.palette.is_some() {
             Some(Modal::Palette)
         } else if self.viewer.is_some() {
             Some(Modal::Viewer)
@@ -1348,18 +1383,50 @@ impl Shell {
         if self.client.is_some() {
             self.composer_notice =
                 Some("Action queued; waiting for daemon acknowledgement. Draft kept.".into());
-            self.client_request(ClientCommand::Intent(intent), cx);
+            if intent.starts_work() {
+                let draft = self.draft(cx).to_string();
+                if let Some(client) = &self.client {
+                    if let Err(error) = client.review(intent, draft) {
+                        self.composer_notice = Some(format!("{error} Draft kept.").into());
+                    }
+                }
+            } else {
+                self.invalidate_forecast(cx);
+                self.client_request(ClientCommand::Intent(intent), cx);
+            }
         }
         cx.notify();
     }
 
     pub fn connect_daemon(&mut self, endpoint: client::Endpoint, cx: &mut Context<Self>) {
-        self.client = Some(Client::start(endpoint));
+        self.attach_client(Client::start(endpoint), cx);
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn connect_recording_daemon(&mut self, cx: &mut Context<Self>) {
+        self.attach_client(Client::recording(), cx);
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn take_client_commands(&mut self) -> Vec<ClientCommand> {
+        self.client
+            .as_mut()
+            .map(Client::take_recorded)
+            .unwrap_or_default()
+    }
+
+    pub fn client_epoch(&self) -> Option<u64> {
+        self.client.as_ref().map(Client::epoch)
+    }
+
+    fn attach_client(&mut self, client: Client, cx: &mut Context<Self>) {
+        self.client = Some(client);
         self.client_connected = false;
         self.client_snapshot_ready = false;
         self.client_status = "Connecting to the local Daemon Core…".into();
         self.client_attention = false;
         self.client_recovery = None;
+        self.forecast = None;
         self.invalidate_source_view();
         self.transcript_source = TranscriptSource::NotLoaded;
         self.transcript_state = None;
@@ -1385,7 +1452,110 @@ impl Shell {
         cx.notify();
     }
 
+    fn invalidate_forecast(&mut self, cx: &mut Context<Self>) {
+        if let Some(client) = &self.client {
+            client.invalidate_context();
+        }
+        if self.forecast.take().is_some() {
+            self.composer_notice =
+                Some("Forecast cancelled. Nothing was started; draft kept.".into());
+        }
+        cx.notify();
+    }
+
+    fn cancel_forecast(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.invalidate_forecast(cx);
+        self.settle(window, cx);
+    }
+
+    fn preparation_current(
+        &self,
+        prepared: &forecast::Prepared,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.client_connected
+            && self.client_snapshot_ready
+            && self
+                .client
+                .as_ref()
+                .is_some_and(|client| client.epoch() == prepared.epoch)
+            && self.client_generation == prepared.generation
+            && self.sidebar.active_id() == Some(prepared.session_id.as_str())
+            && self.draft(cx).as_ref() == prepared.draft_basis
+            && self.composer.update(cx, |composer, cx| {
+                composer.marked_text_range(window, cx).is_none()
+            })
+            && forecast::validate(&prepared.session_id, &prepared.quote).is_ok()
+            && match prepared.label {
+                "Resume" => self
+                    .client_recovery
+                    .as_ref()
+                    .is_some_and(|run| run.recoverable()),
+                "Send" | "Steer" | "Queue" => true,
+                _ => false,
+            }
+    }
+
+    fn confirm_forecast(&mut self, id: uuid::Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(dialog) = self
+            .forecast
+            .as_ref()
+            .filter(|dialog| dialog.prepared.id == id && !dialog.waiting)
+        else {
+            return;
+        };
+        if !self.preparation_current(&dialog.prepared, window, cx) {
+            self.cancel_forecast(window, cx);
+            return;
+        }
+        match self
+            .client
+            .as_ref()
+            .expect("current preparation has a client")
+            .send(ClientCommand::ConfirmPrepared(id))
+        {
+            Ok(()) => {
+                if let Some(dialog) = &mut self.forecast {
+                    dialog.waiting = true;
+                }
+            }
+            Err(error) => {
+                self.cancel_forecast(window, cx);
+                self.composer_notice =
+                    Some(format!("{error} Nothing was started; draft kept.").into());
+            }
+        }
+        cx.notify();
+    }
+
+    fn commit_prepared(&mut self, id: uuid::Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        let result = self
+            .client
+            .as_ref()
+            .ok_or("Not connected")
+            .and_then(|client| client.send(ClientCommand::CommitPrepared(id)));
+        let was_modal = self.forecast.take().is_some();
+        match result {
+            Ok(()) => {
+                self.composer_notice = Some("Submitting the reviewed action. Draft kept.".into())
+            }
+            Err(error) => {
+                self.invalidate_forecast(cx);
+                self.composer_notice = Some(
+                    format!("{error} Nothing was started; draft kept. Try again explicitly.")
+                        .into(),
+                );
+            }
+        }
+        if was_modal {
+            self.settle(window, cx);
+        }
+        cx.notify();
+    }
+
     fn client_select(&mut self, cx: &mut Context<Self>) {
+        self.invalidate_forecast(cx);
         self.client_snapshot_ready = false;
         self.client_recovery = None;
         self.client_generation = self
@@ -1437,6 +1607,10 @@ impl Shell {
                 self.client_connected = ready;
                 self.client_status = notice;
                 if !ready {
+                    self.forecast = None;
+                    if self.modal == Some(Modal::Forecast) {
+                        self.settle(window, cx);
+                    }
                     self.client_snapshot_ready = false;
                     self.sidebar
                         .replace(&self.client_sessions, &HashSet::new(), false);
@@ -1595,6 +1769,79 @@ impl Shell {
                 }
             }
             ClientUpdate::Notice(notice) => self.client_status = notice,
+            ClientUpdate::Prepared(prepared) => {
+                // A retired queued update must not cancel a newer forecast.
+                if self.client_epoch() != Some(prepared.epoch)
+                    || self.client_generation != prepared.generation
+                    || self.sidebar.active_id() != Some(prepared.session_id.as_str())
+                    || !self.client_connected
+                {
+                    return;
+                }
+                if self
+                    .forecast
+                    .as_ref()
+                    .is_some_and(|dialog| dialog.prepared.id == prepared.id)
+                {
+                    return;
+                }
+                if !self.preparation_current(&prepared, window, cx) {
+                    self.invalidate_forecast(cx);
+                    self.composer_notice = Some("The action changed while its forecast loaded. Nothing was started; draft kept.".into());
+                    return;
+                }
+                if !prepared.quote.confirmation_required {
+                    self.commit_prepared(prepared.id, window, cx);
+                } else {
+                    self.palette = None;
+                    self.viewer = None;
+                    self.prefs.close_overlays();
+                    let summary = forecast::summary(&prepared.quote);
+                    let details = serde_json::to_string_pretty(&prepared.quote)
+                        .expect("forecast is serializable");
+                    self.forecast = Some(ForecastDialog {
+                        prepared,
+                        summary,
+                        details,
+                        waiting: false,
+                    });
+                    self.forecast_scroll.scroll_to_item(0);
+                    self.settle(window, cx);
+                }
+            }
+            ClientUpdate::PreparationReady { id, epoch } => {
+                if let Some(dialog) = self
+                    .forecast
+                    .as_ref()
+                    .filter(|dialog| dialog.prepared.id == id && dialog.prepared.epoch == epoch)
+                {
+                    if self.preparation_current(&dialog.prepared, window, cx) {
+                        self.commit_prepared(id, window, cx);
+                    } else {
+                        self.cancel_forecast(window, cx);
+                    }
+                }
+            }
+            ClientUpdate::PreparationFailed { id, epoch, error } => {
+                if self
+                    .client
+                    .as_ref()
+                    .is_some_and(|client| client.epoch() == epoch)
+                {
+                    if self
+                        .forecast
+                        .as_ref()
+                        .is_some_and(|dialog| dialog.prepared.id == id)
+                    {
+                        self.forecast = None;
+                        self.settle(window, cx);
+                    }
+                    self.composer_notice = Some(
+                        format!("Forecast unavailable: {error}. Nothing was started; draft kept.")
+                            .into(),
+                    );
+                }
+            }
         }
         cx.notify();
     }
@@ -2118,6 +2365,18 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<&'static str> {
+        if self.forecast.is_some()
+            && matches!(
+                command,
+                Command::Send
+                    | Command::SendSecondary
+                    | Command::ResumeRun
+                    | Command::AbandonRun
+                    | Command::Stop
+            )
+        {
+            return Some("Confirm or cancel the open forecast first");
+        }
         let state = self.command_state(window, cx);
         if let Some(reason) = commands::entry(command, &state).disabled_reason {
             // Other refusals are as silent as they always were, but a
@@ -2183,6 +2442,7 @@ impl Shell {
     /// field. A panel overlay that is open closes: one modal at a time.
     /// Focus goes back to where it was when the palette closes.
     pub fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.invalidate_forecast(cx);
         if self.palette.is_some() {
             return;
         }
@@ -2441,6 +2701,7 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.invalidate_forecast(cx);
         if self.viewer.take().is_some() {
             self.restore_focus = None;
         }
@@ -2547,12 +2808,16 @@ impl Shell {
                 window.focus(&self.viewer_focus, cx);
                 cx.notify();
             }
+            Modal::Forecast => {
+                window.focus(&self.forecast_cancel_focus, cx);
+                cx.notify();
+            }
         }
     }
 
     fn cycle_region(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
         // The palette and the full-output view trap the cycle too.
-        if let Some(modal @ (Modal::Palette | Modal::Viewer)) =
+        if let Some(modal @ (Modal::Palette | Modal::Viewer | Modal::Forecast)) =
             self.current_modal(self.layout(window))
         {
             self.focus_modal(modal, window, cx);
@@ -2626,6 +2891,7 @@ impl Shell {
     }
 
     fn toggle_panel(&mut self, region: Region, window: &mut Window, cx: &mut Context<Self>) {
+        self.invalidate_forecast(cx);
         let width = self.effective_width(window);
         match region {
             Region::Sidebar => self.prefs.toggle_sidebar(width),
@@ -3868,7 +4134,7 @@ impl Shell {
                         let preview: String = chars.by_ref().take(500).collect();
                         readable("unfinished-run-error", format!("{preview}{}", if chars.next().is_some() { "… (details in the TUI)" } else { "" })).text_sm()
                     }))
-                    .child(readable("run-recovery-help", "Resume continues from the saved transcript. A cost confirmation may require the TUI. Abandon ends recovery without sending your draft.").text_sm())
+                    .child(readable("run-recovery-help", "Resume continues from the saved transcript and reviews any required cost confirmation here. Recovery targets the Session; the daemon does not condition it on this displayed Run ID. Abandon ends recovery without sending your draft.").text_sm())
                     .child(h_flex().flex_wrap().gap_2()
                         .child(div().id("resume-anchor").pt_1().anchor_scroll(Some(self.resume_anchor.clone())).child(button("run-resume", Command::ResumeRun, cx).outline().track_focus(&self.resume_focus)))
                         .child(div().id("abandon-anchor").pt_1().anchor_scroll(Some(self.abandon_anchor.clone())).child(button("run-abandon", Command::AbandonRun, cx).outline().track_focus(&self.abandon_focus))))
@@ -4233,9 +4499,18 @@ impl Shell {
 
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self
+            .forecast
+            .as_ref()
+            .is_some_and(|dialog| self.client_epoch() != Some(dialog.prepared.epoch))
+        {
+            self.forecast = None;
+        }
         // Snapshot replacement has no Window parameter. Finish the modal
         // dismissal/focus fallback here, before stale rows can be drawn.
-        if self.modal == Some(Modal::Viewer) && self.viewer.is_none() {
+        if (self.modal == Some(Modal::Viewer) && self.viewer.is_none())
+            || (self.modal == Some(Modal::Forecast) && self.forecast.is_none())
+        {
             self.settle(window, cx);
         }
         self.commands = self.command_state(window, cx);
@@ -4298,10 +4573,123 @@ impl Render for Shell {
             .when(self.palette.is_some(), |shell| {
                 shell.child(self.render_palette(window, cx))
             })
+            .when(self.forecast.is_some(), |shell| {
+                shell.child(self.render_forecast(window, cx))
+            })
     }
 }
 
 impl Shell {
+    fn scroll_forecast(&mut self, lines: f32, page: bool, cx: &mut Context<Self>) {
+        if self.forecast.is_none() {
+            return;
+        }
+        let amount = if page {
+            self.forecast_scroll
+                .bounds()
+                .size
+                .height
+                .max(self.scaled(40.))
+        } else {
+            self.scaled(40.)
+        };
+        let offset = self.forecast_scroll.offset();
+        let y = (offset.y + amount * lines).clamp(-self.forecast_scroll.max_offset().y, px(0.));
+        self.forecast_scroll.set_offset(point(offset.x, y));
+        cx.notify();
+    }
+
+    fn render_forecast(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let dialog = self.forecast.as_ref().expect("forecast is open");
+        let id = dialog.prepared.id;
+        let viewport = window.viewport_size();
+        let margin = px(16.);
+        let title = format!("Confirm {}", dialog.prepared.label);
+        let footer = h_flex()
+            .flex_shrink_0()
+            .flex_wrap()
+            .gap_2()
+            .child(
+                Button::new("forecast-cancel")
+                    .label("Cancel")
+                    .tooltip("Cancel and keep the draft")
+                    .track_focus(&self.forecast_cancel_focus)
+                    .on_click(cx.listener(|this, _, window, cx| this.cancel_forecast(window, cx))),
+            )
+            .child(
+                Button::new("forecast-copy")
+                    .label("Copy details")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(dialog) = &this.forecast {
+                            cx.write_to_clipboard(ClipboardItem::new_string(
+                                dialog.details.clone(),
+                            ));
+                        }
+                    })),
+            )
+            .child(
+                Button::new("forecast-confirm")
+                    .label(format!("Confirm and {}", dialog.prepared.label))
+                    .primary()
+                    .disabled(dialog.waiting)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.confirm_forecast(id, window, cx)
+                    })),
+            );
+        let panel = v_flex().id("forecast-dialog").test_support().role(Role::Dialog)
+            .aria_label(title.clone()).aria_description("Modal. Local forecast, not a spending limit. Arrow and Page keys read the forecast. Tab reaches confirmation; Escape cancels and keeps the draft.")
+            .map(modal_dialog).key_context(FORECAST_CONTEXT)
+            .on_action(cx.listener(|this, _: &CloseForecast, window, cx| this.cancel_forecast(window, cx)))
+            .on_action(cx.listener(|this, _: &ScrollViewerUp, _, cx| this.scroll_forecast(1., false, cx)))
+            .on_action(cx.listener(|this, _: &ScrollViewerDown, _, cx| this.scroll_forecast(-1., false, cx)))
+            .on_action(cx.listener(|this, _: &ScrollViewerPageUp, _, cx| this.scroll_forecast(1., true, cx)))
+            .on_action(cx.listener(|this, _: &ScrollViewerPageDown, _, cx| this.scroll_forecast(-1., true, cx)))
+            .on_action(cx.listener(|this, _: &ScrollViewerStart, _, cx| { this.forecast_scroll.set_offset(point(px(0.), px(0.))); cx.notify(); }))
+            .on_action(cx.listener(|this, _: &ScrollViewerEnd, _, cx| { this.forecast_scroll.scroll_to_bottom(); cx.notify(); }))
+            .w(self.scaled(620.).min(viewport.width - margin * 2.))
+            .max_h(viewport.height - margin * 2.).p_3().gap_2()
+            .bg(cx.theme().popover).text_color(cx.theme().popover_foreground)
+            .border_1().border_color(cx.theme().border).rounded_lg().shadow_lg().occlude()
+            .child(readable("forecast-heading", title).text_lg().flex_shrink_0())
+            .child(v_flex().id("forecast-body").test_support().flex_1().min_h_0().overflow_y_scroll()
+                .track_scroll(&self.forecast_scroll).gap_2()
+                .when(dialog.waiting, |body| body.child(announced(div().id("forecast-waiting"))
+                    .test_support().role(Role::Label).aria_value("Confirming… Escape cancels.")
+                    .child("Confirming… Escape cancels.")))
+                .child(readable("forecast-session", format!("Session: {}", dialog.prepared.session_id)))
+                .child(readable("forecast-estimate-help", "Local estimates are not a spending limit. Nothing starts until this confirmation is acknowledged and the draft is rechecked."))
+                .children(dialog.summary.iter().enumerate().map(|(index, text)| readable(SharedString::from(format!("forecast-detail-{index}")), text.clone()).text_sm())))
+            .child(footer).focus_trap("forecast-dialog", &self.forecast_focus);
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .child(
+                div()
+                    .id("forecast-backdrop")
+                    .test_support()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .bg(cx.theme().overlay)
+                    .occlude()
+                    .on_click(cx.listener(|this, _, window, cx| this.cancel_forecast(window, cx))),
+            )
+            .child(
+                h_flex()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .justify_center()
+                    .items_start()
+                    .pt(margin)
+                    .child(panel),
+            )
+    }
+
     /// The row under the header where the shell is whole: docked panels on
     /// either side of the main part, and any overlay over all of it.
     fn render_body(

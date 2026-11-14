@@ -16,7 +16,7 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
 };
 use std::time::Duration;
@@ -28,6 +28,7 @@ use serde_json::Value;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc as queue, watch};
 
+use crate::forecast;
 use crate::model::{Destination, Intent};
 use crate::replies::{self, SessionSnapshot};
 
@@ -63,6 +64,16 @@ pub enum Update {
         session_id: String,
         result: Result<(), String>,
     },
+    Prepared(Box<forecast::Prepared>),
+    PreparationReady {
+        id: uuid::Uuid,
+        epoch: u64,
+    },
+    PreparationFailed {
+        id: uuid::Uuid,
+        epoch: u64,
+        error: String,
+    },
     Notice(String),
 }
 
@@ -74,6 +85,13 @@ pub enum Command {
     },
     Page(Destination),
     Intent(Intent),
+    Review {
+        intent: Intent,
+        draft_basis: String,
+        epoch: u64,
+    },
+    ConfirmPrepared(uuid::Uuid),
+    CommitPrepared(uuid::Uuid),
     CreateSession,
     Refresh,
 }
@@ -88,10 +106,14 @@ pub struct Client {
     updates: Receiver<Update>,
     stop: watch::Sender<bool>,
     ready: Arc<AtomicBool>,
+    epoch: Arc<AtomicU64>,
+    #[cfg(feature = "test-support")]
+    recorded: Option<queue::Receiver<Command>>,
 }
 
 impl Drop for Client {
     fn drop(&mut self) {
+        self.invalidate_context();
         let _ = self.stop.send(true);
     }
 }
@@ -103,12 +125,21 @@ impl Client {
         let (stop, cancelled) = watch::channel(false);
         let ready = Arc::new(AtomicBool::new(false));
         let worker_ready = ready.clone();
+        let epoch = Arc::new(AtomicU64::new(0));
+        let worker_epoch = epoch.clone();
         std::thread::spawn(move || {
             match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
             {
-                Ok(runtime) => runtime.block_on(worker(endpoint, rx, tx, cancelled, worker_ready)),
+                Ok(runtime) => runtime.block_on(worker(
+                    endpoint,
+                    rx,
+                    tx,
+                    cancelled,
+                    worker_ready,
+                    worker_epoch,
+                )),
                 Err(error) => {
                     let _ = tx.try_send(Update::Connection {
                         ready: false,
@@ -122,11 +153,25 @@ impl Client {
             updates,
             stop,
             ready,
+            epoch,
+            #[cfg(feature = "test-support")]
+            recorded: None,
         }
     }
 
     pub fn send(&self, command: Command) -> Result<(), &'static str> {
-        if matches!(command, Command::Intent(_) | Command::CreateSession) && !self.is_ready() {
+        if matches!(command, Command::Select { .. } | Command::Reconnect) {
+            self.invalidate_context();
+        }
+        if matches!(
+            command,
+            Command::Intent(_)
+                | Command::CreateSession
+                | Command::Review { .. }
+                | Command::ConfirmPrepared(_)
+                | Command::CommitPrepared(_)
+        ) && !self.is_ready()
+        {
             return Err("Not connected; the action was not queued.");
         }
         self.commands
@@ -140,6 +185,63 @@ impl Client {
     pub fn is_ready(&self) -> bool {
         self.ready.load(Ordering::Acquire)
     }
+
+    pub fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Acquire)
+    }
+
+    /// Synchronous invalidation cannot be lost to the bounded command queue.
+    pub fn invalidate_context(&self) {
+        advance_epoch(&self.epoch);
+    }
+
+    pub fn review(&self, intent: Intent, draft_basis: String) -> Result<(), &'static str> {
+        self.send(Command::Review {
+            intent,
+            draft_basis,
+            epoch: self.epoch(),
+        })
+    }
+
+    /// Serialized view fixture: no I/O, acknowledgements or invented results.
+    #[cfg(feature = "test-support")]
+    pub fn recording() -> Self {
+        let (commands, recorded) = queue::channel(QUEUE);
+        let (_, updates) = mpsc::sync_channel(QUEUE);
+        let (stop, _) = watch::channel(false);
+        Self {
+            commands,
+            updates,
+            stop,
+            ready: Arc::new(AtomicBool::new(true)),
+            epoch: Arc::new(AtomicU64::new(0)),
+            recorded: Some(recorded),
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn take_recorded(&mut self) -> Vec<Command> {
+        let mut commands = Vec::new();
+        if let Some(recorded) = &mut self.recorded {
+            while let Ok(command) = recorded.try_recv() {
+                commands.push(command);
+            }
+        }
+        commands
+    }
+}
+
+fn advance_epoch(epoch: &AtomicU64) {
+    let mut old = epoch.load(Ordering::Acquire);
+    loop {
+        let next = old
+            .checked_add(1)
+            .expect("prospective action epoch exhausted");
+        match epoch.compare_exchange_weak(old, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => break,
+            Err(current) => old = current,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -150,6 +252,8 @@ enum Pending {
     Snapshot { session_id: String, generation: u64 },
     Page(Destination),
     Action(Action),
+    Forecast(Box<Preparation>),
+    Consent(Box<Preparation>),
     Create,
 }
 
@@ -162,10 +266,39 @@ struct Action {
     session_id: String,
 }
 
+#[derive(Debug)]
+enum PreparationStage {
+    Forecast,
+    NeedsConsent(String),
+    Ready,
+}
+
+#[derive(Debug)]
+struct Preparation {
+    id: uuid::Uuid,
+    epoch: u64,
+    generation: u64,
+    active: Option<String>,
+    draft_basis: String,
+    intent: Intent,
+    stage: PreparationStage,
+}
+
+impl Preparation {
+    fn current(&self, engine: &Engine) -> bool {
+        engine.ready
+            && self.epoch == engine.epoch
+            && self.generation == engine.generation
+            && self.active == engine.active
+    }
+}
+
 /// Pure, connection-local correlation and invalidation state. The worker
 /// replaces this on reconnect; selection generations belong to the window.
 #[derive(Default)]
 struct Engine {
+    epoch: u64,
+    prepared: Option<Box<Preparation>>,
     next_id: u64,
     ready: bool,
     active: Option<String>,
@@ -179,6 +312,40 @@ struct Engine {
 }
 
 impl Engine {
+    fn blocked_by_unknown(&self, command: &Command, uncertain: &HashSet<Action>) -> bool {
+        let intent = match command {
+            Command::Intent(intent) | Command::Review { intent, .. } => Some(intent),
+            Command::CommitPrepared(id) => self
+                .prepared
+                .as_ref()
+                .filter(|work| work.id == *id)
+                .map(|work| &work.intent),
+            _ => None,
+        };
+        intent.is_some_and(|intent| {
+            intent.starts_work()
+                && uncertain.iter().any(|action| {
+                    action.session_id == intent.session_id() && !self.pending.values().any(|pending|
+                matches!(pending, Pending::Action(pending) if pending == action))
+                })
+        })
+    }
+    fn sync_epoch(&mut self, epoch: u64) {
+        self.epoch = epoch;
+        let (generation, active) = (self.generation, self.active.as_ref());
+        let current = |work: &Preparation| {
+            work.epoch == epoch && work.generation == generation && work.active.as_ref() == active
+        };
+        if self.prepared.as_ref().is_some_and(|work| !current(work)) {
+            self.prepared = None;
+        }
+        self.pending.retain(|_, pending| match pending {
+            Pending::Forecast(work) | Pending::Consent(work) => current(work),
+            _ => true,
+        });
+        self.outgoing
+            .retain(|request| self.pending.contains_key(&request.id));
+    }
     fn request(&mut self, request: Request, pending: Pending) {
         self.next_id = self
             .next_id
@@ -210,6 +377,7 @@ impl Engine {
     fn select(&mut self, session_id: Option<String>, generation: u64) {
         self.active = session_id;
         self.generation = generation;
+        self.sync_epoch(self.epoch);
         self.dirty_session = true;
         if self.ready {
             self.subscribe();
@@ -292,6 +460,74 @@ impl Engine {
             Command::CreateSession if self.ready => {
                 self.request(Request::CreateSession { name: None }, Pending::Create)
             }
+            Command::Review {
+                intent,
+                draft_basis,
+                epoch,
+            } if self.ready => {
+                if epoch != self.epoch || !intent.starts_work() {
+                    self.updates.push(Update::Notice(
+                        "The action changed before its forecast was requested. Draft kept.".into(),
+                    ));
+                    return;
+                }
+                if self.prepared.is_some() || self.pending.values().any(|pending| matches!(pending,
+                    Pending::Forecast(_) | Pending::Consent(_)
+                ) || matches!(pending, Pending::Action(action) if action.session_id == intent.session_id())) {
+                    self.updates.push(Update::Notice("Finish or cancel the current action first. Draft kept.".into()));
+                    return;
+                }
+                let input = forecast::input(&intent);
+                let work = Preparation {
+                    id: uuid::Uuid::new_v4(),
+                    epoch,
+                    generation: self.generation,
+                    active: self.active.clone(),
+                    draft_basis,
+                    intent,
+                    stage: PreparationStage::Forecast,
+                };
+                self.request(
+                    Request::ForecastRun {
+                        input,
+                        for_send: true,
+                    },
+                    Pending::Forecast(Box::new(work)),
+                );
+            }
+            Command::ConfirmPrepared(id) if self.ready => {
+                let Some(work) = self.prepared.take() else {
+                    return;
+                };
+                if work.id != id || !work.current(self) {
+                    self.prepared = Some(work);
+                    return;
+                }
+                match &work.stage {
+                    PreparationStage::NeedsConsent(consent) => self.request(
+                        Request::ConfirmForecast {
+                            id: consent.clone(),
+                        },
+                        Pending::Consent(work),
+                    ),
+                    _ => self.prepared = Some(work),
+                }
+            }
+            Command::CommitPrepared(id) if self.ready => {
+                let Some(work) = self.prepared.take() else {
+                    return;
+                };
+                if work.id != id
+                    || !work.current(self)
+                    || !matches!(work.stage, PreparationStage::Ready)
+                {
+                    self.prepared = Some(work);
+                    return;
+                }
+                // The view revalidated its exact draft/IME state before this
+                // commit. Neither a quote nor a consent ACK starts work itself.
+                self.command(Command::Intent(work.intent));
+            }
             Command::Intent(intent) if self.ready => {
                 if intent.starts_work() && self.pending.values().any(|pending|
                     matches!(pending, Pending::Action(action) if action.session_id == intent.session_id())) {
@@ -331,7 +567,11 @@ impl Engine {
                     }),
                 );
             }
-            Command::Intent(_) | Command::CreateSession => self.updates.push(Update::Notice(
+            Command::Intent(_)
+            | Command::CreateSession
+            | Command::Review { .. }
+            | Command::ConfirmPrepared(_)
+            | Command::CommitPrepared(_) => self.updates.push(Update::Notice(
                 "Not connected; the action was not sent. The draft was kept.".into(),
             )),
         }
@@ -479,6 +719,61 @@ impl Engine {
                     result: result.map(|_| ()),
                 });
             }
+            Pending::Forecast(mut work) => {
+                if !work.current(self) {
+                    return Ok(());
+                }
+                let quote = result
+                    .and_then(|value| {
+                        serde_json::from_value::<formless_protocol::RunForecast>(value)
+                            .map_err(|error| format!("Could not read the daemon forecast: {error}"))
+                    })
+                    .and_then(|quote| {
+                        forecast::validate(work.intent.session_id(), &quote)?;
+                        Ok(quote)
+                    });
+                match quote {
+                    Ok(quote) => {
+                        work.stage = if quote.confirmation_required {
+                            PreparationStage::NeedsConsent(
+                                quote.confirmation_id.clone().expect("validated consent id"),
+                            )
+                        } else {
+                            PreparationStage::Ready
+                        };
+                        self.updates
+                            .push(Update::Prepared(Box::new(forecast::Prepared {
+                                id: work.id,
+                                epoch: work.epoch,
+                                generation: work.generation,
+                                session_id: work.intent.session_id().into(),
+                                label: forecast::label(&work.intent),
+                                draft_basis: work.draft_basis.clone(),
+                                quote,
+                            })));
+                        self.prepared = Some(work);
+                    }
+                    Err(error) => self.updates.push(Update::PreparationFailed {
+                        id: work.id,
+                        epoch: work.epoch,
+                        error,
+                    }),
+                }
+            }
+            Pending::Consent(mut work) => {
+                if !work.current(self) {
+                    return Ok(());
+                }
+                match result.and_then(|value| if value["confirmed"] == true { Ok(()) }
+                    else { Err("The daemon did not acknowledge this forecast confirmation. Nothing was started.".into()) }) {
+                    Ok(()) => {
+                        work.stage = PreparationStage::Ready;
+                        self.updates.push(Update::PreparationReady { id: work.id, epoch: work.epoch });
+                        self.prepared = Some(work);
+                    }
+                    Err(error) => self.updates.push(Update::PreparationFailed { id: work.id, epoch: work.epoch, error }),
+                }
+            }
             Pending::Create => {
                 self.dirty_list = true;
                 self.updates.push(Update::Notice(match result {
@@ -584,6 +879,7 @@ async fn connected<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
     stop: &mut watch::Receiver<bool>,
     retained: &mut Retained,
     ready: &AtomicBool,
+    epoch: &AtomicU64,
 ) -> Result<(), String> {
     let Retained {
         active,
@@ -603,6 +899,7 @@ async fn connected<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
     let mut deadlines = HashMap::new();
     let mut last_poll = std::time::Instant::now();
     loop {
+        engine.sync_epoch(epoch.load(Ordering::Acquire));
         for id in engine.pending.keys() {
             deadlines.entry(*id).or_insert_with(std::time::Instant::now);
         }
@@ -626,18 +923,19 @@ async fn connected<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
         tokio::select! {
             biased;
             _ = stop.changed() => return Ok(()),
-            command = commands.recv() => match command {
+            command = commands.recv() => { engine.sync_epoch(epoch.load(Ordering::Acquire)); match command {
                 None => return Ok(()),
                 Some(Command::Reconnect) => return Err("Reconnecting at the user's request; actions are not retried.".into()),
                 Some(Command::Select { session_id, generation }) => { *active = (session_id.clone(), generation); engine.select(session_id, generation); }
                 Some(Command::Page(destination)) => { *page = Some(destination); engine.load_page(destination); }
-                Some(Command::Intent(intent)) if intent.starts_work() && uncertain.iter().any(|action| action.session_id == intent.session_id() && !engine.pending.values().any(|p| matches!(p, Pending::Action(pending) if pending == action))) => {
+                Some(command) if engine.blocked_by_unknown(&command, uncertain) => {
                     engine.updates.push(Update::Notice("A previous action's outcome is unknown. It was not retried: deduplication does not survive reconnect. Check this Session in the TUI before starting more work.".into()));
                 }
                 Some(command) => engine.command(command),
-            },
+            } },
             message = reader.next() => match message.map_err(|e| e.to_string())? {
                 Some(message) => {
+                    engine.sync_epoch(epoch.load(Ordering::Acquire));
                     let answered = match &message { ServerMessage::Response { id, .. } => match engine.pending.get(id) { Some(Pending::Action(action)) => Some(action.clone()), _ => None }, _ => None };
                     engine.receive(message)?;
                     ready.store(engine.ready, Ordering::Release);
@@ -662,6 +960,7 @@ async fn worker(
     tx: SyncSender<Update>,
     mut stop: watch::Receiver<bool>,
     ready: Arc<AtomicBool>,
+    epoch: Arc<AtomicU64>,
 ) {
     let mut retained = Retained::default();
     let mut delay = Duration::from_millis(250);
@@ -695,12 +994,13 @@ async fn worker(
         let result = tokio::select! {
             _ = stop.changed() => return,
             result = tokio::time::timeout(Duration::from_secs(2), opening) => match result {
-                Ok(Ok(stream)) => connected(stream, &mut commands, &tx, &mut stop, &mut retained, &ready).await,
+                Ok(Ok(stream)) => connected(stream, &mut commands, &tx, &mut stop, &mut retained, &ready, &epoch).await,
                 Ok(Err(error)) => Err(format!("Cannot connect: {error}. Start the existing daemon with the CLI.")),
                 Err(error) => Err(error.to_string()),
             }
         };
         ready.store(false, Ordering::Release);
+        advance_epoch(&epoch);
         if *stop.borrow() || commands.is_closed() {
             return;
         }
@@ -736,6 +1036,190 @@ mod tests {
     use super::*;
     use formless_protocol::{MessageInfo, SendMode};
     use serde_json::json;
+
+    fn prepare(engine: &mut Engine, required: bool) -> uuid::Uuid {
+        engine.command(Command::Review {
+            intent: Intent::SendMessage {
+                session_id: "a".into(),
+                content: "keep exact draft ไทย".into(),
+                mode: SendMode::Queue,
+            },
+            draft_basis: "keep exact draft ไทย".into(),
+            epoch: engine.epoch,
+        });
+        let request = engine.outgoing.pop_back().unwrap();
+        assert!(matches!(
+            request.request,
+            Request::ForecastRun { for_send: true, .. }
+        ));
+        respond(
+            engine,
+            request.id,
+            serde_json::to_value(crate::fixture::run_forecast("a", required)).unwrap(),
+        );
+        engine
+            .updates
+            .iter()
+            .find_map(|update| match update {
+                Update::Prepared(prepared) => Some(prepared.id),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn forecast_and_consent_replies_never_start_work_without_a_current_view_commit() {
+        for required in [false, true] {
+            let mut engine = ready();
+            let id = prepare(&mut engine, required);
+            assert!(engine.outgoing.is_empty(), "a quote must not send");
+            if required {
+                engine.command(Command::CommitPrepared(id));
+                assert!(engine.outgoing.is_empty(), "consent cannot be skipped");
+                engine.command(Command::ConfirmPrepared(id));
+                let request = engine.outgoing.pop_back().unwrap();
+                assert!(matches!(request.request, Request::ConfirmForecast { .. }));
+                respond(&mut engine, request.id, json!({"confirmed":true}));
+                assert!(engine.outgoing.is_empty(), "a consent ACK must not send");
+                assert!(engine.updates.iter().any(|update| matches!(update, Update::PreparationReady { id: got, .. } if *got == id)));
+            }
+            engine.command(Command::CommitPrepared(uuid::Uuid::new_v4()));
+            assert!(engine.outgoing.is_empty());
+            engine.command(Command::CommitPrepared(id));
+            engine.command(Command::CommitPrepared(id));
+            assert_eq!(
+                engine.outgoing.len(),
+                1,
+                "duplicate commits must not replay"
+            );
+            assert!(
+                matches!(&engine.outgoing[0].request, Request::SendMessage { content, mode: SendMode::Queue, .. } if content == "keep exact draft ไทย")
+            );
+        }
+    }
+
+    #[test]
+    fn changed_draft_selection_or_connection_retires_quotes_and_late_consent() {
+        for navigation in [false, true] {
+            let mut engine = ready();
+            let id = prepare(&mut engine, true);
+            engine.command(Command::ConfirmPrepared(id));
+            let confirm = engine.outgoing.pop_back().unwrap();
+            engine.updates.clear();
+            if navigation {
+                engine.select(Some("b".into()), 2);
+                engine.select(Some("a".into()), 3);
+            } else {
+                engine.sync_epoch(1);
+            }
+            respond(&mut engine, confirm.id, json!({"confirmed":true}));
+            engine.command(Command::CommitPrepared(id));
+            assert!(!engine
+                .outgoing
+                .iter()
+                .any(|request| matches!(request.request, Request::SendMessage { .. })));
+            assert!(!engine
+                .updates
+                .iter()
+                .any(|update| matches!(update, Update::PreparationReady { .. })));
+        }
+        let mut old = ready();
+        let id = prepare(&mut old, false);
+        let mut reconnected = ready();
+        reconnected.command(Command::CommitPrepared(id));
+        assert!(
+            reconnected.outgoing.is_empty(),
+            "connection-local preparation cannot survive reconnect"
+        );
+    }
+
+    #[test]
+    fn malformed_forecasts_and_rejected_consent_keep_the_action_uncommitted() {
+        let mut engine = ready();
+        engine.command(Command::Review {
+            intent: Intent::ResumeRun {
+                session_id: "a".into(),
+            },
+            draft_basis: "retained".into(),
+            epoch: 0,
+        });
+        let request = engine.outgoing.pop_back().unwrap();
+        assert!(
+            matches!(request.request, Request::ForecastRun { input, .. } if input.resume && input.draft.is_empty())
+        );
+        respond(
+            &mut engine,
+            request.id,
+            serde_json::to_value(crate::fixture::run_forecast("foreign", true)).unwrap(),
+        );
+        assert!(engine.prepared.is_none());
+        assert!(engine
+            .updates
+            .iter()
+            .any(|update| matches!(update, Update::PreparationFailed { .. })));
+        engine.updates.clear();
+        let id = prepare(&mut engine, true);
+        engine.command(Command::ConfirmPrepared(id));
+        let confirm = engine.outgoing.pop_back().unwrap();
+        engine
+            .receive(ServerMessage::err(confirm.id, "quote changed".into()))
+            .unwrap();
+        engine.command(Command::CommitPrepared(id));
+        assert!(engine.outgoing.is_empty());
+    }
+
+    #[test]
+    fn unknown_mutations_also_block_reviewed_work_and_prepared_commits() {
+        let mut engine = ready();
+        let id = prepare(&mut engine, false);
+        let uncertain = HashSet::from([Action {
+            id: uuid::Uuid::new_v4(),
+            session_id: "a".into(),
+        }]);
+        assert!(engine.blocked_by_unknown(&Command::CommitPrepared(id), &uncertain));
+        assert!(engine.blocked_by_unknown(
+            &Command::Review {
+                intent: Intent::ResumeRun {
+                    session_id: "a".into()
+                },
+                draft_basis: String::new(),
+                epoch: 0
+            },
+            &uncertain
+        ));
+        engine.sync_epoch(1);
+        assert!(engine.prepared.is_none());
+        assert!(engine.pending.is_empty());
+    }
+
+    #[test]
+    fn cancelling_a_quote_does_not_depend_on_command_queue_capacity() {
+        let (commands, _receiver) = queue::channel(QUEUE);
+        let (_, updates) = mpsc::sync_channel(QUEUE);
+        let (stop, _) = watch::channel(false);
+        let client = Client {
+            commands,
+            updates,
+            stop,
+            ready: Arc::new(AtomicBool::new(true)),
+            epoch: Arc::new(AtomicU64::new(0)),
+            #[cfg(feature = "test-support")]
+            recorded: None,
+        };
+        let mut engine = ready();
+        let id = prepare(&mut engine, false);
+        for _ in 0..QUEUE {
+            client.send(Command::Refresh).unwrap();
+        }
+        assert!(client.send(Command::ConfirmPrepared(id)).is_err());
+        client.invalidate_context();
+        engine.sync_epoch(client.epoch());
+        engine.command(Command::CommitPrepared(id));
+        assert!(
+            engine.outgoing.is_empty(),
+            "full queue cannot preserve a cancelled action"
+        );
+    }
 
     fn respond(engine: &mut Engine, id: u64, value: Value) {
         engine.receive(ServerMessage::ok(id, value)).unwrap();
@@ -1006,6 +1490,7 @@ mod tests {
         let (updates, _rx) = mpsc::sync_channel(QUEUE);
         let (_stop, mut cancelled) = watch::channel(false);
         let ready = AtomicBool::new(false);
+        let epoch = AtomicU64::new(0);
         let mut retained = Retained {
             active: (Some("a".into()), 1),
             ..Default::default()
@@ -1057,6 +1542,7 @@ mod tests {
                 &mut cancelled,
                 &mut retained,
                 &ready,
+                &epoch,
             ),
         )
         .await
@@ -1087,6 +1573,7 @@ mod tests {
             let (updates, rx) = mpsc::sync_channel(QUEUE);
             let (_stop, mut cancelled) = watch::channel(false);
             let ready = AtomicBool::new(false);
+            let epoch = AtomicU64::new(0);
             let peer = tokio::spawn(async move {
                 let retry = || {
                     Command::Intent(if resume {
@@ -1224,6 +1711,7 @@ mod tests {
                     &mut cancelled,
                     &mut retained,
                     &ready,
+                    &epoch,
                 )
                 .await;
                 peer.await.unwrap();

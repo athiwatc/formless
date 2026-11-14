@@ -168,6 +168,52 @@ pub fn huge_block(id: u64, bytes: usize) -> TimelineBlock {
     TimelineBlock::new(id, BlockKind::ToolSummary, markdown)
 }
 
+/// Synthetic quote for presentation/component tests, never a daemon reply.
+pub fn run_forecast(
+    session_id: &str,
+    confirmation_required: bool,
+) -> formless_protocol::RunForecast {
+    use formless_protocol::{ForecastBasis, ForecastRange, RunForecast};
+    RunForecast {
+        fingerprint: "fixture-fingerprint".into(),
+        basis: ForecastBasis {
+            provider_key: "fixture-provider".into(),
+            model: "fixture-model".into(),
+            role: "default".into(),
+            reasoning_effort: None,
+            session_id: Some(session_id.into()),
+            cwd_hash: "fixture-cwd".into(),
+            tools_hash: "fixture-tools".into(),
+            prompt_tokens: 100,
+        },
+        comparable_runs: 2,
+        comparables: Vec::new(),
+        steps: Some(ForecastRange { p50: 1., p90: 3. }),
+        tokens: Some(ForecastRange {
+            p50: 100.,
+            p90: 500.,
+        }),
+        cost_usd: Some(ForecastRange {
+            p50: 0.01,
+            p90: 0.05,
+        }),
+        duration_ms: Some(ForecastRange {
+            p50: 2000.,
+            p90: 10000.,
+        }),
+        context_tokens: 8192,
+        context_source: "fixture".into(),
+        will_compact: false,
+        compaction_probability: None,
+        cached_fraction: None,
+        unpriced: false,
+        warnings: Vec::new(),
+        confirmation_required,
+        confirmation_id: confirmation_required.then(|| "fixture-consent".into()),
+        hint: "Synthetic forecast for component tests; not a spending limit.".into(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

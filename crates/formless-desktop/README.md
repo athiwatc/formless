@@ -40,8 +40,15 @@ rejection, transport failure and navigation. Send deduplication in the daemon
 is connection-scoped: after an unacknowledged action, the client blocks another
 send for that Session in this window. Review the outcome and continue through
 the existing TUI. The same unknown-outcome guard blocks Resume. Resume uses the
-existing daemon admission path; if it requires a forecast confirmation, continue
-through the TUI. Recovery controls never send or clear the composer draft.
+existing daemon admission path. Send/Steer/Queue and Resume first request the
+daemon's forecast. Required consent opens a native dialog with Cancel focused,
+bounded estimates/warnings, keyboard scrolling and copyable quote details.
+Neither the quote nor the consent ACK starts work by itself: the view rechecks
+the exact draft, selection and IME state before committing the prepared action.
+Editing, cancellation, navigation or reconnect retires pending preparations;
+mutations are never automatically retried. Recovery controls never send or
+clear the composer draft. Recovery requests target the Session and cannot be
+conditioned on the displayed Run ID with the current protocol.
 Restarting the app is not a safe retry mechanism. OS pipe-write cancellation
 and native Windows/Linux behavior still require platform validation.
 
@@ -99,6 +106,7 @@ not see GPUI. Run every command below from this directory.
 | `src/search.rs` | Bounded literal matches in finished loaded text, byte-range results, source-revision validation and bounded grapheme-safe snippets | none |
 | `src/commands.rs` | Typed shell command registry and palette search | none |
 | `src/replies.rs` | Read-only, validated `ListSessions` / `GetSession` decoding | none |
+| `src/forecast.rs` | Validation and bounded presentation of daemon forecast quotes; estimates and consent remain daemon-owned | none |
 | `src/transcript.rs` | Pure transcript event application, canonical completion replacement and sticky reload-needed state; a trusted in-memory shell seam uses it, with no transport | none |
 | `src/snapshot_guard.rs` | Unwired local Session/attachment/request ownership guard; stale replies refused before decoding, observed event overlap requests retry, no transport-ordering guarantee | none |
 | `src/full_view.rs` | Grapheme-safe, measured-width row index with bounded shaping candidates for the full-output view | none |

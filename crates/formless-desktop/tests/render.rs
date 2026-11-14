@@ -75,7 +75,25 @@ mod render {
     const WHOLE: Fit = Fit::Whole;
     const REFLOWED: Fit = Fit::Reflowed;
 
-    const STATES: [State; 35] = [
+    const STATES: [State; 37] = [
+        state(
+            "daemon-forecast-light",
+            1440.,
+            900.,
+            LIGHT,
+            100,
+            Some("open-run-forecast"),
+            WHOLE,
+        ),
+        state(
+            "minimum-daemon-forecast-dark-200pct",
+            480.,
+            360.,
+            DARK,
+            200,
+            Some("open-run-forecast"),
+            REFLOWED,
+        ),
         state(
             "daemon-recovery-light",
             1440.,
@@ -723,11 +741,11 @@ mod render {
         } else if let Some(control) = click {
             cx.update_window(any, |_, window, cx| {
                 window.render_frame(cx);
-                if control == "open-run-recovery" {
-                    use formless_desktop::client::{Endpoint, Update};
+                if matches!(control, "open-run-recovery" | "open-run-forecast") {
+                    use formless_desktop::client::Update;
                     let sessions = fixture::sessions(3);
                     shell.update(cx, |shell, cx| {
-                        shell.connect_daemon(Endpoint(std::env::temp_dir().join(format!("absent-{}", uuid::Uuid::new_v4()))), cx);
+                        shell.connect_recording_daemon(cx);
                         shell.apply_client_update(Update::Connection { ready: true, notice: "Connected".into() }, window, cx);
                         shell.apply_client_update(Update::Sessions(sessions.clone()), window, cx);
                     });
@@ -740,20 +758,38 @@ mod render {
                     let generation = shell.read(cx).client_generation();
                     let snapshot = formless_desktop::replies::session_snapshot(&sessions[0].id,
                         &serde_json::json!({"session":{"id":sessions[0].id},"running":false,"messages":[],
-                            "unfinished_run":{"run_id":"interrupted-run","status":"interrupted","error":"The provider request was stopped."}})).unwrap();
+                            "unfinished_run": if control == "open-run-recovery" { serde_json::json!({"run_id":"interrupted-run","status":"interrupted","error":"The provider request was stopped."}) } else { serde_json::Value::Null }})).unwrap();
                     shell.update(cx, |shell, cx| {
                         shell.apply_client_update(Update::Snapshot { generation, snapshot }, window, cx);
                         shell.focus_section(PageSection::Composer, window, cx);
                     });
+                    if control == "open-run-forecast" {
+                        let prepared = {
+                            let state = shell.read(cx);
+                            let session_id = sessions[0].id.clone();
+                            let mut quote = fixture::run_forecast(&session_id, true);
+                            quote.warnings = vec!["Forecast warning ไทย 漢字 😀. Estimates are uncertain.".repeat(10); 12];
+                            Box::new(formless_desktop::forecast::Prepared {
+                                id: uuid::Uuid::new_v4(),
+                                epoch: state.client_epoch().unwrap(),
+                                generation,
+                                session_id,
+                                label: "Send",
+                                draft_basis: state.draft(cx).to_string(),
+                                quote,
+                            })
+                        };
+                        shell.update(cx, |shell, cx| shell.apply_client_update(Update::Prepared(prepared), window, cx));
+                    }
                 } else if control.starts_with("open-daemon-") {
-                    use formless_desktop::client::{Endpoint, Update};
+                    use formless_desktop::client::Update;
                     let destination = if control == "open-daemon-metrics" { Destination::Metrics } else { Destination::Tools };
                     let value = if destination == Destination::Metrics { serde_json::json!({"summary":{"recorded_runs":1,"prompt_tokens":10,"completion_tokens":20}, "runs":[{"run_id":"recorded-run","status":"completed","duration_ms":1250}]}) } else { serde_json::json!([
                         {"id":"tool-a","name":"Tool ไทย 漢字 😀","description":"Unicode data from the daemon view boundary"},
                         {"id":"tool-b","name":"Second Tool","schema":{"type":"object"}}
                     ]) };
                     shell.update(cx, |shell, cx| {
-                        shell.connect_daemon(Endpoint(std::env::temp_dir().join(format!("absent-{}", uuid::Uuid::new_v4()))), cx);
+                        shell.connect_recording_daemon(cx);
                         shell.apply_client_update(Update::Connection { ready: true, notice: "Connected · canonical messages · live token streaming unavailable".into() }, window, cx);
                         shell.apply_client_update(Update::Page { destination, result: Ok(value) }, window, cx);
                         shell.run_command(Command::GoTo(destination), window, cx);
@@ -800,6 +836,53 @@ mod render {
             })
             .expect("offscreen window is open");
             cx.run_until_parked();
+            if control == "open-run-forecast" {
+                cx.update_window(any, |_, window, cx| {
+                    window.render_frame(cx);
+                    assert_eq!(window.find("forecast-cancel").focused(), Some(true));
+                    for id in [
+                        "forecast-dialog",
+                        "forecast-cancel",
+                        "forecast-copy",
+                        "forecast-confirm",
+                    ] {
+                        assert!(
+                            inside(window, id, viewport),
+                            "{name}: {id} outside viewport: {:?}",
+                            window.find(id).bounds()
+                        );
+                    }
+                    let first = window.find("forecast-detail-0").bounds();
+                    window.press("end", cx);
+                    window.render_frame(cx);
+                    assert!(
+                        window.find("forecast-detail-0").bounds().top() < first.top(),
+                        "{name}: forecast cannot be read with keys"
+                    );
+                    window.press("home", cx);
+                    window.render_frame(cx);
+                })
+                .expect("offscreen window is open");
+                capture(&mut cx, "");
+                cx.update_window(any, |_, window, cx| {
+                    window.click("forecast-confirm", cx);
+                    window.render_frame(cx);
+                    assert_eq!(window.find("forecast-confirm").disabled(), Some(true));
+                    for id in [
+                        "forecast-dialog",
+                        "forecast-cancel",
+                        "forecast-copy",
+                        "forecast-confirm",
+                    ] {
+                        assert!(
+                            inside(window, id, viewport),
+                            "{name}: waiting {id} outside viewport"
+                        );
+                    }
+                })
+                .expect("offscreen window is open");
+                capture(&mut cx, "-waiting");
+            }
             if control == "open-run-recovery" {
                 for id in ["run-resume", "run-abandon"] {
                     cx.update_window(any, |_, window, cx| {
@@ -854,6 +937,7 @@ mod render {
             if fit == Fit::Reflowed
                 && !control.starts_with("open-daemon-")
                 && control != "open-run-recovery"
+                && control != "open-run-forecast"
             {
                 // The overlay panel is inside the window, edge to edge at
                 // most, whatever the page under it was scrolled to.
@@ -875,7 +959,9 @@ mod render {
                 })
                 .expect("offscreen window is open");
             }
-            capture(&mut cx, "");
+            if control != "open-run-forecast" {
+                capture(&mut cx, "");
+            }
         } else if fit == Fit::Whole {
             capture(&mut cx, "");
         }

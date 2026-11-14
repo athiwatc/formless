@@ -36,8 +36,8 @@ const WIDE: Size<Pixels> = Size {
     height: px(900.),
 };
 
-// Tests of the serialized view boundary. This endpoint deliberately does
-// not exist; transport behavior is exercised separately by tests/daemon.rs.
+// Tests of the serialized view boundary. The recording client performs no
+// I/O or acknowledgements; real transport is exercised by tests/daemon.rs.
 fn daemon_view(
     cx: &mut TestAppContext,
     handle: WindowHandle<Root>,
@@ -46,12 +46,7 @@ fn daemon_view(
     let sessions = fixture::sessions(3);
     step(cx, handle, |window, cx| {
         shell.update(cx, |shell, cx| {
-            shell.connect_daemon(
-                formless_desktop::client::Endpoint(
-                    std::env::temp_dir().join(format!("absent-{}", uuid::Uuid::new_v4())),
-                ),
-                cx,
-            );
+            shell.connect_recording_daemon(cx);
             shell.apply_client_update(
                 formless_desktop::client::Update::Connection {
                     ready: true,
@@ -151,6 +146,281 @@ fn daemon_view_revalidates_queued_snapshot_generations_and_disables_stale_sends(
         assert_eq!(shell.read(cx).block_count(), 1);
         assert_eq!(shell.read(cx).draft(cx).as_ref(), "unsent ไทย 😀");
     });
+}
+
+fn daemon_quote(
+    shell: &Entity<Shell>,
+    cx: &App,
+    required: bool,
+) -> Box<formless_desktop::forecast::Prepared> {
+    let state = shell.read(cx);
+    let session_id = state.sidebar().active_id().unwrap().to_string();
+    Box::new(formless_desktop::forecast::Prepared {
+        id: uuid::Uuid::new_v4(),
+        epoch: state.client_epoch().unwrap(),
+        generation: state.client_generation(),
+        quote: fixture::run_forecast(&session_id, required),
+        session_id,
+        label: "Send",
+        draft_basis: state.draft(cx).to_string(),
+    })
+}
+
+#[gpui_kit::test]
+fn native_forecast_requires_ack_and_current_draft_before_commit(cx: &mut TestAppContext) {
+    use formless_desktop::client::{Command as WireCommand, Update};
+    let (handle, shell) = open(cx, WIDE, 0, 0);
+    let sessions = daemon_view(cx, handle, &shell);
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        window.click(session_row_id(&sessions[0].id), cx);
+        let id = sessions[0].id.clone();
+        let generation = shell.read(cx).client_generation();
+        shell.update(cx, |shell, cx| {
+            shell.apply_client_update(
+                Update::Snapshot {
+                    generation,
+                    snapshot: replies::session_snapshot(
+                        &id,
+                        &serde_json::json!({"session":{"id":id},"running":false,"messages":[]}),
+                    )
+                    .unwrap(),
+                },
+                window,
+                cx,
+            );
+            shell.focus_section(PageSection::Composer, window, cx);
+            shell.take_client_commands();
+        });
+        window.input("confirm this ไทย 😀", cx);
+        window.render_frame(cx);
+        window.click("composer-primary", cx);
+        let commands = shell.update(cx, |shell, _| shell.take_client_commands());
+        assert!(commands.iter().any(|command| matches!(command, WireCommand::Review { intent: formless_desktop::model::Intent::SendMessage { content, .. }, draft_basis, .. } if content == "confirm this ไทย 😀" && content == draft_basis)));
+        assert!(!commands
+            .iter()
+            .any(|command| matches!(command, WireCommand::Intent(_))));
+        let prepared = daemon_quote(&shell, cx, true);
+        let action = prepared.id;
+        let epoch = prepared.epoch;
+        shell.update(cx, |shell, cx| {
+            shell.apply_client_update(Update::Prepared(prepared.clone()), window, cx)
+        });
+        window.render_frame(cx);
+        assert!(shell.read(cx).background_inert(window));
+        assert_eq!(window.find("forecast-cancel").focused(), Some(true));
+        window.press("f6", cx);
+        window.render_frame(cx);
+        assert_eq!(window.find("forecast-cancel").focused(), Some(true));
+        window.click("forecast-copy", cx);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(
+                &cx.read_from_clipboard().unwrap().text().unwrap()
+            )
+            .unwrap(),
+            serde_json::to_value(&prepared.quote).unwrap()
+        );
+        window.click("forecast-confirm", cx);
+        window.render_frame(cx);
+        let commands = shell.update(cx, |shell, _| shell.take_client_commands());
+        assert!(commands
+            .iter()
+            .any(|command| matches!(command, WireCommand::ConfirmPrepared(got) if *got == action)));
+        assert!(!commands
+            .iter()
+            .any(|command| matches!(command, WireCommand::CommitPrepared(_))));
+        shell.update(cx, |shell, cx| {
+            shell.apply_client_update(Update::Prepared(prepared.clone()), window, cx);
+            shell.apply_client_update(
+                Update::Action {
+                    session_id: id.clone(),
+                    result: Ok(()),
+                },
+                window,
+                cx,
+            );
+            shell.apply_client_update(
+                Update::PreparationReady {
+                    id: uuid::Uuid::new_v4(),
+                    epoch,
+                },
+                window,
+                cx,
+            );
+        });
+        window.render_frame(cx);
+        assert_eq!(window.find("forecast-confirm").disabled(), Some(true));
+        assert!(shell
+            .update(cx, |shell, _| shell.take_client_commands())
+            .is_empty());
+        shell.update(cx, |shell, cx| {
+            shell.apply_client_update(Update::PreparationReady { id: action, epoch }, window, cx)
+        });
+        window.render_frame(cx);
+        assert!(window.try_find("forecast-dialog").is_none());
+        assert!(shell
+            .update(cx, |shell, _| shell.take_client_commands())
+            .iter()
+            .any(|command| matches!(command, WireCommand::CommitPrepared(got) if *got == action)));
+        assert_eq!(shell.read(cx).draft(cx).as_ref(), "confirm this ไทย 😀");
+    });
+}
+
+#[gpui_kit::test]
+fn native_forecast_cancel_and_late_replies_cannot_commit_changed_input(cx: &mut TestAppContext) {
+    use formless_desktop::client::{Command as WireCommand, Update};
+    let (handle, shell) = open(cx, WIDE, 0, 0);
+    let sessions = daemon_view(cx, handle, &shell);
+    let old = step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        window.click(session_row_id(&sessions[0].id), cx);
+        let id = sessions[0].id.clone();
+        let generation = shell.read(cx).client_generation();
+        shell.update(cx, |shell, cx| {
+            shell.apply_client_update(
+                Update::Snapshot {
+                    generation,
+                    snapshot: replies::session_snapshot(
+                        &id,
+                        &serde_json::json!({"session":{"id":id},"running":false,"messages":[]}),
+                    )
+                    .unwrap(),
+                },
+                window,
+                cx,
+            );
+            shell.focus_section(PageSection::Composer, window, cx);
+        });
+        window.input("keep me", cx);
+        window.render_frame(cx);
+        let old = daemon_quote(&shell, cx, true);
+        shell.update(cx, |shell, cx| {
+            shell.apply_client_update(Update::Prepared(old.clone()), window, cx)
+        });
+        window.render_frame(cx);
+        window.press("escape", cx);
+        window.render_frame(cx);
+        assert!(window.try_find("forecast-dialog").is_none());
+        assert_eq!(window.find_by_label("Message").focused(), Some(true));
+        assert_ne!(shell.read(cx).client_epoch(), Some(old.epoch));
+        old
+    });
+    cx.run_until_parked();
+    let current = step(cx, handle, |window, cx| {
+        let current = daemon_quote(&shell, cx, true);
+        shell.update(cx, |shell, cx| {
+            shell.apply_client_update(Update::Prepared(current.clone()), window, cx);
+            shell.apply_client_update(Update::Prepared(old.clone()), window, cx);
+            shell.apply_client_update(
+                Update::PreparationReady {
+                    id: old.id,
+                    epoch: old.epoch,
+                },
+                window,
+                cx,
+            );
+            shell.take_client_commands();
+        });
+        current
+    });
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find("forecast-dialog").is_some(),
+            "old updates must not cancel a newer dialog"
+        );
+        shell.update(cx, |shell, cx| {
+            let composer = shell.composer().clone();
+            composer.update(cx, |composer, cx| {
+                composer.set_value("changed before observer", window, cx)
+            });
+            shell.apply_client_update(
+                Update::PreparationReady {
+                    id: current.id,
+                    epoch: current.epoch,
+                },
+                window,
+                cx,
+            );
+        });
+        window.render_frame(cx);
+        assert!(!shell
+            .update(cx, |shell, _| shell.take_client_commands())
+            .iter()
+            .any(|command| matches!(command, WireCommand::CommitPrepared(_))));
+        assert_eq!(shell.read(cx).draft(cx).as_ref(), "changed before observer");
+    });
+}
+
+#[gpui_kit::test]
+fn native_forecast_rechecks_marked_text_before_quote_or_consent_commit(cx: &mut TestAppContext) {
+    use formless_desktop::client::{Command as WireCommand, Update};
+    for consent_ack in [false, true] {
+        let (handle, shell) = open(cx, WIDE, 0, 0);
+        let sessions = daemon_view(cx, handle, &shell);
+        step(cx, handle, |window, cx| {
+            window.render_frame(cx);
+            window.click(session_row_id(&sessions[0].id), cx);
+            let id = sessions[0].id.clone();
+            let generation = shell.read(cx).client_generation();
+            shell.update(cx, |shell, cx| {
+                shell.apply_client_update(
+                    Update::Snapshot {
+                        generation,
+                        snapshot: replies::session_snapshot(
+                            &id,
+                            &serde_json::json!({"session":{"id":id},"running":false,"messages":[]}),
+                        )
+                        .unwrap(),
+                    },
+                    window,
+                    cx,
+                );
+                shell.focus_section(PageSection::Composer, window, cx);
+                shell.take_client_commands();
+            });
+            window.input("かな", cx);
+            window.render_frame(cx);
+            let prepared = daemon_quote(&shell, cx, consent_ack);
+            if consent_ack {
+                shell.update(cx, |shell, cx| {
+                    shell.apply_client_update(Update::Prepared(prepared.clone()), window, cx)
+                });
+                window.render_frame(cx);
+                window.click("forecast-confirm", cx);
+            }
+            // Direct input-handler delivery tests the ordering before the
+            // composer's deferred observer; it is not OS IME acceptance.
+            let bounds = window.find_by_label("Message").bounds();
+            let composer = shell.read(cx).composer().clone();
+            TestInput::new(ElementInputHandler::new(bounds, composer), window).compose_text(
+                Some(0..2),
+                "かな",
+                None,
+                cx,
+            );
+            assert_eq!(shell.read(cx).draft(cx).as_ref(), "かな");
+            shell.update(cx, |shell, cx| {
+                if consent_ack {
+                    shell.apply_client_update(
+                        Update::PreparationReady {
+                            id: prepared.id,
+                            epoch: prepared.epoch,
+                        },
+                        window,
+                        cx,
+                    );
+                } else {
+                    shell.apply_client_update(Update::Prepared(prepared), window, cx);
+                }
+            });
+            assert!(!shell
+                .update(cx, |shell, _| shell.take_client_commands())
+                .iter()
+                .any(|command| matches!(command, WireCommand::CommitPrepared(_))));
+        });
+    }
 }
 
 #[gpui_kit::test]

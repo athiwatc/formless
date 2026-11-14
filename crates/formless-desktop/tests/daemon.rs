@@ -146,8 +146,29 @@ async fn until(client: &Client, stage: &'static str, mut predicate: impl FnMut(U
                 Update::Action { result, .. } => format!("action {result:?}"),
                 Update::Notice(notice) => notice.clone(),
                 Update::Attention { pending, .. } => format!("attention pending={pending}"),
+                Update::Prepared(prepared) => format!(
+                    "forecast {} confirmation={}",
+                    prepared.label, prepared.quote.confirmation_required
+                ),
+                Update::PreparationReady { .. } => "forecast consent acknowledged".into(),
+                Update::PreparationFailed { error, .. } => format!("forecast error {error}"),
             };
             eprintln!("{stage}: {summary}");
+            // This headless fixture has no editable GUI state. It commits a
+            // current quote only when no consent is required, or after the
+            // test explicitly confirmed it. It never manufactures consent.
+            match &update {
+                Update::Prepared(prepared)
+                    if !prepared.quote.confirmation_required
+                        && prepared.epoch == client.epoch() =>
+                {
+                    client.send(Command::CommitPrepared(prepared.id)).unwrap();
+                }
+                Update::PreparationReady { id, epoch } if *epoch == client.epoch() => {
+                    client.send(Command::CommitPrepared(*id)).unwrap();
+                }
+                _ => {}
+            }
             if predicate(update) {
                 return;
             }
@@ -189,12 +210,12 @@ async fn real_daemon_provider_send_navigation_resources_and_reconnect() {
                     else if matches!(number, 2 | 4) { interrupt_answers.notified().await; }
                     else { tokio::time::sleep(Duration::from_millis(300)).await; }
                     let events = [
-                        json!({"type":"message_start","message":{"usage":{"input_tokens":1}}}),
+                        json!({"type":"message_start","message":{"usage":{"input_tokens":2000}}}),
                         json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
                         json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Canonical provider reply "}}),
                         json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ไทย 😀"}}),
                         json!({"type":"content_block_stop","index":0}),
-                        json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}),
+                        json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":100}}),
                         json!({"type":"message_stop"}),
                     ];
                     let encode = |events: &[Value]| -> String { events.iter().map(|event| format!("event: {}\ndata: {event}\n\n", event["type"].as_str().unwrap())).collect() };
@@ -219,6 +240,14 @@ async fn real_daemon_provider_send_navigation_resources_and_reconnect() {
     config.provider.base_url = base_url;
     config.provider.api_style = "anthropic".into();
     config.provider.model = "desktop-test-model".into();
+    config.provider.prices.insert(
+        "desktop-test-model".into(),
+        formless_core::config::ModelPrice {
+            input: 1.,
+            output: 2.,
+            ..Default::default()
+        },
+    );
     config.provider.max_retries = 0;
     config.naming.enabled = false;
     config.skills.auto_create = false;
@@ -267,11 +296,14 @@ async fn real_daemon_provider_send_navigation_resources_and_reconnect() {
     )
     .await;
     client
-        .send(Command::Intent(Intent::SendMessage {
-            session_id: a.clone(),
-            content: "Desktop real transport request".into(),
-            mode: SendMode::Send,
-        }))
+        .review(
+            Intent::SendMessage {
+                session_id: a.clone(),
+                content: "Desktop real transport request".into(),
+                mode: SendMode::Send,
+            },
+            "Desktop real transport request".into(),
+        )
         .unwrap();
     until(&client, "stage-3", |u| {
         matches!(u, Update::Action { result: Ok(()), .. })
@@ -359,11 +391,14 @@ async fn real_daemon_provider_send_navigation_resources_and_reconnect() {
     for abandon in [false, true] {
         let request_count = if abandon { 4 } else { 2 };
         client
-            .send(Command::Intent(Intent::SendMessage {
-                session_id: a.clone(),
-                content: "interrupt this private request".into(),
-                mode: SendMode::Send,
-            }))
+            .review(
+                Intent::SendMessage {
+                    session_id: a.clone(),
+                    content: "interrupt this private request".into(),
+                    mode: SendMode::Send,
+                },
+                "interrupt this private request".into(),
+            )
             .unwrap();
         until(&client, "recovery-send-ack", |update| {
             matches!(update, Update::Action { result: Ok(()), .. })
@@ -398,17 +433,22 @@ async fn real_daemon_provider_send_navigation_resources_and_reconnect() {
             stop_acknowledged && interrupted
         })
         .await;
-        client
-            .send(Command::Intent(if abandon {
-                Intent::AbandonRun {
+        if abandon {
+            client
+                .send(Command::Intent(Intent::AbandonRun {
                     session_id: a.clone(),
-                }
-            } else {
-                Intent::ResumeRun {
-                    session_id: a.clone(),
-                }
-            }))
-            .unwrap();
+                }))
+                .unwrap();
+        } else {
+            client
+                .review(
+                    Intent::ResumeRun {
+                        session_id: a.clone(),
+                    },
+                    "retained recovery draft".into(),
+                )
+                .unwrap();
+        }
         until(&client, "recovery-action-ack", |update| {
             matches!(update, Update::Action { result: Ok(()), .. })
         })
@@ -423,6 +463,118 @@ async fn real_daemon_provider_send_navigation_resources_and_reconnect() {
         );
     }
     interrupt_answers.notify_waiters();
+    daemon
+        .handle(Request::SetSetting {
+            key: "limits.forecast_confirm_usd".into(),
+            value: json!(0.0),
+        })
+        .await
+        .unwrap();
+    let cost_message = "explicitly reviewed private fixture request";
+    client
+        .review(
+            Intent::SendMessage {
+                session_id: a.clone(),
+                content: cost_message.into(),
+                mode: SendMode::Send,
+            },
+            cost_message.into(),
+        )
+        .unwrap();
+    let mut retired_quote = None;
+    until(
+        &client,
+        "required-forecast-before-navigation",
+        |update| match update {
+            Update::Prepared(prepared) => {
+                assert!(
+                    prepared.quote.confirmation_required,
+                    "priced completed fixture Runs must require consent at a zero threshold: {:?}",
+                    prepared.quote
+                );
+                retired_quote = Some(prepared.id);
+                true
+            }
+            _ => false,
+        },
+    )
+    .await;
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        4,
+        "forecasting itself cannot call the provider"
+    );
+    client
+        .send(Command::Select {
+            session_id: Some(b.clone()),
+            generation: 4,
+        })
+        .unwrap();
+    until(&client, "required-forecast-switch", |update| {
+        matches!(update, Update::Snapshot { generation: 4, .. })
+    })
+    .await;
+    client
+        .send(Command::ConfirmPrepared(retired_quote.unwrap()))
+        .unwrap();
+    client
+        .send(Command::CommitPrepared(retired_quote.unwrap()))
+        .unwrap();
+    client
+        .send(Command::Select {
+            session_id: Some(a.clone()),
+            generation: 5,
+        })
+        .unwrap();
+    until(&client, "required-forecast-return", |update| {
+        matches!(update, Update::Snapshot { generation: 5, .. })
+    })
+    .await;
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        4,
+        "retired quote identities cannot start work"
+    );
+    client
+        .review(
+            Intent::SendMessage {
+                session_id: a.clone(),
+                content: cost_message.into(),
+                mode: SendMode::Send,
+            },
+            cost_message.into(),
+        )
+        .unwrap();
+    let mut current_quote = None;
+    until(
+        &client,
+        "required-forecast-current",
+        |update| match update {
+            Update::Prepared(prepared) => {
+                assert!(prepared.quote.confirmation_required);
+                current_quote = Some(prepared.id);
+                true
+            }
+            _ => false,
+        },
+    )
+    .await;
+    assert_eq!(requests.lock().unwrap().len(), 4);
+    // Explicit fixture-user confirmation, on the same real connection. The
+    // helper only commits after the daemon's definite confirmation ACK.
+    client
+        .send(Command::ConfirmPrepared(current_quote.unwrap()))
+        .unwrap();
+    until(&client, "required-forecast-send-ack", |update| {
+        matches!(update, Update::Action { result: Ok(()), .. })
+    })
+    .await;
+    until(&client, "required-forecast-completed", |update| matches!(update, Update::Snapshot { generation: 5, snapshot } if !snapshot.running && snapshot.blocks.iter().filter(|block| block.markdown() == "Canonical provider reply ไทย 😀").count() == 3)).await;
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        5,
+        "one confirmed action starts one provider request"
+    );
     for destination in [
         Destination::Tools,
         Destination::Metrics,
@@ -479,10 +631,10 @@ async fn real_daemon_provider_send_navigation_resources_and_reconnect() {
         matches!(u, Update::Connection { ready: true, .. })
     })
     .await;
-    until(&client, "stage-10", |u| matches!(u, Update::Snapshot { generation: 3, snapshot } if snapshot.blocks.iter().filter(|block| block.markdown() == "Canonical provider reply ไทย 😀").count() == 2)).await;
+    until(&client, "stage-10", |u| matches!(u, Update::Snapshot { generation: 5, snapshot } if snapshot.blocks.iter().filter(|block| block.markdown() == "Canonical provider reply ไทย 😀").count() == 3)).await;
     assert_eq!(
         requests.lock().unwrap().len(),
-        4,
+        5,
         "reconnect did not replay a user mutation"
     );
     if let Ok(seconds) = std::env::var("FORMLESS_DESKTOP_NATIVE_HOLD_SECONDS") {
