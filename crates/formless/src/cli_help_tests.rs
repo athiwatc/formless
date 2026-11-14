@@ -736,3 +736,92 @@ fn session_list_organization_filters_parse_together_without_dispatch() {
         assert!(normalized(&help).contains(expected));
     }
 }
+
+#[test]
+fn mcp_log_lines_exposes_and_enforces_the_existing_bounds() {
+    for lines in ["1", "50", "1000"] {
+        assert!(super::Cli::try_parse_from([
+            "formless", "mcp", "log", "fixture", "--lines", lines
+        ])
+        .is_ok());
+    }
+    for lines in ["0", "1001", "5000", "nonsense"] {
+        let error =
+            super::Cli::try_parse_from(["formless", "mcp", "log", "fixture", "--lines", lines])
+                .err()
+                .expect("expected argument/help error");
+        assert_eq!(error.exit_code(), 2);
+        assert!(error.to_string().contains("between 1 and 1000"));
+    }
+    let help = super::Cli::try_parse_from(["formless", "mcp", "log", "--help"])
+        .err()
+        .expect("expected argument/help error")
+        .to_string();
+    let help = normalized(&help);
+    assert!(help.contains("minimum 1, maximum 1000") && help.contains("default: 50"));
+}
+
+#[test]
+fn naming_pull_metadata_and_validation_share_the_model_registry() {
+    let root = command_tree();
+    let pull = root
+        .find_subcommand("naming")
+        .unwrap()
+        .find_subcommand("pull")
+        .unwrap();
+    let model = pull
+        .get_arguments()
+        .find(|arg| arg.get_id() == "model")
+        .unwrap();
+    let choices: Vec<_> = model
+        .get_possible_values()
+        .into_iter()
+        .map(|v| v.get_name().to_owned())
+        .collect();
+    assert_eq!(
+        choices,
+        formless_core::namer::MODELS
+            .iter()
+            .map(|m| m.id.to_owned())
+            .collect::<Vec<_>>()
+    );
+    for spec in formless_core::namer::MODELS {
+        for raw in [
+            spec.id.to_owned(),
+            format!(" {} ", spec.id.to_ascii_uppercase()),
+        ] {
+            let parsed = super::Cli::try_parse_from(["formless", "naming", "pull", raw.as_str()])
+                .expect("valid model argument");
+            let Some(super::Cmd::Naming {
+                action: super::NamingAction::Pull { model },
+            }) = parsed.cmd
+            else {
+                panic!("wrong command");
+            };
+            assert_eq!(model.as_deref(), Some(raw.as_str()));
+        }
+    }
+    let parsed = super::Cli::try_parse_from(["formless", "naming", "pull"])
+        .expect("configured model remains optional");
+    let Some(super::Cmd::Naming {
+        action: super::NamingAction::Pull { model },
+    }) = parsed.cmd
+    else {
+        panic!("wrong command");
+    };
+    assert!(model.is_none());
+    let error = super::Cli::try_parse_from(["formless", "naming", "pull", "not-a-model"])
+        .err()
+        .expect("invalid explicit model");
+    assert_eq!(error.exit_code(), 2);
+    for model in formless_core::namer::MODELS {
+        assert!(error.to_string().contains(model.id));
+    }
+    let mut root = command_tree();
+    let mut bash = Vec::new();
+    clap_complete::generate(clap_complete::Shell::Bash, &mut root, "formless", &mut bash);
+    let bash = String::from_utf8(bash).unwrap();
+    for model in formless_core::namer::MODELS {
+        assert!(bash.contains(model.id));
+    }
+}
