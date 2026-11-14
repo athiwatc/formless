@@ -23,6 +23,7 @@ pub enum Command {
     Stop,
     ResumeRun,
     AbandonRun,
+    Questions,
     ToggleSessions,
     ToggleContext,
     ToggleTheme,
@@ -70,6 +71,7 @@ pub struct State {
     pub has_composer: bool,
     /// A current, connected canonical snapshot has a recoverable last Run.
     pub can_recover: bool,
+    pub can_questions: bool,
     /// Whether an input method is composing text in the composer.
     pub composing: bool,
     pub sessions_shown: bool,
@@ -158,6 +160,7 @@ pub fn keys(command: Command) -> &'static [&'static str] {
         | Command::Stop
         | Command::ResumeRun
         | Command::AbandonRun
+        | Command::Questions
         | Command::ToggleTheme
         | Command::GoTo(_) => &[],
     }
@@ -225,6 +228,7 @@ pub fn palette(state: &State) -> Vec<Entry> {
         Command::Stop,
         Command::ResumeRun,
         Command::AbandonRun,
+        Command::Questions,
         Command::ToggleSessions,
         Command::ToggleContext,
     ]);
@@ -327,6 +331,14 @@ pub fn entry(command: Command, state: &State) -> Entry {
             } else {
                 None
             },
+        ),
+        Command::Questions => (
+            "Questions",
+            "Review Profile questions".into(),
+            Group::Run,
+            "Answer pending questions for their original Sessions",
+            None,
+            (!state.can_questions).then_some("Connect to a Profile first"),
         ),
         Command::ToggleSessions => (
             "Sessions",
@@ -453,6 +465,7 @@ mod tests {
             composer: ComposerActions::for_state(run, draft_is_empty),
             has_composer: true,
             can_recover: false,
+            can_questions: false,
             composing: false,
             sessions_shown: true,
             context_shown: false,

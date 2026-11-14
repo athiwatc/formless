@@ -344,3 +344,157 @@ async fn tool_turn_and_final_answer_share_a_run_but_have_distinct_canonical_boun
     drop(observer);
     fixture.finish().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn profile_question_restores_on_another_session_after_reconnect_and_answers_once() {
+    use formless_desktop::questions::Outcome;
+    use formless_protocol::QuestionAnswer;
+    let env = credential_env::EnvGuard::isolated();
+    env.set("FORMLESS_API_KEY", "private-question-fixture-key");
+    let requests: Arc<Mutex<Vec<Value>>> = Arc::default();
+    let fixture=Fixture::start(app(axum::routing::post({let requests=requests.clone();move|axum::Json(body):axum::Json<Value>|{
+        let requests=requests.clone();async move {
+            let number={let mut requests=requests.lock().unwrap();requests.push(body);requests.len()};
+            let text=if number==1 {
+                let args=json!({"questions":[{"question":"Choose any fixture options ไทย?","header":"Choices","multi_select":true,"options":[{"label":"Alpha","description":"First option"},{"label":"Beta"},{"label":"Gamma"}]},{"question":"Add context 漢字?"}]});
+                prefix("A question follows. ")+&encode(&[
+                    json!({"type":"content_block_stop","index":0}),
+                    json!({"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"question-call","name":"ask_user"}}),
+                    json!({"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":args.to_string()}}),
+                    json!({"type":"content_block_stop","index":1}),
+                    json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":10}}),json!({"type":"message_stop"}),
+                ])
+            } else {assert_eq!(number,2,"question response must not be replayed");prefix("Question answered ")+&tail("ไทย 😀")};
+            axum::response::Response::builder().header("content-type","text/event-stream").body(axum::body::Body::from(text)).unwrap()
+        }
+    }})),0).await;
+    let other = fixture
+        .daemon
+        .handle(Request::CreateSession {
+            name: Some("Displayed other Session".into()),
+        })
+        .await
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let client = Client::start(fixture.endpoint.clone());
+    until(&client, "question-connect", |update| {
+        matches!(update, Update::Connection { ready: true, .. })
+    })
+    .await;
+    client
+        .send(Command::Select {
+            session_id: Some(other.clone()),
+            generation: 1,
+        })
+        .unwrap();
+    until(
+        &client,
+        "question-other-session",
+        |update| matches!(update,Update::Snapshot{snapshot,..} if snapshot.session_id==other),
+    )
+    .await;
+    let mut observer = Observer::connect(&fixture.endpoint, &fixture.session).await;
+    send(&mut observer, &fixture.session).await;
+    let mut open = None;
+    until(&client, "question-global-event", |update| {
+        if let Update::Questions(state) = update {
+            open = state
+                .open
+                .into_iter()
+                .find(|question| question.session_id == fixture.session);
+        }
+        open.is_some()
+    })
+    .await;
+    let open = open.unwrap();
+    assert_eq!(open.questions.len(), 2);
+    assert!(open.questions[0].multi_select);
+    let old_connection = client.connection();
+    client.send(Command::Reconnect).unwrap();
+    let mut restored = None;
+    until(&client, "question-restored-global-snapshot", |update| {
+        if let Update::Questions(state) = update {
+            if state.connection > old_connection {
+                restored = state
+                    .open
+                    .into_iter()
+                    .find(|question| question.id == open.id);
+            }
+        }
+        restored.is_some()
+    })
+    .await;
+    assert_eq!(
+        restored.as_ref(),
+        Some(&open),
+        "pending question retains its original Session and full definition"
+    );
+    let answers = vec![
+        QuestionAnswer {
+            selected: vec!["Alpha".into(), "Gamma".into()],
+            text: Some("Own detail ไทย 😀".into()),
+        },
+        QuestionAnswer {
+            selected: vec![],
+            text: Some("Context 漢字".into()),
+        },
+    ];
+    let operation = uuid::Uuid::new_v4();
+    client
+        .send(Command::AnswerQuestion {
+            connection: client.connection(),
+            operation,
+            question: Box::new(open.clone()),
+            answers: answers.clone(),
+        })
+        .unwrap();
+    until(&client,"question-positive-ack",|update|matches!(update,Update::QuestionAnswer{operation:got,outcome:Outcome::Accepted,..} if got==operation)).await;
+    wait(&mut observer,|event|matches!(event,Event::MessageComplete{message,..} if message.content=="Question answered ไทย 😀")).await;
+    wait(&mut observer, |event| {
+        matches!(event, Event::RunFinished { .. })
+    })
+    .await;
+    let repeated = uuid::Uuid::new_v4();
+    client
+        .send(Command::AnswerQuestion {
+            connection: client.connection(),
+            operation: repeated,
+            question: Box::new(open.clone()),
+            answers,
+        })
+        .unwrap();
+    until(&client,"question-duplicate-not-sent",|update|matches!(update,Update::QuestionAnswer{operation:got,outcome:Outcome::Rejected(_),..} if got==repeated)).await;
+    let duplicate = observer
+        .request(Request::AnswerQuestion {
+            question_id: open.id,
+            answer: "too late".into(),
+            answers: vec![],
+        })
+        .await;
+    assert_eq!(
+        duplicate["answered"], false,
+        "ok transport response is not a positive answer acknowledgement"
+    );
+    {
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let result = requests[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|message| message["content"].as_array().into_iter().flatten())
+            .find(|part| part["type"] == "tool_result" && part["tool_use_id"] == "question-call")
+            .unwrap();
+        let result: Value = serde_json::from_str(result["content"].as_str().unwrap()).unwrap();
+        assert_eq!(result["formless_data"], 1);
+        let result: Value = serde_json::from_str(result["content"].as_str().unwrap()).unwrap();
+        assert_eq!(result["answers"][0]["selected"], json!(["Alpha", "Gamma"]));
+        assert_eq!(result["answers"][0]["text"], "Own detail ไทย 😀");
+        assert_eq!(result["answers"][1]["text"], "Context 漢字");
+    }
+    drop(client);
+    drop(observer);
+    fixture.finish().await;
+}

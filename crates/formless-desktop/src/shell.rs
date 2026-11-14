@@ -34,6 +34,7 @@ use crate::client::{self, Client, Command as ClientCommand, Update as ClientUpda
 use crate::commands::{self, Command};
 use crate::directory::{self, Directory};
 use crate::forecast;
+mod questions;
 use crate::full_view;
 use crate::memory::{
     edit_span, format_bytes, limits, paste_can_never_fit, snap_to_graphemes, within_composer_limit,
@@ -74,6 +75,7 @@ gpui_kit::actions!(
         RunSelectedCommand,
         ClosePalette,
         CloseForecast,
+        CloseQuestions,
         ScrollViewerUp,
         ScrollViewerDown,
         ScrollViewerPageUp,
@@ -99,6 +101,8 @@ const OVERLAY_CONTEXT: &str = "FormlessOverlay";
 const INSPECTOR_CONTEXT: &str = "FormlessInspector";
 const PALETTE_CONTEXT: &str = "FormlessPalette";
 const FORECAST_CONTEXT: &str = "FormlessForecast";
+const QUESTIONS_CONTEXT: &str = "FormlessQuestions";
+const QUESTIONS_READ_CONTEXT: &str = "FormlessQuestions && !Input";
 const VIEWER_CONTEXT: &str = "FormlessViewer";
 const RESOURCE_CONTEXT: &str = "FormlessResource";
 const VIEWER_DESCRIPTION: &str =
@@ -153,6 +157,7 @@ pub fn bind_keys(cx: &mut App) {
                 | Command::Stop
                 | Command::ResumeRun
                 | Command::AbandonRun
+                | Command::Questions
                 | Command::ToggleTheme
                 | Command::GoTo(_) => unreachable!("{command:?} has no global shortcut"),
             })
@@ -160,6 +165,17 @@ pub fn bind_keys(cx: &mut App) {
     cx.bind_keys(global.collect::<Vec<_>>());
     cx.bind_keys([
         KeyBinding::new("escape", CloseForecast, Some(FORECAST_CONTEXT)),
+        KeyBinding::new("escape", CloseQuestions, Some(QUESTIONS_CONTEXT)),
+        KeyBinding::new("up", ScrollViewerUp, Some(QUESTIONS_READ_CONTEXT)),
+        KeyBinding::new("down", ScrollViewerDown, Some(QUESTIONS_READ_CONTEXT)),
+        KeyBinding::new("pageup", ScrollViewerPageUp, Some(QUESTIONS_READ_CONTEXT)),
+        KeyBinding::new(
+            "pagedown",
+            ScrollViewerPageDown,
+            Some(QUESTIONS_READ_CONTEXT),
+        ),
+        KeyBinding::new("home", ScrollViewerStart, Some(QUESTIONS_READ_CONTEXT)),
+        KeyBinding::new("end", ScrollViewerEnd, Some(QUESTIONS_READ_CONTEXT)),
         KeyBinding::new("up", ScrollViewerUp, Some(FORECAST_CONTEXT)),
         KeyBinding::new("down", ScrollViewerDown, Some(FORECAST_CONTEXT)),
         KeyBinding::new("pageup", ScrollViewerPageUp, Some(FORECAST_CONTEXT)),
@@ -398,6 +414,7 @@ enum Modal {
     /// The full-output view of one block.
     Viewer,
     Forecast,
+    Questions,
 }
 
 struct ForecastDialog {
@@ -558,6 +575,11 @@ pub struct Shell {
     client_generation: u64,
     client_status: String,
     client_attention: bool,
+    client_questions: crate::questions::State,
+    question_panel: Option<questions::Panel>,
+    question_drafts: Drafts,
+    question_draft_ids: Vec<String>,
+    questions_toggle_focus: FocusHandle,
     client_recovery: Option<crate::replies::UnfinishedRun>,
     client_sessions: Vec<SessionInfo>,
     forecast: Option<ForecastDialog>,
@@ -725,6 +747,11 @@ impl Shell {
             client_generation: 0,
             client_status: String::new(),
             client_attention: false,
+            client_questions: crate::questions::State::default(),
+            question_panel: None,
+            question_drafts: Drafts::new(16, 4 * 1024 * 1024),
+            question_draft_ids: Vec::new(),
+            questions_toggle_focus: cx.focus_handle(),
             client_recovery: None,
             client_sessions: Vec::new(),
             forecast: None,
@@ -761,6 +788,7 @@ impl Shell {
                 composer: ComposerActions::for_state(RunState::Idle, true),
                 has_composer: true,
                 can_recover: false,
+                can_questions: false,
                 composing: false,
                 sessions_shown: true,
                 context_shown: true,
@@ -1114,7 +1142,9 @@ impl Shell {
     /// What holds the window modally in `layout`: the palette, which is
     /// always on top, or a panel overlay.
     fn current_modal(&self, layout: Layout) -> Option<Modal> {
-        if self.forecast.is_some() {
+        if self.question_panel.is_some() {
+            Some(Modal::Questions)
+        } else if self.forecast.is_some() {
             Some(Modal::Forecast)
         } else if self.palette.is_some() {
             Some(Modal::Palette)
@@ -1425,6 +1455,7 @@ impl Shell {
         self.client_snapshot_ready = false;
         self.client_status = "Connecting to the local Daemon Core…".into();
         self.client_attention = false;
+        self.client_questions = crate::questions::State::default();
         self.client_recovery = None;
         self.forecast = None;
         self.invalidate_source_view();
@@ -1607,6 +1638,7 @@ impl Shell {
                 self.client_connected = ready;
                 self.client_status = notice;
                 if !ready {
+                    self.questions_disconnected(cx);
                     self.forecast = None;
                     if self.modal == Some(Modal::Forecast) {
                         self.settle(window, cx);
@@ -1616,6 +1648,22 @@ impl Shell {
                         .replace(&self.client_sessions, &HashSet::new(), false);
                 }
             }
+            ClientUpdate::Questions(state) => {
+                if self
+                    .client
+                    .as_ref()
+                    .is_some_and(|client| client.connection() == state.connection)
+                {
+                    self.client_questions = state;
+                    self.questions_restored(window, cx);
+                }
+            }
+            ClientUpdate::QuestionAnswer {
+                connection,
+                operation,
+                question_id,
+                outcome,
+            } => self.question_outcome(connection, operation, &question_id, outcome, cx),
             ClientUpdate::Sessions(sessions) => {
                 let previous = self.sidebar.active_id().map(str::to_string);
                 let previous_state = self.run_state();
@@ -2345,6 +2393,7 @@ impl Shell {
                     .client_recovery
                     .as_ref()
                     .is_some_and(|run| run.recoverable()),
+            can_questions: self.client.is_some(),
             composing,
             sessions_shown: layout.sidebar != SidebarMode::Collapsed,
             context_shown: layout.inspector != InspectorMode::Hidden,
@@ -2365,6 +2414,24 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<&'static str> {
+        if self.question_panel.is_some()
+            && !matches!(
+                command,
+                Command::Questions
+                    | Command::FocusNextRegion
+                    | Command::FocusPreviousRegion
+                    | Command::IncreaseTextSize
+                    | Command::DecreaseTextSize
+                    | Command::ResetTextSize
+                    | Command::ToggleTheme
+            )
+        {
+            if let Some(panel) = &mut self.question_panel {
+                panel.notice=Some("Close question review before changing the underlying view. Answers will be kept.".into());
+            }
+            cx.notify();
+            return Some("Close question review first");
+        }
         if self.forecast.is_some()
             && matches!(
                 command,
@@ -2390,6 +2457,7 @@ impl Shell {
             return Some(reason);
         }
         match command {
+            Command::Questions => self.open_questions(window, cx),
             Command::Send => self.submit(false, cx),
             Command::SendSecondary => self.submit(true, cx),
             Command::Stop => self.stop(cx),
@@ -2812,12 +2880,18 @@ impl Shell {
                 window.focus(&self.forecast_cancel_focus, cx);
                 cx.notify();
             }
+            Modal::Questions => {
+                if let Some(panel) = &self.question_panel {
+                    window.focus(&panel.close_focus, cx);
+                }
+                cx.notify();
+            }
         }
     }
 
     fn cycle_region(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
         // The palette and the full-output view trap the cycle too.
-        if let Some(modal @ (Modal::Palette | Modal::Viewer | Modal::Forecast)) =
+        if let Some(modal @ (Modal::Palette | Modal::Viewer | Modal::Forecast | Modal::Questions)) =
             self.current_modal(self.layout(window))
         {
             self.focus_modal(modal, window, cx);
@@ -2963,6 +3037,14 @@ impl Shell {
                 &self.commands_toggle_focus,
             ),
         ]
+        .into_iter()
+        .chain(self.client.iter().map(|_| {
+            (
+                "show-questions",
+                Command::Questions,
+                &self.questions_toggle_focus,
+            )
+        }))
         .map(|(id, command, focus)| {
             let entry = commands::entry(command, &self.commands);
             Button::new(id)
@@ -2973,7 +3055,8 @@ impl Shell {
                 .track_focus(focus)
                 .selected(entry.checked == Some(true))
                 .on_click(Self::on_command(command, cx))
-        });
+        })
+        .collect::<Vec<_>>();
         // A banner landmark, so the header's controls have one node that can
         // be taken out of the tree behind a dialog.
         let header = div()
@@ -3295,7 +3378,7 @@ impl Shell {
                 )
             })
             .when(self.client.is_some() && self.client_attention, |region| region.child(
-                readable("daemon-pending-attention", "This Profile has pending decisions. Review and answer them in the Formless TUI.").text_sm().px_2().py_1()
+                readable("daemon-pending-attention", "This Profile has pending decisions. Use Questions for user questions; approvals remain in the Formless TUI.").text_sm().px_2().py_1()
             ))
             .when(self.client.is_some() && !self.client_snapshot_ready, |region| region.child(
                 readable("daemon-session-state", if self.sidebar.active_id().is_none() {
@@ -4412,7 +4495,7 @@ impl Shell {
             .when(self.client.is_some() && self.client_attention, |status| {
                 status.child(readable(
                     "status-pending-attention",
-                    "Decisions reported · review in the Formless TUI",
+                    "Profile decisions · Questions / Formless TUI approvals",
                 ))
             });
         if reflowed {
@@ -4499,6 +4582,7 @@ impl Shell {
 
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.reveal_question_focus(window, cx);
         if self
             .forecast
             .as_ref()
@@ -4575,6 +4659,9 @@ impl Render for Shell {
             })
             .when(self.forecast.is_some(), |shell| {
                 shell.child(self.render_forecast(window, cx))
+            })
+            .when(self.question_panel.is_some(), |shell| {
+                shell.child(self.render_questions(window, cx))
             })
     }
 }

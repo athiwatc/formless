@@ -13,6 +13,7 @@ pub mod full_view;
 pub mod memory;
 pub mod model;
 pub mod pages;
+pub mod questions;
 pub mod replies;
 pub mod search;
 #[cfg(feature = "gui")]

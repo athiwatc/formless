@@ -149,6 +149,16 @@ async fn until(client: &Client, stage: &'static str, mut predicate: impl FnMut(U
                 Update::Action { result, .. } => format!("action {result:?}"),
                 Update::Notice(notice) => notice.clone(),
                 Update::Attention { pending, .. } => format!("attention pending={pending}"),
+                Update::Questions(state) => format!(
+                    "profile questions={} blocked={}",
+                    state.open.len(),
+                    state.blocked.len()
+                ),
+                Update::QuestionAnswer {
+                    question_id,
+                    outcome,
+                    ..
+                } => format!("answer {question_id}: {outcome:?}"),
                 Update::Prepared(prepared) => format!(
                     "forecast {} confirmation={}",
                     prepared.label, prepared.quote.confirmation_required

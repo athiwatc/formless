@@ -214,6 +214,53 @@ pub fn run_forecast(
     }
 }
 
+/// Synthetic structured question for native component/render diagnostics.
+pub fn user_question(session: &str) -> formless_protocol::Event {
+    use formless_protocol::{Question, QuestionOption};
+    formless_protocol::Event::UserQuestion {
+        question_id: "native-question".into(),
+        session_id: session.into(),
+        question: String::new(),
+        options: vec![],
+        questions: vec![
+            Question {
+                question: "Choose one ไทย?".into(),
+                header: Some("Choice".into()),
+                options: vec![
+                    QuestionOption {
+                        label: "First".into(),
+                        description: Some("First choice".into()),
+                    },
+                    QuestionOption {
+                        label: "Second".into(),
+                        description: None,
+                    },
+                ],
+                multi_select: false,
+            },
+            Question {
+                question: "Choose any 漢字 😀?".into(),
+                header: None,
+                options: vec![
+                    QuestionOption {
+                        label: "Alpha".into(),
+                        description: None,
+                    },
+                    QuestionOption {
+                        label: "Beta".into(),
+                        description: None,
+                    },
+                    QuestionOption {
+                        label: "Gamma".into(),
+                        description: None,
+                    },
+                ],
+                multi_select: true,
+            },
+        ],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

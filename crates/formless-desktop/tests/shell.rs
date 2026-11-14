@@ -12,6 +12,9 @@
 
 use std::time::{Duration, Instant};
 
+#[path = "support/questions.rs"]
+mod question_tests;
+
 use formless_desktop::commands::{self, Command};
 use formless_desktop::fixture;
 use formless_desktop::memory::{limits, IntentKind, IntentRecord};

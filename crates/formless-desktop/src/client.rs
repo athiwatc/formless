@@ -30,6 +30,7 @@ use tokio::sync::{mpsc as queue, watch};
 
 use crate::forecast;
 use crate::model::{Destination, Intent};
+use crate::questions;
 use crate::replies::{self, SessionSnapshot};
 
 const QUEUE: usize = 16;
@@ -55,6 +56,13 @@ pub enum Update {
     Attention {
         generation: u64,
         pending: bool,
+    },
+    Questions(questions::State),
+    QuestionAnswer {
+        connection: u64,
+        operation: uuid::Uuid,
+        question_id: String,
+        outcome: questions::Outcome,
     },
     Page {
         destination: Destination,
@@ -94,6 +102,12 @@ pub enum Command {
     CommitPrepared(uuid::Uuid),
     CreateSession,
     Refresh,
+    AnswerQuestion {
+        connection: u64,
+        operation: uuid::Uuid,
+        question: Box<questions::Open>,
+        answers: Vec<formless_protocol::QuestionAnswer>,
+    },
 }
 
 /// An explicit local socket/pipe path avoids duplicating Profile discovery
@@ -107,6 +121,7 @@ pub struct Client {
     stop: watch::Sender<bool>,
     ready: Arc<AtomicBool>,
     epoch: Arc<AtomicU64>,
+    connection: Arc<AtomicU64>,
     #[cfg(feature = "test-support")]
     recorded: Option<queue::Receiver<Command>>,
 }
@@ -127,6 +142,8 @@ impl Client {
         let worker_ready = ready.clone();
         let epoch = Arc::new(AtomicU64::new(0));
         let worker_epoch = epoch.clone();
+        let connection = Arc::new(AtomicU64::new(0));
+        let worker_connection = connection.clone();
         std::thread::spawn(move || {
             match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -139,6 +156,7 @@ impl Client {
                     cancelled,
                     worker_ready,
                     worker_epoch,
+                    worker_connection,
                 )),
                 Err(error) => {
                     let _ = tx.try_send(Update::Connection {
@@ -154,6 +172,7 @@ impl Client {
             stop,
             ready,
             epoch,
+            connection,
             #[cfg(feature = "test-support")]
             recorded: None,
         }
@@ -170,6 +189,7 @@ impl Client {
                 | Command::Review { .. }
                 | Command::ConfirmPrepared(_)
                 | Command::CommitPrepared(_)
+                | Command::AnswerQuestion { .. }
         ) && !self.is_ready()
         {
             return Err("Not connected; the action was not queued.");
@@ -188,6 +208,9 @@ impl Client {
 
     pub fn epoch(&self) -> u64 {
         self.epoch.load(Ordering::Acquire)
+    }
+    pub fn connection(&self) -> u64 {
+        self.connection.load(Ordering::Acquire)
     }
 
     /// Synchronous invalidation cannot be lost to the bounded command queue.
@@ -215,6 +238,7 @@ impl Client {
             stop,
             ready: Arc::new(AtomicBool::new(true)),
             epoch: Arc::new(AtomicU64::new(0)),
+            connection: Arc::new(AtomicU64::new(0)),
             recorded: Some(recorded),
         }
     }
@@ -249,12 +273,17 @@ enum Pending {
     Ping,
     Subscribe,
     Sessions,
-    Snapshot { session_id: String, generation: u64 },
+    Snapshot {
+        session_id: String,
+        generation: u64,
+        questions_revision: u64,
+    },
     Page(Destination),
     Action(Action),
     Forecast(Box<Preparation>),
     Consent(Box<Preparation>),
     Create,
+    Answer(Action),
 }
 
 /// Transport request ids restart on reconnect. Each mutation needs a separate
@@ -264,6 +293,7 @@ enum Pending {
 struct Action {
     id: uuid::Uuid,
     session_id: String,
+    question_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -297,6 +327,10 @@ impl Preparation {
 /// replaces this on reconnect; selection generations belong to the window.
 #[derive(Default)]
 struct Engine {
+    connection: u64,
+    questions: questions::Directory,
+    blocked_questions: HashSet<String>,
+    question_recovery_limit: bool,
     epoch: u64,
     prepared: Option<Box<Preparation>>,
     next_id: u64,
@@ -312,6 +346,27 @@ struct Engine {
 }
 
 impl Engine {
+    fn emit_questions(&mut self) {
+        let mut state = self
+            .questions
+            .state(self.connection, self.blocked_questions.clone());
+        if self.question_recovery_limit {
+            state
+                .blocked
+                .extend(state.open.iter().map(|question| question.id.clone()));
+            state.notice =
+                Some("Too many unacknowledged question answers; continue in the TUI.".into());
+        }
+        state.inflight = self
+            .pending
+            .values()
+            .filter_map(|pending| match pending {
+                Pending::Answer(action) => action.question_id.clone(),
+                _ => None,
+            })
+            .collect();
+        self.updates.push(Update::Questions(state));
+    }
     fn blocked_by_unknown(&self, command: &Command, uncertain: &HashSet<Action>) -> bool {
         let intent = match command {
             Command::Intent(intent) | Command::Review { intent, .. } => Some(intent),
@@ -325,8 +380,8 @@ impl Engine {
         intent.is_some_and(|intent| {
             intent.starts_work()
                 && uncertain.iter().any(|action| {
-                    action.session_id == intent.session_id() && !self.pending.values().any(|pending|
-                matches!(pending, Pending::Action(pending) if pending == action))
+                    action.question_id.is_none() && action.session_id == intent.session_id() && !self.pending.values().any(|pending|
+                matches!(pending, Pending::Action(pending) | Pending::Answer(pending) if pending == action))
                 })
         })
     }
@@ -412,6 +467,7 @@ impl Engine {
                     Pending::Snapshot {
                         session_id,
                         generation: self.generation,
+                        questions_revision: self.questions.revision(),
                     },
                 );
             }
@@ -444,6 +500,42 @@ impl Engine {
 
     fn command(&mut self, command: Command) {
         match command {
+            Command::AnswerQuestion {
+                connection,
+                operation,
+                question,
+                answers,
+            } if self.ready => {
+                let error = if connection != self.connection || self.questions.get(&question.id) != Some(question.as_ref()) {
+                    Some("This question is no longer current. Answers kept.".to_string())
+                } else if self.question_recovery_limit || self.blocked_questions.contains(&question.id) {
+                    Some("A previous answer's outcome is unknown. Do not retry; continue in the TUI.".to_string())
+                } else if self.pending.values().any(|pending| matches!(pending, Pending::Answer(action) if action.question_id.as_deref() == Some(question.id.as_str()))) {
+                    Some("An answer is already awaiting acknowledgement.".to_string())
+                } else { question.validate_answers(&answers).err().map(str::to_string) };
+                if let Some(error) = error {
+                    self.updates.push(Update::QuestionAnswer {
+                        connection: self.connection,
+                        operation,
+                        question_id: question.id,
+                        outcome: questions::Outcome::Rejected(error),
+                    });
+                } else {
+                    self.request(
+                        Request::AnswerQuestion {
+                            question_id: question.id.clone(),
+                            answer: formless_protocol::QuestionAnswer::summary_of(&answers),
+                            answers,
+                        },
+                        Pending::Answer(Action {
+                            id: operation,
+                            session_id: question.session_id,
+                            question_id: Some(question.id),
+                        }),
+                    );
+                    self.emit_questions();
+                }
+            }
             Command::Reconnect => {} // The I/O owner handles this command.
             Command::Select {
                 session_id,
@@ -564,6 +656,7 @@ impl Engine {
                     Pending::Action(Action {
                         id: action_id,
                         session_id,
+                        question_id: None,
                     }),
                 );
             }
@@ -574,12 +667,29 @@ impl Engine {
             | Command::CommitPrepared(_) => self.updates.push(Update::Notice(
                 "Not connected; the action was not sent. The draft was kept.".into(),
             )),
+            Command::AnswerQuestion {
+                operation,
+                question,
+                ..
+            } => self.updates.push(Update::QuestionAnswer {
+                connection: self.connection,
+                operation,
+                question_id: question.id,
+                outcome: questions::Outcome::Rejected("Not connected; no answer was sent.".into()),
+            }),
         }
     }
 
     fn receive(&mut self, message: ServerMessage) -> Result<(), String> {
-        let (id, result) = match message {
+        let (id, result, response_ok) = match message {
             ServerMessage::Event(event) => {
+                if matches!(
+                    event,
+                    Event::UserQuestion { .. } | Event::UserQuestionClosed { .. }
+                ) {
+                    self.questions.event(&event);
+                    self.emit_questions();
+                }
                 // No event mutates canonical text or asserts a Run state.
                 // Unscoped gap notices conservatively invalidate everything.
                 if event
@@ -626,6 +736,7 @@ impl Engine {
                 } else {
                     Err(error.unwrap_or_else(|| "The daemon rejected this request.".into()))
                 },
+                ok,
             ),
         };
         let Some(pending) = self.pending.remove(&id) else {
@@ -660,6 +771,7 @@ impl Engine {
                     notice: "Connected · canonical messages · live token streaming unavailable"
                         .into(),
                 });
+                self.emit_questions();
                 if let Some(page) = self.page {
                     self.load_page(page);
                 }
@@ -675,7 +787,17 @@ impl Engine {
             Pending::Snapshot {
                 session_id,
                 generation,
+                questions_revision,
             } => {
+                if let Ok(value) = &result {
+                    if let Some(events) = value.get("pending_events").and_then(Value::as_array) {
+                        if self.questions.snapshot(events, questions_revision) {
+                            self.emit_questions();
+                        } else if questions_revision != self.questions.revision() {
+                            self.dirty_session = true;
+                        }
+                    }
+                }
                 // Refuse retired A→B→A requests before decoding/allocating.
                 if self.active.as_deref() == Some(&session_id) && self.generation == generation {
                     match result.and_then(|value| {
@@ -718,6 +840,36 @@ impl Engine {
                     session_id: action.session_id,
                     result: result.map(|_| ()),
                 });
+            }
+            Pending::Answer(action) => {
+                let question_id = action.question_id.expect("question action has identity");
+                let outcome = match result {
+                    Ok(value) if value["answered"] == true => {
+                        self.questions.close(&question_id);
+                        questions::Outcome::Accepted
+                    }
+                    Ok(value) if value["answered"] == false => {
+                        self.questions.close(&question_id);
+                        questions::Outcome::Closed
+                    }
+                    Ok(_) => {
+                        self.blocked_questions.insert(question_id.clone());
+                        questions::Outcome::Unknown
+                    }
+                    Err(_) if response_ok => {
+                        self.blocked_questions.insert(question_id.clone());
+                        questions::Outcome::Unknown
+                    }
+                    Err(error) => questions::Outcome::Rejected(error),
+                };
+                self.updates.push(Update::QuestionAnswer {
+                    connection: self.connection,
+                    operation: action.id,
+                    question_id,
+                    outcome,
+                });
+                self.emit_questions();
+                self.dirty_session = true;
             }
             Pending::Forecast(mut work) => {
                 if !work.current(self) {
@@ -872,15 +1024,25 @@ struct Retained {
     uncertain: HashSet<Action>,
 }
 
+struct ConnectionState<'a> {
+    ready: &'a AtomicBool,
+    epoch: &'a AtomicU64,
+    connection: &'a AtomicU64,
+}
+
 async fn connected<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
     stream: S,
     commands: &mut queue::Receiver<Command>,
     tx: &SyncSender<Update>,
     stop: &mut watch::Receiver<bool>,
     retained: &mut Retained,
-    ready: &AtomicBool,
-    epoch: &AtomicU64,
+    state: ConnectionState<'_>,
 ) -> Result<(), String> {
+    let ConnectionState {
+        ready,
+        epoch,
+        connection,
+    } = state;
     let Retained {
         active,
         page,
@@ -889,6 +1051,11 @@ async fn connected<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = Frames::new(BufReader::new(reader));
     let mut engine = Engine {
+        connection: connection.load(Ordering::Acquire),
+        blocked_questions: uncertain
+            .iter()
+            .filter_map(|action| action.question_id.clone())
+            .collect(),
         active: active.0.clone(),
         generation: active.1,
         page: *page,
@@ -910,12 +1077,21 @@ async fn connected<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
         // Mutations with no definite response are never replayed. Record
         // them before attempting a write, which may partially succeed.
         uncertain.extend(engine.pending.values().filter_map(|p| {
-            if let Pending::Action(action) = p {
+            if let Pending::Action(action) | Pending::Answer(action) = p {
                 Some(action.clone())
             } else {
                 None
             }
         }));
+        let limit = uncertain
+            .iter()
+            .filter(|action| action.question_id.is_some())
+            .count()
+            >= 512;
+        if engine.question_recovery_limit != limit {
+            engine.question_recovery_limit = limit;
+            engine.emit_questions();
+        }
         write_requests(&mut writer, &mut engine)
             .await
             .map_err(|e| e.to_string())?;
@@ -936,7 +1112,10 @@ async fn connected<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
             message = reader.next() => match message.map_err(|e| e.to_string())? {
                 Some(message) => {
                     engine.sync_epoch(epoch.load(Ordering::Acquire));
-                    let answered = match &message { ServerMessage::Response { id, .. } => match engine.pending.get(id) { Some(Pending::Action(action)) => Some(action.clone()), _ => None }, _ => None };
+                    let answered = match &message { ServerMessage::Response { id, ok, result, .. } => match engine.pending.get(id) {
+                        Some(Pending::Action(action)) => Some(action.clone()),
+                        Some(Pending::Answer(action)) if !ok || result.as_ref().and_then(|value| value["answered"].as_bool()).is_some() => Some(action.clone()),
+                        _ => None }, _ => None };
                     engine.receive(message)?;
                     ready.store(engine.ready, Ordering::Release);
                     if let Some(id) = answered { uncertain.remove(&id); }
@@ -961,6 +1140,7 @@ async fn worker(
     mut stop: watch::Receiver<bool>,
     ready: Arc<AtomicBool>,
     epoch: Arc<AtomicU64>,
+    connection: Arc<AtomicU64>,
 ) {
     let mut retained = Retained::default();
     let mut delay = Duration::from_millis(250);
@@ -994,13 +1174,14 @@ async fn worker(
         let result = tokio::select! {
             _ = stop.changed() => return,
             result = tokio::time::timeout(Duration::from_secs(2), opening) => match result {
-                Ok(Ok(stream)) => connected(stream, &mut commands, &tx, &mut stop, &mut retained, &ready, &epoch).await,
+                Ok(Ok(stream)) => connected(stream, &mut commands, &tx, &mut stop, &mut retained, ConnectionState { ready:&ready,epoch:&epoch,connection:&connection }).await,
                 Ok(Err(error)) => Err(format!("Cannot connect: {error}. Start the existing daemon with the CLI.")),
                 Err(error) => Err(error.to_string()),
             }
         };
         ready.store(false, Ordering::Release);
         advance_epoch(&epoch);
+        advance_epoch(&connection);
         if *stop.borrow() || commands.is_closed() {
             return;
         }
@@ -1036,6 +1217,121 @@ mod tests {
     use super::*;
     use formless_protocol::{MessageInfo, SendMode};
     use serde_json::json;
+
+    fn question(id: &str) -> formless_protocol::Event {
+        Event::UserQuestion {
+            question_id: id.into(),
+            session_id: "a".into(),
+            question: "Which option ไทย?".into(),
+            options: vec!["one".into(), "two".into()],
+            questions: vec![],
+        }
+    }
+
+    fn answer(open: &questions::Open) -> Command {
+        Command::AnswerQuestion {
+            connection: 0,
+            operation: uuid::Uuid::new_v4(),
+            question: Box::new(open.clone()),
+            answers: vec![formless_protocol::QuestionAnswer {
+                selected: vec!["two".into()],
+                text: Some("Own answer 😀".into()),
+            }],
+        }
+    }
+
+    #[test]
+    fn question_identity_survives_navigation_and_requires_a_specific_positive_ack() {
+        for acknowledged in [false, true] {
+            let mut engine = ready();
+            let event = question("q");
+            let open = questions::Open::from_event(&event).unwrap();
+            engine.receive(ServerMessage::Event(event)).unwrap();
+            engine.select(Some("different-session".into()), 9);
+            engine.outgoing.clear();
+            engine.command(answer(&open));
+            let request = engine.outgoing.pop_back().unwrap();
+            assert!(
+                matches!(&request.request,Request::AnswerQuestion { question_id,answers,.. } if question_id=="q" && answers[0].selected==["two"] && answers[0].text.as_deref()==Some("Own answer 😀"))
+            );
+            engine.command(answer(&open));
+            assert!(
+                engine.outgoing.is_empty(),
+                "no repeated mutation while pending"
+            );
+            respond(&mut engine, request.id, json!({"answered":acknowledged}));
+            let outcome = engine
+                .updates
+                .iter()
+                .rev()
+                .find_map(|update| match update {
+                    Update::QuestionAnswer { outcome, .. } => Some(outcome),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(
+                (
+                    matches!(outcome, questions::Outcome::Accepted),
+                    matches!(outcome, questions::Outcome::Closed)
+                ),
+                (acknowledged, !acknowledged)
+            );
+            assert!(engine.questions.get("q").is_none());
+            engine.command(answer(&open));
+            assert!(
+                engine.outgoing.is_empty(),
+                "closed identity cannot be answered again"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_answer_ack_is_unknown_and_a_retired_snapshot_cannot_revive_a_closed_question() {
+        for payload in [Some(json!({"unexpected":true})), None] {
+            let mut engine = ready();
+            let event = question("q");
+            let open = questions::Open::from_event(&event).unwrap();
+            engine.receive(ServerMessage::Event(event.clone())).unwrap();
+            engine.command(answer(&open));
+            let request = engine.outgoing.pop_back().unwrap();
+            engine
+                .receive(ServerMessage::Response {
+                    id: request.id,
+                    ok: true,
+                    result: payload,
+                    error: None,
+                })
+                .unwrap();
+            assert!(engine.blocked_questions.contains("q"));
+            assert!(engine.updates.iter().any(|update| matches!(
+                update,
+                Update::QuestionAnswer {
+                    outcome: questions::Outcome::Unknown,
+                    ..
+                }
+            )));
+            engine.command(answer(&open));
+            assert!(engine.outgoing.is_empty());
+        }
+        let mut engine = ready();
+        engine.select(Some("a".into()), 1);
+        let request = snapshot_request(&mut engine);
+        let event = question("q");
+        engine.receive(ServerMessage::Event(event.clone())).unwrap();
+        engine
+            .receive(ServerMessage::Event(Event::UserQuestionClosed {
+                question_id: "q".into(),
+            }))
+            .unwrap();
+        let mut old = snapshot("a", "canonical");
+        old["pending_events"] = json!([event]);
+        respond(&mut engine, request, old);
+        assert!(engine.questions.get("q").is_none());
+        assert!(
+            engine.dirty_session,
+            "profile questions are refreshed after observed read overlap"
+        );
+    }
 
     fn prepare(engine: &mut Engine, required: bool) -> uuid::Uuid {
         engine.command(Command::Review {
@@ -1175,6 +1471,7 @@ mod tests {
         let uncertain = HashSet::from([Action {
             id: uuid::Uuid::new_v4(),
             session_id: "a".into(),
+            question_id: None,
         }]);
         assert!(engine.blocked_by_unknown(&Command::CommitPrepared(id), &uncertain));
         assert!(engine.blocked_by_unknown(
@@ -1203,6 +1500,7 @@ mod tests {
             stop,
             ready: Arc::new(AtomicBool::new(true)),
             epoch: Arc::new(AtomicU64::new(0)),
+            connection: Arc::new(AtomicU64::new(0)),
             #[cfg(feature = "test-support")]
             recorded: None,
         };
@@ -1541,8 +1839,11 @@ mod tests {
                 &updates,
                 &mut cancelled,
                 &mut retained,
-                &ready,
-                &epoch,
+                ConnectionState {
+                    ready: &ready,
+                    epoch: &epoch,
+                    connection: &AtomicU64::new(0),
+                },
             ),
         )
         .await
@@ -1559,6 +1860,152 @@ mod tests {
     #[tokio::test]
     async fn eof_after_a_send_preserves_unknown_outcome_without_replay() {
         disconnect_after_unacknowledged_send().await;
+    }
+
+    #[tokio::test]
+    async fn unknown_question_answer_survives_reconnect_stop_and_an_unrelated_question_ack() {
+        let mut retained = disconnect_after_unacknowledged_send().await;
+        let original_send = retained.uncertain.clone();
+        for reconnect in [false, true] {
+            let before = retained.uncertain.clone();
+            let (stream, server) = tokio::io::duplex(16384);
+            let (command_tx, mut commands) = queue::channel(QUEUE);
+            let _keep_commands = command_tx.clone();
+            let (updates, rx) = mpsc::sync_channel(QUEUE);
+            let (_stop, mut cancelled) = watch::channel(false);
+            let ready = AtomicBool::new(false);
+            let epoch = AtomicU64::new(0);
+            let connection = AtomicU64::new(0);
+            let peer = tokio::spawn(async move {
+                let mut server = BufReader::new(server);
+                loop {
+                    let mut line = String::new();
+                    assert_ne!(server.read_line(&mut line).await.unwrap(), 0);
+                    let request: RequestEnvelope = serde_json::from_str(&line).unwrap();
+                    let mut events = Vec::new();
+                    let mut finish = false;
+                    let result = match request.request {
+                        Request::Ping => json!({"min_protocol":1,"max_protocol":1}),
+                        Request::Subscribe { .. } => {
+                            events.push(question("q1"));
+                            if reconnect {
+                                events.push(question("q2"));
+                            }
+                            json!({"subscribed":true})
+                        }
+                        Request::ListSessions => json!([]),
+                        Request::GetSession { id } => snapshot(&id, "canonical"),
+                        Request::AnswerQuestion { question_id, .. } => {
+                            if !reconnect {
+                                assert_eq!(question_id, "q1");
+                                break;
+                            }
+                            assert_eq!(
+                                question_id, "q2",
+                                "the unknown q1 answer must not be retried"
+                            );
+                            finish = true;
+                            json!({"answered":true})
+                        }
+                        Request::InterruptRun { .. } if reconnect => json!({"interrupted":true}),
+                        Request::SendMessage { .. } => {
+                            panic!("an unrelated answer ACK cleared the unknown Send")
+                        }
+                        _ => panic!("unexpected fixture request"),
+                    };
+                    let mut frame =
+                        serde_json::to_vec(&ServerMessage::ok(request.id, result)).unwrap();
+                    frame.push(b'\n');
+                    server.get_mut().write_all(&frame).await.unwrap();
+                    for event in events {
+                        let mut frame = serde_json::to_vec(&ServerMessage::Event(event)).unwrap();
+                        frame.push(b'\n');
+                        server.get_mut().write_all(&frame).await.unwrap();
+                    }
+                    if finish {
+                        break;
+                    }
+                }
+            });
+            let driver = tokio::spawn(async move {
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                loop {
+                    for update in rx.try_iter() {
+                        if let Update::Questions(state) = update {
+                            if state
+                                .open
+                                .iter()
+                                .any(|q| q.id == if reconnect { "q2" } else { "q1" })
+                            {
+                                command_tx
+                                    .try_send(answer(
+                                        &questions::Open::from_event(&question("q1")).unwrap(),
+                                    ))
+                                    .unwrap();
+                                if reconnect {
+                                    command_tx
+                                        .try_send(Command::Intent(Intent::SendMessage {
+                                            session_id: "a".into(),
+                                            content: "must stay blocked".into(),
+                                            mode: SendMode::Send,
+                                        }))
+                                        .unwrap();
+                                    command_tx
+                                        .try_send(Command::Intent(Intent::InterruptRun {
+                                            session_id: "a".into(),
+                                        }))
+                                        .unwrap();
+                                    command_tx
+                                        .try_send(answer(
+                                            &questions::Open::from_event(&question("q2")).unwrap(),
+                                        ))
+                                        .unwrap();
+                                }
+                                return rx;
+                            }
+                        }
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "question inventory never arrived"
+                    );
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            });
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                connected(
+                    stream,
+                    &mut commands,
+                    &updates,
+                    &mut cancelled,
+                    &mut retained,
+                    ConnectionState {
+                        ready: &ready,
+                        epoch: &epoch,
+                        connection: &connection,
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+            peer.await.unwrap();
+            let _receiver = driver.await.unwrap();
+            assert!(result.unwrap_err().contains("disconnected"));
+            if reconnect {
+                assert_eq!(
+                    retained.uncertain, before,
+                    "Stop and q2 ACKs cannot clear either unknown operation"
+                );
+            } else {
+                assert_eq!(retained.uncertain.len(), 2);
+                assert!(retained
+                    .uncertain
+                    .iter()
+                    .any(|action| action.question_id.as_deref() == Some("q1")));
+            }
+            assert!(original_send.is_subset(&retained.uncertain));
+        }
     }
 
     #[tokio::test]
@@ -1710,8 +2157,11 @@ mod tests {
                     &updates,
                     &mut cancelled,
                     &mut retained,
-                    &ready,
-                    &epoch,
+                    ConnectionState {
+                        ready: &ready,
+                        epoch: &epoch,
+                        connection: &AtomicU64::new(0),
+                    },
                 )
                 .await;
                 peer.await.unwrap();

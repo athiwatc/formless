@@ -27,8 +27,9 @@ mod render {
     use gpui_kit::component::{ActiveTheme as _, Theme, ThemeMode};
     use gpui_kit::test::TestWindowExt as _;
     use gpui_kit::{
-        point, px, size, AnyWindowHandle, App, AppContext as _, Bounds, Entity, HeadlessAppContext,
-        Pixels, ScrollDelta, Size, Window, WindowBounds, WindowOptions,
+        point, px, size, AnyWindowHandle, App, AppContext as _, Bounds, ElementId, Entity,
+        Focusable as _, HeadlessAppContext, Pixels, ScrollDelta, Size, Window, WindowBounds,
+        WindowOptions,
     };
 
     /// One state to draw: window size, theme, text size, a control to click
@@ -75,7 +76,43 @@ mod render {
     const WHOLE: Fit = Fit::Whole;
     const REFLOWED: Fit = Fit::Reflowed;
 
-    const STATES: [State; 37] = [
+    const STATES: [State; 41] = [
+        state(
+            "profile-questions-light",
+            1440.,
+            900.,
+            LIGHT,
+            100,
+            Some("open-profile-questions"),
+            WHOLE,
+        ),
+        state(
+            "minimum-profile-questions-dark-200pct",
+            480.,
+            360.,
+            DARK,
+            200,
+            Some("open-profile-questions"),
+            REFLOWED,
+        ),
+        state(
+            "question-form-light",
+            1440.,
+            900.,
+            LIGHT,
+            100,
+            Some("open-profile-questions-form"),
+            WHOLE,
+        ),
+        state(
+            "minimum-question-form-dark-200pct",
+            480.,
+            360.,
+            DARK,
+            200,
+            Some("open-profile-questions-form"),
+            REFLOWED,
+        ),
         state(
             "daemon-forecast-light",
             1440.,
@@ -400,7 +437,7 @@ mod render {
     type ControlSizes = HashMap<(u16, &'static str), Size<Pixels>>;
     const MEASURED: [&str; 3] = ["toggle-sidebar", "composer-primary", "composer-stop"];
 
-    fn inside(window: &Window, id: &'static str, viewport: Size<Pixels>) -> bool {
+    fn inside(window: &Window, id: impl Into<ElementId>, viewport: Size<Pixels>) -> bool {
         let bounds = window.find(id).bounds();
         bounds.left() >= px(0.)
             && bounds.right() <= viewport.width
@@ -657,7 +694,7 @@ mod render {
                     );
                     for id in ids {
                         assert!(
-                            inside(window, id, viewport),
+                            inside(window, *id, viewport),
                             "{name}: with focus in the {label}, {id} is at {:?}, not inside the window",
                             window.find(*id).bounds()
                         );
@@ -741,7 +778,33 @@ mod render {
         } else if let Some(control) = click {
             cx.update_window(any, |_, window, cx| {
                 window.render_frame(cx);
-                if matches!(control, "open-run-recovery" | "open-run-forecast") {
+                if control.starts_with("open-profile-questions") {
+                    use formless_desktop::{client::Update,questions::{Open,State}};
+                    let mut question=Open::from_event(&fixture::user_question("another-profile-session")).unwrap();
+                    question.questions[0].question="A long question ไทย 漢字 😀: choose one option after reviewing the full prompt. ".repeat(20);
+                    question.questions[0].options[0].label="Long option ไทย 漢字 😀 ".repeat(10);
+                    question.questions[0].options[0].description=Some("Long option description for scrolling and focus checks. ".repeat(15));
+                    let mut questions=vec![question.clone()];
+                    if control=="open-profile-questions" {
+                        for i in 1..8 { let mut question=question.clone();question.id=format!("native-question-{i}");questions.push(question); }
+                    }
+                    shell.update(cx,|shell,cx|{
+                        shell.connect_recording_daemon(cx);
+                        shell.apply_client_update(Update::Connection{ready:true,notice:"Connected serialized view fixture".into()},window,cx);
+                        shell.apply_client_update(Update::Questions(State{open:questions,..State::default()}),window,cx);
+                        shell.run_command(Command::Questions,window,cx);
+                    });
+                    window.render_frame(cx);
+                    if control.ends_with("-form") {
+                        for _ in 0..20 {
+                            window.render_frame(cx);
+                            if window.find("open-question-native-question").focused()==Some(true) { break; }
+                            window.press("tab",cx);
+                        }
+                        for _ in 0..3 { window.render_frame(cx);window.simulate_next_frame(cx); }
+                        window.click("open-question-native-question",cx);window.render_frame(cx);
+                    }
+                } else if matches!(control, "open-run-recovery" | "open-run-forecast") {
                     use formless_desktop::client::Update;
                     let sessions = fixture::sessions(3);
                     shell.update(cx, |shell, cx| {
@@ -836,6 +899,160 @@ mod render {
             })
             .expect("offscreen window is open");
             cx.run_until_parked();
+            if control.starts_with("open-profile-questions") {
+                cx.update_window(any, |_, window, cx| {
+                    window.render_frame(cx);
+                    assert!(
+                        inside(window, "questions-dialog", viewport),
+                        "{name}: dialog outside viewport"
+                    );
+                    assert!(
+                        inside(window, "questions-close", viewport),
+                        "{name}: Close outside viewport"
+                    );
+                    assert_eq!(window.find("questions-close").focused(), Some(true));
+                    if control.ends_with("-form") {
+                        assert!(
+                            inside(window, "question-submit", viewport),
+                            "{name}: Submit outside viewport"
+                        );
+                    }
+                })
+                .expect("offscreen window is open");
+                capture(&mut cx, "");
+                let targets: Vec<(ElementId, bool)> = if control.ends_with("-form") {
+                    cx.update_window(any, |_, window, cx| {
+                        let top = window.find("question-prompt").bounds().top();
+                        window.press("end", cx);
+                        window.render_frame(cx);
+                        window.render_frame(cx);
+                        assert!(
+                            window.find("question-prompt").bounds().top() < top,
+                            "{name}: long question cannot be read with keys"
+                        );
+                        window.press("home", cx);
+                        window.render_frame(cx);
+                    })
+                    .expect("offscreen window is open");
+                    vec![
+                        (ElementId::from(("question-option", 0usize)), false),
+                        (ElementId::from(("question-option", 1usize)), false),
+                        (ElementId::from("question-input-anchor"), true),
+                        (ElementId::from("question-copy"), false),
+                        (ElementId::from("question-prompt-copy"), false),
+                        (ElementId::from("question-next"), false),
+                    ]
+                } else {
+                    vec![(ElementId::from("open-question-native-question-7"), false)]
+                };
+                for (id, input) in targets {
+                    cx.update_window(any, |_, window, cx| {
+                        for _ in 0..80 {
+                            window.render_frame(cx);
+                            let focused = if input {
+                                shell
+                                    .read(cx)
+                                    .question_answer_input()
+                                    .unwrap()
+                                    .focus_handle(cx)
+                                    .is_focused(window)
+                            } else {
+                                window.find(id.clone()).focused() == Some(true)
+                            };
+                            if focused {
+                                break;
+                            }
+                            window.press("tab", cx);
+                        }
+                        for _ in 0..3 {
+                            window.render_frame(cx);
+                            window.simulate_next_frame(cx);
+                        }
+                    })
+                    .expect("offscreen window is open");
+                    cx.run_until_parked();
+                    cx.update_window(any, |_, window, cx| {
+                        window.render_frame(cx);
+                        let focused = if input {
+                            shell
+                                .read(cx)
+                                .question_answer_input()
+                                .unwrap()
+                                .focus_handle(cx)
+                                .is_focused(window)
+                        } else {
+                            window.find(id.clone()).focused() == Some(true)
+                        };
+                        assert!(focused, "{name}: {id:?} is keyboard unreachable");
+                        assert!(
+                            inside(window, id.clone(), viewport),
+                            "{name}: focused {id:?} outside viewport: {:?}",
+                            window.find(id.clone()).bounds()
+                        );
+                        if id == ElementId::from(("question-option", 0usize)) {
+                            window.press("space", cx);
+                            window.render_frame(cx);
+                        }
+                    })
+                    .expect("offscreen window is open");
+                }
+                if control.ends_with("-form") {
+                    cx.update_window(any, |_, window, cx| {
+                        window.click("question-submit", cx);
+                        window.render_frame(cx);
+                        assert_eq!(window.find("question-submit").disabled(), Some(true));
+                        assert_eq!(window.find("questions-close").focused(), Some(true));
+                        assert!(
+                            inside(window, "question-submit", viewport),
+                            "{name}: waiting Submit outside viewport"
+                        );
+                        assert!(
+                            inside(window, "questions-close", viewport),
+                            "{name}: waiting Close outside viewport"
+                        );
+                    })
+                    .expect("offscreen window is open");
+                    capture(&mut cx, "-waiting");
+                    cx.update_window(any, |_, window, cx| {
+                        window.click("questions-close", cx);
+                        window.render_frame(cx);
+                        window.click("show-questions", cx);
+                        window.render_frame(cx);
+                        for _ in 0..30 {
+                            if window.find("questions-copy-saved").focused() == Some(true) {
+                                break;
+                            }
+                            window.press("tab", cx);
+                            window.render_frame(cx);
+                        }
+                        for _ in 0..3 {
+                            window.render_frame(cx);
+                            window.simulate_next_frame(cx);
+                        }
+                    })
+                    .expect("offscreen window is open");
+                    cx.run_until_parked();
+                    cx.update_window(any, |_, window, cx| {
+                        window.render_frame(cx);
+                        assert_eq!(window.find("questions-copy-saved").focused(), Some(true));
+                        assert!(
+                            inside(window, "questions-copy-saved", viewport),
+                            "{name}: saved answer copy is outside viewport"
+                        );
+                        window.click("questions-copy-saved", cx);
+                        let saved: serde_json::Value = serde_json::from_str(
+                            &cx.read_from_clipboard().unwrap().text().unwrap(),
+                        )
+                        .unwrap();
+                        assert_eq!(
+                            saved[0]["answers"][0]["selected"][0],
+                            "Long option ไทย 漢字 😀 ".repeat(10)
+                        );
+                    })
+                    .expect("offscreen window is open");
+                    capture(&mut cx, "-saved");
+                }
+            }
             if control == "open-run-forecast" {
                 cx.update_window(any, |_, window, cx| {
                     window.render_frame(cx);
@@ -938,6 +1155,7 @@ mod render {
                 && !control.starts_with("open-daemon-")
                 && control != "open-run-recovery"
                 && control != "open-run-forecast"
+                && !control.starts_with("open-profile-questions")
             {
                 // The overlay panel is inside the window, edge to edge at
                 // most, whatever the page under it was scrolled to.
@@ -959,7 +1177,7 @@ mod render {
                 })
                 .expect("offscreen window is open");
             }
-            if control != "open-run-forecast" {
+            if control != "open-run-forecast" && !control.starts_with("open-profile-questions") {
                 capture(&mut cx, "");
             }
         } else if fit == Fit::Whole {
