@@ -22922,6 +22922,33 @@ mod tests {
         assert_eq!(app.selected_tool().unwrap().name, "csv_sum");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn shell_escaped_drop_attaches_without_replacing_the_composer_draft() {
+        let mut app = test_app();
+        app.current = Some("s".into());
+        std::fs::create_dir_all(&app.paths.data_dir).unwrap();
+        let file = app.paths.data_dir.join("shot (1).png");
+        std::fs::write(&file, b"image fixture").unwrap();
+        let escaped = file
+            .to_str()
+            .unwrap()
+            .replace(' ', "\\ ")
+            .replace('(', "\\(")
+            .replace(')', "\\)");
+        app.input.paste("keep this draft");
+        app.paste(&escaped);
+        assert_eq!(app.attachments.len(), 1);
+        assert_eq!(app.input.expanded(), "keep this draft");
+        assert!(render(&mut app, 100, 24).contains("shot (1).png"));
+        // Inputs containing two paths remain text and never attach one part.
+        let two = format!("'{}' '{}'", file.display(), file.display());
+        app.paste(&two);
+        assert_eq!(app.attachments.len(), 1);
+        assert!(app.input.expanded().ends_with(&two));
+        std::fs::remove_file(file).unwrap();
+    }
+
     #[test]
     fn dropped_files_become_removable_attachment_chips() {
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
