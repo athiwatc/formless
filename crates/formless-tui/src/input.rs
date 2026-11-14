@@ -24,6 +24,8 @@ pub struct InputLine {
     cursor: usize,
     /// Preferred display column for consecutive wrapped-row moves, by width.
     visual_goal: Option<(usize, usize)>,
+    /// Preferred display column across logical-line vertical moves.
+    logical_goal: Option<usize>,
     /// Placeholder shown in `text` -> the pasted text it stands for.
     pastes: Vec<(String, String)>,
     /// Browsing history: (index into the history, the draft to restore).
@@ -116,6 +118,7 @@ impl InputLine {
     }
     fn restore(&mut self, s: EditSnapshot) {
         self.visual_goal = None;
+        self.logical_goal = None;
         self.literal = s.literal;
         self.text = s.text;
         self.cursor = s.cursor;
@@ -128,6 +131,7 @@ impl InputLine {
     }
     fn before_edit(&mut self, typing: bool) {
         self.visual_goal = None;
+        self.logical_goal = None;
         self.history_notice = None;
         if !self.history.coalesces(typing) {
             let current = self.snapshot();
@@ -138,6 +142,7 @@ impl InputLine {
     }
     pub(crate) fn break_edit_group(&mut self) {
         self.visual_goal = None;
+        self.logical_goal = None;
         self.history.break_group();
         self.yank = None;
         self.last_kill = false;
@@ -262,6 +267,12 @@ impl InputLine {
     /// Modal editors use whole grapheme boundaries, not byte/char fragments.
     pub(crate) fn set_modal_cursor(&mut self, at: usize) {
         self.visual_goal = None;
+        self.logical_goal = None;
+        self.clamp_modal_cursor(at);
+    }
+
+    /// Normal-mode end clamping is normalization, not a new horizontal goal.
+    pub(crate) fn clamp_modal_cursor(&mut self, at: usize) {
         self.cursor = self
             .text
             .grapheme_indices(true)
@@ -297,6 +308,7 @@ impl InputLine {
     /// Vim works on actual text. Expand paste placeholders before modal
     /// editing so a partial operator cannot strand or silently discard a paste.
     pub(crate) fn modal_expand_pastes(&mut self) {
+        let mut expanded = false;
         for (placeholder, full) in std::mem::take(&mut self.pastes) {
             if let Some(start) = self.text.find(&placeholder) {
                 let end = start + placeholder.len();
@@ -317,9 +329,17 @@ impl InputLine {
                     self.cursor
                 };
                 self.text.replace_range(start..end, &full);
+                expanded = true;
             }
         }
-        self.set_modal_cursor(self.cursor);
+        if expanded {
+            self.visual_goal = None;
+            self.logical_goal = None;
+            self.snap_after_insert();
+            self.anchor = self.anchor.map(|at| self.boundary_at_or_after(at));
+        } else {
+            self.clamp_modal_cursor(self.cursor);
+        }
     }
 
     pub(crate) fn is_literal(&self) -> bool {
@@ -372,6 +392,7 @@ impl InputLine {
         self.remove_selection();
         self.text.insert(self.cursor, c);
         self.cursor += c.len_utf8();
+        self.snap_after_insert();
         self.browsing = None;
     }
 
@@ -387,7 +408,35 @@ impl InputLine {
     fn insert_raw(&mut self, s: &str) {
         self.text.insert_str(self.cursor, s);
         self.cursor += s.len();
+        self.snap_after_insert();
         self.browsing = None;
+    }
+
+    /// Insertion can join neighbors on both sides. Keep the cursor after the
+    /// completed full-text cluster, without altering the inserted text.
+    fn snap_after_insert(&mut self) {
+        self.cursor = self.boundary_at_or_after(self.cursor);
+    }
+
+    fn boundary_at_or_after(&self, at: usize) -> usize {
+        let mut cursor = unicode_segmentation::GraphemeCursor::new(at, self.text.len(), true);
+        match cursor.is_boundary(&self.text, 0) {
+            Ok(true) => return at,
+            Ok(false) => {
+                if let Ok(Some(next)) = cursor.next_boundary(&self.text, 0) {
+                    return next;
+                }
+            }
+            Err(_) => {}
+        }
+        // Full text is normally sufficient for GraphemeCursor; retain a
+        // boundary-safe fallback for any unexpected context request.
+        self.text
+            .grapheme_indices(true)
+            .map(|(i, _)| i)
+            .chain(std::iter::once(self.text.len()))
+            .find(|&i| i >= at)
+            .unwrap_or(self.text.len())
     }
 
     /// A bracketed paste: inserted as one block, never as Enter presses.
@@ -647,7 +696,8 @@ impl InputLine {
         let start = self.cursor;
         self.insert_raw(&text);
         self.literal = base_literal || self.ring.literal(0);
-        self.yank = Some((start, self.cursor, 0, base_literal));
+        // Track inserted bytes, not a cursor snapped across a neighboring cluster.
+        self.yank = Some((start, start + text.len(), 0, base_literal));
         true
     }
 
@@ -669,7 +719,7 @@ impl InputLine {
         self.remove(start, end);
         self.insert_raw(&text);
         self.literal = base_literal || self.ring.literal(index + 1);
-        self.yank = Some((start, self.cursor, index + 1, base_literal));
+        self.yank = Some((start, start + text.len(), index + 1, base_literal));
         true
     }
 
@@ -687,8 +737,11 @@ impl InputLine {
 
     /// Up/Down inside a multi-line input, keeping the screen column.
     pub fn vertical(&mut self, down: bool) {
+        let col = self
+            .logical_goal
+            .unwrap_or_else(|| text::width(&self.text[self.line_start()..self.cursor]));
         self.break_edit_group();
-        let col = text::width(&self.text[self.line_start()..self.cursor]);
+        self.logical_goal = Some(col);
         let target = if down {
             if self.on_last_line() {
                 return;
@@ -933,6 +986,106 @@ fn find_back(history: &[impl AsRef<str>], query: &str, before: usize) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn composer_joining_insertions_keep_full_grapheme_boundaries() {
+        for (before, at_byte, inserted, after, cursor) in [
+            ("👩💻x", "👩".len(), '\u{200d}', "👩‍💻x", "👩‍💻".len()),
+            ("🇦🇧🇨x", "🇦🇧".len(), '🇩', "🇦🇧🇩🇨x", "🇦🇧🇩🇨".len()),
+            ("abx", 1, '\u{301}', "a\u{301}bx", "a\u{301}".len()),
+            ("abx", 1, '\u{600}', "a\u{600}bx", "a\u{600}b".len()),
+        ] {
+            for mode in 0..4 {
+                let mut line = at(before, at_byte);
+                let text = inserted.to_string();
+                match mode {
+                    0 => line.insert_char(inserted),
+                    1 => line.insert_str(&text),
+                    2 => line.paste(&text),
+                    _ => {
+                        assert!(line.modal_replace(at_byte..at_byte, &text));
+                    }
+                }
+                assert_eq!(line.expanded(), after);
+                assert_eq!(line.cursor_byte(), cursor, "{before:?} mode={mode}");
+                let mut back = line.clone();
+                back.backspace();
+                assert!(
+                    back.cursor_byte() == back.len()
+                        || back
+                            .grapheme_indices(true)
+                            .any(|(at, _)| at == back.cursor_byte())
+                );
+                let mut forward = line.clone();
+                forward.delete();
+                assert!(
+                    forward.cursor_byte() == forward.len()
+                        || forward
+                            .grapheme_indices(true)
+                            .any(|(at, _)| at == forward.cursor_byte())
+                );
+                assert!(line.undo());
+                assert_eq!(line.expanded(), before);
+                assert_eq!(line.cursor_byte(), at_byte);
+                assert!(line.redo());
+                assert_eq!(line.expanded(), after);
+                assert_eq!(line.cursor_byte(), cursor);
+            }
+        }
+        let mut line = at("👩💻x", "👩".len());
+        line.insert_char('\u{200d}');
+        let mut forward = line.clone();
+        forward.delete();
+        assert_eq!(forward.expanded(), "👩‍💻");
+        line.backspace();
+        assert_eq!(line.expanded(), "x");
+    }
+
+    #[test]
+    fn composer_logical_vertical_goal_survives_short_wide_and_empty_lines() {
+        for (text, goal) in [
+            ("abcd\nx\nabcd", 3),
+            ("ab\n界界\nab", 1),
+            ("abcd\n\nabcd", 3),
+        ] {
+            let last = text.rfind('\n').unwrap() + 1;
+            let mut line = at(text, goal);
+            for _ in 0..2 {
+                line.prepare_selection(false);
+                line.vertical(true);
+            }
+            assert_eq!(line.cursor_byte(), last + goal, "{text:?}");
+            for _ in 0..2 {
+                line.prepare_selection(false);
+                line.vertical(false);
+            }
+            assert_eq!(line.cursor_byte(), goal, "{text:?}");
+        }
+        let mut line = at("abcd\nx\nabcd", 3);
+        line.vertical(true);
+        line.left();
+        line.vertical(true);
+        assert_eq!(line.cursor_byte(), 7);
+        line.set("abcd\nx\nabcd");
+        line.set_modal_cursor(3);
+        line.vertical(true);
+        line.insert_char('y');
+        line.vertical(true);
+        assert_eq!(line.cursor_byte(), 10);
+    }
+
+    #[test]
+    fn composer_joining_yank_cycle_preserves_neighboring_text() {
+        let mut line = at("👩💻", "👩".len());
+        line.ring.kill("X".into(), false, false, false);
+        line.ring.kill("\u{200d}".into(), false, false, false);
+        assert!(line.yank());
+        assert_eq!(line.expanded(), "👩‍💻");
+        assert_eq!(line.cursor_byte(), "👩‍💻".len());
+        assert!(line.cycle_yank());
+        assert_eq!(line.expanded(), "👩X💻");
+        assert_eq!(line.cursor_byte(), "👩X".len());
+    }
 
     #[test]
     fn history_search_accept_after_shrink_preserves_the_draft() {

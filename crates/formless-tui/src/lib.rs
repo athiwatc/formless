@@ -19230,6 +19230,18 @@ mod tests {
     }
 
     #[test]
+    fn composer_character_event_keeps_joined_emoji_whole() {
+        let mut app = test_app();
+        app.vim_mode = false;
+        app.input.set("👩💻x");
+        app.input.set_modal_cursor("👩".len());
+        app.key(KeyEvent::new(KeyCode::Char('\u{200d}'), KeyModifiers::NONE));
+        assert_eq!(app.input.cursor_byte(), "👩‍💻".len());
+        app.key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(app.input.expanded(), "x");
+    }
+
+    #[test]
     fn message_role_styles_resolve_named_colors_and_preserve_disabled_rgb_defaults() {
         theme::reset();
         let colors = ["user", "assistant", "tool", "note"]
