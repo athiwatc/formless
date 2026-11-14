@@ -1350,7 +1350,18 @@ pasting paths.
   its finished blocks (up to the last blank line outside a code fence) as
   Markdown, reusing that render, and shows the unfinished tail as plain
   text. Open code fences, tables and lists don't reflow, and the view stays
-  anchored.
+  anchored. Completed-line split state is reused within the current answer;
+  unchanged source does not repeat split work. A commit, retry, new Run or
+  Session/snapshot opening resets the live text caches. Verified event appends
+  reuse checkpoints; other source replacements are checked or rebuilt.
+  String operations, unfinished-block formatting and DOM/layout work remain
+  separate costs; this is not a guarantee of linear total rendering.
+  With thinking visible, the web shows the latest six logical reasoning
+  lines by default. **Expand reasoning** opens all currently retained live
+  text in a bounded keyboard-accessible scrollport; appends preserve its
+  reading position. **Collapse reasoning** returns to the current tail.
+  Hiding thinking hides both text and control. Expansion resets with the
+  current answer and does not add reasoning persistence.
 - **Web `@` mentions.** `@` in the web composer completes Tool names
   (labelled "Tool"; inserted as `@name` for the agent to see) and files
   from the Session's working directory, through the daemon. A chosen file
