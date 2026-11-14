@@ -10143,31 +10143,21 @@ impl Daemon {
             .collect();
         // Shared modules match too, so the agent reuses (and reads, with
         // read_module) a helper instead of rewriting it.
-        let words: Vec<String> = query
-            .split(|c: char| !c.is_alphanumeric())
-            .filter(|w| w.len() >= 3)
-            .map(str::to_lowercase)
-            .collect();
-        let modules: Vec<Value> = self
+        let matcher = crate::summary_search::Query::new(query);
+        let modules = self
             .with_store(|st| st.list_modules())?
             .into_iter()
-            .filter(|m| !m.retired)
-            .filter(|m| {
-                let hay = format!("{} {}", m.name, m.description).to_lowercase();
-                words.iter().any(|w| hay.contains(w.as_str()))
-            })
-            .take(limit)
+            .filter(|m| !m.retired);
+        let modules: Vec<Value> = matcher.rank(modules, limit, |module| (module.name.as_str(), module.description.as_str()))
+            .into_iter()
             .map(|m| json!({"name": m.name, "description": m.description, "version": m.current_version}))
             .collect();
-        let skills: Vec<Value> = self
+        let skills = self
             .with_store(|st| st.list_skills())?
             .into_iter()
-            .filter(|s| s.enabled && !s.retired)
-            .filter(|s| {
-                let hay = format!("{} {}", s.name, s.description).to_lowercase();
-                words.iter().any(|w| hay.contains(w.as_str()))
-            })
-            .take(limit)
+            .filter(|s| s.enabled && !s.retired);
+        let skills: Vec<Value> = matcher.rank(skills, limit, |skill| (skill.name.as_str(), skill.description.as_str()))
+            .into_iter()
             .map(|s| json!({"name": s.name, "description": s.description, "load_with": "load_skill"}))
             .collect();
         // Repeated raw MCP chains among the hits (SPEC §8.3).
@@ -18806,3 +18796,7 @@ mod read_metrics_limit_tests {
 #[cfg(test)]
 #[path = "module_read_projection_tests.rs"]
 mod module_read_projection_tests;
+
+#[cfg(test)]
+#[path = "summary_search_handler_tests.rs"]
+mod summary_search_handler_tests;
