@@ -3860,6 +3860,14 @@ run_tool = "network_policy"     # a registry Tool, or…
   Each block's top border names its language and its index in the
   message (`╭─ rust [2]`), which is the number `/copy code 2` and
   `/pager code 2` use. `tui.code_line_numbers` adds dim line numbers.
+  Code copy and paging use the same parser options and source order as chat,
+  including tilde fences, indented blocks, longer and unclosed fences, and
+  Mermaid among other code blocks. Commands target the last nonblank
+  assistant answer, default to its last block, and use one-based indices.
+  The body has Markdown containers/indentation interpreted by the parser;
+  copying removes exactly one final parser newline, as chat presentation
+  does, and preserves other whitespace. Diagram-command numbering is
+  separate and unchanged.
 - **Tables in narrow terminals (TUI).** Markdown tables wider than the
   pane shrink: columns narrower than an equal share keep their width, and
   the rest share the room in proportion. Cell text wraps inside its
@@ -3868,6 +3876,10 @@ run_tool = "network_policy"     # a registry Tool, or…
   each value wrapping under itself with a hanging indent.
   `/table [N]` opens the last answer's Nth table at full width in the
   pager, where ←/→ scroll sideways.
+  Selection uses parsed table order within the last nonblank assistant
+  answer, defaults to table 1, accepts optional outer pipes, and excludes
+  pipe-like prose or code. Parsed cells, alignment and inline formatting
+  survive enclosing lists/quotes; the full-width pager omits those containers.
 - **Tool calls in the TUI chat.** Persisted calls start collapsed to one
   line: `▸ ⚙ name ✓`, an input summary, and the first line of the result
   (✗ on failure, … while there is none). Their separate result lines are

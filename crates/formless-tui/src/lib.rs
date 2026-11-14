@@ -14042,37 +14042,8 @@ fn mermaid_live_url(src: &str) -> String {
     )
 }
 
-/// The Markdown tables in `text`: runs of lines that start with `|`.
-fn markdown_tables(text: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut cur: Vec<&str> = Vec::new();
-    for line in text.lines().chain(std::iter::once("")) {
-        if line.trim_start().starts_with('|') {
-            cur.push(line);
-        } else if !cur.is_empty() {
-            if cur.len() >= 2 {
-                out.push(cur.join("\n"));
-            }
-            cur.clear();
-        }
-    }
-    out
-}
-
 fn code_blocks(text: &str) -> Vec<String> {
-    let mut blocks = Vec::new();
-    let mut current: Option<Vec<&str>> = None;
-    for line in text.lines() {
-        if line.trim_start().starts_with("```") {
-            match current.take() {
-                Some(lines) => blocks.push(lines.join("\n")),
-                None => current = Some(Vec::new()),
-            }
-        } else if let Some(lines) = current.as_mut() {
-            lines.push(line);
-        }
-    }
-    blocks
+    markdown::code_blocks(text)
 }
 
 /// OSC 52: the terminal puts `text` on the clipboard (works over SSH;
@@ -15193,14 +15164,15 @@ impl App {
             self.notes.push("no answer with a table yet".into());
             return;
         };
-        let tables = markdown_tables(&last.content);
+        let tables = markdown::tables(&last.content);
         let n = arg.parse::<usize>().unwrap_or(1);
         let Some(table) = n.checked_sub(1).and_then(|i| tables.get(i)) else {
             self.notes
                 .push(format!("the last answer has {} table(s)", tables.len()));
             return;
         };
-        let lines = markdown::render(table, false, "", 100_000)
+        let lines = table
+            .render(false, 100_000)
             .into_iter()
             .map(|l| {
                 l.spans
@@ -24017,6 +23989,50 @@ mod tests {
     }
 
     #[test]
+    fn table_command_uses_parsed_order_and_the_last_nonblank_answer() {
+        let mut app = test_app();
+        let message = |id: &str, role: &str, content: &str| MessageInfo {
+            id: id.into(),
+            session_id: "s".into(),
+            seq: 1,
+            role: role.into(),
+            content: content.into(),
+            created_at: String::new(),
+            meta: None,
+        };
+        let source = "Name | Value\n--- | ---\nalpha | 1\n\n| prose one\n| prose two\n\n~~~\n| Fake | Value |\n| --- | --- |\n| ignored | 2 |\n~~~\n\n> Next | Value\n> --- | ---\n> beta | 3";
+        app.messages = vec![
+            message(
+                "old",
+                "assistant",
+                "| Old | Value |\n|---|---|\n| old | 0 |",
+            ),
+            message("current", "assistant", source),
+            message("blank", "assistant", "  \n"),
+            message("user", "user", "not an answer"),
+        ];
+        app.open_table("");
+        let pager = app.pager.as_ref().expect("first parsed table");
+        assert_eq!(pager.title, "table 1 of 2");
+        assert!(
+            pager.lines.iter().any(|line| line.contains("alpha")),
+            "{:?}",
+            pager.lines
+        );
+        app.open_table("2");
+        let pager = app.pager.as_ref().unwrap();
+        assert_eq!(pager.title, "table 2 of 2");
+        assert!(pager.lines.iter().any(|line| line.contains("beta")));
+        for index in ["0", "3"] {
+            app.open_table(index);
+            assert!(app.notes.last().unwrap().contains("2 table(s)"));
+        }
+        app.messages[1].content = "No tables in the newest answer".into();
+        app.open_table("");
+        assert!(app.notes.last().unwrap().contains("0 table(s)"));
+    }
+
+    #[test]
     fn tables_open_full_width_in_the_pager() {
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
         let mut app = test_app();
@@ -24033,7 +24049,7 @@ mod tests {
             created_at: String::new(),
             meta: None,
         }];
-        assert_eq!(markdown_tables(&app.messages[0].content).len(), 2);
+        assert_eq!(markdown::tables(&app.messages[0].content).len(), 2);
         app.slash("table");
         let p = app.pager.as_ref().unwrap();
         assert_eq!(p.title, "table 1 of 2");
@@ -24133,6 +24149,47 @@ mod tests {
         assert_eq!(role_style(true, "user").fg, Some(Color::Rgb(255, 0, 0)));
         assert_eq!(fg(false, Color::Yellow).fg, None, "NO_COLOR still wins");
         theme::reset();
+    }
+
+    #[test]
+    fn parsed_code_blocks_preserve_pager_ordinals_and_latest_answer() {
+        let mut app = test_app();
+        let message = |id: &str, role: &str, content: &str| MessageInfo {
+            id: id.into(),
+            session_id: "s".into(),
+            seq: 1,
+            role: role.into(),
+            content: content.into(),
+            created_at: String::new(),
+            meta: None,
+        };
+        app.messages = vec![message("old", "assistant", "```\nold\n```"), message("new", "assistant", "~~~\nfirst\n~~~\n\n    second\n\n```mermaid\ngraph LR\nA --> B\n```\n\n````\nlast\n```\ncontinued"), message("blank", "assistant", " "), message("user", "user", "ignored")];
+        app.open_code("");
+        assert_eq!(app.pager.as_ref().unwrap().title, "code block 4 of 4");
+        assert_eq!(
+            app.pager.as_ref().unwrap().lines,
+            ["1 │ last", "2 │ ```", "3 │ continued"]
+        );
+        app.open_code("2");
+        assert_eq!(app.pager.as_ref().unwrap().lines, ["1 │ second"]);
+        app.open_code("3");
+        assert_eq!(app.pager.as_ref().unwrap().title, "code block 3 of 4");
+        assert!(app
+            .pager
+            .as_ref()
+            .unwrap()
+            .lines
+            .iter()
+            .any(|line| line.contains("graph LR")));
+        for index in ["0", "5"] {
+            app.open_code(index);
+            assert!(app.notes.last().unwrap().contains("4 code block(s)"));
+            app.copy_cmd(&format!("code {index}"));
+            assert!(app.notes.last().unwrap().contains("4 code block(s)"));
+        }
+        app.messages[1].content = "No code in the newest answer".into();
+        app.open_code("");
+        assert!(app.notes.last().unwrap().contains("0 code block(s)"));
     }
 
     #[test]
