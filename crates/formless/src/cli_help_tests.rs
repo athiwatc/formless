@@ -413,7 +413,7 @@ fn docs_long_help_lists_every_topic_name_and_description() {
     let docs = root.find_subcommand("docs").unwrap();
     assert_eq!(
         docs.get_about().map(ToString::to_string).as_deref(),
-        Some("Open the guides in a browser")
+        Some("Open an online guide or read this build's bundled Markdown")
     );
     let error = match super::Cli::try_parse_from(["formless", "docs", "--help"]) {
         Err(error) => error,
@@ -421,7 +421,7 @@ fn docs_long_help_lists_every_topic_name_and_description() {
     };
     assert_eq!(error.kind(), ErrorKind::DisplayHelp);
     let rendered = normalized(&error.to_string());
-    assert!(rendered.contains("Open the guides in a browser"));
+    assert!(rendered.contains("Open an online guide or read this build's bundled Markdown"));
     for (name, _, description) in formless_core::docs::TOPICS {
         assert!(
             rendered.contains(name),
@@ -439,7 +439,9 @@ fn parsed_docs(args: &[&str]) -> (Option<String>, bool, bool) {
         panic!("parser rejected {}: {error}", args.join(" "));
     });
     match cli.cmd {
-        Some(super::Cmd::Docs { topic, print, keys }) => (topic, print, keys),
+        Some(super::Cmd::Docs {
+            topic, print, keys, ..
+        }) => (topic, print, keys),
         _ => panic!("expected docs command"),
     }
 }
@@ -911,5 +913,18 @@ fn task_guide_examples_parse_without_dispatch_and_schedule_examples_are_valid() 
                 }
             }
         }
+    }
+}
+
+#[test]
+fn bundled_docs_text_conflicts_with_url_and_keys_modes() {
+    for args in [
+        ["formless", "docs", "--text", "--print"],
+        ["formless", "docs", "--text", "--keys"],
+    ] {
+        let error = super::Cli::try_parse_from(args)
+            .err()
+            .expect("modes must conflict");
+        assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
     }
 }

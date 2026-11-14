@@ -8128,19 +8128,22 @@ impl App {
             "mcp catalog" => self.request(Pending::McpCatalog, Request::McpCatalog),
             "status" => self.request(Pending::DaemonStatus, Request::Status),
             cmd if cmd == "docs" || cmd.starts_with("docs ") => {
-                let topic = cmd["docs".len()..].trim();
-                match formless_core::docs::resolve(Some(topic).filter(|t| !t.is_empty())) {
-                    Ok(url) => {
-                        let opened = formless_core::docs::open_url(&url);
-                        self.notes.push(if opened {
-                            format!("opened {url}")
+                let (topic, text) = formless_core::docs::text_option(cmd["docs".len()..].trim());
+                match formless_core::docs::present(Some(&topic), text) {
+                    Ok(guide) => {
+                        if let Some(body) = guide.text {
+                            self.pager = Some(Pager {
+                                title: format!("Guide · {} (bundled {})", if topic.is_empty() { "gallery" } else { &topic }, env!("CARGO_PKG_VERSION")),
+                                lines: body.lines().map(str::to_owned).collect(),
+                                top: 0, left: 0, styled: Vec::new(),
+                            });
+                            self.notes.push(format!("Current online copy (may differ from this build): {}", guide.url));
                         } else {
-                            format!("docs: {url}")
-                        });
+                            self.notes.push(format!("opened current online copy: {}", guide.url));
+                        }
                     }
                     Err(error) => {
-                        let names: Vec<&str> =
-                            formless_core::docs::TOPICS.iter().map(|(n, _, _)| *n).collect();
+                        let names: Vec<&str> = formless_core::docs::TOPICS.iter().map(|(n, _, _)| *n).collect();
                         self.notes.push(format!("{error}; docs topics: {}", names.join(", ")));
                     }
                 }
@@ -22821,6 +22824,32 @@ mod tests {
     }
 
     #[test]
+    fn docs_text_uses_the_local_pager_and_reports_topic_errors() {
+        let mut app = test_app();
+        app.slash("docs --text docker");
+        let page = app.pager.as_ref().unwrap();
+        assert!(page.title.contains("bundled"));
+        assert_eq!(
+            page.lines.join("\n"),
+            include_str!("../../../docs/docker.md")
+                .lines()
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let screen = render(&mut app, 100, 24);
+        assert!(screen.contains("bundled"), "{screen}");
+        app.pager = None;
+        app.slash("docs approvals --text");
+        assert!(app.pager.as_ref().unwrap().lines[0].starts_with("## Are you asked?"));
+        app.pager = None;
+        app.slash("docs --text nope");
+        assert!(app.pager.is_none());
+        assert!(app.notes.last().unwrap().contains("unknown docs topic"));
+        app.slash("docs s --text");
+        assert!(app.notes.last().unwrap().contains("ambiguous docs topic"));
+    }
+
+    #[test]
     fn list_views_filter_sort_and_keep_selection_on_visible_rows() {
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
         let mut app = test_app();
@@ -22891,6 +22920,33 @@ mod tests {
         assert_eq!(app.selected_tool().unwrap().name, "read_file");
         app.key(key(KeyCode::Down));
         assert_eq!(app.selected_tool().unwrap().name, "csv_sum");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_escaped_drop_attaches_without_replacing_the_composer_draft() {
+        let mut app = test_app();
+        app.current = Some("s".into());
+        std::fs::create_dir_all(&app.paths.data_dir).unwrap();
+        let file = app.paths.data_dir.join("shot (1).png");
+        std::fs::write(&file, b"image fixture").unwrap();
+        let escaped = file
+            .to_str()
+            .unwrap()
+            .replace(' ', "\\ ")
+            .replace('(', "\\(")
+            .replace(')', "\\)");
+        app.input.paste("keep this draft");
+        app.paste(&escaped);
+        assert_eq!(app.attachments.len(), 1);
+        assert_eq!(app.input.expanded(), "keep this draft");
+        assert!(render(&mut app, 100, 24).contains("shot (1).png"));
+        // Inputs containing two paths remain text and never attach one part.
+        let two = format!("'{}' '{}'", file.display(), file.display());
+        app.paste(&two);
+        assert_eq!(app.attachments.len(), 1);
+        assert!(app.input.expanded().ends_with(&two));
+        std::fs::remove_file(file).unwrap();
     }
 
     #[test]
