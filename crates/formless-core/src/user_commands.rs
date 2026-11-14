@@ -269,7 +269,9 @@ fn parse(text: &str) -> Result<(String, String), &'static str> {
             if line.trim().is_empty() || line.trim_start().starts_with('#') {
                 continue;
             }
-            let Some(value) = line.strip_prefix("description:") else {
+            let key = line.trim_start();
+            let key_indent = line.len() - key.len();
+            let Some(value) = key.strip_prefix("description:") else {
                 return Err("Only description frontmatter is supported");
             };
             if found {
@@ -279,10 +281,15 @@ fn parse(text: &str) -> Result<(String, String), &'static str> {
             let value = crate::frontmatter::scalar_without_comment(value.trim());
             description = if matches!(value, ">" | "|" | ">-" | "|-") {
                 let mut parts = Vec::new();
-                while index < header.len()
-                    && (header[index].starts_with(char::is_whitespace) || header[index].is_empty())
-                {
-                    parts.push(header[index].trim());
+                while index < header.len() {
+                    let line = header[index];
+                    let content = line.trim_start();
+                    // A sibling key/comment ends the block, even when the
+                    // description key itself has leading whitespace.
+                    if !content.is_empty() && line.len() - content.len() <= key_indent {
+                        break;
+                    }
+                    parts.push(line.trim());
                     index += 1;
                 }
                 parts.join(" ")
@@ -1196,6 +1203,70 @@ mod tests {
             assert!(parse(text).is_err(), "{text:?}");
         }
     }
+    #[test]
+    fn indented_description_keys_load_without_consuming_sibling_keys() {
+        for (header, expected) in [
+            ("  description: Review the diff", "Review the diff"),
+            ("\tdescription: Review the diff", "Review the diff"),
+            (
+                "  # comment\n  description: \"Review # diff\" # note",
+                "Review # diff",
+            ),
+            ("  description: 'It''s useful'", "It's useful"),
+            (
+                "  description: >\n    First line\n    second line",
+                "First line second line",
+            ),
+            (
+                "\tdescription: |-\n\t\tliteral # content",
+                "literal # content",
+            ),
+            ("  description: >\n    text\n  # sibling comment", "text"),
+            (
+                "  description: |\n    description: literal\n    other: content",
+                "description: literal other: content",
+            ),
+        ] {
+            let source = format!("---\n{header}\n---\nReview $1\n$ARGUMENTS_PATH\n");
+            assert_eq!(parse(&source).unwrap().0, expected, "{header}");
+            let fixture = Fixture::new();
+            fixture.global("review.md", &source);
+            let snapshot = fixture.load(&[]);
+            assert!(
+                snapshot.diagnostics.is_empty(),
+                "{:?}",
+                snapshot.diagnostics
+            );
+            let command = snapshot.find("review").unwrap();
+            assert_eq!(command.description, expected);
+            assert_eq!(snapshot.projection().commands[0].description, expected);
+            assert_eq!(command.max_position, 1);
+            assert!(!command.uses_arguments);
+            assert_eq!(
+                command.expand("diff.patch").unwrap(),
+                "Review diff.patch\n$ARGUMENTS_PATH\n"
+            );
+        }
+        for header in [
+            "  other: unsupported",
+            "  description: first\n  description: second",
+            "  description: >\n    first\n  description: second",
+            "  description: >\n    first\n  other: unsupported",
+            "\tdescription: |\n\t\tfirst\n\tother: unsupported",
+            "  description: >\n  not deeper",
+            "  description: # empty",
+            "  description: \"unfinished",
+        ] {
+            let source = format!("---\n{header}\n---\nBody");
+            assert!(parse(&source).is_err(), "{header}");
+            let fixture = Fixture::new();
+            fixture.global("review.md", &source);
+            let snapshot = fixture.load(&[]);
+            assert!(snapshot.find("review").is_none(), "{header}");
+            assert_eq!(snapshot.diagnostics.len(), 1, "{header}");
+        }
+    }
+
     #[test]
     fn frontmatter_comments_preserve_scalar_text_and_command_discovery() {
         for (header, expected) in [
