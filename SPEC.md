@@ -4951,8 +4951,8 @@ undo, redo and replacements invalidate prior asynchronous editor previews.
   the main keys and every command, troubleshooting, and Docker. The `mcp`,
   `skills` and `jobs` topics open `docs/mcp.md`, `docs/skills.md` and
   `docs/jobs.md`; each links to its full specification section. `/docs [topic]` (TUI and web) and `formless docs [topic]
-  [--print]` open one (`gallery`, `capabilities`, `approvals`, `keys`,
-  `troubleshooting`, `mcp`, `skills`, `jobs`, `spec`; a unique prefix works;
+  [--print|--text]` access one (`gallery`, `capabilities`, `approvals`, `keys`,
+  `troubleshooting`, `docker`, `mcp`, `skills`, `jobs`, `spec`; a unique prefix works;
   none opens the gallery). `formless doctor` prints the troubleshooting link, and
   `/help` points to `/docs`.
 - `docs/keys.md` is generated from the same key and command tables `/help`
@@ -4963,12 +4963,26 @@ Terminal docs commands default to the gallery. Exact topic names win;
 otherwise a unique prefix is required. Unknown names and ambiguous prefixes
 are reported explicitly (CLI usage exit 2 with available topics; TUI/plain
 notes name the error and candidates). CLI help examples are shell-tokenized
-and checked against the real parser without dispatch. SSH sessions and
-headless Linux print the URL without launching an opener; desktop openers
-must exit successfully within two seconds, and every child is reaped
-(stalled launchers are stopped). An opener's success does not prove browser
-navigation; the URL is retained in every result. `formless docs --print` and
-topic errors need no profile/config or daemon.
+and checked against the real parser without dispatch. `formless docs TOPIC
+--text` prints the bundled Markdown exactly, without config/profile, daemon,
+network or browser access. All topics have embedded content; `spec` is the
+full bundled SPEC and anchored topics select a top-level Markdown heading's
+subtree through the next same-or-higher-level heading. A Markdown parser
+supplies byte offsets and rendered heading labels, ignoring code/quoted
+examples; missing or duplicate bundled anchors are explicit errors.
+
+Desktop defaults still open the current online copy. A failed or unavailable
+opener (including SSH/headless hosts) falls back to bundled text in the CLI
+or a TUI pager, retaining a separately labeled current online URL that may
+differ from the installed build. An opener must exit successfully within two
+seconds and is reaped; success cannot prove browser navigation. Terminal
+`/docs --text TOPIC` (or `TOPIC --text`) explicitly reads the bundle in the
+TUI pager or plain output; plain mode's default retains its online address.
+The web topic table includes Docker and continues to open online pages.
+`--print` keeps bare online-URL output and conflicts with `--text`; `--keys`
+conflicts with topic, `--print` and `--text`. These CLI modes and topic errors
+need no profile/config or daemon. `--text` is version-matched to the compiled
+source; online URLs remain on `main`.
 
 ## 11. Compaction
 

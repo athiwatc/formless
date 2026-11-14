@@ -198,7 +198,7 @@ Type `/` in the TUI or the web composer; the same commands work in both (a few a
 | `/storage` | disk used by Sessions, artifacts, logs, backups |
 | `/gc [run]` | what clean-up would free; `run` frees it |
 | `/backup` | back up the database now |
-| `/docs [topic]` | open the guides: gallery, capabilities, approvals, keys, troubleshooting, mcp, skills, jobs |
+| `/docs [topic] [--text]` | open an online guide; terminal --text reads this build's bundled Markdown |
 | `/setup` | the setup wizard again: re-enter the API key, or change provider |
 | `/tour [skip]` | a 2-minute guided first task; `skip` hides the offer |
 | `/notes` | every note so far, in the pager |

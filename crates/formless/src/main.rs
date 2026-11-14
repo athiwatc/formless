@@ -158,17 +158,20 @@ enum Cmd {
         #[command(subcommand)]
         action: DaemonAction,
     },
-    /// Open the guides in a browser
+    /// Open an online guide or read this build's bundled Markdown
     Docs {
         /// Guide name to open; omit to open the gallery
         #[arg(value_parser = DocsTopicParser::new())]
         topic: Option<String>,
-        /// Print the URL instead of opening it
+        /// Print the current online URL (may differ from this build)
         #[arg(long)]
         print: bool,
+        /// Print bundled Markdown without a browser, config or daemon
+        #[arg(long, conflicts_with_all = ["print", "keys"])]
+        text: bool,
         /// Print the keyboard and command reference as Markdown
         /// (docs/keys.md)
-        #[arg(long, conflicts_with_all = ["topic", "print"])]
+        #[arg(long, conflicts_with_all = ["topic", "print", "text"])]
         keys: bool,
     },
     /// Diagnostics: config, dirs, keychain, endpoint probe
@@ -1828,25 +1831,59 @@ impl clap::builder::TypedValueParser for NamingModelParser {
     }
 }
 
-fn docs_cmd(topic: Option<&str>, print: bool, keys: bool) -> Result<()> {
-    if keys {
-        print!("{}", formless_tui::keys_reference());
-        return Ok(());
+fn docs_cmd(topic: Option<&str>, print: bool, keys: bool, text: bool) -> Result<()> {
+    let result: Result<()> = (|| {
+        let mut out = std::io::stdout().lock();
+        if keys {
+            write!(out, "{}", formless_tui::keys_reference())?;
+            return Ok(());
+        }
+        let url = formless_core::docs::resolve(topic).map_err(|error| {
+            let topics = formless_core::docs::TOPICS
+                .iter()
+                .map(|(name, _, what)| format!("  {name:<16} {what}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            usage(format!("{error}\n\nTOPIC            WHAT\n{topics}"))
+        })?;
+        if print {
+            writeln!(out, "{url}")?;
+        } else if text {
+            write!(out, "{}", formless_core::docs::text(topic)?)?;
+        } else {
+            let guide = formless_core::docs::present(topic, false)?;
+            if let Some(body) = guide.text {
+                writeln!(
+                    out,
+                    "Bundled guide (Formless {}).\n",
+                    env!("CARGO_PKG_VERSION")
+                )?;
+                write!(out, "{body}")?;
+                if !body.ends_with('\n') {
+                    writeln!(out)?;
+                }
+                writeln!(
+                    out,
+                    "\nCurrent online copy (may differ from this build): {}",
+                    guide.url
+                )?;
+            } else {
+                writeln!(out, "opened current online copy: {}", guide.url)?;
+            }
+        }
+        Ok(())
+    })();
+    match result {
+        // Readers such as `head` may finish before the full bundled SPEC.
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::BrokenPipe) =>
+        {
+            Ok(())
+        }
+        result => result,
     }
-    let url = formless_core::docs::resolve(topic).map_err(|error| {
-        let topics = formless_core::docs::TOPICS
-            .iter()
-            .map(|(name, _, what)| format!("  {name:<16} {what}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        usage(format!("{error}\n\nTOPIC            WHAT\n{topics}"))
-    })?;
-    if print || !formless_core::docs::open_url(&url) {
-        println!("{url}");
-    } else {
-        println!("opened {url}");
-    }
-    Ok(())
 }
 
 fn main() {
@@ -1921,8 +1958,14 @@ fn run_cli(mut cli: Cli) -> Result<()> {
             .init();
     }
     // Documentation needs no profile/config/daemon, even for invalid topics.
-    if let Some(Cmd::Docs { topic, print, keys }) = &cli.cmd {
-        return docs_cmd(topic.as_deref(), *print, *keys);
+    if let Some(Cmd::Docs {
+        topic,
+        print,
+        keys,
+        text,
+    }) = &cli.cmd
+    {
+        return docs_cmd(topic.as_deref(), *print, *keys, *text);
     }
     // Completions and the man page need nothing else: no profile, config
     // or daemon.
@@ -2289,7 +2332,12 @@ fn run_cli(mut cli: Cli) -> Result<()> {
             yes,
         }) => uninstall_cmd(&paths, keep_data, keep_binary, yes),
         Some(Cmd::Storage { json }) => storage_cmd(&paths, json),
-        Some(Cmd::Docs { topic, print, keys }) => docs_cmd(topic.as_deref(), print, keys),
+        Some(Cmd::Docs {
+            topic,
+            print,
+            keys,
+            text,
+        }) => docs_cmd(topic.as_deref(), print, keys, text),
         Some(Cmd::Gc { dry_run }) => gc_cmd(&paths, dry_run),
         Some(Cmd::Backup { action }) => match action {
             None => backup_cmd(&paths),
