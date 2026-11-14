@@ -74,7 +74,7 @@ impl Query {
             })
             .collect();
         // Stable: equal scores keep the storage list's existing input order.
-        hits.sort_by(|left, right| right.0.cmp(&left.0));
+        hits.sort_by_key(|hit| std::cmp::Reverse(hit.0));
         hits.into_iter().take(limit).map(|(_, item)| item).collect()
     }
 }
