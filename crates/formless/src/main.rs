@@ -9,6 +9,7 @@ mod cli_pipeline;
 mod cli_proposal_diff;
 mod cli_routing;
 mod cli_run_identity;
+mod cli_session_templates;
 mod cli_tool_filters;
 
 mod cli_runs_list;
@@ -5589,6 +5590,14 @@ enum SessionsAction {
         #[arg(long)]
         json: bool,
     },
+    /// Read saved Session templates (separate from local commands list)
+    #[command(
+        after_help = "Examples:\n  formless sessions templates list --json\n  formless sessions templates show NAME\n\nNames are exact and case-sensitive. List order comes from the daemon; show prints complete stored instructions and first message. Unset and empty values are distinct. These commands only read saved templates."
+    )]
+    Templates {
+        #[command(subcommand)]
+        action: cli_session_templates::Action,
+    },
     /// Hide a Session from the default list (kept and searchable)
     Archive {
         /// Session ID or unambiguous prefix
@@ -5841,6 +5850,7 @@ fn sessions_cmd(paths: Paths, action: SessionsAction) -> Result<()> {
                 );
             }
         }
+        SessionsAction::Templates { action } => cli_session_templates::run(&paths, action)?,
         SessionsAction::Archive { id } => set_archived(&paths, &id, true)?,
         SessionsAction::Unarchive { id } => set_archived(&paths, &id, false)?,
         SessionsAction::Export { id, format, output } => {
@@ -8113,7 +8123,7 @@ fn tool_run(
     }
 }
 
-/// `formless man`: the top-level page, then every subcommand (two levels
+/// `formless man`: the top-level page, then every subcommand (three levels
 /// deep) with its synopsis and options, so `--timeout` and friends are in
 /// the one page that ships (#895).
 fn render_man(out: &mut dyn std::io::Write) -> Result<()> {
@@ -8149,7 +8159,7 @@ fn render_man(out: &mut dyn std::io::Write) -> Result<()> {
                     .replace(".SH OPTIONS\n", ".PP\nOptions:\n");
                 out.write_all(text.as_bytes())?;
             }
-            if depth < 2 {
+            if depth < 3 {
                 section(sub, &name, depth + 1, out)?;
             }
         }
