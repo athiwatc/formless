@@ -136,7 +136,15 @@ fn placeholder(rest: &str) -> (Placeholder<'_>, &str) {
     if let Some(tail) = rest.strip_prefix("$$") {
         (Placeholder::Literal("$"), tail)
     } else if let Some(tail) = rest.strip_prefix("$ARGUMENTS") {
-        (Placeholder::Arguments, tail)
+        if tail
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            (Placeholder::Literal("$ARGUMENTS"), tail)
+        } else {
+            (Placeholder::Arguments, tail)
+        }
     } else if rest.as_bytes().get(1).is_some_and(u8::is_ascii_digit) {
         let digits = rest[1..].bytes().take_while(u8::is_ascii_digit).count();
         let token = if digits == 1 && rest.as_bytes()[1] != b'0' {
@@ -930,7 +938,7 @@ mod tests {
             ("$9", 9, false),
             ("$ARGUMENTS", 0, true),
             ("$$ARGUMENTS", 0, false),
-            ("$$$3 $ARGUMENTSsuffix", 3, true),
+            ("$$$3 $ARGUMENTSsuffix", 3, false),
             ("雪 $1é $9.99", 9, false),
             ("no arguments $HOME $", 0, false),
         ] {
@@ -983,6 +991,38 @@ mod tests {
             "'two words' x"
         );
     }
+    #[test]
+    fn arguments_placeholder_requires_an_identifier_boundary() {
+        for (body, expected, uses_arguments) in [
+            ("Use $ARGUMENTS_PATH now", "Use $ARGUMENTS_PATH now", false),
+            ("See $ARGUMENTS2.", "See $ARGUMENTS2.", false),
+            ("$ARGUMENTSsuffix", "$ARGUMENTSsuffix", false),
+            (
+                "$ARGUMENTS_FILE $ARGUMENTS9",
+                "$ARGUMENTS_FILE $ARGUMENTS9",
+                false,
+            ),
+            ("See $ARGUMENTS.", "See report.md.", true),
+            ("e-$ARGUMENTS", "e-report.md", true),
+            ("$ARGUMENTSé", "report.mdé", true),
+            ("$$ARGUMENTS_PATH", "$ARGUMENTS_PATH", false),
+            (
+                "$ARGUMENTS_PATH $1PATH $10",
+                "$ARGUMENTS_PATH report.mdPATH $10",
+                false,
+            ),
+        ] {
+            let template = command(body);
+            assert_eq!(template.expand("report.md").unwrap(), expected, "{body}");
+            assert_eq!(template.uses_arguments, uses_arguments, "{body}");
+        }
+        let fixture = Fixture::new();
+        fixture.global("literal.md", "$ARGUMENTS_PATH");
+        let snapshot = fixture.load(&[]);
+        assert_eq!(snapshot.find("literal").unwrap().usage(), "/literal");
+        assert!(!snapshot.projection().commands[0].uses_arguments);
+    }
+
     #[test]
     fn dollar_escapes_preserve_prices_code_and_single_pass_substitution() {
         for (body, expected) in [
