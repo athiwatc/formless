@@ -4752,6 +4752,8 @@
 
   function renderSettings() {
     const box = $("settings");
+    const focused = document.activeElement;
+    const focusedKey = box.contains(focused) ? focused.getAttribute("data-setting-control") : null;
     box.replaceChildren();
     // A row is [label, value] or [label, value, settingKey, kind]: the
     // latter gets an Edit control (SetSetting, validated by the daemon).
@@ -4767,7 +4769,7 @@
       rows.map(([k, v, key, kind, choices]) => [h("dt", { title: key || "", "data-setting-key": key || "" }, k), h("dd", null,
         v === "" || v == null ? h("span", { class: "muted" }, "(not set)") : settingDisplay(v),
         key && onTuiStart.has(key) ? h("span", { class: "tag", title: "A running TUI keeps the old value until it restarts" }, "applies when the TUI starts") : null,
-        key && kind ? h("button", { class: "btn ghost small", type: "button", "aria-label": "Edit " + key, onclick: (event) => {
+        key && kind ? h("button", { class: "btn ghost small", type: "button", "data-setting-control": key, "aria-label": "Edit " + key, onclick: (event) => {
           // A pointer click need not focus a native button on macOS. Give the
           // prompt a stable invoker to restore when it closes.
           event.currentTarget.focus({ preventScroll: true });
@@ -4930,6 +4932,13 @@
         h("button", { class: "btn danger small", type: "button", onclick: forget }, "Disconnect and forget this device"))));
     box.append(grid, h("p", { class: "muted" }, "Edits are validated and applied by the daemon; rows marked for TUI startup need a TUI restart. Credentials, endpoint and relay configuration use config.toml or their CLI. Manage MCP servers above."));
     filterSettings();
+    // Restore only a control removed by this synchronous redraw. A user who
+    // moved elsewhere while an asynchronous save was pending keeps that focus.
+    if (focusedKey && (document.activeElement === document.body || document.activeElement === focused)) {
+      const replacement = [...box.querySelectorAll("[data-setting-control]")].find(node => node.getAttribute("data-setting-control") === focusedKey);
+      const target = focusVisible(replacement) ? replacement : $("settings-filter");
+      if (focusVisible(target)) target.focus({ preventScroll: true });
+    }
   }
   /** The Settings filter: rows whose label, key, value or description
    * contain the words stay (matches marked); sections with none left hide,
