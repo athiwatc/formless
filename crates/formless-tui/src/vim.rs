@@ -334,6 +334,12 @@ impl Vim {
                             text = format!("\n{body}");
                             end
                         } else {
+                            // A final-line register can omit its terminal
+                            // newline; the existing next line still needs a
+                            // separator. Do not rewrite the private register.
+                            if !text.ends_with('\n') {
+                                text.push('\n');
+                            }
                             end + 1
                         }
                     } else {
