@@ -1,7 +1,8 @@
 # What can Formless do?
 
-Formless starts with no Tools. You ask for something; when the agent has no
-Tool for it, it writes one (a small JavaScript program with only the access
+A fresh install includes 25 built-in Tools and no starter domain Tools
+([the built-in set](../README.md#51-the-built-in-tools)). You ask for something;
+when the agent has no registry Tool for it, it writes one (a small JavaScript program with only the access
 it declares, see [Capabilities](capabilities.md)), uses it, and keeps it. The
 next similar request reuses that Tool, and the optimiser improves it over
 time. These examples show the kind of Tools that come out, and the commands

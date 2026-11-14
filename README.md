@@ -119,6 +119,9 @@ Illustrative, not scripted: the Tools an agent builds are whatever the task need
         <li><a href="#54-capabilities-closed-taxonomy">Capabilities (closed taxonomy)</a></li>
         <li><a href="#55-the-host-api-inside-a-tool">The host API inside a Tool</a></li>
         <li><a href="#56-composition-rules">Composition rules</a></li>
+        <li><a href="#mcp-servers">MCP servers</a></li>
+        <li><a href="#skills">Skills</a></li>
+        <li><a href="#memory">Memory</a></li>
       </ul>
     </li>
     <li><a href="#6-invocations-async-by-design">Invocations: async by design</a></li>
@@ -277,6 +280,11 @@ command to open it. `formless profiles list` lists the available profiles.
 
 Type a task at the bottom and press **Enter**. Formless starts with the built-in Tools ([§5.1](#51-the-built-in-tools)) and builds whatever else the task needs with `create_tool`.
 
+Essential keys to get started are below. For the generated main-keys and
+command reference, see [Keys and commands](docs/keys.md), run
+`formless docs --keys`, or open `/help` in the TUI. Views, lists and dialogs
+also show their own keys in the footer.
+
 | Key | Action |
 |---|---|
 | `Enter` | send the message, or steer the Run that is in flight |
@@ -292,7 +300,7 @@ Type a task at the bottom and press **Enter**. Formless starts with the built-in
 | `←` `→` `Home` `End`, `Ctrl+A/E/W/U/K`, `Alt+B/F/D` | edit the message (readline keys) |
 | `Ctrl+C` | clear the typed message; press again within 2 s to detach (the daemon keeps running, nothing is lost) |
 
-Slash commands: `/help /new /sessions /fork /search /edit /tools /metrics /proposals /propose /panes /settings /model [ID] /thinking /stop /cancel /resend /resume /abandon /agents /quit`. Type `/` for a command palette (fuzzy filter, Tab completes, Enter runs); `/help` or `?` on an empty input lists every command grouped by area. Ctrl+V or `/paste` attaches a screenshot from the clipboard, and dragging a file into the terminal attaches it. Type `@` to reference files: a popup completes paths under the current directory (respecting `.gitignore`), and on send small files are attached while large files and directories go as a reference the agent reads with its Tools. `/model` opens a picker: type to filter (fuzzy, so `son4` finds `claude-sonnet-4`), Tab changes reasoning effort, Enter switches the current Session, Ctrl+Enter / Alt+Enter / Ctrl+D sets the global default. `/agents` lists the Session's sub-agents (started by `agents.run`) and `/agents <n>` shows one's stored transcript; their steps also show live as activity. `/cancel` stops just the running Tool the daemon flagged as pending or stalled, without stopping the Run. `/resend` aborts and re-sends a stalled provider request (clients flag a stream that has sent nothing for `provider.stall_notice_secs`, default 120). `/resume` continues a Session whose last Run was interrupted (crash, Esc) or paused (provider error) from its transcript; `/abandon` drops it. On terminals at least 110 columns wide, `/panes` switches to a dashboard with Sessions and Tools beside the chat and Metrics on the right; the choice is remembered (`tui` settings).
+Common slash commands: `/help /new /sessions /fork /search /edit /tools /metrics /proposals /propose /panes /settings /model [ID] /thinking /stop /cancel /resend /resume /abandon /agents /quit`. Type `/` for a command palette (fuzzy filter, Tab completes, Enter runs); `/help` or `?` on an empty input lists every command grouped by area. Ctrl+V or `/paste` attaches a screenshot from the clipboard, and dragging a file into the terminal attaches it. Type `@` to reference files: a popup completes paths under the current directory (respecting `.gitignore`), and on send small files are attached while large files and directories go as a reference the agent reads with its Tools. `/model` opens a picker: type to filter (fuzzy, so `son4` finds `claude-sonnet-4`), Tab changes reasoning effort, Enter switches the current Session, Ctrl+Enter / Alt+Enter / Ctrl+D sets the global default. `/agents` lists the Session's sub-agents (started by `agents.run`) and `/agents <n>` shows one's stored transcript; their steps also show live as activity. `/cancel` stops just the running Tool the daemon flagged as pending or stalled, without stopping the Run. `/resend` aborts and re-sends a stalled provider request (clients flag a stream that has sent nothing for `provider.stall_notice_secs`, default 120). `/resume` continues a Session whose last Run was interrupted (crash, Esc) or paused (provider error) from its transcript; `/abandon` drops it. On terminals at least 110 columns wide, `/panes` switches to a dashboard with Sessions and Tools beside the chat and Metrics on the right; the choice is remembered (`tui` settings).
 
 You can add your own prompt commands as Markdown files in the current profile's
 `<config>/commands/` directory or the current project's `.formless/commands/`.
@@ -969,6 +977,8 @@ formless skills list
 formless skills export pdf -o pdf.skill.json   # files only, no metrics
 formless skills import pdf.skill.json          # imported disabled, contents printed
 ```
+
+### Memory
 
 The agent remembers stable preferences you state ("use pnpm", "answer in Thai") as short notes. You see every one, and you can edit them.
 
