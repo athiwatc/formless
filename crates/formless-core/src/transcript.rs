@@ -68,10 +68,10 @@ fn parts(msgs: &[MessageInfo]) -> Vec<Part> {
 }
 
 fn clip(s: &str) -> String {
-    if s.chars().count() <= MAX_CALL_CHARS {
+    let Some((end, _)) = s.char_indices().nth(MAX_CALL_CHARS) else {
         return s.to_string();
-    }
-    let mut out: String = s.chars().take(MAX_CALL_CHARS).collect();
+    };
+    let mut out = s[..end].to_string();
     out.push_str("\n… (cut)");
     out
 }
@@ -263,6 +263,36 @@ mod tests {
         assert!(md.contains("````\na.rs: 3"), "{md}");
         assert!(md.contains("> *The working directory is now /x.*"));
         assert!(md.trim_end().ends_with("There are **3**."));
+    }
+
+    #[test]
+    fn clipping_preserves_scalar_boundaries_and_both_export_outputs() {
+        for unit in ["x", "é", "e\u{301}x", "👨‍👩‍👧‍👦", "\n… (cut)"] {
+            for count in [0, 3999, 4000, 4001, 100_000] {
+                let source: String = unit.chars().cycle().take(count).collect();
+                let expected = if count <= MAX_CALL_CHARS {
+                    source.clone()
+                } else {
+                    let prefix: String = unit.chars().cycle().take(MAX_CALL_CHARS).collect();
+                    format!("{prefix}\n… (cut)")
+                };
+                assert_eq!(clip(&source), expected, "{unit:?}, {count} scalars");
+                let messages = |text: &str| {
+                    let metadata = serde_json::json!({"tool_calls":[{"id":"clip", "function":{"name":"fixture", "arguments":text}}]}).to_string();
+                    vec![
+                        msg("assistant", "", Some(&metadata)),
+                        msg("tool", text, Some(r#"{"tool_call_id":"clip"}"#)),
+                    ]
+                };
+                let original = messages(&source);
+                let bounded = messages(&expected);
+                assert_eq!(
+                    markdown("fixture", &original),
+                    markdown("fixture", &bounded)
+                );
+                assert_eq!(html("fixture", &original), html("fixture", &bounded));
+            }
+        }
     }
 
     #[test]
