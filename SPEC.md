@@ -2202,6 +2202,15 @@ pattern (§4.4).
     deliberately becomes null. A result's `toJSON` is invoked only once.
   - `console`, timers, `JSON`, `cryptoRandom()` (UUID), `randomBytes(n)`
     (base64). Nothing else.
+
+    `sleep(ms)` and `randomBytes(n)` require finite non-negative safe-integer
+    numbers. Invalid inputs throw; requests over `tools.max_sleep_secs` or
+    `tools.max_random_bytes` throw with that setting named, instead of silently
+    coercing, wrapping or shortening. This changes the older permissive API:
+    generated Tools must supply numeric integer values and handle limit errors.
+    Successful `randomBytes(n)` returns base64 decoding to exactly `n` bytes
+    (including zero), subject to supported allocation bounds. Valid sleep keeps
+    cancellation behavior; its wall time still depends on scheduling.
 - Memory cap: the JS heap is capped at the Tool's declared `memory_mb`.
   Exceeding it faults **only that Invocation**, tagged `resource`. The cap is
   a heap cap, not a data-size cap: streaming APIs exist so data Tools
@@ -2227,6 +2236,7 @@ pattern (§4.4).
 - Modules in the UIs: `GetModule {id|name}` returns a `ModuleDetail`: the
   module, its versions oldest first with code and author, and `used_by`,
   the active Tools whose current code loads it.
+
   - **Editing:** `UpdateModuleCode` saves new code as a new version
     (author `user`) through the same syntax and load check as
     `create_module`. Module code needs no `run()`.
@@ -2700,6 +2710,11 @@ Decision: [ADR 0005](docs/adr/0005-run-script-orchestration.md).
     when the nested Invocation ends (§7.5). Each call runs on its own
     thread (§6.1), so `Promise.all` really runs them in parallel. This is
     the same `tools.call` every Tool has.
+    Nested return values retain JSON data semantics, including own `__proto__`
+    properties through callee and caller serialization. Settlement parses the
+    result envelope as JSON and calls the context's settlement function; parse,
+    lookup and call failures use the existing execution-error path.
+
   - At most `scripts.max_parallel` (8) calls per sandbox are in flight;
     the rest queue.
   - A script that returns while a call is still pending fails, as a Tool
@@ -4970,11 +4985,13 @@ the TUI. Command-specific arguments and defaults are available through
 | `formless jobs` | `list`, `add`, `run`, `history`, `enable`, `disable`, `rm` | Manage scheduled prompts and inspect their history. |
 | `formless logs` | `--follow`, `--level`, `--since`, `--lines` | Read or follow the daemon log and rotated files. |
 | `formless mcp` | `add`, `remove`, `list`, `test`, `login`, `logout`, `catalog`, `import`, `log`, `tools`, `tool`, `prompts`, `prompt` | Manage external MCP servers and inspect their tools/logs. |
+| `formless metrics` | `--since DURATION`, `--json` | Read recorded model, Tool and built-in statistics through independent reports at one cutoff. |
 | `formless memory` | `list`, `add`, `rm`, `edit` | Inspect or change saved user-memory notes. |
+| `formless modules` | `list`, `show`; `show --version N` | Read all modules, inspect metadata/history/dependents, or emit an exact stored source version. |
 | `formless naming` | `status`, `pull`, `test` | Inspect, install, or preview the embedded Session-naming model. |
 | `formless prices` | `import` | Import a model-price catalog for cost and spending limits. |
 | `formless profiles` | `list`, `rm` | List or remove isolated profiles. |
-| `formless prompts` | `list`, `generate`, `apply`, `reject`, `rollback` | Inspect and manage measured prompt/memory proposals. |
+| `formless prompts` | `list`, `diff`, `generate`, `apply`, `reject`, `rollback` | Inspect existing proposal comparisons and manage measured prompt/memory proposals. |
 | `formless providers` | `list`, `add`, `remove`, `test` | Manage named model providers and test a connection. |
 | `formless relay` | `enable`, `disable`, `status` | Manage encrypted browser access through the relay. |
 | `formless reset` | `--force` | Wipe configuration, credentials, and the current profile's data. |
@@ -4984,7 +5001,7 @@ the TUI. Command-specific arguments and defaults are available through
 | `formless routing` | `--json` | Read currently available daemon routing decisions and returned candidate figures without starting a model request. |
 | `formless runs` | No action: list; `show`, `cancel` | List recent Runs, inspect one by ID/prefix, or cancel that exact Run. |
 | `formless security` | `status` | Inspect the daemon's grants, denials, trusted resources, and exposed interfaces. |
-| `formless sessions` | `fork`, `compare`, `list`, `show`, `files`, `rewind`, `rename`, `rm`, `restore`, `import`, `search`, `archive`, `unarchive`, `export` | Manage stored Sessions, follow a Run with `show --follow`, or inspect tracked files. |
+| `formless sessions` | `fork`, `compare`, `list`, `show`, `files`, `rewind`, `rename`, `rm`, `restore`, `import`, `search`, `archive`, `unarchive`, `export` | Manage stored Sessions, follow a Run with `show --follow`, or inspect tracked files. `list --pinned --tag TAG` filters the fetched reply; selectors combine with `--archived`, preserving reply order. |
 | `formless skills` | `reviews`, `add`, `remove`, `list`, `enable`, `disable`, `show`, `export`, `import` | Inspect and manage Skills and their retained description reviews. |
 | `formless storage` | `--json` | Report disk usage by data category. |
 | `formless tools` | `reviews`, `list`, `disable`, `enable`, `undo`, `pin`, `unpin`, `tag`, `show`, `retire`, `restore`, `rollback`, `purge`, `run`, `export`, `import` | Inspect, manage, run, or transfer registry Tools. |
@@ -4992,6 +5009,16 @@ the TUI. Command-specific arguments and defaults are available through
 | `formless uninstall` | `--keep-data`, `--keep-binary`, `--yes` (alias `--force`) | Remove Formless, optionally retaining data or the binary. |
 | `formless update` | No action, `check`, or `--check`; `--json` | Show newer release notes and the applicable upgrade command; never rewrite the binary. |
 | `formless web` | `--port`, `--no-open`, `--stop` | Open, print a link for, or stop the local browser UI. |
+
+`formless metrics --since 7d --json` reads the three existing metrics reports
+with one checked UTC cutoff. Omit `--since` for all history. Tool rows use stored
+`tool_id` values; reports retain their own row order and are independent reads,
+not a transactional snapshot. Runs and daily usage remain separate surfaces.
+
+`formless sessions list --pinned --tag WORK --json` selects active pinned Sessions
+whose stored tags contain exactly `work`. Only the tag argument is lowercased;
+a leading `#` is not stripped. Add `--archived` to select the archived partition.
+These selectors filter the existing reply on the client.
 
 `update --json`, `update check --json`, and `update --check --json` emit one
 object: `{installed, status, newer_releases: [{tag, url, notes}]}`. Notes retain
@@ -5643,8 +5670,8 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
 | `tools.inline_limit` | 40 | Tools listed in a Session's frozen first-step listing; others load via `find_tools` (§7.1) |
 | `tools.max_agent_depth` | 1 | How deep `agents.run` sub-agents may nest (§7.6) |
 | `tools.max_tool_depth` | 8 | How deep `tools.call` composition may nest (cycle guard, §7.6) |
-| `tools.max_sleep_secs` | 60 | Longest single `sleep(ms)` in a Tool (§7.5) |
-| `tools.max_random_bytes` | 1048576 | Largest `randomBytes(n)` (§7.5) |
+| `tools.max_sleep_secs` | 60 | Longest single `sleep(ms)` in a Tool; excess is an error (§7.5) |
+| `tools.max_random_bytes` | 1048576 | Largest decoded `randomBytes(n)` result; excess is an error (§7.5) |
 | `tools.fetch_connect_timeout_secs` | 10 | Tool `fetch`/`fetchChunks` connection deadline, clamped to 1–86400 seconds; applies to shared and DNS-pinned clients. DNS admission/resolution waits on each hop are bounded by the smaller of this budget and the remaining total deadline |
 | `tools.fetch_timeout_secs` | 60 | Total Tool HTTP deadline across DNS waits, redirects and response-body reads, clamped to 1–86400 seconds; trickling data does not reset it. Cancellation returns promptly and HTTP workers retain this deadline. OS DNS uses one fixed pool of four workers with at most sixteen queued lookups: expired queued work is skipped and late results discarded. OS lookups cannot be forcibly cancelled; a stalled lookup may retain one of those four fixed workers, while fetch callers still stop waiting at their deadlines. Timeout errors say `fetch timed out`, distinct from connection failures |
 | `tools.max_read_bytes` | 67108864 | Largest `fs.read` or `fetch` body (64 MB): larger fails as a resource error pointing to `fs.readChunks` / `fetchChunks` (§7.5) |
@@ -6239,6 +6266,29 @@ An already terminal Run exits after replay. Historical terminal Runs without
 stored message boundaries display a Note and the initial Session snapshot only;
 follow never invents a boundary or refreshes that legacy transcript without one.
 Connection loss is an error.
+
+`prompts diff ID [--json]` reads the existing daemon proposal comparison:
+target, already-applied state and ordered operation/line pairs. Human output
+does not fit or clip lines to terminal width; JSON preserves the complete
+response. This is a hypothetical without/with comparison, not an application
+dry run or guarantee of permission/success. It performs no proposal evaluation
+or decision; unknown IDs retain the standard not-found usage error.
+
+Tool selectors use an exact name or full ID. After a miss, up to three
+ranked partial-name suggestions can help you retry with the original exact
+spelling; these use folded subsequence matching, not edit-distance spelling
+correction. A suggestion never selects or runs a Tool automatically.
+
+`modules list [--json]` reads all ModuleInfo rows, including retired modules.
+`modules show NAME_OR_ID [--json] [--version N]` uses the daemon's existing
+name/full-ID resolution. Default human detail shows metadata, version summaries
+and sorted active Tool dependents without code bodies. `--version N` emits
+exactly that stored source, preserving its existing trailing newline; missing
+versions are usage errors. `--json` returns the complete existing ModuleDetail
+and conflicts with `--version`. Invalid versions/conflicts fail before contact.
+GetModule still fetches every version's code even for metadata-only output;
+client projection does not reduce backend work (see #889). No module mutation
+is exposed by these commands.
 
 `runs show ID [--json]` inspects any stored Run; `runs cancel ID [--json]`
 cancels only that exact active Run, never a later Run in the same Session. IDs

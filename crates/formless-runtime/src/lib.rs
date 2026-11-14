@@ -550,7 +550,12 @@ globalThis.progress = (fraction, label) => __call("progress", {
   fraction: typeof fraction === "number" && isFinite(fraction) ? Math.min(1, Math.max(0, fraction)) : null,
   label: label == null ? "" : String(label).slice(0, 120),
 });
-globalThis.sleep = (ms) => __call("sleep", { ms: ms | 0 });
+function __nonnegativeSafeInteger(api, n) {
+  if (typeof n !== "number" || !Number.isSafeInteger(n) || n < 0)
+    throw new Error(api + " requires a finite non-negative safe-integer number");
+  return n;
+}
+globalThis.sleep = (ms) => __call("sleep", { ms: __nonnegativeSafeInteger("sleep", ms) });
 // Real timers: callbacks run from the host's event loop after the current
 // job, in due order (ties by creation), never synchronously.
 const __timers = new Map();
@@ -582,7 +587,7 @@ globalThis.__runTimers = () => {
   return next;
 };
 globalThis.cryptoRandom = () => __call("crypto_random", {});
-globalThis.randomBytes = (n) => __call("random_bytes", { n: n | 0 });
+globalThis.randomBytes = (n) => __call("random_bytes", { n: __nonnegativeSafeInteger("randomBytes", n) });
 "#;
 
 fn denied(msg: impl Into<String>) -> String {
@@ -626,10 +631,51 @@ fn decode(s: &str, enc: Enc) -> Result<Vec<u8>, String> {
 /// Length of the longest prefix of `b` that does not end inside a UTF-8
 /// sequence, so text chunks never split a character.
 /// `n` bytes from the OS CSPRNG (uniform; usable for keys and nonces).
-fn random_bytes(n: usize) -> Vec<u8> {
-    let mut out = vec![0u8; n];
+fn random_bytes(n: usize) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(n)
+        .map_err(|_| "randomBytes allocation failed (tools.max_random_bytes)".to_string())?;
+    out.resize(n, 0);
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut out);
-    out
+    Ok(out)
+}
+
+fn random_base64(n: u64) -> Result<Value, String> {
+    let n = usize::try_from(n).map_err(|_| {
+        "randomBytes exceeds supported allocation bounds (tools.max_random_bytes)".to_string()
+    })?;
+    let encoded_len = base64::encoded_len(n, true)
+        .filter(|&n| n <= isize::MAX as usize)
+        .ok_or_else(|| {
+            "randomBytes exceeds supported allocation bounds (tools.max_random_bytes)".to_string()
+        })?;
+    let bytes = random_bytes(n)?;
+    let mut text = String::new();
+    text.try_reserve_exact(encoded_len).map_err(|_| {
+        "randomBytes encoding allocation failed (tools.max_random_bytes)".to_string()
+    })?;
+    base64::engine::general_purpose::STANDARD.encode_string(bytes, &mut text);
+    Ok(Value::String(text))
+}
+
+fn bounded_count(
+    args: &Value,
+    field: &str,
+    api: &str,
+    cap: u64,
+    setting: &str,
+) -> Result<u64, String> {
+    const MAX_SAFE: f64 = 9_007_199_254_740_991.0;
+    let n = args
+        .get(field)
+        .and_then(Value::as_f64)
+        .filter(|n| n.is_finite() && *n >= 0.0 && *n <= MAX_SAFE && n.fract() == 0.0)
+        .ok_or_else(|| format!("{api} requires a finite non-negative safe-integer number"))?
+        as u64;
+    if n > cap {
+        return Err(format!("{api} request {n} exceeds limit {cap} ({setting})"));
+    }
+    Ok(n)
 }
 
 fn utf8_cut(b: &[u8]) -> usize {
@@ -1195,11 +1241,20 @@ impl State {
                 Ok(Value::Null)
             }
             "sleep" => {
-                let ms = a["ms"]
-                    .as_u64()
-                    .unwrap_or(0)
-                    .min(MAX_SLEEP_MS.load(Ordering::Relaxed));
-                if self.sleep_cancellable(std::time::Duration::from_millis(ms)) {
+                let ms = bounded_count(
+                    a,
+                    "ms",
+                    "sleep",
+                    MAX_SLEEP_MS.load(Ordering::Relaxed),
+                    "tools.max_sleep_secs",
+                )?;
+                let duration = std::time::Duration::from_millis(ms);
+                if std::time::Instant::now().checked_add(duration).is_none() {
+                    return Err(
+                        "sleep exceeds supported duration bounds (tools.max_sleep_secs)".into(),
+                    );
+                }
+                if self.sleep_cancellable(duration) {
                     Ok(Value::Null)
                 } else {
                     Err("interrupted".into())
@@ -1207,11 +1262,14 @@ impl State {
             }
             "crypto_random" => Ok(json!(uuid::Uuid::new_v4().to_string())),
             "random_bytes" => {
-                let n = a["n"]
-                    .as_u64()
-                    .unwrap_or(0)
-                    .min(MAX_RANDOM_BYTES.load(Ordering::Relaxed)) as usize;
-                Ok(encode(&random_bytes(n), Enc::Base64))
+                let n = bounded_count(
+                    a,
+                    "n",
+                    "randomBytes",
+                    MAX_RANDOM_BYTES.load(Ordering::Relaxed),
+                    "tools.max_random_bytes",
+                )?;
+                random_base64(n)
             }
             "emit" => {
                 self.ops.emit(a["chunk"].as_str().unwrap_or_default())?;
@@ -3223,8 +3281,10 @@ pub fn execute(req: &ExecRequest, ops: Arc<dyn HostOps>) -> Result<ExecOutcome, 
                         Ok(v) => json!({"ok": true, "value": v}),
                         Err(e) => json!({"ok": false, "error": e}),
                     };
-                    ctx.eval::<(), _>(format!("__settleCall({id}, {r})"))
-                        .map_err(|e| err(&e))?;
+                    let settle: Function =
+                        ctx.globals().get("__settleCall").map_err(|e| err(&e))?;
+                    let value = ctx.json_parse(r.to_string()).map_err(|e| err(&e))?;
+                    settle.call::<_, ()>((id, value)).map_err(|e| err(&e))?;
                 }
                 Ok(())
             })?;
@@ -3744,10 +3804,174 @@ mod tests {
     }
 
     #[test]
+    fn explicit_sleep_and_random_arguments_reject_coercion_and_named_cap_excess() {
+        for api in ["sleep", "randomBytes"] {
+            let req = live(&format!(
+                r#"function run() {{
+                const invalid=[-1,0.5,NaN,Infinity,-Infinity,Number.MAX_SAFE_INTEGER+1,undefined,null,true,'1',[],{{}},1n];
+                return invalid.map(n=>{{try {{ {api}(n); return 'accepted'; }} catch(e) {{return e.message;}}}});
+            }}"#
+            ));
+            let out = execute(&req, Arc::new(NoHostOps)).unwrap();
+            for message in out.output.as_array().unwrap() {
+                assert!(
+                    message
+                        .as_str()
+                        .unwrap()
+                        .contains("finite non-negative safe-integer number"),
+                    "{api}: {message}"
+                );
+            }
+            let setting = if api == "sleep" {
+                "tools.max_sleep_secs"
+            } else {
+                "tools.max_random_bytes"
+            };
+            let cap = if api == "sleep" {
+                MAX_SLEEP_MS.load(Ordering::Relaxed)
+            } else {
+                MAX_RANDOM_BYTES.load(Ordering::Relaxed)
+            };
+            for n in [
+                cap + 1,
+                3_000_000_000_u64,
+                1_u64 << 32,
+                9_007_199_254_740_991,
+            ] {
+                let error = execute(
+                    &live(&format!("function run() {{ return {api}({n}); }}")),
+                    Arc::new(NoHostOps),
+                )
+                .unwrap_err();
+                assert!(error.message.contains(setting), "{}", error.message);
+                assert!(error.message.contains(&n.to_string()), "{}", error.message);
+            }
+        }
+    }
+
+    #[test]
+    fn direct_host_payloads_cannot_bypass_count_validation_or_caps() {
+        for (op, key, setting) in [
+            ("sleep", "ms", "tools.max_sleep_secs"),
+            ("random_bytes", "n", "tools.max_random_bytes"),
+        ] {
+            for raw in [
+                "{}".to_string(),
+                "null".to_string(),
+                format!(r#"{{"{key}":null}}"#),
+                format!(r#"{{"{key}":"1"}}"#),
+                format!(r#"{{"{key}":-1}}"#),
+                format!(r#"{{"{key}":0.25}}"#),
+                format!(r#"{{"{key}":9007199254740992}}"#),
+                format!(r#"{{"{key}":18446744073709551615}}"#),
+            ] {
+                let req = live(&format!(
+                    "function run() {{ return {{reply:JSON.parse(__host('{}',{}))}}; }}",
+                    op,
+                    serde_json::to_string(&raw).unwrap()
+                ));
+                let out = execute(&req, Arc::new(NoHostOps)).unwrap();
+                assert_eq!(out.output["reply"]["ok"], false, "{op} {raw}");
+                assert!(out.output["reply"]["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("finite non-negative safe-integer number"));
+            }
+            let raw = format!(r#"{{"{key}":4294967296}}"#);
+            let out = execute(
+                &live(&format!(
+                    "function run() {{ return {{reply:JSON.parse(__host('{}',{}))}}; }}",
+                    op,
+                    serde_json::to_string(&raw).unwrap()
+                )),
+                Arc::new(NoHostOps),
+            )
+            .unwrap();
+            assert_eq!(out.output["reply"]["ok"], false);
+            assert!(out.output["reply"]["error"]
+                .as_str()
+                .unwrap()
+                .contains(setting));
+        }
+        assert_eq!(
+            bounded_count(
+                &json!({"n":0}),
+                "n",
+                "randomBytes",
+                0,
+                "tools.max_random_bytes"
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            bounded_count(
+                &json!({"n":1.0}),
+                "n",
+                "randomBytes",
+                1,
+                "tools.max_random_bytes"
+            )
+            .unwrap(),
+            1
+        );
+        assert!(bounded_count(
+            &json!({"n":1}),
+            "n",
+            "randomBytes",
+            0,
+            "tools.max_random_bytes"
+        )
+        .unwrap_err()
+        .contains("tools.max_random_bytes"));
+        assert!(random_base64(u64::MAX)
+            .unwrap_err()
+            .contains("supported allocation bounds"));
+    }
+
+    #[test]
+    fn valid_random_counts_have_exact_decoded_lengths_and_short_sleeps_still_return_null() {
+        for n in [0, 1, 7, 256, 1 << 20] {
+            let req = live(&format!("function run() {{ return randomBytes({n}); }}"));
+            let out = execute(&req, Arc::new(NoHostOps)).unwrap();
+            assert_eq!(
+                base64::engine::general_purpose::STANDARD
+                    .decode(out.output.as_str().unwrap())
+                    .unwrap()
+                    .len(),
+                n
+            );
+        }
+        let out = execute(
+            &live("function run() {return [sleep(0),sleep(1),sleep(2)];}"),
+            Arc::new(NoHostOps),
+        )
+        .unwrap();
+        assert_eq!(out.output, json!([null, null, null]));
+    }
+
+    #[test]
+    fn valid_sleep_keeps_the_existing_interrupted_error_after_host_entry() {
+        let mut req = live("function run() {sleep(250); return 'finished';}");
+        let activity = Arc::new(AtomicU64::new(0));
+        req.activity = Some(activity.clone());
+        let cancel = req.cancel.clone();
+        let worker = std::thread::spawn(move || execute(&req, Arc::new(NoHostOps)));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while activity.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        cancel.store(true, Ordering::SeqCst);
+        let error = worker.join().unwrap().unwrap_err();
+        assert!(activity.load(Ordering::SeqCst) > 0);
+        assert!(error.message.contains("interrupted"), "{}", error.message);
+    }
+
+    #[test]
     fn random_bytes_vary_in_every_bit_position() {
         // UUIDv4 bytes fix 6 bits per 16-byte block; a CSPRNG fixes none.
         let (mut seen_one, mut seen_zero) = ([0u8; 16], [0u8; 16]);
-        for block in random_bytes(16 * 256).chunks(16) {
+        for block in random_bytes(16 * 256).unwrap().chunks(16) {
             for (i, b) in block.iter().enumerate() {
                 seen_one[i] |= b;
                 seen_zero[i] |= !b;
@@ -3755,8 +3979,8 @@ mod tests {
         }
         assert_eq!(seen_one, [0xff; 16]);
         assert_eq!(seen_zero, [0xff; 16]);
-        assert_eq!(random_bytes(5).len(), 5);
-        assert!(random_bytes(0).is_empty());
+        assert_eq!(random_bytes(5).unwrap().len(), 5);
+        assert!(random_bytes(0).unwrap().is_empty());
     }
 
     /// Nested Tools that each take 300 ms; "bad" fails.
@@ -3785,6 +4009,91 @@ mod tests {
             overlay: None,
             activity: None,
             modules: Arc::new(Vec::new()),
+        }
+    }
+
+    /// A real callee serializes a value constructed with JSON.parse, so
+    /// __proto__ is already an own data key before nested settlement begins.
+    struct JsonCalleeOps;
+    impl HostOps for JsonCalleeOps {
+        fn call_tool(&self, _: &str, input: Value) -> Result<Value, String> {
+            let mut req = live("function run(input) { return JSON.parse(input.json); }");
+            req.input = input;
+            execute(&req, Arc::new(NoHostOps))
+                .map(|out| out.output)
+                .map_err(|e| e.message)
+        }
+    }
+
+    #[test]
+    fn nested_json_settlement_retains_own_proto_data_after_callee_and_caller_serialization() {
+        let mut req = live(
+            r#"async function run(input) {
+            const v=await tools.call('json_callee',input);
+            const again=JSON.parse(JSON.stringify(v));
+            return {value:v,own:Object.prototype.hasOwnProperty.call(v,'__proto__'),
+                plain:Object.getPrototypeOf(v)===Object.prototype,
+                inheritedX:'x' in v,againOwn:Object.prototype.hasOwnProperty.call(again,'__proto__'),again};
+        }"#,
+        );
+        req.input = json!({"json":r#"{"__proto__":{"x":1},"y":2}"#});
+        let out = execute(&req, Arc::new(JsonCalleeOps)).unwrap();
+        let expected: Value = serde_json::from_str(r#"{"__proto__":{"x":1},"y":2}"#).unwrap();
+        assert_eq!(
+            out.output,
+            json!({"value":expected,"own":true,"plain":true,"inheritedX":false,"againOwn":true,"again":expected})
+        );
+    }
+
+    #[test]
+    fn nested_json_settlement_preserves_arrays_primitives_and_all_proto_value_types() {
+        for raw in [
+            r#"{"__proto__":null,"y":2}"#,
+            r#"{"__proto__":7,"y":2}"#,
+            r#"{"__proto__":"日本語","y":2}"#,
+            r#"{"__proto__":false,"y":2}"#,
+            r#"[{"__proto__":{"x":1}},{"deep":{"__proto__":null}},[true,42.25,"ไทย"]]"#,
+            r#"{"nested":{"__proto__":{"__proto__":{"x":1}}},"y":2}"#,
+            "null",
+            "true",
+            "false",
+            "42.25",
+            r#""ไทย\n__settleCall(1, {})""#,
+        ] {
+            let mut req = live(
+                r#"async function run(input) {
+                const value=await tools.call('json_callee',input);
+                function normal(v) {
+                    if(v===null || typeof v!=='object') return true;
+                    if(Object.getPrototypeOf(v)!==(Array.isArray(v)?Array.prototype:Object.prototype)) return false;
+                    return Object.keys(v).every(k=>normal(v[k]));
+                }
+                return {value,serialized:JSON.stringify(value),normal:normal(value)};
+            }"#,
+            );
+            req.input = json!({"json":raw});
+            let out = execute(&req, Arc::new(JsonCalleeOps)).unwrap();
+            let expected: Value = serde_json::from_str(raw).unwrap();
+            assert_eq!(out.output["value"], expected, "{raw}");
+            assert_eq!(
+                serde_json::from_str::<Value>(out.output["serialized"].as_str().unwrap()).unwrap(),
+                expected,
+                "{raw}"
+            );
+            assert_eq!(out.output["normal"], true, "{raw}");
+        }
+    }
+
+    #[test]
+    fn nested_settlement_lookup_and_call_failures_surface_as_exec_errors() {
+        for setup in [
+            "globalThis.__settleCall=null;",
+            "globalThis.__settleCall=()=>{throw new Error('settlement failure');};",
+            "Object.defineProperty(globalThis,'__settleCall',{get(){throw new Error('settlement lookup failure');}});",
+        ] {
+            let req=live(&format!("async function run() {{ {setup} return await tools.call('json_callee',{{json:'7'}}); }}"));
+            let error=execute(&req,Arc::new(JsonCalleeOps)).unwrap_err();
+            assert!(!error.message.contains("never settled"),"{}",error.message);
         }
     }
 
