@@ -1,6 +1,9 @@
 # Local daemon client continuation — 2026-11-14
 
 This is an incremental implementation for #1753, not completion of the epic.
+The later [recovery and packaging continuation](recovery-and-packaging-20261114.md)
+records newer source, tests and development artifacts; historical counts below
+remain scoped to their listed commits.
 The published prototype in #1776 is preserved. No original branch, worktree,
 writer, paused Cloud session, daemon policy, credentials or OS security setting
 was changed. The desktop remains a separate optional workspace with its own
@@ -219,7 +222,7 @@ was changed for these checks.
   it does not claim that native IME or screen-reader gates passed.
 - Token streaming needs a genuinely established snapshot/delta reconciliation
   contract. The current safe canonical-only mode does not close that requirement.
-- Native decision forms; Run resume/abandon/step controls; Session rename/fork/pin/tag/export/comparison actions;
+- Native decision forms; Run step controls; Session rename/fork/pin/tag/export/comparison actions;
   attachments, model/Role selection; full Tools/Metrics/Proposals/Settings edit
   flows; and dedicated Memory/Skills/MCP/Jobs/Providers/Invocations/sub-agent/plan/
   compaction surfaces remain open.
