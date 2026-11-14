@@ -26,7 +26,8 @@ pub(crate) enum Outcome {
 }
 #[derive(Debug, Clone)]
 enum Command {
-    Operator(char, String, usize),
+    // The final flag preserves an explicitly supplied motion/operator count.
+    Operator(char, String, usize, bool),
     Insert(char, usize),
     Put(bool, String, bool, bool, usize),
     Delete(usize),
@@ -168,6 +169,7 @@ impl Vim {
         }
         self.pending.push(c);
         let (count, rest) = count_prefix(&self.pending);
+        let explicit_count = rest.len() != self.pending.len();
         if rest.is_empty() {
             return Outcome::Handled;
         }
@@ -177,8 +179,11 @@ impl Vim {
             if let Some(mut change) = self.last.clone() {
                 if let Some(count) = override_count {
                     match &mut change.command {
-                        Command::Operator(_, _, n)
-                        | Command::Insert(_, n)
+                        Command::Operator(_, _, n, explicit) => {
+                            *n = count;
+                            *explicit = true;
+                        }
+                        Command::Insert(_, n)
                         | Command::Put(_, _, _, _, n)
                         | Command::Delete(n) => *n = count,
                     }
@@ -238,6 +243,7 @@ impl Vim {
                 op,
                 motion.to_string(),
                 count.saturating_mul(motion_count).min(999),
+                explicit_count || tail.len() != motion.len(),
             );
             self.pending.clear();
             let changed = self.apply(line, cmd.clone());
@@ -269,7 +275,9 @@ impl Vim {
         }
         let motion = rest.to_string();
         self.pending.clear();
-        if let Some((target, _, _)) = motion_target(line, line.cursor_byte(), &motion, count) {
+        if let Some((target, _, _)) =
+            motion_target(line, line.cursor_byte(), &motion, count, explicit_count)
+        {
             line.set_modal_cursor(target);
             normal_cursor(line);
         }
@@ -377,10 +385,15 @@ impl Vim {
                 }
                 normal_cursor(line);
             }
-            Command::Operator(op, motion, count) => {
-                let Some((mut range, includes_last_line)) =
-                    operator_range(line, line.cursor_byte(), *op, motion, *count)
-                else {
+            Command::Operator(op, motion, count, explicit_count) => {
+                let Some((mut range, includes_last_line)) = operator_range(
+                    line,
+                    line.cursor_byte(),
+                    *op,
+                    motion,
+                    *count,
+                    *explicit_count,
+                ) else {
                     return false;
                 };
                 let linewise =
@@ -633,7 +646,25 @@ fn word_end(s: &str, mut at: usize, big: bool) -> usize {
     }
     at
 }
-fn motion_target(s: &str, at: usize, motion: &str, count: usize) -> Option<(usize, bool, bool)> {
+// One-based absolute line target, clamped to the last (possibly empty) line.
+fn numbered_line_start(s: &str, number: usize) -> usize {
+    let mut at = 0;
+    for _ in 1..number {
+        let end = line_end(s, at);
+        if end == s.len() {
+            break;
+        }
+        at = end + 1;
+    }
+    at
+}
+fn motion_target(
+    s: &str,
+    at: usize,
+    motion: &str,
+    count: usize,
+    explicit_count: bool,
+) -> Option<(usize, bool, bool)> {
     let mut to = at;
     let mut inclusive = false;
     let mut linewise = false;
@@ -670,15 +701,26 @@ fn motion_target(s: &str, at: usize, motion: &str, count: usize) -> Option<(usiz
         }
         "0" => to = line_start(s, at),
         "$" => {
-            to = line_end(s, at);
+            for _ in 1..count {
+                let end = line_end(s, to);
+                if end == s.len() {
+                    break;
+                }
+                to = end + 1;
+            }
+            to = line_end(s, to);
             inclusive = false
         }
         "gg" => {
-            to = 0;
+            to = numbered_line_start(s, count);
             linewise = true
         }
         "G" => {
-            to = line_start(s, s.len());
+            to = if explicit_count {
+                numbered_line_start(s, count)
+            } else {
+                line_start(s, s.len())
+            };
             linewise = true
         }
         "j" | "k" => {
@@ -702,6 +744,7 @@ fn operator_range(
     op: char,
     motion: &str,
     count: usize,
+    explicit_count: bool,
 ) -> Option<(Range<usize>, bool)> {
     if motion == op.to_string() {
         let start = line_start(s, at);
@@ -744,7 +787,7 @@ fn operator_range(
         }
         return Some((at..end, false));
     }
-    let (target, inclusive, linewise) = motion_target(s, at, motion, count)?;
+    let (target, inclusive, linewise) = motion_target(s, at, motion, count, explicit_count)?;
     if linewise {
         let start = line_start(s, at.min(target));
         let end = line_end(s, at.max(target));
@@ -908,6 +951,85 @@ mod tests {
         (vim, line)
     }
     #[test]
+    fn counted_line_motion_unicode_and_operator_forms_keep_boundaries() {
+        let (mut v, mut l) = normal("👩‍💻\ne\u{301}\n中\n");
+        commands(&mut v, &mut l, "2$");
+        assert_eq!(l.cursor_byte(), "👩‍💻\n".len());
+        commands(&mut v, &mut l, "3G");
+        assert_eq!(l.cursor_byte(), "👩‍💻\ne\u{301}\n".len());
+        commands(&mut v, &mut l, "999G");
+        assert_eq!(l.cursor_byte(), l.len());
+        let (mut v, mut l) = normal("a\nb\nc\nd");
+        commands(&mut v, &mut l, "y2G");
+        assert_eq!(&*l, "a\nb\nc\nd");
+        assert_eq!(v.register, "a\nb\n");
+        commands(&mut v, &mut l, "d2$");
+        assert_eq!(&*l, "\nc\nd");
+        assert_eq!(v.register, "a\nb");
+        let (mut v, mut l) = normal("a\nb\nc\nd");
+        l.set_modal_cursor(4);
+        commands(&mut v, &mut l, "d1G");
+        assert_eq!(&*l, "d");
+        assert_eq!(v.register, "a\nb\nc\n");
+        for (change, expected) in [("dG", ""), ("d2G", "g")] {
+            let (mut v, mut l) = normal("a\nb\nc\nd");
+            commands(&mut v, &mut l, change);
+            l.set("e\nf\ng");
+            l.set_modal_cursor(0);
+            commands(&mut v, &mut l, ".");
+            assert_eq!(&*l, expected);
+        }
+    }
+
+    #[test]
+    fn counted_line_motions_target_absolute_lines_or_relative_end_on_both_surfaces() {
+        for surface in [Surface::Composer, Surface::Editor] {
+            for start in [0, 2, 4] {
+                for (keys, expected) in [
+                    ("G", 6),
+                    ("1G", 0),
+                    ("3gg", 4),
+                    ("99gg", 6),
+                    ("99G", 6),
+                    ("gg", 0),
+                    ("2$", (start + 2).min(6)),
+                ] {
+                    let (mut v, mut l) = normal("a\nb\nc\nd");
+                    l.set_modal_cursor(start);
+                    for c in keys.chars() {
+                        v.key(&mut l, key(c), surface);
+                    }
+                    assert_eq!(l.cursor_byte(), expected, "{surface:?} {keys} from {start}");
+                    assert_eq!(&*l, "a\nb\nc\nd");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn counted_line_operators_preserve_ranges_registers_and_explicit_dot_count() {
+        for keys in ["d2G", "2dG", "d2gg", "2dgg"] {
+            let (mut v, mut l) = normal("a\nb\nc\nd");
+            commands(&mut v, &mut l, keys);
+            assert_eq!(&*l, "c\nd", "{keys}");
+            assert_eq!(v.register, "a\nb\n");
+            assert!(v.register_linewise);
+            assert_eq!(l.cursor_byte(), 0);
+        }
+        let (mut v, mut l) = normal("a\nb\nc\nd");
+        commands(&mut v, &mut l, "2d2G");
+        assert_eq!(&*l, "");
+        assert_eq!(v.register, "a\nb\nc\nd");
+        let (mut v, mut l) = normal("a\nb\nc\nd");
+        commands(&mut v, &mut l, "dG");
+        l.set("e\nf\ng");
+        l.set_modal_cursor(0);
+        commands(&mut v, &mut l, "1.");
+        assert_eq!(&*l, "f\ng", "explicit dot count selects line one");
+        assert_eq!(v.register, "e\n");
+    }
+
+    #[test]
     fn normal_u_undoes_on_both_surfaces_and_preserves_dot_and_register() {
         use unicode_segmentation::UnicodeSegmentation;
         for surface in [Surface::Composer, Surface::Editor] {
@@ -989,6 +1111,36 @@ mod tests {
             let before = l.to_string();
             commands(&mut v, &mut l, ".");
             assert_ne!(&*l, before, "{open} must still repeat without Insert keys");
+        }
+    }
+
+    #[test]
+    fn combined_counted_delete_undo_noop_insert_and_dot_preserve_state() {
+        for surface in [Surface::Composer, Surface::Editor] {
+            let (mut v, mut l) = normal("a\nb\nc\nd");
+            for c in "d2G".chars() {
+                v.key(&mut l, key(c), surface);
+            }
+            assert_eq!(&*l, "c\nd");
+            v.key(&mut l, key('u'), surface);
+            assert_eq!(&*l, "a\nb\nc\nd");
+            v.key(&mut l, key('i'), surface);
+            v.key(
+                &mut l,
+                KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+                surface,
+            );
+            v.key(
+                &mut l,
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                surface,
+            );
+            v.key(&mut l, key('.'), surface);
+            assert_eq!(&*l, "c\nd");
+            assert_eq!(v.register, "a\nb\n");
+            assert!(v.register_linewise);
+            assert_eq!(l.cursor_byte(), 0);
+            assert_eq!(v.mode, Mode::Normal);
         }
     }
 
