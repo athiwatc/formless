@@ -3458,19 +3458,45 @@
   // -------------------------------------------------------- approvals
   /** A job's recent firings: when, trigger, outcome, time, cost, Session. */
   async function showJobHistory(j) {
-    const runs = (await request({ type: "job_runs", id: j.id }).catch(() => null)) || [];
+    const body = h("div", { class: "job-history" });
+    let closed = false, retrying = false;
     const secs = (r) => r.finished_at ? uiFormat(Math.round((new Date(r.finished_at) - new Date(r.started_at)) / 1000)) + "s" : "…";
-    const body = runs.length
-      ? h("table", { class: "table" }, h("tbody", null, runs.map((r) => h("tr", null,
-          h("td", { class: "muted" }, uiFormat(new Date(r.started_at))),
-          h("td", null, r.trigger),
-          h("td", { class: r.status === "completed" ? "" : "error" }, r.status),
-          h("td", { class: "muted" }, secs(r)),
-          h("td", { class: "muted" }, r.cost != null ? uiMoney(r.cost, 3) : "—"),
-          h("td", null, r.session_id ? h("button", { class: "btn ghost small", type: "button", onclick: () => openSession(r.session_id) }, "Open") : null),
-          h("td", { class: "muted" }, r.detail || "")))))
-      : h("p", { class: "muted" }, "It has not run yet.");
-    ask({ title: "Job history", body, ok: "Close" });
+    async function load() {
+      try {
+        const runs = await request({ type: "job_runs", id: j.id });
+        if (!Array.isArray(runs)) throw new Error("History response was not a list");
+        return { runs };
+      } catch (error) { return { error }; }
+    }
+    function show(result) {
+      if ("error" in result) {
+        const retry = h("button", { class: "btn small", type: "button", onclick: async () => {
+          if (retrying || closed) return;
+          retrying = true; retry.disabled = true; retry.textContent = "Retrying…";
+          const next = await load();
+          retrying = false;
+          if (closed) return;
+          show(next);
+          if (body.isConnected && activeDialog()?.node === $("ask-backdrop")) focusReturn($("ask-ok"));
+        } }, "Retry");
+        body.replaceChildren(h("p", { class: "error", role: "alert" }, "Could not load Job history. ", result.error?.message || String(result.error)), retry);
+      } else if (!result.runs.length) {
+        body.replaceChildren(h("p", { class: "muted" }, "It has not run yet."));
+      } else {
+        body.replaceChildren(h("div", { class: "table-wrap job-history-table" }, h("table", { class: "table" },
+          h("thead", null, h("tr", null, ["Started", "Trigger", "Status", "Duration", "Cost", "Session", "Detail"].map(label => h("th", { scope: "col" }, label)))),
+          h("tbody", null, result.runs.map((r) => h("tr", null,
+            h("td", { class: "muted" }, uiFormat(new Date(r.started_at))),
+            h("td", null, r.trigger),
+            h("td", { class: r.status === "completed" ? "" : "error" }, r.status),
+            h("td", { class: "muted" }, secs(r)),
+            h("td", { class: "muted" }, r.cost != null ? uiMoney(r.cost, 3) : "—"),
+            h("td", null, r.session_id ? h("button", { class: "btn ghost small", type: "button", onclick: () => openSession(r.session_id) }, "Open") : null),
+            h("td", { class: "muted" }, r.detail || "")))))));
+      }
+    }
+    show(await load());
+    ask({ title: "Job history", body, ok: "Close", hideCancel: true }).then(() => { closed = true; });
   }
   /** A path Capability's wider scopes (file, folder, repository), as a
    * select; the pick is sent with the answer (SPEC §10.3). */
