@@ -322,6 +322,41 @@ mod tests {
     }
 
     #[test]
+    fn recent_only_fallbacks_keep_response_order_after_existing_rows() {
+        let result = serde_json::json!({"aliases":{"short":"endpoint"},
+            "roles":[{"name":"fast","model":"endpoint"}], "models":["endpoint"],
+            "recent":["archived-newest","shared","endpoint","tie-a","模型-ไทย","tie-z"]});
+        let got = items_from_list(&result);
+        assert_eq!(
+            got.iter().map(|item| item.id.as_str()).collect::<Vec<_>>(),
+            [
+                "short",
+                "role:fast",
+                "endpoint",
+                "archived-newest",
+                "shared",
+                "tie-a",
+                "模型-ไทย",
+                "tie-z"
+            ]
+        );
+        assert!(
+            got[2].recent,
+            "existing provider rows retain membership markers"
+        );
+        let picker = ModelPicker::new(got);
+        assert_eq!(
+            picker
+                .matches()
+                .iter()
+                .filter(|(item, _)| item.source.as_deref() == Some("recent"))
+                .map(|(item, _)| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["archived-newest", "shared", "tie-a", "模型-ไทย", "tie-z"]
+        );
+    }
+
+    #[test]
     fn selection_stays_in_range() {
         let mut p = ModelPicker::new(items(&["x1", "x2"]));
         p.down();

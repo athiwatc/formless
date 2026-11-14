@@ -238,11 +238,14 @@ without redesign.
 - **Model picker.** The wizard, `/model` and the web client share one
   picker. Typing filters the list by fuzzy (subsequence) match on the id:
   word starts and runs of consecutive matches rank higher, matched
-  characters are highlighted, and recently used models come first. Roles
+  characters are highlighted, and models reported by Sessions are prioritized
+  as recent. Roles
   show up as `role:<name>` rows with the provider and model they map to.
   `ListModels` returns `{models, roles, recent, current, error}`: `models`
-  comes from the default provider's `/models`, `recent` from the Sessions'
-  models, newest first. When the list can't be fetched, the typed text is
+  comes from the default provider's `/models`. `recent` deduplicates exact
+  nonempty stored Session model IDs, including archived Sessions, after sorting
+  stored `updated_at` descending and Session ID ascending for ties. This is
+  Session-update recency, not measured model-use history. When the list can't be fetched, the typed text is
   used as a free-form model id. In `/model`, Enter sets the **current
   Session**'s model and effort (`SetSessionModel`). Ctrl+Enter, Alt+Enter
   or Ctrl+D (Ctrl/⌘+Enter on the web) sets the global default instead
