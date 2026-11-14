@@ -970,3 +970,8 @@ mark.find { background: var(--accent-soft); color: inherit; border-radius: 0.187
 }
 
 :root[data-viewport-zoomed] .compose-hint { display: none; }
+
+/* Warnings remain available by keyboard/touch outside the live hint region. */
+.forecast-warnings { font-size: 0.875rem; overflow-wrap: anywhere; }
+.forecast-warnings summary { cursor: pointer; }
+.forecast-warnings ul { max-height: 10rem; overflow-y: auto; margin: 0.25rem 0; padding-inline-start: 1.5rem; }
