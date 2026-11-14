@@ -988,3 +988,33 @@ test('relay reconnect registers only existing push opt-in on the current authent
   Object.assign(c.S,{ws,room:'new-v3-room',channel:{},daemonOnline:true});
   await c.restorePushSubscription(ws);assert.equal(frames.length,1,'no existing opt-in creates no subscription');
 });
+
+test('Session selection pruning retains filter-hidden IDs and removes missing IDs', () => {
+  const list=node('ul');
+  const c=setup(['renderSessions','sessionRows'],{$:()=>list,h:node,relTime:()=>'',openSession(){},sessionMenu(){},bulkSessions(){}});
+  c.S.running=new Set();
+  c.S.sessions=[{id:'visible',name:'Visible',tags:['shown']},{id:'hidden',name:'Hidden',tags:['other']},{id:'archived',name:'Archived',archived:true,tags:['other']}];
+  c.S.tagFilter='shown';c.S.marked=new Set(['visible','hidden','archived','deleted']);
+  c.renderSessions();
+  assert.deepEqual([...c.S.marked],['visible','hidden','archived']);
+  assert.equal(list.children.filter(n=>n.attrs?.class==='session').length,1);
+});
+
+test('Session selection pruning clears missing IDs even when the backing list is empty', () => {
+  const list=node('ul');const c=setup(['renderSessions'],{$:()=>list,h:node});
+  c.S.sessions=[];c.S.marked=new Set(['deleted']);c.renderSessions();
+  assert.equal(c.S.marked.size,0);
+  assert.match(plainText(list),/No sessions yet/);
+});
+
+test('Session selection pruning reads each loaded ID once for a large selection', () => {
+  // Isolate selection cleanup from the unchanged DOM/tree renderer. Count ID
+  // reads rather than claiming an end-to-end timing improvement.
+  const list=node('ul');let reads=0;
+  const c=setup(['renderSessions'],{$:()=>list,h:node,sessionRows:()=>[]});
+  c.S.sessions=Array.from({length:4000},(_,i)=>({get id(){reads++;return 's'+i;},name:'Session '+i}));
+  c.S.marked=new Set(Array.from({length:4000},(_,i)=>'s'+i));c.S.marked.add('missing');
+  c.renderSessions();
+  assert.equal(c.S.marked.size,4000);
+  assert.equal(reads,4000,'one loaded-ID index, independent of selected-ID count');
+});
