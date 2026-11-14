@@ -842,10 +842,6 @@ fn parse_state(src: &str) -> Option<Graph> {
     // A multi-line `note … end note` body is text, never states (#879).
     let mut in_note = false;
     for stmt in statements(src) {
-        let stmt = stmt.trim_end_matches('{').trim();
-        if stmt.is_empty() || stmt == "}" {
-            continue;
-        }
         if in_note {
             in_note = stmt != "end note";
             continue;
@@ -864,6 +860,12 @@ fn parse_state(src: &str) -> Option<Graph> {
             "note" | "end" | "classDef" | "class" | "style" | "%%"
         ) {
             continue;
+        }
+        // This renderer has one start/end identity and one layout direction.
+        // A structural scope cannot be flattened without changing the diagram.
+        // Labels and notes may contain braces as ordinary text.
+        if state_scope_delimiter(stmt) {
+            return None;
         }
         if let Some(rest) = stmt.strip_prefix("state ") {
             // `state "Long name" as Id` / `state Id`
@@ -910,6 +912,30 @@ fn parse_state(src: &str) -> Option<Graph> {
         }
     }
     (!g.nodes.is_empty()).then_some(g)
+}
+
+fn state_scope_delimiter(statement: &str) -> bool {
+    let mut quote = None;
+    let mut escaped = false;
+    let mut chars = statement.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if escaped {
+            escaped = false;
+        } else if quote.is_some() && ch == '\\' {
+            escaped = true;
+        } else if quote == Some(ch) {
+            quote = None;
+        } else if quote.is_none() {
+            match ch {
+                '"' | '`' => quote = Some(ch),
+                ':' => return false, // The rest of a state/transition label is text.
+                '%' if chars.peek() == Some(&'%') => return false,
+                '{' | '}' => return true,
+                _ => {}
+            }
+        }
+    }
+    false
 }
 
 // ----------------------------------------------------------- graph layout
@@ -1723,6 +1749,44 @@ mod tests {
             all.contains("╭") && all.contains("Idle") && all.contains("job"),
             "{all}"
         );
+    }
+
+    #[test]
+    fn composite_state_scopes_refuse_flattening_at_every_width() {
+        for declaration in [
+            "state Parent {",
+            "state \"Parent label\" as Parent {",
+            "state Parent\n{",
+        ] {
+            for direction in ["", "direction LR\n"] {
+                let source = format!("stateDiagram-v2\n[*] --> Parent\n{declaration}\n{direction}[*] --> Inner\nInner --> [*]\n}}\nParent --> [*]");
+                assert!(parse_state(&source).is_none(), "{source}");
+                for width in [20, 80, 10_000] {
+                    assert!(render(&source, false, width).is_none(), "{source}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn flat_state_labels_and_note_braces_do_not_create_composite_scopes() {
+        let source = "stateDiagram-v2\ndirection LR\nstate \"Literal {braces}\" as A\n[*] --> A\nnote right of A\nstate Nested {\n  direction TD\n  [*] --> Fake\n}\nend note\nnote left of A: { inline note }\nA --> B: {transition label}\nB --> [*]";
+        let graph = parse_state(source).unwrap();
+        assert!(graph.left_right, "note direction never changes the graph");
+        assert_eq!(graph.edges.len(), 3);
+        let output = text(source, 200).join("\n");
+        assert!(
+            output.contains("Literal {braces}") && output.contains("{transition label}"),
+            "{output}"
+        );
+        assert!(!output.contains("Fake"), "{output}");
+        for label in [
+            r#"state "escaped \" { brace" as A"#,
+            "A: {description}",
+            "A --> B: closing } brace",
+        ] {
+            assert!(!state_scope_delimiter(label), "{label}");
+        }
     }
 
     #[test]

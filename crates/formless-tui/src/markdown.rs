@@ -1546,6 +1546,21 @@ mod tests {
         assert!(out.iter().any(|l| l.contains("gantt")));
     }
 
+    #[test]
+    fn composite_mermaid_state_uses_labelled_source_instead_of_wrong_flat_diagram() {
+        let source = "stateDiagram-v2\n[*] --> Parent\nstate Parent {\ndirection LR\n[*] --> Inner\nInner --> [*]\n}";
+        let out = lines(&format!("```mermaid\n{source}\n```"), 80);
+        assert!(
+            out.iter().any(|line| line.contains("mermaid [1] (source")),
+            "{out:?}"
+        );
+        assert!(
+            out.iter().any(|line| line.contains("state Parent {")),
+            "{out:?}"
+        );
+        assert!(!out.iter().any(|line| line.contains("◇ mermaid · state")));
+    }
+
     /// A too-wide flowchart: one label of about `22 * n` columns (#1742).
     fn wide_mermaid(n: usize) -> String {
         format!(
