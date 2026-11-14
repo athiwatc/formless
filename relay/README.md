@@ -282,6 +282,19 @@ The browser suite uses local fixture replies and performs no real settings,
 provider, daemon or Tool operations. WebKit is engine coverage, not physical
 Safari or assistive-technology evidence. `node --test relay/*.test.mjs` also
 checks dynamic row generation and typed/cancelled/invalid Edit requests.
+
+Existing diagram blocks follow explicit and Auto/OS theme changes without
+rebuilding messages. Source/zoom choices and focus remain on the retained block;
+SVG downloads use its current render. Asset-load failures offer **Retry** and
+evict failed loader jobs, while invalid source keeps a visible error and source
+fallback without paint-time retries. Generation checks discard stale completions.
+
+Run `python relay/web-mermaid.browser-test.py /tmp/formless-mermaid-check` for
+real vendored load/retry checks plus controlled theme/queue/layout races in
+Chromium. It also checks source/zoom/focus, SVG downloads, retained messages,
+paused reading anchors and cached/recreated blocks. This uses owned local UI
+fixtures; no daemon, provider, deployment or physical screen-reader is involved.
+
 ### Job history browser checks
 
 Run `python relay/web-job-history.browser-test.py /tmp/formless-job-history`

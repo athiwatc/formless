@@ -2,8 +2,10 @@ mod cli_attach;
 mod cli_commands;
 #[cfg(test)]
 mod cli_help_tests;
+mod cli_metrics;
 mod cli_modules;
 mod cli_pipeline;
+mod cli_proposal_diff;
 mod cli_routing;
 mod cli_run_identity;
 mod cli_runs_list;
@@ -72,6 +74,18 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Read recorded model, Tool and built-in metrics without a model call
+    #[command(
+        after_help = "Examples:\n  formless metrics --since 7d\n  formless metrics --json\n\nTool rows identify stored tool_id values. Reports are independent reads at one cutoff, not a transactional snapshot."
+    )]
+    Metrics {
+        /// Only records since this duration ago (7d, 24h, 1h30m); omitted: all history
+        #[arg(long, value_name = "DURATION", value_parser = parse_since_cutoff)]
+        since: Option<String>,
+        /// Print all three complete replies as one JSON object
+        #[arg(long)]
+        json: bool,
+    },
     /// Read the daemon's currently available routing decisions without a model call
     Routing {
         /// Print the complete daemon reply as one JSON value
@@ -287,7 +301,9 @@ enum Cmd {
         action: RelayAction,
     },
     /// Prompt/memory self-optimisation proposals
-    #[command(after_help = "Examples:\n  formless prompts list\n  formless prompts list --json")]
+    #[command(
+        after_help = "Examples:\n  formless prompts list\n  formless prompts list --json\n  formless prompts diff PROPOSAL_ID --json"
+    )]
     Prompts {
         #[command(subcommand)]
         action: PromptsAction,
@@ -597,6 +613,14 @@ enum UpdateAction {
 
 #[derive(Subcommand)]
 enum PromptsAction {
+    /// Show the existing proposal comparison without applying it
+    Diff {
+        /// ID of the prompt or memory proposal to compare
+        id: String,
+        /// Print the complete daemon response as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// List proposals with eval scores
     List {
         /// One JSON value instead of a table
@@ -2096,6 +2120,12 @@ fn run_cli(cli: Cli) -> Result<()> {
             None => runs_cmd(paths, limit, json),
         },
         Some(Cmd::Jobs { action }) => jobs_cmd(paths, action),
+        Some(Cmd::Metrics { since, json }) => {
+            formless_core::daemon::ensure_daemon(&paths)?;
+            cli_metrics::write_report(&mut std::io::stdout().lock(), since, json, |request| {
+                formless_tui::client::request_once(&paths, request)
+            })
+        }
         Some(Cmd::Routing { json }) => {
             formless_core::daemon::ensure_daemon(&paths)?;
             cli_routing::write_report(&mut std::io::stdout().lock(), json, |request| {
@@ -2506,6 +2536,7 @@ fn prompts_cmd(paths: Paths, action: PromptsAction) -> Result<()> {
     use formless_tui::client::request_once;
     formless_core::daemon::ensure_daemon(&paths)?;
     match action {
+        PromptsAction::Diff { id, json } => cli_proposal_diff::show(&paths, id, json),
         PromptsAction::List { json } => {
             let v = request_once(&paths, Request::ListProposals)?;
             if json {
@@ -4015,18 +4046,35 @@ fn parse_duration(s: &str) -> Result<std::time::Duration, String> {
         }
         let n: u64 = num.parse().map_err(|_| bad())?;
         num.clear();
-        total += n * match c {
+        let unit = match c {
             's' => 1,
             'm' => 60,
             'h' => 3600,
             'd' => 86_400,
             _ => return Err(bad()),
         };
+        total = n
+            .checked_mul(unit)
+            .and_then(|part| total.checked_add(part))
+            .ok_or_else(bad)?;
     }
     if !num.is_empty() || total == 0 {
         return Err(bad());
     }
     Ok(std::time::Duration::from_secs(total))
+}
+
+fn cutoff_at(value: &str, now: chrono::DateTime<chrono::Utc>) -> Result<String, String> {
+    let duration = parse_duration(value)?;
+    let delta = chrono::Duration::from_std(duration)
+        .map_err(|_| "duration exceeds the supported time range".to_string())?;
+    now.checked_sub_signed(delta)
+        .map(|cutoff| cutoff.to_rfc3339())
+        .ok_or_else(|| "duration produces an unrepresentable UTC cutoff".to_string())
+}
+
+fn parse_since_cutoff(value: &str) -> Result<String, String> {
+    cutoff_at(value, chrono::Utc::now())
 }
 
 /// `1h30m`, `10m`, `45s`.
@@ -5412,6 +5460,12 @@ enum SessionsAction {
         /// List archived Sessions instead of active Sessions
         #[arg(long)]
         archived: bool,
+        /// Keep only pinned Sessions (client-side, combined with other filters)
+        #[arg(long)]
+        pinned: bool,
+        /// Exact stored tag after lowercasing TAG; a leading # is not stripped
+        #[arg(long)]
+        tag: Option<String>,
         /// One JSON array of SessionInfo
         #[arg(long)]
         json: bool,
@@ -5562,16 +5616,47 @@ fn sessions_cmd(paths: Paths, action: SessionsAction) -> Result<()> {
             }
         }
         SessionsAction::Compare { .. } => unreachable!("handled before daemon startup"),
-        SessionsAction::List { archived, json } => {
+        SessionsAction::List {
+            archived,
+            pinned,
+            tag,
+            json,
+        } => {
             let list: Vec<SessionInfo> = serde_json::from_value(daemon(Request::ListSessions)?)?;
+            let normalized_tag = tag.as_ref().map(|tag| tag.to_lowercase());
+            let shown: Vec<&SessionInfo> = list
+                .iter()
+                .filter(|session| {
+                    session.archived == archived
+                        && (!pinned || session.pinned)
+                        && normalized_tag
+                            .as_ref()
+                            .is_none_or(|tag| session.tags.contains(tag))
+                })
+                .collect();
             if json {
-                let shown: Vec<&SessionInfo> =
-                    list.iter().filter(|s| s.archived == archived).collect();
                 println!("{}", serde_json::to_string_pretty(&shown)?);
                 return Ok(());
             }
+            if shown.is_empty() && !list.is_empty() && (pinned || tag.is_some()) {
+                let mut filters = Vec::new();
+                if archived {
+                    filters.push("--archived".to_string());
+                }
+                if pinned {
+                    filters.push("--pinned".to_string());
+                }
+                if let Some(tag) = tag {
+                    filters.push(format!("--tag {}", comparison_terminal_text(&tag)));
+                }
+                println!(
+                    "no Sessions match {} (formless sessions list)",
+                    filters.join(" ")
+                );
+                return Ok(());
+            }
             let mut tbl = Table::new(&["ID", "UPDATED", "MSGS", "NAME", "LAST MESSAGE"]);
-            for s in list.iter().filter(|s| s.archived == archived) {
+            for s in shown {
                 tbl.row(vec![
                     t(&s.id[..8.min(s.id.len())], Tone::Dim),
                     c(s.updated_at.get(..16).unwrap_or(&s.updated_at)),
