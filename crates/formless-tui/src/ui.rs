@@ -87,7 +87,7 @@ pub(crate) fn rate_width(color: bool) -> u16 {
 }
 
 pub(crate) fn rate_text(rate: Option<f64>) -> String {
-    rate.map(|r| format!("{:.0}%", r * 100.0))
+    rate.map(formless_core::success_rate::label)
         .unwrap_or_else(|| "-".into())
 }
 
@@ -102,7 +102,12 @@ pub(crate) fn rate_style(color: bool, rate: Option<f64>) -> Style {
 }
 
 pub(crate) fn bar(rate: f64, width: usize) -> String {
-    let filled = ((rate.clamp(0.0, 1.0) * width as f64).round() as usize).min(width);
+    let max_filled = if rate < 1.0 {
+        width.saturating_sub(1)
+    } else {
+        width
+    };
+    let filled = ((rate.clamp(0.0, 1.0) * width as f64).round() as usize).min(max_filled);
     format!("{}{}", "█".repeat(filled), "░".repeat(width - filled))
 }
 
@@ -182,6 +187,29 @@ pub(crate) fn summarize_args(args: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn imperfect_high_rates_have_bounded_labels_and_leave_a_gauge_gap() {
+        for (rate, expected) in [
+            (0.9949, "99%"),
+            (0.995, ">99%"),
+            (0.9999, ">99%"),
+            (1.0, "100%"),
+        ] {
+            assert_eq!(rate_text(Some(rate)), expected);
+            assert!(matches!(rate_tone(rate), crate::SemanticTone::Good));
+            for width in [0, 1, 4, 20] {
+                let gauge = bar(rate, width);
+                assert_eq!(gauge.chars().count(), width);
+                if rate < 1.0 && width > 0 {
+                    assert!(gauge.ends_with('░'), "rate={rate}, width={width}: {gauge}");
+                } else if rate == 1.0 {
+                    assert_eq!(gauge, "█".repeat(width));
+                }
+            }
+        }
+        assert_eq!(rate_text(None), "-");
+    }
 
     #[test]
     fn formatting_helpers() {

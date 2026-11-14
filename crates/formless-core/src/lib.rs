@@ -69,6 +69,7 @@ pub mod service;
 pub mod setup_draft;
 pub mod skills;
 pub mod storage;
+pub mod success_rate;
 pub mod tokens;
 pub mod tool_compatibility;
 pub mod tools;
