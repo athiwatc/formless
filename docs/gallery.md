@@ -80,6 +80,9 @@ headless with `formless run "…"`.
 
 13. **Remember a preference.** "Always answer in Thai" → saved as a memory
     (`/memory` lists them, `/forget` removes one).
+    This changes the requested answer language. To choose English/Thai interface
+    text instead, use Settings → Interface → language or
+    `formless config set tui.language th`; see [interface language](../SPEC.md#108-language).
 14. **Compare models.** `/compare-models gpt-5 claude-sonnet "explain this regex"`
     runs the same prompt on both and shows the answers side by side with
     time and cost.

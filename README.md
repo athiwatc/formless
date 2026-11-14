@@ -341,6 +341,18 @@ blue/orange status palette. Diffs keep bold `+`/`-` gutters; CLI status cells ad
 `NO_COLOR` suppresses ANSI styling without removing status information; printable
 Unicode is preserved. JSON output retains its original machine-readable values.
 
+For interface language, open **Settings → Interface → language** in the TUI,
+or run `formless config set tui.language th` for Thai. Use
+`formless config set tui.language en` for English or
+`formless config set tui.language auto` to follow the locale. Auto uses the
+first nonempty `LC_ALL`, `LC_MESSAGES`, then `LANG` value in the TUI, and the
+browser language on the web; Thai locales select Thai, otherwise English.
+Supported interface text and date/number formatting follow that choice, but
+catalog coverage is partial: untranslated strings and some daemon messages
+remain English. Web dates retain the Gregorian calendar and Latin digits.
+This setting does not translate agent answers; asking for answers in Thai is
+a separate preference. See [SPEC §10.8](SPEC.md#108-language) for details.
+
 
 
 Approvals for broad Capabilities appear as a modal — the request names the exact host, path or binary, and the agent waits. Purging a Tool's code and history is user-only and lives in the Tools view ([§5.3](#53-lifecycle-and-versioning)).
