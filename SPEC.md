@@ -5545,8 +5545,11 @@ Web approval and promotion decisions remain pending locally until the daemon
 confirms resolution; failures report that the decision was not delivered and
 remain answerable. Recap and rating controls are rebuilt from current Run state
 outside the cached message body, so live completion and rating changes appear
-immediately and only the current last answer has controls. Markdown formatting
-is limited to 32 nesting levels, 4096 characters per inline parse, and 128 KiB
+immediately and only the current last answer has controls. Web Markdown
+recognizes HTTP(S) schemes case-insensitively in bare and angle autolinks,
+and MAILTO in angle autolinks. URL text and mail-address case are retained;
+existing safe-target filtering and trailing-punctuation behavior still apply.
+Markdown formatting is limited to 32 nesting levels, 4096 characters per inline parse, and 128 KiB
 per formatted message. Content beyond these limits is displayed verbatim as
 plain text, preserving access to persisted messages without recursive parsing.
 
