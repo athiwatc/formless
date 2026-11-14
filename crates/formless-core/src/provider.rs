@@ -2814,10 +2814,7 @@ impl Provider {
                         let text = self.redact_native_diagnostic(&raw_text, &credential, Some(&b));
                         // Save every rejected response before any recovery can
                         // continue, including the final send at the resend cap.
-                        last_err = match server_wait {
-                            Some(w) => format!("{status} (retry after {}s): {text}", w.as_secs()),
-                            None => format!("{status}: {text}"),
-                        };
+                        last_err = provider_http_error(status, &text, server_wait);
                         // Recovery inspects protocol data, never display text:
                         // masking even a one-character synthetic credential can
                         // remove a keyword or numeric limit from the diagnostic.
@@ -4723,6 +4720,19 @@ pub fn is_model_error_text(t: &str) -> bool {
             || t.contains("invalid model"))
 }
 
+// Round display hints up without changing the provider's actual retry delay.
+fn provider_http_error(status: reqwest::StatusCode, text: &str, wait: Option<Duration>) -> String {
+    match wait {
+        Some(wait) => {
+            let seconds = wait
+                .as_secs()
+                .saturating_add(u64::from(wait.subsec_nanos() != 0));
+            format!("{status} (retry after {seconds}s): {text}")
+        }
+        None => format!("{status}: {text}"),
+    }
+}
+
 /// How long the server asked us to wait: `Retry-After` (seconds or an
 /// HTTP date), else the longest `x-ratelimit-reset-*` (`"1s"`, `"6m0s"`,
 /// `"20ms"`).
@@ -5720,6 +5730,46 @@ mod tests {
         ] {
             assert!(!looks_like_access_refusal(t), "{t}");
         }
+    }
+
+    #[test]
+    fn stored_retry_hints_round_up_and_explain_the_same_wait() {
+        let context = crate::errors::ErrorContext {
+            base_url: "https://provider.invalid/v1",
+            model: "fixture",
+            alternatives: vec![],
+        };
+        for (wait, seconds) in [
+            (Duration::ZERO, 0),
+            (Duration::from_millis(20), 1),
+            (Duration::from_millis(500), 1),
+            (Duration::from_millis(1900), 2),
+            (Duration::from_secs(30), 30),
+            (Duration::MAX, u64::MAX),
+        ] {
+            let stored = provider_http_error(
+                reqwest::StatusCode::TOO_MANY_REQUESTS,
+                "limited",
+                Some(wait),
+            );
+            assert!(
+                stored.contains(&format!("(retry after {seconds}s)")),
+                "{stored}"
+            );
+            let explained = crate::errors::explain(&stored, &context);
+            assert_eq!(explained.category, "rate_limit");
+            assert!(
+                explained
+                    .message
+                    .ends_with(&format!("Try again in {seconds}s.")),
+                "{}",
+                explained.message
+            );
+        }
+        assert_eq!(
+            provider_http_error(reqwest::StatusCode::BAD_REQUEST, "invalid", None),
+            "400 Bad Request: invalid"
+        );
     }
 
     #[test]
