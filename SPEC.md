@@ -230,6 +230,9 @@ without redesign.
   - Presets also work later: `formless providers add NAME --preset ID`,
     a preset id in Settings → Providers' base_url field, and
     `providers.upsert` with `preset` (or a preset id as `base_url`).
+    These URL-or-preset inputs accept case-insensitive HTTP(S) schemes;
+    only the scheme is lowercased. The remaining URL preserves its case
+    and escaping, apart from existing outer-whitespace and trailing-slash trimming.
 - Onboarding collects `base_url` + API key, then fetches `/models`; the user
   picks a **model** and a **reasoning effort**. If `/models` fails, manual
   model-name entry is offered. Model + effort are a daemon default,
