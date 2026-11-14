@@ -6557,7 +6557,7 @@ impl Daemon {
                             matches!(
                                 error.downcast_ref::<crate::provider::StructuredOutputError>(),
                                 Some(
-                                    crate::provider::StructuredOutputError::InvalidJson
+                                    crate::provider::StructuredOutputError::InvalidJson { .. }
                                         | crate::provider::StructuredOutputError::SchemaViolation
                                 )
                             )
@@ -16392,7 +16392,7 @@ impl HostOps for NestedOps {
         );
         if matches!(
             &value,
-            Err(crate::provider::StructuredOutputError::InvalidJson
+            Err(crate::provider::StructuredOutputError::InvalidJson { .. }
                 | crate::provider::StructuredOutputError::SchemaViolation)
         ) {
             routing_call.claim_contract(identity.clone());

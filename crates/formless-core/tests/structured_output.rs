@@ -499,7 +499,11 @@ async fn paid_invalid_json_schema_refusal_and_cutoff_keep_one_physical_charge() 
                 .await
                 .unwrap_err();
                 let expected = match mode {
-                    "json" => StructuredOutputError::InvalidJson,
+                    "json" => StructuredOutputError::InvalidJson {
+                        category: formless_runtime::structured_output::JsonParserCategory::Syntax,
+                        line: 1,
+                        column: 1,
+                    },
                     "schema" => StructuredOutputError::SchemaViolation,
                     "refusal" => StructuredOutputError::RefusedResponse,
                     _ => StructuredOutputError::IncompleteResponse,
