@@ -3034,7 +3034,14 @@ it says.
   are perfect.
 - **Measurement failures.** A model call in the eval is retried once
   only when the error is transient (429, 408, 5xx, a dropped or timed-out
-  connection); an auth error or bad request fails at once. A proposal
+  connection); an auth error or bad request fails at once. With no HTTP status,
+  an extra measurement retry or temporary-failure explanation requires a known
+  transport diagnostic at the start of an error clause (e.g. request timed out,
+  connection reset/refused, stream dropped or explicit server overload).
+  Generic words such as stream, connection, timeout or reset inside model,
+  schema, authentication or parameter errors do not establish transience;
+  unknown prose gets no extra retry. Explicit probe/deadline metadata retains
+  its existing meaning. A proposal
   whose measurement fails is kept as `rejected` (never applied, listed as
   such) and the error is audit-logged as `proposal.discard_unmeasured`.
 

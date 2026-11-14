@@ -31,21 +31,66 @@ impl<'a> ErrorContext<'a> {
 pub fn is_transient(raw: &str) -> bool {
     match status(raw) {
         Some(code) => code == 408 || code == 429 || code >= 500,
-        None => {
-            let t = raw.to_lowercase();
-            [
-                "timed out",
-                "timeout",
-                "connection",
-                "connect error",
-                "stream",
-                "overloaded",
-                "reset",
-            ]
-            .iter()
-            .any(|k| t.contains(k))
-        }
+        None => raw
+            .to_lowercase()
+            .split([':', '\n'])
+            .any(transient_diagnostic),
     }
+}
+
+/// Text-only compatibility for rendered error chains. Unknown prose is not
+/// enough evidence to spend another request. Match diagnostic clauses, not
+/// arbitrary words inside model IDs, parameter names or permanent messages.
+fn transient_diagnostic(clause: &str) -> bool {
+    let clause = clause.trim();
+    if matches!(
+        clause,
+        "timeout" | "timeout_error" | "request_timeout" | "overloaded" | "overloaded_error"
+    ) {
+        return true;
+    }
+    let event_code = clause
+        .strip_prefix("error (")
+        .or_else(|| clause.strip_prefix("response.failed ("))
+        .and_then(|code| code.strip_suffix(')'));
+    if matches!(
+        event_code,
+        Some("timeout" | "timeout_error" | "request_timeout" | "overloaded" | "overloaded_error")
+    ) {
+        return true;
+    }
+    [
+        "timed out",
+        "request timed out",
+        "operation timed out",
+        "connection timed out",
+        "timeout waiting for",
+        "deadline has elapsed",
+        "connection refused",
+        "connection reset",
+        "connection aborted",
+        "connection closed",
+        "connection lost",
+        "broken pipe",
+        "unexpected eof",
+        "unexpected end of file",
+        "end of file before message length reached",
+        "early eof",
+        "temporary failure in name resolution",
+        "stream dropped",
+        "stream ended before message_stop",
+        "stream ended with a content block still open",
+        "server is overloaded",
+        "server overloaded",
+    ]
+    .iter()
+    .any(|prefix| {
+        clause.strip_prefix(prefix).is_some_and(|rest| {
+            rest.is_empty()
+                || rest == "."
+                || rest.starts_with(|c: char| c.is_whitespace() || matches!(c, '(' | '['))
+        })
+    })
 }
 
 fn status(raw: &str) -> Option<u16> {
@@ -554,6 +599,79 @@ mod tests {
 #[cfg(test)]
 mod transient_tests {
     use super::is_transient;
+
+    #[test]
+    fn permanent_words_do_not_trigger_an_extra_retry_or_temporary_advice() {
+        let context = super::ErrorContext {
+            base_url: "https://fixture.invalid/v1",
+            model: "fixture",
+            alternatives: vec![],
+        };
+        for message in [
+            "model does not support streaming",
+            "downstream rejected the schema",
+            "password reset required",
+            "connection field is missing",
+            "timeout parameter must be positive",
+            "overloaded model family is unsupported",
+            "resettable is not a known parameter",
+            "stream droppedness is not supported",
+        ] {
+            for raw in [
+                message.to_string(),
+                format!("provider error: {message}"),
+                format!("prompt evaluation: {message}"),
+            ] {
+                assert!(!is_transient(&raw), "{raw}");
+                let explained = super::explain(&raw, &context);
+                assert!(!explained.message.contains("temporarily"), "{explained:?}");
+                assert!(!explained
+                    .action
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("/resume"));
+                assert_eq!(explained.details, raw);
+            }
+        }
+    }
+
+    #[test]
+    fn specific_transport_diagnostics_and_status_precedence_are_retained() {
+        for raw in [
+            "request timed out",
+            "outer: operation timed out",
+            "connection reset by peer (os error 104)",
+            "error sending request: connection refused (os error 111)",
+            "stream read: unexpected EOF",
+            "stream read: error reading a body from connection: end of file before message length reached",
+            "timeout_error: request expired",
+            "provider error: stream dropped: stream ended before message_stop",
+            "provider error: overloaded_error: Overloaded",
+            "provider error: error (overloaded_error): server busy",
+            "timeout",
+            "deadline has elapsed",
+        ] {
+            assert!(is_transient(raw), "{raw}");
+        }
+        assert!(!is_transient("error sending request: error trying to connect: invalid peer certificate: UnknownIssuer"));
+        assert!(!is_transient(
+            "provider error: error (invalid_timeout_parameter): timeout must be positive"
+        ));
+        for raw in [
+            "400 Bad Request: connection reset",
+            "401 Unauthorized: stream dropped",
+            "404 Not Found: request timed out",
+        ] {
+            assert!(!is_transient(raw), "{raw}");
+        }
+        for raw in [
+            "408 Request Timeout",
+            "429 Too Many Requests",
+            "503 Service Unavailable: unsupported streaming",
+        ] {
+            assert!(is_transient(raw), "{raw}");
+        }
+    }
 
     #[test]
     fn only_transient_failures_are_retried() {
