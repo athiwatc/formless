@@ -1781,7 +1781,9 @@ impl State {
         let details = a["details"].as_bool().unwrap_or(false);
         let mut entries: std::collections::BTreeMap<String, Value> = Default::default();
         if self.overlay_get(&p) != Some(None) {
-            if let Ok(rd) = std::fs::read_dir(&p) {
+            if let Some(rd) =
+                listing_directory(&p, self.mode.is_overlay(), |path| std::fs::read_dir(path))?
+            {
                 for e in rd {
                     let e = e.map_err(|e| e.to_string())?;
                     let name = e.file_name().to_string_lossy().to_string();
@@ -1796,7 +1798,7 @@ impl State {
                         continue;
                     }
                     if !details {
-                        entries.insert(name.clone(), json!({"name":name}));
+                        entries.insert(name, Value::Null);
                         continue;
                     }
                     self.guard_read(raw_entry, &canonical_entry, "directory entry metadata")?;
@@ -1806,8 +1808,6 @@ impl State {
                     };
                     entries.insert(name, info);
                 }
-            } else if !self.mode.is_overlay() {
-                std::fs::read_dir(&p).map_err(|e| format!("{}: {e}", p.display()))?;
             }
         }
         if self.mode.is_overlay() {
@@ -1838,10 +1838,12 @@ impl State {
                 }
                 match bytes {
                     Some(bytes) => {
-                        entries.insert(
-                            name.clone(),
-                            json!({"name":name,"type":"file","size":bytes}),
-                        );
+                        let info = if details {
+                            json!({"name":name,"type":"file","size":bytes})
+                        } else {
+                            Value::Null
+                        };
+                        entries.insert(name, info);
                     }
                     None => {
                         entries.remove(&name);
@@ -2826,6 +2828,18 @@ fn notify(title: &str, body: &str) -> Result<(), String> {
     {
         let _ = (title, body);
         Err("notifications unsupported on this platform".into())
+    }
+}
+
+fn listing_directory<T>(
+    path: &Path,
+    overlay: bool,
+    open: impl FnOnce(&Path) -> std::io::Result<T>,
+) -> Result<Option<T>, String> {
+    match open(path) {
+        Ok(entries) => Ok(Some(entries)),
+        Err(_) if overlay => Ok(None),
+        Err(error) => Err(format!("{}: {error}", path.display())),
     }
 }
 
@@ -4268,6 +4282,157 @@ mod tests {
             out.output["returns"],
             json!([null, null, null, null, null, null, null, null])
         );
+    }
+
+    #[test]
+    fn fs_list_open_keeps_the_first_error_without_consuming_a_later_success() {
+        use std::{cell::Cell, collections::VecDeque, io};
+        let path = Path::new("synthetic-listing-path");
+        let mut results = VecDeque::from([
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "original-open-failure",
+            )),
+            Ok(vec!["later-success"]),
+        ]);
+        let calls = Cell::new(0);
+        let error = listing_directory(path, false, |_| {
+            calls.set(calls.get() + 1);
+            results.pop_front().unwrap()
+        })
+        .unwrap_err();
+        assert_eq!(calls.get(), 1);
+        assert_eq!(error, "synthetic-listing-path: original-open-failure");
+        assert_eq!(
+            results.len(),
+            1,
+            "Err-then-Ok cannot become an empty success through a second open"
+        );
+        for mode in [HostMode::Smoke, HostMode::Replay, HostMode::DryRun] {
+            let result = listing_directory::<()>(path, mode.is_overlay(), |_| {
+                Err(io::Error::new(io::ErrorKind::NotFound, "fixture"))
+            })
+            .unwrap();
+            assert!(
+                result.is_none(),
+                "overlay disk-open failure still falls through"
+            );
+        }
+        assert_eq!(
+            listing_directory(path, false, |_| Ok(vec!["a", "b"])).unwrap(),
+            Some(vec!["a", "b"])
+        );
+    }
+
+    #[test]
+    fn fs_list_names_details_and_overlays_keep_sorted_merge_and_tombstone_results() {
+        struct PrivateDir(PathBuf);
+        impl Drop for PrivateDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let fixture = PrivateDir(
+            std::env::temp_dir().join(format!("fl-list-fixture-{}", uuid::Uuid::new_v4())),
+        );
+        std::fs::create_dir_all(&fixture.0).unwrap();
+        let root = fixture.0.canonicalize().unwrap();
+        std::fs::write(root.join("a.txt"), "aa").unwrap();
+        std::fs::write(root.join("b.txt"), "bbb").unwrap();
+        std::fs::create_dir(root.join("目录")).unwrap();
+        let request = |code: &str, mode| {
+            let mut req = live(code);
+            req.mode = mode;
+            req.input = json!({"root":root});
+            req.caps = Capabilities::parse(&[
+                format!("fs:read:{}", root.display()),
+                format!("fs:write:{}", root.display()),
+            ])
+            .unwrap();
+            req
+        };
+        let out = execute(&request("function run(i) { return {names:fs.list(i.root), details:fs.list(i.root,{details:true})}; }", HostMode::Live), Arc::new(NoHostOps)).unwrap().output;
+        assert_eq!(out["names"], json!(["a.txt", "b.txt", "目录"]));
+        let details = out["details"].as_array().unwrap();
+        assert_eq!(details[0], json!({"name":"a.txt","type":"file","size":2}));
+        assert_eq!(details[1], json!({"name":"b.txt","type":"file","size":3}));
+        assert_eq!(details[2]["name"], "目录");
+        assert_eq!(details[2]["type"], "dir");
+        for mode in [HostMode::Smoke, HostMode::Replay, HostMode::DryRun] {
+            let out = execute(&request(r#"function run(i) {
+              fs.write(i.root+'/b.txt','replacement'); fs.remove(i.root+'/a.txt'); fs.write(i.root+'/added.txt','new');
+              return {names:fs.list(i.root),details:fs.list(i.root,{details:true})};
+            }"#, mode), Arc::new(NoHostOps)).unwrap().output;
+            assert_eq!(out["names"], json!(["added.txt", "b.txt", "目录"]));
+            assert_eq!(
+                out["details"][0],
+                json!({"name":"added.txt","type":"file","size":3})
+            );
+            assert_eq!(
+                out["details"][1],
+                json!({"name":"b.txt","type":"file","size":11})
+            );
+            let out = execute(&request(r#"function run(i) {
+              const path=i.root+'/missing'; const before=fs.list(path); fs.write(path+'/made','new');
+              return {before,after:fs.list(path),details:fs.list(path,{details:true})};
+            }"#, mode), Arc::new(NoHostOps)).unwrap().output;
+            assert_eq!(
+                out,
+                json!({"before":[],"after":["made"],"details":[{"name":"made","type":"file","size":3}]})
+            );
+        }
+        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "aa");
+        assert_eq!(std::fs::read_to_string(root.join("b.txt")).unwrap(), "bbb");
+        assert!(!root.join("added.txt").exists() && !root.join("missing").exists());
+        let error = execute(
+            &request(
+                "function run(i) { return fs.list(i.root+'/missing'); }",
+                HostMode::Live,
+            ),
+            Arc::new(NoHostOps),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .message
+                .contains(&root.join("missing").display().to_string()),
+            "{}",
+            error.message
+        );
+        let mut tombstone = request(
+            "function run(i) { return fs.list(i.root); }",
+            HostMode::Replay,
+        );
+        let overlay = new_overlay();
+        overlay
+            .lock()
+            .unwrap()
+            .insert(root.to_string_lossy().into_owned(), None);
+        tombstone.overlay = Some(overlay);
+        assert_eq!(
+            execute(&tombstone, Arc::new(NoHostOps)).unwrap().output,
+            json!([])
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            std::fs::write(
+                root.join(std::ffi::OsString::from_vec(vec![b'b', 255])),
+                "fixture",
+            )
+            .unwrap();
+            for details in [false, true] {
+                let mut req = request(
+                    "function run(i) { return fs.list(i.root,{details:i.details}); }",
+                    HostMode::Live,
+                );
+                req.input["details"] = json!(details);
+                assert!(execute(&req, Arc::new(NoHostOps))
+                    .unwrap_err()
+                    .message
+                    .contains("directory entry path is not UTF-8"));
+            }
+        }
     }
 
     #[test]
