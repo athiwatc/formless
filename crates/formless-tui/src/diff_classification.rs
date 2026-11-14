@@ -27,52 +27,49 @@ fn hunk_counts(line: &str) -> Option<(usize, usize)> {
 /// hunk headers clear the counts. No-newline markers consume neither side.
 /// Incomplete hunks retain their remaining budget until a new header/invalid
 /// row; ambiguous data cannot be validated as a complete patch by this view.
-pub(super) fn classify(text: &str) -> Vec<(&str, Kind)> {
+pub(super) fn classify(text: &str) -> impl Iterator<Item = (&str, Kind)> {
     let mut remaining = None;
-    text.lines()
-        .map(|line| {
-            let kind = if line.starts_with("@@") {
-                remaining = hunk_counts(line);
-                Kind::Hunk
-            } else if line == "\\ No newline at end of file" {
-                Kind::Plain
-            } else {
-                let in_hunk =
-                    remaining
-                        .as_mut()
-                        .and_then(|(old, new)| match line.as_bytes().first() {
-                            Some(b'+') if *new > 0 => {
-                                *new -= 1;
-                                Some(Kind::Added)
-                            }
-                            Some(b'-') if *old > 0 => {
-                                *old -= 1;
-                                Some(Kind::Removed)
-                            }
-                            Some(b' ') if *old > 0 && *new > 0 => {
-                                *old -= 1;
-                                *new -= 1;
-                                Some(Kind::Plain)
-                            }
-                            _ => None,
-                        });
-                match in_hunk {
-                    Some(kind) => kind,
-                    None => {
-                        remaining = None;
-                        if line.starts_with("+++") || line.starts_with("---") {
-                            Kind::Header
-                        } else if line.starts_with('+') {
-                            Kind::Added
-                        } else if line.starts_with('-') {
-                            Kind::Removed
-                        } else {
-                            Kind::Plain
-                        }
+    text.lines().map(move |line| {
+        let kind = if line.starts_with("@@") {
+            remaining = hunk_counts(line);
+            Kind::Hunk
+        } else if line == "\\ No newline at end of file" {
+            Kind::Plain
+        } else {
+            let in_hunk = remaining
+                .as_mut()
+                .and_then(|(old, new)| match line.as_bytes().first() {
+                    Some(b'+') if *new > 0 => {
+                        *new -= 1;
+                        Some(Kind::Added)
+                    }
+                    Some(b'-') if *old > 0 => {
+                        *old -= 1;
+                        Some(Kind::Removed)
+                    }
+                    Some(b' ') if *old > 0 && *new > 0 => {
+                        *old -= 1;
+                        *new -= 1;
+                        Some(Kind::Plain)
+                    }
+                    _ => None,
+                });
+            match in_hunk {
+                Some(kind) => kind,
+                None => {
+                    remaining = None;
+                    if line.starts_with("+++") || line.starts_with("---") {
+                        Kind::Header
+                    } else if line.starts_with('+') {
+                        Kind::Added
+                    } else if line.starts_with('-') {
+                        Kind::Removed
+                    } else {
+                        Kind::Plain
                     }
                 }
-            };
-            (line, kind)
-        })
-        .collect()
+            }
+        };
+        (line, kind)
+    })
 }

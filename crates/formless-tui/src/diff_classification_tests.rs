@@ -23,7 +23,6 @@ fn multiple_files_hunks_empty_sides_and_no_newline_markers_have_shared_roles() {
     assert_eq!(diff_stat(text), (3, 3));
     use DiffKind::*;
     let kinds: Vec<_> = diff_classification::classify(text)
-        .into_iter()
         .map(|(_, kind)| kind)
         .collect();
     assert_eq!(
@@ -76,7 +75,6 @@ fn malformed_and_incomplete_fragments_use_explicit_bounded_fallback() {
     ] {
         assert_eq!(
             diff_classification::classify(text)
-                .into_iter()
                 .map(|(_, kind)| kind)
                 .collect::<Vec<_>>(),
             expected,

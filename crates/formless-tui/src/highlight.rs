@@ -891,7 +891,7 @@ pub(crate) fn is_unified_diff(text: &str) -> bool {
 /// `2 * CONTEXT` collapsed to their first and last `CONTEXT` lines.
 pub(crate) fn diff_lines(text: &str, color: bool) -> Vec<Vec<Span<'static>>> {
     const CONTEXT: usize = 3;
-    let lines = diff_classification::classify(text);
+    let lines: Vec<_> = diff_classification::classify(text).collect();
     let mut out = Vec::new();
     let mut i = 0;
     while i < lines.len() {
@@ -933,13 +933,11 @@ pub(crate) fn diff_lines(text: &str, color: bool) -> Vec<Vec<Span<'static>>> {
 
 /// `+added −removed` for a diff (file headers excluded).
 pub(crate) fn diff_stat(text: &str) -> (usize, usize) {
-    diff_classification::classify(text)
-        .into_iter()
-        .fold((0, 0), |(added, removed), (_, kind)| match kind {
-            DiffKind::Added => (added + 1, removed),
-            DiffKind::Removed => (added, removed + 1),
-            _ => (added, removed),
-        })
+    diff_classification::classify(text).fold((0, 0), |(added, removed), (_, kind)| match kind {
+        DiffKind::Added => (added + 1, removed),
+        DiffKind::Removed => (added, removed + 1),
+        _ => (added, removed),
+    })
 }
 
 #[cfg(test)]
