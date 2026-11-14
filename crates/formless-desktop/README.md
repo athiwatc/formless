@@ -37,7 +37,8 @@ Reconnect reloads state without replaying mutations. Sending is disabled until
 a current Session snapshot arrives. Drafts are kept after acknowledgement,
 rejection, transport failure and navigation. Send deduplication in the daemon
 is connection-scoped: after an unacknowledged action, the client blocks another
-send for that Session until the user reconciles it through the existing TUI.
+send for that Session in this window. Review the outcome and continue through
+the existing TUI.
 Restarting the app is not a safe retry mechanism. OS pipe-write cancellation
 and native Windows/Linux behavior still require platform validation.
 
