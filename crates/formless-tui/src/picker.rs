@@ -13,16 +13,49 @@ pub struct ModelItem {
     pub detail: Option<String>,
 }
 
+/// Exact token counts: keep decimal multiples familiar, mark binary prefixes
+/// explicitly, and never round an irregular window to a smaller number.
+fn model_context_label(value: u64) -> String {
+    let raw = value.to_string();
+    if value < 1000 {
+        return format!("{raw} ctx");
+    }
+    if value % 1000 != 0 {
+        if value % 1_048_576 == 0 {
+            return format!("{}Mi ctx", value / 1_048_576);
+        }
+        if value % 1024 == 0 {
+            return format!("{}Ki ctx", value / 1024);
+        }
+    }
+    let (places, suffix) = if value >= 1_000_000 {
+        (6, "M")
+    } else {
+        (3, "k")
+    };
+    let (whole, fraction) = raw.split_at(raw.len() - places);
+    let fraction = fraction.trim_end_matches('0');
+    let compact = if fraction.is_empty() {
+        format!("{whole}{suffix}")
+    } else {
+        format!("{whole}.{fraction}{suffix}")
+    };
+    format!(
+        "{} ctx",
+        if compact.len() <= raw.len() {
+            &compact
+        } else {
+            &raw
+        }
+    )
+}
+
 /// "200k · $3/$15 · vision · tools · ✗ test failed" from a model's
 /// `ListModels` metadata and remembered test (SPEC §4.2, §4.3).
 pub fn model_detail(meta: &serde_json::Value, test: &serde_json::Value) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
     if let Some(c) = meta["context"].as_u64() {
-        parts.push(if c >= 1_000_000 {
-            format!("{}M ctx", c / 1_000_000)
-        } else {
-            format!("{}k ctx", c / 1000)
-        });
+        parts.push(model_context_label(c));
     }
     if let (Some(i), Some(o)) = (meta["input_price"].as_f64(), meta["output_price"].as_f64()) {
         let fmt = |v: f64| {
@@ -220,6 +253,36 @@ impl ModelPicker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn context_labels_preserve_exact_known_and_irregular_sizes() {
+        let fixtures: Vec<(u64, String)> =
+            serde_json::from_str(include_str!("../tests/fixtures/model-context-labels.json"))
+                .unwrap();
+        for (context, expected) in fixtures {
+            assert_eq!(
+                model_detail(
+                    &serde_json::json!({"context":context}),
+                    &serde_json::Value::Null
+                )
+                .as_deref(),
+                Some(expected.as_str()),
+                "{context}"
+            );
+        }
+        for context in [
+            serde_json::Value::Null,
+            serde_json::json!("131072"),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+        ] {
+            assert!(model_detail(
+                &serde_json::json!({"context":context}),
+                &serde_json::Value::Null
+            )
+            .is_none());
+        }
+        assert_eq!(model_detail(&serde_json::json!({"context":131072,"input_price":3,"output_price":15,"vision":true,"tools":true}), &serde_json::json!({"ok":true})).as_deref(), Some("128Ki ctx · $3/$15 per M · vision · tools · ✓ tested"));
+    }
     #[test]
     fn transient_model_failures_explain_the_manual_retry() {
         let failed = serde_json::json!({"ok":false,"transient":true});
