@@ -30,14 +30,19 @@ fn words(text: &str) -> BTreeSet<String> {
 }
 
 fn name_tokens(name: &str) -> BTreeSet<String> {
-    // camelCase and PascalCase split like snake_case (#829).
+    // camelCase, PascalCase and acronym-to-word transitions match snake_case.
     let mut spaced = String::new();
     let mut prev_lower = false;
-    for c in name.chars() {
-        if c.is_uppercase() && prev_lower {
+    let mut prev_upper = false;
+    let mut chars = name.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c.is_uppercase()
+            && (prev_lower || (prev_upper && chars.peek().is_some_and(|next| next.is_lowercase())))
+        {
             spaced.push('_');
         }
         prev_lower = c.is_lowercase() || c.is_ascii_digit();
+        prev_upper = c.is_uppercase();
         spaced.push(c);
     }
     spaced
@@ -167,6 +172,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn acronym_names_match_snake_case_without_splitting_capital_runs() {
+        for (name, snake) in [
+            ("HTTPGetJson", "http_get_json"),
+            ("getHTTPResponse", "get_http_response"),
+            ("XMLHttpRequest", "xml_http_request"),
+            ("JSONToPDF", "json_to_pdf"),
+            ("readFile", "read_file"),
+            ("HTTP2Json", "http2_json"),
+            ("getHTTPResponses", "get_http_responses"),
+        ] {
+            assert_eq!(name_tokens(name), name_tokens(snake), "{name}");
+            assert_eq!(jaccard(&name_tokens(name), &name_tokens(snake)), 1.0);
+        }
+        assert_eq!(name_tokens("URL"), BTreeSet::from(["url".to_string()]));
+        assert_eq!(
+            name_tokens("MCP_LIST"),
+            BTreeSet::from(["mcp".to_string(), "list".to_string()])
+        );
+    }
+
+    #[test]
     fn literals_keep_their_spaces_and_names_tokenise_alike() {
         assert_ne!(code_key("return \"a b\";"), code_key("return \"ab\";"));
         assert_eq!(code_key("return  1 ;\n"), code_key("return 1;"));
@@ -174,7 +200,7 @@ mod tests {
         assert_eq!(name_tokens("readFile"), name_tokens("read_file"));
         assert_eq!(
             name_tokens("HTTPGetJson").len(),
-            2,
+            3,
             "{:?}",
             name_tokens("HTTPGetJson")
         );

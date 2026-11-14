@@ -149,3 +149,21 @@ async fn find_tools_and_the_background_check_flag_duplicates() {
         serde_json::json!(["file_read", "read_file"])
     );
 }
+
+#[test]
+fn acronym_name_similarity_retains_duplicate_threshold_and_reason() {
+    for (name, snake) in [
+        ("HTTPGetJson", "http_get_json"),
+        ("getHTTPResponse", "get_http_response"),
+    ] {
+        let a = tool(name, "", "{}", "return 1;");
+        let b = tool(snake, "", "{}", "return 2;");
+        let (score, reason) = similarity((&a.0, &a.1), (&b.0, &b.1));
+        assert!(
+            score >= formless_core::dupes::THRESHOLD,
+            "{name}: {score} {reason}"
+        );
+        assert!(reason.contains("similar names"));
+        assert_eq!(near_duplicates(&[a, b]).len(), 1);
+    }
+}
