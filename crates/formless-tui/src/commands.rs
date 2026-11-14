@@ -649,6 +649,7 @@ const KEYS: &[(&str, &str)] = &[
         "Vim: d/c/y + motion or object",
         "iw/aw, iW/aW, quotes, ()/[]/{}/<>; dd/cc/yy for lines",
     ),
+    ("Vim: u", "undo the previous edit in Normal mode"),
     (
         "Vim: . / p / P",
         "repeat last change / paste private yank register (no OS clipboard)",

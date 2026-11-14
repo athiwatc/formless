@@ -5,7 +5,7 @@ use crate::input::InputLine;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::ops::Range;
 
-pub(crate) const HELP: &str = "Vim editing: i/a/I/A insert; Esc returns to Normal. h/j/k/l, w/b/e, W/B/E, 0/$, gg/G move. d/c/y + motion; dd/cc/yy operate on lines. iw/aw/iW/aW, quotes and ()/[]/{}/<> text objects. x deletes; p/P paste the private yank register; . repeats the last change. Counts 1–999; counted inserts repeat on Esc. Normal Esc stops a Run; editor Ctrl+S saves and Ctrl+Q cancels. List-view keys are unchanged.";
+pub(crate) const HELP: &str = "Vim editing: i/a/I/A insert; Esc returns to Normal. h/j/k/l, w/b/e, W/B/E, 0/$, gg/G move. d/c/y + motion; dd/cc/yy operate on lines. iw/aw/iW/aW, quotes and ()/[]/{}/<> text objects. x deletes; u undoes; p/P paste the private yank register; . repeats the last change. Counts 1–999; counted inserts repeat on Esc. Normal Esc stops a Run; editor Ctrl+S saves and Ctrl+Q cancels. List-view keys are unchanged.";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum Mode {
     Normal,
@@ -149,6 +149,11 @@ impl Vim {
             KeyCode::Enter if surface == Surface::Editor => 'j',
             _ => return Outcome::Pass,
         };
+        if c == 'u' && self.pending.is_empty() {
+            line.undo();
+            normal_cursor(line);
+            return Outcome::Handled;
+        }
         if c == '?' && self.pending.is_empty() {
             return Outcome::Help;
         }
@@ -853,6 +858,37 @@ mod tests {
         vim.mode = Mode::Normal;
         (vim, line)
     }
+    #[test]
+    fn normal_u_undoes_on_both_surfaces_and_preserves_dot_and_register() {
+        use unicode_segmentation::UnicodeSegmentation;
+        for surface in [Surface::Composer, Surface::Editor] {
+            for command in ["x", "dw"] {
+                let (mut v, mut l) = normal("👩‍💻e\u{301} one two");
+                for c in command.chars() {
+                    v.key(&mut l, key(c), surface);
+                }
+                let edited = l.to_string();
+                let register = v.register.clone();
+                assert_ne!(edited, "👩‍💻e\u{301} one two");
+                v.key(&mut l, key('u'), surface);
+                assert_eq!(&*l, "👩‍💻e\u{301} one two");
+                assert_eq!(v.register, register);
+                assert!(l
+                    .grapheme_indices(true)
+                    .any(|(at, _)| at == l.cursor_byte()));
+                v.key(&mut l, key('.'), surface);
+                assert_eq!(&*l, edited);
+            }
+            let (mut v, mut l) = normal("");
+            assert_eq!(v.key(&mut l, key('u'), surface), Outcome::Handled);
+            assert_eq!(&*l, "");
+            assert_eq!(l.cursor_byte(), 0);
+            v.key(&mut l, key('i'), surface);
+            v.key(&mut l, key('u'), surface);
+            assert_eq!(&*l, "u", "Insert u remains typing");
+        }
+    }
+
     #[test]
     fn motions_and_operator_ranges_work_on_actual_multiline_input() {
         let (mut v, mut l) = normal("one two\nlast line");
