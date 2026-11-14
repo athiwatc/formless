@@ -1202,6 +1202,7 @@ struct EditorReview {
 }
 
 struct EditorState {
+    viewport: std::cell::Cell<(usize, usize)>,
     draft: Option<input::InputLine>,
     original: Option<String>,
     confirm_exit: bool,
@@ -1303,11 +1304,37 @@ impl EditorState {
     }
     /// The cursor's screen column on its line.
     fn cursor_col(&self) -> usize {
-        let start = self.chars[..self.cursor]
+        let cursor = self.cursor.min(self.chars.len());
+        let start = self.chars[..cursor]
             .iter()
             .rposition(|c| *c == '\n')
             .map_or(0, |i| i + 1);
-        text::width(&self.chars[start..self.cursor].iter().collect::<String>())
+        text::width(&self.chars[start..cursor].iter().collect::<String>())
+    }
+    fn visible_offsets(
+        &self,
+        cursor: (usize, usize),
+        content: (usize, usize),
+        size: (usize, usize),
+    ) -> (usize, usize) {
+        fn reveal(previous: usize, cursor: usize, total: usize, extent: usize) -> usize {
+            let extent = extent.max(1);
+            let offset = previous.min(total.saturating_sub(extent));
+            if cursor < offset {
+                cursor
+            } else if cursor >= offset.saturating_add(extent) {
+                cursor.saturating_sub(extent - 1)
+            } else {
+                offset
+            }
+        }
+        let (top, left) = self.viewport.get();
+        let offsets = (
+            reveal(top, cursor.0, content.0, size.0),
+            reveal(left, cursor.1, content.1.saturating_add(1), size.1),
+        );
+        self.viewport.set(offsets);
+        offsets
     }
     fn move_vertical(&mut self, down: bool) {
         // Keep the screen column; target line start found by scans.
@@ -9980,6 +10007,7 @@ impl App {
                                 let cursor = chars.len();
                                 self.editor_generation = self.editor_generation.wrapping_add(1);
                                 self.editor = Some(EditorState {
+                                    viewport: Default::default(),
                                     draft: None,
                                     original: None,
                                     confirm_exit: false,
@@ -10256,6 +10284,7 @@ impl App {
                 let chars: Vec<char> = code.chars().collect();
                 self.editor_generation = self.editor_generation.wrapping_add(1);
                 self.editor = Some(EditorState {
+                    viewport: Default::default(),
                     draft: None,
                     original: None,
                     confirm_exit: false,
@@ -14373,6 +14402,7 @@ impl App {
             .collect();
         self.editor_generation = self.editor_generation.wrapping_add(1);
         self.editor = Some(EditorState {
+            viewport: Default::default(),
             draft: None,
             original: None,
             confirm_exit: false,
@@ -14474,6 +14504,7 @@ impl App {
         let chars: Vec<char> = text.chars().collect();
         self.editor_generation = self.editor_generation.wrapping_add(1);
         self.editor = Some(EditorState {
+            viewport: Default::default(),
             draft: None,
             original: None,
             confirm_exit: false,
@@ -18102,7 +18133,7 @@ fn draw_editor(f: &mut Frame, ed: &EditorState, app: &App) {
     let inner = block.inner(parts[0]);
     f.render_widget(block, parts[0]);
 
-    let before = &ed.chars[..ed.cursor];
+    let before = &ed.chars[..ed.cursor.min(ed.chars.len())];
     let cursor_line = before.iter().filter(|c| **c == '\n').count();
     // Screen columns, so the cursor sits where ratatui drew the cell (#785).
     let cursor_col = ed.cursor_col();
@@ -18112,9 +18143,13 @@ fn draw_editor(f: &mut Frame, ed: &EditorState, app: &App) {
     let cols = Layout::horizontal([Constraint::Length(gutter_w), Constraint::Min(1)]).split(inner);
     let height = inner.height as usize;
     let code_w = cols[1].width as usize;
-    // Keep the cursor visible both vertically and horizontally (no wrap).
-    let scroll_y = cursor_line.saturating_sub(height.saturating_sub(1));
-    let scroll_x = cursor_col.saturating_sub(code_w.saturating_sub(1));
+    // Retain context while the cursor stays visible; clamp after edits/resize.
+    let max_columns = text.split('\n').map(text::width).max().unwrap_or(0);
+    let (scroll_y, scroll_x) = ed.visible_offsets(
+        (cursor_line, cursor_col),
+        (line_total, max_columns),
+        (height, code_w),
+    );
     let gutter: Vec<Line> = (scroll_y..line_total.min(scroll_y + height))
         .map(|i| {
             let style = if i == cursor_line {
@@ -18174,10 +18209,12 @@ fn draw_editor(f: &mut Frame, ed: &EditorState, app: &App) {
         })
         .collect();
     f.render_widget(Paragraph::new(lines).scroll((0, scroll_x as u16)), cols[1]);
-    f.set_cursor_position((
-        cols[1].x + (cursor_col - scroll_x) as u16,
-        cols[1].y + (cursor_line - scroll_y) as u16,
-    ));
+    if height > 0 && code_w > 0 {
+        f.set_cursor_position((
+            cols[1].x + (cursor_col - scroll_x) as u16,
+            cols[1].y + (cursor_line - scroll_y) as u16,
+        ));
+    }
     let hints = match ed.mode {
         EditMode::Run => " Ctrl+S run (asks for approval as usual) · Ctrl+D dry run · Esc cancel",
         EditMode::Code => " Ctrl+D review diff and checks · Ctrl+S save as new version (smoke-tested) · Esc cancel",
@@ -19084,6 +19121,7 @@ mod tests {
         let _env = credential_env::EnvGuard::isolated();
         let mut app = test_app();
         app.editor = Some(EditorState {
+            viewport: Default::default(),
             draft: None,
             original: None,
             confirm_exit: false,
@@ -19182,6 +19220,7 @@ mod tests {
         let mut app = test_app();
         app.vim_mode = true;
         app.editor = Some(EditorState {
+            viewport: Default::default(),
             draft: None,
             original: None,
             confirm_exit: false,
@@ -21306,6 +21345,7 @@ mod tests {
     #[test]
     fn editor_works_in_grapheme_clusters() {
         let ed = |s: &str, cursor: usize| EditorState {
+            viewport: Default::default(),
             draft: None,
             original: None,
             confirm_exit: false,
@@ -21342,10 +21382,116 @@ mod tests {
         assert_eq!(e.cursor_col(), 3, "表 is two columns");
     }
 
+    fn viewport_editor(text: &str, cursor: usize) -> EditorState {
+        EditorState {
+            viewport: Default::default(),
+            draft: None,
+            original: None,
+            confirm_exit: false,
+            review_base_version: None,
+            vim: vim::Vim::default(),
+            tool_id: "viewport-fixture".into(),
+            name: "viewport-fixture".into(),
+            chars: text.chars().collect(),
+            cursor,
+            mode: EditMode::Code,
+        }
+    }
+
+    #[test]
+    fn editor_viewport_retains_vertical_and_horizontal_context_until_cursor_leaves() {
+        let mut app = test_app();
+        let text = (0..100)
+            .map(|i| format!("line {i:03}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.editor = Some(viewport_editor(&text, 40 * 9));
+        let screen = render(&mut app, 80, 33); // 30 body rows, excluding panel/footer.
+        assert_eq!(app.editor.as_ref().unwrap().viewport.get().0, 11);
+        assert!(screen.contains("line 011") && screen.contains("line 040"));
+        for _ in 0..5 {
+            app.key(key(KeyCode::Up));
+        }
+        let screen = render(&mut app, 80, 33);
+        let ed = app.editor.as_ref().unwrap();
+        assert_eq!(ed.cursor, 35 * 9);
+        assert_eq!(ed.viewport.get().0, 11);
+        assert_eq!(ed.text(), text);
+        assert!(
+            screen.contains("line 040"),
+            "context below the cursor stays visible"
+        );
+        for _ in 0..6 {
+            app.key(key(KeyCode::Down));
+        }
+        render(&mut app, 80, 33);
+        assert_eq!(app.editor.as_ref().unwrap().viewport.get().0, 12);
+        app.editor.as_mut().unwrap().cursor = 8 * 9;
+        render(&mut app, 80, 33);
+        assert_eq!(app.editor.as_ref().unwrap().viewport.get().0, 8);
+
+        app.editor = Some(viewport_editor(&"x".repeat(200), 100));
+        render(&mut app, 20, 10); // 15 code columns after panel and gutter.
+        assert_eq!(app.editor.as_ref().unwrap().viewport.get().1, 86);
+        for _ in 0..5 {
+            app.key(key(KeyCode::Left));
+        }
+        render(&mut app, 20, 10);
+        assert_eq!(app.editor.as_ref().unwrap().viewport.get().1, 86);
+        app.editor.as_mut().unwrap().cursor = 85;
+        render(&mut app, 20, 10);
+        assert_eq!(app.editor.as_ref().unwrap().viewport.get().1, 85);
+        app.editor.as_mut().unwrap().cursor = 101;
+        render(&mut app, 20, 10);
+        assert_eq!(app.editor.as_ref().unwrap().viewport.get().1, 87);
+    }
+
+    #[test]
+    fn editor_viewport_clamps_resize_shortened_buffers_reopen_and_unicode_cursor() {
+        use ratatui::backend::Backend;
+        let mut app = test_app();
+        let text = format!("{}\n{}", "a\n".repeat(60), "表".repeat(100));
+        app.editor = Some(viewport_editor(&text, text.chars().count()));
+        render(&mut app, 20, 12);
+        let offsets = app.editor.as_ref().unwrap().viewport.get();
+        assert!(offsets.0 > 0 && offsets.1 > 0);
+        app.editor_review = Some(EditorReview {
+            diff: "unchanged preview".into(),
+            verdict: "fixture".into(),
+            ok: true,
+        });
+        render(&mut app, 120, 80);
+        assert_eq!(
+            app.editor.as_ref().unwrap().viewport.get(),
+            offsets,
+            "review has its own geometry"
+        );
+        app.editor_review = None;
+        render(&mut app, 240, 80);
+        assert_eq!(app.editor.as_ref().unwrap().viewport.get(), (0, 0));
+        render(&mut app, 20, 12);
+        app.editor.as_mut().unwrap().chars = "表e\u{301}".chars().collect();
+        // Deliberately retain the old cursor, as in a programmatic replacement.
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(20, 10)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        assert_eq!(app.editor.as_ref().unwrap().viewport.get(), (0, 0));
+        assert_eq!(
+            terminal.backend_mut().get_cursor_position().unwrap(),
+            (7, 1).into()
+        );
+        for (width, height) in [(0, 0), (1, 1), (2, 2), (4, 3), (10, 4)] {
+            render(&mut app, width, height);
+        }
+        app.editor = Some(viewport_editor("new", 0));
+        render(&mut app, 80, 33);
+        assert_eq!(app.editor.as_ref().unwrap().viewport.get(), (0, 0));
+    }
+
     #[test]
     fn programmatic_editor_replacement_clamps_stale_cursor_and_preserves_unicode_undo() {
         let old = "previous schema skeleton ".repeat(6);
         let mut ed = EditorState {
+            viewport: Default::default(),
             draft: Some(input::InputLine::from(old.as_str())),
             original: None,
             confirm_exit: false,
@@ -21392,6 +21538,7 @@ mod tests {
             "{screen}"
         );
         app.editor = Some(EditorState {
+            viewport: Default::default(),
             draft: Some(app.input.clone()),
             original: None,
             confirm_exit: false,
@@ -21446,6 +21593,7 @@ mod tests {
         line.set(&"x".repeat(1024 * 1024 + 1));
         line.kill_to_start();
         app.editor = Some(EditorState {
+            viewport: Default::default(),
             draft: Some(line),
             original: None,
             confirm_exit: false,
@@ -21472,6 +21620,7 @@ mod tests {
     fn editor_edits_text_and_moves_cursor() {
         let mut app = test_app();
         app.editor = Some(EditorState {
+            viewport: Default::default(),
             draft: None,
             original: None,
             confirm_exit: false,
@@ -22097,6 +22246,7 @@ mod tests {
             session_id: None,
         });
         app.editor = Some(EditorState {
+            viewport: Default::default(),
             draft: None,
             original: None,
             confirm_exit: false,
@@ -22618,6 +22768,7 @@ mod tests {
     fn the_code_editor_reviews_before_saving() {
         let mut app = test_app();
         app.editor = Some(EditorState {
+            viewport: Default::default(),
             draft: None,
             original: None,
             confirm_exit: false,
@@ -27564,6 +27715,7 @@ mod tests {
         let mut vim = vim::Vim::default();
         vim.mode = vim::Mode::Normal;
         app.editor = Some(EditorState {
+            viewport: Default::default(),
             draft: None,
             original: None,
             confirm_exit: false,
@@ -27644,6 +27796,7 @@ mod tests {
         let (client, sent) = DaemonClient::recording();
         app.client = Some(client);
         app.editor = Some(EditorState {
+            viewport: Default::default(),
             draft: None,
             original: None,
             confirm_exit: false,
@@ -27697,6 +27850,7 @@ mod tests {
             .any(|line| line.contains("Vim: d/c/y")));
         app.pager = None;
         app.editor = Some(EditorState {
+            viewport: Default::default(),
             draft: None,
             original: None,
             confirm_exit: false,
@@ -27805,6 +27959,7 @@ mod tests {
         let mut app = test_app();
         app.vim_mode = true;
         app.editor = Some(EditorState {
+            viewport: Default::default(),
             draft: None,
             original: None,
             confirm_exit: false,
