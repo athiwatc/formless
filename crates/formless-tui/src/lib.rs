@@ -18591,6 +18591,8 @@ fn draw_panes(f: &mut Frame, area: Rect, app: &mut App) {
     );
 }
 
+mod wizard_layout;
+
 fn draw_wizard(f: &mut Frame, w: &Wizard, color: bool) {
     let (step_no, step_name) = match w.step {
         WizardStep::PickPreset | WizardStep::BaseUrl => (1, "Provider"),
@@ -18624,16 +18626,13 @@ fn draw_wizard(f: &mut Frame, w: &Wizard, color: bool) {
         ]),
         Line::raw(""),
     ];
-    let status_rows = wrap_rows(
-        &w.status,
-        f.area().width.min(84).saturating_sub(2).max(1) as usize,
-    );
-    let status_extra = status_rows.len().saturating_sub(1);
-    text.extend(
-        status_rows
-            .into_iter()
-            .map(|line| Line::styled(line, status_style)),
-    );
+    let inner_width = f.area().width.min(84).saturating_sub(2).max(1);
+    let status_line = Line::styled(w.status.clone(), status_style);
+    let status_extra = Paragraph::new(status_line.clone())
+        .wrap(Wrap { trim: false })
+        .line_count(inner_width)
+        .saturating_sub(1);
+    text.push(status_line);
     text.push(Line::raw(""));
     let mut hint_rows = 0;
     if let Some(hint) = &w.setup_hint {
@@ -18644,9 +18643,9 @@ fn draw_wizard(f: &mut Frame, w: &Wizard, color: bool) {
             .saturating_sub(15 + status_extra)
             .min(4);
         if budget > 0 {
-            let mut rows = wrap_rows(hint, width);
+            let mut rows = wizard_layout::hint_rows(hint, width);
             if rows.len() > budget {
-                let more = wrap_rows("More: formless profiles list", width);
+                let more = wizard_layout::hint_rows("More: formless profiles list", width);
                 rows.truncate(budget.saturating_sub(more.len()));
                 rows.extend(more.into_iter().take(budget));
             }
@@ -18743,31 +18742,20 @@ fn draw_wizard(f: &mut Frame, w: &Wizard, color: bool) {
         }
     }
     text.push(Line::raw(""));
-    text.push(Line::styled(
+    let footer = Line::styled(
         if w.can_cancel {
             "Enter continue · Esc back (at Provider: cancel) · Ctrl+C quit"
         } else {
             "Enter continue · Esc back · Ctrl+C quit"
         },
         ui::dim(color),
-    ));
-    let width = area.width.min(84);
-    let height = (text.len() as u16 + 2).min(area.height);
-    let rect = Rect {
-        x: area.x + (area.width - width) / 2,
-        y: area.y + area.height.saturating_sub(height) / 3,
-        width,
-        height,
-    };
-    f.render_widget(
-        Paragraph::new(text)
-            .block(ui::panel(
-                format!(" ◇ Formless setup · profile: {} ", w.profile),
-                color,
-                Color::Cyan,
-            ))
-            .wrap(Wrap { trim: false }),
-        rect,
+    );
+    wizard_layout::draw(
+        f,
+        text,
+        footer,
+        format!(" ◇ Formless setup · profile: {} ", w.profile),
+        color,
     );
 }
 
