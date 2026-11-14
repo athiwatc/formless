@@ -453,7 +453,20 @@ enum Cmd {
         action: ToolsAction,
     },
     /// Launch the TUI (default)
-    Tui,
+    #[command(
+        after_help = "Examples:\n  formless tui --new\n  formless tui -c\n  formless tui --plain"
+    )]
+    Tui {
+        /// Use the existing line-oriented screen-reader client
+        #[arg(long)]
+        plain: bool,
+        /// Open the most recently active Session; conflicts with --new
+        #[arg(short = 'c', long = "continue", conflicts_with = "new")]
+        continue_last: bool,
+        /// Start a fresh Session; conflicts with --continue
+        #[arg(long)]
+        new: bool,
+    },
     /// Remove Formless from this machine: stop the daemon, remove the login
     /// service, delete keychain entries and every profile's data, and the
     /// binary (SPEC §15)
@@ -1846,13 +1859,35 @@ fn validate_mcp_prompt_args(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-fn run_cli(cli: Cli) -> Result<()> {
+fn validate_tui_start(cli: &mut Cli) -> Result<()> {
+    if let Some(Cmd::Tui {
+        plain,
+        continue_last,
+        new,
+    }) = &cli.cmd
+    {
+        cli.plain |= *plain;
+        cli.continue_last |= *continue_last;
+        cli.new |= *new;
+    }
+    if cli.continue_last && cli.new {
+        return Err(usage(
+            "--continue and --new cannot be used together, including across tui",
+        ));
+    }
     // The TUI's own flags mean nothing to other commands (#897).
-    if !matches!(cli.cmd, None | Some(Cmd::Tui)) && (cli.plain || cli.continue_last || cli.new) {
+    if !matches!(cli.cmd, None | Some(Cmd::Tui { .. }))
+        && (cli.plain || cli.continue_last || cli.new)
+    {
         return Err(usage(
             "--plain, -c/--continue and --new start the TUI; use them without a command (or `formless tui`)",
         ));
     }
+    Ok(())
+}
+
+fn run_cli(mut cli: Cli) -> Result<()> {
+    validate_tui_start(&mut cli)?;
     // Export usage errors must precede profile setup, Session lookup and any
     // daemon connection. sessions_cmd validates again for direct callers.
     validate_cli_export_format(&cli)?;
@@ -2134,8 +2169,8 @@ fn run_cli(cli: Cli) -> Result<()> {
             .unwrap_or_default(),
     );
     match cli.cmd {
-        None | Some(Cmd::Tui) if cli.plain => formless_tui::plain::run(paths),
-        None | Some(Cmd::Tui) => formless_tui::run_with(
+        None | Some(Cmd::Tui { .. }) if cli.plain => formless_tui::plain::run(paths),
+        None | Some(Cmd::Tui { .. }) => formless_tui::run_with(
             paths,
             match (cli.continue_last, cli.new) {
                 (true, _) => Some("last"),
@@ -9545,3 +9580,7 @@ mod pairing_qr_width_tests {
 #[cfg(test)]
 #[path = "session_search_tests.rs"]
 mod session_search_tests;
+
+#[cfg(test)]
+#[path = "tui_start_cli_tests.rs"]
+mod tui_start_cli_tests;
