@@ -3080,10 +3080,10 @@ pub fn check_syntax(code: &str) -> Result<(), String> {
 }
 
 const RUNNER: &str = r#"
-  (function () {
+  (function (heapLimitBytes) {
     // QuickJS throws null when it cannot even allocate the out-of-memory
     // error, so a null exception is reported as out of memory.
-    const fail = (e) => { globalThis.__result_json = JSON.stringify({ ok: false, error: e === null ? "out of memory (heap limit reached)" : String((e && e.message) || e) + "\n" + String((e && e.stack) || ""), nested: __nestedError(e) }); };
+    const fail = (e) => { globalThis.__result_json = JSON.stringify({ ok: false, error: e === null ? "out of memory (heap limit reached) (configured limit: " + heapLimitBytes + " bytes)" : String((e && e.message) || e) + "\n" + String((e && e.stack) || ""), nested: __nestedError(e) }); };
     const done = (v) => {
       try {
         const encoded = JSON.stringify(v === undefined ? null : v);
@@ -3098,8 +3098,12 @@ const RUNNER: &str = r#"
       const out = run(JSON.parse(globalThis.__input_json));
       if (out && typeof out.then === "function") out.then(done, fail); else done(out);
     } catch (e) { fail(e); }
-  })();
+  })
 "#;
+
+fn effective_heap_limit_bytes(memory_mb: u32) -> usize {
+    (memory_mb as usize).saturating_mul(1024 * 1024)
+}
 
 fn nested_error<'js>(
     ctx: &rquickjs::Ctx<'js>,
@@ -3201,7 +3205,8 @@ pub fn execute(req: &ExecRequest, ops: Arc<dyn HostOps>) -> Result<ExecOutcome, 
         },
     )));
 
-    runtime.set_memory_limit((req.memory_mb as usize).saturating_mul(1024 * 1024));
+    let heap_limit_bytes = effective_heap_limit_bytes(req.memory_mb);
+    runtime.set_memory_limit(heap_limit_bytes);
     runtime.set_max_stack_size(1024 * 1024);
     let cancel = req.cancel.clone();
     runtime.set_interrupt_handler(Some(Box::new(move || cancel.load(Ordering::SeqCst))));
@@ -3241,8 +3246,11 @@ pub fn execute(req: &ExecRequest, ops: Arc<dyn HostOps>) -> Result<ExecOutcome, 
             .map_err(|e| err(&e))?;
         let mut runner_options = EvalOptions::default();
         runner_options.filename = Some("formless-runner.js".into());
-        ctx.eval_with_options::<(), _>(RUNNER, runner_options)
-            .map_err(|e| err(&e))
+        ctx.eval_with_options::<(), _>(
+            format!("{}({heap_limit_bytes});", RUNNER.trim()),
+            runner_options,
+        )
+        .map_err(|e| err(&e))
     })?;
     // Event loop: drain the job queue (an async run() settles through it),
     // then fire due timers, waiting until the next one or a nested call's
@@ -4010,6 +4018,51 @@ mod tests {
             activity: None,
             modules: Arc::new(Vec::new()),
         }
+    }
+
+    #[test]
+    fn generated_heap_diagnostic_reports_only_the_configured_effective_cap() {
+        for (memory_mb, expected_bytes) in [(32, 33_554_432), (96, 100_663_296)] {
+            // Exercise the existing null-exception branch without exhausting a
+            // heap. This does not assert that a null throw proves genuine OOM.
+            let mut request = live("function run() { console.log('fixture log'); throw null; }");
+            request.memory_mb = memory_mb;
+            let error = execute(&request, Arc::new(NoHostOps)).unwrap_err();
+            assert_eq!(
+                error.message,
+                format!(
+                    "out of memory (heap limit reached) (configured limit: {} bytes)",
+                    expected_bytes
+                )
+            );
+            assert!(matches!(error.kind, ExecErrorKind::Resource));
+            assert_eq!(error.logs, vec!["fixture log"]);
+            let mut ordinary =
+                live("function run() { throw new Error('out of memory from the Tool'); }");
+            ordinary.memory_mb = memory_mb;
+            let error = execute(&ordinary, Arc::new(NoHostOps)).unwrap_err();
+            assert!(error.message.starts_with("out of memory from the Tool"));
+            assert!(!error.message.contains("configured limit"));
+            assert_eq!(
+                execute(&live("function run() { return 7; }"), Arc::new(NoHostOps))
+                    .unwrap()
+                    .output,
+                json!(7)
+            );
+        }
+        for memory_mb in [0, 1, 32, u32::MAX] {
+            let mathematical_bytes = u128::from(memory_mb) * 1_048_576;
+            assert_eq!(
+                effective_heap_limit_bytes(memory_mb),
+                mathematical_bytes.min(usize::MAX as u128) as usize
+            );
+        }
+        let unrelated = classify("resource limit: read cap reached", false);
+        assert!(matches!(unrelated.kind, ExecErrorKind::Resource));
+        assert_eq!(unrelated.message, "resource limit: read cap reached");
+        let cancelled = classify("out of memory (heap limit reached)", true);
+        assert!(matches!(cancelled.kind, ExecErrorKind::Cancelled));
+        assert_eq!(cancelled.message, "interrupted");
     }
 
     /// A real callee serializes a value constructed with JSON.parse, so
