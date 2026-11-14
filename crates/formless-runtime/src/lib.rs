@@ -2743,6 +2743,9 @@ fn run_capture_impl(
     detailed: bool,
 ) -> Result<String, String> {
     use std::io::Write;
+    // All stdin-bearing callers are clipboard writes. Protect their errors
+    // on every platform, including the legacy non-detailed helper path.
+    let protected_diagnostics = detailed || stdin_text.is_some();
     let mut child = std::process::Command::new(cmd)
         .args(args)
         .stdin(std::process::Stdio::piped())
@@ -2750,7 +2753,7 @@ fn run_capture_impl(
         .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| {
-            if detailed {
+            if protected_diagnostics {
                 clipboard_diagnostics::failure(cmd, "could not spawn", &e.to_string(), stdin_text)
             } else {
                 format!("{cmd}: {e}")
@@ -2762,14 +2765,14 @@ fn run_capture_impl(
         }
     }
     let out = child.wait_with_output().map_err(|e| {
-        if detailed {
+        if protected_diagnostics {
             clipboard_diagnostics::failure(cmd, "could not wait", &e.to_string(), stdin_text)
         } else {
             e.to_string()
         }
     })?;
     if !out.status.success() {
-        if detailed {
+        if protected_diagnostics {
             return Err(clipboard_diagnostics::failure(
                 cmd,
                 &format!("exited unsuccessfully ({})", out.status),

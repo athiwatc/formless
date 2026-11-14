@@ -211,6 +211,40 @@ mod tests {
     }
 
     #[test]
+    fn shared_write_runner_suppresses_stderr_with_detailed_mode_off() {
+        let args = &[
+            "-c",
+            "printf 'stdout sentinel'; printf 'invalid input: private clipboard' >&2; exit 7",
+        ];
+        for text in ["private clipboard\nsecond line", "", "ไทย 日本語"] {
+            assert_eq!(
+                super::super::run_capture("sh", args, Some(text)).unwrap_err(),
+                "sh: exited unsuccessfully (exit status: 7)"
+            );
+        }
+        for echo in [
+            serde_json::to_string("private clipboard\nsecond line").unwrap(),
+            "ไทย\\n日本語".into(),
+        ] {
+            let args = &[
+                "-c",
+                "printf '%s' \"$1\" >&2; exit 7",
+                "fixture",
+                echo.as_str(),
+            ];
+            assert_eq!(
+                super::super::run_capture("sh", args, Some("private clipboard\nsecond line"))
+                    .unwrap_err(),
+                "sh: exited unsuccessfully (exit status: 7)"
+            );
+        }
+        assert_eq!(
+            super::super::run_capture("sh", args, None).unwrap_err(),
+            "sh failed: invalid input: private clipboard"
+        );
+    }
+
+    #[test]
     fn diagnostic_context_is_bounded_unicode_safe_and_control_free() {
         let control = failure(
             "wl-paste",
