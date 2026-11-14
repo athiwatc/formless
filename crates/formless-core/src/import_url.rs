@@ -21,11 +21,18 @@ pub enum Source {
 /// a gist page to its id, a `github.com/…/blob/…` page to its raw file.
 pub fn resolve(url: &str) -> Result<Source> {
     let url = url.trim();
-    let rest = url
-        .strip_prefix("https://")
-        .ok_or_else(|| anyhow!("only https:// URLs can be imported"))?;
-    let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
-    let path = path.split(['?', '#']).next().unwrap_or_default();
+    let parsed = reqwest::Url::parse(url).context("invalid bundle URL")?;
+    if parsed.scheme() != "https" {
+        bail!("only https:// URLs can be imported");
+    }
+    // Only the ordinary service authority maps to its API/raw endpoint.
+    // Preserve explicit non-default ports and userinfo on direct URLs.
+    if parsed.port().is_some() || !parsed.username().is_empty() || parsed.password().is_some() {
+        return Ok(Source::Direct(url.to_string()));
+    }
+    let host = parsed.host_str().unwrap_or_default();
+    let host = host.strip_prefix("www.").unwrap_or(host);
+    let path = parsed.path().strip_prefix('/').unwrap_or(parsed.path());
     match host {
         "gist.github.com" | "gist.githubusercontent.com" => {
             let id = path
