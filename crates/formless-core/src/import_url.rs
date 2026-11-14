@@ -175,7 +175,7 @@ impl std::error::Error for DownloadTooLarge {}
 fn gist_metadata_error(error: anyhow::Error) -> anyhow::Error {
     if error.is::<DownloadTooLarge>() {
         error.context(
-            "gist metadata is too large for preview; import the bundle's raw file URL directly",
+            "gist metadata is too large for preview; download the selected bundle JSON from the Gist and import the saved local file with `formless tools import FILE` (raw Gist URLs also use metadata)",
         )
     } else {
         error
@@ -391,6 +391,27 @@ mod fetch_tests {
     }
 
     #[test]
+    fn oversized_gist_guidance_avoids_the_raw_metadata_loop() {
+        let id = "0123456789abcdef0123456789abcdef";
+        for url in [
+            format!("https://gist.github.com/ada/{id}"),
+            format!("https://gist.githubusercontent.com/ada/{id}/raw/abcdef/tool.json"),
+        ] {
+            assert_eq!(resolve(&url).unwrap(), Source::Gist(id.into()));
+        }
+        let error = gist_metadata_error(DownloadTooLarge("gist metadata".into()).into());
+        let advice = error.to_string();
+        assert!(
+            advice.contains("download")
+                && advice.contains("local file")
+                && advice.contains("formless tools import FILE"),
+            "{advice}"
+        );
+        assert!(!advice.contains("raw file URL directly"), "{advice}");
+        assert!(format!("{error:#}").contains("larger than 2 MB"));
+    }
+
+    #[test]
     fn ordinary_gist_metadata_errors_are_not_mislabeled_as_oversized() {
         let error = gist_metadata_error(anyhow!("fixture metadata unavailable"));
         assert_eq!(error.to_string(), "fixture metadata unavailable");
@@ -484,7 +505,9 @@ mod fetch_tests {
             assert!(metadata_error
                 .to_string()
                 .contains("gist metadata is too large"));
-            assert!(metadata_error.to_string().contains("raw file URL"));
+            assert!(metadata_error
+                .to_string()
+                .contains("formless tools import FILE"));
         }
     }
 }
