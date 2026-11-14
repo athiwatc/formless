@@ -600,16 +600,17 @@ the client's own environment applied.
 
 ### 3.10 Troubleshooting
 
+Start with `formless doctor`, inspect the daemon log with `formless logs`,
+and use `formless bug-report` to collect a redacted report for an issue.
+The maintained [Troubleshooting guide](docs/troubleshooting.md) covers startup,
+keychain, provider and recovery problems by symptom. Open that topic from the
+CLI with `formless docs troubleshooting`.
+
 | Symptom | Fix |
 |---|---|
 | `not configured; run formless for the wizard` | headless runs need a configured provider first — launch the TUI once |
 | "does not support tool-calling" during onboarding | pick another model or endpoint; tool calling is mandatory |
 | TUI renders garbage or does not respond | it needs a real TTY; run it interactively rather than through a pipe |
-| "the daemon is vX but this formless is vY" | an old daemon is still running after an upgrade: `formless daemon restart` (or `/restart-daemon` in the TUI) |
-| Daemon will not start | read `<data dir>/daemon.log`, then `formless doctor` and `formless daemon status` |
-| Keychain prompt on every launch | the `0600` `api_key` file in the config dir exists exactly for this; check it is present |
-| macOS refuses to run the binary | `xattr -d com.apple.quarantine formless` (releases are unsigned) |
-| Everything is wedged | `formless reset --force` (destroys config, key and data dir) |
 
 ### 3.11 CLI reference
 
