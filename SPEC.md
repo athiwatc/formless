@@ -230,6 +230,9 @@ without redesign.
   - Presets also work later: `formless providers add NAME --preset ID`,
     a preset id in Settings → Providers' base_url field, and
     `providers.upsert` with `preset` (or a preset id as `base_url`).
+    These URL-or-preset inputs accept case-insensitive HTTP(S) schemes;
+    only the scheme is lowercased. The remaining URL preserves its case
+    and escaping, apart from existing outer-whitespace and trailing-slash trimming.
 - Onboarding collects `base_url` + API key, then fetches `/models`; the user
   picks a **model** and a **reasoning effort**. If `/models` fails, manual
   model-name entry is offered. Model + effort are a daemon default,
@@ -413,7 +416,10 @@ without redesign.
   `supported_parameters`), else a built-in table for well-known families
   (GPT-5, o-series, GPT-4o/4.1, Claude, Gemini, reasoning-only models).
   The TUI and web pickers show it on each row (`200k ctx · $3/$15 per M ·
-  vision · tools`). Context labels retain exact token counts: decimal multiples
+  vision · tools`). TUI model prices retain the metadata's thousandths of
+  USD per million tokens (0.075/0.007/0.001), trimming unused trailing zeros;
+  an actual zero and whole-dollar prices remain distinct and unpadded.
+  Context labels retain exact token counts: decimal multiples
   keep k/M units (200000 → 200k, 1500000 → 1.5M); other exact binary multiples
   use explicit Ki/Mi (131072 → 128Ki, 65536 → 64Ki). Smaller or irregular
   windows use exact decimal fractions only when no longer than the whole count,
@@ -3855,12 +3861,16 @@ run_tool = "network_policy"     # a registry Tool, or…
   clickable in terminals that support OSC 8 hyperlinks. After each draw,
   the TUI repaints the visible URL cells wrapped in OSC 8, keeping their
   style, but only when the set of visible links changed
-  (`tui.hyperlinks`). A URL ends where its brackets balance
+  (`tui.hyperlinks`). HTTP(S) schemes are matched case-insensitively;
+  targets lowercase only the scheme while visible text and the remaining
+  URL keep their original spelling. A URL ends where its brackets balance
   (`…/f_(x))` keeps one `)`), and a long URL hard-wrapped across rows is
   one link on every fragment, never a link to its first piece. In the
   Markdown, an image inside a link shows both addresses, and inline HTML
   shows its text: `<b>`, `<i>`, `<s>`, `<code>`, `<kbd>` and `<a href>`
-  style it, other tags and comments are dropped. `/open link [N]` opens the Nth link in the last
+  style it, other tags and comments are dropped. Anchor attribute names
+  are ASCII case-insensitive, allow whitespace around `=`, and retain
+  quoted or unquoted destinations. `/open link [N]` opens the Nth link in the last
   answer with the system opener (`open`, `xdg-open`, `start`).
   File paths in the chat (`src/main.rs`, `./a/b.txt:42`, `Cargo.toml`)
   that exist under the TUI's working directory are linked the same way,
@@ -3877,8 +3887,12 @@ run_tool = "network_policy"     # a registry Tool, or…
   rows are all on screen are sent with the terminal's own protocol, which
   scales the image into the box: iTerm2's inline images (iTerm2,
   WezTerm) or the kitty graphics protocol (kitty, Ghostty), which takes
-  PNG: JPEG, GIF and WebP are transcoded to a PNG thumbnail (at most
-  800 px) first. Rows are reserved only for an image that can be drawn;
+  PNG. Both protocols decode PNG, JPEG, GIF or WebP and downscale oversized
+  images to at most 800 px on the long side, preserving aspect ratio and
+  PNG transparency. Oversized previews and non-PNG kitty inputs are encoded
+  as PNG; small supported iTerm images and small PNGs keep their original
+  bytes. Resized animated images show a still preview. Rows are reserved
+  only for a supported image header;
   one that can't keeps its reference line, marked "can't be shown in
   this terminal".
   When thumbnails move, the screen is redrawn first so none linger. Other
@@ -3936,7 +3950,9 @@ run_tool = "network_policy"     # a registry Tool, or…
   the rest share the room in proportion. Cell text wraps inside its
   column instead of being cut. When the pane can't give every column 4
   characters, the table is shown as one `key: value` record per row,
-  each value wrapping under itself with a hanging indent.
+  each value wrapping under itself with a hanging indent. Hard-wrapped
+  text keeps grapheme clusters whole; a cluster wider than its row budget
+  is represented by `…`, and a zero-column hard-wrap budget emits no rows.
   `/table [N]` opens the last answer's Nth table at full width in the
   pager, where ←/→ scroll sideways.
   Selection uses parsed table order within the last nonblank assistant

@@ -27,6 +27,48 @@ pub(crate) fn set_line_numbers(on: bool) {
     LINE_NUMBERS.with(|l| l.set(on));
 }
 
+/// Read the first actual href, skipping other complete attributes so names
+/// in quoted values and data-href cannot become a destination. Values remain
+/// verbatim, as in the existing inline-HTML renderer.
+fn html_href(body: &str) -> Option<&str> {
+    let space = |c: char| matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0c');
+    let mut attrs = &body[body.find(space)?..];
+    loop {
+        attrs = attrs.trim_start_matches(space);
+        if attrs.is_empty() {
+            return None;
+        }
+        let end = attrs
+            .find(|c| space(c) || c == '=' || c == '/')
+            .unwrap_or(attrs.len());
+        if end == 0 {
+            return None;
+        }
+        let name = &attrs[..end];
+        attrs = attrs[end..].trim_start_matches(space);
+        let value = if let Some(after) = attrs.strip_prefix('=') {
+            attrs = after.trim_start_matches(space);
+            if let Some(quote) = attrs.chars().next().filter(|c| *c == '\'' || *c == '"') {
+                let after = &attrs[1..];
+                let end = after.find(quote)?;
+                let value = &after[..end];
+                attrs = &after[end + 1..];
+                value
+            } else {
+                let end = attrs.find(space).unwrap_or(attrs.len());
+                let value = &attrs[..end];
+                attrs = &attrs[end..];
+                value
+            }
+        } else {
+            ""
+        };
+        if name.eq_ignore_ascii_case("href") {
+            return Some(value);
+        }
+    }
+}
+
 fn parser_options() -> Options {
     Options::ENABLE_TABLES
         | Options::ENABLE_STRIKETHROUGH
@@ -250,18 +292,7 @@ impl Renderer {
                 "code" | "kbd" | "samp" => fg(color, Color::Yellow),
                 "sub" | "sup" | "span" | "small" | "mark" => Style::default(),
                 "a" => {
-                    let href = body
-                        .split("href=")
-                        .nth(1)
-                        .map(|v| {
-                            let q = v.chars().next().filter(|c| *c == '"' || *c == '\'');
-                            match q {
-                                Some(q) => v[1..].split(q).next().unwrap_or_default(),
-                                None => v.split_whitespace().next().unwrap_or_default(),
-                            }
-                        })
-                        .unwrap_or_default()
-                        .to_string();
+                    let href = html_href(body).unwrap_or_default().to_string();
                     if self.link.is_none() && !href.is_empty() {
                         self.link = Some((href, self.mark()));
                     }
@@ -1032,6 +1063,9 @@ fn wrap(spans: Vec<InlineSpan>, avail: usize) -> Vec<Vec<Span<'static>>> {
 
 /// Split spans into rows of at most `avail` columns, ignoring words.
 fn hard_wrap(spans: Vec<Span<'static>>, avail: usize) -> Vec<Vec<Span<'static>>> {
+    if avail == 0 {
+        return Vec::new();
+    }
     let mut rows = vec![Vec::new()];
     let mut w = 0;
     for span in spans {
@@ -1039,6 +1073,7 @@ fn hard_wrap(spans: Vec<Span<'static>>, avail: usize) -> Vec<Vec<Span<'static>>>
         // By cluster, so a mark never starts a row and an emoji sequence
         // is never cut (#786).
         for g in span.content.graphemes(true) {
+            let g = if g.width() > avail { "…" } else { g };
             let cw = g.width();
             if w + cw > avail && w > 0 {
                 if !buf.is_empty() {
@@ -1719,13 +1754,13 @@ mod tests {
                     .flat_map(|row| row.iter())
                     .map(|span| span.content.as_ref())
                     .collect::<String>(),
-                "（文）"
+                if width == 1 { "………" } else { "（文）" }
             );
             assert!(rows.iter().all(|row| row
                 .iter()
                 .map(|span| span.content.width())
                 .sum::<usize>()
-                <= width.max(2)));
+                <= width));
         }
         for source in ["กขคง", "ກຂຄງ", "កខគឃ", "ကခဂဃ"] {
             let rows = wrap(vec![span(source, bold)], 2);
@@ -1744,6 +1779,94 @@ mod tests {
                 text_rows(hard_wrap(vec![Span::styled(source, bold)], 2))
             );
         }
+    }
+
+    #[test]
+    fn hard_wrap_replaces_clusters_wider_than_the_row_budget() {
+        let span = |text: &str, style| InlineSpan {
+            content: text.into(),
+            style,
+            literal: false,
+        };
+        let bold = Style::default().add_modifier(Modifier::BOLD);
+        let family = "👨\u{200d}👩\u{200d}👧\u{200d}👦";
+        for source in ["界", family, "a界b", "界界", "a\u{301}界b"] {
+            let expected = source
+                .graphemes(true)
+                .map(|g| if g.width() > 1 { "…" } else { g })
+                .collect::<String>();
+            let rows = hard_wrap(vec![Span::styled(source.to_string(), bold)], 1);
+            assert!(
+                rows.iter()
+                    .all(|r| r.iter().map(|s| s.content.width()).sum::<usize>() <= 1),
+                "{rows:?}"
+            );
+            assert_eq!(
+                rows.iter()
+                    .flatten()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>(),
+                expected
+            );
+            assert!(rows.iter().flatten().all(|s| s.style == bold));
+            assert!(hard_wrap(vec![Span::styled(source.to_string(), bold)], 0).is_empty());
+            let rows = wrap(vec![span(source, bold)], 1);
+            assert!(
+                rows.iter()
+                    .all(|r| r.iter().map(|s| s.content.width()).sum::<usize>() <= 1),
+                "{rows:?}"
+            );
+        }
+        let rows = hard_wrap(vec![Span::styled("a", bold), Span::raw("界b")], 1);
+        assert_eq!(
+            rows.iter()
+                .flatten()
+                .map(|s| s.content.as_ref())
+                .collect::<String>(),
+            "a…b"
+        );
+        assert_eq!(rows[0][0].style, bold);
+        assert_eq!(rows[1][0].style, Style::default());
+        let rows = hard_wrap(vec![Span::raw(format!("{family}界"))], 2);
+        assert_eq!(
+            rows.iter()
+                .flatten()
+                .map(|s| s.content.as_ref())
+                .collect::<String>(),
+            format!("{family}界")
+        );
+    }
+
+    #[test]
+    fn narrow_table_record_values_keep_wide_clusters_inside_the_body() {
+        let source =
+            "| Key | Value |\n|---|---|\n| 界界界界界 | 👨\u{200d}👩\u{200d}👧\u{200d}👦界 |";
+        // Exercise the table renderer with a five-column body budget, as
+        // can remain after reserving enclosing prefixes and indentation.
+        let mut renderer = Renderer {
+            width: 5,
+            ..Default::default()
+        };
+        for event in Parser::new_ext(source, parser_options()) {
+            renderer.event(event);
+        }
+        renderer.flush();
+        let rows = renderer.out;
+        // Scope the assertion to wrapped values: the existing fixed row
+        // heading has its own minimum width and is outside hard wrapping.
+        let values: Vec<_> = rows
+            .iter()
+            .filter(|row| row.spans.first().is_some_and(|s| s.content == "    "))
+            .collect();
+        assert!(!values.is_empty());
+        assert!(values.iter().all(|row| row.width() <= 5), "{values:?}");
+        assert!(
+            values
+                .iter()
+                .flat_map(|row| &row.spans)
+                .any(|s| s.content.contains('…')),
+            "{rows:?}"
+        );
     }
 
     #[test]
@@ -1826,6 +1949,39 @@ mod tests {
             .find(|s| s.content == "bold")
             .unwrap();
         assert!(span.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn inline_html_anchor_attributes_preserve_destinations() {
+        for attrs in [
+            r#"HREF="https://Case.Example/A%2Fb?TokenAbC#Frag""#,
+            r#"href = 'https://Case.Example/A%2Fb?TokenAbC#Frag'"#,
+            "HrEf\t=\nhttps://Case.Example/A%2Fb?TokenAbC#Frag",
+            r#"title='a href=wrong' data-href="wrong" HREF = "https://Case.Example/A%2Fb?TokenAbC#Frag""#,
+            r#"disabled HREF="https://Case.Example/A%2Fb?TokenAbC#Frag" title="last""#,
+        ] {
+            let source = format!("see <A {attrs}>the docs</A> next");
+            let out = lines(&source, 160).join("\n");
+            assert_eq!(
+                out.trim(),
+                "see the docs (https://Case.Example/A%2Fb?TokenAbC#Frag) next",
+                "{source}"
+            );
+        }
+        for attrs in [
+            r#"data-href="https://wrong.test""#,
+            r#"title="href=https://wrong.test""#,
+            r#"href="" HREF="https://wrong.test""#,
+        ] {
+            let out = lines(&format!("see <a {attrs}>docs</a> next"), 160).join("\n");
+            assert_eq!(out.trim(), "see docs next", "{attrs}");
+        }
+        let out = lines(
+            "see <a HrEf='#local'>docs</a> and <a HREF='mailto:a@example.test'>a@example.test</a>",
+            160,
+        )
+        .join("\n");
+        assert_eq!(out.trim(), "see docs and a@example.test");
     }
 
     #[test]
