@@ -809,6 +809,7 @@
    * Keep typography and the main layout width native; only the keyboard's
    * available height and floating controls follow the visible rectangle. */
   let viewportFrame = 0;
+  let composerInputWidth = 0;
   let viewportPrinting = false;
   function viewportBounds() {
     const viewport = window.visualViewport;
@@ -934,15 +935,22 @@
         const inputStyle = getComputedStyle(input);
         const oneLine = (parseFloat(inputStyle.lineHeight) || parseFloat(inputStyle.fontSize) * 1.45)
           + parseFloat(inputStyle.paddingTop) + parseFloat(inputStyle.paddingBottom) + parseFloat(inputStyle.borderTopWidth) + parseFloat(inputStyle.borderBottomWidth);
-        if (viewportVariable("--composer-input-limit", Math.max(oneLine, Math.min(viewport.height * .35, available * .45)))) autosize();
+        const inputLimitChanged = viewportVariable("--composer-input-limit", Math.max(oneLine, Math.min(viewport.height * .35, available * .45)));
+        // Measure after applying the width for the current viewport mode. The
+        // existing observers batch another frame when height changes; comparing
+        // only width prevents that notification from repeatedly autosizing.
+        if (zoomed) composer.style.width = Math.max(0, bounds.right - bounds.left) + "px";
+        else for (const property of ["left", "top", "right", "bottom", "width"]) composer.style.removeProperty(property);
+        const inputWidth = input.getBoundingClientRect().width;
+        const inputWidthChanged = inputWidth !== composerInputWidth;
+        composerInputWidth = inputWidth;
+        if (inputLimitChanged || inputWidthChanged) autosize();
         if (zoomed) {
-          composer.style.width = Math.max(0, bounds.right - bounds.left) + "px";
           const height = composer.getBoundingClientRect().height;
           const bottom = Math.min(bounds.bottom, rect.bottom);
           positionFixedBox(composer, bounds.left, Math.max(bounds.top, bottom - height));
           viewportVariable("--floating-composer-height", height + fontSize * .5);
         } else {
-          for (const property of ["left", "top", "right", "bottom", "width"]) composer.style.removeProperty(property);
           viewportVariable("--floating-composer-height", 0);
         }
         if (composing) revealViewportControl(document.activeElement, composer, bounds);
