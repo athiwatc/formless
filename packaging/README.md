@@ -28,10 +28,12 @@ platform app-dirs (SPEC §9.4).
      would instead be treated as a filename;
    - installs the packages in clean Debian, Ubuntu and Rocky containers
      and runs `formless --version`;
-   - builds the Docker image, runs it and checks the daemon answers, then
+   - waits for native builds/tests and Linux package install checks before
+     building the Docker image, running it and checking the daemon answers, then
      pushes `ghcr.io/athiwatc/formless:<tag>` and `:latest` (`Dockerfile`,
      [docs/docker.md](../docs/docker.md)); nothing is published if that
-     fails;
+     fails. The push tags the same immutable local image used by the smoke
+     check; it does not rebuild the image for publication;
    - renders the Homebrew formula, AUR `PKGBUILD` and winget manifests
      for the version (`scripts/render-packaging.sh`, which fails on a
      missing checksum, an unfilled placeholder, a version that isn't
