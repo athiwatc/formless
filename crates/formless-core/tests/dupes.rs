@@ -232,3 +232,46 @@ fn literal_and_line_break_changes_are_not_identical_tools() {
         assert!(!reason.contains("identical code"));
     }
 }
+
+#[test]
+fn post_merge_debugger_regex_values_are_not_identical() {
+    let left = "function run(){let result=false;debugger\n/a b/.test('a b')&&(result=true);return result;}";
+    let right = left.replace("/a b/", "/a   b/");
+    let a = tool("alpha", "", "{}", left);
+    let b = tool("beta", "", "{}", &right);
+    let (score, reason) = similarity((&a.0, &a.1), (&b.0, &b.1));
+    assert!(
+        score < 1.0 && reason != "identical code",
+        "{score}: {reason}"
+    );
+}
+
+#[test]
+fn post_merge_numeric_boundaries_ignore_comments_and_layout() {
+    for (left, right) in [
+        (
+            "function run(){return 1..toString();}",
+            "function run(){return 1. /* note */ .toString();}",
+        ),
+        (
+            "function run(){return 0x1e+2;}",
+            "function run(){return 0x1e + 2;}",
+        ),
+        (
+            "function run(){return 1e+2.toString();}",
+            "function run(){return 1e+2 .toString();}",
+        ),
+        (
+            "function run(){return .5.toString();}",
+            "function run(){return .5 .toString();}",
+        ),
+    ] {
+        let a = tool("alpha", "", "{}", left);
+        let b = tool("beta", "", "{}", right);
+        assert_eq!(
+            similarity((&a.0, &a.1), (&b.0, &b.1)),
+            (1.0, "identical code".into()),
+            "{left}"
+        );
+    }
+}

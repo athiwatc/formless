@@ -3121,8 +3121,12 @@ such as `read_file`, `read_text_file` and `file_read`.
   code tokens, ignoring comments and layout whitespace while retaining literal
   spellings, token boundaries and restricted-production/postfix line breaks.
   Strings, regexes and whole templates (including interpolations) remain
-  value-sensitive. Uncertain slash goals (e.g. after a closing parenthesis or
-  brace), unsupported syntax and unfinished literals conservatively compare
+  value-sensitive. Numeric literals stop before property dots and binary
+  operators (including hex digits e/E followed by + or -), keeping their
+  original spelling; legacy leading-zero forms use raw-source comparison.
+  Uncertain slash goals (e.g. after a closing parenthesis or
+  brace, or after a line break that may end a statement through automatic
+  semicolon insertion), unsupported syntax and unfinished literals compare
   raw source; they can miss a duplicate rather than guess an identical-code
   verdict. This exact key is separate from lossy script recurrence fingerprints.
   Otherwise the score is 0.4 × the name-token
