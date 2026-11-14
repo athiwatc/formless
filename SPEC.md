@@ -4577,7 +4577,12 @@ undo, redo and replacements invalidate prior asynchronous editor previews.
   `/good`, `/bad`, `/unrate`). Plain text is always chat.
 - **Local prompt commands.** Plain Markdown templates in the selected profile's
   `<config>/commands/NAME.md` and selected Session working directory's
-  `.formless/commands/NAME.md` define `/NAME [ARGUMENTS]`. Names are 1–64 lowercase
+  `.formless/commands/NAME.md` define `/NAME [ARGUMENTS]`. Discovery records the
+  highest required single-digit position and whether `$ARGUMENTS` occurs, using
+  the same token rules as expansion. TUI/plain help, the TUI picker and CLI
+  metadata listings show `<arg1> … <argN>` and optional `[arguments…]` hints;
+  `commands list --json` exposes `max_position` and `uses_arguments` without
+  exposing template bodies. Names are 1–64 lowercase
   ASCII letters/digits/underscores/hyphens, starting with a letter. Optional
   frontmatter accepts only a nonempty `description` string (plain, quoted or
   block text); malformed templates are excluded with a stable diagnostic, never

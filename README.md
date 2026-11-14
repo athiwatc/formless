@@ -328,6 +328,11 @@ a repaired file becomes invalid again.
 files; `formless commands list --json` returns the same shared metadata projection
 used by the TUI. Listing is read-only: it does not start a daemon, create a
 profile, expand a template or open its referenced attachments.
+TUI/plain `/help`, the TUI picker and `commands list` show required positions
+(for example `/workflow <arg1>`) and `[arguments…]` when `$ARGUMENTS` is used.
+Positions count whitespace-separated words; `$ARGUMENTS` may be empty. JSON
+metadata includes `max_position` and `uses_arguments`. Escaped `$$5` and literal
+multi-digit `$10` do not add required arguments.
 
 For red/green colour blindness, set `formless config set tui.theme colorblind`
 (or choose **colorblind** in Settings). The TUI and CLI share an Okabe–Ito-derived

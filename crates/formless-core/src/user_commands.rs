@@ -27,6 +27,8 @@ pub struct CommandInfo {
     pub name: String,
     pub description: String,
     pub source: Source,
+    pub max_position: u8,
+    pub uses_arguments: bool,
     #[serde(serialize_with = "serialize_path")]
     pub path: PathBuf,
 }
@@ -35,6 +37,8 @@ pub struct UserCommand {
     pub name: String,
     pub description: String,
     pub source: Source,
+    pub max_position: u8,
+    pub uses_arguments: bool,
     pub path: PathBuf,
     body: String,
 }
@@ -84,6 +88,8 @@ impl Snapshot {
                     name: command.name.clone(),
                     description: command.description.clone(),
                     source: command.source,
+                    max_position: command.max_position,
+                    uses_arguments: command.uses_arguments,
                     path: command.path.clone(),
                 })
                 .collect(),
@@ -118,7 +124,63 @@ impl std::fmt::Display for ExpansionError {
     }
 }
 impl std::error::Error for ExpansionError {}
+
+enum Placeholder<'a> {
+    Literal(&'a str),
+    Arguments,
+    Position(u8),
+}
+// Called only at a dollar. Discovery and expansion consume exactly the same
+// token, including dollar escapes and multi-digit literals.
+fn placeholder(rest: &str) -> (Placeholder<'_>, &str) {
+    if let Some(tail) = rest.strip_prefix("$$") {
+        (Placeholder::Literal("$"), tail)
+    } else if let Some(tail) = rest.strip_prefix("$ARGUMENTS") {
+        (Placeholder::Arguments, tail)
+    } else if rest.as_bytes().get(1).is_some_and(u8::is_ascii_digit) {
+        let digits = rest[1..].bytes().take_while(u8::is_ascii_digit).count();
+        let token = if digits == 1 && rest.as_bytes()[1] != b'0' {
+            Placeholder::Position(rest.as_bytes()[1] - b'0')
+        } else {
+            Placeholder::Literal(&rest[..1 + digits])
+        };
+        (token, &rest[1 + digits..])
+    } else {
+        (Placeholder::Literal("$"), &rest[1..])
+    }
+}
+fn argument_metadata(mut body: &str) -> (u8, bool) {
+    let (mut max_position, mut uses_arguments) = (0, false);
+    while let Some(index) = body.find('$') {
+        let (token, tail) = placeholder(&body[index..]);
+        match token {
+            Placeholder::Position(position) => max_position = max_position.max(position),
+            Placeholder::Arguments => uses_arguments = true,
+            Placeholder::Literal(_) => {}
+        }
+        body = tail;
+    }
+    (max_position, uses_arguments)
+}
+fn usage(name: &str, max_position: u8, uses_arguments: bool) -> String {
+    let mut hint = format!("/{name}");
+    for position in 1..=max_position {
+        hint.push_str(&format!(" <arg{position}>"));
+    }
+    if uses_arguments {
+        hint.push_str(" [arguments…]");
+    }
+    hint
+}
+impl CommandInfo {
+    pub fn usage(&self) -> String {
+        usage(&self.name, self.max_position, self.uses_arguments)
+    }
+}
 impl UserCommand {
+    pub fn usage(&self) -> String {
+        usage(&self.name, self.max_position, self.uses_arguments)
+    }
     /// Literal single pass. Positions 1..9 split on Unicode whitespace; all
     /// arguments preserve their original spelling/whitespace in $ARGUMENTS.
     /// `$$` emits a literal dollar; missing positions are errors before send.
@@ -139,30 +201,20 @@ impl UserCommand {
         let mut rest = self.body.as_str();
         while let Some(index) = rest.find('$') {
             push(&mut output, &rest[..index])?;
-            rest = &rest[index..];
-            if let Some(tail) = rest.strip_prefix("$$") {
-                push(&mut output, "$")?;
-                rest = tail;
-            } else if let Some(tail) = rest.strip_prefix("$ARGUMENTS") {
-                push(&mut output, arguments)?;
-                rest = tail;
-            } else if rest.as_bytes().get(1).is_some_and(u8::is_ascii_digit) {
-                let digits = rest[1..].bytes().take_while(u8::is_ascii_digit).count();
-                if digits == 1 && rest.as_bytes()[1] != b'0' {
-                    let position = (rest.as_bytes()[1] - b'1') as usize;
+            let (token, tail) = placeholder(&rest[index..]);
+            match token {
+                Placeholder::Literal(text) => push(&mut output, text)?,
+                Placeholder::Arguments => push(&mut output, arguments)?,
+                Placeholder::Position(number) => {
+                    let position = (number - 1) as usize;
                     let value = positions.get(position).ok_or_else(|| ExpansionError(format!(
                         "{} references ${}, but only {} argument(s) were supplied; provide at least {} or write $${} for a literal ${}",
                         self.path.display(), position + 1, positions.len(), position + 1, position + 1, position + 1,
                     )))?;
                     push(&mut output, value)?;
-                } else {
-                    push(&mut output, &rest[..1 + digits])?;
                 }
-                rest = &rest[1 + digits..];
-            } else {
-                push(&mut output, "$")?;
-                rest = &rest[1..];
             }
+            rest = tail;
         }
         push(&mut output, rest)?;
         Ok(output)
@@ -359,10 +411,13 @@ pub fn load(config_dir: &Path, project_cwd: Option<&Path>, builtin_names: &[Stri
                     continue;
                 }
             };
+            let (max_position, uses_arguments) = argument_metadata(&body);
             let command = UserCommand {
                 name: name_text.into(),
                 description,
                 source,
+                max_position,
+                uses_arguments,
                 path: path.clone(),
                 body,
             };
@@ -853,13 +908,61 @@ mod tests {
         }
     }
     fn command(body: &str) -> UserCommand {
+        let (max_position, uses_arguments) = argument_metadata(body);
         UserCommand {
             name: "test".into(),
             description: "test".into(),
             source: Source::Global,
+            max_position,
+            uses_arguments,
             path: "test.md".into(),
             body: body.into(),
         }
+    }
+
+    #[test]
+    fn argument_metadata_matches_expansion_and_metadata_projection() {
+        let fixture = Fixture::new();
+        for (body, maximum, arguments) in [
+            ("$1/$2", 2, false),
+            ("$$5", 0, false),
+            ("$10 $0 $100", 0, false),
+            ("$9", 9, false),
+            ("$ARGUMENTS", 0, true),
+            ("$$ARGUMENTS", 0, false),
+            ("$$$3 $ARGUMENTSsuffix", 3, true),
+            ("雪 $1é $9.99", 9, false),
+            ("no arguments $HOME $", 0, false),
+        ] {
+            fixture.global("test.md", body);
+            let snapshot = fixture.load(&[]);
+            let command = snapshot.find("test").unwrap();
+            assert_eq!(
+                (command.max_position, command.uses_arguments),
+                (maximum, arguments),
+                "{body}"
+            );
+            let projection = snapshot.projection();
+            let info = &projection.commands[0];
+            assert_eq!(
+                (info.max_position, info.uses_arguments),
+                (maximum, arguments)
+            );
+            assert_eq!(info.usage(), command.usage());
+            assert_eq!(serde_json::to_value(info).unwrap()["max_position"], maximum);
+            let supplied = (1..=maximum).map(|_| "arg").collect::<Vec<_>>().join(" ");
+            assert!(command.expand(&supplied).is_ok(), "{body}");
+            if maximum > 0 {
+                let too_few = (1..maximum).map(|_| "arg").collect::<Vec<_>>().join(" ");
+                assert!(command.expand(&too_few).is_err(), "{body}");
+            }
+        }
+        assert_eq!(
+            command("$1 $2 $ARGUMENTS").usage(),
+            "/test <arg1> <arg2> [arguments…]"
+        );
+        assert_eq!(command("$$5").usage(), "/test");
+        assert_eq!(command("$ARGUMENTS").usage(), "/test [arguments…]");
     }
 
     #[test]
