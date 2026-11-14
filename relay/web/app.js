@@ -95,6 +95,7 @@
     sessions: [],
     current: null,
     messages: [],
+    sessionLoad: null, // { id, status: pending | failed | loaded }
     streaming: "",
     thinking: "",
     running: new Set(),
@@ -2517,6 +2518,26 @@
     };
     return notes[reason] || "The answer ended early (" + reason + ").";
   }
+  function sessionLoadNotice() {
+    const load = S.sessionLoad;
+    if (!S.current || load?.id !== S.current || load.status === "loaded") {
+      historyRender.loadNotice = null;
+      return null;
+    }
+    const key = load.id + ":" + load.status;
+    // Reuse the notice across ordinary paints, avoiding repeated status
+    // announcements and preserving the Retry control while it owns focus.
+    if (historyRender.loadNotice?.key !== key) {
+      const pending = load.status === "pending";
+      const node = h("div", { class: "banner", "data-session-load": load.status,
+        role: pending ? "status" : "group", "aria-label": pending ? null : "Transcript load failed" },
+        pending ? "Loading transcript…" : [
+          h("p", null, "Could not load the transcript."),
+          h("button", { class: "btn small", type: "button", onclick: () => openSession(load.id, true) }, "Retry loading transcript")]);
+      historyRender.loadNotice = { key, node };
+    }
+    return historyRender.loadNotice.node;
+  }
   function renderHistory({ newContent = false } = {}) {
     const box = $("transcript");
     withTranscriptLayout(() => {
@@ -2529,7 +2550,9 @@
         rendered.clear();
       }
       const wanted = [];
-      if (!S.current || (!S.messages.length && !isRunning())) {
+      const loadNotice = sessionLoadNotice();
+      if (loadNotice) wanted.push(loadNotice);
+      if (!S.current || (!S.messages.length && !isRunning() && !loadNotice)) {
         historyRender.turns.clear();
         rendered.clear();
         if (!historyRender.welcome) historyRender.welcome = welcome();
@@ -5574,6 +5597,9 @@
     invalidateBranchSummary();
     ++sessionSeq; // invalidate a snapshot requested on the old connection
     S.sessionSnapshot = null;
+    if (S.sessionLoad?.status === "pending" && S.sessionLoad.id === S.current) {
+      S.sessionLoad = { id: S.current, status: "failed" };
+    }
     S.approvals = [];
     clearQuestions();
     S.running.clear();
@@ -5654,6 +5680,7 @@
     closeSidebar();
     if (!stay && S.view !== "chat") setView("chat");
     S.current = id;
+    S.sessionLoad = { id, status: "pending" };
     const snapshot = S.sessionSnapshot = { events: [] };
     S.messages = [];
     S.streaming = "";
@@ -5693,6 +5720,7 @@
     const r = await act({ type: "get_session", id });
     if (seq !== sessionSeq || S.current !== id) return;
     S.sessionSnapshot = null;
+    S.sessionLoad = { id, status: r ? "loaded" : "failed" };
     if (r) {
       applySessionLiveState(id, r, snapshot.events);
       const live = S.messages;
