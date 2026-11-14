@@ -30,6 +30,7 @@ mod query;
 mod review_wrap;
 mod session_ui;
 mod settings;
+mod tab_view;
 mod text;
 mod text_history;
 mod theme;
@@ -12245,49 +12246,44 @@ fn clickable_rows(
 }
 
 fn draw_tab_bar(f: &mut Frame, area: Rect, app: &App) {
-    let mut spans = vec![Span::styled(
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let views = views_for_click(app);
+    let labels: Vec<_> = views.iter().map(|view| view.label()).collect();
+    let active = views.iter().position(|view| *view == app.view).unwrap_or(0);
+    let parts = tab_view::layout(
+        &labels,
+        active,
+        area.width as usize,
         " ◇ Formless ",
-        bold_fg(app.color, Color::Cyan),
-    )];
-    let mut views: Vec<View> = VIEW_ORDER.to_vec();
-    if app.view == View::Search {
-        views.push(View::Search);
-    }
-    for v in views {
-        let label = format!(" {} ", v.label());
-        if v == app.view {
-            spans.push(Span::styled(
-                label,
-                bold_fg(app.color, Color::Cyan).add_modifier(Modifier::REVERSED),
-            ));
-        } else {
-            spans.push(Span::styled(label, ui::dim(app.color)));
+        " Tab ⇥ ",
+    );
+    let mut spans = Vec::new();
+    let mut offset = 0usize;
+    for part in parts {
+        let style = match part.kind {
+            tab_view::Kind::Brand => bold_fg(app.color, Color::Cyan),
+            tab_view::Kind::View(index) if index == active => {
+                bold_fg(app.color, Color::Cyan).add_modifier(Modifier::REVERSED)
+            }
+            _ => ui::dim(app.color),
+        };
+        let width = text::width(&part.text).min((area.width as usize).saturating_sub(offset));
+        if let tab_view::Kind::View(index) = part.kind {
+            let rect = Rect::new(
+                area.x.saturating_add(offset as u16),
+                area.y,
+                width as u16,
+                1,
+            )
+            .intersection(area);
+            if rect.width > 0 {
+                clickable(app, rect, Click::View(views[index]));
+            }
         }
-    }
-    let mut used: usize = spans.iter().map(|s| s.width()).sum();
-    if used > area.width as usize {
-        // Narrow terminal: the view names matter more than the brand.
-        used -= spans.remove(0).width();
-    }
-    // Each view's tab is clickable.
-    let mut x = area.x;
-    for span in &spans {
-        let w = span.width() as u16;
-        let label = span.content.trim();
-        if let Some(v) = views_for_click(app)
-            .into_iter()
-            .find(|v| v.label() == label)
-        {
-            clickable(app, Rect::new(x, area.y, w, 1), Click::View(v));
-        }
-        x += w;
-    }
-    let tip = " Tab ⇥ ";
-    if used + tip.len() < area.width as usize {
-        spans.push(Span::raw(" ".repeat(
-            (area.width as usize).saturating_sub(used + text::width(tip)),
-        )));
-        spans.push(Span::styled(tip, ui::dim(app.color)));
+        offset += width;
+        spans.push(Span::styled(part.text, style));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
