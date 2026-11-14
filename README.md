@@ -248,7 +248,7 @@ cargo build --release          # binary at ./target/release/formless
 
 **Docker.** `ghcr.io/athiwatc/formless` runs the daemon headless on a server, reachable through the relay; volumes, the API key as a secret and profiles are in [docs/docker.md](docs/docker.md).
 
-**Homebrew / winget.** Releases render a Homebrew formula and winget manifests and publish them once the maintainer's tap and tokens are set up ([packaging/README.md](packaging/README.md)): then `brew install athiwatc/tap/formless` and `winget install athiwatc.formless`. Until then, use the installer or a source build. **Windows:** download the release archive and unzip it, or build from source.
+**Homebrew / winget.** Releases render a Homebrew formula and winget manifests and publish them once the maintainer's tap and tokens are set up ([packaging/README.md](packaging/README.md)): then `brew install athiwatc/tap/formless` and `winget install athiwatc.formless`. Until then, use the installer on macOS/Linux or build from source. **Windows:** follow the [manual ZIP walkthrough](docs/windows-install.md) for checksum verification, the nested executable directory and optional user PATH setup, or build from source.
 
 **Uninstall.** `formless uninstall` stops the daemon, removes the login service, deletes keychain entries and every profile's data, and removes the binary (or names the package-manager command). `--keep-data` keeps Sessions, Tools and config; `formless export-all` keeps a copy first.
 
