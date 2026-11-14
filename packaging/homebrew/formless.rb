@@ -9,6 +9,12 @@ class Formless < Formula
 
   depends_on "rust" => :build
 
+  # Linux only: keyring's sync-secret-service backend links libdbus.
+  on_linux do
+    depends_on "dbus"
+    depends_on "pkgconf" => :build
+  end
+
   def install
     system "cargo", "install", *std_cargo_args(path: "crates/formless")
     # `formless completions bash|zsh|fish` prints each script.
