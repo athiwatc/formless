@@ -2812,8 +2812,14 @@ Decision: [ADR 0005](docs/adr/0005-run-script-orchestration.md).
   - Each script is fingerprinted: SHA-256 over its tokens, with
     whitespace and comments dropped and string, template, regex and
     number literals blanked; a template's `${…}` interpolations count as
-    code. Recurrence is keyed on the fingerprint plus the sorted `uses`
-    list.
+    code. When a slash follows `++`, `--` or `}`, the lightweight lexer
+    cannot reliably distinguish division from a regex or block context:
+    it hashes the exact source with a separate marker instead. This may
+    miss recurrence across literal/formatting changes in those scripts,
+    rather than merge scripts that execute different code. Unambiguous
+    fingerprints keep their existing encoding; old stored counts are not
+    rewritten. Recurrence is keyed on the fingerprint plus the sorted
+    `uses` list.
   - Once one fingerprint has run successfully in
     `scripts.recurrence_threshold` (3) distinct Sessions, the
     `run_script` result carries a `hint` to save it.
