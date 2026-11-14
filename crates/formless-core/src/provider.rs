@@ -1,5 +1,7 @@
 use anyhow::{anyhow, bail, Context, Result};
-pub use formless_runtime::structured_output::{CompletionOptions, StructuredOutputError};
+pub use formless_runtime::structured_output::{
+    CompletionOptions, IncompleteReason, StructuredOutputError,
+};
 use formless_runtime::LockExt as _;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
@@ -2470,7 +2472,7 @@ impl Provider {
     ) {
         if matches!(
             error,
-            StructuredOutputError::InvalidJson | StructuredOutputError::SchemaViolation
+            StructuredOutputError::InvalidJson { .. } | StructuredOutputError::SchemaViolation
         ) {
             if let Some(routing) = routing {
                 routing.claim_contract(crate::routing_observation::Identity::new(
@@ -2496,7 +2498,9 @@ impl Provider {
                 return Err(error.into());
             }
             if result.output_limited {
-                return Err(StructuredOutputError::IncompleteResponse.into());
+                return Err(
+                    StructuredOutputError::IncompleteResponse(IncompleteReason::Unknown).into(),
+                );
             }
             Some(schema.parse_and_validate(&result.text).map_err(|error| {
                 self.note_output_contract(routing.as_ref(), &result.model_used, &error);
@@ -2587,7 +2591,16 @@ impl Provider {
         } else if self.structured_output.is_some()
             && (output_limited || v["stop_reason"] == "model_context_window_exceeded")
         {
-            Some(StructuredOutputError::IncompleteResponse)
+            // The boolean also includes generic Responses incompleteness.
+            // Retain only evidence from the fields already used above; an
+            // output cutoff combined with a context stop is ambiguous.
+            let context_stop = v["stop_reason"] == "model_context_window_exceeded";
+            let reason = match (output_limited, context_stop) {
+                (true, false) if !self.cfg.responses() => IncompleteReason::OutputLimit,
+                (false, true) => IncompleteReason::ContextWindow,
+                _ => IncompleteReason::Unknown,
+            };
+            Some(StructuredOutputError::IncompleteResponse(reason))
         } else {
             None
         };
@@ -3041,7 +3054,9 @@ impl Provider {
             .await?;
         if let Some(schema) = options.output_schema() {
             if result.truncated {
-                return Err(StructuredOutputError::IncompleteResponse.into());
+                return Err(
+                    StructuredOutputError::IncompleteResponse(IncompleteReason::Truncated).into(),
+                );
             }
             if result
                 .stop_reason

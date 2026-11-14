@@ -199,13 +199,17 @@ h3 { font-size: 0.9375rem; margin: 1.375rem 0 0.5rem; }
 /* Per-message wrapper (render cache); it anchors the message's ⋯ menu. */
 .msg { display: block; position: relative; }
 .md p:last-child { margin-bottom: 0; }
-.md h1, .md h2, .md h3, .md h4 { font-size: 1rem; margin: 0.75rem 0 0.375rem; }
+.md .md-heading { font-size: 1rem; line-height: 1.35; font-weight: 650; margin: 0.8rem 0 0.375rem; overflow-wrap: anywhere; }
+.md .md-heading-1 { font-size: 1.375rem; font-weight: 750; border-bottom: 2px solid var(--line); padding-bottom: 0.25rem; }
+.md .md-heading-2 { font-size: 1.25rem; font-weight: 700; }
+.md .md-heading-3 { font-size: 1.125rem; font-weight: 700; border-left: 3px solid var(--line); padding-left: 0.5rem; }
+.md .md-heading-4 { font-weight: 700; border-left: 2px solid var(--line); padding-left: 0.5rem; }
+.md .md-heading-5 { border-left: 2px dashed var(--line); padding-left: 0.75rem; margin-left: 0.25rem; }
+.md .md-heading-6 { font-weight: 600; font-style: italic; border-left: 2px dotted var(--line); padding-left: 0.75rem; margin-left: 0.5rem; }
 .md ul, .md ol { margin: 0.25rem 0 0.5rem; padding-left: 1.375rem; }
 .md blockquote { margin: 0.375rem 0; padding-left: 0.75rem; border-left: 3px solid var(--line); color: var(--muted); }
 .md code { background: var(--code-bg); border-radius: 0.25rem; padding: 0.0625rem 0.3125rem; }
 .md a { color: var(--user); }
-.md h5, .md h6 { font-size: 0.875rem; margin: 0.625rem 0 0.25rem; }
-.md h2 { font-size: 1.125rem; } .md h3 { font-size: 1rem; }
 .md hr { border: 0; border-top: 1px solid var(--line); margin: 0.875rem 0; }
 .md del { color: var(--muted); }
 .md li > p { margin: 0; }
@@ -307,6 +311,7 @@ h3 { font-size: 0.9375rem; margin: 1.375rem 0 0.5rem; }
 
 /* Tables */
 .table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); }
+.job-history-table { max-width: 100%; min-width: 0; }
 .table { width: 100%; border-collapse: collapse; font-size: 0.875rem; }
 .table th { text-align: left; font-size: 0.6875rem; text-transform: uppercase; letter-spacing: 0.03125rem; color: var(--muted); font-weight: 650; padding: 0.5625rem 0.75rem; border-bottom: 1px solid var(--line); white-space: nowrap; }
 .table td { padding: 0.5625rem 0.75rem; border-bottom: 1px solid var(--line); vertical-align: middle; }
@@ -387,6 +392,9 @@ h3 { font-size: 0.9375rem; margin: 1.375rem 0 0.5rem; }
 /* Settings */
 .settings-grid { display: grid; gap: 0.875rem; grid-template-columns: repeat(auto-fit, minmax(min(100%, 20rem), 1fr)); }
 .settings-grid section { border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); padding: 0.875rem 1rem; }
+.settings-grid .settings-records { min-width: 0; }
+.settings-records .table-wrap { min-width: 0; max-width: 100%; }
+.settings-records .record-prose { min-width: 8rem; overflow-wrap: anywhere; }
 .settings-grid h3 { margin: 0 0 0.375rem; color: var(--accent); }
 .settings-grid .kv { grid-template-columns: minmax(0, .9fr) minmax(0, 1.1fr); }
 .settings-grid dt { min-width: 0; overflow-wrap: anywhere; }
@@ -499,6 +507,7 @@ h3 { font-size: 0.9375rem; margin: 1.375rem 0 0.5rem; }
 .modal input.q-other { margin-top: 0.25rem; }
 
 .run-banner .banner-text { flex: 1; min-width: 0; }
+#run-banner > .banner-text { flex: 1 1 12.5rem; min-width: 0; max-width: 100%; overflow-wrap: anywhere; }
 .run-banner details { margin-top: 0.25rem; font-size: 0.75rem; }
 .run-tools { display: flex; align-items: center; gap: 0.375rem; flex-wrap: wrap; margin-bottom: 0.375rem; font-size: 0.8125rem; }
 .run-tools .chip { border: 1px solid var(--line); border-radius: 62.4375rem; padding: 0.125rem 0.625rem; background: var(--panel); color: inherit; cursor: pointer; font: inherit; }
@@ -514,11 +523,12 @@ h3 { font-size: 0.9375rem; margin: 1.375rem 0 0.5rem; }
 .compare { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 16.25rem), 1fr)); gap: 1rem; }
 .compare-col h3 { margin: 0 0 0.25rem; }
 .compare-answer { margin: 0.5rem 0; }
-.tprogress { font-size: 0.75rem; color: var(--muted); white-space: nowrap; }
-.tprogress progress { width: 5rem; height: 0.5rem; vertical-align: middle; }
+.tprogress { font-size: 0.75rem; color: var(--muted); white-space: normal; min-width: 0; max-width: 100%; overflow-wrap: anywhere; }
+.tprogress progress { width: 5rem; max-width: 100%; height: 0.5rem; vertical-align: middle; }
 .recap summary { cursor: pointer; color: var(--muted); }
 .recap ul { margin: 0.125rem 0 0.375rem; padding-left: 1.25rem; }
 .files-body { max-height: 60vh; overflow: auto; }
+.session-comparison { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; }
 .run-file { margin-bottom: 0.75rem; }
 .run-file-head { display: flex; align-items: center; gap: 0.5rem; }
 .diff { font-size: 0.75rem; overflow-x: auto; margin: 0.25rem 0 0; }
@@ -603,8 +613,10 @@ h3 { font-size: 0.9375rem; margin: 1.375rem 0 0.5rem; }
 
 /* Attachments: chips above the composer, and a drop zone over the chat */
 .attach-chips { display: flex; flex-wrap: wrap; gap: 0.375rem; margin-bottom: 0.375rem; }
-.attach-chip { display: inline-flex; align-items: center; gap: 0.25rem; }
-.attach-chip .btn { padding: 0 0.25rem; line-height: 1; }
+.attach-chip { display: inline-flex; align-items: center; gap: 0.25rem; min-width: 0; max-width: 100%; }
+.attach-chip .attach-name { min-width: 0; overflow-wrap: anywhere; white-space: normal; }
+.attach-chip .attach-icon { flex-shrink: 0; }
+.attach-chip .btn { flex-shrink: 0; padding: 0 0.25rem; line-height: 1; }
 .chat-view { position: relative; }
 .drop-zone { position: absolute; inset: 0.5rem; z-index: 20; display: flex; align-items: center; justify-content: center; border: 2px dashed var(--accent); border-radius: 0.875rem; background: color-mix(in srgb, var(--bg) 85%, transparent); color: var(--accent); font-weight: 600; pointer-events: none; }
 
@@ -676,7 +688,7 @@ mark.find { background: var(--accent-soft); color: inherit; border-radius: 0.187
    direction from its own first strong letter, so an Arabic or Hebrew
    answer is right-aligned and an English one beside it stays left; names
    in lists are isolated so they never reorder the time next to them. */
-.bubble, .md p, .md li, .md h1, .md h2, .md h3, .md h4, .md blockquote, .md td, .md th {
+.bubble, .md p, .md li, .md h1, .md h2, .md h3, .md h4, .md .md-heading, .md blockquote, .md td, .md th {
   unicode-bidi: plaintext;
   text-align: start;
 }

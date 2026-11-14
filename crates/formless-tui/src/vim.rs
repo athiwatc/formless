@@ -326,14 +326,18 @@ impl Vim {
                     let at = if *after {
                         let end = line_end(line, line.cursor_byte());
                         if end == line.len() {
-                            let body = if *count > 1 {
-                                text.strip_suffix('\n').unwrap_or(&text)
-                            } else {
-                                text.trim_end_matches('\n')
-                            };
+                            // Remove one structural terminator, retaining
+                            // any additional copied blank lines.
+                            let body = text.strip_suffix('\n').unwrap_or(&text);
                             text = format!("\n{body}");
                             end
                         } else {
+                            // A final-line register can omit its terminal
+                            // newline; the existing next line still needs a
+                            // separator. Do not rewrite the private register.
+                            if !text.ends_with('\n') {
+                                text.push('\n');
+                            }
                             end + 1
                         }
                     } else {

@@ -1384,10 +1384,10 @@ impl Store {
     /// Sessions with a provisional name, most recent first: what the naming
     /// model renames once it is installed (#871).
     pub fn provisionally_named_sessions(&self, limit: usize) -> Result<Vec<String>> {
-        let mut stmt = self.ps("SELECT id FROM sessions WHERE name_source='heuristic'
-             ORDER BY updated_at DESC LIMIT ?1")?;
+        let mut stmt = self.ps("SELECT id FROM sessions WHERE deleted_at IS NULL
+             AND (name=?2 OR name_source='heuristic') ORDER BY updated_at DESC LIMIT ?1")?;
         let ids = stmt
-            .query_map(params![limit as i64], |r| r.get(0))?
+            .query_map(params![limit as i64, DEFAULT_SESSION_NAME], |r| r.get(0))?
             .collect::<rusqlite::Result<Vec<String>>>()?;
         Ok(ids)
     }
@@ -1879,21 +1879,34 @@ impl Store {
         // FTS5 (bm25, then newest): every word as a prefix term. A query
         // with no word characters falls back to a substring scan.
         let fts = fts_query(query);
-        let sql = if fts.is_some() {
+        let phrase = identifier_prefix_phrase(query);
+        let sql = if phrase.is_some() {
             "SELECT m.session_id, s.name, m.id, m.seq, m.role, m.content, m.created_at \
              FROM messages_fts f JOIN messages m ON m.rowid = f.rowid \
              JOIN sessions s ON s.id = m.session_id AND s.deleted_at IS NULL \
              WHERE messages_fts MATCH ?1 \
-             ORDER BY bm25(messages_fts), m.created_at DESC LIMIT ?2"
+             ORDER BY CASE WHEN m.rowid IN \
+               (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?3) \
+               THEN 0 ELSE 1 END, bm25(messages_fts), m.created_at DESC, m.rowid DESC LIMIT ?2"
+        } else if fts.is_some() {
+            "SELECT m.session_id, s.name, m.id, m.seq, m.role, m.content, m.created_at \
+             FROM messages_fts f JOIN messages m ON m.rowid = f.rowid \
+             JOIN sessions s ON s.id = m.session_id AND s.deleted_at IS NULL \
+             WHERE messages_fts MATCH ?1 \
+             ORDER BY bm25(messages_fts), m.created_at DESC, m.rowid DESC LIMIT ?2"
         } else {
             "SELECT m.session_id, s.name, m.id, m.seq, m.role, m.content, m.created_at \
              FROM messages m JOIN sessions s ON s.id = m.session_id AND s.deleted_at IS NULL \
              WHERE instr(lower(m.content), lower(?1)) > 0 \
-             ORDER BY m.created_at DESC LIMIT ?2"
+             ORDER BY m.created_at DESC, m.rowid DESC LIMIT ?2"
         };
         let mut stmt = self.ps(sql)?;
         let arg = fts.unwrap_or_else(|| query.to_string());
-        let rows = stmt.query_map(params![arg, limit], |r| {
+        let mut args = vec![rusqlite::types::Value::from(arg), limit.into()];
+        if let Some(phrase) = phrase {
+            args.push(phrase.into());
+        }
+        let rows = stmt.query_map(rusqlite::params_from_iter(args), |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
@@ -4071,6 +4084,29 @@ impl Store {
         Ok(rows)
     }
 
+    /// Agent read projection: all metadata, only the selected code body.
+    /// Unrequested code is intentionally absent; selected code still decodes
+    /// as required text, preserving its conversion failures.
+    pub(crate) fn module_versions_for_read(
+        &self,
+        module_id: &str,
+        selected: i64,
+    ) -> Result<Vec<(i64, Option<String>, String, String)>> {
+        let mut stmt = self.ps("SELECT version, CASE WHEN version=?2 THEN code ELSE NULL END, author, created_at FROM module_versions WHERE module_id=?1 ORDER BY version")?;
+        let rows = stmt
+            .query_map(params![module_id, selected], |row| {
+                let version: i64 = row.get(0)?;
+                let code = if version == selected {
+                    Some(row.get::<_, String>(1)?)
+                } else {
+                    None
+                };
+                Ok((version, code, row.get(2)?, row.get(3)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
     /// Active Tools whose current code requires the module (by name).
     pub fn module_dependents(&self, name: &str) -> Result<Vec<String>> {
         let lower = name.to_lowercase();
@@ -4484,12 +4520,15 @@ impl Store {
             )
             .optional()?;
         Ok(row.map(|mut ex| {
-            if ex.output.len() > MAX {
-                let mut end = MAX;
-                while !ex.output.is_char_boundary(end) {
-                    end -= 1;
+            for field in [&mut ex.input, &mut ex.output] {
+                if field.len() > MAX {
+                    let mut end = MAX;
+                    while !field.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    field.truncate(end);
+                    field.push_str("… (cut)");
                 }
-                ex.output = format!("{}… (cut)", &ex.output[..end]);
             }
             ex
         }))
@@ -4766,8 +4805,9 @@ impl Store {
         tool_id: &str,
         limit: usize,
     ) -> Result<Vec<(i64, String, String, String)>> {
-        let mut stmt = self.ps("SELECT version, tag, input, error FROM invocations
-             WHERE tool_id=?1 AND status='failure' ORDER BY created_at DESC LIMIT ?2")?;
+        let mut stmt =
+            self.ps("SELECT version, tag, input, error FROM invocations
+             WHERE tool_id=?1 AND status='failure' ORDER BY created_at DESC, rowid DESC LIMIT ?2")?;
         let rows = stmt
             .query_map(params![tool_id, limit as i64], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
@@ -7022,6 +7062,24 @@ pub fn provider_message(m: &MessageInfo) -> Value {
     msg
 }
 
+/// An adjacency tier only for supported separator-joined identifiers.
+/// Every segment remains a prefix, including non-final segments. This asks
+/// for adjacent indexed tokens, not literal punctuation or identifier equality.
+fn identifier_prefix_phrase(text: &str) -> Option<String> {
+    let separator = |c| matches!(c, '_' | '.' | '-' | '/');
+    if !text.chars().any(separator)
+        || text.chars().any(|c| {
+            !c.is_alphanumeric()
+                && !unicode_normalization::char::is_combining_mark(c)
+                && !separator(c)
+        })
+    {
+        return None;
+    }
+    let terms = fts_query(text)?;
+    terms.contains(' ').then(|| terms.replace(' ', " + "))
+}
+
 /// An FTS5 query from free text: each word quoted as a prefix term, all
 /// required. None when the text has no word characters.
 pub fn fts_query(text: &str) -> Option<String> {
@@ -7681,11 +7739,13 @@ mod user_naming_text_tests {
             ],
         );
         let got = assert_same(&store, &mixed, "mixed").unwrap();
-        assert_eq!(got, substantive);
+        // The first uncertain short request is now substantive, even when
+        // it consists of eleven combining graphemes.
+        assert_eq!(got, eleven);
         assert!(!got.contains("ASSISTANT_ONLY"));
         assert!(!got.contains("TOOL_ONLY"));
         assert!(!got.contains("LATE_ONLY"));
-        assert!(!got.contains('\u{0301}'));
+        assert!(got.contains('\u{0301}'));
 
         let later = "summarise the quarterly notes in one page";
         let earliest = "please convert this csv export into json";
@@ -7745,16 +7805,16 @@ mod user_naming_text_tests {
                 ("assistant", &assistant),
             ],
         );
-        let got = assert_same(&store, &graphemes, "12 graphemes").unwrap();
-        assert_eq!(got, thai12);
-        assert!(!got.contains('\u{0301}'));
+        let got = assert_same(&store, &graphemes, "short combining request").unwrap();
+        assert_eq!(got, eleven);
+        assert!(got.contains('\u{0301}'));
         assert!(!got.contains("LATE_ONLY"));
 
         let short_nl = transcript(
             &store,
             &[
                 ("tool", &tool),
-                ("user", "yo"),
+                ("user", "hi"),
                 ("user", "go\non"),
                 ("user", &late),
             ],
@@ -7763,6 +7823,22 @@ mod user_naming_text_tests {
             assert_same(&store, &short_nl, "short newline").as_deref(),
             Some("go\non")
         );
+    }
+
+    #[test]
+    fn user_naming_text_retains_uncertain_short_requests_before_later_logs() {
+        let store = Store::open_in_memory().unwrap();
+        let late = marked("LATE_ONLY");
+        for request in ["yo", "ab", "Fix the CI", "修复登录错误", "กกก", "e\u{0301}"] {
+            let id = transcript(
+                &store,
+                &[("user", "hi"), ("user", request), ("user", &late)],
+            );
+            assert_eq!(
+                assert_same(&store, &id, "short request").as_deref(),
+                Some(request)
+            );
+        }
     }
 
     #[test]
@@ -7784,16 +7860,14 @@ mod user_naming_text_tests {
         );
         assert_eq!(assert_same(&store, &whitespace, "whitespace users"), None);
 
-        let eleven = "e\u{0301}".repeat(11);
         let trivial = transcript(
             &store,
             &[
                 ("user", blank),
                 ("user", "  hi  "),
-                ("user", "\nab\n"),
-                ("user", &eleven),
-                ("user", "\u{200B}"),
-                ("user", &cluster),
+                ("user", "ok"),
+                ("user", "thank you"),
+                ("user", "!!!"),
                 ("user", "hello"),
                 ("tool", &tool),
             ],
@@ -7823,7 +7897,7 @@ mod user_naming_text_tests {
                 ("tool", &tool),
             ],
         );
-        let got = assert_same(&store, &only_cluster, "huge trivial grapheme").unwrap();
+        let got = assert_same(&store, &only_cluster, "huge single grapheme").unwrap();
         assert_head_tail(&got, &cluster);
     }
 
@@ -7882,12 +7956,11 @@ mod user_naming_text_tests {
     fn user_naming_text_stops_before_irrelevant_late_rows() {
         assert_eq!(scanned(&[], 0, 1), None);
 
-        let cluster = huge_grapheme();
         let all_trivial = vec![
             " \u{00A0}\u{3000}\n".to_string(),
             "  hi  ".to_string(),
-            "\nab\n".to_string(),
-            cluster,
+            "ok".to_string(),
+            "!!!".to_string(),
         ];
         assert_eq!(
             scanned(&all_trivial, all_trivial.len(), all_trivial.len() + 1).as_deref(),
@@ -7904,11 +7977,13 @@ mod user_naming_text_tests {
             twelve.clone(),
             late.clone(),
         ];
-        let got = scanned(&graphemes, 3, 4).unwrap();
-        assert_eq!(got, twelve);
+        let got = scanned(&graphemes, 1, 2).unwrap();
+        assert_eq!(got, "e\u{0301}".repeat(11));
         assert!(!got.contains("LATE_ONLY"));
 
-        let multiline = vec!["yo".to_string(), "go\non".to_string(), late.clone()];
+        let short = vec!["yo".to_string(), late.clone()];
+        assert_eq!(scanned(&short, 0, 1).as_deref(), Some("yo"));
+        let multiline = vec!["hi".to_string(), "go\non".to_string(), late.clone()];
         assert_eq!(scanned(&multiline, 1, 2).as_deref(), Some("go\non"));
 
         let long = long_multibyte();
@@ -7916,5 +7991,56 @@ mod user_naming_text_tests {
         let got = scanned(&shaped, 1, 2).unwrap();
         assert_head_tail(&got, &long);
         assert!(!got.contains("LATE_ONLY"));
+    }
+}
+
+#[cfg(test)]
+mod recent_failure_order_tests {
+    use super::*;
+
+    #[test]
+    fn recent_failures_break_timestamp_ties_by_recording_order() {
+        let store = Store::open_in_memory().unwrap();
+        let tool = store
+            .create_tool_version(
+                "failure_order",
+                "fixture",
+                "{}",
+                "{}",
+                "function run(i){return i}",
+                &Capabilities::default(),
+                64,
+                "agent",
+            )
+            .unwrap()
+            .0
+            .id;
+        let insert = |tag: &str, timestamp: &str, status: &str| {
+            store.conn.execute(
+                "INSERT INTO invocations(id,tool_id,version,status,tag,input,error,created_at) VALUES(?1,?2,1,?3,?1,?4,?5,?6)",
+                params![tag,tool,status,r#"{"text":"ไทย 日本語"}"#,"ผิดพลาด\n詳細",timestamp],
+            ).unwrap();
+        };
+        insert("first", "2026-01-02T00:00:00Z", "failure");
+        insert("second", "2026-01-02T00:00:00Z", "failure");
+        insert("third", "2026-01-02T00:00:00Z", "failure");
+        assert_eq!(store.recent_failures(&tool, 1).unwrap()[0].1, "third");
+        insert("older_recorded_later", "2026-01-01T00:00:00Z", "failure");
+        insert("success", "2026-01-04T00:00:00Z", "success");
+        insert("running", "2026-01-04T00:00:00Z", "running");
+        insert("newest", "2026-01-03T00:00:00Z", "failure");
+        let rows = store.recent_failures(&tool, 10).unwrap();
+        assert_eq!(
+            rows.iter().map(|row| row.1.as_str()).collect::<Vec<_>>(),
+            ["newest", "third", "second", "first", "older_recorded_later"]
+        );
+        assert_eq!(store.recent_failures(&tool, 3).unwrap(), rows[..3]);
+        assert!(store.recent_failures(&tool, 0).unwrap().is_empty());
+        assert!(store.recent_failures("other_tool", 10).unwrap().is_empty());
+        for (version, _, input, error) in rows {
+            assert_eq!(version, 1);
+            assert_eq!(input, r#"{"text":"ไทย 日本語"}"#);
+            assert_eq!(error, "ผิดพลาด\n詳細");
+        }
     }
 }
