@@ -4,6 +4,7 @@ mod artifact_delete;
 mod artifact_text;
 pub mod artifacts;
 mod attachment_access;
+mod audit_cursor;
 pub mod auth;
 pub mod backup_verification;
 mod budget;

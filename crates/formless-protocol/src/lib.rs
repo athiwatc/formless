@@ -818,6 +818,9 @@ pub struct ModuleDetail {
 /// One audit-log entry (SPEC §14).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AuditEntry {
+    /// Opaque ListAudit boundary; absent when reading older daemon responses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
     pub actor: String,
     pub action: String,
     pub detail: String,
@@ -2293,7 +2296,8 @@ pub enum Request {
     },
     StopWebUi,
     /// The audit log, newest first (SPEC §14): `filter` matches actor,
-    /// action or detail; `before` (an entry's `created_at`) pages back.
+    /// action or detail; `before` accepts an entry's opaque `cursor` or a
+    /// legacy `created_at` timestamp (strictly older timestamps only).
     ListAudit {
         #[serde(default)]
         filter: Option<String>,
