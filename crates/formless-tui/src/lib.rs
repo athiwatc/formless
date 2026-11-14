@@ -21,6 +21,7 @@ mod markdown;
 mod mermaid;
 mod metrics_tools;
 mod notify;
+mod palette_view;
 mod picker;
 pub mod plain;
 #[cfg(test)]
@@ -11981,7 +11982,7 @@ fn draw_question_panel(f: &mut Frame, chat: Rect, open: &OpenQuestion, typing: b
 
 /// The `/` palette, just above the input box, scrolled to the selection.
 fn draw_palette(f: &mut Frame, input: Rect, items: &[PaletteItem], sel: usize, color: bool) {
-    if input.y < 3 {
+    if input.y < 3 || input.width == 0 || items.is_empty() {
         return;
     }
     let sel = sel.min(items.len() - 1);
@@ -11989,9 +11990,11 @@ fn draw_palette(f: &mut Frame, input: Rect, items: &[PaletteItem], sel: usize, c
     let start = sel
         .saturating_sub(rows - 1)
         .min(items.len().saturating_sub(rows));
+    let width = input.width.min(100);
+    let columns = width.saturating_sub(2) as usize;
     let label_w = items
         .iter()
-        .map(|i| i.label.chars().count())
+        .map(|item| text::width(&item.label))
         .max()
         .unwrap_or(0)
         .min(40);
@@ -12001,38 +12004,20 @@ fn draw_palette(f: &mut Frame, input: Rect, items: &[PaletteItem], sel: usize, c
         .skip(start)
         .take(rows)
         .map(|(i, item)| {
-            let style = if i == sel {
-                bold_fg(color, Color::Green)
-            } else {
-                Style::default()
-            };
-            Line::from(vec![
-                Span::styled(
-                    format!(
-                        "{} {}  ",
-                        if i == sel { "›" } else { " " },
-                        ui::pad(&truncate_chars(&item.label, 40), label_w)
-                    ),
-                    style,
-                ),
-                Span::styled(item.desc.clone(), ui::dim(color)),
-            ])
+            palette_view::row(&item.label, &item.desc, label_w, columns, i == sel, color)
         })
         .collect();
     let h = (lines.len() as u16 + 2).min(input.y);
     let rect = Rect {
         x: input.x,
         y: input.y - h,
-        width: input.width.clamp(1, 100),
+        width,
         height: h,
     };
     f.render_widget(Clear, rect);
     f.render_widget(
         Paragraph::new(lines).block(ui::panel(
-            format!(
-                " / commands · {} · Tab complete · Enter run · Esc hide ",
-                items.len()
-            ),
+            palette_view::title(items.len(), columns),
             color,
             Color::Cyan,
         )),
