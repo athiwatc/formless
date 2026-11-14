@@ -71,6 +71,80 @@ class LinkChecks(unittest.TestCase):
         for suffix in ["/issues", "/issues/new?labels=bug", "/issues/new?labels=enhancement"]:
             links.validate_repository_url(ROOT + suffix, lambda p: {"has_issues": True})
 
+    def issue(self, number=1406):
+        return {"number": number, "url": links.API + "/issues/" + str(number),
+                "html_url": ROOT + "/issues/" + str(number), "repository_url": links.API}
+
+    def test_numbered_issue_checks_exact_endpoint_and_identity(self):
+        calls = []
+        url = ROOT + "/issues/1406"
+        exclusion = links.validate_repository_url(url, lambda path: calls.append(path) or self.issue())
+        self.assertEqual(calls, ["/issues/1406"])
+        self.assertEqual(exclusion, "^https://github\\.com/athiwatc/formless/issues/1406$")
+
+    def test_numbered_issue_missing_does_not_fall_back_to_repository(self):
+        def missing(path):
+            self.assertEqual(path, "/issues/1406")
+            raise ValueError("GitHub API check failed: HTTP 404")
+        with self.assertRaisesRegex(ValueError, "HTTP 404"):
+            links.validate_repository_url(ROOT + "/issues/1406", missing)
+
+    def test_numbered_issue_rejects_wrong_identity_and_pr_objects(self):
+        wrong = [None, [], {}, {"has_issues": True}, self.issue(1407)]
+        for field, value in [("number", True), ("number", "1406"),
+                             ("url", links.API + "/issues/1407"),
+                             ("html_url", ROOT + "/pull/1406"),
+                             ("html_url", "https://github.com/other/repo/issues/1406"),
+                             ("repository_url", "https://api.github.com/repos/other/repo"),
+                             ("pull_request", {}), ("pull_request", None)]:
+            data = self.issue(); data[field] = value; wrong.append(data)
+        for data in wrong:
+            with self.subTest(data=data), self.assertRaises(ValueError):
+                links.validate_repository_url(ROOT + "/issues/1406", lambda path: data)
+
+    def test_numbered_issue_malformed_paths_fail_before_request(self):
+        def unexpected(path): self.fail("unexpected API request: " + path)
+        for path in ["/issues/0", "/issues/01406", "/issues/-1", "/issues/+1", "/issues/1.0",
+                     "/issues/١", "/issues/%31", "/issues//1406", "/issues/1406/",
+                     "/issues/1406//", "/issues/1406/comments", "/issues/1406/../2",
+                     "/issues/1406?labels=bug", "/issues/1406#issuecomment-1", "/pull/1406"]:
+            with self.subTest(path=path), self.assertRaises(ValueError):
+                links.validate_repository_url(ROOT + path, unexpected)
+
+    def test_numbered_issue_transport_is_fixed_host_and_refuses_redirects(self):
+        captured = []
+        class Opener:
+            def open(self, request, timeout):
+                captured.append((request.full_url, request.get_header("Authorization"), timeout))
+                raise links.HTTPError(request.full_url, 302, "redirect", {"Location": "https://evil.example"}, None)
+        with patch.object(links, "build_opener", return_value=Opener()) as build:
+            with self.assertRaisesRegex(ValueError, "HTTP 302"):
+                links.api_get("/issues/1406", "dummy")
+        self.assertEqual(captured, [(links.API + "/issues/1406", "Bearer dummy", 20)])
+        self.assertIsInstance(build.call_args.args[0], links.NoRedirects)
+
+    def test_numbered_issue_wrong_repository_form_fails_before_request(self):
+        def unexpected(path): self.fail("unexpected API request: " + path)
+        for url in ["https://github.com/other/repo/issues/1406", ROOT + "-other/issues/1406",
+                    ROOT.replace("github.com", "user@github.com") + "/issues/1406",
+                    ROOT.replace("github.com", "github.com:443") + "/issues/1406"]:
+            with self.subTest(url=url), self.assertRaises(ValueError):
+                links.validate_repository_url(url, unexpected)
+
+    def test_numbered_issue_exact_exclusion_and_credential_isolation(self):
+        calls = []
+        def run(command, **kwargs):
+            for key in ["FORMLESS_LINK_GITHUB_TOKEN", "GITHUB_TOKEN", "GH_TOKEN"]:
+                self.assertNotIn(key, kwargs["env"])
+            calls.append(command)
+            return SimpleNamespace(stdout=(ROOT + "/issues/1406\n") * 2, returncode=0)
+        with patch.dict(os.environ, {"FORMLESS_LINK_GITHUB_TOKEN": "dummy", "GITHUB_TOKEN": "dummy", "GH_TOKEN": "dummy"}), patch.object(links.subprocess, "run", side_effect=run), patch.object(links, "api_get", return_value=self.issue()) as api:
+            self.assertEqual(links.main(["script", "lychee", "README.md", "SPEC.md"]), 0)
+        api.assert_called_once_with("/issues/1406", "dummy")
+        expected = "^https://github\\.com/athiwatc/formless/issues/1406$"
+        self.assertEqual(calls[-1][calls[-1].index("--exclude") + 1], expected)
+        self.assertNotIn("dummy", " ".join(calls[-1]))
+
     def test_disabled_issues_fail(self):
         with self.assertRaises(ValueError):
             links.validate_repository_url(ROOT + "/issues", lambda p: {"has_issues": False})
