@@ -71,33 +71,13 @@ fn jaccard(a: &BTreeSet<String>, b: &BTreeSet<String>) -> f64 {
     a.intersection(b).count() as f64 / a.union(b).count() as f64
 }
 
-/// Code with layout whitespace dropped but string and template literals
-/// kept as written, so `"a b"` and `"ab"` stay different (#829).
+#[path = "dupes_code.rs"]
+mod lexical;
+
+/// Comment/layout-insensitive exact tokens, preserving literal values and
+/// restricted line breaks. Uncertain syntax falls back to raw source.
 fn code_key(code: &str) -> String {
-    let mut out = String::new();
-    let mut quote: Option<char> = None;
-    let mut escaped = false;
-    for c in code.chars() {
-        match quote {
-            Some(q) => {
-                out.push(c);
-                if escaped {
-                    escaped = false;
-                } else if c == '\\' {
-                    escaped = true;
-                } else if c == q {
-                    quote = None;
-                }
-            }
-            None if matches!(c, '"' | '\'' | '`') => {
-                quote = Some(c);
-                out.push(c);
-            }
-            None if c.is_whitespace() => {}
-            None => out.push(c),
-        }
-    }
-    out
+    lexical::key(code)
 }
 
 /// Input fields alike; two Tools that both take nothing count as alike
@@ -196,7 +176,7 @@ mod tests {
     fn literals_keep_their_spaces_and_names_tokenise_alike() {
         assert_ne!(code_key("return \"a b\";"), code_key("return \"ab\";"));
         assert_eq!(code_key("return  1 ;\n"), code_key("return 1;"));
-        assert_eq!(code_key("x = `a ${b}`"), "x=`a ${b}`");
+        assert_eq!(code_key("x = `a ${b}`"), code_key("x=`a ${b}`"));
         assert_eq!(name_tokens("readFile"), name_tokens("read_file"));
         assert_eq!(
             name_tokens("HTTPGetJson").len(),
