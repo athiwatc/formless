@@ -4917,7 +4917,7 @@ fn retry_seconds(seconds: f64) -> Option<Duration> {
     Duration::try_from_secs_f64(seconds.max(0.0)).ok()
 }
 
-/// `"1m30s"`, `"6m0s"`, `"20ms"`, `"0.5s"`, or bare seconds.
+/// Unit durations (`"1d 2h"`, `"1m30s"`, `"20ms"`, `"0.5s"`) or bare seconds.
 fn parse_reset_duration(text: &str) -> Option<Duration> {
     let text = text.trim();
     if let Ok(secs) = text.parse::<f64>() {
@@ -4935,7 +4935,8 @@ fn parse_reset_duration(text: &str) -> Option<Duration> {
             .find(|c: char| c.is_ascii_digit() || c == '.')
             .unwrap_or(rest.len());
         total += value
-            * match &rest[..unit_len] {
+            * match rest[..unit_len].trim_end() {
+                "d" => 86_400.0,
                 "h" => 3600.0,
                 "m" => 60.0,
                 "s" => 1.0,
@@ -5998,6 +5999,60 @@ mod tests {
             headers.insert("retry-after", HeaderValue::from_static(value));
             headers.insert("x-ratelimit-reset-tokens", HeaderValue::from_static("9s"));
             assert_eq!(retry_after(&headers), Some(expected), "{value}");
+        }
+    }
+
+    #[test]
+    fn retry_hints_accept_spaced_compound_reset_units() {
+        use reqwest::header::{HeaderMap, HeaderValue};
+        for (text, expected) in [
+            ("1h 2m", Duration::from_secs(3720)),
+            (" 1h 2m 3s ", Duration::from_secs(3723)),
+            ("1m\t30s", Duration::from_secs(90)),
+        ] {
+            assert_eq!(parse_reset_duration(text), Some(expected), "{text}");
+            for name in ["x-ratelimit-reset-requests", "x-ratelimit-reset-tokens"] {
+                let mut headers = HeaderMap::new();
+                headers.insert(name, HeaderValue::from_str(text).unwrap());
+                assert_eq!(retry_after(&headers), Some(expected), "{name}: {text}");
+                headers.insert("retry-after", HeaderValue::from_static("7"));
+                assert_eq!(retry_after(&headers), Some(Duration::from_secs(7)));
+            }
+        }
+        for text in ["1h 2", "1 h 2m", "1h rubbish", "1h 2m trailing"] {
+            assert_eq!(parse_reset_duration(text), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn retry_hints_accept_days_and_keep_reset_selection_bounded() {
+        use reqwest::header::{HeaderMap, HeaderValue};
+        for (text, expected) in [
+            ("1d", Duration::from_secs(86400)),
+            ("1d2h", Duration::from_secs(93600)),
+            ("1d 2h 3m 4s", Duration::from_secs(93784)),
+            (".5d", Duration::from_secs(43200)),
+        ] {
+            assert_eq!(parse_reset_duration(text), Some(expected), "{text}");
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "x-ratelimit-reset-requests",
+                HeaderValue::from_str(text).unwrap(),
+            );
+            headers.insert("x-ratelimit-reset-tokens", HeaderValue::from_static("20s"));
+            assert_eq!(retry_after(&headers), Some(expected), "{text}");
+            headers.insert(
+                "x-ratelimit-reset-requests",
+                HeaderValue::from_static("soon"),
+            );
+            headers.insert(
+                "x-ratelimit-reset-tokens",
+                HeaderValue::from_str(text).unwrap(),
+            );
+            assert_eq!(retry_after(&headers), Some(expected), "{text}");
+        }
+        for text in ["1day", "1d-2h", "10000000000000000000d", "1d trailing"] {
+            assert_eq!(parse_reset_duration(text), None, "{text}");
         }
     }
 
