@@ -3860,7 +3860,9 @@ run_tool = "network_policy"     # a registry Tool, or…
   one link on every fragment, never a link to its first piece. In the
   Markdown, an image inside a link shows both addresses, and inline HTML
   shows its text: `<b>`, `<i>`, `<s>`, `<code>`, `<kbd>` and `<a href>`
-  style it, other tags and comments are dropped. `/open link [N]` opens the Nth link in the last
+  style it, other tags and comments are dropped. Anchor attribute names
+  are ASCII case-insensitive, allow whitespace around `=`, and retain
+  quoted or unquoted destinations. `/open link [N]` opens the Nth link in the last
   answer with the system opener (`open`, `xdg-open`, `start`).
   File paths in the chat (`src/main.rs`, `./a/b.txt:42`, `Cargo.toml`)
   that exist under the TUI's working directory are linked the same way,
