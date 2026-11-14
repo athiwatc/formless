@@ -372,10 +372,31 @@
   const pct = (r) => (r == null ? "-" : uiFormat(r, { style: "percent", maximumFractionDigits: 0 }));
   // Same thresholds as the TUI: green at the optimiser trigger (90%).
   const rateClass = (r) => (r == null ? "muted" : r >= 0.9 ? "rate-good" : r >= 0.7 ? "rate-mid" : "rate-bad");
-  const truncate = (s, n) => {
+  // Keep the existing UTF-16 budget, including the ellipsis. Older engines
+  // without Segmenter retain code points, but cannot guarantee whole graphemes.
+  const summarySegments = typeof Intl.Segmenter === "function"
+    ? new Intl.Segmenter(undefined, { granularity: "grapheme" }) : null;
+  function truncate(s, n) {
     s = String(s || "").replace(/\s+/g, " ").trim();
-    return s.length > n ? s.slice(0, n - 1) + "…" : s;
-  };
+    if (s.length <= n) return s;
+    if (n <= 0) return "";
+    let end = 0;
+    const segments = summarySegments ? summarySegments.segment(s) : s;
+    for (const part of segments) {
+      const length = summarySegments ? part.segment.length : part.length;
+      if (end + length > n - 1) break;
+      end += length;
+    }
+    return s.slice(0, end) + "…";
+  }
+  // Rust str::lines(): a final LF ends a line instead of adding an empty one.
+  // CRLF has the same count; lone CR is ordinary content.
+  function logicalLineCount(text) {
+    if (!text.length) return 0;
+    let count = text.endsWith("\n") ? 0 : 1;
+    for (let i = 0; i < text.length; i++) if (text[i] === "\n") count++;
+    return count;
+  }
   function rateCell(r) {
     return h("span", { class: rateClass(r) }, pct(r));
   }
@@ -1938,7 +1959,7 @@
   }
   function toolResultChip(content) {
     const failed = /"ok"\s*:\s*false/.test(content) || /^\s*error/i.test(content);
-    const lines = content.split("\n").length;
+    const lines = logicalLineCount(content);
     const refs = artifactRefs(content);
     const chip = h("details", { class: "chip result" + (failed ? " failed" : "") },
       h("summary", null,
