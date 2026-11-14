@@ -1,3 +1,4 @@
+mod cli_artifacts;
 mod cli_attach;
 mod cli_commands;
 #[cfg(test)]
@@ -87,6 +88,14 @@ enum Cmd {
     Approvals {
         #[command(subcommand)]
         action: ApprovalsAction,
+    },
+    /// Read stored artifact text by ID (decoded text, not a binary download)
+    #[command(
+        after_help = "Examples:\n  formless artifacts show ARTIFACT_ID\n  formless artifacts show ARTIFACT_ID --offset 0 --length 128 --json\n\nOffsets and lengths count Unicode scalar values; invalid UTF-8 is replaced. The daemon reads and decodes the full source before slicing; a small page does not make that read streaming. JSON bytes is stored byte metadata, not slice length."
+    )]
+    Artifacts {
+        #[command(subcommand)]
+        action: cli_artifacts::Action,
     },
     /// Provider credential login/status/logout (API key or OAuth)
     #[command(
@@ -2157,6 +2166,7 @@ fn run_cli(cli: Cli) -> Result<()> {
         Some(Cmd::BugReport { output }) => bug_report(&paths, output),
         Some(Cmd::Mcp { action }) => mcp_cmd(paths, action),
         Some(Cmd::Skills { action }) => skills_cmd(paths, action),
+        Some(Cmd::Artifacts { action }) => cli_artifacts::run(&paths, action),
         Some(Cmd::Modules { action }) => cli_modules::run(&paths, action),
         Some(Cmd::Memory { action }) => memory_cmd(paths, action),
         Some(Cmd::Runs {

@@ -4998,6 +4998,7 @@ the TUI. Command-specific arguments and defaults are available through
 | Command | Actions / useful options | Purpose |
 |---|---|---|
 | `formless approvals` | `pending`, `approve`, `deny`, `list`, `revoke`, `denials` | Inspect pending requests, answer one, or inspect and manage existing grants/denials. |
+| `formless artifacts` | `show ID [--offset CHARS] [--length CHARS] [--json]` | Read decoded artifact text in Unicode scalar slices; not a byte-exact download. |
 | `formless auth` | `login`, `status`, `logout` | Manage provider credentials (API key or OAuth). |
 | `formless backup` | No action: create; `list`, `verify`, `restore`, `drill` | Create, inspect, verify, restore, or rehearse database snapshots. |
 | `formless bug-report` | `-o FILE` / `--output FILE` | Write a redacted Markdown diagnostic report. |
