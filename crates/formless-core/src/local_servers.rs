@@ -62,13 +62,13 @@ fn ollama_origins(raw: Option<&str>) -> Result<Vec<String>, &'static str> {
             tail.strip_prefix(':')
                 .ok_or(invalid)?
                 .parse::<u16>()
-                .map_err(|_| invalid)?
+                .unwrap_or(default_port)
         };
         (host, port)
     } else if authority.parse::<IpAddr>().is_ok() {
         (authority, default_port)
     } else if let Some((host, port)) = authority.rsplit_once(':') {
-        (host, port.parse::<u16>().map_err(|_| invalid)?)
+        (host, port.parse::<u16>().unwrap_or(default_port))
     } else {
         (authority, default_port)
     };
@@ -409,6 +409,26 @@ mod tests {
             ("http://localhost", vec!["http://127.0.0.1", "http://[::1]"]),
             ("https://127.0.0.1", vec!["https://127.0.0.1"]),
             (
+                "localhost:",
+                vec!["http://127.0.0.1:11434", "http://[::1]:11434"],
+            ),
+            (
+                "localhost:65536",
+                vec!["http://127.0.0.1:11434", "http://[::1]:11434"],
+            ),
+            ("127.0.0.1:70000", vec!["http://127.0.0.1:11434"]),
+            (
+                "localhost:abc",
+                vec!["http://127.0.0.1:11434", "http://[::1]:11434"],
+            ),
+            ("[::1]:", vec!["http://[::1]:11434"]),
+            ("[::1]:70000", vec!["http://[::1]:11434"]),
+            (
+                "http://localhost:abc",
+                vec!["http://127.0.0.1", "http://[::1]"],
+            ),
+            ("https://[::1]:70000", vec!["https://[::1]"]),
+            (
                 " 'localhost:11500/prefix/' ",
                 vec!["http://127.0.0.1:11500/prefix", "http://[::1]:11500/prefix"],
             ),
@@ -431,7 +451,10 @@ mod tests {
             "http://localhost:11500/?token=secret",
             "http://localhost:11500/#secret",
             "ftp://127.0.0.1",
-            "localhost:65536",
+            "example.com:70000",
+            "192.168.1.2:",
+            "[2001:db8::1]:abc",
+            "[::1]garbage",
             "[::1",
             "local\nhost",
         ] {

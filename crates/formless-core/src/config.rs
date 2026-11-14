@@ -2334,11 +2334,14 @@ pub fn save_api_key(paths: &Paths, key: &str) -> Result<()> {
 }
 
 /// The key in the file a `*_FILE` variable names: None when the variable
-/// is unset, an error naming the variable and file when it can't be used
+/// is unset or empty, an error naming the variable and file when it can't be used
 /// (missing, unreadable, not UTF-8, empty). A BOM and surrounding
 /// whitespace are trimmed (#1083).
 pub fn key_from_file_env(var: &str) -> Option<std::result::Result<String, String>> {
     let path = std::env::var_os(var)?;
+    if path.is_empty() {
+        return None;
+    }
     let shown = std::path::Path::new(&path).display().to_string();
     Some(match std::fs::read(&path) {
         Err(e) => Err(format!("{var} names {shown}, which can't be read: {e}")),

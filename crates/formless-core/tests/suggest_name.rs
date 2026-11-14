@@ -69,6 +69,10 @@ fn heuristic_names_are_provisional_and_user_names_final() {
         store.get_session(&a).unwrap().unwrap().name,
         DEFAULT_SESSION_NAME
     );
+    assert_eq!(
+        store.provisionally_named_sessions(10).unwrap(),
+        vec![a.clone()]
+    );
     let s = store
         .auto_name_session(&a, "can you write me a tool…", "heuristic")
         .unwrap();
@@ -122,4 +126,94 @@ fn heuristic_names_are_provisional_and_user_names_final() {
         .unwrap()
         .is_some());
     let _ = std::fs::remove_file(&db);
+}
+
+#[test]
+fn provisional_batch_matches_live_default_or_heuristic_eligibility() {
+    use formless_core::storage::DEFAULT_SESSION_NAME;
+    let root = std::env::temp_dir().join(format!("fl-provisional-batch-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    struct Owned(std::path::PathBuf);
+    impl Drop for Owned {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _owned = Owned(root.clone());
+    let db = root.join("fixture.db");
+    let store = Store::open(&db).unwrap();
+    let raw = rusqlite::Connection::open(&db).unwrap();
+    let mut eligible = Vec::new();
+    for (name, source, deleted, archived, stamp, include) in [
+        (
+            DEFAULT_SESSION_NAME,
+            None,
+            false,
+            false,
+            "2026-01-01T00:00:01Z",
+            true,
+        ),
+        (
+            "ไทย heuristic",
+            Some("heuristic"),
+            false,
+            true,
+            "2026-01-01T00:00:02Z",
+            true,
+        ),
+        (
+            DEFAULT_SESSION_NAME,
+            Some("model"),
+            false,
+            false,
+            "2026-01-01T00:00:03Z",
+            true,
+        ),
+        (
+            "User name",
+            None,
+            false,
+            false,
+            "2026-01-01T00:00:04Z",
+            false,
+        ),
+        (
+            "Model name",
+            Some("model"),
+            false,
+            false,
+            "2026-01-01T00:00:05Z",
+            false,
+        ),
+        (
+            DEFAULT_SESSION_NAME,
+            None,
+            true,
+            false,
+            "2026-01-01T00:00:06Z",
+            false,
+        ),
+        (
+            "Deleted heuristic",
+            Some("heuristic"),
+            true,
+            false,
+            "2026-01-01T00:00:07Z",
+            false,
+        ),
+    ] {
+        let session = store.create_session(Some(name.into())).unwrap();
+        raw.execute("UPDATE sessions SET name_source=?2, deleted_at=?3, archived=?4, updated_at=?5 WHERE id=?1",
+            rusqlite::params![session.id, source, if deleted {Some("2026-01-02")}else{None}, archived, stamp]).unwrap();
+        if include {
+            eligible.push(session.id);
+        }
+    }
+    eligible.reverse();
+    assert_eq!(store.provisionally_named_sessions(10).unwrap(), eligible);
+    assert_eq!(
+        store.provisionally_named_sessions(1).unwrap(),
+        eligible[..1]
+    );
+    assert!(store.provisionally_named_sessions(0).unwrap().is_empty());
 }
