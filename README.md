@@ -1026,12 +1026,13 @@ promoted to errors. Fork pull requests are skipped on the persistent runners.
 Runners need the standard `self-hosted` label plus `macOS`/`ARM64` or
 `Linux`/`X64`, and outbound access for GitHub Actions and dependency downloads.
 The Mac needs Xcode Command Line Tools, Git, Rustup and Python 3.9+. The Linux
-runner needs Docker; builds run inside `rust:1-bookworm`, with D-Bus headers,
-pkg-config and Python installed only in that disposable container. CI installs
-stable Rust with rustfmt/Clippy and Node 24. Cargo dependencies are cached;
+runner needs Git and a Debian/Ubuntu-compatible environment; CI verifies the C
+compiler, Python and D-Bus development headers/pkg-config, installing missing
+build dependencies through apt as root or with noninteractive sudo. Both
+platforms run native jobs, including Linux runners themselves hosted in Docker.
+CI installs stable Rust with rustfmt/Clippy and Node 24. Cargo dependencies are cached;
 application data/config and logs use private temporary directories cleaned after
-the job. Container-created workspace files have their original owner restored.
-Test debug artifacts are removed before release compilation to limit disk use.
+the job. Test debug artifacts are removed before release compilation to limit disk use.
 The workflow does not deploy or publish a release; release packaging remains in
 `release.yml`. Live external-link checks remain in `docs.yml`; Playwright browser
 checks in `relay/README.md` remain separate manual checks. AUR packaging tests

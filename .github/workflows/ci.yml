@@ -11,7 +11,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.event.pull_request.number || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 defaults:
@@ -36,25 +36,28 @@ jobs:
         include:
           - platform: macOS ARM64
             runner: [self-hosted, macOS, ARM64]
-            container: ''
           - platform: Linux X64
             runner: [self-hosted, Linux, X64]
-            container: rust:1-bookworm
     runs-on: ${{ matrix.runner }}
-    container: ${{ matrix.container }}
     timeout-minutes: 90
     steps:
-      - name: Record Linux workspace owner
+      - name: Ensure Linux build dependencies
         if: runner.os == 'Linux'
         run: |
-          test ! -L "$GITHUB_WORKSPACE"
-          echo "CI_WORKSPACE_OWNER=$(stat -c '%u:%g' "$GITHUB_WORKSPACE")" >> "$GITHUB_ENV"
-
-      - name: Install Linux build dependencies (container only)
-        if: runner.os == 'Linux'
-        run: |
-          apt-get update
-          apt-get install -y --no-install-recommends libdbus-1-dev pkg-config python3
+          set -euo pipefail
+          if command -v cc >/dev/null && command -v python3 >/dev/null &&
+             command -v pkg-config >/dev/null && pkg-config --exists dbus-1; then
+            exit 0
+          fi
+          # Native jobs also support runners hosted inside a container, where
+          # sibling Docker jobs cannot resolve the runner's bind-mount paths.
+          command -v apt-get >/dev/null
+          ci_privilege=()
+          if [[ "$(id -u)" != 0 ]]; then
+            ci_privilege=(sudo -n)
+          fi
+          "${ci_privilege[@]}" apt-get update
+          "${ci_privilege[@]}" apt-get install -y --no-install-recommends build-essential libdbus-1-dev pkg-config python3
 
       - uses: actions/checkout@v4
         with:
@@ -194,10 +197,3 @@ jobs:
             "$RUNNER_TEMP"/formless-ci.*) rm -rf -- "$CI_DIR" ;;
             *) echo 'Refusing cleanup outside the private CI directory' >&2; exit 1 ;;
           esac
-
-      - name: Restore Linux workspace ownership
-        if: ${{ always() && runner.os == 'Linux' && env.CI_WORKSPACE_OWNER != '' }}
-        run: |
-          test ! -L "$GITHUB_WORKSPACE"
-          [[ "$CI_WORKSPACE_OWNER" =~ ^[0-9]+:[0-9]+$ ]]
-          chown -hRP "$CI_WORKSPACE_OWNER" "$GITHUB_WORKSPACE"
