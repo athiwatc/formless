@@ -4968,6 +4968,7 @@ the TUI. Command-specific arguments and defaults are available through
 | `formless mcp` | `add`, `remove`, `list`, `test`, `login`, `logout`, `catalog`, `import`, `log`, `tools`, `tool` | Manage external MCP servers and inspect their tools/logs. |
 | `formless metrics` | `--since DURATION`, `--json` | Read recorded model, Tool and built-in statistics through independent reports at one cutoff. |
 | `formless memory` | `list`, `add`, `rm`, `edit` | Inspect or change saved user-memory notes. |
+| `formless modules` | `list`, `show`; `show --version N` | Read all modules, inspect metadata/history/dependents, or emit an exact stored source version. |
 | `formless naming` | `status`, `pull`, `test` | Inspect, install, or preview the embedded Session-naming model. |
 | `formless prices` | `import` | Import a model-price catalog for cost and spending limits. |
 | `formless profiles` | `list`, `rm` | List or remove isolated profiles. |
@@ -6160,7 +6161,9 @@ configuration interface): `FORMLESS_DOCS_OPENER_FIXTURE`,
 `FORMLESS_TEST_MAINTENANCE_CONFIG`, `FORMLESS_TEST_MAINTENANCE_DATA`,
 `FORMLESS_TEST_MAINTENANCE_ISOLATION`, `FORMLESS_TEST_MAINTENANCE_OPERATION`,
 `FORMLESS_TEST_OWNERSHIP_CONFIG`, `FORMLESS_TEST_OWNERSHIP_DATA`,
-`FORMLESS_TEST_PANIC_MARKER`.
+`FORMLESS_TEST_PANIC_MARKER`, and `FORMLESS_TEST_DOCTOR_ARGS` (JSON CLI arguments
+for the test-only doctor subprocess, which installs an in-memory credential
+backend before read-only dispatch; the shipped binary does not read this variable).
 
 `FORMLESS_EXPORT_DESCRIPTOR_FIXTURE` is a Linux-only export test hook pointing
 to an owned redirected-stdout alias; it verifies that descriptor output preserves
@@ -6268,6 +6271,17 @@ Tool selectors use an exact name or full ID. After a miss, up to three
 ranked partial-name suggestions can help you retry with the original exact
 spelling; these use folded subsequence matching, not edit-distance spelling
 correction. A suggestion never selects or runs a Tool automatically.
+
+`modules list [--json]` reads all ModuleInfo rows, including retired modules.
+`modules show NAME_OR_ID [--json] [--version N]` uses the daemon's existing
+name/full-ID resolution. Default human detail shows metadata, version summaries
+and sorted active Tool dependents without code bodies. `--version N` emits
+exactly that stored source, preserving its existing trailing newline; missing
+versions are usage errors. `--json` returns the complete existing ModuleDetail
+and conflicts with `--version`. Invalid versions/conflicts fail before contact.
+GetModule still fetches every version's code even for metadata-only output;
+client projection does not reduce backend work (see #889). No module mutation
+is exposed by these commands.
 
 `runs show ID [--json]` inspects any stored Run; `runs cancel ID [--json]`
 cancels only that exact active Run, never a later Run in the same Session. IDs
