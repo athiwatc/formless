@@ -20,8 +20,11 @@ lockfile and pinned GPUI Kit 0.9.1 / GPUI-pre 0.3.12.
 - Native 200% header correction: `524e53afc902c733c04db08dc60b7119d5f9a224`.
 - Deterministic provider/navigation and teardown fixture:
   `ddcf55eb7a3f97d517959f93341dfeb7e2c9efc1`.
-- Final main reconciliation: `26f9eddfa4e657985d8479d13e45752110fb1a77`,
+- Third main reconciliation: `26f9eddfa4e657985d8479d13e45752110fb1a77`,
   incorporating main `47ebac8c30af92a7cd937501f9761df101b83187`.
+- Post-publication main reconciliation: `cc68b2cb911400a19c479b3d70dedb119da58a65`,
+  incorporating main `da34c1172bf049edad6a0759ca268ad3af915f4e`.
+- Published draft: [PR #2081](https://github.com/athiwatc/formless/pull/2081).
 
 The desktop tree is `3ad560af5cc4a63c4ffcbc8e250ec53ffc793086` and the
 protocol tree is `a9912076a69b36043508622f3d9bf25742405790` at both the initial
@@ -121,7 +124,8 @@ Local evidence is retained under ignored `evidence/gpui-1753-sol/`:
 `b1696d84-*.log`, `1e68d032-daemon.log`, `1e68d032-clippy-daemon.log`,
 `graph-assertions.json`, `final-scope-checks.json`, `final-metrics-scope.log`,
 `resource-header-render.log`, `final-header-shell.log`, `final-header-clippy.log`,
-`final-synchronized-daemon.log`, `final-synchronized-clippy.log` and `shell-*.png`. The native captures include the new
+`final-synchronized-daemon.log`, `final-synchronized-clippy.log`,
+`cc68b2cb-daemon.log`, `cc68b2cb-clippy-daemon.log` and `shell-*.png`. The native captures include the new
 Tools and Metrics resource views at wide/100% and minimum/200%. Those capture serialized view
 fixtures, not a foreground GUI connected to the private daemon. Existing Thai
 segmentation warnings remain; the pinned toolkit was not upgraded.
@@ -147,6 +151,13 @@ has no recorded final result. It is not counted as a pass. After reconnection,
 read-only process inspection found no Formless test process. The fresh integration
 runs above passed independently. Native screenshot filenames are reused on
 subsequent render runs; per-attempt logs are retained.
+
+The first hosted desktop run, [43632030492](https://github.com/athiwatc/formless/actions/runs/43632030492),
+at `871447053b45240f85f6831b9467bff14cbf5127` failed on all three platforms
+before any job steps ran. Each job reported runner ID zero and no steps; the
+Windows job log returned BlobNotFound. The cause is not established by these
+results. They provide no Windows/Linux build or test evidence. The Code Review
+diagnostics tool also required local Desktop access unavailable to this task.
 
 ## Remaining acceptance
 
