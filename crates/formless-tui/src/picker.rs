@@ -20,11 +20,11 @@ fn model_context_label(value: u64) -> String {
     if value < 1000 {
         return format!("{raw} ctx");
     }
-    if value % 1000 != 0 {
-        if value % 1_048_576 == 0 {
+    if !value.is_multiple_of(1000) {
+        if value.is_multiple_of(1_048_576) {
             return format!("{}Mi ctx", value / 1_048_576);
         }
-        if value % 1024 == 0 {
+        if value.is_multiple_of(1024) {
             return format!("{}Ki ctx", value / 1024);
         }
     }
