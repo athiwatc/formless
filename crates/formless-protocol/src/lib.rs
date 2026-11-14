@@ -1563,7 +1563,9 @@ pub struct ToolDetail {
 }
 
 /// One concrete call of a Tool: its (redacted) input and output, as
-/// recorded, the output cut to a few KB.
+/// recorded. Each field is a UTF-8 prefix of at most 4,000 bytes plus a cut
+/// marker when oversized: an illustrative preview, not necessarily valid JSON
+/// or a complete replayable call. Original records are unchanged.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ToolExample {
     pub version: i64,

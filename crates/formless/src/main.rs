@@ -2,9 +2,14 @@ mod cli_attach;
 mod cli_commands;
 #[cfg(test)]
 mod cli_help_tests;
+mod cli_metrics;
 mod cli_pipeline;
+mod cli_proposal_diff;
+mod cli_routing;
 mod cli_run_identity;
+mod cli_runs_list;
 mod cli_tool_success;
+mod cli_update;
 #[cfg(test)]
 mod session_export_tests;
 mod table;
@@ -68,6 +73,24 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Read recorded model, Tool and built-in metrics without a model call
+    #[command(
+        after_help = "Examples:\n  formless metrics --since 7d\n  formless metrics --json\n\nTool rows identify stored tool_id values. Reports are independent reads at one cutoff, not a transactional snapshot."
+    )]
+    Metrics {
+        /// Only records since this duration ago (7d, 24h, 1h30m); omitted: all history
+        #[arg(long, value_name = "DURATION", value_parser = parse_since_cutoff)]
+        since: Option<String>,
+        /// Print all three complete replies as one JSON object
+        #[arg(long)]
+        json: bool,
+    },
+    /// Read the daemon's currently available routing decisions without a model call
+    Routing {
+        /// Print the complete daemon reply as one JSON value
+        #[arg(long)]
+        json: bool,
+    },
     /// Launch the TUI (default)
     Tui,
     /// Manage the background daemon and its login service
@@ -269,19 +292,26 @@ enum Cmd {
         action: RelayAction,
     },
     /// Prompt/memory self-optimisation proposals
-    #[command(after_help = "Examples:\n  formless prompts list\n  formless prompts list --json")]
+    #[command(
+        after_help = "Examples:\n  formless prompts list\n  formless prompts list --json\n  formless prompts diff PROPOSAL_ID --json"
+    )]
     Prompts {
         #[command(subcommand)]
         action: PromptsAction,
     },
     /// Check for a newer release, show what changed, and how to upgrade
-    #[command(after_help = "Examples:\n  formless update check\n  formless update --check")]
+    #[command(
+        after_help = "Examples:\n  formless update check\n  formless update --check\n  formless update check --json\n\nJSON: {installed, status, newer_releases: [{tag, url, notes}]}. Status is update_available, up_to_date (within the fetched page), or release_check_unavailable (HTTP 404 status). Checks never execute an updater."
+    )]
     Update {
         #[command(subcommand)]
         action: Option<UpdateAction>,
         /// Only report (same as `update check`)
         #[arg(long)]
         check: bool,
+        /// One JSON report with installed version, response status and ordered release notes
+        #[arg(long, global = true)]
+        json: bool,
     },
     /// Tool registry inspection/transfer (SPEC §7.8, §12)
     #[command(
@@ -500,14 +530,36 @@ enum AuthAction {
 
 /// The pairing link as a terminal QR code, for a phone's camera; only on a
 /// terminal (it holds the secret, so it never goes into a pipe or a log).
+fn pairing_qr_columns(lines: &[String]) -> usize {
+    use unicode_width::UnicodeWidthStr;
+    lines.iter().map(|line| line.width()).max().unwrap_or(0)
+}
+
+fn pairing_qr_fits(lines: &[String], width: Option<u16>) -> bool {
+    !lines.is_empty() && width.is_some_and(|width| pairing_qr_columns(lines) <= width as usize)
+}
+
 fn print_pairing_qr(url: &str) {
     use std::io::IsTerminal;
     if !std::io::stdout().is_terminal() || !table::color_allowed() {
         return;
     }
-    if let Some(code) = formless_tui::qr::ansi(url) {
+    if let Some(lines) = formless_tui::qr::lines(url) {
+        let width = crossterm::terminal::size().ok().map(|(width, _)| width);
+        if !pairing_qr_fits(&lines, width) {
+            if width.is_some() {
+                println!("Widen the terminal to at least {} columns to show the pairing QR code, or open the link above.", pairing_qr_columns(&lines));
+            } else {
+                println!(
+                    "Open the link above; terminal width is unavailable for the pairing QR code."
+                );
+            }
+            return;
+        }
         println!();
-        print!("{code}");
+        for line in lines {
+            println!("\x1b[97;40m{line}\x1b[0m");
+        }
         println!("            Scan with your phone. This code contains the pairing secret:");
         println!(
             "            anyone who sees it can use your daemon. Rotate with --rotate if it leaks."
@@ -552,6 +604,14 @@ enum UpdateAction {
 
 #[derive(Subcommand)]
 enum PromptsAction {
+    /// Show the existing proposal comparison without applying it
+    Diff {
+        /// ID of the prompt or memory proposal to compare
+        id: String,
+        /// Print the complete daemon response as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// List proposals with eval scores
     List {
         /// One JSON value instead of a table
@@ -1007,6 +1067,14 @@ enum MemoryAction {
     },
 }
 
+fn parse_mcp_log_lines(value: &str) -> std::result::Result<usize, String> {
+    value
+        .parse::<usize>()
+        .ok()
+        .filter(|lines| (1..=1000).contains(lines))
+        .ok_or_else(|| "--lines must be between 1 and 1000".into())
+}
+
 #[derive(Subcommand)]
 enum McpAction {
     /// Add a server: `add NAME -- COMMAND [ARGS]` (stdio), `add NAME --url
@@ -1081,8 +1149,8 @@ enum McpAction {
     Log {
         /// Configured MCP server name
         name: String,
-        /// Maximum number of recent stderr log lines to show
-        #[arg(long, default_value_t = 50)]
+        /// Recent stderr log lines to show (minimum 1, maximum 1000)
+        #[arg(long, default_value_t = 50, value_parser = parse_mcp_log_lines)]
         lines: usize,
     },
     /// A server's tools, on or off, with their token cost
@@ -1115,7 +1183,8 @@ enum NamingAction {
     },
     /// Download the model (default: the configured one)
     Pull {
-        /// Model id: qwen2.5-0.5b or lfm2.5-350m
+        /// Model ID to download; omit to use the configured model
+        #[arg(value_parser = NamingModelParser::new())]
         model: Option<String>,
     },
     /// Print the title the namer would give a first message
@@ -1638,6 +1707,50 @@ impl clap::builder::TypedValueParser for DocsTopicParser {
     }
 }
 
+#[derive(Clone)]
+struct NamingModelParser(clap::builder::StringValueParser);
+
+impl NamingModelParser {
+    fn new() -> Self {
+        Self(clap::builder::StringValueParser::new())
+    }
+}
+
+impl clap::builder::TypedValueParser for NamingModelParser {
+    type Value = String;
+
+    fn parse_ref(
+        &self,
+        cmd: &clap::Command,
+        arg: Option<&clap::Arg>,
+        value: &std::ffi::OsStr,
+    ) -> Result<String, clap::Error> {
+        let value = self.0.parse_ref(cmd, arg, value)?;
+        if formless_core::namer::spec(&value).is_some() {
+            return Ok(value);
+        }
+        let choices = formless_core::namer::MODELS
+            .iter()
+            .map(|model| model.id)
+            .collect::<Vec<_>>()
+            .join(", ");
+        Err(cmd.clone().error(
+            clap::error::ErrorKind::InvalidValue,
+            format!("unknown naming model '{value}'; valid model IDs: {choices}"),
+        ))
+    }
+
+    fn possible_values(
+        &self,
+    ) -> Option<Box<dyn Iterator<Item = clap::builder::PossibleValue> + '_>> {
+        Some(Box::new(
+            formless_core::namer::MODELS
+                .iter()
+                .map(|model| clap::builder::PossibleValue::new(model.id)),
+        ))
+    }
+}
+
 fn docs_cmd(topic: Option<&str>, print: bool, keys: bool) -> Result<()> {
     if keys {
         print!("{}", formless_tui::keys_reference());
@@ -1997,6 +2110,18 @@ fn run_cli(cli: Cli) -> Result<()> {
             None => runs_cmd(paths, limit, json),
         },
         Some(Cmd::Jobs { action }) => jobs_cmd(paths, action),
+        Some(Cmd::Metrics { since, json }) => {
+            formless_core::daemon::ensure_daemon(&paths)?;
+            cli_metrics::write_report(&mut std::io::stdout().lock(), since, json, |request| {
+                formless_tui::client::request_once(&paths, request)
+            })
+        }
+        Some(Cmd::Routing { json }) => {
+            formless_core::daemon::ensure_daemon(&paths)?;
+            cli_routing::write_report(&mut std::io::stdout().lock(), json, |request| {
+                formless_tui::client::request_once(&paths, request)
+            })
+        }
         Some(Cmd::Security {
             action: SecurityAction::Status { json },
         }) => {
@@ -2031,9 +2156,11 @@ fn run_cli(cli: Cli) -> Result<()> {
         Some(Cmd::Auth { action }) => auth_cmd(paths, action),
         Some(Cmd::Relay { action }) => relay_cmd(paths, action),
         Some(Cmd::Prompts { action }) => prompts_cmd(paths, action),
-        Some(Cmd::Update { action, check }) => {
-            update_cmd(check || matches!(action, Some(UpdateAction::Check)))
-        }
+        Some(Cmd::Update {
+            action,
+            check,
+            json,
+        }) => update_cmd(check || matches!(action, Some(UpdateAction::Check)), json),
         Some(Cmd::Tools { action }) => tools_cmd(paths, action),
         Some(Cmd::Naming { action }) => naming_cmd(paths, action),
         Some(Cmd::Reset { force }) => reset_cmd(paths, force),
@@ -2384,55 +2511,22 @@ const INSTALL_COMMAND: &str = concat!(
 
 /// `formless update`: what's newer than this build and what changed in
 /// each release, then how to upgrade (`--check` stops after the report).
-fn update_cmd(check: bool) -> Result<()> {
-    let current = env!("CARGO_PKG_VERSION");
-    let body = match update_http::get(
-        "https://api.github.com/repos/athiwatc/formless/releases?per_page=50",
-    ) {
-        Ok(b) => b,
-        Err(e) if e.to_string().contains("404") => {
-            println!("installed: v{current}");
-            println!("latest:    (no published releases yet)");
-            return Ok(());
-        }
-        Err(e) => return Err(e),
-    };
-    let releases: Value = serde_json::from_str(&body).context("parse releases")?;
-    let newer = newer_releases(&releases, current);
-    println!("installed: v{current}");
-    let Some((latest, _, url)) = newer.last() else {
-        println!("up to date");
-        return Ok(());
-    };
-    println!("latest:    {latest}  ({url})");
-    println!();
-    for (tag, notes, _) in &newer {
-        println!("── {tag} ──");
-        println!(
-            "{}",
-            if notes.is_empty() {
-                "(no release notes)"
-            } else {
-                notes
-            }
-        );
-        println!();
-    }
-    if check {
-        println!(
-            "{} newer release(s); `formless update` shows how to upgrade.",
-            newer.len()
-        );
-    } else {
-        println!("To upgrade to {latest}:\n  {}", upgrade_command());
-    }
-    Ok(())
+fn update_cmd(check: bool, json: bool) -> Result<()> {
+    cli_update::report(
+        &mut std::io::stdout().lock(),
+        check,
+        json,
+        env!("CARGO_PKG_VERSION"),
+        upgrade_command(),
+        || update_http::get("https://api.github.com/repos/athiwatc/formless/releases?per_page=50"),
+    )
 }
 
 fn prompts_cmd(paths: Paths, action: PromptsAction) -> Result<()> {
     use formless_tui::client::request_once;
     formless_core::daemon::ensure_daemon(&paths)?;
     match action {
+        PromptsAction::Diff { id, json } => cli_proposal_diff::show(&paths, id, json),
         PromptsAction::List { json } => {
             let v = request_once(&paths, Request::ListProposals)?;
             if json {
@@ -3942,18 +4036,35 @@ fn parse_duration(s: &str) -> Result<std::time::Duration, String> {
         }
         let n: u64 = num.parse().map_err(|_| bad())?;
         num.clear();
-        total += n * match c {
+        let unit = match c {
             's' => 1,
             'm' => 60,
             'h' => 3600,
             'd' => 86_400,
             _ => return Err(bad()),
         };
+        total = n
+            .checked_mul(unit)
+            .and_then(|part| total.checked_add(part))
+            .ok_or_else(bad)?;
     }
     if !num.is_empty() || total == 0 {
         return Err(bad());
     }
     Ok(std::time::Duration::from_secs(total))
+}
+
+fn cutoff_at(value: &str, now: chrono::DateTime<chrono::Utc>) -> Result<String, String> {
+    let duration = parse_duration(value)?;
+    let delta = chrono::Duration::from_std(duration)
+        .map_err(|_| "duration exceeds the supported time range".to_string())?;
+    now.checked_sub_signed(delta)
+        .map(|cutoff| cutoff.to_rfc3339())
+        .ok_or_else(|| "duration produces an unrepresentable UTC cutoff".to_string())
+}
+
+fn parse_since_cutoff(value: &str) -> Result<String, String> {
+    cutoff_at(value, chrono::Utc::now())
 }
 
 /// `1h30m`, `10m`, `45s`.
@@ -6487,24 +6598,16 @@ fn runs_cmd(paths: Paths, limit: usize, json: bool) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&v)?);
         return Ok(());
     }
-    let summary: formless_protocol::RunSummary = serde_json::from_value(v["summary"].clone())?;
-    println!("{}", formless_core::runs::summary_line(&summary));
-    for r in v["runs"].as_array().into_iter().flatten() {
-        println!(
-            "{}  {}  {:<11} {:>3} steps {:>3} tools {:>8} tokens {:>6.1}s",
-            r["run_id"].as_str().unwrap_or_default(),
-            r["created_at"]
-                .as_str()
-                .unwrap_or_default()
-                .get(..19)
-                .unwrap_or_default(),
-            r["outcome"].as_str().unwrap_or_default(),
-            r["steps"],
-            r["tool_calls"],
-            r["prompt_tokens"].as_i64().unwrap_or(0) + r["completion_tokens"].as_i64().unwrap_or(0),
-            r["duration_ms"].as_i64().unwrap_or(0) as f64 / 1000.0
-        );
-    }
+    use std::io::IsTerminal;
+    let width = std::io::stdout()
+        .is_terminal()
+        .then(|| {
+            crossterm::terminal::size()
+                .ok()
+                .map(|(width, _)| width as usize)
+        })
+        .flatten();
+    print!("{}", cli_runs_list::render(&v, width)?);
     Ok(())
 }
 
@@ -9155,3 +9258,32 @@ mod tests {
 #[cfg(test)]
 #[path = "log_cli_tests.rs"]
 mod log_cli_tests;
+
+#[cfg(test)]
+mod pairing_qr_width_tests {
+    #[test]
+    fn pairing_qr_fit_counts_display_columns_and_includes_the_quiet_zone() {
+        use unicode_width::UnicodeWidthStr;
+        let lines = formless_tui::qr::lines("https://example.invalid/#k=private-fixture").unwrap();
+        let required = super::pairing_qr_columns(&lines);
+        assert_eq!(required, lines[0].width());
+        assert!(
+            required < lines[0].len(),
+            "block glyph bytes must not count as columns"
+        );
+        assert!(super::pairing_qr_fits(
+            &lines,
+            Some(required.try_into().unwrap())
+        ));
+        assert!(super::pairing_qr_fits(
+            &lines,
+            Some((required + 1).try_into().unwrap())
+        ));
+        assert!(!super::pairing_qr_fits(
+            &lines,
+            Some((required - 1).try_into().unwrap())
+        ));
+        assert!(!super::pairing_qr_fits(&lines, None));
+        assert!(!super::pairing_qr_fits(&[], Some(80)));
+    }
+}

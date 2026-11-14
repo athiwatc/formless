@@ -3241,12 +3241,13 @@ impl Daemon {
                     .with_context(|| RequestFailure::not_found(format!("no artifact '{id}'")))?;
                 let source =
                     crate::attachment_access::read_artifact_record(&self.paths, &path, bytes)?;
-                let text = String::from_utf8_lossy(&source).into_owned();
-                let total = text.chars().count();
+                let text = String::from_utf8_lossy(&source);
                 let offset = offset.unwrap_or(0);
                 let length = length.unwrap_or(200_000).min(1_000_000);
-                let slice: String = text.chars().skip(offset).take(length).collect();
-                let end = offset + slice.chars().count();
+                let page = crate::artifact_text::page(&text, offset, length);
+                let total = page.total;
+                let slice = page.text;
+                let end = offset + page.selected;
                 // Never the filesystem path (SPEC §9.6).
                 Ok(json!({"id": id, "session_id": session, "bytes": bytes,
                           "total_chars": total, "offset": offset, "end": end, "text": slice}))
@@ -3509,7 +3510,12 @@ impl Daemon {
             }
             Request::JobRuns { id, limit } => {
                 Ok(serde_json::to_value(self.with_reader(|st| {
-                    st.job_runs(&id, limit.unwrap_or(20).clamp(1, 500))
+                    let runs = st.job_runs(&id, limit.unwrap_or(20).clamp(1, 500))?;
+                    if runs.is_empty() {
+                        st.get_job(&id)?
+                            .with_context(|| RequestFailure::not_found(format!("no job '{id}'")))?;
+                    }
+                    Ok(runs)
                 })?)?)
             }
             Request::SetJobOptions {
@@ -6557,7 +6563,7 @@ impl Daemon {
                             matches!(
                                 error.downcast_ref::<crate::provider::StructuredOutputError>(),
                                 Some(
-                                    crate::provider::StructuredOutputError::InvalidJson
+                                    crate::provider::StructuredOutputError::InvalidJson { .. }
                                         | crate::provider::StructuredOutputError::SchemaViolation
                                 )
                             )
@@ -12277,23 +12283,24 @@ impl Daemon {
                 RequestFailure::not_found(format!("no artifact '{id}' in this session"))
             })?;
         let source = crate::attachment_access::read_artifact_record(&self.paths, &path, bytes)?;
-        let text = String::from_utf8_lossy(&source).into_owned();
+        let text = String::from_utf8_lossy(&source);
         if let Some(needle) = args["grep"].as_str().filter(|g| !g.is_empty()) {
             let needle = needle.to_lowercase();
             let hits: Vec<Value> = text
                 .lines()
                 .enumerate()
-                .filter(|(_, l)| l.to_lowercase().contains(&needle))
+                .filter(|(_, l)| crate::artifact_text::contains_lowercase(l, &needle))
                 .take(200)
                 .map(|(i, l)| json!({"line": i + 1, "text": l.chars().take(500).collect::<String>()}))
                 .collect();
             return Ok(json!({"id": id, "matches": hits}).to_string());
         }
-        let total = text.chars().count();
         let offset = args["offset"].as_u64().unwrap_or(0) as usize;
         let length = args["length"].as_u64().unwrap_or(20_000).min(100_000) as usize;
-        let slice: String = text.chars().skip(offset).take(length).collect();
-        let end = (offset + slice.chars().count()).min(total);
+        let page = crate::artifact_text::page(&text, offset, length);
+        let total = page.total;
+        let slice = page.text;
+        let end = (offset + page.selected).min(total);
         Ok(
             json!({"id": id, "offset": offset, "end": end, "total_chars": total, "text": slice})
                 .to_string(),
@@ -12305,16 +12312,17 @@ impl Daemon {
         let (info, _) = self
             .with_store(|st| st.get_module_by_name(name))?
             .with_context(|| RequestFailure::not_found(format!("no module named '{name}'")))?;
+        let want = args["version"].as_i64().unwrap_or(info.current_version);
         let (versions, dependents) = self.with_store(|st| {
             Ok((
-                st.module_versions(&info.id)?,
+                st.module_versions_for_read(&info.id, want)?,
                 st.module_dependents(&info.name)?,
             ))
         })?;
-        let want = args["version"].as_i64().unwrap_or(info.current_version);
         let (version, code, ..) = versions.iter().find(|v| v.0 == want).with_context(|| {
             RequestFailure::not_found(format!("module '{name}' has no version {want}"))
         })?;
+        let code = code.as_ref().context("selected module code is missing")?;
         Ok(json!({
             "name": info.name,
             "description": info.description,
@@ -14584,7 +14592,10 @@ impl Daemon {
             memory.mark_started();
         }
         let mut reader = BufReader::new(read_half);
+        let mut relay_controls = tokio::task::JoinSet::new();
         loop {
+            // Completed control handles must not accumulate on a long-lived CID.
+            while relay_controls.try_join_next().is_some() {}
             let (line, mut input_lease) = tokio::select! {
                 _ = kick.cancelled() => break,
                 r = async {
@@ -14686,7 +14697,7 @@ impl Daemon {
                         let held = input_lease.take();
                         let (this, tx, who, kick) =
                             (self.clone(), tx.clone(), client(), kick.clone());
-                        tokio::spawn(async move {
+                        let control = async move {
                             let _permit = permit;
                             let _input_lease = held;
                             let result = tokio::select! {
@@ -14701,7 +14712,12 @@ impl Daemon {
                                 _ = kick.cancelled() => {}
                                 _ = tx.send(resp) => {}
                             }
-                        });
+                        };
+                        if relay_memory.is_some() {
+                            relay_controls.spawn(control);
+                        } else {
+                            tokio::spawn(control);
+                        }
                         continue;
                     } else {
                         let queued = tokio::select! {
@@ -14756,6 +14772,9 @@ impl Daemon {
             worker.abort();
         }
         let _ = worker.await;
+        // Keep the same control/cancellation behavior, but wait for each relay
+        // task to drop its input/output leases before reporting teardown done.
+        while relay_controls.join_next().await.is_some() {}
         self.sent_keys
             .locked()
             .retain(|(client, _, _), _| *client != Some(conn));
@@ -16396,7 +16415,7 @@ impl HostOps for NestedOps {
         );
         if matches!(
             &value,
-            Err(crate::provider::StructuredOutputError::InvalidJson
+            Err(crate::provider::StructuredOutputError::InvalidJson { .. }
                 | crate::provider::StructuredOutputError::SchemaViolation)
         ) {
             routing_call.claim_contract(identity.clone());
@@ -18783,3 +18802,7 @@ mod read_metrics_limit_tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "module_read_projection_tests.rs"]
+mod module_read_projection_tests;

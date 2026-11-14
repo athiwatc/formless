@@ -18,17 +18,21 @@ mod links;
 mod lists;
 mod markdown;
 mod mermaid;
+mod metrics_tools;
 mod notify;
 mod picker;
 pub mod plain;
 #[cfg(test)]
 mod profile_context_tests;
 pub mod qr;
+mod query;
 mod session_ui;
 mod settings;
 mod text;
 mod text_history;
 mod theme;
+#[cfg(test)]
+mod toast_preview_tests;
 mod ui;
 mod user_commands_ui;
 mod vim;
@@ -100,7 +104,7 @@ pub(crate) fn pane_layout(multi_pane: bool, width: u16) -> bool {
 }
 
 fn colors_enabled() -> bool {
-    std::env::var_os("NO_COLOR").is_none()
+    std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty())
 }
 
 fn fg(enabled: bool, color: Color) -> Style {
@@ -496,6 +500,7 @@ enum Click {
     /// A row of the Sessions, Tools or Proposals list (visible index).
     Session(usize),
     Tool(usize),
+    MetricsTool(String),
     Proposal(usize),
     /// A persisted tool call's header in the chat.
     Call(String),
@@ -1658,6 +1663,7 @@ struct App {
     /// The Proposal shown in the pager for review (`a`/`r` decide).
     reviewing: Option<String>,
     metrics_range: usize,
+    metrics_tools: std::cell::RefCell<metrics_tools::State>,
     range_tools: HashMap<String, (i64, Option<f64>)>,
     /// Token use in the range: breakdown (`USAGE_BY`) and its rows.
     usage_by: usize,
@@ -1773,6 +1779,8 @@ struct App {
     on_start: String,
     /// The Ctrl+K Session switcher: (query, selected row).
     switcher: Option<(String, usize)>,
+    switcher_page_rows: std::cell::Cell<usize>,
+    rollback_page_rows: std::cell::Cell<usize>,
     /// `/quit` while Runs are working asks first (SPEC §10.5).
     quit_confirm: bool,
     /// `?` in an approval: explain each capability under it.
@@ -2020,6 +2028,7 @@ impl App {
             tool_filter: lists::ListFilter::default(),
             tool_detail: None,
             metrics_range: 0,
+            metrics_tools: Default::default(),
             reviewing: None,
             usage_by: 0,
             usage_rows: Vec::new(),
@@ -2083,6 +2092,8 @@ impl App {
             approval_explain: false,
             quit_confirm: false,
             switcher: None,
+            switcher_page_rows: std::cell::Cell::new(10),
+            rollback_page_rows: std::cell::Cell::new(10),
             on_start: cfg.tui.on_start.clone(),
             approval_code: None,
             image_placed: Vec::new(),
@@ -4954,18 +4965,28 @@ impl App {
             d.tool.name.clone(),
             d.tool.current_version,
         );
+        if d.versions.is_empty() {
+            return;
+        }
+        let pick = RollbackPick {
+            idx: pick.idx.min(last),
+            ..pick
+        };
+        if let Some(index) = query::navigate(
+            &key,
+            pick.idx,
+            d.versions.len(),
+            self.rollback_page_rows.get(),
+        ) {
+            self.rollback_pick = Some(RollbackPick {
+                idx: index,
+                armed: false,
+                ..pick
+            });
+            return;
+        }
         let version = d.versions[pick.idx].version;
         let next = match key.code {
-            KeyCode::Up => Some(RollbackPick {
-                idx: pick.idx.saturating_sub(1),
-                armed: false,
-                ..pick
-            }),
-            KeyCode::Down => Some(RollbackPick {
-                idx: (pick.idx + 1).min(last),
-                armed: false,
-                ..pick
-            }),
             KeyCode::Enter if version == current => {
                 self.notes.push(format!("v{version} is already current"));
                 Some(pick)
@@ -8413,8 +8434,6 @@ impl App {
         }
         match key.code {
             KeyCode::Esc => self.model_overlay = None,
-            KeyCode::Up => o.picker.up(),
-            KeyCode::Down => o.picker.down(),
             KeyCode::Tab => o.effort_idx = (o.effort_idx + 1) % o.efforts().len().max(1),
             KeyCode::BackTab => {
                 let n = o.efforts().len().max(1);
@@ -8432,9 +8451,9 @@ impl App {
                     );
                 }
             }
-            KeyCode::Backspace => o.picker.backspace(),
-            KeyCode::Char(c) => o.picker.type_char(c),
-            _ => {}
+            _ => {
+                o.picker.key(&key);
+            }
         }
     }
 
@@ -8773,6 +8792,9 @@ impl App {
             };
             return;
         }
+        if w.step == WizardStep::PickModel && key.code != KeyCode::Enter && w.picker.key(&key) {
+            return;
+        }
         if ctrl {
             return;
         }
@@ -8836,15 +8858,13 @@ impl App {
                 _ => {}
             },
             WizardStep::PickModel => match key.code {
-                KeyCode::Up => w.picker.up(),
-                KeyCode::Down => w.picker.down(),
                 KeyCode::Enter if !w.model().trim().is_empty() => {
                     w.step = WizardStep::PickEffort;
                     w.status = "Pick reasoning effort.".into();
                 }
-                KeyCode::Char(c) => w.picker.type_char(c),
-                KeyCode::Backspace => w.picker.backspace(),
-                _ => {}
+                _ => {
+                    w.picker.key(&key);
+                }
             },
             WizardStep::PickEffort => match key.code {
                 KeyCode::Up => w.effort_idx = w.effort_idx.saturating_sub(1),
@@ -9641,10 +9661,14 @@ impl App {
             return;
         }
         if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
-            self.cycle_view(key.code == KeyCode::Tab);
+            if self.view == View::Settings && self.settings_form.is_some() {
+                self.settings_key(key);
+            } else {
+                self.cycle_view(key.code == KeyCode::Tab);
+            }
             return;
         }
-        if self.list_filter_key(key.code) || self.list_nav_key(&key) {
+        if self.list_filter_key(&key) || self.list_nav_key(&key) {
             return;
         }
         match self.view {
@@ -9669,7 +9693,12 @@ impl App {
                 _ => {}
             },
             View::Metrics => {
-                if key.code == KeyCode::Char('r') {
+                if key.code == KeyCode::Enter {
+                    let rows = self.metrics_rows();
+                    if let Some(index) = self.metrics_selection(&rows) {
+                        self.request_tool(rows[index].id.clone());
+                    }
+                } else if key.code == KeyCode::Char('r') {
                     self.metrics_range = (self.metrics_range + 1) % METRIC_RANGES.len();
                     self.load_metrics();
                 } else if key.code == KeyCode::Char('b') {
@@ -10445,9 +10474,15 @@ impl App {
     /// Vim-style movement in every list view (SPEC §10.5): j/k, g/G (or
     /// Home/End) and Ctrl+D/Ctrl+U by half a page; true when used.
     fn list_nav_key(&mut self, key: &KeyEvent) -> bool {
+        let metrics = (self.view == View::Metrics).then(|| self.metrics_rows());
+        let mut metrics_index = metrics
+            .as_ref()
+            .and_then(|rows| self.metrics_selection(rows))
+            .unwrap_or(0);
         let len = match self.view {
             View::Sessions => self.visible_sessions().len(),
-            View::Tools | View::Metrics => self.visible_tools().len(),
+            View::Tools => self.visible_tools().len(),
+            View::Metrics => metrics.as_ref().unwrap().len(),
             View::Proposals => self.visible_proposals().len(),
             _ => return false,
         };
@@ -10455,6 +10490,7 @@ impl App {
         let idx = match self.view {
             View::Sessions => &mut self.session_idx,
             View::Proposals => &mut self.proposal_idx,
+            View::Metrics => &mut metrics_index,
             _ => &mut self.tool_idx,
         };
         let last = len.saturating_sub(1);
@@ -10471,11 +10507,14 @@ impl App {
             KeyCode::Up if self.view == View::Metrics => idx.saturating_sub(1),
             _ => return false,
         };
+        if let Some(rows) = metrics {
+            self.select_metrics_row(&rows, metrics_index);
+        }
         true
     }
 
     /// `/`, `s` and `v` in a list view (SPEC §10.4); true when used.
-    fn list_filter_key(&mut self, code: KeyCode) -> bool {
+    fn list_filter_key(&mut self, event: &KeyEvent) -> bool {
         use lists::*;
         let (filter, idx, sorts, quicks) = match self.view {
             View::Tools => (
@@ -10498,8 +10537,22 @@ impl App {
             ),
             _ => return false,
         };
-        let used = lists::key(filter, code, sorts.len(), quicks.len());
-        if used {
+        let before = (
+            filter.query.len(),
+            filter.sort,
+            filter.quick,
+            filter.editing,
+        );
+        let used = lists::key(filter, event, sorts.len(), quicks.len());
+        if used
+            && before
+                != (
+                    filter.query.len(),
+                    filter.sort,
+                    filter.quick,
+                    filter.editing,
+                )
+        {
             *idx = 0;
         }
         used
@@ -11513,6 +11566,13 @@ fn draw_rollback_picker(f: &mut Frame, app: &App, pick: &RollbackPick) {
     else {
         return;
     };
+    let area = f.area();
+    let rows = (area.height as usize).saturating_sub(6).max(1);
+    app.rollback_page_rows.set(rows);
+    let start = pick
+        .idx
+        .min(d.versions.len().saturating_sub(1))
+        .saturating_sub(rows - 1);
     let mut lines = vec![
         Line::raw(""),
         Line::styled(
@@ -11520,7 +11580,7 @@ fn draw_rollback_picker(f: &mut Frame, app: &App, pick: &RollbackPick) {
             ui::dim(app.color),
         ),
     ];
-    for (i, v) in d.versions.iter().enumerate() {
+    for (i, v) in d.versions.iter().enumerate().skip(start).take(rows) {
         let m = d
             .version_metrics
             .iter()
@@ -11552,11 +11612,10 @@ fn draw_rollback_picker(f: &mut Frame, app: &App, pick: &RollbackPick) {
         if pick.armed {
             "  Enter again to confirm · Esc cancel"
         } else {
-            "  ↑/↓ choose · Enter roll back · Esc cancel"
+            "  ↑/↓ PgUp/PgDn Home/End · Enter roll back · Esc cancel"
         },
         ui::dim(app.color),
     ));
-    let area = f.area();
     let w = 64.min(area.width.saturating_sub(2)).max(1);
     let h = (lines.len() as u16 + 2).min(area.height);
     let rect = Rect {
@@ -11579,10 +11638,15 @@ fn draw_rollback_picker(f: &mut Frame, app: &App, pick: &RollbackPick) {
 /// The model list with the filter line, matched chars highlighted and
 /// the selection kept on screen.
 fn picker_lines(p: &picker::ModelPicker, max_items: usize, color: bool) -> Vec<Line<'static>> {
+    p.set_page_rows(max_items);
     let mut out = vec![Line::from(vec![
         Span::styled("Filter   ", ui::dim(color)),
         Span::raw(format!("{}▏", p.query)),
     ])];
+    out.push(Line::styled(
+        "↑/↓ PgUp/PgDn Home/End · Ctrl+U clear · Ctrl+W word",
+        ui::dim(color),
+    ));
     if p.loading {
         out.push(Line::styled("  loading models…", ui::dim(color)));
         return out;
@@ -11911,39 +11975,131 @@ fn draw_mention_popup(f: &mut Frame, input: Rect, m: &MentionPopup, color: bool)
     );
 }
 
+fn model_overlay_hints(width: usize, color: bool) -> Option<Vec<Line<'static>>> {
+    let actions = [
+        "Enter this Session",
+        "Ctrl+Enter/Alt+Enter/Ctrl+D global default",
+        "Ctrl+T test",
+        "Esc cancel",
+    ];
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for action in actions {
+        if text::width(action) > width {
+            return None;
+        }
+        if !current.is_empty() && text::width(&current) + 3 + text::width(action) > width {
+            lines.push(Line::styled(std::mem::take(&mut current), ui::dim(color)));
+        }
+        if !current.is_empty() {
+            current.push_str(" · ");
+        }
+        current.push_str(action);
+    }
+    if !current.is_empty() {
+        lines.push(Line::styled(current, ui::dim(color)));
+    }
+    Some(lines)
+}
+
 fn draw_model_overlay(f: &mut Frame, o: &ModelOverlay, color: bool) {
     let area = f.area();
-    let max_items = (area.height as usize).saturating_sub(10).clamp(3, 20);
-    let mut lines = picker_lines(&o.picker, max_items, color);
-    lines.push(Line::raw(""));
-    if o.efforts().len() <= 1 {
-        lines.push(Line::styled(
-            "Effort   has no effect for this model",
-            ui::dim(color),
-        ));
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let w = 84.min(area.width.saturating_sub(2)).max(1);
+    let inner_width = w.saturating_sub(2);
+    let fallback = |f: &mut Frame| {
+        let h = area.height.min(4);
+        let rect = Rect {
+            x: area.x + area.width.saturating_sub(w) / 2,
+            y: area.y + area.height.saturating_sub(h) / 3,
+            width: w,
+            height: h,
+        };
+        let messages = if h >= 4 {
+            vec!["Too small; resize", "Esc cancel"]
+        } else {
+            vec!["Resize"]
+        };
+        let lines: Vec<_> = messages
+            .into_iter()
+            .map(|message| Line::raw(text::truncate(message, inner_width as usize)))
+            .collect();
+        f.render_widget(Clear, rect);
+        f.render_widget(
+            Paragraph::new(lines).block(ui::panel(" Model ", color, Color::Cyan)),
+            rect,
+        );
+    };
+    let Some(hints) = model_overlay_hints(inner_width as usize, color) else {
+        fallback(f);
+        return;
+    };
+    let effort = if o.efforts().len() <= 1 {
+        Line::styled("Effort   has no effect for this model", ui::dim(color))
     } else {
-        lines.push(Line::from(vec![
+        Line::from(vec![
             Span::styled("Effort   ", ui::dim(color)),
             Span::raw(o.effort().unwrap_or("default (provider)")),
             Span::styled("  (Tab to change)", ui::dim(color)),
-        ]));
+        ])
+    };
+    let effort_height = Paragraph::new(effort.clone())
+        .wrap(Wrap { trim: false })
+        .line_count(inner_width);
+    let footer_height = 1 + effort_height + hints.len();
+    let body_height = (area.height as usize).saturating_sub(footer_height + 2);
+    if body_height < 2 {
+        fallback(f);
+        return;
     }
-    lines.push(Line::styled(
-        "Enter this Session · Ctrl+Enter/Alt+Enter/Ctrl+D global default · Ctrl+T test · Esc cancel",
-        ui::dim(color),
-    ));
-    let w = 84.min(area.width.saturating_sub(2)).max(1);
-    let h = (lines.len() as u16 + 2).min(area.height);
+    let mut max_items = body_height.saturating_sub(3).clamp(1, 20);
+    let mut lines = picker_lines(&o.picker, max_items, color);
+    while lines.len() > body_height && max_items > 1 {
+        max_items -= 1;
+        lines = picker_lines(&o.picker, max_items, color);
+    }
+    if lines.len() > body_height {
+        fallback(f);
+        return;
+    }
+    let body_lines = lines.len() as u16;
+    let hint_height = hints.len() as u16;
+    let h = body_lines + footer_height as u16 + 2;
     let rect = Rect {
         x: area.x + area.width.saturating_sub(w) / 2,
         y: area.y + area.height.saturating_sub(h) / 3,
         width: w,
         height: h,
     };
+    let block = ui::panel(" Model ", color, Color::Cyan);
+    let inner = block.inner(rect);
     f.render_widget(Clear, rect);
+    f.render_widget(block, rect);
     f.render_widget(
-        Paragraph::new(lines).block(ui::panel(" Model ", color, Color::Cyan)),
-        rect,
+        Paragraph::new(lines),
+        Rect {
+            height: body_lines,
+            ..inner
+        },
+    );
+    let footer_y = inner.y + body_lines + 1;
+    f.render_widget(
+        Paragraph::new(effort).wrap(Wrap { trim: false }),
+        Rect {
+            y: footer_y,
+            height: effort_height as u16,
+            ..inner
+        },
+    );
+    f.render_widget(
+        Paragraph::new(hints),
+        Rect {
+            y: footer_y + effort_height as u16,
+            height: hint_height,
+            ..inner
+        },
     );
 }
 
@@ -12273,7 +12429,11 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App, show_cursor: bool) {
     if let Some(forecast) = &app.forecast.hint {
         title.push_str(&format!(" · {} ", truncate_chars(&forecast.hint, 100)));
     }
-    let flashing = app.target_flash.is_some_and(|t| Instant::now() < t);
+    if let Some(notice) = app.input.edit_notice() {
+        title = format!(" {notice} ");
+    }
+    let flashing =
+        app.input.edit_notice().is_some() || app.target_flash.is_some_and(|t| Instant::now() < t);
     let mut block = ui::panel(
         title,
         app.color,
@@ -12612,11 +12772,103 @@ fn is_error_note(note: &str) -> bool {
 /// How long an ordinary toast stays.
 const TOAST_SECS: u64 = 6;
 
+/// One bounded switcher row; matching/scoring stays in `switcher_matches`.
+fn switcher_session_line(
+    session: &SessionInfo,
+    query: &str,
+    width: usize,
+    selected: bool,
+    color: bool,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Line<'static> {
+    let clip = |value: &str, width| {
+        if width == 0 {
+            String::new()
+        } else {
+            truncate_chars(value, width)
+        }
+    };
+    let tag_parts: Vec<_> = session.tags.iter().map(|tag| format!("#{tag}")).collect();
+    let tags = tag_parts.join(" ");
+    let tag_only = !query.trim().is_empty()
+        && formless_core::fuzzy::fuzzy_match(query, &session.name).is_none()
+        && formless_core::fuzzy::fuzzy_match(query, session.preview.as_deref().unwrap_or(""))
+            .is_none();
+    let priority = if tag_only {
+        formless_core::fuzzy::fuzzy_match(query, &tags)
+            .and_then(|(_, positions)| positions.first().copied())
+            .and_then(|position| {
+                let mut start = 0;
+                tag_parts.iter().position(|tag| {
+                    let end = start + tag.chars().count();
+                    let hit = position >= start && position < end;
+                    start = end + 1;
+                    hit
+                })
+            })
+    } else {
+        None
+    };
+    let tags = priority.map_or(tags, |priority| {
+        std::iter::once(tag_parts[priority].as_str())
+            .chain(
+                tag_parts
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| *index != priority)
+                    .map(|(_, tag)| tag.as_str()),
+            )
+            .collect::<Vec<_>>()
+            .join(" ")
+    });
+    let marker = clip(if selected { "› " } else { "  " }, width);
+    let available = width.saturating_sub(text::width(&marker));
+    let tag_budget = text::width(&tags).min(if tag_only {
+        available.saturating_sub((available / 3).min(12) + 2)
+    } else {
+        (available / 3).min(24)
+    });
+    let name_budget = available
+        .saturating_sub(tag_budget + if tag_budget > 0 { 2 } else { 0 })
+        .min(40);
+    let name = clip(&session.name, name_budget);
+    let tags = clip(&tags, tag_budget);
+    let tag_text = if tags.is_empty() {
+        String::new()
+    } else {
+        format!("  {tags}")
+    };
+    let used = text::width(&marker) + text::width(&name) + text::width(&tag_text);
+    let metadata = format!(
+        "  {}{}",
+        ui::relative_time(&session.updated_at, now),
+        session
+            .preview
+            .as_deref()
+            .map(|preview| format!(" · “{preview}”"))
+            .unwrap_or_default()
+    );
+    let metadata = clip(&metadata, width.saturating_sub(used));
+    Line::from(vec![
+        Span::styled(
+            format!("{marker}{name}"),
+            if selected {
+                bold_fg(color, Color::Green)
+            } else {
+                Style::default()
+            },
+        ),
+        Span::styled(tag_text, ui::dim(color)),
+        Span::styled(metadata, ui::dim(color)),
+    ])
+}
+
 /// The Ctrl+K Session switcher.
 fn draw_switcher(f: &mut Frame, app: &App, query: &str, sel: usize) {
     let area = f.area();
     let matches = app.switcher_matches(query);
     let rows = (area.height as usize).saturating_sub(8).clamp(1, 12);
+    app.switcher_page_rows.set(rows);
     let sel = sel.min(matches.len().saturating_sub(1));
     let start = sel.saturating_sub(rows - 1);
     let mut lines = vec![Line::from(vec![
@@ -12624,35 +12876,16 @@ fn draw_switcher(f: &mut Frame, app: &App, query: &str, sel: usize) {
         Span::raw(format!("{query}▏")),
     ])];
     let now = chrono::Utc::now();
+    let w = 90.min(area.width.saturating_sub(2)).max(1);
     for (k, &i) in matches.iter().enumerate().skip(start).take(rows) {
-        let s = &app.sessions[i];
-        let here = k == sel;
-        let style = if here {
-            bold_fg(app.color, Color::Green)
-        } else {
-            Style::default()
-        };
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!(
-                    "{} {}",
-                    if here { "›" } else { " " },
-                    truncate_chars(&s.name, 40)
-                ),
-                style,
-            ),
-            Span::styled(
-                format!(
-                    "  {}{}",
-                    ui::relative_time(&s.updated_at, now),
-                    s.preview
-                        .as_deref()
-                        .map(|p| format!(" · “{}”", truncate_chars(p, 50)))
-                        .unwrap_or_default()
-                ),
-                ui::dim(app.color),
-            ),
-        ]));
+        lines.push(switcher_session_line(
+            &app.sessions[i],
+            query,
+            w.saturating_sub(2) as usize,
+            k == sel,
+            app.color,
+            now,
+        ));
     }
     if matches.is_empty() {
         lines.push(Line::styled(
@@ -12661,10 +12894,17 @@ fn draw_switcher(f: &mut Frame, app: &App, query: &str, sel: usize) {
         ));
     }
     lines.push(Line::styled(
-        "Enter switch · Ctrl+N new Session named this · Esc close",
+        format!(
+            "{}/{} · Enter switch · Ctrl+N new Session named this · Esc close",
+            if matches.is_empty() { 0 } else { sel + 1 },
+            matches.len()
+        ),
         ui::dim(app.color),
     ));
-    let w = 90.min(area.width.saturating_sub(2)).max(1);
+    lines.push(Line::styled(
+        "PgUp/PgDn Home/End · Ctrl+U clear · Ctrl+W word",
+        ui::dim(app.color),
+    ));
     let h = (lines.len() as u16 + 2).min(area.height);
     let rect = Rect::new(
         area.x + area.width.saturating_sub(w) / 2,
@@ -12726,34 +12966,49 @@ fn draw_quit_confirm(f: &mut Frame, app: &App) {
 /// Recent notes as toasts in the top-right corner of `area`, newest at
 /// the bottom; errors in red until dismissed.
 fn draw_toasts(f: &mut Frame, area: Rect, app: &App) {
-    let live: Vec<&(String, Instant, bool)> = app.toasts.iter().rev().take(4).rev().collect();
-    if live.is_empty() || area.width < 20 || area.height < 4 {
+    if app.toasts.is_empty() || area.width < 20 || area.height < 4 {
         return;
     }
     let w = (area.width / 2).clamp(20, 64);
-    let lines: Vec<Line> = live
+    // The top offset and both borders consume three rows. Reserve one
+    // preview row for every retained toast before expanding any error.
+    let budget = area.height.saturating_sub(3) as usize;
+    let live: Vec<_> = app.toasts.iter().rev().take(4.min(budget)).rev().collect();
+    let mut shortened = app
+        .toasts
         .iter()
-        .map(|(text, _, error)| {
-            Line::styled(
-                truncate_chars(
-                    &if *error {
-                        ui::status_text(app.color, SemanticTone::Bad, text)
-                    } else {
-                        text.clone()
-                    },
-                    w as usize - 4,
-                ),
-                if *error {
-                    bold_fg(app.color, Color::Red)
-                } else {
-                    fg(app.color, Color::Gray)
-                },
-            )
-        })
-        .collect();
+        .rev()
+        .take(4)
+        .skip(live.len())
+        .any(|t| t.2);
+    let mut lines = Vec::new();
+    for (index, (text, _, error)) in live.iter().enumerate() {
+        let style = if *error {
+            bold_fg(app.color, Color::Red)
+        } else {
+            fg(app.color, Color::Gray)
+        };
+        if *error {
+            let cap = (budget - lines.len() - (live.len() - index - 1)).min(3);
+            let (rows, omitted) = toast_error_rows(
+                &ui::status_text(app.color, SemanticTone::Bad, text),
+                w as usize - 4,
+                cap,
+            );
+            shortened |= omitted;
+            lines.extend(rows.into_iter().map(|row| Line::styled(row, style)));
+        } else {
+            lines.push(Line::styled(truncate_chars(text, w as usize - 4), style));
+        }
+    }
     let any_error = live.iter().any(|t| t.2);
-    let h = (lines.len() as u16 + 2).min(area.height);
-    let rect = Rect::new(area.right().saturating_sub(w + 1), area.y + 1, w, h);
+    let h = lines.len() as u16 + 2;
+    let rect = Rect::new(
+        area.right().saturating_sub(w + 1).max(area.x),
+        area.y + 1,
+        w,
+        h,
+    );
     let mut block = ui::panel(
         " notes ",
         app.color,
@@ -12763,11 +13018,58 @@ fn draw_toasts(f: &mut Frame, area: Rect, app: &App) {
             Color::DarkGray
         },
     );
-    if any_error {
-        block = block.title_bottom(ui::hint("Esc dismisses", app.color));
+    if any_error || shortened {
+        let hint = if shortened {
+            ["Esc dismisses · /notes full text", "Esc · /notes", "/notes"]
+                .into_iter()
+                .find(|hint| text::width(hint) <= w as usize - 4)
+                .unwrap()
+        } else {
+            "Esc dismisses"
+        };
+        block = block.title_bottom(ui::hint(hint, app.color));
     }
     f.render_widget(Clear, rect);
     f.render_widget(Paragraph::new(lines).block(block), rect);
+}
+
+/// A bounded error preview, stopping at the row cap and between graphemes.
+/// Other than line breaks, text controls follow the existing toast policy.
+fn toast_error_rows(text: &str, width: usize, cap: usize) -> (Vec<String>, bool) {
+    use unicode_segmentation::UnicodeSegmentation;
+    let mut rows = vec![String::new()];
+    let mut omitted = false;
+    let mut clusters = text.graphemes(true).peekable();
+    while let Some(cluster) = clusters.next() {
+        if cluster == "\n" || cluster == "\r\n" {
+            if rows.len() == cap {
+                omitted |= clusters.peek().is_some();
+                break;
+            }
+            rows.push(String::new());
+            continue;
+        }
+        if text::width(rows.last().unwrap()) + text::width(cluster) > width {
+            if rows.len() == cap {
+                omitted = true;
+                break;
+            }
+            rows.push(String::new());
+        }
+        if text::width(cluster) > width {
+            rows.last_mut()
+                .unwrap()
+                .push_str(&text::truncate(cluster, width));
+            omitted = true;
+        } else {
+            rows.last_mut().unwrap().push_str(cluster);
+        }
+    }
+    if omitted {
+        let last = rows.last_mut().unwrap();
+        *last = text::truncate(&format!("{last}…"), width);
+    }
+    (rows, omitted)
 }
 
 /// Speaker groups: tool results belong to the assistant turn around them.
@@ -13759,6 +14061,15 @@ impl App {
                     self.key(enter);
                 }
             }
+            Click::MetricsTool(id) => {
+                let rows = self.metrics_rows();
+                if let Some(index) = rows.iter().position(|tool| tool.id == id) {
+                    self.select_metrics_row(&rows, index);
+                    if double {
+                        self.key(enter);
+                    }
+                }
+            }
             Click::Proposal(i) => self.proposal_idx = i,
             Click::Call(id) => {
                 if !self.expanded_calls.remove(&id) {
@@ -14435,7 +14746,7 @@ impl App {
             return;
         };
         let matches = self.switcher_matches(&query);
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let ctrl = key.modifiers == KeyModifiers::CONTROL;
         match key.code {
             KeyCode::Esc => self.switcher = None,
             KeyCode::Char('n') if ctrl => {
@@ -14452,17 +14763,18 @@ impl App {
                     self.view = View::Chat;
                 }
             }
-            KeyCode::Up => self.switcher = Some((query, sel.saturating_sub(1))),
-            KeyCode::Down => {
-                self.switcher = Some((query, (sel + 1).min(matches.len().saturating_sub(1))))
+            _ => {
+                let mut query = query;
+                if let Some(changed) = query::edit(&mut query, &key) {
+                    if changed {
+                        self.switcher = Some((query, 0));
+                    }
+                } else if let Some(selected) =
+                    query::navigate(&key, sel, matches.len(), self.switcher_page_rows.get())
+                {
+                    self.switcher = Some((query, selected));
+                }
             }
-            KeyCode::Backspace => {
-                let mut q = query;
-                q.pop();
-                self.switcher = Some((q, 0));
-            }
-            KeyCode::Char(c) if !ctrl => self.switcher = Some((format!("{query}{c}"), 0)),
-            _ => {}
         }
     }
 
@@ -16080,8 +16392,12 @@ struct UsageRow {
 
 /// `12.3k`, `4.5M`.
 fn short_count(n: i64) -> String {
+    // Compact labels are separate from locale-aware full counts. Promote
+    // before a one-decimal lower unit would round to 1000.0; B is the highest
+    // unit even for larger totals. Negative/zero counts retain exact spelling.
     match n {
-        1_000_000.. => format!("{:.1}M", n as f64 / 1e6),
+        999_950_000.. => format!("{:.1}B", n as f64 / 1e9),
+        999_950.. => format!("{:.1}M", n as f64 / 1e6),
         1_000.. => format!("{:.1}k", n as f64 / 1e3),
         _ => n.to_string(),
     }
@@ -16274,7 +16590,13 @@ fn table_header(cols: &[&'static str], color: bool) -> Row<'static> {
 }
 
 fn draw_metrics(f: &mut Frame, area: Rect, app: &App) {
-    let detail_h = if app.tool_detail.is_some() { 5 } else { 0 };
+    let tools = app.metrics_rows();
+    let selected = app.metrics_selection(&tools);
+    let detail = app
+        .tool_detail
+        .as_ref()
+        .filter(|detail| selected.is_some_and(|index| tools[index].id == detail.tool.id));
+    let detail_h = if tools.is_empty() { 0 } else { 5 };
     let routing_h = if app.model_stats.is_empty() {
         0
     } else {
@@ -16369,24 +16691,7 @@ fn draw_metrics(f: &mut Frame, area: Rect, app: &App) {
             parts[4],
         );
     }
-    // In a range, each Tool's calls and success rate within it.
-    let ranged = !app.metrics_range.is_multiple_of(METRIC_RANGES.len());
-    let tools: Vec<ToolInfo> = app
-        .tools
-        .iter()
-        .map(|t| {
-            let mut t = t.clone();
-            if ranged {
-                let (n, rate) = app.range_tools.get(&t.id).copied().unwrap_or((0, None));
-                t.invocations = n;
-                t.success_rate = rate;
-            }
-            t
-        })
-        .collect();
-    let mut sorted: Vec<&ToolInfo> = tools.iter().collect();
-    sorted.sort_by_key(|t| std::cmp::Reverse(t.invocations));
-    let rows: Vec<Row> = sorted
+    let rows: Vec<Row> = tools
         .iter()
         .map(|t| {
             let mut row_cells = tool_cells(t, app.color);
@@ -16420,7 +16725,8 @@ fn draw_metrics(f: &mut Frame, area: Rect, app: &App) {
             parts[0],
         );
     } else {
-        f.render_widget(
+        let mut state = app.metrics_tools.borrow_mut();
+        f.render_stateful_widget(
             Table::new(
                 rows,
                 [
@@ -16436,11 +16742,29 @@ fn draw_metrics(f: &mut Frame, area: Rect, app: &App) {
                 app.color,
             ))
             .column_spacing(2)
+            .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+            .highlight_symbol("› ")
             .block(block),
             parts[0],
+            &mut state.table,
         );
+        let offset = state.table.offset();
+        drop(state);
+        let height = parts[0].height.saturating_sub(3) as usize;
+        for (index, tool) in tools.iter().enumerate().skip(offset).take(height) {
+            clickable(
+                app,
+                Rect::new(
+                    parts[0].x + 1,
+                    parts[0].y + 2 + (index - offset) as u16,
+                    parts[0].width.saturating_sub(2),
+                    1,
+                ),
+                Click::MetricsTool(tool.id.clone()),
+            );
+        }
     }
-    if let Some(d) = &app.tool_detail {
+    if let Some(d) = detail {
         let m = &d.metrics;
         let pct = |r: Option<f64>| {
             r.map(|r| format!("{:.1}%", r * 100.0))
@@ -16489,13 +16813,23 @@ fn draw_metrics(f: &mut Frame, area: Rect, app: &App) {
         f.render_widget(
             Paragraph::new(lines).block(ui::panel(
                 if d.tool.title.is_empty() {
-                    format!(" {} ", d.tool.name)
+                    format!(" {} · all time ", d.tool.name)
                 } else {
-                    format!(" {} · {} ", d.tool.title, d.tool.name)
+                    format!(" {} · {} · all time ", d.tool.title, d.tool.name)
                 },
                 app.color,
                 Color::Yellow,
             )),
+            parts[1],
+        );
+    } else if let Some(index) = selected {
+        f.render_widget(
+            Paragraph::new(format!(
+                "Enter loads detail for {} (all time).",
+                tools[index].name
+            ))
+            .wrap(Wrap { trim: false })
+            .block(ui::panel(" Tool detail ", app.color, Color::Yellow)),
             parts[1],
         );
     }
@@ -16592,6 +16926,13 @@ fn draw_proposals(f: &mut Frame, area: Rect, app: &App) {
         .map(|&i| &app.proposals[i])
         .map(|p| {
             let scores = match (p.baseline_score, p.candidate_score) {
+                (Some(b), Some(c)) if b.is_finite() && c.is_finite() && b == c => Line::from(vec![
+                    Span::styled(format!("{:.0}%", c * 100.0), ui::dim(app.color)),
+                    Span::styled(
+                        format!(" vs {:.0}% ({})", b * 100.0, p.eval_total),
+                        ui::dim(app.color),
+                    ),
+                ]),
                 (Some(b), Some(c)) => Line::from(vec![
                     Span::styled(
                         ui::status_text(
@@ -17844,6 +18185,8 @@ fn draw_editor(f: &mut Frame, ed: &EditorState, app: &App) {
     };
     let hints = if ed.confirm_exit {
         " Discard unsaved edit? y discard · n/Esc keep".to_owned()
+    } else if let Some(notice) = ed.draft.as_ref().and_then(input::InputLine::edit_notice) {
+        notice.to_owned()
     } else {
         format!("{hints} · Ctrl+G external editor · Ctrl+_ undo · Alt+/ redo")
     };
@@ -18116,13 +18459,23 @@ fn draw_wizard(f: &mut Frame, w: &Wizard, color: bool) {
     text.push(Line::raw(""));
     let mut hint_rows = 0;
     if let Some(hint) = &w.setup_hint {
-        let rows = wrap_rows(
-            hint,
-            f.area().width.min(84).saturating_sub(2).max(1) as usize,
-        );
-        hint_rows = rows.len() + 1;
-        text.extend(rows.into_iter().map(Line::raw));
-        text.push(Line::raw(""));
+        let width = f.area().width.min(84).saturating_sub(2).max(1) as usize;
+        // Leave room for the active controls and navigation footer, even when
+        // many saved profiles (or long profile names) produce a large CLI hint.
+        let budget = (f.area().height as usize)
+            .saturating_sub(15 + status_extra)
+            .min(4);
+        if budget > 0 {
+            let mut rows = wrap_rows(hint, width);
+            if rows.len() > budget {
+                let more = wrap_rows("More: formless profiles list", width);
+                rows.truncate(budget.saturating_sub(more.len()));
+                rows.extend(more.into_iter().take(budget));
+            }
+            hint_rows = rows.len() + 1;
+            text.extend(rows.into_iter().map(Line::raw));
+            text.push(Line::raw(""));
+        }
     }
     let area = f.area();
     let max_items = (area.height as usize)
@@ -18406,19 +18759,12 @@ pub fn run_with(paths: Paths, start: Option<&str>) -> Result<()> {
 
 /// "3 steps · 12.3k in / 1.2k out · 40% cached · $0.021" (SPEC §10.6).
 fn usage_text(u: &formless_protocol::UsageInfo) -> String {
-    fn k(n: i64) -> String {
-        if n >= 1000 {
-            format!("{:.1}k", n as f64 / 1000.0)
-        } else {
-            n.to_string()
-        }
-    }
     let mut s = format!(
         "{} step{} · {} in / {} out",
         u.steps,
         if u.steps == 1 { "" } else { "s" },
-        k(u.prompt_tokens),
-        k(u.completion_tokens)
+        short_count(u.prompt_tokens),
+        short_count(u.completion_tokens)
     );
     if u.prompt_tokens > 0 && u.cached_tokens > 0 {
         s.push_str(&format!(
@@ -18427,7 +18773,10 @@ fn usage_text(u: &formless_protocol::UsageInfo) -> String {
         ));
     }
     if u.cache_write_tokens > 0 {
-        s.push_str(&format!(" · {} written to cache", k(u.cache_write_tokens)));
+        s.push_str(&format!(
+            " · {} written to cache",
+            short_count(u.cache_write_tokens)
+        ));
     }
     match u.cost {
         Some(c) => s.push_str(&format!(" · ${c:.3}")),
@@ -18566,6 +18915,7 @@ mod tests {
             tool_filter: lists::ListFilter::default(),
             tool_detail: None,
             metrics_range: 0,
+            metrics_tools: Default::default(),
             reviewing: None,
             usage_by: 0,
             usage_rows: Vec::new(),
@@ -18629,6 +18979,8 @@ mod tests {
             approval_explain: false,
             quit_confirm: false,
             switcher: None,
+            switcher_page_rows: std::cell::Cell::new(10),
+            rollback_page_rows: std::cell::Cell::new(10),
             on_start: "last".into(),
             approval_code: None,
             image_placed: Vec::new(),
@@ -20837,6 +21189,32 @@ mod tests {
     }
 
     #[test]
+    fn wizard_bounds_long_alternate_profile_hints_and_keeps_controls_visible() {
+        let mut app = test_app();
+        let mut wizard = Wizard::new(&Config::default());
+        let hint = (0..20)
+            .map(|i| format!("Profile 'saved-{i}': formless --profile saved-{i}\n"))
+            .collect::<String>();
+        wizard.setup_hint = Some(hint.clone());
+        app.wizard = Some(wizard);
+        for (width, height) in [(80, 24), (40, 24), (80, 16)] {
+            let screen = render(&mut app, width, height);
+            assert!(screen.contains("1. OpenAI"), "{width}x{height}: {screen}");
+            assert!(screen.contains("Enter continue"), "{screen}");
+            for _ in 0..20 {
+                app.key(key(KeyCode::Down));
+            }
+            let screen = render(&mut app, width, height);
+            assert!(screen.contains("Custom URL"), "{screen}");
+            app.wizard.as_mut().unwrap().preset_idx = 0;
+        }
+        assert_eq!(
+            app.wizard.as_ref().unwrap().setup_hint.as_deref(),
+            Some(hint.as_str())
+        );
+    }
+
+    #[test]
     fn wizard_remembers_saved_startup_options() {
         let mut cfg = Config::default();
         cfg.provider.base_url = "https://api.deepseek.com".into();
@@ -20996,6 +21374,98 @@ mod tests {
         ed.apply_modal_line(line);
         assert_eq!(ed.cursor, 0);
         assert_eq!(ed.text(), replacement);
+    }
+
+    #[test]
+    fn oversized_history_refusal_is_visible_for_composer_and_editor() {
+        let mut app = test_app();
+        app.input.set("small");
+        app.input.paste(&"x".repeat(16 * 1024 * 1024 + 1));
+        let visible = app.input.to_string();
+        let expanded = app.input.expanded();
+        app.key(KeyEvent::new(KeyCode::Char('_'), KeyModifiers::CONTROL));
+        assert_eq!(&*app.input, visible);
+        assert_eq!(app.input.expanded(), expanded);
+        let screen = render(&mut app, 120, 24);
+        assert!(
+            screen.contains("Undo refused: current draft exceeds the 16 MiB history limit"),
+            "{screen}"
+        );
+        app.editor = Some(EditorState {
+            draft: Some(app.input.clone()),
+            original: None,
+            confirm_exit: false,
+            review_base_version: None,
+            vim: vim::Vim::default(),
+            tool_id: "fixture".into(),
+            name: "fixture".into(),
+            chars: visible.chars().collect(),
+            cursor: visible.chars().count(),
+            mode: EditMode::Code,
+        });
+        app.key(KeyEvent::new(KeyCode::Char('_'), KeyModifiers::CONTROL));
+        let screen = render(&mut app, 120, 24);
+        assert!(
+            screen.contains("Undo refused: current draft exceeds the 16 MiB history limit"),
+            "{screen}"
+        );
+        assert_eq!(app.editor.as_ref().unwrap().text(), visible);
+        assert_eq!(
+            app.editor
+                .as_ref()
+                .unwrap()
+                .draft
+                .as_ref()
+                .unwrap()
+                .expanded(),
+            expanded
+        );
+    }
+
+    #[test]
+    fn unavailable_cut_is_visible_and_ordinary_yank_cannot_restore_an_older_cut() {
+        let mut app = test_app();
+        app.input.set("older ไทย");
+        app.input.kill_to_start();
+        app.input.set(&"x".repeat(1024 * 1024 + 1));
+        app.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert!(app.input.is_empty());
+        let screen = render(&mut app, 120, 24);
+        assert!(
+            screen.contains("Cut unavailable for Yank (1 MiB limit)"),
+            "{screen}"
+        );
+        assert!(screen.contains("Alt+Y older cuts"), "{screen}");
+        app.key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL));
+        assert!(app.input.is_empty());
+        app.key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::ALT));
+        assert_eq!(app.input, "older ไทย");
+        assert!(!render(&mut app, 120, 24).contains("Cut unavailable for Yank"));
+        let mut line = input::InputLine::from("older editor 🦀");
+        line.kill_to_start();
+        line.set(&"x".repeat(1024 * 1024 + 1));
+        line.kill_to_start();
+        app.editor = Some(EditorState {
+            draft: Some(line),
+            original: None,
+            confirm_exit: false,
+            review_base_version: None,
+            vim: vim::Vim::default(),
+            tool_id: "fixture".into(),
+            name: "fixture".into(),
+            chars: Vec::new(),
+            cursor: 0,
+            mode: EditMode::Code,
+        });
+        let screen = render(&mut app, 120, 24);
+        assert!(
+            screen.contains("Cut unavailable for Yank (1 MiB limit)"),
+            "{screen}"
+        );
+        app.key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL));
+        assert_eq!(app.editor.as_ref().unwrap().text(), "");
+        app.key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::ALT));
+        assert_eq!(app.editor.as_ref().unwrap().text(), "older editor 🦀");
     }
 
     #[test]
@@ -21505,6 +21975,83 @@ mod tests {
             !screen.contains("**"),
             "markdown markers are rendered: {screen}"
         );
+    }
+
+    #[test]
+    fn active_settings_form_owns_tabs_after_overlays_without_hidden_form_capture() {
+        let mut app = test_app();
+        let (client, sent) = DaemonClient::recording();
+        app.client = Some(client);
+        app.view = View::Settings;
+        let mut form = settings::Form::provider(None);
+        form.fields[0].input.set("ไทย provider");
+        form.fields[1].input.set("https://例え.example");
+        let text = form
+            .fields
+            .iter()
+            .map(|field| field.input.to_string())
+            .collect::<Vec<_>>();
+        let cursors = form
+            .fields
+            .iter()
+            .map(|field| field.input.cursor_byte())
+            .collect::<Vec<_>>();
+        let count = form.fields.len();
+        app.settings_form = Some(form);
+        for index in 1..=count {
+            app.key(key(KeyCode::Tab));
+            assert_eq!(app.view, View::Settings);
+            assert_eq!(app.settings_form.as_ref().unwrap().idx, index % count);
+        }
+        app.key(key(KeyCode::BackTab));
+        assert_eq!(app.settings_form.as_ref().unwrap().idx, count - 1);
+        app.key(key(KeyCode::Tab));
+        assert_eq!(app.settings_form.as_ref().unwrap().idx, 0);
+        assert_eq!(
+            app.settings_form
+                .as_ref()
+                .unwrap()
+                .fields
+                .iter()
+                .map(|field| field.input.to_string())
+                .collect::<Vec<_>>(),
+            text
+        );
+        assert_eq!(
+            app.settings_form
+                .as_ref()
+                .unwrap()
+                .fields
+                .iter()
+                .map(|field| field.input.cursor_byte())
+                .collect::<Vec<_>>(),
+            cursors
+        );
+        app.pager = Some(Pager {
+            title: "overlay".into(),
+            lines: vec!["first".into()],
+            top: 0,
+            left: 0,
+            styled: Vec::new(),
+        });
+        app.key(key(KeyCode::Tab));
+        app.key(key(KeyCode::BackTab));
+        assert_eq!(app.settings_form.as_ref().unwrap().idx, 0);
+        assert!(app.pager.is_some());
+        assert_eq!(app.view, View::Settings);
+        assert!(
+            sent.try_recv().is_err(),
+            "field navigation and the pager send no requests"
+        );
+        app.pager = None;
+        app.view = View::Chat;
+        app.key(key(KeyCode::Tab));
+        assert_eq!(app.view, View::Sessions);
+        assert_eq!(app.settings_form.as_ref().unwrap().idx, 0);
+        app.view = View::Settings;
+        app.settings_form = None;
+        app.key(key(KeyCode::Tab));
+        assert_eq!(app.view, View::Chat);
     }
 
     #[test]
@@ -23426,19 +23973,27 @@ mod tests {
                 author: "agent".into(),
             })
             .collect();
+        let selected = |app: &App| {
+            if app.view == View::Metrics {
+                let rows = app.metrics_rows();
+                rows[app.metrics_selection(&rows).unwrap()].name.clone()
+            } else {
+                app.selected_tool().unwrap().name.clone()
+            }
+        };
         for view in [View::Tools, View::Metrics] {
             app.view = view;
             app.tool_idx = 0;
             app.key(key(KeyCode::Char('j')));
             app.key(key(KeyCode::Char('j')));
             app.key(key(KeyCode::Char('k')));
-            assert_eq!(app.selected_tool().unwrap().name, "t01", "{view:?}");
+            assert_eq!(selected(&app), "t01", "{view:?}");
             app.key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
-            assert_eq!(app.selected_tool().unwrap().name, "t11");
+            assert_eq!(selected(&app), "t11");
             app.key(key(KeyCode::Char('G')));
-            assert_eq!(app.selected_tool().unwrap().name, "t29");
+            assert_eq!(selected(&app), "t29");
             app.key(key(KeyCode::Char('g')));
-            assert_eq!(app.selected_tool().unwrap().name, "t00");
+            assert_eq!(selected(&app), "t00");
         }
         // In Proposals, g is "top" now; n generates.
         app.view = View::Proposals;
@@ -24661,6 +25216,69 @@ mod tests {
     }
 
     #[test]
+    fn finite_proposal_score_ties_are_neutral_without_changing_status_or_rounding() {
+        for (theme_name, color) in [("dark", true), ("dark", false), ("colorblind", true)] {
+            let mut app = test_app();
+            let _theme = theme::test_theme(theme_name);
+            app.color = color;
+            app.view = View::Proposals;
+            for (candidate, baseline, expected) in [
+                (Some(0.5), Some(0.5), "50% vs 50%"),
+                (Some(0.50001), Some(0.5), "ok 50% vs 50%"),
+                (Some(0.49999), Some(0.5), "fail 50% vs 50%"),
+                (None, Some(0.5), "unmeasured"),
+                (
+                    Some(f64::INFINITY),
+                    Some(f64::INFINITY),
+                    "fail inf% vs inf%",
+                ),
+            ] {
+                app.proposals = vec![PromptProposalInfo {
+                    id: "fixture".into(),
+                    kind: "prompt".into(),
+                    content: "private proposal".into(),
+                    rationale: "เหตุผล 日本語".into(),
+                    status: "measured".into(),
+                    baseline_score: baseline,
+                    candidate_score: candidate,
+                    eval_total: 20,
+                    est_tokens: 1,
+                    created_at: String::new(),
+                    applied_at: None,
+                }];
+                let screen = render(&mut app, 160, 24);
+                let row = screen
+                    .lines()
+                    .find(|line| line.contains("private proposal"))
+                    .unwrap();
+                let row = row.split_whitespace().collect::<Vec<_>>().join(" ");
+                let redundant = theme::redundant(color);
+                assert_eq!(redundant, !color || theme_name == "colorblind");
+                let expected = if redundant {
+                    expected.to_owned()
+                } else {
+                    expected
+                        .trim_start_matches("ok ")
+                        .trim_start_matches("fail ")
+                        .to_owned()
+                };
+                assert!(row.contains(&expected), "{theme_name}/{color}: {row}");
+                if candidate == Some(0.5) && baseline == Some(0.5) {
+                    assert!(
+                        !row.contains("fail 50%") && !row.contains("ok 50%"),
+                        "{row}"
+                    );
+                }
+                assert!(
+                    row.contains("measured")
+                        && row.contains("เหตุผล")
+                        && row.replace(' ', "").contains("日本語")
+                );
+            }
+        }
+    }
+
+    #[test]
     fn enter_reviews_a_proposal_and_decides_from_the_diff() {
         let mut app = test_app();
         app.view = View::Proposals;
@@ -24763,6 +25381,82 @@ mod tests {
         assert!(screen.contains("24h (r)"), "{screen}");
         assert!(screen.contains("4 invocations"), "{screen}");
         assert!(screen.contains("50%"), "{screen}");
+    }
+
+    #[test]
+    fn compact_usage_units_promote_without_changing_exact_counts_cost_or_percentages() {
+        for (count, expected) in [
+            (i64::MIN, "-9223372036854775808"),
+            (-1000, "-1000"),
+            (0, "0"),
+            (999, "999"),
+            (1000, "1.0k"),
+            (999_949, "999.9k"),
+            (999_950, "1.0M"),
+            (999_999, "1.0M"),
+            (1_000_000, "1.0M"),
+            (12_345_678, "12.3M"),
+            (999_949_999, "999.9M"),
+            (999_950_000, "1.0B"),
+            (1_000_000_000, "1.0B"),
+            (12_345_678_901, "12.3B"),
+            (i64::MAX, "9223372036.9B"),
+        ] {
+            assert_eq!(short_count(count), expected, "{count}");
+        }
+        for count in [-5000, -1, 0, 1, 999, 1000, 12345, 999_900, 999_949] {
+            let prior = if count >= 1000 {
+                format!("{:.1}k", count as f64 / 1000.0)
+            } else {
+                count.to_string()
+            };
+            assert_eq!(short_count(count), prior);
+        }
+        let usage = UsageInfo {
+            steps: 3,
+            prompt_tokens: 999_999,
+            completion_tokens: 12_345_678,
+            cached_tokens: 400_000,
+            cache_write_tokens: 1_000_000,
+            cost: Some(1.23456),
+            memories: 2,
+            ..Default::default()
+        };
+        let expected="3 steps · 1.0M in / 12.3M out · 40% cached · 1.0M written to cache · $1.235 · used 2 memories (/memory used)";
+        assert_eq!(usage_text(&usage), expected);
+        let mut app = test_app();
+        app.current = Some("s1".into());
+        app.run_usage.insert("s1".into(), usage.clone());
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(300, 1)).unwrap();
+        terminal
+            .draw(|frame| draw_status(frame, frame.area(), &app))
+            .unwrap();
+        let status = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(status.contains(expected), "{status}");
+        let (client, sent) = DaemonClient::recording();
+        let (tx, inbox) = mpsc::channel();
+        app.client = Some(client);
+        app.inbox = Some(inbox);
+        app.slash("usage");
+        let request: RequestEnvelope = serde_json::from_str(&sent.try_recv().unwrap()).unwrap();
+        assert!(matches!(request.request, Request::SessionUsage { .. }));
+        tx.send(ServerMessage::Response {
+            id: request.id,
+            ok: true,
+            result: Some(serde_json::json!({"last_run":usage,"total":usage,"runs":2})),
+            error: None,
+        })
+        .unwrap();
+        app.drain_daemon();
+        assert!(app.notes.contains(&format!("last Run: {expected}")));
+        assert!(app.notes.contains(&format!("session (2 Runs): {expected}")));
+        assert_eq!(app.run_usage["s1"], usage);
     }
 
     #[test]
@@ -24968,6 +25662,60 @@ mod tests {
     }
 
     #[test]
+    fn switcher_tag_only_matches_keep_bounded_grapheme_context_visible() {
+        use unicode_segmentation::UnicodeSegmentation;
+        let mut app = test_app();
+        let session: SessionInfo = serde_json::from_value(serde_json::json!({
+            "id":"fixture", "name":"Long unrelated name ".repeat(20),
+            "created_at":"", "updated_at":"2026-01-01", "preview":"unrelated preview ".repeat(30),
+            "tags":["aaa-unrelated-tag-with-long-text", "café👩‍💻日本語"]
+        }))
+        .unwrap();
+        app.sessions = vec![session.clone()];
+        let query = "cafe";
+        let before = app.switcher_matches(query);
+        assert_eq!(before, vec![0]);
+        for width in [0, 1, 2, 8, 20, 38, 58, 88] {
+            let line =
+                switcher_session_line(&session, query, width, true, false, chrono::Utc::now());
+            let text = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>();
+            assert!(crate::text::width(&text) <= width, "{width}: {text}");
+            if width >= 38 {
+                assert!(text.contains("#café👩‍💻日本語"), "{width}: {text}");
+            }
+            // Each clipped field ends at a complete cluster from its source.
+            let tag_span = line.spans[1].content.trim_start().trim_end_matches('…');
+            let source = "#café👩‍💻日本語";
+            if !tag_span.is_empty() && source.starts_with(tag_span) {
+                assert!(
+                    source
+                        .grapheme_indices(true)
+                        .any(|(index, _)| index == tag_span.len())
+                        || tag_span.len() == source.len()
+                );
+            }
+        }
+        for (width, height) in [(100, 24), (60, 18), (40, 12), (12, 6)] {
+            app.switcher = Some((query.into(), 0));
+            let output = render(&mut app, width, height);
+            if width >= 40 {
+                // TestBackend prints an empty trailing cell after each wide glyph.
+                assert!(
+                    output.replace(' ', "").contains("#café👩‍💻日本語"),
+                    "{width}: {output}"
+                );
+            }
+        }
+        assert_eq!(app.switcher_matches(query), before);
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.switcher.is_none());
+    }
+
+    #[test]
     fn ctrl_k_switches_sessions_from_anywhere() {
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
         let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
@@ -25157,6 +25905,71 @@ mod tests {
             .map(|s| s.content.to_string())
             .collect();
         assert_eq!(marked, vec!["@src/main.rs"]);
+    }
+
+    #[test]
+    fn model_overlay_reserves_complete_hints_and_keeps_unicode_selection_visible() {
+        let items = (0..40)
+            .map(|i| picker::ModelItem {
+                id: format!("模型-{i:02}"),
+                source: None,
+                recent: false,
+                detail: None,
+            })
+            .collect();
+        let mut picker = picker::ModelPicker::new(Vec::new());
+        picker.set_items(items, "模型-38");
+        let overlay = ModelOverlay {
+            picker,
+            meta: serde_json::json!({}),
+            effort_idx: 0,
+            default_only: false,
+        };
+        let render_overlay = |width, height| {
+            let mut terminal =
+                Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| draw_model_overlay(frame, &overlay, false))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            (0..height)
+                .map(|y| {
+                    (0..width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                        + "\n"
+                })
+                .collect::<String>()
+        };
+        for (width, height) in [(100, 30), (80, 24), (50, 16), (46, 12), (100, 12)] {
+            let painted = render_overlay(width, height);
+            for action in [
+                "Enter this Session",
+                "Ctrl+Enter/Alt+Enter/Ctrl+D global default",
+                "Ctrl+T test",
+                "Esc cancel",
+            ] {
+                assert!(
+                    painted.contains(action),
+                    "{width}x{height}: {action}: {painted}"
+                );
+            }
+            let selected = painted.lines().find(|line| line.contains('›')).unwrap();
+            assert!(
+                selected.contains('模') && selected.contains('型') && selected.contains("-38"),
+                "{selected}"
+            );
+        }
+        for (width, height) in [(25, 8), (46, 8)] {
+            let painted = render_overlay(width, height);
+            assert!(
+                painted.contains("resize") && painted.contains("Esc cancel"),
+                "{painted}"
+            );
+        }
+        for (width, height) in [(1, 1), (12, 3)] {
+            render_overlay(width, height);
+        }
     }
 
     #[test]

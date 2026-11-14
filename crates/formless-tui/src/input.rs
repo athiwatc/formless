@@ -16,6 +16,10 @@ pub struct InputLine {
     anchor: Option<usize>,
     yank: Option<(usize, usize, usize, bool)>,
     last_kill: bool,
+    /// Retained older cuts are available only by explicit Alt+Y after a
+    /// failed retention, so ordinary Yank cannot impersonate the latest cut.
+    cut_unavailable: bool,
+    history_notice: Option<&'static str>,
     /// Byte offset, always on a char boundary.
     cursor: usize,
     /// Placeholder shown in `text` -> the pasted text it stands for.
@@ -94,6 +98,8 @@ impl InputLine {
             cursor: self.cursor,
             pastes: self.pastes.clone(),
             anchor: self.anchor,
+            cut_unavailable: self.cut_unavailable,
+            history_notice: self.history_notice,
             ..Self::default()
         }
     }
@@ -118,6 +124,7 @@ impl InputLine {
         self.last_kill = false;
     }
     fn before_edit(&mut self, typing: bool) {
+        self.history_notice = None;
         if !self.history.coalesces(typing) {
             let current = self.snapshot();
             self.history.before_edit(&current, typing);
@@ -132,19 +139,41 @@ impl InputLine {
     }
     pub(crate) fn undo(&mut self) -> bool {
         let current = self.snapshot();
-        let Some(s) = self.history.undo(&current) else {
-            return false;
-        };
-        self.restore(s);
-        true
+        match self.history.undo(&current) {
+            crate::text_history::Restore::Value(s) => {
+                self.restore(s);
+                self.history_notice = None;
+                true
+            }
+            crate::text_history::Restore::Empty => {
+                self.history_notice = None;
+                false
+            }
+            crate::text_history::Restore::BudgetRefused => {
+                self.history_notice =
+                    Some("Undo refused: current draft exceeds the 16 MiB history limit");
+                false
+            }
+        }
     }
     pub(crate) fn redo(&mut self) -> bool {
         let current = self.snapshot();
-        let Some(s) = self.history.redo(&current) else {
-            return false;
-        };
-        self.restore(s);
-        true
+        match self.history.redo(&current) {
+            crate::text_history::Restore::Value(s) => {
+                self.restore(s);
+                self.history_notice = None;
+                true
+            }
+            crate::text_history::Restore::Empty => {
+                self.history_notice = None;
+                false
+            }
+            crate::text_history::Restore::BudgetRefused => {
+                self.history_notice =
+                    Some("Redo refused: current draft exceeds the 16 MiB history limit");
+                false
+            }
+        }
     }
 
     pub(crate) fn prepare_selection(&mut self, extend: bool) {
@@ -579,17 +608,30 @@ impl InputLine {
         let consecutive = self.last_kill;
         let prepend = start < self.cursor;
         self.before_edit(false);
-        self.ring.kill(
+        let retained = self.ring.kill(
             self.expanded_range(start, end),
             prepend,
             consecutive,
             self.literal,
         );
         self.remove(start, end);
-        self.last_kill = true;
+        self.last_kill = retained;
+        self.cut_unavailable = !retained;
+    }
+
+    pub(crate) fn kill_notice(&self) -> Option<&'static str> {
+        self.cut_unavailable
+            .then_some("Cut unavailable for Yank (1 MiB limit) · Alt+Y older cuts")
+    }
+
+    pub(crate) fn edit_notice(&self) -> Option<&'static str> {
+        self.history_notice.or_else(|| self.kill_notice())
     }
 
     pub(crate) fn yank(&mut self) -> bool {
+        if self.cut_unavailable {
+            return false;
+        }
         let Some(text) = self.ring.get(0).map(str::to_owned) else {
             return false;
         };
@@ -604,6 +646,13 @@ impl InputLine {
     }
 
     pub(crate) fn cycle_yank(&mut self) -> bool {
+        if self.cut_unavailable {
+            if self.ring.get(0).is_none() {
+                return false;
+            }
+            self.cut_unavailable = false;
+            return self.yank();
+        }
         let Some((start, end, index, base_literal)) = self.yank else {
             return false;
         };
@@ -1206,6 +1255,88 @@ mod tests {
             "returning to a typed draft preserves its original command intent"
         );
     }
+    #[test]
+    fn oversized_visible_and_backing_drafts_refuse_history_without_losing_metadata() {
+        for backing in [false, true] {
+            let mut line = InputLine::from("first");
+            line.insert_str(" second");
+            line.insert_str(" third");
+            assert!(line.undo());
+            if backing {
+                line.text = "[pasted]".into();
+                line.pastes = vec![("[pasted]".into(), "x".repeat(16 * 1024 * 1024 + 1))];
+            } else {
+                line.text = "x".repeat(16 * 1024 * 1024 + 1);
+            }
+            line.cursor = 3;
+            line.anchor = Some(1);
+            line.literal = true;
+            let current = line.snapshot();
+            let history = format!("{:?}", line.history);
+            assert!(!line.undo());
+            assert!(line.edit_notice().unwrap().starts_with("Undo refused:"));
+            assert_eq!(&*line, current.text);
+            assert_eq!(line.cursor, current.cursor);
+            assert_eq!(line.anchor, current.anchor);
+            assert_eq!(line.pastes, current.pastes);
+            assert_eq!(line.literal, current.literal);
+            assert_eq!(format!("{:?}", line.history), history);
+            assert!(!line.redo());
+            assert!(line.edit_notice().unwrap().starts_with("Redo refused:"));
+            assert_eq!(&*line, current.text);
+            assert_eq!(line.cursor, current.cursor);
+            assert_eq!(line.anchor, current.anchor);
+            assert_eq!(line.pastes, current.pastes);
+            assert_eq!(line.literal, current.literal);
+            assert_eq!(format!("{:?}", line.history), history);
+            line.anchor = None;
+            line.end();
+            line.insert_char('!');
+            assert!(line.edit_notice().is_none());
+            let copied = line.expanded();
+            assert_eq!(copied.len(), 16 * 1024 * 1024 + 2);
+            assert!(copied.ends_with('!'));
+        }
+    }
+
+    #[test]
+    fn rejected_cuts_keep_older_yanks_explicit_and_break_the_coalescing_chain() {
+        let mut line = InputLine::from("/quit");
+        line.set_literal(true);
+        line.kill_to_start();
+        line.set(&"x".repeat(1024 * 1024 + 1));
+        line.kill_to_start();
+        assert!(line.is_empty());
+        assert!(line.kill_notice().is_some());
+        assert!(line.projection().kill_notice().is_some());
+        assert!(!line.yank());
+        assert!(line.is_empty());
+        assert!(line.cycle_yank());
+        assert_eq!(line, "/quit");
+        assert!(line.is_literal());
+        assert!(line.kill_notice().is_none());
+        let mut line = InputLine::from("z");
+        line.kill_to_start();
+        line.set(&("a".repeat(1024 * 1024 - 4) + "bbbbbbbbEND"));
+        line.home();
+        line.kill_range(0, 1024 * 1024 - 4);
+        let old = line.ring.get(0).unwrap().to_string();
+        line.kill_range(0, 8);
+        assert!(line.cut_unavailable);
+        assert!(!line.last_kill);
+        assert_eq!(line.ring.get(0), Some(old.as_str()));
+        assert_eq!(line.ring.get(1), Some("z"));
+        line.kill_range(0, 3);
+        assert!(!line.cut_unavailable);
+        assert_eq!(line.ring.get(0), Some("END"));
+        assert_eq!(line.ring.get(1), Some(old.as_str()));
+        assert_eq!(line.ring.get(2), Some("z"));
+        assert!(line.yank());
+        assert_eq!(line, "END");
+        assert!(line.cycle_yank());
+        assert_eq!(&*line, old.as_str());
+    }
+
     #[test]
     fn private_kill_ring_keeps_distinct_intents_and_cycles_without_reclassifying_the_draft() {
         let mut line = InputLine::from("/quit");

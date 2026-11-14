@@ -794,7 +794,7 @@ task, with quality as a gate**.
   candidate's samples, good rate, average time, score or relative cost,
   whether it passed the quality gate, and the rule that decided
   (exploring, nothing qualified yet, or the cheapest qualified).
-  `RoutingDecisions`; TUI `/routing` (pager), web `/routing` (dialog).
+  `RoutingDecisions`; CLI `formless routing [--json]`, TUI `/routing` (pager), web `/routing` (dialog). The CLI preserves report order and returned figures; this wrapper does not change attribution or the report limitations tracked in #1052.
 
 ## 5. Agent loop, Sessions, and Runs
 
@@ -883,10 +883,15 @@ task, with quality as a gate**.
     with Undo.
   - Tool purge: TUI `p` twice; web needs the Tool name typed.
   - `formless reset`: needs `reset` typed.
+  Whitespace-free identifiers joined with `_`, `.`, `-` or `/` rank adjacent
+  prefix tokens before scattered matches, retaining BM25, newest timestamp and
+  recording order within each tier. Every segment remains a prefix; indexed
+  adjacency does not imply literal punctuation or identifier equality.
   Search uses an FTS5 index over message content (schema v24, with
   `unicode61` tokens and diacritics folded). Triggers keep the index
   current through inserts, edits and deletes. Every query word must match
-  as a word prefix, and results are ranked by bm25, then newest. A query
+  as a word prefix. Within each tier, results rank by bm25, then newest
+  timestamp and recording order. A query
   with no word characters falls back to a substring scan. Search runs on a
   reader connection and never takes the store lock.
 
@@ -2197,6 +2202,15 @@ pattern (§4.4).
     deliberately becomes null. A result's `toJSON` is invoked only once.
   - `console`, timers, `JSON`, `cryptoRandom()` (UUID), `randomBytes(n)`
     (base64). Nothing else.
+
+    `sleep(ms)` and `randomBytes(n)` require finite non-negative safe-integer
+    numbers. Invalid inputs throw; requests over `tools.max_sleep_secs` or
+    `tools.max_random_bytes` throw with that setting named, instead of silently
+    coercing, wrapping or shortening. This changes the older permissive API:
+    generated Tools must supply numeric integer values and handle limit errors.
+    Successful `randomBytes(n)` returns base64 decoding to exactly `n` bytes
+    (including zero), subject to supported allocation bounds. Valid sleep keeps
+    cancellation behavior; its wall time still depends on scheduling.
 - Memory cap: the JS heap is capped at the Tool's declared `memory_mb`.
   Exceeding it faults **only that Invocation**, tagged `resource`. The cap is
   a heap cap, not a data-size cap: streaming APIs exist so data Tools
@@ -2222,6 +2236,7 @@ pattern (§4.4).
 - Modules in the UIs: `GetModule {id|name}` returns a `ModuleDetail`: the
   module, its versions oldest first with code and author, and `used_by`,
   the active Tools whose current code loads it.
+
   - **Editing:** `UpdateModuleCode` saves new code as a new version
     (author `user`) through the same syntax and load check as
     `create_module`. Module code needs no `run()`.
@@ -2676,6 +2691,11 @@ Decision: [ADR 0005](docs/adr/0005-run-script-orchestration.md).
     when the nested Invocation ends (§7.5). Each call runs on its own
     thread (§6.1), so `Promise.all` really runs them in parallel. This is
     the same `tools.call` every Tool has.
+    Nested return values retain JSON data semantics, including own `__proto__`
+    properties through callee and caller serialization. Settlement parses the
+    result envelope as JSON and calls the context's settlement function; parse,
+    lookup and call failures use the existing execution-error path.
+
   - At most `scripts.max_parallel` (8) calls per sandbox are in flight;
     the rest queue.
   - A script that returns while a call is still pending fails, as a Tool
@@ -4312,7 +4332,13 @@ run_tool = "network_policy"     # a registry Tool, or…
   `PreviewToolCode {id, code}`, which runs the same gate and saves nothing.
   From the review, Ctrl+S saves, and any other key returns to editing.
   A standalone **Metrics view** (v2, `/metrics`) summarises every Tool's
-  invocations and success rate, with the selected Tool's detail.
+  invocations and success rate. Its table includes all Tools independently of
+  the Tools filter, ordered by invocation count in the current range (stable
+  daemon order for ties). Selection follows Tool identity across range/order
+  changes, clamps when removed and scrolls into view. Enter loads the highlighted
+  Tool's existing all-time detail; unrelated cached detail stays hidden behind
+  an activation hint. Mouse rows use the same identity/order. General paging
+  keys and visible-capacity movement remain a separate concern (#1468).
 - **Bulk actions.** In the TUI Sessions view, Space marks rows (✓, with
   the count in the panel title) and Esc clears the marks. With marks:
   `a` archives them (or restores them if all are archived), `e` exports
@@ -4592,6 +4618,15 @@ undo, redo and replacements invalidate prior asynchronous editor previews.
   switcher over Session names, tags and last messages from any view,
   newest first until you type. Enter opens the Session; Ctrl+N (Ctrl/⌘+
   Enter on the web) starts a new Session named after the typed text.
+  TUI model/wizard queries, list filters and the Session switcher share
+  Ctrl+U clear and Ctrl+W/Alt+Backspace previous-word deletion. Only unmodified
+  or Shift-modified characters enter queries; other Ctrl/Alt character chords
+  are ignored except for the picker's explicit actions. Ctrl+S/Ctrl+V do not
+  cycle list filters. Model, switcher and rollback result pickers support
+  PgUp/PgDn and Home/End, clamped to matches, using their rendered row count
+  (ten rows before the first draw). Rollback navigation disarms confirmation
+  and keeps its selected version visible. General main-list paging is separate
+  (#1468).
 - **Command palette.** Typing `/` at the start of the input opens a popup
   of commands with one-line descriptions, filtered fuzzily (exact prefixes
   first). ↑/↓ select, Tab completes, Enter runs. A command that still
@@ -4688,7 +4723,12 @@ undo, redo and replacements invalidate prior asynchronous editor previews.
     prompt, completion and cached tokens, and the estimated cost.
   - The TUI status line and the web status bar show it for the current
     Session, for example `3 steps · 12.3k in / 1.2k out · 40% cached ·
-    $0.021`.
+    $0.021`. The TUI uses one compact count rule for prompt/completion/cache
+    writes in that status and both `/usage` notes: k, M, then B, with promotion
+    at 999,950 and 999,950,000 so the lower one-decimal unit never reaches
+    1000.0. B remains the highest unit for larger totals; counts below 1,000,
+    including zero/negative inputs, retain their existing exact spelling.
+    Locale-aware full counts and recorded accounting values stay separate.
   - `SessionUsage` returns the last Run and Session totals: TUI and web
     `/usage`, and the web status-bar tooltip.
   - Cost is what the provider billed when it reports it (OpenRouter's
@@ -4926,17 +4966,19 @@ the TUI. Command-specific arguments and defaults are available through
 | `formless jobs` | `list`, `add`, `run`, `history`, `enable`, `disable`, `rm` | Manage scheduled prompts and inspect their history. |
 | `formless logs` | `--follow`, `--level`, `--since`, `--lines` | Read or follow the daemon log and rotated files. |
 | `formless mcp` | `add`, `remove`, `list`, `test`, `login`, `logout`, `catalog`, `import`, `log`, `tools`, `tool` | Manage external MCP servers and inspect their tools/logs. |
+| `formless metrics` | `--since DURATION`, `--json` | Read recorded model, Tool and built-in statistics through independent reports at one cutoff. |
 | `formless memory` | `list`, `add`, `rm`, `edit` | Inspect or change saved user-memory notes. |
 | `formless naming` | `status`, `pull`, `test` | Inspect, install, or preview the embedded Session-naming model. |
 | `formless prices` | `import` | Import a model-price catalog for cost and spending limits. |
 | `formless profiles` | `list`, `rm` | List or remove isolated profiles. |
-| `formless prompts` | `list`, `generate`, `apply`, `reject`, `rollback` | Inspect and manage measured prompt/memory proposals. |
+| `formless prompts` | `list`, `diff`, `generate`, `apply`, `reject`, `rollback` | Inspect existing proposal comparisons and manage measured prompt/memory proposals. |
 | `formless providers` | `list`, `add`, `remove`, `test` | Manage named model providers and test a connection. |
 | `formless relay` | `enable`, `disable`, `status` | Manage encrypted browser access through the relay. |
 | `formless reset` | `--force` | Wipe configuration, credentials, and the current profile's data. |
 | `formless restore` | `FILE` | Replace the database from a backup, preserving the current database. |
 | `formless roles` | `list`, `add`, `rm` | Map named purposes to a provider and model. |
 | `formless run` | `TASK`; `--estimate`, `--session`, `--output`, `--attach` and other Run options | Run one headless task, or print its local forecast without starting it. |
+| `formless routing` | `--json` | Read currently available daemon routing decisions and returned candidate figures without starting a model request. |
 | `formless runs` | No action: list; `show`, `cancel` | List recent Runs, inspect one by ID/prefix, or cancel that exact Run. |
 | `formless security` | `status` | Inspect the daemon's grants, denials, trusted resources, and exposed interfaces. |
 | `formless sessions` | `fork`, `compare`, `list`, `show`, `files`, `rewind`, `rename`, `rm`, `restore`, `import`, `search`, `archive`, `unarchive`, `export` | Manage stored Sessions, follow a Run with `show --follow`, or inspect tracked files. |
@@ -4945,8 +4987,24 @@ the TUI. Command-specific arguments and defaults are available through
 | `formless tools` | `reviews`, `list`, `disable`, `enable`, `undo`, `pin`, `unpin`, `tag`, `show`, `retire`, `restore`, `rollback`, `purge`, `run`, `export`, `import` | Inspect, manage, run, or transfer registry Tools. |
 | `formless tui` | No action | Launch the full-screen terminal client; also the default with no command. |
 | `formless uninstall` | `--keep-data`, `--keep-binary`, `--yes` (alias `--force`) | Remove Formless, optionally retaining data or the binary. |
-| `formless update` | No action, `check`, or `--check` | Show newer release notes and the applicable upgrade command; never rewrite the binary. |
+| `formless update` | No action, `check`, or `--check`; `--json` | Show newer release notes and the applicable upgrade command; never rewrite the binary. |
 | `formless web` | `--port`, `--no-open`, `--stop` | Open, print a link for, or stop the local browser UI. |
+
+`formless metrics --since 7d --json` reads the three existing metrics reports
+with one checked UTC cutoff. Omit `--since` for all history. Tool rows use stored
+`tool_id` values; reports retain their own row order and are independent reads,
+not a transactional snapshot. Runs and daily usage remain separate surfaces.
+
+`update --json`, `update check --json`, and `update --check --json` emit one
+object: `{installed, status, newer_releases: [{tag, url, notes}]}`. Notes retain
+the existing trimmed body and oldest-first order; `installed` has no `v` prefix.
+`update_available` means the fetched page contains newer stable releases;
+`up_to_date` means none in that single 50-release response, without pagination.
+`release_check_unavailable` maps to an actual HTTP 404 response,
+not verified absence of releases. Error text alone never selects this status.
+Completed checks exit 0; other fetch or JSON parse failures remain errors with
+no success JSON. Human output stays unchanged, and the JSON form never runs
+an updater.
 
 ### Root and global flags
 
@@ -5179,7 +5237,7 @@ previous headless Run's Session.
   an unapproved sensitive Invocation fails with a clear error
   (approve first in the TUI), unless `--yes` is passed (auto-approve for
   that Run only: each prompt is answered *once*, nothing is stored). Exit codes: `0` answered, `1` Run errored/paused, `2`
-  usage/config error, `130` interrupted.
+  usage/config error, `3` Run paused because schema validation failed (see `--schema` above), `124` Run timed out (see `--timeout` above), `130` interrupted.
 - `formless daemon start|stop|status` — daemon management (same lifecycle
   rules as §9.1).
 - `formless web [--port N] [--no-open] [--stop]` — the opt-in **local web
@@ -5227,11 +5285,13 @@ previous headless Run's Session.
   terminal you type the confirmation word; anywhere else `--force` is
   required (`--yes` is an alias where it was the old spelling), so piped
   input never confirms. Refusing is a usage error.
-- **Exit codes**, for every command: 0 success; 1 a failure (the daemon,
+- **Exit codes**, common to commands: 0 success; 1 a failure (the daemon,
   the provider, the Tool); 2 a usage mistake (an unknown id, a missing or
   conflicting flag, a bad value, malformed `--input`, a refused
   confirmation), checked before a daemon is started where the client can
-  tell; 124 `run --timeout`; 130 interrupted. Errors print as `error: …`
+  tell; 130 interrupted. Run-specific extensions: 3 Run paused because schema
+  validation failed (see `run --schema` above); 124 Run timed out (see
+  `run --timeout` above). Errors print as `error: …`
   on stderr. Flags that would silently override each other are refused by
   the parser (`run --json --output`, `export NAME --all`, `jobs add --cron
   --at`, `web --stop --port`, `approvals revoke … --all`), and the TUI's
@@ -5585,8 +5645,8 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
 | `tools.inline_limit` | 40 | Tools listed in a Session's frozen first-step listing; others load via `find_tools` (§7.1) |
 | `tools.max_agent_depth` | 1 | How deep `agents.run` sub-agents may nest (§7.6) |
 | `tools.max_tool_depth` | 8 | How deep `tools.call` composition may nest (cycle guard, §7.6) |
-| `tools.max_sleep_secs` | 60 | Longest single `sleep(ms)` in a Tool (§7.5) |
-| `tools.max_random_bytes` | 1048576 | Largest `randomBytes(n)` (§7.5) |
+| `tools.max_sleep_secs` | 60 | Longest single `sleep(ms)` in a Tool; excess is an error (§7.5) |
+| `tools.max_random_bytes` | 1048576 | Largest decoded `randomBytes(n)` result; excess is an error (§7.5) |
 | `tools.fetch_connect_timeout_secs` | 10 | Tool `fetch`/`fetchChunks` connection deadline, clamped to 1–86400 seconds; applies to shared and DNS-pinned clients. DNS admission/resolution waits on each hop are bounded by the smaller of this budget and the remaining total deadline |
 | `tools.fetch_timeout_secs` | 60 | Total Tool HTTP deadline across DNS waits, redirects and response-body reads, clamped to 1–86400 seconds; trickling data does not reset it. Cancellation returns promptly and HTTP workers retain this deadline. OS DNS uses one fixed pool of four workers with at most sixteen queued lookups: expired queued work is skipped and late results discarded. OS lookups cannot be forcibly cancelled; a stalled lookup may retain one of those four fixed workers, while fetch callers still stop waiting at their deadlines. Timeout errors say `fetch timed out`, distinct from connection failures |
 | `tools.max_read_bytes` | 67108864 | Largest `fs.read` or `fetch` body (64 MB): larger fails as a resource error pointing to `fs.readChunks` / `fetchChunks` (§7.5) |
@@ -6181,6 +6241,13 @@ An already terminal Run exits after replay. Historical terminal Runs without
 stored message boundaries display a Note and the initial Session snapshot only;
 follow never invents a boundary or refreshes that legacy transcript without one.
 Connection loss is an error.
+
+`prompts diff ID [--json]` reads the existing daemon proposal comparison:
+target, already-applied state and ordered operation/line pairs. Human output
+does not fit or clip lines to terminal width; JSON preserves the complete
+response. This is a hypothetical without/with comparison, not an application
+dry run or guarantee of permission/success. It performs no proposal evaluation
+or decision; unknown IDs retain the standard not-found usage error.
 
 `runs show ID [--json]` inspects any stored Run; `runs cancel ID [--json]`
 cancels only that exact active Run, never a later Run in the same Session. IDs

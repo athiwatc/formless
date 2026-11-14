@@ -20,6 +20,7 @@ clap_mangen = "0.3"
 chrono.workspace = true
 crossterm = "0.28"
 unicode-width = "0.2"
+unicode-segmentation.workspace = true
 regex = "1"
 formless-core = { path = "../formless-core" }
 formless-protocol = { path = "../formless-protocol" }
