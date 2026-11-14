@@ -1905,13 +1905,19 @@
     const ordered = /\d/.test(first[2]);
     const el = h(ordered ? "ol" : "ul");
     if (ordered && parseInt(first[2], 10) !== 1) el.setAttribute("start", String(parseInt(first[2], 10)));
+    // A marker before the current item's content column is a sibling, even
+    // when its indentation varies within the ordinary 0–3-space margin.
+    const sibling = (m, limit) => m && /\d/.test(m[2]) === ordered
+      && (indentOf(m[1]) <= 3 || indentOf(m[1]) === base) && indentOf(m[1]) < limit;
+    let siblingLimit = Infinity;
     let loose = false, stopped = false;
     while (i < lines.length) {
       const itemStart = i;
       let looseAfter = Infinity;
       const m = lines[i].match(ITEM);
-      if (!m || indentOf(m[1]) !== base || /\d/.test(m[2]) !== ordered) break;
-      const contentIndent = base + m[2].length + Math.max(1, Math.min(4, m[3].length));
+      if (!sibling(m, siblingLimit)) break;
+      const contentIndent = indentOf(m[1]) + m[2].length + Math.max(1, Math.min(4, m[3].length));
+      siblingLimit = contentIndent;
       const body = [m[4]], bodyLazy = [lazy[i]];
       i++;
       while (i < lines.length) {
@@ -1919,20 +1925,20 @@
         if (!l.trim()) {
           let j = i + 1;
           while (j < lines.length && !lines[j].trim()) j++;
-          if (j < lines.length && indentOf(lines[j]) > base) {
+          if (j < lines.length && indentOf(lines[j]) >= contentIndent) {
             if (!ITEM.test(lines[j])) looseAfter = Math.min(looseAfter, body.length + 1);
             body.push(""); bodyLazy.push(false); i++; continue;
           }
-          const sibling = j < lines.length && lines[j].match(ITEM);
-          if (sibling && !RULE.test(lines[j]) && indentOf(sibling[1]) === base && /\d/.test(sibling[2]) === ordered) {
+          const next = j < lines.length && lines[j].match(ITEM);
+          if (sibling(next, contentIndent) && !RULE.test(lines[j])) {
             looseAfter = Math.min(looseAfter, body.length);
             i = j;
           }
           break;
         }
         const ind = indentOf(l);
-        if (ind > base) {
-          bodyLazy.push(lazy[i] || ind < contentIndent);
+        if (ind >= contentIndent) {
+          bodyLazy.push(lazy[i]);
           body.push(" ".repeat(Math.max(0, ind - contentIndent)) + l.trim()); i++; continue;
         }
         if (ITEM.test(l) || startsBlock(lines, i) || !body[body.length - 1].trim()) break;
