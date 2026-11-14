@@ -68,6 +68,9 @@ Illustrative, not scripted: the Tools an agent builds are whatever the task need
 | [packaging/README.md](packaging/README.md) | Release process, installer, Homebrew/winget templates |
 | [docs/gallery.md](docs/gallery.md) | What Formless can do: 15 example tasks |
 | [docs/capabilities.md](docs/capabilities.md) | What Tools can access, the risks, recommended trust settings |
+| [docs/mcp.md](docs/mcp.md) | Connect, authorize, inspect and remove MCP servers |
+| [docs/skills.md](docs/skills.md) | Install, review, enable and share Skills |
+| [docs/jobs.md](docs/jobs.md) | Schedule tasks, receive results and manage Jobs |
 | [docs/keys.md](docs/keys.md) | Every key and command (generated: `formless docs --keys`) |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | Common problems and their fixes |
 | [docs/docker.md](docs/docker.md) | Running the daemon in Docker |

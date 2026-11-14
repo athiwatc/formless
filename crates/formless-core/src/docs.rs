@@ -27,9 +27,9 @@ pub const TOPICS: &[(&str, &str, &str)] = &[
         "docs/troubleshooting.md",
         "common problems and fixes",
     ),
-    ("mcp", "SPEC.md#79-external-mcp-servers", "MCP servers"),
-    ("skills", "SPEC.md#710-skills", "Skills"),
-    ("jobs", "SPEC.md#97-scheduled-jobs", "scheduled jobs"),
+    ("mcp", "docs/mcp.md", "MCP servers"),
+    ("skills", "docs/skills.md", "Skills"),
+    ("jobs", "docs/jobs.md", "scheduled jobs"),
     ("spec", "SPEC.md", "the full specification"),
 ];
 
@@ -181,7 +181,7 @@ mod tests {
         assert_eq!(resolve(None), resolve(Some("  ")));
         assert!(resolve(Some(" SKILLS "))
             .unwrap()
-            .ends_with("SPEC.md#710-skills"));
+            .ends_with("docs/skills.md"));
         assert!(resolve(Some("spe")).unwrap().ends_with("SPEC.md"));
         assert_eq!(
             resolve(Some("s")),

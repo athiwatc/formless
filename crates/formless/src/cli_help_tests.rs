@@ -877,3 +877,39 @@ fn naming_pull_metadata_and_validation_share_the_model_registry() {
         assert!(bash.contains(model.id));
     }
 }
+
+#[test]
+fn task_guide_examples_parse_without_dispatch_and_schedule_examples_are_valid() {
+    use chrono::TimeZone;
+    let now = chrono::Local
+        .with_ymd_and_hms(2026, 1, 15, 12, 0, 0)
+        .unwrap();
+    for (topic, text) in [
+        ("mcp", include_str!("../../../docs/mcp.md")),
+        ("skills", include_str!("../../../docs/skills.md")),
+        ("jobs", include_str!("../../../docs/jobs.md")),
+    ] {
+        assert!(formless_core::docs::resolve(Some(topic))
+            .unwrap()
+            .ends_with(&format!("docs/{topic}.md")));
+        let problems = example_problems(&format!("Examples:\n{text}"));
+        assert!(problems.is_empty(), "{topic}: {problems:?}");
+        for line in text.lines() {
+            let Some(args) = example_args(line).unwrap() else {
+                continue;
+            };
+            let cli = super::Cli::try_parse_from(args).unwrap();
+            if let Some(super::Cmd::Jobs {
+                action: super::JobsAction::Add { at, cron, .. },
+            }) = cli.cmd
+            {
+                if let Some(at) = at {
+                    assert!(formless_core::jobs::parse_at(&at, now).is_ok(), "{line}");
+                }
+                if let Some(cron) = cron {
+                    assert!(formless_core::jobs::to_cron(&cron).is_ok(), "{line}");
+                }
+            }
+        }
+    }
+}
