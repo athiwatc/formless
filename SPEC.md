@@ -3960,7 +3960,9 @@ run_tool = "network_policy"     # a registry Tool, or…
   block comments (nested in Rust) and multi-line strings (Python `"""`,
   JS/Go backticks, Rust raw strings) across lines and tells a JS regex
   from a comment; `diff`/`patch` (any case) are coloured as diffs; other
-  languages are plain text in the default colour.
+  languages are plain text in the default colour. In both clients, Python
+  hash comments need no preceding whitespace; YAML/TOML/env values retain
+  semicolons, while INI/conf/properties keep semicolon comments.
   Each block's top border names its language and its index in the
   message (`╭─ rust [2]`), which is the number `/copy code 2` and
   `/pager code 2` use. `tui.code_line_numbers` adds dim line numbers.

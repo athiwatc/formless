@@ -471,6 +471,7 @@ enum Tok {
 pub(crate) struct Highlighter {
     lang: &'static Lang,
     rust_numbers: bool,
+    python_comments: bool,
     color: bool,
     /// Open block comments (more than one only where they nest).
     in_block: usize,
@@ -558,9 +559,11 @@ fn rust_number_end(chars: &[char], start: usize) -> usize {
 
 impl Highlighter {
     pub(crate) fn new(name: &str, color: bool) -> Option<Self> {
-        lang(name).map(|lang| Self {
+        let name = name.to_ascii_lowercase();
+        lang(&name).map(|lang| Self {
             lang,
-            rust_numbers: matches!(name.to_ascii_lowercase().as_str(), "rust" | "rs"),
+            rust_numbers: matches!(name.as_str(), "rust" | "rs"),
+            python_comments: matches!(name.as_str(), "py" | "python" | "python3"),
             color,
             in_block: 0,
             in_str: None,
@@ -709,7 +712,7 @@ impl Highlighter {
                 }
             }
             if l.line_comments.iter().any(|p| at(i, p))
-                && (c != '#' || i == 0 || chars[i - 1].is_whitespace())
+                && (c != '#' || self.python_comments || i == 0 || chars[i - 1].is_whitespace())
             {
                 push(Tok::Comment, &chars[i..]);
                 break;
@@ -1066,6 +1069,53 @@ mod tests {
                     .map(|s| s.content.as_ref())
                     .collect::<String>(),
                 source
+            );
+        }
+    }
+
+    #[test]
+    fn python_hash_comments_do_not_need_whitespace_but_other_languages_keep_boundaries() {
+        for lang in ["py", "python", "python3", "PYTHON"] {
+            for (source, expected) in [
+                ("x=1#keep the rest", "#keep the rest"),
+                ("print(x)#done", "#done"),
+                ("def f():#entry", "#entry"),
+                ("# at the start", "# at the start"),
+                ("x = 1  # spaced", "# spaced"),
+                ("s='# inside'; x=1#outside", "#outside"),
+                ("s=\"# inside\"", ""),
+            ] {
+                let tokens = toks(lang, source);
+                let comments: String = tokens
+                    .iter()
+                    .filter(|(_, color)| *color == Some(Color::DarkGray))
+                    .map(|(text, _)| text.as_str())
+                    .collect();
+                assert_eq!(comments, expected, "{lang}: {source}");
+                for color in [true, false] {
+                    let mut highlighter = Highlighter::new(lang, color).unwrap();
+                    let actual: String = highlighter
+                        .line(source)
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect();
+                    assert_eq!(actual, source, "{lang}: {source}");
+                }
+            }
+        }
+        for lang in ["sh", "bash", "yaml", "toml", "env", "ini"] {
+            for source in ["echo foo#bar", "${#arr}", "key='x#y'"] {
+                assert!(
+                    !toks(lang, source)
+                        .iter()
+                        .any(|(_, color)| *color == Some(Color::DarkGray)),
+                    "{lang}: {source}"
+                );
+            }
+            assert!(
+                toks(lang, "value # comment")
+                    .contains(&("# comment".into(), Some(Color::DarkGray))),
+                "{lang}"
             );
         }
     }
