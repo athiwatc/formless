@@ -2276,10 +2276,27 @@
   /** `/model`: filter models as you type; Enter sets this Session's model,
    * Ctrl/⌘+Enter the global default. */
   // "200k ctx · $3/$15 per M · vision · tools · ✗ test failed" (SPEC §4.2).
+  function modelContextLabel(value) {
+    if (!Number.isSafeInteger(value) || value < 0) return null;
+    const raw = String(value);
+    if (value < 1000) return raw + " ctx";
+    // Keep decimal windows such as 128000 in familiar decimal units.
+    if (value % 1000 !== 0) {
+      if (value % 1048576 === 0) return value / 1048576 + "Mi ctx";
+      if (value % 1024 === 0) return value / 1024 + "Ki ctx";
+    }
+    // Split integer digits instead of rounding floating-point quotients.
+    const places = value >= 1e6 ? 6 : 3;
+    const whole = raw.slice(0, -places);
+    const fraction = raw.slice(-places).replace(/0+$/, "");
+    const compact = whole + (fraction ? "." + fraction : "") + (places === 6 ? "M" : "k");
+    return (compact.length <= raw.length ? compact : raw) + " ctx";
+  }
   function modelDetail(m, t) {
     const parts = [];
     m = m || {};
-    if (m.context) parts.push(m.context >= 1e6 ? Math.floor(m.context / 1e6) + "M ctx" : Math.floor(m.context / 1000) + "k ctx");
+    const context = modelContextLabel(m.context);
+    if (context !== null) parts.push(context);
     if (m.input_price != null && m.output_price != null) parts.push(uiMoney(m.input_price, null) + "/" + uiMoney(m.output_price, null) + " per M");
     if (m.vision) parts.push("vision");
     if (m.tools === true) parts.push("tools");
@@ -5619,7 +5636,7 @@
     const desc = h("input", { type: "text", value: r.description || "", placeholder: "When to use it, written for the agent" });
     const prov = h("select", null, providers.map((p) => h("option", { value: p, selected: (r.provider || "default") === p }, p)));
     const model = h("input", { type: "text", value: r.model || "", placeholder: "model (blank = the provider's default)", spellcheck: "false" });
-    const effort = h("select", null, ["", "low", "medium", "high"].map((e) => h("option", { value: e, selected: (r.reasoning_effort || "") === e }, e || "default effort")));
+    const effort = h("select", null, ["", "minimal", "low", "medium", "high"].map((e) => h("option", { value: e, selected: (r.reasoning_effort || "") === e }, e || "default effort")));
     const body = h("div", { class: "try-form" }, field("Name", name), field("Description", desc), field("Provider", prov), field("Model", model), field("Reasoning effort", effort));
     if (!(await ask({ title: existing ? "Edit role " + existing : "Add role", body, ok: "Save" }))) return;
     const role = Object.assign({}, r, { description: desc.value.trim(), provider: prov.value === "default" ? null : prov.value, model: model.value.trim(), reasoning_effort: effort.value || null });

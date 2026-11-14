@@ -413,7 +413,13 @@ without redesign.
   `supported_parameters`), else a built-in table for well-known families
   (GPT-5, o-series, GPT-4o/4.1, Claude, Gemini, reasoning-only models).
   The TUI and web pickers show it on each row (`200k ctx · $3/$15 per M ·
-  vision · tools`). `efforts` limits the effort choices to what the model
+  vision · tools`). Context labels retain exact token counts: decimal multiples
+  keep k/M units (200000 → 200k, 1500000 → 1.5M); other exact binary multiples
+  use explicit Ki/Mi (131072 → 128Ki, 65536 → 64Ki). Smaller or irregular
+  windows use exact decimal fractions only when no longer than the whole count,
+  otherwise the whole count, never a rounded-down zero or integer. Missing or
+  invalid context metadata is omitted (web numbers must be safe integers).
+  `efforts` limits the effort choices to what the model
   accepts (`[]` hides the picker: effort has no effect; absent offers all).
 - **Aliases.** `[provider.aliases] fast = "…"` names models; an alias is
   accepted wherever a model id is (`/model fast`, `--model`, Roles,
@@ -1217,7 +1223,10 @@ pasting paths.
     Native Windows separators are retained when decoding the legacy
     backslash-space form, after exact-file checks.
     No variables, globs or commands are expanded or executed; relative,
-    incomplete, multiple-path or multiline inputs remain composer text.
+    incomplete, multiple-path or multiline inputs remain composer text. A
+    shell-style trailing comment also keeps the complete paste as text; no
+    instructions are discarded to recognize one file. Quoted/escaped hashes
+    and hashes within a filename remain literal, with exact-file precedence.
     File URLs preserve native drive/UNC paths and percent-encode reserved
     characters; dropping the URL resolves back to the same local file.
   - Attaching an image when the current model doesn't look vision-capable
@@ -3121,8 +3130,12 @@ such as `read_file`, `read_text_file` and `file_read`.
   code tokens, ignoring comments and layout whitespace while retaining literal
   spellings, token boundaries and restricted-production/postfix line breaks.
   Strings, regexes and whole templates (including interpolations) remain
-  value-sensitive. Uncertain slash goals (e.g. after a closing parenthesis or
-  brace), unsupported syntax and unfinished literals conservatively compare
+  value-sensitive. Numeric literals stop before property dots and binary
+  operators (including hex digits e/E followed by + or -), keeping their
+  original spelling; legacy leading-zero forms use raw-source comparison.
+  Uncertain slash goals (e.g. after a closing parenthesis or
+  brace, or after a line break that may end a statement through automatic
+  semicolon insertion), unsupported syntax and unfinished literals compare
   raw source; they can miss a duplicate rather than guess an identical-code
   verdict. This exact key is separate from lossy script recurrence fingerprints.
   Otherwise the score is 0.4 × the name-token
@@ -4499,6 +4512,9 @@ run_tool = "network_policy"     # a registry Tool, or…
   model/effort. Safely hot-reloadable values apply immediately; data-dir /
   transport-class changes state “restart required”. Includes the full-reset
   action (§15).
+  - Reasoning-effort choices in terminal Settings and the web Role editor
+    include default/unset, minimal, low, medium and high. Editing only a Role's
+    description preserves its stored effort; explicitly selecting default clears it.
   - No settable key needs a daemon restart: the daemon re-reads the file,
     and running TUIs reload their `tui.*` display settings on
     `SettingsChanged` (theme, colours, line numbers, images, panes,

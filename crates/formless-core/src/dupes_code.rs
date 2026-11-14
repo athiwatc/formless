@@ -141,6 +141,99 @@ impl Lexer {
         }
         None
     }
+    fn digits(&mut self, radix: u32) -> Option<bool> {
+        let mut any = false;
+        while let Some(&c) = self.chars.get(self.at) {
+            if c.is_digit(radix) {
+                any = true;
+                self.at += 1;
+            } else if c == '_' {
+                if !any
+                    || !self
+                        .chars
+                        .get(self.at + 1)
+                        .is_some_and(|c| c.is_digit(radix))
+                {
+                    return None;
+                }
+                self.at += 1;
+            } else {
+                break;
+            }
+        }
+        Some(any)
+    }
+
+    fn number_end(&self) -> Option<()> {
+        // A number cannot absorb an adjacent identifier. Escaped identifiers
+        // are handled by the ordinary unsupported-syntax fallback.
+        (!self.chars.get(self.at).is_some_and(|c| {
+            c.is_alphanumeric() || matches!(*c, '_' | '$') || (!c.is_ascii() && !c.is_whitespace())
+        }))
+        .then_some(())
+    }
+
+    fn number(&mut self) -> Option<()> {
+        let mut integer = true;
+        if self.chars[self.at] == '.' {
+            integer = false;
+            self.at += 1;
+            if !self.digits(10)? {
+                return None;
+            }
+        } else {
+            if self.chars[self.at] == '0' {
+                let radix = match self.chars.get(self.at + 1) {
+                    Some('x' | 'X') => Some(16),
+                    Some('b' | 'B') => Some(2),
+                    Some('o' | 'O') => Some(8),
+                    _ => None,
+                };
+                if let Some(radix) = radix {
+                    self.at += 2;
+                    if !self.digits(radix)? {
+                        return None;
+                    }
+                    if self.chars.get(self.at) == Some(&'n') {
+                        self.at += 1;
+                    }
+                    return self.number_end();
+                }
+                // Legacy leading-zero forms require strict/script context.
+                if self
+                    .chars
+                    .get(self.at + 1)
+                    .is_some_and(|c| c.is_ascii_digit() || *c == '_')
+                {
+                    return None;
+                }
+            }
+            self.digits(10)?;
+            if self.chars.get(self.at) == Some(&'.') {
+                integer = false;
+                self.at += 1;
+                self.digits(10)?;
+            }
+        }
+        if matches!(self.chars.get(self.at), Some('e' | 'E')) {
+            integer = false;
+            self.at += 1;
+            if matches!(self.chars.get(self.at), Some('+' | '-')) {
+                self.at += 1;
+            }
+            if !self.digits(10)? {
+                return None;
+            }
+        }
+        if self.chars.get(self.at) == Some(&'n') {
+            if !integer {
+                return None;
+            }
+            self.at += 1;
+        }
+        self.number_end()
+    }
+
     fn code(&mut self, out: &mut String, nested: bool, emit: bool, depth: usize) -> Option<()> {
         if depth > 64 {
             return None;
@@ -154,6 +247,12 @@ impl Lexer {
             let Some(&c) = self.chars.get(self.at) else {
                 return (!nested).then_some(());
             };
+            // A statement may have ended through ASI (e.g. debugger or an
+            // uninitialized declaration). Without a parser, a slash on a new
+            // logical line must not be guessed to be division.
+            if newline && c == '/' && (goal != Goal::Expression || restricted) {
+                return None;
+            }
             if nested && c == '}' && braces == 0 {
                 self.at += 1;
                 return Some(());
@@ -173,6 +272,15 @@ impl Lexer {
                 goal = Goal::Operand;
             } else if c == '/' && goal == Goal::Unknown {
                 return None;
+            } else if c.is_ascii_digit()
+                || (c == '.'
+                    && self
+                        .chars
+                        .get(self.at + 1)
+                        .is_some_and(char::is_ascii_digit))
+            {
+                self.number()?;
+                goal = Goal::Operand;
             } else if c.is_alphanumeric() || c == '_' || c == '$' || !c.is_ascii() {
                 self.at += 1;
                 while self.chars.get(self.at).is_some_and(|c| {
@@ -181,16 +289,6 @@ impl Lexer {
                         || (!c.is_ascii() && !c.is_whitespace())
                 }) {
                     self.at += 1;
-                }
-                if c.is_ascii_digit() {
-                    while self.chars.get(self.at).is_some_and(|c| {
-                        c.is_ascii_alphanumeric()
-                            || matches!(*c, '_' | '.')
-                            || (matches!(*c, '+' | '-')
-                                && matches!(self.chars[self.at - 1], 'e' | 'E'))
-                    }) {
-                        self.at += 1;
-                    }
                 }
                 let word: String = self.chars[start..self.at].iter().collect();
                 goal = if was_property {
@@ -279,6 +377,8 @@ mod tests {
     fn comments_and_layout_keep_values_and_token_boundaries() {
         for (a, b) in [
             ("// don't\nreturn 1;", "/* can't */ return  1 ;"),
+            ("// don't\n/a b/.test(x);", "/a b/.test(x);"),
+            ("x();\n/a b/.test(x);", "x(); /a b/.test(x);"),
             (
                 "const re = /'/g; return re;",
                 "const re=/'/g;/* \" */return re;",
@@ -312,6 +412,46 @@ mod tests {
             assert_ne!(key(a), key(b), "{a} / {b}");
         }
     }
+    #[test]
+    fn numeric_tokens_stop_before_properties_and_operators() {
+        for (left, right) in [
+            ("return 1..toString();", "return 1. /* note */ .toString();"),
+            ("return 0x1e+2;", "return 0x1e + 2;"),
+            ("return 1e+2.toString();", "return 1e+2 .toString();"),
+            ("return .5.toString();", "return .5 .toString();"),
+            ("return 0b10n+1n;", "return 0b10n + 1n;"),
+        ] {
+            assert_eq!(key(left), key(right), "{left}");
+            assert!(key(left).starts_with("tokens:"));
+        }
+        for (left, right) in [
+            ("return 1e2;", "return 100;"),
+            ("return 1n;", "return 1;"),
+            ("return 0x1e+2;", "return 0x1e+3;"),
+        ] {
+            assert_ne!(key(left), key(right));
+        }
+        for source in [
+            "return 0x;",
+            "return 1e+;",
+            "return 1__0;",
+            "return 1.0n;",
+            "return 0755;",
+        ] {
+            assert_eq!(key(source), format!("raw:{source}"));
+        }
+    }
+
+    #[test]
+    fn uncertain_newline_slashes_do_not_erase_regex_values() {
+        for prefix in ["debugger", "var x", "break label", "continue label"] {
+            let left = format!("{prefix}\n/a b/.test(x);");
+            let right = left.replace("/a b/", "/a   b/");
+            assert_eq!(key(&left), format!("raw:{left}"));
+            assert_ne!(key(&left), key(&right));
+        }
+    }
+
     #[test]
     fn templates_remain_verbatim_including_nested_interpolations() {
         let a = concat!("const t = `hello $", "{`inner $", "{'a b'}`}`; return t;");

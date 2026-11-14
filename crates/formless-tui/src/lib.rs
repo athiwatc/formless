@@ -22950,6 +22950,24 @@ mod tests {
     }
 
     #[test]
+    fn dropped_path_comment_tail_stays_in_the_composer() {
+        let mut app = test_app();
+        app.current = Some("s".into());
+        std::fs::create_dir_all(&app.paths.data_dir).unwrap();
+        let file = app.paths.data_dir.join("notes.txt");
+        std::fs::write(&file, b"fixture").unwrap();
+        let pasted = format!("'{}' # keep these instructions", file.display());
+        app.paste(&pasted);
+        assert_eq!(
+            app.input.expanded(),
+            pasted,
+            "must retain the complete paste instead of silently attaching only its first word"
+        );
+        assert!(app.attachments.is_empty());
+        std::fs::remove_file(file).unwrap();
+    }
+
+    #[test]
     fn dropped_files_become_removable_attachment_chips() {
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
         let mut app = test_app();
