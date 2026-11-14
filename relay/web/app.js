@@ -670,6 +670,7 @@
     }
     $("sidebar").classList.toggle("hidden", S.view !== "chat");
     $("menu-btn").classList.toggle("hidden", S.view !== "chat");
+    syncSidebar();
     const conn = $("conn");
     conn.title = "";
     conn.onclick = null;
@@ -6212,13 +6213,30 @@
     t.style.height = Math.min(t.scrollHeight, Number.isFinite(maxHeight) ? maxHeight : t.scrollHeight) + "px";
   }
 
-  function openSidebar() { $("sidebar").classList.add("open"); }
-  function closeSidebar() {
-    const sidebar = $("sidebar");
-    const returnFocus = sidebar.contains(document.activeElement);
-    sidebar.classList.remove("open");
-    if (returnFocus && getComputedStyle(sidebar).visibility === "hidden") focusReturn($("menu-btn"));
+  // Read CSS visibility so viewport and container-query layouts agree.
+  let sidebarLastFocus = null;
+  function syncSidebar() {
+    const sidebar = $("sidebar"), menu = $("menu-btn");
+    const visible = !!(sidebar.getClientRects().length
+      && !sidebar.closest(".hidden, [hidden]") && getComputedStyle(sidebar).visibility !== "hidden");
+    menu.setAttribute("aria-expanded", String(visible));
+    const focused = document.activeElement;
+    const previous = focused === document.body ? sidebarLastFocus : focused;
+    if (!focusVisible(sidebar) && sidebar.contains(previous)) focusReturn(menu);
+    else if (!focusVisible(menu) && previous === menu) focusReturn(visible ? $("new-session") : null);
   }
+  function setSidebar(open, { focus = false } = {}) {
+    $("sidebar").classList.toggle("open", open);
+    syncSidebar();
+    if (open && focus && getComputedStyle($("sidebar")).position === "absolute" && focusVisible($("new-session"))) {
+      $("new-session").focus({ preventScroll: true });
+    }
+  }
+  function openSidebar(options) { setSidebar(true, options); }
+  function closeSidebar() { setSidebar(false); }
+  document.addEventListener("focusin", () => { sidebarLastFocus = document.activeElement; });
+  const sidebarResize = new ResizeObserver(syncSidebar);
+  for (const element of [$("app"), $("sidebar"), $("menu-btn")]) sidebarResize.observe(element);
 
   // ============================================================== events
   let toolRefresh = null;
@@ -7041,7 +7059,7 @@
   $("optimise-all").onclick = () => act({ type: "run_optimiser", tool_id: null }, "Optimiser started");
   $("generate-proposal").onclick = () => { act({ type: "generate_proposal" }, "Generating and measuring a proposal…"); };
   $("stop-btn").onclick = stop;
-  $("menu-btn").onclick = () => $("sidebar").classList.toggle("open");
+  $("menu-btn").onclick = () => setSidebar(!$("sidebar").classList.contains("open"), { focus: true });
   $("notes-btn").onclick = () => {
     const panel = $("notes-panel");
     panel.classList.toggle("hidden");
