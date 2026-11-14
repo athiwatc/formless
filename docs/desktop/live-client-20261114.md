@@ -24,9 +24,9 @@ lockfile and pinned GPUI Kit 0.9.1 / GPUI-pre 0.3.12.
   incorporating main `47ebac8c30af92a7cd937501f9761df101b83187`.
 
 The desktop tree is `3ad560af5cc4a63c4ffcbc8e250ec53ffc793086` and the
-protocol tree is `a9912076a69b36043508622f3d9bf25742405790` at both implementation
-and latest reconciliation commits. The later merge therefore leaves the
-validated frontend and protocol byte-for-byte unchanged. Daemon integration
+protocol tree is `a9912076a69b36043508622f3d9bf25742405790` at both the initial
+implementation (`b1696d84`) and second reconciliation (`1e68d032`) commits.
+Later UI/test follow-ups are listed above. Daemon integration
 was rerun against the updated core after each main merge. The final merge changes
 neither desktop source nor render tests relative to the header correction, and
 changes no protocol or workspace dependency manifest.
