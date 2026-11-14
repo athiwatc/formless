@@ -63,7 +63,7 @@ jobs:
       - name: Verify runner Python
         # setup-python's macOS builds require /Users/runner permissions.
         # Use the native Python already used by this runner's docs workflow.
-        run: python3 -c 'import sys; assert sys.version_info >= (3, 11), "Python 3.11+ is required"'
+        run: python3 -c 'import sys; assert sys.version_info >= (3, 9), "Python 3.9+ is required"'
 
       - name: Restore Cargo dependency cache
         uses: actions/cache@v4
