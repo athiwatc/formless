@@ -2452,6 +2452,22 @@
   function copy(text, what) {
     navigator.clipboard.writeText(text).then(() => toast("Copied " + what), () => toast("Copy failed", true));
   }
+  // Read rendered line breaks from an inert, offscreen copy so generated
+  // controls never enter the clipboard and the live message stays untouched.
+  function messageCopyText(node) {
+    const source = node.querySelector(".bubble, .md") || node;
+    const clone = source.cloneNode(true);
+    for (const control of clone.querySelectorAll("button, [role=button]")) control.remove();
+    clone.inert = true;
+    clone.setAttribute("aria-hidden", "true");
+    clone.style.cssText += ";position:fixed;left:-100000px;top:0;opacity:0;pointer-events:none;width:" + source.getBoundingClientRect().width + "px";
+    // User/system-note ancestors supply pre-wrap; preserve the source's
+    // computed whitespace when the clone leaves that ancestor context.
+    clone.style.whiteSpace = getComputedStyle(source).whiteSpace;
+    document.body.append(clone);
+    try { return clone.innerText; }
+    finally { clone.remove(); }
+  }
   /** Actions on one message (SPEC §10.2): copy it (as text or Markdown),
    * edit and re-run a user message, fork the Session from it, and copy a
    * Tool call's input or a result. */
@@ -2463,7 +2479,7 @@
     const items = [];
     if (m.role === "tool") items.push(item("Copy output", () => copy(m.content || "", "the output")));
     else if (m.content) {
-      const text = (node.querySelector(".bubble, .md") || node).innerText;
+      const text = messageCopyText(node);
       items.push(item("Copy", () => copy(text, "the message")));
       items.push(item("Copy as Markdown", () => copy(m.content, "as Markdown")));
     }
