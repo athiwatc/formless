@@ -4437,17 +4437,25 @@ run_tool = "network_policy"     # a registry Tool, or…
   `message_count`, `preview` and `last_run_status` for this. The web
   sidebar shows the preview under the name.
 - **Filtering lists.** In the TUI's Tools, Sessions and Proposals
-  views, `/` types a fuzzy filter: on name and description for Tools,
-  name for Sessions, and content, rationale and kind for Proposals. Enter
-  keeps it and Esc clears it. `s` cycles the sort and `v` the quick
-  filters:
+  views, `/` filters identifiers fuzzily (Tool/Session name, Tool title
+  and tags, or Proposal kind). Descriptions and Proposal content/rationale
+  require a contiguous match under the shared accent-insensitive fold.
+  Query edges are trimmed; inner whitespace is literal in prose, while
+  identifier fuzzy matching ignores query whitespace. Primary names/kind
+  rank above secondary fields, then prose; contiguous identifiers rank
+  above scattered matches, and earlier prose matches rank first. The selected
+  sort breaks equal relevance inside existing Tool groups and pinned Session
+  ordering. Empty queries and queries beginning with `#` keep their selected
+  sort; the Tools/Session `#tag` rules are unchanged. Quick filters, collapsed groups and parent-before-child Session
+  trees still apply. Enter keeps the filter and Esc clears it. `s` cycles
+  the tie-break sort and `v` the quick filters:
   - Tools sort by name, success rate, last used or calls; show all,
     active, retired, failing (<80%) or needing attention.
   - Sessions sort by last activity, created or name; show all or running.
   - Proposals sort newest first or by score; show all, pending, applied
     or rejected.
   The panel title shows the match count and the active sort, filter and
-  query (`Tools · 12/240 · sort: calls · failing · /csv`), and the
+  query (`Tools · 12/240 · sort: relevance (ties: calls) · failing · /csv`), and the
   selection follows the visible rows. The web Tools and Proposals views
   have the same filter box, sort and show menus; web Sessions use the
   sidebar search.
