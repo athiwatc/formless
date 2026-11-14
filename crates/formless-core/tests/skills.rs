@@ -62,6 +62,72 @@ fn skill_md_frontmatter_is_parsed_and_validated() {
 }
 
 #[test]
+fn skill_scalar_quotes_preserve_literal_text_and_decode_complete_pairs() {
+    for (value, expected) in [
+        (r#"say "hello""#, r#"say "hello""#),
+        (r#""hi" there"#, r#""hi" there"#),
+        ("users'", "users'"),
+        (r#""Work with PDFs""#, "Work with PDFs"),
+        (r#""say \"hi\"""#, r#"say "hi""#),
+        (r#""C:\\work\\file""#, r"C:\work\file"),
+        ("'It''s useful'", "It's useful"),
+        ("'\"hello\"'", "\"hello\""),
+    ] {
+        let source = format!("---\nname: pdf-tools\ndescription: {value}\n---\n# Body\n");
+        let meta = parse_skill_md(&source).unwrap();
+        assert_eq!(meta.description, expected, "{value}");
+        assert_eq!(meta.body, "# Body\n");
+    }
+    let meta = parse_skill_md(
+        "---\nname: pdf-tools\ndescription: |-\n  \"literal quoted block\"\n---\nBody",
+    )
+    .unwrap();
+    assert_eq!(meta.description, "\"literal quoted block\"");
+}
+
+#[test]
+fn skill_scalar_comments_leave_quoted_hashes_and_block_content_intact() {
+    for (value, expected) in [
+        ("Work with PDFs # annotation", "Work with PDFs"),
+        (r#""Work with PDFs" # annotation"#, "Work with PDFs"),
+        ("'It''s # useful' # annotation", "It's # useful"),
+        (r#""Say \"hi\" # text" # annotation"#, "Say \"hi\" # text"),
+        (
+            "https://example.test/#anchor # annotation",
+            "https://example.test/#anchor",
+        ),
+        ("C# helpers # annotation", "C# helpers"),
+        ("Bob's notes # annotation", "Bob's notes"),
+        (
+            "|- # header annotation\n  literal # content",
+            "literal # content",
+        ),
+    ] {
+        let source=format!("---\n# name: ignored\nname: 'pdf-tools' # primary\ndescription: {value}\n---\n# Body # unchanged\n");
+        let meta = parse_skill_md(&source).unwrap();
+        assert_eq!(meta.name, "pdf-tools");
+        assert_eq!(meta.description, expected, "{value}");
+        assert_eq!(meta.body, "# Body # unchanged\n");
+    }
+}
+
+#[test]
+fn skill_scalar_metadata_survives_disabled_installation() {
+    let (_fixture, paths) = temp_paths("skill-scalars");
+    let store = Store::open(&paths.db_file()).unwrap();
+    let src = paths.data_dir.join("src/skill");
+    std::fs::create_dir_all(&src).unwrap();
+    let source="---\nname: pdf-tools # primary\ndescription: \"say \\\"hi\\\"\" # annotation\n---\n# Body\n";
+    std::fs::write(src.join("SKILL.md"), source).unwrap();
+    let installed = install(&paths, &store, src.to_str().unwrap(), None, None, "user").unwrap();
+    assert_eq!(installed.description, "say \"hi\"");
+    assert!(!installed.enabled);
+    let saved = store.get_skill("pdf-tools").unwrap().unwrap();
+    assert_eq!(saved.description, "say \"hi\"");
+    assert!(!saved.enabled);
+}
+
+#[test]
 fn skills_install_from_folder_zip_and_git_and_version() {
     let (_fixture, paths) = temp_paths("skills");
     let store = Store::open(&paths.db_file()).unwrap();

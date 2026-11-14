@@ -2607,8 +2607,12 @@ Tools fill capability gaps; skills say how to use them well.
 
 - **Format:** the Agent Skills `SKILL.md` convention: YAML frontmatter with
   `name` (1-64 lowercase letters, digits, `-`) and `description` (1-1024
-  chars), a Markdown body, and optional extra files. Existing skills
-  install as-is.
+  chars), a Markdown body, and optional extra files. Header comments outside
+  scalar content are ignored; whitespace-separated inline `#` comments leave
+  quoted hashes and URL fragments intact. Only a complete quoted scalar is
+  decoded (JSON-compatible double-quote escapes or doubled single quotes);
+  literal quote fragments and block content retain their characters. Existing
+  skills install as-is; historical installed metadata is not rewritten.
 - **Install:** from a folder, a git URL (`--ref`, `--subdir`) or a
   `.zip`; validated, then stored versioned under
   `<data>/skills/<name>/v<N>/` (10 MB max). A `.zip` is extracted
@@ -2719,7 +2723,8 @@ suite cannot measure preferences.
   Detection covers:
   - known key and token formats (`sk-`, `ghp_`, `AKIA`, `xoxb-`, …)
   - private keys, bearer tokens and JWTs
-  - `password/token/api_key is|:|= …` assignments
+  - explicit `password/token/api_key :|= …` assignments, quoted `is` values,
+    and unquoted `is` values with a secret shape
   - long mixed-case random-looking strings
   `remember` also refuses text of 40 or more characters copied verbatim
   from the Session's recent Tool results; the agent must restate the
@@ -4755,8 +4760,14 @@ undo, redo and replacements invalidate prior asynchronous editor previews.
   reparse points, symlinks, hardlinked files and unsupported namespaces. Each
   directory is bounded to 256 entries and 128 Markdown templates; files are at
   most 64 KiB, combined template bytes 1 MiB, and diagnostics at most 64.
+  Description frontmatter permits indented comment lines and trailing
+  whitespace-separated `#` comments outside quoted values. Literal hashes in
+  quoted or block scalar content and URL fragments remain description text;
+  malformed quotes, unsupported fields and duplicate descriptions still fail.
   Expansion is a single literal pass: `$ARGUMENTS` preserves the text after the
-  invocation's first separator; `$1` through `$9` select Unicode-whitespace
+  invocation's first separator only when no ASCII letter, digit or underscore
+  immediately follows its name; `$ARGUMENTS_PATH` and `$ARGUMENTS2` remain
+  literal, while `$ARGUMENTS.` still expands. `$1` through `$9` select Unicode-whitespace
   separated positions. `$$` emits one literal `$`, so `$$1`, `$$5` and
   `$$9.99` preserve shell examples or prices. Escaped dollars and inserted
   arguments are not re-expanded. Missing referenced positions stop expansion
@@ -5534,8 +5545,11 @@ Web approval and promotion decisions remain pending locally until the daemon
 confirms resolution; failures report that the decision was not delivered and
 remain answerable. Recap and rating controls are rebuilt from current Run state
 outside the cached message body, so live completion and rating changes appear
-immediately and only the current last answer has controls. Markdown formatting
-is limited to 32 nesting levels, 4096 characters per inline parse, and 128 KiB
+immediately and only the current last answer has controls. Web Markdown
+recognizes HTTP(S) schemes case-insensitively in bare and angle autolinks,
+and MAILTO in angle autolinks. URL text and mail-address case are retained;
+existing safe-target filtering and trailing-punctuation behavior still apply.
+Markdown formatting is limited to 32 nesting levels, 4096 characters per inline parse, and 128 KiB
 per formatted message. Content beyond these limits is displayed verbatim as
 plain text, preserving access to persisted messages without recursive parsing.
 
@@ -6019,7 +6033,13 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
   provider for approval summaries. It looks for secret shapes (provider
   key prefixes, JWTs, private keys, bearer tokens, `password = …`,
   `token=…`, `cookie: …` assignments, long random-looking tokens) rather
-  than key names, plus `security.secret_patterns`. A Tool result holding
+  than key names, plus `security.secret_patterns`. For unquoted `keyword is
+  value` phrases, a value needs a number, internal mixed case, or a recognized
+  secret shape; ordinary prose such as "token is refreshed" stays intact.
+  `:`/`=` and quoted assignments keep conservative masking. This heuristic
+  cannot distinguish an unquoted plain-word secret from ordinary prose;
+  masking known submitted credential values and configured patterns remains
+  unconditional. A Tool result holding
   one is still sent to the model, with a one-time note per Tool and kind
   in the Run.
   Recorded payloads never leave the data dir except redacted, to the user's

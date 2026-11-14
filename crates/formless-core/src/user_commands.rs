@@ -136,7 +136,15 @@ fn placeholder(rest: &str) -> (Placeholder<'_>, &str) {
     if let Some(tail) = rest.strip_prefix("$$") {
         (Placeholder::Literal("$"), tail)
     } else if let Some(tail) = rest.strip_prefix("$ARGUMENTS") {
-        (Placeholder::Arguments, tail)
+        if tail
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            (Placeholder::Literal("$ARGUMENTS"), tail)
+        } else {
+            (Placeholder::Arguments, tail)
+        }
     } else if rest.as_bytes().get(1).is_some_and(u8::is_ascii_digit) {
         let digits = rest[1..].bytes().take_while(u8::is_ascii_digit).count();
         let token = if digits == 1 && rest.as_bytes()[1] != b'0' {
@@ -228,6 +236,7 @@ fn valid_name(name: &str) -> bool {
             byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
         })
 }
+
 fn parse(text: &str) -> Result<(String, String), &'static str> {
     if text.contains('\0') {
         return Err("Template contains a NUL byte");
@@ -257,7 +266,7 @@ fn parse(text: &str) -> Result<(String, String), &'static str> {
         while index < header.len() {
             let line = header[index];
             index += 1;
-            if line.trim().is_empty() || line.starts_with('#') {
+            if line.trim().is_empty() || line.trim_start().starts_with('#') {
                 continue;
             }
             let Some(value) = line.strip_prefix("description:") else {
@@ -267,7 +276,7 @@ fn parse(text: &str) -> Result<(String, String), &'static str> {
                 return Err("Duplicate frontmatter description");
             }
             found = true;
-            let value = value.trim();
+            let value = crate::frontmatter::scalar_without_comment(value.trim());
             description = if matches!(value, ">" | "|" | ">-" | "|-") {
                 let mut parts = Vec::new();
                 while index < header.len()
@@ -930,7 +939,7 @@ mod tests {
             ("$9", 9, false),
             ("$ARGUMENTS", 0, true),
             ("$$ARGUMENTS", 0, false),
-            ("$$$3 $ARGUMENTSsuffix", 3, true),
+            ("$$$3 $ARGUMENTSsuffix", 3, false),
             ("雪 $1é $9.99", 9, false),
             ("no arguments $HOME $", 0, false),
         ] {
@@ -983,6 +992,38 @@ mod tests {
             "'two words' x"
         );
     }
+    #[test]
+    fn arguments_placeholder_requires_an_identifier_boundary() {
+        for (body, expected, uses_arguments) in [
+            ("Use $ARGUMENTS_PATH now", "Use $ARGUMENTS_PATH now", false),
+            ("See $ARGUMENTS2.", "See $ARGUMENTS2.", false),
+            ("$ARGUMENTSsuffix", "$ARGUMENTSsuffix", false),
+            (
+                "$ARGUMENTS_FILE $ARGUMENTS9",
+                "$ARGUMENTS_FILE $ARGUMENTS9",
+                false,
+            ),
+            ("See $ARGUMENTS.", "See report.md.", true),
+            ("e-$ARGUMENTS", "e-report.md", true),
+            ("$ARGUMENTSé", "report.mdé", true),
+            ("$$ARGUMENTS_PATH", "$ARGUMENTS_PATH", false),
+            (
+                "$ARGUMENTS_PATH $1PATH $10",
+                "$ARGUMENTS_PATH report.mdPATH $10",
+                false,
+            ),
+        ] {
+            let template = command(body);
+            assert_eq!(template.expand("report.md").unwrap(), expected, "{body}");
+            assert_eq!(template.uses_arguments, uses_arguments, "{body}");
+        }
+        let fixture = Fixture::new();
+        fixture.global("literal.md", "$ARGUMENTS_PATH");
+        let snapshot = fixture.load(&[]);
+        assert_eq!(snapshot.find("literal").unwrap().usage(), "/literal");
+        assert!(!snapshot.projection().commands[0].uses_arguments);
+    }
+
     #[test]
     fn dollar_escapes_preserve_prices_code_and_single_pass_substitution() {
         for (body, expected) in [
@@ -1155,6 +1196,73 @@ mod tests {
             assert!(parse(text).is_err(), "{text:?}");
         }
     }
+    #[test]
+    fn frontmatter_comments_preserve_scalar_text_and_command_discovery() {
+        for (header, expected) in [
+            (
+                " # review helper\n  # another note\ndescription: Review the diff",
+                "Review the diff",
+            ),
+            ("description: Review the diff # why", "Review the diff"),
+            ("description: \"Review the diff\" # why", "Review the diff"),
+            ("description: 'Review the diff' # why", "Review the diff"),
+            ("description: \"hash # stays\" # annotation", "hash # stays"),
+            (
+                "description: 'It''s # useful' # annotation",
+                "It's # useful",
+            ),
+            (
+                r#"description: "Say \"hi\" # text" # annotation"#,
+                "Say \"hi\" # text",
+            ),
+            ("description: Bob's notes # annotation", "Bob's notes"),
+            (
+                "description: https://example.test/#anchor # annotation",
+                "https://example.test/#anchor",
+            ),
+            ("description: C# helpers # annotation", "C# helpers"),
+            (
+                "description: |- # header annotation\n  literal # content",
+                "literal # content",
+            ),
+            (
+                "description: >- # header annotation\n  first\n  second",
+                "first second",
+            ),
+            ("\t# note\r\ndescription: Simple\t# comment", "Simple"),
+        ] {
+            let source = format!("---\n{header}\n---\n# Body stays literal\n$ARGUMENTS_PATH\n");
+            let (description, body) = parse(&source).unwrap_or_else(|e| panic!("{header}: {e}"));
+            assert_eq!(description, expected, "{header}");
+            assert_eq!(body, "# Body stays literal\n$ARGUMENTS_PATH\n");
+            let fixture = Fixture::new();
+            fixture.global("review.md", &source);
+            let snapshot = fixture.load(&[]);
+            assert!(
+                snapshot.diagnostics.is_empty(),
+                "{header}: {:?}",
+                snapshot.diagnostics
+            );
+            assert_eq!(snapshot.find("review").unwrap().description, expected);
+            assert_eq!(snapshot.projection().commands[0].description, expected);
+        }
+        for header in [
+            "description: \"unfinished # still quoted",
+            "description: 'unfinished # still quoted",
+            "description: \"fine\" trailing # invalid",
+            "description: 'fine' trailing # invalid",
+            "description: # only comment",
+            "description: \"\" # empty",
+            "description: first # comment\ndescription: second",
+            " # note\nother: unsupported",
+        ] {
+            assert!(
+                parse(&format!("---\n{header}\n---\nBody")).is_err(),
+                "{header}"
+            );
+        }
+    }
+
     #[test]
     fn discovery_limits_oversized_and_excess_entries_without_attachment_reads() {
         let fixture = Fixture::new();
