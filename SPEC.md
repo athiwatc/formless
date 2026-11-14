@@ -3887,8 +3887,12 @@ run_tool = "network_policy"     # a registry Tool, or…
   rows are all on screen are sent with the terminal's own protocol, which
   scales the image into the box: iTerm2's inline images (iTerm2,
   WezTerm) or the kitty graphics protocol (kitty, Ghostty), which takes
-  PNG: JPEG, GIF and WebP are transcoded to a PNG thumbnail (at most
-  800 px) first. Rows are reserved only for an image that can be drawn;
+  PNG. Both protocols decode PNG, JPEG, GIF or WebP and downscale oversized
+  images to at most 800 px on the long side, preserving aspect ratio and
+  PNG transparency. Oversized previews and non-PNG kitty inputs are encoded
+  as PNG; small supported iTerm images and small PNGs keep their original
+  bytes. Resized animated images show a still preview. Rows are reserved
+  only for a supported image header;
   one that can't keeps its reference line, marked "can't be shown in
   this terminal".
   When thumbnails move, the screen is redrawn first so none linger. Other
