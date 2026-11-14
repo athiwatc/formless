@@ -416,11 +416,13 @@
       return k + "=" + v;
     }).join("  "), 200);
   }
-  /** <pre> for a Tool payload: JSON is pretty-printed and highlighted. */
+  /** Original Tool payload text, with syntax highlighting for valid JSON.
+   * Parsing only classifies the text: stringify would round large integers,
+   * discard repeated keys and change numeric spellings/whitespace. */
   function payload(text) {
     try {
-      const p = JSON.stringify(JSON.parse(text), null, 2);
-      return h("pre", null, highlight(p, "json"));
+      JSON.parse(text);
+      return h("pre", null, highlight(text, "json"));
     } catch (_) {
       return h("pre", null, text);
     }
