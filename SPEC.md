@@ -4805,7 +4805,12 @@ undo, redo and replacements invalidate prior asynchronous editor previews.
     unpriced models. `formless prices import [--provider NAME] [--all]
     [--dry-run]` copies the endpoint's own `/models` prices (OpenRouter
     publishes them) for the models in use, dated, and `doctor` flags
-    imported prices older than 90 days. Usage rows record their provider,
+    imported prices older than 90 days. Import compares all four rates,
+    ignoring a timestamp-only change, and shows old/new values for updates.
+    A changed record replaces the full listed record: an absent cache rate
+    is shown as unset and uses the input rate locally, rather than zero.
+    `--dry-run` reports the same changes without saving price configuration.
+    Usage rows record their provider,
     so `UsageByDay {by: "provider"}` works; rows stay when their Session
     is deleted (spend history).
 - **Colour:** roles, statuses, list selections, borders, and approval
