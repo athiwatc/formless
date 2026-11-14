@@ -1384,10 +1384,10 @@ impl Store {
     /// Sessions with a provisional name, most recent first: what the naming
     /// model renames once it is installed (#871).
     pub fn provisionally_named_sessions(&self, limit: usize) -> Result<Vec<String>> {
-        let mut stmt = self.ps("SELECT id FROM sessions WHERE name_source='heuristic'
-             ORDER BY updated_at DESC LIMIT ?1")?;
+        let mut stmt = self.ps("SELECT id FROM sessions WHERE deleted_at IS NULL
+             AND (name=?2 OR name_source='heuristic') ORDER BY updated_at DESC LIMIT ?1")?;
         let ids = stmt
-            .query_map(params![limit as i64], |r| r.get(0))?
+            .query_map(params![limit as i64, DEFAULT_SESSION_NAME], |r| r.get(0))?
             .collect::<rusqlite::Result<Vec<String>>>()?;
         Ok(ids)
     }
