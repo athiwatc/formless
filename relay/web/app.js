@@ -2814,10 +2814,16 @@
    * unfinished tail (the TUI's complete-prefix rule): blocks end at a blank
    * line outside a code fence or display math. An unfinished block stays
    * plain text, and completed blocks above it keep their DOM identity. */
-  function splitStreaming(text) {
-    let fence = null, math = false, cut = 0, at = 0;
-    for (const line of text.split("\n")) {
-      const next = at + line.length + 1;
+  function splitStreaming(text, state = {}, trustedAppend = false) {
+    if (state.text === text) return state.value;
+    const append = typeof state.text === "string" && text.length >= state.text.length
+      && (trustedAppend || text.startsWith(state.text));
+    let { fence = null, math = false, cut = 0, at = 0, search = 0 } = append ? state : {};
+    // Checkpoint before the unfinished line. Its delimiter meaning is only
+    // committed when its newline arrives; extending it must not keep a
+    // provisional fence/math decision. Search only the newly appended suffix.
+    for (let end; (end = text.indexOf("\n", search)) >= 0;) {
+      const line = text.slice(at, end), next = end + 1;
       if (math) math = mathBlockOpen(line, true);
       else if (fence) {
         if (fenceCloses(line, fence)) fence = null;
@@ -2825,11 +2831,59 @@
         const marker = line.match(FENCE);
         if (marker) fence = marker[2];
         else if (MATH_BLOCK.test(line)) math = mathBlockOpen(line);
-        else if (!line.trim() && next <= text.length) cut = next;
+        else if (!line.trim()) cut = next;
       }
-      at = next;
+      at = search = next;
     }
-    return [text.slice(0, cut), text.slice(cut)];
+    const done = append && cut === state.cut ? state.value[0] : text.slice(0, cut);
+    Object.assign(state, { text, fence, math, cut, at, search: text.length, value: [done, text.slice(cut)] });
+    return state.value;
+  }
+  function thinkingTail(text, state = {}, trustedAppend = false) {
+    if (state.text === text) return state.value;
+    const append = typeof state.text === "string" && text.length >= state.text.length
+      && (trustedAppend || text.startsWith(state.text));
+    if (!append) { state.lines = [""]; state.more = false; }
+    let at = append ? state.text.length : 0;
+    for (let end; (end = text.indexOf("\n", at)) >= 0;) {
+      state.lines[state.lines.length - 1] += text.slice(at, end);
+      state.lines.push("");
+      if (state.lines.length > 6) { state.lines.shift(); state.more = true; }
+      at = end + 1;
+    }
+    state.lines[state.lines.length - 1] += text.slice(at);
+    state.text = text;
+    state.value = (state.more ? "… " : "") + state.lines.join("\n");
+    return state.value;
+  }
+  // Per-stream caches, not Session-wide caches: a Session can emit many
+  // answers in one Run. Every clear/commit/retry invalidates them explicitly.
+  const liveText = { session: undefined, run: undefined, answer: {}, thinking: {}, answerSource: undefined, thinkingSource: undefined, expanded: false };
+  function currentLiveText() {
+    if (liveText.session !== S.current || liveText.run !== S.liveRun?.id) {
+      Object.assign(liveText, { session: S.current, run: S.liveRun?.id, answer: {}, thinking: {}, answerSource: undefined, thinkingSource: undefined, expanded: false });
+    }
+    return liveText;
+  }
+  function appendLiveText(kind, delta) {
+    const state = currentLiveText(), key = kind === "streaming" ? "answer" : "thinking";
+    const source = key + "Source";
+    // Only our append reducer supplies this proof. A snapshot/direct source
+    // replacement invalidates it, without comparing growing prefixes per RAF.
+    if (state[source] !== S[kind]) state[key] = {};
+    S[kind] += delta;
+    state[source] = S[kind];
+  }
+  function cachedLiveText(kind, text) {
+    const state = currentLiveText(), source = kind + "Source";
+    const value = (kind === "answer" ? splitStreaming : thinkingTail)(text, state[kind], state[source] === text);
+    state[source] = text;
+    return value;
+  }
+  function clearLiveText() {
+    S.streaming = "";
+    S.thinking = "";
+    Object.assign(liveText, { session: undefined, run: undefined, answer: {}, thinking: {}, answerSource: undefined, thinkingSource: undefined, expanded: false });
   }
   function reuseStreamingBlock(previous, node) {
     if (previous?.isEqualNode(node)) return previous;
@@ -2861,7 +2915,7 @@
       liveDone.node = h("div", { class: "streaming" }, liveDone.done, liveDone.tail);
       liveDone.plainText = null;
     }
-    const [done, tail] = splitStreaming(text);
+    const [done, tail] = cachedLiveText("answer", text);
     if (liveDone.src !== done) {
       const extra = done.startsWith(liveDone.src) ? done.slice(liveDone.src.length) : null;
       const last = liveDone.done.lastElementChild;
@@ -2980,12 +3034,20 @@
     const live = $("live");
     if (!live) return;
     withTranscriptLayout(() => {
+      const textState = currentLiveText();
       if (liveRender.session !== S.current || liveRender.root !== live) {
         liveRender.session = S.current;
         liveRender.root = live;
         liveRender.who = h("div", { class: "who assistant" }, "Formless");
         liveRender.thinkingText = document.createTextNode("");
-        liveRender.thinking = h("div", { class: "thinking" }, liveRender.thinkingText);
+        liveRender.thinking = h("div", { class: "thinking", id: "live-reasoning", "aria-label": "Live reasoning" }, liveRender.thinkingText);
+        liveRender.thinkingToggleText = document.createTextNode("");
+        liveRender.thinkingToggle = h("button", { type: "button", class: "btn ghost small", "aria-controls": "live-reasoning", onclick: () => {
+          const state = currentLiveText();
+          state.expanded = !state.expanded;
+          renderLive();
+        } }, liveRender.thinkingToggleText);
+        liveRender.thinkingBox = h("div", { class: "live-thinking" }, liveRender.thinkingToggle, liveRender.thinking);
         liveRender.activityText = document.createTextNode("");
         liveRender.activity = h("div", { class: "activity" }, h("span", { class: "spinner" }), h("span", { "data-live-activity": "" }, liveRender.activityText));
         liveRender.rows.clear();
@@ -2996,9 +3058,20 @@
       if (running || S.streaming || tools.length) {
         children.push(liveRender.who);
         if (S.showThinking && S.thinking) {
-          const lines = S.thinking.split("\n");
-          updateText(liveRender.thinkingText, lines.length > 6 ? "… " + lines.slice(-6).join("\n") : S.thinking);
-          children.push(liveRender.thinking);
+          const expanded = textState.expanded;
+          const top = liveRender.thinking.scrollTop;
+          const className = "thinking" + (expanded ? " expanded" : "");
+          if (liveRender.thinking.className !== className) liveRender.thinking.className = className;
+          const tabIndex = expanded ? 0 : -1;
+          if (liveRender.thinking.tabIndex !== tabIndex) liveRender.thinking.tabIndex = tabIndex;
+          if (liveRender.thinkingToggle.getAttribute("aria-expanded") !== String(expanded)) {
+            liveRender.thinkingToggle.setAttribute("aria-expanded", String(expanded));
+          }
+          updateText(liveRender.thinkingToggleText, expanded ? "Collapse reasoning" : "Expand reasoning");
+          updateText(liveRender.thinkingText, expanded ? S.thinking : cachedLiveText("thinking", S.thinking));
+          // Updating the retained full text must not follow its growing end.
+          liveRender.thinking.scrollTop = expanded ? top : 0;
+          children.push(liveRender.thinkingBox);
         }
         for (const [tool, folded] of liveTree(S.liveTools)) {
           const row = liveToolRow(tool);
@@ -5642,8 +5715,7 @@
     clearQuestions();
     S.running.clear();
     S.activity = null;
-    S.streaming = "";
-    S.thinking = "";
+    clearLiveText();
     S.liveTools = []; S.liveRun = null;
     renderApproval();
   }
@@ -5721,8 +5793,7 @@
     S.sessionLoad = { id, status: "pending" };
     const snapshot = S.sessionSnapshot = { events: [] };
     S.messages = [];
-    S.streaming = "";
-    S.thinking = "";
+    clearLiveText();
     S.liveTools = []; S.liveRun = null;
     renderHistory();
     S.runTools = null;
@@ -6591,7 +6662,7 @@
       case "run_started":
         S.running.add(ev.session_id);
         if (here) { S.unfinished = null; renderRunBanner(); S.runTools = null; renderRunTools(); S.rated = null; S.recap = null; S.recapRunId = null; }
-        if (here) { S.streaming = ""; S.thinking = ""; S.liveTools = (S.liveTools || []).filter(t => t.status === "running" && t.handle); S.liveRun = { id: ev.run_id, ended: false }; setActivity("waiting for model"); }
+        if (here) { clearLiveText(); S.liveTools = (S.liveTools || []).filter(t => t.status === "running" && t.handle); S.liveRun = { id: ev.run_id, ended: false }; setActivity("waiting for model"); }
         break;
       case "run_recap":
         if (here && (!S.liveRun || S.liveRun.id === ev.run_id)) {
@@ -6611,7 +6682,7 @@
         // A persisted assistant step (e.g. text before a Tool call) replaces
         // the live stream, so the next step starts fresh.
         if (ev.message.role === "assistant") commitReadingStream(ev.session_id, ev.message);
-        if (here && (ev.type === "message_complete" || ev.message.role === "assistant")) { S.streaming = ""; S.thinking = ""; }
+        if (here && (ev.type === "message_complete" || ev.message.role === "assistant")) { clearLiveText(); }
         if (here) {
           const index = S.messages.findIndex((m) => m.id === ev.message.id);
           if (index < 0) S.messages.push(ev.message);
@@ -6620,7 +6691,7 @@
         }
         break;
       case "message_delta":
-        if (here) { S.streaming += ev.delta; if (!S.activity || S.activity.label !== "responding") setActivity("responding"); else scheduleEventRender({ live: true }); }
+        if (here) { appendLiveText("streaming", ev.delta); if (!S.activity || S.activity.label !== "responding") setActivity("responding"); else scheduleEventRender({ live: true }); }
         break;
       case "provider_stalled":
         if (here) { setActivity("provider stalled"); note("no data from the provider for " + ev.idle_secs + "s; /resend re-sends the request", true); }
@@ -6663,10 +6734,10 @@
         }
         break;
       case "stream_restarted":
-        if (here) { S.streaming = ""; S.thinking = ""; note("provider stream dropped; retrying"); scheduleEventRender({ live: true }); }
+        if (here) { clearLiveText(); note("provider stream dropped; retrying"); scheduleEventRender({ live: true }); }
         break;
       case "reasoning_delta":
-        if (here) { S.thinking += ev.delta; if (!S.activity || S.activity.label !== "thinking") setActivity("thinking"); else scheduleEventRender({ live: true }); }
+        if (here) { appendLiveText("thinking", ev.delta); if (!S.activity || S.activity.label !== "thinking") setActivity("thinking"); else scheduleEventRender({ live: true }); }
         break;
       case "run_finished":
       case "run_paused":
@@ -6683,8 +6754,7 @@
           renderRunBanner();
         }
         if (here) {
-          S.streaming = "";
-          S.thinking = "";
+          clearLiveText();
           S.liveTools = (S.liveTools || []).filter(t => t.status === "running" && t.handle); S.liveRun = { id: ev.run_id, ended: true };
           setActivity(null);
           if (ev.type === "run_paused") note("run paused: " + ((ev.explained && ev.explained.message) || ev.error), true);
