@@ -1715,6 +1715,17 @@ impl Store {
             .optional()?)
     }
 
+    /// Fork source prefix, decoded within the existing fork transaction.
+    fn list_messages_up_to(&self, session_id: &str, limit: i64) -> Result<Vec<MessageInfo>> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT * FROM messages WHERE session_id=?1 AND seq<=?2 ORDER BY seq")?;
+        let rows = statement
+            .query_map(params![session_id, limit], Self::row_msg)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// Messages with `seq > after`, in order (incremental context builds).
     pub fn list_messages_after(&self, session_id: &str, after: i64) -> Result<Vec<MessageInfo>> {
         let mut stmt = self
@@ -1833,12 +1844,13 @@ impl Store {
         if self.session_deleted(id)? {
             return Ok(None);
         }
-        let limit = up_to_seq.unwrap_or(i64::MAX);
-        let messages: Vec<MessageInfo> = self
-            .list_messages(id)?
-            .into_iter()
-            .filter(|m| m.seq <= limit)
-            .collect();
+        // Decode only the requested prefix, inside this same transaction.
+        // Conversion errors in excluded later rows no longer abort a bounded
+        // fork; included rows still use the ordinary row_msg contract.
+        let messages = match up_to_seq {
+            Some(limit) => self.list_messages_up_to(id, limit)?,
+            None => self.list_messages(id)?,
+        };
         let point = messages.last().map(|message| message.seq).unwrap_or(0);
         let checkpoints: Vec<(String, String, i64)> = self.ps(
             "SELECT id,summary,up_to_seq FROM checkpoints WHERE session_id=?1 AND up_to_seq<=?2 ORDER BY up_to_seq,rowid"
@@ -8239,3 +8251,7 @@ mod recent_failure_order_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "fork_projection_tests.rs"]
+mod fork_projection_tests;
