@@ -84,7 +84,11 @@ pub fn explain(raw: &str, ctx: &ErrorContext) -> ErrorExplained {
         .split('/')
         .next()
         .unwrap_or_default();
-    let local = host.starts_with("localhost") || host.starts_with("127.0.0.1");
+    let parsed_url = reqwest::Url::parse(ctx.base_url).ok();
+    let local = parsed_url
+        .as_ref()
+        .and_then(|url| url.host_str())
+        .is_some_and(crate::config::is_loopback_host);
     let (category, message, action) = if t.starts_with("stuck: repeated daemon correction:") {
         (
             "stuck",
@@ -181,8 +185,8 @@ pub fn explain(raw: &str, ctx: &ErrorContext) -> ErrorExplained {
         || t.contains("error sending request")
         || t.contains("timed out")
     {
-        let port = reqwest::Url::parse(ctx.base_url)
-            .ok()
+        let port = parsed_url
+            .as_ref()
             .and_then(|url| url.port_or_known_default());
         let hint = if port == Some(11434) {
             "Is Ollama running? Start it with `ollama serve`, then /resume"
@@ -274,6 +278,55 @@ mod tests {
             model: "gpt-x",
             alternatives: vec![],
         }
+    }
+
+    #[test]
+    fn loopback_provider_hints_use_parsed_endpoint_identity() {
+        for endpoint in [
+            "http://[::1]:8080/v1",
+            "http://127.0.0.2:8000/v1",
+            "http://app.localhost:8000/v1",
+            "http://demo:placeholder@localhost:8000/v1",
+            "HTTP://LOCALHOST:8000/v1",
+        ] {
+            let raw = "error sending request: tcp connect error: connection refused";
+            let explained = explain(raw, &ctx(endpoint));
+            assert_eq!(explained.category, "unreachable", "{endpoint}");
+            assert_eq!(
+                explained.action.as_deref(),
+                Some("Start the local server, then /resume"),
+                "{endpoint}"
+            );
+            assert_eq!(explained.details, raw);
+        }
+    }
+
+    #[test]
+    fn remote_lookalikes_and_invalid_urls_do_not_get_local_server_hints() {
+        for endpoint in [
+            "http://localhost.example.com:8080/v1",
+            "http://127.0.0.1.nip.io:8080/v1",
+            "http://localhost@remote.invalid:8080/v1",
+            "http://remote.invalid:8080/localhost",
+            "not a URL",
+        ] {
+            let explained = explain("connection refused", &ctx(endpoint));
+            assert_eq!(explained.category, "unreachable");
+            assert!(
+                explained.action.unwrap().starts_with("Check your network"),
+                "{endpoint}"
+            );
+        }
+        assert!(explain("connection refused", &ctx("http://[::1]:11434/v1"))
+            .action
+            .unwrap()
+            .contains("Ollama"));
+        assert!(
+            explain("connection refused", &ctx("http://localhost:1234/v1"))
+                .action
+                .unwrap()
+                .contains("LM Studio")
+        );
     }
 
     #[test]
