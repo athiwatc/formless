@@ -675,7 +675,8 @@ const KEYS: &[(&str, &str)] = &[
     ("Tool editor Esc / Ctrl+Q in Vim", "ask before discarding modified text; y discards, n/Esc keeps editing"),
     ("Ctrl+C", "clear the input; twice to detach"),
     ("Tab / Shift+Tab", "switch views"),
-    ("PgUp / PgDn, ↑ / ↓", "scroll the chat"),
+    ("PgUp / PgDn", "scroll the chat"),
+    ("↑ / ↓ (non-Vim composer)", "move within wrapped draft rows; browse Session history at the first/last row, including empty/one-line input"),
     (
         "j / k, g / G, Ctrl+D / Ctrl+U",
         "move in list views (Sessions, Tools, Metrics, Proposals)",
