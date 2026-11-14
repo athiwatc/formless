@@ -3458,10 +3458,27 @@ impl Store {
     /// Forget the Anthropic thinking stored on a Session's tool-call turns
     /// (the endpoint rejected it): it is not replayed again.
     pub fn drop_thinking_blocks(&self, session_id: &str) -> Result<usize> {
+        // Collect before any writes, in the original sequence order. Keep id
+        // conversion strict and meta conversion-to-missing like row_msg.
+        // Unused message columns (including corrupt content) are no longer
+        // decoded; this deliberately narrows the corrupt-row error surface.
+        let messages = {
+            let mut statement = self
+                .conn
+                .prepare("SELECT id, meta FROM messages WHERE session_id=?1 ORDER BY seq")?;
+            let rows = statement
+                .query_map(params![session_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1).ok().flatten(),
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
         let mut changed = 0;
-        for m in self.list_messages(session_id)? {
-            let Some(mut meta) = m
-                .meta
+        for (id, metadata) in messages {
+            let Some(mut meta) = metadata
                 .as_deref()
                 .and_then(|s| serde_json::from_str::<Value>(s).ok())
             else {
@@ -3474,7 +3491,7 @@ impl Store {
             {
                 changed += self.ex(
                     "UPDATE messages SET meta=?3 WHERE session_id=?1 AND id=?2",
-                    params![session_id, m.id, meta.to_string()],
+                    params![session_id, id, meta.to_string()],
                 )?;
             }
         }
@@ -8239,3 +8256,7 @@ mod recent_failure_order_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "thinking_metadata_tests.rs"]
+mod thinking_metadata_tests;
