@@ -1024,9 +1024,9 @@ the development command below; existing warnings are reported without being
 promoted to errors. Fork pull requests are skipped on the persistent runner.
 
 The runner needs the standard `self-hosted`, `macOS`, `ARM64` labels, Xcode
-Command Line Tools, Git, Rustup and outbound access for GitHub Actions, Cargo,
-Node and Python downloads. CI installs stable Rust with rustfmt/Clippy, Node 24
-and Python 3.12. Cargo dependencies are cached; application data/config and logs
+Command Line Tools, Git, Rustup, Python 3.11+ and outbound access for GitHub
+Actions, Cargo and Node downloads. CI installs stable Rust with rustfmt/Clippy
+and Node 24, and verifies the runner's native Python. Cargo dependencies are cached; application data/config and logs
 use private temporary directories that are cleaned after the job. This workflow
 does not deploy or publish a release; release packaging remains in `release.yml`.
 Live external-link checks remain in `docs.yml`; Playwright browser checks in
