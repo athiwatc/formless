@@ -6250,6 +6250,16 @@ stored message boundaries display a Note and the initial Session snapshot only;
 follow never invents a boundary or refreshes that legacy transcript without one.
 Connection loss is an error.
 
+`tools list --filter FILTER` selects one stored-state predicate: `not-retired`
+(including disabled Tools), `retired`, `failing` (known success rate below 0.8),
+`needs-attention`, `off` (disabled) or `pinned`. It combines by AND with
+`--tag TAG`, retaining exact stored-tag matching after the existing argument
+lowercasing/leading-# removal. Unknown rates do not count as failing; states
+may overlap. JSON uses the same selection and existing ToolInfo schema.
+Human output distinguishes an empty registry from no matching rows and names
+the flags to clear. `--show-pinned` adds a human PINNED yes/no column; default
+piped cells and row order remain unchanged. These flags never mutate a Tool.
+
 `prompts diff ID [--json]` reads the existing daemon proposal comparison:
 target, already-applied state and ordered operation/line pairs. Human output
 does not fit or clip lines to terminal width; JSON preserves the complete
