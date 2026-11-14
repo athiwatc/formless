@@ -116,11 +116,16 @@ impl Page {
                 }
             })
             .collect::<Vec<_>>();
+        let scope = if destination == Destination::Metrics {
+            " · Summary and up to 100 recent Runs"
+        } else {
+            ""
+        };
         Ok(Self {
             revision: 0,
             selected: (!rows.is_empty()).then_some(0),
             notice: format!(
-                "{} entries{} · Read only. Use the Formless TUI to edit.",
+                "{} entries{}{scope} · Read only. Use the Formless TUI to edit.",
                 rows.len(),
                 if truncated { " · first 1000 only" } else { "" }
             ),
@@ -148,6 +153,12 @@ mod tests {
             .unwrap()
             .rows
             .is_empty());
+    }
+
+    #[test]
+    fn metrics_notice_names_the_server_request_scope() {
+        let page = Page::decode(Destination::Metrics, json!({"summary":{},"runs":[]})).unwrap();
+        assert!(page.notice.contains("up to 100 recent Runs"));
     }
 
     #[test]
