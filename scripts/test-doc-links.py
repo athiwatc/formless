@@ -3,6 +3,7 @@
 import importlib.util
 from pathlib import Path
 import os
+import re
 import unittest
 from unittest.mock import patch
 from types import SimpleNamespace
@@ -181,6 +182,54 @@ class LinkChecks(unittest.TestCase):
         with patch.object(links, "build_opener", return_value=Opener()):
             links.api_get("", "dummy")
         self.assertEqual(captured, [("https://api.github.com/repos/athiwatc/formless", "Bearer dummy", 20)])
+
+    def assert_docs_workflow_contract(self, workflow):
+        # Fail-closed checks for this workflow's literal block mappings. This
+        # deliberately adds no YAML dependency to the native offline checks.
+        def permissions(source, indent):
+            pattern = r"(?m)^" + " " * indent + r"permissions:\n((?:" + " " * (indent + 2) + r"[^\n]*\n)+)"
+            matches = re.findall(pattern, source)
+            self.assertEqual(len(matches), 1, "one literal permissions mapping required")
+            entries = [tuple(part.strip() for part in line.strip().split(":", 1))
+                       for line in matches[0].splitlines()]
+            self.assertTrue(all(len(entry) == 2 for entry in entries))
+            self.assertEqual(len(entries), len(dict(entries)), "duplicate permission key")
+            return dict(entries)
+        self.assertEqual(permissions(workflow, 0), {"contents": "read"})
+        self.assertEqual(workflow.count("\njobs:\n"), 1)
+        jobs = workflow.split("\njobs:\n", 1)[1]
+        links_jobs = re.findall(r"(?ms)^  links:\n(.*?)(?=^  [A-Za-z0-9_-]+:|\Z)", jobs)
+        self.assertEqual(len(links_jobs), 1)
+        job = links_jobs[0]
+        self.assertEqual(permissions(job, 4), {"contents": "read", "issues": "read"})
+        self.assertEqual(len(re.findall(r"(?m)^[ \t]*permissions:", workflow)), 2,
+                         "no additional workflow/job permission grants")
+        self.assertEqual(re.findall(r"(?m)^[ \t]*issues:\s*(.*)$", workflow), ["read"])
+        self.assertIn("    if: github.ref == 'refs/heads/main'\n", job)
+        self.assertIn("          persist-credentials: false\n", job)
+        self.assertEqual(workflow.count("FORMLESS_LINK_GITHUB_TOKEN:"), 1)
+        self.assertIn("          FORMLESS_LINK_GITHUB_TOKEN: ${{ github.token }}\n", job)
+        self.assertIn('env -u FORMLESS_LINK_GITHUB_TOKEN "$binary" --version', job)
+        self.assertIn('python3 scripts/check-doc-links.py "$binary"', job)
+
+    def test_docs_workflow_limits_issue_read_to_links_job(self):
+        workflow = Path(__file__).resolve().parents[1] / ".github/workflows/docs.yml"
+        self.assert_docs_workflow_contract(workflow.read_text())
+
+    def test_docs_workflow_guard_rejects_expansion_and_isolation_regressions(self):
+        workflow = (Path(__file__).resolve().parents[1] / ".github/workflows/docs.yml").read_text()
+        mutations = [
+            workflow.replace("      issues: read\n", ""),
+            workflow.replace("      issues: read", "      issues: write"),
+            workflow.replace("\npermissions:\n  contents: read", "\npermissions:\n  contents: read\n  issues: read"),
+            workflow.replace("      contents: read\n", ""),
+            workflow + "\n  other:\n    permissions:\n      issues: read\n",
+            workflow.replace("persist-credentials: false", "persist-credentials: true"),
+            workflow.replace('env -u FORMLESS_LINK_GITHUB_TOKEN "$binary" --version', '"$binary" --version'),
+        ]
+        for mutated in mutations:
+            with self.subTest(workflow=mutated), self.assertRaises(AssertionError):
+                self.assert_docs_workflow_contract(mutated)
 
     def test_child_process_has_no_tokens(self):
         calls = []
