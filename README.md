@@ -147,7 +147,7 @@ Illustrative, not scripted: the Tools an agent builds are whatever the task need
 
 1. **A small, fixed boot set.** A fresh install exposes 25 built-in Tools and nothing else: the registry, memory, MCP, skills and planning primitives ([§5.1](#51-the-built-in-tools)). No domain Tool ships — web access, files, shell work and everything task-specific is built by the agent, then persisted and reused.
 2. **Measured, never vibes.** Self-Optimisation is triggered and judged only by recorded Invocation outcomes. No silent or untested mutation, ever.
-3. **No time-based killing.** Runs and Invocations have no step, token or time limits. The only terminators are completion, fault or the user.
+3. **Opt-in Run step controls.** Runs have no step cap by default. Existing [step controls](#run-controls) let you choose a pause threshold.
 4. **Deny by default.** Tools run sandboxed with only their declared Capabilities. The runtime offers nothing a Tool was not granted.
 5. **Local-first, zero telemetry.** Nothing leaves the machine except calls to the configured provider endpoint.
 6. **One core, many clients.** All behaviour lives in the Daemon Core. TUI, CLI and future frontends are interchangeable clients of one protocol.
@@ -1012,12 +1012,20 @@ formless memory rm m1a2b3c4
 ## 7. Sessions, Runs and Steer
 
 * **Session** — a resumable conversation plus Run history; many run concurrently against one Daemon Core. Deleting a Session removes payloads but keeps anonymised tallies.
-* **Run** — one unit of work: user message → final answer. No step, token or time limit; it ends on completion, fault or interruption.
+* **Run** — one unit of work: user message → final answer. No step cap by default; it ends on completion, fault or interruption.
 * **Steer** — a user message sent while a Run is active, injected at the next step boundary.
 * **Auto-naming** — when an `Untitled` Session finishes its first Run, the daemon gives it a short title (for example "Fixing Rust Error E0502"). A small model, [LFM2.5-230M](https://huggingface.co/LiquidAI/LFM2.5-230M) (153 MB, Q4_K_M), runs in-process on the CPU, so naming spends no provider tokens and sends nothing off the machine. It runs in the background, never delays a Run, and never replaces a name you set. The model downloads once into `<data dir>/models/` on first use (pinned revision, SHA-256 verified) or with `formless naming pull`. Until it is installed, or if it fails or exceeds `naming.timeout_secs`, the title is the first few words of your message. Set `naming.enabled = false` to turn naming off, or `naming.auto_download = false` to keep the model off the network. The model is licensed under the [LFM Open License v1.0](https://huggingface.co/LiquidAI/LFM2.5-230M/blob/main/LICENSE), which limits commercial use above a revenue threshold; building without the default `embedded-llm` cargo feature removes it and leaves only first-words titles.
 * **Compaction** — a persisted summary checkpoint that replaces old history and Tool output as context grows, so long Sessions keep going without losing the trail.
 * **Artifacts** — large Tool output is written to an artifact file; only a bounded preview enters model context.
 * **Tracked path changes** — `/files` lists paths captured by live host filesystem operations, including directories created with `fs.mkdir`. `/rewind` attempts safe restoration and reports skipped paths with reasons. Programs launched by Tools and MCP tools can write outside this tracking; when those capabilities are invoked, file notes and recaps warn that untracked writes are possible, including when no paths were captured. Counts describe tracked paths only. Paths whose recovery images expired remain listed with the reason; rewind never substitutes an older Run silently. Windows restoration also requires retained original objects and live object or directory proofs where applicable. Lost or expired proofs, including process-local proofs lost on restart, leave those paths read-only rather than reconstructing authority from stored hashes.
+
+### Run controls
+
+Set a profile default with `limits.run_steps`, use `/limit N` or `/limit off`
+in the TUI, or pass `formless run --max-steps N`. Reaching a step threshold
+pauses that Run. See the existing [step-limit and resume/abandon behavior](SPEC.md#54-interruption-and-resumption)
+and [spending-limit rules](SPEC.md#52-run-lifecycle). The client's `--timeout`
+is a separate interruption option.
 
 ---
 

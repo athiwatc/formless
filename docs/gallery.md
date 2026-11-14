@@ -20,9 +20,16 @@ headless with `formless run "…"`.
    Paperwhite on these three sites and make a table." → reuses `fetch_page`
    and adds an `extract_price` Tool; the table is the answer.
 3. **Track a changelog.** "Every Monday at 9, tell me what's new in the
-   Rust release notes." → a scheduled job (`/jobs`, or `formless jobs add
-   --every "monday at 9am"`) that runs the same request weekly and delivers
-   the answer as a notification (`--notify`) or into a file (`--to-file`).
+   Rust release notes." → a scheduled job (`/jobs`, or the complete command
+   below) that runs the same request weekly. For notification delivery:
+
+   ```sh
+   formless jobs add "Tell me what's new in the Rust release notes" --every "monday at 9am" --notify
+   ```
+
+   For file delivery, replace `--notify` with
+   `--to-file "./rust-release-notes.txt"`. Delivery requires the daemon and
+   computer to be available when the job runs.
 
 ## Your repositories
 
