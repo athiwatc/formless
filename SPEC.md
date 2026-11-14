@@ -4312,7 +4312,13 @@ run_tool = "network_policy"     # a registry Tool, or…
   `PreviewToolCode {id, code}`, which runs the same gate and saves nothing.
   From the review, Ctrl+S saves, and any other key returns to editing.
   A standalone **Metrics view** (v2, `/metrics`) summarises every Tool's
-  invocations and success rate, with the selected Tool's detail.
+  invocations and success rate. Its table includes all Tools independently of
+  the Tools filter, ordered by invocation count in the current range (stable
+  daemon order for ties). Selection follows Tool identity across range/order
+  changes, clamps when removed and scrolls into view. Enter loads the highlighted
+  Tool's existing all-time detail; unrelated cached detail stays hidden behind
+  an activation hint. Mouse rows use the same identity/order. General paging
+  keys and visible-capacity movement remain a separate concern (#1468).
 - **Bulk actions.** In the TUI Sessions view, Space marks rows (✓, with
   the count in the panel title) and Esc clears the marks. With marks:
   `a` archives them (or restores them if all are archived), `e` exports
