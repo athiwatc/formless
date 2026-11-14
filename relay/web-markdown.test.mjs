@@ -333,3 +333,31 @@ test('repeated Setext quote exits retain nested structure and each callout title
     }
   }
 });
+
+test('list siblings before the content column stay siblings across indent variations', () => {
+  const c=fixture();
+  for (const [source,tag] of [
+    ['- parent\n - sibling\n- third','ul'],
+    [' - parent\n- sibling','ul'],
+    ['- parent\n\n - sibling\n\n- third','ul'],
+    ['10. parent\n   11. sibling\n12. third','ol'],
+  ]) {
+    const root=c.markdown(source), list=root.children[0];
+    assert.equal(root.children.length,1,source);
+    assert.equal(list.tag,tag,source);
+    assert.equal(list.children.length,source.includes('third')?3:2,source);
+    assert.equal(all(list).filter(n=>n.tag===tag).length,1,source);
+  }
+});
+
+test('nested markers need the actual parent content column', () => {
+  const c=fixture();
+  for (const source of ['- parent\n  - child\n- sibling','10. parent\n    - child\n11. sibling','1. parent\n   - child\n2. sibling']) {
+    const root=c.markdown(source), list=root.children[0];
+    assert.equal(root.children.length,1,source);
+    assert.equal(list.children.length,2,source);
+    assert.equal(all(list.children[0]).filter(n=>n.tag==='ul').length,1,source);
+    assert.equal(plain(list.children[1]),'sibling',source);
+  }
+  assert.equal(plain(c.markdown('- lazy\n continuation').children[0].children[0]),'lazycontinuation');
+});
