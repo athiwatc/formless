@@ -16835,6 +16835,11 @@ pub fn credential_path(path: &std::path::Path) -> Option<&'static str> {
         }
     }
     let name = path.file_name()?.to_string_lossy().to_lowercase();
+    let env_template = formless_runtime::sensitive_paths::is_env_template_file(path)
+        && matches!(
+            formless_runtime::sensitive_paths::PathPolicy::default().classify(path, path),
+            Ok(formless_runtime::sensitive_paths::PathDecision::Ordinary)
+        );
     let secret_file = [
         ".netrc",
         ".npmrc",
@@ -16843,8 +16848,7 @@ pub fn credential_path(path: &std::path::Path) -> Option<&'static str> {
         ".git-credentials",
     ]
     .contains(&name.as_str())
-        || name == ".env"
-        || name.starts_with(".env.")
+        || ((name == ".env" || name.starts_with(".env.")) && !env_template)
         || name.starts_with("id_rsa")
         || name.starts_with("id_ed25519")
         || name.starts_with("id_ecdsa")
