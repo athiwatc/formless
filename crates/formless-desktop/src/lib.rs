@@ -16,6 +16,7 @@ pub mod pages;
 pub mod questions;
 pub mod replies;
 pub mod search;
+pub mod session_edit;
 #[cfg(feature = "gui")]
 pub mod shell;
 pub mod snapshot_guard;

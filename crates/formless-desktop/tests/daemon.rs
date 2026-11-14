@@ -159,6 +159,14 @@ async fn until(client: &Client, stage: &'static str, mut predicate: impl FnMut(U
                     outcome,
                     ..
                 } => format!("answer {question_id}: {outcome:?}"),
+                Update::SessionEdited {
+                    session_id,
+                    outcome,
+                    ..
+                } => format!("metadata {session_id}: {outcome:?}"),
+                Update::SessionDetails {
+                    session_id, result, ..
+                } => format!("metadata read {session_id}: ok={}", result.is_ok()),
                 Update::Prepared(prepared) => format!(
                     "forecast {} confirmation={}",
                     prepared.label, prepared.quote.confirmation_required
@@ -296,6 +304,45 @@ async fn real_daemon_provider_send_navigation_resources_and_reconnect() {
     })
     .await;
     let mut observer = Observer::connect(&endpoint, &a).await;
+    // Metadata changes are separate, acknowledged setters for a frozen
+    // target, independent of the open transcript and provider execution.
+    let metadata_read = uuid::Uuid::new_v4();
+    client
+        .send(Command::ReadSessionDetails {
+            connection: client.connection(),
+            operation: metadata_read,
+            session_id: b.clone(),
+        })
+        .unwrap();
+    until(&client,"metadata-read",|u|matches!(u,Update::SessionDetails {operation,result:Ok(metadata),..} if operation==metadata_read && metadata.id==b)).await;
+    for change in [
+        formless_desktop::session_edit::Change::Name("Desktop renamed ไทย 😀".into()),
+        formless_desktop::session_edit::Change::Tags(vec![
+            "#Work".into(),
+            "work".into(),
+            "ไทย 漢字 😀".into(),
+        ]),
+        formless_desktop::session_edit::Change::Pin(true),
+    ] {
+        let operation = uuid::Uuid::new_v4();
+        let expected = change.clone();
+        client
+            .send(Command::EditSession {
+                connection: client.connection(),
+                operation,
+                session_id: b.clone(),
+                change,
+            })
+            .unwrap();
+        until(&client,"metadata-save",|u|matches!(u,Update::SessionEdited {operation:ack,session_id,outcome:formless_desktop::session_edit::Outcome::Applied(metadata),..} if ack==operation && session_id==b && expected.matches(&metadata))).await;
+    }
+    let metadata = daemon
+        .handle(Request::GetSession { id: b.clone() })
+        .await
+        .unwrap();
+    assert_eq!(metadata["session"]["name"], "Desktop renamed ไทย 😀");
+    assert_eq!(metadata["session"]["tags"], json!(["work", "ไทย 漢字 😀"]));
+    assert_eq!(metadata["session"]["pinned"], true);
     client
         .send(Command::Select {
             session_id: Some(a.clone()),

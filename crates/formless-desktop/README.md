@@ -20,6 +20,9 @@ cargo test --no-default-features --features daemon-tests --test daemon --locked
 This mode loads real Sessions, supports New Session, Send/Steer/Queue/Stop and
 Resume/Abandon for a confirmed paused or interrupted Run,
 and displays read-only Tools, recorded Run Metrics, Proposals and Settings.
+Session details (palette or Sessions > Details) edits name, tags or pin using
+one acknowledged setter per Save. It targets the chosen list entry, or the
+open Session outside the list.
 Arrow keys browse resource entries; Copy details copies all returned fields
 as JSON. Loaded-text Search keeps its explicit Session scope. Existing pending
 questions are available in the Profile-wide Questions command/header entry,
@@ -65,6 +68,19 @@ rejected whole. Existing questions reload through a Session snapshot, so open
 a Session after connecting to restore them; new question events are global.
 Unsupported definitions and exhausted native recovery limits explicitly
 handoff to the TUI. These forms do not implement security approval semantics.
+
+Session details loads a fresh correlated read before enabling Save. These
+existing setters replace a current field; they cannot compare against a
+previous revision, so another client's intervening edit can be overwritten.
+Tags are one per line and use the daemon's normalization. Names/tags inputs
+are limited to 16 KiB; at most 128 tags of 256 bytes each are editable here.
+Cancel and Reload discard unsaved metadata edits explicitly; neither undoes
+an already sent save. Errors retain the edit. A disconnect or ambiguous ACK
+freezes Save until an explicit fresh Reload; no mutation is replayed.
+New Step prompts for the subscribed Session produce an explicit Formless TUI
+handoff notice. The current protocol does not restore pending Step identities
+in Subscribe/GetSession;
+native Step control/reconnect parity remains incomplete.
 
 The optional `daemon-tests` feature links the daemon only into the test build.
 The normal desktop graph does not embed the daemon or depend on the TUI.
@@ -125,6 +141,8 @@ not see GPUI. Run every command below from this directory.
 | `src/commands.rs` | Typed shell command registry and palette search | none |
 | `src/replies.rs` | Read-only, validated `ListSessions` / `GetSession` decoding | none |
 | `src/forecast.rs` | Validation and bounded presentation of daemon forecast quotes; estimates and consent remain daemon-owned | none |
+| `src/session_edit.rs` | Bounded Session metadata setters and acknowledgement validation | none |
+| `src/shell/sessions.rs` | Native Session metadata editor with correlated reads, focus and reconnect recovery | `gui` feature |
 | `src/questions.rs` | Profile-wide question identity, validated answers and bounded close-event tombstones | none |
 | `src/shell/questions.rs` | Native question review, bounded answer drafts, input, focus and acknowledgement states | `gui` feature |
 | `src/transcript.rs` | Pure transcript event application, canonical completion replacement and sticky reload-needed state; a trusted in-memory shell seam uses it, with no transport | none |

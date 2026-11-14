@@ -159,6 +159,109 @@ async fn snapshot(observer: &mut Observer, session: &str) -> Value {
         .await
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn step_prompt_has_a_live_handoff_but_no_snapshot_or_reconnect_inventory() {
+    let env = credential_env::EnvGuard::isolated();
+    env.set("FORMLESS_API_KEY", "private-step-fixture-key");
+    let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let fixture=Fixture::start(app(axum::routing::post({let requests=requests.clone();move|| {
+        let number=requests.fetch_add(1,std::sync::atomic::Ordering::SeqCst)+1;
+        async move {
+            let gate=Arc::new(Notify::new());gate.notify_one();
+            match number {
+                1=>gated_response(prefix("Review this missing fixture Tool. "),Some(encode(&[
+                    json!({"type":"content_block_stop","index":0}),
+                    json!({"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"step-call","name":"no_such_step_fixture_tool"}}),
+                    json!({"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{}"}}),
+                    json!({"type":"content_block_stop","index":1}),
+                    json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":10}}),json!({"type":"message_stop"})
+                ])),gate),
+                2=>gated_response(prefix("Step was skipped. "),Some(tail("Done 😀")),gate),
+                _=>panic!("unexpected provider replay {number}"),
+            }
+        }
+    }})),0).await;
+    let client = Client::start(fixture.endpoint.clone());
+    until(&client, "step-desktop-connect", |update| {
+        matches!(update, Update::Connection { ready: true, .. })
+    })
+    .await;
+    client
+        .send(Command::Select {
+            session_id: Some(fixture.session.clone()),
+            generation: 1,
+        })
+        .unwrap();
+    until(&client, "step-subscription-ready", |update| {
+        matches!(update, Update::Snapshot { generation: 1, .. })
+    })
+    .await;
+    let mut observer = Observer::connect(&fixture.endpoint, &fixture.session).await;
+    let result = observer
+        .request(Request::SetStepMode {
+            session_id: fixture.session.clone(),
+            on: true,
+        })
+        .await;
+    assert_eq!(result["on"], true);
+    send(&mut observer, &fixture.session).await;
+    wait(&mut observer, |event| {
+        matches!(event, Event::StepPending { .. })
+    })
+    .await;
+    let step = observer
+        .events
+        .iter()
+        .find_map(|event| match event {
+            Event::StepPending { step_id, .. } => Some(step_id.clone()),
+            _ => None,
+        })
+        .unwrap();
+    until(&client,"step-native-handoff",|update|matches!(update,Update::Notice(text) if text.contains("Step review requested") && text.contains("Formless TUI"))).await;
+    let before = snapshot(&mut observer, &fixture.session).await;
+    assert_eq!(before["step_mode"], true);
+    assert_eq!(before["running"], true);
+    assert!(before["pending_events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|event| event["step_id"].as_str() != Some(step.as_str())));
+    drop(client);
+    drop(observer);
+    let mut observer = Observer::connect(&fixture.endpoint, &fixture.session).await;
+    let after = snapshot(&mut observer, &fixture.session).await;
+    assert_eq!(after["step_mode"], true);
+    assert_eq!(after["running"], true);
+    assert!(after["pending_events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|event| event["step_id"].as_str() != Some(step.as_str())));
+    assert!(
+        !observer
+            .events
+            .iter()
+            .any(|event| matches!(event, Event::StepPending { .. })),
+        "Subscribe/GetSession do not replay the missing prompt"
+    );
+    let result = observer
+        .request(Request::StepDecision {
+            step_id: step.clone(),
+            action: "skip".into(),
+            arguments: None,
+        })
+        .await;
+    assert_eq!(result["step_id"], step);
+    assert_eq!(result["action"], "skip");
+    wait(&mut observer, |event| {
+        matches!(event, Event::RunFinished { .. })
+    })
+    .await;
+    assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 2);
+    drop(observer);
+    fixture.finish().await;
+}
+
 // A fast provider may publish the event before the Send acknowledgement.
 // Each predicate below names a unique boundary within its one-Run fixture.
 async fn wait(observer: &mut Observer, predicate: impl FnMut(&Event) -> bool) {

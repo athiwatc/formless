@@ -14,6 +14,8 @@ use std::time::{Duration, Instant};
 
 #[path = "support/questions.rs"]
 mod question_tests;
+#[path = "support/session_edit.rs"]
+mod session_edit_tests;
 
 use formless_desktop::commands::{self, Command};
 use formless_desktop::fixture;

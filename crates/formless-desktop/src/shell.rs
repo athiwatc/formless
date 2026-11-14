@@ -35,6 +35,7 @@ use crate::commands::{self, Command};
 use crate::directory::{self, Directory};
 use crate::forecast;
 mod questions;
+mod sessions;
 use crate::full_view;
 use crate::memory::{
     edit_span, format_bytes, limits, paste_can_never_fit, snap_to_graphemes, within_composer_limit,
@@ -76,6 +77,7 @@ gpui_kit::actions!(
         ClosePalette,
         CloseForecast,
         CloseQuestions,
+        CloseSessionEditor,
         ScrollViewerUp,
         ScrollViewerDown,
         ScrollViewerPageUp,
@@ -102,6 +104,7 @@ const INSPECTOR_CONTEXT: &str = "FormlessInspector";
 const PALETTE_CONTEXT: &str = "FormlessPalette";
 const FORECAST_CONTEXT: &str = "FormlessForecast";
 const QUESTIONS_CONTEXT: &str = "FormlessQuestions";
+const SESSION_EDITOR_CONTEXT: &str = "FormlessSessionEditor";
 const QUESTIONS_READ_CONTEXT: &str = "FormlessQuestions && !Input";
 const VIEWER_CONTEXT: &str = "FormlessViewer";
 const RESOURCE_CONTEXT: &str = "FormlessResource";
@@ -158,6 +161,7 @@ pub fn bind_keys(cx: &mut App) {
                 | Command::ResumeRun
                 | Command::AbandonRun
                 | Command::Questions
+                | Command::SessionDetails
                 | Command::ToggleTheme
                 | Command::GoTo(_) => unreachable!("{command:?} has no global shortcut"),
             })
@@ -166,6 +170,37 @@ pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("escape", CloseForecast, Some(FORECAST_CONTEXT)),
         KeyBinding::new("escape", CloseQuestions, Some(QUESTIONS_CONTEXT)),
+        KeyBinding::new("escape", CloseSessionEditor, Some(SESSION_EDITOR_CONTEXT)),
+        KeyBinding::new(
+            "up",
+            ScrollViewerUp,
+            Some("FormlessSessionEditor && !Input"),
+        ),
+        KeyBinding::new(
+            "down",
+            ScrollViewerDown,
+            Some("FormlessSessionEditor && !Input"),
+        ),
+        KeyBinding::new(
+            "pageup",
+            ScrollViewerPageUp,
+            Some("FormlessSessionEditor && !Input"),
+        ),
+        KeyBinding::new(
+            "pagedown",
+            ScrollViewerPageDown,
+            Some("FormlessSessionEditor && !Input"),
+        ),
+        KeyBinding::new(
+            "home",
+            ScrollViewerStart,
+            Some("FormlessSessionEditor && !Input"),
+        ),
+        KeyBinding::new(
+            "end",
+            ScrollViewerEnd,
+            Some("FormlessSessionEditor && !Input"),
+        ),
         KeyBinding::new("up", ScrollViewerUp, Some(QUESTIONS_READ_CONTEXT)),
         KeyBinding::new("down", ScrollViewerDown, Some(QUESTIONS_READ_CONTEXT)),
         KeyBinding::new("pageup", ScrollViewerPageUp, Some(QUESTIONS_READ_CONTEXT)),
@@ -415,6 +450,7 @@ enum Modal {
     Viewer,
     Forecast,
     Questions,
+    SessionEditor,
 }
 
 struct ForecastDialog {
@@ -577,6 +613,7 @@ pub struct Shell {
     client_attention: bool,
     client_questions: crate::questions::State,
     question_panel: Option<questions::Panel>,
+    session_editor: Option<sessions::Panel>,
     question_drafts: Drafts,
     question_draft_ids: Vec<String>,
     questions_toggle_focus: FocusHandle,
@@ -749,6 +786,7 @@ impl Shell {
             client_attention: false,
             client_questions: crate::questions::State::default(),
             question_panel: None,
+            session_editor: None,
             question_drafts: Drafts::new(16, 4 * 1024 * 1024),
             question_draft_ids: Vec::new(),
             questions_toggle_focus: cx.focus_handle(),
@@ -789,6 +827,7 @@ impl Shell {
                 has_composer: true,
                 can_recover: false,
                 can_questions: false,
+                can_edit_session: false,
                 composing: false,
                 sessions_shown: true,
                 context_shown: true,
@@ -1142,7 +1181,9 @@ impl Shell {
     /// What holds the window modally in `layout`: the palette, which is
     /// always on top, or a panel overlay.
     fn current_modal(&self, layout: Layout) -> Option<Modal> {
-        if self.question_panel.is_some() {
+        if self.session_editor.is_some() {
+            Some(Modal::SessionEditor)
+        } else if self.question_panel.is_some() {
             Some(Modal::Questions)
         } else if self.forecast.is_some() {
             Some(Modal::Forecast)
@@ -1668,6 +1709,25 @@ impl Shell {
                 question_id,
                 outcome,
             } => self.question_outcome(connection, operation, &question_id, outcome, cx),
+            ClientUpdate::SessionEdited {
+                connection,
+                operation,
+                session_id,
+                outcome,
+            } => self.session_edit_outcome(connection, operation, &session_id, outcome, window, cx),
+            ClientUpdate::SessionDetails {
+                connection,
+                operation,
+                session_id,
+                result,
+            } => self.session_details_received(
+                connection,
+                operation,
+                &session_id,
+                result,
+                window,
+                cx,
+            ),
             ClientUpdate::Sessions(sessions) => {
                 let previous = self.sidebar.active_id().map(str::to_string);
                 let previous_state = self.run_state();
@@ -2398,6 +2458,7 @@ impl Shell {
                     .as_ref()
                     .is_some_and(|run| run.recoverable()),
             can_questions: self.client.is_some(),
+            can_edit_session: self.client_connected && self.session_edit_target().is_some(),
             composing,
             sessions_shown: layout.sidebar != SidebarMode::Collapsed,
             context_shown: layout.inspector != InspectorMode::Hidden,
@@ -2418,6 +2479,19 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<&'static str> {
+        if self.session_editor.is_some()
+            && !matches!(
+                command,
+                Command::FocusNextRegion
+                    | Command::FocusPreviousRegion
+                    | Command::IncreaseTextSize
+                    | Command::DecreaseTextSize
+                    | Command::ResetTextSize
+                    | Command::ToggleTheme
+            )
+        {
+            return Some("Close Session details before changing the underlying view");
+        }
         if self.question_panel.is_some()
             && !matches!(
                 command,
@@ -2462,6 +2536,7 @@ impl Shell {
         }
         match command {
             Command::Questions => self.open_questions(window, cx),
+            Command::SessionDetails => self.open_session_editor(window, cx),
             Command::Send => self.submit(false, cx),
             Command::SendSecondary => self.submit(true, cx),
             Command::Stop => self.stop(cx),
@@ -2890,13 +2965,24 @@ impl Shell {
                 }
                 cx.notify();
             }
+            Modal::SessionEditor => {
+                if let Some(panel) = &self.session_editor {
+                    window.focus(&panel.cancel, cx);
+                }
+                cx.notify();
+            }
         }
     }
 
     fn cycle_region(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
         // The palette and the full-output view trap the cycle too.
-        if let Some(modal @ (Modal::Palette | Modal::Viewer | Modal::Forecast | Modal::Questions)) =
-            self.current_modal(self.layout(window))
+        if let Some(
+            modal @ (Modal::Palette
+            | Modal::Viewer
+            | Modal::Forecast
+            | Modal::Questions
+            | Modal::SessionEditor),
+        ) = self.current_modal(self.layout(window))
         {
             self.focus_modal(modal, window, cx);
             return;
@@ -3946,7 +4032,7 @@ impl Shell {
         let focused = self.conversation_focus.contains_focused(window, cx);
         v_flex().id("region-conversation").test_support().role(Role::Main)
             .aria_label(if self.client.is_some() { "Daemon Sessions" } else { "Fixture Sessions" })
-            .aria_description(if self.client.is_some() { "Daemon Sessions; archived Sessions excluded. Arrows choose, Enter opens, Escape returns to Chat. Refresh reloads the list. New Session creates a Session in the connected daemon." } else { "Read-only fixture Sessions; archived Sessions excluded. Filter title, preview or ID, up to 256 characters. Arrows choose, Enter opens, Escape returns to Chat. Shared synthetic transcript only; no daemon connection or Session management actions." })
+            .aria_description(if self.client.is_some() { "Daemon Sessions; archived Sessions excluded. Arrows choose, Enter opens, Escape returns to Chat. Refresh reloads the list. Details edits the chosen entry. New Session creates a Session in the connected daemon." } else { "Read-only fixture Sessions; archived Sessions excluded. Filter title, preview or ID, up to 256 characters. Arrows choose, Enter opens, Escape returns to Chat. Shared synthetic transcript only; no daemon connection or Session management actions." })
             .track_focus(&self.conversation_focus)
             .map(|region| inert_while(region, self.background_inert(window)))
             .map(|region| Self::main_size(region, page_height))
@@ -3958,9 +4044,11 @@ impl Shell {
             .on_action(cx.listener(|this, _: &DirectoryPrevious, window, cx| this.move_directory(-1, window, cx)))
             .on_action(cx.listener(|this, _: &DirectoryOpen, window, cx| this.open_directory_choice(window, cx)))
             .on_action(cx.listener(|this, _: &DirectoryBack, window, cx| this.directory_back(window, cx)))
-            .child(h_flex().gap_2()
+            .child(h_flex().gap_2().flex_wrap().flex_shrink_0()
                 .child(readable("directory-title", if self.client.is_some() { "Daemon Sessions" } else { "Fixture Sessions" }).flex_1().min_w_0().truncate())
                 .when(self.client.is_some(), |header| header
+                    .child(Button::new("edit-daemon-session").small().label("Details").disabled(!self.client_connected || self.session_edit_target().is_none())
+                        .on_click(cx.listener(|this,_,window,cx| {this.run_command(Command::SessionDetails,window,cx);})))
                     .child(Button::new("new-daemon-session").small().label("New Session").disabled(!self.client_connected)
                         .on_click(cx.listener(|this, _, _, cx| this.client_request(ClientCommand::CreateSession, cx))))
                     .child(Button::new("refresh-daemon-sessions").small().label("Refresh").disabled(!self.client_connected)
@@ -4586,6 +4674,7 @@ impl Shell {
 
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.reveal_session_editor(window, cx);
         self.reveal_question_focus(window, cx);
         if self
             .forecast
@@ -4666,6 +4755,9 @@ impl Render for Shell {
             })
             .when(self.question_panel.is_some(), |shell| {
                 shell.child(self.render_questions(window, cx))
+            })
+            .when(self.session_editor.is_some(), |shell| {
+                shell.child(self.render_session_editor(window, cx))
             })
     }
 }

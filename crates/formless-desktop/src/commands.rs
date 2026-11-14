@@ -24,6 +24,7 @@ pub enum Command {
     ResumeRun,
     AbandonRun,
     Questions,
+    SessionDetails,
     ToggleSessions,
     ToggleContext,
     ToggleTheme,
@@ -72,6 +73,7 @@ pub struct State {
     /// A current, connected canonical snapshot has a recoverable last Run.
     pub can_recover: bool,
     pub can_questions: bool,
+    pub can_edit_session: bool,
     /// Whether an input method is composing text in the composer.
     pub composing: bool,
     pub sessions_shown: bool,
@@ -161,6 +163,7 @@ pub fn keys(command: Command) -> &'static [&'static str] {
         | Command::ResumeRun
         | Command::AbandonRun
         | Command::Questions
+        | Command::SessionDetails
         | Command::ToggleTheme
         | Command::GoTo(_) => &[],
     }
@@ -229,6 +232,7 @@ pub fn palette(state: &State) -> Vec<Entry> {
         Command::ResumeRun,
         Command::AbandonRun,
         Command::Questions,
+        Command::SessionDetails,
         Command::ToggleSessions,
         Command::ToggleContext,
     ]);
@@ -339,6 +343,18 @@ pub fn entry(command: Command, state: &State) -> Entry {
             "Answer pending questions for their original Sessions",
             None,
             (!state.can_questions).then_some("Connect to a Profile first"),
+        ),
+        Command::SessionDetails => (
+            "Session details",
+            "Edit Session name, tags or pin".into(),
+            Group::Navigation,
+            "Edit the chosen Sessions-list entry, or the open Session outside that list",
+            None,
+            if state.composing {
+                Some(COMPOSING)
+            } else {
+                (!state.can_edit_session).then_some("Choose a Session while connected")
+            },
         ),
         Command::ToggleSessions => (
             "Sessions",
@@ -466,6 +482,7 @@ mod tests {
             has_composer: true,
             can_recover: false,
             can_questions: false,
+            can_edit_session: false,
             composing: false,
             sessions_shown: true,
             context_shown: false,

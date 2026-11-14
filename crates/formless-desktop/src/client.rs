@@ -32,6 +32,7 @@ use crate::forecast;
 use crate::model::{Destination, Intent};
 use crate::questions;
 use crate::replies::{self, SessionSnapshot};
+use crate::session_edit;
 
 const QUEUE: usize = 16;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -63,6 +64,18 @@ pub enum Update {
         operation: uuid::Uuid,
         question_id: String,
         outcome: questions::Outcome,
+    },
+    SessionEdited {
+        connection: u64,
+        operation: uuid::Uuid,
+        session_id: String,
+        outcome: session_edit::Outcome,
+    },
+    SessionDetails {
+        connection: u64,
+        operation: uuid::Uuid,
+        session_id: String,
+        result: Result<session_edit::Metadata, String>,
     },
     Page {
         destination: Destination,
@@ -107,6 +120,17 @@ pub enum Command {
         operation: uuid::Uuid,
         question: Box<questions::Open>,
         answers: Vec<formless_protocol::QuestionAnswer>,
+    },
+    EditSession {
+        connection: u64,
+        operation: uuid::Uuid,
+        session_id: String,
+        change: session_edit::Change,
+    },
+    ReadSessionDetails {
+        connection: u64,
+        operation: uuid::Uuid,
+        session_id: String,
     },
 }
 
@@ -190,6 +214,8 @@ impl Client {
                 | Command::ConfirmPrepared(_)
                 | Command::CommitPrepared(_)
                 | Command::AnswerQuestion { .. }
+                | Command::EditSession { .. }
+                | Command::ReadSessionDetails { .. }
         ) && !self.is_ready()
         {
             return Err("Not connected; the action was not queued.");
@@ -292,6 +318,15 @@ enum Pending {
     Consent(Box<Preparation>),
     Create,
     Answer(Action),
+    EditSession {
+        operation: uuid::Uuid,
+        session_id: String,
+        change: session_edit::Change,
+    },
+    ReadSessionDetails {
+        operation: uuid::Uuid,
+        session_id: String,
+    },
 }
 
 /// Transport request ids restart on reconnect. Each mutation needs a separate
@@ -560,6 +595,64 @@ impl Engine {
             Command::CreateSession if self.ready => {
                 self.request(Request::CreateSession { name: None }, Pending::Create)
             }
+            Command::ReadSessionDetails {
+                connection,
+                operation,
+                session_id,
+            } if self.ready => {
+                if connection != self.connection || session_id.is_empty() || session_id.len() > 256
+                {
+                    self.updates.push(Update::SessionDetails {
+                        connection: self.connection,
+                        operation,
+                        session_id,
+                        result: Err(
+                            "Connection or Session identity changed; reload details.".into()
+                        ),
+                    });
+                } else {
+                    self.request(
+                        Request::GetSession {
+                            id: session_id.clone(),
+                        },
+                        Pending::ReadSessionDetails {
+                            operation,
+                            session_id,
+                        },
+                    );
+                }
+            }
+            Command::EditSession {
+                connection,
+                operation,
+                session_id,
+                change,
+            } if self.ready => {
+                let error = if connection != self.connection {
+                    Some("Connection changed; reload Session details before editing.".into())
+                } else if session_id.is_empty() || session_id.len() > 256 {
+                    Some("Invalid Session identity; no change was sent.".into())
+                } else if self.pending.values().any(|pending| matches!(pending, Pending::EditSession { session_id: id, .. } if id == &session_id)) {
+                    Some("A metadata change for this Session is already waiting.".into())
+                } else { change.validate().err().map(str::to_string) };
+                if let Some(error) = error {
+                    self.updates.push(Update::SessionEdited {
+                        connection: self.connection,
+                        operation,
+                        session_id,
+                        outcome: session_edit::Outcome::Rejected(error),
+                    });
+                } else {
+                    self.request(
+                        change.request(&session_id),
+                        Pending::EditSession {
+                            operation,
+                            session_id,
+                            change,
+                        },
+                    );
+                }
+            }
             Command::Review {
                 intent,
                 draft_basis,
@@ -685,12 +778,40 @@ impl Engine {
                 question_id: question.id,
                 outcome: questions::Outcome::Rejected("Not connected; no answer was sent.".into()),
             }),
+            Command::EditSession {
+                operation,
+                session_id,
+                ..
+            } => self.updates.push(Update::SessionEdited {
+                connection: self.connection,
+                operation,
+                session_id,
+                outcome: session_edit::Outcome::Rejected(
+                    "Not connected; no change was sent.".into(),
+                ),
+            }),
+            Command::ReadSessionDetails {
+                operation,
+                session_id,
+                ..
+            } => self.updates.push(Update::SessionDetails {
+                connection: self.connection,
+                operation,
+                session_id,
+                result: Err("Not connected; no details were requested.".into()),
+            }),
         }
     }
 
     fn receive(&mut self, message: ServerMessage) -> Result<(), String> {
         let (id, result, response_ok) = match message {
             ServerMessage::Event(event) => {
+                if let Event::StepPending { session_id, .. } = &event {
+                    // Historical handoff for a subscribed Session only.
+                    // GetSession does not retain pending Step identities, so
+                    // it cannot assert a recoverable current decision state.
+                    self.updates.push(Update::Notice(format!("Step review requested for Session {}. Continue in Formless TUI; native Step decisions are not available.",questions::preview(session_id,200))));
+                }
                 if matches!(
                     event,
                     Event::UserQuestion { .. } | Event::UserQuestionClosed { .. }
@@ -847,6 +968,55 @@ impl Engine {
                 self.updates.push(Update::Action {
                     session_id: action.session_id,
                     result: result.map(|_| ()),
+                });
+            }
+            Pending::EditSession {
+                operation,
+                session_id,
+                change,
+            } => {
+                let outcome = match result {
+                    Ok(value) => serde_json::from_value::<SessionInfo>(value)
+                        .ok()
+                        .filter(|session| session.id == session_id)
+                        .and_then(|session| session_edit::Metadata::from_session(&session).ok())
+                        .filter(|metadata| change.matches(metadata))
+                        .map_or(
+                            session_edit::Outcome::Unknown,
+                            session_edit::Outcome::Applied,
+                        ),
+                    Err(_) if response_ok => session_edit::Outcome::Unknown,
+                    Err(error) => session_edit::Outcome::Rejected(error),
+                };
+                self.updates.push(Update::SessionEdited {
+                    connection: self.connection,
+                    operation,
+                    session_id,
+                    outcome,
+                });
+                self.dirty_list = true;
+            }
+            Pending::ReadSessionDetails {
+                operation,
+                session_id,
+            } => {
+                let result = result
+                    .and_then(|value| {
+                        serde_json::from_value::<SessionInfo>(value["session"].clone())
+                            .map_err(|_| "Could not decode Session metadata.".into())
+                    })
+                    .and_then(|session| {
+                        if session.id != session_id {
+                            Err("The metadata reply belongs to another Session.".into())
+                        } else {
+                            session_edit::Metadata::from_session(&session).map_err(str::to_string)
+                        }
+                    });
+                self.updates.push(Update::SessionDetails {
+                    connection: self.connection,
+                    operation,
+                    session_id,
+                    result,
                 });
             }
             Pending::Answer(action) => {
@@ -1082,8 +1252,9 @@ async fn connected<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
         if deadlines.values().any(|at| at.elapsed() >= REQUEST_TIMEOUT) {
             return Err("A daemon request timed out; its action outcome may be unknown.".into());
         }
-        // Mutations with no definite response are never replayed. Record
-        // them before attempting a write, which may partially succeed.
+        // Mutations are never replayed. Retain Run/question identities before
+        // writes, which may partially succeed. The metadata editor instead
+        // freezes on connection change and requires an explicit fresh read.
         uncertain.extend(engine.pending.values().filter_map(|p| {
             if let Pending::Action(action) | Pending::Answer(action) = p {
                 Some(action.clone())
@@ -1225,6 +1396,106 @@ mod tests {
     use super::*;
     use formless_protocol::{MessageInfo, SendMode};
     use serde_json::json;
+
+    #[test]
+    fn session_metadata_uses_frozen_target_and_validates_operation_specific_replies() {
+        for valid in [true, false] {
+            let mut engine = ready();
+            engine.active = Some("another-session".into());
+            let mut session = crate::fixture::sessions(1).remove(0);
+            let target = session.id.clone();
+            session.name = "Renamed ไทย 😀".into();
+            let operation = uuid::Uuid::new_v4();
+            engine.command(Command::EditSession {
+                connection: 0,
+                operation,
+                session_id: target.clone(),
+                change: session_edit::Change::Name(session.name.clone()),
+            });
+            let request = engine.outgoing.pop_back().unwrap();
+            assert!(
+                matches!(&request.request,Request::RenameSession {id,name} if id==&target && name=="Renamed ไทย 😀")
+            );
+            engine.command(Command::EditSession {
+                connection: 0,
+                operation: uuid::Uuid::new_v4(),
+                session_id: target.clone(),
+                change: session_edit::Change::Pin(true),
+            });
+            assert!(
+                engine.outgoing.is_empty(),
+                "no duplicate while this Session's save is pending"
+            );
+            if !valid {
+                session.id = "foreign".into();
+            }
+            respond(
+                &mut engine,
+                request.id,
+                serde_json::to_value(&session).unwrap(),
+            );
+            assert!(engine.updates.iter().any(|update|matches!(update,Update::SessionEdited {operation:id,outcome,..} if *id==operation && if valid {matches!(outcome,session_edit::Outcome::Applied(_))} else {matches!(outcome,session_edit::Outcome::Unknown)})));
+            engine.command(Command::EditSession {
+                connection: 1,
+                operation: uuid::Uuid::new_v4(),
+                session_id: target.clone(),
+                change: session_edit::Change::Pin(true),
+            });
+            assert!(
+                engine.outgoing.is_empty(),
+                "retired connection cannot dispatch metadata changes"
+            );
+            let read = uuid::Uuid::new_v4();
+            engine.command(Command::ReadSessionDetails {
+                connection: 0,
+                operation: read,
+                session_id: target.clone(),
+            });
+            let request = engine.outgoing.pop_back().unwrap();
+            assert!(matches!(request.request,Request::GetSession {id} if id==target));
+            respond(&mut engine, request.id, json!({"session":session}));
+            assert!(engine.updates.iter().any(|update|matches!(update,Update::SessionDetails {operation,result,..} if *operation==read && result.is_ok()==valid)));
+        }
+    }
+
+    #[test]
+    fn metadata_missing_or_mismatched_success_is_unknown_and_cannot_clear_unknown_send() {
+        for reply in [
+            Value::Null,
+            json!({"pinned":true}),
+            serde_json::to_value(crate::fixture::sessions(1).remove(0)).unwrap(),
+        ] {
+            let mut engine = ready();
+            let session = crate::fixture::sessions(1).remove(0);
+            let id = session.id;
+            let unknown = Action {
+                id: uuid::Uuid::new_v4(),
+                session_id: id.clone(),
+                question_id: None,
+            };
+            let uncertain = HashSet::from([unknown]);
+            let send = Command::Intent(Intent::ResumeRun {
+                session_id: id.clone(),
+            });
+            assert!(engine.blocked_by_unknown(&send, &uncertain));
+            engine.command(Command::EditSession {
+                connection: 0,
+                operation: uuid::Uuid::new_v4(),
+                session_id: id,
+                change: session_edit::Change::Name("Desired different name".into()),
+            });
+            let request = engine.outgoing.pop_back().unwrap();
+            respond(&mut engine, request.id, reply);
+            assert!(engine.updates.iter().any(|update| matches!(
+                update,
+                Update::SessionEdited {
+                    outcome: session_edit::Outcome::Unknown,
+                    ..
+                }
+            )));
+            assert!(engine.blocked_by_unknown(&send, &uncertain));
+        }
+    }
 
     fn question(id: &str) -> formless_protocol::Event {
         Event::UserQuestion {

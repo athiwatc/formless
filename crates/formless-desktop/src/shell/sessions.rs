@@ -1,0 +1,701 @@
+use super::*;
+use crate::questions::preview;
+use crate::session_edit::{Field, Metadata, Outcome, MAX_INPUT};
+
+#[derive(Clone, Copy)]
+enum Waiting {
+    Read(uuid::Uuid),
+    Write(uuid::Uuid),
+}
+
+pub(super) struct Panel {
+    id: String,
+    metadata: Option<Metadata>,
+    field: Field,
+    name: String,
+    tags: String,
+    input: Option<Entity<TextareaState>>,
+    _subscription: Option<Subscription>,
+    accepted: String,
+    connection: u64,
+    waiting: Option<Waiting>,
+    retired: bool,
+    notice: String,
+    focus: FocusHandle,
+    pub cancel: FocusHandle,
+    scroll: ScrollHandle,
+    controls: Vec<(FocusHandle, gpui_kit::ScrollAnchor)>,
+    input_anchor: gpui_kit::ScrollAnchor,
+    revealed: Option<FocusHandle>,
+    viewport: Option<Size<Pixels>>,
+    scale: TextScale,
+    frames: u8,
+}
+
+impl Shell {
+    pub(super) fn session_edit_target(&self) -> Option<&str> {
+        self.client.as_ref()?;
+        if self.destination == Destination::Sessions {
+            self.directory.choice(self.sidebar.rows()).map(|index| {
+                self.sidebar.rows()[self.directory.matches()[index]]
+                    .id
+                    .as_str()
+            })
+        } else {
+            self.sidebar.active_id()
+        }
+    }
+    #[cfg(feature = "test-support")]
+    pub fn session_edit_input(&self) -> Option<Entity<TextareaState>> {
+        self.session_editor.as_ref()?.input.clone()
+    }
+
+    pub(super) fn open_session_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.session_editor.is_some() || !self.client_connected {
+            return;
+        }
+        if self.destination == Destination::Sessions
+            && self.finish_directory_composition(window, cx)
+        {
+            return;
+        }
+        let Some(id) = self.session_edit_target().map(str::to_string) else {
+            return;
+        };
+        self.invalidate_forecast(cx);
+        self.palette = None;
+        self.viewer = None;
+        self.prefs.close_overlays();
+        let scroll = ScrollHandle::new();
+        self.session_editor = Some(Panel {
+            id,
+            metadata: None,
+            field: Field::Name,
+            name: String::new(),
+            tags: String::new(),
+            input: None,
+            _subscription: None,
+            accepted: String::new(),
+            connection: self.client.as_ref().unwrap().connection(),
+            waiting: None,
+            retired: true,
+            notice: String::new(),
+            focus: cx.focus_handle(),
+            cancel: cx.focus_handle(),
+            controls: (0..5)
+                .map(|_| {
+                    (
+                        cx.focus_handle(),
+                        gpui_kit::ScrollAnchor::for_handle(scroll.clone()),
+                    )
+                })
+                .collect(),
+            input_anchor: gpui_kit::ScrollAnchor::for_handle(scroll.clone()),
+            scroll,
+            revealed: None,
+            viewport: None,
+            scale: self.text_scale,
+            frames: 2,
+        });
+        self.reload_session_details(window, cx);
+        self.settle(window, cx);
+    }
+
+    fn rebuild_session_edit_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let panel = self.session_editor.as_mut().unwrap();
+        let text = match panel.field {
+            Field::Name => &panel.name,
+            Field::Tags => &panel.tags,
+            Field::Pin => "",
+        };
+        panel.accepted = text.into();
+        let input = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .auto_grow(2, 2)
+                .default_value(text.to_string())
+        });
+        let subscription =
+            cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::Change) {
+                    let Some(panel) = this.session_editor.as_mut() else {
+                        return;
+                    };
+                    let input = panel.input.as_ref().unwrap().clone();
+                    if !input.update(cx, |input, cx| {
+                        input.marked_text_range(window, cx).is_some()
+                    }) {
+                        let text = input.read(cx).value().to_string();
+                        if text.len() > MAX_INPUT {
+                            let accepted=panel.accepted.clone();
+                            cx.defer_in(window,move|this,window,cx| {
+                                let Some(panel)=this.session_editor.as_mut() else {return;};
+                                if panel.input.as_ref()!=Some(&input) || input.update(cx,|input,cx|input.marked_text_range(window,cx).is_some()) || input.read(cx).value().len()<=MAX_INPUT {return;}
+                                let focused=input.focus_handle(cx).contains_focused(window,cx);
+                                match panel.field {Field::Name=>panel.name=accepted,Field::Tags=>panel.tags=accepted,Field::Pin=>{}}
+                                panel.notice="Edit exceeds 16 KiB and was rejected whole. Earlier text kept; undo history cleared.".into();
+                                this.rebuild_session_edit_input(window,cx);
+                                if focused {this.session_editor.as_ref().unwrap().input.as_ref().unwrap().update(cx,|input,cx|input.focus(window,cx));}
+                                cx.notify();
+                            });
+                        } else {
+                            panel.accepted = text;
+                        }
+                    }
+                    panel.frames = 2;
+                    cx.notify();
+                }
+            });
+        panel.input = Some(input);
+        panel._subscription = Some(subscription);
+        panel.frames = 2;
+    }
+
+    fn keep_session_edit_input(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let panel = self.session_editor.as_mut().unwrap();
+        let Some(input) = &panel.input else {
+            return true;
+        };
+        if input.update(cx, |input, cx| {
+            input.marked_text_range(window, cx).is_some()
+        }) {
+            panel.notice = "Finish composing before changing fields or saving.".into();
+            cx.notify();
+            return false;
+        }
+        let text = input.read(cx).value().to_string();
+        if text.len() > MAX_INPUT {
+            panel.notice = "Edit exceeds 16 KiB; shorten or copy it before continuing.".into();
+            cx.notify();
+            return false;
+        }
+        match panel.field {
+            Field::Name => panel.name = text,
+            Field::Tags => panel.tags = text,
+            Field::Pin => {}
+        }
+        true
+    }
+
+    fn choose_session_edit_field(
+        &mut self,
+        field: Field,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.session_editor.as_ref().unwrap().waiting.is_some()
+            || !self.keep_session_edit_input(window, cx)
+        {
+            return;
+        }
+        let panel = self.session_editor.as_mut().unwrap();
+        panel.field = field;
+        // A fresh entity keeps undo history scoped to the displayed field.
+        self.rebuild_session_edit_input(window, cx);
+        self.session_editor
+            .as_ref()
+            .unwrap()
+            .cancel
+            .focus(window, cx);
+        cx.notify();
+    }
+
+    fn reload_session_details(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.keep_session_edit_input(window, cx) {
+            return;
+        }
+        let panel = self.session_editor.as_mut().unwrap();
+        if panel.waiting.is_some() {
+            return;
+        }
+        let Some(client) = &self.client else {
+            return;
+        };
+        if !client.is_ready() {
+            panel.notice = "Not connected. Your edits were kept; reload when connected.".into();
+            cx.notify();
+            return;
+        }
+        let operation = uuid::Uuid::new_v4();
+        panel.connection = client.connection();
+        panel.retired = true;
+        match client.send(ClientCommand::ReadSessionDetails {
+            connection: panel.connection,
+            operation,
+            session_id: panel.id.clone(),
+        }) {
+            Ok(()) => {
+                panel.waiting = Some(Waiting::Read(operation));
+                panel.cancel.focus(window, cx);
+                panel.notice =
+                    "Loading current Session metadata. Reload replaces unsaved metadata edits."
+                        .into();
+            }
+            Err(error) => panel.notice = error.into(),
+        }
+        cx.notify();
+    }
+
+    fn save_session_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.keep_session_edit_input(window, cx) {
+            return;
+        }
+        let panel = self.session_editor.as_mut().unwrap();
+        let Some(client) = &self.client else {
+            return;
+        };
+        if !self.client_connected
+            || panel.retired
+            || panel.waiting.is_some()
+            || !client.is_ready()
+            || client.connection() != panel.connection
+        {
+            panel.notice =
+                "Not saved. Reload current details after connecting; your edits were kept.".into();
+            cx.notify();
+            return;
+        }
+        let Some(metadata) = &panel.metadata else {
+            return;
+        };
+        let text = match panel.field {
+            Field::Name => &panel.name,
+            Field::Tags => &panel.tags,
+            Field::Pin => "",
+        };
+        let change = match crate::session_edit::Change::from_input(panel.field, text, metadata) {
+            Ok(change) => change,
+            Err(error) => {
+                panel.notice = error.into();
+                cx.notify();
+                return;
+            }
+        };
+        let operation = uuid::Uuid::new_v4();
+        match client.send(ClientCommand::EditSession {
+            connection: panel.connection,
+            operation,
+            session_id: panel.id.clone(),
+            change,
+        }) {
+            Ok(()) => {
+                panel.waiting = Some(Waiting::Write(operation));
+                panel.notice =
+                    "Waiting for acknowledgement. This change will not be retried automatically."
+                        .into();
+                panel.cancel.focus(window, cx);
+            }
+            Err(error) => panel.notice = format!("{error} Your edits were kept."),
+        }
+        cx.notify();
+    }
+
+    pub(super) fn session_details_received(
+        &mut self,
+        connection: u64,
+        operation: uuid::Uuid,
+        id: &str,
+        result: Result<Metadata, String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .client
+            .as_ref()
+            .is_none_or(|client| client.connection() != connection)
+        {
+            return;
+        }
+        let Some(panel) = &mut self.session_editor else {
+            return;
+        };
+        if panel.connection != connection
+            || panel.id != id
+            || !matches!(panel.waiting,Some(Waiting::Read(expected)) if expected==operation)
+        {
+            return;
+        }
+        panel.waiting = None;
+        match result {
+            Ok(metadata) if metadata.id == id => {
+                panel.name = metadata.name.clone();
+                panel.tags = metadata.tags.join("\n");
+                panel.metadata = Some(metadata);
+                panel.retired = false;
+                panel.notice =
+                    "Current values loaded. Each Save changes only the displayed field.".into();
+                self.rebuild_session_edit_input(window, cx);
+            }
+            Ok(_) => {
+                panel.retired = true;
+                panel.notice =
+                    "The details belonged to another Session; nothing was applied.".into();
+            }
+            Err(error) => {
+                panel.retired = true;
+                panel.notice = format!(
+                    "Could not load details: {}. Edits kept.",
+                    preview(&error, 500)
+                );
+            }
+        }
+        cx.notify();
+    }
+
+    pub(super) fn session_edit_outcome(
+        &mut self,
+        connection: u64,
+        operation: uuid::Uuid,
+        id: &str,
+        outcome: Outcome,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .client
+            .as_ref()
+            .is_none_or(|client| client.connection() != connection)
+        {
+            return;
+        }
+        let Some(panel) = &mut self.session_editor else {
+            return;
+        };
+        if panel.connection != connection
+            || panel.id != id
+            || !matches!(panel.waiting,Some(Waiting::Write(expected)) if expected==operation)
+        {
+            return;
+        }
+        panel.waiting = None;
+        match outcome {
+            Outcome::Applied(metadata) if metadata.id == id => {
+                panel.metadata = Some(metadata);
+                panel.notice = "Saved and acknowledged. Other unsaved fields are unchanged.".into();
+            }
+            Outcome::Rejected(error) => {
+                panel.notice = format!(
+                    "Save error: {}. Your edits were kept.",
+                    preview(&error, 500)
+                )
+            }
+            _ => {
+                panel.retired = true;
+                panel.notice="Outcome unknown. It was not retried. Copy your edits, then reload current values before another save.".into();
+            }
+        }
+        panel.frames = 2;
+        cx.notify();
+    }
+
+    fn close_session_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(input) = self
+            .session_editor
+            .as_ref()
+            .and_then(|panel| panel.input.clone())
+        {
+            if input.update(cx, |input, cx| {
+                input.marked_text_range(window, cx).is_some()
+            }) {
+                input.update(cx, |input, cx| input.unmark_text(window, cx));
+                return;
+            }
+        }
+        self.session_editor = None;
+        self.settle(window, cx);
+    }
+
+    pub(super) fn reveal_session_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(panel) = &mut self.session_editor else {
+            return;
+        };
+        if let Some(client) = &self.client {
+            if client.connection() != panel.connection {
+                let unknown = matches!(panel.waiting, Some(Waiting::Write(_)));
+                panel.connection = client.connection();
+                panel.waiting = None;
+                panel.retired = true;
+                panel.notice=if unknown {"Connection changed; save outcome unknown. No retry. Copy edits before reloading current values."} else {"Connection changed. Edits kept; reload current values before saving."}.into();
+            }
+        }
+        let focused = window.focused(cx);
+        if panel.revealed != focused
+            || panel.viewport != Some(window.viewport_size())
+            || panel.scale != self.text_scale
+        {
+            panel.revealed = focused;
+            panel.viewport = Some(window.viewport_size());
+            panel.scale = self.text_scale;
+            panel.frames = 2;
+        }
+        if panel.frames > 0 {
+            panel.frames -= 1;
+            let anchor = if panel.field != Field::Pin
+                && panel
+                    .input
+                    .as_ref()
+                    .is_some_and(|input| input.focus_handle(cx).contains_focused(window, cx))
+            {
+                Some(&panel.input_anchor)
+            } else {
+                panel
+                    .controls
+                    .iter()
+                    .find(|(focus, _)| focus.contains_focused(window, cx))
+                    .map(|(_, anchor)| anchor)
+            };
+            if let Some(anchor) = anchor {
+                anchor.scroll_to(window, cx);
+                window.request_animation_frame();
+            }
+        }
+    }
+
+    fn scroll_session_editor(&self, lines: f32, page: bool, cx: &mut Context<Self>) {
+        let Some(panel) = &self.session_editor else {
+            return;
+        };
+        let amount = if page {
+            panel.scroll.bounds().size.height.max(self.scaled(40.))
+        } else {
+            self.scaled(40.)
+        };
+        let offset = panel.scroll.offset();
+        let y = (offset.y + amount * lines).clamp(-panel.scroll.max_offset().y, px(0.));
+        panel.scroll.set_offset(point(offset.x, y));
+        cx.notify();
+    }
+
+    pub(super) fn render_session_editor(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let panel = self.session_editor.as_ref().unwrap();
+        let viewport = window.viewport_size();
+        let margin = px(16.);
+        let busy = panel.waiting.is_some();
+        let ready = self.client_connected
+            && !busy
+            && !panel.retired
+            && panel.metadata.is_some()
+            && self
+                .client
+                .as_ref()
+                .is_some_and(|client| client.is_ready() && client.connection() == panel.connection);
+        let mut body=v_flex().id("session-edit-body").test_support().flex_1().min_h_0().overflow_y_scroll().track_scroll(&panel.scroll).gap_2()
+            .child(readable("session-edit-id",format!("Session: {}",panel.id)))
+            .child(readable("session-edit-help","Saves replace the current field, including changes made by another client. Cancel discards unsaved metadata edits; it does not undo a sent save. Reload also replaces these edits."));
+        let mut tabs = h_flex().flex_wrap().gap_2();
+        for (index, field) in [Field::Name, Field::Tags, Field::Pin]
+            .into_iter()
+            .enumerate()
+        {
+            tabs = tabs.child(
+                div()
+                    .id(SharedString::from(format!(
+                        "session-edit-field-anchor-{index}"
+                    )))
+                    .pt_1()
+                    .anchor_scroll(Some(panel.controls[index].1.clone()))
+                    .child(
+                        Button::new(SharedString::from(format!(
+                            "session-edit-{}",
+                            field.label().to_lowercase()
+                        )))
+                        .label(field.label())
+                        .selected(panel.field == field)
+                        .disabled(busy || panel.metadata.is_none())
+                        .track_focus(&panel.controls[index].0)
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| {
+                                this.choose_session_edit_field(field, window, cx)
+                            },
+                        )),
+                    ),
+            );
+        }
+        body = body.child(tabs);
+        if panel.field == Field::Pin {
+            if let Some(metadata) = &panel.metadata {
+                body = body.child(readable(
+                    "session-edit-pin-value",
+                    format!(
+                        "Currently {}. Save will {} this Session.",
+                        if metadata.pinned {
+                            "pinned"
+                        } else {
+                            "unpinned"
+                        },
+                        if metadata.pinned { "unpin" } else { "pin" }
+                    ),
+                ));
+            }
+        } else if let Some(input) = &panel.input {
+            body=body.child(readable("session-edit-field-label",if panel.field==Field::Name {"Session name (one line)"} else {"Tags (one per line; blank clears). The daemon normalizes case, # prefixes and duplicates."}))
+                .child(div().id("session-edit-input-anchor").test_support().pt_1().anchor_scroll(Some(panel.input_anchor.clone())).child(Textarea::new(input).aria_label(if panel.field==Field::Name {"Session name"} else {"Session tags, one per line"})));
+        }
+        body = body
+            .child(
+                h_flex()
+                    .flex_wrap()
+                    .gap_2()
+                    .child(
+                        div()
+                            .id("session-edit-copy-anchor")
+                            .pt_1()
+                            .anchor_scroll(Some(panel.controls[3].1.clone()))
+                            .child(
+                                Button::new("session-edit-copy")
+                                    .label("Copy edit")
+                                    .track_focus(&panel.controls[3].0)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        if let Some(panel) = &this.session_editor {
+                                            let text = if panel.field == Field::Pin {
+                                                panel
+                                                    .metadata
+                                                    .as_ref()
+                                                    .map(|metadata| Field::Pin.value(metadata))
+                                                    .unwrap_or_default()
+                                            } else {
+                                                panel
+                                                    .input
+                                                    .as_ref()
+                                                    .map(|input| input.read(cx).value().to_string())
+                                                    .unwrap_or_default()
+                                            };
+                                            cx.write_to_clipboard(ClipboardItem::new_string(text));
+                                        }
+                                    })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("session-edit-reload-anchor")
+                            .pt_1()
+                            .anchor_scroll(Some(panel.controls[4].1.clone()))
+                            .child(
+                                Button::new("session-edit-reload")
+                                    .label("Reload")
+                                    .disabled(
+                                        busy || self
+                                            .client
+                                            .as_ref()
+                                            .is_none_or(|client| !client.is_ready()),
+                                    )
+                                    .track_focus(&panel.controls[4].0)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.reload_session_details(window, cx)
+                                    })),
+                            ),
+                    ),
+            )
+            .child(
+                announced(div().id("session-edit-notice"))
+                    .test_support()
+                    .role(Role::Label)
+                    .aria_value(panel.notice.clone())
+                    .child(panel.notice.clone()),
+            );
+        let dialog = v_flex()
+            .id("session-edit-dialog")
+            .test_support()
+            .role(Role::Dialog)
+            .aria_label("Session details")
+            .map(modal_dialog)
+            .key_context(SESSION_EDITOR_CONTEXT)
+            .on_action(cx.listener(|this, _: &CloseSessionEditor, window, cx| {
+                this.close_session_editor(window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ScrollViewerUp, _, cx| {
+                this.scroll_session_editor(1., false, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ScrollViewerDown, _, cx| {
+                this.scroll_session_editor(-1., false, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ScrollViewerPageUp, _, cx| {
+                this.scroll_session_editor(1., true, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ScrollViewerPageDown, _, cx| {
+                this.scroll_session_editor(-1., true, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ScrollViewerStart, _, cx| {
+                if let Some(panel) = &this.session_editor {
+                    panel.scroll.set_offset(point(px(0.), px(0.)));
+                    cx.notify();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ScrollViewerEnd, _, cx| {
+                if let Some(panel) = &this.session_editor {
+                    panel.scroll.scroll_to_bottom();
+                    cx.notify();
+                }
+            }))
+            .w(self.scaled(640.).min(viewport.width - margin * 2.))
+            .max_h(viewport.height - margin * 2.)
+            .p_3()
+            .gap_2()
+            .bg(cx.theme().popover)
+            .text_color(cx.theme().popover_foreground)
+            .border_1()
+            .border_color(cx.theme().border)
+            .rounded_lg()
+            .shadow_lg()
+            .occlude()
+            .child(
+                readable("session-edit-heading", "Session")
+                    .text_lg()
+                    .flex_shrink_0(),
+            )
+            .child(body)
+            .child(
+                h_flex()
+                    .flex_shrink_0()
+                    .flex_wrap()
+                    .gap_2()
+                    .child(
+                        Button::new("session-edit-cancel")
+                            .label("Cancel")
+                            .track_focus(&panel.cancel)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.close_session_editor(window, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("session-edit-save")
+                            .label("Save")
+                            .accessibility_label("Save displayed Session field")
+                            .primary()
+                            .disabled(!ready)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.save_session_edit(window, cx)
+                            })),
+                    ),
+            )
+            .focus_trap("session-edit-dialog", &panel.focus);
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .bg(cx.theme().overlay)
+                    .occlude(),
+            )
+            .child(
+                h_flex()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .justify_center()
+                    .items_start()
+                    .pt(margin)
+                    .child(dialog),
+            )
+    }
+}

@@ -76,7 +76,25 @@ mod render {
     const WHOLE: Fit = Fit::Whole;
     const REFLOWED: Fit = Fit::Reflowed;
 
-    const STATES: [State; 41] = [
+    const STATES: [State; 43] = [
+        state(
+            "session-edit-light",
+            1440.,
+            900.,
+            LIGHT,
+            100,
+            Some("open-session-edit"),
+            WHOLE,
+        ),
+        state(
+            "minimum-session-edit-dark-200pct",
+            480.,
+            360.,
+            DARK,
+            200,
+            Some("open-session-edit"),
+            REFLOWED,
+        ),
         state(
             "profile-questions-light",
             1440.,
@@ -778,7 +796,22 @@ mod render {
         } else if let Some(control) = click {
             cx.update_window(any, |_, window, cx| {
                 window.render_frame(cx);
-                if control.starts_with("open-profile-questions") {
+                if control=="open-session-edit" {
+                    use formless_desktop::client::{Update,Command as WireCommand};
+                    let sessions=fixture::sessions(3);
+                    shell.update(cx,|shell,cx|{
+                        shell.connect_recording_daemon(cx);
+                        shell.apply_client_update(Update::Connection {ready:true,notice:"Connected view fixture".into()},window,cx);
+                        shell.apply_client_update(Update::Sessions(sessions.clone()),window,cx);
+                    });
+                    window.render_frame(cx);
+                    if window.try_find(shell::session_row_id(&sessions[0].id)).is_none() {window.click("toggle-sidebar",cx);window.render_frame(cx);}
+                    window.click(shell::session_row_id(&sessions[0].id),cx);
+                    shell.update(cx,|shell,cx| {shell.run_command(Command::SessionDetails,window,cx);});
+                    let operation=shell.update(cx,|shell,_|shell.take_client_commands()).into_iter().find_map(|command|match command {WireCommand::ReadSessionDetails {operation,..}=>Some(operation),_=>None}).unwrap();
+                    shell.update(cx,|shell,cx|shell.apply_client_update(Update::SessionDetails {connection:0,operation,session_id:sessions[0].id.clone(),result:Ok(formless_desktop::session_edit::Metadata::from_session(&sessions[0]).unwrap())},window,cx));
+                    window.render_frame(cx);assert_eq!(window.find("session-edit-cancel").focused(),Some(true));
+                } else if control.starts_with("open-profile-questions") {
                     use formless_desktop::{client::Update,questions::{Open,State}};
                     let mut question=Open::from_event(&fixture::user_question("another-profile-session")).unwrap();
                     question.questions[0].question="A long question ไทย 漢字 😀: choose one option after reviewing the full prompt. ".repeat(20);
@@ -899,6 +932,104 @@ mod render {
             })
             .expect("offscreen window is open");
             cx.run_until_parked();
+            if control == "open-session-edit" {
+                for (field, label, suffix) in [
+                    ("session-edit-name", "Session name", ""),
+                    ("session-edit-tags", "Session tags, one per line", "-tags"),
+                ] {
+                    cx.update_window(any, |_, window, cx| {
+                        for _ in 0..30 {
+                            window.render_frame(cx);
+                            if window.find(field).focused() == Some(true) {
+                                break;
+                            }
+                            window.press("tab", cx);
+                        }
+                        for _ in 0..3 {
+                            window.render_frame(cx);
+                            window.simulate_next_frame(cx);
+                        }
+                        window.click(field, cx);
+                        window.render_frame(cx);
+                        let input = shell.read(cx).session_edit_input().unwrap();
+                        input.update(cx, |input, cx| {
+                            input.set_value(
+                                if suffix.is_empty() {
+                                    "Native renamed ไทย 漢字 😀"
+                                } else {
+                                    "one ไทย\ntwo 漢字\nthree 😀\nfour\nfive\nsix"
+                                },
+                                window,
+                                cx,
+                            );
+                            input.focus(window, cx);
+                        });
+                        for _ in 0..4 {
+                            window.render_frame(cx);
+                            window.simulate_next_frame(cx);
+                        }
+                    })
+                    .unwrap();
+                    cx.run_until_parked();
+                    cx.update_window(any, |_, window, cx| {
+                        window.render_frame(cx);
+                        let body = window.find("session-edit-body").bounds();
+                        let bounds = window.find("session-edit-input-anchor").bounds();
+                        assert!(
+                            bounds.top() >= body.top() && bounds.bottom() <= body.bottom(),
+                            "{name}: {label} outside body: {bounds:?} / {body:?}"
+                        );
+                        for id in [
+                            "session-edit-dialog",
+                            "session-edit-cancel",
+                            "session-edit-save",
+                        ] {
+                            assert!(
+                                inside(window, id, viewport),
+                                "{name}: {id} outside viewport"
+                            );
+                        }
+                    })
+                    .unwrap();
+                    capture(&mut cx, suffix);
+                }
+                cx.update_window(any, |_, window, cx| {
+                    for _ in 0..30 {
+                        window.render_frame(cx);
+                        if window.find("session-edit-pin").focused() == Some(true) {
+                            break;
+                        }
+                        window.press("tab", cx);
+                    }
+                    for _ in 0..3 {
+                        window.render_frame(cx);
+                        window.simulate_next_frame(cx);
+                    }
+                    window.click("session-edit-pin", cx);
+                    window.render_frame(cx);
+                })
+                .unwrap();
+                capture(&mut cx, "-pin");
+                cx.update_window(any, |_, window, cx| {
+                    window.click("session-edit-save", cx);
+                    window.render_frame(cx);
+                    assert_eq!(window.find("session-edit-save").disabled(), Some(true));
+                    assert_eq!(window.find("session-edit-cancel").focused(), Some(true));
+                    for id in [
+                        "session-edit-dialog",
+                        "session-edit-cancel",
+                        "session-edit-save",
+                    ] {
+                        assert!(
+                            inside(window, id, viewport),
+                            "{name}: waiting {id} outside viewport"
+                        );
+                    }
+                })
+                .unwrap();
+                capture(&mut cx, "-waiting");
+            }
+
             if control.starts_with("open-profile-questions") {
                 cx.update_window(any, |_, window, cx| {
                     window.render_frame(cx);
@@ -1171,6 +1302,7 @@ mod render {
             }
             if fit == Fit::Reflowed
                 && !control.starts_with("open-daemon-")
+                && control != "open-session-edit"
                 && control != "open-run-recovery"
                 && control != "open-run-forecast"
                 && !control.starts_with("open-profile-questions")
@@ -1195,7 +1327,10 @@ mod render {
                 })
                 .expect("offscreen window is open");
             }
-            if control != "open-run-forecast" && !control.starts_with("open-profile-questions") {
+            if control != "open-session-edit"
+                && control != "open-run-forecast"
+                && !control.starts_with("open-profile-questions")
+            {
                 capture(&mut cx, "");
             }
         } else if fit == Fit::Whole {
