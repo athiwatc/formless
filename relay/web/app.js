@@ -1287,6 +1287,12 @@
   function renderSessions() {
     const list = $("sessions");
     list.replaceChildren();
+    S.marked = S.marked || new Set();
+    if (S.marked.size) {
+      // Index the backing list, including filter-hidden and archived Sessions.
+      const loadedIds = new Set(S.sessions.map((s) => s.id));
+      for (const id of S.marked) if (!loadedIds.has(id)) S.marked.delete(id);
+    }
     if (!S.sessions.length) {
       list.append(h("li", { class: "muted", style: "padding:0.5rem" }, "No sessions yet."));
       return;
@@ -1301,8 +1307,6 @@
           onclick: () => { S.tagFilter = S.tagFilter === t ? null : t; renderSessions(); } }, "#" + t))));
     }
     // Bulk actions on checked Sessions (SPEC §10.4).
-    S.marked = S.marked || new Set();
-    for (const id of [...S.marked]) if (!S.sessions.some((s) => s.id === id)) S.marked.delete(id);
     if (S.marked.size) {
       const ids = [...S.marked];
       const btn = (label, run, cls) => h("button", { type: "button", class: "btn small" + (cls ? " " + cls : ""), onclick: run }, label);
