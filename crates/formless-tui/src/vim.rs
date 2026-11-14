@@ -33,11 +33,23 @@ enum Command {
     Delete(usize),
 }
 #[derive(Debug, Clone)]
+enum InsertEdit {
+    Key {
+        key: KeyEvent,
+        insertion: Option<Range<usize>>,
+    },
+    /// Own byte range before cursor snapping can include a neighbor.
+    Paste {
+        text: String,
+        insertion: Range<usize>,
+    },
+}
+#[derive(Debug, Clone)]
 struct Change {
     edited: bool,
     literal: bool,
     command: Command,
-    edits: Vec<KeyEvent>,
+    edits: Vec<InsertEdit>,
 }
 #[derive(Debug, Default, Clone)]
 pub(crate) struct Vim {
@@ -65,25 +77,27 @@ impl Vim {
         if self.mode == Mode::Normal {
             self.apply(line, Command::Insert('i', 1));
         }
-        for c in text.replace("\r\n", "\n").replace('\r', "\n").chars() {
-            let key = if c == '\n' {
-                KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)
-            } else {
-                KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
-            };
-            let changed = insert_key(line, key, Surface::Editor).unwrap_or(false);
-            self.inserting
-                .get_or_insert(Change {
-                    edited: false,
-                    literal: line.is_literal(),
-                    command: Command::Insert('i', 1),
-                    edits: vec![],
-                })
-                .edits
-                .push(key);
-            self.inserting.as_mut().unwrap().literal = line.is_literal();
-            self.inserting.as_mut().unwrap().edited |= changed;
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        if text.is_empty() {
+            return;
         }
+        let changed = line.selection().is_none_or(|range| line[range] != text);
+        let start = line
+            .selection()
+            .map_or(line.cursor_byte(), |range| range.start);
+        let insertion = start..start + text.len();
+        // Snapping after each scalar can cross an existing neighbor joined by
+        // a Prepend/ZWJ/RI character and reorder later pasted characters.
+        line.insert_modal_paste(&text);
+        let change = self.inserting.get_or_insert(Change {
+            edited: false,
+            literal: line.is_literal(),
+            command: Command::Insert('i', 1),
+            edits: Vec::new(),
+        });
+        change.edits.push(InsertEdit::Paste { text, insertion });
+        change.literal = line.is_literal();
+        change.edited |= changed;
     }
 
     pub(crate) fn key(&mut self, line: &mut InputLine, key: KeyEvent, surface: Surface) -> Outcome {
@@ -125,6 +139,12 @@ impl Vim {
             return Outcome::Pass;
         }
         if self.mode == Mode::Insert {
+            let insertion = match key.code {
+                KeyCode::Char(c) if c != '\n' && line.selection().is_none() => {
+                    Some(line.cursor_byte()..line.cursor_byte() + c.len_utf8())
+                }
+                _ => None,
+            };
             if let Some(changed) = insert_key(line, key, surface) {
                 self.inserting
                     .get_or_insert(Change {
@@ -134,7 +154,7 @@ impl Vim {
                         edits: Vec::new(),
                     })
                     .edits
-                    .push(key);
+                    .push(InsertEdit::Key { key, insertion });
                 self.inserting.as_mut().unwrap().literal = line.is_literal();
                 self.inserting.as_mut().unwrap().edited |= changed;
                 return Outcome::Handled;
@@ -470,16 +490,87 @@ fn replay_edits(line: &mut InputLine, change: &Change, surface: Surface, skip_fi
         Command::Insert(_, count) => count,
         _ => 1,
     };
+    // A trailing Prepend/ZWJ/RI can snap the visible cursor past an old
+    // neighbor. Repeat a verified contiguous insertion as one payload, using
+    // only its own byte range for the already-applied first iteration.
+    if count > 1 && matches!(change.command, Command::Insert('i' | 'a' | 'I' | 'A', _)) {
+        if let Some((range, text)) = contiguous_paste_insert(&change.edits) {
+            let repeated = text.repeat(count);
+            if !skip_first {
+                line.insert_modal_paste(&repeated);
+                return;
+            }
+            if line.replace_modal_inserted(range, &text, &repeated) {
+                return;
+            }
+            // Navigation made the old insertion range ineligible. Keep the
+            // already-applied first copy and put remaining copies together
+            // at the current cursor, respecting its new undo boundary.
+            line.insert_modal_paste(&text.repeat(count - 1));
+            return;
+        }
+    }
     for n in usize::from(skip_first)..count {
         if n > 0 {
             if let Command::Insert(kind @ ('o' | 'O'), _) = change.command {
                 open_line(line, kind);
             }
         }
-        for key in &change.edits {
-            let _ = insert_key(line, *key, surface);
+        for edit in &change.edits {
+            match edit {
+                InsertEdit::Key { key, .. } => {
+                    let _ = insert_key(line, *key, surface);
+                }
+                InsertEdit::Paste { text, .. } => line.insert_modal_paste(text),
+            }
         }
     }
+}
+
+/// Only straight, byte-contiguous insertions containing a bracketed paste.
+/// Motions/deletions and other editing keys retain their ordinary replay.
+fn contiguous_paste_insert(edits: &[InsertEdit]) -> Option<(Range<usize>, String)> {
+    if !edits
+        .iter()
+        .any(|edit| matches!(edit, InsertEdit::Paste { .. }))
+    {
+        return None;
+    }
+    let mut start = None;
+    let mut end = 0;
+    let mut text = String::new();
+    for edit in edits {
+        let (range, length) = match edit {
+            InsertEdit::Paste { text, insertion } => (insertion, text.len()),
+            InsertEdit::Key {
+                key:
+                    KeyEvent {
+                        code: KeyCode::Char(c),
+                        ..
+                    },
+                insertion: Some(range),
+            } => (range, c.len_utf8()),
+            _ => return None,
+        };
+        if range.end.checked_sub(range.start)? != length || start.is_some() && range.start != end {
+            return None;
+        }
+        start.get_or_insert(range.start);
+        end = range.end;
+        match edit {
+            InsertEdit::Paste { text: part, .. } => text.push_str(part),
+            InsertEdit::Key {
+                key:
+                    KeyEvent {
+                        code: KeyCode::Char(c),
+                        ..
+                    },
+                ..
+            } => text.push(*c),
+            _ => return None,
+        }
+    }
+    Some((start?..end, text))
 }
 
 /// Some records a handled key and whether it changed text. Motion keys remain
@@ -1303,6 +1394,196 @@ mod tests {
             l.is_empty(),
             "yank must not replace the previous delete for dot repeat"
         );
+    }
+
+    #[test]
+    fn bracketed_paste_and_replay_preserve_atomic_unicode_and_literal_controls() {
+        use unicode_segmentation::UnicodeSegmentation;
+        for surface in [Surface::Composer, Surface::Editor] {
+            for (original, at, pasted) in [
+                ("ab", 1, "\u{0600}X"),
+                ("👩💻", "👩".len(), "\u{200d}X"),
+                ("🇦🇧", 0, "🇨X"),
+                ("ab", 1, "dw\r\n\tX\rY"),
+            ] {
+                let (mut vim, mut line) = normal(original);
+                line.set_literal(surface == Surface::Editor);
+                line.set_modal_cursor(at);
+                let expected = format!(
+                    "{}{}{}",
+                    &original[..at],
+                    pasted.replace("\r\n", "\n").replace('\r', "\n"),
+                    &original[at..]
+                );
+                vim.paste(&mut line, pasted);
+                assert_eq!(&*line, expected, "{surface:?}: {pasted:?}");
+                assert!(
+                    line.cursor_byte() == line.len()
+                        || line
+                            .grapheme_indices(true)
+                            .any(|(at, _)| at == line.cursor_byte())
+                );
+                vim.key(
+                    &mut line,
+                    KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                    surface,
+                );
+                vim.key(&mut line, key('u'), surface);
+                assert_eq!(&*line, original);
+                line.set_modal_cursor(at);
+                vim.key(&mut line, key('.'), surface);
+                assert_eq!(&*line, expected, "replay {surface:?}: {pasted:?}");
+                vim.key(&mut line, key('u'), surface);
+                assert_eq!(&*line, original);
+            }
+        }
+    }
+
+    #[test]
+    fn counted_paste_after_mouse_uses_current_target_and_keeps_undo_and_dot() {
+        for surface in [Surface::Composer, Surface::Editor] {
+            for (original, target_prefix, target_suffix, payload) in [
+                ("abc", "ab", "c", "X\u{0600}"),
+                ("abc", "ab", "c", "👩\u{200d}"),
+                ("a🇦🇧", "a", "🇦🇧", "X🇨"),
+            ] {
+                let (mut vim, mut line) = normal(original);
+                for c in ['3', 'i'] {
+                    vim.key(&mut line, key(c), surface);
+                }
+                vim.paste(&mut line, payload);
+                line.mouse_cursor(payload.len() + target_prefix.len(), false);
+                vim.key(
+                    &mut line,
+                    KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                    surface,
+                );
+                assert_eq!(
+                    &*line,
+                    format!(
+                        "{payload}{target_prefix}{}{target_suffix}",
+                        payload.repeat(2)
+                    )
+                );
+                vim.key(&mut line, key('u'), surface);
+                assert_eq!(&*line, format!("{payload}{original}"));
+                vim.key(&mut line, key('.'), surface);
+                assert_eq!(
+                    &*line,
+                    format!(
+                        "{payload}{target_prefix}{}{target_suffix}",
+                        payload.repeat(3)
+                    )
+                );
+                vim.key(&mut line, key('u'), surface);
+                assert_eq!(&*line, format!("{payload}{original}"));
+                vim.key(&mut line, key('u'), surface);
+                assert_eq!(&*line, original);
+            }
+        }
+    }
+
+    #[test]
+    fn counted_paste_replay_keeps_trailing_joiners_and_owned_insertions_together() {
+        use unicode_segmentation::UnicodeSegmentation;
+        for surface in [Surface::Composer, Surface::Editor] {
+            for (original, at, pasted) in [
+                ("ab", 1, "X\u{0600}"),
+                ("ab", 1, "\u{0600}"),
+                ("💻", 0, "👩\u{200d}"),
+                ("🇦🇧", 0, "X🇨"),
+                ("ab", 1, "x\n\u{0600}"),
+            ] {
+                for split in [false, true] {
+                    for with_key in [false, true] {
+                        let (mut vim, mut line) = normal(original);
+                        line.set_modal_cursor(at);
+                        for c in ['3', 'i'] {
+                            vim.key(&mut line, key(c), surface);
+                        }
+                        if with_key {
+                            vim.key(&mut line, key('L'), surface);
+                        }
+                        if split {
+                            let last = pasted.char_indices().last().unwrap().0;
+                            vim.paste(&mut line, &pasted[..last]);
+                            vim.paste(&mut line, &pasted[last..]);
+                        } else {
+                            vim.paste(&mut line, pasted);
+                        }
+                        vim.key(
+                            &mut line,
+                            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                            surface,
+                        );
+                        let payload = format!("{}{pasted}", if with_key { "L" } else { "" });
+                        let expected = format!(
+                            "{}{}{}",
+                            &original[..at],
+                            payload.repeat(3),
+                            &original[at..]
+                        );
+                        assert_eq!(
+                            &*line, expected,
+                            "{surface:?}, {pasted:?}, split={split}, key={with_key}"
+                        );
+                        assert!(
+                            line.cursor_byte() == line.len()
+                                || line
+                                    .grapheme_indices(true)
+                                    .any(|(at, _)| at == line.cursor_byte())
+                        );
+                        vim.key(&mut line, key('u'), surface);
+                        assert_eq!(&*line, original);
+                        assert!(line.redo());
+                        assert_eq!(&*line, expected);
+                        assert!(line.undo());
+                        vim.key(&mut line, key('.'), surface);
+                        assert_eq!(&*line, expected);
+                        vim.key(&mut line, key('u'), surface);
+                        for c in ['2', '.'] {
+                            vim.key(&mut line, key(c), surface);
+                        }
+                        assert_eq!(
+                            &*line,
+                            format!(
+                                "{}{}{}",
+                                &original[..at],
+                                payload.repeat(2),
+                                &original[at..]
+                            )
+                        );
+                        vim.key(&mut line, key('u'), surface);
+                        assert_eq!(&*line, original);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn atomic_paste_keeps_surrounding_insert_keys_in_undo_and_dot() {
+        for surface in [Surface::Composer, Surface::Editor] {
+            let (mut vim, mut line) = normal("ab");
+            line.set_modal_cursor(1);
+            vim.key(&mut line, key('i'), surface);
+            vim.key(&mut line, key('L'), surface);
+            vim.paste(&mut line, "\u{0600}X");
+            vim.key(&mut line, key('R'), surface);
+            vim.key(
+                &mut line,
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                surface,
+            );
+            assert_eq!(&*line, "aL\u{0600}XRb");
+            vim.key(&mut line, key('u'), surface);
+            assert_eq!(&*line, "ab");
+            line.set_modal_cursor(1);
+            vim.key(&mut line, key('.'), surface);
+            assert_eq!(&*line, "aL\u{0600}XRb");
+            vim.key(&mut line, key('u'), surface);
+            assert_eq!(&*line, "ab");
+        }
     }
 
     #[test]

@@ -28533,6 +28533,127 @@ mod tests {
     }
 
     #[test]
+    fn vim_counted_paste_honors_actual_mouse_relocation_before_escape() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        use unicode_segmentation::UnicodeSegmentation;
+        let _env = credential_env::EnvGuard::isolated();
+        for payload in ["X", "\u{0600}X", "X\u{0600}", "👩\u{200d}", "🇨"] {
+            let mut app = test_app();
+            app.vim_mode = true;
+            app.input = input::InputLine::from("ab");
+            app.input.set_modal_cursor(0);
+            app.vim_input.mode = vim::Mode::Normal;
+            app.key(key(KeyCode::Char('2')));
+            app.key(key(KeyCode::Char('i')));
+            app.paste(payload);
+            assert_eq!(&*app.input, format!("{payload}ab"));
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+            terminal.draw(|f| draw(f, &mut app)).unwrap();
+            let hit = app
+                .draft_hits
+                .borrow()
+                .iter()
+                .find(|(_, at)| *at == app.input.len())
+                .unwrap()
+                .0;
+            app.mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: hit.x,
+                row: hit.y,
+                modifiers: KeyModifiers::NONE,
+            });
+            assert_eq!(app.input.cursor_byte(), app.input.len());
+            app.key(key(KeyCode::Esc));
+            assert_eq!(
+                &*app.input,
+                format!("{payload}ab{payload}"),
+                "mouse relocation for {payload:?}"
+            );
+            assert!(
+                app.input.cursor_byte() == app.input.len()
+                    || app
+                        .input
+                        .grapheme_indices(true)
+                        .any(|(at, _)| at == app.input.cursor_byte())
+            );
+            app.key(key(KeyCode::Char('u')));
+            assert_eq!(
+                &*app.input,
+                format!("{payload}ab"),
+                "mouse creates an undo boundary"
+            );
+            app.key(key(KeyCode::Char('$')));
+            app.key(key(KeyCode::Char('2')));
+            app.key(key(KeyCode::Char('.')));
+            assert_eq!(&*app.input, format!("{payload}a{}b", payload.repeat(2)));
+            app.key(key(KeyCode::Char('u')));
+            assert_eq!(&*app.input, format!("{payload}ab"));
+            app.key(key(KeyCode::Char('u')));
+            assert_eq!(&*app.input, "ab");
+        }
+    }
+
+    #[test]
+    fn vim_counted_paste_keeps_trailing_prepend_repetitions_before_neighbors() {
+        let mut app = test_app();
+        app.vim_mode = true;
+        app.input.set("ab");
+        app.input.set_modal_cursor(1);
+        app.vim_input.mode = vim::Mode::Normal;
+        app.key(key(KeyCode::Char('3')));
+        app.key(key(KeyCode::Char('i')));
+        app.paste("X\u{0600}");
+        app.key(key(KeyCode::Esc));
+        let expected = format!("a{}b", "X\u{0600}".repeat(3));
+        assert_eq!(&*app.input, expected);
+        app.key(key(KeyCode::Char('u')));
+        assert_eq!(&*app.input, "ab");
+        app.key(key(KeyCode::Char('.')));
+        assert_eq!(&*app.input, expected);
+        app.key(key(KeyCode::Char('u')));
+        assert_eq!(&*app.input, "ab");
+        app.key(key(KeyCode::Char('2')));
+        app.key(key(KeyCode::Char('.')));
+        assert_eq!(&*app.input, format!("a{}b", "X\u{0600}".repeat(2)));
+        app.key(key(KeyCode::Char('u')));
+        assert_eq!(&*app.input, "ab");
+    }
+
+    #[test]
+    fn vim_bracketed_paste_keeps_prepend_order_through_undo_count_and_dot() {
+        let mut app = test_app();
+        app.vim_mode = true;
+        app.input.set("ab");
+        app.input.set_modal_cursor(1);
+        app.vim_input.mode = vim::Mode::Normal;
+        app.key(key(KeyCode::Char('i')));
+        app.paste("\u{0600}X");
+        assert_eq!(&*app.input, "a\u{0600}Xb");
+        assert_eq!(app.input.cursor_byte(), "a\u{0600}X".len());
+        app.key(key(KeyCode::Esc));
+        app.key(key(KeyCode::Char('u')));
+        assert_eq!(&*app.input, "ab");
+        app.key(key(KeyCode::Char('.')));
+        assert_eq!(&*app.input, "a\u{0600}Xb");
+        app.key(key(KeyCode::Char('u')));
+        assert_eq!(&*app.input, "ab");
+        app.input.set_modal_cursor(1);
+        app.key(key(KeyCode::Char('3')));
+        app.key(key(KeyCode::Char('i')));
+        app.paste("\u{0600}X");
+        app.key(key(KeyCode::Esc));
+        assert_eq!(&*app.input, format!("a{}b", "\u{0600}X".repeat(3)));
+        app.key(key(KeyCode::Char('u')));
+        assert_eq!(&*app.input, "ab");
+        app.input.set_modal_cursor(1);
+        app.key(key(KeyCode::Char('2')));
+        app.key(key(KeyCode::Char('.')));
+        assert_eq!(&*app.input, format!("a{}b", "\u{0600}X".repeat(2)));
+        app.key(key(KeyCode::Char('u')));
+        assert_eq!(&*app.input, "ab");
+    }
+
+    #[test]
     fn vim_does_not_capture_list_navigation_and_pastes_are_literal_insertions() {
         let mut app = test_app();
         app.view = View::Sessions;
