@@ -18116,13 +18116,23 @@ fn draw_wizard(f: &mut Frame, w: &Wizard, color: bool) {
     text.push(Line::raw(""));
     let mut hint_rows = 0;
     if let Some(hint) = &w.setup_hint {
-        let rows = wrap_rows(
-            hint,
-            f.area().width.min(84).saturating_sub(2).max(1) as usize,
-        );
-        hint_rows = rows.len() + 1;
-        text.extend(rows.into_iter().map(Line::raw));
-        text.push(Line::raw(""));
+        let width = f.area().width.min(84).saturating_sub(2).max(1) as usize;
+        // Leave room for the active controls and navigation footer, even when
+        // many saved profiles (or long profile names) produce a large CLI hint.
+        let budget = (f.area().height as usize)
+            .saturating_sub(15 + status_extra)
+            .min(4);
+        if budget > 0 {
+            let mut rows = wrap_rows(hint, width);
+            if rows.len() > budget {
+                let more = wrap_rows("More: formless profiles list", width);
+                rows.truncate(budget.saturating_sub(more.len()));
+                rows.extend(more.into_iter().take(budget));
+            }
+            hint_rows = rows.len() + 1;
+            text.extend(rows.into_iter().map(Line::raw));
+            text.push(Line::raw(""));
+        }
     }
     let area = f.area();
     let max_items = (area.height as usize)
@@ -20834,6 +20844,32 @@ mod tests {
         let mut cfg = Config::default();
         cfg.provider.base_url = "https://openrouter.ai/api/v1".into();
         assert_eq!(Wizard::new(&cfg).preset.unwrap().id, "openrouter");
+    }
+
+    #[test]
+    fn wizard_bounds_long_alternate_profile_hints_and_keeps_controls_visible() {
+        let mut app = test_app();
+        let mut wizard = Wizard::new(&Config::default());
+        let hint = (0..20)
+            .map(|i| format!("Profile 'saved-{i}': formless --profile saved-{i}\n"))
+            .collect::<String>();
+        wizard.setup_hint = Some(hint.clone());
+        app.wizard = Some(wizard);
+        for (width, height) in [(80, 24), (40, 24), (80, 16)] {
+            let screen = render(&mut app, width, height);
+            assert!(screen.contains("1. OpenAI"), "{width}x{height}: {screen}");
+            assert!(screen.contains("Enter continue"), "{screen}");
+            for _ in 0..20 {
+                app.key(key(KeyCode::Down));
+            }
+            let screen = render(&mut app, width, height);
+            assert!(screen.contains("Custom URL"), "{screen}");
+            app.wizard.as_mut().unwrap().preset_idx = 0;
+        }
+        assert_eq!(
+            app.wizard.as_ref().unwrap().setup_hint.as_deref(),
+            Some(hint.as_str())
+        );
     }
 
     #[test]

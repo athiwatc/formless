@@ -24,11 +24,22 @@ pub fn missing_setup_message(paths: &Paths) -> String {
 }
 
 pub fn alternate_setup_hint(paths: &Paths) -> Option<String> {
-    let other = paths.list_profiles().into_iter().find(|other| {
-        other.profile != paths.profile
-            && Config::load_file_only(other).is_ok_and(|cfg| cfg.provider.is_configured())
-    })?;
-    Some(format!("Saved setup exists in profile '{}'.\nOpen it with `{}`.\nSee profiles with `formless profiles list`.", other.profile, setup_command(&other.profile)))
+    let others: Vec<_> = paths
+        .list_profiles()
+        .into_iter()
+        .filter(|other| {
+            other.profile != paths.profile
+                && Config::load_file_only(other).is_ok_and(|cfg| cfg.provider.is_configured())
+        })
+        .collect();
+    match others.as_slice() {
+        [] => None,
+        [other] => Some(format!("Saved setup exists in profile '{}'.\nOpen it with `{}`.\nSee profiles with `formless profiles list`.", other.profile, setup_command(&other.profile))),
+        _ => {
+            let choices = others.iter().map(|other| format!("  '{}': `{}`", other.profile, setup_command(&other.profile))).collect::<Vec<_>>().join("\n");
+            Some(format!("Saved setup exists in these profiles:\n{choices}\nSee profiles with `formless profiles list`."))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -60,6 +71,18 @@ mod tests {
             assert!(!active.config_file().exists());
             assert!(!active.db_file().exists());
         }
+        let home = base.named("home").unwrap();
+        cfg.save(&home).unwrap();
+        let home_before = std::fs::read(home.config_file()).unwrap();
+        for active in [&base, &scratch] {
+            let message = missing_setup_message(active);
+            assert!(message.contains("formless --profile home"), "{message}");
+            assert!(message.contains("formless --profile work"), "{message}");
+            assert!(message.find("'home'").unwrap() < message.find("'work'").unwrap());
+            assert!(!active.config_file().exists());
+            assert!(!active.db_file().exists());
+        }
+        assert_eq!(std::fs::read(home.config_file()).unwrap(), home_before);
         assert_eq!(std::fs::read(other.config_file()).unwrap(), before);
     }
 }
