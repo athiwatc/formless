@@ -33,6 +33,7 @@ enum Command {
 }
 #[derive(Debug, Clone)]
 struct Change {
+    edited: bool,
     literal: bool,
     command: Command,
     edits: Vec<KeyEvent>,
@@ -69,9 +70,10 @@ impl Vim {
             } else {
                 KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
             };
-            insert_key(line, key, Surface::Editor);
+            let changed = insert_key(line, key, Surface::Editor).unwrap_or(false);
             self.inserting
                 .get_or_insert(Change {
+                    edited: false,
                     literal: line.is_literal(),
                     command: Command::Insert('i', 1),
                     edits: vec![],
@@ -79,6 +81,7 @@ impl Vim {
                 .edits
                 .push(key);
             self.inserting.as_mut().unwrap().literal = line.is_literal();
+            self.inserting.as_mut().unwrap().edited |= changed;
         }
     }
 
@@ -88,7 +91,7 @@ impl Vim {
             if self.mode == Mode::Insert {
                 self.mode = Mode::Normal;
                 if let Some(change) = self.inserting.take() {
-                    if !change.edits.is_empty()
+                    if change.edited
                         || matches!(
                             change.command,
                             Command::Operator(..) | Command::Insert('o' | 'O', _)
@@ -121,10 +124,10 @@ impl Vim {
             return Outcome::Pass;
         }
         if self.mode == Mode::Insert {
-            let handled = insert_key(line, key, surface);
-            if handled {
+            if let Some(changed) = insert_key(line, key, surface) {
                 self.inserting
                     .get_or_insert(Change {
+                        edited: false,
                         literal: line.is_literal(),
                         command: Command::Insert('i', 1),
                         edits: Vec::new(),
@@ -132,6 +135,7 @@ impl Vim {
                     .edits
                     .push(key);
                 self.inserting.as_mut().unwrap().literal = line.is_literal();
+                self.inserting.as_mut().unwrap().edited |= changed;
                 return Outcome::Handled;
             }
             return Outcome::Pass;
@@ -216,6 +220,7 @@ impl Vim {
             );
             if self.apply(line, cmd.clone()) {
                 self.last = Some(Change {
+                    edited: false,
                     literal: line.is_literal(),
                     command: cmd,
                     edits: vec![],
@@ -238,6 +243,7 @@ impl Vim {
             let changed = self.apply(line, cmd.clone());
             if changed && op != 'y' && self.mode != Mode::Insert {
                 self.last = Some(Change {
+                    edited: false,
                     literal: line.is_literal(),
                     command: cmd,
                     edits: vec![],
@@ -253,6 +259,7 @@ impl Vim {
             self.pending.clear();
             if self.apply(line, cmd.clone()) {
                 self.last = Some(Change {
+                    edited: false,
                     literal: line.is_literal(),
                     command: cmd,
                     edits: vec![],
@@ -292,6 +299,7 @@ impl Vim {
                 }
                 self.mode = Mode::Insert;
                 self.inserting = Some(Change {
+                    edited: false,
                     literal: line.is_literal(),
                     command: command.clone(),
                     edits: vec![],
@@ -400,6 +408,7 @@ impl Vim {
                 if *op == 'c' {
                     self.mode = Mode::Insert;
                     self.inserting = Some(Change {
+                        edited: false,
                         literal: line.is_literal(),
                         command: command.clone(),
                         edits: vec![],
@@ -448,32 +457,72 @@ fn replay_edits(line: &mut InputLine, change: &Change, surface: Surface, skip_fi
             }
         }
         for key in &change.edits {
-            insert_key(line, *key, surface);
+            let _ = insert_key(line, *key, surface);
         }
     }
 }
 
-fn insert_key(line: &mut InputLine, key: KeyEvent, surface: Surface) -> bool {
-    match key.code {
-        KeyCode::Char(c) => line.insert_char(c),
-        KeyCode::Backspace => line.backspace(),
-        KeyCode::Delete => line.delete(),
-        KeyCode::Left => line.left(),
-        KeyCode::Right => line.right(),
-        KeyCode::Up => line.vertical(false),
-        KeyCode::Down => line.vertical(true),
-        KeyCode::Home => line.home(),
-        KeyCode::End => line.end(),
+/// Some records a handled key and whether it changed text. Motion keys remain
+/// in a genuine edit's replay, without making a movement-only visit a change.
+fn insert_key(line: &mut InputLine, key: KeyEvent, surface: Surface) -> Option<bool> {
+    let before_len = line.len();
+    let inserted = match key.code {
+        KeyCode::Char(c) => {
+            let mut bytes = [0; 4];
+            let text = c.encode_utf8(&mut bytes);
+            let changed = line.selection().is_none_or(|range| &line[range] != text);
+            line.insert_char(c);
+            changed
+        }
+        KeyCode::Backspace => {
+            line.backspace();
+            false
+        }
+        KeyCode::Delete => {
+            line.delete();
+            false
+        }
+        KeyCode::Left => {
+            line.left();
+            false
+        }
+        KeyCode::Right => {
+            line.right();
+            false
+        }
+        KeyCode::Up => {
+            line.vertical(false);
+            false
+        }
+        KeyCode::Down => {
+            line.vertical(true);
+            false
+        }
+        KeyCode::Home => {
+            line.home();
+            false
+        }
+        KeyCode::End => {
+            line.end();
+            false
+        }
         KeyCode::Enter
             if surface == Surface::Editor || key.modifiers.contains(KeyModifiers::SHIFT) =>
         {
-            line.newline()
+            let changed = line.selection().is_none_or(|range| &line[range] != "\n");
+            line.newline();
+            changed
         }
-        KeyCode::Tab if surface == Surface::Editor => line.insert_str("  "),
-        _ => return false,
-    }
-    true
+        KeyCode::Tab if surface == Surface::Editor => {
+            let changed = line.selection().is_none_or(|range| &line[range] != "  ");
+            line.insert_str("  ");
+            changed
+        }
+        _ => return None,
+    };
+    Some(inserted || line.len() != before_len)
 }
+
 fn count_prefix(s: &str) -> (usize, &str) {
     let end = s
         .char_indices()
@@ -886,6 +935,60 @@ mod tests {
             v.key(&mut l, key('i'), surface);
             v.key(&mut l, key('u'), surface);
             assert_eq!(&*l, "u", "Insert u remains typing");
+        }
+    }
+
+    #[test]
+    fn insert_noops_keep_prior_dot_change_on_both_surfaces() {
+        for surface in [Surface::Composer, Surface::Editor] {
+            for keys in [
+                vec![KeyCode::Backspace],
+                vec![KeyCode::Right, KeyCode::Home],
+                vec![KeyCode::End, KeyCode::Delete, KeyCode::Home],
+            ] {
+                let (mut v, mut l) = normal("a b c");
+                for c in "dwi".chars() {
+                    v.key(&mut l, key(c), surface);
+                }
+                for code in keys {
+                    v.key(&mut l, KeyEvent::new(code, KeyModifiers::NONE), surface);
+                }
+                v.key(
+                    &mut l,
+                    KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                    surface,
+                );
+                l.set_modal_cursor(0);
+                v.key(&mut l, key('.'), surface);
+                assert_eq!(&*l, "c", "{surface:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn real_insert_keeps_movements_and_empty_open_changes_remain_repeatable() {
+        let (mut v, mut l) = normal("ab");
+        commands(&mut v, &mut l, "iX");
+        for code in [KeyCode::Left, KeyCode::Right, KeyCode::Esc] {
+            v.key(
+                &mut l,
+                KeyEvent::new(code, KeyModifiers::NONE),
+                Surface::Composer,
+            );
+        }
+        commands(&mut v, &mut l, ".");
+        assert_eq!(&*l, "XXab");
+        for open in ["o", "O", "cw"] {
+            let (mut v, mut l) = normal("a b c");
+            commands(&mut v, &mut l, open);
+            v.key(
+                &mut l,
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                Surface::Composer,
+            );
+            let before = l.to_string();
+            commands(&mut v, &mut l, ".");
+            assert_ne!(&*l, before, "{open} must still repeat without Insert keys");
         }
     }
 
