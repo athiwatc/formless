@@ -131,7 +131,7 @@ fn role_style(enabled: bool, role: &str) -> Style {
         _ => ("assistant", Color::Green),
     };
     match theme::role(name).filter(|_| enabled) {
-        // An override is used as given, not remapped.
+        // Already resolved through the role palette; avoid accent/error chaining.
         Some(c) => Style::default().fg(c).add_modifier(Modifier::BOLD),
         None => bold_fg(enabled, color),
     }
@@ -19227,6 +19227,39 @@ mod tests {
             last_click: None,
             stream_cache: Default::default(),
         }
+    }
+
+    #[test]
+    fn message_role_styles_resolve_named_colors_and_preserve_disabled_rgb_defaults() {
+        theme::reset();
+        let colors = ["user", "assistant", "tool", "note"]
+            .into_iter()
+            .map(|name| (name.to_string(), "yellow".to_string()))
+            .collect();
+        theme::set(theme::from_config("light", &colors));
+        for role in ["user", "assistant", "tool", "system-note"] {
+            assert_eq!(
+                role_style(true, role).fg,
+                Some(Color::Rgb(150, 100, 0)),
+                "{role}"
+            );
+            assert_eq!(role_style(false, role).fg, None, "{role}");
+        }
+        let colors = ["user", "assistant", "tool", "note"]
+            .into_iter()
+            .map(|name| (name.to_string(), "#123abc".to_string()))
+            .collect();
+        theme::set(theme::from_config("light", &colors));
+        for role in ["user", "assistant", "tool", "system-note"] {
+            assert_eq!(
+                role_style(true, role).fg,
+                Some(Color::Rgb(0x12, 0x3a, 0xbc))
+            );
+        }
+        theme::set(theme::from_config("light", &HashMap::new()));
+        assert_eq!(role_style(true, "user"), bold_fg(true, Color::Cyan));
+        assert_eq!(role_style(true, "assistant"), bold_fg(true, Color::Green));
+        theme::reset();
     }
 
     #[test]
