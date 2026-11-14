@@ -2202,6 +2202,15 @@ pattern (§4.4).
     deliberately becomes null. A result's `toJSON` is invoked only once.
   - `console`, timers, `JSON`, `cryptoRandom()` (UUID), `randomBytes(n)`
     (base64). Nothing else.
+
+    `sleep(ms)` and `randomBytes(n)` require finite non-negative safe-integer
+    numbers. Invalid inputs throw; requests over `tools.max_sleep_secs` or
+    `tools.max_random_bytes` throw with that setting named, instead of silently
+    coercing, wrapping or shortening. This changes the older permissive API:
+    generated Tools must supply numeric integer values and handle limit errors.
+    Successful `randomBytes(n)` returns base64 decoding to exactly `n` bytes
+    (including zero), subject to supported allocation bounds. Valid sleep keeps
+    cancellation behavior; its wall time still depends on scheduling.
 - Memory cap: the JS heap is capped at the Tool's declared `memory_mb`.
   Exceeding it faults **only that Invocation**, tagged `resource`. The cap is
   a heap cap, not a data-size cap: streaming APIs exist so data Tools
@@ -2227,6 +2236,7 @@ pattern (§4.4).
 - Modules in the UIs: `GetModule {id|name}` returns a `ModuleDetail`: the
   module, its versions oldest first with code and author, and `used_by`,
   the active Tools whose current code loads it.
+
   - **Editing:** `UpdateModuleCode` saves new code as a new version
     (author `user`) through the same syntax and load check as
     `create_module`. Module code needs no `run()`.
@@ -5629,8 +5639,8 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
 | `tools.inline_limit` | 40 | Tools listed in a Session's frozen first-step listing; others load via `find_tools` (§7.1) |
 | `tools.max_agent_depth` | 1 | How deep `agents.run` sub-agents may nest (§7.6) |
 | `tools.max_tool_depth` | 8 | How deep `tools.call` composition may nest (cycle guard, §7.6) |
-| `tools.max_sleep_secs` | 60 | Longest single `sleep(ms)` in a Tool (§7.5) |
-| `tools.max_random_bytes` | 1048576 | Largest `randomBytes(n)` (§7.5) |
+| `tools.max_sleep_secs` | 60 | Longest single `sleep(ms)` in a Tool; excess is an error (§7.5) |
+| `tools.max_random_bytes` | 1048576 | Largest decoded `randomBytes(n)` result; excess is an error (§7.5) |
 | `tools.fetch_connect_timeout_secs` | 10 | Tool `fetch`/`fetchChunks` connection deadline, clamped to 1–86400 seconds; applies to shared and DNS-pinned clients. DNS admission/resolution waits on each hop are bounded by the smaller of this budget and the remaining total deadline |
 | `tools.fetch_timeout_secs` | 60 | Total Tool HTTP deadline across DNS waits, redirects and response-body reads, clamped to 1–86400 seconds; trickling data does not reset it. Cancellation returns promptly and HTTP workers retain this deadline. OS DNS uses one fixed pool of four workers with at most sixteen queued lookups: expired queued work is skipped and late results discarded. OS lookups cannot be forcibly cancelled; a stalled lookup may retain one of those four fixed workers, while fetch callers still stop waiting at their deadlines. Timeout errors say `fetch timed out`, distinct from connection failures |
 | `tools.max_read_bytes` | 67108864 | Largest `fs.read` or `fetch` body (64 MB): larger fails as a resource error pointing to `fs.readChunks` / `fetchChunks` (§7.5) |

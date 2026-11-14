@@ -1552,10 +1552,10 @@ pub struct ToolsCfg {
     /// How deep `tools.call` composition may nest (a cycle guard).
     #[serde(default = "default_max_tool_depth")]
     pub max_tool_depth: usize,
-    /// Longest single `sleep(ms)` inside a Tool, in seconds.
+    /// Longest single `sleep(ms)` inside a Tool, in seconds; excess is an error.
     #[serde(default = "default_max_sleep_secs")]
     pub max_sleep_secs: u64,
-    /// Largest `randomBytes(n)` a Tool may ask for.
+    /// Largest exact decoded `randomBytes(n)` result; excess is an error.
     #[serde(default = "default_max_random_bytes")]
     pub max_random_bytes: usize,
     /// Native caps outside the JS heap (#604): one `fs.read` or `fetch`
