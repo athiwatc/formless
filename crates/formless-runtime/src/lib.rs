@@ -549,9 +549,19 @@ globalThis.modules = { load: globalThis.requireModule, list: () => __call("modul
 globalThis.emit = (chunk) => __call("emit", { chunk: String(chunk) });
 // Progress for long work: a fraction 0..1 (or null when unknown) and a
 // short label; the daemon decides whether it represents advancing work.
+function __progressLabel(label) {
+  const text = label == null ? "" : String(label);
+  if (text.length <= 120) return text;
+  // Reserve one UTF-16 unit for the visible truncation marker. Do not cut
+  // between the high and low surrogates of a supplementary code point.
+  let end = 119;
+  const before = text.charCodeAt(end - 1), after = text.charCodeAt(end);
+  if (before >= 0xd800 && before <= 0xdbff && after >= 0xdc00 && after <= 0xdfff) end--;
+  return text.slice(0, end) + "…";
+}
 globalThis.progress = (fraction, label) => __call("progress", {
   fraction: typeof fraction === "number" && isFinite(fraction) ? Math.min(1, Math.max(0, fraction)) : null,
-  label: label == null ? "" : String(label).slice(0, 120),
+  label: __progressLabel(label),
 });
 function __nonnegativeSafeInteger(api, n) {
   if (typeof n !== "number" || !Number.isSafeInteger(n) || n < 0)
@@ -3505,6 +3515,62 @@ mod tests {
     impl HostOps for ProgressOps {
         fn progress(&self, fraction: Option<f64>, label: &str) {
             self.0.locked().push((fraction, label.to_string()));
+        }
+    }
+
+    #[test]
+    fn progress_label_json_bridge_preserves_codepoints_within_utf16_budget() {
+        // Evaluate only the host prelude with a recording JSON bridge. No Tool
+        // source, Run, host dispatch or progress scheduler is started.
+        let runtime = Runtime::new().unwrap();
+        runtime.set_memory_limit(8 * 1024 * 1024);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        runtime.set_interrupt_handler(Some(Box::new(move || {
+            std::time::Instant::now() >= deadline
+        })));
+        let context = Context::full(&runtime).unwrap();
+        let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+        context.with(|ctx| {
+            let recorded = calls.clone();
+            let host = Function::new(ctx.clone(), move |op: String, args: String| {
+                recorded.locked().push(format!("{op}\n{args}"));
+                r#"{"ok":true,"value":null}"#.to_string()
+            })
+            .unwrap();
+            ctx.globals().set("__host", host).unwrap();
+            ctx.eval::<(), _>(PRELUDE).unwrap();
+            ctx.eval::<(), _>(
+                r#"
+                progress(0.5, "a".repeat(120));
+                progress(7, "a".repeat(119) + "😀");
+                progress(-1, "a".repeat(118) + "😀x");
+                progress(Infinity, "a".repeat(118) + "😀");
+                progress("x", null);
+                progress(NaN, "ไทย\n\"quoted\"");
+                progress(0, "😀".repeat(60));
+                progress(1, "😀".repeat(61));
+            "#,
+            )
+            .unwrap();
+        });
+        let expected = [
+            (json!(0.5), "a".repeat(120)),
+            (json!(1), format!("{}…", "a".repeat(119))),
+            (json!(0), format!("{}…", "a".repeat(118))),
+            (Value::Null, format!("{}😀", "a".repeat(118))),
+            (Value::Null, String::new()),
+            (Value::Null, "ไทย\n\"quoted\"".to_string()),
+            (json!(0), "😀".repeat(60)),
+            (json!(1), format!("{}…", "😀".repeat(59))),
+        ];
+        let calls = calls.locked();
+        assert_eq!(calls.len(), expected.len());
+        for (call, (fraction, label)) in calls.iter().zip(expected) {
+            let args = call.strip_prefix("progress\n").unwrap();
+            let parsed: Value = serde_json::from_str(args)
+                .expect("bridge JSON must decode without lone surrogates");
+            assert_eq!(parsed, json!({"fraction": fraction, "label": label}));
+            assert!(label.encode_utf16().count() <= 120);
         }
     }
 
