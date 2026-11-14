@@ -8,9 +8,17 @@ statement that forecast confirmation requires a TUI handoff.
 ## Exact source and ownership
 
 - Implementation: `336ad81bf5758ded62cd593e2d4e6a6aa2dd9bc8`.
-- Final implementation and main reconciliation:
+- Implementation source for the full desktop checks:
   `b3a9a60eaa87a37d8fa59d522944ae1335a58c96`.
-- Reconciled main: `b7b9d3c0d31b593489b9f749da82df654b81f17a`.
+- That reconciled main `b7b9d3c0d31b593489b9f749da82df654b81f17a`.
+- A final remote check found one more main advance, reconciled at
+  `d5c052e54bc4fb7aa9c2266f64bdd093ad9a1c65`: main
+  `f6149fce0719a5a1dca890735abaf4feb4266531`. Its changes are confined to Skill
+  source routing, its tests and SPEC. The desktop source/tests, manifests,
+  lockfile and protocol have no diff against the fully checked source above.
+  The real daemon fixture and strict daemon-fixture clippy were rerun and
+  passed after this merge; logs are `f6149fce-main-daemon.log` (1 passed,
+  3.82 seconds) and `f6149fce-main-clippy-daemon.log`.
 - Same isolated clone: `formless-gpui-1753-sol-20261115`; branch:
   `work/sol-gpui-1753-20261115`.
 - Original #1776 remained at
