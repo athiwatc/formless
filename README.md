@@ -621,11 +621,12 @@ The table covers every visible root command, including Clap's generated
 | `formless jobs` | `list`, `add`, `run`, `history`, `enable`, `disable`, `rm` | Manage scheduled prompts and inspect their history. |
 | `formless logs` | `--follow`, `--level`, `--since`, `--lines` | Read or follow the daemon log and rotated files. |
 | `formless mcp` | `add`, `remove`, `list`, `test`, `login`, `logout`, `catalog`, `import`, `log`, `tools`, `tool` | Manage external MCP servers and inspect their tools/logs. |
+| `formless metrics` | `--since DURATION`, `--json` | Read recorded model, Tool and built-in statistics through independent reports at one cutoff. |
 | `formless memory` | `list`, `add`, `rm`, `edit` | Inspect or change saved user-memory notes. |
 | `formless naming` | `status`, `pull`, `test` | Inspect, install, or preview the embedded Session-naming model. |
 | `formless prices` | `import` | Import a model-price catalog for cost and spending limits. |
 | `formless profiles` | `list`, `rm` | List or remove isolated profiles. |
-| `formless prompts` | `list`, `generate`, `apply`, `reject`, `rollback` | Inspect and manage measured prompt/memory proposals. |
+| `formless prompts` | `list`, `diff`, `generate`, `apply`, `reject`, `rollback` | Inspect existing proposal comparisons and manage measured prompt/memory proposals. |
 | `formless providers` | `list`, `add`, `remove`, `test` | Manage named model providers and test a connection. |
 | `formless relay` | `enable`, `disable`, `status` | Manage encrypted browser access through the relay. |
 | `formless reset` | `--force` | Wipe configuration, credentials, and the current profile's data. |
@@ -635,7 +636,7 @@ The table covers every visible root command, including Clap's generated
 | `formless routing` | `--json` | Read currently available daemon routing decisions and returned candidate figures without starting a model request. |
 | `formless runs` | No action: list; `show`, `cancel` | List recent Runs, inspect one by ID/prefix, or cancel that exact Run. |
 | `formless security` | `status` | Inspect the daemon's grants, denials, trusted resources, and exposed interfaces. |
-| `formless sessions` | `fork`, `compare`, `list`, `show`, `files`, `rewind`, `rename`, `rm`, `restore`, `import`, `search`, `archive`, `unarchive`, `export` | Manage stored Sessions, follow a Run with `show --follow`, or inspect tracked files. |
+| `formless sessions` | `fork`, `compare`, `list`, `show`, `files`, `rewind`, `rename`, `rm`, `restore`, `import`, `search`, `archive`, `unarchive`, `export` | Manage stored Sessions, follow a Run with `show --follow`, or inspect tracked files. `list --pinned --tag TAG` filters the fetched reply; selectors combine with `--archived`, preserving reply order. |
 | `formless skills` | `reviews`, `add`, `remove`, `list`, `enable`, `disable`, `show`, `export`, `import` | Inspect and manage Skills and their retained description reviews. |
 | `formless storage` | `--json` | Report disk usage by data category. |
 | `formless tools` | `reviews`, `list`, `disable`, `enable`, `undo`, `pin`, `unpin`, `tag`, `show`, `retire`, `restore`, `rollback`, `purge`, `run`, `export`, `import` | Inspect, manage, run, or transfer registry Tools. |
@@ -643,6 +644,16 @@ The table covers every visible root command, including Clap's generated
 | `formless uninstall` | `--keep-data`, `--keep-binary`, `--yes` (alias `--force`) | Remove Formless, optionally retaining data or the binary. |
 | `formless update` | No action, `check`, or `--check`; `--json` | Show newer release notes and the applicable upgrade command; never rewrite the binary. |
 | `formless web` | `--port`, `--no-open`, `--stop` | Open, print a link for, or stop the local browser UI. |
+
+`formless metrics --since 7d --json` reads the three existing metrics reports
+with one checked UTC cutoff. Omit `--since` for all history. Tool rows use stored
+`tool_id` values; reports retain their own row order and are independent reads,
+not a transactional snapshot. Runs and daily usage remain separate surfaces.
+
+`formless sessions list --pinned --tag WORK --json` selects active pinned Sessions
+whose stored tags contain exactly `work`. Only the tag argument is lowercased;
+a leading `#` is not stripped. Add `--archived` to select the archived partition.
+These selectors filter the existing reply on the client.
 
 Tool selectors use an exact name or full ID. After a miss, up to three
 ranked partial-name suggestions can help you retry with the original exact
