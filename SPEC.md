@@ -1144,6 +1144,13 @@ pasting paths.
   web the first Send turns it into a chip and stops), reaches only the
   working folder (or `~/…` when written so), and never a credential
   (`.ssh`, `.aws`, `.env`, private keys, …), whoever wrote it.
+- **Image capability guess.** With `provider.vision` unset, image-part
+  preparation and the TUI attachment warning share the model-name heuristic.
+  Full o1/o1-pro are included; o1-mini/preview, o3-mini, Gemma 3 270M/1B
+  (including Ollama size tags), and Claude 1/2/Instant names are text-only
+  exceptions before broad family matches. Explicit true/false overrides remain
+  available for custom endpoints or renamed models. Prompt-tool image policy
+  is unchanged; a name guess does not prove endpoint availability or support.
 - **Provider file authority.** Stored or imported attachment metadata is not
   permission to read a host path. Native image projection requires an artifact
   ID and path/size matching this profile's artifact registry, a regular file
