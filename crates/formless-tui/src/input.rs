@@ -428,7 +428,9 @@ impl InputLine {
         expected: &str,
         replacement: &str,
     ) -> bool {
-        if self.text.get(range.clone()) != Some(expected) {
+        // Mouse/navigation breaks the insertion undo group. Even unchanged
+        // bytes then belong to an old location, not the current repeat target.
+        if !self.history.coalesces(true) || self.text.get(range.clone()) != Some(expected) {
             return false;
         }
         self.before_edit(true);
@@ -1021,6 +1023,17 @@ fn find_back(history: &[impl AsRef<str>], query: &str, before: usize) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn modal_insert_range_replacement_refuses_after_mouse_navigation() {
+        let mut line = InputLine::from("ab");
+        line.set_modal_cursor(0);
+        line.insert_modal_paste("X");
+        line.mouse_cursor(line.len(), false);
+        assert!(!line.replace_modal_inserted(0..1, "X", "XX"));
+        assert_eq!(&*line, "Xab");
+        assert_eq!(line.cursor_byte(), line.len());
+    }
 
     #[test]
     fn modal_insert_range_replacement_preserves_joined_neighbor_and_refuses_stale_bytes() {

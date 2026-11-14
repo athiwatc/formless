@@ -503,6 +503,11 @@ fn replay_edits(line: &mut InputLine, change: &Change, surface: Surface, skip_fi
             if line.replace_modal_inserted(range, &text, &repeated) {
                 return;
             }
+            // Navigation made the old insertion range ineligible. Keep the
+            // already-applied first copy and put remaining copies together
+            // at the current cursor, respecting its new undo boundary.
+            line.insert_modal_paste(&text.repeat(count - 1));
+            return;
         }
     }
     for n in usize::from(skip_first)..count {
@@ -1428,6 +1433,50 @@ mod tests {
                 line.set_modal_cursor(at);
                 vim.key(&mut line, key('.'), surface);
                 assert_eq!(&*line, expected, "replay {surface:?}: {pasted:?}");
+                vim.key(&mut line, key('u'), surface);
+                assert_eq!(&*line, original);
+            }
+        }
+    }
+
+    #[test]
+    fn counted_paste_after_mouse_uses_current_target_and_keeps_undo_and_dot() {
+        for surface in [Surface::Composer, Surface::Editor] {
+            for (original, target_prefix, target_suffix, payload) in [
+                ("abc", "ab", "c", "X\u{0600}"),
+                ("abc", "ab", "c", "👩\u{200d}"),
+                ("a🇦🇧", "a", "🇦🇧", "X🇨"),
+            ] {
+                let (mut vim, mut line) = normal(original);
+                for c in ['3', 'i'] {
+                    vim.key(&mut line, key(c), surface);
+                }
+                vim.paste(&mut line, payload);
+                line.mouse_cursor(payload.len() + target_prefix.len(), false);
+                vim.key(
+                    &mut line,
+                    KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                    surface,
+                );
+                assert_eq!(
+                    &*line,
+                    format!(
+                        "{payload}{target_prefix}{}{target_suffix}",
+                        payload.repeat(2)
+                    )
+                );
+                vim.key(&mut line, key('u'), surface);
+                assert_eq!(&*line, format!("{payload}{original}"));
+                vim.key(&mut line, key('.'), surface);
+                assert_eq!(
+                    &*line,
+                    format!(
+                        "{payload}{target_prefix}{}{target_suffix}",
+                        payload.repeat(3)
+                    )
+                );
+                vim.key(&mut line, key('u'), surface);
+                assert_eq!(&*line, format!("{payload}{original}"));
                 vim.key(&mut line, key('u'), surface);
                 assert_eq!(&*line, original);
             }
