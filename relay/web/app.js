@@ -4659,11 +4659,11 @@
       audit.length >= 50 * (S.auditPages || 1) ? h("div", { class: "detail-actions" },
         h("button", { class: "btn small", type: "button", onclick: () => loadAudit(true) }, "Older")) : null));
     const jobs = S.jobs || [];
-    grid.append(h("section", null, h("h3", null, "Jobs"),
+    grid.append(h("section", { class: "settings-records" }, h("h3", null, "Jobs"),
       (S.settings || {}).jobs_warning ? h("p", { class: "error" }, S.settings.jobs_warning) : null,
-      jobs.length ? h("table", { class: "table" },
+      jobs.length ? h("div", { class: "table-wrap" }, h("table", { class: "table" },
         h("tbody", null, jobs.map((j) => h("tr", null,
-          h("td", null, h("div", null, j.prompt),
+          h("td", { class: "record-prose" }, h("div", null, j.prompt),
             h("div", { class: "muted" }, (j.cron ? describeCron(j.cron) : "once") + " · next " + (j.next_run ? uiFormat(new Date(j.next_run)) : "-") + (j.last_status ? " · last: " + j.last_status : "") + " · " + j.author)),
           h("td", null,
             h("button", { class: "btn small" + (j.enabled && j.approved ? "" : " primary"), type: "button", onclick: () => act({ type: "set_job_enabled", id: j.id, enabled: !(j.enabled && j.approved) }, "Updated").then(refreshSettings) },
@@ -4672,15 +4672,15 @@
             h("button", { class: "btn small", type: "button", onclick: () => showJobHistory(j) }, "History"),
             h("button", { class: "btn small danger", type: "button", onclick: async () => {
               if (await ask({ title: "Delete this job?", text: j.prompt, ok: "Delete", danger: true })) { await act({ type: "delete_job", id: j.id }, "Deleted"); refreshSettings(); }
-            } }, "Delete"))))))
+            } }, "Delete")))))))
         : h("p", { class: "muted" }, "None yet. The agent can also schedule_run."),
       h("div", { class: "detail-actions" }, h("button", { class: "btn small", type: "button", onclick: () => newJob() }, "New job"))));
     const memories = S.memories || [];
-    grid.append(h("section", null, h("h3", null, "Memory"),
+    grid.append(h("section", { class: "settings-records" }, h("h3", null, "Memory"),
       h("p", { class: "muted" }, "Notes the agent keeps about your preferences; they go into new sessions' prompts."),
-      memories.length ? h("table", { class: "table" },
+      memories.length ? h("div", { class: "table-wrap" }, h("table", { class: "table" },
         h("tbody", null, memories.map((m) => h("tr", null,
-          h("td", null, h("div", { class: m.enabled ? "" : "muted" }, m.text),
+          h("td", { class: "record-prose" }, h("div", { class: m.enabled ? "" : "muted" }, m.text),
             h("div", { class: "muted" }, m.scope + " · " + (m.session_id ? "from session " + m.session_id.slice(0, 8) : m.author) + (m.enabled ? "" : " · off"))),
           h("td", null,
             h("button", { class: "btn small", type: "button", onclick: async () => {
@@ -4690,7 +4690,7 @@
             h("button", { class: "btn small", type: "button", onclick: () => act({ type: "upsert_memory", id: m.id, enabled: !m.enabled }, m.enabled ? "Disabled" : "Enabled").then(refreshSettings) }, m.enabled ? "Disable" : "Enable"),
             h("button", { class: "btn small danger", type: "button", onclick: async () => {
               if (await ask({ title: "Delete this memory?", text: m.text, ok: "Delete", danger: true })) { await act({ type: "delete_memory", id: m.id }, "Deleted"); refreshSettings(); }
-            } }, "Delete"))))))
+            } }, "Delete")))))))
         : h("p", { class: "muted" }, "None yet."),
       h("div", { class: "detail-actions" },
         h("button", { class: "btn small", type: "button", onclick: async () => {
