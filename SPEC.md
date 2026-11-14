@@ -1150,6 +1150,12 @@ pasting paths.
   web the first Send turns it into a chip and stops), reaches only the
   working folder (or `~/…` when written so), and never a credential
   (`.ssh`, `.aws`, `.env`, private keys, …), whoever wrote it.
+  The exact leaf template names `.env.example`, `.env.sample`,
+  `.env.template` and `.env.dist` are ordinary for regular files and
+  prospective new files. Existing directories, symbolic links and special
+  files retain credential classification. This convention does not certify their contents;
+  credential ancestors, resolved secret targets, protected profile/key sources
+  and configured sensitive-path rules still take precedence.
 - **Image capability guess.** With `provider.vision` unset, image-part
   preparation and the TUI attachment warning share the model-name heuristic.
   Full o1/o1-pro are included; o1-mini/preview, o3-mini, Gemma 3 270M/1B
@@ -2040,7 +2046,10 @@ pattern (§4.4).
   reads, stay quiet. Builtin credential directories (`.ssh`, `.aws`, `.gnupg`,
   `.pki`, `.kube`, `.docker`, `.password-store`), `.env*`, `*.pem`, `*.key`,
   shell histories and native/browser
-  credential stores require separate exact-path consent. This gate applies
+  credential stores require separate exact-path consent. Only the four exact
+  regular-file env-template names listed in §5.6 are exempt from the builtin
+  `.env*` filename rule; template-named symlinks, directories and their descendants
+  remain sensitive, and user rules/protected paths still apply. This gate applies
   even with `security.secure = false`; broad read grants and trusted folders
   cannot cover it. Its synthetic Capability grants no file, network or process
   authority. The prompt uses the actual Invocation's Tool/version, Run/source
