@@ -6180,7 +6180,9 @@ configuration interface): `FORMLESS_DOCS_OPENER_FIXTURE`,
 `FORMLESS_TEST_MAINTENANCE_CONFIG`, `FORMLESS_TEST_MAINTENANCE_DATA`,
 `FORMLESS_TEST_MAINTENANCE_ISOLATION`, `FORMLESS_TEST_MAINTENANCE_OPERATION`,
 `FORMLESS_TEST_OWNERSHIP_CONFIG`, `FORMLESS_TEST_OWNERSHIP_DATA`,
-`FORMLESS_TEST_PANIC_MARKER`.
+`FORMLESS_TEST_PANIC_MARKER`, and `FORMLESS_TEST_DOCTOR_ARGS` (JSON CLI arguments
+for the test-only doctor subprocess, which installs an in-memory credential
+backend before read-only dispatch; the shipped binary does not read this variable).
 
 `FORMLESS_EXPORT_DESCRIPTOR_FIXTURE` is a Linux-only export test hook pointing
 to an owned redirected-stdout alias; it verifies that descriptor output preserves
@@ -6266,6 +6268,16 @@ An already terminal Run exits after replay. Historical terminal Runs without
 stored message boundaries display a Note and the initial Session snapshot only;
 follow never invents a boundary or refreshes that legacy transcript without one.
 Connection loss is an error.
+
+`tools list --filter FILTER` selects one stored-state predicate: `not-retired`
+(including disabled Tools), `retired`, `failing` (known success rate below 0.8),
+`needs-attention`, `off` (disabled) or `pinned`. It combines by AND with
+`--tag TAG`, retaining exact stored-tag matching after the existing argument
+lowercasing/leading-# removal. Unknown rates do not count as failing; states
+may overlap. JSON uses the same selection and existing ToolInfo schema.
+Human output distinguishes an empty registry from no matching rows and names
+the flags to clear. `--show-pinned` adds a human PINNED yes/no column; default
+piped cells and row order remain unchanged. These flags never mutate a Tool.
 
 `prompts diff ID [--json]` reads the existing daemon proposal comparison:
 target, already-applied state and ordered operation/line pairs. Human output
