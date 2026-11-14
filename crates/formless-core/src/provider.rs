@@ -194,6 +194,9 @@ mod model_test_failure_tests {
             ("provider error: 401 Unauthorized", false),
             ("provider error: 400 Bad Request", false),
             ("no tool call returned", false),
+            ("model does not support streaming", false),
+            ("downstream rejected the schema", false),
+            ("password reset required", false),
         ] {
             let test = ModelTest {
                 error: Some(error.into()),
