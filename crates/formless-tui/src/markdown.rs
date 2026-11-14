@@ -1643,6 +1643,23 @@ mod tests {
     }
 
     #[test]
+    fn narrow_mermaid_pie_uses_existing_wide_preview_and_pager_path() {
+        let source = "pie\n\"abcdefghijklmnopqrstuvwxyzab\":1";
+        assert!(mermaid::render(source, false, 28).is_none());
+        let wide = mermaid::render(source, false, 10_000).unwrap();
+        assert_eq!(wide.kind, "pie");
+        let out = fitted(&format!("```mermaid\n{source}\n```"), 30);
+        assert!(out.iter().all(|line| line.width() <= 30));
+        let text = out.join("\n");
+        assert!(text.contains("/pager diagram 1"), "{text}");
+        assert!(text.contains("pie"), "{text}");
+        assert!(
+            !text.contains("source —"),
+            "supported wide pie uses a preview before source fallback"
+        );
+    }
+
+    #[test]
     fn wide_mermaid_banner_keeps_its_index_under_nested_prefixes() {
         // Eleven blocks first, so the diagram is [12].
         let before = "```\nx\n```\n\n".repeat(11);
