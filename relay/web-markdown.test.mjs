@@ -361,3 +361,38 @@ test('nested markers need the actual parent content column', () => {
   }
   assert.equal(plain(c.markdown('- lazy\n continuation').children[0].children[0]),'lazycontinuation');
 });
+
+test('thematic breaks take precedence over varied-indent list siblings', () => {
+  const c=fixture();
+  for (const marker of ['* * *','- - -','***','---','_ _ _']) {
+    for (const indent of ['', ' ']) {
+      const source='- item\n'+indent+marker;
+      const root=c.markdown(source);
+      assert.deepEqual(root.children.map(n=>n.tag),['ul','hr'],source);
+      assert.equal(root.children[0].children.length,1,source);
+      assert.equal(plain(root.children[0]),'item',source);
+    }
+  }
+  assert.deepEqual(c.markdown('- item\n\n * * *').children.map(n=>n.tag),['ul','hr']);
+});
+
+test('sibling grouping and sufficiently indented thematic breaks retain their structure', () => {
+  const c=fixture();
+  const mixed=c.markdown('- item\n - sibling\n- third');
+  assert.deepEqual(mixed.children.map(n=>n.tag),['ul']);
+  assert.equal(mixed.children[0].children.length,3);
+  for (const marker of ['* * *','- - -']) {
+    const root=c.markdown('- item\n  '+marker+'\n - sibling');
+    assert.deepEqual(root.children.map(n=>n.tag),['ul']);
+    assert.equal(root.children[0].children.length,2);
+    assert.equal(all(root.children[0].children[0]).filter(n=>n.tag==='hr').length,1);
+  }
+});
+
+for (const marker of ['* * *','- - -']) {
+  test('one-space '+marker+' leaves the list as a thematic break', () => {
+    const root=fixture().markdown('- item\n '+marker);
+    assert.deepEqual(root.children.map(n=>n.tag),['ul','hr']);
+    assert.equal(root.children[0].children.length,1);
+  });
+}
