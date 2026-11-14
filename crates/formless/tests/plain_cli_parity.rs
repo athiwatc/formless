@@ -10,7 +10,7 @@ use std::{
     os::unix::net::UnixListener,
     process::{Command, Stdio},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
     time::{Duration, Instant},
@@ -35,13 +35,15 @@ impl Fixture {
         )
     }
     fn with_tools(tool_rows: Value) -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
         let root = std::path::PathBuf::from("/tmp").join(format!(
-            "f1009-{}-{}",
+            "f1009-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         let paths = Paths {
             data_dir: root.join("d/p"),
