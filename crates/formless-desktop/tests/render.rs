@@ -760,6 +760,19 @@ mod render {
             })
             .expect("offscreen window is open");
             cx.run_until_parked();
+            if control.starts_with("open-daemon-") {
+                cx.update_window(any, |_, window, cx| {
+                    window.render_frame(cx);
+                    for id in ["refresh-resource", "resource-back"] {
+                        assert!(
+                            inside(window, id, viewport),
+                            "{name}: {id} outside the viewport: {:?}",
+                            window.find(id).bounds()
+                        );
+                    }
+                })
+                .expect("offscreen window is open");
+            }
             if fit == Fit::Reflowed && !control.starts_with("open-daemon-") {
                 // The overlay panel is inside the window, edge to edge at
                 // most, whatever the page under it was scrolled to.

@@ -3700,26 +3700,16 @@ impl Shell {
                     .overflow_y_scrollbar()
                     .child(
                         h_flex()
-                            .gap_2()
-                            .flex_wrap()
-                            .child(Label::new(destination.label()).flex_1())
-                            .child(
-                                Button::new("refresh-resource")
-                                    .small()
-                                    .label("Refresh")
+                            .w_full().min_w_0().gap_2()
+                            .when(page_height.is_some(), |header| header.flex_col().items_start())
+                            .child(Label::new(destination.label()).min_w_0().when(page_height.is_none(), |title| title.flex_1()))
+                            .child(h_flex().min_w_0().gap_2().flex_wrap()
+                                .when(page_height.is_some(), |actions| actions.w_full())
+                                .child(Button::new("refresh-resource").small().flex_shrink_0().label("Refresh")
                                     .disabled(!self.client_connected)
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.client_request(ClientCommand::Refresh, cx)
-                                    })),
-                            )
-                            .child(
-                                Button::new("resource-back")
-                                    .small()
-                                    .label("Back to Chat")
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.set_destination(Destination::Chat, window, cx)
-                                    })),
-                            ),
+                                    .on_click(cx.listener(|this, _, _, cx| this.client_request(ClientCommand::Refresh, cx))))
+                                .child(Button::new("resource-back").small().flex_shrink_0().label("Back to Chat")
+                                    .on_click(cx.listener(|this, _, window, cx| this.set_destination(Destination::Chat, window, cx)))))
                     )
                     .child(readable("resource-notice", notice))
                     .child(list)

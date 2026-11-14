@@ -225,6 +225,13 @@ fn daemon_resource_error_and_status_reflow_at_200_percent(cx: &mut TestAppContex
         for id in ["region-conversation", "resource-notice", "resource-detail"] {
             assert!(window.find(id).bounds().size.width <= px(480.), "{id}");
         }
+        for id in ["refresh-resource", "resource-back"] {
+            let bounds = window.find(id).bounds();
+            assert!(
+                bounds.left() >= px(0.) && bounds.right() <= px(480.),
+                "{id}: {bounds:?}"
+            );
+        }
         shell.update(cx, |shell, cx| {
             shell.focus_section(PageSection::Status, window, cx)
         });
