@@ -614,8 +614,9 @@ the client's own environment applied.
 ### 3.11 CLI reference
 
 With no command, `formless` launches the TUI and auto-starts its daemon.
-The table covers every visible root command, including Clap's generated
-`help` command. Use `formless COMMAND --help` for arguments and defaults;
+Root commands appear alphabetically in `--help` and the generated man page;
+Clap appends its generated `help` command at the end of root help. The table
+covers every visible root command, including `help`. Use `formless COMMAND --help` for arguments and defaults;
 `formless help COMMAND SUBCOMMAND` also opens nested help.
 
 | Command | Actions / useful options | Purpose |

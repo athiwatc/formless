@@ -76,33 +76,39 @@ struct Cli {
     cmd: Option<Cmd>,
 }
 
+// Root commands are alphabetical; Clap appends its generated help command.
+// Keep complete variants in this order so help, man and completions agree.
 #[derive(Subcommand)]
 enum Cmd {
-    /// Read recorded model, Tool and built-in metrics without a model call
+    /// Every approval grant, and revoking them
     #[command(
-        after_help = "Examples:\n  formless metrics --since 7d\n  formless metrics --json\n\nTool rows identify stored tool_id values. Reports are independent reads at one cutoff, not a transactional snapshot."
+        after_help = "Examples:\n  formless approvals pending\n  formless approvals list --json"
     )]
-    Metrics {
-        /// Only records since this duration ago (7d, 24h, 1h30m); omitted: all history
-        #[arg(long, value_name = "DURATION", value_parser = parse_since_cutoff)]
-        since: Option<String>,
-        /// Print all three complete replies as one JSON object
-        #[arg(long)]
-        json: bool,
-    },
-    /// Read the daemon's currently available routing decisions without a model call
-    Routing {
-        /// Print the complete daemon reply as one JSON value
-        #[arg(long)]
-        json: bool,
-    },
-    /// Launch the TUI (default)
-    Tui,
-    /// Manage the background daemon and its login service
-    #[command(after_help = "Examples:\n  formless daemon status\n  formless daemon status --json")]
-    Daemon {
+    Approvals {
         #[command(subcommand)]
-        action: DaemonAction,
+        action: ApprovalsAction,
+    },
+    /// Provider credential login/status/logout (API key or OAuth)
+    #[command(
+        after_help = "Examples:\n  formless auth status\n  formless auth status --provider local --json"
+    )]
+    Auth {
+        #[command(subcommand)]
+        action: AuthAction,
+    },
+    /// Back up the database now (kept with the daily ones in <data>/backups)
+    #[command(
+        after_help = "Examples:\n  formless backup list\n  formless backup verify backup.sqlite\n  formless backup drill backup.sqlite"
+    )]
+    Backup {
+        #[command(subcommand)]
+        action: Option<BackupAction>,
+    },
+    /// Write a redacted bug report (doctor, versions, OS, recent log) to attach to an issue
+    BugReport {
+        /// Where to write it (default: ./formless-bug-report-<time>.md)
+        #[arg(short, long)]
+        output: Option<std::path::PathBuf>,
     },
     /// Line-mode chat: no full screen, for dumb terminals, SSH and screen
     /// readers (approvals and questions are answered inline)
@@ -114,123 +120,11 @@ enum Cmd {
         #[arg(long)]
         new: bool,
     },
-    /// Every approval grant, and revoking them
-    #[command(
-        after_help = "Examples:\n  formless approvals pending\n  formless approvals list --json"
-    )]
-    Approvals {
-        #[command(subcommand)]
-        action: ApprovalsAction,
-    },
-    /// What the daemon can reach: grants, denials, trusted folders, MCP
-    /// servers, trusted hooks, relay and web UI
-    #[command(
-        after_help = "Examples:\n  formless security status\n  formless security status --json"
-    )]
-    Security {
-        #[command(subcommand)]
-        action: SecurityAction,
-    },
-    /// List or remove profiles (isolated data dirs made with --profile)
-    #[command(after_help = "Examples:\n  formless profiles list\n  formless profiles list --json")]
-    Profiles {
-        #[command(subcommand)]
-        action: ProfilesAction,
-    },
-    /// Diagnostics: config, dirs, keychain, endpoint probe
-    Doctor {
-        /// Rehearse newest backup in an isolated offline profile, then exit
-        #[arg(long, conflicts_with = "fix")]
-        restore_drill: bool,
-        /// Apply the safe fixes: clear a stale socket or lock, restart a
-        /// stuck daemon, tighten secret file permissions, then check again
-        #[arg(long)]
-        fix: bool,
-        /// A machine-readable report, secrets redacted
-        #[arg(long, conflicts_with = "fix")]
-        json: bool,
-    },
-    /// Write a redacted bug report (doctor, versions, OS, recent log) to attach to an issue
-    BugReport {
-        /// Where to write it (default: ./formless-bug-report-<time>.md)
-        #[arg(short, long)]
-        output: Option<std::path::PathBuf>,
-    },
     /// List local user-defined slash commands without starting a daemon
     #[command(after_help = "Examples:\n  formless commands list\n  formless commands list --json")]
     Commands {
         #[command(subcommand)]
         action: cli_commands::Action,
-    },
-    /// Skills: SKILL.md know-how the agent loads on demand (SPEC §7.10)
-    #[command(
-        after_help = "Examples:\n  formless skills list\n  formless skills show example-skill"
-    )]
-    Skills {
-        #[command(subcommand)]
-        action: SkillsAction,
-    },
-    /// Read the module inventory, metadata and stored source versions
-    #[command(
-        after_help = "Examples:\n  formless modules list --json\n  formless modules show MODULE_NAME\n  formless modules show MODULE_NAME --version 1"
-    )]
-    Modules {
-        #[command(subcommand)]
-        action: cli_modules::Action,
-    },
-    /// Open the web UI from this machine's daemon on 127.0.0.1 (SPEC §12)
-    Web {
-        /// Port (default: a free one)
-        #[arg(long)]
-        port: Option<u16>,
-        /// Print the one-time link instead of opening a browser
-        #[arg(long)]
-        no_open: bool,
-        /// Stop serving the web UI
-        #[arg(long, conflicts_with_all = ["port", "no_open"])]
-        stop: bool,
-    },
-    /// Extra model providers (SPEC §4.5)
-    #[command(
-        after_help = "Examples:\n  formless providers list\n  formless providers test local"
-    )]
-    Providers {
-        #[command(subcommand)]
-        action: ProvidersAction,
-    },
-    /// Model prices for spending limits and cost (provider.prices)
-    #[command(
-        after_help = "Examples:\n  formless prices import --dry-run\n  formless prices import --provider local --dry-run"
-    )]
-    Prices {
-        #[command(subcommand)]
-        action: PricesAction,
-    },
-    /// Sessions: list, show, search, rename, delete, export or import them
-    #[command(
-        after_help = "Examples:\n  formless sessions list\n  formless sessions show SESSION_ID\n  formless sessions export SESSION_ID --format markdown"
-    )]
-    Sessions {
-        #[command(subcommand)]
-        action: SessionsAction,
-    },
-    /// Print the man page (roff), for packaging: `formless man > formless.1`
-    #[command(hide = true)]
-    Man,
-    /// Show the daemon log (daemon.log and its rotated files)
-    Logs {
-        /// Keep printing new lines as they're written
-        #[arg(short, long)]
-        follow: bool,
-        /// Only this level and worse: error, warn, info, debug, trace
-        #[arg(long, value_parser = ["error", "warn", "info", "debug", "trace"])]
-        level: Option<String>,
-        /// Only entries from this long ago on (10m, 2h, 1d)
-        #[arg(long, value_parser = parse_duration)]
-        since: Option<std::time::Duration>,
-        /// How many of the latest entries to show (default 200; 0 = all)
-        #[arg(short = 'n', long, default_value_t = 200)]
-        lines: usize,
     },
     /// Print a shell completion script (bash, zsh, fish, powershell, elvish)
     Completions {
@@ -246,101 +140,11 @@ enum Cmd {
         #[command(subcommand)]
         action: ConfigAction,
     },
-    /// Roles: a purpose mapped to a provider + model (SPEC §4.5)
-    #[command(after_help = "Examples:\n  formless roles list\n  formless roles list --json")]
-    Roles {
+    /// Manage the background daemon and its login service
+    #[command(after_help = "Examples:\n  formless daemon status\n  formless daemon status --json")]
+    Daemon {
         #[command(subcommand)]
-        action: RolesAction,
-    },
-    /// Scheduled jobs: prompts that run later or on a cron (SPEC §9.7)
-    #[command(
-        after_help = "Examples:\n  formless jobs list\n  formless jobs history JOB_ID --json"
-    )]
-    Jobs {
-        #[command(subcommand)]
-        action: JobsAction,
-    },
-    /// Recent Runs and their outcomes: steps, tool calls, tokens (SPEC §8.7)
-    #[command(
-        after_help = "Examples:\n  formless runs --limit 10\n  formless runs show RUN_ID --json"
-    )]
-    Runs {
-        #[command(subcommand)]
-        action: Option<cli_attach::RunsAction>,
-        /// Maximum number of recent Runs to list
-        #[arg(long, default_value_t = 20)]
-        limit: usize,
-        /// Print machine-readable JSON instead of human-readable output
-        #[arg(long)]
-        json: bool,
-    },
-    /// User memory: notes the agent keeps about your preferences (SPEC §7.11)
-    #[command(after_help = "Examples:\n  formless memory list\n  formless memory list --json")]
-    Memory {
-        #[command(subcommand)]
-        action: MemoryAction,
-    },
-    /// External MCP servers (SPEC §7.9)
-    #[command(
-        after_help = "Examples:\n  formless mcp list\n  formless mcp catalog\n  formless mcp tools SERVER_NAME\n  formless mcp prompts --json\n  formless mcp prompt SERVER NAME --arg key=value"
-    )]
-    Mcp {
-        #[command(subcommand)]
-        action: McpAction,
-    },
-    /// Provider credential login/status/logout (API key or OAuth)
-    #[command(
-        after_help = "Examples:\n  formless auth status\n  formless auth status --provider local --json"
-    )]
-    Auth {
-        #[command(subcommand)]
-        action: AuthAction,
-    },
-    /// Hosted relay + web frontend (SPEC §12, v2)
-    #[command(
-        after_help = "Examples:\n  formless relay status --json\n  formless relay status --qr"
-    )]
-    Relay {
-        #[command(subcommand)]
-        action: RelayAction,
-    },
-    /// Prompt/memory self-optimisation proposals
-    #[command(
-        after_help = "Examples:\n  formless prompts list\n  formless prompts list --json\n  formless prompts diff PROPOSAL_ID --json"
-    )]
-    Prompts {
-        #[command(subcommand)]
-        action: PromptsAction,
-    },
-    /// Check for a newer release, show what changed, and how to upgrade
-    #[command(
-        after_help = "Examples:\n  formless update check\n  formless update --check\n  formless update check --json\n\nJSON: {installed, status, newer_releases: [{tag, url, notes}]}. Status is update_available, up_to_date (within the fetched page), or release_check_unavailable (HTTP 404 status). Checks never execute an updater."
-    )]
-    Update {
-        #[command(subcommand)]
-        action: Option<UpdateAction>,
-        /// Only report (same as `update check`)
-        #[arg(long)]
-        check: bool,
-        /// One JSON report with installed version, response status and ordered release notes
-        #[arg(long, global = true)]
-        json: bool,
-    },
-    /// Tool registry inspection/transfer (SPEC §7.8, §12)
-    #[command(
-        after_help = "Examples:\n  formless tools list\n  formless tools list --filter not-retired --tag work --show-pinned\n  formless tools show TOOL_NAME --json\n  formless tools export TOOL_NAME --output tool.json"
-    )]
-    Tools {
-        #[command(subcommand)]
-        action: ToolsAction,
-    },
-    /// Embedded session-naming model: status, install, try it out
-    #[command(
-        after_help = "Examples:\n  formless naming status\n  formless naming test \"Plan my week\""
-    )]
-    Naming {
-        #[command(subcommand)]
-        action: NamingAction,
+        action: DaemonAction,
     },
     /// Open the guides in a browser
     Docs {
@@ -355,26 +159,18 @@ enum Cmd {
         #[arg(long, conflicts_with_all = ["topic", "print"])]
         keys: bool,
     },
-    /// Disk used by Sessions, artifacts, Tool versions, logs, backups
-    Storage {
-        /// Print machine-readable JSON instead of human-readable output
+    /// Diagnostics: config, dirs, keychain, endpoint probe
+    Doctor {
+        /// Rehearse newest backup in an isolated offline profile, then exit
+        #[arg(long, conflicts_with = "fix")]
+        restore_drill: bool,
+        /// Apply the safe fixes: clear a stale socket or lock, restart a
+        /// stuck daemon, tighten secret file permissions, then check again
         #[arg(long)]
+        fix: bool,
+        /// A machine-readable report, secrets redacted
+        #[arg(long, conflicts_with = "fix")]
         json: bool,
-    },
-    /// Free disk space: old artifacts and snapshots, long MCP logs, old
-    /// migration copies, database free space
-    Gc {
-        /// List what would be freed without removing anything
-        #[arg(long)]
-        dry_run: bool,
-    },
-    /// Back up the database now (kept with the daily ones in <data>/backups)
-    #[command(
-        after_help = "Examples:\n  formless backup list\n  formless backup verify backup.sqlite\n  formless backup drill backup.sqlite"
-    )]
-    Backup {
-        #[command(subcommand)]
-        action: Option<BackupAction>,
     },
     /// Everything for a new machine in one file: Tools, modules, Skills,
     /// memories, jobs, providers/Roles/MCP servers (no keys or secrets)
@@ -386,10 +182,129 @@ enum Cmd {
         #[arg(short, long)]
         output: Option<std::path::PathBuf>,
     },
+    /// Free disk space: old artifacts and snapshots, long MCP logs, old
+    /// migration copies, database free space
+    Gc {
+        /// List what would be freed without removing anything
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Load a file from `formless export-all` (adds; never overwrites)
     ImportAll {
         /// Path to a bundle produced by export-all
         file: std::path::PathBuf,
+    },
+    /// Scheduled jobs: prompts that run later or on a cron (SPEC §9.7)
+    #[command(
+        after_help = "Examples:\n  formless jobs list\n  formless jobs history JOB_ID --json"
+    )]
+    Jobs {
+        #[command(subcommand)]
+        action: JobsAction,
+    },
+    /// Show the daemon log (daemon.log and its rotated files)
+    Logs {
+        /// Keep printing new lines as they're written
+        #[arg(short, long)]
+        follow: bool,
+        /// Only this level and worse: error, warn, info, debug, trace
+        #[arg(long, value_parser = ["error", "warn", "info", "debug", "trace"])]
+        level: Option<String>,
+        /// Only entries from this long ago on (10m, 2h, 1d)
+        #[arg(long, value_parser = parse_duration)]
+        since: Option<std::time::Duration>,
+        /// How many of the latest entries to show (default 200; 0 = all)
+        #[arg(short = 'n', long, default_value_t = 200)]
+        lines: usize,
+    },
+    /// Print the man page (roff), for packaging: `formless man > formless.1`
+    #[command(hide = true)]
+    Man,
+    /// External MCP servers (SPEC §7.9)
+    #[command(
+        after_help = "Examples:\n  formless mcp list\n  formless mcp catalog\n  formless mcp tools SERVER_NAME\n  formless mcp prompts --json\n  formless mcp prompt SERVER NAME --arg key=value"
+    )]
+    Mcp {
+        #[command(subcommand)]
+        action: McpAction,
+    },
+    /// User memory: notes the agent keeps about your preferences (SPEC §7.11)
+    #[command(after_help = "Examples:\n  formless memory list\n  formless memory list --json")]
+    Memory {
+        #[command(subcommand)]
+        action: MemoryAction,
+    },
+    /// Read recorded model, Tool and built-in metrics without a model call
+    #[command(
+        after_help = "Examples:\n  formless metrics --since 7d\n  formless metrics --json\n\nTool rows identify stored tool_id values. Reports are independent reads at one cutoff, not a transactional snapshot."
+    )]
+    Metrics {
+        /// Only records since this duration ago (7d, 24h, 1h30m); omitted: all history
+        #[arg(long, value_name = "DURATION", value_parser = parse_since_cutoff)]
+        since: Option<String>,
+        /// Print all three complete replies as one JSON object
+        #[arg(long)]
+        json: bool,
+    },
+    /// Read the module inventory, metadata and stored source versions
+    #[command(
+        after_help = "Examples:\n  formless modules list --json\n  formless modules show MODULE_NAME\n  formless modules show MODULE_NAME --version 1"
+    )]
+    Modules {
+        #[command(subcommand)]
+        action: cli_modules::Action,
+    },
+    /// Embedded session-naming model: status, install, try it out
+    #[command(
+        after_help = "Examples:\n  formless naming status\n  formless naming test \"Plan my week\""
+    )]
+    Naming {
+        #[command(subcommand)]
+        action: NamingAction,
+    },
+    /// Model prices for spending limits and cost (provider.prices)
+    #[command(
+        after_help = "Examples:\n  formless prices import --dry-run\n  formless prices import --provider local --dry-run"
+    )]
+    Prices {
+        #[command(subcommand)]
+        action: PricesAction,
+    },
+    /// List or remove profiles (isolated data dirs made with --profile)
+    #[command(after_help = "Examples:\n  formless profiles list\n  formless profiles list --json")]
+    Profiles {
+        #[command(subcommand)]
+        action: ProfilesAction,
+    },
+    /// Prompt/memory self-optimisation proposals
+    #[command(
+        after_help = "Examples:\n  formless prompts list\n  formless prompts list --json\n  formless prompts diff PROPOSAL_ID --json"
+    )]
+    Prompts {
+        #[command(subcommand)]
+        action: PromptsAction,
+    },
+    /// Extra model providers (SPEC §4.5)
+    #[command(
+        after_help = "Examples:\n  formless providers list\n  formless providers test local"
+    )]
+    Providers {
+        #[command(subcommand)]
+        action: ProvidersAction,
+    },
+    /// Hosted relay + web frontend (SPEC §12, v2)
+    #[command(
+        after_help = "Examples:\n  formless relay status --json\n  formless relay status --qr"
+    )]
+    Relay {
+        #[command(subcommand)]
+        action: RelayAction,
+    },
+    /// Wipe config, keychain entry, and the entire data dir (SPEC §15)
+    Reset {
+        /// Skip the interactive reset confirmation
+        #[arg(long)]
+        force: bool,
     },
     /// Replace the database with a backup (stop the daemon first); the
     /// current one is saved next to the backups
@@ -397,26 +312,17 @@ enum Cmd {
         /// Path to the database backup to restore
         file: std::path::PathBuf,
     },
-    /// Remove Formless from this machine: stop the daemon, remove the login
-    /// service, delete keychain entries and every profile's data, and the
-    /// binary (SPEC §15)
-    Uninstall {
-        /// Keep Sessions, Tools and config (remove only the service,
-        /// secrets and binary)
-        #[arg(long)]
-        keep_data: bool,
-        /// Leave the binary in place
-        #[arg(long)]
-        keep_binary: bool,
-        /// Don't ask for confirmation (required when not on a terminal)
-        #[arg(long, short, visible_alias = "force")]
-        yes: bool,
+    /// Roles: a purpose mapped to a provider + model (SPEC §4.5)
+    #[command(after_help = "Examples:\n  formless roles list\n  formless roles list --json")]
+    Roles {
+        #[command(subcommand)]
+        action: RolesAction,
     },
-    /// Wipe config, keychain entry, and the entire data dir (SPEC §15)
-    Reset {
-        /// Skip the interactive reset confirmation
+    /// Read the daemon's currently available routing decisions without a model call
+    Routing {
+        /// Print the complete daemon reply as one JSON value
         #[arg(long)]
-        force: bool,
+        json: bool,
     },
     /// Headless single Run (SPEC §12). Approvals fail closed unless --yes.
     /// A message queued while an earlier Run closes exits 2 without a
@@ -482,6 +388,102 @@ enum Cmd {
         max_steps: Option<u32>,
         #[command(flatten)]
         pipeline: cli_pipeline::Args,
+    },
+    /// Recent Runs and their outcomes: steps, tool calls, tokens (SPEC §8.7)
+    #[command(
+        after_help = "Examples:\n  formless runs --limit 10\n  formless runs show RUN_ID --json"
+    )]
+    Runs {
+        #[command(subcommand)]
+        action: Option<cli_attach::RunsAction>,
+        /// Maximum number of recent Runs to list
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Print machine-readable JSON instead of human-readable output
+        #[arg(long)]
+        json: bool,
+    },
+    /// What the daemon can reach: grants, denials, trusted folders, MCP
+    /// servers, trusted hooks, relay and web UI
+    #[command(
+        after_help = "Examples:\n  formless security status\n  formless security status --json"
+    )]
+    Security {
+        #[command(subcommand)]
+        action: SecurityAction,
+    },
+    /// Sessions: list, show, search, rename, delete, export or import them
+    #[command(
+        after_help = "Examples:\n  formless sessions list\n  formless sessions show SESSION_ID\n  formless sessions export SESSION_ID --format markdown"
+    )]
+    Sessions {
+        #[command(subcommand)]
+        action: SessionsAction,
+    },
+    /// Skills: SKILL.md know-how the agent loads on demand (SPEC §7.10)
+    #[command(
+        after_help = "Examples:\n  formless skills list\n  formless skills show example-skill"
+    )]
+    Skills {
+        #[command(subcommand)]
+        action: SkillsAction,
+    },
+    /// Disk used by Sessions, artifacts, Tool versions, logs, backups
+    Storage {
+        /// Print machine-readable JSON instead of human-readable output
+        #[arg(long)]
+        json: bool,
+    },
+    /// Tool registry inspection/transfer (SPEC §7.8, §12)
+    #[command(
+        after_help = "Examples:\n  formless tools list\n  formless tools list --filter not-retired --tag work --show-pinned\n  formless tools show TOOL_NAME --json\n  formless tools export TOOL_NAME --output tool.json"
+    )]
+    Tools {
+        #[command(subcommand)]
+        action: ToolsAction,
+    },
+    /// Launch the TUI (default)
+    Tui,
+    /// Remove Formless from this machine: stop the daemon, remove the login
+    /// service, delete keychain entries and every profile's data, and the
+    /// binary (SPEC §15)
+    Uninstall {
+        /// Keep Sessions, Tools and config (remove only the service,
+        /// secrets and binary)
+        #[arg(long)]
+        keep_data: bool,
+        /// Leave the binary in place
+        #[arg(long)]
+        keep_binary: bool,
+        /// Don't ask for confirmation (required when not on a terminal)
+        #[arg(long, short, visible_alias = "force")]
+        yes: bool,
+    },
+    /// Check for a newer release, show what changed, and how to upgrade
+    #[command(
+        after_help = "Examples:\n  formless update check\n  formless update --check\n  formless update check --json\n\nJSON: {installed, status, newer_releases: [{tag, url, notes}]}. Status is update_available, up_to_date (within the fetched page), or release_check_unavailable (HTTP 404 status). Checks never execute an updater."
+    )]
+    Update {
+        #[command(subcommand)]
+        action: Option<UpdateAction>,
+        /// Only report (same as `update check`)
+        #[arg(long)]
+        check: bool,
+        /// One JSON report with installed version, response status and ordered release notes
+        #[arg(long, global = true)]
+        json: bool,
+    },
+    /// Open the web UI from this machine's daemon on 127.0.0.1 (SPEC §12)
+    Web {
+        /// Port (default: a free one)
+        #[arg(long)]
+        port: Option<u16>,
+        /// Print the one-time link instead of opening a browser
+        #[arg(long)]
+        no_open: bool,
+        /// Stop serving the web UI
+        #[arg(long, conflicts_with_all = ["port", "no_open"])]
+        stop: bool,
     },
 }
 
@@ -9142,6 +9144,70 @@ mod tests {
             !cmd.contains("| sh"),
             "a failed download must not be piped into sh: {cmd}"
         );
+    }
+
+    /// Root presentation order is deliberate (#1609), independently of inventory.
+    #[test]
+    fn root_help_and_man_use_alphabetical_command_order() {
+        use clap::CommandFactory;
+        let mut cli = super::Cli::command().term_width(160);
+        cli.build();
+        let mut expected: Vec<_> = cli
+            .get_subcommands()
+            .filter(|command| !command.is_hide_set() && command.get_name() != "help")
+            .map(|command| command.get_name().to_owned())
+            .collect();
+        expected.sort();
+        expected.push("help".into());
+        for help in [
+            cli.render_help().to_string(),
+            cli.render_long_help().to_string(),
+        ] {
+            let commands = help
+                .split("Commands:\n")
+                .nth(1)
+                .unwrap()
+                .split("\nOptions:")
+                .next()
+                .unwrap();
+            let actual: Vec<_> = commands
+                .lines()
+                .filter_map(|line| {
+                    let line = line.strip_prefix("  ")?;
+                    if line.starts_with(' ') {
+                        return None;
+                    }
+                    line.split_whitespace().next()
+                })
+                .collect();
+            assert_eq!(actual, expected, "{help}");
+        }
+        let mut man = Vec::new();
+        clap_mangen::Man::new(cli)
+            .render_subcommands_section(&mut man)
+            .unwrap();
+        let man = String::from_utf8(man).unwrap();
+        let positions: Vec<_> = expected
+            .iter()
+            .map(|name| {
+                let escaped = name.replace('-', "\\-");
+                man.find(&format!("formless\\-{escaped}(1)"))
+                    .unwrap_or_else(|| panic!("missing {name}: {man}"))
+            })
+            .collect();
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]), "{man}");
+        let mut page = Vec::new();
+        super::render_man(&mut page).unwrap();
+        let page = String::from_utf8(page).unwrap();
+        let positions: Vec<_> = expected
+            .iter()
+            .filter(|name| name.as_str() != "help")
+            .map(|name| {
+                page.find(&format!(".SH \"FORMLESS {}\"", name.to_uppercase()))
+                    .unwrap()
+            })
+            .collect();
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
     }
 
     /// The man page documents nested options (#895).
