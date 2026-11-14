@@ -5117,11 +5117,15 @@
       value = select.value || null;
     } else {
       const initial = current == null ? "" : kind === "json" || kind === "list" ? JSON.stringify(current) : String(current);
-      const text = await ask({ title: "Set " + key, inputKind: "machine", input: true, value: initial, ok: "Save",
-        text: "Leave empty for the default. " + (kind === "list" ? "Comma-separated strings or a JSON array (numbers stay numeric)." : kind === "json" ? "JSON value (quote strings; maps and numeric lists use JSON)." : "") });
-      if (text == null) return;
-      try { value = parseSettingInput(text, kind); }
-      catch (error) { toast(error.message || "invalid value", true); return; }
+      let draft = initial, error = "";
+      while (true) {
+        const text = await ask({ title: "Set " + key, inputKind: "machine", input: true, value: draft, ok: "Save",
+          text: "Leave empty for the default. " + (kind === "list" ? "Comma-separated strings or a JSON array (numbers stay numeric)." : kind === "json" ? "JSON value (quote strings; maps and numeric lists use JSON)." : ""),
+          body: error ? h("p", { class: "error", role: "alert" }, error) : null });
+        if (text == null) return;
+        try { value = parseSettingInput(text, kind); break; }
+        catch (cause) { draft = text; error = cause.message || "Invalid value"; }
+      }
     }
     const r = await act({ type: "set_setting", key, value });
     if (!r) return;
