@@ -150,6 +150,10 @@ pub fn rate_limits() -> HashMap<String, Value> {
 pub struct ModelTest {
     pub model: String,
     pub ok: bool,
+    /// A temporary transport/rate/server/deadline failure, eligible for a
+    /// bounded background retry when the user already opted into auto tests.
+    #[serde(default)]
+    pub transient: bool,
     /// Time to the first streamed token, and to the end of the answer.
     pub first_token_ms: Option<u64>,
     pub total_ms: Option<u64>,
@@ -165,6 +169,110 @@ pub struct ModelTest {
     /// Reported counters across physical probe attempts; missing is unknown.
     #[serde(default)]
     pub probe_usage: Option<Value>,
+}
+
+fn model_test_failure_is_transient(test: &ModelTest, deadline: bool) -> bool {
+    !test.ok
+        && (test.transient
+            || deadline
+            || test
+                .error
+                .as_deref()
+                .is_some_and(crate::errors::is_transient))
+}
+
+#[cfg(test)]
+mod model_test_failure_tests {
+    use super::*;
+    #[test]
+    fn failure_classification_and_legacy_results_keep_their_meaning() {
+        for (error, expected) in [
+            ("provider error: 429 Too Many Requests", true),
+            ("provider error: 503 Unavailable", true),
+            ("connection reset", true),
+            ("request timed out", true),
+            ("provider error: 401 Unauthorized", false),
+            ("provider error: 400 Bad Request", false),
+            ("no tool call returned", false),
+        ] {
+            let test = ModelTest {
+                error: Some(error.into()),
+                ..Default::default()
+            };
+            assert_eq!(
+                model_test_failure_is_transient(&test, false),
+                expected,
+                "{error}"
+            );
+        }
+        let mut test = ModelTest::default();
+        assert!(model_test_failure_is_transient(&test, true));
+        test.transient = true;
+        assert!(model_test_failure_is_transient(&test, false));
+        test.ok = true;
+        assert!(!model_test_failure_is_transient(&test, true));
+        let mut legacy = serde_json::to_value(&test).unwrap();
+        legacy.as_object_mut().unwrap().remove("transient");
+        assert!(
+            !serde_json::from_value::<ModelTest>(legacy)
+                .unwrap()
+                .transient
+        );
+    }
+    #[tokio::test]
+    async fn actual_local_probes_classify_http_deadline_and_fallback_failures() {
+        use axum::response::IntoResponse;
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let env = crate::credential_env::EnvGuard::isolated();
+        env.set("NO_PROXY", "127.0.0.1,localhost");
+        for mode in [429u16, 401, 503] {
+            let count = Arc::new(AtomicUsize::new(0));
+            let app=axum::Router::new().route("/chat/completions",axum::routing::post({let count=count.clone();move || {let count=count.clone();async move {
+                let request=count.fetch_add(1,Ordering::SeqCst);
+                if mode==503 && request==0 {
+                    return ([("content-type","text/event-stream")], "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n").into_response();
+                }
+                if mode==503 && request==1 {
+                    return axum::Json(json!({"choices":[{"message":{"content":"no native tool call"}}]})).into_response();
+                }
+                (axum::http::StatusCode::from_u16(mode).unwrap(),axum::Json(json!({"error":{"message":"local fixture failure"}}))).into_response()
+            }}}));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut cfg = ProviderCfg::default();
+            cfg.base_url = format!("http://{}", listener.local_addr().unwrap());
+            cfg.max_retries = 0;
+            cfg.fallback_models.clear();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let provider = Provider::new(cfg, "local-test-key".into()).unwrap();
+            let deadline = provider
+                .test_model_scoped(
+                    "fixture",
+                    crate::probe_policy::ProbePolicy::limited(std::time::Duration::ZERO, 8),
+                )
+                .await;
+            assert!(!deadline.ok && deadline.transient, "{deadline:?}");
+            assert_eq!(count.load(Ordering::SeqCst), 0);
+            let test = provider
+                .test_model_scoped(
+                    "fixture",
+                    crate::probe_policy::ProbePolicy::limited(
+                        std::time::Duration::from_secs(10),
+                        8,
+                    ),
+                )
+                .await;
+            assert!(!test.ok);
+            assert_eq!(test.transient, mode != 401, "{test:?}");
+            assert_eq!(
+                count.load(Ordering::SeqCst),
+                if mode == 503 { 3 } else { 1 }
+            );
+            server.abort();
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -2045,7 +2153,10 @@ impl Provider {
             ..Default::default()
         });
         result.total_ms = Some(started.elapsed().as_millis() as u64);
-        result.probe_usage = Some(policy.report());
+        let usage = policy.report();
+        result.transient =
+            model_test_failure_is_transient(&result, usage["deadline_exceeded"] == true);
+        result.probe_usage = Some(usage);
         result
     }
 
@@ -2102,14 +2213,20 @@ impl Provider {
         match native {
             Ok(true) => t.tool_calling = true,
             other => {
-                if probe_prompt_tool_call(self, model, &tool)
-                    .await
-                    .unwrap_or(false)
-                {
+                let fallback = probe_prompt_tool_call(self, model, &tool).await;
+                if fallback.as_ref().is_ok_and(|called| *called) {
                     t.tool_calling = true;
                     t.prompt_fallback = true;
-                } else if let Err(e) = other {
-                    t.error = Some(format!("tool call: {e:#}"));
+                } else {
+                    // Preserve a temporary fallback failure even when the
+                    // native probe returned false without an error string.
+                    t.transient = fallback
+                        .as_ref()
+                        .err()
+                        .is_some_and(|error| crate::errors::is_transient(&format!("{error:#}")));
+                    if let Err(e) = other {
+                        t.error = Some(format!("tool call: {e:#}"));
+                    }
                 }
             }
         }

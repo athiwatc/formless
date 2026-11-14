@@ -2284,7 +2284,7 @@
     if (m.vision) parts.push("vision");
     if (m.tools === true) parts.push("tools");
     if (m.tools === false) parts.push("no tools");
-    if (t) parts.push(t.ok ? "✓ tested" : "✗ test failed");
+    if (t) parts.push(t.ok ? "✓ tested" : t.transient === true ? "✗ temporary test failure (use Test to retry)" : "✗ test failed");
     return parts.join(" · ");
   }
   function modelTestText(t) {

@@ -45,6 +45,8 @@ pub fn model_detail(meta: &serde_json::Value, test: &serde_json::Value) -> Optio
     if test.is_object() {
         parts.push(if test["ok"] == true {
             "✓ tested".into()
+        } else if test["transient"] == true {
+            "✗ temporary test failure (Ctrl+T to retry)".into()
         } else {
             "✗ test failed".into()
         });
@@ -218,6 +220,18 @@ impl ModelPicker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn transient_model_failures_explain_the_manual_retry() {
+        let failed = serde_json::json!({"ok":false,"transient":true});
+        assert_eq!(
+            model_detail(&serde_json::Value::Null, &failed).unwrap(),
+            "✗ temporary test failure (Ctrl+T to retry)"
+        );
+        assert_eq!(
+            model_detail(&serde_json::Value::Null, &serde_json::json!({"ok":false})).unwrap(),
+            "✗ test failed"
+        );
+    }
     #[test]
     fn query_chords_and_page_keys_clamp_to_matches_and_rendered_capacity() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
