@@ -117,6 +117,13 @@ See [room-budget-design.md](room-budget-design.md) and
 | `room.test.mjs` | `node relay/room.test.mjs` (room teardown, disconnect codes, CSP) |
 | `push.test.mjs`, `push.dev-test.mjs` | `node relay/push.test.mjs` (signing), `node relay/push.dev-test.mjs` (end to end through `dev.mjs`) |
 
+An explicit conformance `BASE` must be an HTTP(S) origin, such as
+`http://127.0.0.1:8797`, with an optional trailing slash. Paths, queries,
+fragments, credentials and `ws://`/`wss://` input are rejected before connecting.
+HTTP probes and WebSocket checks derive their targets from the same origin.
+`node --test relay/conformance-base.test.mjs` checks argument validation and
+both trailing-slash forms against an owned local relay.
+
 ## Use
 
 ```sh
