@@ -3946,7 +3946,9 @@ run_tool = "network_policy"     # a registry Tool, or…
   the rest share the room in proportion. Cell text wraps inside its
   column instead of being cut. When the pane can't give every column 4
   characters, the table is shown as one `key: value` record per row,
-  each value wrapping under itself with a hanging indent.
+  each value wrapping under itself with a hanging indent. Hard-wrapped
+  text keeps grapheme clusters whole; a cluster wider than its row budget
+  is represented by `…`, and a zero-column hard-wrap budget emits no rows.
   `/table [N]` opens the last answer's Nth table at full width in the
   pager, where ←/→ scroll sideways.
   Selection uses parsed table order within the last nonblank assistant
