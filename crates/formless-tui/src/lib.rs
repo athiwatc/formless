@@ -18463,9 +18463,16 @@ fn draw_panes(f: &mut Frame, area: Rect, app: &mut App) {
             ]))
         })
         .collect();
-    f.render_widget(
+    let current_row = app
+        .sessions
+        .iter()
+        .filter(|session| !session.archived)
+        .position(|session| Some(&session.id) == app.current.as_ref());
+    let mut session_state = ListState::default().with_selected(current_row);
+    f.render_stateful_widget(
         List::new(session_items).block(ui::panel(" Sessions ", app.color, Color::Cyan)),
         left[0],
+        &mut session_state,
     );
     if app.tools.is_empty() {
         f.render_widget(
@@ -18556,14 +18563,31 @@ fn draw_panes(f: &mut Frame, area: Rect, app: &mut App) {
             })
             .collect()
     };
+    let block = ui::panel(" Activity ", app.color, Color::Magenta)
+        .title_bottom(ui::hint("/panes", app.color));
+    let inner = block.inner(right[1]);
+    f.render_widget(block, right[1]);
+    let mut row_starts = Vec::with_capacity(notes.len());
+    let mut rows = 0usize;
+    if inner.width > 0 {
+        for note in &notes {
+            row_starts.push(rows);
+            rows += Paragraph::new(note.clone())
+                .wrap(Wrap { trim: false })
+                .line_count(inner.width)
+                .max(1);
+        }
+    }
+    let top = rows.saturating_sub(inner.height as usize);
+    let first = row_starts
+        .partition_point(|&start| start <= top)
+        .saturating_sub(1);
+    let offset = top.saturating_sub(row_starts.get(first).copied().unwrap_or(0));
     f.render_widget(
-        Paragraph::new(notes)
-            .block(
-                ui::panel(" Activity ", app.color, Color::Magenta)
-                    .title_bottom(ui::hint("/panes", app.color)),
-            )
-            .wrap(Wrap { trim: false }),
-        right[1],
+        Paragraph::new(notes.into_iter().skip(first).collect::<Vec<_>>())
+            .wrap(Wrap { trim: false })
+            .scroll((offset.min(u16::MAX as usize) as u16, 0)),
+        inner,
     );
 }
 
@@ -24136,6 +24160,120 @@ mod tests {
         );
         assert_eq!(p.lines[1], "2 │   return 1;");
         assert!(p.styled[0].spans.iter().any(|s| s.content == "function"));
+    }
+
+    fn side_pane_regions(app: &mut App, width: u16, height: u16) -> (Vec<String>, Vec<String>) {
+        app.pane_widths = (25, 25);
+        let mut terminal =
+            Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| draw_panes(frame, frame.area(), app))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let rows = |start, end| {
+            (0..height)
+                .map(|y| {
+                    (start..end)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+        };
+        (rows(0, width / 4), rows(width * 3 / 4, width))
+    }
+
+    #[test]
+    fn side_pane_sessions_keep_current_eligible_row_visible_without_reordering() {
+        let mut app = test_app();
+        app.sessions = (0..100)
+            .map(|index| {
+                serde_json::from_value(serde_json::json!({
+                    "id": format!("s{index}"), "name": format!("SESSION-{index:03}"),
+                    "created_at":"", "updated_at":"", "archived": index % 3 == 0,
+                }))
+                .unwrap()
+            })
+            .collect();
+        app.current = Some("s98".into());
+        let before: Vec<_> = app
+            .sessions
+            .iter()
+            .map(|session| (session.id.clone(), session.archived))
+            .collect();
+        for (width, height) in [(120, 24), (160, 12), (120, 40)] {
+            let (left, _) = side_pane_regions(&mut app, width, height);
+            let row = left
+                .iter()
+                .find(|row| row.contains("SESSION-098"))
+                .expect("current Session visible");
+            assert!(row.contains('●'), "{row}");
+            assert_eq!(app.current.as_deref(), Some("s98"));
+        }
+        for id in ["s2", "missing", "s0"] {
+            app.current = Some(id.into());
+            let (left, _) = side_pane_regions(&mut app, 120, 24);
+            let text = left.join("\n");
+            assert!(text.contains("SESSION-001"), "{text}");
+            assert!(
+                !text.contains("SESSION-000"),
+                "archived Sessions remain excluded"
+            );
+            if id == "s2" {
+                assert!(left.iter().any(|row| row.contains("● SESSION-002")));
+            }
+        }
+        assert_eq!(
+            app.sessions
+                .iter()
+                .map(|session| (session.id.clone(), session.archived))
+                .collect::<Vec<_>>(),
+            before
+        );
+        app.sessions.truncate(3);
+        let (left, _) = side_pane_regions(&mut app, 120, 24);
+        assert!(left.join("\n").contains("SESSION-002"));
+        for (width, height) in [(0, 0), (1, 1), (4, 2), (12, 4)] {
+            side_pane_regions(&mut app, width, height);
+        }
+    }
+
+    #[test]
+    fn side_pane_activity_keeps_newest_wrapped_tail_visible_on_resize() {
+        let mut app = test_app();
+        app.notes = vec![
+            "oldest ".repeat(15),
+            "older ".repeat(18),
+            format!("{}表👩🏽‍💻\nembedded note tail-END", "latest ".repeat(10)),
+        ];
+        let before = app.notes.clone();
+        for (width, height) in [(80, 16), (120, 16), (160, 24), (80, 12)] {
+            let (_, right) = side_pane_regions(&mut app, width, height);
+            assert!(
+                right.iter().any(|row| row.contains("tail-END")),
+                "{right:?}"
+            );
+        }
+        assert_eq!(app.notes, before);
+        app.notes = vec!["FIRST".into(), "SECOND".into(), "THIRD".into()];
+        let (_, right) = side_pane_regions(&mut app, 120, 24);
+        let first = right.iter().position(|row| row.contains("FIRST")).unwrap();
+        let second = right.iter().position(|row| row.contains("SECOND")).unwrap();
+        let third = right.iter().position(|row| row.contains("THIRD")).unwrap();
+        assert!(first < second && second < third);
+        assert!(right[first].contains('·'));
+        app.notes = vec![format!("{}hidden-after-cap", "x".repeat(120))];
+        assert!(!side_pane_regions(&mut app, 120, 24)
+            .1
+            .join("\n")
+            .contains("hidden-after-cap"));
+        app.notes.clear();
+        assert!(side_pane_regions(&mut app, 120, 24)
+            .1
+            .join("\n")
+            .contains("Nothing yet."));
+        for (width, height) in [(0, 0), (1, 1), (4, 2), (12, 4)] {
+            side_pane_regions(&mut app, width, height);
+        }
     }
 
     #[test]
