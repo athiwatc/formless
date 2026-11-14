@@ -5,6 +5,7 @@ mod commands;
 mod external_editor;
 mod external_editor_ui;
 mod highlight;
+mod history_search_view;
 #[cfg(test)]
 mod history_tests;
 mod hunk_controller;
@@ -12431,13 +12432,10 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App, show_cursor: bool) {
         let hit = found
             .and_then(|i| input_history(&app.messages, app.current.as_deref()).nth(i))
             .unwrap_or_default();
-        let label = format!("(history search) {query}▏: ");
+        let (label, preview) = history_search_view::parts(query, hit, avail);
         lines.push(Line::from(vec![
-            Span::styled(label.clone(), bold_fg(app.color, Color::Magenta)),
-            Span::raw(history_preview(
-                hit,
-                avail.saturating_sub(label.chars().count()),
-            )),
+            Span::styled(label, bold_fg(app.color, Color::Magenta)),
+            Span::raw(preview),
         ]));
         // The ▏ marks the query's end; no terminal cursor.
         cursor = None;
