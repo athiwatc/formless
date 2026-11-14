@@ -81,6 +81,7 @@ struct Renderer {
     /// Styles opened by inline HTML tags (`<kbd>`, `<b>`…), innermost last.
     html: Vec<(String, Style)>,
     need_gap: bool,
+    heading: bool,
     /// Code blocks so far, so each is labelled `[n]` like `/copy code n`.
     code_index: usize,
 }
@@ -256,7 +257,10 @@ impl Renderer {
             return;
         }
         let spans = std::mem::take(&mut self.spans);
-        let avail = self.width.saturating_sub(self.prefix_width()).max(8);
+        let avail = self
+            .width
+            .saturating_sub(self.prefix_width())
+            .max(if self.heading { 1 } else { 8 });
         for row in wrap(spans, avail) {
             self.emit(row);
         }
@@ -295,10 +299,19 @@ impl Renderer {
                 } else {
                     ("☐ ", dim(color))
                 };
-                // GitHub shows the checkbox instead of the bullet.
+                // Ordered tasks keep their sequence number; unordered tasks
+                // use the checkbox in place of the bullet. The final marker
+                // determines both wrapping and the hanging indent.
+                let ordered = matches!(self.lists.last(), Some(Some(_)));
                 match self.prefixes.last_mut() {
                     Some(p) if p.first.is_some() => {
-                        p.first = Some(vec![Span::styled(mark, style)]);
+                        let first = p.first.as_mut().unwrap();
+                        if !ordered {
+                            first.clear();
+                        }
+                        first.push(Span::styled(mark, style));
+                        let width = first.iter().map(|span| span.content.width()).sum();
+                        p.rest = vec![Span::raw(" ".repeat(width))];
                     }
                     _ => self.push_text(mark, style),
                 }
@@ -322,6 +335,19 @@ impl Renderer {
                     _ => Style::default().add_modifier(Modifier::BOLD),
                 };
                 self.styles.push(style);
+                let depth = match level {
+                    HeadingLevel::H1 => 1,
+                    HeadingLevel::H2 => 2,
+                    HeadingLevel::H3 => 3,
+                    HeadingLevel::H4 => 4,
+                    HeadingLevel::H5 => 5,
+                    HeadingLevel::H6 => 6,
+                };
+                self.prefixes.push(Prefix {
+                    first: Some(vec![Span::styled(format!("H{depth} "), style)]),
+                    rest: vec![Span::raw("   ")],
+                });
+                self.heading = true;
             }
             Tag::BlockQuote(kind) => {
                 self.flush();
@@ -439,7 +465,13 @@ impl Renderer {
                 self.need_gap = true;
             }
             TagEnd::Heading(_) => {
-                self.flush();
+                if self.spans.is_empty() {
+                    self.emit(Vec::new());
+                } else {
+                    self.flush();
+                }
+                self.prefixes.pop();
+                self.heading = false;
                 self.styles.pop();
                 self.need_gap = true;
             }
@@ -529,13 +561,9 @@ impl Renderer {
             // Wider than the pane: a cut-down preview, with the full
             // diagram in the pager.
             if let Some(d) = mermaid::render(body, color, 10_000) {
-                self.emit(vec![Span::styled(
-                    format!(
-                        "◇ mermaid [{index}] · {} · wider than the chat: /pager diagram {index} · /open diagram {index}",
-                        d.kind
-                    ),
-                    dim(color),
-                )]);
+                for row in wide_banner(index, d.kind, avail) {
+                    self.emit(vec![Span::styled(row, dim(color))]);
+                }
                 let total = d.lines.len();
                 for line in d.lines.into_iter().take(PREVIEW_ROWS) {
                     self.emit(truncate_spans(line.spans, avail));
@@ -549,14 +577,22 @@ impl Renderer {
                 return;
             }
         }
-        let label = if lang.eq_ignore_ascii_case("mermaid") {
-            format!("╭─ mermaid [{index}] (source — diagram too wide or not drawable here)")
-        } else if lang.is_empty() {
-            format!("╭─ [{index}]")
+        if lang.eq_ignore_ascii_case("mermaid") {
+            // Word-wrapped to the pane, so the label is never clipped (#1742).
+            let label =
+                format!("╭─ mermaid [{index}] (source — diagram too wide or not drawable here)");
+            let words = label.split(' ').map(str::to_string).collect::<Vec<_>>();
+            for row in fit_groups(&[words], " ", avail) {
+                self.emit(vec![Span::styled(row, dim(color))]);
+            }
         } else {
-            format!("╭─ {lang} [{index}]")
-        };
-        self.emit(vec![Span::styled(label, dim(color))]);
+            let label = if lang.is_empty() {
+                format!("╭─ [{index}]")
+            } else {
+                format!("╭─ {lang} [{index}]")
+            };
+            self.emit(vec![Span::styled(label, dim(color))]);
+        }
         let diff = ["diff", "patch"]
             .iter()
             .any(|d| lang.eq_ignore_ascii_case(d));
@@ -578,7 +614,7 @@ impl Renderer {
             .saturating_sub(2 + if numbers { num_w + 1 } else { 0 })
             .max(8);
         for (n, raw) in body.split('\n').enumerate() {
-            let raw = raw.replace('\t', "    ");
+            let raw = expand_code_tabs(raw);
             let spans = if let Some(h) = &mut hl {
                 h.line(&raw)
             } else {
@@ -888,6 +924,82 @@ fn hard_wrap(spans: Vec<Span<'static>>, avail: usize) -> Vec<Vec<Span<'static>>>
     rows
 }
 
+/// The hint above a too-wide diagram's preview, in rows of at most `avail`
+/// columns (#1742). Its phrases stay whole where a row holds them, so
+/// `/pager diagram N` and `/open diagram N` are never cut; a pane narrower
+/// than a command drops the prose and keeps the label and both commands,
+/// broken at their spaces first. No room at all shows no hint.
+fn wide_banner(index: usize, kind: &str, avail: usize) -> Vec<String> {
+    let words = |s: &str| s.split(' ').map(str::to_string).collect::<Vec<_>>();
+    let label = words(&format!("◇ mermaid [{index}]"));
+    let pager = format!("/pager diagram {index}");
+    let open = format!("/open diagram {index}");
+    if avail < pager.width().max(open.width()) {
+        return fit_groups(&[label, words(&pager), words(&open)], " ", avail);
+    }
+    let mut hint = words("wider than the chat:");
+    hint.push(pager);
+    let kind: Vec<String> = words(kind).into_iter().filter(|w| !w.is_empty()).collect();
+    fit_groups(&[label, kind, hint, vec![open]], " · ", avail)
+}
+
+/// Pack groups of words into non-empty rows of at most `avail` columns:
+/// groups joined by `sep` and words by a space. A group moves to a new
+/// row whole when that row holds it; one wider than a row starts a row
+/// and wraps word by word, and a word wider than a row is split between
+/// grapheme clusters. A cluster wider than a row shows as `…`; with no
+/// room at all (`avail == 0`) there are no rows.
+fn fit_groups(groups: &[Vec<String>], sep: &str, avail: usize) -> Vec<String> {
+    let mut rows = Vec::new();
+    if avail == 0 {
+        return rows;
+    }
+    let mut row = String::new();
+    for group in groups.iter().filter(|g| !g.is_empty()) {
+        let whole = group.join(" ");
+        let gap = if row.is_empty() { 0 } else { sep.width() };
+        if row.width() + gap + whole.width() <= avail {
+            if gap > 0 {
+                row.push_str(sep);
+            }
+            row.push_str(&whole);
+            continue;
+        }
+        if whole.width() <= avail {
+            rows.push(std::mem::replace(&mut row, whole));
+            continue;
+        }
+        // Too wide for any row: it starts its own, wrapped by word.
+        if !row.is_empty() {
+            rows.push(std::mem::take(&mut row));
+        }
+        for word in group {
+            let gap = usize::from(!row.is_empty());
+            if row.width() + gap + word.width() <= avail {
+                if gap > 0 {
+                    row.push(' ');
+                }
+                row.push_str(word);
+                continue;
+            }
+            if !row.is_empty() {
+                rows.push(std::mem::take(&mut row));
+            }
+            for g in word.graphemes(true) {
+                let g = if g.width() > avail { "…" } else { g };
+                if !row.is_empty() && row.width() + g.width() > avail {
+                    rows.push(std::mem::take(&mut row));
+                }
+                row.push_str(g);
+            }
+        }
+    }
+    if !row.is_empty() {
+        rows.push(row);
+    }
+    rows
+}
+
 fn truncate_spans(spans: Vec<Span<'static>>, max: usize) -> Vec<Span<'static>> {
     let total: usize = spans.iter().map(|s| s.content.width()).sum();
     if total <= max {
@@ -912,6 +1024,24 @@ fn truncate_spans(spans: Vec<Span<'static>>, max: usize) -> Vec<Span<'static>> {
     out
 }
 
+/// Ordinary code blocks use four-column tab stops measured from the code
+/// origin, before its border/gutter/prefix and before syntax highlighting.
+fn expand_code_tabs(raw: &str) -> String {
+    let mut output = String::with_capacity(raw.len());
+    let mut column = 0;
+    for cluster in raw.graphemes(true) {
+        if cluster == "\t" {
+            let spaces = 4 - column % 4;
+            output.extend(std::iter::repeat_n(' ', spaces));
+            column += spaces;
+        } else {
+            output.push_str(cluster);
+            column += cluster.width();
+        }
+    }
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -921,6 +1051,221 @@ mod tests {
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect()
+    }
+
+    #[test]
+    fn ordered_tasks_keep_numbers_check_state_and_final_hanging_indent() {
+        for start in [1, 10, 100] {
+            let source = format!("{start}. [ ] Task _italic_ 日本語 with enough text to wrap\n{}. [x] Finished `code` with more wrapped content", start + 1);
+            for color in [false, true] {
+                let out = render(&source, color, "", 24);
+                let text = out
+                    .iter()
+                    .map(|line| {
+                        line.spans
+                            .iter()
+                            .map(|span| span.content.as_ref())
+                            .collect::<String>()
+                    })
+                    .collect::<Vec<_>>();
+                let first = format!("{start}. ☐ ");
+                let next = format!("{}. ☑ ", start + 1);
+                let split = text
+                    .iter()
+                    .position(|line| line.starts_with(&next))
+                    .unwrap();
+                for (rows, marker, expected) in [
+                    (
+                        &text[..split],
+                        first.as_str(),
+                        "Taskitalic日本語withenoughtexttowrap",
+                    ),
+                    (
+                        &text[split..],
+                        next.as_str(),
+                        "Finishedcodewithmorewrappedcontent",
+                    ),
+                ] {
+                    assert!(rows[0].starts_with(marker), "{text:?}");
+                    let indent = " ".repeat(marker.width());
+                    let content = rows
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, line)| !line.is_empty())
+                        .map(|(index, line)| {
+                            if index == 0 {
+                                line.strip_prefix(marker).unwrap()
+                            } else {
+                                line.strip_prefix(&indent).unwrap()
+                            }
+                        })
+                        .collect::<String>();
+                    assert_eq!(content.split_whitespace().collect::<String>(), expected);
+                }
+                assert!(text.iter().all(|line| line.width() <= 24), "{text:?}");
+                assert!(out
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .any(|span| span.content == "italic"
+                        && span.style.add_modifier.contains(Modifier::ITALIC)));
+            }
+        }
+    }
+
+    #[test]
+    fn task_prefixes_align_inside_quotes_and_nested_lists() {
+        for (source, first, rest) in [
+            (
+                "> 10. [x] Long task with Unicode 日本語 and wrapped content",
+                "  │ 10. ☑ ",
+                "  │       ",
+            ),
+            (
+                "- [ ] Long task with Unicode 日本語 and wrapped content",
+                "  ☐ ",
+                "    ",
+            ),
+            (
+                "- parent\n\n  10. [ ] Long task with Unicode 日本語 and wrapped content",
+                "    10. ☐ ",
+                "          ",
+            ),
+        ] {
+            let out = lines(source, 24);
+            let start = out
+                .iter()
+                .position(|line| line.starts_with(first))
+                .unwrap_or_else(|| panic!("missing {first:?}: {out:?}"));
+            let rows = out[start..]
+                .iter()
+                .filter(|line| !line.trim().is_empty() && line.trim() != "│")
+                .collect::<Vec<_>>();
+            assert!(rows.len() > 1, "{out:?}");
+            for row in &rows[1..] {
+                assert!(row.starts_with(rest), "{out:?}");
+            }
+            assert!(out.iter().all(|line| line.width() <= 24), "{out:?}");
+            let content = rows
+                .iter()
+                .enumerate()
+                .map(|(index, line)| {
+                    line.strip_prefix(if index == 0 { first } else { rest })
+                        .unwrap()
+                })
+                .collect::<String>();
+            assert_eq!(
+                content.split_whitespace().collect::<String>(),
+                "LongtaskwithUnicode日本語andwrappedcontent"
+            );
+        }
+    }
+
+    #[test]
+    fn heading_depths_have_noncolor_labels_and_keep_inline_content() {
+        let source = (1..=6)
+            .map(|depth| {
+                format!(
+                    "{} Level {depth} _italic_ `code` ไทย 日本語\n\n",
+                    "#".repeat(depth)
+                )
+            })
+            .collect::<String>()
+            + "**ordinary strong paragraph**";
+        for color in [false, true] {
+            let out = render(&source, color, "", 24);
+            let text = out
+                .iter()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>();
+            for depth in 1..=6 {
+                let label = format!("H{depth} ");
+                let start = text
+                    .iter()
+                    .position(|line| line.starts_with(&label))
+                    .unwrap();
+                let end = text[start + 1..]
+                    .iter()
+                    .position(|line| line.is_empty())
+                    .map_or(text.len(), |index| start + 1 + index);
+                let body = text[start..end]
+                    .iter()
+                    .enumerate()
+                    .map(|(index, line)| {
+                        if index == 0 {
+                            &line[3..]
+                        } else {
+                            assert!(line.starts_with("   "), "{text:?}");
+                            &line[3..]
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("");
+                assert_eq!(
+                    body.split_whitespace().collect::<String>(),
+                    format!("Level{depth}italiccodeไทย日本語")
+                );
+                assert!(out[start..end]
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .any(|span| span.content.contains("italic")
+                        && span.style.add_modifier.contains(Modifier::ITALIC)));
+                if !color {
+                    assert!(out[start].spans.iter().all(|span| span.style.fg.is_none()));
+                }
+            }
+            assert!(text.iter().any(|line| line.starts_with("ordinary strong")));
+            assert!(text.iter().all(|line| line.width() <= 24), "{text:?}");
+        }
+        let empty = render("###\n", false, "", 16);
+        assert!(empty
+            .iter()
+            .any(|line| line.spans.iter().any(|span| span.content == "H3 ")));
+    }
+
+    #[test]
+    fn nested_heading_continuations_budget_their_depth_prefix() {
+        let source =
+            "> - ### Long heading 日本語 👩🏽‍💻 with enough content to wrap across several lines";
+        for width in [18, 24, 80] {
+            let out = render(source, false, "  ", width);
+            let lines = out
+                .iter()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<String>()
+                })
+                .filter(|line| line.trim() != "│" && !line.trim().is_empty())
+                .collect::<Vec<_>>();
+            assert!(lines[0].starts_with("  │ • H3 "), "{lines:?}");
+            for line in &lines[1..] {
+                assert!(line.starts_with("  │      "), "{lines:?}");
+            }
+            assert!(
+                lines.iter().all(|line| line.width() <= width),
+                "{width}: {lines:?}"
+            );
+            let content = lines
+                .iter()
+                .map(|line| {
+                    if let Some((_, body)) = line.split_once("H3 ") {
+                        body
+                    } else {
+                        line.strip_prefix("  │      ").unwrap()
+                    }
+                })
+                .collect::<String>();
+            assert_eq!(
+                content.split_whitespace().collect::<String>(),
+                "Longheading日本語👩🏽‍💻withenoughcontenttowrapacrossseverallines"
+            );
+        }
     }
 
     #[test]
@@ -935,7 +1280,7 @@ mod tests {
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect();
-        assert_eq!(text, ["  Title", "", "  The bold and code and gone."]);
+        assert_eq!(text, ["  H1 Title", "", "  The bold and code and gone."]);
         let find = |s: &str| out[2].spans.iter().find(|x| x.content == s).unwrap().style;
         assert!(find("bold").add_modifier.contains(Modifier::BOLD));
         assert_eq!(find("code").fg, Some(Color::Yellow));
@@ -1105,6 +1450,61 @@ mod tests {
     }
 
     #[test]
+    fn code_tabs_advance_to_four_display_column_stops() {
+        for (source, expected) in [
+            ("a\tb", "a   b"),
+            ("ab\tc", "ab  c"),
+            ("abc\td", "abc d"),
+            ("\t\tZ", "        Z"),
+            ("ab\t\tZ", "ab      Z"),
+            ("界\tZ", "界  Z"),
+            ("e\u{301}\tZ", "e\u{301}   Z"),
+            ("👩🏽‍💻\tZ", "👩🏽‍💻  Z"),
+            ("界界a\tZ", "界界a   Z"),
+            ("plain ไทย 👩🏽‍💻 e\u{301}", "plain ไทย 👩🏽‍💻 e\u{301}"),
+        ] {
+            assert_eq!(expand_code_tabs(source), expected);
+        }
+        let source = "```rust\nlet\tx = 1;\n```";
+        let original = source.to_string();
+        assert_eq!(
+            render(source, true, "", 80),
+            render("```rust\nlet x = 1;\n```", true, "", 80)
+        );
+        assert_eq!(source, original);
+        for numbers in [false, true] {
+            for (nested, prefix) in [(false, ""), (false, "  "), (true, "")] {
+                let md = if nested {
+                    "> - ```unknown\n>   a\tb\n>   界\tZ\n>   e\u{301}\tW\n>   ```"
+                } else {
+                    "```unknown\na\tb\n界\tZ\ne\u{301}\tW\n```"
+                };
+                set_line_numbers(numbers);
+                let out = render(md, true, prefix, 80);
+                set_line_numbers(false);
+                let lines: Vec<String> = out
+                    .iter()
+                    .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+                    .collect();
+                for (index, expected) in ["a   b", "界  Z", "e\u{301}   W"].into_iter().enumerate()
+                {
+                    let expected = if numbers {
+                        format!("{} {expected}", index + 1)
+                    } else {
+                        expected.into()
+                    };
+                    assert!(
+                        lines.iter().any(|line| line
+                            .rsplit_once("│ ")
+                            .is_some_and(|(_, body)| body == expected)),
+                        "{numbers}/{nested}/{prefix:?}: {lines:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn code_blocks_are_numbered_and_can_show_line_numbers() {
         let md = "```\na\n```\n\ntext\n\n```py\nx = 1\ny = 2\n```";
         let out = lines(md, 40);
@@ -1144,5 +1544,298 @@ mod tests {
         let out = lines("```mermaid\ngantt\ntitle x\n```", 60);
         assert!(out[0].contains("mermaid [1] (source"), "{out:?}");
         assert!(out.iter().any(|l| l.contains("gantt")));
+    }
+
+    /// A too-wide flowchart: one label of about `22 * n` columns (#1742).
+    fn wide_mermaid(n: usize) -> String {
+        format!(
+            "graph TD\nA[{}] --> B[done]",
+            "a very long step name ".repeat(n).trim_end()
+        )
+    }
+
+    /// `md` rendered with the `lines` indent, checked against `width`.
+    fn fitted(md: &str, width: usize) -> Vec<String> {
+        let out = lines(md, width);
+        for l in &out {
+            assert!(
+                l.width() <= width,
+                "{} > {width}: {l:?}\n{out:#?}",
+                l.width()
+            );
+        }
+        out
+    }
+
+    /// Words of the rendered rows, without quote bars, bullets and `·`.
+    fn words_of(rows: &[String]) -> Vec<String> {
+        rows.iter()
+            .flat_map(|l| l.split_whitespace())
+            .filter(|w| !["·", "│", "•", "◦", "▪"].contains(w))
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn banner_words(index: usize) -> Vec<String> {
+        format!("◇ mermaid [{index}] flowchart wider than the chat: /pager diagram {index} /open diagram {index}")
+            .split(' ')
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Both commands whole, each on one row.
+    fn assert_commands(rows: &[String], index: usize) {
+        for cmd in [
+            format!("/pager diagram {index}"),
+            format!("/open diagram {index}"),
+        ] {
+            assert!(rows.iter().any(|l| l.contains(&cmd)), "{cmd}: {rows:#?}");
+        }
+    }
+
+    #[test]
+    fn wide_mermaid_banner_wraps_at_40_and_80() {
+        for (width, ns) in [(40, 2..=6), (80, 4..=6)] {
+            for n in ns {
+                let src = wide_mermaid(n);
+                let out = fitted(&format!("```mermaid\n{src}\n```"), width);
+                // The preview rows are the existing cut, ellipsis and all.
+                let d = mermaid::render(&src, false, 10_000).unwrap();
+                let preview: Vec<String> = d
+                    .lines
+                    .into_iter()
+                    .take(PREVIEW_ROWS)
+                    .map(|l| {
+                        let cut = truncate_spans(l.spans, width - 2);
+                        format!(
+                            "  {}",
+                            cut.iter().map(|s| s.content.as_ref()).collect::<String>()
+                        )
+                    })
+                    .collect();
+                assert!(out.ends_with(&preview), "{out:#?}\n{preview:#?}");
+                assert!(preview.iter().any(|l| l.ends_with('…')), "{preview:#?}");
+                let banner = &out[..out.len() - preview.len()];
+                assert_eq!(words_of(banner), banner_words(1), "{banner:#?}");
+                assert_commands(banner, 1);
+                if width == 80 {
+                    assert_eq!(
+                        banner,
+                        [
+                            "  ◇ mermaid [1] · flowchart · wider than the chat: /pager diagram 1",
+                            "  /open diagram 1",
+                        ],
+                        "n = {n}"
+                    );
+                } else {
+                    assert_eq!(
+                        banner,
+                        [
+                            "  ◇ mermaid [1] · flowchart",
+                            "  wider than the chat: /pager diagram 1",
+                            "  /open diagram 1",
+                        ],
+                        "n = {n}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn wide_mermaid_banner_keeps_its_index_under_nested_prefixes() {
+        // Eleven blocks first, so the diagram is [12].
+        let before = "```\nx\n```\n\n".repeat(11);
+        let src = wide_mermaid(4);
+        let fence = |bar: &str| {
+            format!("```mermaid\n{src}\n```")
+                .lines()
+                .map(|l| format!("{bar}{l}\n"))
+                .collect::<String>()
+        };
+        let nested = [
+            format!("{before}- intro\n\n{}", fence("  > ")),
+            format!("{before}> > intro\n> >\n{}", fence("> > ")),
+            format!("{before}> - intro\n>\n{}", fence(">   ")),
+        ];
+        for md in &nested {
+            for width in [40, 52, 80] {
+                let out = fitted(md, width);
+                let at = out
+                    .iter()
+                    .position(|l| l.contains("◇ mermaid [12]"))
+                    .unwrap();
+                let rest = &out[at..];
+                let expect = banner_words(12);
+                assert_eq!(words_of(rest)[..expect.len()], expect[..], "{out:#?}");
+                assert_commands(rest, 12);
+                assert!(
+                    rest.iter().any(|l| l.ends_with('…')),
+                    "preview cut: {out:#?}"
+                );
+                assert!(rest.iter().all(|l| l.starts_with("  ")), "{out:#?}");
+            }
+        }
+    }
+
+    #[test]
+    fn wide_mermaid_banner_has_a_compact_form_for_tiny_panes() {
+        for index in [1, 12, 100] {
+            let pager = format!("/pager diagram {index}");
+            let open = format!("/open diagram {index}");
+            let full = banner_words(index);
+            let compact: Vec<String> = format!("◇ mermaid [{index}] {pager} {open}")
+                .split(' ')
+                .map(str::to_string)
+                .collect();
+            assert!(
+                wide_banner(index, "flowchart", 0).is_empty(),
+                "no room: no rows"
+            );
+            for avail in 1..=120 {
+                let rows = wide_banner(index, "flowchart", avail);
+                assert!(
+                    rows.iter().all(|r| r.width() <= avail),
+                    "{avail}: {rows:#?}"
+                );
+                assert!(rows.iter().all(|r| !r.is_empty()), "{avail}: {rows:#?}");
+                let squashed: String = rows.concat().split([' ', '·']).collect();
+                if avail >= pager.width() {
+                    assert_eq!(words_of(&rows), full, "{avail}: {rows:#?}");
+                    assert_commands(&rows, index);
+                } else {
+                    let want: String = compact.concat();
+                    assert_eq!(squashed, want, "{avail}: {rows:#?}");
+                    if avail >= "mermaid".len() {
+                        assert_eq!(words_of(&rows), compact, "words kept: {rows:#?}");
+                    }
+                }
+            }
+        }
+        let quoted = |depth: usize| {
+            format!("```mermaid\n{}\n```", wide_mermaid(2))
+                .lines()
+                .map(|l| format!("{}{l}\n", "> ".repeat(depth)))
+                .collect::<String>()
+        };
+        // Prefixes as wide as the pane (the renderer's minimum of 16
+        // columns) leave no room: no panic, no loop, and no hint rows.
+        for width in [0, 1, 16] {
+            let out = render(&quoted(8), false, "", width);
+            let text: Vec<String> = out
+                .iter()
+                .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+                .collect();
+            assert!(!text.iter().any(|l| l.contains("mermaid")), "{text:#?}");
+        }
+        // Room for exactly the commands (16 columns): both whole.
+        let out = fitted(&quoted(6), 30);
+        assert_commands(&out, 1);
+        // Room for less (10 columns): the compact hint, within the pane.
+        let out = fitted(&quoted(4), 20);
+        let squashed: String = out.concat().split([' ', '│']).collect();
+        assert!(
+            squashed.contains("◇mermaid[1]/pagerdiagram1/opendiagram1"),
+            "{out:#?}"
+        );
+    }
+
+    #[test]
+    fn fit_groups_bounds_wide_and_joined_clusters() {
+        let family = "👩\u{200d}👩\u{200d}👧";
+        let words = ["長", "e\u{301}x", family, "長長", "ab"];
+        let groups = [
+            words.iter().map(|w| w.to_string()).collect::<Vec<_>>(),
+            vec!["e\u{301}".to_string()],
+        ];
+        // Clusters the rows may hold: the input's, the joins and `…`.
+        let ok = ["長", "e\u{301}", "x", family, "a", "b", " ", "·", "…"];
+        for avail in 0..=6 {
+            let rows = fit_groups(&groups, " · ", avail);
+            assert_eq!(rows.is_empty(), avail == 0, "{avail}: {rows:?}");
+            for r in &rows {
+                assert!(!r.is_empty() && r.width() <= avail, "{avail}: {rows:?}");
+                assert!(
+                    r.graphemes(true).all(|g| ok.contains(&g)),
+                    "{avail}: split cluster in {r:?}"
+                );
+            }
+            if avail == 1 {
+                assert!(rows.iter().all(|r| !r.contains('長')), "{rows:?}");
+                assert!(rows.iter().any(|r| r == "…"), "{rows:?}");
+            }
+            if avail >= 2 {
+                assert!(rows.iter().any(|r| r.contains('長')), "{rows:?}");
+            }
+            if avail >= 1 {
+                assert!(rows.iter().any(|r| r.contains("e\u{301}")), "{rows:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn wide_mermaid_banner_fits_beside_unicode_prose_and_labels() {
+        let family = "👩\u{200d}👩\u{200d}👧";
+        let label = format!("長いステップ名 {family} ขั้นตอนที่ยาวมาก ").repeat(4);
+        let src = format!("graph TD\nA[{}] --> B[完了]", label.trim_end());
+        let md = format!(
+            "> ข้อความภาษาไทย 中文说明 {family} prose\n>\n{}",
+            format!("```mermaid\n{src}\n```")
+                .lines()
+                .map(|l| format!("> {l}\n"))
+                .collect::<String>()
+        );
+        for width in [40, 80] {
+            let out = fitted(&md, width);
+            let at = out
+                .iter()
+                .position(|l| l.contains("◇ mermaid [1]"))
+                .unwrap();
+            let expect = banner_words(1);
+            assert_eq!(words_of(&out[at..])[..expect.len()], expect[..], "{out:#?}");
+            assert_commands(&out[at..], 1);
+            for l in &out {
+                assert!(
+                    !l.replace(family, "").contains('\u{200d}'),
+                    "cluster cut: {l:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mermaid_source_label_wraps_to_the_pane() {
+        let md = "```mermaid\ngantt\ntitle x\n```";
+        let label = "╭─ mermaid [1] (source — diagram too wide or not drawable here)";
+        assert_eq!(fitted(md, 80)[0], format!("  {label}"), "fits: unchanged");
+        let words: Vec<String> = label.split(' ').map(str::to_string).collect();
+        for (md, width) in [
+            (md.to_string(), 40),
+            (md.to_string(), 24),
+            (format!("- item\n\n  > {}", md.replace('\n', "\n  > ")), 40),
+            (format!("> > {}", md.replace('\n', "\n> > ")), 40),
+        ] {
+            let out = fitted(&md, width);
+            let at = out
+                .iter()
+                .position(|l| l.contains("╭─ mermaid [1]"))
+                .unwrap();
+            let rows: Vec<String> = out[at..]
+                .iter()
+                .take_while(|l| !l.contains("gantt"))
+                .cloned()
+                .collect();
+            assert!(rows.len() > 1, "{out:#?}");
+            assert_eq!(words_of(&rows), words, "{out:#?}");
+            assert!(out.iter().any(|l| l.contains("│ gantt")), "{out:#?}");
+        }
+        for avail in 0..=70 {
+            let rows = fit_groups(&[words.clone()], " ", avail);
+            assert_eq!(rows.is_empty(), avail == 0, "{rows:?}");
+            assert!(
+                rows.iter().all(|r| !r.is_empty() && r.width() <= avail),
+                "{avail}: {rows:?}"
+            );
+        }
     }
 }

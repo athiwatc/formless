@@ -131,6 +131,18 @@ The `#k=` fragment is never sent to any server.
 
 ## Local development
 
+The Node adapter contains errors per HTTP request or Upgrade socket. Malformed
+asset path escapes return 400, and malformed mock-provider JSON returns an
+OpenAI-shaped 400 error without echoing the body. Unexpected failures return a
+generic 500 before headers or close a response that has started streaming;
+Upgrade failures close that socket. Diagnostics identify the handler/error
+class without logging request bodies or claim headers. Claim/transport checks
+and the scripted mock responses keep their existing behavior.
+
+`node --test relay/dev-errors.test.mjs` checks these boundaries with private
+loopback servers, malformed requests and injected handler faults. It verifies
+health and valid mock replies after failures; it does not deploy a Worker.
+
 Run the relay/web regression suite with `node --test relay/*.test.mjs` from
 the repository root. Display regressions also have a browser check:
 `python relay/web-display.browser-test.py /tmp/formless-display-check`.
@@ -220,11 +232,21 @@ Optional. Without keys, `/push/key` answers 404 and the web app says the
 relay hasn't set up notifications. To turn it on:
 
 ```sh
-node relay/vapid-keys.mjs          # prints the two values
-npx wrangler secret put VAPID_PUBLIC_KEY
-npx wrangler secret put VAPID_PRIVATE_JWK
+# Generate once so both secrets belong to the same pair.
+umask 077
+node relay/vapid-keys.mjs --json > vapid-keys.json
+node relay/vapid-keys.mjs --public vapid-keys.json | npx wrangler secret put VAPID_PUBLIC_KEY
+node relay/vapid-keys.mjs --private vapid-keys.json | npx wrangler secret put VAPID_PRIVATE_JWK
+rm vapid-keys.json
 npx wrangler secret put VAPID_SUBJECT   # optional, e.g. mailto:you@example.com
 ```
+
+The saved JSON contains the private key; keep it private and out of version
+control, then delete it after setup. The default `node relay/vapid-keys.mjs`
+output remains `NAME=value` for `dev.mjs` environment variables. When copying
+into a Wrangler prompt by hand, paste **only the part after the first `=`**,
+without `VAPID_PUBLIC_KEY=` or `VAPID_PRIVATE_JWK=`. Do not generate a new pair
+between setting the public and private secrets.
 
 Browsers opt in from Settings → This browser. The room keeps their
 subscriptions (at most 10). Pushes carry no payload at all, so the relay
@@ -260,3 +282,26 @@ The browser suite uses local fixture replies and performs no real settings,
 provider, daemon or Tool operations. WebKit is engine coverage, not physical
 Safari or assistive-technology evidence. `node --test relay/*.test.mjs` also
 checks dynamic row generation and typed/cancelled/invalid Edit requests.
+
+Existing diagram blocks follow explicit and Auto/OS theme changes without
+rebuilding messages. Source/zoom choices and focus remain on the retained block;
+SVG downloads use its current render. Asset-load failures offer **Retry** and
+evict failed loader jobs, while invalid source keeps a visible error and source
+fallback without paint-time retries. Generation checks discard stale completions.
+
+Run `python relay/web-mermaid.browser-test.py /tmp/formless-mermaid-check` for
+real vendored load/retry checks plus controlled theme/queue/layout races in
+Chromium. It also checks source/zoom/focus, SVG downloads, retained messages,
+paused reading anchors and cached/recreated blocks. This uses owned local UI
+fixtures; no daemon, provider, deployment or physical screen-reader is involved.
+
+### Job history browser checks
+
+Run `python relay/web-job-history.browser-test.py /tmp/formless-job-history`
+with Python Playwright and `/usr/bin/chromium`. The complete frontend uses
+local fixture replies to check failed/timed-out reads, retry and empty states,
+semantic columns, full row data, Session navigation, queued dialogs and late
+replies. Chromium layout checks cover 320/480/900px viewports at 16/32px root
+text sizes and keep wide tables inside their own scrolling wrapper. These
+checks do not exercise job execution, a live daemon, native screen readers or
+other browser engines.

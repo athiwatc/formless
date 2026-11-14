@@ -1,5 +1,7 @@
 use anyhow::{anyhow, bail, Context, Result};
-pub use formless_runtime::structured_output::{CompletionOptions, StructuredOutputError};
+pub use formless_runtime::structured_output::{
+    CompletionOptions, IncompleteReason, StructuredOutputError,
+};
 use formless_runtime::LockExt as _;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
@@ -15,7 +17,7 @@ use crate::Paths;
 /// bootstrap prompt and the optimiser so they never drift apart.
 macro_rules! host_api_doc {
     () => {
-        "Tool code is plain JavaScript defining `function run(input) { ... }` (or `async function run`) returning the output value. On failure, throw an Error: a returned {error: ...} is counted as a failure unless output_schema declares an error property, and swallowing errors hides broken Tools from measurement. Host API (all Capability-gated; data options take encoding \"utf8\" (default) or \"base64\" for binary): fetch(url, {method, headers, body, bodyEncoding, encoding}) -> {status, ok, url, headers, body, text(), json()} (redirects followed only within the granted hosts); fetchChunks(url, opts, size, cb) streams the body in chunks and returns status; fs.read(path, {encoding}), fs.write(path, data, {encoding}), fs.append(path, data, {encoding}), fs.exists(path), fs.stat(path) -> {type, size, modified_ms} or null, fs.list(dir, {details}) -> names or [{name, type, size}], fs.mkdir(path), fs.remove(path, {recursive}), fs.rename(from, to), fs.readChunks(path, size, cb, {encoding}), fs.readLines(path, cb); env.get(key); process.run(cmd, argsArray, {cwd, env, stdin, stdinEncoding, encoding, timeout_ms}) -> {code, signal, stdout, stderr, timed_out, killed, truncated} (no shell; optional timeout kills its group); process.spawn(cmd, argsArray, opts) takes the same options and returns a handle: read(size) -> {stream, data, eof} with stdout/stderr distinguishable, wait()/kill() -> {code, signal, timed_out, killed, truncated}, close(). Read chunks and emit them while work runs; wait discards unread output (truncated: true). Always wait or close in finally; handles cannot outlive this Invocation; tools.call(name, input) -> Promise of the Tool's output (always await it; several in Promise.all run in parallel, and a Tool that returns with a call still pending fails); clipboard.read(), clipboard.write(text); notify(title, body); harness.read() (providers, roles, MCP servers, skills, settings; never keys) and harness.call(op, args, reason) for mcp.add/remove, skills.add/remove/enable, models.set, providers.upsert/remove (no keys; upsert takes base_url or a preset: openai, anthropic, openrouter, gemini, groq, ollama, lmstudio), roles.upsert/delete, config.set: each change is shown to the user with your reason and needs their approval; store.get(key, {ns}), store.set(key, jsonValue, {ns}), store.delete(key, {ns}), store.list(prefix, {ns}) persist small state between Invocations (\"store\" = this Tool's own, \"store:<ns>\" = a shared namespace; 64 KB per value); llm.complete(prompt, {system, model, role, schema}) -> text without schema, or a parsed JSON value validated against schema; agents.run(task, {system, model, role}) -> text (role: a configured Role by name, see the Roles list; it picks the provider and model); requireModule(name) / modules.load(name), modules.list(); emit(chunk) streams large output to an artifact; progress(fraction, label) shows how far long work has got (fraction 0..1 or null; no Capability needed); console.log, sleep(ms), setTimeout/setInterval/clearTimeout (real timers; run() may await them), cryptoRandom(), randomBytes(n) -> base64. Nothing else exists: anything more (URL parsing, base64 decoding to bytes, hashing, compression, formats) you write in JS."
+        "Tool code is plain JavaScript defining `function run(input) { ... }` (or `async function run`) returning the output value. On failure, throw an Error: a returned {error: ...} is counted as a failure unless output_schema declares an error property, and swallowing errors hides broken Tools from measurement. Host API (all Capability-gated; data options take encoding \"utf8\" (default) or \"base64\" for binary): fetch(url, {method, headers, body, bodyEncoding, encoding}) -> {status, ok, url, headers, body, text(), json()} (redirects followed only within the granted hosts); fetchChunks(url, opts, size, cb) streams the body in chunks and returns status; fs.read(path, {encoding}), fs.write(path, data, {encoding}), fs.append(path, data, {encoding}), fs.exists(path), fs.stat(path) -> {type, size, modified_ms} or null, fs.list(dir, {details}) -> names or [{name, type, size}], fs.mkdir(path), fs.remove(path, {recursive}), fs.rename(from, to), fs.readChunks(path, size, cb, {encoding}), fs.readLines(path, cb); env.get(key); process.run(cmd, argsArray, {cwd, env, stdin, stdinEncoding, encoding, timeout_ms}) -> {code, signal, stdout, stderr, timed_out, killed, truncated} (no shell; optional timeout kills its group); process.spawn(cmd, argsArray, opts) takes the same options and returns a handle: read(size) -> {stream, data, eof} with stdout/stderr distinguishable, wait()/kill() -> {code, signal, timed_out, killed, truncated}, close(). Read chunks and emit them while work runs; wait discards unread output (truncated: true). Always wait or close in finally; handles cannot outlive this Invocation; tools.call(name, input) -> Promise of the Tool's output (always await it; several in Promise.all run in parallel, and a Tool that returns with a call still pending fails); clipboard.read(), clipboard.write(text); notify(title, body); harness.read() (providers, roles, MCP servers, skills, settings; never keys) and harness.call(op, args, reason) for mcp.add/remove, skills.add/remove/enable, models.set, providers.upsert/remove (no keys; upsert takes base_url or a preset: openai, anthropic, openrouter, gemini, groq, ollama, lmstudio), roles.upsert/delete, config.set: each change is shown to the user with your reason and needs their approval; store.get(key, {ns}), store.set(key, jsonValue, {ns}), store.delete(key, {ns}), store.list(prefix, {ns}) persist small state between Invocations (\"store\" = this Tool's own, \"store:<ns>\" = a shared namespace; 64 KB per value); llm.complete(prompt, {system, model, role, schema}) -> text without schema, or a parsed JSON value validated against schema; agents.run(task, {system, model, role}) -> text (role: a configured Role by name, see the Roles list; it picks the provider and model); requireModule(name) / modules.load(name), modules.list(); emit(chunk) streams large output to an artifact; progress(fraction, label) shows how far long work has got (fraction 0..1 or null; no Capability needed); console.log, sleep(ms), setTimeout/setInterval/clearTimeout (real timers; run() may await them), cryptoRandom(), randomBytes(n) -> base64 of exactly n bytes. sleep(ms) and randomBytes(n) require finite non-negative safe-integer numbers; invalid inputs and requests above tools.max_sleep_secs/tools.max_random_bytes throw instead of coercing or clamping. Nothing else exists: anything more (URL parsing, base64 decoding to bytes, hashing, compression, formats) you write in JS."
     };
 }
 pub(crate) use host_api_doc;
@@ -2470,7 +2472,7 @@ impl Provider {
     ) {
         if matches!(
             error,
-            StructuredOutputError::InvalidJson | StructuredOutputError::SchemaViolation
+            StructuredOutputError::InvalidJson { .. } | StructuredOutputError::SchemaViolation
         ) {
             if let Some(routing) = routing {
                 routing.claim_contract(crate::routing_observation::Identity::new(
@@ -2496,7 +2498,9 @@ impl Provider {
                 return Err(error.into());
             }
             if result.output_limited {
-                return Err(StructuredOutputError::IncompleteResponse.into());
+                return Err(
+                    StructuredOutputError::IncompleteResponse(IncompleteReason::Unknown).into(),
+                );
             }
             Some(schema.parse_and_validate(&result.text).map_err(|error| {
                 self.note_output_contract(routing.as_ref(), &result.model_used, &error);
@@ -2587,7 +2591,16 @@ impl Provider {
         } else if self.structured_output.is_some()
             && (output_limited || v["stop_reason"] == "model_context_window_exceeded")
         {
-            Some(StructuredOutputError::IncompleteResponse)
+            // The boolean also includes generic Responses incompleteness.
+            // Retain only evidence from the fields already used above; an
+            // output cutoff combined with a context stop is ambiguous.
+            let context_stop = v["stop_reason"] == "model_context_window_exceeded";
+            let reason = match (output_limited, context_stop) {
+                (true, false) if !self.cfg.responses() => IncompleteReason::OutputLimit,
+                (false, true) => IncompleteReason::ContextWindow,
+                _ => IncompleteReason::Unknown,
+            };
+            Some(StructuredOutputError::IncompleteResponse(reason))
         } else {
             None
         };
@@ -3041,7 +3054,9 @@ impl Provider {
             .await?;
         if let Some(schema) = options.output_schema() {
             if result.truncated {
-                return Err(StructuredOutputError::IncompleteResponse.into());
+                return Err(
+                    StructuredOutputError::IncompleteResponse(IncompleteReason::Truncated).into(),
+                );
             }
             if result
                 .stop_reason
@@ -4418,8 +4433,9 @@ pub fn is_vision_model(model: &str) -> bool {
 /// listing's own fields (OpenRouter: `pricing`, `context_length`,
 /// `architecture.input_modalities`, `supported_parameters`), else the
 /// built-in table for well-known families. Prices are USD per million
-/// tokens; `efforts` lists the reasoning efforts it accepts ([] = effort
-/// has no effect; absent = unknown).
+/// tokens, stored only for a finite per-token value >= 0 whose scaled
+/// value is finite. `efforts` lists the reasoning efforts it
+/// accepts ([] = effort has no effect; absent = unknown).
 pub fn parse_model_meta(body: &Value) -> HashMap<String, Value> {
     let windows = parse_model_windows(body);
     body["data"]
@@ -4433,10 +4449,15 @@ pub fn parse_model_meta(body: &Value) -> HashMap<String, Value> {
                 meta["context"] = json!(c);
             }
             let per_m = |v: &Value| {
-                v.as_str()
+                let p = v
+                    .as_str()
                     .and_then(|s| s.parse::<f64>().ok())
-                    .or_else(|| v.as_f64())
-                    .map(|p| (p * 1_000_000.0 * 1000.0).round() / 1000.0)
+                    .or_else(|| v.as_f64())?;
+                if !(p.is_finite() && p >= 0.0) {
+                    return None;
+                }
+                let scaled = (p * 1_000_000.0 * 1000.0).round() / 1000.0;
+                scaled.is_finite().then_some(scaled)
             };
             if let Some(p) = per_m(&m["pricing"]["prompt"]) {
                 meta["input_price"] = json!(p);
@@ -5291,6 +5312,278 @@ mod tests {
     }
 
     use super::*;
+
+    // Finite per-token prices >= 0 whose
+    // `(p * 1_000_000.0 * 1000.0).round() / 1000.0` result is finite are
+    // stored. Every other price key stays absent. Import still
+    // keeps non-finite products and drops free, partial, and unparseable rows.
+    #[test]
+    fn model_meta_prices_keep_only_finite_non_negative_scaled_values() {
+        let scale_overflow = f64::MAX / 1e5;
+        let round_overflow = f64::MAX / 1e8;
+        let large_finite = f64::MAX / 1e12;
+        assert!(
+            scale_overflow.is_finite() && !(scale_overflow * 1_000_000.0).is_finite(),
+            "finite input whose per-million scaling overflows"
+        );
+        assert!(
+            round_overflow.is_finite()
+                && (round_overflow * 1_000_000.0).is_finite()
+                && !(round_overflow * 1_000_000.0 * 1000.0).is_finite(),
+            "finite per-million product that overflows the rounding multiply"
+        );
+        let large_scaled = (large_finite * 1_000_000.0 * 1000.0).round() / 1000.0;
+        assert!(large_finite.is_finite() && large_scaled.is_finite() && large_scaled >= 0.0);
+        let rows: Vec<(&str, Option<Value>, Option<f64>, Option<f64>)> = vec![
+            (
+                "厂商/字符串",
+                Some(json!({"prompt": "0.000003", "completion": "0.000015"})),
+                Some(3.0),
+                Some(15.0),
+            ),
+            (
+                "ベンダー/数値",
+                Some(json!({"prompt": 2, "completion": 5})),
+                Some(2_000_000.0),
+                Some(5_000_000.0),
+            ),
+            (
+                "модель/ноль",
+                Some(json!({"prompt": "0", "completion": "0.0"})),
+                Some(0.0),
+                Some(0.0),
+            ),
+            (
+                "модель/нуль",
+                Some(json!({"prompt": 0, "completion": 0.0})),
+                Some(0.0),
+                Some(0.0),
+            ),
+            (
+                "μοντέλο/μικρό",
+                Some(json!({"prompt": "1e-20", "completion": 1e-20})),
+                Some(0.0),
+                Some(0.0),
+            ),
+            (
+                "모델/음수",
+                Some(json!({"prompt": "-0.000003", "completion": -2})),
+                None,
+                None,
+            ),
+            (
+                "모델/한쪽",
+                Some(json!({"prompt": "0.000003", "completion": -0.000015})),
+                Some(3.0),
+                None,
+            ),
+            (
+                "μοντέλο/ναν",
+                Some(json!({"prompt": "NaN", "completion": "nan"})),
+                None,
+                None,
+            ),
+            (
+                "モデル/無限",
+                Some(json!({"prompt": "inf", "completion": "-Infinity"})),
+                None,
+                None,
+            ),
+            (
+                "モデル/正無限",
+                Some(json!({"prompt": "+inf", "completion": "Infinity"})),
+                None,
+                None,
+            ),
+            (
+                "模型/字面溢出",
+                Some(json!({"prompt": "1e309", "completion": "-1e309"})),
+                None,
+                None,
+            ),
+            ("模型/缺", None, None, None),
+            ("模型/空", Some(json!({})), None, None),
+            (
+                "模型/空值",
+                Some(json!({"prompt": null, "completion": null})),
+                None,
+                None,
+            ),
+            (
+                "模型/坏串",
+                Some(json!({"prompt": "nope", "completion": ""})),
+                None,
+                None,
+            ),
+            (
+                "模型/坏类型",
+                Some(json!({"prompt": true, "completion": []})),
+                None,
+                None,
+            ),
+            ("模型/非对象", Some(json!("0.000003")), None, None),
+            (
+                "模型/只输出",
+                Some(json!({"completion": 5})),
+                None,
+                Some(5_000_000.0),
+            ),
+            (
+                "模型/标度溢出",
+                Some(json!({"prompt": scale_overflow, "completion": scale_overflow})),
+                None,
+                None,
+            ),
+            (
+                "模型/舍入溢出",
+                Some(json!({"prompt": round_overflow, "completion": round_overflow})),
+                None,
+                None,
+            ),
+            (
+                "模型/大有限",
+                Some(json!({"prompt": large_finite, "completion": large_finite})),
+                Some(large_scaled),
+                Some(large_scaled),
+            ),
+        ];
+
+        fn row(id: &str, pricing: Option<&Value>) -> Value {
+            let mut model = json!({
+                "id": id,
+                "context_length": 131072,
+                "max_tokens": 8192,
+                "architecture": {"input_modalities": ["text", "image"]},
+                "supported_parameters": ["tools", "reasoning"]
+            });
+            if let Some(pricing) = pricing {
+                model["pricing"] = pricing.clone();
+            }
+            model
+        }
+
+        let with_pricing = parse_model_meta(&json!({
+            "data": rows
+                .iter()
+                .map(|(id, pricing, _, _)| row(id, pricing.as_ref()))
+                .collect::<Vec<_>>()
+        }));
+        let without_pricing = parse_model_meta(&json!({
+            "data": rows
+                .iter()
+                .map(|(id, _, _, _)| row(id, None))
+                .collect::<Vec<_>>()
+        }));
+        assert_eq!(with_pricing.len(), rows.len());
+        assert_eq!(without_pricing.len(), rows.len());
+        for (id, _, input, output) in &rows {
+            let got = &with_pricing[*id];
+            let plain = &without_pricing[*id];
+            match *input {
+                Some(price) => assert_eq!(got["input_price"], json!(price), "{id} input"),
+                None => assert!(got.get("input_price").is_none(), "{id} input"),
+            }
+            match *output {
+                Some(price) => assert_eq!(got["output_price"], json!(price), "{id} output"),
+                None => assert!(got.get("output_price").is_none(), "{id} output"),
+            }
+            let mut stripped = got.clone();
+            let fields = stripped.as_object_mut().unwrap();
+            fields.remove("input_price");
+            fields.remove("output_price");
+            assert_eq!(&stripped, plain, "{id}");
+            assert_eq!(plain.as_object().unwrap().len(), 5, "{id}");
+            assert_eq!(
+                (
+                    plain["context"].as_u64(),
+                    plain["max_output"].as_u64(),
+                    plain["vision"].as_bool(),
+                    plain["tools"].as_bool()
+                ),
+                (Some(131072), Some(8192), Some(true), Some(true)),
+                "{id}"
+            );
+            assert_eq!(plain["efforts"], json!(["low", "medium", "high"]), "{id}");
+            assert!(plain.get("input_price").is_none(), "{id}");
+            assert!(plain.get("output_price").is_none(), "{id}");
+        }
+
+        let retrieved = "2026-11-11T00:00:00Z";
+        let prices = parse_model_prices(
+            &json!({"data": [
+                {"id": "厂商/价格", "pricing": {
+                    "prompt": 2, "completion": 5,
+                    "input_cache_read": 3, "input_cache_write": 4
+                }},
+                {"id": "overflow-scale", "pricing": {"prompt": scale_overflow, "completion": 1}},
+                {"id": "overflow-round", "pricing": {"prompt": round_overflow, "completion": 1}},
+                {"id": "free/model", "pricing": {"prompt": "0", "completion": 0}},
+                {"id": "zero-input", "pricing": {"prompt": "0", "completion": 1}},
+                {"id": "厂商/无效", "pricing": {"prompt": "-0.000001", "completion": 1}},
+                {"id": "nan", "pricing": {"prompt": "NaN", "completion": "1"}},
+                {"id": "inf", "pricing": {"prompt": "inf", "completion": "1"}},
+                {"id": "one-sided", "pricing": {"prompt": 2}},
+                {"id": "no-pricing"},
+                {"id": "bad", "pricing": {"prompt": "nope", "completion": 1}}
+            ]}),
+            retrieved,
+        );
+        assert_eq!(
+            prices
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            [
+                "厂商/价格",
+                "overflow-scale",
+                "overflow-round",
+                "zero-input"
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<std::collections::BTreeSet<_>>()
+        );
+        let imported = &prices["厂商/价格"];
+        assert_eq!(
+            (
+                imported.input,
+                imported.output,
+                imported.cached_input,
+                imported.cache_write_input,
+                imported.retrieved_at.as_deref(),
+            ),
+            (
+                2_000_000.0,
+                5_000_000.0,
+                Some(3_000_000.0),
+                Some(4_000_000.0),
+                Some(retrieved),
+            )
+        );
+        let scaled = &prices["overflow-scale"];
+        assert!(!scaled.input.is_finite());
+        assert_eq!(scaled.output, 1_000_000.0);
+        assert_eq!(scaled.cached_input, None);
+        assert_eq!(scaled.cache_write_input, None);
+        assert_eq!(scaled.retrieved_at.as_deref(), Some(retrieved));
+        let rounded = &prices["overflow-round"];
+        assert_eq!(rounded.input, round_overflow * 1e6);
+        assert!(rounded.input.is_finite());
+        assert_eq!(rounded.output, 1_000_000.0);
+        assert_eq!(prices["zero-input"].input, 0.0);
+        assert_eq!(prices["zero-input"].output, 1_000_000.0);
+        for id in [
+            "free/model",
+            "厂商/无效",
+            "nan",
+            "inf",
+            "one-sided",
+            "no-pricing",
+            "bad",
+        ] {
+            assert!(!prices.contains_key(id), "{id}");
+        }
+    }
 
     #[test]
     fn usage_reads_reported_cost_and_cache_writes() {

@@ -474,12 +474,12 @@ fn schedule_run_definition() -> Value {
         "type": "function",
         "function": {
             "name": SCHEDULE_RUN,
-            "description": "Schedule a prompt to run later (at) or periodically (cron, 5 fields, local time), e.g. to re-check a build or run nightly cleanup. Recurring jobs need the user's approval. Without session_id each run gets a new Session; \"current\" runs in this one.",
+            "description": "Schedule a prompt to run later (at) or periodically (cron, 5 fields, local time; case-insensitive three-letter month/weekday names such as JAN and MON-FRI, or @yearly/@annually), e.g. to re-check a build or run nightly cleanup. Recurring jobs need the user's approval. Without session_id each run gets a new Session; \"current\" runs in this one.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "prompt": {"type": "string", "description": "The task, self-contained"},
-                    "cron": {"type": "string", "description": "e.g. \"0 3 * * *\" (03:00 daily) or @hourly"},
+                    "cron": {"type": "string", "description": "e.g. \"0 3 * * *\" (03:00 daily), \"0 9 * * MON-FRI\" (weekdays), @hourly or @yearly"},
                     "at": {"type": "string", "description": "One-shot: RFC 3339, \"YYYY-MM-DD HH:MM\" or \"in 30m\""},
                     "session_id": {"type": "string"}
                 },

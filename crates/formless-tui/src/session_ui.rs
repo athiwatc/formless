@@ -207,6 +207,34 @@ pub fn comparison_lines(comparison: &formless_protocol::SessionComparison) -> Ve
         .collect()
 }
 
+/// Body for an empty Sessions list.
+pub const NO_SESSIONS: &str = "No sessions yet — press n to start one.";
+pub const NO_MATCH: &str = "No match — Esc clears the filter.";
+/// The default `all` quick filter hides archived Sessions and Esc has nothing
+/// to clear, so name the recovery: `v` cycles all → running → archived.
+pub const ARCHIVED_ONLY: &str =
+    "All sessions are archived — press v twice to cycle filters to archived, or n to start one.";
+
+/// What an empty Sessions list says, from the full Session count, how many
+/// of them are archived and whether the filter is active (a query or a
+/// non-default quick filter, exactly as `ListFilter::active`).
+pub fn empty_body(total: usize, archived: usize, filter_active: bool) -> &'static str {
+    if total == 0 {
+        NO_SESSIONS
+    } else if !filter_active && archived > 0 {
+        ARCHIVED_ONLY
+    } else {
+        NO_MATCH
+    }
+}
+
+/// Title segment explaining the default view's shown/total gap: `all` leaves
+/// archived Sessions out of the shown count while the total includes them.
+/// Any other filter already names itself in the title, so it stays silent.
+pub fn archived_hidden_segment(filter_active: bool, archived: usize) -> Option<String> {
+    (!filter_active && archived > 0).then(|| format!("· {archived} archived hidden"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,6 +275,41 @@ mod tests {
                 .collect::<Vec<_>>(),
             visible
         );
+    }
+    #[test]
+    fn empty_body_names_archived_only_recovery_and_keeps_other_texts() {
+        assert_eq!(
+            empty_body(0, 0, false),
+            "No sessions yet — press n to start one."
+        );
+        assert_eq!(empty_body(0, 0, true), NO_SESSIONS);
+        assert_eq!(empty_body(3, 3, false), ARCHIVED_ONLY);
+        assert!(ARCHIVED_ONLY.contains("v twice") && ARCHIVED_ONLY.contains("archived"));
+        assert!(!ARCHIVED_ONLY.contains("Esc"));
+        // A query or the running/archived quick filter is active: Esc clears it.
+        assert_eq!(empty_body(3, 3, true), "No match — Esc clears the filter.");
+        assert_eq!(empty_body(15, 3, true), NO_MATCH);
+        assert_eq!(empty_body(4, 0, true), NO_MATCH);
+    }
+    #[test]
+    fn archived_hidden_segment_only_explains_the_default_view() {
+        assert_eq!(
+            archived_hidden_segment(false, 3).as_deref(),
+            Some("· 3 archived hidden")
+        );
+        assert_eq!(
+            archived_hidden_segment(false, 1).as_deref(),
+            Some("· 1 archived hidden")
+        );
+        assert_eq!(archived_hidden_segment(false, 0), None);
+        assert_eq!(archived_hidden_segment(true, 3), None);
+    }
+    #[test]
+    fn archived_is_two_v_presses_from_the_default_quick_filter() {
+        // `v` advances quick by one (lists::key); `ARCHIVED_ONLY` says "twice".
+        let quicks = crate::lists::SESSION_QUICK;
+        assert_eq!(quicks[0], "all");
+        assert_eq!(quicks.iter().position(|q| *q == "archived"), Some(2));
     }
     #[test]
     fn resolution_never_guesses_models_or_ambiguous_session_prefixes() {

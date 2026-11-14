@@ -35,15 +35,35 @@ rm -f "$probe"
 
 # Shell completions under $PREFIX/share, where bash-completion, zsh (with
 # $PREFIX/share/zsh/site-functions on fpath) and fish look for them.
+install_completion() {
+  mkdir -p "$(dirname "$2")" 2>/dev/null || return 1
+  completion_tmp=$(mktemp "$(dirname "$2")/.formless-completion.XXXXXX") || return 1
+  if "$bin" completions "$1" > "$completion_tmp" && [ -s "$completion_tmp" ] &&
+      chmod 644 "$completion_tmp" && mv -f "$completion_tmp" "$2"; then
+    return 0
+  fi
+  rm -f "$completion_tmp"
+  return 1
+}
+
 install_completions() {
   bin="$PREFIX/bin/formless"
-  mkdir -p "$PREFIX/share/bash-completion/completions" "$PREFIX/share/zsh/site-functions" \
-    "$PREFIX/share/fish/vendor_completions.d"
-  "$bin" completions bash > "$PREFIX/share/bash-completion/completions/formless" &&
-    "$bin" completions zsh > "$PREFIX/share/zsh/site-functions/_formless" &&
-    "$bin" completions fish > "$PREFIX/share/fish/vendor_completions.d/formless.fish" &&
-    echo "completions: $PREFIX/share/{bash-completion,zsh/site-functions,fish/vendor_completions.d}" ||
-    echo "note: could not install shell completions (formless completions <shell> prints them)" >&2
+  completion_failed=""
+  for completion_shell in bash zsh fish; do
+    case "$completion_shell" in
+      bash) completion_dest="$PREFIX/share/bash-completion/completions/formless" ;;
+      zsh) completion_dest="$PREFIX/share/zsh/site-functions/_formless" ;;
+      fish) completion_dest="$PREFIX/share/fish/vendor_completions.d/formless.fish" ;;
+    esac
+    if ! install_completion "$completion_shell" "$completion_dest"; then
+      completion_failed="$completion_failed $completion_shell"
+    fi
+  done
+  if [ -z "$completion_failed" ]; then
+    echo "completions: $PREFIX/share/{bash-completion,zsh/site-functions,fish/vendor_completions.d}"
+  else
+    echo "note: could not install completions for:$completion_failed (formless completions <shell> prints them)" >&2
+  fi
 }
 
 # Quote literal paths, including spaces, quotes, dollars and backslashes.
@@ -82,6 +102,28 @@ install_guidance() {
           esac
           ;;
       esac
+      ;;
+  esac
+  guidance_shell="${SHELL:-sh}"
+  case "${guidance_shell##*/}" in
+    zsh)
+      completion_dir="$PREFIX/share/zsh/site-functions"
+      completion_known=false
+      case ":${FPATH:-}:" in *":$completion_dir:"*) completion_known=true ;; esac
+      if ! $completion_known && command -v zsh >/dev/null 2>&1; then
+        # -f avoids loading user startup files just to inspect discovery paths.
+        completion_paths=$(zsh -fc 'print -rl -- $fpath' 2>/dev/null || true)
+        if printf '%s\n' "$completion_paths" | grep -Fqx "$completion_dir"; then completion_known=true; fi
+      fi
+      if ! $completion_known; then
+        printf '\nFor zsh completions, add this to %s/.zshrc before compinit:\n' "${ZDOTDIR:-${HOME:-~}}"
+        printf '  fpath=(%s $fpath)\n' "$(quote_path "$completion_dir")"
+      fi
+      ;;
+    bash)
+      if [ "$PREFIX" != "${HOME:-}/.local" ]; then
+        printf '\nBash completions are in %s/share; bash-completion discovers XDG_DATA_HOME/XDG_DATA_DIRS. Include this share directory there to load them.\n' "$PREFIX"
+      fi
       ;;
   esac
   printf '\nNext: run formless to start the setup wizard, or formless doctor to verify configuration.\n'
@@ -136,12 +178,25 @@ case "${FORMLESS_TARGET:-$os/$arch}" in
 esac
 
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
-fetch() { curl -fsSL --retry 3 --retry-delay 2 "$1" -o "$2"; }
+# Each attempt bounds connection establishment and the complete transfer,
+# including redirects/body reads. Three retries retain transient-error recovery.
+fetch() {
+  if curl -fsSL --connect-timeout 10 --max-time 120 --retry 3 --retry-delay 2 "$1" -o "$2"; then
+    return 0
+  else
+    fetch_status=$?
+  fi
+  [ "$fetch_status" -ne 28 ] || die "download timed out; retry or set FORMLESS_RELEASES_URL to a trusted release mirror"
+  return "$fetch_status"
+}
 
 if [ -z "$version" ]; then
   # Keep curl's status: a rate-limited API (403) says so instead of
   # becoming "no release".
-  code="$(curl -sSL --retry 3 --retry-delay 2 -o "$tmp/latest.json" -w '%{http_code}' "$LATEST_API" 2>"$tmp/curl.err" || true)"
+  lookup_status=0
+  code="$(curl -sSL --connect-timeout 10 --max-time 120 --retry 3 --retry-delay 2 -o "$tmp/latest.json" -w '%{http_code}' "$LATEST_API" 2>"$tmp/curl.err")" || lookup_status=$?
+  [ "$lookup_status" -ne 28 ] || die "release lookup timed out; retry, pin FORMLESS_VERSION, or set FORMLESS_LATEST_URL to a trusted mirror"
+  [ "$lookup_status" -eq 0 ] || die "could not reach $LATEST_API: $(cat "$tmp/curl.err")"
   case "$code" in
     200) ;;
     403 | 429) die "GitHub refused the release lookup (HTTP $code, probably the unauthenticated rate limit); set FORMLESS_VERSION, e.g. FORMLESS_VERSION=v0.1.0" ;;
@@ -159,8 +214,12 @@ fetch "$RELEASES/$version/$asset.sha256" "$tmp/$asset.sha256" || die "could not 
 tar -xzf "$tmp/$asset" -C "$tmp"
 install_file "$tmp/formless-$version-$target/formless" "$PREFIX/bin/formless" 755
 if [ -f "$tmp/formless-$version-$target/formless.1" ]; then
-  mkdir -p "$PREFIX/share/man/man1"
-  install_file "$tmp/formless-$version-$target/formless.1" "$PREFIX/share/man/man1/formless.1" 644
+  if mkdir -p "$PREFIX/share/man/man1" 2>/dev/null &&
+      (install_file "$tmp/formless-$version-$target/formless.1" "$PREFIX/share/man/man1/formless.1" 644) 2>/dev/null; then
+    :
+  else
+    echo "note: could not install the optional man page in $PREFIX/share/man/man1" >&2
+  fi
 fi
 printf 'installed: %s/bin/formless (%s)\n' "$PREFIX" "$version"
 install_completions

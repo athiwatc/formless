@@ -14,6 +14,13 @@ pub(crate) trait Snapshot: Clone {
     fn retained_bytes(&self) -> usize;
 }
 
+#[derive(Debug, PartialEq)]
+pub(crate) enum Restore<T> {
+    Value(T),
+    Empty,
+    BudgetRefused,
+}
+
 #[derive(Debug, Clone)]
 struct Entry<T> {
     value: T,
@@ -73,20 +80,34 @@ impl<T: Snapshot> History<T> {
         self.typing = false;
     }
 
-    pub(crate) fn undo(&mut self, current: &T) -> Option<T> {
+    pub(crate) fn undo(&mut self, current: &T) -> Restore<T> {
+        if self.undo.is_empty() {
+            self.break_group();
+            return Restore::Empty;
+        }
+        if current.retained_bytes() > HISTORY_BYTES {
+            return Restore::BudgetRefused;
+        }
         self.break_group();
-        let entry = self.undo.pop_back()?;
+        let entry = self.undo.pop_back().expect("checked undo entry");
         self.bytes -= entry.bytes;
         self.push_current(current, false);
-        Some(entry.value)
+        Restore::Value(entry.value)
     }
 
-    pub(crate) fn redo(&mut self, current: &T) -> Option<T> {
+    pub(crate) fn redo(&mut self, current: &T) -> Restore<T> {
+        if self.redo.is_empty() {
+            self.break_group();
+            return Restore::Empty;
+        }
+        if current.retained_bytes() > HISTORY_BYTES {
+            return Restore::BudgetRefused;
+        }
         self.break_group();
-        let entry = self.redo.pop_back()?;
+        let entry = self.redo.pop_back().expect("checked redo entry");
         self.bytes -= entry.bytes;
         self.push_current(current, true);
-        Some(entry.value)
+        Restore::Value(entry.value)
     }
 
     fn push_current(&mut self, current: &T, undo: bool) {
@@ -131,21 +152,19 @@ impl KillRing {
     }
     /// The existing bounded entry also retains whether its bytes are message
     /// data. Identical bytes with different origins remain distinct entries.
-    fn push_with_intent(&mut self, text: String, literal: bool) {
+    fn push_with_intent(&mut self, text: String, literal: bool) -> bool {
         if text.is_empty() {
-            return;
+            return true;
         }
         if text.len() > RING_BYTES {
-            self.entries.clear();
-            self.bytes = 0;
-            return;
+            return false;
         }
         if self
             .entries
             .front()
             .is_some_and(|(previous, intent)| previous == &text && *intent == literal)
         {
-            return;
+            return true;
         }
         self.bytes += text.len();
         self.entries.push_front((text, literal));
@@ -157,19 +176,33 @@ impl KillRing {
                 .0
                 .len();
         }
+        true
     }
-    pub(crate) fn kill(&mut self, text: String, prepend: bool, consecutive: bool, literal: bool) {
+    /// False means this cut was not retained. In particular a failed join
+    /// leaves every existing entry and its intent untouched.
+    pub(crate) fn kill(
+        &mut self,
+        text: String,
+        prepend: bool,
+        consecutive: bool,
+        literal: bool,
+    ) -> bool {
         if !consecutive || self.entries.is_empty() {
-            self.push_with_intent(text, literal);
-            return;
+            return self.push_with_intent(text, literal);
+        }
+        if self
+            .entries
+            .front()
+            .unwrap()
+            .0
+            .len()
+            .saturating_add(text.len())
+            > RING_BYTES
+        {
+            return false;
         }
         let (previous, previous_literal) = self.entries.pop_front().expect("nonempty ring");
         self.bytes -= previous.len();
-        if previous.len().saturating_add(text.len()) > RING_BYTES {
-            self.entries.clear();
-            self.bytes = 0;
-            return;
-        }
         self.push_with_intent(
             if prepend {
                 text + &previous
@@ -177,7 +210,7 @@ impl KillRing {
                 previous + &text
             },
             literal || previous_literal,
-        );
+        )
     }
     pub(crate) fn get(&self, index: usize) -> Option<&str> {
         if self.entries.is_empty() {
@@ -212,11 +245,45 @@ mod tests {
         h.before_edit(&draft("é", 2), true);
         h.break_group();
         h.before_edit(&draft("é文", 2), true);
-        assert_eq!(h.undo(&draft("é!文", 3)), Some(draft("é文", 2)));
-        assert_eq!(h.undo(&draft("é文", 2)), Some(draft("", 0)));
-        assert_eq!(h.redo(&draft("", 0)), Some(draft("é文", 2)));
+        assert_eq!(h.undo(&draft("é!文", 3)), Restore::Value(draft("é文", 2)));
+        assert_eq!(h.undo(&draft("é文", 2)), Restore::Value(draft("", 0)));
+        assert_eq!(h.redo(&draft("", 0)), Restore::Value(draft("é文", 2)));
         h.before_edit(&draft("é文", 2), false);
-        assert_eq!(h.redo(&draft("new", 3)), None);
+        assert_eq!(h.redo(&draft("new", 3)), Restore::Empty);
+    }
+
+    #[test]
+    fn oversized_reverse_snapshot_refuses_without_consuming_either_stack() {
+        let mut history = History::default();
+        history.before_edit(&draft("first", 1), false);
+        history.before_edit(&draft("second", 2), true);
+        assert_eq!(
+            history.undo(&draft("current", 3)),
+            Restore::Value(draft("second", 2))
+        );
+        let before = format!("{history:?}");
+        let huge = draft(&"x".repeat(HISTORY_BYTES + 1), 7);
+        assert_eq!(history.undo(&huge), Restore::BudgetRefused);
+        assert_eq!(format!("{history:?}"), before);
+        assert_eq!(history.redo(&huge), Restore::BudgetRefused);
+        assert_eq!(format!("{history:?}"), before);
+        assert_eq!(
+            history.redo(&draft("second", 2)),
+            Restore::Value(draft("current", 3))
+        );
+        assert_eq!(
+            history.undo(&draft("current", 3)),
+            Restore::Value(draft("second", 2))
+        );
+        let mut empty: History<Draft> = History::default();
+        assert_eq!(empty.undo(&huge), Restore::Empty);
+        assert_eq!(empty.redo(&huge), Restore::Empty);
+        let mut exact = History::default();
+        exact.before_edit(&draft("small", 0), false);
+        let at_limit = draft(&"x".repeat(HISTORY_BYTES), 1);
+        assert_eq!(exact.undo(&at_limit), Restore::Value(draft("small", 0)));
+        assert_eq!(exact.redo(&draft("small", 0)), Restore::Value(at_limit));
+        assert!(exact.bytes <= HISTORY_BYTES);
     }
 
     #[test]
@@ -248,7 +315,36 @@ mod tests {
             ring.push(n.to_string());
         }
         assert_eq!(ring.entries.len(), RING_ENTRIES);
+        let before = ring.entries.clone();
+        let bytes = ring.bytes;
         ring.push("x".repeat(RING_BYTES + 1));
-        assert_eq!(ring.get(0), None);
+        assert_eq!(ring.entries, before);
+        assert_eq!(ring.bytes, bytes);
+    }
+
+    #[test]
+    fn failed_cuts_preserve_entries_and_normal_coalescing_keeps_text_and_intent() {
+        let mut ring = KillRing::default();
+        assert!(ring.kill("older ไทย".into(), false, false, true));
+        assert!(ring.kill("new 🦀".into(), false, false, false));
+        let before = ring.entries.clone();
+        let bytes = ring.bytes;
+        for consecutive in [false, true] {
+            assert!(!ring.kill("x".repeat(RING_BYTES + 1), false, consecutive, true));
+            assert_eq!(ring.entries, before);
+            assert_eq!(ring.bytes, bytes);
+        }
+        assert!(ring.kill(" tail".into(), false, true, true));
+        assert_eq!(ring.get(0), Some("new 🦀 tail"));
+        assert!(ring.literal(0));
+        assert!(ring.kill("head ".into(), true, true, false));
+        assert_eq!(ring.get(0), Some("head new 🦀 tail"));
+        assert_eq!(ring.get(1), Some("older ไทย"));
+        let before = ring.entries.clone();
+        let bytes = ring.bytes;
+        assert!(!ring.kill("y".repeat(RING_BYTES - 5), true, true, false));
+        assert_eq!(ring.entries, before);
+        assert_eq!(ring.bytes, bytes);
+        assert!(ring.entries.len() <= RING_ENTRIES && ring.bytes <= RING_BYTES);
     }
 }

@@ -670,6 +670,7 @@
     }
     $("sidebar").classList.toggle("hidden", S.view !== "chat");
     $("menu-btn").classList.toggle("hidden", S.view !== "chat");
+    syncSidebar();
     const conn = $("conn");
     conn.title = "";
     conn.onclick = null;
@@ -1283,35 +1284,39 @@
     const tagged = (s) => !S.tagFilter || (s.tags || []).includes(S.tagFilter);
     // Archived Sessions sit in their own collapsible group at the end.
     const archived = S.sessions.filter((s) => s.archived && tagged(s));
-    const shown = S.sessions.filter((s) => tagged(s) && (!s.archived || S.showArchived));
-    for (const row of sessionRows(S.sessions, shown, !!S.sessionTree)) {
-      const s = row.session;
-      const menu = h("button", {
-        class: "icon-btn menu", type: "button", "aria-label": "Session actions", "aria-haspopup": "menu",
-        onkeydown: (e) => menuTriggerKey(e, (last) => sessionMenu(menu, s, last)),
-        onclick: (e) => { e.stopPropagation(); sessionMenu(menu, s); },
-      }, "⋯");
-      list.append(h("li", {
-        class: "session" + (s.id === S.current ? " active" : ""),
-        tabindex: 0,
-        onclick: () => openSession(s.id),
-        onkeydown: (e) => { if (e.key === "Enter") openSession(s.id); },
-      },
-      h("input", { type: "checkbox", class: "mark", "aria-label": "Select " + s.name, checked: S.marked.has(s.id),
-        onclick: (e) => { e.stopPropagation(); if (e.target.checked) S.marked.add(s.id); else S.marked.delete(s.id); renderSessions(); } }),
-      S.running.has(s.id) ? h("span", { class: "running", title: "running" })
-        : s.last_run_status === "paused" ? h("span", { class: "state", title: "paused" }, "⏸") : null,
-      h("span", { class: "name", title: s.name, style: "padding-inline-start:" + (row.depth * 0.75) + "rem" }, s.pinned ? "★ " : null, row.depth ? "↳ " : null, s.name,
-        row.note ? h("span", { class: "muted lineage", title: row.note }, " · " + row.note) : null,
-        s.preview ? h("span", { class: "preview", title: s.preview }, s.preview) : null),
-      h("span", { class: "when", title: (s.message_count || 0) + " messages" + (s.model ? " · " + s.model : "") }, relTime(s.updated_at)),
-      menu));
-    }
+    const active = S.sessions.filter((s) => !s.archived && tagged(s));
+    const appendRows = (visible) => {
+      for (const row of sessionRows(S.sessions, visible, !!S.sessionTree)) {
+        const s = row.session;
+        const menu = h("button", {
+          class: "icon-btn menu", type: "button", "aria-label": "Session actions", "aria-haspopup": "menu",
+          onkeydown: (e) => menuTriggerKey(e, (last) => sessionMenu(menu, s, last)),
+          onclick: (e) => { e.stopPropagation(); sessionMenu(menu, s); },
+        }, "⋯");
+        list.append(h("li", {
+          class: "session" + (s.id === S.current ? " active" : ""),
+          tabindex: 0,
+          onclick: () => openSession(s.id),
+          onkeydown: (e) => { if (e.key === "Enter") openSession(s.id); },
+        },
+        h("input", { type: "checkbox", class: "mark", "aria-label": "Select " + s.name, checked: S.marked.has(s.id),
+          onclick: (e) => { e.stopPropagation(); if (e.target.checked) S.marked.add(s.id); else S.marked.delete(s.id); renderSessions(); } }),
+        S.running.has(s.id) ? h("span", { class: "running", title: "running" })
+          : s.last_run_status === "paused" ? h("span", { class: "state", title: "paused" }, "⏸") : null,
+        h("span", { class: "name", title: s.name, style: "padding-inline-start:" + (row.depth * 0.75) + "rem" }, s.pinned ? "★ " : null, row.depth ? "↳ " : null, s.name,
+          row.note ? h("span", { class: "muted lineage", title: row.note }, " · " + row.note) : null,
+          s.preview ? h("span", { class: "preview", title: s.preview }, s.preview) : null),
+        h("span", { class: "when", title: (s.message_count || 0) + " messages" + (s.model ? " · " + s.model : "") }, relTime(s.updated_at)),
+        menu));
+      }
+    };
+    appendRows(active);
     if (archived.length) {
-      list.append(h("li", { class: "session archived-toggle muted", tabindex: 0,
+      list.append(h("li", { class: "session archived-toggle muted", tabindex: 0, role: "button", "aria-expanded": String(!!S.showArchived),
         onclick: () => { S.showArchived = !S.showArchived; renderSessions(); },
-        onkeydown: (e) => { if (e.key === "Enter") { S.showArchived = !S.showArchived; renderSessions(); } } },
+        onkeydown: (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); S.showArchived = !S.showArchived; renderSessions(); } } },
       (S.showArchived ? "▾ " : "▸ ") + "Archived (" + archived.length + ")"));
+      if (S.showArchived) appendRows(archived);
     }
   }
 
@@ -1519,6 +1524,7 @@
   let mermaidReady = null;
   let mermaidQueue = Promise.resolve();
   let mermaidSeq = 0;
+  const diagramStates = new WeakMap();
   const darkScheme = window.matchMedia("(prefers-color-scheme: dark)");
   const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
   let configuredAnimations = true;
@@ -1569,24 +1575,40 @@
     prefs.set("theme", e.target.value);
     applyTheme(e.target.value);
     mermaidCache.clear();
-    renderAll();
+    refreshDiagrams();
   });
   darkScheme.addEventListener("change", () => {
     if (document.documentElement.dataset.theme) return;
     applyTheme("auto");
     mermaidCache.clear();
-    renderAll();
+    refreshDiagrams();
   });
+  function mermaidLoadError(message) {
+    return Object.assign(new Error(message), { retryableMermaidLoad: true });
+  }
   function loadMermaid() {
     if (!mermaidReady) {
-      mermaidReady = new Promise((resolve, reject) => {
-        const s = h("script", { src: MERMAID_SRC });
-        s.onload = () => (window.mermaid ? resolve(window.mermaid) : reject(new Error("mermaid missing")));
-        s.onerror = () => { mermaidReady = null; reject(new Error("could not load " + MERMAID_SRC)); };
-        document.head.append(s);
+      const script = h("script", { src: MERMAID_SRC });
+      const job = new Promise((resolve, reject) => {
+        script.onload = () => {
+          const mermaid = window.mermaid;
+          if (mermaid && ["initialize", "parse", "render"].every((key) => typeof mermaid[key] === "function")) resolve(mermaid);
+          else reject(mermaidLoadError("mermaid missing"));
+        };
+        script.onerror = () => reject(mermaidLoadError("could not load " + MERMAID_SRC));
       });
+      mermaidReady = job;
+      job.catch(() => {
+        if (mermaidReady === job) mermaidReady = null;
+        script.remove();
+      });
+      document.head.append(script);
     }
     return mermaidReady;
+  }
+  const mermaidTheme = () => isDark() ? "dark" : "default";
+  function refreshDiagrams(root = document) {
+    for (const box of root.querySelectorAll(".diagram")) diagramStates.get(box)?.refresh();
   }
   /** Pie slices in the app palette (mermaid's dark pie is near-black). */
   function pieColors() {
@@ -1596,16 +1618,16 @@
     ["accent", "user", "warn", "think", "err", "muted"].forEach((n, i) => { vars["pie" + (i + 1)] = v(n); });
     return vars;
   }
-  function renderMermaid(src) {
-    const theme = isDark() ? "dark" : "default";
+  function renderMermaid(src, theme = mermaidTheme()) {
     const key = theme + "\n" + src;
     if (!mermaidCache.has(key)) {
+      const colors = pieColors();
       const job = mermaidQueue.then(async () => {
         const mermaid = await loadMermaid();
         mermaid.initialize({
           startOnLoad: false, securityLevel: "strict", theme, htmlLabels: false,
           flowchart: { htmlLabels: false }, fontFamily: MERMAID_FONT, fontSize: 16,
-          themeVariables: pieColors(),
+          themeVariables: colors,
         });
         if (!(await mermaid.parse(src, { suppressErrors: true }))) throw new Error("not a valid Mermaid diagram");
         const id = "mmd-" + ++mermaidSeq;
@@ -1617,13 +1639,16 @@
         try {
           const { svg } = await mermaid.render(id, src, measure);
           const vb = svg.match(/viewBox="[-\d.]+ [-\d.]+ ([\d.]+) ([\d.]+)"/);
-          return { url: "data:image/svg+xml;charset=utf-8," + encodeURIComponent(svg), svg, theme, width: vb ? Math.ceil(+vb[1]) : 0 };
+          return { url: "data:image/svg+xml;charset=utf-8," + encodeURIComponent(svg), svg, theme, width: vb ? Math.ceil(+vb[1]) : 0, height: vb ? Math.ceil(+vb[2]) : 0 };
         } finally {
           measure.replaceChildren();
         }
       });
       mermaidQueue = job.catch(() => {});
       mermaidCache.set(key, job);
+      job.catch((error) => {
+        if (error?.retryableMermaidLoad && mermaidCache.get(key) === job) mermaidCache.delete(key);
+      });
       if (mermaidCache.size > 200) mermaidCache.delete(mermaidCache.keys().next().value);
     }
     return mermaidCache.get(key);
@@ -1632,29 +1657,82 @@
     const code = h("pre", { class: "diagram-src" }, h("code", null, src));
     const view = h("div", { class: "diagram-view" }, h("span", { class: "muted" }, closed ? "Rendering diagram…" : "Waiting for the diagram to finish…"));
     const box = h("div", { class: "codeblock diagram" });
-    const toggle = h("button", { class: "btn ghost small", type: "button", onclick: () => setSource(!box.classList.contains("show-src")) }, "Source");
-    const save = h("button", { class: "btn ghost small", type: "button", hidden: true }, "SVG");
+    const errorMessage = h("div", { class: "diagram-error error", role: "status", hidden: true });
+    let wantedSource = !closed;
+    let generation = 0, theme = null, pending = false;
     const setSource = (on) => { box.classList.toggle("show-src", on); toggle.textContent = on ? "Diagram" : "Source"; };
-    box.append(h("div", { class: "lang" }, h("span", null, "mermaid"), h("span", { class: "spacer" }), toggle, save, copyButton(src)), view, code);
-    if (!closed) { setSource(true); return box; }
-    renderMermaid(src).then((d) => {
-      const img = h("img", { src: d.url, alt: "Mermaid diagram", class: "diagram-img", "data-theme": d.theme, title: "Click to zoom" });
-      if (d.width) img.style.width = d.width + "px";
-      img.addEventListener("click", () => box.classList.toggle("zoom"));
-      img.addEventListener("load", () => { if ($("transcript").contains(img)) scrollToBottom(); }, { once: true });
-      const update = () => { view.replaceChildren(img); save.hidden = false; };
-      if ($("transcript").contains(view)) withTranscriptLayout(update);
-      else update();
-      save.onclick = () => downloadBlob("diagram.svg", new Blob([d.svg], { type: "image/svg+xml" }));
-    }, (e) => {
-      view.replaceChildren(h("span", { class: "error" }, "Diagram not rendered: " + (e && e.message ? e.message : e)));
-      setSource(true);
-    });
+    const toggle = h("button", { class: "btn ghost small", type: "button", onclick: () => { wantedSource = !box.classList.contains("show-src"); setSource(wantedSource); } }, "Source");
+    const save = h("button", { class: "btn ghost small", type: "button", hidden: true }, "SVG");
+    const retry = h("button", { class: "btn ghost small", type: "button", hidden: true, onclick: () => { if (!pending) render(true); } }, "Retry");
+    const update = (change) => {
+      if ($("transcript").contains(box)) withTranscriptLayout(change);
+      else change();
+    };
+    const retryState = (visible) => {
+      if (!visible && document.activeElement === retry) toggle.focus({ preventScroll: true });
+      retry.hidden = !visible;
+      retry.textContent = "Retry";
+      retry.removeAttribute("aria-disabled");
+    };
+    const render = (force = false) => {
+      const nextTheme = mermaidTheme();
+      if (!closed || (!force && theme === nextTheme)) return;
+      theme = nextTheme;
+      const attempt = ++generation;
+      const current = () => attempt === generation && theme === nextTheme && mermaidTheme() === nextTheme;
+      pending = true;
+      view.setAttribute("aria-busy", "true");
+      if (!retry.hidden) { retry.textContent = "Retrying…"; retry.setAttribute("aria-disabled", "true"); }
+      renderMermaid(src, nextTheme).then((d) => {
+        if (!current()) return;
+        const img = h("img", { src: d.url, alt: "Mermaid diagram", class: "diagram-img", "data-theme": d.theme, title: "Click to zoom" });
+        if (d.width) img.style.width = d.width + "px";
+        if (d.width && d.height) { img.width = d.width; img.height = d.height; }
+        img.addEventListener("click", () => box.classList.toggle("zoom"));
+        img.addEventListener("load", () => {
+          if (current() && $("transcript").contains(img)) withTranscriptLayout(() => {});
+        }, { once: true });
+        update(() => {
+          view.replaceChildren(img);
+          errorMessage.hidden = true;
+          view.removeAttribute("aria-busy");
+          save.hidden = false;
+          save.onclick = () => downloadBlob("diagram.svg", new Blob([d.svg], { type: "image/svg+xml" }));
+          retryState(false);
+          setSource(wantedSource);
+        });
+        pending = false;
+      }, (error) => {
+        if (!current()) return;
+        update(() => {
+          view.replaceChildren();
+          errorMessage.textContent = "Diagram not rendered: " + (error?.message || error);
+          errorMessage.hidden = false;
+          view.removeAttribute("aria-busy");
+          if (document.activeElement === save) toggle.focus({ preventScroll: true });
+          save.hidden = true;
+          retryState(!!error?.retryableMermaidLoad);
+          setSource(true);
+        });
+        pending = false;
+      });
+    };
+    box.append(h("div", { class: "lang" }, h("span", null, "mermaid"), h("span", { class: "spacer" }), toggle, save, retry, copyButton(src)), errorMessage, view, code);
+    diagramStates.set(box, { refresh: () => render() });
+    if (!closed) setSource(true);
+    else render();
     return box;
   }
 
   const FENCE = /^(\s*)(`{3,}|~{3,})\s*([^\s`{,]*)/;
   const HEADING = /^\s{0,3}(#{1,6})\s+(.*?)(?:\s+#+\s*)?$/;
+  const SETEXT = /^ {0,3}(=+|-+)[ \t]*$/;
+  // Reuse collected quote spans when a Setext heading returns an outer tail.
+  const quoteBuffers = new WeakMap();
+  // Message headings nest below the Session title (h2). ARIA levels preserve
+  // depths beyond HTML's h6; source-depth classes control readable styling.
+  const markdownHeading = (level, content) => h(level <= 4 ? "h" + (level + 2) : "div",
+    { class: "md-heading md-heading-" + level, role: "heading", "aria-level": level + 2, "data-heading-level": level }, content);
   const RULE = /^\s{0,3}([-*_])(?:\s*\1){2,}\s*$/;
   const ITEM = /^(\s*)([-*+]|\d{1,9}[.)])(\s+|$)(.*)$/;
   const QUOTE = /^\s{0,3}>/;
@@ -1662,10 +1740,13 @@
   const TABLE_SEP = /^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$/;
   const ALERTS = { NOTE: "ℹ Note", TIP: "★ Tip", IMPORTANT: "‼ Important", WARNING: "⚠ Warning", CAUTION: "✖ Caution" };
   const indentOf = (l) => l.match(/^\s*/)[0].replace(/\t/g, "    ").length;
+  const tableStart = (lines, i) => i + 1 < lines.length && lines[i].includes("|")
+    && TABLE_SEP.test(lines[i + 1])
+    && splitRow(lines[i]).length === splitRow(lines[i + 1]).length;
   const startsBlock = (lines, i) => {
     const l = lines[i];
     return FENCE.test(l) || HEADING.test(l) || RULE.test(l) || ITEM.test(l) || QUOTE.test(l) || MATH_BLOCK.test(l)
-      || (l.includes("|") && i + 1 < lines.length && TABLE_SEP.test(lines[i + 1]) && lines[i + 1].includes("-"));
+      || tableStart(lines, i);
   };
   // Shared delimiter rules keep persisted and streamed block boundaries aligned.
   function fenceCloses(line, marker) {
@@ -1681,10 +1762,10 @@
     return s.split(/(?<!\\)\|/).map((c) => c.trim().replace(/\\\|/g, "|"));
   }
 
-  /** Append the block structure of `lines` to `root`. */
-  function blocks(lines, root, depth = 0) {
-    if (depth >= MD_DEPTH) { root.append(h("pre", { class: "md-plain" }, lines.join("\n"))); return root; }
-    let i = 0;
+  /** Append blocks and return the next line index (lazy Setext tails remain outside). */
+  function blocks(lines, root, depth = 0, lazy = [], start = 0) {
+    if (depth >= MD_DEPTH) { root.append(h("pre", { class: "md-plain" }, lines.slice(start).join("\n"))); return lines.length; }
+    let i = start;
     while (i < lines.length) {
       const line = lines[i];
       if (!line.trim()) { i++; continue; }
@@ -1717,9 +1798,9 @@
         continue;
       }
       const head = line.match(HEADING);
-      if (head) { root.append(h("h" + Math.min(6, head[1].length + 1), null, inline(head[2]))); i++; continue; }
+      if (head) { root.append(markdownHeading(head[1].length, inline(head[2]))); i++; continue; }
       if (RULE.test(line)) { root.append(h("hr")); i++; continue; }
-      if (line.includes("|") && i + 1 < lines.length && TABLE_SEP.test(lines[i + 1]) && lines[i + 1].includes("-")) {
+      if (tableStart(lines, i)) {
         const header = splitRow(line);
         const aligns = splitRow(lines[i + 1]).map((c) => (/^:-+:$/.test(c) ? "center" : /-:$/.test(c) ? "right" : null));
         const cell = (tag, text, k) => h(tag, { class: aligns[k] ? "al-" + aligns[k] : null }, inline(text));
@@ -1733,57 +1814,89 @@
         continue;
       }
       if (QUOTE.test(line)) {
-        const buf = [];
-        while (i < lines.length && (QUOTE.test(lines[i]) || (lines[i].trim() && buf.length && !startsBlock(lines, i)))) {
-          buf.push(lines[i++].replace(/^\s{0,3}>\s?/, ""));
+        let quote = quoteBuffers.get(lines);
+        if (!quote || i < quote.start || i >= quote.end) {
+          const begin = i, buf = [], bufLazy = [];
+          let end = i;
+          while (end < lines.length && (QUOTE.test(lines[end]) || (lines[end].trim() && buf.length && !startsBlock(lines, end)))) {
+            bufLazy.push(lazy[end] || !QUOTE.test(lines[end]));
+            buf.push(lines[end++].replace(/^\s{0,3}>\s?/, ""));
+          }
+          quote = { start: begin, end, lines: buf, lazy: bufLazy };
+          quoteBuffers.set(lines, quote);
         }
-        const alert = buf[0] && buf[0].trim().match(/^\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\]$/i);
+        const from = i - quote.start;
+        const alert = quote.lines[from].trim().match(/^\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\]$/i);
         const q = h("blockquote", { class: alert ? "callout " + alert[1].toLowerCase() : null });
-        if (alert) { buf.shift(); q.append(h("div", { class: "callout-title" }, ALERTS[alert[1].toUpperCase()])); }
-        blocks(buf, q, depth + 1);
+        if (alert) q.append(h("div", { class: "callout-title" }, ALERTS[alert[1].toUpperCase()]));
+        const consumed = blocks(quote.lines, q, depth + 1, quote.lazy, from + (alert ? 1 : 0));
         root.append(q);
+        i = quote.start + consumed;
+        if (i < quote.end && lazy[i]) return i;
         continue;
       }
-      if (ITEM.test(line)) { i = list(lines, i, root, depth); continue; }
-      const p = h("p");
-      p.append(...inline(line.trim()));
+      if (ITEM.test(line)) {
+        const result = list(lines, i, root, depth, lazy);
+        i = result.next;
+        if (result.stopped && lazy[i]) return i;
+        continue;
+      }
+      const content = [...inline(line.trim())];
+      let level = null;
       i++;
-      while (i < lines.length && lines[i].trim() && !startsBlock(lines, i)) { p.append(h("br"), ...inline(lines[i++].trim())); }
-      root.append(p);
+      while (i < lines.length && lines[i].trim()) {
+        // Lazy container continuations are paragraph text, not underlines.
+        const underline = !lazy[i] && lines[i].match(SETEXT);
+        if (underline) { level = underline[1][0] === "=" ? 1 : 2; i++; break; }
+        if (startsBlock(lines, i)) break;
+        content.push(h("br"), ...inline(lines[i++].trim()));
+      }
+      root.append(level ? markdownHeading(level, content) : h("p", null, content));
+      // A heading closes its paragraph; the following lazy line belongs outside.
+      if (level && lazy[i]) return i;
     }
-    return root;
+    return lines.length;
   }
 
-  /** A (possibly nested) list starting at lines[i]; returns the next index. */
-  function list(lines, i, root, depth = 0) {
+  /** A list plus its next index and whether a Setext heading ended lazy collection. */
+  function list(lines, i, root, depth = 0, lazy = []) {
     const first = lines[i].match(ITEM);
     const base = indentOf(first[1]);
     const ordered = /\d/.test(first[2]);
     const el = h(ordered ? "ol" : "ul");
     if (ordered && parseInt(first[2], 10) !== 1) el.setAttribute("start", String(parseInt(first[2], 10)));
-    let loose = false;
+    let loose = false, stopped = false;
     while (i < lines.length) {
+      const itemStart = i;
+      let looseAfter = Infinity;
       const m = lines[i].match(ITEM);
       if (!m || indentOf(m[1]) !== base || /\d/.test(m[2]) !== ordered) break;
       const contentIndent = base + m[2].length + Math.max(1, Math.min(4, m[3].length));
-      const body = [m[4]];
+      const body = [m[4]], bodyLazy = [lazy[i]];
       i++;
       while (i < lines.length) {
         const l = lines[i];
         if (!l.trim()) {
           let j = i + 1;
           while (j < lines.length && !lines[j].trim()) j++;
-          if (j < lines.length && indentOf(lines[j]) > base) { body.push(""); loose = loose || !ITEM.test(lines[j]); i++; continue; }
+          if (j < lines.length && indentOf(lines[j]) > base) {
+            if (!ITEM.test(lines[j])) looseAfter = Math.min(looseAfter, body.length + 1);
+            body.push(""); bodyLazy.push(false); i++; continue;
+          }
           const sibling = j < lines.length && lines[j].match(ITEM);
           if (sibling && !RULE.test(lines[j]) && indentOf(sibling[1]) === base && /\d/.test(sibling[2]) === ordered) {
-            loose = true;
+            looseAfter = Math.min(looseAfter, body.length);
             i = j;
           }
           break;
         }
         const ind = indentOf(l);
-        if (ind > base) { body.push(" ".repeat(Math.max(0, ind - contentIndent)) + l.trim()); i++; continue; }
+        if (ind > base) {
+          bodyLazy.push(lazy[i] || ind < contentIndent);
+          body.push(" ".repeat(Math.max(0, ind - contentIndent)) + l.trim()); i++; continue;
+        }
         if (ITEM.test(l) || startsBlock(lines, i) || !body[body.length - 1].trim()) break;
+        bodyLazy.push(true);
         body.push(l.trim()); // lazy continuation
         i++;
       }
@@ -1794,19 +1907,23 @@
         li.className = "task";
         li.append(h("input", { type: "checkbox", disabled: true, checked: task[1] !== " ", "aria-label": task[1] !== " " ? "done" : "not done" }));
       }
-      blocks(body, li, depth + 1);
+      const consumed = blocks(body, li, depth + 1, bodyLazy);
+      // Ignore blank separators collected beyond a heading's rejected lazy tail.
+      if (looseAfter <= consumed) loose = true;
       el.append(li);
+      if (consumed < body.length) { i = itemStart + consumed; stopped = true; break; }
     }
     if (loose) el.classList.add("loose");
     root.append(el);
-    return i;
+    return { next: i, stopped };
   }
 
   function markdown(text) {
     text = String(text || "");
     const root = h("div", { class: "md bubble" });
     if (text.length > MD_FORMAT_CHARS) { root.append(h("pre", { class: "md-plain" }, text)); return root; }
-    return blocks(text.replace(/\r\n?/g, "\n").split("\n"), root);
+    blocks(text.replace(/\r\n?/g, "\n").split("\n"), root);
+    return root;
   }
 
   // ------------------------------------------------------------- chat
@@ -2218,16 +2335,30 @@
     test.onclick = async () => {
       const model = choice();
       if (!model) return;
-      status.textContent = "testing " + model + "…";
+      const testing = "testing " + model + "…";
+      status.textContent = testing;
       const t = await act({ type: "test_model", model }, null, 120000);
-      if (!t) return;
+      // act already reported why; end the label it left, unless newer text
+      // replaced it (#1730).
+      if (!t) {
+        if (status.textContent === testing) status.textContent = "✗ " + model + ": test did not complete";
+        return;
+      }
       tests[model] = t;
       status.textContent = modelTestText(t);
       draw();
     };
     openDialog(dialog, { initialFocus: input, onDismiss: close });
     const r = await act({ type: "list_models" }, null, 30000);
-    if (!r || !dialog.isConnected) return;
+    if (!dialog.isConnected) return;
+    if (!r) {
+      // act already reported why; free-form entry still works (#1730).
+      if (status.textContent === "loading models…") {
+        status.textContent = "could not load models — type a model id";
+        status.classList.add("err");
+      }
+      return;
+    }
     const recent = r.recent || [];
     meta = r.meta || {};
     tests = r.tests || {};
@@ -2242,7 +2373,8 @@
     items.sort((a, b) => b.recent - a.recent);
     const current = (session && session.model) || (r.current && r.current.model) || "";
     sel = Math.max(0, items.findIndex((i) => i.id === current));
-    status.textContent = r.error ? "could not list models: " + r.error : "";
+    status.textContent = r.error ? "could not list models: " + r.error
+      : items.length ? "" : "no models listed — type a model id";
     if (!items.length && r.error) status.classList.add("err");
     draw();
   }
@@ -2282,6 +2414,7 @@
       }
       node.messageSignature = signature;
     }
+    refreshDiagrams(node);
     return node;
   }
   function copy(text, what) {
@@ -3163,7 +3296,7 @@
       ? h("span", { class: "banner-text" }, "⏸ " + x.message,
         x.action ? h("span", { class: "muted" }, " " + x.action + ".") : null,
         h("details", null, h("summary", null, "details"), h("code", null, u.error || x.details)))
-      : h("span", null, "⏸ The last Run was " + u.status + (u.error ? ": " + truncate(u.error, 200) : ""));
+      : h("span", { class: "banner-text" }, "⏸ The last Run was " + u.status + (u.error ? ": " + truncate(u.error, 200) : ""));
     box.replaceChildren(
       text,
       h("button", { class: "btn small primary", type: "button", onclick: async () => {
@@ -3392,19 +3525,45 @@
   // -------------------------------------------------------- approvals
   /** A job's recent firings: when, trigger, outcome, time, cost, Session. */
   async function showJobHistory(j) {
-    const runs = (await request({ type: "job_runs", id: j.id }).catch(() => null)) || [];
+    const body = h("div", { class: "job-history" });
+    let closed = false, retrying = false;
     const secs = (r) => r.finished_at ? uiFormat(Math.round((new Date(r.finished_at) - new Date(r.started_at)) / 1000)) + "s" : "…";
-    const body = runs.length
-      ? h("table", { class: "table" }, h("tbody", null, runs.map((r) => h("tr", null,
-          h("td", { class: "muted" }, uiFormat(new Date(r.started_at))),
-          h("td", null, r.trigger),
-          h("td", { class: r.status === "completed" ? "" : "error" }, r.status),
-          h("td", { class: "muted" }, secs(r)),
-          h("td", { class: "muted" }, r.cost != null ? uiMoney(r.cost, 3) : "—"),
-          h("td", null, r.session_id ? h("button", { class: "btn ghost small", type: "button", onclick: () => openSession(r.session_id) }, "Open") : null),
-          h("td", { class: "muted" }, r.detail || "")))))
-      : h("p", { class: "muted" }, "It has not run yet.");
-    ask({ title: "Job history", body, ok: "Close" });
+    async function load() {
+      try {
+        const runs = await request({ type: "job_runs", id: j.id });
+        if (!Array.isArray(runs)) throw new Error("History response was not a list");
+        return { runs };
+      } catch (error) { return { error }; }
+    }
+    function show(result) {
+      if ("error" in result) {
+        const retry = h("button", { class: "btn small", type: "button", onclick: async () => {
+          if (retrying || closed) return;
+          retrying = true; retry.disabled = true; retry.textContent = "Retrying…";
+          const next = await load();
+          retrying = false;
+          if (closed) return;
+          show(next);
+          if (body.isConnected && activeDialog()?.node === $("ask-backdrop")) focusReturn($("ask-ok"));
+        } }, "Retry");
+        body.replaceChildren(h("p", { class: "error", role: "alert" }, "Could not load Job history. ", result.error?.message || String(result.error)), retry);
+      } else if (!result.runs.length) {
+        body.replaceChildren(h("p", { class: "muted" }, "It has not run yet."));
+      } else {
+        body.replaceChildren(h("div", { class: "table-wrap job-history-table" }, h("table", { class: "table" },
+          h("thead", null, h("tr", null, ["Started", "Trigger", "Status", "Duration", "Cost", "Session", "Detail"].map(label => h("th", { scope: "col" }, label)))),
+          h("tbody", null, result.runs.map((r) => h("tr", null,
+            h("td", { class: "muted" }, uiFormat(new Date(r.started_at))),
+            h("td", null, r.trigger),
+            h("td", { class: r.status === "completed" ? "" : "error" }, r.status),
+            h("td", { class: "muted" }, secs(r)),
+            h("td", { class: "muted" }, r.cost != null ? uiMoney(r.cost, 3) : "—"),
+            h("td", null, r.session_id ? h("button", { class: "btn ghost small", type: "button", onclick: () => openSession(r.session_id) }, "Open") : null),
+            h("td", { class: "muted" }, r.detail || "")))))));
+      }
+    }
+    show(await load());
+    ask({ title: "Job history", body, ok: "Close", hideCancel: true }).then(() => { closed = true; });
   }
   /** A path Capability's wider scopes (file, folder, repository), as a
    * select; the pick is sent with the answer (SPEC §10.3). */
@@ -3858,14 +4017,18 @@
     const sort = opts.sortable && S.toolSort;
     const cols = TOOL_COLS.concat([[opts.bars ? "" : "Capabilities", null]]);
     // Sortable headers: click (or Enter) sorts by the column, again reverses.
+    // Name and version ascend; calls, success and last used descend. The
+    // active glyph and aria-sort both come from that one direction.
     table.append(h("thead", null, h("tr", null, cols.map(([label, key, num]) => {
       const active = sort && key && sort.key === key;
-      const th = h("th", { class: num ? "num" : null, "aria-sort": active ? (sort.reverse !== (key === "name" || key === "version") ? "ascending" : "descending") : null },
+      const direction = active ? (sort.reverse !== (key === "name" || key === "version") ? "ascending" : "descending") : null;
+      const glyph = direction === "ascending" ? " ▴" : direction === "descending" ? " ▾" : "";
+      const th = h("th", { class: num ? "num" : null, "aria-sort": direction },
         opts.sortable && key ? h("button", { class: "th-sort", type: "button", title: "Sort by " + label.toLowerCase(), onclick: () => {
           S.toolSort = { key, reverse: active ? !sort.reverse : false };
           if ([...$("tools-sort").options].some((o) => o.value === key)) $("tools-sort").value = key;
           renderTools();
-        } }, label, active ? (sort.reverse ? " ▴" : " ▾") : "") : label);
+        } }, label, glyph) : label);
       return th;
     }))));
     const body = h("tbody");
@@ -4292,29 +4455,62 @@
       }
       return null;
     }
+    let paintedText = null, lineData = [], previousPair = [], previousError = null;
+    function rowAt(position) {
+      let low = 0, high = lineData.length;
+      while (low < high) {
+        const mid = (low + high) >>> 1;
+        if (lineData[mid].start <= position) low = mid + 1;
+        else high = mid;
+      }
+      const row = low - 1, data = lineData[row];
+      return data && position < data.start + data.text.length ? row : null;
+    }
     function paint() {
       const text = area.value;
-      const nodes = highlight(text + "\n", "js");
-      hl.replaceChildren(...(nodes || [text + "\n"]));
-      // Marks: the same text, invisible, with backgrounds where it counts.
-      const lines = (text + "\n").split("\n");
-      const pair = bracketPair(text, area.selectionStart);
-      let offset = 0;
-      marks.replaceChildren(...lines.map((line, n) => {
-        const start = offset;
-        offset += line.length + 1;
-        const parts = [];
-        let at = 0;
-        for (const p of pair || []) {
-          if (p >= start && p < start + line.length) {
-            parts.push(line.slice(at, p - start), h("span", { class: "ed-bracket" }, line[p - start]));
-            at = p - start + 1;
+      if (text !== paintedText) {
+        const nodes = highlight(text + "\n", "js");
+        hl.replaceChildren(...(nodes || [text + "\n"]));
+        // Rebuild line structure only for a changed source, preserving the
+        // existing extra newline that aligns the textarea's final line.
+        const lines = (text + "\n").split("\n");
+        let offset = 0;
+        lineData = lines.map(line => {
+          const data = { text: line, start: offset, node: h("span", { class: "ed-line" }, line) };
+          offset += line.length + 1;
+          return data;
+        });
+        marks.replaceChildren(...lineData.flatMap((data, n) => n < lineData.length - 1 ? [data.node, "\n"] : [data.node]));
+        paintedText = text;
+        previousPair = [];
+        previousError = null;
+      }
+      const pair = bracketPair(text, area.selectionStart) || [];
+      if (pair.length !== previousPair.length || pair.some((position, i) => position !== previousPair[i])) {
+        const changed = new Set([...previousPair, ...pair].map(rowAt));
+        for (const row of changed) {
+          if (row === null) continue;
+          const data = lineData[row], parts = [];
+          let at = 0;
+          for (const position of pair) {
+            if (position >= data.start && position < data.start + data.text.length) {
+              parts.push(data.text.slice(at, position - data.start), h("span", { class: "ed-bracket" }, data.text[position - data.start]));
+              at = position - data.start + 1;
+            }
           }
+          parts.push(data.text.slice(at));
+          data.node.replaceChildren(...parts);
         }
-        parts.push(line.slice(at));
-        const el = h("span", { class: errLine === n + 1 ? "ed-line ed-err" : "ed-line" }, ...parts);
-        return n < lines.length - 1 ? [el, "\n"] : el;
-      }).flat());
+        previousPair = pair;
+      }
+      if (errLine !== previousError) {
+        // Keep bracket children intact when only the diagnostic moved.
+        for (const line of [previousError, errLine]) {
+          const node = Number.isInteger(line) && lineData[line - 1]?.node;
+          if (node) node.classList.toggle("ed-err", line === errLine);
+        }
+        previousError = errLine;
+      }
       sync();
     }
     function sync() {
@@ -4593,11 +4789,11 @@
       audit.length >= 50 * (S.auditPages || 1) ? h("div", { class: "detail-actions" },
         h("button", { class: "btn small", type: "button", onclick: () => loadAudit(true) }, "Older")) : null));
     const jobs = S.jobs || [];
-    grid.append(h("section", null, h("h3", null, "Jobs"),
+    grid.append(h("section", { class: "settings-records" }, h("h3", null, "Jobs"),
       (S.settings || {}).jobs_warning ? h("p", { class: "error" }, S.settings.jobs_warning) : null,
-      jobs.length ? h("table", { class: "table" },
+      jobs.length ? h("div", { class: "table-wrap" }, h("table", { class: "table" },
         h("tbody", null, jobs.map((j) => h("tr", null,
-          h("td", null, h("div", null, j.prompt),
+          h("td", { class: "record-prose" }, h("div", null, j.prompt),
             h("div", { class: "muted" }, (j.cron ? describeCron(j.cron) : "once") + " · next " + (j.next_run ? uiFormat(new Date(j.next_run)) : "-") + (j.last_status ? " · last: " + j.last_status : "") + " · " + j.author)),
           h("td", null,
             h("button", { class: "btn small" + (j.enabled && j.approved ? "" : " primary"), type: "button", onclick: () => act({ type: "set_job_enabled", id: j.id, enabled: !(j.enabled && j.approved) }, "Updated").then(refreshSettings) },
@@ -4606,15 +4802,15 @@
             h("button", { class: "btn small", type: "button", onclick: () => showJobHistory(j) }, "History"),
             h("button", { class: "btn small danger", type: "button", onclick: async () => {
               if (await ask({ title: "Delete this job?", text: j.prompt, ok: "Delete", danger: true })) { await act({ type: "delete_job", id: j.id }, "Deleted"); refreshSettings(); }
-            } }, "Delete"))))))
+            } }, "Delete")))))))
         : h("p", { class: "muted" }, "None yet. The agent can also schedule_run."),
       h("div", { class: "detail-actions" }, h("button", { class: "btn small", type: "button", onclick: () => newJob() }, "New job"))));
     const memories = S.memories || [];
-    grid.append(h("section", null, h("h3", null, "Memory"),
+    grid.append(h("section", { class: "settings-records" }, h("h3", null, "Memory"),
       h("p", { class: "muted" }, "Notes the agent keeps about your preferences; they go into new sessions' prompts."),
-      memories.length ? h("table", { class: "table" },
+      memories.length ? h("div", { class: "table-wrap" }, h("table", { class: "table" },
         h("tbody", null, memories.map((m) => h("tr", null,
-          h("td", null, h("div", { class: m.enabled ? "" : "muted" }, m.text),
+          h("td", { class: "record-prose" }, h("div", { class: m.enabled ? "" : "muted" }, m.text),
             h("div", { class: "muted" }, m.scope + " · " + (m.session_id ? "from session " + m.session_id.slice(0, 8) : m.author) + (m.enabled ? "" : " · off"))),
           h("td", null,
             h("button", { class: "btn small", type: "button", onclick: async () => {
@@ -4624,7 +4820,7 @@
             h("button", { class: "btn small", type: "button", onclick: () => act({ type: "upsert_memory", id: m.id, enabled: !m.enabled }, m.enabled ? "Disabled" : "Enabled").then(refreshSettings) }, m.enabled ? "Disable" : "Enable"),
             h("button", { class: "btn small danger", type: "button", onclick: async () => {
               if (await ask({ title: "Delete this memory?", text: m.text, ok: "Delete", danger: true })) { await act({ type: "delete_memory", id: m.id }, "Deleted"); refreshSettings(); }
-            } }, "Delete"))))))
+            } }, "Delete")))))))
         : h("p", { class: "muted" }, "None yet."),
       h("div", { class: "detail-actions" },
         h("button", { class: "btn small", type: "button", onclick: async () => {
@@ -4656,31 +4852,39 @@
   }
   /** The Settings filter: rows whose label, key, value or description
    * contain the words stay (matches marked); sections with none left hide,
-   * unless their title matches. */
+   * unless their title matches. Every word must be in one target (label,
+   * value, key or table row), folded by `foldMap` as `markWords` folds it,
+   * so a visible label shows its highlight (#1731). */
   function filterSettings() {
-    const words = $("settings-filter").value.toLowerCase().split(/\s+/).filter(Boolean);
-    const hit = (el) => { const t = el.textContent.toLowerCase(); return words.every((w) => t.includes(w)); };
-    for (const m of $("settings").querySelectorAll("mark.find")) m.replaceWith(m.textContent);
+    const words = $("settings-filter").value.split(/\s+/).filter(Boolean);
+    const keys = words.map((w) => foldMap(w).folded).filter(Boolean);
+    // Each target's text is folded once per call, not once per word.
+    const hitText = (text) => { const t = foldMap(text).folded; return keys.every((k) => t.includes(k)); };
+    const hit = (el) => hitText(el.textContent);
+    // Unwrap the last marks, then merge the split text back together so the
+    // next query can match across the old mark's edges (#1731).
+    const parents = new Set();
+    for (const m of $("settings").querySelectorAll("mark.find")) { parents.add(m.parentNode); m.replaceWith(m.textContent); }
+    for (const p of parents) p.normalize();
     for (const sec of $("settings").querySelectorAll("section")) {
-      const titleHit = words.length && hit(sec.querySelector("h3") || sec);
+      const titleHit = keys.length && hit(sec.querySelector("h3") || sec);
       let shown = 0;
       for (const dt of sec.querySelectorAll("dl.kv > dt")) {
         const dd = dt.nextElementSibling;
-        const ok = !words.length || titleHit || hit(dt) || (dd && hit(dd)) || (dt.title && words.every((w) => dt.title.toLowerCase().includes(w)));
+        const ok = !keys.length || titleHit || hit(dt) || (dd && hit(dd)) || (dt.title && hitText(dt.title));
         dt.classList.toggle("hidden", !ok);
         if (dd) dd.classList.toggle("hidden", !ok);
-        if (ok) { shown++; if (words.length) markWords(dt, words); }
+        if (ok) { shown++; if (keys.length) markWords(dt, words); }
       }
       for (const tr of sec.querySelectorAll("tbody > tr")) {
-        const ok = !words.length || titleHit || hit(tr);
+        const ok = !keys.length || titleHit || hit(tr);
         tr.classList.toggle("hidden", !ok);
         if (ok) shown++;
       }
       const hasRows = sec.querySelector("dl.kv > dt, tbody > tr");
-      sec.classList.toggle("hidden", !!words.length && !titleHit && (hasRows ? !shown : !hit(sec)));
+      sec.classList.toggle("hidden", !!keys.length && !titleHit && (hasRows ? !shown : !hit(sec)));
     }
   }
-  /** Wrap the words' first occurrences in an element's own text in <mark>. */
   /** `text` folded for matching with, per folded UTF-16 unit, the offset
    * of the original character it came from (#789): decomposed, marks
    * dropped, lower-cased one character at a time, so `İ` stays one
@@ -4698,6 +4902,8 @@
     from.push(at);
     return { folded, from };
   }
+  /** Wrap the words' first occurrences in an element's own text in <mark>,
+   * adding no empty text nodes. */
   function markWords(el, words) {
     const keys = words.map((w) => foldMap(w).folded).filter((w) => w);
     for (const node of [...el.childNodes].filter((n) => n.nodeType === 3)) {
@@ -4709,16 +4915,18 @@
         .map((w) => [folded.indexOf(w), w.length])
         .filter(([i]) => i >= 0)
         .map(([i, n]) => [from[i], from[i + n] - from[i]])
+        .filter(([, n]) => n > 0)
         .sort((a, b) => a[0] - b[0]);
       if (!spans.length) continue;
       const parts = [];
       let at = 0;
       for (const [i, n] of spans) {
         if (i < at) continue;
-        parts.push(text.slice(at, i), h("mark", { class: "find" }, text.slice(i, i + n)));
+        if (i > at) parts.push(text.slice(at, i));
+        parts.push(h("mark", { class: "find" }, text.slice(i, i + n)));
         at = i + n;
       }
-      parts.push(text.slice(at));
+      if (at < text.length) parts.push(text.slice(at));
       node.replaceWith(...parts);
     }
   }
@@ -6135,13 +6343,30 @@
     t.style.height = Math.min(t.scrollHeight, Number.isFinite(maxHeight) ? maxHeight : t.scrollHeight) + "px";
   }
 
-  function openSidebar() { $("sidebar").classList.add("open"); }
-  function closeSidebar() {
-    const sidebar = $("sidebar");
-    const returnFocus = sidebar.contains(document.activeElement);
-    sidebar.classList.remove("open");
-    if (returnFocus && getComputedStyle(sidebar).visibility === "hidden") focusReturn($("menu-btn"));
+  // Read CSS visibility so viewport and container-query layouts agree.
+  let sidebarLastFocus = null;
+  function syncSidebar() {
+    const sidebar = $("sidebar"), menu = $("menu-btn");
+    const visible = !!(sidebar.getClientRects().length
+      && !sidebar.closest(".hidden, [hidden]") && getComputedStyle(sidebar).visibility !== "hidden");
+    menu.setAttribute("aria-expanded", String(visible));
+    const focused = document.activeElement;
+    const previous = focused === document.body ? sidebarLastFocus : focused;
+    if (!focusVisible(sidebar) && sidebar.contains(previous)) focusReturn(menu);
+    else if (!focusVisible(menu) && previous === menu) focusReturn(visible ? $("new-session") : null);
   }
+  function setSidebar(open, { focus = false } = {}) {
+    $("sidebar").classList.toggle("open", open);
+    syncSidebar();
+    if (open && focus && getComputedStyle($("sidebar")).position === "absolute" && focusVisible($("new-session"))) {
+      $("new-session").focus({ preventScroll: true });
+    }
+  }
+  function openSidebar(options) { setSidebar(true, options); }
+  function closeSidebar() { setSidebar(false); }
+  document.addEventListener("focusin", () => { sidebarLastFocus = document.activeElement; });
+  const sidebarResize = new ResizeObserver(syncSidebar);
+  for (const element of [$("app"), $("sidebar"), $("menu-btn")]) sidebarResize.observe(element);
 
   // ============================================================== events
   let toolRefresh = null;
@@ -6964,7 +7189,7 @@
   $("optimise-all").onclick = () => act({ type: "run_optimiser", tool_id: null }, "Optimiser started");
   $("generate-proposal").onclick = () => { act({ type: "generate_proposal" }, "Generating and measuring a proposal…"); };
   $("stop-btn").onclick = stop;
-  $("menu-btn").onclick = () => $("sidebar").classList.toggle("open");
+  $("menu-btn").onclick = () => setSidebar(!$("sidebar").classList.contains("open"), { focus: true });
   $("notes-btn").onclick = () => {
     const panel = $("notes-panel");
     panel.classList.toggle("hidden");
@@ -7018,8 +7243,8 @@
     try { atts = JSON.parse(m.meta || "{}").attachments || []; } catch (_) {}
     if (!atts.length) return [];
     return [h("div", { class: "muted sent-from" }, ...atts.map((a) => h("span", { class: "tag attach-chip" },
-      a.reference ? "↗ " : (a.mime || "").startsWith("image/") ? "🖼 " : "📄 ", a.name || "attachment",
-      a.expired ? " · expired" : "")))];
+      h("span", { class: "attach-icon" }, a.reference ? "↗" : (a.mime || "").startsWith("image/") ? "🖼" : "📄"),
+      h("span", { class: "attach-name" }, a.name || "attachment", a.expired ? " · expired" : ""))))];
   }
   /** The current Session's pending attachments, each removable (×). */
   function renderChips() {
@@ -7027,7 +7252,8 @@
     const list = S.chips[S.current] || [];
     box.classList.toggle("hidden", !list.length);
     box.replaceChildren(...list.map((a) => h("span", { class: "tag attach-chip", title: (a.mime || "file") + " · " + Math.max(1, Math.round(a.bytes / 1024)) + " KB" },
-      (a.mime || "").startsWith("image/") ? "🖼 " : "📄 ", a.name,
+      h("span", { class: "attach-icon" }, (a.mime || "").startsWith("image/") ? "🖼" : "📄"),
+      h("span", { class: "attach-name" }, a.name),
       h("button", { class: "btn ghost small", type: "button", "aria-label": "Remove " + a.name, onclick: async () => {
         const sid = S.current;
         // A referenced file (too big to attach) is named by its path.
@@ -7054,6 +7280,9 @@
       attachFiles([...e.dataTransfer.files]);
     });
   }
+  // A real button so Tab, Enter and Space reach it (#1740); its click is
+  // the user gesture that opens the hidden file picker.
+  $("attach-btn").addEventListener("click", () => $("attach-input").click());
   $("attach-input").addEventListener("change", (e) => { attachFiles([...e.target.files]); e.target.value = ""; });
   $("input").addEventListener("paste", (e) => {
     const files = [...((e.clipboardData && e.clipboardData.files) || [])];

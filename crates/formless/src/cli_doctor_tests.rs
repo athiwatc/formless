@@ -290,6 +290,10 @@ fn doctor_reports_unknown_role_providers_without_changing_configuration() {
     assert!(!formless_core::daemon::endpoint_occupied(&f.paths).unwrap());
     #[cfg(unix)]
     assert!(!f.paths.socket_path().exists());
+    assert!(
+        !f.paths.lock_file().exists(),
+        "doctor must not publish a PID"
+    );
     f.assert_no_provider_calls();
 }
 

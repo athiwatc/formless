@@ -1333,7 +1333,9 @@ dependencies = [
  "shlex",
  "tokio",
  "tracing-subscriber",
+ "unicode-segmentation",
  "unicode-width 0.2.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1363,6 +1365,7 @@ dependencies = [
  "reqwest 0.12.28",
  "rusqlite",
  "rustls",
+ "same-file",
  "serde",
  "serde_json",
  "sha2",

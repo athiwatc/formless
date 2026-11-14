@@ -21,7 +21,15 @@ package() {
   install -Dm644 formless.1 "${pkgdir}/usr/share/man/man1/formless.1"
   install -Dm644 README.md "${pkgdir}/usr/share/doc/formless/README.md"
   install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
-  "${pkgdir}/usr/bin/formless" completions bash | install -Dm644 /dev/stdin "${pkgdir}/usr/share/bash-completion/completions/formless"
-  "${pkgdir}/usr/bin/formless" completions zsh | install -Dm644 /dev/stdin "${pkgdir}/usr/share/zsh/site-functions/_formless"
-  "${pkgdir}/usr/bin/formless" completions fish | install -Dm644 /dev/stdin "${pkgdir}/usr/share/fish/vendor_completions.d/formless.fish"
+  # makepkg does not enable pipefail: check the generator itself before install.
+  for shell in bash zsh fish; do
+    if ! "${pkgdir}/usr/bin/formless" completions "$shell" > "completion.$shell"; then
+      echo "error: could not generate $shell completion" >&2
+      return 1
+    fi
+    [[ -s "completion.$shell" ]] || { echo "error: empty $shell completion" >&2; return 1; }
+  done
+  install -Dm644 completion.bash "${pkgdir}/usr/share/bash-completion/completions/formless"
+  install -Dm644 completion.zsh "${pkgdir}/usr/share/zsh/site-functions/_formless"
+  install -Dm644 completion.fish "${pkgdir}/usr/share/fish/vendor_completions.d/formless.fish"
 }
