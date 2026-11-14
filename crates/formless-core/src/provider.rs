@@ -194,6 +194,9 @@ mod model_test_failure_tests {
             ("provider error: 401 Unauthorized", false),
             ("provider error: 400 Bad Request", false),
             ("no tool call returned", false),
+            ("model does not support streaming", false),
+            ("downstream rejected the schema", false),
+            ("password reset required", false),
         ] {
             let test = ModelTest {
                 error: Some(error.into()),
@@ -4519,6 +4522,35 @@ fn encoded_image(
 /// A guess at whether a model accepts image input, from its name.
 pub fn is_vision_model(model: &str) -> bool {
     let m = model.to_lowercase();
+    let name = m.rsplit('/').next().unwrap_or(&m);
+    // Known text-only variants take precedence over broad family matches.
+    // Users serving a customized model can still set provider.vision explicitly.
+    let small_gemma3 = (name.contains("gemma-3") || name.contains("gemma3"))
+        && name
+            .split(['-', ':', '_', '.'])
+            .any(|part| matches!(part, "1b" | "270m"));
+    let variant_suffix =
+        |tail: &str| tail.is_empty() || tail.starts_with(['-', ':', '.', '_', '@']);
+    let starts_variant = |prefix: &str| name.strip_prefix(prefix).is_some_and(variant_suffix);
+    if starts_variant("o3-mini")
+        || starts_variant("o1-mini")
+        || starts_variant("o1-preview")
+        || [
+            "claude-instant",
+            "claude-1",
+            "claude-v1",
+            "claude-2",
+            "claude-v2",
+        ]
+        .iter()
+        .any(|old| name.split(*old).skip(1).any(variant_suffix))
+        || small_gemma3
+    {
+        return false;
+    }
+    if name == "o1" || name.starts_with("o1-") {
+        return true;
+    }
     [
         "gpt-4o",
         "gpt-4.1",
@@ -4542,6 +4574,10 @@ pub fn is_vision_model(model: &str) -> bool {
     .iter()
     .any(|k| m.contains(k))
 }
+
+#[cfg(test)]
+#[path = "provider_vision_tests.rs"]
+mod vision_model_tests;
 
 /// What a model can do and costs, per id (SPEC §4.2): from the
 /// listing's own fields (OpenRouter: `pricing`, `context_length`,

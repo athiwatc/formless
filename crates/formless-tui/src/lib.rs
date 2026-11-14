@@ -22968,6 +22968,69 @@ mod tests {
     }
 
     #[test]
+    fn image_attachment_warning_uses_known_text_only_model_exceptions() {
+        let env = credential_env::EnvGuard::isolated();
+        env.remove("FORMLESS_MODEL");
+        let mut app = test_app();
+        app.current = None;
+        for (model, warns) in [
+            ("o1", false),
+            ("o3-mini", true),
+            ("gemma3:1b", true),
+            ("google/gemma-3-4b-it", false),
+            ("claude-2", true),
+            ("claude-3-haiku", false),
+        ] {
+            let mut cfg = Config::default();
+            cfg.provider.model = model.into();
+            cfg.provider.vision = None;
+            cfg.save(&app.paths).unwrap();
+            let loaded = Config::load(&app.paths).unwrap();
+            assert_eq!(loaded.provider.model, model, "loaded fixture model");
+            assert_eq!(
+                loaded.provider.vision, cfg.provider.vision,
+                "loaded fixture override"
+            );
+            app.notes.clear();
+            app.attachments.clear();
+            app.add_attachment("fixture.png".into(), vec![1]);
+            assert_eq!(
+                formless_core::provider::is_vision_model(model),
+                !warns,
+                "linked core helper for {model}"
+            );
+            assert_eq!(app.attachments.len(), 1);
+            assert_eq!(
+                app.notes
+                    .iter()
+                    .any(|note| note.contains("may not read images")),
+                warns,
+                "{model}"
+            );
+        }
+        for (model, vision) in [("o3-mini", true), ("o1", false)] {
+            let mut cfg = Config::default();
+            cfg.provider.model = model.into();
+            cfg.provider.vision = Some(vision);
+            cfg.save(&app.paths).unwrap();
+            let loaded = Config::load(&app.paths).unwrap();
+            assert_eq!(loaded.provider.model, model, "loaded fixture model");
+            assert_eq!(
+                loaded.provider.vision, cfg.provider.vision,
+                "loaded fixture override"
+            );
+            app.notes.clear();
+            app.add_attachment("fixture.png".into(), vec![1]);
+            assert_eq!(
+                app.notes
+                    .iter()
+                    .any(|note| note.contains("may not read images")),
+                !vision
+            );
+        }
+    }
+
+    #[test]
     fn dropped_files_become_removable_attachment_chips() {
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
         let mut app = test_app();

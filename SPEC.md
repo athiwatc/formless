@@ -1144,6 +1144,13 @@ pasting paths.
   web the first Send turns it into a chip and stops), reaches only the
   working folder (or `~/…` when written so), and never a credential
   (`.ssh`, `.aws`, `.env`, private keys, …), whoever wrote it.
+- **Image capability guess.** With `provider.vision` unset, image-part
+  preparation and the TUI attachment warning share the model-name heuristic.
+  Full o1/o1-pro are included; o1-mini/preview, o3-mini, Gemma 3 270M/1B
+  (including Ollama size tags), and Claude 1/2/Instant names are text-only
+  exceptions before broad family matches. Explicit true/false overrides remain
+  available for custom endpoints or renamed models. Prompt-tool image policy
+  is unchanged; a name guess does not prove endpoint availability or support.
 - **Provider file authority.** Stored or imported attachment metadata is not
   permission to read a host path. Native image projection requires an artifact
   ID and path/size matching this profile's artifact registry, a regular file
@@ -3043,7 +3050,14 @@ it says.
   are perfect.
 - **Measurement failures.** A model call in the eval is retried once
   only when the error is transient (429, 408, 5xx, a dropped or timed-out
-  connection); an auth error or bad request fails at once. A proposal
+  connection); an auth error or bad request fails at once. With no HTTP status,
+  an extra measurement retry or temporary-failure explanation requires a known
+  transport diagnostic at the start of an error clause (e.g. request timed out,
+  connection reset/refused, stream dropped or explicit server overload).
+  Generic words such as stream, connection, timeout or reset inside model,
+  schema, authentication or parameter errors do not establish transience;
+  unknown prose gets no extra retry. Explicit probe/deadline metadata retains
+  its existing meaning. A proposal
   whose measurement fails is kept as `rejected` (never applied, listed as
   such) and the error is audit-logged as `proposal.discard_unmeasured`.
 
