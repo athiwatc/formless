@@ -207,9 +207,9 @@ fn cell_text(text: &str) -> String {
     visible
 }
 
-/// Colour is allowed unless `NO_COLOR` is set to anything (no-color.org).
+/// Colour is allowed unless `NO_COLOR` is nonempty (no-color.org).
 pub fn color_allowed() -> bool {
-    std::env::var_os("NO_COLOR").is_none()
+    std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty())
 }
 
 /// `text` cut to `w` columns with an ellipsis.
