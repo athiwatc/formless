@@ -699,6 +699,7 @@
     const conn = $("conn");
     conn.title = "";
     conn.onclick = null;
+    const localConnected = S.local && S.ws?.readyState === 1 && S.daemonOnline;
     if (S.reconnect) {
       // Visible backoff with a manual retry (SPEC §12).
       const secs = Math.max(0, Math.ceil((S.reconnect.at - Date.now()) / 1000));
@@ -706,12 +707,12 @@
       conn.textContent = (S.local ? "daemon" : "relay") + " offline · retry in " + secs + "s";
       conn.title = "Retry now";
       conn.onclick = retryNow;
-    } else if (!navigator.onLine) {
+    } else if (!navigator.onLine && !localConnected) {
       conn.className = "pill off";
       conn.textContent = "offline · daemon unreachable";
     } else if (!S.ws || S.ws.readyState !== 1) {
       conn.className = "pill off";
-      conn.textContent = S.ws && S.ws.readyState === 0 ? "connecting…" : "relay disconnected";
+      conn.textContent = S.ws && S.ws.readyState === 0 ? "connecting…" : (S.local ? "daemon disconnected" : "relay disconnected");
     } else if (!S.daemonOnline) {
       conn.className = "pill off";
       conn.textContent = "daemon offline";
@@ -721,7 +722,7 @@
       conn.textContent = S.handshakeFailed ? "couldn't secure the connection" : "securing the connection…";
     } else {
       conn.className = "pill on";
-      conn.textContent = "● connected";
+      conn.textContent = "● connected" + (!navigator.onLine ? " · browser offline" : "");
     }
   }
 
