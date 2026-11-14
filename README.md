@@ -1059,6 +1059,24 @@ formless memory rm m1a2b3c4
 * **Artifacts** — large Tool output is written to an artifact file; only a bounded preview enters model context.
 * **Tracked path changes** — `/files` lists paths captured by live host filesystem operations, including directories created with `fs.mkdir`. `/rewind` attempts safe restoration and reports skipped paths with reasons. Programs launched by Tools and MCP tools can write outside this tracking; when those capabilities are invoked, file notes and recaps warn that untracked writes are possible, including when no paths were captured. Counts describe tracked paths only. Paths whose recovery images expired remain listed with the reason; rewind never substitutes an older Run silently. Windows restoration also requires retained original objects and live object or directory proofs where applicable. Lost or expired proofs, including process-local proofs lost on restart, leave those paths read-only rather than reconstructing authority from stored hashes.
 
+### Context and compaction
+
+Use `/context` to inspect the Session's context window and what fills it.
+Formless automatically compacts as a Run approaches its model's context limit.
+When the Session is idle, `/compact` requests a summary now; add a focus, for
+example `/compact Keep repository constraints and unresolved decisions`, to
+say what the summary should emphasize. A summary can omit detail; compaction
+is not lossless.
+
+On-demand compaction is refused while a Run is active or when nothing is new
+since the last checkpoint. The ordinary daemon-side summarizer rejects an
+empty or output-limit-cut summary before saving a checkpoint, retaining the
+turns. Read any failure note before trying again. Provider-side compaction is
+an opt-in endpoint-specific path, not a capability every provider supplies.
+See [the generated command reference](docs/keys.md#session),
+[SPEC §11](SPEC.md#11-compaction), and the
+[context troubleshooting guidance](docs/troubleshooting.md#context-pressure-or-failed-compaction).
+
 ### Run controls
 
 Set a profile default with `limits.run_steps`, use `/limit N` or `/limit off`

@@ -114,6 +114,15 @@ headless with `formless run "…"`.
     agent keeps a checklist pinned above the input (`update_plan`) and a
     "What I did" recap when it finishes.
 
+## Long conversations
+
+16. **Make room for the next task.** Inspect `/context`, then, when the Run
+    has ended, use `/compact Keep repository constraints and unresolved decisions`
+    to request a focused summary. `/compact` without a focus is also supported.
+    Summaries can omit details; review the result and failure notes. See the
+    [context guide](../README.md#context-and-compaction) and
+    [command reference](keys.md#session).
+
 ## Seeing what it built
 
 - `Tab` to the **Tools** view: every Tool, its code, versions, success rate
