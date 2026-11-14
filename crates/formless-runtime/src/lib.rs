@@ -7,6 +7,8 @@ mod clipboard_diagnostics;
 mod dns;
 mod process_executable;
 mod processes;
+mod read_size;
+use read_size::ReadSize;
 pub mod sensitive_paths;
 pub mod structured_output;
 pub mod sync;
@@ -198,18 +200,18 @@ pub fn set_io_limits(read: u64, process_output: u64, log: u64) {
     MAX_LOG_BYTES.store(log.max(1), Ordering::Relaxed);
 }
 
-/// "fs.read: 80 MB is over the 64 MB resource limit (tools.max_read_bytes); use fs.readChunks".
-fn over_limit(what: &str, size: u64, setting: &str, instead: &str) -> String {
-    let mb = |b: u64| format!("{:.1} MB", b as f64 / 1_048_576.0);
-    format!(
-        "{what}: {} is over the {} resource limit ({setting}); {instead}",
-        mb(size),
-        mb(MAX_READ_BYTES.load(Ordering::Relaxed))
+/// Whole-read errors retain byte-exact observations and their source.
+fn over_limit(what: &str, size: ReadSize, setting: &str, instead: &str) -> String {
+    size.over_limit(
+        what,
+        MAX_READ_BYTES.load(Ordering::Relaxed),
+        setting,
+        instead,
     )
 }
 
-fn check_read_size(len: u64) -> Result<(), String> {
-    if len > MAX_READ_BYTES.load(Ordering::Relaxed) {
+fn check_read_size(len: ReadSize) -> Result<(), String> {
+    if len.bytes() > MAX_READ_BYTES.load(Ordering::Relaxed) {
         return Err(over_limit(
             "fs.read",
             len,
@@ -228,14 +230,14 @@ fn read_capped(p: &std::path::Path) -> Result<Vec<u8>, String> {
     let cap = MAX_READ_BYTES.load(Ordering::Relaxed);
     // Fast early error for files that already say they're too big.
     if let Ok(m) = std::fs::metadata(p) {
-        check_read_size(m.len())?;
+        check_read_size(ReadSize::Reported(m.len()))?;
     }
     let f = std::fs::File::open(p).map_err(|e| format!("{}: {e}", p.display()))?;
     let mut out = Vec::new();
     f.take(cap + 1)
         .read_to_end(&mut out)
         .map_err(|e| format!("{}: {e}", p.display()))?;
-    check_read_size(out.len() as u64)?;
+    check_read_size(ReadSize::AtLeast(out.len() as u64))?;
     Ok(out)
 }
 
@@ -1534,7 +1536,7 @@ impl State {
                 let p = self.resolve(a["path"].as_str().unwrap_or_default(), false)?;
                 match self.overlay_get(&p) {
                     Some(Some(bytes)) => {
-                        check_read_size(bytes.len() as u64)?;
+                        check_read_size(ReadSize::Exact(bytes.len() as u64))?;
                         return Ok(encode(&bytes, enc));
                     }
                     Some(None) => return Err(format!("not found: {}", p.display())),
@@ -1568,7 +1570,7 @@ impl State {
                         Vec::new()
                     };
                     full.extend_from_slice(&data);
-                    check_read_size(full.len() as u64)?;
+                    check_read_size(ReadSize::Exact(full.len() as u64))?;
                     if self.mode == HostMode::DryRun {
                         self.would(format!(
                             "{} {} bytes to {}",
@@ -2063,7 +2065,7 @@ impl State {
             if let Some(len) = resp.content_length().filter(|l| *l > cap) {
                 return Err(over_limit(
                     "fetch",
-                    len,
+                    ReadSize::Reported(len),
                     "tools.max_read_bytes",
                     "stream it with fetchChunks",
                 ));
@@ -2076,7 +2078,7 @@ impl State {
             if bytes.len() as u64 > cap {
                 return Err(over_limit(
                     "fetch",
-                    bytes.len() as u64,
+                    ReadSize::AtLeast(bytes.len() as u64),
                     "tools.max_read_bytes",
                     "stream it with fetchChunks",
                 ));
@@ -3397,6 +3399,28 @@ pub fn execute_anyhow(req: &ExecRequest, ops: Arc<dyn HostOps>) -> Result<ExecOu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn whole_read_limit_errors_distinguish_exact_byte_counts() {
+        let cap = MAX_READ_BYTES.load(Ordering::Relaxed);
+        let error = over_limit(
+            "fs.read",
+            ReadSize::AtLeast(cap + 1),
+            "tools.max_read_bytes",
+            "use fs.readChunks or fs.readLines",
+        );
+        assert!(error.contains(&(cap + 1).to_string()), "{error}");
+        assert!(error.contains(&cap.to_string()), "{error}");
+        assert!(
+            error.contains("at least"),
+            "bounded probes are not a total size: {error}"
+        );
+        assert!(
+            error.contains("tools.max_read_bytes")
+                && error.contains("fs.readChunks")
+                && error.contains("fs.readLines")
+        );
+    }
 
     #[test]
     fn structured_incomplete_reasons_keep_runtime_error_classification() {
