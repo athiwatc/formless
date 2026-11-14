@@ -18899,3 +18899,7 @@ mod summary_search_handler_tests;
 #[cfg(test)]
 #[path = "model_text_failure_tests.rs"]
 mod model_text_failure_tests;
+
+#[cfg(test)]
+#[path = "daemon_provider_url_tests.rs"]
+mod provider_url_tests;

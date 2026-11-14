@@ -1113,6 +1113,25 @@ mod tests {
     }
 
     #[test]
+    fn provider_form_accepts_mixed_case_http_schemes_without_changing_the_path() {
+        let mut form = Form::provider(None);
+        form.fields[0].input.set("fixture");
+        form.fields[1]
+            .input
+            .set("HTTPS://Case.Example/V1/Keep%2FCase/");
+        let Request::UpsertProvider {
+            base_url, api_key, ..
+        } = form.request().unwrap()
+        else {
+            panic!("provider request");
+        };
+        assert_eq!(base_url, "https://Case.Example/V1/Keep%2FCase");
+        assert!(api_key.is_none());
+        form.fields[1].input.set("FTP://Case.Example/V1");
+        assert!(form.request().is_err());
+    }
+
+    #[test]
     fn forms_validate_and_build_requests() {
         let mut f = Form::provider(None);
         assert!(f.request().unwrap_err().starts_with("name"));
