@@ -300,6 +300,7 @@ fn hunk_review_wrong_owner_hidden_modal_and_reconnect_cannot_mutate() {
 fn hunk_tool_editor(app: &mut App) {
     app.editor_generation = 7;
     app.editor = Some(EditorState {
+        viewport: Default::default(),
         draft: None,
         original: None,
         confirm_exit: false,

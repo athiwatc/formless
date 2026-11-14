@@ -744,6 +744,7 @@ mod tests {
     }
     fn editor(text: &str, mode: EditMode) -> EditorState {
         EditorState {
+            viewport: Default::default(),
             draft: None,
             original: None,
             confirm_exit: false,
