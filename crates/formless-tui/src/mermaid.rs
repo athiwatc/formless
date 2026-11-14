@@ -1625,7 +1625,18 @@ fn pie(src: &str, color: bool, width: usize) -> Option<Vec<Line<'static>>> {
         .max()
         .unwrap_or(0)
         .min(28);
-    let bar_w = width.saturating_sub(label_w + 12).clamp(4, 40);
+    // Reserve the label, separating space and widest formatted percentage
+    // before allocating bar cells. Refuse a width that cannot show a readable
+    // four-cell bar; the caller can use its wider preview/pager fallback.
+    let percentages: Vec<_> = slices
+        .iter()
+        .map(|(_, value)| format!(" {:.1}%", value / total * 100.0))
+        .collect();
+    let percent_w = percentages.iter().map(|value| value.width()).max()?;
+    let bar_w = width.checked_sub(label_w + 1 + percent_w)?.min(40);
+    if bar_w < 4 {
+        return None;
+    }
     let max = slices.iter().map(|s| s.1).fold(0.0, f64::max);
     const PALETTE: [Color; 6] = [
         Color::Cyan,
@@ -1637,16 +1648,20 @@ fn pie(src: &str, color: bool, width: usize) -> Option<Vec<Line<'static>>> {
     ];
     let mut lines = Vec::new();
     for (i, (label, v)) in slices.iter().enumerate() {
-        let cells = ((v / max) * bar_w as f64).round() as usize;
+        let cells = if *v == 0.0 {
+            0
+        } else {
+            (((v / max) * bar_w as f64).round() as usize).max(1)
+        };
         let shown = super::ui::pad(label, label_w);
         lines.push(Line::from(vec![
             Span::raw(format!("{shown} ")),
-            Span::styled(
-                "█".repeat(cells.max(1)),
-                fg(color, PALETTE[i % PALETTE.len()]),
-            ),
-            Span::styled(format!(" {:.1}%", v / total * 100.0), super::ui::dim(color)),
+            Span::styled("█".repeat(cells), fg(color, PALETTE[i % PALETTE.len()])),
+            Span::styled(percentages[i].clone(), super::ui::dim(color)),
         ]));
+    }
+    if lines.iter().any(|line| line.width() > width) {
+        return None;
     }
     Some(lines)
 }
@@ -1752,6 +1767,46 @@ mod tests {
             "{out:?}"
         );
         assert!(out[2].contains("25.0%"));
+    }
+
+    #[test]
+    fn pie_zero_and_clamped_negative_slices_have_no_positive_bar() {
+        let source = "pie\n\"Zero\":0\n\"Negative\":-1\n\"Tiny\":0.000001\n\"Positive\":1";
+        for color in [false, true] {
+            let diagram = render(source, color, 60).unwrap();
+            for row in &diagram.lines[..2] {
+                let text: String = row.spans.iter().map(|span| span.content.as_ref()).collect();
+                assert!(text.ends_with("0.0%"), "{text}");
+                assert!(!text.contains('█'), "{text}");
+            }
+            assert_eq!(diagram.lines[2].spans[1].content, "█");
+            assert!(diagram.lines[3].spans[1].content.chars().count() > 1);
+            assert!(render("pie\n\"A\":0\n\"B\":-1", color, 60).is_none());
+        }
+    }
+
+    #[test]
+    fn pie_lines_and_titles_fit_requested_display_width_or_refuse() {
+        for source in [
+            "pie\n\"abcdefghijklmnopqrstuvwxyzab\":1".to_string(),
+            format!("pie title {}\n\"A\":1", "Long title ".repeat(8)),
+            format!("pie\n\"{}\":1\n\"ไทย👩🏽‍💻\":2", "表".repeat(30)),
+            "pie\n\"\":1".to_string(),
+        ] {
+            for color in [false, true] {
+                for width in 0..=120 {
+                    if let Some(diagram) = render(&source, color, width) {
+                        assert!(
+                            diagram.lines.iter().all(|line| line.width() <= width),
+                            "width {width}: {source}"
+                        );
+                    }
+                }
+                assert!(render(&source, color, 200).is_some());
+            }
+        }
+        assert!(render("pie\n\"abcdefghijklmnopqrstuvwxyzab\":1", false, 30).is_none());
+        assert!(render("pie\n\"A\":1", false, 3).is_none());
     }
 
     /// `;` inside a label or after a message's `:` is text (#878).
