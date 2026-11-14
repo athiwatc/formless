@@ -1,11 +1,9 @@
 name: docs
 
 on:
-  pull_request:
-    paths: ['README.md', 'SPEC.md', 'GLOSSARY.md', 'docs/adr/**', '.github/workflows/docs.yml']
   push:
     branches: [main]
-    paths: ['README.md', 'SPEC.md', 'GLOSSARY.md', 'docs/adr/**', '.github/workflows/docs.yml']
+    paths: ['README.md', 'SPEC.md', 'GLOSSARY.md', 'CHANGELOG.md', 'docs/**/*.md', '.github/workflows/docs.yml', 'scripts/check-doc-links.py', 'scripts/test-doc-links.py']
   schedule:
     - cron: '17 8 * * 1'
   workflow_dispatch:
@@ -13,16 +11,45 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: true
+
+# Only reviewed main content runs on a persistent runner; no PR checkout.
 jobs:
   links:
-    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, macOS, ARM64]
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - name: Check documentation links and anchors
-        uses: lycheeverse/lychee-action@v2
         with:
-          args: --include-fragments --accept 200,206,429 --max-retries 2 --timeout 20 README.md SPEC.md GLOSSARY.md 'docs/adr/**/*.md'
-          fail: true
+          persist-credentials: false
+      - name: Check documentation links and anchors (native Apple Silicon)
+        shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORMLESS_LINK_GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(uname -s)" = Darwin
+          test "$(uname -m)" = arm64
+          # lychee-action v2 downloads Linux binaries, so use the official native
+          # release directly. Pin both version and SHA-256; install only in temp.
+          tool_dir=$(mktemp -d "$RUNNER_TEMP/formless-lychee.XXXXXX")
+          trap 'rm -rf -- "$tool_dir"' EXIT
+          archive="$tool_dir/lychee.tar.gz"
+          curl --fail --location --retry 2 --connect-timeout 20 --max-time 120 \
+            --output "$archive" \
+            https://github.com/lycheeverse/lychee/releases/download/lychee-v0.24.2/lychee-aarch64-apple-darwin.tar.gz
+          printf '%s  %s\n' c9d3740ea2d891854d37116c9fba840f37b6e7c89d330e7db84ac333631c4977 "$archive" | shasum -a 256 -c -
+          tar -xzf "$archive" -C "$tool_dir"
+          binaries=()
+          while IFS= read -r candidate; do
+            binaries+=("$candidate")
+          done < <(find "$tool_dir" -type f -name lychee)
+          test "${#binaries[@]}" -eq 1
+          binary="${binaries[0]}"
+          test -x "$binary"
+          env -u FORMLESS_LINK_GITHUB_TOKEN "$binary" --version
+          python3 scripts/test-doc-links.py
+          python3 scripts/check-doc-links.py "$binary" README.md SPEC.md GLOSSARY.md CHANGELOG.md 'docs/**/*.md'

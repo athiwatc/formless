@@ -1,5 +1,7 @@
 //! Shipped file commands against an owned, provider-free fake daemon.
 #![cfg(unix)]
+#[path = "support/unix_fixture_io.rs"]
+mod unix_fixture_io;
 use formless_core::Paths;
 use formless_protocol::{Request, RequestEnvelope};
 use serde_json::{json, Value};
@@ -13,6 +15,12 @@ use std::{
     },
     time::{Duration, Instant},
 };
+use unix_fixture_io::FixtureStream;
+
+fn run_report() -> Value {
+    let rows=[1,10,100,1000].into_iter().enumerate().map(|(i,n)|json!({"run_id":format!("full-run-日本語-{i}"),"created_at":"2026-11-01T12:34:56Z","outcome":if i==1 {"longer-than-eleven-outcome"} else {"completed"},"steps":n,"tool_calls":n,"prompt_tokens":10,"completion_tokens":5,"duration_ms":1200})).collect::<Vec<_>>();
+    json!({"summary":{"runs":4,"completed":0.5,"interrupted":0.25,"paused":0.25,"edited":0.0,"corrected":0.0,"avg_steps":4.0,"avg_tool_calls":2.0,"avg_tokens":100.0,"avg_duration_ms":1200.0},"runs":rows,"future":{"preserved":true}})
+}
 
 struct Fixture {
     root: std::path::PathBuf,
@@ -47,7 +55,7 @@ impl Fixture {
         let seen = requests.clone();
         let thread = std::thread::spawn(move || {
             while !stopped.load(Ordering::SeqCst) {
-                let (mut socket, _) = match listener.accept() {
+                let (socket, _) = match listener.accept() {
                     Ok(pair) => pair,
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         std::thread::sleep(Duration::from_millis(2));
@@ -55,9 +63,13 @@ impl Fixture {
                     }
                     Err(e) => panic!("{e}"),
                 };
-                socket
-                    .set_read_timeout(Some(Duration::from_secs(2)))
-                    .unwrap();
+                let mut socket = FixtureStream::new(
+                    socket,
+                    stopped.clone(),
+                    Instant::now() + Duration::from_secs(15),
+                    Duration::from_secs(2),
+                )
+                .unwrap();
                 let mut reader = BufReader::new(socket.try_clone().unwrap());
                 let mut line = String::new();
                 while reader.read_line(&mut line).unwrap_or(0) > 0 {
@@ -76,6 +88,16 @@ impl Fixture {
                         }
                         Request::GetSubagent { id } => {
                             json!({"subagent":{"id":id,"session_id":"abc-one","run_id":"run-one","task":"Task 日本語","depth":1,"model":"role · model","status":"running","steps":2,"result":null,"created_at":"first","updated_at":"last"},"messages":[{"provider-special":{"part":["🦀",3]},"role":"assistant"},{"unknown":"ไทย"}],"future":7})
+                        }
+                        Request::RunMetrics {
+                            limit,
+                            session_id,
+                            since,
+                        } => {
+                            assert_eq!(*limit, Some(4));
+                            assert!(session_id.is_none());
+                            assert!(since.is_none());
+                            run_report()
                         }
                         Request::RunFiles { session_id, run_id } => {
                             assert_eq!(session_id, "abc-one");
@@ -307,4 +329,55 @@ fn shipped_subagent_reports_preserve_session_resolution_exact_ids_and_provider_j
             .count(),
         2
     );
+}
+
+#[test]
+fn shipped_run_list_retains_report_json_summary_order_and_numeric_units() {
+    let fixture = Fixture::new();
+    let output = fixture.run(&["runs", "--limit", "4", "--json"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+        run_report()
+    );
+    let output = fixture.run(&["runs", "--limit", "4"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    let summary: formless_protocol::RunSummary =
+        serde_json::from_value(run_report()["summary"].clone()).unwrap();
+    assert_eq!(
+        text.lines().next(),
+        Some(formless_core::runs::summary_line(&summary).as_str())
+    );
+    assert!(text.contains("STEPS"));
+    assert!(text.contains("TOOLS"));
+    assert!(text.contains("TOKENS"));
+    assert!(text.contains("DURATION"));
+    assert!(text.contains("1000"));
+    assert!(text.contains("1.2s"));
+    assert!(text.contains("longer-than-eleven-outcome"));
+    let mut previous = 0;
+    for i in 0..4 {
+        let at = text.find(&format!("full-run-日本語-{i}")).unwrap();
+        assert!(at > previous);
+        previous = at;
+    }
+    assert!(!text.contains("ok completed"));
+    assert!(!text.contains("fail completed"));
+    assert!(fixture.requests.lock().unwrap().iter().all(|req| matches!(
+        req,
+        Request::RunMetrics {
+            limit: Some(4),
+            session_id: None,
+            since: None
+        }
+    )));
 }

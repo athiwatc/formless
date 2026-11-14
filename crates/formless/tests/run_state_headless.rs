@@ -1,6 +1,8 @@
 //! Shipped headless output contracts with interleaved plan/recap/progress IPC.
 //! A private fake daemon owns the only socket; no provider or service is used.
 #![cfg(unix)]
+#[path = "support/unix_fixture_io.rs"]
+mod unix_fixture_io;
 use formless_core::{Config, Paths, Store};
 use formless_protocol::{Event, Request, RequestEnvelope, ServerMessage};
 use serde_json::{json, Value};
@@ -9,11 +11,12 @@ use std::{
     os::unix::net::{UnixListener, UnixStream},
     process::{Command, Output, Stdio},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
     time::{Duration, Instant},
 };
+use unix_fixture_io::FixtureStream;
 struct Fixture {
     root: std::path::PathBuf,
     paths: Paths,
@@ -30,15 +33,17 @@ impl Fixture {
         Self::with_history(paused, false)
     }
     fn with_history(paused: bool, obsolete: bool) -> Self {
+        static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
         let root = std::path::PathBuf::from("/tmp").join(format!(
-            "fl-ho-{}-{}",
+            "fl-ho-{}-{}-{}",
             std::process::id(),
+            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
         ));
-        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir(&root).unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
         let paths = Paths::from_dirs(root.join("d"), root.join("c")).unwrap();
@@ -196,23 +201,19 @@ impl Drop for Fixture {
         let _ = std::fs::remove_dir_all(&self.root);
     }
 }
-fn frame(stream: &mut UnixStream, message: ServerMessage) {
+fn frame(stream: &mut FixtureStream, message: ServerMessage) {
     writeln!(stream, "{}", serde_json::to_string(&message).unwrap()).unwrap();
 }
 fn serve_peer(
-    mut stream: UnixStream,
+    stream: UnixStream,
     stop: Arc<AtomicBool>,
     session: formless_protocol::SessionInfo,
     events: Vec<Event>,
     obsolete: bool,
 ) {
-    stream
-        .set_read_timeout(Some(Duration::from_millis(50)))
-        .unwrap();
-    stream
-        .set_write_timeout(Some(Duration::from_secs(2)))
-        .unwrap();
     let deadline = Instant::now() + Duration::from_secs(15);
+    let mut stream =
+        FixtureStream::new(stream, stop.clone(), deadline, Duration::from_millis(50)).unwrap();
     let mut pending = Vec::new();
     let mut chunk = [0u8; 4096];
     while !stop.load(Ordering::SeqCst) && Instant::now() < deadline {
@@ -323,10 +324,13 @@ fn interleaved_run_metadata_preserves_every_headless_stdout_mode() {
                     ),
                     "json" => {
                         let value: Value = serde_json::from_slice(&bytes).unwrap();
-                        assert_eq!(value["answer"], "ONLY_FINAL_ANSWER_761");
-                        assert_eq!(value["status"], "completed");
-                        assert_eq!(value["session_id"], fixture.session.id);
-                        assert_eq!(value.as_object().unwrap().len(), 4);
+                        assert_eq!(
+                            value,
+                            json!({
+                                "answer": "ONLY_FINAL_ANSWER_761", "status": "completed",
+                                "session_id": fixture.session.id, "result": null, "error": null,
+                            })
+                        );
                     }
                     "jsonl-events" => {
                         let actual: Vec<Value> = String::from_utf8(bytes)
