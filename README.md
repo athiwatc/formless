@@ -174,7 +174,7 @@ Illustrative, not scripted: the Tools an agent builds are whatever the task need
                                     └─────────────────┘   └────────────────┘
 ```
 
-* **One binary:** `formless`. The daemon is not a separate executable — it is `formless daemon` running in daemon mode, spawned automatically by clients. No system service on any OS.
+* **One binary:** `formless`. The daemon is not a separate executable — it is `formless daemon` running in daemon mode, spawned automatically by clients. Ordinary startup needs no separately installed service; [optional per-user autostart](#36-daemon-diagnostics-and-reset) is supported.
 * **One Daemon Core per data dir**, enforced by a lock file. `--profile <name>` runs an additional isolated daemon with its own data and config dirs.
 * **Transport:** a Unix domain socket in the data dir (dir mode `0700`) on macOS/Linux, a named pipe with an owner-only ACL on Windows. No localhost-TCP fallback in v1.
 * **Clients are stateless.** The daemon persists everything; killing the TUI never kills a Run.
@@ -531,7 +531,47 @@ formless tools run fetch_page --input '{"url":"https://example.com"}' --yes
 formless reset --force    # destructive: config, key, whole data dir
 ```
 
-There is one daemon per profile, reachable over a unix socket (`<data dir>/daemon.sock`) or a named pipe on Windows. It exits on its own after `daemon.idle_grace_secs` (default 60 s) with no clients and no pending Invocations, and the next client starts it again — so there is nothing to supervise.
+There is one daemon per profile, reachable over a unix socket (`<data dir>/daemon.sock`) or a named pipe on Windows. By default it exits after `daemon.idle_grace_secs` (60 s) with no clients and no pending Invocations; the next client starts it again when needed.
+
+#### Optional per-user autostart
+
+Preview the login entry and manager commands without installing them:
+
+```sh
+formless daemon install-service --dry-run
+```
+
+Install only when you want per-user startup at login:
+
+```sh
+formless daemon install-service
+```
+
+For a named profile, preview and install with the same profile name:
+
+```sh
+formless --profile work daemon install-service --dry-run
+```
+
+```sh
+formless --profile work daemon install-service
+```
+
+Remove that profile's login entry with:
+
+```sh
+formless --profile work daemon uninstall-service
+```
+
+For the default profile, use `formless daemon uninstall-service`. These are
+per-user login entries (launchd agent, systemd user unit or Windows logon task).
+`formless doctor` reports installed-state diagnostics; an installed entry alone
+does not establish service health. See [SPEC §9.1](SPEC.md#91-lifecycle).
+
+The entry uses `daemon serve --stay`, which prevents idle exit while the daemon
+is running. It does not guarantee scheduled delivery through logout, sleep,
+shutdown, network failure or reboot without login. Linux session/logout
+lifecycle guidance is tracked separately in [#1406](https://github.com/athiwatc/formless/issues/1406).
 
 ### 3.7 Browser access via the relay (v2)
 
@@ -1162,7 +1202,7 @@ Release work is documented separately in [`packaging/README.md`](packaging/READM
 ## 13. Non-goals
 
 * Hosted or multi-user mode, accounts, sharing servers.
-* System services, localhost-TCP transport, cloud sync or telemetry.
+* System-wide services, localhost-TCP transport, cloud sync or telemetry. Optional per-user login autostart is supported ([§3.6](#36-daemon-diagnostics-and-reset)).
 * Publishing signed/notarised binaries and submitting the Homebrew/winget packages (the workflow, installer and templates are in [`packaging/`](packaging/README.md); signing needs maintainer certificates).
 
 v2 shipped what v1 left out: the encrypted Relay and Web frontend ([§3.7](#37-browser-access-via-the-relay-v2), [`relay/`](relay/README.md)), the Responses API, prompt-based tool calling, failover and measured routing, OAuth providers ([§3.8](#38-provider-options-v2)), shared modules, sub-agents, prompt/memory self-optimisation, the Tool editor and the multi-pane TUI.
