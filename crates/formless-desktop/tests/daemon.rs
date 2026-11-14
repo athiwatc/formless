@@ -16,6 +16,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+#[path = "support/stream_ordering.rs"]
+mod stream_ordering;
+
 #[cfg(unix)]
 type LocalStream = tokio::net::UnixStream;
 #[cfg(windows)]
