@@ -7362,12 +7362,15 @@
   /** The current Session's pending attachments, each removable (×). */
   function renderChips() {
     const box = $("attach-chips");
+    const previous = [...box.querySelectorAll("button[data-attachment-key]")];
+    const focusIndex = previous.indexOf(document.activeElement);
+    const focusKey = focusIndex >= 0 ? previous[focusIndex].dataset.attachmentKey : null;
     const list = S.chips[S.current] || [];
     box.classList.toggle("hidden", !list.length);
     box.replaceChildren(...list.map((a) => h("span", { class: "tag attach-chip", title: (a.mime || "file") + " · " + Math.max(1, Math.round(a.bytes / 1024)) + " KB" },
       h("span", { class: "attach-icon" }, (a.mime || "").startsWith("image/") ? "🖼" : "📄"),
       h("span", { class: "attach-name" }, a.name),
-      h("button", { class: "btn ghost small", type: "button", "aria-label": "Remove " + a.name, onclick: async () => {
+      h("button", { class: "btn ghost small", type: "button", "data-attachment-key": a.id || a.path || a.name || "", "aria-label": "Remove " + a.name, onclick: async () => {
         const sid = S.current;
         // A referenced file (too big to attach) is named by its path.
         if (await act({ type: "detach_file", session_id: sid, id: a.id || a.path })) {
@@ -7376,6 +7379,13 @@
           renderChips();
         }
       } }, "×"))));
+    if (focusIndex >= 0) {
+      const next = [...box.querySelectorAll("button[data-attachment-key]")];
+      // Keep a deliberately focused remaining chip. Otherwise use the next
+      // chip, then the previous one, then the composer after the final removal.
+      (next.find(button => button.dataset.attachmentKey === focusKey)
+        || next[Math.min(focusIndex, next.length - 1)] || $("input")).focus({ preventScroll: true });
+    }
   }
   // Drop files anywhere on the chat to attach them.
   {
