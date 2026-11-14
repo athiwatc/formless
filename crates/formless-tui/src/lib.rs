@@ -18798,7 +18798,7 @@ pub fn run(paths: Paths) -> Result<()> {
 /// [`run`], opening `start` ("last", "new" or "picker") instead of
 /// `tui.on_start` (SPEC §10.1): `formless --continue` / `--new`.
 pub fn run_with(paths: Paths, start: Option<&str>) -> Result<()> {
-    // Screen readers get the line-oriented mode (SPEC §10.7).
+    // Screen readers get the line-oriented mode (SPEC §10.5).
     if Config::load(&paths).is_ok_and(|c| c.tui.screen_reader) {
         return plain::run(paths);
     }
