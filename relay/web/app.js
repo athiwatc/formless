@@ -105,6 +105,7 @@
     modules: [],
     selectedTool: null,
     toolDetail: null,
+    toolDetailError: null, // id of the selected Tool whose detail fetch failed
     editingCode: null, // { toolId, code }
     metricTool: null,
     modelStats: [],
@@ -4117,7 +4118,7 @@
     box.replaceChildren();
     const d = S.toolDetail;
     if (!d || d.tool.id !== S.selectedTool) {
-      box.append(h("p", { class: "placeholder" }, S.selectedTool ? "Loading Tool details…" : S.tools.length ? "Select a Tool for its versions, metrics, optimiser history, and code." : "Tools appear here once the agent creates them."));
+      box.append(toolDetailFailure(S.selectedTool) || h("p", { class: "placeholder" }, S.selectedTool ? "Loading Tool details…" : S.tools.length ? "Select a Tool for its versions, metrics, optimiser history, and code." : "Tools appear here once the agent creates them."));
     } else {
       renderToolDetail(box, d);
     }
@@ -4588,6 +4589,9 @@
     const d = S.toolDetail;
     if (d && d.tool.id === S.metricTool) {
       box.append(h("div", { class: "detail" }, h("h3", null, d.tool.name), metricsBlock(d.metrics)));
+    } else {
+      const failure = toolDetailFailure(S.metricTool);
+      if (failure) box.append(failure);
     }
     const rt = $("routing-table");
     rt.replaceChildren(h("thead", null, h("tr", null, ["Model", "Calls", "Success", "Avg latency", "Prompt tokens", "Cached"].map((c, i) => h("th", { class: i ? "num" : null }, c)))));
@@ -5512,15 +5516,23 @@
       selectTool(t.id, true);
     }
   }
+  function toolDetailFailure(id) {
+    if (!id || S.toolDetailError !== id) return null;
+    return h("div", { class: "placeholder" },
+      h("p", { class: "error" }, "Could not load Tool details."),
+      h("button", { class: "btn small", type: "button", onclick: () => selectTool(id, true) }, "Retry"));
+  }
   let toolSeq = 0;
   async function selectTool(id, quiet) {
     const seq = ++toolSeq;
     S.selectedTool = id;
+    S.toolDetailError = null;
     renderView();
     if (!quiet && S.editingCode && S.editingCode.toolId !== id) S.editingCode = null;
     const d = await act({ type: "get_tool", id });
     if (seq !== toolSeq || S.selectedTool !== id) return;
     if (d) S.toolDetail = d;
+    else S.toolDetailError = id;
     renderView();
   }
 
