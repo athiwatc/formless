@@ -16,6 +16,9 @@ pub struct InputLine {
     anchor: Option<usize>,
     yank: Option<(usize, usize, usize, bool)>,
     last_kill: bool,
+    /// Retained older cuts are available only by explicit Alt+Y after a
+    /// failed retention, so ordinary Yank cannot impersonate the latest cut.
+    cut_unavailable: bool,
     /// Byte offset, always on a char boundary.
     cursor: usize,
     /// Placeholder shown in `text` -> the pasted text it stands for.
@@ -94,6 +97,7 @@ impl InputLine {
             cursor: self.cursor,
             pastes: self.pastes.clone(),
             anchor: self.anchor,
+            cut_unavailable: self.cut_unavailable,
             ..Self::default()
         }
     }
@@ -579,17 +583,26 @@ impl InputLine {
         let consecutive = self.last_kill;
         let prepend = start < self.cursor;
         self.before_edit(false);
-        self.ring.kill(
+        let retained = self.ring.kill(
             self.expanded_range(start, end),
             prepend,
             consecutive,
             self.literal,
         );
         self.remove(start, end);
-        self.last_kill = true;
+        self.last_kill = retained;
+        self.cut_unavailable = !retained;
+    }
+
+    pub(crate) fn kill_notice(&self) -> Option<&'static str> {
+        self.cut_unavailable
+            .then_some("Cut unavailable for Yank (1 MiB limit) · Alt+Y older cuts")
     }
 
     pub(crate) fn yank(&mut self) -> bool {
+        if self.cut_unavailable {
+            return false;
+        }
         let Some(text) = self.ring.get(0).map(str::to_owned) else {
             return false;
         };
@@ -604,6 +617,13 @@ impl InputLine {
     }
 
     pub(crate) fn cycle_yank(&mut self) -> bool {
+        if self.cut_unavailable {
+            if self.ring.get(0).is_none() {
+                return false;
+            }
+            self.cut_unavailable = false;
+            return self.yank();
+        }
         let Some((start, end, index, base_literal)) = self.yank else {
             return false;
         };
@@ -1206,6 +1226,44 @@ mod tests {
             "returning to a typed draft preserves its original command intent"
         );
     }
+    #[test]
+    fn rejected_cuts_keep_older_yanks_explicit_and_break_the_coalescing_chain() {
+        let mut line = InputLine::from("/quit");
+        line.set_literal(true);
+        line.kill_to_start();
+        line.set(&"x".repeat(1024 * 1024 + 1));
+        line.kill_to_start();
+        assert!(line.is_empty());
+        assert!(line.kill_notice().is_some());
+        assert!(line.projection().kill_notice().is_some());
+        assert!(!line.yank());
+        assert!(line.is_empty());
+        assert!(line.cycle_yank());
+        assert_eq!(line, "/quit");
+        assert!(line.is_literal());
+        assert!(line.kill_notice().is_none());
+        let mut line = InputLine::from("z");
+        line.kill_to_start();
+        line.set(&("a".repeat(1024 * 1024 - 4) + "bbbbbbbbEND"));
+        line.home();
+        line.kill_range(0, 1024 * 1024 - 4);
+        let old = line.ring.get(0).unwrap().to_string();
+        line.kill_range(0, 8);
+        assert!(line.cut_unavailable);
+        assert!(!line.last_kill);
+        assert_eq!(line.ring.get(0), Some(old.as_str()));
+        assert_eq!(line.ring.get(1), Some("z"));
+        line.kill_range(0, 3);
+        assert!(!line.cut_unavailable);
+        assert_eq!(line.ring.get(0), Some("END"));
+        assert_eq!(line.ring.get(1), Some(old.as_str()));
+        assert_eq!(line.ring.get(2), Some("z"));
+        assert!(line.yank());
+        assert_eq!(line, "END");
+        assert!(line.cycle_yank());
+        assert_eq!(&*line, old.as_str());
+    }
+
     #[test]
     fn private_kill_ring_keeps_distinct_intents_and_cycles_without_reclassifying_the_draft() {
         let mut line = InputLine::from("/quit");

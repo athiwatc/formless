@@ -131,21 +131,19 @@ impl KillRing {
     }
     /// The existing bounded entry also retains whether its bytes are message
     /// data. Identical bytes with different origins remain distinct entries.
-    fn push_with_intent(&mut self, text: String, literal: bool) {
+    fn push_with_intent(&mut self, text: String, literal: bool) -> bool {
         if text.is_empty() {
-            return;
+            return true;
         }
         if text.len() > RING_BYTES {
-            self.entries.clear();
-            self.bytes = 0;
-            return;
+            return false;
         }
         if self
             .entries
             .front()
             .is_some_and(|(previous, intent)| previous == &text && *intent == literal)
         {
-            return;
+            return true;
         }
         self.bytes += text.len();
         self.entries.push_front((text, literal));
@@ -157,19 +155,33 @@ impl KillRing {
                 .0
                 .len();
         }
+        true
     }
-    pub(crate) fn kill(&mut self, text: String, prepend: bool, consecutive: bool, literal: bool) {
+    /// False means this cut was not retained. In particular a failed join
+    /// leaves every existing entry and its intent untouched.
+    pub(crate) fn kill(
+        &mut self,
+        text: String,
+        prepend: bool,
+        consecutive: bool,
+        literal: bool,
+    ) -> bool {
         if !consecutive || self.entries.is_empty() {
-            self.push_with_intent(text, literal);
-            return;
+            return self.push_with_intent(text, literal);
+        }
+        if self
+            .entries
+            .front()
+            .unwrap()
+            .0
+            .len()
+            .saturating_add(text.len())
+            > RING_BYTES
+        {
+            return false;
         }
         let (previous, previous_literal) = self.entries.pop_front().expect("nonempty ring");
         self.bytes -= previous.len();
-        if previous.len().saturating_add(text.len()) > RING_BYTES {
-            self.entries.clear();
-            self.bytes = 0;
-            return;
-        }
         self.push_with_intent(
             if prepend {
                 text + &previous
@@ -177,7 +189,7 @@ impl KillRing {
                 previous + &text
             },
             literal || previous_literal,
-        );
+        )
     }
     pub(crate) fn get(&self, index: usize) -> Option<&str> {
         if self.entries.is_empty() {
@@ -248,7 +260,36 @@ mod tests {
             ring.push(n.to_string());
         }
         assert_eq!(ring.entries.len(), RING_ENTRIES);
+        let before = ring.entries.clone();
+        let bytes = ring.bytes;
         ring.push("x".repeat(RING_BYTES + 1));
-        assert_eq!(ring.get(0), None);
+        assert_eq!(ring.entries, before);
+        assert_eq!(ring.bytes, bytes);
+    }
+
+    #[test]
+    fn failed_cuts_preserve_entries_and_normal_coalescing_keeps_text_and_intent() {
+        let mut ring = KillRing::default();
+        assert!(ring.kill("older ไทย".into(), false, false, true));
+        assert!(ring.kill("new 🦀".into(), false, false, false));
+        let before = ring.entries.clone();
+        let bytes = ring.bytes;
+        for consecutive in [false, true] {
+            assert!(!ring.kill("x".repeat(RING_BYTES + 1), false, consecutive, true));
+            assert_eq!(ring.entries, before);
+            assert_eq!(ring.bytes, bytes);
+        }
+        assert!(ring.kill(" tail".into(), false, true, true));
+        assert_eq!(ring.get(0), Some("new 🦀 tail"));
+        assert!(ring.literal(0));
+        assert!(ring.kill("head ".into(), true, true, false));
+        assert_eq!(ring.get(0), Some("head new 🦀 tail"));
+        assert_eq!(ring.get(1), Some("older ไทย"));
+        let before = ring.entries.clone();
+        let bytes = ring.bytes;
+        assert!(!ring.kill("y".repeat(RING_BYTES - 5), true, true, false));
+        assert_eq!(ring.entries, before);
+        assert_eq!(ring.bytes, bytes);
+        assert!(ring.entries.len() <= RING_ENTRIES && ring.bytes <= RING_BYTES);
     }
 }
