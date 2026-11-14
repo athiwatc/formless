@@ -238,27 +238,32 @@ pub fn proposals(props: &[PromptProposalInfo], f: &ListFilter) -> Vec<usize> {
 /// typing, Enter keeps the filter and Esc clears it; `s`/`v` cycle.
 pub fn key(
     f: &mut ListFilter,
-    code: crossterm::event::KeyCode,
+    key: &crossterm::event::KeyEvent,
     sorts: usize,
     quicks: usize,
 ) -> bool {
     use crossterm::event::KeyCode;
     if f.editing {
-        match code {
+        if super::query::edit(&mut f.query, key).is_some() {
+            return true;
+        }
+        if !super::query::plain(key) {
+            return false;
+        }
+        match key.code {
             KeyCode::Enter => f.editing = false,
             KeyCode::Esc => {
                 f.editing = false;
                 f.query.clear();
             }
-            KeyCode::Backspace => {
-                f.query.pop();
-            }
-            KeyCode::Char(c) => f.query.push(c),
             _ => return false,
         }
         return true;
     }
-    match code {
+    if !super::query::plain(key) {
+        return false;
+    }
+    match key.code {
         KeyCode::Char('/') => f.editing = true,
         KeyCode::Char('s') => f.sort = (f.sort + 1) % sorts,
         KeyCode::Char('v') => f.quick = (f.quick + 1) % quicks,
@@ -275,6 +280,48 @@ pub fn key(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn full_key_events_keep_control_and_alt_chords_out_of_filters() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut filter = ListFilter {
+            query: "alpha 日本語".into(),
+            editing: true,
+            ..Default::default()
+        };
+        assert!(key(
+            &mut filter,
+            &KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL),
+            2,
+            3
+        ));
+        assert_eq!(filter.query, "alpha ");
+        for modifiers in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+            assert!(key(
+                &mut filter,
+                &KeyEvent::new(KeyCode::Char('b'), modifiers),
+                2,
+                3
+            ));
+            assert_eq!(filter.query, "alpha ");
+        }
+        assert!(key(
+            &mut filter,
+            &KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            2,
+            3
+        ));
+        assert!(filter.query.is_empty());
+        filter.editing = false;
+        for code in [KeyCode::Char('s'), KeyCode::Char('v'), KeyCode::Char('/')] {
+            assert!(!key(
+                &mut filter,
+                &KeyEvent::new(code, KeyModifiers::CONTROL),
+                2,
+                3
+            ));
+            assert_eq!((filter.sort, filter.quick, filter.editing), (0, 0, false));
+        }
+    }
 
     fn tool(name: &str, rate: Option<f64>, calls: i64, retired: bool) -> ToolInfo {
         ToolInfo {
@@ -381,16 +428,27 @@ mod tests {
     #[test]
     fn filter_keys() {
         use crossterm::event::KeyCode;
+        let key_event =
+            |code| crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE);
         let mut f = ListFilter::default();
-        assert!(key(&mut f, KeyCode::Char('/'), 2, 2));
-        assert!(key(&mut f, KeyCode::Char('s'), 2, 2), "typed while editing");
+        assert!(key(&mut f, &key_event(KeyCode::Char('/')), 2, 2));
+        assert!(
+            key(&mut f, &key_event(KeyCode::Char('s')), 2, 2),
+            "typed while editing"
+        );
         assert_eq!(f.query, "s");
-        key(&mut f, KeyCode::Enter, 2, 2);
-        assert!(key(&mut f, KeyCode::Char('s'), 2, 2));
+        key(&mut f, &key_event(KeyCode::Enter), 2, 2);
+        assert!(key(&mut f, &key_event(KeyCode::Char('s')), 2, 2));
         assert_eq!(f.sort, 1);
-        assert!(key(&mut f, KeyCode::Esc, 2, 2), "clears the filter first");
+        assert!(
+            key(&mut f, &key_event(KeyCode::Esc), 2, 2),
+            "clears the filter first"
+        );
         assert!(f.query.is_empty());
-        assert!(!key(&mut f, KeyCode::Esc, 2, 2), "then Esc leaves the view");
-        assert!(!key(&mut f, KeyCode::Char('x'), 2, 2));
+        assert!(
+            !key(&mut f, &key_event(KeyCode::Esc), 2, 2),
+            "then Esc leaves the view"
+        );
+        assert!(!key(&mut f, &key_event(KeyCode::Char('x')), 2, 2));
     }
 }
