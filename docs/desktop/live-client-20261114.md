@@ -14,14 +14,22 @@ lockfile and pinned GPUI Kit 0.9.1 / GPUI-pre 0.3.12.
 - First main reconciliation: `7ab3e1cf96a44dd4fc52911a88682e653ad555d3`,
   incorporating main `93f68358104166a5585be388af4191f894ea88e5`.
 - Implementation: `b1696d8493ca2e26d51b27e850f81ad9798c0b88`.
-- Latest main reconciliation: `1e68d032e49be62fd1c73722a1d2198981d0d523`,
+- Second main reconciliation: `1e68d032e49be62fd1c73722a1d2198981d0d523`,
   incorporating main `546c26d23641e3982300d60d9e5c4350291fb45a`.
+- Metrics scope and native states: `1dc16a1adddc482efed2f594cd89f4aa5c704553`.
+- Native 200% header correction: `524e53afc902c733c04db08dc60b7119d5f9a224`.
+- Deterministic provider/navigation and teardown fixture:
+  `ddcf55eb7a3f97d517959f93341dfeb7e2c9efc1`.
+- Final main reconciliation: `26f9eddfa4e657985d8479d13e45752110fb1a77`,
+  incorporating main `47ebac8c30af92a7cd937501f9761df101b83187`.
 
 The desktop tree is `3ad560af5cc4a63c4ffcbc8e250ec53ffc793086` and the
 protocol tree is `a9912076a69b36043508622f3d9bf25742405790` at both implementation
 and latest reconciliation commits. The later merge therefore leaves the
 validated frontend and protocol byte-for-byte unchanged. Daemon integration
-was rerun against the updated core after that merge.
+was rerun against the updated core after each main merge. The final merge changes
+neither desktop source nor render tests relative to the header correction, and
+changes no protocol or workspace dependency manifest.
 
 ## Implemented behavior
 
@@ -81,8 +89,8 @@ desktop target directory. Commands below run from `crates/formless-desktop`.
 | Check | Result |
 |---|---|
 | `cargo fmt -- --check` | Passed |
-| `cargo test --no-default-features --lib` | 146 passed |
-| `cargo test --features test-support,thai-breaks --lib` | 151 passed |
+| `cargo test --no-default-features --lib` | 147 passed |
+| `cargo test --features test-support,thai-breaks --lib` | 152 passed |
 | `cargo test --features test-support,thai-breaks --test shell` | 122 passed |
 | `cargo clippy --all-targets -- -D warnings` in GUI-free, plain GUI, `test-support,thai-breaks`, and `ax-dump` configurations | Passed |
 | `cargo clippy --no-default-features --features daemon-tests --test daemon -- -D warnings` after latest main merge | Passed; existing core dependency warnings remain |
@@ -90,11 +98,17 @@ desktop target directory. Commands below run from `crates/formless-desktop`.
 | Python platform-checker failure-path harness with ResourceWarning as error | 8 passed |
 | Normal dependency-graph assertions | 52-package GUI-free graph has no GPUI; 379-package GUI graph has no core/runtime/TUI |
 | `cargo test --no-default-features --features daemon-tests --test daemon` after latest main merge | 1 passed |
-| `cargo test --features test-support --test render` at the committed frontend | 31 states, 51 captures, real font checks passed |
+| `cargo test --features test-support --test render` at the committed frontend | 33 states, 53 captures, real font checks passed |
+
+The later UI follow-ups were checked again with GUI-free model tests, the
+feature-enabled model/shell suite and strict clippy. The final header checks
+include actual-font viewport bounds for Refresh and Back at 200%.
 
 The integration test uses a real private-profile daemon and local fake HTTP
 provider. It checks one send causing one provider request, canonical Thai/emoji
-output, interrupted Session navigation, all four resource reply shapes, Session
+output, interrupted Session navigation (the provider reply is held until the
+other Session is confirmed and the original Run is still running), all four
+resource reply shapes, Session
 creation and reconnect restoration without mutation replay. This is actual IPC
 and provider-path integration, not a fixture directory pretending to be a daemon.
 It does not validate a paid provider, real credentials or foreground native GUI
@@ -105,8 +119,10 @@ process exit would also tear down its runtime.
 Local evidence is retained under ignored `evidence/gpui-1753-sol/`:
 `final-model.log`, `final-daemon.log`, `final-checks.json`,
 `b1696d84-*.log`, `1e68d032-daemon.log`, `1e68d032-clippy-daemon.log`,
-`graph-assertions.json` and `shell-*.png`. The native captures include the new
-resource view at wide/100% and minimum/200%. Those capture serialized view
+`graph-assertions.json`, `final-scope-checks.json`, `final-metrics-scope.log`,
+`resource-header-render.log`, `final-header-shell.log`, `final-header-clippy.log`,
+`final-synchronized-daemon.log`, `final-synchronized-clippy.log` and `shell-*.png`. The native captures include the new
+Tools and Metrics resource views at wide/100% and minimum/200%. Those capture serialized view
 fixtures, not a foreground GUI connected to the private daemon. Existing Thai
 segmentation warnings remain; the pinned toolkit was not upgraded.
 
@@ -116,7 +132,12 @@ without changing OS permissions. Fixture corrections fixed a TOML u64 overflow,
 HTTP model-discovery handling, and in-process shutdown/lease assumptions. The
 native renderer then exposed a genuine empty-sidebar panic; resetting list sizes
 and bounding stale virtual-list ranges fixed it, with a regression test over a
-populated/scrolled list, empty attachment, repopulation and removal. A dependency
+populated/scrolled list, empty attachment, repopulation and removal. Visual review
+then found that Metrics' Refresh control overflowed at 200% despite the broad
+pixel check passing. Grouping actions below the title in reflowed layouts fixed
+it; the final native tests assert both controls are inside the viewport, and the
+fresh captures were inspected. Metrics also names its 100-recent-Run request
+scope instead of implying complete history. A dependency
 diagnostic initially used `cargo tree -i` for an inactive optional package and
 returned 101; explicit normal-graph absence assertions replaced that incorrect
 diagnostic. Prior failures are not counted as passes.
@@ -140,7 +161,7 @@ subsequent render runs; per-attempt logs are retained.
   it does not claim that native IME or screen-reader gates passed.
 - Token streaming needs a genuinely established snapshot/delta reconciliation
   contract. The current safe canonical-only mode does not close that requirement.
-- Native decision forms; Session rename/fork/pin/tag/export/comparison actions;
+- Native decision forms; Run resume/abandon/step controls; Session rename/fork/pin/tag/export/comparison actions;
   attachments, model/Role selection; full Tools/Metrics/Proposals/Settings edit
   flows; and dedicated Memory/Skills/MCP/Jobs/Providers/Invocations/sub-agent/plan/
   compaction surfaces remain open.

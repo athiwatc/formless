@@ -50,6 +50,10 @@ their synthetic-only behavior applies when `--connect` is omitted.
 Findings, measurements, the parity inventory and the open blockers are in
 [docs/desktop/phase0-findings.md](../../docs/desktop/phase0-findings.md).
 
+Current continuation evidence and remaining acceptance are recorded in
+[the live-client report](../../docs/desktop/live-client-20261114.md). Later
+fixture-only evidence notes below describe historical checkpoints.
+
 ## Why it is outside the workspace
 
 This crate has its own `[workspace]` table and its own `Cargo.lock`. It is not
@@ -77,7 +81,7 @@ not see GPUI. Run every command below from this directory.
 | `src/shell.rs` | The GPUI Kit window over the model | `gui` feature |
 | `src/main.rs` | `formless-desktop` binary | `gui` feature |
 | `tests/shell.rs` | Headless tests of the real shell view. The test window has no real fonts: every character is the same width | `test-support` feature |
-| `tests/render.rs` | Offscreen render of twenty-nine shell states through GPUI's real renderer, and measurements that need real fonts (macOS, Linux) | `test-support` feature |
+| `tests/render.rs` | Offscreen render of native shell states through GPUI's real renderer, and measurements that need real fonts (macOS, Linux) | `test-support` feature |
 
 ## Commands
 
