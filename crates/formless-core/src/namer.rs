@@ -245,10 +245,16 @@ pub fn heuristic_title(user: &str) -> Option<String> {
     clean_title(&title)
 }
 
-/// A message too short to say what a Session is about ("hi", "hello?").
+/// Recognized small-talk openers only. An uncertain short message may carry
+/// the whole task in any script, so length is not evidence of triviality.
 fn trivial(message: &str) -> bool {
     let t = message.trim();
-    !t.contains('\n') && t.graphemes(true).count() < 12
+    let opener = t.trim_matches(|c: char| c.is_ascii_punctuation() || c.is_whitespace());
+    opener.is_empty()
+        || (!t.contains('\n')
+            && ["hi", "hello", "hey", "thanks", "thank you", "ok", "okay"]
+                .iter()
+                .any(|greeting| opener.eq_ignore_ascii_case(greeting)))
 }
 
 /// `text` is already trimmed. A long message keeps the head and the tail
@@ -280,8 +286,8 @@ pub fn naming_text(user_messages: &[String]) -> Option<String> {
 
 /// Oldest-first user contents. Keeps the first nonempty trimmed row as the
 /// fallback and the current row, and stops at the first nontrivial row.
-/// Empty and trivial follow [`naming_text`]: Unicode trim, then one line
-/// shorter than 12 graphemes.
+/// Empty and trivial follow [`naming_text`]: Unicode trim, then conservative
+/// recognized openers rather than a language-dependent length threshold.
 pub(crate) fn try_naming_text_from_contents<I, S, E>(
     contents: I,
 ) -> std::result::Result<Option<String>, E>
@@ -714,6 +720,50 @@ mod tests {
             heuristic_title("ช่วย debug โค้ด Rust ตัวนี้ ที่ compile ไม่ผ่าน").as_deref(),
             Some("ช่วย debug โค้ด Rust ตัวนี้ ที่…")
         );
+    }
+
+    #[test]
+    fn naming_retains_short_requests_and_skips_only_recognized_openers() {
+        let log = format!("{}\nPrivate log tail", "long pasted context\n".repeat(200));
+        for request in [
+            "Fix the CI",
+            "Add tests",
+            "修复登录错误",
+            "แก้บั๊ก",
+            "🦀",
+            "你好",
+            "hi there, fix CI",
+            "No",
+            "e\u{301}",
+        ] {
+            let messages = vec!["".into(), format!("  {request}  "), log.clone()];
+            assert_eq!(naming_text(&messages).as_deref(), Some(request));
+            let selected =
+                try_naming_text_from_contents(messages.iter().map(|s| Ok::<_, ()>(s.as_str())))
+                    .unwrap();
+            assert_eq!(selected.as_deref(), Some(request));
+        }
+        for opener in ["hi", "Hello?", "HEY!", "ok", "Thank you.", "!!!", "  ...  "] {
+            let messages = vec![opener.into(), "convert this csv to json please".into()];
+            assert_eq!(
+                naming_text(&messages).as_deref(),
+                Some("convert this csv to json please")
+            );
+        }
+        assert_eq!(naming_text(&[]), None);
+        assert_eq!(naming_text(&["".into(), " \n ".into()]), None);
+        assert_eq!(
+            naming_text(&["hi".into(), "okay".into(), "!!!".into()]).as_deref(),
+            Some("hi")
+        );
+        assert_eq!(
+            naming_text(&["".into(), "!!!".into(), "hi".into()]).as_deref(),
+            Some("!!!")
+        );
+        let selected = naming_text(&["hi".into(), log.clone()]).unwrap();
+        assert_eq!(selected, shape_naming_text(&log));
+        assert!(selected.ends_with("Private log tail"));
+        assert!(selected.chars().count() <= MAX_PROMPT_CHARS + 3);
     }
 
     #[test]

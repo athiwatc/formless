@@ -8,7 +8,7 @@
 
 <p>
   <a href="https://github.com/athiwatc/formless/blob/main/Cargo.toml"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License: Apache-2.0"></a>
-  <a href="https://github.com/athiwatc/formless/releases/latest"><img src="https://img.shields.io/github/v/release/athiwatc/formless?sort=semver" alt="Latest release"></a>
+  <a href="https://github.com/athiwatc/formless/releases"><img src="https://img.shields.io/github/v/release/athiwatc/formless?sort=semver" alt="Releases"></a>
   <a href="#32-install"><img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg" alt="Platforms: macOS, Linux, Windows"></a>
   <a href="#10-security-and-privacy"><img src="https://img.shields.io/badge/telemetry-none-success.svg" alt="Telemetry: none"></a>
 </p>
@@ -400,7 +400,7 @@ usage, errors and coverage; interrupted or incomplete usage stays unknown.
 
 Piped stdin is read only when stdin isn't a terminal; from a script that leaves stdin open without writing to it, add `< /dev/null`.
 
-Approvals are **opt-in**: by default (`security.secure = false`) Tools run without asking, and each sensitive call is recorded in the audit log (`tool.run_unasked`). With approvals on (`formless --secure`, or `security.secure = true` in `config.toml`), they are not skipped by scripting: without `--yes` a sensitive Invocation **fails closed** with a clear error instead of being silently granted. `--timeout 10m` (also `90s`, `1h30m`) interrupts a Run that takes too long. Exit codes: `0` answered, `1` Run errored/paused, `2` usage/config error, `124` timed out, `130` interrupted.
+Approvals are **opt-in**: by default (`security.secure = false`) Tools run without asking, and each sensitive call is recorded in the audit log (`tool.run_unasked`). With approvals on (`formless --secure`, or `security.secure = true` in `config.toml`), they are not skipped by scripting: without `--yes` a sensitive Invocation **fails closed** with a clear error instead of being silently granted. `--timeout 10m` (also `90s`, `1h30m`) interrupts a Run that takes too long. Exit codes: `0` answered, `1` Run errored/paused, `2` usage/config error, `3` Run paused because schema validation failed (see `--schema` above), `124` Run timed out (see `--timeout` above), `130` interrupted.
 
 ### Sessions from the command line
 
@@ -621,26 +621,28 @@ The table covers every visible root command, including Clap's generated
 | `formless jobs` | `list`, `add`, `run`, `history`, `enable`, `disable`, `rm` | Manage scheduled prompts and inspect their history. |
 | `formless logs` | `--follow`, `--level`, `--since`, `--lines` | Read or follow the daemon log and rotated files. |
 | `formless mcp` | `add`, `remove`, `list`, `test`, `login`, `logout`, `catalog`, `import`, `log`, `tools`, `tool` | Manage external MCP servers and inspect their tools/logs. |
+| `formless metrics` | `--since DURATION`, `--json` | Read recorded model, Tool and built-in statistics through independent reports at one cutoff. |
 | `formless memory` | `list`, `add`, `rm`, `edit` | Inspect or change saved user-memory notes. |
 | `formless naming` | `status`, `pull`, `test` | Inspect, install, or preview the embedded Session-naming model. |
 | `formless prices` | `import` | Import a model-price catalog for cost and spending limits. |
 | `formless profiles` | `list`, `rm` | List or remove isolated profiles. |
-| `formless prompts` | `list`, `generate`, `apply`, `reject`, `rollback` | Inspect and manage measured prompt/memory proposals. |
+| `formless prompts` | `list`, `diff`, `generate`, `apply`, `reject`, `rollback` | Inspect existing proposal comparisons and manage measured prompt/memory proposals. |
 | `formless providers` | `list`, `add`, `remove`, `test` | Manage named model providers and test a connection. |
 | `formless relay` | `enable`, `disable`, `status` | Manage encrypted browser access through the relay. |
 | `formless reset` | `--force` | Wipe configuration, credentials, and the current profile's data. |
 | `formless restore` | `FILE` | Replace the database from a backup, preserving the current database. |
 | `formless roles` | `list`, `add`, `rm` | Map named purposes to a provider and model. |
 | `formless run` | `TASK`; `--estimate`, `--session`, `--output`, `--attach` and other Run options | Run one headless task, or print its local forecast without starting it. |
+| `formless routing` | `--json` | Read currently available daemon routing decisions and returned candidate figures without starting a model request. |
 | `formless runs` | No action: list; `show`, `cancel` | List recent Runs, inspect one by ID/prefix, or cancel that exact Run. |
 | `formless security` | `status` | Inspect the daemon's grants, denials, trusted resources, and exposed interfaces. |
-| `formless sessions` | `fork`, `compare`, `list`, `show`, `files`, `rewind`, `rename`, `rm`, `restore`, `import`, `search`, `archive`, `unarchive`, `export` | Manage stored Sessions, follow a Run with `show --follow`, or inspect tracked files. |
+| `formless sessions` | `fork`, `compare`, `list`, `show`, `files`, `rewind`, `rename`, `rm`, `restore`, `import`, `search`, `archive`, `unarchive`, `export` | Manage stored Sessions, follow a Run with `show --follow`, or inspect tracked files. `list --pinned --tag TAG` filters the fetched reply; selectors combine with `--archived`, preserving reply order. |
 | `formless skills` | `reviews`, `add`, `remove`, `list`, `enable`, `disable`, `show`, `export`, `import` | Inspect and manage Skills and their retained description reviews. |
 | `formless storage` | `--json` | Report disk usage by data category. |
 | `formless tools` | `reviews`, `list`, `disable`, `enable`, `undo`, `pin`, `unpin`, `tag`, `show`, `retire`, `restore`, `rollback`, `purge`, `run`, `export`, `import` | Inspect, manage, run, or transfer registry Tools. |
 | `formless tui` | No action | Launch the full-screen terminal client; also the default with no command. |
 | `formless uninstall` | `--keep-data`, `--keep-binary`, `--yes` (alias `--force`) | Remove Formless, optionally retaining data or the binary. |
-| `formless update` | No action, `check`, or `--check` | Show newer release notes and the applicable upgrade command; never rewrite the binary. |
+| `formless update` | No action, `check`, or `--check`; `--json` | Show newer release notes and the applicable upgrade command; never rewrite the binary. |
 | `formless web` | `--port`, `--no-open`, `--stop` | Open, print a link for, or stop the local browser UI. |
 
 `tools list --filter FILTER` selects one stored-state predicate: `not-retired`
@@ -652,6 +654,32 @@ may overlap. JSON uses the same selection and existing ToolInfo schema.
 Human output distinguishes an empty registry from no matching rows and names
 the flags to clear. `--show-pinned` adds a human PINNED yes/no column; default
 piped cells and row order remain unchanged. These flags never mutate a Tool.
+
+`formless metrics --since 7d --json` reads the three existing metrics reports
+with one checked UTC cutoff. Omit `--since` for all history. Tool rows use stored
+`tool_id` values; reports retain their own row order and are independent reads,
+not a transactional snapshot. Runs and daily usage remain separate surfaces.
+
+`formless sessions list --pinned --tag WORK --json` selects active pinned Sessions
+whose stored tags contain exactly `work`. Only the tag argument is lowercased;
+a leading `#` is not stripped. Add `--archived` to select the archived partition.
+These selectors filter the existing reply on the client.
+
+Tool selectors use an exact name or full ID. After a miss, up to three
+ranked partial-name suggestions can help you retry with the original exact
+spelling; these use folded subsequence matching, not edit-distance spelling
+correction. A suggestion never selects or runs a Tool automatically.
+
+`update --json`, `update check --json`, and `update --check --json` emit one
+object: `{installed, status, newer_releases: [{tag, url, notes}]}`. Notes retain
+the existing trimmed body and oldest-first order; `installed` has no `v` prefix.
+`update_available` means the fetched page contains newer stable releases;
+`up_to_date` means none in that single 50-release response, without pagination.
+`release_check_unavailable` maps to an actual HTTP 404 response,
+not verified absence of releases. Error text alone never selects this status.
+Completed checks exit 0; other fetch or JSON parse failures remain errors with
+no success JSON. Human output stays unchanged, and the JSON form never runs
+an updater.
 
 #### Root and global flags
 

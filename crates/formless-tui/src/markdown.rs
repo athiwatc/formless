@@ -81,6 +81,7 @@ struct Renderer {
     /// Styles opened by inline HTML tags (`<kbd>`, `<b>`…), innermost last.
     html: Vec<(String, Style)>,
     need_gap: bool,
+    heading: bool,
     /// Code blocks so far, so each is labelled `[n]` like `/copy code n`.
     code_index: usize,
 }
@@ -256,7 +257,10 @@ impl Renderer {
             return;
         }
         let spans = std::mem::take(&mut self.spans);
-        let avail = self.width.saturating_sub(self.prefix_width()).max(8);
+        let avail = self
+            .width
+            .saturating_sub(self.prefix_width())
+            .max(if self.heading { 1 } else { 8 });
         for row in wrap(spans, avail) {
             self.emit(row);
         }
@@ -295,10 +299,19 @@ impl Renderer {
                 } else {
                     ("☐ ", dim(color))
                 };
-                // GitHub shows the checkbox instead of the bullet.
+                // Ordered tasks keep their sequence number; unordered tasks
+                // use the checkbox in place of the bullet. The final marker
+                // determines both wrapping and the hanging indent.
+                let ordered = matches!(self.lists.last(), Some(Some(_)));
                 match self.prefixes.last_mut() {
                     Some(p) if p.first.is_some() => {
-                        p.first = Some(vec![Span::styled(mark, style)]);
+                        let first = p.first.as_mut().unwrap();
+                        if !ordered {
+                            first.clear();
+                        }
+                        first.push(Span::styled(mark, style));
+                        let width = first.iter().map(|span| span.content.width()).sum();
+                        p.rest = vec![Span::raw(" ".repeat(width))];
                     }
                     _ => self.push_text(mark, style),
                 }
@@ -322,6 +335,19 @@ impl Renderer {
                     _ => Style::default().add_modifier(Modifier::BOLD),
                 };
                 self.styles.push(style);
+                let depth = match level {
+                    HeadingLevel::H1 => 1,
+                    HeadingLevel::H2 => 2,
+                    HeadingLevel::H3 => 3,
+                    HeadingLevel::H4 => 4,
+                    HeadingLevel::H5 => 5,
+                    HeadingLevel::H6 => 6,
+                };
+                self.prefixes.push(Prefix {
+                    first: Some(vec![Span::styled(format!("H{depth} "), style)]),
+                    rest: vec![Span::raw("   ")],
+                });
+                self.heading = true;
             }
             Tag::BlockQuote(kind) => {
                 self.flush();
@@ -439,7 +465,13 @@ impl Renderer {
                 self.need_gap = true;
             }
             TagEnd::Heading(_) => {
-                self.flush();
+                if self.spans.is_empty() {
+                    self.emit(Vec::new());
+                } else {
+                    self.flush();
+                }
+                self.prefixes.pop();
+                self.heading = false;
                 self.styles.pop();
                 self.need_gap = true;
             }
@@ -582,7 +614,7 @@ impl Renderer {
             .saturating_sub(2 + if numbers { num_w + 1 } else { 0 })
             .max(8);
         for (n, raw) in body.split('\n').enumerate() {
-            let raw = raw.replace('\t', "    ");
+            let raw = expand_code_tabs(raw);
             let spans = if let Some(h) = &mut hl {
                 h.line(&raw)
             } else {
@@ -992,6 +1024,24 @@ fn truncate_spans(spans: Vec<Span<'static>>, max: usize) -> Vec<Span<'static>> {
     out
 }
 
+/// Ordinary code blocks use four-column tab stops measured from the code
+/// origin, before its border/gutter/prefix and before syntax highlighting.
+fn expand_code_tabs(raw: &str) -> String {
+    let mut output = String::with_capacity(raw.len());
+    let mut column = 0;
+    for cluster in raw.graphemes(true) {
+        if cluster == "\t" {
+            let spaces = 4 - column % 4;
+            output.extend(std::iter::repeat_n(' ', spaces));
+            column += spaces;
+        } else {
+            output.push_str(cluster);
+            column += cluster.width();
+        }
+    }
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1001,6 +1051,221 @@ mod tests {
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect()
+    }
+
+    #[test]
+    fn ordered_tasks_keep_numbers_check_state_and_final_hanging_indent() {
+        for start in [1, 10, 100] {
+            let source = format!("{start}. [ ] Task _italic_ 日本語 with enough text to wrap\n{}. [x] Finished `code` with more wrapped content", start + 1);
+            for color in [false, true] {
+                let out = render(&source, color, "", 24);
+                let text = out
+                    .iter()
+                    .map(|line| {
+                        line.spans
+                            .iter()
+                            .map(|span| span.content.as_ref())
+                            .collect::<String>()
+                    })
+                    .collect::<Vec<_>>();
+                let first = format!("{start}. ☐ ");
+                let next = format!("{}. ☑ ", start + 1);
+                let split = text
+                    .iter()
+                    .position(|line| line.starts_with(&next))
+                    .unwrap();
+                for (rows, marker, expected) in [
+                    (
+                        &text[..split],
+                        first.as_str(),
+                        "Taskitalic日本語withenoughtexttowrap",
+                    ),
+                    (
+                        &text[split..],
+                        next.as_str(),
+                        "Finishedcodewithmorewrappedcontent",
+                    ),
+                ] {
+                    assert!(rows[0].starts_with(marker), "{text:?}");
+                    let indent = " ".repeat(marker.width());
+                    let content = rows
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, line)| !line.is_empty())
+                        .map(|(index, line)| {
+                            if index == 0 {
+                                line.strip_prefix(marker).unwrap()
+                            } else {
+                                line.strip_prefix(&indent).unwrap()
+                            }
+                        })
+                        .collect::<String>();
+                    assert_eq!(content.split_whitespace().collect::<String>(), expected);
+                }
+                assert!(text.iter().all(|line| line.width() <= 24), "{text:?}");
+                assert!(out
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .any(|span| span.content == "italic"
+                        && span.style.add_modifier.contains(Modifier::ITALIC)));
+            }
+        }
+    }
+
+    #[test]
+    fn task_prefixes_align_inside_quotes_and_nested_lists() {
+        for (source, first, rest) in [
+            (
+                "> 10. [x] Long task with Unicode 日本語 and wrapped content",
+                "  │ 10. ☑ ",
+                "  │       ",
+            ),
+            (
+                "- [ ] Long task with Unicode 日本語 and wrapped content",
+                "  ☐ ",
+                "    ",
+            ),
+            (
+                "- parent\n\n  10. [ ] Long task with Unicode 日本語 and wrapped content",
+                "    10. ☐ ",
+                "          ",
+            ),
+        ] {
+            let out = lines(source, 24);
+            let start = out
+                .iter()
+                .position(|line| line.starts_with(first))
+                .unwrap_or_else(|| panic!("missing {first:?}: {out:?}"));
+            let rows = out[start..]
+                .iter()
+                .filter(|line| !line.trim().is_empty() && line.trim() != "│")
+                .collect::<Vec<_>>();
+            assert!(rows.len() > 1, "{out:?}");
+            for row in &rows[1..] {
+                assert!(row.starts_with(rest), "{out:?}");
+            }
+            assert!(out.iter().all(|line| line.width() <= 24), "{out:?}");
+            let content = rows
+                .iter()
+                .enumerate()
+                .map(|(index, line)| {
+                    line.strip_prefix(if index == 0 { first } else { rest })
+                        .unwrap()
+                })
+                .collect::<String>();
+            assert_eq!(
+                content.split_whitespace().collect::<String>(),
+                "LongtaskwithUnicode日本語andwrappedcontent"
+            );
+        }
+    }
+
+    #[test]
+    fn heading_depths_have_noncolor_labels_and_keep_inline_content() {
+        let source = (1..=6)
+            .map(|depth| {
+                format!(
+                    "{} Level {depth} _italic_ `code` ไทย 日本語\n\n",
+                    "#".repeat(depth)
+                )
+            })
+            .collect::<String>()
+            + "**ordinary strong paragraph**";
+        for color in [false, true] {
+            let out = render(&source, color, "", 24);
+            let text = out
+                .iter()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>();
+            for depth in 1..=6 {
+                let label = format!("H{depth} ");
+                let start = text
+                    .iter()
+                    .position(|line| line.starts_with(&label))
+                    .unwrap();
+                let end = text[start + 1..]
+                    .iter()
+                    .position(|line| line.is_empty())
+                    .map_or(text.len(), |index| start + 1 + index);
+                let body = text[start..end]
+                    .iter()
+                    .enumerate()
+                    .map(|(index, line)| {
+                        if index == 0 {
+                            &line[3..]
+                        } else {
+                            assert!(line.starts_with("   "), "{text:?}");
+                            &line[3..]
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("");
+                assert_eq!(
+                    body.split_whitespace().collect::<String>(),
+                    format!("Level{depth}italiccodeไทย日本語")
+                );
+                assert!(out[start..end]
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .any(|span| span.content.contains("italic")
+                        && span.style.add_modifier.contains(Modifier::ITALIC)));
+                if !color {
+                    assert!(out[start].spans.iter().all(|span| span.style.fg.is_none()));
+                }
+            }
+            assert!(text.iter().any(|line| line.starts_with("ordinary strong")));
+            assert!(text.iter().all(|line| line.width() <= 24), "{text:?}");
+        }
+        let empty = render("###\n", false, "", 16);
+        assert!(empty
+            .iter()
+            .any(|line| line.spans.iter().any(|span| span.content == "H3 ")));
+    }
+
+    #[test]
+    fn nested_heading_continuations_budget_their_depth_prefix() {
+        let source =
+            "> - ### Long heading 日本語 👩🏽‍💻 with enough content to wrap across several lines";
+        for width in [18, 24, 80] {
+            let out = render(source, false, "  ", width);
+            let lines = out
+                .iter()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<String>()
+                })
+                .filter(|line| line.trim() != "│" && !line.trim().is_empty())
+                .collect::<Vec<_>>();
+            assert!(lines[0].starts_with("  │ • H3 "), "{lines:?}");
+            for line in &lines[1..] {
+                assert!(line.starts_with("  │      "), "{lines:?}");
+            }
+            assert!(
+                lines.iter().all(|line| line.width() <= width),
+                "{width}: {lines:?}"
+            );
+            let content = lines
+                .iter()
+                .map(|line| {
+                    if let Some((_, body)) = line.split_once("H3 ") {
+                        body
+                    } else {
+                        line.strip_prefix("  │      ").unwrap()
+                    }
+                })
+                .collect::<String>();
+            assert_eq!(
+                content.split_whitespace().collect::<String>(),
+                "Longheading日本語👩🏽‍💻withenoughcontenttowrapacrossseverallines"
+            );
+        }
     }
 
     #[test]
@@ -1015,7 +1280,7 @@ mod tests {
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect();
-        assert_eq!(text, ["  Title", "", "  The bold and code and gone."]);
+        assert_eq!(text, ["  H1 Title", "", "  The bold and code and gone."]);
         let find = |s: &str| out[2].spans.iter().find(|x| x.content == s).unwrap().style;
         assert!(find("bold").add_modifier.contains(Modifier::BOLD));
         assert_eq!(find("code").fg, Some(Color::Yellow));
@@ -1182,6 +1447,61 @@ mod tests {
         assert!(w[1] > w[2] && w.iter().sum::<usize>() <= 35, "{w:?}");
         let tiny = fit_widths(&[30, 30], 8);
         assert!(tiny.iter().all(|&x| x >= MIN_COL), "{tiny:?}");
+    }
+
+    #[test]
+    fn code_tabs_advance_to_four_display_column_stops() {
+        for (source, expected) in [
+            ("a\tb", "a   b"),
+            ("ab\tc", "ab  c"),
+            ("abc\td", "abc d"),
+            ("\t\tZ", "        Z"),
+            ("ab\t\tZ", "ab      Z"),
+            ("界\tZ", "界  Z"),
+            ("e\u{301}\tZ", "e\u{301}   Z"),
+            ("👩🏽‍💻\tZ", "👩🏽‍💻  Z"),
+            ("界界a\tZ", "界界a   Z"),
+            ("plain ไทย 👩🏽‍💻 e\u{301}", "plain ไทย 👩🏽‍💻 e\u{301}"),
+        ] {
+            assert_eq!(expand_code_tabs(source), expected);
+        }
+        let source = "```rust\nlet\tx = 1;\n```";
+        let original = source.to_string();
+        assert_eq!(
+            render(source, true, "", 80),
+            render("```rust\nlet x = 1;\n```", true, "", 80)
+        );
+        assert_eq!(source, original);
+        for numbers in [false, true] {
+            for (nested, prefix) in [(false, ""), (false, "  "), (true, "")] {
+                let md = if nested {
+                    "> - ```unknown\n>   a\tb\n>   界\tZ\n>   e\u{301}\tW\n>   ```"
+                } else {
+                    "```unknown\na\tb\n界\tZ\ne\u{301}\tW\n```"
+                };
+                set_line_numbers(numbers);
+                let out = render(md, true, prefix, 80);
+                set_line_numbers(false);
+                let lines: Vec<String> = out
+                    .iter()
+                    .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+                    .collect();
+                for (index, expected) in ["a   b", "界  Z", "e\u{301}   W"].into_iter().enumerate()
+                {
+                    let expected = if numbers {
+                        format!("{} {expected}", index + 1)
+                    } else {
+                        expected.into()
+                    };
+                    assert!(
+                        lines.iter().any(|line| line
+                            .rsplit_once("│ ")
+                            .is_some_and(|(_, body)| body == expected)),
+                        "{numbers}/{nested}/{prefix:?}: {lines:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

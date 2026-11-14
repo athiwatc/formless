@@ -2,45 +2,76 @@
 
 use formless_protocol::{RunMetricsInfo, RunSummary};
 
+const OPENINGS: &[&str] = &[
+    "that's wrong",
+    "thats wrong",
+    "that is wrong",
+    "that's not right",
+    "that is not right",
+    "that's not what",
+    "that is not what",
+    "not what i asked",
+    "not what i meant",
+    "no, that",
+    "no that's",
+    "wrong",
+    "it didn't work",
+    "it doesn't work",
+    "that didn't work",
+    "that doesn't work",
+    "you didn't",
+    "still broken",
+    "still not working",
+];
+// Praise and reassurance that open like a correction (#831).
+const NOT_CORRECTIONS: &[&str] = &[
+    "no, that was perfect",
+    "no, that's perfect",
+    "no, that was great",
+    "no, that's great",
+    "no, that was right",
+    "no, that's right",
+    "no, that works",
+    "no, that's fine",
+    "no, that was fine",
+    "you didn't need to",
+    "you didn't have to",
+];
+
+const CORRECTION_SOURCE_SCALARS: usize = 32;
+const _: () = {
+    let lists = [OPENINGS, NOT_CORRECTIONS];
+    let mut list = 0;
+    while list < lists.len() {
+        let mut index = 0;
+        while index < lists[list].len() {
+            let phrase = lists[list][index];
+            assert!(
+                phrase.is_ascii(),
+                "reconsider bounded normalization for non-ASCII phrases"
+            );
+            assert!(
+                phrase.len() + 1 <= CORRECTION_SOURCE_SCALARS,
+                "phrase and boundary must fit the source prefix"
+            );
+            index += 1;
+        }
+        list += 1;
+    }
+};
+
 /// Whether a user message reads like "that's wrong": the previous Run
 /// missed the goal. Deliberately narrow: only the message's opening.
 pub fn is_correction(text: &str) -> bool {
-    const OPENINGS: &[&str] = &[
-        "that's wrong",
-        "thats wrong",
-        "that is wrong",
-        "that's not right",
-        "that is not right",
-        "that's not what",
-        "that is not what",
-        "not what i asked",
-        "not what i meant",
-        "no, that",
-        "no that's",
-        "wrong",
-        "it didn't work",
-        "it doesn't work",
-        "that didn't work",
-        "that doesn't work",
-        "you didn't",
-        "still broken",
-        "still not working",
-    ];
-    // Praise and reassurance that open like a correction (#831).
-    const NOT_CORRECTIONS: &[&str] = &[
-        "no, that was perfect",
-        "no, that's perfect",
-        "no, that was great",
-        "no, that's great",
-        "no, that was right",
-        "no, that's right",
-        "no, that works",
-        "no, that's fine",
-        "no, that was fine",
-        "you didn't need to",
-        "you didn't have to",
-    ];
-    let t = text.trim().to_lowercase().replace('’', "'");
+    let trimmed = text.trim();
+    let end = trimmed
+        .char_indices()
+        .nth(CORRECTION_SOURCE_SCALARS)
+        .map_or(trimmed.len(), |(index, _)| index);
+    // Trimming still scans whitespace. Only normalization allocation/work is
+    // bounded. Contextual lowercase can differ beyond the ASCII comparisons;
+    // boundary letters remain alphanumeric in either form.
+    let t = trimmed[..end].to_lowercase().replace('’', "'");
     if NOT_CORRECTIONS.iter().any(|p| t.starts_with(p)) {
         return false;
     }
@@ -95,4 +126,79 @@ pub fn summary_line(s: &RunSummary) -> String {
         s.avg_tool_calls,
         s.avg_tokens
     )
+}
+
+#[cfg(test)]
+mod correction_prefix_tests {
+    use super::*;
+
+    fn full_normalization_reference(text: &str) -> bool {
+        let text = text.trim().to_lowercase().replace('’', "'");
+        !NOT_CORRECTIONS
+            .iter()
+            .any(|prefix| text.starts_with(prefix))
+            && OPENINGS.iter().any(|prefix| {
+                text.starts_with(prefix)
+                    && text[prefix.len()..]
+                        .chars()
+                        .next()
+                        .is_none_or(|c| !c.is_alphanumeric())
+            })
+    }
+
+    #[test]
+    fn bounded_correction_normalization_preserves_all_phrase_and_unicode_boundaries() {
+        for phrase in OPENINGS.iter().chain(NOT_CORRECTIONS) {
+            for prefix in [
+                phrase.to_string(),
+                phrase.to_uppercase(),
+                phrase.to_uppercase().replace('\'', "’"),
+            ] {
+                for suffix in [
+                    String::new(),
+                    "!".into(),
+                    "doing".into(),
+                    "ไทย".into(),
+                    "İ".into(),
+                    format!("Σ{}A", "\u{301}".repeat(100)),
+                    format!(" {}", "long tail ไทย ".repeat(1000)),
+                ] {
+                    let text = format!(
+                        "{}{}{}{}",
+                        " \t\n".repeat(100),
+                        prefix,
+                        suffix,
+                        " \n".repeat(100)
+                    );
+                    assert_eq!(
+                        is_correction(&text),
+                        full_normalization_reference(&text),
+                        "phrase {phrase:?}"
+                    );
+                }
+            }
+        }
+        for text in [
+            "",
+            " \n\t",
+            "Wrongdoing",
+            "No that's great!",
+            "No that was perfect",
+            "İT DIDN'T WORK",
+        ] {
+            assert_eq!(
+                is_correction(text),
+                full_normalization_reference(text),
+                "{text}"
+            );
+        }
+        // A contextual mapping really can change when the source is cut;
+        // both sigma forms still reject the same ASCII-opening boundary.
+        let text = format!("WRONGΣ{}A", "\u{301}".repeat(100));
+        let prefix: String = text.chars().take(CORRECTION_SOURCE_SCALARS).collect();
+        assert!(prefix.to_lowercase().contains('ς'));
+        assert!(text.to_lowercase().contains('σ'));
+        assert_eq!(is_correction(&text), full_normalization_reference(&text));
+        assert!(!is_correction(&text));
+    }
 }

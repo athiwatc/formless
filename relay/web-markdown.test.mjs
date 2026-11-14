@@ -53,7 +53,7 @@ test('different list kinds or a following paragraph still terminate a list', () 
   const c=fixture();
   for (const [text, tags] of [
     ['- a\n\n1. b',['ul','ol']],['1. a\n\n- b',['ol','ul']],
-    ['- a\n\nParagraph',['ul','p']],['- a\n\n- - -\n\n- b',['ul','hr','ul']],['* a\n\n* * *\n\n* b',['ul','hr','ul']],['1. a\n\n## Heading',['ol','h3']],
+    ['- a\n\nParagraph',['ul','p']],['- a\n\n- - -\n\n- b',['ul','hr','ul']],['* a\n\n* * *\n\n* b',['ul','hr','ul']],['1. a\n\n## Heading',['ol','h4']],
   ]) assert.deepEqual(c.markdown(text).children.map(child=>child.tag),tags,text);
   const tight=c.markdown('1. a\n2. b').children[0];
   assert.equal(tight.attrs.class,undefined);assert.equal(tight.children.length,2);
@@ -109,4 +109,227 @@ test('math and fence state follow parser precedence and closing-length rules', (
   assert.equal(all(c.markdown(fenced)).filter(n=>n.attrs?.class==='math block').length,0);
   const languageLikeClose='```js\ncode\n```js\n\nnot closed';
   assert.equal(c.splitStreaming(languageLikeClose)[0],'');
+});
+
+test('table recognition shares logical header and delimiter cell counts with lookahead', () => {
+  const c=fixture();
+  for(const source of ['A | B\n---','| a | b |\n|---|','a | b\n--- | --- | ---','a | b\n---\\|---']) {
+    c.caseLines=source.split('\n');
+    assert.equal(vm.runInContext('tableStart(caseLines,0)',c),false,source);
+    assert.equal(vm.runInContext('startsBlock(caseLines,0)',c),false,source);
+    assert.equal(all(c.markdown(source)).some(n=>n.tag==='table'),false,source);
+    const following=c.markdown('Leading paragraph\n'+source);
+    assert.equal(all(following).some(n=>n.tag==='table'),false,source);
+    assert.ok(plain(following.children[0]).includes('Leading paragraph'));
+    assert.ok(plain(following.children[0]).includes(source.split('\n')[0]),'lookahead must not split at a rejected table');
+  }
+});
+
+test('valid tables keep edge pipes, escaped header pipes, alignment and body padding', () => {
+  const c=fixture();
+  for(const [header,delimiter] of [
+    ['a | b','--- | :---:'],['| a | b |','|:---|---:|'],
+    ['a\\|b | c','--- | ---'],['| a\\|b | c |','|---|---|'],
+  ]) {
+    c.caseLines=[header,delimiter];
+    assert.equal(vm.runInContext('tableStart(caseLines,0)',c),true);
+    assert.equal(vm.runInContext('startsBlock(caseLines,0)',c),true);
+    const root=c.markdown(header+'\n'+delimiter+'\none |\nleft | right | extra');
+    const table=all(root).find(n=>n.tag==='table');assert.ok(table);
+    const rows=all(table).filter(n=>n.tag==='tbody')[0].children;
+    assert.equal(rows[0].children.length,2);assert.equal(plain(rows[0].children[1]),'');
+    assert.equal(rows[1].children.length,2);assert.equal(plain(rows[1]),'leftright');
+  }
+});
+
+test('streamed table prefixes use the same predicate and completed block shapes', () => {
+  const c=fixture();
+  for(const source of ['A | B\n---','A | B\n--- | ---\na | b','a\\|b | c\n--- | ---']) {
+    for(let end=0;end<=source.length;end++) {
+      const prefix=source.slice(0,end);c.caseLines=prefix.split('\n');
+      const recognized=vm.runInContext('tableStart(caseLines,0)',c);
+      assert.equal(all(c.markdown(prefix)).some(n=>n.tag==='table'),recognized,prefix);
+    }
+    const text='Earlier paragraph\n\n'+source+'\n\nFinal paragraph';
+    const [stable,tail]=c.splitStreaming(text);
+    assert.deepEqual([...c.markdown(stable).children,...c.markdown(tail).children].map(shape),c.markdown(text).children.map(shape));
+  }
+});
+
+test('Setext paragraphs share logical levels with ATX and retain multiline inline content', () => {
+  const c=fixture();
+  for(const [underline,atx] of [['===','#'],['---','##'],['=','#'],['-','##']]) {
+    const title='ไทย **Title** [link](https://example.invalid)';
+    assert.deepEqual(shape(c.markdown(title+'\n'+underline).children[0]),shape(c.markdown(atx+' '+title).children[0]));
+    const heading=c.markdown('First line\n'+title+'\n  '+underline+'  ').children[0];
+    assert.equal(heading.tag,c.markdown(atx+' title').children[0].tag);
+    assert.equal(plain(heading),'First line'+title);
+    assert.ok(heading.children.some(child=>child.tag==='br'));
+  }
+});
+
+test('Setext precedence preserves standalone rules, fences, tables and nested block handling', () => {
+  const c=fixture();
+  assert.deepEqual(c.markdown('Title\n\n---').children.map(n=>n.tag),['p','hr']);
+  assert.deepEqual(c.markdown('---').children.map(n=>n.tag),['hr']);
+  assert.deepEqual(c.markdown('```text\nTitle\n===\n```').children.map(n=>n.tag),['pre']);
+  assert.equal(plain(c.markdown('```text\nTitle\n---\n```')),'Title\n---');
+  assert.equal(all(c.markdown('A | B\n--- | ---')).some(n=>n.tag==='table'),true);
+  const rejected=c.markdown('A | B\n---');
+  assert.equal(rejected.children[0].tag,c.markdown('## title').children[0].tag);
+  assert.equal(plain(rejected),'A | B');
+  assert.equal(c.markdown('Title\n    ===').children[0].tag,'p','four-space underline is not Setext');
+  const quote=c.markdown('> Quoted title\n> ===').children[0];
+  assert.equal(quote.tag,'blockquote');assert.equal(quote.children[0].tag,c.markdown('# title').children[0].tag);
+  const list=c.markdown('- item\n  title\n  ===').children[0];
+  assert.equal(list.tag,'ul');assert.ok(all(list).some(n=>n.tag===c.markdown('# title').children[0].tag));
+});
+
+test('Setext incremental tails settle to the same completed blocks', () => {
+  const c=fixture();
+  for(const text of ['Title\n===','First line\nSecond line\n---','A | B\n---','A | B\n--- | ---\nx | y']) {
+    for(let end=0;end<=text.length;end++) {
+      const prefix='Earlier paragraph\n\n'+text.slice(0,end);
+      const [stable,tail]=c.splitStreaming(prefix);
+      assert.deepEqual([...c.markdown(stable).children,...c.markdown(tail).children].map(shape),c.markdown(prefix).children.map(shape),prefix);
+    }
+  }
+});
+
+test('all six Markdown heading depths remain distinct below the Session title', () => {
+  const c=fixture();
+  const headings=c.markdown(Array.from({length:6},(_,i)=>'#'.repeat(i+1)+' ไทย **depth '+(i+1)+'**').join('\n\n')).children;
+  assert.equal(headings.length,6);
+  for(const [index,heading] of headings.entries()) {
+    assert.equal(heading.attrs.role,'heading');
+    assert.equal(heading.attrs['aria-level'],index+3);
+    assert.equal(heading.attrs['data-heading-level'],index+1);
+    assert.ok(heading.attrs.class.includes('md-heading-'+(index+1)));
+    assert.equal(plain(heading),'ไทย **depth '+(index+1)+'**');
+  }
+  assert.equal(new Set(headings.map(h=>h.attrs['aria-level'])).size,6);
+});
+
+test('lazy quote continuations retain literal Setext-like text through nested containers', () => {
+  const c=fixture();
+  for(const [source,text] of [
+    ['> Foo\n===','Foo==='],['> Foo\nbar\n===','Foobar==='],
+    ['> > Foo\n===','Foo==='],['> > Foo\n> ===','Foo==='],
+    ['> [!NOTE]\n> Foo\n===','ℹ NoteFoo==='],
+    ['- > Foo\n  ===','Foo==='],
+  ]) {
+    const root=c.markdown(source);
+    assert.equal(all(root).some(n=>/^h[1-6]$/.test(n.tag)||n.attrs?.role==='heading'),false,source);
+    assert.equal(plain(root),text,source);
+  }
+  for(const source of ['> Foo\n> ===','> Foo\nbar\n> ===','> > Foo\n> > ===','- > Foo\n  > ===']) {
+    const heading=all(c.markdown(source)).find(n=>n.tag===c.markdown('# Foo').children[0].tag);
+    assert.ok(heading,source);assert.ok(plain(heading).startsWith('Foo'),source);
+    assert.equal(plain(heading).includes('==='),false,source);
+  }
+});
+
+test('Setext list underlines require the item content indentation', () => {
+  const c=fixture();
+  for(const source of ['- Foo\n===','- Foo\n ===','10. Foo\n   ===','> - Foo\n> ===','> - Foo\n===','- Foo\nbar\n===']) {
+    const root=c.markdown(source);
+    assert.equal(all(root).some(n=>/^h[1-6]$/.test(n.tag)||n.attrs?.role==='heading'),false,source);
+    assert.ok(plain(root).endsWith('==='),source);
+  }
+  for(const [source,atx] of [
+    ['- Foo\n  ===','# Foo'],['- Foo\n  ---','## Foo'],
+    ['10. Foo\n    ===','# Foo'],['- Foo\nbar\n  ===','# Foo'],
+    ['> - Foo\n>   ===','# Foo'],
+  ]) {
+    const heading=all(c.markdown(source)).find(n=>n.tag===c.markdown(atx).children[0].tag);
+    assert.ok(heading,source);assert.equal(plain(heading).includes('==='),false,source);
+  }
+  assert.deepEqual(c.markdown('- Foo\n---').children.map(n=>n.tag),['ul','hr']);
+});
+
+test('lazy and marked container underlines converge across streamed prefixes', () => {
+  const c=fixture();
+  for(const source of ['> Foo\n===','> > Foo\n===','> Foo\nbar\n> ===','- Foo\n ===','- Foo\n  ===','- > Foo\n  ===','> [!NOTE]\n> Foo\n===']) {
+    for(let end=0;end<=source.length;end++) {
+      const prefix='Earlier paragraph\n\n'+source.slice(0,end);
+      const [stable,tail]=c.splitStreaming(prefix);
+      assert.deepEqual([...c.markdown(stable).children,...c.markdown(tail).children].map(shape),c.markdown(prefix).children.map(shape),prefix);
+    }
+    const completed='Earlier paragraph\n\n'+source+'\n\nFinal paragraph';
+    const [stable,tail]=c.splitStreaming(completed);
+    assert.deepEqual([...c.markdown(stable).children,...c.markdown(tail).children].map(shape),c.markdown(completed).children.map(shape),completed);
+  }
+});
+
+
+test('a completed quoted Setext heading ends lazy continuation of that paragraph', () => {
+  const c=fixture();
+  for(const source of [
+    '> Foo\n> ===\nOutside','> Foo\n> ---\nOutside',
+    '> Foo\nbar\n> ===\nOutside','> > Foo\n> > ===\nOutside',
+    '> [!NOTE]\n> Foo\n> ===\nOutside','> - Foo\n>   ===\nOutside',
+  ]) {
+    const root=c.markdown(source);
+    assert.deepEqual(root.children.map(n=>n.tag),['blockquote','p'],source);
+    assert.equal(plain(root.children[1]),'Outside',source);
+    assert.equal(plain(root.children[0]).includes('Outside'),false,source);
+  }
+  for(const source of ['> Foo\n===\nOutside','> ===\nOutside','> Foo\n> ===\n> Bar\nOutside','> Foo\n> ===\n> ===\nOutside']) {
+    const root=c.markdown(source);
+    assert.equal(root.children.length,1,source);
+    assert.ok(plain(root.children[0]).endsWith('Outside'),source);
+  }
+  const nested=c.markdown('> > Foo\n> > ===\n> Outside');
+  assert.equal(nested.children.length,1);
+  assert.deepEqual(nested.children[0].children.map(n=>n.tag),['blockquote','p']);
+  assert.equal(plain(nested.children[0].children[1]),'Outside');
+});
+
+test('a completed list Setext heading returns subsequent lazy text outside the item', () => {
+  const c=fixture();
+  for(const [source,tag] of [
+    ['- Foo\n  ===\nOutside','ul'],['- Foo\n  ---\nOutside','ul'],
+    ['10. Foo\n    ===\nOutside','ol'],['- > Foo\n  > ===\nOutside','ul'],
+    ['- Foo\n  ===\n Outside','ul'],['- Foo\n  ===\nOutside\n\n- Next','ul'],
+  ]) {
+    const root=c.markdown(source);
+    assert.equal(root.children[0].tag,tag,source);
+    assert.equal(root.children[1]?.tag,'p',source);
+    assert.equal(plain(root.children[1]),'Outside',source);
+    assert.equal(plain(root.children[0]).includes('Outside'),false,source);
+  }
+  for(const source of ['- Foo\n===\nOutside','- Foo\n  ===\n  Bar\nOutside','- ===\nOutside']) {
+    const root=c.markdown(source);
+    assert.equal(root.children.length,1,source);
+    assert.ok(plain(root.children[0]).endsWith('Outside'),source);
+  }
+});
+
+test('Setext container exits agree across streamed prefixes and completed blocks', () => {
+  const c=fixture();
+  for(const source of ['> Foo\n> ===\nOutside','- Foo\n  ===\nOutside','> > Foo\n> > ===\nOutside','- > Foo\n  > ===\nOutside','- Foo\n  ===\nOutside\n\n- Next']) {
+    for(let end=0;end<=source.length;end++) {
+      const prefix='Before\n\n'+source.slice(0,end);
+      const [stable,tail]=c.splitStreaming(prefix);
+      assert.deepEqual([...c.markdown(stable).children,...c.markdown(tail).children].map(shape),c.markdown(prefix).children.map(shape),prefix);
+    }
+    const text='Before\n\n'+source+'\n\nAfter\n\n';
+    const [stable,tail]=c.splitStreaming(text);
+    assert.deepEqual([...c.markdown(stable).children,...c.markdown(tail).children].map(shape),c.markdown(text).children.map(shape),text);
+  }
+});
+
+
+test('repeated Setext quote exits retain nested structure and each callout title', () => {
+  const c=fixture(), count=128;
+  for(const block of ['> Foo\n> ===\nOutside\n','> > Foo\n> > ===\nOutside\n','> [!NOTE]\n> Foo\n> ===\nOutside\n']) {
+    const root=c.markdown(block.repeat(count));
+    assert.equal(root.children.length,count*2,block);
+    for(let i=0;i<count;i++) {
+      const quote=root.children[i*2],outside=root.children[i*2+1];
+      assert.equal(quote.tag,'blockquote');assert.equal(outside.tag,'p');
+      assert.equal(plain(outside),'Outside');
+      assert.equal(plain(quote),block.includes('[!NOTE]')?'ℹ NoteFoo':'Foo');
+    }
+  }
 });

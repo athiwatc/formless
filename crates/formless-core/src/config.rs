@@ -1552,10 +1552,10 @@ pub struct ToolsCfg {
     /// How deep `tools.call` composition may nest (a cycle guard).
     #[serde(default = "default_max_tool_depth")]
     pub max_tool_depth: usize,
-    /// Longest single `sleep(ms)` inside a Tool, in seconds.
+    /// Longest single `sleep(ms)` inside a Tool, in seconds; excess is an error.
     #[serde(default = "default_max_sleep_secs")]
     pub max_sleep_secs: u64,
-    /// Largest `randomBytes(n)` a Tool may ask for.
+    /// Largest exact decoded `randomBytes(n)` result; excess is an error.
     #[serde(default = "default_max_random_bytes")]
     pub max_random_bytes: usize,
     /// Native caps outside the JS heap (#604): one `fs.read` or `fetch`
@@ -2334,11 +2334,14 @@ pub fn save_api_key(paths: &Paths, key: &str) -> Result<()> {
 }
 
 /// The key in the file a `*_FILE` variable names: None when the variable
-/// is unset, an error naming the variable and file when it can't be used
+/// is unset or empty, an error naming the variable and file when it can't be used
 /// (missing, unreadable, not UTF-8, empty). A BOM and surrounding
 /// whitespace are trimmed (#1083).
 pub fn key_from_file_env(var: &str) -> Option<std::result::Result<String, String>> {
     let path = std::env::var_os(var)?;
+    if path.is_empty() {
+        return None;
+    }
     let shown = std::path::Path::new(&path).display().to_string();
     Some(match std::fs::read(&path) {
         Err(e) => Err(format!("{var} names {shown}, which can't be read: {e}")),
