@@ -1915,7 +1915,7 @@
       const itemStart = i;
       let looseAfter = Infinity;
       const m = lines[i].match(ITEM);
-      if (!sibling(m, siblingLimit)) break;
+      if (RULE.test(lines[i]) || !sibling(m, siblingLimit)) break;
       const contentIndent = indentOf(m[1]) + m[2].length + Math.max(1, Math.min(4, m[3].length));
       siblingLimit = contentIndent;
       const body = [m[4]], bodyLazy = [lazy[i]];
