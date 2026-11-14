@@ -12,6 +12,10 @@ use std::path::{Path, PathBuf};
 #[path = "job_schedule_tests.rs"]
 mod job_schedule_tests;
 
+#[cfg(test)]
+#[path = "pin_batch_tests.rs"]
+mod pin_batch_tests;
+
 /// Token use for one key and model: (key, model, prompt, completion,
 /// cached, provider-reported USD when every request reported one).
 /// (key, provider, model, prompt, completion, cached, cache-write, reported cost).
@@ -4755,6 +4759,49 @@ impl Store {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .ok())
+    }
+
+    /// Per-listing active snapshots for only the shown IDs. Decode errors in
+    /// an individual pin remain missing, like pinned_definition. SQL/iteration
+    /// errors propagate so the caller can retain the legacy per-Tool path.
+    pub(crate) fn pinned_definitions_for(
+        &self,
+        session_id: &str,
+        tool_ids: &[&str],
+    ) -> Result<std::collections::HashMap<String, (i64, String)>> {
+        let mut pins = std::collections::HashMap::new();
+        // Stay below SQLite's conservative parameter limit; no query for [].
+        for chunk in tool_ids.chunks(128) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql = format!(
+                "SELECT tool_id, pinned_version, pinned_def FROM session_tools
+                 WHERE session_id=? AND tool_id IN ({placeholders}) AND pinned_def IS NOT NULL"
+            );
+            let mut stmt = self.ps(&sql)?;
+            let rows = stmt.query_map(
+                rusqlite::params_from_iter(
+                    std::iter::once(session_id).chain(chunk.iter().copied()),
+                ),
+                |row| {
+                    let id: String = row.get(0)?;
+                    let pin = row
+                        .get::<_, i64>(1)
+                        .and_then(|version| {
+                            row.get::<_, String>(2)
+                                .map(|definition| (version, definition))
+                        })
+                        .ok();
+                    Ok((id, pin))
+                },
+            )?;
+            for row in rows {
+                let (id, pin) = row?;
+                if let Some(pin) = pin {
+                    pins.insert(id, pin);
+                }
+            }
+        }
+        Ok(pins)
     }
 
     /// Pinned definitions of a Session's Tools that are no longer active
