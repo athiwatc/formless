@@ -1386,12 +1386,14 @@
   // output cannot inject markup. Mermaid diagrams render via a vendored,
   // lazily loaded mermaid.js into <img> data URLs (see renderMermaid).
   const SAFE_URL = /^(https?:|mailto:)/i;
+  // Asterisk emphasis consumes escapes as pairs before closing delimiters: an
+  // odd backslash run escapes the delimiter while an even run does not.
   const INLINE = new RegExp([
     /(`+)([^`]|[^`][\s\S]*?[^`])\1(?!`)/.source, // 1,2 code
-    /\*\*(?=\S)([\s\S]*?\S)\*\*/.source, // 3 strong
+    /\*\*(?=\S)((?:\\[\s\S]|[^\\])*?(?:\\\S|[^\\\s]))\*\*/.source, // 3 strong
     /__(?=\S)([\s\S]*?\S)__(?!\w)/.source, // 4 strong
     /~~(?=\S)([\s\S]*?\S)~~/.source, // 5 strike
-    /\*(?=[^\s*])((?:[^*]|\*\*[^*]+\*\*)*?[^\s*])\*/.source, // 6 em
+    /\*(?=[^\s*])((?:\\[\s\S]|[^*\\]|\*\*[^*]+\*\*)*?(?:\\\S|[^\\\s*]))\*/.source, // 6 em
     /(?<![\w\\])_(?=[^\s_])([^_]*?[^\s_])_(?!\w)/.source, // 7 em
     /!\[([^\]]*)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/.source, // 8,9 image
     /\[((?:[^\]\\]|\\.)+)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/.source, // 10,11 link
