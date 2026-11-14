@@ -2719,7 +2719,8 @@ suite cannot measure preferences.
   Detection covers:
   - known key and token formats (`sk-`, `ghp_`, `AKIA`, `xoxb-`, …)
   - private keys, bearer tokens and JWTs
-  - `password/token/api_key is|:|= …` assignments
+  - explicit `password/token/api_key :|= …` assignments, quoted `is` values,
+    and unquoted `is` values with a secret shape
   - long mixed-case random-looking strings
   `remember` also refuses text of 40 or more characters copied verbatim
   from the Session's recent Tool results; the agent must restate the
@@ -6019,7 +6020,13 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
   provider for approval summaries. It looks for secret shapes (provider
   key prefixes, JWTs, private keys, bearer tokens, `password = …`,
   `token=…`, `cookie: …` assignments, long random-looking tokens) rather
-  than key names, plus `security.secret_patterns`. A Tool result holding
+  than key names, plus `security.secret_patterns`. For unquoted `keyword is
+  value` phrases, a value needs a number, internal mixed case, or a recognized
+  secret shape; ordinary prose such as "token is refreshed" stays intact.
+  `:`/`=` and quoted assignments keep conservative masking. This heuristic
+  cannot distinguish an unquoted plain-word secret from ordinary prose;
+  masking known submitted credential values and configured patterns remains
+  unconditional. A Tool result holding
   one is still sent to the model, with a one-time note per Tool and kind
   in the Run.
   Recorded payloads never leave the data dir except redacted, to the user's
