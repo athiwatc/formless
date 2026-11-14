@@ -5,6 +5,7 @@ mod cli_commands;
 mod cli_help_tests;
 mod cli_mcp_prompts;
 mod cli_metrics;
+mod cli_models;
 mod cli_modules;
 mod cli_pipeline;
 mod cli_proposal_diff;
@@ -255,6 +256,12 @@ enum Cmd {
         /// Print all three complete replies as one JSON object
         #[arg(long)]
         json: bool,
+    },
+    /// List the default provider's endpoint models and existing picker report
+    #[command(after_help = "Examples:\n  formless models list\n  formless models list --json")]
+    Models {
+        #[command(subcommand)]
+        action: cli_models::Action,
     },
     /// Read the module inventory, metadata and stored source versions
     #[command(
@@ -2168,6 +2175,13 @@ fn run_cli(cli: Cli) -> Result<()> {
         Some(Cmd::Mcp { action }) => mcp_cmd(paths, action),
         Some(Cmd::Skills { action }) => skills_cmd(paths, action),
         Some(Cmd::Artifacts { action }) => cli_artifacts::run(&paths, action),
+        Some(Cmd::Models { action }) => {
+            let code = cli_models::run(&paths, action)?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
         Some(Cmd::Modules { action }) => cli_modules::run(&paths, action),
         Some(Cmd::Memory { action }) => memory_cmd(paths, action),
         Some(Cmd::Runs {

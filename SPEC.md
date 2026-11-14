@@ -5018,6 +5018,7 @@ the TUI. Command-specific arguments and defaults are available through
 | `formless mcp` | `add`, `remove`, `list`, `test`, `login`, `logout`, `catalog`, `import`, `log`, `tools`, `tool`, `prompts`, `prompt` | Manage external MCP servers and inspect their tools/logs. |
 | `formless metrics` | `--since DURATION`, `--json` | Read recorded model, Tool and built-in statistics through independent reports at one cutoff. |
 | `formless memory` | `list`, `add`, `rm`, `edit` | Inspect or change saved user-memory notes. |
+| `formless models` | `list [--json]` | Fetch the default-provider model catalog and existing picker report; a non-null listing error prints a partial report and exits 1. |
 | `formless modules` | `list`, `show`; `show --version N` | Read all modules, inspect metadata/history/dependents, or emit an exact stored source version. |
 | `formless naming` | `status`, `pull`, `test` | Inspect, install, or preview the embedded Session-naming model. |
 | `formless prices` | `import` | Import a model-price catalog for cost and spending limits. |
