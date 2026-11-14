@@ -24420,7 +24420,9 @@ mod tests {
         let mut app = test_app();
         std::fs::create_dir_all(&app.paths.data_dir).unwrap();
         let png = app.paths.data_dir.join("shot.png");
-        std::fs::write(&png, b"\x89PNG\r\n\x1a\nfake").unwrap();
+        image::RgbaImage::from_pixel(20, 10, image::Rgba([200, 30, 30, 128]))
+            .save_with_format(&png, image::ImageFormat::Png)
+            .unwrap();
         app.messages = vec![MessageInfo {
             id: "u".into(),
             session_id: "s".into(),
@@ -24439,15 +24441,17 @@ mod tests {
         // Without a protocol nothing is reserved.
         render(&mut app, 100, 40);
         assert!(app.image_placed.is_empty());
-        app.image_proto = Some(images::Protocol::ITerm);
-        let screen = render(&mut app, 100, 40);
-        assert!(screen.contains("🖼 shot.png") && !screen.contains("notes.txt"));
-        assert_eq!(app.image_placed.len(), 1);
-        let p = &app.image_placed[0];
-        assert_eq!((p.cols, p.path.as_str()), (40, png.to_str().unwrap()));
-        // Too short to show the whole box: not placed.
-        render(&mut app, 100, 12);
-        assert!(app.image_placed.is_empty());
+        for proto in [images::Protocol::ITerm, images::Protocol::Kitty] {
+            app.image_proto = Some(proto);
+            let screen = render(&mut app, 100, 40);
+            assert!(screen.contains("🖼 shot.png") && !screen.contains("notes.txt"));
+            assert_eq!(app.image_placed.len(), 1);
+            let p = &app.image_placed[0];
+            assert_eq!((p.cols, p.path.as_str()), (40, png.to_str().unwrap()));
+            // Too short to show the whole box: not placed.
+            render(&mut app, 100, 12);
+            assert!(app.image_placed.is_empty());
+        }
     }
 
     #[test]
