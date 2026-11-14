@@ -4769,8 +4769,9 @@ impl Store {
         tool_id: &str,
         limit: usize,
     ) -> Result<Vec<(i64, String, String, String)>> {
-        let mut stmt = self.ps("SELECT version, tag, input, error FROM invocations
-             WHERE tool_id=?1 AND status='failure' ORDER BY created_at DESC LIMIT ?2")?;
+        let mut stmt =
+            self.ps("SELECT version, tag, input, error FROM invocations
+             WHERE tool_id=?1 AND status='failure' ORDER BY created_at DESC, rowid DESC LIMIT ?2")?;
         let rows = stmt
             .query_map(params![tool_id, limit as i64], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
@@ -7919,5 +7920,56 @@ mod user_naming_text_tests {
         let got = scanned(&shaped, 1, 2).unwrap();
         assert_head_tail(&got, &long);
         assert!(!got.contains("LATE_ONLY"));
+    }
+}
+
+#[cfg(test)]
+mod recent_failure_order_tests {
+    use super::*;
+
+    #[test]
+    fn recent_failures_break_timestamp_ties_by_recording_order() {
+        let store = Store::open_in_memory().unwrap();
+        let tool = store
+            .create_tool_version(
+                "failure_order",
+                "fixture",
+                "{}",
+                "{}",
+                "function run(i){return i}",
+                &Capabilities::default(),
+                64,
+                "agent",
+            )
+            .unwrap()
+            .0
+            .id;
+        let insert = |tag: &str, timestamp: &str, status: &str| {
+            store.conn.execute(
+                "INSERT INTO invocations(id,tool_id,version,status,tag,input,error,created_at) VALUES(?1,?2,1,?3,?1,?4,?5,?6)",
+                params![tag,tool,status,r#"{"text":"ไทย 日本語"}"#,"ผิดพลาด\n詳細",timestamp],
+            ).unwrap();
+        };
+        insert("first", "2026-01-02T00:00:00Z", "failure");
+        insert("second", "2026-01-02T00:00:00Z", "failure");
+        insert("third", "2026-01-02T00:00:00Z", "failure");
+        assert_eq!(store.recent_failures(&tool, 1).unwrap()[0].1, "third");
+        insert("older_recorded_later", "2026-01-01T00:00:00Z", "failure");
+        insert("success", "2026-01-04T00:00:00Z", "success");
+        insert("running", "2026-01-04T00:00:00Z", "running");
+        insert("newest", "2026-01-03T00:00:00Z", "failure");
+        let rows = store.recent_failures(&tool, 10).unwrap();
+        assert_eq!(
+            rows.iter().map(|row| row.1.as_str()).collect::<Vec<_>>(),
+            ["newest", "third", "second", "first", "older_recorded_later"]
+        );
+        assert_eq!(store.recent_failures(&tool, 3).unwrap(), rows[..3]);
+        assert!(store.recent_failures(&tool, 0).unwrap().is_empty());
+        assert!(store.recent_failures("other_tool", 10).unwrap().is_empty());
+        for (version, _, input, error) in rows {
+            assert_eq!(version, 1);
+            assert_eq!(input, r#"{"text":"ไทย 日本語"}"#);
+            assert_eq!(error, "ผิดพลาด\n詳細");
+        }
     }
 }
