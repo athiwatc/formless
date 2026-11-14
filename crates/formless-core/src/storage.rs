@@ -3951,23 +3951,25 @@ impl Store {
         Ok(out)
     }
 
+    fn module_row(r: &rusqlite::Row) -> rusqlite::Result<ModuleInfo> {
+        Ok(ModuleInfo {
+            id: r.get(0)?,
+            name: r.get(1)?,
+            description: crate::descriptions::screen(&r.get::<_, String>(2)?).text,
+            current_version: r.get(3)?,
+            retired: r.get::<_, i64>(4)? != 0,
+            created_at: r.get(5)?,
+            updated_at: r.get(6)?,
+        })
+    }
+
     fn module_info(&self, id: &str) -> Result<Option<ModuleInfo>> {
         Ok(self
             .conn
             .query_row(
                 "SELECT id,name,description,current_version,retired,created_at,updated_at FROM modules WHERE id=?1",
                 params![id],
-                |r| {
-                    Ok(ModuleInfo {
-                        id: r.get(0)?,
-                        name: r.get(1)?,
-                        description: crate::descriptions::screen(&r.get::<_,String>(2)?).text,
-                        current_version: r.get(3)?,
-                        retired: r.get::<_, i64>(4)? != 0,
-                        created_at: r.get(5)?,
-                        updated_at: r.get(6)?,
-                    })
-                },
+                Self::module_row,
             )
             .ok())
     }
@@ -4174,14 +4176,29 @@ impl Store {
     }
 
     pub fn list_module_code(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.ps(
+            "SELECT m.id,m.name,m.description,m.current_version,m.retired,m.created_at,m.updated_at,v.code
+             FROM modules m LEFT JOIN module_versions v ON v.module_id=m.id AND v.version=m.current_version
+             ORDER BY m.name_lower",
+        )?;
+        let mut rows = stmt.query([])?;
         let mut out = Vec::new();
-        for info in self.list_modules()? {
+        while let Some(row) = rows.next()? {
+            // The former id-list read propagated id conversion failures, while
+            // module_info skipped unreadable metadata. Keep those distinct.
+            let _: String = row.get(0)?;
+            let Ok(info) = Self::module_row(row) else {
+                continue;
+            };
             if info.retired {
                 continue;
             }
-            if let Some((_, code)) = self.get_module_by_name(&info.name)? {
-                out.push((info.name, code));
+            // LEFT JOIN keeps a missing current version visible as an error,
+            // rather than silently omitting an otherwise readable live module.
+            if matches!(row.get_ref(7)?, rusqlite::types::ValueRef::Null) {
+                return Err(rusqlite::Error::QueryReturnedNoRows.into());
             }
+            out.push((info.name, row.get(7)?));
         }
         Ok(out)
     }
@@ -6654,6 +6671,10 @@ pub fn estimate_tokens(text: &str) -> usize {
 }
 
 pub type BuiltContext = (Vec<Value>, bool, i64);
+
+#[cfg(test)]
+#[path = "module_snapshot_tests.rs"]
+mod module_snapshot_tests;
 
 /// Build provider context (OpenAI message objects) from checkpoint +
 /// post-checkpoint messages. Tool-call/tool messages are reconstructed from
