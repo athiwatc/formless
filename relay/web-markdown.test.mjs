@@ -53,7 +53,7 @@ test('different list kinds or a following paragraph still terminate a list', () 
   const c=fixture();
   for (const [text, tags] of [
     ['- a\n\n1. b',['ul','ol']],['1. a\n\n- b',['ol','ul']],
-    ['- a\n\nParagraph',['ul','p']],['- a\n\n- - -\n\n- b',['ul','hr','ul']],['* a\n\n* * *\n\n* b',['ul','hr','ul']],['1. a\n\n## Heading',['ol','h3']],
+    ['- a\n\nParagraph',['ul','p']],['- a\n\n- - -\n\n- b',['ul','hr','ul']],['* a\n\n* * *\n\n* b',['ul','hr','ul']],['1. a\n\n## Heading',['ol','h4']],
   ]) assert.deepEqual(c.markdown(text).children.map(child=>child.tag),tags,text);
   const tight=c.markdown('1. a\n2. b').children[0];
   assert.equal(tight.attrs.class,undefined);assert.equal(tight.children.length,2);
@@ -196,6 +196,19 @@ test('Setext incremental tails settle to the same completed blocks', () => {
   }
 });
 
+test('all six Markdown heading depths remain distinct below the Session title', () => {
+  const c=fixture();
+  const headings=c.markdown(Array.from({length:6},(_,i)=>'#'.repeat(i+1)+' ไทย **depth '+(i+1)+'**').join('\n\n')).children;
+  assert.equal(headings.length,6);
+  for(const [index,heading] of headings.entries()) {
+    assert.equal(heading.attrs.role,'heading');
+    assert.equal(heading.attrs['aria-level'],index+3);
+    assert.equal(heading.attrs['data-heading-level'],index+1);
+    assert.ok(heading.attrs.class.includes('md-heading-'+(index+1)));
+    assert.equal(plain(heading),'ไทย **depth '+(index+1)+'**');
+  }
+  assert.equal(new Set(headings.map(h=>h.attrs['aria-level'])).size,6);
+});
 
 test('lazy quote continuations retain literal Setext-like text through nested containers', () => {
   const c=fixture();
