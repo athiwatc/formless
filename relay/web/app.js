@@ -3474,14 +3474,26 @@
     const session = S.sessions.find((s) => s.id === S.current);
     return JSON.stringify([S.current, S.editMessageId, draft, session && session.model, session && session.cwd, S.chips[S.current] || [], S.daemonOnline, S.hello, forecastRevision]);
   }
+  function renderForecastPreview(result) {
+    const hint = $("forecast-hint");
+    if (hint) {
+      hint.textContent = result ? result.hint : "";
+      hint.removeAttribute("title");
+    }
+    const disclosure = $("forecast-warnings"), list = $("forecast-warning-list");
+    if (!disclosure || !list) return;
+    const warnings = Array.isArray(result?.warnings) ? result.warnings.filter(text => typeof text === "string") : [];
+    list.replaceChildren(...warnings.map(text => h("li", null, text)));
+    disclosure.hidden = warnings.length === 0;
+    if (!warnings.length) disclosure.open = false;
+  }
   function scheduleForecast() {
     const stamp = forecastStamp();
     if (stamp === forecastStampLast) return;
     forecastStampLast = stamp;
     const sequence = ++forecastSequence;
     clearTimeout(forecastTimer);
-    const box = $("forecast-hint");
-    if (box) box.textContent = "";
+    renderForecastPreview(null);
     const draft = $("input").value.trim();
     if (!S.daemonOnline || !S.current || !draft || draft.startsWith("/") || isRunning()) return;
     const sid = S.current;
@@ -3489,7 +3501,7 @@
       try {
         const result = await request({type:"forecast_run",input:{session_id:sid,draft,edit_message_id:S.editMessageId || null}});
         if (sequence !== forecastSequence || stamp !== forecastStamp()) return;
-        if (box) { box.textContent = result.hint; box.title = (result.warnings || []).join("\n"); }
+        renderForecastPreview(result);
       } catch (_) { /* A failed preview never executes or clears a draft. */ }
     }, 300);
   }
