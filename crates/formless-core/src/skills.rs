@@ -295,23 +295,38 @@ fn stage(paths: &Paths, source: &str, git_ref: Option<&str>) -> Result<PathBuf> 
     }
 }
 
+// Normalize only recognized URI schemes for Git's transport lookup. Legacy
+// git@ and .git spellings still delegate validation/policy to Git itself.
+fn git_source(source: &str) -> Option<std::borrow::Cow<'_, str>> {
+    if let Some((scheme, remainder)) = source.split_once("://") {
+        if ["http", "https", "ssh", "git", "file"]
+            .iter()
+            .any(|known| scheme.eq_ignore_ascii_case(known))
+        {
+            return Some(std::borrow::Cow::Owned(format!(
+                "{}://{remainder}",
+                scheme.to_ascii_lowercase()
+            )));
+        }
+    }
+    (source.starts_with("git@") || source.trim_end_matches('/').ends_with(".git"))
+        .then_some(std::borrow::Cow::Borrowed(source))
+}
+
 fn fetch_into(staging: &Path, source: &str, git_ref: Option<&str>) -> Result<()> {
     let local = Path::new(source);
-    let is_git = source.starts_with("https://")
-        || source.starts_with("git@")
-        || source.trim_end_matches('/').ends_with(".git");
-    if is_git {
+    if local.is_dir() {
+        copy_dir(local, staging)?;
+    } else if source.to_lowercase().ends_with(".zip") && local.is_file() {
+        extract_zip(local, staging)?;
+    } else if let Some(git_source) = git_source(source) {
         let mut git = std::process::Command::new("git");
         git.args(["clone", "--depth", "1"]);
         if let Some(r) = git_ref {
             git.args(["--branch", r]);
         }
-        git.arg(source).arg(staging);
+        git.arg(git_source.as_ref()).arg(staging);
         run(&mut git, "git clone")?;
-    } else if local.is_dir() {
-        copy_dir(local, staging)?;
-    } else if source.to_lowercase().ends_with(".zip") && local.is_file() {
-        extract_zip(local, staging)?;
     } else {
         bail!("skill source must be a folder, a .zip or a git URL: {source}");
     }
@@ -610,4 +625,55 @@ pub fn read_file(store: &Store, name: &str, rel: &str) -> Result<String> {
         bail!("'{rel}' is outside the skill");
     }
     Ok(String::from_utf8_lossy(&std::fs::read(path)?).into_owned())
+}
+
+#[cfg(test)]
+mod source_tests {
+    use super::git_source;
+
+    #[test]
+    fn recognized_git_uri_schemes_normalize_only_the_scheme() {
+        for (source, expected) in [
+            (
+                "http://Case.Example/Team/Skill",
+                "http://Case.Example/Team/Skill",
+            ),
+            (
+                "HTTPS://Case.Example/Team/Skill",
+                "https://Case.Example/Team/Skill",
+            ),
+            (
+                "HtTpS://Case.Example/Team/Skill%2FPart?Token=AbC#Frag",
+                "https://Case.Example/Team/Skill%2FPart?Token=AbC#Frag",
+            ),
+            (
+                "ssh://GitUser@Case.Example/Team/Skill",
+                "ssh://GitUser@Case.Example/Team/Skill",
+            ),
+            (
+                "SSH://GitUser@Case.Example/Team/Skill",
+                "ssh://GitUser@Case.Example/Team/Skill",
+            ),
+            (
+                "GiT://Case.Example/Team/Skill",
+                "git://Case.Example/Team/Skill",
+            ),
+            (
+                "FILE:///Owned/Case/Repo.git/",
+                "file:///Owned/Case/Repo.git/",
+            ),
+            ("git@Case.Example:Team/Skill", "git@Case.Example:Team/Skill"),
+            ("host:Team/Repo.git", "host:Team/Repo.git"),
+        ] {
+            assert_eq!(git_source(source).as_deref(), Some(expected), "{source}");
+        }
+        for source in [
+            "notes.txt",
+            "httpsx://example.test/Skill",
+            "ws://example.test/Skill",
+            "",
+        ] {
+            assert!(git_source(source).is_none(), "{source}");
+        }
+    }
 }

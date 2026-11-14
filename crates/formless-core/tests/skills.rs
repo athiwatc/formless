@@ -217,16 +217,24 @@ fn skills_install_from_folder_zip_and_git_and_version() {
         ],
         &paths.data_dir,
     );
+    // A local path always copies working files, including .git directories.
+    // An explicit file URL requests Git cloning; uppercase also exercises the
+    // real normalized transport lookup without a remote/network dependency.
+    let source = reqwest::Url::from_directory_path(&bare)
+        .unwrap()
+        .to_string()
+        .replacen("file:", "FILE:", 1);
     let g = install(
         &paths,
         &store,
-        bare.to_str().unwrap(),
+        &source,
         Some("skills/git-skill"),
         None,
         "user",
     )
     .unwrap();
     assert_eq!(g.name, "git-skill");
+    assert_eq!(g.source, source);
     assert_eq!((g.version, g.enabled, g.has_scripts), (1, false, true));
     assert_eq!(
         read_file(&store, "git-skill", "reference.md").unwrap(),
@@ -620,4 +628,23 @@ fn hostile_skill_zips_are_refused_and_leave_nothing() {
     w.add_symlink("hosts", "/etc/hosts", opts).unwrap();
     w.finish().unwrap();
     refused(&link, "'hosts' is a symbolic link");
+}
+
+#[test]
+fn local_skill_directory_with_git_suffix_is_copied_as_a_folder() {
+    let (_fixture, paths) = temp_paths("skill-git-name");
+    let store = Store::open(&paths.db_file()).unwrap();
+    let src = paths.data_dir.join("vendor/notes.git");
+    write_skill(&src, "git-named-folder", "Local working files.");
+    // The directory is intentionally not a Git repository. Both spellings
+    // must read its actual files rather than invoking clone.
+    for source in [
+        src.to_string_lossy().into_owned(),
+        format!("{}/", src.display()),
+    ] {
+        let info = install(&paths, &store, &source, None, None, "user").unwrap();
+        assert_eq!(info.name, "git-named-folder");
+        assert_eq!(info.description, "Turn spreadsheets into tidy reports.");
+        assert!(!info.enabled);
+    }
 }
