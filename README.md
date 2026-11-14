@@ -1013,25 +1013,29 @@ formless/
 
 ## 12. Development
 
-The [CI workflow](.github/workflows/ci.yml) runs on the self-hosted macOS ARM64
-runner for pushes to `main`, same-repository pull requests targeting `main`, and
+The [CI workflow](.github/workflows/ci.yml) runs on self-hosted macOS ARM64 and Linux x64
+runners for pushes to `main`, same-repository pull requests targeting `main`, and
 manual dispatches. It checks Rust formatting and Clippy, runs workspace tests
 (including doc tests), relay/web Node tests, relay wire conformance and offline
 documentation/tooling tests, then builds the release workspace and smoke-tests
 the CLI, man page and shell completions. Tested binaries, generated assets and
 diagnostic logs are retained as workflow artifacts for seven days. Clippy uses
 the development command below; existing warnings are reported without being
-promoted to errors. Fork pull requests are skipped on the persistent runner.
+promoted to errors. Fork pull requests are skipped on the persistent runners.
 
-The runner needs the standard `self-hosted`, `macOS`, `ARM64` labels, Xcode
-Command Line Tools, Git, Rustup, Python 3.9+ and outbound access for GitHub
-Actions, Cargo and Node downloads. CI installs stable Rust with rustfmt/Clippy
-and Node 24, and verifies the runner's native Python. Cargo dependencies are cached; application data/config and logs
-use private temporary directories that are cleaned after the job. This workflow
-does not deploy or publish a release; release packaging remains in `release.yml`.
-Live external-link checks remain in `docs.yml`; Playwright browser checks in
-`relay/README.md` remain separate manual checks. AUR packaging tests require
-Linux/GNU install and are outside this macOS workflow.
+Runners need the standard `self-hosted` label plus `macOS`/`ARM64` or
+`Linux`/`X64`, and outbound access for GitHub Actions and dependency downloads.
+The Mac needs Xcode Command Line Tools, Git, Rustup and Python 3.9+. The Linux
+runner needs Docker; builds run inside `rust:1-bookworm`, with D-Bus headers,
+pkg-config and Python installed only in that disposable container. CI installs
+stable Rust with rustfmt/Clippy and Node 24. Cargo dependencies are cached;
+application data/config and logs use private temporary directories cleaned after
+the job. Container-created workspace files have their original owner restored.
+Test debug artifacts are removed before release compilation to limit disk use.
+The workflow does not deploy or publish a release; release packaging remains in
+`release.yml`. Live external-link checks remain in `docs.yml`; Playwright browser
+checks in `relay/README.md` remain separate manual checks. AUR packaging tests
+run only in the Linux job because they require GNU install.
 
 ```bash
 cargo build --workspace                # debug build of the single binary

@@ -27,12 +27,35 @@ env:
 
 jobs:
   build-test:
-    name: Build and test (macOS ARM64)
+    name: Build and test (${{ matrix.platform }})
     # Never execute fork contributions on the persistent self-hosted machine.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, macOS, ARM64]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macOS ARM64
+            runner: [self-hosted, macOS, ARM64]
+            container: ''
+          - platform: Linux X64
+            runner: [self-hosted, Linux, X64]
+            container: rust:1-bookworm
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container }}
     timeout-minutes: 90
     steps:
+      - name: Record Linux workspace owner
+        if: runner.os == 'Linux'
+        run: |
+          test ! -L "$GITHUB_WORKSPACE"
+          echo "CI_WORKSPACE_OWNER=$(stat -c '%u:%g' "$GITHUB_WORKSPACE")" >> "$GITHUB_ENV"
+
+      - name: Install Linux build dependencies (container only)
+        if: runner.os == 'Linux'
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends libdbus-1-dev pkg-config python3
+
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
@@ -40,8 +63,13 @@ jobs:
       - name: Create private job directories
         run: |
           set -euo pipefail
-          test "$(uname -s)" = Darwin
-          test "$(uname -m)" = arm64
+          if [[ "$RUNNER_OS" = macOS ]]; then
+            test "$(uname -s)" = Darwin
+            test "$(uname -m)" = arm64
+          else
+            test "$(uname -s)" = Linux
+            test "$(uname -m)" = x86_64
+          fi
           ci_dir=$(mktemp -d "$RUNNER_TEMP/formless-ci.XXXXXX")
           mkdir -p "$ci_dir/cargo" "$ci_dir/data" "$ci_dir/config" "$ci_dir/logs" "$ci_dir/dist"
           {
@@ -102,6 +130,10 @@ jobs:
             python3 "$suite" 2>&1 | tee "$CI_DIR/logs/$(basename "$suite").log"
           done
 
+      - name: Linux AUR packaging regression tests
+        if: runner.os == 'Linux'
+        run: python3 scripts/test-aur-completions.py 2>&1 | tee "$CI_DIR/logs/aur-completions.log"
+
       - name: Workspace unit, integration and doc tests
         run: cargo test --workspace --locked --no-fail-fast 2>&1 | tee "$CI_DIR/logs/rust-tests.log"
 
@@ -125,12 +157,19 @@ jobs:
           test -s "$CI_DIR/dist/help.txt"
           test -s "$CI_DIR/dist/formless.1"
           cp "$binary" LICENSE "$CI_DIR/dist/"
-          (cd "$CI_DIR/dist" && shasum -a 256 formless > formless.sha256 && shasum -a 256 -c formless.sha256)
+          cd "$CI_DIR/dist"
+          if [[ "$RUNNER_OS" = Linux ]]; then
+            sha256sum formless > formless.sha256
+            sha256sum -c formless.sha256
+          else
+            shasum -a 256 formless > formless.sha256
+            shasum -a 256 -c formless.sha256
+          fi
 
       - name: Upload tested release binary and generated assets
         uses: actions/upload-artifact@v4
         with:
-          name: formless-macos-arm64-${{ github.sha }}
+          name: formless-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
           path: ${{ env.CI_DIR }}/dist/
           if-no-files-found: error
           retention-days: 7
@@ -139,7 +178,7 @@ jobs:
         if: ${{ always() && env.CI_DIR != '' }}
         uses: actions/upload-artifact@v4
         with:
-          name: ci-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          name: ci-logs-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ env.CI_DIR }}/logs/
           if-no-files-found: ignore
           retention-days: 7
@@ -155,3 +194,10 @@ jobs:
             "$RUNNER_TEMP"/formless-ci.*) rm -rf -- "$CI_DIR" ;;
             *) echo 'Refusing cleanup outside the private CI directory' >&2; exit 1 ;;
           esac
+
+      - name: Restore Linux workspace ownership
+        if: ${{ always() && runner.os == 'Linux' && env.CI_WORKSPACE_OWNER != '' }}
+        run: |
+          test ! -L "$GITHUB_WORKSPACE"
+          [[ "$CI_WORKSPACE_OWNER" =~ ^[0-9]+:[0-9]+$ ]]
+          chown -hRP "$CI_WORKSPACE_OWNER" "$GITHUB_WORKSPACE"
