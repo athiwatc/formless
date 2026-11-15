@@ -1,6 +1,7 @@
 use super::*;
 use formless_desktop::client::{Command as WireCommand, Update};
 use formless_desktop::session_edit::{Change, Metadata, Outcome, MAX_INPUT};
+use gpui_kit::EntityInputHandler as _;
 
 fn show(
     cx: &mut TestAppContext,
@@ -390,6 +391,31 @@ fn metadata_input_guards_composition_and_stays_visible_after_resize(cx: &mut Tes
             input.focus(window, cx);
         });
         window.press(&chord("z"), cx);
+        assert!(input.read(cx).value().len() <= MAX_INPUT);
+    });
+    // IME preedit has notifications but no ordinary Change event. Leave it
+    // owned by the input method, then enforce the bound after unmarking.
+    step(cx, handle, |window, cx| {
+        let input = shell.read(cx).session_edit_input().unwrap();
+        let bounds = window.find_by_label("Session tags, one per line").bounds();
+        TestInput::new(ElementInputHandler::new(bounds, input.clone()), window).compose_text(
+            None,
+            &"x".repeat(MAX_INPUT + 1),
+            None,
+            cx,
+        );
+        assert!(input.read(cx).value().len() > MAX_INPUT);
+        input.update(cx, |input, cx| {
+            input.unmark_text(window, cx);
+            cx.notify();
+        });
+        window.render_frame(cx);
+        assert!(window.try_find("session-edit-dialog").is_some());
+    });
+    cx.run_until_parked();
+    step(cx, handle, |_, cx| {
+        let input = shell.read(cx).session_edit_input().unwrap();
+        assert!(input.read(cx).value().contains("six"));
         assert!(input.read(cx).value().len() <= MAX_INPUT);
     });
 }

@@ -115,8 +115,7 @@ impl Shell {
                 .default_value(text.to_string())
         });
         let subscription =
-            cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| {
-                if matches!(event, InputEvent::Change) {
+            cx.observe_in(&input, window, |this, _, window, cx| {
                     let Some(panel) = this.session_editor.as_mut() else {
                         return;
                     };
@@ -143,7 +142,6 @@ impl Shell {
                     }
                     panel.frames = 2;
                     cx.notify();
-                }
             });
         panel.input = Some(input);
         panel._subscription = Some(subscription);
@@ -396,7 +394,10 @@ impl Shell {
             if input.update(cx, |input, cx| {
                 input.marked_text_range(window, cx).is_some()
             }) {
-                input.update(cx, |input, cx| input.unmark_text(window, cx));
+                input.update(cx, |input, cx| {
+                    input.unmark_text(window, cx);
+                    cx.notify();
+                });
                 return;
             }
         }
