@@ -5593,6 +5593,19 @@ impl Store {
         Ok(rows)
     }
 
+    /// Names only for pattern detection. Input/status conversion is intentionally
+    /// reserved for full invocation reads used by distillation.
+    fn run_tool_names(&self, run_id: &str) -> Result<Vec<String>> {
+        let mut stmt = self.ps(
+            "SELECT t.name FROM invocations i JOIN tools t ON t.id=i.tool_id
+             WHERE i.run_id=?1 ORDER BY i.created_at, i.rowid",
+        )?;
+        let rows = stmt
+            .query_map(params![run_id], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
     /// Whether a completed Run in another Session called the same Tools in
     /// the same order (a repeated pattern worth a skill).
     pub fn tool_sequence_seen_elsewhere(&self, session_id: &str, seq: &[String]) -> Result<bool> {
@@ -5605,11 +5618,7 @@ impl Store {
             .query_map(params![session_id], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
         for run in runs {
-            let other: Vec<String> = self
-                .run_invocations(&run)?
-                .into_iter()
-                .map(|(name, _, _)| name)
-                .collect();
+            let other = self.run_tool_names(&run)?;
             if other == seq {
                 return Ok(true);
             }
@@ -7009,6 +7018,10 @@ pub fn estimate_tokens(text: &str) -> usize {
 }
 
 pub type BuiltContext = (Vec<Value>, bool, i64);
+
+#[cfg(test)]
+#[path = "tool_sequence_names_tests.rs"]
+mod tool_sequence_names_tests;
 
 #[cfg(test)]
 #[path = "targeted_message_lookup_tests.rs"]
