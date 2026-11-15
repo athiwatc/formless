@@ -1253,9 +1253,9 @@ impl Engine {
         let (id, result, response_ok) = match message {
             ServerMessage::Event(event) => {
                 if let Event::StepPending { session_id, .. } = &event {
-                    // Historical handoff for a subscribed Session only.
-                    // GetSession does not retain pending Step identities, so
-                    // it cannot assert a recoverable current decision state.
+                    // Historical event notice only. GetSession separately
+                    // restores bounded read-only identities after reconnect;
+                    // neither a preview nor an event authorizes a decision.
                     self.updates.push(Update::Notice(format!("Step review requested for Session {}. Continue in Formless TUI; native Step decisions are not available.",questions::preview(session_id,200))));
                 }
                 if matches!(

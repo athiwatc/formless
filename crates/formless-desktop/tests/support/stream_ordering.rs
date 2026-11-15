@@ -160,11 +160,23 @@ async fn snapshot(observer: &mut Observer, session: &str) -> Value {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn step_prompt_has_a_live_handoff_but_no_snapshot_or_reconnect_inventory() {
+async fn step_prompt_has_a_live_handoff_and_restored_snapshot_inventory() {
     let env = credential_env::EnvGuard::isolated();
     env.set("FORMLESS_API_KEY", "private-step-fixture-key");
     exercise_step_handoff(false).await;
     exercise_step_handoff(true).await;
+}
+
+fn step_inventory(update: &Update) -> Option<&formless_desktop::steps::Inventory> {
+    match update {
+        Update::Snapshot { snapshot, .. } => Some(&snapshot.steps),
+        Update::Transcript(batch) => batch
+            .baseline
+            .as_ref()
+            .map(|s| &s.steps)
+            .or_else(|| batch.status.as_ref().map(|s| &s.steps)),
+        _ => None,
+    }
 }
 
 async fn exercise_step_handoff(future_reader: bool) {
@@ -232,6 +244,11 @@ async fn exercise_step_handoff(future_reader: bool) {
     let before = snapshot(&mut observer, &fixture.session).await;
     assert_eq!(before["step_mode"], true);
     assert_eq!(before["running"], true);
+    assert_eq!(before["pending_steps"]["prompts"][0]["step_id"], step);
+    assert_eq!(
+        before["pending_steps"]["prompts"][0]["arguments_preview"],
+        "{}"
+    );
     assert!(before["pending_events"]
         .as_array()
         .unwrap()
@@ -239,15 +256,25 @@ async fn exercise_step_handoff(future_reader: bool) {
         .all(|event| event["step_id"].as_str() != Some(step.as_str())));
     drop(client);
     drop(observer);
-    let future = if future_reader {
-        Some(future_cases::reader(&fixture).await)
+    let restored = if future_reader {
+        Client::start_future_attempts_for_validation(fixture.endpoint.clone())
     } else {
-        None
+        Client::start(fixture.endpoint.clone())
     };
+    restored
+        .send(Command::Select {
+            session_id: Some(fixture.session.clone()),
+            generation: 1,
+        })
+        .unwrap();
+    until(&restored,"step-restored-client-inventory",|update| {
+        matches!(step_inventory(&update),Some(formless_desktop::steps::Inventory::Snapshot(s)) if s.prompts.len()==1 && s.prompts[0].step_id==step)
+    }).await;
     let mut observer = Observer::connect(&fixture.endpoint, &fixture.session).await;
     let after = snapshot(&mut observer, &fixture.session).await;
     assert_eq!(after["step_mode"], true);
     assert_eq!(after["running"], true);
+    assert_eq!(after["pending_steps"]["prompts"][0]["step_id"], step);
     assert!(after["pending_events"]
         .as_array()
         .unwrap()
@@ -273,10 +300,17 @@ async fn exercise_step_handoff(future_reader: bool) {
         matches!(event, Event::RunFinished { .. })
     })
     .await;
-    if let Some(client) = future {
-        future_cases::canonical(&client, "Step was skipped. Done 😀", &[]).await;
-        drop(client);
-    }
+    future_cases::canonical(&restored, "Step was skipped. Done 😀", &[]).await;
+    until(&restored,"step-resolved-client-inventory",|update| {
+        matches!(step_inventory(&update),Some(formless_desktop::steps::Inventory::Snapshot(s)) if s.prompts.is_empty() && !s.more)
+    }).await;
+    assert!(
+        snapshot(&mut observer, &fixture.session).await["pending_steps"]["prompts"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    drop(restored);
     assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 2);
     drop(observer);
     fixture.finish().await;

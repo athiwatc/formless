@@ -57,3 +57,7 @@ required parity, accepted throughput/memory/render budgets and distribution
 gates remain open. General mid-attempt replay is absent. The original conflicting
 checkout is preserved, and the unresolved foreground approval/action is neither
 repeated nor bypassed.
+
+The later [Step inventory increment](step-inventory-20261115.md) addresses the
+previously characterized missing reconnect inventory. It does not enable native
+Step controls or production streaming.

@@ -819,7 +819,7 @@ pub struct Daemon {
 
     /// Sessions in step mode (`/step`), and the step decisions awaited.
     step_sessions: StdMutex<std::collections::HashSet<String>>,
-    step_waiters: StdMutex<HashMap<String, tokio::sync::oneshot::Sender<(String, Option<String>)>>>,
+    step_waiters: StdMutex<HashMap<String, step_inventory::Waiter>>,
     /// Registry changes made by each running Run, by run id.
     run_tool_changes: StdMutex<HashMap<String, Vec<ToolChange>>>,
     /// Approvals for one Session only, by (session id, tool id): the
@@ -4718,7 +4718,7 @@ impl Daemon {
                     .unwrap()
                     .remove(&step_id)
                     .context(RequestFailure::not_found("that step is no longer waiting"))?;
-                let _ = tx.send((action.clone(), arguments));
+                let _ = tx.decision.send((action.clone(), arguments));
                 Ok(json!({"step_id": step_id, "action": action}))
             }
             Request::ImportAll { bundle } => self.import_all(&bundle).await,
@@ -7384,11 +7384,7 @@ impl Daemon {
             }
             let step_id = uuid::Uuid::new_v4().to_string();
             let (tx, rx) = tokio::sync::oneshot::channel();
-            self.step_waiters
-                .lock()
-                .unwrap()
-                .insert(step_id.clone(), tx);
-            self.broadcast(Event::StepPending {
+            let prompt = Event::StepPending {
                 session_id: session_id.to_string(),
                 run_id: run_id.to_string(),
                 step_id: step_id.clone(),
@@ -7396,16 +7392,21 @@ impl Daemon {
                 arguments: tc.arguments.clone(),
                 index,
                 count,
-            });
+            };
+            self.step_waiters
+                .locked()
+                .insert(step_id.clone(), step_inventory::Waiter::new(&prompt, tx));
+            let waiting = step_inventory::Waiting {
+                daemon: self,
+                session: session_id,
+                id: &step_id,
+            };
+            self.broadcast(prompt);
             let decision = tokio::select! {
                 _ = cancel.cancelled() => None,
                 d = rx => d.ok(),
             };
-            self.step_waiters.locked().remove(&step_id);
-            self.broadcast(Event::StepResolved {
-                session_id: session_id.to_string(),
-                step_id,
-            });
+            drop(waiting);
             let Some((action, arguments)) = decision else {
                 return Err(anyhow!("interrupted"));
             };
@@ -18972,3 +18973,6 @@ mod model_text_failure_tests;
 #[cfg(test)]
 #[path = "daemon_provider_url_tests.rs"]
 mod provider_url_tests;
+
+#[path = "step_inventory.rs"]
+mod step_inventory;

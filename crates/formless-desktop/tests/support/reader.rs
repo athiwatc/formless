@@ -191,6 +191,7 @@ fn reader_view_batches_preserve_draft_and_live_text_while_status_refreshes(
                     events: vec![],
                     reload: false,
                     status: Some(StreamStatus {
+                        steps: Default::default(),
                         running: true,
                         unfinished_run: None,
                     }),

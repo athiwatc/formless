@@ -16,7 +16,7 @@ or authorization to merge while substantive gates fail.
 | Conversation and large output | Virtualized blocks, bounded previews, whole-output viewer, exact block source copy | Cross-block selection/copy, dedicated code-copy/link opening, richer attachments/artifacts/diagrams and native semantics |
 | Composer | Send/Steer/Queue/Stop, preserved drafts, IME guards, forecast consent; new per-window send-key choice | Attachments/drop/image paste/external editor, remaining Role/model/reference controls |
 | Context/resources | Recorded Session usage; bounded read-only Tools/Metrics/Proposals/Settings and exact details copy; explicit exact-identity recorded Run inspection; bounded read-only unfinished Tool Invocation snapshots, exact details and associated Session navigation | Artifact detail selection, Invocation control/history, Run pinning/navigation, scoped diff and remaining editable resource actions |
-| Questions/security decisions/Step | Native user questions, forecast consent; approvals and Step explicitly hand off to TUI | Native security-approval parity; restored pending Step identities and reconnect/control parity |
+| Questions/security decisions/Step | Native user questions, forecast consent; bounded read-only Step inventory restored from canonical snapshots after reconnect; approvals and Step decisions explicitly hand off to TUI | Native security-approval parity; native Step decisions and remaining reconnect/control acceptance |
 | Search/navigation | Loaded literal Search and native Find; separate persisted Profile Search | Remaining global action discovery and resource navigation parity; native usability acceptance |
 | Layout/focus/scaling | Responsive panes/overlays, modal traps/restoration, reflow and headless 200% checks | Resizable panel preferences, real selection/input/trackpad, human 200% and multimonitor/HiDPI acceptance |
 | Themes/preferences | Light/dark and 100–200% text; explicit versioned Save/Reload of view, docked-panel and send-key choices; corruption/conflict handling | System/high-contrast/colorblind themes, density/reduced motion/font choices, geometry/per-Session view persistence and native filesystem/latency acceptance |
@@ -77,3 +77,7 @@ upstream texts and an earlier MIT notice with separate provenance, preserving
 all nineteen scope flags and all three empty-notice flags. It identifies exact
 archive evidence and owner decisions without treating file counts or partial
 review receipts as release acceptance.
+
+The [Step inventory report](step-inventory-20261115.md) adds recovery of currently
+waiting prompt identities and bounded read-only previews, plus owner retirement
+on cancellation/drop. Native decision authority and full Step parity remain open.

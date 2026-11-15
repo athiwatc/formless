@@ -1759,6 +1759,29 @@ impl QuestionAnswer {
     }
 }
 
+/// Read-only Step inventory sampled by GetSession. A preview is not decision authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingStep {
+    pub session_id: String,
+    pub run_id: String,
+    pub step_id: String,
+    pub tool_name: String,
+    pub arguments_preview: String,
+    pub arguments_bytes: usize,
+    pub index: usize,
+    pub count: usize,
+}
+
+/// Bounded inventory; omitted by older daemons. Decisions may change after sampling.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingSteps {
+    pub prompts: Vec<PendingStep>,
+    pub more: bool,
+}
+
+pub const STEP_PREVIEW_BYTES: usize = 4096;
+pub const MAX_PENDING_STEPS: usize = 64;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {

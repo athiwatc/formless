@@ -24,6 +24,7 @@ impl StreamOwner {
 }
 #[derive(Debug)]
 pub struct StreamStatus {
+    pub steps: crate::steps::Inventory,
     pub running: bool,
     pub unfinished_run: Option<replies::UnfinishedRun>,
 }
@@ -358,6 +359,7 @@ impl Engine {
         // Content changes are reconciled by canonical events or a fresh load.
         let mut batch = StreamBatch::empty(owner);
         batch.status = Some(StreamStatus {
+            steps: snapshot.steps,
             running: snapshot.running,
             unfinished_run: snapshot.unfinished_run,
         });

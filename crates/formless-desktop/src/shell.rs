@@ -696,6 +696,7 @@ pub struct Shell {
     question_drafts: Drafts,
     question_draft_ids: Vec<String>,
     questions_toggle_focus: FocusHandle,
+    client_steps: crate::steps::Inventory,
     client_recovery: Option<crate::replies::UnfinishedRun>,
     client_sessions: Vec<SessionInfo>,
     forecast: Option<ForecastDialog>,
@@ -940,6 +941,7 @@ impl Shell {
             question_drafts: Drafts::new(16, 4 * 1024 * 1024),
             question_draft_ids: Vec::new(),
             questions_toggle_focus: cx.focus_handle(),
+            client_steps: Default::default(),
             client_recovery: None,
             client_sessions: Vec::new(),
             forecast: None,
@@ -1746,6 +1748,7 @@ impl Shell {
         self.client_attention = false;
         self.client_questions = crate::questions::State::default();
         self.client_recovery = None;
+        self.client_steps = Default::default();
         self.forecast = None;
         self.invalidate_source_view();
         self.transcript_source = TranscriptSource::NotLoaded;
@@ -1883,6 +1886,7 @@ impl Shell {
         self.invalidate_forecast(cx);
         self.client_snapshot_ready = false;
         self.client_recovery = None;
+        self.client_steps = Default::default();
         self.client_generation = self
             .client_generation
             .checked_add(1)
@@ -1966,6 +1970,7 @@ impl Shell {
             self.composer
                 .update(cx, |composer, cx| composer.focus(window, cx));
         }
+        self.client_steps = snapshot.steps.clone();
         self.client_recovery = snapshot.unfinished_run.take();
         if !self.client_snapshot_ready {
             self.client_status =
@@ -2032,6 +2037,7 @@ impl Shell {
                     self.questions_restored(window, cx);
                 }
                 if !ready {
+                    self.client_steps = Default::default();
                     self.retire_stream_view(cx);
                     self.retire_invocations("Connection lost. Read Invocations explicitly after reconnecting; no read is replayed.");
                     self.reset_run_inspection("Connection lost. Select a Run in Metrics after reconnecting; no inspection is replayed.");
@@ -2223,6 +2229,7 @@ impl Shell {
                     return;
                 }
                 self.client_snapshot_ready = false;
+                self.client_steps = Default::default();
                 self.sidebar.set_run_state(&session_id, RunState::Unknown);
                 if let Some(row) = self
                     .directory_rows
@@ -4088,6 +4095,9 @@ impl Shell {
                         .child(Label::new(reason.notice())),
                 )
             })
+            .when_some(self.client_steps.summary(), |region, summary| region.child(
+                readable("daemon-step-inventory", summary).text_sm().px_2().py_1().max_h(px(120.)).overflow_y_hidden()
+            ))
             .when(self.client.is_some() && self.client_attention, |region| region.child(
                 readable("daemon-pending-attention", "This Profile has pending decisions. Use Questions for user questions; approvals remain in the Formless TUI.").text_sm().px_2().py_1()
             ))

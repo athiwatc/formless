@@ -239,7 +239,7 @@ impl Daemon {
         let texts: Vec<&str> = queued.iter().map(|q| q.content.as_str()).collect();
         Ok(
             json!({"session": session, "messages": messages, "queued": texts, "queued_items": queued, "plan": plan, "plan_state": plan_state, "last_recap": last_recap, "step_mode": self.step_sessions.locked().contains(&id), "unfinished_run": last_run, "running": running,
-                "latest_run": latest_run, "pending_events": self.pending_attention.locked().clone() }),
+                "latest_run": latest_run, "pending_events": self.pending_attention.locked().clone(), "pending_steps": self.pending_steps_snapshot(&id) }),
         )
     }
 }
