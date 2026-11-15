@@ -196,9 +196,32 @@ fn native_security_approval_once_then_deny_reaches_real_daemon_without_persistin
                 .update(cx, |s, cx| s.run_command(Command::Approvals, window, cx))
                 .is_none());
         });
-        until(cx, handle, &shell, "native approval loaded", |s| {
-            s.approval_target().is_some()
-        });
+        // The daemon inventory can become visible before the Client receives
+        // its lifecycle event. That event deliberately retires an overlapping
+        // read. Model a user explicitly reloading, never a decision retry.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut reloads = 0;
+        loop {
+            pump(cx, handle, &shell);
+            if step(cx, handle, |_, cx| {
+                shell.read(cx).approval_target().is_some()
+            }) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "native approval loaded; reloads={reloads}"
+            );
+            step(cx, handle, |window, cx| {
+                if window.find("approval-reload").disabled() == Some(false) {
+                    reloads += 1;
+                    assert!(reloads <= 8, "approval read did not stabilize");
+                    window.click("approval-reload", cx);
+                }
+            });
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        eprintln!("native approval review {index}: explicit read reloads={reloads}");
         step(cx, handle, |window, cx| {
             let (_, prompt) = shell.read(cx).approval_target().unwrap();
             assert_eq!(prompt.session(), f.session);
