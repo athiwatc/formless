@@ -1988,13 +1988,20 @@ impl Shell {
             .flatten();
         let old_count = self.blocks.borrow().len();
         let count = snapshot.blocks.len();
+        // Every accepted canonical baseline establishes fresh reducer state,
+        // even when its visible rows are identical. Retirement/gap latches,
+        // prior Run ownership and hidden-message sequence changes cannot be
+        // inferred from row equality. Keep row/scroll reuse independent.
+        self.transcript_state = Some(TranscriptState::new(
+            snapshot.session_id.clone(),
+            snapshot.last_seq,
+        ));
         if prefix != old_count
             || prefix != count
             || self.transcript_source != TranscriptSource::Snapshot
         {
             self.invalidate_source_view();
-            let (state, blocks) = Transcript::new(snapshot).into_parts();
-            self.transcript_state = Some(state);
+            let (_, blocks) = Transcript::new(snapshot).into_parts();
             self.transcript_source = TranscriptSource::Snapshot;
             *self.blocks.borrow_mut() = blocks;
             self.timeline.update(cx, |timeline, cx| {

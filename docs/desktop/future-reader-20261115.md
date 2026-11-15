@@ -18,6 +18,11 @@ synchronous view epoch, selection generation, Session and fresh basis identity.
 Baseline loads additionally carry a monotonic read identity. The view refuses
 old/different contexts and duplicate/older loads before replacing any content.
 A Profile replacement cannot revive queued frames even if numeric counters match.
+Every accepted owned baseline resets reducer metadata, including the reload
+latch, prior Run and canonical sequence floor, even when rendered rows are
+identical and can retain their list/scroll identity. Independent review caught
+the unchanged-row retirement case; its failing regression and passing rerun are
+retained separately from the original reader evidence.
 
 The view epoch is separate from forecast/draft invalidation. Select/Reconnect
 retire it synchronously before bounded command enqueue; physical disconnect and

@@ -51,6 +51,85 @@ fn batch(
     })
 }
 #[gpui_kit::test]
+fn reader_unchanged_owned_baseline_resets_retirement_before_next_attempt(cx: &mut TestAppContext) {
+    let (handle, shell) = open(cx, WIDE, 0, 0);
+    future_view(cx, handle, &shell);
+    step(cx, handle, |window, cx| {
+        let mut current = owner(&shell, cx);
+        let id = current.session_id.clone();
+        shell.update(cx, |shell, cx| {
+            shell.apply_client_update(
+                batch(
+                    current.clone(),
+                    Some(event_snapshot(&id, "Question")),
+                    vec![typed_delta(&id, "discarded prefix")],
+                    false,
+                ),
+                window,
+                cx,
+            );
+        });
+        for cycle in 0..2 {
+            shell.update(cx, |shell, cx| {
+                shell.apply_client_update(batch(current.clone(), None, vec![], true), window, cx);
+                shell.take_client_commands();
+            });
+            assert_eq!(shell.read(cx).block_count(), 1);
+            assert!(shell.read(cx).transcript_reload_needed().is_some());
+            current.load += 1;
+            current.basis = uuid::Uuid::new_v4();
+            // In the second cycle an empty persisted assistant advances the
+            // canonical sequence without changing any rendered row.
+            let snapshot = if cycle == 0 {
+                event_snapshot(&id, "Question")
+            } else {
+                replies::session_snapshot(
+                    &id,
+                    &serde_json::json!({
+                        "session":{"id":id}, "running":true,
+                        "messages":[typed_message(&id,1,"user","Question"),
+                            typed_message(&id,2,"assistant","")]
+                    }),
+                )
+                .unwrap()
+            };
+            let text = format!("fresh attempt {cycle} ไทย 😀");
+            let mut delta = typed_delta(&id, &text);
+            if let formless_protocol::Event::MessageDelta { run_id, .. } = &mut delta {
+                *run_id = format!("new-run-{cycle}");
+            }
+            let mut events = vec![delta];
+            if cycle == 1 {
+                // This duplicate must be ignored using the new hidden seq=2
+                // floor; treating it as new would discard the fresh prefix.
+                events.push(formless_protocol::Event::MessageAppended {
+                    session_id: id.clone(),
+                    message: typed_message(&id, 2, "assistant", ""),
+                });
+            }
+            shell.update(cx, |shell, cx| {
+                // The baseline and buffered fresh prefix share one accepted
+                // batch, as they do in the real worker handshake.
+                shell.apply_client_update(
+                    batch(current.clone(), Some(snapshot), events, false),
+                    window,
+                    cx,
+                );
+                assert!(!shell
+                    .take_client_commands()
+                    .iter()
+                    .any(|command| matches!(command, formless_desktop::client::Command::Refresh)));
+            });
+            settle_frames(window, cx);
+            assert!(shell.read(cx).transcript_reload_needed().is_none());
+            assert_eq!(shell.read(cx).live_stream_owner(), Some(current.clone()));
+            assert_eq!(shell.read(cx).block_count(), 2);
+            assert!(shell.read(cx).last_block_preview().contains(&text));
+        }
+    });
+}
+
+#[gpui_kit::test]
 fn reader_view_rejects_unrequested_mode_and_stale_baselines(cx: &mut TestAppContext) {
     let (handle, shell) = open(cx, WIDE, 0, 0);
     let sessions = daemon_view(cx, handle, &shell);

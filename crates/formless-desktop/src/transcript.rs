@@ -95,7 +95,7 @@ pub(crate) struct TranscriptState {
 }
 
 impl TranscriptState {
-    fn new(session_id: String, last_seq: Option<u64>) -> Self {
+    pub(crate) fn new(session_id: String, last_seq: Option<u64>) -> Self {
         Self {
             session_id,
             last_seq,
