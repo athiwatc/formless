@@ -868,3 +868,6 @@ mod future_attempts;
 
 #[path = "future_cases.rs"]
 mod future_cases;
+
+#[path = "future_faults.rs"]
+mod future_faults;

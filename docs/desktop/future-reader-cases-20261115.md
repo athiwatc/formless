@@ -1,4 +1,15 @@
-# Additional reader schedules: staged, execution blocked by disk
+# Additional reader schedules
+
+Execution update: after parent-coordinated cleanup restored roughly 64 GiB of
+free space, staged commit `f0561c2` compiled and passed the focused schema/EOF,
+Tool, Step and compaction schedules, strict daemon-target lint and the full
+16-test daemon suite. Tool, Step and compaction each exercised both subscription
+modes. The historical staging note below records the earlier disk stop; it no
+longer describes the validation status of `f0561c2`. Exact logs and source hashes
+are frozen in `reader-cases-validated-checks.json` in the task evidence directory.
+Additional failure schedules are described in `future-reader-faults-20261115.md`.
+
+## Historical staging note
 
 These tests extend validated head `a5f2b96`. They have passed rustfmt parsing
 and whitespace checks only. They have **not been type-checked, compiled or run**.
