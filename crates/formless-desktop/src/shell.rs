@@ -2148,9 +2148,7 @@ impl Shell {
                 operation,
                 revision,
                 result,
-            } => {
-                self.approval_inventory(client, connection, operation, revision, result, window, cx)
-            }
+            } => self.approval_inventory(client, connection, operation, revision, result, cx),
             ClientUpdate::ApprovalInvalidated {
                 client,
                 connection,

@@ -156,7 +156,6 @@ impl Shell {
         operation: uuid::Uuid,
         revision: u64,
         result: Result<Option<Prompt>, String>,
-        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(p) = &self.approval_panel else {
