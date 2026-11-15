@@ -12,6 +12,8 @@
 
 use std::time::{Duration, Instant};
 
+#[path = "support/archive.rs"]
+mod archive_tests;
 #[path = "support/questions.rs"]
 mod question_tests;
 #[path = "support/session_edit.rs"]

@@ -43,7 +43,7 @@ use crate::memory::{
 };
 use crate::model::{
     send_mode_label, tokens, BlockKind, ComposerActions, Destination, Drafts, Fit, InspectorMode,
-    Intent, Layout, PanelPrefs, Region, RunState, Sidebar, SidebarMode, TextScale,
+    Intent, Layout, PanelPrefs, Region, RunState, SessionGroup, Sidebar, SidebarMode, TextScale,
 };
 use crate::replies::SessionSnapshot;
 use crate::search::{self, Hit as SearchHit, Search as TranscriptSearch};
@@ -162,6 +162,7 @@ pub fn bind_keys(cx: &mut App) {
                 | Command::AbandonRun
                 | Command::Questions
                 | Command::SessionDetails
+                | Command::ToggleArchived
                 | Command::ToggleTheme
                 | Command::GoTo(_) => unreachable!("{command:?} has no global shortcut"),
             })
@@ -685,8 +686,12 @@ pub struct Shell {
     transcript_source: TranscriptSource,
     transcript_state: Option<TranscriptState>,
     directory: Directory,
+    directory_rows: Vec<crate::model::SessionRow>,
+    include_archived: bool,
     directory_query: Entity<InputState>,
     directory_scroll: gpui_kit::UniformListScrollHandle,
+    directory_anchor: gpui_kit::ScrollAnchor,
+    directory_reveal: Option<(String, u8)>,
     search: TranscriptSearch,
     search_query: Entity<InputState>,
     search_scroll: gpui_kit::UniformListScrollHandle,
@@ -748,8 +753,10 @@ impl Shell {
             |this, _, event: &InputEvent, _, cx| {
                 if matches!(event, InputEvent::Change) {
                     let query = this.directory_query.read(cx).value();
-                    this.directory.rebuild(this.sidebar.rows(), &query);
-                    if let Some(index) = this.directory.choice(this.sidebar.rows()) {
+                    this.directory.rebuild(&this.directory_rows, &query);
+                    this.directory_reveal = None;
+                    this.revealed = None;
+                    if let Some(index) = this.directory.choice(&this.directory_rows) {
                         this.directory_scroll
                             .scroll_to_item_strict(index, ScrollStrategy::Top);
                     }
@@ -772,11 +779,13 @@ impl Shell {
             },
         ));
         let mut directory = Directory::default();
-        directory.rebuild(sidebar.rows(), "");
+        let directory_rows = sidebar.rows().to_vec();
+        directory.rebuild(&directory_rows, "");
         composer.update(cx, |composer, cx| composer.focus(window, cx));
 
         let session_sizes = Self::row_sizes(sidebar.rows().len(), TextScale::default());
         let page_scroll = ScrollHandle::new();
+        let directory_anchor = gpui_kit::ScrollAnchor::for_handle(page_scroll.clone());
         Self {
             client: None,
             client_connected: false,
@@ -828,6 +837,8 @@ impl Shell {
                 can_recover: false,
                 can_questions: false,
                 can_edit_session: false,
+                can_browse_archived: false,
+                archived_included: false,
                 composing: false,
                 sessions_shown: true,
                 context_shown: true,
@@ -846,8 +857,12 @@ impl Shell {
             transcript_source: TranscriptSource::Fixture,
             transcript_state: None,
             directory,
+            directory_rows,
+            include_archived: false,
             directory_query,
             directory_scroll: gpui_kit::UniformListScrollHandle::new(),
+            directory_anchor,
+            directory_reveal: None,
             search: TranscriptSearch::default(),
             search_query,
             search_scroll: gpui_kit::UniformListScrollHandle::new(),
@@ -1504,7 +1519,10 @@ impl Shell {
         self.transcript_state = None;
         self.sidebar.replace(&[], &HashSet::new(), false);
         self.session_sizes = Self::row_sizes(0, self.text_scale);
-        self.directory.rebuild(self.sidebar.rows(), "");
+        self.directory = Directory::default();
+        self.directory_rows.clear();
+        self.include_archived = false;
+        self.directory.rebuild(&self.directory_rows, "");
         self.client_sessions.clear();
         self.resource_pages.clear();
         *self.blocks.borrow_mut() = Timeline::new(Vec::new());
@@ -1690,6 +1708,7 @@ impl Shell {
                     self.client_snapshot_ready = false;
                     self.sidebar
                         .replace(&self.client_sessions, &HashSet::new(), false);
+                    self.rebuild_directory(cx);
                 }
             }
             ClientUpdate::Questions(state) => {
@@ -1751,8 +1770,7 @@ impl Shell {
                     self.sidebar.set_run_state(id, previous_state);
                 }
                 self.session_sizes = Self::row_sizes(self.sidebar.rows().len(), self.text_scale);
-                let query = self.directory_query.read(cx).value();
-                self.directory.rebuild(self.sidebar.rows(), &query);
+                self.rebuild_directory(cx);
                 if vanished {
                     self.invalidate_source_view();
                     self.transcript_state = None;
@@ -1789,6 +1807,13 @@ impl Shell {
                         .map_or(RunState::Idle, |s| RunState::of(s, &HashSet::new(), true))
                 };
                 self.sidebar.set_run_state(&snapshot.session_id, state);
+                if let Some(row) = self
+                    .directory_rows
+                    .iter_mut()
+                    .find(|row| row.id == snapshot.session_id)
+                {
+                    row.run_state = state;
+                }
                 if snapshot.unfinished_run.is_none()
                     && (self.resume_focus.is_focused(window)
                         || self.abandon_focus.is_focused(window))
@@ -1841,6 +1866,13 @@ impl Shell {
                 }
                 self.client_snapshot_ready = false;
                 self.sidebar.set_run_state(&session_id, RunState::Unknown);
+                if let Some(row) = self
+                    .directory_rows
+                    .iter_mut()
+                    .find(|row| row.id == session_id)
+                {
+                    row.run_state = RunState::Unknown;
+                }
                 self.client_status = format!("Could not refresh this Session: {error}. The displayed transcript may be stale; sending is disabled until it reloads.");
             }
             ClientUpdate::Page {
@@ -2459,6 +2491,8 @@ impl Shell {
                     .is_some_and(|run| run.recoverable()),
             can_questions: self.client.is_some(),
             can_edit_session: self.client_connected && self.session_edit_target().is_some(),
+            can_browse_archived: self.client.is_some(),
+            archived_included: self.include_archived,
             composing,
             sessions_shown: layout.sidebar != SidebarMode::Collapsed,
             context_shown: layout.inspector != InspectorMode::Hidden,
@@ -2537,6 +2571,7 @@ impl Shell {
         match command {
             Command::Questions => self.open_questions(window, cx),
             Command::SessionDetails => self.open_session_editor(window, cx),
+            Command::ToggleArchived => self.toggle_archived_directory(window, cx),
             Command::Send => self.submit(false, cx),
             Command::SendSecondary => self.submit(true, cx),
             Command::Stop => self.stop(cx),
@@ -3861,6 +3896,37 @@ impl Shell {
                 .aria_label("Matches in finished loaded text").flex_1().min_h_0().child(list))
     }
 
+    fn rebuild_directory(&mut self, cx: &App) {
+        self.directory_rows = self.sidebar.rows().to_vec();
+        if self.include_archived && self.client.is_some() {
+            self.directory_rows.extend(
+                self.client_sessions
+                    .iter()
+                    .filter(|session| session.archived)
+                    .map(|session| crate::model::SessionRow::of(session, &HashSet::new(), false)),
+            );
+        }
+        let query = self.directory_query.read(cx).value();
+        self.directory.rebuild(&self.directory_rows, &query);
+    }
+
+    fn toggle_archived_directory(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.destination == Destination::Sessions
+            && self.finish_directory_composition(window, cx)
+        {
+            return;
+        }
+        self.include_archived = !self.include_archived;
+        self.directory.scope_changed();
+        self.rebuild_directory(cx);
+        self.set_destination(Destination::Sessions, window, cx);
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn directory_selected_id(&self) -> Option<&str> {
+        self.directory.chosen_id(&self.directory_rows)
+    }
+
     pub fn directory_query(&self) -> &Entity<InputState> {
         &self.directory_query
     }
@@ -3899,12 +3965,38 @@ impl Shell {
         if self.directory_composing(window, cx) {
             return;
         }
-        self.directory.move_selection(self.sidebar.rows(), delta);
-        if let Some(index) = self.directory.choice(self.sidebar.rows()) {
+        self.directory
+            .move_selection(self.directory_rows.as_slice(), delta);
+        if let Some(index) = self.directory.choice(self.directory_rows.as_slice()) {
             self.directory_scroll
                 .scroll_to_item_strict(index, ScrollStrategy::Top);
         }
+        self.directory_reveal = self
+            .directory
+            .chosen_id(&self.directory_rows)
+            .map(|id| (id.to_string(), 2));
         cx.notify();
+    }
+
+    fn reveal_directory_choice(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((id, frames)) = self.directory_reveal.take() else {
+            return;
+        };
+        if self.fit(window) == Fit::Reflowed
+            && self.destination == Destination::Sessions
+            && self.directory.chosen_id(&self.directory_rows) == Some(id.as_str())
+            && self.directory_navigation_focused(window, cx)
+            && !self.background_inert(window)
+        {
+            // Reveal the list container in the page; UniformList separately
+            // puts the chosen virtual row at its top. A virtual row's local
+            // anchor cannot be used with the outer page's ScrollHandle.
+            self.directory_anchor.scroll_to(window, cx);
+            window.request_animation_frame();
+            if frames > 1 {
+                self.directory_reveal = Some((id, frames - 1));
+            }
+        }
     }
 
     fn open_directory_choice(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -3917,7 +4009,7 @@ impl Shell {
         }
         if let Some(id) = self
             .directory
-            .chosen_id(self.sidebar.rows())
+            .chosen_id(self.directory_rows.as_slice())
             .map(str::to_string)
         {
             self.open_directory_id(&id, window, cx);
@@ -3927,12 +4019,21 @@ impl Shell {
     fn open_directory_id(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         if self.destination != Destination::Sessions
             || self.finish_directory_composition(window, cx)
-            || !self.directory.contains(self.sidebar.rows(), id)
+            || !self.directory.contains(self.directory_rows.as_slice(), id)
         {
             return;
         }
-        self.sidebar.select_id(id);
-        self.activate_selected(window, cx);
+        self.directory.select_id(&self.directory_rows, id);
+        if self
+            .directory_rows
+            .iter()
+            .any(|row| row.id == id && row.group == SessionGroup::Archived)
+        {
+            self.open_session_editor(window, cx);
+        } else {
+            self.sidebar.select_id(id);
+            self.activate_selected(window, cx);
+        }
     }
 
     fn directory_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -3953,8 +4054,8 @@ impl Shell {
                 "Filter too long. Use at most {} characters.",
                 directory::FILTER_MAX_CHARS
             )
-        } else if let Some(index) = self.directory.choice(self.sidebar.rows()) {
-            let row = &self.sidebar.rows()[self.directory.matches()[index]];
+        } else if let Some(index) = self.directory.choice(self.directory_rows.as_slice()) {
+            let row = &self.directory_rows.as_slice()[self.directory.matches()[index]];
             format!(
                 "{} of {count}: {}, {} · {}",
                 index + 1,
@@ -3962,8 +4063,15 @@ impl Shell {
                 row.group.label(),
                 row.run_state.label()
             )
+        } else if count > 0 {
+            format!("{count} matching Sessions. Choose one with the arrows or a click.")
         } else {
             "No matching Sessions. Clear or change the filter.".to_string()
+        };
+        let status = if self.include_archived {
+            format!("Including archived · {status}")
+        } else {
+            status
         };
         let list = gpui_kit::uniform_list(
             "directory-list",
@@ -3972,11 +4080,11 @@ impl Shell {
                 range
                     .filter_map(|index| {
                         let source = *this.directory.matches().get(index)?;
-                        let row = this.sidebar.rows().get(source)?;
+                        let row = this.directory_rows.as_slice().get(source)?;
                         let id = row.id.clone();
-                        let selected = this.directory.choice(this.sidebar.rows()) == Some(index);
+                        let selected = this.directory.choice(&this.directory_rows) == Some(index);
                         let meta = format!(
-                            "{} · {}{}{}",
+                            "{} · {}{}{}{}",
                             row.group.label(),
                             row.run_state.label(),
                             if this.sidebar.active_id() == Some(row.id.as_str()) {
@@ -3988,8 +4096,32 @@ impl Shell {
                                 " · Draft"
                             } else {
                                 ""
+                            },
+                            if row.group == SessionGroup::Archived {
+                                if this.client_connected {
+                                    " · Enter for restore details"
+                                } else {
+                                    " · Connect for restore details"
+                                }
+                            } else {
+                                ""
                             }
                         );
+                        let tag_preview = row
+                            .tags
+                            .iter()
+                            .take(2)
+                            .map(|tag| directory::visual_text(tag))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let preview = if tag_preview.is_empty() {
+                            directory::visual_text(row.preview.as_deref().unwrap_or(""))
+                        } else {
+                            format!(
+                                "Tags: {tag_preview} · {}",
+                                directory::visual_text(row.preview.as_deref().unwrap_or(""))
+                            )
+                        };
                         Some(
                             v_flex()
                                 .id(directory_row_id(&id))
@@ -4015,9 +4147,12 @@ impl Shell {
                                         .child(directory::visual_text(&row.title)),
                                 )
                                 .child(div().text_xs().truncate().child(meta))
-                                .child(div().text_xs().truncate().child(directory::visual_text(
-                                    row.preview.as_deref().unwrap_or(""),
-                                )))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .truncate()
+                                        .child(directory::visual_text(&preview)),
+                                )
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     this.open_directory_id(&id, window, cx)
                                 })),
@@ -4032,11 +4167,13 @@ impl Shell {
         let focused = self.conversation_focus.contains_focused(window, cx);
         v_flex().id("region-conversation").test_support().role(Role::Main)
             .aria_label(if self.client.is_some() { "Daemon Sessions" } else { "Fixture Sessions" })
-            .aria_description(if self.client.is_some() { "Daemon Sessions; archived Sessions excluded. Arrows choose, Enter opens, Escape returns to Chat. Refresh reloads the list. Details edits the chosen entry. New Session creates a Session in the connected daemon." } else { "Read-only fixture Sessions; archived Sessions excluded. Filter title, preview or ID, up to 256 characters. Arrows choose, Enter opens, Escape returns to Chat. Shared synthetic transcript only; no daemon connection or Session management actions." })
+            .aria_description(if self.client.is_some() { if self.include_archived {"Daemon Sessions including archived. Filter title, preview, ID or tags. Arrows choose; Enter opens an unarchived Session or restore details for an archived entry. Escape returns to Chat."} else {"Daemon Sessions; archived excluded. Filter title, preview, ID or tags. Arrows choose, Enter opens, Escape returns to Chat. Archived toggles the directory scope. Details edits the chosen entry."} } else { "Read-only fixture Sessions; archived Sessions excluded. Filter title, preview or ID, up to 256 characters. Arrows choose, Enter opens, Escape returns to Chat. Shared synthetic transcript only; no daemon connection or Session management actions." })
             .track_focus(&self.conversation_focus)
             .map(|region| inert_while(region, self.background_inert(window)))
             .map(|region| Self::main_size(region, page_height))
-            .when_some(page_height, |region, height| region.h(height))
+            // The daemon toolbar can wrap to two lines at 200%. Keep a
+            // complete row below it; the surrounding page scrolls normally.
+            .when_some(page_height, |region, height| region.h(if self.client.is_some(){height.max(self.scaled(240.))}else{height}))
             .p_2().gap_2().border_1()
             .border_color(region_border(focused, cx.theme().background, cx))
             .key_context(DIRECTORY_CONTEXT)
@@ -4055,10 +4192,16 @@ impl Shell {
                         .on_click(cx.listener(|this, _, _, cx| this.client_request(ClientCommand::Refresh, cx)))))
                 .child(Button::new("back-to-chat").small().label("Back to Chat")
                     .on_click(cx.listener(|this, _, window, cx| this.directory_back(window, cx)))))
-            .child(Input::new(&self.directory_query).small().aria_label("Filter Sessions"))
+            .child(h_flex().gap_2().flex_shrink_0()
+                .child(Input::new(&self.directory_query).small().aria_label("Filter Sessions").flex_1().min_w_0())
+                .when(self.client.is_some(),|row|row.child(Button::new("toggle-archived-sessions").small().label(if self.include_archived {"Archived on"} else {"Archived off"}).selected(self.include_archived)
+                    .accessibility_label(if self.include_archived {"Hide archived Sessions"} else {"Include archived Sessions"})
+                    .on_click(cx.listener(|this,_,window,cx|{this.run_command(Command::ToggleArchived,window,cx);}))))
+            )
             .child(announced(div().id("directory-status")).test_support().role(Role::Label)
                 .aria_value(status.clone()).text_xs().truncate().child(directory::visual_text(&status)))
             .child(v_flex().id("directory-results").test_support().role(Role::ListBox)
+                .anchor_scroll(Some(self.directory_anchor.clone()))
                 .aria_label(if self.client.is_some() { "Filtered daemon Sessions" } else { "Filtered fixture Sessions" }).flex_1().min_h_0().child(list))
     }
 
@@ -4674,6 +4817,7 @@ impl Shell {
 
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.reveal_directory_choice(window, cx);
         self.reveal_session_editor(window, cx);
         self.reveal_question_focus(window, cx);
         if self

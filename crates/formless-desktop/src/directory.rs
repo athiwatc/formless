@@ -1,4 +1,4 @@
-//! Read-only projection of the existing unarchived Session list. No GPUI,
+//! Read-only filtering of the chosen Session projection. No GPUI,
 //! no second Session store, no domain actions. Filtering never activates a
 //! Session. Selection follows its ID across filtering and source reordering.
 
@@ -29,15 +29,19 @@ pub fn visual_text(text: &str) -> String {
 
 #[derive(Debug, Default)]
 pub struct Directory {
-    /// Positions in the current Sidebar projection, not copied Session bodies.
+    /// Positions in the current Directory projection, not copied Session bodies.
     matches: Vec<usize>,
     selected: Option<String>,
     too_long: bool,
+    query: Option<String>,
+    had_selection: bool,
 }
 
 impl Directory {
     pub fn rebuild(&mut self, rows: &[SessionRow], query: &str) {
         self.too_long = !valid_filter(query);
+        let filter_changed = self.query.as_deref() != Some(query);
+        self.query = (!self.too_long).then(|| query.to_string());
         self.matches.clear();
         if !self.too_long {
             let query = query.to_lowercase();
@@ -48,10 +52,11 @@ impl Directory {
                     continue;
                 }
                 let haystack = format!(
-                    "{} {} {}",
+                    "{} {} {} {}",
                     row.id,
                     row.title,
-                    row.preview.as_deref().unwrap_or("")
+                    row.preview.as_deref().unwrap_or(""),
+                    row.tags.join(" ")
                 )
                 .to_lowercase();
                 if words.iter().all(|word| haystack.contains(word)) {
@@ -60,8 +65,26 @@ impl Directory {
             }
         }
         if self.choice(rows).is_none() {
-            self.selected = self.matches.first().map(|index| rows[*index].id.clone());
+            // A deliberate filter change can choose a first preview. A
+            // disappearing source identity must never select its neighbour.
+            self.selected = if filter_changed || !self.had_selection {
+                self.matches.first().map(|index| rows[*index].id.clone())
+            } else {
+                None
+            };
         }
+        self.had_selection |= self.selected.is_some();
+    }
+
+    pub fn scope_changed(&mut self) {
+        self.query = None;
+    }
+    pub fn select_id(&mut self, rows: &[SessionRow], id: &str) -> bool {
+        if !self.contains(rows, id) {
+            return false;
+        }
+        self.selected = Some(id.into());
+        true
     }
 
     pub fn matches(&self) -> &[usize] {
@@ -93,11 +116,18 @@ impl Directory {
         if self.matches.is_empty() {
             return;
         }
-        let index = self
-            .choice(rows)
-            .unwrap_or(0)
-            .saturating_add_signed(delta)
-            .min(self.matches.len() - 1);
+        let index = match self.choice(rows) {
+            Some(index) => index
+                .saturating_add_signed(delta)
+                .min(self.matches.len() - 1),
+            None => {
+                if delta < 0 {
+                    self.matches.len() - 1
+                } else {
+                    0
+                }
+            }
+        };
         self.selected = Some(rows[self.matches[index]].id.clone());
     }
 }
@@ -112,6 +142,43 @@ mod tests {
         let mut sidebar = Sidebar::default();
         sidebar.replace(&sessions, &fixture::running(&sessions), true);
         sidebar.rows().to_vec()
+    }
+
+    #[test]
+    fn tags_are_searchable_and_removal_does_not_select_a_neighbour() {
+        let mut rows = rows();
+        rows[2].tags = vec!["Work".into(), "ทริป 漢字 😀".into()];
+        let target = rows[2].id.clone();
+        let mut directory = Directory::default();
+        directory.rebuild(&rows, "work ทริป");
+        assert_eq!(directory.chosen_id(&rows), Some(target.as_str()));
+        directory.rebuild(&rows, "");
+        assert_eq!(directory.chosen_id(&rows), Some(target.as_str()));
+        rows.retain(|row| row.id != target);
+        directory.rebuild(&rows, "");
+        assert!(!directory.matches().is_empty());
+        assert_eq!(directory.chosen_id(&rows), None);
+        directory.rebuild(&rows, "");
+        assert_eq!(directory.chosen_id(&rows), None);
+        directory.move_selection(&rows, 1);
+        assert_eq!(directory.chosen_id(&rows), Some(rows[0].id.as_str()));
+    }
+
+    #[test]
+    fn initial_load_can_choose_a_preview_and_scope_changes_remain_explicit() {
+        let rows = rows();
+        let mut directory = Directory::default();
+        directory.rebuild(&[], "");
+        directory.rebuild(&rows, "");
+        let selected = directory.chosen_id(&rows).unwrap().to_string();
+        assert!(directory.select_id(&rows, &rows[3].id));
+        assert!(!directory.select_id(&rows, "missing"));
+        directory.rebuild(&[], "");
+        directory.rebuild(&rows, "");
+        assert_eq!(directory.chosen_id(&rows), None);
+        directory.scope_changed();
+        directory.rebuild(&rows, "");
+        assert_eq!(directory.chosen_id(&rows), Some(selected.as_str()));
     }
 
     #[test]

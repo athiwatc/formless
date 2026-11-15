@@ -76,7 +76,43 @@ mod render {
     const WHOLE: Fit = Fit::Whole;
     const REFLOWED: Fit = Fit::Reflowed;
 
-    const STATES: [State; 43] = [
+    const STATES: [State; 47] = [
+        state(
+            "session-archive-light",
+            1440.,
+            900.,
+            LIGHT,
+            100,
+            Some("open-session-archive"),
+            WHOLE,
+        ),
+        state(
+            "minimum-session-archive-dark-200pct",
+            480.,
+            360.,
+            DARK,
+            200,
+            Some("open-session-archive"),
+            REFLOWED,
+        ),
+        state(
+            "archived-directory-light",
+            1440.,
+            900.,
+            LIGHT,
+            100,
+            Some("open-archived-directory"),
+            WHOLE,
+        ),
+        state(
+            "minimum-archived-directory-dark-200pct",
+            480.,
+            360.,
+            DARK,
+            200,
+            Some("open-archived-directory"),
+            REFLOWED,
+        ),
         state(
             "session-edit-light",
             1440.,
@@ -796,7 +832,7 @@ mod render {
         } else if let Some(control) = click {
             cx.update_window(any, |_, window, cx| {
                 window.render_frame(cx);
-                if control=="open-session-edit" {
+                if matches!(control,"open-session-edit"|"open-session-archive") {
                     use formless_desktop::client::{Update,Command as WireCommand};
                     let sessions=fixture::sessions(3);
                     shell.update(cx,|shell,cx|{
@@ -891,6 +927,20 @@ mod render {
                         shell.run_command(Command::GoTo(destination), window, cx);
                         shell.focus_section(PageSection::Conversation, window, cx);
                     });
+                } else if control == "open-archived-directory" {
+                    use formless_desktop::client::Update;
+                    let mut sessions=fixture::sessions(3);
+                    sessions[1].archived=true;
+                    sessions[1].tags=vec!["Work".into(),"ไทย 漢字 😀".into()];
+                    shell.update(cx,|shell,cx| {
+                        shell.connect_recording_daemon(cx);
+                        shell.apply_client_update(Update::Connection{ready:true,notice:"Connected view fixture".into()},window,cx);
+                        shell.apply_client_update(Update::Sessions(sessions),window,cx);
+                        shell.run_command(Command::ToggleArchived,window,cx);
+                        shell.directory_query().update(cx,|query,cx|query.focus(window,cx));
+                    });
+                    window.input("work",cx);
+                    shell.update(cx,|shell,cx|shell.focus_section(PageSection::Conversation,window,cx));
                 } else if control == "open-directory" {
                     shell.update(cx, |shell, cx| {
                         shell.run_command(Command::GoTo(Destination::Sessions), window, cx)
@@ -932,6 +982,114 @@ mod render {
             })
             .expect("offscreen window is open");
             cx.run_until_parked();
+            if control == "open-session-archive" {
+                cx.update_window(any, |_, window, cx| {
+                    for _ in 0..30 {
+                        window.render_frame(cx);
+                        if window.find("session-edit-archive").focused() == Some(true) {
+                            break;
+                        }
+                        window.press("tab", cx);
+                    }
+                    for _ in 0..3 {
+                        window.render_frame(cx);
+                        window.simulate_next_frame(cx);
+                    }
+                    window.click("session-edit-archive", cx);
+                    window.render_frame(cx);
+                })
+                .unwrap();
+                capture(&mut cx, "-archive");
+                cx.update_window(any, |_, window, cx| {
+                    use formless_desktop::{
+                        client::{Command as WireCommand, Update},
+                        session_edit::{Change, Metadata, Outcome},
+                    };
+                    window.click("session-edit-save", cx);
+                    window.render_frame(cx);
+                    assert_eq!(window.find("session-edit-save").disabled(), Some(true));
+                    let operation = shell
+                        .update(cx, |shell, _| shell.take_client_commands())
+                        .into_iter()
+                        .find_map(|command| match command {
+                            WireCommand::EditSession {
+                                operation,
+                                change: Change::Archive(true),
+                                ..
+                            } => Some(operation),
+                            _ => None,
+                        })
+                        .unwrap();
+                    let mut sessions = fixture::sessions(3);
+                    sessions[0].archived = true;
+                    shell.update(cx, |shell, cx| {
+                        shell.apply_client_update(
+                            Update::SessionEdited {
+                                connection: 0,
+                                operation,
+                                session_id: sessions[0].id.clone(),
+                                outcome: Outcome::Applied(
+                                    Metadata::from_session(&sessions[0]).unwrap(),
+                                ),
+                            },
+                            window,
+                            cx,
+                        );
+                        shell.apply_client_update(Update::Sessions(sessions), window, cx);
+                    });
+                    window.render_frame(cx);
+                    assert!(window
+                        .find("session-edit-archive-value")
+                        .value()
+                        .unwrap()
+                        .contains("Restore"));
+                    for id in [
+                        "session-edit-dialog",
+                        "session-edit-cancel",
+                        "session-edit-save",
+                    ] {
+                        assert!(
+                            inside(window, id, viewport),
+                            "{name}: {id} outside viewport"
+                        );
+                    }
+                })
+                .unwrap();
+                capture(&mut cx, "-restore");
+            }
+            if control == "open-archived-directory" {
+                capture(&mut cx, "-scope");
+                cx.update_window(any, |_, window, cx| {
+                    window.render_frame(cx);
+                    let id = fixture::sessions(3)[1].id.clone();
+                    assert_eq!(shell.read(cx).directory_selected_id(), Some(id.as_str()));
+                    assert!(window
+                        .find("directory-status")
+                        .value()
+                        .unwrap()
+                        .contains("Including archived"));
+                    assert!(
+                        inside(window, "toggle-archived-sessions", viewport),
+                        "{name}: scope button outside viewport"
+                    );
+                    window.press("down", cx);
+                    for _ in 0..4 {
+                        window.render_frame(cx);
+                        window.simulate_next_frame(cx);
+                    }
+                })
+                .unwrap();
+                cx.run_until_parked();
+                cx.update_window(any,|_,window,cx|{
+                    window.render_frame(cx);
+                    let id=fixture::sessions(3)[1].id.clone();
+                    assert!(
+                        inside(window, shell::directory_row_id(&id), viewport),
+                        "{name}: archived row {:?} outside viewport {viewport:?}, results {:?}, main {:?}",window.find(shell::directory_row_id(&id)).bounds(),window.find("directory-results").bounds(),window.find("region-conversation").bounds()
+                    );
+                })
+                .unwrap();
+            }
             if control == "open-session-edit" {
                 for (field, label, suffix) in [
                     ("session-edit-name", "Session name", ""),
@@ -1303,6 +1461,8 @@ mod render {
             if fit == Fit::Reflowed
                 && !control.starts_with("open-daemon-")
                 && control != "open-session-edit"
+                && control != "open-session-archive"
+                && control != "open-archived-directory"
                 && control != "open-run-recovery"
                 && control != "open-run-forecast"
                 && !control.starts_with("open-profile-questions")
@@ -1314,9 +1474,10 @@ mod render {
                     let panel = match control {
                         "toggle-sidebar" => "region-sidebar",
                         "show-commands" => "palette",
-                        "open-directory" | "open-search" | "open-transcript-gap" => {
-                            "region-conversation"
-                        }
+                        "open-directory"
+                        | "open-archived-directory"
+                        | "open-search"
+                        | "open-transcript-gap" => "region-conversation",
                         _ => "region-inspector",
                     };
                     assert!(
@@ -1328,6 +1489,7 @@ mod render {
                 .expect("offscreen window is open");
             }
             if control != "open-session-edit"
+                && control != "open-session-archive"
                 && control != "open-run-forecast"
                 && !control.starts_with("open-profile-questions")
             {

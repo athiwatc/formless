@@ -25,6 +25,7 @@ pub enum Command {
     AbandonRun,
     Questions,
     SessionDetails,
+    ToggleArchived,
     ToggleSessions,
     ToggleContext,
     ToggleTheme,
@@ -76,6 +77,8 @@ pub struct State {
     pub can_recover: bool,
     pub can_questions: bool,
     pub can_edit_session: bool,
+    pub can_browse_archived: bool,
+    pub archived_included: bool,
     /// Whether an input method is composing text in the composer.
     pub composing: bool,
     pub sessions_shown: bool,
@@ -166,6 +169,7 @@ pub fn keys(command: Command) -> &'static [&'static str] {
         | Command::AbandonRun
         | Command::Questions
         | Command::SessionDetails
+        | Command::ToggleArchived
         | Command::ToggleTheme
         | Command::GoTo(_) => &[],
     }
@@ -235,6 +239,7 @@ pub fn palette(state: &State) -> Vec<Entry> {
         Command::AbandonRun,
         Command::Questions,
         Command::SessionDetails,
+        Command::ToggleArchived,
         Command::ToggleSessions,
         Command::ToggleContext,
     ]);
@@ -356,6 +361,23 @@ pub fn entry(command: Command, state: &State) -> Entry {
                 Some(COMPOSING)
             } else {
                 (!state.can_edit_session).then_some("Choose a Session while connected")
+            },
+        ),
+        Command::ToggleArchived => (
+            "Archived",
+            if state.archived_included {
+                "Hide archived Sessions"
+            } else {
+                "Include archived Sessions"
+            }
+            .into(),
+            Group::Session,
+            "Include archived Sessions in the directory; archived entries open restore details",
+            Some(state.archived_included),
+            if state.composing {
+                Some(COMPOSING)
+            } else {
+                (!state.can_browse_archived).then_some("Connect to a Profile first")
             },
         ),
         Command::ToggleSessions => (
@@ -485,6 +507,8 @@ mod tests {
             can_recover: false,
             can_questions: false,
             can_edit_session: false,
+            can_browse_archived: false,
+            archived_included: false,
             composing: false,
             sessions_shown: true,
             context_shown: false,

@@ -612,9 +612,7 @@ impl Engine {
                     });
                 } else {
                     self.request(
-                        Request::GetSession {
-                            id: session_id.clone(),
-                        },
+                        Request::ListSessions,
                         Pending::ReadSessionDetails {
                             operation,
                             session_id,
@@ -1000,18 +998,24 @@ impl Engine {
                 operation,
                 session_id,
             } => {
-                let result = result
-                    .and_then(|value| {
-                        serde_json::from_value::<SessionInfo>(value["session"].clone())
-                            .map_err(|_| "Could not decode Session metadata.".into())
-                    })
-                    .and_then(|session| {
-                        if session.id != session_id {
-                            Err("The metadata reply belongs to another Session.".into())
-                        } else {
-                            session_edit::Metadata::from_session(&session).map_err(str::to_string)
-                        }
-                    });
+                let result = result.and_then(|value| {
+                    let sessions =
+                        replies::session_list(&value).map_err(|error| error.to_string())?;
+                    let mut matching = sessions
+                        .into_iter()
+                        .filter(|session| session.id == session_id);
+                    let session = matching.next().ok_or_else(|| {
+                        "This Session is no longer listed. Refresh Sessions before editing."
+                            .to_string()
+                    })?;
+                    if matching.next().is_some() {
+                        return Err(
+                            "The metadata list repeats this Session identity; no edit is allowed."
+                                .into(),
+                        );
+                    }
+                    session_edit::Metadata::from_session(&session).map_err(str::to_string)
+                });
                 self.updates.push(Update::SessionDetails {
                     connection: self.connection,
                     operation,
@@ -1398,6 +1402,29 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn metadata_reads_reject_missing_duplicate_or_malformed_target_without_loading_history() {
+        let session = crate::fixture::sessions(1).remove(0);
+        for value in [
+            json!([]),
+            json!([session.clone(), session.clone()]),
+            json!({"session":session.clone()}),
+            json!([{"id":session.id}]),
+        ] {
+            let mut engine = ready();
+            let operation = uuid::Uuid::new_v4();
+            engine.command(Command::ReadSessionDetails {
+                connection: 0,
+                operation,
+                session_id: session.id.clone(),
+            });
+            let request = engine.outgoing.pop_back().unwrap();
+            assert!(matches!(request.request, Request::ListSessions));
+            respond(&mut engine, request.id, value);
+            assert!(engine.updates.iter().any(|update|matches!(update,Update::SessionDetails {operation:op,result:Err(_),..} if *op==operation)));
+        }
+    }
+
+    #[test]
     fn session_metadata_uses_frozen_target_and_validates_operation_specific_replies() {
         for valid in [true, false] {
             let mut engine = ready();
@@ -1452,8 +1479,8 @@ mod tests {
                 session_id: target.clone(),
             });
             let request = engine.outgoing.pop_back().unwrap();
-            assert!(matches!(request.request,Request::GetSession {id} if id==target));
-            respond(&mut engine, request.id, json!({"session":session}));
+            assert!(matches!(request.request, Request::ListSessions));
+            respond(&mut engine, request.id, json!([session]));
             assert!(engine.updates.iter().any(|update|matches!(update,Update::SessionDetails {operation,result,..} if *operation==read && result.is_ok()==valid)));
         }
     }

@@ -386,6 +386,27 @@ async fn real_daemon_provider_send_navigation_resources_and_reconnect() {
         true,
         "the provider is still blocked during navigation"
     );
+    for archived in [true, false] {
+        let operation = uuid::Uuid::new_v4();
+        client
+            .send(Command::EditSession {
+                connection: client.connection(),
+                operation,
+                session_id: a.clone(),
+                change: formless_desktop::session_edit::Change::Archive(archived),
+            })
+            .unwrap();
+        until(&client,"archive-running-session",|update|matches!(update,Update::SessionEdited {operation:ack,session_id,outcome:formless_desktop::session_edit::Outcome::Applied(metadata),..} if ack==operation && session_id==a && metadata.archived==archived)).await;
+        let current = daemon
+            .handle(Request::GetSession { id: a.clone() })
+            .await
+            .unwrap();
+        assert_eq!(current["session"]["archived"], archived);
+        assert_eq!(
+            current["running"], true,
+            "archiving/restoring is not a Run control"
+        );
+    }
     first_answer.notify_one();
     observer
         .until(|event| {

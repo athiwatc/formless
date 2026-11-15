@@ -11,6 +11,7 @@ pub struct Metadata {
     pub name: String,
     pub tags: Vec<String>,
     pub pinned: bool,
+    pub archived: bool,
 }
 
 impl Metadata {
@@ -32,6 +33,7 @@ impl Metadata {
             name: session.name.clone(),
             tags: session.tags.clone(),
             pinned: session.pinned,
+            archived: session.archived,
         })
     }
 }
@@ -41,6 +43,7 @@ pub enum Field {
     Name,
     Tags,
     Pin,
+    Archive,
 }
 
 impl Field {
@@ -49,6 +52,7 @@ impl Field {
             Self::Name => "Name",
             Self::Tags => "Tags",
             Self::Pin => "Pin",
+            Self::Archive => "Archive",
         }
     }
     pub fn value(self, metadata: &Metadata) -> String {
@@ -61,6 +65,12 @@ impl Field {
                 "Unpinned"
             }
             .into(),
+            Self::Archive => if metadata.archived {
+                "Archived"
+            } else {
+                "Unarchived"
+            }
+            .into(),
         }
     }
 }
@@ -70,6 +80,7 @@ pub enum Change {
     Name(String),
     Tags(Vec<String>),
     Pin(bool),
+    Archive(bool),
 }
 
 impl Change {
@@ -81,6 +92,7 @@ impl Change {
             Field::Name => Self::Name(text.trim().into()),
             Field::Tags => Self::Tags(text.lines().map(str::to_string).collect()),
             Field::Pin => Self::Pin(!metadata.pinned),
+            Field::Archive => Self::Archive(!metadata.archived),
         };
         change.validate()?;
         Ok(change)
@@ -118,12 +130,17 @@ impl Change {
                 id: id.into(),
                 pinned: *pinned,
             },
+            Self::Archive(archived) => Request::SetSessionArchived {
+                id: id.into(),
+                archived: *archived,
+            },
         }
     }
     pub fn matches(&self, metadata: &Metadata) -> bool {
         match self {
             Self::Name(name) => name == &metadata.name,
             Self::Pin(pinned) => pinned == &metadata.pinned,
+            Self::Archive(archived) => archived == &metadata.archived,
             Self::Tags(tags) => {
                 // Existing storage setter semantics; the acknowledged values
                 // are displayed, never inferred as an optimistic local update.
@@ -151,12 +168,32 @@ pub enum Outcome {
 mod tests {
     use super::*;
     #[test]
+    fn archive_and_restore_are_explicit_boolean_setters() {
+        let mut session = crate::fixture::sessions(1).remove(0);
+        session.archived = false;
+        let mut metadata = Metadata::from_session(&session).unwrap();
+        let archive = Change::from_input(Field::Archive, "", &metadata).unwrap();
+        assert_eq!(archive, Change::Archive(true));
+        assert!(!archive.matches(&metadata));
+        assert!(
+            matches!(archive.request(&metadata.id),Request::SetSessionArchived {id,archived:true} if id==metadata.id)
+        );
+        metadata.archived = true;
+        assert!(archive.matches(&metadata));
+        assert_eq!(
+            Change::from_input(Field::Archive, "", &metadata).unwrap(),
+            Change::Archive(false)
+        );
+        assert_eq!(Field::Archive.value(&metadata), "Archived");
+    }
+    #[test]
     fn edits_are_bounded_and_use_exact_ids_with_existing_tag_normalization() {
         let mut metadata = Metadata {
             id: "original".into(),
             name: "Before".into(),
             tags: vec![],
             pinned: false,
+            archived: false,
         };
         let change =
             Change::from_input(Field::Tags, "#Work\nwork\n  ไทย 漢字 😀 \n", &metadata).unwrap();

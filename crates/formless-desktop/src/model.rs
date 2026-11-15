@@ -497,6 +497,7 @@ pub enum SessionGroup {
     Pinned,
     Active,
     Recent,
+    Archived,
 }
 
 impl SessionGroup {
@@ -505,6 +506,7 @@ impl SessionGroup {
             SessionGroup::Pinned => "Pinned",
             SessionGroup::Active => "Active",
             SessionGroup::Recent => "Recent",
+            SessionGroup::Archived => "Archived",
         }
     }
 }
@@ -517,6 +519,32 @@ pub struct SessionRow {
     pub group: SessionGroup,
     pub run_state: RunState,
     pub preview: Option<String>,
+    pub tags: Vec<String>,
+}
+
+impl SessionRow {
+    /// View-only metadata projection. Callers decide whether archived rows
+    /// belong in their view; the default sidebar excludes them.
+    pub fn of(session: &SessionInfo, running: &HashSet<String>, connected: bool) -> Self {
+        let run_state = RunState::of(session, running, connected);
+        let group = if session.archived {
+            SessionGroup::Archived
+        } else if session.pinned {
+            SessionGroup::Pinned
+        } else if matches!(run_state, RunState::Running | RunState::Paused) {
+            SessionGroup::Active
+        } else {
+            SessionGroup::Recent
+        };
+        Self {
+            id: session.id.clone(),
+            title: session.name.clone(),
+            group,
+            run_state,
+            preview: session.preview.clone(),
+            tags: session.tags.clone(),
+        }
+    }
 }
 
 /// The Session list with selection kept apart from activation: arrows move
@@ -569,29 +597,14 @@ impl Sidebar {
         let mut rows: Vec<SessionRow> = sessions
             .iter()
             .filter(|session| !session.archived)
-            .map(|session| {
-                let run_state = RunState::of(session, running, connected);
-                let group = if session.pinned {
-                    SessionGroup::Pinned
-                } else if matches!(run_state, RunState::Running | RunState::Paused) {
-                    SessionGroup::Active
-                } else {
-                    SessionGroup::Recent
-                };
-                SessionRow {
-                    id: session.id.clone(),
-                    title: session.name.clone(),
-                    group,
-                    run_state,
-                    preview: session.preview.clone(),
-                }
-            })
+            .map(|session| SessionRow::of(session, running, connected))
             .collect();
         // Stable: the daemon's order is kept inside each group.
         rows.sort_by_key(|row| match row.group {
             SessionGroup::Pinned => 0,
             SessionGroup::Active => 1,
             SessionGroup::Recent => 2,
+            SessionGroup::Archived => 3,
         });
         self.rows = rows;
         if self
