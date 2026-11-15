@@ -640,6 +640,20 @@ impl Shell {
 
 #[cfg(feature = "test-support")]
 impl Shell {
+    pub fn approval_review_diagnostic(&self) -> String {
+        self.approval_panel
+            .as_ref()
+            .map(|p| {
+                format!(
+                    "reading={} retired={} owner={} notice={}",
+                    p.reading,
+                    p.retired,
+                    self.approval_owner_current(p),
+                    p.notice
+                )
+            })
+            .unwrap_or_else(|| "no panel".into())
+    }
     pub fn approval_review_status(&self) -> Status {
         self.client
             .as_ref()

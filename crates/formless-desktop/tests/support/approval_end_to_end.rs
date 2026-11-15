@@ -210,10 +210,13 @@ fn native_security_approval_once_then_deny_reaches_real_daemon_without_persistin
             }
             assert!(
                 Instant::now() < deadline,
-                "native approval loaded; reloads={reloads}"
+                "native approval loaded; reloads={reloads}; {}",
+                step(cx, handle, |_, cx| shell
+                    .read(cx)
+                    .approval_review_diagnostic())
             );
             step(cx, handle, |window, cx| {
-                if window.find("approval-reload").disabled() == Some(false) {
+                if window.find("approval-reload").disabled() != Some(true) {
                     reloads += 1;
                     assert!(reloads <= 8, "approval read did not stabilize");
                     window.click("approval-reload", cx);
