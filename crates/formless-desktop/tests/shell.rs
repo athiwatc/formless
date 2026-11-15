@@ -7531,3 +7531,6 @@ fn composer_send_key_choice_preserves_selection_and_existing_undo_redo(cx: &mut 
         assert!(shell.read(cx).last_intent().is_none());
     });
 }
+
+#[path = "support/reader.rs"]
+mod reader_tests;

@@ -1,11 +1,14 @@
 //! Local daemon client. Domain state stays in the out-of-process daemon.
 //!
 //! Ordering contract: the existing protocol orders frames, but has no
-//! snapshot watermark or delta offset. Consequently this client subscribes
-//! with `deltas: false`, treats events as invalidations, and installs only
+//! snapshot watermark or delta offset in its legacy mode. The production
+//! constructor subscribes with `deltas: false`, treats events as invalidations, and installs only
 //! correlated canonical snapshots. It never replays events onto a snapshot.
 //! A relevant event during a read schedules another read, including when the
 //! first reply already contained it. This is deliberately conservative.
+//! A separate validation-only constructor negotiates the opt-in future-attempt
+//! contract, stages owned frames and emits tagged view batches. It is not a
+//! production preference or CLI switch.
 //!
 //! A worker owns all I/O and a bounded command/update queue. Reconnect starts
 //! a fresh engine and never retries mutations: daemon send deduplication is
@@ -28,6 +31,9 @@ use serde_json::Value;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc as queue, watch};
 
+mod reader;
+pub use reader::{StreamBatch, StreamOwner, StreamStatus};
+
 use crate::forecast;
 use crate::model::{Destination, Intent};
 use crate::profile_search;
@@ -44,6 +50,7 @@ const REFRESH: Duration = Duration::from_millis(250);
 
 #[derive(Debug)]
 pub enum Update {
+    Transcript(StreamBatch),
     Invocations {
         connection: u64,
         operation: uuid::Uuid,
@@ -216,6 +223,9 @@ pub struct Client {
     epoch: Arc<AtomicU64>,
     connection: Arc<AtomicU64>,
     forks: Arc<session_fork::Ledger>,
+    stream_epoch: Arc<AtomicU64>,
+    instance: uuid::Uuid,
+    future_attempts: bool,
     #[cfg(feature = "test-support")]
     recorded: Option<queue::Receiver<Command>>,
 }
@@ -223,12 +233,21 @@ pub struct Client {
 impl Drop for Client {
     fn drop(&mut self) {
         self.invalidate_context();
+        advance_epoch(&self.stream_epoch);
         let _ = self.stop.send(true);
     }
 }
 
 impl Client {
     pub fn start(endpoint: Endpoint) -> Self {
+        Self::start_policy(endpoint, false)
+    }
+    /// Validation only. No CLI, preference or production constructor enables it.
+    #[cfg(any(test, feature = "daemon-tests"))]
+    pub fn start_future_attempts_for_validation(endpoint: Endpoint) -> Self {
+        Self::start_policy(endpoint, true)
+    }
+    fn start_policy(endpoint: Endpoint, future_attempts: bool) -> Self {
         let (commands, rx) = queue::channel(QUEUE);
         let (tx, updates) = mpsc::sync_channel(QUEUE);
         let (stop, cancelled) = watch::channel(false);
@@ -238,6 +257,9 @@ impl Client {
         let worker_epoch = epoch.clone();
         let connection = Arc::new(AtomicU64::new(0));
         let worker_connection = connection.clone();
+        let stream_epoch = Arc::new(AtomicU64::new(0));
+        let worker_stream_epoch = stream_epoch.clone();
+        let instance = uuid::Uuid::new_v4();
         let forks = Arc::new(session_fork::Ledger::default());
         let worker_forks = forks.clone();
         std::thread::spawn(move || {
@@ -255,6 +277,9 @@ impl Client {
                         epoch: worker_epoch,
                         connection: worker_connection,
                         forks: worker_forks,
+                        stream_epoch: worker_stream_epoch,
+                        future_attempts,
+                        instance,
                     },
                 )),
                 Err(error) => {
@@ -273,6 +298,9 @@ impl Client {
             epoch,
             connection,
             forks,
+            stream_epoch,
+            future_attempts,
+            instance,
             #[cfg(feature = "test-support")]
             recorded: None,
         }
@@ -281,6 +309,7 @@ impl Client {
     pub fn send(&self, command: Command) -> Result<(), &'static str> {
         if matches!(command, Command::Select { .. } | Command::Reconnect) {
             self.invalidate_context();
+            advance_epoch(&self.stream_epoch);
         }
         if matches!(
             command,
@@ -352,6 +381,15 @@ impl Client {
     pub fn connection(&self) -> u64 {
         self.connection.load(Ordering::Acquire)
     }
+    pub fn instance(&self) -> uuid::Uuid {
+        self.instance
+    }
+    pub fn stream_epoch(&self) -> u64 {
+        self.stream_epoch.load(Ordering::Acquire)
+    }
+    pub fn future_attempt_validation(&self) -> bool {
+        self.future_attempts
+    }
 
     /// Synchronous invalidation cannot be lost to the bounded command queue.
     pub fn invalidate_context(&self) {
@@ -380,10 +418,19 @@ impl Client {
             epoch: Arc::new(AtomicU64::new(0)),
             connection: Arc::new(AtomicU64::new(0)),
             forks: Arc::new(session_fork::Ledger::default()),
+            stream_epoch: Arc::new(AtomicU64::new(0)),
+            instance: uuid::Uuid::new_v4(),
+            future_attempts: false,
             recorded: Some(recorded),
         }
     }
 
+    #[cfg(feature = "test-support")]
+    pub fn recording_future_attempts() -> Self {
+        let mut client = Self::recording();
+        client.future_attempts = true;
+        client
+    }
     #[cfg(feature = "test-support")]
     pub fn take_recorded(&mut self) -> Vec<Command> {
         let mut commands = Vec::new();
@@ -423,6 +470,15 @@ fn advance_epoch(epoch: &AtomicU64) {
 
 #[derive(Debug)]
 enum Pending {
+    StreamSubscribe(StreamOwner),
+    StreamBarrier {
+        owner: StreamOwner,
+        questions_revision: u64,
+    },
+    StreamStatus {
+        owner: StreamOwner,
+        questions_revision: u64,
+    },
     Invocations {
         operation: uuid::Uuid,
     },
@@ -514,6 +570,9 @@ impl Preparation {
 /// replaces this on reconnect; selection generations belong to the window.
 #[derive(Default)]
 struct Engine {
+    instance: uuid::Uuid,
+    reader: reader::Reader,
+    stream_epoch: u64,
     forks: Arc<session_fork::Ledger>,
     connection: u64,
     questions: questions::Directory,
@@ -607,6 +666,9 @@ impl Engine {
     }
 
     fn subscribe(&mut self) {
+        if self.stream_subscribe() {
+            return;
+        }
         self.request(
             Request::Subscribe {
                 sessions: Some(self.active.iter().cloned().collect()),
@@ -618,6 +680,7 @@ impl Engine {
     }
 
     fn select(&mut self, session_id: Option<String>, generation: u64) {
+        self.reader.clear();
         self.active = session_id;
         self.generation = generation;
         self.sync_epoch(self.epoch);
@@ -639,6 +702,9 @@ impl Engine {
         {
             self.dirty_list = false;
             self.request(Request::ListSessions, Pending::Sessions);
+        }
+        if self.stream_refresh() {
+            return;
         }
         if self.dirty_session
             && !self
@@ -967,6 +1033,7 @@ impl Engine {
             } => self.select(session_id, generation),
             Command::Page(page) => self.load_page(page),
             Command::Refresh => {
+                self.stream_reload();
                 self.dirty_list = true;
                 self.dirty_session = true;
                 if let Some(page) = self.page {
@@ -1198,16 +1265,19 @@ impl Engine {
                     self.questions.event(&event);
                     self.emit_questions();
                 }
+                let stream_handled = self.stream_event(&event);
                 // No event mutates canonical text or asserts a Run state.
                 // Unscoped gap notices conservatively invalidate everything.
-                if event
-                    .session_id()
-                    .is_none_or(|id| Some(id) == self.active.as_deref())
+                if !stream_handled
+                    && event
+                        .session_id()
+                        .is_none_or(|id| Some(id) == self.active.as_deref())
                     && !matches!(
                         event,
                         Event::MessageDelta { .. }
                             | Event::ReasoningDelta { .. }
                             | Event::ToolProgress { .. }
+                            | Event::TranscriptAttempt { .. }
                     )
                 {
                     self.dirty_session = true;
@@ -1251,6 +1321,15 @@ impl Engine {
             return Ok(());
         };
         match pending {
+            Pending::StreamSubscribe(owner) => self.stream_subscribed(owner, result),
+            Pending::StreamBarrier {
+                owner,
+                questions_revision,
+            } => self.stream_loaded(owner, questions_revision, result),
+            Pending::StreamStatus {
+                owner,
+                questions_revision,
+            } => self.stream_status(owner, questions_revision, result),
             Pending::Ping => {
                 let result = result?;
                 let min = result["min_protocol"]
@@ -1267,6 +1346,11 @@ impl Engine {
                             .into(),
                     );
                 }
+                self.reader.available = result["features"].as_array().is_some_and(|features| {
+                    features
+                        .iter()
+                        .any(|feature| feature == "future_transcript_attempts_v1")
+                });
                 self.subscribe();
             }
             Pending::Subscribe => {
@@ -1669,6 +1753,9 @@ fn deliver(tx: &SyncSender<Update>, engine: &mut Engine) -> Result<(), String> {
 
 #[derive(Default)]
 struct Retained {
+    instance: uuid::Uuid,
+    stream_epoch: Arc<AtomicU64>,
+    future_attempts: bool,
     active: (Option<String>, u64),
     page: Option<Destination>,
     uncertain: HashSet<Action>,
@@ -1699,12 +1786,18 @@ async fn connected<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
         page,
         uncertain,
         forks,
+        stream_epoch,
+        future_attempts,
+        instance,
     } = retained;
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = Frames::new(BufReader::new(reader));
     let _fork_connection_guard =
         session_fork::ConnectionGuard::new(forks.clone(), connection.load(Ordering::Acquire));
     let mut engine = Engine {
+        instance: *instance,
+        reader: reader::Reader::new(*future_attempts),
+        stream_epoch: stream_epoch.load(Ordering::Acquire),
         forks: forks.clone(),
         connection: connection.load(Ordering::Acquire),
         blocked_questions: uncertain
@@ -1721,6 +1814,7 @@ async fn connected<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
     let mut deadlines = HashMap::new();
     let mut last_poll = std::time::Instant::now();
     loop {
+        engine.sync_stream_epoch(stream_epoch.load(Ordering::Acquire));
         engine.sync_epoch(epoch.load(Ordering::Acquire));
         for id in engine.pending.keys() {
             deadlines.entry(*id).or_insert_with(std::time::Instant::now);
@@ -1764,7 +1858,7 @@ async fn connected<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
         tokio::select! {
             biased;
             _ = stop.changed() => return Ok(()),
-            command = commands.recv() => { engine.sync_epoch(epoch.load(Ordering::Acquire)); match command {
+            command = commands.recv() => { engine.sync_stream_epoch(stream_epoch.load(Ordering::Acquire)); engine.sync_epoch(epoch.load(Ordering::Acquire)); match command {
                 None => return Ok(()),
                 Some(Command::Reconnect) => return Err("Reconnecting at the user's request; actions are not retried.".into()),
                 Some(Command::Select { session_id, generation }) => { *active = (session_id.clone(), generation); engine.select(session_id, generation); }
@@ -1776,6 +1870,7 @@ async fn connected<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
             } },
             message = reader.next() => match message.map_err(|e| e.to_string())? {
                 Some(message) => {
+                    engine.sync_stream_epoch(stream_epoch.load(Ordering::Acquire));
                     engine.sync_epoch(epoch.load(Ordering::Acquire));
                     let answered = match &message { ServerMessage::Response { id, ok, result, .. } => match engine.pending.get(id) {
                         Some(Pending::Action(action)) => Some(action.clone()),
@@ -1799,6 +1894,9 @@ async fn connected<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
 }
 
 struct WorkerState {
+    instance: uuid::Uuid,
+    stream_epoch: Arc<AtomicU64>,
+    future_attempts: bool,
     ready: Arc<AtomicBool>,
     epoch: Arc<AtomicU64>,
     connection: Arc<AtomicU64>,
@@ -1817,9 +1915,15 @@ async fn worker(
         epoch,
         connection,
         forks,
+        stream_epoch,
+        future_attempts,
+        instance,
     } = state;
     let mut retained = Retained {
         forks,
+        stream_epoch: stream_epoch.clone(),
+        future_attempts,
+        instance,
         ..Default::default()
     };
     let mut delay = Duration::from_millis(250);
@@ -1865,6 +1969,7 @@ async fn worker(
         ready.store(false, Ordering::Release);
         advance_epoch(&epoch);
         advance_epoch(&connection);
+        advance_epoch(&stream_epoch);
         if *stop.borrow() || commands.is_closed() {
             return;
         }
@@ -2297,6 +2402,9 @@ mod tests {
             epoch: Arc::new(AtomicU64::new(0)),
             connection: Arc::new(AtomicU64::new(0)),
             forks: Arc::new(session_fork::Ledger::default()),
+            stream_epoch: Arc::new(AtomicU64::new(0)),
+            instance: uuid::Uuid::new_v4(),
+            future_attempts: false,
             #[cfg(feature = "test-support")]
             recorded: None,
         };
@@ -2647,6 +2755,9 @@ mod tests {
             epoch: Arc::new(AtomicU64::new(0)),
             connection: Arc::new(AtomicU64::new(0)),
             forks: Arc::new(session_fork::Ledger::default()),
+            stream_epoch: Arc::new(AtomicU64::new(0)),
+            instance: uuid::Uuid::new_v4(),
+            future_attempts: false,
             #[cfg(feature = "test-support")]
             recorded: None,
         };

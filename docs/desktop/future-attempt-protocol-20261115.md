@@ -133,8 +133,8 @@ final command/source/log hashes remain in the sibling evidence manifest.
 
 This is an unenabled protocol/admission foundation, not streaming acceptance.
 Before the desktop opts in, independently review the proof and exact patch;
-implement its serialized reader/handshake integration and explicit fallback UX;
-then test full transport ownership, real queue overflow/connection loss,
+review the validation-only [serialized reader and view adapter](future-reader-20261115.md)
+and its explicit fallback handling; then extend full transport ownership tests, real queue overflow/connection loss,
 A→B→A/reconnect and same-process epoch handling, queued Runs, manual retry,
 Tool/Step/schema/compaction transitions, concurrent canonical edits/appends,
 pre-response starts, cancellation and sustained bounded operation. Current

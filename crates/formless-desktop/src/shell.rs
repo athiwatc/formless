@@ -39,6 +39,7 @@ mod invocations;
 mod preferences;
 mod profile_search;
 mod questions;
+mod reader;
 mod reading_positions;
 mod run_inspection;
 mod session_fork;
@@ -784,6 +785,8 @@ pub struct Shell {
     /// A loaded empty snapshot is different from a Session not loaded yet.
     transcript_source: TranscriptSource,
     transcript_state: Option<TranscriptState>,
+    stream_view_owner: Option<client::StreamOwner>,
+    stream_view_latest: Option<client::StreamOwner>,
     directory: Directory,
     directory_rows: Vec<crate::model::SessionRow>,
     include_archived: bool,
@@ -1039,6 +1042,8 @@ impl Shell {
             reading_notice: None,
             transcript_source: TranscriptSource::Fixture,
             transcript_state: None,
+            stream_view_owner: None,
+            stream_view_latest: None,
             directory,
             directory_rows,
             include_archived: false,
@@ -1698,6 +1703,10 @@ impl Shell {
     }
 
     #[cfg(feature = "test-support")]
+    pub fn connect_recording_future_attempts(&mut self, cx: &mut Context<Self>) {
+        self.attach_client(Client::recording_future_attempts(), cx);
+    }
+    #[cfg(feature = "test-support")]
     pub fn take_client_commands(&mut self) -> Vec<ClientCommand> {
         self.client
             .as_mut()
@@ -1710,6 +1719,8 @@ impl Shell {
     }
 
     fn attach_client(&mut self, client: Client, cx: &mut Context<Self>) {
+        self.retire_stream_view(cx);
+        self.stream_view_latest = None;
         self.retire_invocations(
             "Profile attachment changed. Read Invocations again; no read was replayed.",
         );
@@ -1893,6 +1904,7 @@ impl Shell {
     /// here because a reply can already be queued when navigation happens.
     pub fn poll_client(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.sync_fork_status(cx);
+        self.validate_stream_view(cx);
         let updates: Vec<_> = self
             .client
             .as_ref()
@@ -1901,6 +1913,7 @@ impl Shell {
         for update in updates {
             self.apply_client_update(update, window, cx);
         }
+        self.validate_stream_view(cx);
         if self.client_connected
             && self
                 .client
@@ -1911,6 +1924,92 @@ impl Shell {
         }
     }
 
+    fn install_client_snapshot(
+        &mut self,
+        generation: u64,
+        mut snapshot: SessionSnapshot,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if generation != self.client_generation
+            || self.sidebar.active_id() != Some(snapshot.session_id.as_str())
+            || !self.client_connected
+        {
+            return;
+        }
+        self.reading_notice = None;
+        let state = if snapshot.running {
+            RunState::Running
+        } else if snapshot
+            .unfinished_run
+            .as_ref()
+            .is_some_and(|run| run.recoverable())
+        {
+            RunState::Paused
+        } else {
+            self.client_sessions
+                .iter()
+                .find(|s| s.id == snapshot.session_id)
+                .map_or(RunState::Idle, |s| RunState::of(s, &HashSet::new(), true))
+        };
+        self.sidebar.set_run_state(&snapshot.session_id, state);
+        if let Some(row) = self
+            .directory_rows
+            .iter_mut()
+            .find(|row| row.id == snapshot.session_id)
+        {
+            row.run_state = state;
+        }
+        if snapshot.unfinished_run.is_none()
+            && (self.resume_focus.is_focused(window) || self.abandon_focus.is_focused(window))
+        {
+            self.composer
+                .update(cx, |composer, cx| composer.focus(window, cx));
+        }
+        self.client_recovery = snapshot.unfinished_run.take();
+        if !self.client_snapshot_ready {
+            self.client_status =
+                "Connected · canonical messages · live token streaming unavailable".into();
+        }
+        self.client_snapshot_ready = true;
+        let prefix = self
+            .blocks
+            .borrow()
+            .blocks()
+            .iter()
+            .zip(&snapshot.blocks)
+            .take_while(|(old, new)| old == new)
+            .count();
+        // A replacement overlapping the visible row cannot retain
+        // a positional list anchor. Preserve its persisted identity.
+        let reading = (self.reading_restore.is_none()
+            && prefix <= self.timeline.read(cx).logical_scroll_top().item_ix)
+            .then(|| self.current_reading_message(cx))
+            .flatten();
+        let old_count = self.blocks.borrow().len();
+        let count = snapshot.blocks.len();
+        if prefix != old_count
+            || prefix != count
+            || self.transcript_source != TranscriptSource::Snapshot
+        {
+            self.invalidate_source_view();
+            let (state, blocks) = Transcript::new(snapshot).into_parts();
+            self.transcript_state = Some(state);
+            self.transcript_source = TranscriptSource::Snapshot;
+            *self.blocks.borrow_mut() = blocks;
+            self.timeline.update(cx, |timeline, cx| {
+                let known = timeline.item_count();
+                let prefix = prefix.min(known);
+                timeline.splice(prefix..known, count - prefix, cx);
+            });
+            self.invalidate_search(cx);
+            if let Some(message) = reading {
+                self.scroll_to_reading_message(message, cx);
+            }
+        }
+        self.restore_reading_position(cx);
+    }
+
     pub fn apply_client_update(
         &mut self,
         update: ClientUpdate,
@@ -1918,6 +2017,7 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         match update {
+            ClientUpdate::Transcript(batch) => self.apply_stream_batch(batch, window, cx),
             ClientUpdate::Connection { ready, notice } => {
                 self.client_connected = ready;
                 self.client_status = notice;
@@ -1925,6 +2025,7 @@ impl Shell {
                     self.questions_restored(window, cx);
                 }
                 if !ready {
+                    self.retire_stream_view(cx);
                     self.retire_invocations("Connection lost. Read Invocations explicitly after reconnecting; no read is replayed.");
                     self.reset_run_inspection("Connection lost. Select a Run in Metrics after reconnecting; no inspection is replayed.");
                     self.reset_comparison("Connection lost. Mark a pair again after reconnecting; no comparison is replayed.");
@@ -2094,86 +2195,15 @@ impl Shell {
             }
             ClientUpdate::Snapshot {
                 generation,
-                mut snapshot,
+                snapshot,
             } => {
-                if generation != self.client_generation
-                    || self.sidebar.active_id() != Some(snapshot.session_id.as_str())
-                    || !self.client_connected
+                if generation == self.client_generation
+                    && self.client_connected
+                    && self.sidebar.active_id() == Some(snapshot.session_id.as_str())
                 {
-                    return;
+                    self.stream_view_owner = None;
+                    self.install_client_snapshot(generation, snapshot, window, cx);
                 }
-                self.reading_notice = None;
-                let state = if snapshot.running {
-                    RunState::Running
-                } else if snapshot
-                    .unfinished_run
-                    .as_ref()
-                    .is_some_and(|run| run.recoverable())
-                {
-                    RunState::Paused
-                } else {
-                    self.client_sessions
-                        .iter()
-                        .find(|s| s.id == snapshot.session_id)
-                        .map_or(RunState::Idle, |s| RunState::of(s, &HashSet::new(), true))
-                };
-                self.sidebar.set_run_state(&snapshot.session_id, state);
-                if let Some(row) = self
-                    .directory_rows
-                    .iter_mut()
-                    .find(|row| row.id == snapshot.session_id)
-                {
-                    row.run_state = state;
-                }
-                if snapshot.unfinished_run.is_none()
-                    && (self.resume_focus.is_focused(window)
-                        || self.abandon_focus.is_focused(window))
-                {
-                    self.composer
-                        .update(cx, |composer, cx| composer.focus(window, cx));
-                }
-                self.client_recovery = snapshot.unfinished_run.take();
-                if !self.client_snapshot_ready {
-                    self.client_status =
-                        "Connected · canonical messages · live token streaming unavailable".into();
-                }
-                self.client_snapshot_ready = true;
-                let prefix = self
-                    .blocks
-                    .borrow()
-                    .blocks()
-                    .iter()
-                    .zip(&snapshot.blocks)
-                    .take_while(|(old, new)| old == new)
-                    .count();
-                // A replacement overlapping the visible row cannot retain
-                // a positional list anchor. Preserve its persisted identity.
-                let reading = (self.reading_restore.is_none()
-                    && prefix <= self.timeline.read(cx).logical_scroll_top().item_ix)
-                    .then(|| self.current_reading_message(cx))
-                    .flatten();
-                let old_count = self.blocks.borrow().len();
-                let count = snapshot.blocks.len();
-                if prefix != old_count
-                    || prefix != count
-                    || self.transcript_source != TranscriptSource::Snapshot
-                {
-                    self.invalidate_source_view();
-                    let (state, blocks) = Transcript::new(snapshot).into_parts();
-                    self.transcript_state = Some(state);
-                    self.transcript_source = TranscriptSource::Snapshot;
-                    *self.blocks.borrow_mut() = blocks;
-                    self.timeline.update(cx, |timeline, cx| {
-                        let known = timeline.item_count();
-                        let prefix = prefix.min(known);
-                        timeline.splice(prefix..known, count - prefix, cx);
-                    });
-                    self.invalidate_search(cx);
-                    if let Some(message) = reading {
-                        self.scroll_to_reading_message(message, cx);
-                    }
-                }
-                self.restore_reading_position(cx);
             }
             ClientUpdate::SnapshotError {
                 generation,
@@ -2349,6 +2379,7 @@ impl Shell {
         if self.sidebar.active_id() != Some(snapshot.session_id.as_str()) {
             return Err("the snapshot is not for the open Session");
         }
+        self.stream_view_owner = None;
         self.reading_notice = None;
         self.invalidate_source_view();
         self.transcript_source = TranscriptSource::Snapshot;

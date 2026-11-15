@@ -239,3 +239,285 @@ async fn future_attempt_provider_retry_has_one_turn_new_attempt_and_a_complete_p
     drop(observer);
     fixture.finish().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn actual_reader_negotiates_and_keeps_live_prefix_during_status_reads() {
+    let env = credential_env::EnvGuard::isolated();
+    env.set("FORMLESS_API_KEY", "private-reader-key");
+    let complete = Arc::new(Notify::new());
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let fixture = Fixture::start(
+        app(axum::routing::post({
+            let complete = complete.clone();
+            let calls = calls.clone();
+            move || {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let complete = complete.clone();
+                async move {
+                    gated_response(prefix("Owned live ไทย "), Some(tail("😀")), complete)
+                }
+            }
+        })),
+        0,
+    )
+    .await;
+    let client = Client::start_future_attempts_for_validation(fixture.endpoint.clone());
+    client
+        .send(Command::Select {
+            session_id: Some(fixture.session.clone()),
+            generation: 1,
+        })
+        .unwrap();
+    super::super::until(&client,"actual-reader-baseline",|update|matches!(update,Update::Transcript(batch) if batch.owner.generation==1&&batch.baseline.is_some())).await;
+    let mut observer = Observer::connect(&fixture.endpoint, &fixture.session).await;
+    send(&mut observer, &fixture.session).await;
+    let (mut live, mut status) = (false, false);
+    super::super::until(&client, "actual-reader-live-and-status", |update| {
+        if let Update::Transcript(batch) = update {
+            assert_eq!(batch.owner.session_id, fixture.session);
+            assert_eq!(batch.owner.generation, 1);
+            assert_eq!(batch.owner.connection, client.connection());
+            assert_eq!(batch.owner.view_epoch, client.stream_epoch());
+            if batch.events.iter().any(
+                |event| matches!(event,Event::MessageDelta{delta,..} if delta=="Owned live ไทย "),
+            ) {
+                assert!(batch.status.is_none());
+                live = true;
+            }
+            if batch.status.as_ref().is_some_and(|status| status.running) {
+                assert!(batch.baseline.is_none());
+                status = true;
+            }
+        }
+        live && status
+    })
+    .await;
+    complete.notify_one();
+    let mut reloaded = false;
+    super::super::until(&client, "actual-reader-final-canonical", |update| {
+        if let Update::Transcript(batch) = update {
+            reloaded |= batch.reload;
+            if let Some(snapshot) = batch.baseline {
+                if snapshot
+                    .blocks
+                    .iter()
+                    .any(|block| block.markdown() == "Owned live ไทย 😀")
+                {
+                    assert!(
+                        reloaded,
+                        "live closure retires provisional text before canonical install"
+                    );
+                    assert_eq!(snapshot.blocks.len(), 2);
+                    return true;
+                }
+            }
+        }
+        false
+    })
+    .await;
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    drop(client);
+    drop(observer);
+    fixture.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn actual_reader_a_b_a_and_reconnect_never_revive_the_old_prefix_or_replay_work() {
+    let env = credential_env::EnvGuard::isolated();
+    env.set("FORMLESS_API_KEY", "private-reader-context-key");
+    let complete = Arc::new(Notify::new());
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let fixture = Fixture::start(
+        app(axum::routing::post({
+            let complete = complete.clone();
+            let calls = calls.clone();
+            move || {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let complete = complete.clone();
+                async move {
+                    gated_response(
+                        prefix("Original prefix "),
+                        Some(tail("final ไทย 😀")),
+                        complete,
+                    )
+                }
+            }
+        })),
+        0,
+    )
+    .await;
+    let other = fixture
+        .daemon
+        .handle(Request::CreateSession {
+            name: Some("Other private Session".into()),
+        })
+        .await
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let client = Client::start_future_attempts_for_validation(fixture.endpoint.clone());
+    client
+        .send(Command::Select {
+            session_id: Some(fixture.session.clone()),
+            generation: 1,
+        })
+        .unwrap();
+    super::super::until(&client,"reader-context-initial",|update|matches!(update,Update::Transcript(batch) if batch.baseline.is_some()&&batch.owner.generation==1)).await;
+    let mut observer = Observer::connect(&fixture.endpoint, &fixture.session).await;
+    send(&mut observer, &fixture.session).await;
+    super::super::until(&client,"reader-context-live",|update|matches!(update,Update::Transcript(batch) if batch.events.iter().any(|event|matches!(event,Event::MessageDelta{delta,..} if delta=="Original prefix ")))).await;
+    let before = client.stream_epoch();
+    client
+        .send(Command::Select {
+            session_id: Some(other),
+            generation: 2,
+        })
+        .unwrap();
+    client
+        .send(Command::Select {
+            session_id: Some(fixture.session.clone()),
+            generation: 3,
+        })
+        .unwrap();
+    assert!(
+        client.stream_epoch() > before,
+        "view invalidation precedes worker command dispatch"
+    );
+    super::super::until(&client, "reader-context-returned-a", |update| {
+        if let Update::Transcript(batch) = update {
+            if batch.owner.generation == 3 && batch.owner.view_epoch == client.stream_epoch() {
+                if let Some(snapshot) = batch.baseline {
+                    assert_eq!(snapshot.blocks.len(), 1);
+                    return true;
+                }
+            }
+        }
+        false
+    })
+    .await;
+    let connection = client.connection();
+    client.send(Command::Reconnect).unwrap();
+    super::super::until(&client, "reader-context-reconnected", |update| {
+        if let Update::Transcript(batch) = update {
+            if batch.owner.generation == 3
+                && batch.owner.connection != connection
+                && batch.owner.connection == client.connection()
+                && batch.owner.view_epoch == client.stream_epoch()
+            {
+                if let Some(snapshot) = batch.baseline {
+                    assert_eq!(snapshot.blocks.len(), 1);
+                    return true;
+                }
+            }
+        }
+        false
+    })
+    .await;
+    complete.notify_one();
+    super::super::until(&client,"reader-context-final",|update| {
+        if let Update::Transcript(batch)=update {
+            if batch.owner.connection==client.connection()&&batch.owner.view_epoch==client.stream_epoch()&&batch.owner.generation==3 {
+                assert!(!batch.events.iter().any(|event|matches!(event,Event::MessageDelta{..})),"the old mid-attempt suffix is not an eligible prefix");
+                if batch.events.iter().any(|event|matches!(event,Event::MessageComplete{message,..} if message.content=="Original prefix final ไทย 😀")) {return true;}
+                if batch.baseline.as_ref().is_some_and(|snapshot|snapshot.blocks.iter().any(|block|block.markdown()=="Original prefix final ไทย 😀")) {return true;}
+            }
+        }false
+    }).await;
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "navigation and reconnect never restart paid/provider work"
+    );
+    drop(client);
+    drop(observer);
+    fixture.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn actual_reader_ui_queue_overflow_retires_old_frames_and_reconnects_without_work_replay() {
+    let env = credential_env::EnvGuard::isolated();
+    env.set("FORMLESS_API_KEY", "private-reader-overflow-key");
+    let complete = Arc::new(Notify::new());
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let fixture=Fixture::start(app(axum::routing::post({let complete=complete.clone();let calls=calls.clone();move|| {
+        let complete=complete.clone();calls.fetch_add(1,std::sync::atomic::Ordering::SeqCst);
+        async move {
+            let mut chunks=prefix("x");for _ in 0..99 {chunks.push_str(&encode(&[json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"x"}})]));}
+            gated_response(chunks,Some(tail("done")),complete)
+        }
+    }})),0).await;
+    let client = Client::start_future_attempts_for_validation(fixture.endpoint.clone());
+    client
+        .send(Command::Select {
+            session_id: Some(fixture.session.clone()),
+            generation: 1,
+        })
+        .unwrap();
+    super::super::until(
+        &client,
+        "reader-overflow-baseline",
+        |update| matches!(update,Update::Transcript(batch) if batch.baseline.is_some()),
+    )
+    .await;
+    let connection = client.connection();
+    let epoch = client.stream_epoch();
+    let mut observer = Observer::connect(&fixture.endpoint, &fixture.session).await;
+    send(&mut observer, &fixture.session).await;
+    // Deliberately do not drain the bounded UI channel until it fails closed.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while client.connection() == connection {
+        assert!(
+            Instant::now() < deadline,
+            "full UI channel did not retire its connection"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(client.stream_epoch() > epoch);
+    let old = client
+        .drain()
+        .filter_map(|update| {
+            if let Update::Transcript(batch) = update {
+                Some(batch)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    assert!(!old.is_empty());
+    assert!(
+        old.iter().all(|batch| batch.owner.connection == connection
+            && batch.owner.view_epoch != client.stream_epoch()),
+        "queued old frames are visibly retired before view delivery"
+    );
+    super::super::until(&client, "reader-overflow-canonical-recovery", |update| {
+        if let Update::Transcript(batch) = update {
+            if batch.owner.connection == client.connection()
+                && batch.owner.connection != connection
+                && batch.owner.view_epoch == client.stream_epoch()
+            {
+                if let Some(snapshot) = batch.baseline {
+                    assert_eq!(snapshot.blocks.len(), 1);
+                    return true;
+                }
+            }
+        }
+        false
+    })
+    .await;
+    complete.notify_one();
+    let expected = format!("{}done", "x".repeat(100));
+    super::super::until(&client,"reader-overflow-final",|update| {
+        if let Update::Transcript(batch)=update {
+            if batch.owner.connection==client.connection()&&batch.owner.view_epoch==client.stream_epoch() {
+                assert!(!batch.events.iter().any(|event|matches!(event,Event::MessageDelta{..})),"recovery cannot resume the missing prefix");
+                if batch.events.iter().any(|event|matches!(event,Event::MessageComplete{message,..} if message.content==expected)) {return true;}
+                if batch.baseline.as_ref().is_some_and(|snapshot|snapshot.blocks.iter().any(|block|block.markdown()==expected)) {return true;}
+            }
+        }false
+    }).await;
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    drop(client);
+    drop(observer);
+    fixture.finish().await;
+}

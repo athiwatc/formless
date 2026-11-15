@@ -51,6 +51,7 @@ const LIVE_BLOCK_ID: u64 = u64::MAX;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReloadReason {
+    CanonicalRefresh,
     MessagesEdited,
     DeltasDropped,
     StreamRestarted,
@@ -66,6 +67,7 @@ impl ReloadReason {
     /// User-facing state for a future view/client, not a silent gap.
     pub fn notice(&self) -> &'static str {
         match self {
+            Self::CanonicalRefresh => "Live text paused; waiting for fresh stored messages.",
             Self::MessagesEdited => "The transcript was edited; reload this Session.",
             Self::DeltasDropped => "Some live text was missed; this transcript may be incomplete. Reload this Session.",
             Self::StreamRestarted => "The provider stream restarted; the partial answer was discarded. Reload this Session.",
@@ -177,6 +179,13 @@ impl TranscriptState {
             timeline_changed: changed,
             ..Change::default()
         }
+    }
+
+    #[cfg(feature = "gui")]
+    pub(crate) fn retire_live(&mut self, timeline: &mut Timeline) -> Change {
+        let mut change = self.need_reload(ReloadReason::CanonicalRefresh);
+        change.timeline_changed = self.discard_stream(timeline);
+        change
     }
 
     pub(crate) fn apply(&mut self, timeline: &mut Timeline, event: &Event) -> Change {

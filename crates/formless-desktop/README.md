@@ -503,5 +503,6 @@ They do not enable streaming or discharge the missing snapshot cutoff contract.
 
 An unenabled [future-attempt protocol and admission model](../../docs/desktop/future-attempt-protocol-20261115.md)
 adds a conservative producer barrier, turn/attempt correlation and byte offsets.
-The production desktop remains canonical-only until its reader integration and
-full streaming acceptance schedules pass independent review.
+A [serialized reader and view adapter](../../docs/desktop/future-reader-20261115.md)
+now exist behind validation-only constructors. The production desktop remains
+canonical-only until independent review and full streaming acceptance pass.

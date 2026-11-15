@@ -57,6 +57,9 @@ impl Gate {
             retired: false,
         })
     }
+    pub fn canonical_seq(&self) -> u64 {
+        self.base_seq as u64
+    }
     pub fn retired(&self) -> bool {
         self.retired
     }
@@ -196,6 +199,13 @@ impl std::io::Write for Count {
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }
+}
+pub(crate) fn fits_event(event: &Event) -> bool {
+    let mut count = Count {
+        bytes: 0,
+        remaining: MAX_LIVE_BYTES as usize,
+    };
+    serde_json::to_writer(&mut count, event).is_ok()
 }
 impl Pending {
     pub fn new(attachment: Attachment, session: &str) -> Result<Self, &'static str> {
