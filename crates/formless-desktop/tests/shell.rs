@@ -7544,3 +7544,6 @@ mod native_step_tests;
 #[cfg(feature = "daemon-tests")]
 #[path = "support/v1_end_to_end.rs"]
 mod v1_end_to_end;
+
+#[path = "support/step_enable.rs"]
+mod step_enable;

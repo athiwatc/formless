@@ -158,6 +158,7 @@ pub enum Update {
 
 pub enum Command {
     DecideStep(crate::step_decision::Dispatch),
+    EnableStepMode(crate::step_mode::Dispatch),
     ReadInvocations {
         connection: u64,
         operation: uuid::Uuid,
@@ -230,6 +231,7 @@ pub struct Endpoint(pub PathBuf);
 
 pub struct Client {
     step_ledger: Arc<crate::step_decision::Ledger>,
+    mode_ledger: Arc<crate::step_mode::Ledger>,
     commands: queue::Sender<Command>,
     updates: Receiver<Update>,
     stop: watch::Sender<bool>,
@@ -248,6 +250,8 @@ impl Drop for Client {
     fn drop(&mut self) {
         self.invalidate_context();
         advance_epoch(&self.stream_epoch);
+        self.mode_ledger
+            .cancel_unsent("Client closed before writing; Enable was not sent.");
         let _ = self.stop.send(true);
     }
 }
@@ -306,6 +310,7 @@ impl Client {
         });
         Self {
             step_ledger: Arc::new(crate::step_decision::Ledger::default()),
+            mode_ledger: Arc::new(crate::step_mode::Ledger::default()),
             commands,
             updates,
             stop,
@@ -359,7 +364,41 @@ impl Client {
         }
         self.send(Command::DecideStep(self.step_ledger.reserve(action)?))
     }
+    #[cfg(feature = "test-support")]
+    pub fn finish_recorded_mode(
+        &self,
+        dispatch: &crate::step_mode::Dispatch,
+        outcome: crate::step_mode::Outcome,
+    ) {
+        assert!(self.recorded.is_some() && dispatch.owned_by(&self.mode_ledger));
+        assert!(dispatch.before_write());
+        dispatch.finish(outcome);
+    }
+    pub fn step_mode_status(&self) -> crate::step_mode::Status {
+        self.mode_ledger.status()
+    }
+    pub fn enable_step_mode(&self, action: crate::step_mode::Action) -> Result<(), &'static str> {
+        if !self.is_ready()
+            || action.client != self.instance()
+            || action.connection != self.connection()
+            || action.view_epoch != self.stream_epoch()
+        {
+            return Err("Session view or connection changed; Enable was not queued.");
+        }
+        self.send(Command::EnableStepMode(self.mode_ledger.reserve(action)?))
+    }
     pub fn send(&self, command: Command) -> Result<(), &'static str> {
+        if let Command::EnableStepMode(d) = &command {
+            if !d.owned_by(&self.mode_ledger)
+                || !self.is_ready()
+                || d.action().client != self.instance()
+                || d.action().connection != self.connection()
+                || d.action().view_epoch != self.stream_epoch()
+            {
+                d.reject("Session view or connection changed; Enable was not queued.");
+                return Err("Session view or connection changed; Enable was not queued.");
+            }
+        }
         if let Command::DecideStep(dispatch) = &command {
             if !dispatch.owned_by(&self.step_ledger)
                 || !self.is_ready()
@@ -374,6 +413,9 @@ impl Client {
         if matches!(command, Command::Select { .. } | Command::Reconnect) {
             self.invalidate_context();
             advance_epoch(&self.stream_epoch);
+            self.mode_ledger.cancel_unsent(
+                "Selection or connection changed before writing; Enable was not sent.",
+            );
         }
         if matches!(
             command,
@@ -458,6 +500,8 @@ impl Client {
     /// Synchronous invalidation cannot be lost to the bounded command queue.
     pub fn invalidate_context(&self) {
         advance_epoch(&self.epoch);
+        self.step_ledger
+            .cancel_unsent("Review context changed before writing; no Step decision was sent.");
     }
 
     pub fn review(&self, intent: Intent, draft_basis: String) -> Result<(), &'static str> {
@@ -476,6 +520,7 @@ impl Client {
         let (stop, _) = watch::channel(false);
         Self {
             step_ledger: Arc::new(crate::step_decision::Ledger::default()),
+            mode_ledger: Arc::new(crate::step_mode::Ledger::default()),
             commands,
             updates,
             stop,
@@ -535,6 +580,14 @@ fn advance_epoch(epoch: &AtomicU64) {
 
 #[derive(Debug)]
 enum Pending {
+    ModeInspect {
+        dispatch: crate::step_mode::Dispatch,
+        revision: u64,
+    },
+    ModeCommit {
+        dispatch: crate::step_mode::Dispatch,
+        revision: u64,
+    },
     StepInspect(crate::step_decision::Dispatch),
     StepCommit(crate::step_decision::Dispatch),
     StreamSubscribe(StreamOwner),
@@ -666,6 +719,94 @@ struct Engine {
 }
 
 impl Engine {
+    fn mode_current(&self, d: &crate::step_mode::Dispatch) -> bool {
+        let a = d.action();
+        self.ready
+            && a.valid()
+            && a.client == self.instance
+            && a.connection == self.connection
+            && a.generation == self.generation
+            && a.view_epoch == self.stream_epoch
+            && self.active.as_deref() == Some(a.session_id.as_str())
+    }
+    fn retire_mode_enables(&mut self) {
+        let ids = self
+            .pending
+            .iter()
+            .filter_map(|(id, p)| match p {
+                Pending::ModeInspect {
+                    dispatch: d,
+                    revision,
+                } if !d.reserved()
+                    || !self.mode_current(d)
+                    || *revision != self.status_revision =>
+                {
+                    Some(*id)
+                }
+                Pending::ModeCommit {
+                    dispatch: d,
+                    revision,
+                } if !d.sent()
+                    && (!d.reserved()
+                        || !self.mode_current(d)
+                        || *revision != self.status_revision) =>
+                {
+                    Some(*id)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for id in ids {
+            self.outgoing.retain(|r| r.id != id);
+            if let Some(
+                Pending::ModeInspect { dispatch, .. } | Pending::ModeCommit { dispatch, .. },
+            ) = self.pending.remove(&id)
+            {
+                dispatch.reject("Session/Run/Step changed before writing; Enable was not sent.");
+            }
+        }
+    }
+    fn invalidate_mode_metadata(&mut self) -> Result<(), String> {
+        self.status_revision = self
+            .status_revision
+            .checked_add(1)
+            .ok_or("Session status revision exhausted")?;
+        self.sync_epoch(self.epoch);
+        self.retire_step_reviews(true);
+        self.retire_mode_enables();
+        self.dirty_session = true;
+        if let Some(session_id) = self.active.clone() {
+            self.updates.push(Update::SessionStatusInvalidated {
+                client: self.instance,
+                connection: self.connection,
+                generation: self.generation,
+                session_id,
+            });
+        }
+        Ok(())
+    }
+    fn before_mode_writes(&mut self) -> Result<(), String> {
+        let work = self
+            .pending
+            .values()
+            .filter_map(|p| match p {
+                Pending::ModeCommit { dispatch, .. } if !dispatch.sent() => Some(dispatch.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for dispatch in work {
+            if self.status_revision == u64::MAX {
+                return Err("Session status revision exhausted".into());
+            }
+            if !dispatch.before_write() {
+                return Err(
+                    "Step-mode reservation retired before writing; no retry was sent.".into(),
+                );
+            }
+            self.invalidate_mode_metadata()?;
+        }
+        Ok(())
+    }
     fn step_current(&self, dispatch: &crate::step_decision::Dispatch) -> bool {
         let a = dispatch.action();
         self.ready
@@ -893,6 +1034,22 @@ impl Engine {
                     });
                 } else {
                     self.request(Request::ListInvocations, Pending::Invocations { operation });
+                }
+            }
+            Command::EnableStepMode(dispatch) => {
+                if self.pending.values().any(|p|matches!(p,Pending::ModeInspect{dispatch:d,..}|Pending::ModeCommit{dispatch:d,..} if d.action().operation==dispatch.action().operation)){return;}
+                if !self.mode_current(&dispatch) || !dispatch.reserved() {
+                    dispatch.reject("Session view changed; Enable was not sent.");
+                } else {
+                    self.request(
+                        Request::GetSession {
+                            id: dispatch.action().session_id.clone(),
+                        },
+                        Pending::ModeInspect {
+                            dispatch,
+                            revision: self.status_revision,
+                        },
+                    );
                 }
             }
             Command::DecideStep(dispatch) => {
@@ -1387,6 +1544,7 @@ impl Engine {
                         | Event::RunPaused { .. }
                         | Event::StepPending { .. }
                         | Event::StepResolved { .. }
+                        | Event::SessionDeleted { .. }
                 ) && event
                     .session_id()
                     .is_some_and(|id| Some(id) == self.active.as_deref())
@@ -1399,6 +1557,7 @@ impl Engine {
                     // can commit one based on the old Run or Step inventory.
                     self.sync_epoch(self.epoch);
                     self.retire_step_reviews(true);
+                    self.retire_mode_enables();
                     self.dirty_session = true;
                     self.updates.push(Update::SessionStatusInvalidated {
                         client: self.instance,
@@ -1589,6 +1748,51 @@ impl Engine {
                     operation,
                     result: result.and_then(crate::invocations::Report::decode),
                 });
+            }
+            Pending::ModeInspect { dispatch, revision } => {
+                if !self.mode_current(&dispatch)
+                    || !dispatch.reserved()
+                    || revision != self.status_revision
+                {
+                    dispatch.reject("Session/Run/Step changed; Enable was not sent.");
+                } else {
+                    match result
+                        .as_ref()
+                        .ok()
+                        .filter(|v| {
+                            v["session"]["id"].as_str() == Some(&dispatch.action().session_id)
+                        })
+                        .and_then(|v| v.get("step_mode"))
+                        .and_then(Value::as_bool)
+                    {
+                        Some(true) => {
+                            dispatch.observed_enabled();
+                            self.invalidate_mode_metadata()?;
+                        }
+                        Some(false) => self.request(
+                            Request::SetStepMode {
+                                session_id: dispatch.action().session_id.clone(),
+                                on: true,
+                            },
+                            Pending::ModeCommit { dispatch, revision },
+                        ),
+                        None => {
+                            dispatch.reject("Current Step mode is unavailable or unsupported; no setting was sent.");
+                            self.invalidate_mode_metadata()?;
+                        }
+                    }
+                }
+            }
+            Pending::ModeCommit { dispatch, .. } => {
+                dispatch.finish(crate::step_mode::decode(
+                    dispatch.action(),
+                    result,
+                    response_ok,
+                ));
+                if self.active.as_deref() == Some(&dispatch.action().session_id) {
+                    self.invalidate_mode_metadata()?;
+                }
+                self.dirty_session = true;
             }
             Pending::StepInspect(dispatch) => {
                 let action = dispatch.action();
@@ -2037,6 +2241,8 @@ async fn connected<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
             engine.emit_questions();
         }
         engine.retire_step_reviews(false);
+        engine.retire_mode_enables();
+        engine.before_mode_writes()?;
         for pending in engine.pending.values() {
             if let Pending::StepCommit(dispatch) = pending {
                 if !dispatch.before_write() {
@@ -2661,6 +2867,7 @@ mod tests {
         let (stop, _) = watch::channel(false);
         let client = Client {
             step_ledger: Arc::new(crate::step_decision::Ledger::default()),
+            mode_ledger: Arc::new(crate::step_mode::Ledger::default()),
             commands,
             updates,
             stop,
@@ -3015,6 +3222,7 @@ mod tests {
         let (stop, _) = watch::channel(false);
         let client = Client {
             step_ledger: Arc::new(crate::step_decision::Ledger::default()),
+            mode_ledger: Arc::new(crate::step_mode::Ledger::default()),
             commands,
             updates,
             stop,
@@ -4190,3 +4398,7 @@ mod tests {
 #[cfg(test)]
 #[path = "client/native_steps_tests.rs"]
 mod native_steps_tests;
+
+#[cfg(test)]
+#[path = "client/step_mode_tests.rs"]
+mod step_mode_tests;

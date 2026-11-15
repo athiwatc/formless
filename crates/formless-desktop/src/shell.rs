@@ -44,6 +44,7 @@ mod reading_positions;
 mod run_inspection;
 mod session_fork;
 mod sessions;
+mod step_mode;
 mod step_review;
 mod usage;
 use crate::full_view;
@@ -730,6 +731,9 @@ pub struct Shell {
     step_panel: Option<step_review::Panel>,
     step_draft: Option<(uuid::Uuid, formless_protocol::PendingStep, String)>,
     step_open_focus: FocusHandle,
+    mode_enable_focus: FocusHandle,
+    mode_observed: crate::step_mode::Status,
+    client_step_mode: Option<bool>,
     client_steps: crate::steps::Inventory,
     client_recovery: Option<crate::replies::UnfinishedRun>,
     client_sessions: Vec<SessionInfo>,
@@ -866,6 +870,7 @@ pub struct Shell {
     resume_anchor: gpui_kit::ScrollAnchor,
     abandon_anchor: gpui_kit::ScrollAnchor,
     composer_anchor: gpui_kit::ScrollAnchor,
+    mode_enable_anchor: gpui_kit::ScrollAnchor,
     /// The status line is a tab stop on a reflowed page, where it can be
     /// off screen and holds nothing else that focus could bring into view.
     status_focus: FocusHandle,
@@ -978,6 +983,9 @@ impl Shell {
             step_panel: None,
             step_draft: None,
             step_open_focus: cx.focus_handle(),
+            mode_enable_focus: cx.focus_handle(),
+            mode_observed: Default::default(),
+            client_step_mode: None,
             client_steps: Default::default(),
             client_recovery: None,
             client_sessions: Vec::new(),
@@ -1021,6 +1029,7 @@ impl Shell {
             resume_anchor: gpui_kit::ScrollAnchor::for_handle(page_scroll.clone()),
             abandon_anchor: gpui_kit::ScrollAnchor::for_handle(page_scroll.clone()),
             composer_anchor: gpui_kit::ScrollAnchor::for_handle(page_scroll.clone()),
+            mode_enable_anchor: gpui_kit::ScrollAnchor::for_handle(page_scroll.clone()),
             page_scroll,
             reveal_frames: 0,
             usage_controls: (0..2)
@@ -1627,7 +1636,9 @@ impl Shell {
         self.reveal_frames -= 1;
         // Recovery can make the composer taller than the viewport. Scroll to
         // its focused descendant instead of trying to fit the whole section.
-        let anchor = if self.resume_focus.is_focused(window) {
+        let anchor = if self.mode_enable_focus.is_focused(window) {
+            Some(&self.mode_enable_anchor)
+        } else if self.resume_focus.is_focused(window) {
             Some(&self.resume_anchor)
         } else if self.abandon_focus.is_focused(window) {
             Some(&self.abandon_anchor)
@@ -1807,6 +1818,7 @@ impl Shell {
         self.step_panel = None;
         self.step_draft = None;
         self.client = Some(client);
+        self.mode_observed = Default::default();
         self.client_connected = false;
         self.client_snapshot_ready = false;
         self.client_status = "Connecting to the local Daemon Core…".into();
@@ -1814,6 +1826,7 @@ impl Shell {
         self.client_questions = crate::questions::State::default();
         self.client_recovery = None;
         self.client_steps = Default::default();
+        self.client_step_mode = None;
         self.forecast = None;
         self.invalidate_source_view();
         self.transcript_source = TranscriptSource::NotLoaded;
@@ -1952,6 +1965,7 @@ impl Shell {
         self.client_snapshot_ready = false;
         self.client_recovery = None;
         self.client_steps = Default::default();
+        self.client_step_mode = None;
         self.client_generation = self
             .client_generation
             .checked_add(1)
@@ -1974,6 +1988,7 @@ impl Shell {
     pub fn poll_client(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.sync_fork_status(cx);
         self.sync_step_status(cx);
+        self.sync_mode_status(cx);
         self.validate_stream_view(cx);
         let updates: Vec<_> = self
             .client
@@ -2037,6 +2052,7 @@ impl Shell {
                 .update(cx, |composer, cx| composer.focus(window, cx));
         }
         self.client_steps = snapshot.steps.clone();
+        self.client_step_mode = snapshot.step_mode;
         self.client_recovery = snapshot.unfinished_run.take();
         if !self.client_snapshot_ready {
             self.client_status =
@@ -2104,6 +2120,7 @@ impl Shell {
                 }
                 if !ready {
                     self.client_steps = Default::default();
+                    self.client_step_mode = None;
                     self.retire_stream_view(cx);
                     self.retire_invocations("Connection lost. Read Invocations explicitly after reconnecting; no read is replayed.");
                     self.reset_run_inspection("Connection lost. Select a Run in Metrics after reconnecting; no inspection is replayed.");
@@ -2289,6 +2306,7 @@ impl Shell {
                 self.client_snapshot_ready = false;
                 self.client_recovery = None;
                 self.client_steps = Default::default();
+                self.client_step_mode = None;
                 self.sidebar.set_run_state(&session_id, RunState::Unknown);
                 if let Some(row) = self
                     .directory_rows
@@ -2297,7 +2315,7 @@ impl Shell {
                 {
                     row.run_state = RunState::Unknown;
                 }
-                self.client_status = "Run or Step changed · refreshing Session controls".into();
+                self.client_status = "Session state changed · refreshing controls".into();
                 self.invalidate_forecast(cx);
                 if self.resume_focus.is_focused(window) || self.abandon_focus.is_focused(window) {
                     self.composer
@@ -2329,6 +2347,7 @@ impl Shell {
                 }
                 self.client_snapshot_ready = false;
                 self.client_steps = Default::default();
+                self.client_step_mode = None;
                 self.sidebar.set_run_state(&session_id, RunState::Unknown);
                 if let Some(row) = self
                     .directory_rows
@@ -4218,6 +4237,12 @@ impl Shell {
                 readable("stream-recovery-policy", client::FUTURE_ATTEMPT_LIMITATION)
                     .text_sm().px_2().py_1().flex_shrink_0()
             ))
+            .when_some(self.client_step_mode, |region,on|region.child(
+                h_flex().min_w_0().w_full().flex_wrap().items_center().gap_2().px_2().py_1()
+                    .child(readable("step-mode-state",if on {"Step mode: On (sampled)"} else {"Step mode: Off (sampled)"}).text_sm())
+                    .when_some(self.mode_enable_action(),|row,action|row.child(div().id("step-mode-enable-anchor").anchor_scroll(Some(self.mode_enable_anchor.clone())).child(Button::new("step-mode-enable").track_focus(&self.mode_enable_focus).label("Enable Step mode").on_click(cx.listener(move|this,_,window,cx|this.enable_mode(action.clone(),window,cx))))))
+                    .child(readable("step-mode-help","For this daemon; waiting prompts and approvals still need review.").min_w_0().max_w_full().text_xs())
+            ))
             .when_some(self.client_steps.summary(), |region, summary| region.child(
                 readable("daemon-step-inventory", summary).text_sm().px_2().py_1().max_h(px(120.)).overflow_y_hidden()
             ))
@@ -4241,7 +4266,9 @@ impl Shell {
                     .test_support()
                     .relative()
                     .flex_1()
-                    .min_h_0()
+                    // Reflowed metadata may wrap beyond the nominal page
+                    // section height. Grow the page instead of erasing history.
+                    .map(|area| if reflowed { area.min_h(self.scaled(80.)) } else { area.min_h_0() })
                     // Before the timeline, so it is first to see the wheel.
                     .when(reflowed, |area| area.child(self.wheel_to_page(cx)))
                     .child(timeline),
@@ -5560,7 +5587,11 @@ impl Shell {
     ) -> impl IntoElement {
         let reflowed = reflowed || self.client.is_some() || self.preferences.is_some();
         let intent = if self.client.is_some() {
-            self.client_status.clone()
+            if let Some(receipt) = self.mode_notice() {
+                format!("{} · {}", self.client_status, receipt)
+            } else {
+                self.client_status.clone()
+            }
         } else {
             match &self.last_intent {
                 Some(record) => match record.kind {
@@ -5733,8 +5764,8 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         self.reveal_focused(window, cx);
-        // One screen of conversation at most, so the composer under it is
-        // never more than one screen away.
+        // A screen-sized conversation baseline, growing for wrapped controls
+        // and a bounded timeline viewport. The page keeps the composer reachable.
         let height = window
             .viewport_size()
             .height

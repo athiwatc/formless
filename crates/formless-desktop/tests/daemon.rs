@@ -1240,3 +1240,7 @@ mod status_fence;
 
 #[path = "support/cursor_order.rs"]
 mod cursor_order;
+
+#[cfg(unix)]
+#[path = "support/step_mode_transport.rs"]
+mod step_mode_transport;

@@ -25,6 +25,7 @@ impl StreamOwner {
 #[derive(Debug)]
 pub struct StreamStatus {
     pub steps: crate::steps::Inventory,
+    pub step_mode: Option<bool>,
     pub running: bool,
     pub unfinished_run: Option<replies::UnfinishedRun>,
 }
@@ -376,6 +377,7 @@ impl Engine {
         let mut batch = StreamBatch::empty(owner);
         batch.status = Some(StreamStatus {
             steps: snapshot.steps,
+            step_mode: snapshot.step_mode,
             running: snapshot.running,
             unfinished_run: snapshot.unfinished_run,
         });

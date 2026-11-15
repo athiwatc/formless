@@ -193,6 +193,7 @@ fn reader_view_batches_preserve_draft_and_live_text_while_status_refreshes(
                     reload: false,
                     status: Some(StreamStatus {
                         steps: Default::default(),
+                        step_mode: None,
                         running: true,
                         unfinished_run: None,
                     }),
@@ -476,6 +477,7 @@ fn lifecycle_status_invalidation_preserves_live_rows_draft_and_stream_basis(
                     events: vec![],
                     status: Some(StreamStatus {
                         steps: Default::default(),
+                        step_mode: None,
                         running: true,
                         unfinished_run: None,
                     }),

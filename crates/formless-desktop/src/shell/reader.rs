@@ -32,6 +32,7 @@ impl Shell {
             return;
         }
         self.client_steps = Default::default();
+        self.client_step_mode = None;
         if let Some(state) = self.transcript_state.as_mut() {
             state.retire_live(&mut self.blocks.borrow_mut());
         }
@@ -86,6 +87,7 @@ impl Shell {
                 .update(cx, |composer, cx| composer.focus(window, cx));
         }
         self.client_steps = status.steps;
+        self.client_step_mode = status.step_mode;
         self.client_recovery = status.unfinished_run;
         if !self.client_snapshot_ready {
             self.client_status = client::FUTURE_ATTEMPT_STATUS.into();

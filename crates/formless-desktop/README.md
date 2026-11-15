@@ -199,10 +199,15 @@ fallback; choose a volume with hard-link support or use Formless TUI. Directory
 creation, replacement and automatic retry are not performed. This is not a
 power-loss, latency or native OS picker/filesystem acceptance claim.
 
-New Step prompts for the subscribed Session produce an explicit Formless TUI
-handoff notice. The current protocol does not restore pending Step identities
-in Subscribe/GetSession;
-native Step control/reconnect parity remains incomplete.
+Step prompts are recovered through bounded inventory reads. One complete supported
+prompt can be reviewed with native Continue, Skip, Edit or Session Step-off;
+unsupported and multiple prompts use the Formless TUI. Enable Step mode is an
+explicit, freshly revalidated Session control. It only turns the mode on for
+this daemon lifetime; it never approves or releases a Tool. Missing sampled
+mode disables the control, and an uncertain write blocks further native enables
+for that Client without replay. See the [enable report](../../docs/desktop/step-mode-enable-20261115.md)
+for ownership, receipt limits and validation. Native OS acceptance and full Step
+and security-approval parity remain open.
 
 The optional `daemon-tests` feature links the daemon only into the test build.
 The normal desktop graph does not embed the daemon or depend on the TUI.

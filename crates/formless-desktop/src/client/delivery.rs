@@ -305,6 +305,7 @@ mod tests {
                 "status" => {
                     b.status = Some(StreamStatus {
                         steps: Default::default(),
+                        step_mode: None,
                         running: true,
                         unfinished_run: None,
                     })

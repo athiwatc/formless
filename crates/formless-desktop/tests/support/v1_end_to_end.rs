@@ -498,3 +498,90 @@ fn v1_older_peer_uses_only_canonical_subscription_through_the_actual_view(cx: &m
     std::fs::remove_file(root.join("ipc.sock")).unwrap();
     std::fs::remove_dir(root).unwrap();
 }
+
+#[gpui_kit::test]
+fn native_step_mode_enable_reaches_real_daemon_without_starting_work_and_preserves_live_text(
+    cx: &mut TestAppContext,
+) {
+    use formless_desktop::step_mode::{Outcome, Status};
+    let env = credential_env::EnvGuard::isolated();
+    env.set("FORMLESS_API_KEY", "private-step-enable-key");
+    for future in [false, true] {
+        let f = Fixture::start();
+        let (handle, shell) = open(cx, WIDE, 0, 0);
+        step(cx, handle, |_, cx| {
+            shell.update(cx, |s, cx| {
+                if future {
+                    s.connect_future_attempts_for_validation(f.endpoint.clone(), cx)
+                } else {
+                    s.connect_daemon(f.endpoint.clone(), cx)
+                }
+            })
+        });
+        until(cx, handle, &shell, "mode Session list", |s, _| {
+            s.sidebar().rows().iter().any(|r| r.id == f.session)
+        });
+        step(cx, handle, |window, cx| {
+            window.click(session_row_id(&f.session), cx)
+        });
+        until(cx, handle, &shell, "mode metadata", |s, _| {
+            s.step_mode_enable_target().is_some()
+        });
+        if future {
+            let _ = f.send();
+            until(cx, handle, &shell, "mode live prefix", |s, _| {
+                s.last_block_preview() == "A prefix before attachment "
+                    && s.step_mode_enable_target().is_some()
+            });
+        }
+        let (composer, owner) = step(cx, handle, |window, cx| {
+            shell.update(cx, |s, cx| {
+                s.focus_section(PageSection::Composer, window, cx)
+            });
+            window.input("Mode draft ไทย 😀", cx);
+            let input = shell.read(cx).composer().clone();
+            let owner = shell.read(cx).live_stream_owner();
+            window.click("step-mode-enable", cx);
+            (input, owner)
+        });
+        until(cx, handle, &shell, "mode enabled and sampled", |s, _| {
+            s.sampled_step_mode() == Some(true)
+                && matches!(
+                    s.mode_enable_status(),
+                    Status::Finished {
+                        outcome: Outcome::Enabled,
+                        ..
+                    }
+                )
+        });
+        assert_eq!(f.snapshot()["step_mode"], true);
+        assert_eq!(
+            f.calls.load(Ordering::SeqCst),
+            usize::from(future),
+            "Enable must not start provider work"
+        );
+        step(cx, handle, |_, cx| {
+            assert_eq!(shell.read(cx).composer(), &composer);
+            assert_eq!(composer.read(cx).value().as_ref(), "Mode draft ไทย 😀");
+            if future {
+                assert_eq!(shell.read(cx).live_stream_owner(), owner);
+                assert_eq!(
+                    shell.read(cx).last_block_preview(),
+                    "A prefix before attachment "
+                );
+            }
+        });
+        if future {
+            f.complete[0].notify_one();
+            until(cx, handle, &shell, "mode canonical completion", |s, _| {
+                s.block_count() == 2
+                    && s.last_block_preview() == "A prefix before attachment A final 😀"
+            });
+            f.wait("mode Run idle", || f.snapshot()["running"] == false);
+        }
+        step(cx, handle, |_, cx| {
+            shell.update(cx, |s, cx| s.connect_recording_daemon(cx))
+        });
+        f.finish();
+    }
+}

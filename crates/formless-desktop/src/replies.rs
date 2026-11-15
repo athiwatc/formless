@@ -71,6 +71,8 @@ pub struct SessionSnapshot {
     pub session_id: String,
     /// Read-only Step identities sampled with this reply; absent on older daemons.
     pub steps: crate::steps::Inventory,
+    /// Sampled Step-mode state; absent/malformed on older daemons remains unknown.
+    pub step_mode: Option<bool>,
     /// Whether a Run is in progress, as the daemon says at reply time.
     pub running: bool,
     /// Recovery state sampled by the daemon, never inferred from an old badge.
@@ -192,6 +194,7 @@ pub fn session_snapshot(
     }
     Ok(SessionSnapshot {
         steps: crate::steps::Inventory::decode(asked, result.get("pending_steps")),
+        step_mode: result.get("step_mode").and_then(serde_json::Value::as_bool),
         session_id,
         running,
         unfinished_run,

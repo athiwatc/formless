@@ -224,6 +224,7 @@ fn command_queue_failure_is_known_unsent_and_a_foreign_client_cannot_dispatch_it
     let (stop, _) = watch::channel(false);
     let client = Client {
         step_ledger: Arc::new(model::Ledger::default()),
+        mode_ledger: Arc::new(crate::step_mode::Ledger::default()),
         commands,
         updates,
         stop,
