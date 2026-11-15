@@ -5,6 +5,7 @@ mod commands;
 mod external_editor;
 mod external_editor_ui;
 mod highlight;
+mod history_search_view;
 #[cfg(test)]
 mod history_tests;
 mod hunk_controller;
@@ -20,14 +21,17 @@ mod markdown;
 mod mermaid;
 mod metrics_tools;
 mod notify;
+mod palette_view;
 mod picker;
 pub mod plain;
 #[cfg(test)]
 mod profile_context_tests;
 pub mod qr;
 mod query;
+mod review_wrap;
 mod session_ui;
 mod settings;
+mod tab_view;
 mod text;
 mod text_history;
 mod theme;
@@ -127,7 +131,7 @@ fn role_style(enabled: bool, role: &str) -> Style {
         _ => ("assistant", Color::Green),
     };
     match theme::role(name).filter(|_| enabled) {
-        // An override is used as given, not remapped.
+        // Already resolved through the role palette; avoid accent/error chaining.
         Some(c) => Style::default().fg(c).add_modifier(Modifier::BOLD),
         None => bold_fg(enabled, color),
     }
@@ -1195,10 +1199,40 @@ struct Activity {
 }
 
 struct EditorReview {
+    scroll: std::cell::Cell<EditorReviewScroll>,
     diff: String,
     /// "Passes the syntax and smoke checks", or what fails.
     verdict: String,
     ok: bool,
+}
+
+#[derive(Clone, Copy, Default)]
+struct EditorReviewScroll {
+    top: usize,
+    rows: usize,
+    height: usize,
+}
+impl EditorReview {
+    fn scroll_key(&self, key: KeyEvent) -> bool {
+        if !key.modifiers.is_empty() {
+            return false;
+        }
+        let mut scroll = self.scroll.get();
+        let max_top = scroll.rows.saturating_sub(scroll.height);
+        scroll.top = scroll.top.min(max_top);
+        let page = scroll.height.saturating_sub(1).max(1);
+        scroll.top = match key.code {
+            KeyCode::Up => scroll.top.saturating_sub(1),
+            KeyCode::Down => scroll.top.saturating_add(1).min(max_top),
+            KeyCode::PageUp => scroll.top.saturating_sub(page),
+            KeyCode::PageDown => scroll.top.saturating_add(page).min(max_top),
+            KeyCode::Home => 0,
+            KeyCode::End => max_top,
+            _ => return false,
+        };
+        self.scroll.set(scroll);
+        true
+    }
 }
 
 struct EditorState {
@@ -3337,6 +3371,7 @@ impl App {
                             }
                             if self.editor.is_some() {
                                 self.editor_review = Some(EditorReview {
+                                    scroll: Default::default(),
                                     diff: result["diff"].as_str().unwrap_or_default().to_string(),
                                     verdict,
                                     ok,
@@ -8093,19 +8128,22 @@ impl App {
             "mcp catalog" => self.request(Pending::McpCatalog, Request::McpCatalog),
             "status" => self.request(Pending::DaemonStatus, Request::Status),
             cmd if cmd == "docs" || cmd.starts_with("docs ") => {
-                let topic = cmd["docs".len()..].trim();
-                match formless_core::docs::resolve(Some(topic).filter(|t| !t.is_empty())) {
-                    Ok(url) => {
-                        let opened = formless_core::docs::open_url(&url);
-                        self.notes.push(if opened {
-                            format!("opened {url}")
+                let (topic, text) = formless_core::docs::text_option(cmd["docs".len()..].trim());
+                match formless_core::docs::present(Some(&topic), text) {
+                    Ok(guide) => {
+                        if let Some(body) = guide.text {
+                            self.pager = Some(Pager {
+                                title: format!("Guide · {} (bundled {})", if topic.is_empty() { "gallery" } else { &topic }, env!("CARGO_PKG_VERSION")),
+                                lines: body.lines().map(str::to_owned).collect(),
+                                top: 0, left: 0, styled: Vec::new(),
+                            });
+                            self.notes.push(format!("Current online copy (may differ from this build): {}", guide.url));
                         } else {
-                            format!("docs: {url}")
-                        });
+                            self.notes.push(format!("opened current online copy: {}", guide.url));
+                        }
                     }
                     Err(error) => {
-                        let names: Vec<&str> =
-                            formless_core::docs::TOPICS.iter().map(|(n, _, _)| *n).collect();
+                        let names: Vec<&str> = formless_core::docs::TOPICS.iter().map(|(n, _, _)| *n).collect();
                         self.notes.push(format!("{error}; docs topics: {}", names.join(", ")));
                     }
                 }
@@ -9029,6 +9067,15 @@ impl App {
     }
 
     fn editor_key(&mut self, key: KeyEvent) {
+        if !self.vim_help
+            && !self.editor.as_ref().is_some_and(|ed| ed.confirm_exit)
+            && self
+                .editor_review
+                .as_ref()
+                .is_some_and(|review| review.scroll_key(key))
+        {
+            return;
+        }
         self.editor_generation = self.editor_generation.wrapping_add(1);
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if self.vim_help {
@@ -9118,7 +9165,7 @@ impl App {
             self.begin_tool_hunks();
             return;
         }
-        // Reviewing: Ctrl+S saves, anything else goes back to editing.
+        // Reviewing: navigation was handled above; Ctrl+S saves, other keys edit.
         if self.editor_review.is_some() && !(ctrl && key.code == KeyCode::Char('s')) {
             self.editor_review = None;
             return;
@@ -10846,6 +10893,9 @@ impl App {
                 };
             }
             KeyCode::Enter => {}
+            // Find currently edits at the query's end, so forward Delete is
+            // a no-op. Consume it before ordinary hidden-draft editing.
+            KeyCode::Delete => return true,
             KeyCode::Backspace => {
                 find.query.pop();
                 find.current = usize::MAX;
@@ -11781,35 +11831,58 @@ fn picker_lines(p: &picker::ModelPicker, max_items: usize, color: bool) -> Vec<L
     out
 }
 
-/// Highlight case-insensitive `query` matches in a line's spans; `style`
-/// gets each match's index in the line. Returns the line and its match
-/// count (matches across span boundaries are not found).
+/// Highlight folded `query` matches in one displayed logical line, including
+/// matches crossing styled spans. The callback receives the logical match index.
 fn highlight_matches(
-    line: Line<'static>,
+    mut line: Line<'static>,
     query: &str,
     style: impl Fn(usize) -> Style,
 ) -> (Line<'static>, usize) {
     if formless_core::fuzzy::fold(query).is_empty() {
         return (line, 0);
     }
-    let mut found = 0;
+    let text: String = line
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect();
+    let ranges = formless_core::fuzzy::folded_match_ranges(&text, query);
+    if ranges.is_empty() {
+        return (line, 0);
+    }
+    let marks: Vec<_> = (0..ranges.len()).map(style).collect();
     let mut spans = Vec::new();
-    for span in line.spans {
+    let mut offset = 0;
+    let mut match_index = 0;
+    for span in std::mem::take(&mut line.spans) {
         let chars: Vec<char> = span.content.chars().collect();
+        let end = offset + chars.len();
         let mut start = 0;
-        for range in formless_core::fuzzy::folded_match_ranges(&span.content, query) {
-            if range.start > start {
+        while let Some(range) = ranges.get(match_index) {
+            if range.start >= end {
+                break;
+            }
+            if range.end <= offset {
+                match_index += 1;
+                continue;
+            }
+            let local_start = range.start.saturating_sub(offset);
+            let local_end = range.end.min(end) - offset;
+            if local_start > start {
                 spans.push(Span::styled(
-                    chars[start..range.start].iter().collect::<String>(),
+                    chars[start..local_start].iter().collect::<String>(),
                     span.style,
                 ));
             }
             spans.push(Span::styled(
-                chars[range.clone()].iter().collect::<String>(),
-                style(found),
+                chars[local_start..local_end].iter().collect::<String>(),
+                span.style.patch(marks[match_index]),
             ));
-            found += 1;
-            start = range.end;
+            start = local_end;
+            if range.end > end {
+                break;
+            }
+            match_index += 1;
         }
         if start == 0 {
             spans.push(span);
@@ -11819,8 +11892,10 @@ fn highlight_matches(
                 span.style,
             ));
         }
+        offset = end;
     }
-    (Line::from(spans).style(line.style), found)
+    line.spans = spans;
+    (line, ranges.len())
 }
 
 /// A user-message line with `@path` mentions highlighted.
@@ -11939,7 +12014,7 @@ fn draw_question_panel(f: &mut Frame, chat: Rect, open: &OpenQuestion, typing: b
 
 /// The `/` palette, just above the input box, scrolled to the selection.
 fn draw_palette(f: &mut Frame, input: Rect, items: &[PaletteItem], sel: usize, color: bool) {
-    if input.y < 3 {
+    if input.y < 3 || input.width == 0 || items.is_empty() {
         return;
     }
     let sel = sel.min(items.len() - 1);
@@ -11947,9 +12022,11 @@ fn draw_palette(f: &mut Frame, input: Rect, items: &[PaletteItem], sel: usize, c
     let start = sel
         .saturating_sub(rows - 1)
         .min(items.len().saturating_sub(rows));
+    let width = input.width.min(100);
+    let columns = width.saturating_sub(2) as usize;
     let label_w = items
         .iter()
-        .map(|i| i.label.chars().count())
+        .map(|item| text::width(&item.label))
         .max()
         .unwrap_or(0)
         .min(40);
@@ -11959,38 +12036,20 @@ fn draw_palette(f: &mut Frame, input: Rect, items: &[PaletteItem], sel: usize, c
         .skip(start)
         .take(rows)
         .map(|(i, item)| {
-            let style = if i == sel {
-                bold_fg(color, Color::Green)
-            } else {
-                Style::default()
-            };
-            Line::from(vec![
-                Span::styled(
-                    format!(
-                        "{} {}  ",
-                        if i == sel { "›" } else { " " },
-                        ui::pad(&truncate_chars(&item.label, 40), label_w)
-                    ),
-                    style,
-                ),
-                Span::styled(item.desc.clone(), ui::dim(color)),
-            ])
+            palette_view::row(&item.label, &item.desc, label_w, columns, i == sel, color)
         })
         .collect();
     let h = (lines.len() as u16 + 2).min(input.y);
     let rect = Rect {
         x: input.x,
         y: input.y - h,
-        width: input.width.clamp(1, 100),
+        width,
         height: h,
     };
     f.render_widget(Clear, rect);
     f.render_widget(
         Paragraph::new(lines).block(ui::panel(
-            format!(
-                " / commands · {} · Tab complete · Enter run · Esc hide ",
-                items.len()
-            ),
+            palette_view::title(items.len(), columns),
             color,
             Color::Cyan,
         )),
@@ -12203,49 +12262,44 @@ fn clickable_rows(
 }
 
 fn draw_tab_bar(f: &mut Frame, area: Rect, app: &App) {
-    let mut spans = vec![Span::styled(
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let views = views_for_click(app);
+    let labels: Vec<_> = views.iter().map(|view| view.label()).collect();
+    let active = views.iter().position(|view| *view == app.view).unwrap_or(0);
+    let parts = tab_view::layout(
+        &labels,
+        active,
+        area.width as usize,
         " ◇ Formless ",
-        bold_fg(app.color, Color::Cyan),
-    )];
-    let mut views: Vec<View> = VIEW_ORDER.to_vec();
-    if app.view == View::Search {
-        views.push(View::Search);
-    }
-    for v in views {
-        let label = format!(" {} ", v.label());
-        if v == app.view {
-            spans.push(Span::styled(
-                label,
-                bold_fg(app.color, Color::Cyan).add_modifier(Modifier::REVERSED),
-            ));
-        } else {
-            spans.push(Span::styled(label, ui::dim(app.color)));
+        " Tab ⇥ ",
+    );
+    let mut spans = Vec::new();
+    let mut offset = 0usize;
+    for part in parts {
+        let style = match part.kind {
+            tab_view::Kind::Brand => bold_fg(app.color, Color::Cyan),
+            tab_view::Kind::View(index) if index == active => {
+                bold_fg(app.color, Color::Cyan).add_modifier(Modifier::REVERSED)
+            }
+            _ => ui::dim(app.color),
+        };
+        let width = text::width(&part.text).min((area.width as usize).saturating_sub(offset));
+        if let tab_view::Kind::View(index) = part.kind {
+            let rect = Rect::new(
+                area.x.saturating_add(offset as u16),
+                area.y,
+                width as u16,
+                1,
+            )
+            .intersection(area);
+            if rect.width > 0 {
+                clickable(app, rect, Click::View(views[index]));
+            }
         }
-    }
-    let mut used: usize = spans.iter().map(|s| s.width()).sum();
-    if used > area.width as usize {
-        // Narrow terminal: the view names matter more than the brand.
-        used -= spans.remove(0).width();
-    }
-    // Each view's tab is clickable.
-    let mut x = area.x;
-    for span in &spans {
-        let w = span.width() as u16;
-        let label = span.content.trim();
-        if let Some(v) = views_for_click(app)
-            .into_iter()
-            .find(|v| v.label() == label)
-        {
-            clickable(app, Rect::new(x, area.y, w, 1), Click::View(v));
-        }
-        x += w;
-    }
-    let tip = " Tab ⇥ ";
-    if used + tip.len() < area.width as usize {
-        spans.push(Span::raw(" ".repeat(
-            (area.width as usize).saturating_sub(used + text::width(tip)),
-        )));
-        spans.push(Span::styled(tip, ui::dim(app.color)));
+        offset += width;
+        spans.push(Span::styled(part.text, style));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -12390,13 +12444,10 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App, show_cursor: bool) {
         let hit = found
             .and_then(|i| input_history(&app.messages, app.current.as_deref()).nth(i))
             .unwrap_or_default();
-        let label = format!("(history search) {query}▏: ");
+        let (label, preview) = history_search_view::parts(query, hit, avail);
         lines.push(Line::from(vec![
-            Span::styled(label.clone(), bold_fg(app.color, Color::Magenta)),
-            Span::raw(history_preview(
-                hit,
-                avail.saturating_sub(label.chars().count()),
-            )),
+            Span::styled(label, bold_fg(app.color, Color::Magenta)),
+            Span::raw(preview),
         ]));
         // The ▏ marks the query's end; no terminal cursor.
         cursor = None;
@@ -13994,37 +14045,8 @@ fn mermaid_live_url(src: &str) -> String {
     )
 }
 
-/// The Markdown tables in `text`: runs of lines that start with `|`.
-fn markdown_tables(text: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut cur: Vec<&str> = Vec::new();
-    for line in text.lines().chain(std::iter::once("")) {
-        if line.trim_start().starts_with('|') {
-            cur.push(line);
-        } else if !cur.is_empty() {
-            if cur.len() >= 2 {
-                out.push(cur.join("\n"));
-            }
-            cur.clear();
-        }
-    }
-    out
-}
-
 fn code_blocks(text: &str) -> Vec<String> {
-    let mut blocks = Vec::new();
-    let mut current: Option<Vec<&str>> = None;
-    for line in text.lines() {
-        if line.trim_start().starts_with("```") {
-            match current.take() {
-                Some(lines) => blocks.push(lines.join("\n")),
-                None => current = Some(Vec::new()),
-            }
-        } else if let Some(lines) = current.as_mut() {
-            lines.push(line);
-        }
-    }
-    blocks
+    markdown::code_blocks(text)
 }
 
 /// OSC 52: the terminal puts `text` on the clipboard (works over SSH;
@@ -15145,14 +15167,15 @@ impl App {
             self.notes.push("no answer with a table yet".into());
             return;
         };
-        let tables = markdown_tables(&last.content);
+        let tables = markdown::tables(&last.content);
         let n = arg.parse::<usize>().unwrap_or(1);
         let Some(table) = n.checked_sub(1).and_then(|i| tables.get(i)) else {
             self.notes
                 .push(format!("the last answer has {} table(s)", tables.len()));
             return;
         };
-        let lines = markdown::render(table, false, "", 100_000)
+        let lines = table
+            .render(false, 100_000)
             .into_iter()
             .map(|l| {
                 l.spans
@@ -18323,16 +18346,55 @@ fn draw_editor_review(
             _ => Line::raw(l.to_string()),
         });
     }
-    f.render_widget(
-        Paragraph::new(lines)
-            .block(ui::panel(
-                format!(" Review {} ", ed.name),
-                color,
-                Color::Yellow,
-            ))
-            .wrap(Wrap { trim: false }),
-        body,
-    );
+    let block = ui::panel(format!(" Review {} ", ed.name), color, Color::Yellow)
+        .title_bottom(ui::hint("↑↓ PgUp/PgDn Home/End scroll", color));
+    let inner = block.inner(body);
+    f.render_widget(block, body);
+    let mut starts = Vec::with_capacity(lines.len());
+    let mut rows = 0;
+    if inner.width > 0 {
+        for line in &lines {
+            starts.push(rows);
+            rows += Paragraph::new(line.clone())
+                .wrap(Wrap { trim: false })
+                .line_count(inner.width)
+                .max(1);
+        }
+    }
+    let height = inner.height as usize;
+    let top = r.scroll.get().top.min(rows.saturating_sub(height));
+    r.scroll.set(EditorReviewScroll { top, rows, height });
+    // Skip whole logical lines before the visible row, preserving styles and
+    // avoiding Paragraph's u16 scroll limit for long multi-line diffs.
+    let first = starts
+        .partition_point(|&start| start <= top)
+        .saturating_sub(1);
+    let offset = top.saturating_sub(starts.get(first).copied().unwrap_or(0));
+    if offset <= u16::MAX as usize {
+        f.render_widget(
+            Paragraph::new(lines.into_iter().skip(first).collect::<Vec<_>>())
+                .wrap(Wrap { trim: false })
+                .scroll((offset as u16, 0)),
+            inner,
+        );
+    } else {
+        // One logical line can itself exceed Paragraph's u16 scroll range.
+        // Reflow only this rare visible window with its matching word wrapper,
+        // retaining usize row positions and the original grapheme styles.
+        let mut visible = Vec::new();
+        for (index, line) in lines.iter().enumerate().skip(first) {
+            if visible.len() >= height {
+                break;
+            }
+            visible.extend(review_wrap::window(
+                line,
+                inner.width,
+                if index == first { offset } else { 0 },
+                height - visible.len(),
+            ));
+        }
+        f.render_widget(review_wrap::Rows(visible), inner);
+    }
     f.render_widget(
         Paragraph::new(Line::styled(
             if r.ok {
@@ -18383,9 +18445,16 @@ fn draw_panes(f: &mut Frame, area: Rect, app: &mut App) {
             ]))
         })
         .collect();
-    f.render_widget(
+    let current_row = app
+        .sessions
+        .iter()
+        .filter(|session| !session.archived)
+        .position(|session| Some(&session.id) == app.current.as_ref());
+    let mut session_state = ListState::default().with_selected(current_row);
+    f.render_stateful_widget(
         List::new(session_items).block(ui::panel(" Sessions ", app.color, Color::Cyan)),
         left[0],
+        &mut session_state,
     );
     if app.tools.is_empty() {
         f.render_widget(
@@ -18476,16 +18545,35 @@ fn draw_panes(f: &mut Frame, area: Rect, app: &mut App) {
             })
             .collect()
     };
+    let block = ui::panel(" Activity ", app.color, Color::Magenta)
+        .title_bottom(ui::hint("/panes", app.color));
+    let inner = block.inner(right[1]);
+    f.render_widget(block, right[1]);
+    let mut row_starts = Vec::with_capacity(notes.len());
+    let mut rows = 0usize;
+    if inner.width > 0 {
+        for note in &notes {
+            row_starts.push(rows);
+            rows += Paragraph::new(note.clone())
+                .wrap(Wrap { trim: false })
+                .line_count(inner.width)
+                .max(1);
+        }
+    }
+    let top = rows.saturating_sub(inner.height as usize);
+    let first = row_starts
+        .partition_point(|&start| start <= top)
+        .saturating_sub(1);
+    let offset = top.saturating_sub(row_starts.get(first).copied().unwrap_or(0));
     f.render_widget(
-        Paragraph::new(notes)
-            .block(
-                ui::panel(" Activity ", app.color, Color::Magenta)
-                    .title_bottom(ui::hint("/panes", app.color)),
-            )
-            .wrap(Wrap { trim: false }),
-        right[1],
+        Paragraph::new(notes.into_iter().skip(first).collect::<Vec<_>>())
+            .wrap(Wrap { trim: false })
+            .scroll((offset.min(u16::MAX as usize) as u16, 0)),
+        inner,
     );
 }
+
+mod wizard_layout;
 
 fn draw_wizard(f: &mut Frame, w: &Wizard, color: bool) {
     let (step_no, step_name) = match w.step {
@@ -18520,16 +18608,13 @@ fn draw_wizard(f: &mut Frame, w: &Wizard, color: bool) {
         ]),
         Line::raw(""),
     ];
-    let status_rows = wrap_rows(
-        &w.status,
-        f.area().width.min(84).saturating_sub(2).max(1) as usize,
-    );
-    let status_extra = status_rows.len().saturating_sub(1);
-    text.extend(
-        status_rows
-            .into_iter()
-            .map(|line| Line::styled(line, status_style)),
-    );
+    let inner_width = f.area().width.min(84).saturating_sub(2).max(1);
+    let status_line = Line::styled(w.status.clone(), status_style);
+    let status_extra = Paragraph::new(status_line.clone())
+        .wrap(Wrap { trim: false })
+        .line_count(inner_width)
+        .saturating_sub(1);
+    text.push(status_line);
     text.push(Line::raw(""));
     let mut hint_rows = 0;
     if let Some(hint) = &w.setup_hint {
@@ -18540,9 +18625,9 @@ fn draw_wizard(f: &mut Frame, w: &Wizard, color: bool) {
             .saturating_sub(15 + status_extra)
             .min(4);
         if budget > 0 {
-            let mut rows = wrap_rows(hint, width);
+            let mut rows = wizard_layout::hint_rows(hint, width);
             if rows.len() > budget {
-                let more = wrap_rows("More: formless profiles list", width);
+                let more = wizard_layout::hint_rows("More: formless profiles list", width);
                 rows.truncate(budget.saturating_sub(more.len()));
                 rows.extend(more.into_iter().take(budget));
             }
@@ -18639,31 +18724,20 @@ fn draw_wizard(f: &mut Frame, w: &Wizard, color: bool) {
         }
     }
     text.push(Line::raw(""));
-    text.push(Line::styled(
+    let footer = Line::styled(
         if w.can_cancel {
             "Enter continue · Esc back (at Provider: cancel) · Ctrl+C quit"
         } else {
             "Enter continue · Esc back · Ctrl+C quit"
         },
         ui::dim(color),
-    ));
-    let width = area.width.min(84);
-    let height = (text.len() as u16 + 2).min(area.height);
-    let rect = Rect {
-        x: area.x + (area.width - width) / 2,
-        y: area.y + area.height.saturating_sub(height) / 3,
-        width,
-        height,
-    };
-    f.render_widget(
-        Paragraph::new(text)
-            .block(ui::panel(
-                format!(" ◇ Formless setup · profile: {} ", w.profile),
-                color,
-                Color::Cyan,
-            ))
-            .wrap(Wrap { trim: false }),
-        rect,
+    );
+    wizard_layout::draw(
+        f,
+        text,
+        footer,
+        format!(" ◇ Formless setup · profile: {} ", w.profile),
+        color,
     );
 }
 
@@ -18694,7 +18768,7 @@ pub fn run(paths: Paths) -> Result<()> {
 /// [`run`], opening `start` ("last", "new" or "picker") instead of
 /// `tui.on_start` (SPEC §10.1): `formless --continue` / `--new`.
 pub fn run_with(paths: Paths, start: Option<&str>) -> Result<()> {
-    // Screen readers get the line-oriented mode (SPEC §10.7).
+    // Screen readers get the line-oriented mode (SPEC §10.5).
     if Config::load(&paths).is_ok_and(|c| c.tui.screen_reader) {
         return plain::run(paths);
     }
@@ -19128,6 +19202,51 @@ mod tests {
             last_click: None,
             stream_cache: Default::default(),
         }
+    }
+
+    #[test]
+    fn composer_character_event_keeps_joined_emoji_whole() {
+        let mut app = test_app();
+        app.vim_mode = false;
+        app.input.set("👩💻x");
+        app.input.set_modal_cursor("👩".len());
+        app.key(KeyEvent::new(KeyCode::Char('\u{200d}'), KeyModifiers::NONE));
+        assert_eq!(app.input.cursor_byte(), "👩‍💻".len());
+        app.key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(app.input.expanded(), "x");
+    }
+
+    #[test]
+    fn message_role_styles_resolve_named_colors_and_preserve_disabled_rgb_defaults() {
+        theme::reset();
+        let colors = ["user", "assistant", "tool", "note"]
+            .into_iter()
+            .map(|name| (name.to_string(), "yellow".to_string()))
+            .collect();
+        theme::set(theme::from_config("light", &colors));
+        for role in ["user", "assistant", "tool", "system-note"] {
+            assert_eq!(
+                role_style(true, role).fg,
+                Some(Color::Rgb(150, 100, 0)),
+                "{role}"
+            );
+            assert_eq!(role_style(false, role).fg, None, "{role}");
+        }
+        let colors = ["user", "assistant", "tool", "note"]
+            .into_iter()
+            .map(|name| (name.to_string(), "#123abc".to_string()))
+            .collect();
+        theme::set(theme::from_config("light", &colors));
+        for role in ["user", "assistant", "tool", "system-note"] {
+            assert_eq!(
+                role_style(true, role).fg,
+                Some(Color::Rgb(0x12, 0x3a, 0xbc))
+            );
+        }
+        theme::set(theme::from_config("light", &HashMap::new()));
+        assert_eq!(role_style(true, "user"), bold_fg(true, Color::Cyan));
+        assert_eq!(role_style(true, "assistant"), bold_fg(true, Color::Green));
+        theme::reset();
     }
 
     #[test]
@@ -21494,6 +21613,7 @@ mod tests {
         let offsets = app.editor.as_ref().unwrap().viewport.get();
         assert!(offsets.0 > 0 && offsets.1 > 0);
         app.editor_review = Some(EditorReview {
+            scroll: Default::default(),
             diff: "unchanged preview".into(),
             verdict: "fixture".into(),
             ok: true,
@@ -22704,6 +22824,32 @@ mod tests {
     }
 
     #[test]
+    fn docs_text_uses_the_local_pager_and_reports_topic_errors() {
+        let mut app = test_app();
+        app.slash("docs --text docker");
+        let page = app.pager.as_ref().unwrap();
+        assert!(page.title.contains("bundled"));
+        assert_eq!(
+            page.lines.join("\n"),
+            include_str!("../../../docs/docker.md")
+                .lines()
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let screen = render(&mut app, 100, 24);
+        assert!(screen.contains("bundled"), "{screen}");
+        app.pager = None;
+        app.slash("docs approvals --text");
+        assert!(app.pager.as_ref().unwrap().lines[0].starts_with("## Are you asked?"));
+        app.pager = None;
+        app.slash("docs --text nope");
+        assert!(app.pager.is_none());
+        assert!(app.notes.last().unwrap().contains("unknown docs topic"));
+        app.slash("docs s --text");
+        assert!(app.notes.last().unwrap().contains("ambiguous docs topic"));
+    }
+
+    #[test]
     fn list_views_filter_sort_and_keep_selection_on_visible_rows() {
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
         let mut app = test_app();
@@ -22738,7 +22884,10 @@ mod tests {
         app.key(key(KeyCode::Enter));
         assert_eq!(app.selected_tool().unwrap().name, "http_get");
         let screen = render(&mut app, 120, 30);
-        assert!(screen.contains("Tools · 1/3 · /http"), "{screen}");
+        assert!(
+            screen.contains("Tools · 1/3 · sort: relevance (ties: name) · /http"),
+            "{screen}"
+        );
         // Esc clears the filter, then a second Esc leaves the view.
         app.key(key(KeyCode::Esc));
         assert_eq!(app.visible_tools().len(), 3);
@@ -22753,6 +22902,132 @@ mod tests {
         app.key(key(KeyCode::Esc));
         app.key(key(KeyCode::Esc));
         assert_eq!(app.view, View::Chat);
+        // A real typed filter selects the primary name, even when the chosen
+        // calls sort favors a prose-only hit; scattered description letters
+        // cannot keep an unrelated Tool in the visible selection model.
+        app.view = View::Tools;
+        app.tool_filter = lists::ListFilter {
+            sort: 3,
+            ..Default::default()
+        };
+        app.tools[1].description = "rotate every answer daily".into();
+        app.tools[2].description = "read records".into();
+        for c in "/read".chars() {
+            app.key(key(KeyCode::Char(c)));
+        }
+        app.key(key(KeyCode::Enter));
+        assert_eq!(app.visible_tools().len(), 2);
+        assert_eq!(app.selected_tool().unwrap().name, "read_file");
+        app.key(key(KeyCode::Down));
+        assert_eq!(app.selected_tool().unwrap().name, "csv_sum");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_escaped_drop_attaches_without_replacing_the_composer_draft() {
+        let mut app = test_app();
+        app.current = Some("s".into());
+        std::fs::create_dir_all(&app.paths.data_dir).unwrap();
+        let file = app.paths.data_dir.join("shot (1).png");
+        std::fs::write(&file, b"image fixture").unwrap();
+        let escaped = file
+            .to_str()
+            .unwrap()
+            .replace(' ', "\\ ")
+            .replace('(', "\\(")
+            .replace(')', "\\)");
+        app.input.paste("keep this draft");
+        app.paste(&escaped);
+        assert_eq!(app.attachments.len(), 1);
+        assert_eq!(app.input.expanded(), "keep this draft");
+        assert!(render(&mut app, 100, 24).contains("shot (1).png"));
+        // Inputs containing two paths remain text and never attach one part.
+        let two = format!("'{}' '{}'", file.display(), file.display());
+        app.paste(&two);
+        assert_eq!(app.attachments.len(), 1);
+        assert!(app.input.expanded().ends_with(&two));
+        std::fs::remove_file(file).unwrap();
+    }
+
+    #[test]
+    fn dropped_path_comment_tail_stays_in_the_composer() {
+        let mut app = test_app();
+        app.current = Some("s".into());
+        std::fs::create_dir_all(&app.paths.data_dir).unwrap();
+        let file = app.paths.data_dir.join("notes.txt");
+        std::fs::write(&file, b"fixture").unwrap();
+        let pasted = format!("'{}' # keep these instructions", file.display());
+        app.paste(&pasted);
+        assert_eq!(
+            app.input.expanded(),
+            pasted,
+            "must retain the complete paste instead of silently attaching only its first word"
+        );
+        assert!(app.attachments.is_empty());
+        std::fs::remove_file(file).unwrap();
+    }
+
+    #[test]
+    fn image_attachment_warning_uses_known_text_only_model_exceptions() {
+        let env = credential_env::EnvGuard::isolated();
+        env.remove("FORMLESS_MODEL");
+        let mut app = test_app();
+        app.current = None;
+        for (model, warns) in [
+            ("o1", false),
+            ("o3-mini", true),
+            ("gemma3:1b", true),
+            ("google/gemma-3-4b-it", false),
+            ("claude-2", true),
+            ("claude-3-haiku", false),
+        ] {
+            let mut cfg = Config::default();
+            cfg.provider.model = model.into();
+            cfg.provider.vision = None;
+            cfg.save(&app.paths).unwrap();
+            let loaded = Config::load(&app.paths).unwrap();
+            assert_eq!(loaded.provider.model, model, "loaded fixture model");
+            assert_eq!(
+                loaded.provider.vision, cfg.provider.vision,
+                "loaded fixture override"
+            );
+            app.notes.clear();
+            app.attachments.clear();
+            app.add_attachment("fixture.png".into(), vec![1]);
+            assert_eq!(
+                formless_core::provider::is_vision_model(model),
+                !warns,
+                "linked core helper for {model}"
+            );
+            assert_eq!(app.attachments.len(), 1);
+            assert_eq!(
+                app.notes
+                    .iter()
+                    .any(|note| note.contains("may not read images")),
+                warns,
+                "{model}"
+            );
+        }
+        for (model, vision) in [("o3-mini", true), ("o1", false)] {
+            let mut cfg = Config::default();
+            cfg.provider.model = model.into();
+            cfg.provider.vision = Some(vision);
+            cfg.save(&app.paths).unwrap();
+            let loaded = Config::load(&app.paths).unwrap();
+            assert_eq!(loaded.provider.model, model, "loaded fixture model");
+            assert_eq!(
+                loaded.provider.vision, cfg.provider.vision,
+                "loaded fixture override"
+            );
+            app.notes.clear();
+            app.add_attachment("fixture.png".into(), vec![1]);
+            assert_eq!(
+                app.notes
+                    .iter()
+                    .any(|note| note.contains("may not read images")),
+                !vision
+            );
+        }
     }
 
     #[test]
@@ -22842,6 +23117,107 @@ mod tests {
     }
 
     #[test]
+    fn editor_review_pages_wrapped_rows_and_bounds_repeated_navigation() {
+        let mut app = test_app();
+        app.editor = Some(viewport_editor("function run() { return 1; }", 0));
+        let diff = (0..80)
+            .map(|i| format!("+ row {i:03} 表👩🏽‍💻 {}", "wrapped words ".repeat(8)))
+            .chain(std::iter::once("+ final-review-marker".into()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.editor_review = Some(EditorReview {
+            scroll: Default::default(),
+            diff,
+            verdict: "safe fixture verdict".into(),
+            ok: true,
+        });
+        let initial = render(&mut app, 60, 14);
+        let initial_state = app.editor_review.as_ref().unwrap().scroll.get();
+        assert!(initial_state.rows > 81);
+        assert!(initial.contains("safe fixture verdict") && initial.contains("PgUp/PgDn"));
+        let generation = app.editor_generation;
+        app.key(key(KeyCode::PageDown));
+        assert!(app.editor_review.is_some());
+        let screen = render(&mut app, 60, 14);
+        assert_ne!(initial, screen);
+        assert_eq!(
+            app.editor_review.as_ref().unwrap().scroll.get().top,
+            initial_state.height - 1
+        );
+        assert_eq!(
+            app.editor_generation, generation,
+            "scrolling does not edit or invalidate save review"
+        );
+        for _ in 0..1000 {
+            app.key(key(KeyCode::PageDown));
+        }
+        let screen = render(&mut app, 60, 14);
+        assert!(screen.contains("final-review-marker"), "{screen}");
+        let end = app.editor_review.as_ref().unwrap().scroll.get();
+        assert_eq!(end.top, end.rows - end.height);
+        app.key(key(KeyCode::Up));
+        assert_eq!(
+            app.editor_review.as_ref().unwrap().scroll.get().top,
+            end.top - 1
+        );
+        app.key(key(KeyCode::Home));
+        assert_eq!(app.editor_review.as_ref().unwrap().scroll.get().top, 0);
+        app.key(key(KeyCode::End));
+        let screen = render(&mut app, 100, 30);
+        let resized = app.editor_review.as_ref().unwrap().scroll.get();
+        assert_eq!(resized.top, resized.rows.saturating_sub(resized.height));
+        assert!(screen.contains("final-review-marker"), "{screen}");
+        assert_eq!(
+            app.editor.as_ref().unwrap().text(),
+            "function run() { return 1; }"
+        );
+        app.key(key(KeyCode::Char('x')));
+        assert!(
+            app.editor_review.is_none(),
+            "ordinary return-to-edit behavior remains"
+        );
+    }
+
+    #[test]
+    fn editor_review_short_tiny_and_large_logical_line_counts_stay_bounded() {
+        let mut app = test_app();
+        app.editor = Some(viewport_editor("function run() {}", 0));
+        app.editor_review = Some(EditorReview {
+            scroll: Default::default(),
+            diff: "+ short".into(),
+            verdict: "fixture".into(),
+            ok: false,
+        });
+        render(&mut app, 80, 24);
+        for code in [KeyCode::Down, KeyCode::PageDown, KeyCode::End, KeyCode::Up] {
+            app.key(key(code));
+        }
+        assert_eq!(app.editor_review.as_ref().unwrap().scroll.get().top, 0);
+        for (width, height) in [(1, 1), (2, 2), (4, 3), (10, 4), (80, 24)] {
+            render(&mut app, width, height);
+        }
+        let review = app.editor_review.as_mut().unwrap();
+        review.diff = format!("{}\n+ last beyond u16", "+ row\n".repeat(66_000));
+        render(&mut app, 80, 12);
+        app.key(key(KeyCode::End));
+        let screen = render(&mut app, 80, 12);
+        assert!(screen.contains("last beyond u16"), "{screen}");
+        app.editor_review.as_mut().unwrap().diff = format!("+{}Z\n+Q", "x ".repeat(70_000));
+        render(&mut app, 4, 12);
+        assert!(app.editor_review.as_ref().unwrap().scroll.get().rows > u16::MAX as usize);
+        app.key(key(KeyCode::End));
+        let screen = render(&mut app, 4, 12);
+        assert!(
+            screen.contains('Z'),
+            "single wrapped logical line must reach its tail: {screen}"
+        );
+        assert!(
+            screen.contains('Q'),
+            "later logical lines remain visible: {screen}"
+        );
+    }
+
+    #[test]
     fn the_code_editor_reviews_before_saving() {
         let mut app = test_app();
         app.editor = Some(EditorState {
@@ -22860,6 +23236,7 @@ mod tests {
         app.key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
         assert_eq!(app.notes.last().unwrap(), "checking the edit…");
         app.editor_review = Some(EditorReview {
+            scroll: Default::default(),
             diff: "@@ code (v1 → v2)\n-  return 1;\n+  return 2;".into(),
             verdict: "Passes the syntax and smoke checks".into(),
             ok: true,
@@ -23365,6 +23742,53 @@ mod tests {
     }
 
     #[test]
+    fn find_delete_cannot_edit_hidden_draft_or_selection() {
+        for selected in [false, true] {
+            let mut app = test_app();
+            app.input.set("private draft ไทย");
+            app.input.set_modal_cursor(8);
+            if selected {
+                app.input.mouse_cursor(13, true);
+            }
+            let before = (
+                app.input.expanded(),
+                app.input.cursor_byte(),
+                app.input.selection(),
+            );
+            app.key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+            app.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+            for modifiers in [
+                KeyModifiers::NONE,
+                KeyModifiers::SHIFT,
+                KeyModifiers::CONTROL,
+            ] {
+                app.key(KeyEvent::new(KeyCode::Delete, modifiers));
+                assert_eq!(
+                    (
+                        app.input.expanded(),
+                        app.input.cursor_byte(),
+                        app.input.selection()
+                    ),
+                    before
+                );
+                assert_eq!(app.find.as_ref().unwrap().query, "a");
+            }
+            app.key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+            assert!(app.find.as_ref().unwrap().query.is_empty());
+            app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+            assert!(app.find.is_none());
+            assert_eq!(
+                (
+                    app.input.expanded(),
+                    app.input.cursor_byte(),
+                    app.input.selection()
+                ),
+                before
+            );
+        }
+    }
+
+    #[test]
     fn find_in_session_highlights_and_steps_through_matches() {
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
         let mut app = test_app();
@@ -23373,9 +23797,9 @@ mod tests {
                 id: format!("m{i}"),
                 session_id: "s".into(),
                 seq: i,
-                role: if i % 2 == 0 { "user" } else { "assistant" }.into(),
+                role: if i % 4 == 0 { "user" } else { "assistant" }.into(),
                 content: if i == 2 || i == 6 {
-                    "the Postgres decision".into()
+                    "the **Postgres** decision".into()
                 } else {
                     "filler\n\n".repeat(10)
                 },
@@ -23385,7 +23809,7 @@ mod tests {
             .collect();
         render(&mut app, 80, 16);
         app.key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
-        for c in "postgres".chars() {
+        for c in "the postgres".chars() {
             app.key(key(KeyCode::Char(c)));
         }
         // The first draw finds the matches; the next shows the count.
@@ -23405,6 +23829,69 @@ mod tests {
         assert!(app.find.is_none() && app.chat_scroll_top.is_none());
         let (line, n) = highlight_matches(Line::raw("Aa aA"), "aa", |_| Style::default());
         assert_eq!((n, line.spans.len()), (2, 3));
+    }
+
+    #[test]
+    fn find_across_styles_preserves_text_styles_and_match_order() {
+        let bold = Style::default().add_modifier(Modifier::BOLD);
+        let italic = Style::default().add_modifier(Modifier::ITALIC);
+        let highlight = Style::default().bg(Color::Yellow);
+        let source = Line::from(vec![
+            Span::styled("prefix alpha ", italic),
+            Span::styled("beta", bold),
+            Span::raw("; alpha "),
+            Span::styled("beta", bold),
+            Span::styled(" suffix", italic),
+        ])
+        .style(Style::default().fg(Color::Cyan));
+        let (lit, count) = highlight_matches(source.clone(), "alpha beta", |index| {
+            highlight.fg(if index == 0 { Color::Red } else { Color::Green })
+        });
+        assert_eq!(count, 2);
+        assert_eq!(lit.to_string(), source.to_string());
+        assert_eq!(lit.style, source.style);
+        assert_eq!(lit.spans.first().unwrap().style, italic);
+        assert_eq!(lit.spans.last().unwrap().style, italic);
+        let matches: Vec<_> = lit
+            .spans
+            .iter()
+            .filter(|s| s.style.bg == Some(Color::Yellow))
+            .collect();
+        assert_eq!(
+            matches
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<Vec<_>>(),
+            vec!["alpha ", "beta", "alpha ", "beta"]
+        );
+        assert!(matches[1].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(matches[0].style.fg, Some(Color::Red));
+        assert_eq!(matches[1].style.fg, Some(Color::Red));
+        assert_eq!(matches[2].style.fg, Some(Color::Green));
+        let (unchanged, count) = highlight_matches(source.clone(), "absent", |_| highlight);
+        assert_eq!(count, 0);
+        assert_eq!(unchanged, source);
+    }
+
+    #[test]
+    fn find_cross_span_combining_sequences_keep_original_text() {
+        let marked = Style::default().add_modifier(Modifier::REVERSED);
+        let line = Line::from(vec![
+            Span::raw("ca"),
+            Span::raw("fe"),
+            Span::raw("\u{301}!"),
+        ]);
+        let (lit, count) = highlight_matches(line, "CAFÉ", |_| marked);
+        assert_eq!(count, 1);
+        assert_eq!(lit.to_string(), "cafe\u{301}!");
+        assert_eq!(
+            lit.spans
+                .iter()
+                .filter(|s| s.style == marked)
+                .map(|s| s.content.as_ref())
+                .collect::<String>(),
+            "cafe"
+        );
     }
 
     #[test]
@@ -23432,7 +23919,7 @@ mod tests {
         assert_eq!(line.to_string(), "İ cafe\u{301} café");
         let source = Line::from(vec![Span::raw("stra"), Span::raw("ße")]);
         let (line, count) = highlight_matches(source, "strasse", |_| marked);
-        assert_eq!(count, 0, "span-boundary behavior remains unchanged");
+        assert_eq!(count, 1, "one phrase crosses the styled span boundary");
         assert_eq!(line.to_string(), "straße");
         let (_, count) = highlight_matches(Line::raw("straße"), "\u{301}", |_| marked);
         assert_eq!(count, 0);
@@ -23660,6 +24147,50 @@ mod tests {
     }
 
     #[test]
+    fn table_command_uses_parsed_order_and_the_last_nonblank_answer() {
+        let mut app = test_app();
+        let message = |id: &str, role: &str, content: &str| MessageInfo {
+            id: id.into(),
+            session_id: "s".into(),
+            seq: 1,
+            role: role.into(),
+            content: content.into(),
+            created_at: String::new(),
+            meta: None,
+        };
+        let source = "Name | Value\n--- | ---\nalpha | 1\n\n| prose one\n| prose two\n\n~~~\n| Fake | Value |\n| --- | --- |\n| ignored | 2 |\n~~~\n\n> Next | Value\n> --- | ---\n> beta | 3";
+        app.messages = vec![
+            message(
+                "old",
+                "assistant",
+                "| Old | Value |\n|---|---|\n| old | 0 |",
+            ),
+            message("current", "assistant", source),
+            message("blank", "assistant", "  \n"),
+            message("user", "user", "not an answer"),
+        ];
+        app.open_table("");
+        let pager = app.pager.as_ref().expect("first parsed table");
+        assert_eq!(pager.title, "table 1 of 2");
+        assert!(
+            pager.lines.iter().any(|line| line.contains("alpha")),
+            "{:?}",
+            pager.lines
+        );
+        app.open_table("2");
+        let pager = app.pager.as_ref().unwrap();
+        assert_eq!(pager.title, "table 2 of 2");
+        assert!(pager.lines.iter().any(|line| line.contains("beta")));
+        for index in ["0", "3"] {
+            app.open_table(index);
+            assert!(app.notes.last().unwrap().contains("2 table(s)"));
+        }
+        app.messages[1].content = "No tables in the newest answer".into();
+        app.open_table("");
+        assert!(app.notes.last().unwrap().contains("0 table(s)"));
+    }
+
+    #[test]
     fn tables_open_full_width_in_the_pager() {
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
         let mut app = test_app();
@@ -23676,7 +24207,7 @@ mod tests {
             created_at: String::new(),
             meta: None,
         }];
-        assert_eq!(markdown_tables(&app.messages[0].content).len(), 2);
+        assert_eq!(markdown::tables(&app.messages[0].content).len(), 2);
         app.slash("table");
         let p = app.pager.as_ref().unwrap();
         assert_eq!(p.title, "table 1 of 2");
@@ -23779,6 +24310,47 @@ mod tests {
     }
 
     #[test]
+    fn parsed_code_blocks_preserve_pager_ordinals_and_latest_answer() {
+        let mut app = test_app();
+        let message = |id: &str, role: &str, content: &str| MessageInfo {
+            id: id.into(),
+            session_id: "s".into(),
+            seq: 1,
+            role: role.into(),
+            content: content.into(),
+            created_at: String::new(),
+            meta: None,
+        };
+        app.messages = vec![message("old", "assistant", "```\nold\n```"), message("new", "assistant", "~~~\nfirst\n~~~\n\n    second\n\n```mermaid\ngraph LR\nA --> B\n```\n\n````\nlast\n```\ncontinued"), message("blank", "assistant", " "), message("user", "user", "ignored")];
+        app.open_code("");
+        assert_eq!(app.pager.as_ref().unwrap().title, "code block 4 of 4");
+        assert_eq!(
+            app.pager.as_ref().unwrap().lines,
+            ["1 │ last", "2 │ ```", "3 │ continued"]
+        );
+        app.open_code("2");
+        assert_eq!(app.pager.as_ref().unwrap().lines, ["1 │ second"]);
+        app.open_code("3");
+        assert_eq!(app.pager.as_ref().unwrap().title, "code block 3 of 4");
+        assert!(app
+            .pager
+            .as_ref()
+            .unwrap()
+            .lines
+            .iter()
+            .any(|line| line.contains("graph LR")));
+        for index in ["0", "5"] {
+            app.open_code(index);
+            assert!(app.notes.last().unwrap().contains("4 code block(s)"));
+            app.copy_cmd(&format!("code {index}"));
+            assert!(app.notes.last().unwrap().contains("4 code block(s)"));
+        }
+        app.messages[1].content = "No code in the newest answer".into();
+        app.open_code("");
+        assert!(app.notes.last().unwrap().contains("0 code block(s)"));
+    }
+
+    #[test]
     fn code_blocks_open_unwrapped_in_the_pager() {
         let mut app = test_app();
         app.messages = vec![MessageInfo {
@@ -23848,7 +24420,9 @@ mod tests {
         let mut app = test_app();
         std::fs::create_dir_all(&app.paths.data_dir).unwrap();
         let png = app.paths.data_dir.join("shot.png");
-        std::fs::write(&png, b"\x89PNG\r\n\x1a\nfake").unwrap();
+        image::RgbaImage::from_pixel(20, 10, image::Rgba([200, 30, 30, 128]))
+            .save_with_format(&png, image::ImageFormat::Png)
+            .unwrap();
         app.messages = vec![MessageInfo {
             id: "u".into(),
             session_id: "s".into(),
@@ -23867,15 +24441,17 @@ mod tests {
         // Without a protocol nothing is reserved.
         render(&mut app, 100, 40);
         assert!(app.image_placed.is_empty());
-        app.image_proto = Some(images::Protocol::ITerm);
-        let screen = render(&mut app, 100, 40);
-        assert!(screen.contains("🖼 shot.png") && !screen.contains("notes.txt"));
-        assert_eq!(app.image_placed.len(), 1);
-        let p = &app.image_placed[0];
-        assert_eq!((p.cols, p.path.as_str()), (40, png.to_str().unwrap()));
-        // Too short to show the whole box: not placed.
-        render(&mut app, 100, 12);
-        assert!(app.image_placed.is_empty());
+        for proto in [images::Protocol::ITerm, images::Protocol::Kitty] {
+            app.image_proto = Some(proto);
+            let screen = render(&mut app, 100, 40);
+            assert!(screen.contains("🖼 shot.png") && !screen.contains("notes.txt"));
+            assert_eq!(app.image_placed.len(), 1);
+            let p = &app.image_placed[0];
+            assert_eq!((p.cols, p.path.as_str()), (40, png.to_str().unwrap()));
+            // Too short to show the whole box: not placed.
+            render(&mut app, 100, 12);
+            assert!(app.image_placed.is_empty());
+        }
     }
 
     #[test]
@@ -23953,6 +24529,120 @@ mod tests {
         );
         assert_eq!(p.lines[1], "2 │   return 1;");
         assert!(p.styled[0].spans.iter().any(|s| s.content == "function"));
+    }
+
+    fn side_pane_regions(app: &mut App, width: u16, height: u16) -> (Vec<String>, Vec<String>) {
+        app.pane_widths = (25, 25);
+        let mut terminal =
+            Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| draw_panes(frame, frame.area(), app))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let rows = |start, end| {
+            (0..height)
+                .map(|y| {
+                    (start..end)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+        };
+        (rows(0, width / 4), rows(width * 3 / 4, width))
+    }
+
+    #[test]
+    fn side_pane_sessions_keep_current_eligible_row_visible_without_reordering() {
+        let mut app = test_app();
+        app.sessions = (0..100)
+            .map(|index| {
+                serde_json::from_value(serde_json::json!({
+                    "id": format!("s{index}"), "name": format!("SESSION-{index:03}"),
+                    "created_at":"", "updated_at":"", "archived": index % 3 == 0,
+                }))
+                .unwrap()
+            })
+            .collect();
+        app.current = Some("s98".into());
+        let before: Vec<_> = app
+            .sessions
+            .iter()
+            .map(|session| (session.id.clone(), session.archived))
+            .collect();
+        for (width, height) in [(120, 24), (160, 12), (120, 40)] {
+            let (left, _) = side_pane_regions(&mut app, width, height);
+            let row = left
+                .iter()
+                .find(|row| row.contains("SESSION-098"))
+                .expect("current Session visible");
+            assert!(row.contains('●'), "{row}");
+            assert_eq!(app.current.as_deref(), Some("s98"));
+        }
+        for id in ["s2", "missing", "s0"] {
+            app.current = Some(id.into());
+            let (left, _) = side_pane_regions(&mut app, 120, 24);
+            let text = left.join("\n");
+            assert!(text.contains("SESSION-001"), "{text}");
+            assert!(
+                !text.contains("SESSION-000"),
+                "archived Sessions remain excluded"
+            );
+            if id == "s2" {
+                assert!(left.iter().any(|row| row.contains("● SESSION-002")));
+            }
+        }
+        assert_eq!(
+            app.sessions
+                .iter()
+                .map(|session| (session.id.clone(), session.archived))
+                .collect::<Vec<_>>(),
+            before
+        );
+        app.sessions.truncate(3);
+        let (left, _) = side_pane_regions(&mut app, 120, 24);
+        assert!(left.join("\n").contains("SESSION-002"));
+        for (width, height) in [(0, 0), (1, 1), (4, 2), (12, 4)] {
+            side_pane_regions(&mut app, width, height);
+        }
+    }
+
+    #[test]
+    fn side_pane_activity_keeps_newest_wrapped_tail_visible_on_resize() {
+        let mut app = test_app();
+        app.notes = vec![
+            "oldest ".repeat(15),
+            "older ".repeat(18),
+            format!("{}表👩🏽‍💻\nembedded note tail-END", "latest ".repeat(10)),
+        ];
+        let before = app.notes.clone();
+        for (width, height) in [(80, 16), (120, 16), (160, 24), (80, 12)] {
+            let (_, right) = side_pane_regions(&mut app, width, height);
+            assert!(
+                right.iter().any(|row| row.contains("tail-END")),
+                "{right:?}"
+            );
+        }
+        assert_eq!(app.notes, before);
+        app.notes = vec!["FIRST".into(), "SECOND".into(), "THIRD".into()];
+        let (_, right) = side_pane_regions(&mut app, 120, 24);
+        let first = right.iter().position(|row| row.contains("FIRST")).unwrap();
+        let second = right.iter().position(|row| row.contains("SECOND")).unwrap();
+        let third = right.iter().position(|row| row.contains("THIRD")).unwrap();
+        assert!(first < second && second < third);
+        assert!(right[first].contains('·'));
+        app.notes = vec![format!("{}hidden-after-cap", "x".repeat(120))];
+        assert!(!side_pane_regions(&mut app, 120, 24)
+            .1
+            .join("\n")
+            .contains("hidden-after-cap"));
+        app.notes.clear();
+        assert!(side_pane_regions(&mut app, 120, 24)
+            .1
+            .join("\n")
+            .contains("Nothing yet."));
+        for (width, height) in [(0, 0), (1, 1), (4, 2), (12, 4)] {
+            side_pane_regions(&mut app, width, height);
+        }
     }
 
     #[test]
@@ -28002,6 +28692,127 @@ mod tests {
                 "invalid options must not send requests"
             );
         }
+    }
+
+    #[test]
+    fn vim_counted_paste_honors_actual_mouse_relocation_before_escape() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        use unicode_segmentation::UnicodeSegmentation;
+        let _env = credential_env::EnvGuard::isolated();
+        for payload in ["X", "\u{0600}X", "X\u{0600}", "👩\u{200d}", "🇨"] {
+            let mut app = test_app();
+            app.vim_mode = true;
+            app.input = input::InputLine::from("ab");
+            app.input.set_modal_cursor(0);
+            app.vim_input.mode = vim::Mode::Normal;
+            app.key(key(KeyCode::Char('2')));
+            app.key(key(KeyCode::Char('i')));
+            app.paste(payload);
+            assert_eq!(&*app.input, format!("{payload}ab"));
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+            terminal.draw(|f| draw(f, &mut app)).unwrap();
+            let hit = app
+                .draft_hits
+                .borrow()
+                .iter()
+                .find(|(_, at)| *at == app.input.len())
+                .unwrap()
+                .0;
+            app.mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: hit.x,
+                row: hit.y,
+                modifiers: KeyModifiers::NONE,
+            });
+            assert_eq!(app.input.cursor_byte(), app.input.len());
+            app.key(key(KeyCode::Esc));
+            assert_eq!(
+                &*app.input,
+                format!("{payload}ab{payload}"),
+                "mouse relocation for {payload:?}"
+            );
+            assert!(
+                app.input.cursor_byte() == app.input.len()
+                    || app
+                        .input
+                        .grapheme_indices(true)
+                        .any(|(at, _)| at == app.input.cursor_byte())
+            );
+            app.key(key(KeyCode::Char('u')));
+            assert_eq!(
+                &*app.input,
+                format!("{payload}ab"),
+                "mouse creates an undo boundary"
+            );
+            app.key(key(KeyCode::Char('$')));
+            app.key(key(KeyCode::Char('2')));
+            app.key(key(KeyCode::Char('.')));
+            assert_eq!(&*app.input, format!("{payload}a{}b", payload.repeat(2)));
+            app.key(key(KeyCode::Char('u')));
+            assert_eq!(&*app.input, format!("{payload}ab"));
+            app.key(key(KeyCode::Char('u')));
+            assert_eq!(&*app.input, "ab");
+        }
+    }
+
+    #[test]
+    fn vim_counted_paste_keeps_trailing_prepend_repetitions_before_neighbors() {
+        let mut app = test_app();
+        app.vim_mode = true;
+        app.input.set("ab");
+        app.input.set_modal_cursor(1);
+        app.vim_input.mode = vim::Mode::Normal;
+        app.key(key(KeyCode::Char('3')));
+        app.key(key(KeyCode::Char('i')));
+        app.paste("X\u{0600}");
+        app.key(key(KeyCode::Esc));
+        let expected = format!("a{}b", "X\u{0600}".repeat(3));
+        assert_eq!(&*app.input, expected);
+        app.key(key(KeyCode::Char('u')));
+        assert_eq!(&*app.input, "ab");
+        app.key(key(KeyCode::Char('.')));
+        assert_eq!(&*app.input, expected);
+        app.key(key(KeyCode::Char('u')));
+        assert_eq!(&*app.input, "ab");
+        app.key(key(KeyCode::Char('2')));
+        app.key(key(KeyCode::Char('.')));
+        assert_eq!(&*app.input, format!("a{}b", "X\u{0600}".repeat(2)));
+        app.key(key(KeyCode::Char('u')));
+        assert_eq!(&*app.input, "ab");
+    }
+
+    #[test]
+    fn vim_bracketed_paste_keeps_prepend_order_through_undo_count_and_dot() {
+        let mut app = test_app();
+        app.vim_mode = true;
+        app.input.set("ab");
+        app.input.set_modal_cursor(1);
+        app.vim_input.mode = vim::Mode::Normal;
+        app.key(key(KeyCode::Char('i')));
+        app.paste("\u{0600}X");
+        assert_eq!(&*app.input, "a\u{0600}Xb");
+        assert_eq!(app.input.cursor_byte(), "a\u{0600}X".len());
+        app.key(key(KeyCode::Esc));
+        app.key(key(KeyCode::Char('u')));
+        assert_eq!(&*app.input, "ab");
+        app.key(key(KeyCode::Char('.')));
+        assert_eq!(&*app.input, "a\u{0600}Xb");
+        app.key(key(KeyCode::Char('u')));
+        assert_eq!(&*app.input, "ab");
+        app.input.set_modal_cursor(1);
+        app.key(key(KeyCode::Char('3')));
+        app.key(key(KeyCode::Char('i')));
+        app.paste("\u{0600}X");
+        app.key(key(KeyCode::Esc));
+        assert_eq!(&*app.input, format!("a{}b", "\u{0600}X".repeat(3)));
+        app.key(key(KeyCode::Char('u')));
+        assert_eq!(&*app.input, "ab");
+        app.input.set_modal_cursor(1);
+        app.key(key(KeyCode::Char('2')));
+        app.key(key(KeyCode::Char('.')));
+        assert_eq!(&*app.input, format!("a{}b", "\u{0600}X".repeat(2)));
+        app.key(key(KeyCode::Char('u')));
+        assert_eq!(&*app.input, "ab");
     }
 
     #[test]

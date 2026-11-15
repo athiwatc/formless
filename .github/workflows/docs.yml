@@ -18,6 +18,10 @@ concurrency:
 # Only reviewed main content runs on a persistent runner; no PR checkout.
 jobs:
   links:
+    # Exact private issue links require issue metadata as well as file reads.
+    permissions:
+      contents: read
+      issues: read
     if: github.ref == 'refs/heads/main'
     runs-on: [self-hosted, macOS, ARM64]
     timeout-minutes: 10
