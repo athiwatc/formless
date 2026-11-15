@@ -67,9 +67,11 @@ stale legacy snapshots, wrong basis/connection/epoch, monotonic baseline loads,
 physical retirement and Profile replacement with matching counters. They execute
 in TestPlatform, not an OS application or screen-reader session.
 
-Three real Client worker/private-daemon/fake-provider schedules cover normal
+Five real Client worker/private-daemon/fake-provider schedules cover normal
 Send and concurrent status reads; A→B→A and same-process reconnect while an
-answer is held; and deliberately not draining the UI channel until it overflows.
+answer is held; deliberately not draining the UI channel until it overflows;
+manual provider retry followed by queued Run turnover; and 5,000 paced indexed
+UTF-8 frames with concurrent status reads and a slow second subscriber.
 Recovery omits the old incomplete prefix, obtains canonical final text and keeps
 the provider request count at one. The full prior private daemon suite also runs.
 These tests use private Profiles and fake credentials, with no paid calls.
@@ -79,10 +81,12 @@ owned disposable package outputs were cleared; source, immutable evidence
 archives and the conflicting partial checkout were preserved. The failed log is
 retained. No writer/process was interrupted and no foreground action occurred.
 
-These are correctness schedules, not throughput/native acceptance. The simple
+These are correctness schedules and a bounded transport sample, not native
+acceptance or an accepted throughput budget. See
+`future-reader-schedules-20261115.md` for workload and measurement limits. The simple
 bounded delivery policy may reconnect at high token rates; accepted sustained
 performance and coalescing policy remain open. New-mode actual daemon schedules
-for manual retry, queued Runs, Tool/Step/schema/compaction, arbitrary EOF/server
+for Tool/Step/schema/compaction, arbitrary EOF/server
 subscriber overflow, concurrent edit publication and delayed status/question
 replies still need broader coverage and independent review. General mid-attempt
 replay is not implemented; the deliberate fallback is persisted history until

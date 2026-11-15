@@ -3,6 +3,272 @@ use super::*;
 use formless_desktop::attempt_admission::{Attachment, Change, Gate};
 use formless_protocol::{TranscriptAttemptChange as Phase, TranscriptBarrier};
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn actual_reader_manual_retry_then_queued_run_preserves_canonical_boundaries() {
+    let env = credential_env::EnvGuard::isolated();
+    env.set("FORMLESS_API_KEY", "private-reader-manual-retry-key");
+    let complete = Arc::new(Notify::new());
+    let queued_complete = Arc::new(Notify::new());
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let fixture = Fixture::start(
+        app(axum::routing::post({
+            let complete = complete.clone();
+            let queued_complete = queued_complete.clone();
+            let calls = calls.clone();
+            move || {
+                let complete = complete.clone();
+                let queued_complete = queued_complete.clone();
+                let number = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                async move {
+                    match number {
+                        1 => gated_response(
+                            prefix("Discard candidate ไทย"),
+                            None,
+                            Arc::new(Notify::new()),
+                        ),
+                        2 => gated_response(
+                            prefix("Replacement candidate "),
+                            Some(tail("😀")),
+                            complete,
+                        ),
+                        3 => gated_response(
+                            prefix("Queued Run answer "),
+                            Some(tail("漢字")),
+                            queued_complete,
+                        ),
+                        _ => panic!("unexpected provider request {number}"),
+                    }
+                }
+            }
+        })),
+        0,
+    )
+    .await;
+    let client = Client::start_future_attempts_for_validation(fixture.endpoint.clone());
+    client
+        .send(Command::Select {
+            session_id: Some(fixture.session.clone()),
+            generation: 1,
+        })
+        .unwrap();
+    super::super::until(
+        &client,
+        "manual-retry-initial",
+        |u| matches!(u,Update::Transcript(b) if b.baseline.is_some()),
+    )
+    .await;
+    let connection = client.connection();
+    let mut observer = Observer::connect(&fixture.endpoint, &fixture.session).await;
+    send(&mut observer, &fixture.session).await;
+    super::super::until(&client,"manual-retry-old-prefix",|u|matches!(u,Update::Transcript(b) if b.events.iter().any(|e|matches!(e,Event::MessageDelta{delta,..} if delta=="Discard candidate ไทย")))).await;
+    observer
+        .request(Request::RetryProviderRequest {
+            session_id: fixture.session.clone(),
+        })
+        .await;
+    let mut retired = false;
+    super::super::until(&client, "manual-retry-fresh-baseline", |u| {
+        if let Update::Transcript(b) = u {
+            assert_eq!(b.owner.connection, connection);
+            retired |= b.reload;
+            if retired {
+                assert!(!b.events.iter().any(
+                    |e| matches!(e,Event::MessageDelta{delta,..} if delta.contains("Discard"))
+                ));
+                if let Some(s) = b.baseline {
+                    assert_eq!(
+                        s.blocks.len(),
+                        1,
+                        "discarded candidate never becomes canonical"
+                    );
+                    return true;
+                }
+            }
+        }
+        false
+    })
+    .await;
+    observer
+        .request(Request::SendMessage {
+            session_id: fixture.session.clone(),
+            content: "Queued user message".into(),
+            mode: SendMode::Queue,
+            client_msg_id: Some(uuid::Uuid::new_v4().to_string()),
+        })
+        .await;
+    complete.notify_one();
+    super::super::until(&client,"manual-retry-canonical-final",|u| {
+        if let Update::Transcript(b)=u {
+            assert_eq!(b.owner.connection,connection);
+            if let Some(s)=b.baseline {
+                assert!(!s.blocks.iter().any(|block|block.markdown().contains("Discard")));
+                if s.blocks.iter().any(|block|block.markdown()=="Replacement candidate 😀") {assert_eq!(s.blocks.len(),2);return true;}
+            }
+            if b.events.iter().any(|e|matches!(e,Event::MessageComplete{message,..} if message.content=="Replacement candidate 😀")) {return true;}
+        }false
+    }).await;
+    wait(
+        &mut observer,
+        |event| matches!(event,Event::MessageDelta{delta,..} if delta=="Queued Run answer "),
+    )
+    .await;
+    queued_complete.notify_one();
+    super::super::until(&client,"queued-run-canonical-final",|u| {
+        if let Update::Transcript(b)=u {
+            assert_eq!(b.owner.connection,connection);
+            if b.baseline.as_ref().is_some_and(|s|s.blocks.iter().any(|block|block.markdown()=="Queued Run answer 漢字")) {return true;}
+            if b.events.iter().any(|e|matches!(e,Event::MessageComplete{message,..} if message.content=="Queued Run answer 漢字")) {return true;}
+        }false
+    }).await;
+    let stored = snapshot(&mut observer, &fixture.session).await;
+    assert_eq!(assistant_messages(&stored).len(), 2);
+    assert_eq!(
+        assistant_messages(&stored)[0]["content"],
+        "Replacement candidate 😀"
+    );
+    assert_eq!(
+        assistant_messages(&stored)[1]["content"],
+        "Queued Run answer 漢字"
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+    drop(client);
+    drop(observer);
+    fixture.finish().await;
+}
+
+/// A transport-only paced schedule, not a renderer benchmark or an SLA.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn actual_reader_sustained_paced_utf8_delivery_records_latency_without_reconnect() {
+    const FRAMES: usize = 5000;
+    const PACING_MS: u64 = 5;
+    let env = credential_env::EnvGuard::isolated();
+    env.set("FORMLESS_API_KEY", "private-reader-paced-key");
+    let complete = Arc::new(Notify::new());
+    let emitted: Arc<Mutex<Vec<Instant>>> = Arc::default();
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let piece = |index: usize| format!("{index:04}|ไทย😀\n");
+    let expected = (0..FRAMES).map(piece).collect::<String>() + "END";
+    let fixture = Fixture::start(app(axum::routing::post({
+        let complete=complete.clone();let emitted=emitted.clone();let calls=calls.clone();
+        move || {
+            let complete=complete.clone();let emitted=emitted.clone();
+            assert_eq!(calls.fetch_add(1,std::sync::atomic::Ordering::SeqCst),0);
+            async move {
+                let stream = futures_util::stream::unfold((0,complete,emitted), |(index,complete,emitted)|async move {
+                    if index > FRAMES {return None;}
+                    let chunk = if index == FRAMES {
+                        complete.notified().await;
+                        tail("END")
+                    } else {
+                        tokio::time::sleep(Duration::from_millis(PACING_MS)).await;
+                        let text=format!("{index:04}|ไทย😀\n");
+                        emitted.lock().unwrap().push(Instant::now());
+                        if index == 0 {prefix(&text)} else {
+                            encode(&[json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":text}})])
+                        }
+                    };
+                    Some((Ok::<_,std::io::Error>(chunk),(index+1,complete,emitted)))
+                });
+                axum::response::Response::builder().header("content-type","text/event-stream").body(axum::body::Body::from_stream(stream)).unwrap()
+            }
+        }
+    })),0).await;
+    let client = Client::start_future_attempts_for_validation(fixture.endpoint.clone());
+    client
+        .send(Command::Select {
+            session_id: Some(fixture.session.clone()),
+            generation: 1,
+        })
+        .unwrap();
+    super::super::until(
+        &client,
+        "paced-reader-baseline",
+        |u| matches!(u,Update::Transcript(b) if b.baseline.is_some()),
+    )
+    .await;
+    let connection = client.connection();
+    let mut observer = Observer::connect(&fixture.endpoint, &fixture.session).await;
+    let start = Instant::now();
+    send(&mut observer, &fixture.session).await;
+    let mut received = String::new();
+    let mut latencies = Vec::with_capacity(FRAMES);
+    let mut statuses = 0;
+    let mut max_drain = 0;
+    while latencies.len() < FRAMES {
+        assert!(
+            start.elapsed() < Duration::from_secs(90),
+            "paced stream deadline: {} frames",
+            latencies.len()
+        );
+        assert_eq!(
+            client.connection(),
+            connection,
+            "paced consumer unexpectedly reconnected"
+        );
+        let mut drain = 0;
+        for update in client.drain() {
+            drain += 1;
+            if let Update::Transcript(b) = update {
+                assert_eq!(b.owner.connection, connection);
+                assert_eq!(b.owner.view_epoch, client.stream_epoch());
+                assert!(
+                    !b.reload && b.baseline.is_none(),
+                    "paced live delivery lost reconciliation"
+                );
+                statuses += usize::from(b.status.is_some());
+                for event in b.events {
+                    if let Event::MessageDelta { delta, .. } = event {
+                        let index = latencies.len();
+                        assert_eq!(
+                            delta,
+                            piece(index),
+                            "lost, merged, reordered or duplicated frame"
+                        );
+                        latencies.push(emitted.lock().unwrap()[index].elapsed().as_micros() as u64);
+                        received.push_str(&delta);
+                    }
+                }
+            }
+        }
+        max_drain = max_drain.max(drain);
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    let elapsed = start.elapsed();
+    assert_eq!(received.len() + 3, expected.len());
+    assert!(
+        statuses > 0,
+        "sustained stream never overlapped a status read"
+    );
+    latencies.sort_unstable();
+    eprintln!(
+        "reader_sustained_metrics {}",
+        json!({"frames":FRAMES,"pacing_ms":PACING_MS,"payload_bytes":received.len(),"elapsed_ms":elapsed.as_millis(),"frames_per_second":FRAMES as f64/elapsed.as_secs_f64(),"provider_emit_to_client_drain_us":{"p50":latencies[FRAMES/2],"p95":latencies[FRAMES*95/100],"p99":latencies[FRAMES*99/100],"max":latencies[FRAMES-1]},"status_batches":statuses,"max_updates_per_drain":max_drain,"connection_changes":0,"lost_or_reordered_frames":0,"renderer_executed":false})
+    );
+    complete.notify_one();
+    super::super::until(&client, "paced-reader-final", |u| {
+        if let Update::Transcript(b) = u {
+            if b.baseline
+                .as_ref()
+                .is_some_and(|s| s.blocks.iter().any(|block| block.markdown() == expected))
+            {
+                return true;
+            }
+            if b.events.iter().any(
+                |e| matches!(e,Event::MessageComplete{message,..} if message.content==expected),
+            ) {
+                return true;
+            }
+        }
+        false
+    })
+    .await;
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(client.connection(), connection);
+    drop(client);
+    drop(observer);
+    fixture.finish().await;
+}
+
 async fn barrier(observer: &mut Observer, session: &str) -> (Attachment, Gate) {
     let value = observer
         .request(Request::GetTranscriptBarrier { id: session.into() })
