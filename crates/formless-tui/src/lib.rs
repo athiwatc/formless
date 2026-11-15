@@ -16,6 +16,7 @@ mod images;
 mod input;
 mod keys;
 mod links;
+mod list_paging;
 mod lists;
 mod markdown;
 mod mermaid;
@@ -29,6 +30,7 @@ mod profile_context_tests;
 pub mod qr;
 mod query;
 mod review_wrap;
+mod search_jump;
 mod session_ui;
 mod settings;
 mod tab_view;
@@ -1720,6 +1722,7 @@ struct App {
     run_tool_changes: Vec<ToolChange>,
     tool_idx: usize,
     tool_filter: lists::ListFilter,
+    list_page_rows: std::cell::Cell<[Option<usize>; 5]>,
     tool_detail: Option<ToolDetail>,
     /// The Metrics view's range (`METRIC_RANGES`), and per-Tool (calls,
     /// success rate) in it.
@@ -1921,6 +1924,7 @@ struct App {
     /// shown before saving (SPEC §10.4).
     editor_review: Option<EditorReview>,
     search_hits: Vec<SearchHit>,
+    search_jump: Option<search_jump::Target>,
     search_idx: usize,
     search_mode: bool,
     editing_id: Option<String>,
@@ -2090,6 +2094,7 @@ impl App {
             tool_idx: 0,
             run_tool_changes: Vec::new(),
             tool_filter: lists::ListFilter::default(),
+            list_page_rows: std::cell::Cell::new([None; 5]),
             tool_detail: None,
             metrics_range: 0,
             metrics_tools: Default::default(),
@@ -2199,6 +2204,7 @@ impl App {
             editor: None,
             editor_review: None,
             search_hits: Vec::new(),
+            search_jump: None,
             search_idx: 0,
             search_mode: false,
             editing_id: None,
@@ -2771,6 +2777,14 @@ impl App {
                 _ => None,
             };
             let id = c.send(req);
+            if let Some(target) = self.search_jump.as_mut().filter(|target| {
+                target.request.is_none()
+                    && state_read
+                        .as_ref()
+                        .is_some_and(|(session, _)| session == &target.session)
+            }) {
+                target.request = Some(id);
+            }
             if let Some(read) = state_read {
                 self.run_state_reads.insert(id, read);
             }
@@ -2788,6 +2802,7 @@ impl App {
             .map(|(id, _)| *id)
             .collect();
         for id in late {
+            self.failed_search_jump(id);
             self.pending_since.remove(&id);
             self.run_state_reads.remove(&id);
             let Some(kind) = self.pending.remove(&id) else {
@@ -3023,6 +3038,9 @@ impl App {
                     }
                     self.pending_since.remove(&id);
                     let state_read = self.run_state_reads.remove(&id);
+                    if !ok {
+                        self.failed_search_jump(id);
+                    }
                     let Some(kind) = self.pending.remove(&id) else {
                         continue;
                     };
@@ -4931,7 +4949,10 @@ impl App {
                                             call.status == "running" && call.handle.is_some()
                                         });
                                     }
+                                    let search_jump = self.search_jump.take();
                                     self.follow_chat_bottom();
+                                    self.search_jump = search_jump;
+                                    self.loaded_search_jump(id);
                                 }
                             }
                             self.run_banner = result["unfinished_run"].as_object().map(|r| {
@@ -5348,12 +5369,14 @@ impl App {
     }
 
     fn scroll_chat_up(&mut self, lines: usize) {
+        self.search_jump = None;
         let max_top = self.chat_max_top();
         let cur = self.chat_scroll_top.unwrap_or(max_top);
         self.chat_scroll_top = Some(cur.saturating_sub(lines));
     }
 
     fn scroll_chat_down(&mut self, lines: usize) {
+        self.search_jump = None;
         if let Some(top) = self.chat_scroll_top {
             let next = top + lines;
             self.chat_scroll_top = if next >= self.chat_max_top() {
@@ -5365,6 +5388,7 @@ impl App {
     }
 
     fn follow_chat_bottom(&mut self) {
+        self.search_jump = None;
         self.chat_scroll_top = None;
     }
 
@@ -7276,21 +7300,16 @@ impl App {
         true
     }
 
-    /// Open, refresh or close the `@` popup for the input's last word.
+    /// Open, refresh or close the popup for the shared mention token at the cursor.
     fn update_mention(&mut self) {
-        let word = self
-            .input
-            .before_cursor()
-            .rsplit(char::is_whitespace)
-            .next()
-            .unwrap_or("");
-        let query = match word.strip_prefix('@') {
-            Some(q) if !self.input.starts_with('/') => q.to_string(),
-            _ => {
-                self.mention = None;
-                return;
-            }
-        };
+        let query =
+            match formless_core::files::mention_completion(&self.input, self.input.cursor_byte()) {
+                Some(completion) if !self.input.starts_with('/') => completion.query,
+                _ => {
+                    self.mention = None;
+                    return;
+                }
+            };
         if self.mention.as_ref().is_some_and(|m| m.query == query) {
             return;
         }
@@ -7327,19 +7346,17 @@ impl App {
             KeyCode::Esc => m.dismissed = true,
             KeyCode::Tab | KeyCode::Enter if key.modifiers.is_empty() => {
                 let f = m.files[m.sel.min(m.files.len() - 1)].clone();
-                let word_chars = self
-                    .input
-                    .before_cursor()
-                    .rsplit(char::is_whitespace)
-                    .next()
-                    .unwrap_or("")
-                    .chars()
-                    .count();
-                for _ in 0..word_chars {
-                    self.input.backspace();
+                let Some(completion) =
+                    formless_core::files::mention_completion(&self.input, self.input.cursor_byte())
+                else {
+                    self.mention = None;
+                    return true;
+                };
+                let insertion = formless_core::files::encode_mention(&f.path, f.dir);
+                let start = completion.range.start;
+                if self.input.modal_replace(completion.range, &insertion.text) {
+                    self.input.set_modal_cursor(start + insertion.cursor);
                 }
-                self.input
-                    .insert_str(&format!("@{}{}", f.path, if f.dir { '/' } else { ' ' }));
                 self.update_mention();
             }
             _ => return false,
@@ -7349,6 +7366,9 @@ impl App {
 
     /// Switch view and fetch what it shows.
     fn open_view(&mut self, view: View) {
+        if view != View::Chat {
+            self.search_jump = None;
+        }
         self.view = view;
         match view {
             View::Sessions => self.request(Pending::ListSessions, Request::ListSessions),
@@ -9751,18 +9771,21 @@ impl App {
         match self.view {
             View::Settings => self.settings_key(key),
             View::Search => match key.code {
-                KeyCode::Up => self.search_idx = self.search_idx.saturating_sub(1),
-                KeyCode::Down => {
-                    self.search_idx =
-                        (self.search_idx + 1).min(self.search_hits.len().saturating_sub(1))
-                }
                 KeyCode::Enter => {
                     if let Some(hit) = self.search_hits.get(self.search_idx).cloned() {
                         self.switch_session(hit.session_id.clone());
+                        self.start_search_jump(hit.clone());
                         self.request(
                             Pending::GetSession,
                             Request::GetSession { id: hit.session_id },
                         );
+                        if self
+                            .search_jump
+                            .as_ref()
+                            .is_some_and(|target| target.request.is_none())
+                        {
+                            self.search_jump = None;
+                        }
                         self.view = View::Chat;
                     }
                 }
@@ -9781,6 +9804,8 @@ impl App {
                 } else if key.code == KeyCode::Char('b') {
                     self.usage_by = (self.usage_by + 1) % USAGE_BY.len();
                     self.load_metrics();
+                } else if key.code == KeyCode::Char('m') && !self.model_stats.is_empty() {
+                    self.pager = Some(model_metrics_pager(&self.model_stats, self.color));
                 }
             }
             View::Proposals => match key.code {
@@ -10553,6 +10578,20 @@ impl App {
     /// Vim-style movement in every list view (SPEC §10.5): j/k, g/G (or
     /// Home/End) and Ctrl+D/Ctrl+U by half a page; true when used.
     fn list_nav_key(&mut self, key: &KeyEvent) -> bool {
+        let editing = match self.view {
+            View::Sessions => self.session_filter.editing,
+            View::Tools => self.tool_filter.editing,
+            View::Proposals => self.proposal_filter.editing,
+            _ => false,
+        };
+        if editing && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) {
+            return true;
+        }
+        let plain = query::plain(key);
+        let ctrl = key.modifiers == KeyModifiers::CONTROL;
+        if !plain && !ctrl {
+            return false;
+        }
         let metrics = (self.view == View::Metrics).then(|| self.metrics_rows());
         let mut metrics_index = metrics
             .as_ref()
@@ -10563,27 +10602,35 @@ impl App {
             View::Tools => self.visible_tools().len(),
             View::Metrics => metrics.as_ref().unwrap().len(),
             View::Proposals => self.visible_proposals().len(),
+            View::Search => self.search_hits.len(),
             _ => return false,
         };
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let page = self.list_capacity(self.view);
         let idx = match self.view {
             View::Sessions => &mut self.session_idx,
             View::Proposals => &mut self.proposal_idx,
             View::Metrics => &mut metrics_index,
+            View::Search => &mut self.search_idx,
             _ => &mut self.tool_idx,
         };
         let last = len.saturating_sub(1);
-        let half = 10;
+        let half = (page / 2).max(1);
         *idx = match key.code {
-            KeyCode::Char('j') if !ctrl => (*idx + 1).min(last),
-            KeyCode::Char('k') if !ctrl => idx.saturating_sub(1),
-            KeyCode::Char('d') if ctrl => (*idx + half).min(last),
+            KeyCode::Char('j') if plain => idx.saturating_add(1).min(last),
+            KeyCode::Char('k') if plain => idx.saturating_sub(1),
+            KeyCode::Char('d') if ctrl => idx.saturating_add(half).min(last),
             KeyCode::Char('u') if ctrl => idx.saturating_sub(half),
-            KeyCode::Char('g') | KeyCode::Home => 0,
-            KeyCode::Char('G') | KeyCode::End => last,
+            KeyCode::Char('g') | KeyCode::Home if plain => 0,
+            KeyCode::Char('G') | KeyCode::End if plain => last,
+            KeyCode::PageUp if plain => idx.saturating_sub(page),
+            KeyCode::PageDown if plain => idx.saturating_add(page).min(last),
             // The Metrics view had no list keys of its own.
-            KeyCode::Down if self.view == View::Metrics => (*idx + 1).min(last),
-            KeyCode::Up if self.view == View::Metrics => idx.saturating_sub(1),
+            KeyCode::Down if plain && matches!(self.view, View::Metrics | View::Search) => {
+                idx.saturating_add(1).min(last)
+            }
+            KeyCode::Up if plain && matches!(self.view, View::Metrics | View::Search) => {
+                idx.saturating_sub(1)
+            }
             _ => return false,
         };
         if let Some(rows) = metrics {
@@ -10913,6 +10960,7 @@ impl App {
     /// Scroll to the previous/next user message (SPEC §10.2); past the
     /// last one, follow the live bottom again.
     fn jump_user_message(&mut self, forward: bool) {
+        self.search_jump = None;
         let max_top = self.chat_line_count.saturating_sub(self.chat_view_height);
         let top = self.chat_scroll_top.unwrap_or(max_top);
         let target = if forward {
@@ -11312,7 +11360,10 @@ impl App {
             KeyCode::Down if ctrl => self.jump_user_message(true),
             KeyCode::Char('{') if empty => self.jump_user_message(false),
             KeyCode::Char('}') if empty => self.jump_user_message(true),
-            KeyCode::Home if empty => self.chat_scroll_top = Some(0),
+            KeyCode::Home if empty => {
+                self.search_jump = None;
+                self.chat_scroll_top = Some(0);
+            }
             KeyCode::PageUp => self.scroll_chat_up(page),
             KeyCode::PageDown => self.scroll_chat_down(page),
             KeyCode::Up
@@ -11901,18 +11952,16 @@ fn highlight_matches(
 /// A user-message line with `@path` mentions highlighted.
 fn mention_line(text: &str, color: bool) -> Line<'static> {
     let mut spans = vec![Span::raw("  ")];
-    for word in text.split_inclusive(char::is_whitespace) {
-        let bare = word.trim_end();
-        if bare.len() > 1 && bare.starts_with('@') {
-            spans.push(Span::styled(
-                bare.to_string(),
-                fg(color, Color::Cyan).add_modifier(Modifier::UNDERLINED),
-            ));
-            spans.push(Span::raw(word[bare.len()..].to_string()));
-        } else {
-            spans.push(Span::raw(word.to_string()));
-        }
+    let mut at = 0;
+    for range in formless_core::files::mention_ranges(text) {
+        spans.push(Span::raw(text[at..range.start].to_owned()));
+        spans.push(Span::styled(
+            text[range.clone()].to_owned(),
+            fg(color, Color::Cyan).add_modifier(Modifier::UNDERLINED),
+        ));
+        at = range.end;
     }
+    spans.push(Span::raw(text[at..].to_owned()));
     Line::from(spans)
 }
 
@@ -13039,44 +13088,91 @@ fn draw_switcher(f: &mut Frame, app: &App, query: &str, sel: usize) {
 /// "Runs are still working" before quitting.
 fn draw_quit_confirm(f: &mut Frame, app: &App) {
     let n = app.running_sessions.len();
-    let lines = vec![
-        Line::raw(""),
-        Line::raw(format!(
-            "  {n} Run{} still working in the daemon. {} keep going if you quit.",
-            if n == 1 { " is" } else { "s are" },
-            if n == 1 { "It will" } else { "They'll" }
-        )),
-        Line::raw(""),
-        Line::from(vec![
-            Span::styled(
-                " q ",
-                bold_fg(app.color, Color::Green).add_modifier(Modifier::REVERSED),
-            ),
-            Span::raw(" quit    "),
-            Span::styled(
-                " s ",
-                bold_fg(app.color, Color::Red).add_modifier(Modifier::REVERSED),
-            ),
-            Span::raw(" stop them and quit    "),
-            Span::styled(" Esc ", ui::dim(app.color).add_modifier(Modifier::REVERSED)),
-            Span::raw(" cancel"),
-        ]),
-    ];
+    let warning = Line::raw(format!(
+        "  {n} Run{} still working in the daemon. {} keep going if you quit.",
+        if n == 1 { " is" } else { "s are" },
+        if n == 1 { "It will" } else { "They'll" }
+    ));
+    let actions = Line::from(vec![
+        Span::styled(
+            " q ",
+            bold_fg(app.color, Color::Green).add_modifier(Modifier::REVERSED),
+        ),
+        Span::raw(" quit    "),
+        Span::styled(
+            " s ",
+            bold_fg(app.color, Color::Red).add_modifier(Modifier::REVERSED),
+        ),
+        Span::raw(" stop them and quit    "),
+        Span::styled(" Esc ", ui::dim(app.color).add_modifier(Modifier::REVERSED)),
+        Span::raw(" cancel"),
+    ]);
     let area = f.area();
-    let w = 66.min(area.width.saturating_sub(2)).max(1);
-    let h = 6.min(area.height);
+    let w = 66.min(area.width.saturating_sub(2)).max(1).min(area.width);
+    let width = w.saturating_sub(2);
+    // Measure the exact styled Paragraph wrapping, without a block: borders
+    // are charged once below, independently of the warning and key labels.
+    let warning_rows = Paragraph::new(warning.clone())
+        .wrap(Wrap { trim: false })
+        .line_count(width) as u16;
+    let action_rows = Paragraph::new(actions.clone())
+        .wrap(Wrap { trim: false })
+        .line_count(width) as u16;
+    let required = warning_rows.saturating_add(action_rows);
+    let available = area.height.saturating_sub(2);
+    let fits = width > 0 && required <= available;
+    let gaps = if fits {
+        available.saturating_sub(required).min(2)
+    } else {
+        0
+    };
+    let h = if fits {
+        required + gaps + 2
+    } else {
+        area.height.min(4)
+    };
     let rect = Rect::new(
         area.x + area.width.saturating_sub(w) / 2,
         area.y + area.height.saturating_sub(h) / 2,
         w,
         h,
     );
+    let block = ui::panel(
+        if fits { " Quit? " } else { " Quit? Resize " },
+        app.color,
+        Color::Yellow,
+    );
+    let inner = block.inner(rect);
     f.render_widget(Clear, rect);
+    f.render_widget(block, rect);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    if !fits {
+        let fallback = if inner.height >= 2 && inner.width >= 9 {
+            "Resize\nEsc cancel"
+        } else if inner.width >= 9 {
+            "Esc cancel"
+        } else {
+            "Esc"
+        };
+        f.render_widget(Paragraph::new(fallback).style(ui::dim(app.color)), inner);
+        return;
+    }
+    let top_gap = u16::from(gaps == 2);
+    let between = gaps - top_gap;
     f.render_widget(
-        Paragraph::new(lines)
-            .block(ui::panel(" Quit? ", app.color, Color::Yellow))
-            .wrap(Wrap { trim: false }),
-        rect,
+        Paragraph::new(warning).wrap(Wrap { trim: false }),
+        Rect::new(inner.x, inner.y + top_gap, inner.width, warning_rows),
+    );
+    f.render_widget(
+        Paragraph::new(actions).wrap(Wrap { trim: false }),
+        Rect::new(
+            inner.x,
+            inner.y + top_gap + warning_rows + between,
+            inner.width,
+            action_rows,
+        ),
     );
 }
 
@@ -15583,6 +15679,8 @@ fn tool_call_block(
 struct ChatRender {
     lines: Vec<Line<'static>>,
     focus_line: Option<usize>,
+    search_line: Option<usize>,
+    search_nearby: bool,
     user_lines: Vec<usize>,
     image_lines: Vec<(usize, String)>,
     /// Persisted tool calls' header lines, for clicks.
@@ -15592,6 +15690,12 @@ struct ChatRender {
 fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
     let mut lines: Vec<Line> = Vec::new();
     let mut focus_line = None;
+    let mut search_line = None;
+    let mut search_nearby = false;
+    let search_target = app
+        .search_jump
+        .as_ref()
+        .filter(|target| target.ready && app.is_current(&target.session));
     let mut user_lines = Vec::new();
     // Rows reserved for image thumbnails: (first line, file).
     let mut image_lines: Vec<(usize, String)> = Vec::new();
@@ -15644,6 +15748,7 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
             }
             day = Some(d);
         }
+        let first_line = lines.len();
         match m.role.as_str() {
             "user" => {
                 user_lines.push(lines.len());
@@ -15741,8 +15846,27 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
                 }
             }
         }
+        if search_target
+            .is_some_and(|target| target.session == m.session_id && target.message == m.id)
+        {
+            if lines.len() > first_line {
+                search_line = Some(first_line);
+            } else {
+                search_line = first_line.checked_sub(1);
+                search_nearby = true;
+            }
+        }
         if let Some(footer) = footers.get(&mi) {
             lines.push(Line::styled(format!("  {footer}"), ui::dim(app.color)));
+        }
+    }
+    if search_line.is_none() {
+        if let Some(call) = search_target.and_then(|target| target.call.as_ref()) {
+            search_line = call_lines
+                .iter()
+                .find(|(_, id)| id == call)
+                .map(|(line, _)| *line);
+            search_nearby = search_line.is_some();
         }
     }
     // Live call tree (persisted lines above keep the history): running
@@ -15942,6 +16066,8 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
     ChatRender {
         lines,
         focus_line,
+        search_line,
+        search_nearby,
         user_lines,
         image_lines,
         call_lines,
@@ -15958,6 +16084,8 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
     let ChatRender {
         mut lines,
         focus_line,
+        search_line,
+        search_nearby,
         user_lines,
         image_lines,
         call_lines,
@@ -16014,6 +16142,27 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
         find.rows = match_lines.iter().map(|&i| line_rows[i]).collect();
     }
     // Bring a newly focused tool call into view (rows before it, wrapped).
+    let search_ready = app
+        .search_jump
+        .as_ref()
+        .is_some_and(|target| target.ready && app.is_current(&target.session));
+    let search_row = search_ready
+        .then(|| search_line.and_then(|line| line_rows.get(line).copied()))
+        .flatten();
+    if search_ready {
+        app.search_jump = None;
+        if search_row.is_none() {
+            app.follow_chat_bottom();
+            app.notes.push(
+                "Search hit could not be shown in this view; following the Session bottom.".into(),
+            );
+        } else if search_nearby {
+            app.notes.push(
+                "Search hit is grouped with other content; showing its nearest visible context."
+                    .into(),
+            );
+        }
+    }
     let focus_row = focus_line
         .filter(|_| std::mem::take(&mut app.scroll_to_focus))
         .map(|i| line_rows[i]);
@@ -16031,7 +16180,7 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
             find_row = f.rows.get(f.current).copied();
         }
     }
-    if let Some(row) = focus_row.or(find_row) {
+    if let Some(row) = search_row.or(focus_row).or(find_row) {
         let top = app.chat_scroll_top.unwrap_or(max_top);
         if row < top || row >= top + height {
             app.chat_scroll_top = Some(row.saturating_sub(height / 3).min(max_top));
@@ -16281,6 +16430,10 @@ fn draw_sessions(f: &mut Frame, area: Rect, app: &App) {
         &mut state,
     );
     clickable_rows(app, area, 0, state.offset(), count, Click::Session);
+    app.record_list_capacity(
+        View::Sessions,
+        count.min(area.height.saturating_sub(2) as usize),
+    );
 }
 
 fn draw_settings(f: &mut Frame, area: Rect, app: &App) {
@@ -16431,6 +16584,12 @@ fn draw_settings_form(f: &mut Frame, form: &settings::Form, color: bool) {
 }
 
 fn draw_search(f: &mut Frame, area: Rect, app: &App) {
+    app.record_list_capacity(
+        View::Search,
+        app.search_hits
+            .len()
+            .min(area.height.saturating_sub(2) as usize),
+    );
     let items: Vec<ListItem> = if app.search_hits.is_empty() {
         vec![ListItem::new(Line::styled(
             "No hits. /search to try again.",
@@ -16680,7 +16839,59 @@ fn table_header(cols: &[&'static str], color: bool) -> Row<'static> {
     Row::new(cols.iter().map(|c| Cell::from(*c))).style(ui::dim(color).add_modifier(Modifier::BOLD))
 }
 
+/// The preview spends only spare rows after the existing section requests
+/// and Tool minimum. Its size stops growing after five model rows.
+fn model_preview_height(height: u16, reserved: u16, count: usize) -> u16 {
+    let spare = height.saturating_sub(reserved);
+    if count == 0 || spare < 4 {
+        0
+    } else {
+        spare.min(count.min(5) as u16 + 3)
+    }
+}
+
+fn model_preview_hint(shown: usize, total: usize, width: u16) -> String {
+    [
+        format!("Models {shown}/{total} · m full list"),
+        format!("Models {shown}/{total} · m"),
+        format!("{shown}/{total} m"),
+        "m models".into(),
+        "m".into(),
+    ]
+    .into_iter()
+    .find(|text| text::width(text) <= width as usize)
+    .unwrap_or_default()
+}
+
+fn model_metrics_pager(stats: &[formless_protocol::ModelStatInfo], color: bool) -> Pager {
+    let mut lines = Vec::new();
+    for st in stats {
+        let n = st.successes + st.failures;
+        let rate = (n > 0).then(|| st.successes as f64 / n as f64);
+        let avg = if n > 0 {
+            format!("{:.0}ms", st.total_ms as f64 / n as f64)
+        } else {
+            "-".into()
+        };
+        lines.push(st.model.clone());
+        lines.push(format!(
+            "  CALLS {n} · SUCCESS {} · AVG {avg} · CACHED {}",
+            ui::rate_display(color, rate),
+            cache_hit_text(st)
+        ));
+        lines.push(String::new());
+    }
+    Pager {
+        title: format!("Model routing (measured) · {} models", stats.len()),
+        lines,
+        top: 0,
+        left: 0,
+        styled: Vec::new(),
+    }
+}
+
 fn draw_metrics(f: &mut Frame, area: Rect, app: &App) {
+    app.record_list_capacity(View::Metrics, 0);
     let tools = app.metrics_rows();
     let selected = app.metrics_selection(&tools);
     let detail = app
@@ -16688,11 +16899,6 @@ fn draw_metrics(f: &mut Frame, area: Rect, app: &App) {
         .as_ref()
         .filter(|detail| selected.is_some_and(|index| tools[index].id == detail.tool.id));
     let detail_h = if tools.is_empty() { 0 } else { 5 };
-    let routing_h = if app.model_stats.is_empty() {
-        0
-    } else {
-        app.model_stats.len() as u16 + 3
-    };
     let builtins_h = if app.builtin_stats.is_empty() {
         0
     } else {
@@ -16700,6 +16906,16 @@ fn draw_metrics(f: &mut Frame, area: Rect, app: &App) {
     };
     let usage_stride = if theme::redundant(app.color) { 2 } else { 1 };
     let usage_h = app.usage_rows.len().clamp(1, 10) as u16 * usage_stride + 2;
+    let hint_h = u16::from(!app.model_stats.is_empty() && area.height > 0);
+    let content = Rect {
+        height: area.height.saturating_sub(hint_h),
+        ..area
+    };
+    let routing_h = model_preview_height(
+        content.height,
+        5 + detail_h + usage_h + builtins_h,
+        app.model_stats.len(),
+    );
     let parts = Layout::vertical([
         Constraint::Min(5),
         Constraint::Length(detail_h),
@@ -16707,7 +16923,7 @@ fn draw_metrics(f: &mut Frame, area: Rect, app: &App) {
         Constraint::Length(routing_h),
         Constraint::Length(builtins_h),
     ])
-    .split(area);
+    .split(content);
     {
         let by = USAGE_BY[app.usage_by % USAGE_BY.len()];
         let total: i64 = app
@@ -16842,6 +17058,10 @@ fn draw_metrics(f: &mut Frame, area: Rect, app: &App) {
         let offset = state.table.offset();
         drop(state);
         let height = parts[0].height.saturating_sub(3) as usize;
+        app.record_list_capacity(
+            View::Metrics,
+            tools.len().saturating_sub(offset).min(height),
+        );
         for (index, tool) in tools.iter().enumerate().skip(offset).take(height) {
             clickable(
                 app,
@@ -16924,10 +17144,22 @@ fn draw_metrics(f: &mut Frame, area: Rect, app: &App) {
             parts[1],
         );
     }
-    if !app.model_stats.is_empty() {
+    let shown = app
+        .model_stats
+        .len()
+        .min(parts[3].height.saturating_sub(3) as usize);
+    if hint_h > 0 {
+        f.render_widget(
+            Paragraph::new(model_preview_hint(shown, app.model_stats.len(), area.width))
+                .style(ui::dim(app.color)),
+            Rect::new(area.x, content.bottom(), area.width, hint_h),
+        );
+    }
+    if parts[3].height >= 4 {
         let rows: Vec<Row> = app
             .model_stats
             .iter()
+            .take(shown)
             .map(|st| {
                 let n = st.successes + st.failures;
                 let rate = (n > 0).then(|| st.successes as f64 / n as f64);
@@ -16990,6 +17222,10 @@ fn proposal_status_style(color: bool, status: &str) -> Style {
 
 fn draw_proposals(f: &mut Frame, area: Rect, app: &App) {
     let visible = app.visible_proposals();
+    app.record_list_capacity(
+        View::Proposals,
+        visible.len().min(area.height.saturating_sub(3) as usize),
+    );
     let mut title = app.proposal_filter.title(
         "Prompt proposals",
         visible.len(),
@@ -17481,6 +17717,7 @@ fn module_detail_lines(d: &ModuleDetail, color: bool) -> Vec<Line<'static>> {
 }
 
 fn draw_tools(f: &mut Frame, area: Rect, app: &App) {
+    app.record_list_capacity(View::Tools, 0);
     let visible = app.visible_tools();
     let groups = lists::tool_groups(&app.tools, &app.tool_filter);
     let list_h = ((visible.len() + groups.len()).max(1) as u16 + 3)
@@ -17590,6 +17827,15 @@ fn draw_tools(f: &mut Frame, area: Rect, app: &App) {
         // Clicks select Tools; headers between them take rows too.
         let top = parts[0].y + 2;
         let height = parts[0].height.saturating_sub(3) as usize;
+        app.record_list_capacity(
+            View::Tools,
+            layout
+                .iter()
+                .skip(state.offset())
+                .take(height)
+                .filter(|row| row.is_ok())
+                .count(),
+        );
         for (k, r) in layout.iter().enumerate().skip(state.offset()).take(height) {
             if let Ok(p) = r {
                 clickable(
@@ -18370,7 +18616,13 @@ fn draw_editor_review(
         .partition_point(|&start| start <= top)
         .saturating_sub(1);
     let offset = top.saturating_sub(starts.get(first).copied().unwrap_or(0));
-    if offset <= u16::MAX as usize {
+    // Paragraph adds the viewport height and origin to its u16 row counter
+    // before subtracting scroll. Keep those intermediate sums in range too.
+    if offset
+        .saturating_add(height)
+        .saturating_add(inner.y as usize)
+        <= u16::MAX as usize
+    {
         f.render_widget(
             Paragraph::new(lines.into_iter().skip(first).collect::<Vec<_>>())
                 .wrap(Wrap { trim: false })
@@ -18378,7 +18630,7 @@ fn draw_editor_review(
             inner,
         );
     } else {
-        // One logical line can itself exceed Paragraph's u16 scroll range.
+        // One logical line or its visible window can exceed Paragraph's u16 range.
         // Reflow only this rare visible window with its matching word wrapper,
         // retaining usize row positions and the original grapheme styles.
         let mut visible = Vec::new();
@@ -19062,6 +19314,7 @@ mod tests {
             tool_idx: 0,
             run_tool_changes: Vec::new(),
             tool_filter: lists::ListFilter::default(),
+            list_page_rows: std::cell::Cell::new([None; 5]),
             tool_detail: None,
             metrics_range: 0,
             metrics_tools: Default::default(),
@@ -19172,6 +19425,7 @@ mod tests {
             editor: None,
             editor_review: None,
             search_hits: Vec::new(),
+            search_jump: None,
             search_idx: 0,
             search_mode: false,
             editing_id: None,
@@ -23218,6 +23472,54 @@ mod tests {
     }
 
     #[test]
+    fn editor_review_viewport_crossing_u16_boundary_renders_every_row() {
+        let ed = viewport_editor("function run() {}", 0);
+        for (offset, origin) in [
+            (65_525usize, 0),
+            (65_526, 0),
+            (65_527, 0),
+            (65_530, 0),
+            (65_535, 0),
+            (65_536, 0),
+            (65_526, 3),
+        ] {
+            let review = EditorReview {
+                scroll: std::cell::Cell::new(EditorReviewScroll {
+                    top: offset + 2, // verdict and blank logical lines
+                    rows: 0,
+                    height: 0,
+                }),
+                diff: "x".repeat(70_000),
+                verdict: "v".into(),
+                ok: true,
+            };
+            let backend = ratatui::backend::TestBackend::new(3, origin + 12);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal
+                .draw(|f| {
+                    draw_editor_review(
+                        f,
+                        Rect::new(0, origin, 3, 11),
+                        Rect::new(0, origin + 11, 3, 1),
+                        &ed,
+                        &review,
+                        false,
+                    )
+                })
+                .unwrap();
+            assert_eq!(review.scroll.get().height, 9);
+            assert_eq!(review.scroll.get().top, offset + 2);
+            for y in origin + 1..origin + 10 {
+                assert_eq!(
+                    terminal.backend().buffer()[(1, y)].symbol(),
+                    "x",
+                    "offset {offset}, row {y}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn the_code_editor_reviews_before_saving() {
         let mut app = test_app();
         app.editor = Some(EditorState {
@@ -26134,6 +26436,70 @@ mod tests {
     }
 
     #[test]
+    fn quit_dialog_reserves_wrapped_warning_and_all_action_labels() {
+        let mut app = test_app();
+        for count in [1, 2] {
+            app.running_sessions = (0..count).map(|index| format!("private-{index}")).collect();
+            for (width, height) in [(80, 24), (120, 24), (40, 24), (80, 5), (40, 7)] {
+                let mut terminal =
+                    Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+                terminal
+                    .draw(|frame| draw_quit_confirm(frame, &app))
+                    .unwrap();
+                let buffer = terminal.backend().buffer();
+                let screen = (0..height)
+                    .map(|y| {
+                        (0..width)
+                            .map(|x| buffer[(x, y)].symbol())
+                            .collect::<String>()
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let text = screen
+                    .chars()
+                    .filter(|c| !"╭╮╰╯─│".contains(*c))
+                    .collect::<String>()
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let warning = format!(
+                    "{count} Run{} still working in the daemon. {} keep going if you quit.",
+                    if count == 1 { " is" } else { "s are" },
+                    if count == 1 { "It will" } else { "They'll" }
+                );
+                assert!(text.contains(&warning), "{width}x{height}: {text}");
+                assert!(
+                    text.contains("q quit s stop them and quit Esc cancel"),
+                    "{width}x{height}: {text}"
+                );
+                assert!(!text.contains("Resize"));
+            }
+        }
+        for (width, height) in [(80, 4), (20, 4), (12, 3), (1, 1)] {
+            let mut terminal =
+                Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| draw_quit_confirm(frame, &app))
+                .unwrap();
+            let screen = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            if width >= 20 {
+                assert!(
+                    screen.contains("Resize") && screen.contains("Esc cancel"),
+                    "{screen}"
+                );
+            } else if width >= 12 {
+                assert!(screen.contains("Esc"));
+            }
+        }
+    }
+
+    #[test]
     fn finite_proposal_score_ties_are_neutral_without_changing_status_or_rounding() {
         for (theme_name, color) in [("dark", true), ("dark", false), ("colorblind", true)] {
             let mut app = test_app();
@@ -26753,6 +27119,184 @@ mod tests {
         assert!(app.palette_items().is_empty());
         app.key(key(KeyCode::Char('d')));
         assert!(!app.palette_items().is_empty());
+    }
+
+    #[test]
+    fn spaced_mentions_complete_whole_tokens_and_keep_directory_queries_decoded() {
+        use formless_core::files::{encode_mention, mentions, FileEntry};
+        let mut app = test_app();
+        let (client, sent) = DaemonClient::recording();
+        app.client = Some(client);
+        app.input.set("explain @my");
+        app.update_mention();
+        app.mention.as_mut().unwrap().files = vec![FileEntry {
+            path: "my notes".into(),
+            dir: true,
+            bytes: 0,
+        }];
+        assert!(app.mention_key(&key(KeyCode::Tab)));
+        assert_eq!(&*app.input, "explain @\"my notes/\"");
+        assert_eq!(app.input.cursor_byte(), app.input.len() - 1);
+        assert_eq!(app.mention.as_ref().unwrap().query, "my notes/");
+        app.mention.as_mut().unwrap().files = vec![FileEntry {
+            path: "my notes/report.md".into(),
+            dir: false,
+            bytes: 10,
+        }];
+        assert!(app.mention_key(&key(KeyCode::Enter)));
+        assert_eq!(&*app.input, "explain @\"my notes/report.md\" ");
+        assert!(app.mention.is_none());
+        assert_eq!(mentions(&app.input), vec!["my notes/report.md"]);
+        let queries = std::iter::from_fn(|| sent.try_recv().ok())
+            .filter_map(|line| {
+                let request: RequestEnvelope = serde_json::from_str(&line).unwrap();
+                if let Request::ListFiles { query, .. } = request.request {
+                    Some(query)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(queries, vec!["my", "my notes/"]);
+        for (before, path) in [
+            ("explain @\"my notes/re", "my notes/report.md"),
+            ("read @", "ไทย notes/a\"b\\c.md"),
+        ] {
+            app.input.set(before);
+            app.update_mention();
+            app.mention.as_mut().unwrap().files = vec![FileEntry {
+                path: path.into(),
+                dir: false,
+                bytes: 1,
+            }];
+            assert!(app.mention_key(&key(KeyCode::Tab)));
+            assert_eq!(mentions(&app.input), vec![path]);
+            assert!(app.input.ends_with(&encode_mention(path, false).text));
+        }
+        app.input.set("read @\"my notes/re\" tail");
+        app.input.set_modal_cursor("read @\"my notes/re".len());
+        app.update_mention();
+        app.mention.as_mut().unwrap().files = vec![FileEntry {
+            path: "my notes/report.md".into(),
+            dir: false,
+            bytes: 1,
+        }];
+        app.mention_key(&key(KeyCode::Tab));
+        assert_eq!(&*app.input, "read @\"my notes/report.md\"  tail");
+        assert_eq!(mentions(&app.input), vec!["my notes/report.md"]);
+        let source = "read @\"ไทย notes/report.md\" and mail a@b.c";
+        let rendered = mention_line(source, true);
+        assert_eq!(
+            rendered
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>(),
+            format!("  {source}")
+        );
+        assert_eq!(
+            rendered
+                .spans
+                .iter()
+                .filter(|s| s.style.add_modifier.contains(Modifier::UNDERLINED))
+                .map(|s| s.content.as_ref())
+                .collect::<Vec<_>>(),
+            vec!["@\"ไทย notes/report.md\""]
+        );
+    }
+
+    #[test]
+    fn mention_completion_clears_backward_selection_before_typing() {
+        use formless_core::files::FileEntry;
+        for (before, path, dir) in [
+            ("read @very_long_path_name", "a", false),
+            ("read @x", "ไทย notes/report.md", false),
+            ("read @very_long_directory_name", "a b", true),
+        ] {
+            let mut app = test_app();
+            app.input.set(before);
+            app.key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
+            assert!(app.input.selection().is_some());
+            app.update_mention();
+            app.mention.as_mut().unwrap().files = vec![FileEntry {
+                path: path.into(),
+                dir,
+                bytes: 0,
+            }];
+            assert!(app.mention_key(&key(KeyCode::Tab)));
+            assert!(app.input.selection().is_none());
+            let mut expected = app.input.to_string();
+            expected.insert(app.input.cursor_byte(), 'z');
+            app.key(key(KeyCode::Char('z')));
+            assert_eq!(&*app.input, expected);
+        }
+    }
+
+    #[test]
+    fn quoted_mentions_share_full_paths_for_chips_forecast_and_submit() {
+        let mut app = test_app();
+        let root = app
+            .paths
+            .data_dir
+            .join(format!("mention-fixture-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("my notes")).unwrap();
+        let root = root.canonicalize().unwrap();
+        let right = b"right-data";
+        std::fs::write(root.join("my notes/report.md"), right).unwrap();
+        std::fs::write(root.join("my"), b"wrong").unwrap();
+        app.sessions = vec![serde_json::from_value(serde_json::json!({"id":"mention-session","name":"mentions","created_at":"","updated_at":"","cwd":root.to_string_lossy()})).unwrap()];
+        app.current = Some("mention-session".into());
+        let (client, sent) = DaemonClient::recording();
+        app.client = Some(client);
+        app.input.set("read @\"my notes/report.md\"");
+        assert!(render(&mut app, 180, 24).contains("[@my notes/report.md]"));
+        let input = app.forecast_input();
+        assert_eq!(input.attachments.len(), 1);
+        let expected = formless_core::forecast::attachment("report.md".into(), right);
+        assert_eq!(input.attachments[0].name, expected.name);
+        assert_eq!(input.attachments[0].bytes, expected.bytes);
+        assert_eq!(input.attachments[0].sha256, expected.sha256);
+        app.submit_chat(false);
+        let requests = std::iter::from_fn(|| sent.try_recv().ok())
+            .map(|line| {
+                serde_json::from_str::<RequestEnvelope>(&line)
+                    .unwrap()
+                    .request
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(
+                    |r| matches!(r,Request::AttachPath { path, .. } if path=="my notes/report.md")
+                )
+                .count(),
+            1,
+            "{requests:?}"
+        );
+        assert!(!requests
+            .iter()
+            .any(|r| matches!(r,Request::AttachPath { path, .. } if path=="my")));
+        assert_eq!(app.pending_send.as_ref().unwrap().waiting, 1);
+        app.pending_send = None;
+        app.input.set("read @\"my notes/report.md");
+        assert!(app.forecast_input().attachments.is_empty());
+        assert!(!render(&mut app, 180, 24).contains("[@my]"));
+        app.submit_chat(false);
+        let requests = std::iter::from_fn(|| sent.try_recv().ok())
+            .map(|line| {
+                serde_json::from_str::<RequestEnvelope>(&line)
+                    .unwrap()
+                    .request
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !requests
+                .iter()
+                .any(|r| matches!(r, Request::AttachPath { .. })),
+            "{requests:?}"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -27395,6 +27939,148 @@ mod tests {
         );
         assert!(sent.try_recv().is_err());
     }
+    #[test]
+    fn metrics_model_preview_is_bounded_and_keeps_crowded_full_list_action() {
+        for height in [0, 1, 5, 12, 24, 40, 100] {
+            assert!(model_preview_height(height, 8, 1000) <= 8);
+            assert_eq!(
+                model_preview_height(height, 8, 100),
+                model_preview_height(height, 8, 1000)
+            );
+            assert_eq!(model_preview_height(height, 8, 0), 0);
+        }
+        assert_eq!(model_preview_height(40, 8, 1), 4);
+        for (theme_name, color) in [("dark", true), ("dark", false), ("colorblind", true)] {
+            let _theme = theme::test_theme(theme_name);
+            let mut app = test_app();
+            app.color = color;
+            app.view = View::Metrics;
+            app.model_stats = (0..100)
+                .map(|i| formless_protocol::ModelStatInfo {
+                    model: format!("model-{i:03}-日本語"),
+                    successes: 3,
+                    failures: 1,
+                    total_ms: 1234,
+                    prompt_tokens: 10,
+                    completion_tokens: 5,
+                    cached_tokens: 2,
+                })
+                .collect();
+            let mut tool = description_fixture_detail().tool;
+            tool.name = "tool-minimum".into();
+            tool.title.clear();
+            app.tools = vec![tool];
+            for crowded in [false, true] {
+                app.usage_rows = (0..if crowded { 10 } else { 1 })
+                    .map(|i| UsageRow {
+                        key: format!("day-{i}"),
+                        prompt_tokens: 10,
+                        completion_tokens: 5,
+                        cached_tokens: 2,
+                        cost: None,
+                    })
+                    .collect();
+                app.builtin_stats = if crowded {
+                    (0..8)
+                        .map(|i| formless_protocol::BuiltinStatInfo {
+                            name: format!("builtin-{i}"),
+                            calls: 1,
+                            failures: 0,
+                            total_ms: 1.0,
+                            avg_ms: 1.0,
+                            kinds: Default::default(),
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                app.tool_detail = crowded.then(description_fixture_detail);
+                for (width, height) in [(120, 40), (80, 24), (40, 12), (20, 6), (1, 1)] {
+                    let mut terminal =
+                        Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+                    terminal
+                        .draw(|frame| draw_metrics(frame, frame.area(), &app))
+                        .unwrap();
+                    let buffer = terminal.backend().buffer();
+                    let rows = (0..height)
+                        .map(|y| {
+                            (0..width)
+                                .map(|x| buffer[(x, y)].symbol())
+                                .collect::<String>()
+                        })
+                        .collect::<Vec<_>>();
+                    if width >= 40 {
+                        assert!(
+                            rows.last().unwrap().contains("/100")
+                                && rows.last().unwrap().contains("m"),
+                            "{rows:?}"
+                        );
+                        assert!(rows[..5].iter().any(|row| row.contains("v1")), "{rows:?}");
+                    }
+                    assert!(rows.iter().filter(|row| row.contains("model-")).count() <= 5);
+                    if crowded && height <= 24 && width >= 40 {
+                        assert!(rows.last().unwrap().contains("0/100"), "{rows:?}");
+                    }
+                }
+            }
+            app.model_stats.clear();
+            assert!(!render(&mut app, 120, 40).contains("m full list"));
+        }
+    }
+
+    #[test]
+    fn metrics_models_pager_reaches_every_full_identifier_without_requests_or_selection_changes() {
+        let (client, rx) = DaemonClient::recording();
+        let mut app = test_app();
+        app.client = Some(client);
+        app.view = View::Metrics;
+        app.model_stats = (0..100)
+            .map(|i| formless_protocol::ModelStatInfo {
+                model: format!("model-{i:03}-{}", "日本語🦀".repeat(40)),
+                successes: 3,
+                failures: 1,
+                total_ms: 1234,
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                cached_tokens: 2,
+            })
+            .collect();
+        let original = app.model_stats.clone();
+        let index = app.tool_idx;
+        app.key(key(KeyCode::Char('m')));
+        assert!(rx.try_recv().is_err());
+        let lines = app.pager.as_ref().unwrap().lines.clone();
+        for (i, model) in original.iter().enumerate() {
+            assert_eq!(lines[i * 3], model.model);
+            assert!(lines[i * 3 + 1].contains("CALLS 4"));
+            assert!(lines[i * 3 + 1].contains("75%"));
+            assert!(lines[i * 3 + 1].contains("AVG 308ms"));
+            assert!(lines[i * 3 + 1].contains(&cache_hit_text(model)));
+        }
+        for i in 0..lines.len() {
+            let p = app.pager.as_ref().unwrap();
+            assert_eq!(p.top, i);
+            assert_eq!(p.lines[p.top], lines[i]);
+            app.key(key(KeyCode::Down));
+        }
+        app.key(key(KeyCode::Right));
+        assert_eq!(app.pager.as_ref().unwrap().left, 8);
+        for size in [(80, 24), (40, 12), (120, 40)] {
+            let _ = render(&mut app, size.0, size.1);
+        }
+        app.key(key(KeyCode::Home));
+        assert_eq!(app.pager.as_ref().unwrap().top, 0);
+        app.key(key(KeyCode::End));
+        assert_eq!(app.pager.as_ref().unwrap().top, lines.len() - 1);
+        app.key(key(KeyCode::Esc));
+        assert!(app.pager.is_none());
+        assert_eq!(app.tool_idx, index);
+        assert_eq!(app.model_stats, original);
+        assert!(rx.try_recv().is_err());
+        app.key(key(KeyCode::Char('f')));
+        assert_eq!(app.pager.as_ref().unwrap().title, "Forecast versus actual");
+    }
+
     #[test]
     fn metrics_shortcuts_keep_range_and_forecast_actions_visible_at_standard_width() {
         let mut app = test_app();
