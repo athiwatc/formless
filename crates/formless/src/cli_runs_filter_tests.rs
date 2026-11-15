@@ -16,7 +16,7 @@ fn runs_filters_use_existing_selectors_and_one_checked_cutoff() {
     .unwrap();
     validate_runs_filters(&cli).unwrap();
     assert!(
-        matches!(cli.cmd,Some(Cmd::Runs{session:Some(session),since:Some(since),limit:7,json:true,action:None}) if session=="prefix" && chrono::DateTime::parse_from_rfc3339(&since).is_ok())
+        matches!(cli.cmd,Some(Cmd::Runs{session:Some(session),since:Some(since),limit:Some(7),json:true,action:None}) if session=="prefix" && chrono::DateTime::parse_from_rfc3339(&since).is_ok())
     );
     let cli = Cli::try_parse_from(["formless", "runs"]).unwrap();
     assert!(matches!(
@@ -24,7 +24,7 @@ fn runs_filters_use_existing_selectors_and_one_checked_cutoff() {
         Some(Cmd::Runs {
             session: None,
             since: None,
-            limit: 20,
+            limit: None,
             json: false,
             action: None
         })

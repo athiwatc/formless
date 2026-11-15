@@ -430,14 +430,14 @@ enum Cmd {
     },
     /// Recent Runs and their outcomes: steps, tool calls, tokens (SPEC §8.7)
     #[command(
-        after_help = "Examples:\n  formless runs --limit 10\n  formless runs --session SESSION --since 24h\n  formless runs show RUN_ID --json"
+        after_help = "Examples:\n  formless runs --limit 10\n  formless runs --session SESSION --since 24h\n  formless runs show RUN_ID --json\n  formless runs running --json"
     )]
     Runs {
         #[command(subcommand)]
         action: Option<cli_attach::RunsAction>,
-        /// Maximum number of recent Runs to list
-        #[arg(long, default_value_t = 20)]
-        limit: usize,
+        /// Maximum number of recent Runs to list (default: 20)
+        #[arg(long)]
+        limit: Option<usize>,
         /// Only this Session's Runs (existing ID/prefix/name selector)
         #[arg(long, value_name = "SESSION")]
         session: Option<String>,
@@ -2013,6 +2013,7 @@ fn validate_tui_start(cli: &mut Cli) -> Result<()> {
 }
 
 fn run_cli(mut cli: Cli) -> Result<()> {
+    cli_attach::validate_runs_limit(&cli)?;
     validate_runs_filters(&cli)?;
     validate_tui_start(&mut cli)?;
     // Export usage errors must precede profile setup, Session lookup and any
@@ -2353,7 +2354,7 @@ fn run_cli(mut cli: Cli) -> Result<()> {
             since,
         }) => match action {
             Some(action) => cli_attach::runs(&paths, action, json),
-            None => runs_cmd(paths, limit, json, session, since),
+            None => runs_cmd(paths, limit.unwrap_or(20), json, session, since),
         },
         Some(Cmd::Jobs { action }) => jobs_cmd(paths, action),
         Some(Cmd::Metrics { since, json }) => {
