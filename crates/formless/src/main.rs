@@ -4,6 +4,7 @@ mod cli_commands;
 #[cfg(test)]
 mod cli_help_tests;
 mod cli_mcp_prompts;
+mod cli_mcp_test;
 mod cli_metrics;
 mod cli_models;
 mod cli_modules;
@@ -12,8 +13,14 @@ mod cli_price_import;
 mod cli_proposal_diff;
 mod cli_routing;
 mod cli_run_identity;
+#[cfg(test)]
+mod cli_runs_filter_tests;
+mod cli_session_lookup;
+mod cli_session_org;
 mod cli_session_report;
 mod cli_session_templates;
+mod cli_session_usage;
+mod cli_tool_detail;
 mod cli_tool_diff;
 mod cli_tool_filters;
 
@@ -205,6 +212,9 @@ enum Cmd {
         /// List what would be freed without removing anything
         #[arg(long)]
         dry_run: bool,
+        /// Print the complete reported GC result as one JSON value
+        #[arg(long)]
+        json: bool,
     },
     /// Load a file from `formless export-all` (adds; never overwrites)
     ImportAll {
@@ -414,7 +424,7 @@ enum Cmd {
     },
     /// Recent Runs and their outcomes: steps, tool calls, tokens (SPEC §8.7)
     #[command(
-        after_help = "Examples:\n  formless runs --limit 10\n  formless runs show RUN_ID --json"
+        after_help = "Examples:\n  formless runs --limit 10\n  formless runs --session SESSION --since 24h\n  formless runs show RUN_ID --json"
     )]
     Runs {
         #[command(subcommand)]
@@ -422,6 +432,12 @@ enum Cmd {
         /// Maximum number of recent Runs to list
         #[arg(long, default_value_t = 20)]
         limit: usize,
+        /// Only this Session's Runs (existing ID/prefix/name selector)
+        #[arg(long, value_name = "SESSION")]
+        session: Option<String>,
+        /// Only Runs since this duration ago; omitted: all history
+        #[arg(long,value_name="DURATION",value_parser=parse_since_cutoff)]
+        since: Option<String>,
         /// Print machine-readable JSON instead of human-readable output
         #[arg(long)]
         json: bool,
@@ -437,7 +453,7 @@ enum Cmd {
     },
     /// Sessions: list, show, search, rename, delete, export or import them
     #[command(
-        after_help = "Examples:\n  formless sessions list\n  formless sessions show SESSION_ID\n  formless sessions export SESSION_ID --format markdown"
+        after_help = "Examples:\n  formless sessions list\n  formless sessions show SESSION_ID\n  formless sessions usage SESSION_ID --json\n  formless sessions export SESSION_ID --format markdown"
     )]
     Sessions {
         #[command(subcommand)]
@@ -459,7 +475,7 @@ enum Cmd {
     },
     /// Tool registry inspection/transfer (SPEC §7.8, §12)
     #[command(
-        after_help = "Examples:\n  formless tools list\n  formless tools list --filter not-retired --tag work --show-pinned\n  formless tools show TOOL_NAME --json\n  formless tools export TOOL_NAME --output tool.json"
+        after_help = "Examples:\n  formless tools list\n  formless tools list --filter not-retired --tag work --show-pinned\n  formless tools show TOOL_NAME --json\n  formless tools show TOOL_NAME --code\n  formless tools export TOOL_NAME --output tool.json"
     )]
     Tools {
         #[command(subcommand)]
@@ -770,6 +786,9 @@ enum ToolsAction {
         /// The full detail as JSON
         #[arg(long)]
         json: bool,
+        /// Write only the current version's exact source
+        #[arg(long, conflicts_with = "json")]
+        code: bool,
     },
     /// Retire a Tool: hidden from the agent, kept with its history
     Retire {
@@ -1193,9 +1212,15 @@ enum McpAction {
         json: bool,
     },
     /// Restart a server and list its tools again
+    #[command(
+        after_help = "Restarts the server. Prints the complete report, then exits 0 for success (including zero tools), or 1 for a reported restart error. Request failures retain their existing exit mapping."
+    )]
     Test {
         /// Configured MCP server name
         name: String,
+        /// Print the complete restart reply as one JSON value
+        #[arg(long)]
+        json: bool,
     },
     /// Authorize Formless with a remote (http) MCP server via OAuth
     Login {
@@ -1951,6 +1976,7 @@ fn validate_tui_start(cli: &mut Cli) -> Result<()> {
 }
 
 fn run_cli(mut cli: Cli) -> Result<()> {
+    validate_runs_filters(&cli)?;
     validate_tui_start(&mut cli)?;
     // Export usage errors must precede profile setup, Session lookup and any
     // daemon connection. sessions_cmd validates again for direct callers.
@@ -2286,9 +2312,11 @@ fn run_cli(mut cli: Cli) -> Result<()> {
             limit,
             json,
             action,
+            session,
+            since,
         }) => match action {
             Some(action) => cli_attach::runs(&paths, action, json),
-            None => runs_cmd(paths, limit, json),
+            None => runs_cmd(paths, limit, json, session, since),
         },
         Some(Cmd::Jobs { action }) => jobs_cmd(paths, action),
         Some(Cmd::Metrics { since, json }) => {
@@ -2357,7 +2385,7 @@ fn run_cli(mut cli: Cli) -> Result<()> {
             keys,
             text,
         }) => docs_cmd(topic.as_deref(), print, keys, text),
-        Some(Cmd::Gc { dry_run }) => gc_cmd(&paths, dry_run),
+        Some(Cmd::Gc { dry_run, json }) => gc_cmd(&paths, dry_run, json),
         Some(Cmd::Backup { action }) => match action {
             None => backup_cmd(&paths),
             Some(BackupAction::List { json }) => {
@@ -3689,8 +3717,8 @@ fn storage_cmd(paths: &Paths, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// `formless gc [--dry-run]`.
-fn gc_cmd(paths: &Paths, dry_run: bool) -> Result<()> {
+/// `formless gc [--dry-run] [--json]`.
+fn gc_cmd(paths: &Paths, dry_run: bool, json: bool) -> Result<()> {
     use formless_core::housekeeping::human_bytes;
     let r = if daemon_reachable(paths) {
         formless_tui::client::request_once(paths, Request::Gc { dry_run })?
@@ -3698,6 +3726,10 @@ fn gc_cmd(paths: &Paths, dry_run: bool) -> Result<()> {
         let store = formless_core::Store::open(&paths.db_file())?;
         formless_core::housekeeping::gc(paths, &store, &Config::load(paths)?, dry_run)?
     };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&r)?);
+        return Ok(());
+    }
     let mut tbl = Table::new(&["KIND", "ITEMS", "FREES", "WHAT"]);
     for k in r["kinds"].as_array().into_iter().flatten() {
         tbl.row(vec![
@@ -5607,6 +5639,14 @@ fn write_session_export(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
 
 #[derive(Subcommand)]
 enum SessionsAction {
+    /// Read recorded Session usage and the current prompt/context estimate
+    Usage {
+        /// Session selector, using the existing ID/prefix/name resolution
+        id: String,
+        /// Print both complete daemon reports as one JSON value
+        #[arg(long)]
+        json: bool,
+    },
     /// Fork stored history without starting a Run
     Fork {
         /// Session ID or unambiguous prefix
@@ -5643,6 +5683,38 @@ enum SessionsAction {
         #[arg(long)]
         tag: Option<String>,
         /// One JSON array of SessionInfo
+        #[arg(long)]
+        json: bool,
+    },
+    /// Pin a Session using its stored returned state
+    Pin {
+        /// Session ID, unambiguous prefix or full name
+        id: String,
+        /// Print the returned Session as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Unpin a Session using its stored returned state
+    Unpin {
+        /// Session ID, unambiguous prefix or full name
+        id: String,
+        /// Print the returned Session as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Read tags, or replace the entire stored tag list
+    #[command(
+        after_help = "Examples:\n  formless sessions tag ID                 # read only\n  formless sessions tag ID work travel     # replace all tags\n  formless sessions tag ID --clear         # replace with no tags"
+    )]
+    Tag {
+        /// Session ID, unambiguous prefix or full name
+        id: String,
+        /// Replacement tags, passed unchanged to storage; omission only reads
+        tags: Vec<String>,
+        /// Explicitly replace all tags with an empty list
+        #[arg(long, conflicts_with = "tags")]
+        clear: bool,
+        /// Print the stored or returned Session as JSON
         #[arg(long)]
         json: bool,
     },
@@ -5775,6 +5847,16 @@ fn sessions_cmd(paths: Paths, action: SessionsAction) -> Result<()> {
     formless_core::daemon::ensure_daemon(&paths)?;
     let daemon = |r| formless_tui::client::request_once(&paths, r);
     match action {
+        SessionsAction::Usage { id, json } => {
+            let session = find_session(&paths, &id)?;
+            cli_session_usage::write_report(
+                &mut std::io::stdout().lock(),
+                &session.id,
+                json,
+                daemon,
+            )?;
+        }
+
         SessionsAction::Fork {
             id,
             name,
@@ -5800,6 +5882,14 @@ fn sessions_cmd(paths: Paths, action: SessionsAction) -> Result<()> {
             }
         }
         SessionsAction::Compare { .. } => unreachable!("handled before daemon startup"),
+        SessionsAction::Pin { id, json } => cli_session_org::pin(&paths, &id, true, json)?,
+        SessionsAction::Unpin { id, json } => cli_session_org::pin(&paths, &id, false, json)?,
+        SessionsAction::Tag {
+            id,
+            tags,
+            clear,
+            json,
+        } => cli_session_org::tag(&paths, &id, tags, clear, json)?,
         SessionsAction::List {
             archived,
             pinned,
@@ -6197,7 +6287,8 @@ fn find_session_in(list: &[SessionInfo], id: &str) -> Result<SessionInfo> {
         .filter(|s| s.id.starts_with(id))
         .cloned()
         .collect();
-    if matches.is_empty() {
+    let by_name = matches.is_empty();
+    if by_name {
         matches = list
             .iter()
             .filter(|s| s.name.eq_ignore_ascii_case(id.trim()))
@@ -6207,9 +6298,7 @@ fn find_session_in(list: &[SessionInfo], id: &str) -> Result<SessionInfo> {
     match matches.len() {
         1 => Ok(matches.remove(0)),
         0 => Err(usage(format!("no Session '{id}' (formless sessions list)"))),
-        n => Err(usage(format!(
-            "'{id}' matches {n} Sessions; give more of the id"
-        ))),
+        _ => Err(usage(cli_session_lookup::ambiguous(id, &matches, by_name))),
     }
 }
 
@@ -6839,14 +6928,34 @@ fn jobs_cmd(paths: Paths, action: JobsAction) -> Result<()> {
     Ok(())
 }
 
-fn runs_cmd(paths: Paths, limit: usize, json: bool) -> Result<()> {
+fn validate_runs_filters(cli: &Cli) -> Result<()> {
+    if matches!(&cli.cmd,Some(Cmd::Runs{action:Some(_),session,since,..}) if session.is_some() || since.is_some())
+    {
+        return Err(usage(
+            "--session and --since apply only to the Runs list, not its subcommands",
+        ));
+    }
+    Ok(())
+}
+
+fn runs_cmd(
+    paths: Paths,
+    limit: usize,
+    json: bool,
+    session: Option<String>,
+    since: Option<String>,
+) -> Result<()> {
     formless_core::daemon::ensure_daemon(&paths)?;
+    let session_id = session
+        .as_deref()
+        .map(|selector| find_session(&paths, selector).map(|session| session.id))
+        .transpose()?;
     let v = formless_tui::client::request_once(
         &paths,
         Request::RunMetrics {
             limit: Some(limit),
-            session_id: None,
-            since: None,
+            session_id,
+            since,
         },
     )?;
     if json {
@@ -7322,10 +7431,10 @@ fn mcp_cmd(paths: Paths, action: McpAction) -> Result<()> {
             })?;
             println!("{name}: {tool} is {}", if on { "on" } else { "off" });
         }
-        McpAction::Test { name } => {
-            let r = daemon(Request::RestartMcpServer { name: name.clone() })?;
-            println!("server:  {name}");
-            report(&r);
+        McpAction::Test { name, json } => {
+            if !cli_mcp_test::run(&name, json, daemon, &mut std::io::stdout().lock())? {
+                std::process::exit(1);
+            }
         }
         McpAction::Login { server } => {
             let scfg = cfg
@@ -7601,10 +7710,14 @@ fn tools_cmd(paths: Paths, action: ToolsAction) -> Result<()> {
             }
             Ok(())
         }
-        ToolsAction::Show { name, json } => {
+        ToolsAction::Show { name, json, code } => {
             let tool = find_tool(&paths, &name)?;
             let d: formless_protocol::ToolDetail =
                 serde_json::from_value(request_once(&paths, Request::GetTool { id: tool.id })?)?;
+            if code {
+                std::io::stdout().write_all(cli_tool_detail::current_source(&d)?.as_bytes())?;
+                return Ok(());
+            }
             if json {
                 println!("{}", serde_json::to_string_pretty(&d)?);
                 return Ok(());
@@ -8031,6 +8144,7 @@ fn print_tool_detail(d: &formless_protocol::ToolDetail) {
         "active"
     };
     println!("{} v{}  [{status}]", t.name, t.current_version);
+    println!("pinned:       {}", if t.pinned { "yes" } else { "no" });
     if !t.title.is_empty() {
         println!("{}", t.title);
     }
@@ -8093,19 +8207,7 @@ fn print_tool_detail(d: &formless_protocol::ToolDetail) {
     for reason in &d.attention {
         println!("attention:    {reason}");
     }
-    println!(
-        "versions:     {}",
-        d.versions
-            .iter()
-            .map(|v| format!(
-                "v{} {} {}",
-                v.version,
-                v.author,
-                v.created_at.get(..10).unwrap_or(&v.created_at)
-            ))
-            .collect::<Vec<_>>()
-            .join(" · ")
-    );
+    print!("{}", cli_tool_detail::history(d));
     if let Some(v) = d.versions.iter().find(|v| v.version == t.current_version) {
         let pretty = |s: &str| {
             serde_json::from_str::<serde_json::Value>(s)
