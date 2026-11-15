@@ -107,6 +107,16 @@ fn profile_search_is_explicit_and_opening_a_result_preserves_the_previous_compos
         take_search(&shell, cx)
     });
     assert_eq!(request.1, "needle");
+    step(cx, handle, |window, cx| {
+        window.press("enter", cx);
+        assert!(
+            !shell
+                .update(cx, |shell, _| shell.take_client_commands())
+                .iter()
+                .any(|command| matches!(command, WireCommand::SearchProfile { .. })),
+            "repeated Enter must honour the pending Search state"
+        );
+    });
     let found = hit(&sessions[1].id, "stored-message");
     reply(cx, handle, &shell, &request, vec![found.clone()]);
     step(cx, handle, |window, cx| {

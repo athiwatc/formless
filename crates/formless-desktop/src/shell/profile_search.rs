@@ -44,6 +44,13 @@ impl Shell {
         if self.finish_profile_composition(window, cx) {
             return;
         }
+        let text = self.profile_query.read(cx).value();
+        // Match the button's pending guard even before input observers run.
+        // A different query retires its old read and can explicitly replace it.
+        self.profile_search.changed(&text);
+        if self.profile_search.pending() {
+            return;
+        }
         let Some(client) = &self.client else {
             return;
         };
@@ -54,11 +61,10 @@ impl Shell {
             return;
         }
         let operation = uuid::Uuid::new_v4();
-        if let Ok(query) = self.profile_search.start(
-            client.connection(),
-            operation,
-            &self.profile_query.read(cx).value(),
-        ) {
+        if let Ok(query) = self
+            .profile_search
+            .start(client.connection(), operation, &text)
+        {
             if let Err(error) = client.send(ClientCommand::SearchProfile {
                 connection: client.connection(),
                 operation,
