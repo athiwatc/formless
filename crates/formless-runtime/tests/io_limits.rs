@@ -47,6 +47,13 @@ fn reads_output_and_logs_stop_at_their_caps() {
         e.message
     );
 
+    assert!(
+        e.message.contains("reported size 5000 bytes")
+            && e.message.contains("1000-byte resource limit"),
+        "{}",
+        e.message
+    );
+
     // A file whose size says 0 is still read only up to the cap (#1103).
     #[cfg(unix)]
     {
@@ -56,6 +63,11 @@ fn reads_output_and_logs_stop_at_their_caps() {
         )
         .unwrap_err();
         assert_eq!(e.kind, ExecErrorKind::Resource, "{}", e.message);
+        assert!(
+            e.message.contains("observed at least 1001 bytes"),
+            "{}",
+            e.message
+        );
     }
     // An overlay (dry-run) read over the cap fails the same way.
     let staged = dir.join("staged.txt");

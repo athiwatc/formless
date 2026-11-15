@@ -90,8 +90,9 @@ impl Cron {
             dom: field(dom, 1, 31, "day")?,
             month: field(mo, 1, 12, "month")?,
             dow: dow_set,
-            dom_any: *dom == "*",
-            dow_any: *dow == "*",
+            // Cronie flags depend on leading syntax, not the generated value set.
+            dom_any: dom.starts_with('*'),
+            dow_any: dow.starts_with('*'),
         })
     }
 
@@ -452,6 +453,90 @@ fn notify(title: &str, body: &str) -> std::result::Result<(), String> {
 #[cfg(test)]
 mod schedule_tests {
     use super::*;
+
+    #[test]
+    fn leading_wildcard_steps_constrain_day_field_matches() {
+        let monday = Local.with_ymd_and_hms(2026, 1, 5, 9, 0, 0).unwrap();
+        let tuesday = Local.with_ymd_and_hms(2026, 1, 6, 9, 0, 0).unwrap();
+        let cron = Cron::parse("0 9 */1 * 1").unwrap();
+        assert!(cron.matches(&monday));
+        assert!(
+            !cron.matches(&tuesday),
+            "wildcard-step DOM must still require Monday"
+        );
+    }
+
+    #[test]
+    fn day_field_flags_follow_leading_syntax_not_value_coverage() {
+        for (expr, day, expected) in [
+            ("0 9 */2 * 1", 5, true),
+            ("0 9 */2 * 1", 12, false),
+            ("0 9 */2 * 1", 19, true),
+            ("0 9 15 * */1", 5, false),
+            ("0 9 15 * */1", 15, true),
+            ("0 9 15 * 1", 5, true),
+            ("0 9 15 * 1", 15, true),
+            ("0 9 15 * 1", 6, false),
+            ("0 9 1-31 * 1", 6, true),
+            ("0 9 15 * 0-7", 6, true),
+            ("0 9 */2,2 * 1", 2, false),
+            ("0 9 2,*/2 * 1", 2, true),
+            ("0 9 */2,2 * 1", 12, false),
+            ("0 9 2,*/2 * 1", 12, true),
+            ("0 9 *,1 * 1", 6, false),
+            ("0 9 1,* * 1", 6, true),
+            ("0 9 15 * *,1", 6, false),
+            ("0 9 15 * 1,*", 6, true),
+            ("0 9 15 * */2,MON", 5, false),
+            ("0 9 15 * MON,*/2", 5, true),
+            ("0 9 */2 * */2", 1, true),
+            ("0 9 */2 * */2", 5, false),
+            ("0 9 */2 * */2", 6, false),
+            ("0 9 * * 7", 4, true),
+            ("0 9 * * 0", 4, true),
+            ("0 9 */1 * MON", 5, true),
+            ("0 9 */1 * MON", 6, false),
+        ] {
+            let at = Local.with_ymd_and_hms(2026, 1, day, 9, 0, 0).unwrap();
+            assert_eq!(
+                Cron::parse(expr).unwrap().matches(&at),
+                expected,
+                "{expr}, January {day}"
+            );
+        }
+        for day in 1..=31 {
+            let at = Local.with_ymd_and_hms(2026, 1, day, 9, 0, 0).unwrap();
+            for (bare, step) in [
+                ("0 9 * * 1", "0 9 */1 * 1"),
+                ("0 9 15 * *", "0 9 15 * */1"),
+                ("0 9 * * *", "0 9 */1 * */1"),
+            ] {
+                assert_eq!(
+                    Cron::parse(bare).unwrap().matches(&at),
+                    Cron::parse(step).unwrap().matches(&at)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wildcard_step_first_run_and_previews_agree_without_rewriting_expression() {
+        let now = Local.with_ymd_and_hms(2026, 1, 4, 8, 0, 0).unwrap();
+        let expr = "0 9 */1 * 1";
+        assert_eq!(to_cron(expr).unwrap(), expr);
+        let runs = next_runs(expr, now, 3).unwrap();
+        assert_eq!(
+            runs.iter().map(|at| at.day()).collect::<Vec<_>>(),
+            [5, 12, 19]
+        );
+        let mut previous = now;
+        for expected in runs {
+            assert_eq!(first_run(Some(expr), None, previous).unwrap(), expected);
+            previous = expected;
+        }
+        let runs = next_runs("0 9 */2 * 1", now, 2).unwrap();
+        assert_eq!(runs.iter().map(|at| at.day()).collect::<Vec<_>>(), [5, 19]);
+    }
 
     #[test]
     fn plain_english_schedules_become_cron() {
