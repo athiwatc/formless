@@ -31,6 +31,22 @@ as JSON. A queued copy is bound to the displayed destination, page revision
 and selected entry; selection changes, refresh and open dialogs retire that
 action rather than copying a replacement entry. Loaded-text Search keeps its explicit Session scope.
 
+In the connected Sessions directory, Mark left chooses a comparison's left
+Session without opening it or reading history. Select another entry with the
+arrow keys, then Compare to read stored lineage, whole-message differences,
+warnings and recorded branch usage. The left/right IDs and daemon sequence
+scope stay explicit. A missing cost is unavailable, and priced subtotals or
+observed-record ranges do not bound missing/unpriced usage. No model call,
+branch summary or Run mutation is requested. Refresh is explicit; Back to
+Sessions retires the result and keeps the left mark. Disconnect, Profile
+replacement or a missing Session retires the mark too. No comparison is
+replayed after reconnect. The native limit is 1 MiB and 1,000 message rows;
+unsupported replies show an error rather than a partial comparison. Scope's
+Copy details copies the whole validated JSON of known protocol fields,
+including private Session settings and message metadata. Other rows copy
+one complete record; their visual previews remain limited. See
+[comparison evidence](../../docs/desktop/session-comparison-20261115.md).
+
 Profile Search is a separate command in the palette (Go to Profile Search).
 It explicitly searches persisted messages across the connected Profile,
 including archived Sessions, using the daemon's query/ranking semantics.

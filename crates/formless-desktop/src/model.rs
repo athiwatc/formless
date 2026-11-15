@@ -151,6 +151,7 @@ pub enum Destination {
     Settings,
     Search,
     ProfileSearch,
+    Comparison,
 }
 
 impl Destination {
@@ -174,11 +175,15 @@ impl Destination {
             Destination::Settings => "Settings",
             Destination::Search => "Search",
             Destination::ProfileSearch => "Profile Search",
+            Destination::Comparison => "Session comparison",
         }
     }
 
     pub fn is_transient(self) -> bool {
-        matches!(self, Destination::Search | Destination::ProfileSearch)
+        matches!(
+            self,
+            Destination::Search | Destination::ProfileSearch | Destination::Comparison
+        )
     }
 }
 

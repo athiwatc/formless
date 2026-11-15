@@ -6,6 +6,7 @@
 
 pub mod client;
 pub mod commands;
+pub mod comparison;
 pub mod directory;
 pub mod fixture;
 pub mod forecast;

@@ -126,6 +126,12 @@ async fn until(client: &Client, stage: &'static str, mut predicate: impl FnMut(U
     loop {
         for update in client.drain() {
             let summary = match &update {
+                Update::SessionComparison { pair, result, .. } => format!(
+                    "comparison {} / {}: ok={}",
+                    pair.left,
+                    pair.right,
+                    result.is_ok()
+                ),
                 Update::SessionUsage { target, result, .. } => format!(
                     "recorded usage {}: ok={}",
                     target.session_id,
@@ -520,6 +526,52 @@ async fn real_daemon_provider_send_navigation_resources_and_reconnect() {
             "export must not call the provider"
         );
     }
+    // A comparison is a persisted read even while one Run is in flight.
+    let pair = formless_desktop::comparison::Pair {
+        left: a.clone(),
+        right: b.clone(),
+    };
+    let before = daemon
+        .handle(Request::GetSession { id: a.clone() })
+        .await
+        .unwrap();
+    let expected = formless_desktop::comparison::Report::decode(
+        &pair,
+        daemon
+            .handle(Request::CompareSessions {
+                left: a.clone(),
+                right: b.clone(),
+            })
+            .await
+            .unwrap(),
+    )
+    .unwrap()
+    .page
+    .rows[0]
+        .detail
+        .clone();
+    let operation = uuid::Uuid::new_v4();
+    client
+        .send(Command::CompareSessions {
+            connection: client.connection(),
+            operation,
+            pair: pair.clone(),
+        })
+        .unwrap();
+    until(&client,"compare-running-session",|update|matches!(update,Update::SessionComparison{operation:ack,pair:actual,result:Ok(report),..} if ack==operation&&actual==pair&&report.page.rows[0].detail==expected)).await;
+    assert_eq!(
+        daemon
+            .handle(Request::GetSession { id: a.clone() })
+            .await
+            .unwrap(),
+        before,
+        "comparison does not mutate the persisted Session or running state"
+    );
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        1,
+        "comparison never calls a provider"
+    );
     first_answer.notify_one();
     observer
         .until(|event| {

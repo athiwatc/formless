@@ -12,7 +12,7 @@ or authorization to merge while substantive gates fail.
 | Optional native target; existing headless clients compatible | Detached desktop workspace; unchanged root/desktop manifests and lockfiles in this continuation; kit facade | Revalidate combined main after integration; supported platform policy |
 | Daemon connection and canonical Sessions/transcripts | Existing client, request ownership and snapshots; local suites; prior real daemon/fake-Provider evidence | Latest native/live acceptance; general delta replay still unproved |
 | Ordered streaming / reconnect | `deltas: false`; canonical snapshots and event invalidation; unknown mutations not replayed | Protocol cutoff/watermark/offset or equivalent ordering proof before enabling deltas |
-| Sessions | Directory, New Session, metadata/tags/pin/archive, instructions, persisted export and bounded new-file Save through the system picker | Remaining actions such as fork/comparisons; native import and full-Profile backup; OS picker/volume acceptance; bounded per-Session view-state restoration |
+| Sessions | Directory, New Session, metadata/tags/pin/archive, instructions, persisted export and bounded new-file Save through the system picker; explicit persisted Session comparison with recorded usage | Remaining actions such as fork and paid branch-summary workflows; native import and full-Profile backup; OS picker/volume acceptance; bounded per-Session view-state restoration |
 | Conversation and large output | Virtualized blocks, bounded previews, whole-output viewer, exact block source copy | Cross-block selection/copy, dedicated code-copy/link opening, richer attachments/artifacts/diagrams and native semantics |
 | Composer | Send/Steer/Queue/Stop, preserved drafts, IME guards, forecast consent; new per-window send-key choice | Attachments/drop/image paste/external editor, remaining Role/model/reference controls |
 | Context/resources | Recorded Session usage; bounded read-only Tools/Metrics/Proposals/Settings and exact details copy | General-purpose artifact/Invocation/Run detail selection/pinning/navigation, scoped diff and remaining editable resource actions |
@@ -39,7 +39,7 @@ That goal does not make the failed or missing evidence above pass.
    recovery is established; do not adopt its unverified edits.
 2. Finish exact-patch reviews of each new isolated commit. Parent-reported
    reviews found no confirmed blocker in `acabff81`, `dfbab768` and
-   `8a18d80a`, `7658c8b5` and `f750cc2b`; those reviews inspected tests/logs without rerunning them.
+   `8a18d80a`, `7658c8b5`, `f750cc2b` and `852932ef`; those reviews inspected tests/logs without rerunning them.
 3. Resolve the existing foreground approval and prior uncertain launch/control
    outcome through the supported approval/evidence path. No foreground action
    is repeated or substituted here, and no writer/Claude session is controlled.

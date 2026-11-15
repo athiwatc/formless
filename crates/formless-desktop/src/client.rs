@@ -43,6 +43,12 @@ const REFRESH: Duration = Duration::from_millis(250);
 
 #[derive(Debug)]
 pub enum Update {
+    SessionComparison {
+        connection: u64,
+        operation: uuid::Uuid,
+        pair: crate::comparison::Pair,
+        result: Result<crate::comparison::Report, String>,
+    },
     SessionUsage {
         target: session_usage::Target,
         operation: uuid::Uuid,
@@ -120,6 +126,11 @@ pub enum Update {
 }
 
 pub enum Command {
+    CompareSessions {
+        connection: u64,
+        operation: uuid::Uuid,
+        pair: crate::comparison::Pair,
+    },
     ReadSessionUsage {
         target: session_usage::Target,
         operation: uuid::Uuid,
@@ -343,6 +354,10 @@ fn advance_epoch(epoch: &AtomicU64) {
 
 #[derive(Debug)]
 enum Pending {
+    SessionComparison {
+        operation: uuid::Uuid,
+        pair: crate::comparison::Pair,
+    },
     SessionUsage {
         target: session_usage::Target,
         operation: uuid::Uuid,
@@ -595,6 +610,41 @@ impl Engine {
 
     fn command(&mut self, command: Command) {
         match command {
+            Command::CompareSessions {
+                connection,
+                operation,
+                pair,
+            } => {
+                let error = if !self.ready || connection != self.connection || !pair.valid() {
+                    Some("Connection or Session pair changed. Choose the pair again.".to_string())
+                } else if self
+                    .pending
+                    .values()
+                    .filter(|p| matches!(p, Pending::SessionComparison { .. }))
+                    .count()
+                    >= 2
+                {
+                    Some("Two comparisons remain outstanding. Wait for a reply before reading again.".to_string())
+                } else {
+                    None
+                };
+                if let Some(error) = error {
+                    self.updates.push(Update::SessionComparison {
+                        connection: self.connection,
+                        operation,
+                        pair,
+                        result: Err(error),
+                    });
+                } else {
+                    self.request(
+                        Request::CompareSessions {
+                            left: pair.left.clone(),
+                            right: pair.right.clone(),
+                        },
+                        Pending::SessionComparison { operation, pair },
+                    );
+                }
+            }
             Command::ReadSessionUsage { target, operation } => {
                 let error = if !self.ready
                     || self.connection != target.connection
@@ -1121,6 +1171,16 @@ impl Engine {
                         }),
                     }
                 }
+            }
+            Pending::SessionComparison { operation, pair } => {
+                let result =
+                    result.and_then(|value| crate::comparison::Report::decode(&pair, value));
+                self.updates.push(Update::SessionComparison {
+                    connection: self.connection,
+                    operation,
+                    pair,
+                    result,
+                });
             }
             Pending::SessionUsage { target, operation } => {
                 self.updates.push(Update::SessionUsage {
@@ -2245,6 +2305,60 @@ mod tests {
     }
 
     #[test]
+    fn comparisons_are_explicit_bounded_reads_with_request_owned_replies() {
+        use crate::comparison::{test_value, Pair};
+        let mut engine = ready();
+        let pair = Pair {
+            left: "left".into(),
+            right: "right".into(),
+        };
+        let operations = [
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+        ];
+        for operation in operations {
+            engine.command(Command::CompareSessions {
+                connection: 0,
+                operation,
+                pair: pair.clone(),
+            });
+        }
+        assert_eq!(engine.outgoing.len(), 2);
+        assert!(engine.updates.iter().any(|u|matches!(u,Update::SessionComparison{operation,result:Err(_),..} if *operation==operations[2])));
+        let a = engine.outgoing.pop_front().unwrap();
+        let b = engine.outgoing.pop_front().unwrap();
+        assert!(
+            matches!(&a.request,Request::CompareSessions{left,right} if left=="left"&&right=="right")
+        );
+        engine.select(Some("unrelated".into()), 99);
+        respond(&mut engine, b.id, test_value(&pair));
+        assert!(engine.updates.iter().any(|u|matches!(u,Update::SessionComparison{connection:0,operation,pair:actual,result:Ok(_)} if *operation==operations[1]&&actual==&pair)));
+        let count = engine.updates.len();
+        respond(&mut engine, b.id, test_value(&pair));
+        assert_eq!(engine.updates.len(), count);
+        let mut wrong = test_value(&pair);
+        wrong["right"]["session"]["id"] = "foreign".into();
+        respond(&mut engine, a.id, wrong);
+        assert!(engine.updates.iter().any(|u|matches!(u,Update::SessionComparison{operation,result:Err(_),..} if *operation==operations[0])));
+        engine.outgoing.clear();
+        engine.command(Command::CompareSessions {
+            connection: 1,
+            operation: uuid::Uuid::new_v4(),
+            pair: pair.clone(),
+        });
+        engine.command(Command::CompareSessions {
+            connection: 0,
+            operation: uuid::Uuid::new_v4(),
+            pair: Pair {
+                left: pair.left.clone(),
+                right: pair.left,
+            },
+        });
+        assert!(engine.outgoing.is_empty());
+    }
+
+    #[test]
     fn exports_use_request_identity_not_selected_session_and_bound_outstanding_reads() {
         use session_export::Format;
         let mut engine = ready();
@@ -2660,7 +2774,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_send_and_question_survive_stop_metadata_export_usage_and_another_question_ack()
+    async fn unknown_send_and_question_survive_unrelated_reads_mutations_and_another_question_ack()
     {
         let mut retained = disconnect_after_unacknowledged_send().await;
         let original_send = retained.uncertain.clone();
@@ -2677,6 +2791,7 @@ mod tests {
             let metadata_operation = uuid::Uuid::new_v4();
             let export_operation = uuid::Uuid::new_v4();
             let usage_operation = uuid::Uuid::new_v4();
+            let comparison_operation = uuid::Uuid::new_v4();
             let peer = tokio::spawn(async move {
                 let mut server = BufReader::new(server);
                 loop {
@@ -2715,6 +2830,11 @@ mod tests {
                                 serde_json::to_value(formless_protocol::UsageInfo::default())
                                     .unwrap();
                             json!({"total":counters,"last_run":null,"runs":0})
+                        }
+                        Request::CompareSessions { left, right } if reconnect => {
+                            assert_eq!(left, "a");
+                            assert_eq!(right, "b");
+                            crate::comparison::test_value(&crate::comparison::Pair { left, right })
                         }
                         Request::ExportSession { id, format } if reconnect => {
                             assert_eq!(id, "a");
@@ -2803,6 +2923,16 @@ mod tests {
                                         })
                                         .unwrap();
                                     command_tx
+                                        .try_send(Command::CompareSessions {
+                                            connection: 0,
+                                            operation: comparison_operation,
+                                            pair: crate::comparison::Pair {
+                                                left: "a".into(),
+                                                right: "b".into(),
+                                            },
+                                        })
+                                        .unwrap();
+                                    command_tx
                                         .try_send(answer(
                                             &questions::Open::from_event(&question("q2")).unwrap(),
                                         ))
@@ -2844,9 +2974,10 @@ mod tests {
                 assert!(final_updates.iter().any(|update|matches!(update,Update::SessionEdited {operation,outcome:session_edit::Outcome::Applied(_),..} if *operation==metadata_operation)),"the metadata ACK must actually be processed");
                 assert!(final_updates.iter().any(|update|matches!(update,Update::SessionExport {operation,result:Ok(_),..} if *operation==export_operation)),"the export reply must actually be processed");
                 assert!(final_updates.iter().any(|update|matches!(update,Update::SessionUsage{operation,result:Ok(_),..} if *operation==usage_operation)),"the usage reply must actually be processed");
+                assert!(final_updates.iter().any(|update|matches!(update,Update::SessionComparison{operation,result:Ok(_),..} if *operation==comparison_operation)),"comparison reply must actually be processed");
                 assert_eq!(
                     retained.uncertain, before,
-                    "Stop, metadata, export, usage and q2 ACKs cannot clear either unknown operation"
+                    "Stop, metadata, export, usage, comparison and q2 ACKs cannot clear either unknown operation"
                 );
             } else {
                 assert_eq!(retained.uncertain.len(), 2);

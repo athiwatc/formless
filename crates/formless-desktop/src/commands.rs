@@ -25,6 +25,8 @@ pub enum Command {
     AbandonRun,
     Questions,
     SessionDetails,
+    MarkComparisonLeft,
+    CompareMarked,
     ToggleArchived,
     ToggleSessions,
     ToggleContext,
@@ -87,6 +89,8 @@ pub struct State {
     pub composing: bool,
     pub enter_sends: bool,
     pub can_preferences: bool,
+    pub can_mark_comparison: bool,
+    pub comparison_reason: Option<&'static str>,
     pub sessions_shown: bool,
     pub context_shown: bool,
     pub dark: bool,
@@ -176,6 +180,8 @@ pub fn keys(command: Command) -> &'static [&'static str] {
         | Command::AbandonRun
         | Command::Questions
         | Command::SessionDetails
+        | Command::MarkComparisonLeft
+        | Command::CompareMarked
         | Command::ToggleArchived
         | Command::ToggleTheme
         | Command::ToggleEnterSends
@@ -259,6 +265,8 @@ pub fn palette(state: &State) -> Vec<Entry> {
         Command::AbandonRun,
         Command::Questions,
         Command::SessionDetails,
+        Command::MarkComparisonLeft,
+        Command::CompareMarked,
         Command::ToggleArchived,
         Command::ToggleSessions,
         Command::ToggleContext,
@@ -333,6 +341,16 @@ pub fn entry(command: Command, state: &State) -> Entry {
             "Change send keys for this window; drafts and undo stay intact",
             Some(state.enter_sends),
             if !state.has_composer { Some(NO_COMPOSER) } else if state.composing { Some(COMPOSING) } else { None },
+        ),
+        Command::MarkComparisonLeft => (
+            "Mark left", "Mark selected Session as comparison left".into(), Group::Session,
+            "Choose the left Session for a read-only persisted history comparison. No history is read yet", None,
+            (!state.can_mark_comparison).then_some("Choose a Session in the connected Sessions directory"),
+        ),
+        Command::CompareMarked => (
+            "Compare", "Compare marked left with selected Session".into(), Group::Session,
+            "Read stored lineage, whole-message differences and recorded usage. No model call or paid summary", None,
+            state.comparison_reason,
         ),
         Command::SaveDesktopPreferences => (
             "Save desktop preferences", "Save desktop preferences".into(), Group::Appearance,
@@ -558,6 +576,8 @@ mod tests {
             composing: false,
             enter_sends: true,
             can_preferences: false,
+            can_mark_comparison: false,
+            comparison_reason: Some("Mark a left Session first"),
             sessions_shown: true,
             context_shown: false,
             dark: false,
