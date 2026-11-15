@@ -14,6 +14,7 @@ mod cli_routing;
 mod cli_run_identity;
 mod cli_session_lookup;
 mod cli_session_templates;
+mod cli_tool_diff;
 mod cli_tool_filters;
 
 mod cli_runs_list;
@@ -697,6 +698,23 @@ enum ToolsAction {
         #[arg(long)]
         kind: Option<String>,
         /// Print machine-readable JSON instead of human-readable output
+        #[arg(long)]
+        json: bool,
+    },
+    /// Compare stored Tool versions using the daemon's sectioned report
+    #[command(
+        after_help = "Examples:\n  formless tools diff TOOL_NAME\n  formless tools diff TOOL_NAME --from 1 --to 2 --json\n\n--to defaults to the current version; --from defaults to its predecessor, which must be at least 1. Explicit missing versions are reported by the daemon. Lookup uses ListTools, then DiffToolVersions; the daemon currently loads full history internally."
+    )]
+    Diff {
+        /// Exact Tool name or full ID, using the existing lookup
+        name: String,
+        /// Stored source version (positive integer; default target minus one)
+        #[arg(long,value_parser=clap::value_parser!(i64).range(1..))]
+        from: Option<i64>,
+        /// Stored target version (positive integer; default current version)
+        #[arg(long,value_parser=clap::value_parser!(i64).range(1..))]
+        to: Option<i64>,
+        /// Print the complete diff and schema-compatibility reply as JSON
         #[arg(long)]
         json: bool,
     },
@@ -7502,6 +7520,12 @@ fn tools_cmd(paths: Paths, action: ToolsAction) -> Result<()> {
     }
     formless_core::daemon::ensure_daemon(&paths)?;
     match action {
+        ToolsAction::Diff {
+            name,
+            from,
+            to,
+            json,
+        } => cli_tool_diff::run(&paths, &name, from, to, json),
         ToolsAction::Reviews { name, kind, json } => {
             description_reviews_cmd(&paths, kind, name, json)
         }
