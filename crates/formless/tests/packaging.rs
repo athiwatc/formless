@@ -169,7 +169,19 @@ fn job_needs_version_check(workflow: &str, job: &str) -> bool {
         .take_while(|line| {
             line.trim().is_empty() || line.trim_start().starts_with('#') || line.starts_with("    ")
         })
-        .any(|line| line.trim_end() == "    needs: version-check")
+        .any(|line| {
+            let Some(value) = line.strip_prefix("    needs: ") else {
+                return false;
+            };
+            let value = value.split('#').next().unwrap_or_default().trim();
+            if value == "version-check" {
+                return true;
+            }
+            value
+                .strip_prefix('[')
+                .and_then(|items| items.strip_suffix(']'))
+                .is_some_and(|items| items.split(',').any(|item| item.trim() == "version-check"))
+        })
 }
 
 #[test]
@@ -189,6 +201,20 @@ fn version_check_dependency_is_scoped_to_the_job() {
         "jobs:\n  docker:\n    # needs: version-check\n    steps:\n      - run: |\n          needs: version-check\n",
         "docker"
     ));
+    assert!(job_needs_version_check(
+        "jobs:\n  docker:\n    needs: [build, version-check, linux, linux-install-test] # gate\n",
+        "docker"
+    ));
+    for value in [
+        "[build, linux]",
+        "[build, version-check-extra]",
+        "[not-version-check]",
+    ] {
+        assert!(!job_needs_version_check(
+            &format!("jobs:\n  docker:\n    needs: {value}\n"),
+            "docker"
+        ));
+    }
     assert!(!job_needs_version_check(&workflow, "missing"));
 }
 
