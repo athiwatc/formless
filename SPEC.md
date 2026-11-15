@@ -6589,6 +6589,17 @@ GetModule still fetches every version's code even for metadata-only output;
 client projection does not reduce backend work (see #889). No module mutation
 is exposed by these commands.
 
+`tools show NAME_OR_ID` includes stored pin state, the newest ten version
+summaries (explicit numeric order) and up to five of the returned recent-call
+metadata rows. Omitted counts point to `--json`, which retains the existing
+complete detail contract. No new call inputs/outputs are added to these
+summaries; the existing schema/example sections remain. `--code` conflicts
+with JSON and writes only the exact current version source, preserving its
+trailing newline state; a missing current version is an error. This intentional
+human-detail layout change leaves fetching, metrics and security fields intact.
+The existing GetTool all-version payload remains until protocol selectors
+are addressed separately (#889).
+
 `runs show ID [--json]` inspects any stored Run; `runs cancel ID [--json]`
 cancels only that exact active Run, never a later Run in the same Session. IDs
 accept unambiguous prefixes. Show uses the same terminal exit codes as follow;

@@ -813,6 +813,17 @@ Completed checks exit 0; other fetch or JSON parse failures remain errors with
 no success JSON. Human output stays unchanged, and the JSON form never runs
 an updater.
 
+`tools show NAME_OR_ID` includes stored pin state, the newest ten version
+summaries (explicit numeric order) and up to five of the returned recent-call
+metadata rows. Omitted counts point to `--json`, which retains the existing
+complete detail contract. No new call inputs/outputs are added to these
+summaries; the existing schema/example sections remain. `--code` conflicts
+with JSON and writes only the exact current version source, preserving its
+trailing newline state; a missing current version is an error. This intentional
+human-detail layout change leaves fetching, metrics and security fields intact.
+The existing GetTool all-version payload remains until protocol selectors
+are addressed separately (#889).
+
 #### Root and global flags
 
 | Flag | Short | Availability | Meaning |
