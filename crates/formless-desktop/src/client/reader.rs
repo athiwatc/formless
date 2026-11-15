@@ -109,7 +109,7 @@ impl Engine {
             basis: uuid::Uuid::new_v4(),
         })
     }
-    fn owns_stream(&self, owner: &StreamOwner) -> bool {
+    pub(super) fn owns_stream(&self, owner: &StreamOwner) -> bool {
         !self.reader.blocked
             && owner.client == self.instance
             && owner.connection == self.connection

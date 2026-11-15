@@ -709,8 +709,17 @@ async fn actual_reader_ui_queue_overflow_retires_old_frames_and_reconnects_witho
     let fixture=Fixture::start(app(axum::routing::post({let complete=complete.clone();let calls=calls.clone();move|| {
         let complete=complete.clone();calls.fetch_add(1,std::sync::atomic::Ordering::SeqCst);
         async move {
-            let mut chunks=prefix("x");for _ in 0..99 {chunks.push_str(&encode(&[json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"x"}})]));}
-            gated_response(chunks,Some(tail("done")),complete)
+            // A hundred time-separated flushes exceed the UI capacity even
+            // with live batching, while staying far below the server queue.
+            let stream=futures_util::stream::unfold((0,complete),|(index,complete)|async move {
+                if index>100{return None;}
+                let chunk=if index==100 {complete.notified().await;tail("done")}else {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    if index==0 {prefix("x")}else {encode(&[json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"x"}})])}
+                };
+                Some((Ok::<_,std::io::Error>(chunk),(index+1,complete)))
+            });
+            axum::response::Response::builder().header("content-type","text/event-stream").body(axum::body::Body::from_stream(stream)).unwrap()
         }
     }})),0).await;
     let client = Client::start_future_attempts_for_validation(fixture.endpoint.clone());
@@ -782,6 +791,106 @@ async fn actual_reader_ui_queue_overflow_retires_old_frames_and_reconnects_witho
             }
         }false
     }).await;
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    drop(client);
+    drop(observer);
+    fixture.finish().await;
+}
+
+/// Producer microbursts with a UI-like 16 ms consumer, not a renderer SLA.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn actual_reader_batches_indexed_utf8_bursts_without_losing_order_or_reconnecting() {
+    const FRAMES: usize = 2048;
+    const BURST: usize = 32;
+    let env = credential_env::EnvGuard::isolated();
+    env.set("FORMLESS_API_KEY", "private-batched-reader-key");
+    let complete = Arc::new(Notify::new());
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let piece = |i: usize| format!("{i:04}|ไทย😀\n");
+    let expected = (0..FRAMES).map(piece).collect::<String>() + "END";
+    let fixture=Fixture::start(app(axum::routing::post({let complete=complete.clone();let calls=calls.clone();move||{let complete=complete.clone();assert_eq!(calls.fetch_add(1,std::sync::atomic::Ordering::SeqCst),0);async move {
+        let stream=futures_util::stream::unfold((0,complete),|(index,complete)|async move {
+            if index>FRAMES{return None;}
+            let chunk=if index==FRAMES{complete.notified().await;tail("END")}else {
+                tokio::time::sleep(Duration::from_millis(4)).await;
+                let mut data=String::new();for at in index..(index+BURST).min(FRAMES){let text=format!("{at:04}|ไทย😀\n");data.push_str(&if at==0{prefix(&text)}else{encode(&[json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":text}})])});}data
+            };
+            let next=if index==FRAMES{FRAMES+1}else{(index+BURST).min(FRAMES)};Some((Ok::<_,std::io::Error>(chunk),(next,complete)))
+        });axum::response::Response::builder().header("content-type","text/event-stream").body(axum::body::Body::from_stream(stream)).unwrap()
+    }}})),0).await;
+    let client = Client::start_future_attempts_for_validation(fixture.endpoint.clone());
+    client
+        .send(Command::Select {
+            session_id: Some(fixture.session.clone()),
+            generation: 1,
+        })
+        .unwrap();
+    super::super::until(
+        &client,
+        "batched-burst-baseline",
+        |u| matches!(u,Update::Transcript(b) if b.baseline.is_some()),
+    )
+    .await;
+    let connection = client.connection();
+    let mut observer = Observer::connect(&fixture.endpoint, &fixture.session).await;
+    let start = Instant::now();
+    send(&mut observer, &fixture.session).await;
+    let mut count = 0;
+    let mut received = String::new();
+    let mut ui_batches = 0;
+    let mut max_batch_events = 0;
+    let mut max_batch_bytes = 0;
+    let mut max_drain = 0;
+    while count < FRAMES {
+        assert!(
+            start.elapsed() < Duration::from_secs(45),
+            "burst deadline at {count}"
+        );
+        assert_eq!(client.connection(), connection, "batched burst reconnected");
+        let mut drain = 0;
+        for update in client.drain() {
+            drain += 1;
+            if let Update::Transcript(b) = update {
+                assert_eq!(b.owner.connection, connection);
+                assert_eq!(b.owner.view_epoch, client.stream_epoch());
+                assert!(
+                    !b.reload && b.baseline.is_none(),
+                    "burst lost its owned live baseline"
+                );
+                let mut batch_events = 0;
+                let mut batch_bytes = 0;
+                for event in b.events {
+                    if let Event::MessageDelta { delta, .. } = event {
+                        assert_eq!(
+                            delta,
+                            piece(count),
+                            "lost, reordered, duplicated or rewritten source event"
+                        );
+                        count += 1;
+                        batch_events += 1;
+                        batch_bytes += delta.len();
+                        received.push_str(&delta);
+                    }
+                }
+                if batch_events > 0 {
+                    ui_batches += 1;
+                    max_batch_events = max_batch_events.max(batch_events);
+                    max_batch_bytes = max_batch_bytes.max(batch_bytes);
+                }
+            }
+        }
+        max_drain = max_drain.max(drain);
+        tokio::time::sleep(Duration::from_millis(16)).await;
+    }
+    assert_eq!(received + "END", expected);
+    assert!(max_batch_events > 1, "no microburst was batched");
+    assert!(max_batch_events <= 256 && max_batch_bytes <= 64 * 1024);
+    eprintln!(
+        "reader_burst_batch_metrics {}",
+        json!({"source_frames":FRAMES,"source_burst_frames":BURST,"source_burst_pacing_ms":4,"consumer_pacing_ms":16,"ui_delta_batches":ui_batches,"max_batch_events":max_batch_events,"max_batch_payload_bytes":max_batch_bytes,"max_updates_per_drain":max_drain,"elapsed_ms":start.elapsed().as_millis(),"connection_changes":0,"lost_or_reordered_events":0,"renderer_executed":false})
+    );
+    complete.notify_one();
+    super::future_cases::canonical(&client, &expected, &[]).await;
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     drop(client);
     drop(observer);

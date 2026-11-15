@@ -85,3 +85,8 @@ on cancellation/drop. Native decision authority and full Step parity remain open
 The [native Step decision report](native-step-decisions-20261115.md) adds explicit
 complete-prompt review with fresh worker validation and a non-replayed receipt
 ledger. Its size/scope limits and native acceptance gates remain explicit.
+
+The [bounded stream delivery report](stream-delivery-20261115.md) adds batching
+only for admitted validation-reader live text. It preserves event identity/order
+and fail-closed recovery, while production streaming remains disabled pending
+complete review and acceptance.

@@ -31,6 +31,7 @@ use serde_json::Value;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc as queue, watch};
 
+mod delivery;
 mod reader;
 pub use reader::{StreamBatch, StreamOwner, StreamStatus};
 
@@ -1931,9 +1932,21 @@ async fn connected<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
     let mut tick = tokio::time::interval(REFRESH);
     let mut deadlines = HashMap::new();
     let mut last_poll = std::time::Instant::now();
+    let mut delivery = delivery::Delivery::default();
+    let flush_timer = tokio::time::sleep(Duration::from_secs(86400));
+    tokio::pin!(flush_timer);
+    let mut armed_deadline = None;
     loop {
         engine.sync_stream_epoch(stream_epoch.load(Ordering::Acquire));
         engine.sync_epoch(epoch.load(Ordering::Acquire));
+        if *future_attempts {
+            delivery.before_io(
+                tx,
+                tokio::time::Instant::now(),
+                !engine.outgoing.is_empty(),
+                |owner| engine.owns_stream(owner),
+            )?;
+        }
         for id in engine.pending.keys() {
             deadlines.entry(*id).or_insert_with(std::time::Instant::now);
         }
@@ -1980,7 +1993,18 @@ async fn connected<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
         write_requests(&mut writer, &mut engine)
             .await
             .map_err(|e| e.to_string())?;
-        deliver(tx, &mut engine)?;
+        if *future_attempts {
+            delivery.drain(tx, &mut engine, tokio::time::Instant::now())?;
+        } else {
+            deliver(tx, &mut engine)?;
+        }
+        let deadline = delivery.deadline();
+        if deadline != armed_deadline {
+            if let Some(at) = deadline {
+                flush_timer.as_mut().reset(at);
+            }
+            armed_deadline = deadline;
+        }
         tokio::select! {
             biased;
             _ = stop.changed() => return Ok(()),
@@ -1994,6 +2018,7 @@ async fn connected<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
                 }
                 Some(command) => engine.command(command),
             } },
+            _ = &mut flush_timer, if deadline.is_some() => {},
             message = reader.next() => match message.map_err(|e| e.to_string())? {
                 Some(message) => {
                     engine.sync_stream_epoch(stream_epoch.load(Ordering::Acquire));
