@@ -1,7 +1,9 @@
 # Profile-wide persisted message search
 
 Draft #2081 continues epic #1753 after independent source review of `0df24dd2`.
-Final runtime/tests: `919c93a702f3ce4292c2ad554653ddd41cab458b`.
+Final runtime/tests: `2ca88d50746f62ca32a018d8b6cf62e6b6e98790`.
+Initial implementation: `919c93a702f3ce4292c2ad554653ddd41cab458b`; the final
+follow-up guards repeated keyboard submission while a search is pending.
 This is another parity increment, not epic completion. Streaming is disabled.
 
 ## Behavior and protocol
@@ -16,7 +18,8 @@ is a storage read, with no provider request or mutation. FTS prefix terms and
 the punctuation-only substring fallback remain daemon behavior.
 
 Search requires an explicit Search click or Enter in the query. Editing does
-not send requests. Queries are trimmed and limited to 256 characters; requests
+not send requests. Repeated Enter with the same pending query is ignored; an
+explicitly edited query can replace its old read even before input observers run. Queries are trimmed and limited to 256 characters; requests
 ask for at most 50 matches. Two outstanding searches per connection bound the
 worker's pending search count. This does not bound the daemon's underlying
 scan cost or establish a search performance budget.
@@ -59,20 +62,20 @@ All Cargo commands use the optional manifest, `--offline --locked`, two jobs,
 incremental disabled, and dev/test debug info disabled. Evidence remains under
 ignored `evidence/gpui-1753-sol/`.
 
-| Check at runtime `919c93a` | Result / evidence |
+| Check at runtime `2ca88d5` | Result / evidence |
 |---|---|
 | `cargo test --no-default-features --lib` | 175 passed; `profile-search-final-model.log` |
-| GUI/Thai library + shell suites | 180 + 143 passed; final UI source in `profile-search-final-ui-tests.log` |
+| GUI/Thai library + shell suites | 180 + 143 passed; final UI source in `profile-search-repeat-final-ui-tests.log` |
 | Real private daemon/local fake provider suite | Five passed; `profile-search-final-daemon-second.log` |
-| Strict clippy (`-- -D warnings`) | GUI-free lib/unit tests; GUI/Thai lib + shell/render; ax-dump/Thai binary; daemon fixture passed. `profile-search-final-clippy-model.log`, `profile-search-final-ui-clippy.log`, `profile-search-final-bin-clippy.log`, `profile-search-final-daemon-clippy.log`. 26 existing core dependency warnings remain. |
+| Strict clippy (`-- -D warnings`) | GUI-free lib/unit tests; GUI/Thai lib + shell/render; ax-dump/Thai binary; daemon fixture passed. `profile-search-final-clippy-model.log`, `profile-search-repeat-final-clippy.log`, `profile-search-repeat-final-bin-clippy.log`, `profile-search-final-daemon-clippy.log`. 26 existing core dependency warnings remain. |
 | All-feature docs | Passed, zero doctests; `profile-search-final-doc.log` |
 | Windows GNU GUI-free all-targets check | Passed; `profile-search-final-windows-model.log`; no GUI/link/execution claim |
-| Native Mac fonts/Metal offscreen renderer | 49 states / 91 captures passed; `profile-search-native-final.log`, images in `profile-search-native-final/`, hashes in `profile-search-native-manifest.json` |
+| Native Mac fonts/Metal offscreen renderer | 49 states / 91 captures passed; `profile-search-repeat-native-final.log`, images in `profile-search-repeat-native-final/`, hashes in `profile-search-native-manifest.json` |
 | Formatting/whitespace and unchanged dependency/protocol scope | Passed; no manifest, lockfile, protocol or relay change |
 
 The runner's exact command arrays and exit codes are in
 `profile-search-final-checks.json`; final UI checks follow the focus-ring padding
-correction. Selected minimum-size query, result and error captures were visually
+correction and repeated-Enter guard. Selected minimum-size query, result and error captures were visually
 inspected, including the final corrected query focus ring. Existing native
 Thai shaping diagnostics remain. This is not foreground OS input, native IME,
 screen-reader speech or human usability acceptance.
@@ -99,7 +102,11 @@ compile errors; the new reply missing from the fixture's exhaustive diagnostic
 match; a nested-scroll anchor leaving the selected row offscreen; and native
 200% query reveal leaving Search below the viewport. The correction uses the
 body scroller's direct-child API, aligns query/results at its top and preserves
-focus-ring padding. Earlier failing logs/captures are not final validation.
+focus-ring padding. Earlier failing logs/captures are not final validation. A later repeated-Enter
+regression reproduced a duplicate read despite the disabled Search button
+(`profile-search-repeat-enter-reproduction.log`). The handler now checks the
+live query and pending state before starting another read; the complete UI
+suites, strict UI/bin lint and full native renderer passed after that fix.
 
 ## Ownership and remaining gates
 
