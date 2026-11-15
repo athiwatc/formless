@@ -197,6 +197,8 @@ fn commands_list_mirrors_current_metadata_overrides_and_builtin_shadowing_withou
     let review = commands.iter().find(|c| c["name"] == "workflow").unwrap();
     assert_eq!(review["description"], "Project review");
     assert_eq!(review["source"], "project");
+    assert_eq!(review["max_position"], 1);
+    assert_eq!(review["uses_arguments"], true);
     assert!(
         !commands.iter().any(|c| c["name"] == "quit"),
         "builtin wins"
@@ -215,6 +217,7 @@ fn commands_list_mirrors_current_metadata_overrides_and_builtin_shadowing_withou
     let text = f.run(&["commands", "list"]);
     assert!(text.status.success());
     let text = String::from_utf8(text.stdout).unwrap();
+    assert!(text.contains("/workflow <arg1> [arguments…]"), "{text}");
     assert!(
         text.contains("/workflow") && text.contains("Project review") && text.contains("/quit")
     );

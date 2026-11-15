@@ -2,6 +2,8 @@
 //! Session snapshot, including historical Runs with unknown message boundaries.
 //! A private fake daemon owns the only socket; no provider or service is used.
 #![cfg(unix)]
+#[path = "support/unix_fixture_io.rs"]
+mod unix_fixture_io;
 use formless_core::{Config, Paths, Store};
 use formless_protocol::{Request, RequestEnvelope, ServerMessage};
 use serde_json::{json, Value};
@@ -15,6 +17,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
+use unix_fixture_io::FixtureStream;
 struct Fixture {
     root: std::path::PathBuf,
     paths: Paths,
@@ -150,22 +153,18 @@ impl Drop for Fixture {
         let _ = std::fs::remove_dir_all(&self.root);
     }
 }
-fn frame(stream: &mut UnixStream, message: ServerMessage) {
+fn frame(stream: &mut FixtureStream, message: ServerMessage) {
     writeln!(stream, "{}", serde_json::to_string(&message).unwrap()).unwrap();
 }
 fn serve_peer(
-    mut stream: UnixStream,
+    stream: UnixStream,
     stop: Arc<AtomicBool>,
     session: formless_protocol::SessionInfo,
     snapshot: Value,
 ) {
-    stream
-        .set_read_timeout(Some(Duration::from_millis(50)))
-        .unwrap();
-    stream
-        .set_write_timeout(Some(Duration::from_secs(2)))
-        .unwrap();
     let deadline = Instant::now() + Duration::from_secs(15);
+    let mut stream =
+        FixtureStream::new(stream, stop.clone(), deadline, Duration::from_millis(50)).unwrap();
     let mut pending = Vec::new();
     let mut chunk = [0u8; 4096];
     while !stop.load(Ordering::SeqCst) && Instant::now() < deadline {

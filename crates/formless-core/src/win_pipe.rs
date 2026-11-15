@@ -49,6 +49,39 @@ impl OwnerOnly {
         })
     }
 
+    /// Comparison template for files and directories created with [`Self::new`].
+    ///
+    /// `CreateFile` and `CreateDirectory` map `GENERIC_ALL` (`GA`, `0x10000000`)
+    /// through `MapGenericMask` and the file generic mapping, whose `GenericAll`
+    /// is `FILE_ALL_ACCESS` (`FA`, `0x001F01FF`). Named pipes must keep [`Self::new`].
+    /// This descriptor is not a creation template and does not add trustees or rights.
+    pub(crate) fn persisted_file_dacl() -> std::io::Result<Self> {
+        let sid = current_user_sid()?;
+        let sddl: Vec<u16> = format!("D:P(A;;FA;;;{sid})(A;;FA;;;SY)\0")
+            .encode_utf16()
+            .collect();
+        let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        let ok = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut sd,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self {
+            sd,
+            attrs: SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: sd,
+                bInheritHandle: 0,
+            },
+        })
+    }
+
     /// For `ServerOptions::create_with_security_attributes_raw`.
     pub fn as_raw(&self) -> *mut c_void {
         &self.attrs as *const SECURITY_ATTRIBUTES as *mut c_void

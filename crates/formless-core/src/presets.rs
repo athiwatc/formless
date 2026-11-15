@@ -162,8 +162,14 @@ pub fn restyle(old_url: Option<&str>, new_url: &str, current: &str) -> Option<&'
 /// A base URL from either a URL or a preset id.
 pub fn resolve_base_url(value: &str) -> Option<String> {
     let v = value.trim();
-    if v.starts_with("http://") || v.starts_with("https://") {
-        return Some(v.trim_end_matches('/').to_string());
+    if let Some((scheme, remainder)) = v.split_once("://") {
+        if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https") {
+            return Some(
+                format!("{}://{}", scheme.to_ascii_lowercase(), remainder)
+                    .trim_end_matches('/')
+                    .to_string(),
+            );
+        }
     }
     find(v).map(|p| p.base_url.to_string())
 }
@@ -237,6 +243,44 @@ mod azure_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn http_schemes_are_case_insensitive_and_only_the_scheme_is_normalized() {
+        for (input, expected) in [
+            (
+                "HTTPS://Case.Example/V1/Keep%2FCase?Token=AbC#Frag",
+                "https://Case.Example/V1/Keep%2FCase?Token=AbC#Frag",
+            ),
+            (
+                "  Http://localhost:11434/v1/  ",
+                "http://localhost:11434/v1",
+            ),
+            ("hTtPs://Example.test/Mixed/", "https://Example.test/Mixed"),
+        ] {
+            assert_eq!(resolve_base_url(input).as_deref(), Some(expected));
+        }
+        for input in [
+            "FTP://example.test",
+            "file:///tmp/fixture",
+            "data:text/plain,fixture",
+            "ws://example.test",
+            "https:example.test",
+            "ht tp://example.test",
+            "unknown-preset",
+        ] {
+            assert_eq!(resolve_base_url(input), None, "{input}");
+        }
+        assert_eq!(
+            resolve_base_url(" OPENROUTER "),
+            resolve_base_url("openrouter")
+        );
+        assert_eq!(
+            for_url(&resolve_base_url("HTTPS://API.ANTHROPIC.COM/v1/").unwrap())
+                .unwrap()
+                .id,
+            "anthropic"
+        );
+    }
 
     #[test]
     fn presets_resolve_by_id_and_url() {

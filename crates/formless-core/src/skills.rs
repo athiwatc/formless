@@ -21,6 +21,24 @@ pub struct SkillMeta {
     pub body: String,
 }
 
+// Decode one complete quoted scalar. Literal quote fragments in the
+// permissive Skill metadata format remain text instead of losing characters.
+fn quoted_scalar(value: &str) -> Option<String> {
+    if value.starts_with('"') {
+        return serde_json::from_str::<String>(value).ok();
+    }
+    let inner = value.strip_prefix('\'')?.strip_suffix('\'')?;
+    let mut chars = inner.chars();
+    let mut decoded = String::new();
+    while let Some(c) = chars.next() {
+        if c == '\'' && chars.next() != Some('\'') {
+            return None;
+        }
+        decoded.push(c);
+    }
+    Some(decoded)
+}
+
 /// Parse `SKILL.md`: `---` frontmatter with `name` and `description`
 /// (plain, quoted, or folded `>`/`|` values), then the body.
 pub fn parse_skill_md(text: &str) -> Result<SkillMeta> {
@@ -38,13 +56,16 @@ pub fn parse_skill_md(text: &str) -> Result<SkillMeta> {
     while i < lines.len() {
         let line = lines[i];
         i += 1;
-        if line.starts_with(char::is_whitespace) || line.trim().is_empty() {
+        if line.starts_with(char::is_whitespace)
+            || line.trim().is_empty()
+            || line.trim_start().starts_with('#')
+        {
             continue;
         }
         let Some((key, value)) = line.split_once(':') else {
             continue;
         };
-        let mut value = value.trim().to_string();
+        let mut value = crate::frontmatter::scalar_without_comment(value.trim()).to_string();
         if value.is_empty() || value == ">" || value == "|" || value == ">-" || value == "|-" {
             // Folded/literal block: the indented lines that follow.
             let mut parts = Vec::new();
@@ -55,8 +76,9 @@ pub fn parse_skill_md(text: &str) -> Result<SkillMeta> {
                 i += 1;
             }
             value = parts.join(" ").trim().to_string();
+        } else if let Some(decoded) = quoted_scalar(&value) {
+            value = decoded;
         }
-        let value = value.trim_matches(|c| c == '"' || c == '\'').to_string();
         fields.insert(key.trim().to_string(), value);
     }
     let name = fields.remove("name").unwrap_or_default();
@@ -221,7 +243,10 @@ pub fn extract_zip(archive: &Path, dest: &Path) -> Result<u64> {
     let mut total = 0u64;
     for i in 0..zip.len() {
         let mut entry = zip.by_index(i)?;
-        let name = entry.name().to_string();
+        let name = entry
+            .name()
+            .context("zip entry name could not be decoded")?
+            .into_owned();
         if entry.is_symlink() {
             bail!("zip entry '{name}' is a symbolic link; skills may not contain links");
         }
@@ -273,23 +298,38 @@ fn stage(paths: &Paths, source: &str, git_ref: Option<&str>) -> Result<PathBuf> 
     }
 }
 
+// Normalize only recognized URI schemes for Git's transport lookup. Legacy
+// git@ and .git spellings still delegate validation/policy to Git itself.
+fn git_source(source: &str) -> Option<std::borrow::Cow<'_, str>> {
+    if let Some((scheme, remainder)) = source.split_once("://") {
+        if ["http", "https", "ssh", "git", "file"]
+            .iter()
+            .any(|known| scheme.eq_ignore_ascii_case(known))
+        {
+            return Some(std::borrow::Cow::Owned(format!(
+                "{}://{remainder}",
+                scheme.to_ascii_lowercase()
+            )));
+        }
+    }
+    (source.starts_with("git@") || source.trim_end_matches('/').ends_with(".git"))
+        .then_some(std::borrow::Cow::Borrowed(source))
+}
+
 fn fetch_into(staging: &Path, source: &str, git_ref: Option<&str>) -> Result<()> {
     let local = Path::new(source);
-    let is_git = source.starts_with("https://")
-        || source.starts_with("git@")
-        || source.trim_end_matches('/').ends_with(".git");
-    if is_git {
+    if local.is_dir() {
+        copy_dir(local, staging)?;
+    } else if source.to_lowercase().ends_with(".zip") && local.is_file() {
+        extract_zip(local, staging)?;
+    } else if let Some(git_source) = git_source(source) {
         let mut git = std::process::Command::new("git");
         git.args(["clone", "--depth", "1"]);
         if let Some(r) = git_ref {
             git.args(["--branch", r]);
         }
-        git.arg(source).arg(staging);
+        git.arg(git_source.as_ref()).arg(staging);
         run(&mut git, "git clone")?;
-    } else if local.is_dir() {
-        copy_dir(local, staging)?;
-    } else if source.to_lowercase().ends_with(".zip") && local.is_file() {
-        extract_zip(local, staging)?;
     } else {
         bail!("skill source must be a folder, a .zip or a git URL: {source}");
     }
@@ -588,4 +628,55 @@ pub fn read_file(store: &Store, name: &str, rel: &str) -> Result<String> {
         bail!("'{rel}' is outside the skill");
     }
     Ok(String::from_utf8_lossy(&std::fs::read(path)?).into_owned())
+}
+
+#[cfg(test)]
+mod source_tests {
+    use super::git_source;
+
+    #[test]
+    fn recognized_git_uri_schemes_normalize_only_the_scheme() {
+        for (source, expected) in [
+            (
+                "http://Case.Example/Team/Skill",
+                "http://Case.Example/Team/Skill",
+            ),
+            (
+                "HTTPS://Case.Example/Team/Skill",
+                "https://Case.Example/Team/Skill",
+            ),
+            (
+                "HtTpS://Case.Example/Team/Skill%2FPart?Token=AbC#Frag",
+                "https://Case.Example/Team/Skill%2FPart?Token=AbC#Frag",
+            ),
+            (
+                "ssh://GitUser@Case.Example/Team/Skill",
+                "ssh://GitUser@Case.Example/Team/Skill",
+            ),
+            (
+                "SSH://GitUser@Case.Example/Team/Skill",
+                "ssh://GitUser@Case.Example/Team/Skill",
+            ),
+            (
+                "GiT://Case.Example/Team/Skill",
+                "git://Case.Example/Team/Skill",
+            ),
+            (
+                "FILE:///Owned/Case/Repo.git/",
+                "file:///Owned/Case/Repo.git/",
+            ),
+            ("git@Case.Example:Team/Skill", "git@Case.Example:Team/Skill"),
+            ("host:Team/Repo.git", "host:Team/Repo.git"),
+        ] {
+            assert_eq!(git_source(source).as_deref(), Some(expected), "{source}");
+        }
+        for source in [
+            "notes.txt",
+            "httpsx://example.test/Skill",
+            "ws://example.test/Skill",
+            "",
+        ] {
+            assert!(git_source(source).is_none(), "{source}");
+        }
+    }
 }

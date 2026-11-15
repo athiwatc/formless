@@ -133,9 +133,21 @@ pub fn parse_color(s: &str) -> Option<Color> {
     })
 }
 
-/// A role's override (`[tui.colors]`), if any.
+/// A role's override resolved through the active palette, if any.
 pub fn role(name: &str) -> Option<Color> {
-    THEME.with(|t| t.borrow().as_ref()?.roles.get(name).copied())
+    THEME.with(|slot| {
+        let theme = slot.borrow();
+        let t = theme.as_ref()?;
+        t.roles.get(name).map(|&color| resolve_override(t, color))
+    })
+}
+
+/// Resolve a named override without applying another role's override.
+fn resolve_override(t: &Theme, color: Color) -> Color {
+    match color {
+        Color::Rgb(..) | Color::Indexed(_) => color,
+        named => palette(t.kind, named),
+    }
 }
 
 /// The colour to draw for `c` under the active theme. Cyan is the accent
@@ -153,10 +165,7 @@ fn remap_with(t: &Theme, c: Color) -> Color {
     // A named override goes through the theme like any other colour, so
     // `accent = "yellow"` is deepened on the light theme too (#883).
     if let Some(&r) = role {
-        return match r {
-            Color::Rgb(..) | Color::Indexed(_) => r,
-            named => palette(t.kind, named),
-        };
+        return resolve_override(t, r);
     }
     palette(t.kind, c)
 }
@@ -293,10 +302,7 @@ pub fn contrast_warnings(t: &Theme) -> Vec<String> {
     roles
         .into_iter()
         .filter_map(|(name, c)| {
-            let drawn = match c {
-                Color::Rgb(..) | Color::Indexed(_) => *c,
-                named => palette(t.kind, *named),
-            };
+            let drawn = resolve_override(t, *c);
             let ratio = contrast(rgb(drawn)?, bg);
             (ratio < 4.5).then(|| {
                 format!("[tui.colors] {name} has {ratio:.1}:1 contrast on this theme's background (4.5:1 is the readable minimum)")
@@ -433,6 +439,44 @@ mod tests {
     }
 
     #[test]
+    fn message_role_resolution_matches_contrast_without_accent_error_chaining() {
+        for theme in ["dark", "light", "high-contrast", "colorblind"] {
+            for (name, color) in [
+                ("cyan", Color::Cyan),
+                ("red", Color::Red),
+                ("yellow", Color::Yellow),
+            ] {
+                for role_name in ["user", "assistant", "tool", "note"] {
+                    let colors = HashMap::from([
+                        (role_name.to_string(), name.to_string()),
+                        ("accent".into(), "#112233".into()),
+                        ("error".into(), "#445566".into()),
+                    ]);
+                    let t = from_config(theme, &colors);
+                    let expected = palette(t.kind, color);
+                    let low_contrast = contrast(rgb(expected).unwrap(), background(t.kind)) < 4.5;
+                    assert_eq!(
+                        contrast_warnings(&t)
+                            .iter()
+                            .any(|warning| warning
+                                .starts_with(&format!("[tui.colors] {role_name} "))),
+                        low_contrast
+                    );
+                    set(t);
+                    assert_eq!(
+                        role(role_name),
+                        Some(expected),
+                        "{theme} {role_name} {name}"
+                    );
+                    assert_eq!(remap(Color::Cyan), Color::Rgb(0x11, 0x22, 0x33));
+                    assert_eq!(remap(Color::Red), Color::Rgb(0x44, 0x55, 0x66));
+                }
+            }
+        }
+        reset();
+    }
+
+    #[test]
     fn themes_remap_base_colours_and_roles() {
         let mut colors = HashMap::new();
         colors.insert("accent".to_string(), "#112233".to_string());
@@ -446,7 +490,7 @@ mod tests {
             "accent override"
         );
         assert_eq!(remap(Color::Yellow), Color::Rgb(150, 100, 0));
-        assert_eq!(role("user"), Some(Color::Magenta));
+        assert_eq!(role("user"), Some(palette(Kind::Light, Color::Magenta)));
         // A named accent override is deepened like any other colour.
         let mut colors = HashMap::new();
         colors.insert("accent".to_string(), "yellow".to_string());
