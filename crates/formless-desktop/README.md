@@ -288,6 +288,10 @@ inputs under the same ZIP toolchain. This does not establish reproducible Rust
 builds across hosts. Notice collection includes lowercase filenames and notices
 under embedded data/assets/fonts; each copied source path and hash is recorded.
 Collection is an inventory, not a complete licensing audit.
+Reviewed immutable upstream notices and compiler-bound Rust notices are added
+offline from `notices/`; lock, VCS, declaration and content changes fail closed.
+Known licensing-note-only and missing-file gaps remain explicit. See that
+directory's README and the accessible-performance/notice report in docs/desktop.
 
 macOS gets a `Formless Development.app`; Windows and Linux get a portable
 development directory. Each also gets a ZIP and SHA256SUMS. The helper never
@@ -372,6 +376,9 @@ cargo run --release --locked -- --stream-seconds 30 --stream-rate 100
 
 # The model's share of that work alone: no window, no GPUI in the build.
 cargo run --release --no-default-features --locked --example stream_model
+
+# Bounded parser/conversion profile, 20 rounds, no GUI (allowed range 1..50).
+cargo run --no-default-features --locked --example accessible_profile -- 20
 
 # Check what a real macOS window gives assistive technology: three windows in
 # the background, nothing typed or clicked; exit 0 when every check holds.

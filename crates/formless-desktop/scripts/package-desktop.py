@@ -78,7 +78,95 @@ def write_archive(bundle, executable, archive, epoch):
                 shutil.copyfileobj(contents, entry)
 
 
-def collect_notices(packages, built, destination):
+def verified_notice(upstream, notice):
+    local = notice.get("local", "")
+    path = Path(local)
+    if not local or "\\" in local or ":" in local or path.is_absolute() or ".." in path.parts:
+        raise ValueError("invalid reviewed notice path")
+    source = upstream / path
+    if upstream.is_symlink() or source.is_symlink() or not source.is_file():
+        raise ValueError("missing or symlinked reviewed notice: " + local)
+    source.resolve().relative_to(upstream.resolve())
+    if source.stat().st_size > 2 * 1024 * 1024 or digest(source) != notice.get("sha256"):
+        raise ValueError("reviewed notice hash/size changed: " + local)
+    return source
+
+
+def collect_toolchain_notices(upstream, destination, rustc):
+    manifest = upstream / "TOOLCHAIN.json"
+    if not manifest.exists():
+        return None
+    if upstream.is_symlink() or manifest.is_symlink() or manifest.stat().st_size > 2 * 1024 * 1024:
+        raise ValueError("invalid toolchain notice manifest")
+    document = json.loads(manifest.read_text(encoding="utf-8"))
+    commit = re.search(r"^commit-hash: ([0-9a-f]{40})$", rustc, re.M)
+    if document.get("schema") != 1 or commit is None or commit.group(1) != document.get("compiler_commit_hash"):
+        raise ValueError("toolchain notices do not match rustc; refresh notice review")
+    notices = document.get("files", [])
+    names = {notice.get("name") for notice in notices}
+    required = {"LICENSE-APACHE", "LICENSE-MIT", "COPYRIGHT"}
+    if len(notices) != len(names) or not required <= names or not names <= required | {"COPYRIGHT-library.html"}:
+        raise ValueError("invalid toolchain notice set")
+    for notice in notices:
+        source = verified_notice(upstream, notice)
+        destination.mkdir(parents=True, exist_ok=True)
+        target = destination / notice["name"]
+        shutil.copyfile(source, target)
+        if digest(target) != notice["sha256"]:
+            raise ValueError("toolchain notice changed while copying")
+    shutil.copyfile(manifest, destination / "PROVENANCE.json")
+    return digest(manifest)
+
+
+def reviewed_notices(package, root, upstream, entry):
+    if package.get("license") != entry.get("license"):
+        raise ValueError("reviewed notice license declaration changed: " + package["name"])
+    if entry.get("source_kind") == "workspace":
+        expected = upstream.parent / "Cargo.toml"
+        if package.get("source") is not None or Path(package["manifest_path"]).resolve() != expected.resolve():
+            raise ValueError("reviewed workspace notice does not match this package")
+    elif entry.get("source_kind") == "registry":
+        if not str(package.get("source", "")).startswith("registry+"):
+            raise ValueError("reviewed upstream notice requires the registry package")
+        field = entry.get("repository_field")
+        if field not in ("repository", "homepage") or package.get(field) != entry.get("repository_metadata_value"):
+            raise ValueError("reviewed upstream repository changed: " + package["name"])
+        vcs = root / ".cargo_vcs_info.json"
+        if not vcs.is_file() or vcs.is_symlink() or digest(vcs) != entry.get("vcs_sha256"):
+            raise ValueError("reviewed upstream VCS receipt changed: " + package["name"])
+    else:
+        raise ValueError("unsupported reviewed notice provenance")
+    result = []
+    for notice in entry.get("files", []):
+        source = verified_notice(upstream, notice)
+        if entry["source_kind"] == "workspace":
+            if digest(upstream.parent.parents[1] / "LICENSE") != notice["sha256"]:
+                raise ValueError("workspace license changed; refresh notice review")
+        result.append((source, dict(source=notice["source"], sha256=notice["sha256"],
+            url=notice.get("url"), revision=entry.get("revision"),
+            git_blob=notice.get("git_blob"), registry_checksum=entry.get("registry_checksum"),
+            reviewed_local=notice["local"])))
+    return result
+
+
+def collect_notices(packages, built, destination, upstream=None, lockfile=None):
+    reviewed = {}
+    if upstream is not None and upstream.is_symlink():
+        raise ValueError("symlinked reviewed notice root")
+    if upstream is not None and (upstream / "UPSTREAM.json").exists():
+        manifest = upstream / "UPSTREAM.json"
+        if manifest.is_symlink() or manifest.stat().st_size > 2 * 1024 * 1024:
+            raise ValueError("invalid reviewed notice manifest")
+        document = json.loads(manifest.read_text(encoding="utf-8"))
+        if document.get("schema") != 1 or lockfile is None or digest(lockfile) != document.get("cargo_lock_sha256"):
+            raise ValueError("reviewed notices do not match Cargo.lock; refresh notice review")
+        for entry in document.get("packages", []):
+            if not entry.get("name") or not entry.get("version") or not isinstance(entry.get("files"), list) or not entry["files"]:
+                raise ValueError("invalid reviewed notice package")
+            key = (entry["name"], entry["version"])
+            if key in reviewed:
+                raise ValueError("duplicate reviewed notice package")
+            reviewed[key] = entry
     inventory = []
     for package in sorted(packages, key=lambda item: (item["name"], item["version"])):
         if package["id"] not in built:
@@ -114,11 +202,23 @@ def collect_notices(packages, built, destination):
             shutil.copyfile(source, target)
             copied.append(str(target.relative_to(destination)))
             sources.append({"source": relative.as_posix(), "sha256": digest(target)})
+        entry = reviewed.get((package["name"], package["version"]))
+        if entry is not None:
+            for source, receipt in reviewed_notices(package, root, upstream, entry):
+                relative = Path(receipt["reviewed_local"])
+                target = destination / (package["name"] + "-" + package["version"]) / "reviewed" / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(source, target)
+                if digest(target) != receipt["sha256"]:
+                    raise ValueError("reviewed notice changed while copying")
+                copied.append(str(target.relative_to(destination)))
+                sources.append(receipt)
         inventory.append({
             "name": package["name"], "version": package["version"],
             "license": package.get("license"), "repository": package.get("repository"),
             "notice_files": copied,
             "notice_sources": sources,
+            "notice_review_limitations": entry.get("collection_limitations", []) if entry else [],
         })
     return inventory
 
@@ -202,15 +302,22 @@ def package(args):
         shutil.copy2(binary, executable)
         shutil.copyfile(repository / "LICENSE", resources / "LICENSE")
         shutil.copyfile(desktop / "README.md", resources / "README.md")
-        inventory = collect_notices(metadata["packages"], built, resources / "third-party-notices")
+        upstream = desktop / "notices"
+        inventory = collect_notices(metadata["packages"], built, resources / "third-party-notices", upstream, desktop / "Cargo.lock")
+        if (upstream / "UPSTREAM.json").is_file():
+            shutil.copyfile(upstream / "UPSTREAM.json", resources / "UPSTREAM_NOTICES.json")
+        toolchain_manifest = collect_toolchain_notices(upstream, resources / "toolchain-notices", rustc)
         write_json(resources / "DEPENDENCIES.json", inventory)
         provenance = {"commit": commit, "dirty": dirty, "profile": args.profile, "target": host,
                       "version": version, "binary_sha256": digest(executable),
                       "lockfile_sha256": digest(desktop / "Cargo.lock"), "build_command": command,
                       "distribution": "development only; no distribution signing performed",
                       "native_acceptance": False,
+                      "upstream_notice_manifest_sha256": digest(upstream / "UPSTREAM.json") if (upstream / "UPSTREAM.json").is_file() else None,
+                      "toolchain_notice_manifest_sha256": toolchain_manifest,
                       "archive_timestamp_source": "git commit time, UTC, normalized to ZIP range/granularity",
-                      "license_review": "Cargo dependency notices collected; manual asset/stdlib and distribution review still required",
+                      "license_review": "Cargo, reviewed upstream and top-level Rust notices collected; full asset/stdlib and distribution review still required",
+                      "packages_with_notice_review_limitations": [p["name"] + "-" + p["version"] for p in inventory if p["notice_review_limitations"]],
                       "packages_without_notice_files": [p["name"] + "-" + p["version"] for p in inventory if not p["notice_files"]]}
         write_json(resources / "BUILD.json", provenance)
         archive = stage / ("formless-desktop-" + version + "-" + host + ".zip")

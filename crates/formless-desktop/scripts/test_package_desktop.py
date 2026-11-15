@@ -66,6 +66,109 @@ class Packaging(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "oversized"):
             package.collect_notices([self.metadata(root)], {"test-id"}, self.root / "notices")
 
+    def reviewed_fixture(self):
+        base = Path(tempfile.mkdtemp(dir=self.root))
+        root = base / "registry-crate"
+        root.mkdir()
+        (root / ".cargo_vcs_info.json").write_text('{"git":{"sha1":"fixture revision"}}')
+        upstream = base / "desktop/notices"
+        local = "upstream/fixture/revision/LICENSE-MIT"
+        source = upstream / local
+        source.parent.mkdir(parents=True)
+        source.write_text("fixture upstream terms")
+        lock = upstream.parent / "Cargo.lock"
+        lock.write_text("fixture locked dependency graph")
+        metadata = self.metadata(root)
+        metadata.update(source="registry+fixture", repository="https://github.com/fixture/project")
+        entry = dict(name="fixture", version="1.0", license="MIT", source_kind="registry",
+                     repository_field="repository", repository_metadata_value=metadata["repository"],
+                     vcs_sha256=package.digest(root / ".cargo_vcs_info.json"), revision="fixture revision",
+                     files=[dict(local=local, source="LICENSE-MIT", sha256=package.digest(source),
+                                 url="https://example.invalid/immutable/LICENSE-MIT", git_blob="fixture blob")])
+        document = dict(schema=1, cargo_lock_sha256=package.digest(lock), packages=[entry])
+        (upstream / "UPSTREAM.json").write_text(json.dumps(document))
+        return root, upstream, lock, metadata, document, source
+
+    def test_reviewed_notice_is_bound_to_lock_vcs_repository_and_content(self):
+        root, upstream, lock, metadata, _, source = self.reviewed_fixture()
+        destination = self.root / "collected"
+        inventory = package.collect_notices([metadata], {"test-id"}, destination, upstream, lock)
+        notice = inventory[0]["notice_files"][0]
+        self.assertEqual((destination / notice).read_bytes(), source.read_bytes())
+        receipt = inventory[0]["notice_sources"][0]
+        self.assertEqual(receipt["revision"], "fixture revision")
+        self.assertEqual(receipt["sha256"], package.digest(source))
+
+    def test_reviewed_notice_input_changes_fail_closed(self):
+        for changed in ["lock", "vcs", "repository", "license", "bytes"]:
+            with self.subTest(changed=changed):
+                root, upstream, lock, metadata, _, source = self.reviewed_fixture()
+                if changed == "lock":
+                    lock.write_text("different graph")
+                elif changed == "vcs":
+                    (root / ".cargo_vcs_info.json").write_text("different receipt")
+                elif changed == "repository":
+                    metadata["repository"] = "https://example.invalid/other"
+                elif changed == "license":
+                    metadata["license"] = "different declaration"
+                else:
+                    source.write_text("different terms")
+                with self.assertRaises(ValueError):
+                    package.collect_notices([metadata], {"test-id"}, root / "out", upstream, lock)
+
+    def test_reviewed_notice_paths_and_symlinks_cannot_escape(self):
+        for local in ["../outside", "/absolute", "C:\\outside"]:
+            with self.subTest(local=local):
+                root, upstream, lock, metadata, document, _ = self.reviewed_fixture()
+                document["packages"][0]["files"][0]["local"] = local
+                (upstream / "UPSTREAM.json").write_text(json.dumps(document))
+                with self.assertRaises(ValueError):
+                    package.collect_notices([metadata], {"test-id"}, root / "out", upstream, lock)
+        root, upstream, lock, metadata, _, source = self.reviewed_fixture()
+        source.unlink()
+        source.symlink_to(lock)
+        with self.assertRaises(ValueError):
+            package.collect_notices([metadata], {"test-id"}, root / "out", upstream, lock)
+
+    def toolchain_fixture(self):
+        upstream = Path(tempfile.mkdtemp(dir=self.root))
+        commit = "a" * 40
+        files = []
+        for name in ["LICENSE-APACHE", "LICENSE-MIT", "COPYRIGHT"]:
+            local = "toolchain/" + name
+            path = upstream / local
+            path.parent.mkdir(exist_ok=True)
+            path.write_text("fixture " + name)
+            files.append(dict(name=name, local=local, sha256=package.digest(path)))
+        document = dict(schema=1, compiler_commit_hash=commit, files=files)
+        (upstream / "TOOLCHAIN.json").write_text(json.dumps(document))
+        return upstream, document, "commit-hash: " + commit
+
+    def test_toolchain_notices_are_bound_to_compiler_and_exact_content(self):
+        upstream, document, compiler = self.toolchain_fixture()
+        destination = self.root / "toolchain-out"
+        receipt = package.collect_toolchain_notices(upstream, destination, compiler)
+        self.assertEqual(receipt, package.digest(upstream / "TOOLCHAIN.json"))
+        for notice in document["files"]:
+            self.assertEqual(package.digest(destination / notice["name"]), notice["sha256"])
+        self.assertTrue((destination / "PROVENANCE.json").is_file())
+
+    def test_toolchain_changes_and_incomplete_sets_fail_closed(self):
+        for changed in ["compiler", "bytes", "incomplete", "path"]:
+            with self.subTest(changed=changed):
+                upstream, document, compiler = self.toolchain_fixture()
+                if changed == "compiler":
+                    compiler = "commit-hash: " + "b" * 40
+                elif changed == "bytes":
+                    (upstream / document["files"][0]["local"]).write_text("changed terms")
+                elif changed == "incomplete":
+                    document["files"].pop()
+                else:
+                    document["files"][0]["name"] = "../outside"
+                (upstream / "TOOLCHAIN.json").write_text(json.dumps(document))
+                with self.assertRaises(ValueError):
+                    package.collect_toolchain_notices(upstream, self.root / "not-published", compiler)
+
     def bundle(self):
         bundle = self.root / "Formless Development.app"
         executable = bundle / "Contents/MacOS/formless-desktop"

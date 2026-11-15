@@ -65,3 +65,9 @@ classifies checks that can run safely without the unresolved foreground action,
 records concrete model performance limits, and prepares integration with main
 `c410af9`. Package notice/determinism checks improve development evidence without
 clearing native, product-parity, performance or distribution acceptance.
+
+The subsequent [parser profile and notice report](accessible-performance-notices-20261115.md)
+improves the measured dev/test parser cost without changing semantics and adds
+version-bound upstream/Rust notices. Three empty inventories, nineteen
+licensing-note-only cases and native/performance/distribution acceptance remain
+explicitly unresolved.

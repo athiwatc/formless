@@ -14,6 +14,16 @@ publish = false
 
 [workspace]
 
+# Accessibility converts bounded Markdown windows on demand. Profiling shows
+# parser/AST construction dominates this path in unoptimized builds. Keep the
+# identical GFM parser and semantics, but optimize this dependency in dev/test
+# builds as well; the desktop and other dependencies remain debuggable.
+[profile.dev.package.markdown]
+opt-level = 3
+
+[profile.test.package.markdown]
+opt-level = 3
+
 [features]
 default = ["gui"]
 # The GPUI Kit shell. Without it only the presentation model and fixture
