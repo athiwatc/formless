@@ -93,6 +93,26 @@ captures were visually inspected. Long help/handoff text remains scrollable.
 Pinned-layer Thai shaping diagnostics remain. These tests do not validate
 foreground keyboard/selection, actual OS IME, VoiceOver speech or human usability.
 
+## Fresh development artifact
+
+The packager ran with ResourceWarning treated as an error, `--profile dev
+--offline`, from clean `e3c6b71bf532279cc776448dd032db07e2f9bf0a`. Only README
+and this report differ from tested runtime `af8b8c0`. Output:
+`evidence/gpui-1753-sol/package-e3c6b71`.
+
+- Binary SHA256:
+  `44415d90248f76ed291a1f11cb4719fb14b1d5e28cb2780113d0927f2aac579e`.
+- ZIP SHA256:
+  `1b6867afa0a18433a251f3c352d31983d6c3810c6375ae96248bc50a949ec0f2`.
+- Provenance/plist identity, safe archive paths/types, integrity, executable
+  mode/byte identity, hashes and 21 system-library loads passed. Evidence:
+  `instructions-final-package.log`, `instructions-final-package-verification.json`.
+- 655 archive files; 415 packages / 649 notice files; 46 packages lack root
+  notice files. Manual licensing/assets/stdlib review remains.
+- The bundle has linker ad-hoc signing, no Team ID, an unbound plist and no
+  sealed resources. No app was installed or launched; no distribution signing
+  or notarization occurred.
+
 ## Ownership and open gates
 
 The same isolated checkout and `work/sol-gpui-1753-20261115` branch are used.
