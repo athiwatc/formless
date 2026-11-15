@@ -526,3 +526,10 @@ canonical-only until independent review and full streaming acceptance pass.
 The [minimum production streaming plan](../../docs/desktop/production-streaming-plan-20261115.md)
 records the required future-only recovery scope decision, implemented guarantees,
 deterministic cutoff/publication schedules and remaining enablement gates.
+
+Future-attempt-only v1 is the selected initial streaming scope. Its persistent
+notice states that attaching or reconnecting mid-answer shows persisted history
+until the answer completes or the next eligible attempt; this is not seamless
+recovery. Production remains disabled. The
+[real daemon-to-headless-view continuation](../../docs/desktop/v1-end-to-end-20261115.md)
+checks that path and older-peer fallback without a native launch.

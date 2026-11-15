@@ -49,6 +49,11 @@ const QUEUE: usize = 16;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const REFRESH: Duration = Duration::from_millis(250);
 
+/// Visible v1 recovery contract, including compatibility fallback.
+pub const FUTURE_ATTEMPT_LIMITATION: &str = "Attaching or reconnecting mid-answer shows persisted history until the answer completes or the next eligible attempt. Older daemons use persisted history.";
+pub const FUTURE_ATTEMPT_STATUS: &str =
+    "Connected · future-attempt streaming · persisted-history recovery";
+
 #[derive(Debug)]
 pub enum Update {
     Transcript(StreamBatch),

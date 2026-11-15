@@ -182,7 +182,7 @@ impl Engine {
         self.reader.phase = Phase::NeedBarrier;
         self.updates.push(Update::Connection {
             ready: true,
-            notice: "Connected · live reader validation · stored-message fallback".into(),
+            notice: FUTURE_ATTEMPT_STATUS.into(),
         });
         self.emit_questions();
         if let Some(page) = self.page {

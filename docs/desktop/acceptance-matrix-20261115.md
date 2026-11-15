@@ -108,3 +108,9 @@ ordering obligations to evidence, and sequences combined review, portable/native
 acceptance and the eventual separately reviewed production-policy change. New
 deterministic model schedules cover cutoff/receipt staging, ownership retirement,
 canonical storage/publication and wire permutations; production remains disabled.
+
+The owner selected future-attempt-only v1 for the initial implementation. A
+persistent visible limitation and actual fake-provider/daemon/IPC/client to
+TestPlatform view checks are documented in the
+[v1 path report](v1-end-to-end-20261115.md). This records the scope decision and
+headless evidence, not production enablement or seamless recovery acceptance.

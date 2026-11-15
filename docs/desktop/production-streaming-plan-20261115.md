@@ -4,7 +4,7 @@ Production remains canonical-only. This plan describes the implemented v1
 contract, the remaining decisions and the work required to enable it. A local
 merge or successful model schedule is not enablement approval or epic completion.
 
-## Decision needed before changing production policy
+## Selected initial scope; production policy remains disabled
 
 The implemented `future_attempts_only_v1` mode deliberately waits for a future
 eligible attempt after attachment, reload or reconnect. It cannot reconstruct
@@ -12,11 +12,13 @@ a prefix that was produced before its barrier. Persisted history remains the
 fallback. A normal new Send can stream; an already-running answer may remain
 canonical-only until a fresh retry/turn or its persisted completion.
 
-The owner must choose whether that behavior satisfies the first production
-release. If seamless mid-attempt attachment/recovery is required, v1 is
-insufficient. Do not disguise the difference with a local offset, optimistic
-snapshot merge or unbounded client buffer. Choosing v1 is only a scope decision;
-review, native acceptance and release gates below still apply.
+The owner has selected future-attempt-only v1 as the initial implementation.
+Mid-answer attachment/reconnection shows persisted history until completion or
+the next eligible attempt; this is not seamless recovery. Bounded-prefix support
+is deferred as a possible versioned extension. Do not disguise that limitation
+with a local offset, optimistic snapshot merge or unbounded buffer. This scope
+selection does not enable production: review, protocol/compatibility, native
+acceptance and release gates below still apply.
 
 ## Implemented ordering contract and checks
 
@@ -42,8 +44,9 @@ necessary evidence. No production source behavior changes in this increment.
 
 ## Ordered implementation and acceptance steps
 
-1. Record the v1 versus seamless-recovery scope decision. Keep production off
-   until this and all later enablement conditions pass.
+1. The initial scope is recorded: future-attempt-only v1, with a persistent
+   visible mid-answer attach/reconnect limitation. Keep production off until
+   exact-head review, protocol/compatibility and acceptance conditions pass.
 2. Finish independent review of the entire combined runtime/protocol range,
    including every canonical publisher, producer lock order, retry retirement,
    subscriber loss and the detached lockfile. Incremental no-blocker receipts

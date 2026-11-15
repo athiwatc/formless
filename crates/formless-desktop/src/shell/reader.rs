@@ -88,8 +88,7 @@ impl Shell {
         self.client_steps = status.steps;
         self.client_recovery = status.unfinished_run;
         if !self.client_snapshot_ready {
-            self.client_status =
-                "Connected · live reader validation · stored-message fallback".into();
+            self.client_status = client::FUTURE_ATTEMPT_STATUS.into();
         }
         self.client_snapshot_ready = true;
         cx.notify();
@@ -113,6 +112,7 @@ impl Shell {
                 return;
             }
             self.install_client_snapshot(batch.owner.generation, snapshot, window, cx);
+            self.client_status = client::FUTURE_ATTEMPT_STATUS.into();
             self.stream_view_owner = Some(batch.owner.clone());
             self.stream_view_latest = Some(batch.owner.clone());
         } else if self.stream_view_owner.as_ref() != Some(&batch.owner) {

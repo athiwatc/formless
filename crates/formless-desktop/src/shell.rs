@@ -1738,6 +1738,24 @@ impl Shell {
         self.attach_client(Client::start(endpoint), cx);
     }
 
+    /// Actual transport through TestPlatform only; never a production enable path.
+    #[cfg(all(feature = "test-support", feature = "daemon-tests"))]
+    pub fn connect_future_attempts_for_validation(
+        &mut self,
+        endpoint: client::Endpoint,
+        cx: &mut Context<Self>,
+    ) {
+        self.attach_client(Client::start_future_attempts_for_validation(endpoint), cx);
+    }
+    #[cfg(all(feature = "test-support", feature = "daemon-tests"))]
+    pub fn reconnect_future_attempts_for_validation(&mut self) -> Result<(), &'static str> {
+        let client = self.client.as_ref().ok_or("No validation client")?;
+        if !client.future_attempt_validation() {
+            return Err("Not a future-attempt validation client");
+        }
+        client.send(ClientCommand::Reconnect)
+    }
+
     #[cfg(feature = "test-support")]
     pub fn connect_recording_daemon(&mut self, cx: &mut Context<Self>) {
         self.attach_client(Client::recording(), cx);
@@ -4196,6 +4214,10 @@ impl Shell {
                         .child(Label::new(reason.notice())),
                 )
             })
+            .when(self.client.as_ref().is_some_and(|client| client.future_attempt_validation()), |region| region.child(
+                readable("stream-recovery-policy", client::FUTURE_ATTEMPT_LIMITATION)
+                    .text_sm().px_2().py_1().flex_shrink_0()
+            ))
             .when_some(self.client_steps.summary(), |region, summary| region.child(
                 readable("daemon-step-inventory", summary).text_sm().px_2().py_1().max_h(px(120.)).overflow_y_hidden()
             ))

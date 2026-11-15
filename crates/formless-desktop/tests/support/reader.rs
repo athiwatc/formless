@@ -488,9 +488,32 @@ fn lifecycle_status_invalidation_preserves_live_rows_draft_and_stream_basis(
         window.render_frame(cx);
         assert_eq!(
             window.find("status-intent").value(),
-            Some("Connected · live reader validation · stored-message fallback")
+            Some(formless_desktop::client::FUTURE_ATTEMPT_STATUS)
         );
         assert_eq!(shell.read(cx).live_stream_owner(), Some(current));
         assert_eq!(composer.read(cx).value().as_ref(), "Unsent ไทย 😀");
+    });
+}
+
+#[gpui_kit::test]
+fn v1_recovery_limitation_is_readable_without_breaking_small_window_reflow(
+    cx: &mut TestAppContext,
+) {
+    let (handle, shell) = open(cx, WIDE, 0, 0);
+    future_view(cx, handle, &shell);
+    cx.simulate_window_resize(handle.into(), MINIMUM);
+    step(cx, handle, |window, cx| {
+        shell.update(cx, |s, cx| s.set_text_scale(TextScale::LARGEST, window, cx));
+        settle_frames(window, cx);
+        assert_eq!(
+            window.find("stream-recovery-policy").value(),
+            Some(formless_desktop::client::FUTURE_ATTEMPT_LIMITATION)
+        );
+        assert_fitted(window, &shell, MINIMUM, cx, "v1 limitation at 200%");
+        shell.update(cx, |s, cx| {
+            s.focus_section(PageSection::Composer, window, cx)
+        });
+        settle_frames(window, cx);
+        assert_composer_in_view(window, MINIMUM, "v1 limitation with composer focused");
     });
 }
