@@ -52,8 +52,8 @@ jobs:
         run: cargo test --no-default-features --features daemon-tests --test daemon --locked
       - name: Native build
         run: cargo build --locked
-      - name: Native shell layout and keyboard dispatch tests
-        run: cargo test --features test-support --test shell --locked
+      - name: Headless shell layout, keyboard and streaming transport
+        run: cargo test --features test-support,daemon-tests --test shell --locked
       - name: Development package (no install, signing or launch)
         run: python scripts/package-desktop.py --profile dev --output "$RUNNER_TEMP/formless-desktop-package"
       - uses: actions/upload-artifact@v4

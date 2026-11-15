@@ -52,8 +52,8 @@ necessary evidence. No production source behavior changes in this increment.
    subscriber loss and the detached lockfile. Incremental no-blocker receipts
    do not replace this combined review. Resolve any finding with a regression.
 3. On the agreed current-main head, run portable model/IPC suites on supported
-   hosts. The existing `desktop.yml` includes the new model tests. Hosted CI has
-   not been executed for these unpublished local commits. Windows GNU model
+   hosts. The existing `desktop.yml` includes the new model tests and now enables
+   the transport-backed shell cases. Hosted CI has not been executed for these unpublished local commits. Windows GNU model
    compilation is not Windows execution, and no current Linux GUI acceptance
    or support-tier decision is inferred.
 4. Resolve the existing Formless Sol Validation approval

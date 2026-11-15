@@ -7541,6 +7541,6 @@ mod step_inventory_tests;
 #[path = "support/native_step.rs"]
 mod native_step_tests;
 
-#[cfg(all(unix, feature = "daemon-tests"))]
+#[cfg(feature = "daemon-tests")]
 #[path = "support/v1_end_to_end.rs"]
 mod v1_end_to_end;

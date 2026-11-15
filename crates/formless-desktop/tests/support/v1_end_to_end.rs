@@ -60,7 +60,11 @@ impl Fixture {
         let complete = (0..3).map(|_| Arc::new(Notify::new())).collect::<Vec<_>>();
         let extra = Arc::new(Notify::new());
         let calls = Arc::new(AtomicUsize::new(0));
-        let root = std::path::PathBuf::from("/tmp").join(format!(
+        #[cfg(unix)]
+        let temp = std::path::PathBuf::from("/tmp");
+        #[cfg(windows)]
+        let temp = std::env::temp_dir();
+        let root = temp.join(format!(
             "fl-v1-ui-{}",
             &uuid::Uuid::new_v4().to_string()[..8]
         ));
@@ -148,13 +152,11 @@ impl Fixture {
                 let daemon = daemon.clone();
                 async move { daemon.serve().await.map_err(|e| e.to_string()) }
             });
-            (
-                daemon,
-                server,
-                provider,
-                Endpoint(paths.socket_path()),
-                session,
-            )
+            #[cfg(unix)]
+            let endpoint = Endpoint(paths.socket_path());
+            #[cfg(windows)]
+            let endpoint = Endpoint(paths.pipe_name().into());
+            (daemon, server, provider, endpoint, session)
         });
         Self {
             runtime,
@@ -169,7 +171,7 @@ impl Fixture {
             extra,
         }
     }
-    fn send(&self) {
+    fn send(&self) -> String {
         let value = self
             .runtime
             .block_on(self.daemon.handle(Request::SendMessage {
@@ -179,7 +181,7 @@ impl Fixture {
                 client_msg_id: Some(uuid::Uuid::new_v4().to_string()),
             }))
             .unwrap();
-        assert!(value.get("run_id").is_some(), "{value}");
+        value["run_id"].as_str().expect("Run identity").to_owned()
     }
     fn snapshot(&self) -> Value {
         self.runtime
@@ -257,6 +259,11 @@ fn until(
 fn v1_real_daemon_to_view_waits_on_mid_answer_attach_and_reconnect_then_streams_next_attempt(
     cx: &mut TestAppContext,
 ) {
+    for retry in [false, true] {
+        exercise_v1_view(cx, retry);
+    }
+}
+fn exercise_v1_view(cx: &mut TestAppContext, retry: bool) {
     let env = credential_env::EnvGuard::isolated();
     env.set("FORMLESS_API_KEY", "private-v1-view-key");
     let f = Fixture::start();
@@ -296,7 +303,7 @@ fn v1_real_daemon_to_view_waits_on_mid_answer_attach_and_reconnect_then_streams_
         s.block_count() == 2 && s.last_block_preview() == "A prefix before attachment A final 😀"
     });
     f.wait("first idle", || f.snapshot()["running"] == false);
-    f.send();
+    let second_run = f.send();
     until(cx, handle, &shell, "eligible live prefix", |s, _| {
         s.block_count() == 4 && s.last_block_preview() == "B future prefix "
     });
@@ -348,39 +355,57 @@ fn v1_real_daemon_to_view_waits_on_mid_answer_attach_and_reconnect_then_streams_
             Some(FUTURE_ATTEMPT_LIMITATION)
         )
     });
-    f.complete[1].notify_one();
-    until(
-        cx,
-        handle,
-        &shell,
-        "persisted reconnected answer",
-        |s, _| {
-            s.block_count() == 4
-                && s.last_block_preview() == "B future prefix B suffix after reconnect B final 漢字"
-        },
-    );
-    f.wait("second idle", || f.snapshot()["running"] == false);
-    f.send();
-    until(cx, handle, &shell, "next eligible attempt", |s, _| {
-        s.block_count() == 6 && s.last_block_preview() == "C next eligible prefix "
-    });
+    if retry {
+        f.runtime
+            .block_on(f.daemon.handle(Request::RetryProviderRequest {
+                session_id: f.session.clone(),
+            }))
+            .unwrap();
+        until(cx, handle, &shell, "same-Run future retry", |s, _| {
+            s.block_count() == 4 && s.last_block_preview() == "C next eligible prefix "
+        });
+        assert_eq!(f.snapshot()["latest_run"]["run_id"], second_run);
+    } else {
+        f.complete[1].notify_one();
+        until(
+            cx,
+            handle,
+            &shell,
+            "persisted reconnected answer",
+            |s, _| {
+                s.block_count() == 4
+                    && s.last_block_preview()
+                        == "B future prefix B suffix after reconnect B final 漢字"
+            },
+        );
+        f.wait("second idle", || f.snapshot()["running"] == false);
+        let next_run = f.send();
+        assert_ne!(next_run, second_run);
+        until(cx, handle, &shell, "next eligible Run", |s, _| {
+            s.block_count() == 6 && s.last_block_preview() == "C next eligible prefix "
+        });
+    }
+    let messages = if retry { 4 } else { 6 };
     f.complete[2].notify_one();
     until(cx, handle, &shell, "final persisted answer", |s, _| {
-        s.block_count() == 6 && s.last_block_preview() == "C next eligible prefix C final ไทย"
+        s.block_count() == messages
+            && s.last_block_preview() == "C next eligible prefix C final ไทย"
     });
-    f.wait("third idle", || f.snapshot()["running"] == false);
+    f.wait("final idle", || f.snapshot()["running"] == false);
     assert_eq!(f.calls.load(Ordering::SeqCst), 3);
     step(cx, handle, |_, cx| {
         assert_eq!(shell.read(cx).composer(), &composer);
         assert_eq!(composer.read(cx).value().as_ref(), "Unsent ไทย 😀");
     });
-    assert_eq!(f.snapshot()["messages"].as_array().unwrap().len(), 6);
+    assert_eq!(f.snapshot()["messages"].as_array().unwrap().len(), messages);
+    eprintln!("v1_provider_view_case {{\"route\":\"{}\",\"provider_calls\":3,\"messages\":{messages},\"reconnected\":true,\"draft_preserved\":true}}", if retry {"same_run_retry"} else {"completion_then_new_run"});
     step(cx, handle, |_, cx| {
         shell.update(cx, |s, cx| s.connect_recording_daemon(cx))
     });
     f.finish();
 }
 
+#[cfg(unix)]
 #[gpui_kit::test]
 fn v1_older_peer_uses_only_canonical_subscription_through_the_actual_view(cx: &mut TestAppContext) {
     use formless_protocol::{RequestEnvelope, ServerMessage};
@@ -401,25 +426,38 @@ fn v1_older_peer_uses_only_canonical_subscription_through_the_actual_view(cx: &m
     let subscriptions = Arc::new(AtomicUsize::new(0));
     let seen = subscriptions.clone();
     let (stop, mut stopped) = tokio::sync::oneshot::channel::<()>();
-    let peer=runtime.block_on(async {
-        let listener=tokio::net::UnixListener::bind(&endpoint.0).unwrap();
+    let peer = {
+        let _entered = runtime.enter();
+        let listener = tokio::net::UnixListener::bind(&endpoint.0).unwrap();
         tokio::spawn(async move {
-            let (stream,_)=listener.accept().await.unwrap();let (read,mut write)=stream.into_split();let mut reader=BufReader::new(read);
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut reader = BufReader::new(read);
             loop {
-                let mut line=String::new();let count=tokio::select!{_=&mut stopped=>break,result=reader.read_line(&mut line)=>result.unwrap()};
-                if count==0 {break;}
-                let envelope:RequestEnvelope=serde_json::from_str(&line).unwrap();
-                let value=match envelope.request {
-                    Request::Ping=>json!({"min_protocol":1,"max_protocol":1,"features":[]}),
-                    Request::Subscribe {deltas:false,..}=>{seen.fetch_add(1,Ordering::SeqCst);json!({"subscribed":true})},
-                    Request::ListSessions=>json!([session]),
-                    Request::GetSession {id}=>json!({"session":{"id":id},"running":true,"messages":[{"id":"old-message","session_id":id,"seq":1,"role":"assistant","content":"Legacy canonical answer","created_at":"now"}],"pending_events":[]}),
-                    other=>panic!("unsupported or mutating request sent to old peer: {other:?}"),
+                let mut line = String::new();
+                let count = tokio::select! {_=&mut stopped=>break,result=reader.read_line(&mut line)=>result.unwrap()};
+                if count == 0 {
+                    break;
+                }
+                let envelope: RequestEnvelope = serde_json::from_str(&line).unwrap();
+                let value = match envelope.request {
+                    Request::Ping => json!({"min_protocol":1,"max_protocol":1,"features":[]}),
+                    Request::Subscribe { deltas: false, .. } => {
+                        seen.fetch_add(1, Ordering::SeqCst);
+                        json!({"subscribed":true})
+                    }
+                    Request::ListSessions => json!([session]),
+                    Request::GetSession { id } => {
+                        json!({"session":{"id":id},"running":true,"messages":[{"id":"old-message","session_id":id,"seq":1,"role":"assistant","content":"Legacy canonical answer","created_at":"now"}],"pending_events":[]})
+                    }
+                    other => panic!("unsupported or mutating request sent to old peer: {other:?}"),
                 };
-                let mut bytes=serde_json::to_vec(&ServerMessage::ok(envelope.id,value)).unwrap();bytes.push(b'\n');write.write_all(&bytes).await.unwrap();
+                let mut bytes = serde_json::to_vec(&ServerMessage::ok(envelope.id, value)).unwrap();
+                bytes.push(b'\n');
+                write.write_all(&bytes).await.unwrap();
             }
         })
-    });
+    };
     let (handle, shell) = open(cx, WIDE, 0, 0);
     step(cx, handle, |_, cx| {
         shell.update(cx, |s, cx| {
