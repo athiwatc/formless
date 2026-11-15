@@ -39,6 +39,7 @@ fn genuine_schema66_upgrade_preserves_unknown_plan_and_recovery_and_replay_evide
     let image = crate::review_file_io::ReviewImage {
         bytes: Some(b"original\r\n".to_vec()),
         security_complete: true,
+        unix_metadata: None,
         ..Default::default()
     };
     let metadata = crate::review_file_io::encode_before_metadata(&image).unwrap();

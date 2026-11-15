@@ -13,23 +13,59 @@ pub struct ModelItem {
     pub detail: Option<String>,
 }
 
+/// Exact token counts: keep decimal multiples familiar, mark binary prefixes
+/// explicitly, and never round an irregular window to a smaller number.
+fn model_context_label(value: u64) -> String {
+    let raw = value.to_string();
+    if value < 1000 {
+        return format!("{raw} ctx");
+    }
+    if !value.is_multiple_of(1000) {
+        if value.is_multiple_of(1_048_576) {
+            return format!("{}Mi ctx", value / 1_048_576);
+        }
+        if value.is_multiple_of(1024) {
+            return format!("{}Ki ctx", value / 1024);
+        }
+    }
+    let (places, suffix) = if value >= 1_000_000 {
+        (6, "M")
+    } else {
+        (3, "k")
+    };
+    let (whole, fraction) = raw.split_at(raw.len() - places);
+    let fraction = fraction.trim_end_matches('0');
+    let compact = if fraction.is_empty() {
+        format!("{whole}{suffix}")
+    } else {
+        format!("{whole}.{fraction}{suffix}")
+    };
+    format!(
+        "{} ctx",
+        if compact.len() <= raw.len() {
+            &compact
+        } else {
+            &raw
+        }
+    )
+}
+
 /// "200k · $3/$15 · vision · tools · ✗ test failed" from a model's
 /// `ListModels` metadata and remembered test (SPEC §4.2, §4.3).
 pub fn model_detail(meta: &serde_json::Value, test: &serde_json::Value) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
     if let Some(c) = meta["context"].as_u64() {
-        parts.push(if c >= 1_000_000 {
-            format!("{}M ctx", c / 1_000_000)
-        } else {
-            format!("{}k ctx", c / 1000)
-        });
+        parts.push(model_context_label(c));
     }
     if let (Some(i), Some(o)) = (meta["input_price"].as_f64(), meta["output_price"].as_f64()) {
         let fmt = |v: f64| {
             if v.fract() == 0.0 {
                 format!("{v:.0}")
             } else {
-                format!("{v:.2}")
+                format!("{v:.3}")
+                    .trim_end_matches('0')
+                    .trim_end_matches('.')
+                    .to_string()
             }
         };
         parts.push(format!("${}/${} per M", fmt(i), fmt(o)));
@@ -45,6 +81,8 @@ pub fn model_detail(meta: &serde_json::Value, test: &serde_json::Value) -> Optio
     if test.is_object() {
         parts.push(if test["ok"] == true {
             "✓ tested".into()
+        } else if test["transient"] == true {
+            "✗ temporary test failure (Ctrl+T to retry)".into()
         } else {
             "✗ test failed".into()
         });
@@ -112,6 +150,8 @@ pub struct ModelPicker {
     /// Why the list is empty (e.g. `GET /models` failed); typing a model
     /// id still works.
     pub error: Option<String>,
+    /// Rendered result capacity; ten before the first draw.
+    page_rows: std::cell::Cell<usize>,
 }
 
 impl ModelPicker {
@@ -122,6 +162,7 @@ impl ModelPicker {
             sel: 0,
             loading: false,
             error: None,
+            page_rows: std::cell::Cell::new(10),
         }
     }
 
@@ -184,6 +225,26 @@ impl ModelPicker {
         self.sel = (self.sel + 1).min(n.saturating_sub(1));
     }
 
+    pub(super) fn set_page_rows(&self, rows: usize) {
+        self.page_rows.set(rows.max(1));
+    }
+
+    pub(super) fn key(&mut self, key: &crossterm::event::KeyEvent) -> bool {
+        if let Some(changed) = super::query::edit(&mut self.query, key) {
+            if changed {
+                self.sel = 0;
+            }
+            return true;
+        }
+        if let Some(selected) =
+            super::query::navigate(key, self.sel, self.matches().len(), self.page_rows.get())
+        {
+            self.sel = selected;
+            return true;
+        }
+        false
+    }
+
     /// Whether rows should name their source.
     pub fn multi_source(&self) -> bool {
         let mut it = self.items.iter().map(|i| i.source.as_deref());
@@ -195,6 +256,107 @@ impl ModelPicker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn context_labels_preserve_exact_known_and_irregular_sizes() {
+        let fixtures: Vec<(u64, String)> =
+            serde_json::from_str(include_str!("../tests/fixtures/model-context-labels.json"))
+                .unwrap();
+        for (context, expected) in fixtures {
+            assert_eq!(
+                model_detail(
+                    &serde_json::json!({"context":context}),
+                    &serde_json::Value::Null
+                )
+                .as_deref(),
+                Some(expected.as_str()),
+                "{context}"
+            );
+        }
+        for context in [
+            serde_json::Value::Null,
+            serde_json::json!("131072"),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+        ] {
+            assert!(model_detail(
+                &serde_json::json!({"context":context}),
+                &serde_json::Value::Null
+            )
+            .is_none());
+        }
+        assert_eq!(model_detail(&serde_json::json!({"context":131072,"input_price":3,"output_price":15,"vision":true,"tools":true}), &serde_json::json!({"ok":true})).as_deref(), Some("128Ki ctx · $3/$15 per M · vision · tools · ✓ tested"));
+    }
+    #[test]
+    fn model_prices_keep_the_metadata_thousandths() {
+        for (input, output, expected) in [
+            ("0.000000075", "0.000000001", "$0.075/$0.001 per M"),
+            ("0.000000007", "0.000003", "$0.007/$3 per M"),
+            ("0", "0.000015", "$0/$15 per M"),
+            ("0.0000012", "0.00000123", "$1.2/$1.23 per M"),
+        ] {
+            let meta = formless_core::provider::parse_model_meta(
+                &serde_json::json!({"data":[{"id":"fixture-price","pricing":{"prompt":input,"completion":output}}]}),
+            );
+            assert_eq!(
+                model_detail(&meta["fixture-price"], &serde_json::Value::Null).as_deref(),
+                Some(expected)
+            );
+        }
+        assert!(model_detail(
+            &serde_json::json!({"input_price":0.001}),
+            &serde_json::Value::Null
+        )
+        .is_none());
+        assert!(model_detail(&serde_json::Value::Null, &serde_json::Value::Null).is_none());
+        assert_eq!(model_detail(&serde_json::json!({"input_price":0.001,"output_price":0.075,"vision":true,"tools":true}), &serde_json::json!({"ok":true})).as_deref(), Some("$0.001/$0.075 per M · vision · tools · ✓ tested"));
+    }
+    #[test]
+    fn transient_model_failures_explain_the_manual_retry() {
+        let failed = serde_json::json!({"ok":false,"transient":true});
+        assert_eq!(
+            model_detail(&serde_json::Value::Null, &failed).unwrap(),
+            "✗ temporary test failure (Ctrl+T to retry)"
+        );
+        assert_eq!(
+            model_detail(&serde_json::Value::Null, &serde_json::json!({"ok":false})).unwrap(),
+            "✗ test failed"
+        );
+    }
+    #[test]
+    fn query_chords_and_page_keys_clamp_to_matches_and_rendered_capacity() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let ids = (0..300)
+            .map(|i| format!("model-{i:03}"))
+            .collect::<Vec<_>>();
+        let mut picker =
+            ModelPicker::new(items(&ids.iter().map(String::as_str).collect::<Vec<_>>()));
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        assert!(picker.key(&key(KeyCode::PageDown)));
+        assert_eq!(picker.sel, 10);
+        picker.set_page_rows(7);
+        picker.key(&key(KeyCode::PageDown));
+        assert_eq!(picker.sel, 17);
+        picker.key(&key(KeyCode::End));
+        assert_eq!(picker.sel, 299);
+        picker.key(&key(KeyCode::PageDown));
+        assert_eq!(picker.sel, 299);
+        picker.key(&key(KeyCode::PageUp));
+        assert_eq!(picker.sel, 292);
+        picker.key(&key(KeyCode::Home));
+        assert_eq!(picker.sel, 0);
+        picker.query = "model 日本語".into();
+        picker.key(&KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(picker.query, "model ");
+        picker.key(&KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert!(picker.query.is_empty());
+        picker.key(&KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT));
+        assert!(picker.query.is_empty());
+        picker.query = "no matches".into();
+        picker.key(&key(KeyCode::End));
+        assert_eq!(picker.sel, 0);
+        picker.key(&key(KeyCode::PageDown));
+        assert_eq!(picker.sel, 0);
+    }
 
     fn items(ids: &[&str]) -> Vec<ModelItem> {
         ids.iter()
@@ -261,6 +423,41 @@ mod tests {
             Some("role · local · its default model")
         );
         assert!(got[2].recent && got[3].recent && !got[1].recent);
+    }
+
+    #[test]
+    fn recent_only_fallbacks_keep_response_order_after_existing_rows() {
+        let result = serde_json::json!({"aliases":{"short":"endpoint"},
+            "roles":[{"name":"fast","model":"endpoint"}], "models":["endpoint"],
+            "recent":["archived-newest","shared","endpoint","tie-a","模型-ไทย","tie-z"]});
+        let got = items_from_list(&result);
+        assert_eq!(
+            got.iter().map(|item| item.id.as_str()).collect::<Vec<_>>(),
+            [
+                "short",
+                "role:fast",
+                "endpoint",
+                "archived-newest",
+                "shared",
+                "tie-a",
+                "模型-ไทย",
+                "tie-z"
+            ]
+        );
+        assert!(
+            got[2].recent,
+            "existing provider rows retain membership markers"
+        );
+        let picker = ModelPicker::new(got);
+        assert_eq!(
+            picker
+                .matches()
+                .iter()
+                .filter(|(item, _)| item.source.as_deref() == Some("recent"))
+                .map(|(item, _)| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["archived-newest", "shared", "tie-a", "模型-ไทย", "tie-z"]
+        );
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //! focused when a Run finishes, fails or stalls, or needs the user.
 
 /// Escape sequences for one notification. `mode` is `tui.notify`;
-/// `term` is `$TERM_PROGRAM` (or a known terminal's marker) and `tmux`
+/// `term` is the selected terminal identity and `tmux`
 /// says whether to wrap the sequence for tmux passthrough.
 pub fn sequence(mode: &str, term: &str, tmux: bool, title: &str, body: &str) -> String {
     let clean = |s: &str| -> String {
@@ -17,10 +17,12 @@ pub fn sequence(mode: &str, term: &str, tmux: bool, title: &str, body: &str) -> 
         "desktop" => match term {
             // kitty: OSC 99, title then body.
             "kitty" => format!("\x1b]99;i=1:d=0;{title}\x1b\\\x1b]99;i=1:d=1:p=body;{body}\x1b\\"),
-            // urxvt, foot and others: OSC 777.
-            "" | "rxvt" | "foot" => format!("\x1b]777;notify;{title};{body}\x1b\\"),
-            // iTerm2, WezTerm, Ghostty, Windows Terminal: OSC 9.
-            _ => format!("\x1b]9;{title}: {body}\x07"),
+            // Only known OSC 9 terminals select that protocol.
+            "iTerm.app" | "WezTerm" | "Ghostty" | "WindowsTerminal" => {
+                format!("\x1b]9;{title}: {body}\x07")
+            }
+            // urxvt, foot and unknown terminals use the legacy 777 fallback.
+            _ => format!("\x1b]777;notify;{title};{body}\x1b\\"),
         },
         "bell" => String::new(),
         _ => return String::new(),
@@ -34,20 +36,124 @@ pub fn sequence(mode: &str, term: &str, tmux: bool, title: &str, body: &str) -> 
     format!("{osc}\x07")
 }
 
-/// The terminal, from the environment.
+/// The terminal, from environment markers. Multiplexers are not terminal
+/// identities; no external command is run while delivering a notification.
 pub fn terminal() -> String {
-    if std::env::var_os("WT_SESSION").is_some() {
-        return "WindowsTerminal".into();
+    terminal_from(
+        &std::env::var("TERM_PROGRAM").unwrap_or_default(),
+        &std::env::var("TERM").unwrap_or_default(),
+        &std::env::var("LC_TERMINAL").unwrap_or_default(),
+        std::env::var_os("WT_SESSION").is_some(),
+        std::env::var_os("KITTY_WINDOW_ID").is_some(),
+    )
+    .to_string()
+}
+
+fn known_terminal(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "kitty" => Some("kitty"),
+        "iterm.app" | "iterm2" => Some("iTerm.app"),
+        "wezterm" => Some("WezTerm"),
+        "ghostty" => Some("Ghostty"),
+        "windowsterminal" => Some("WindowsTerminal"),
+        "foot" | "footclient" => Some("foot"),
+        "rxvt" | "urxvt" => Some("rxvt"),
+        _ => None,
     }
-    if std::env::var_os("KITTY_WINDOW_ID").is_some() {
-        return "kitty".into();
+}
+
+fn terminal_from(
+    program: &str,
+    term: &str,
+    outer: &str,
+    windows: bool,
+    kitty: bool,
+) -> &'static str {
+    if windows {
+        return "WindowsTerminal";
     }
-    std::env::var("TERM_PROGRAM").unwrap_or_default()
+    if kitty {
+        return "kitty";
+    }
+    if let Some(known) = known_terminal(program).or_else(|| known_terminal(outer)) {
+        return known;
+    }
+    let term = term.to_ascii_lowercase();
+    if term == "foot" || term.starts_with("foot-") {
+        "foot"
+    } else if term == "rxvt"
+        || term.starts_with("rxvt-")
+        || term == "urxvt"
+        || term.starts_with("urxvt-")
+    {
+        "rxvt"
+    } else if term == "xterm-kitty" {
+        "kitty"
+    } else {
+        ""
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn environment_selection_reaches_existing_protocols_without_commands() {
+        for (program, term, outer, windows, kitty, expected) in [
+            ("tmux", "foot", "", false, false, "foot"),
+            ("screen", "rxvt-unicode-256color", "", false, false, "rxvt"),
+            ("vscode", "foot-direct", "", false, false, "foot"),
+            (
+                "tmux",
+                "screen-256color",
+                "iTerm2",
+                false,
+                false,
+                "iTerm.app",
+            ),
+            (
+                "WezTerm",
+                "xterm-256color",
+                "iTerm2",
+                false,
+                false,
+                "WezTerm",
+            ),
+            ("tmux", "screen-256color", "", false, true, "kitty"),
+            ("tmux", "screen-256color", "", true, true, "WindowsTerminal"),
+            ("", "xterm-kitty", "", false, false, "kitty"),
+            ("unknown", "screen-256color", "unknown", false, false, ""),
+        ] {
+            let selected = terminal_from(program, term, outer, windows, kitty);
+            assert_eq!(selected, expected);
+            let plain = sequence("desktop", selected, false, "t", "b");
+            let protocol = match expected {
+                "kitty" => "\x1b]99;",
+                "iTerm.app" | "WezTerm" | "WindowsTerminal" => "\x1b]9;",
+                _ => "\x1b]777;",
+            };
+            assert!(plain.starts_with(protocol), "{program}: {plain:?}");
+            let wrapped = sequence("desktop", selected, true, "t", "b");
+            assert_eq!(
+                wrapped,
+                format!(
+                    "\x1bPtmux;{}\x1b\\\x07",
+                    plain[..plain.len() - 1].replace('\x1b', "\x1b\x1b")
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_terminal_notification_uses_legacy_777() {
+        for terminal in ["tmux", "screen", "vscode", "Apple_Terminal", "unknown"] {
+            assert!(
+                sequence("desktop", terminal, false, "t", "b").starts_with("\x1b]777;notify;t;b"),
+                "{terminal}"
+            );
+        }
+    }
 
     #[test]
     fn picks_the_terminal_protocol() {

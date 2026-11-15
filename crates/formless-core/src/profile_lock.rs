@@ -563,6 +563,9 @@ mod tests {
 
     fn parent_cleanup_assertions() {
         let _env = crate::credential_env::EnvGuard::isolated();
+        // This exact-test child owns its backend. Even a cleanup-guard
+        // regression must never delete credentials from the native default slot.
+        keyring::set_default_credential_builder(keyring::mock::default_credential_builder());
         let (_fixture, base) = Fixture::new();
         let named = base.named("child").unwrap();
         let child = Paths::from_dirs(named.data_dir.clone(), named.config_dir.clone()).unwrap();

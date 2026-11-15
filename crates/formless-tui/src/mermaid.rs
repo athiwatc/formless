@@ -334,6 +334,22 @@ impl Canvas {
         x
     }
 
+    fn empty_text_slot(&self, x: usize, y: usize, width: usize) -> bool {
+        width > 0
+            && x.checked_add(width).is_some_and(|end| {
+                (x..end).all(|column| {
+                    matches!(
+                        self.rows
+                            .get(y)
+                            .and_then(|row| row.get(column))
+                            .copied()
+                            .unwrap_or(Cell::Empty),
+                        Cell::Empty
+                    )
+                })
+            })
+    }
+
     fn rect(&mut self, x: usize, y: usize, w: usize, h: usize, style: BoxStyle) {
         let [tl, tr, bl, br, hz, vt] = style.chars();
         for i in 1..w - 1 {
@@ -842,10 +858,6 @@ fn parse_state(src: &str) -> Option<Graph> {
     // A multi-line `note … end note` body is text, never states (#879).
     let mut in_note = false;
     for stmt in statements(src) {
-        let stmt = stmt.trim_end_matches('{').trim();
-        if stmt.is_empty() || stmt == "}" {
-            continue;
-        }
         if in_note {
             in_note = stmt != "end note";
             continue;
@@ -864,6 +876,12 @@ fn parse_state(src: &str) -> Option<Graph> {
             "note" | "end" | "classDef" | "class" | "style" | "%%"
         ) {
             continue;
+        }
+        // This renderer has one start/end identity and one layout direction.
+        // A structural scope cannot be flattened without changing the diagram.
+        // Labels and notes may contain braces as ordinary text.
+        if state_scope_delimiter(stmt) {
+            return None;
         }
         if let Some(rest) = stmt.strip_prefix("state ") {
             // `state "Long name" as Id` / `state Id`
@@ -912,6 +930,30 @@ fn parse_state(src: &str) -> Option<Graph> {
     (!g.nodes.is_empty()).then_some(g)
 }
 
+fn state_scope_delimiter(statement: &str) -> bool {
+    let mut quote = None;
+    let mut escaped = false;
+    let mut chars = statement.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if escaped {
+            escaped = false;
+        } else if quote.is_some() && ch == '\\' {
+            escaped = true;
+        } else if quote == Some(ch) {
+            quote = None;
+        } else if quote.is_none() {
+            match ch {
+                '"' | '`' => quote = Some(ch),
+                ':' => return false, // The rest of a state/transition label is text.
+                '%' if chars.peek() == Some(&'%') => return false,
+                '{' | '}' => return true,
+                _ => {}
+            }
+        }
+    }
+    false
+}
+
 // ----------------------------------------------------------- graph layout
 
 struct LNode {
@@ -937,13 +979,13 @@ struct LEdge {
 
 fn graph_lines(g: Graph, color: bool, width: usize) -> Option<Vec<Line<'static>>> {
     let preferred = g.left_right;
-    let canvas = layout(&g, preferred)
+    let canvas = layout(&g, preferred, width)
         .filter(|c| c.width() <= width)
-        .or_else(|| layout(&g, !preferred).filter(|c| c.width() <= width))?;
+        .or_else(|| layout(&g, !preferred, width).filter(|c| c.width() <= width))?;
     Some(canvas.into_lines(color))
 }
 
-fn layout(g: &Graph, lr: bool) -> Option<Canvas> {
+fn layout(g: &Graph, lr: bool, width: usize) -> Option<Canvas> {
     let n = g.nodes.len();
     let edges: Vec<(usize, usize, usize)> = g
         .edges
@@ -1194,12 +1236,77 @@ fn layout(g: &Graph, lr: bool) -> Option<Canvas> {
         v.o0 -= min_o;
     }
 
+    // Legacy labels share a bus row/column. Identify overlapping intervals
+    // before rank spacing, so only affected routes reserve source-side slots.
+    let mut slots = vec![Vec::<(usize, usize, usize)>::new(); layers_n];
+    for e in le
+        .iter()
+        .filter(|e| e.first && !g.edges[e.edge].label.is_empty())
+    {
+        let center = usize::try_from(center(&ln[e.b])).ok()?;
+        let start = center.checked_add(if lr { 0 } else { 2 })?;
+        let end = start.checked_add(if lr { 1 } else { g.edges[e.edge].label.width() })?;
+        slots[ln[e.a].layer].push((start, end, e.edge));
+    }
+    let mut source_label = vec![false; g.edges.len()];
+    for slots in &mut slots {
+        slots.sort_unstable();
+        let mut previous = None;
+        let mut end = 0;
+        for &(start, stop, edge) in slots.iter() {
+            if start < end {
+                source_label[edge] = true;
+                if let Some(previous) = previous {
+                    source_label[previous] = true;
+                }
+            }
+            end = end.max(stop);
+            previous = Some(edge);
+        }
+    }
+    let relocated = source_label.iter().any(|&label| label);
+    let mut departures = vec![0usize; ln.len()];
+    for e in le.iter().filter(|e| e.first) {
+        departures[e.a] += 1;
+    }
+    let mut max_source_label = 0;
+    for e in le.iter().filter(|e| e.first && source_label[e.edge]) {
+        // A shared source leg cannot identify one of its several arrows.
+        // Unsupported label glyphs also retain the existing source fallback.
+        let label = &g.edges[e.edge].label;
+        if departures[e.a] != 1 || label.chars().any(|c| c.width().is_none_or(|w| w == 0)) {
+            return None;
+        }
+        max_source_label = max_source_label.max(label.width());
+    }
+    if relocated && !lr {
+        let margin = max_source_label.checked_add(2)?;
+        let mut right = 0;
+        for v in &ln {
+            right = right.max(usize::try_from(v.o0).ok()?.checked_add(v.olen)?);
+        }
+        if right.checked_add(margin)? > width {
+            return None;
+        }
+        let shift = i64::try_from(margin).ok()?;
+        for v in &mut ln {
+            v.o0 = v.o0.checked_add(shift)?;
+        }
+    }
+
     // 6. Rank coordinates. Left-right gaps widen to fit edge labels; a
     //    top-down gap shrinks to two rows when every edge runs straight.
     let mut label_w = vec![0usize; layers_n];
+    let mut source_w = vec![0usize; layers_n];
+    let mut target_w = vec![0usize; layers_n];
     for e in le.iter().filter(|e| e.first) {
         let k = ln[e.a].layer;
         label_w[k] = label_w[k].max(g.edges[e.edge].label.width());
+        if source_label[e.edge] {
+            source_w[k] = source_w[k].max(g.edges[e.edge].label.width());
+        } else {
+            target_w[k] = target_w[k].max(g.edges[e.edge].label.width());
+        }
     }
     let mut starts = Vec::with_capacity(layers_n);
     let mut ends = Vec::with_capacity(layers_n);
@@ -1225,7 +1332,9 @@ fn layout(g: &Graph, lr: bool) -> Option<Canvas> {
         let straight = le.iter().filter(|e| ln[e.a].layer == k).all(|e| {
             center(&ln[e.a]) == center(&ln[e.b]) && (!e.first || g.edges[e.edge].label.is_empty())
         });
-        let gap = if lr && lw > 0 {
+        let gap = if lr && source_w[k] > 0 {
+            source_w[k].checked_add(target_w[k])?.checked_add(7)?
+        } else if lr && lw > 0 {
             5 + lw
         } else if !lr && straight {
             2
@@ -1235,11 +1344,16 @@ fn layout(g: &Graph, lr: bool) -> Option<Canvas> {
         r += extent + gap;
     }
 
+    if relocated && lr && ends.last()?.checked_add(1)? > width {
+        return None;
+    }
+
     // 7. Draw: edges, labels, then boxes on top.
     let at = |r: usize, o: usize| if lr { (r, o) } else { (o, r) };
     let mut cv = Canvas::default();
     let (arrow_fwd, arrow_back) = if lr { ('▶', '◀') } else { ('▼', '▲') };
     let mut labels: Vec<(usize, usize, &str)> = Vec::new();
+    let mut source_labels: Vec<(Vec<(usize, usize)>, &str)> = Vec::new();
     let mut junctions: Vec<(usize, usize, char)> = Vec::new();
     for e in &le {
         let (a, b) = (&ln[e.a], &ln[e.b]);
@@ -1250,7 +1364,12 @@ fn layout(g: &Graph, lr: bool) -> Option<Canvas> {
         } else {
             ends[a.layer]
         };
-        let bus = ends[a.layer] + 2;
+        let bus = ends[a.layer]
+            + if lr && source_w[a.layer] > 0 {
+                source_w[a.layer] + 3
+            } else {
+                2
+            };
         let entry = if b.real.is_some() {
             b.r0 - 1
         } else {
@@ -1283,8 +1402,26 @@ fn layout(g: &Graph, lr: bool) -> Option<Canvas> {
             cv.glyph(x, y, arrow_back, Ink::Edge);
         }
         if e.first && !edge.label.is_empty() {
-            let (x, y) = if lr { (bus + 2, bo) } else { (bo + 2, bus + 1) };
-            labels.push((x, y, &edge.label));
+            if source_label[e.edge] {
+                let mut candidates = Vec::new();
+                if lr {
+                    let x = ends[a.layer] + 2;
+                    if let Some(y) = ao.checked_sub(1) {
+                        candidates.push((x, y));
+                    }
+                    candidates.push((x, ao + 1));
+                } else {
+                    let y = ends[a.layer] + 1;
+                    candidates.push((ao + 2, y));
+                    if let Some(x) = ao.checked_sub(edge.label.width().checked_add(1)?) {
+                        candidates.push((x, y));
+                    }
+                }
+                source_labels.push((candidates, &edge.label));
+            } else {
+                let (x, y) = if lr { (bus + 2, bo) } else { (bo + 2, bus + 1) };
+                labels.push((x, y, &edge.label));
+            }
         }
     }
     for (x, y, text) in labels {
@@ -1311,6 +1448,16 @@ fn layout(g: &Graph, lr: bool) -> Option<Canvas> {
     }
     for (x, y, ch) in junctions {
         cv.glyph(x, y, ch, Ink::Border);
+    }
+    // Check the finished canvas, including boxes, junctions, arrows and all
+    // other labels. Never erase structure to make an affected label fit.
+    for (candidates, text) in source_labels {
+        let label_width = text.width();
+        let (x, y) = candidates.into_iter().find(|&(x, y)| {
+            x.checked_add(label_width).is_some_and(|end| end <= width)
+                && cv.empty_text_slot(x, y, label_width)
+        })?;
+        cv.text(x, y, text, Ink::Label);
     }
     Some(cv)
 }
@@ -1625,7 +1772,18 @@ fn pie(src: &str, color: bool, width: usize) -> Option<Vec<Line<'static>>> {
         .max()
         .unwrap_or(0)
         .min(28);
-    let bar_w = width.saturating_sub(label_w + 12).clamp(4, 40);
+    // Reserve the label, separating space and widest formatted percentage
+    // before allocating bar cells. Refuse a width that cannot show a readable
+    // four-cell bar; the caller can use its wider preview/pager fallback.
+    let percentages: Vec<_> = slices
+        .iter()
+        .map(|(_, value)| format!(" {:.1}%", value / total * 100.0))
+        .collect();
+    let percent_w = percentages.iter().map(|value| value.width()).max()?;
+    let bar_w = width.checked_sub(label_w + 1 + percent_w)?.min(40);
+    if bar_w < 4 {
+        return None;
+    }
     let max = slices.iter().map(|s| s.1).fold(0.0, f64::max);
     const PALETTE: [Color; 6] = [
         Color::Cyan,
@@ -1637,16 +1795,20 @@ fn pie(src: &str, color: bool, width: usize) -> Option<Vec<Line<'static>>> {
     ];
     let mut lines = Vec::new();
     for (i, (label, v)) in slices.iter().enumerate() {
-        let cells = ((v / max) * bar_w as f64).round() as usize;
+        let cells = if *v == 0.0 {
+            0
+        } else {
+            (((v / max) * bar_w as f64).round() as usize).max(1)
+        };
         let shown = super::ui::pad(label, label_w);
         lines.push(Line::from(vec![
             Span::raw(format!("{shown} ")),
-            Span::styled(
-                "█".repeat(cells.max(1)),
-                fg(color, PALETTE[i % PALETTE.len()]),
-            ),
-            Span::styled(format!(" {:.1}%", v / total * 100.0), super::ui::dim(color)),
+            Span::styled("█".repeat(cells), fg(color, PALETTE[i % PALETTE.len()])),
+            Span::styled(percentages[i].clone(), super::ui::dim(color)),
         ]));
+    }
+    if lines.iter().any(|line| line.width() > width) {
+        return None;
     }
     Some(lines)
 }
@@ -1662,6 +1824,82 @@ mod tests {
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect()
+    }
+
+    #[test]
+    fn converging_labels_remain_complete_in_both_layouts() {
+        for direction in ["TD", "LR"] {
+            for (first, second) in [
+                ("yes", "no"),
+                ("affirmative branch", "no"),
+                ("yes", "long negative branch"),
+                ("はい", "いいえ"),
+            ] {
+                let source = format!("flowchart {direction}\nA -->|{first}| C\nB -->|{second}| C");
+                let graph = parse_flowchart(&source).unwrap();
+                let canvas = layout(&graph, direction == "LR", 200).expect("room for both labels");
+                let output = canvas
+                    .into_lines(false)
+                    .iter()
+                    .map(Line::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(
+                    output.contains(first) && output.contains(second),
+                    "{source}\n{output}"
+                );
+                let locate = |needle: &str| {
+                    output
+                        .lines()
+                        .enumerate()
+                        .find_map(|(y, row)| row.find(needle).map(|byte| (row[..byte].width(), y)))
+                        .unwrap()
+                };
+                for (node, label) in [(" A ", first), (" B ", second)] {
+                    let (node_x, node_y) = locate(node);
+                    let source_x = node_x + 1;
+                    let (label_x, label_y) = locate(label);
+                    if direction == "LR" {
+                        assert_eq!(label_y.abs_diff(node_y), 1, "{output}");
+                        assert!(label_x > source_x, "{output}");
+                    } else {
+                        assert_eq!(label_y, node_y + 2, "{output}");
+                        assert!(
+                            label_x == source_x + 2 || label_x + label.width() + 1 == source_x,
+                            "{output}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn converging_labels_refuse_ambiguous_or_narrow_routes() {
+        for direction in ["TD", "LR"] {
+            let source = format!("flowchart {direction}\nA -->|yes| C\nB -->|no| C");
+            assert!(render(&source, false, 10).is_none());
+            let shared = format!("{source}\nA --> D");
+            assert!(render(&shared, false, 200).is_none());
+            let single = format!("flowchart {direction}\nA -->|yes| B");
+            assert!(text(&single, 200).join("\n").contains("yes"));
+        }
+    }
+
+    #[test]
+    fn relocated_labels_require_genuinely_empty_cells() {
+        let mut canvas = Canvas::default();
+        canvas.bits(0, 0, RIGHT, Dash::Solid);
+        canvas.glyph(1, 0, '▶', Ink::Text);
+        canvas.glyph(2, 0, ' ', Ink::Text);
+        canvas.text(3, 0, "label表", Ink::Text);
+        for x in 0..10 {
+            assert!(!canvas.empty_text_slot(x, 0, 1), "occupied column {x}");
+        }
+        assert!(canvas.empty_text_slot(10, 0, 3));
+        assert!(canvas.empty_text_slot(0, 1, 3));
+        assert!(!canvas.empty_text_slot(0, 1, 0));
+        assert!(!canvas.empty_text_slot(usize::MAX, 1, 2));
     }
 
     #[test]
@@ -1726,6 +1964,44 @@ mod tests {
     }
 
     #[test]
+    fn composite_state_scopes_refuse_flattening_at_every_width() {
+        for declaration in [
+            "state Parent {",
+            "state \"Parent label\" as Parent {",
+            "state Parent\n{",
+        ] {
+            for direction in ["", "direction LR\n"] {
+                let source = format!("stateDiagram-v2\n[*] --> Parent\n{declaration}\n{direction}[*] --> Inner\nInner --> [*]\n}}\nParent --> [*]");
+                assert!(parse_state(&source).is_none(), "{source}");
+                for width in [20, 80, 10_000] {
+                    assert!(render(&source, false, width).is_none(), "{source}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn flat_state_labels_and_note_braces_do_not_create_composite_scopes() {
+        let source = "stateDiagram-v2\ndirection LR\nstate \"Literal {braces}\" as A\n[*] --> A\nnote right of A\nstate Nested {\n  direction TD\n  [*] --> Fake\n}\nend note\nnote left of A: { inline note }\nA --> B: {transition label}\nB --> [*]";
+        let graph = parse_state(source).unwrap();
+        assert!(graph.left_right, "note direction never changes the graph");
+        assert_eq!(graph.edges.len(), 3);
+        let output = text(source, 200).join("\n");
+        assert!(
+            output.contains("Literal {braces}") && output.contains("{transition label}"),
+            "{output}"
+        );
+        assert!(!output.contains("Fake"), "{output}");
+        for label in [
+            r#"state "escaped \" { brace" as A"#,
+            "A: {description}",
+            "A --> B: closing } brace",
+        ] {
+            assert!(!state_scope_delimiter(label), "{label}");
+        }
+    }
+
+    #[test]
     fn sequence_lifelines_and_messages() {
         let out = text(
             "sequenceDiagram\nautonumber\nparticipant A as Alice\nA->>Bob: Hello\nBob-->>A: Hi\nloop retry\nA->>A: think\nend\nNote over A,Bob: done",
@@ -1752,6 +2028,46 @@ mod tests {
             "{out:?}"
         );
         assert!(out[2].contains("25.0%"));
+    }
+
+    #[test]
+    fn pie_zero_and_clamped_negative_slices_have_no_positive_bar() {
+        let source = "pie\n\"Zero\":0\n\"Negative\":-1\n\"Tiny\":0.000001\n\"Positive\":1";
+        for color in [false, true] {
+            let diagram = render(source, color, 60).unwrap();
+            for row in &diagram.lines[..2] {
+                let text: String = row.spans.iter().map(|span| span.content.as_ref()).collect();
+                assert!(text.ends_with("0.0%"), "{text}");
+                assert!(!text.contains('█'), "{text}");
+            }
+            assert_eq!(diagram.lines[2].spans[1].content, "█");
+            assert!(diagram.lines[3].spans[1].content.chars().count() > 1);
+            assert!(render("pie\n\"A\":0\n\"B\":-1", color, 60).is_none());
+        }
+    }
+
+    #[test]
+    fn pie_lines_and_titles_fit_requested_display_width_or_refuse() {
+        for source in [
+            "pie\n\"abcdefghijklmnopqrstuvwxyzab\":1".to_string(),
+            format!("pie title {}\n\"A\":1", "Long title ".repeat(8)),
+            format!("pie\n\"{}\":1\n\"ไทย👩🏽‍💻\":2", "表".repeat(30)),
+            "pie\n\"\":1".to_string(),
+        ] {
+            for color in [false, true] {
+                for width in 0..=120 {
+                    if let Some(diagram) = render(&source, color, width) {
+                        assert!(
+                            diagram.lines.iter().all(|line| line.width() <= width),
+                            "width {width}: {source}"
+                        );
+                    }
+                }
+                assert!(render(&source, color, 200).is_some());
+            }
+        }
+        assert!(render("pie\n\"abcdefghijklmnopqrstuvwxyzab\":1", false, 30).is_none());
+        assert!(render("pie\n\"A\":1", false, 3).is_none());
     }
 
     /// `;` inside a label or after a message's `:` is text (#878).
