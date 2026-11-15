@@ -30,6 +30,8 @@ pub enum Command {
     ToggleContext,
     ToggleTheme,
     ToggleEnterSends,
+    SaveDesktopPreferences,
+    ReloadDesktopPreferences,
     IncreaseTextSize,
     DecreaseTextSize,
     ResetTextSize,
@@ -84,6 +86,7 @@ pub struct State {
     /// Whether an input method is composing text in the composer.
     pub composing: bool,
     pub enter_sends: bool,
+    pub can_preferences: bool,
     pub sessions_shown: bool,
     pub context_shown: bool,
     pub dark: bool,
@@ -176,6 +179,8 @@ pub fn keys(command: Command) -> &'static [&'static str] {
         | Command::ToggleArchived
         | Command::ToggleTheme
         | Command::ToggleEnterSends
+        | Command::SaveDesktopPreferences
+        | Command::ReloadDesktopPreferences
         | Command::GoTo(_) => &[],
     }
 }
@@ -269,6 +274,8 @@ pub fn palette(state: &State) -> Vec<Entry> {
         Command::ResetTextSize,
         Command::ToggleTheme,
         Command::ToggleEnterSends,
+        Command::SaveDesktopPreferences,
+        Command::ReloadDesktopPreferences,
     ]);
     commands
         .into_iter()
@@ -323,9 +330,19 @@ pub fn entry(command: Command, state: &State) -> Entry {
             "Enter sends",
             if state.enter_sends { "Use Enter for newlines" } else { "Use Enter to send" }.to_string(),
             Group::Composer,
-            "Change send keys for this window; drafts and undo stay intact. Not saved between launches",
+            "Change send keys for this window; drafts and undo stay intact",
             Some(state.enter_sends),
             if !state.has_composer { Some(NO_COMPOSER) } else if state.composing { Some(COMPOSING) } else { None },
+        ),
+        Command::SaveDesktopPreferences => (
+            "Save desktop preferences", "Save desktop preferences".into(), Group::Appearance,
+            "Save text size, light/dark appearance, docked panels and send keys. No Session data or drafts", None,
+            (!state.can_preferences).then_some("Preferences are disabled or no path is available; use --preferences PATH"),
+        ),
+        Command::ReloadDesktopPreferences => (
+            "Reload desktop preferences", "Reload desktop preferences".into(), Group::Appearance,
+            "Reload saved view choices, replacing unsaved choices. Drafts stay intact", None,
+            if !state.can_preferences { Some("Preferences are disabled or no path is available; use --preferences PATH") } else if state.composing { Some(COMPOSING) } else { None },
         ),
         Command::Stop => (
             "Stop",
@@ -540,6 +557,7 @@ mod tests {
             archived_included: false,
             composing: false,
             enter_sends: true,
+            can_preferences: false,
             sessions_shown: true,
             context_shown: false,
             dark: false,
@@ -547,6 +565,28 @@ mod tests {
             destination: Destination::Chat,
             palette_open: false,
         }
+    }
+
+    #[test]
+    fn preference_commands_require_a_path_and_reload_respects_preedit() {
+        let mut s = state(RunState::Idle, true);
+        for command in [
+            Command::SaveDesktopPreferences,
+            Command::ReloadDesktopPreferences,
+        ] {
+            assert!(!entry(command, &s).enabled());
+            assert!(keys(command).is_empty());
+        }
+        s.can_preferences = true;
+        s.has_composer = false;
+        assert!(entry(Command::SaveDesktopPreferences, &s).enabled());
+        assert!(entry(Command::ReloadDesktopPreferences, &s).enabled());
+        s.composing = true;
+        assert!(entry(Command::SaveDesktopPreferences, &s).enabled());
+        assert_eq!(
+            entry(Command::ReloadDesktopPreferences, &s).disabled_reason,
+            Some(COMPOSING)
+        );
     }
 
     #[test]

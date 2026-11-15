@@ -6,7 +6,10 @@
 //! - `--connect PATH`: use a local daemon socket or full Windows pipe name.
 //! - `--sessions N`, `--blocks N`: size the fixture.
 //! - `--huge-block-mb N`: add one N MiB output block at the tail.
-//! - `--text-scale P`: start at P percent text size (100 to 200).
+//! - `--text-scale P`: override saved text size (100 to 200) for this launch.
+//! - `--preferences PATH`: use this explicit desktop view preference file.
+//! - `--no-preferences`: disable preference reads/writes. Fixture diagnostics
+//!   default to disabled; daemon mode defaults to the user's desktop config path.
 //! - `--window WxH`: open at this size instead of 1440x900.
 //! - `--keep-window`: do not ask the window to grow to fit the text size, so
 //!   a small window shows the reflowed shell. With `--smoke`, focus is then
@@ -53,7 +56,7 @@ use gpui_kit::prelude::*;
 use gpui_kit::{px, size, App, Bounds, Entity, Window, WindowBounds, WindowOptions};
 
 const USAGE: &str = "usage: formless-desktop [--connect LOCAL_SOCKET_OR_PIPE] [--sessions N] [--blocks N] [--huge-block-mb N] \
-                     [--text-scale P] [--window WxH] [--keep-window] \
+                     [--text-scale P] [--preferences PATH | --no-preferences] [--window WxH] [--keep-window] \
                      [--background] [--lifetime S] [--dump-a11y PATH] \
                      [--dump-platform-a11y PATH] \
                      [--smoke] [--stream-seconds S [--stream-rate R]]";
@@ -63,7 +66,9 @@ struct Options {
     sessions: usize,
     blocks: usize,
     huge_block_mb: usize,
-    text_scale: usize,
+    text_scale: Option<usize>,
+    preferences: Option<std::path::PathBuf>,
+    no_preferences: bool,
     window: (f32, f32),
     keep_window: bool,
     open_panel: Option<bool>,
@@ -78,13 +83,33 @@ struct Options {
     stream_rate: usize,
 }
 
+impl Options {
+    fn preference_path(
+        &self,
+        default: impl FnOnce() -> Option<std::path::PathBuf>,
+    ) -> Option<std::path::PathBuf> {
+        if self.no_preferences {
+            return None;
+        }
+        self.preferences
+            .clone()
+            .or_else(|| self.connect.as_ref().and_then(|_| default()))
+    }
+}
+
 fn parse_options() -> Result<Options, String> {
+    parse_options_from(std::env::args().skip(1))
+}
+
+fn parse_options_from(mut args: impl Iterator<Item = String>) -> Result<Options, String> {
     let mut options = Options {
         connect: None,
         sessions: 10_000,
         blocks: 10_000,
         huge_block_mb: 0,
-        text_scale: 100,
+        text_scale: None,
+        preferences: None,
+        no_preferences: false,
         window: (1440., 900.),
         keep_window: false,
         open_panel: None,
@@ -98,7 +123,6 @@ fn parse_options() -> Result<Options, String> {
         activate_a11y: false,
         stream_markdown: false,
     };
-    let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         let mut count = |name: &str| -> Result<usize, String> {
             let value = args.next().ok_or(format!("{name} needs a number"))?;
@@ -117,7 +141,15 @@ fn parse_options() -> Result<Options, String> {
             "--sessions" => options.sessions = count("--sessions")?,
             "--blocks" => options.blocks = count("--blocks")?,
             "--huge-block-mb" => options.huge_block_mb = count("--huge-block-mb")?,
-            "--text-scale" => options.text_scale = count("--text-scale")?,
+            "--text-scale" => options.text_scale = Some(count("--text-scale")?),
+            "--preferences" => {
+                let path = args
+                    .next()
+                    .filter(|s| !s.is_empty())
+                    .ok_or("--preferences needs a nonempty file path")?;
+                options.preferences = Some(path.into());
+            }
+            "--no-preferences" => options.no_preferences = true,
             "--window" => {
                 let value = args.next().ok_or("--window needs WIDTHxHEIGHT")?;
                 options.window = value
@@ -160,6 +192,9 @@ fn parse_options() -> Result<Options, String> {
         return Err(
             "--connect cannot be combined with synthetic streaming or huge-block fixtures".into(),
         );
+    }
+    if options.no_preferences && options.preferences.is_some() {
+        return Err("--preferences and --no-preferences cannot be combined".into());
     }
     Ok(options)
 }
@@ -600,6 +635,11 @@ fn main() {
         }
         let fixture_built = started.elapsed() - app_ready;
 
+        // Fixture/diagnostic invocations never load personal settings unless
+        // a path was explicitly requested. Loading does not create files.
+        let preference_store = options
+            .preference_path(formless_desktop::preferences::default_path)
+            .map(formless_desktop::preferences::Store::open);
         let bounds = Bounds::centered(None, size(px(options.window.0), px(options.window.1)), cx);
         let window_options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -616,8 +656,13 @@ fn main() {
                 "Formless (Phase 0 spike)"
             });
             let shell = cx.new(|cx| shell::Shell::new(&sessions, &running, blocks, window, cx));
-            let scale = TextScale::from_percent(options.text_scale.min(1_000) as u16);
             shell.update(cx, |shell, cx| {
+                if let Some(store) = preference_store {
+                    shell.attach_preferences(store, window, cx);
+                }
+                let scale = options.text_scale.map_or(shell.text_scale(), |percent| {
+                    TextScale::from_percent(percent.min(1_000) as u16)
+                });
                 if let Some(endpoint) = options.connect.clone() {
                     shell.connect_daemon(formless_desktop::client::Endpoint(endpoint), cx);
                 }
@@ -741,7 +786,7 @@ fn main() {
                             options.sessions,
                             options.blocks,
                             options.huge_block_mb,
-                            options.text_scale,
+                            shell.read(cx).text_scale().percent(),
                             app_ready.as_millis(),
                             fixture_built.as_millis(),
                             started.elapsed().as_millis()
@@ -810,4 +855,42 @@ fn main() {
             .detach();
         }
     });
+}
+
+#[cfg(test)]
+mod preference_option_tests {
+    use super::*;
+    fn options(args: &[&str]) -> Result<Options, String> {
+        parse_options_from(args.iter().map(|s| s.to_string()))
+    }
+    #[test]
+    fn fixtures_do_not_resolve_personal_preferences_and_explicit_paths_win() {
+        let default = options(&[]).unwrap();
+        assert!(default
+            .preference_path(|| panic!("fixture must not resolve personal preferences"))
+            .is_none());
+        assert!(default.text_scale.is_none());
+        let explicit =
+            options(&["--preferences", "private/view.json", "--text-scale", "175"]).unwrap();
+        assert_eq!(
+            explicit.preference_path(|| panic!("explicit path must not resolve default")),
+            Some("private/view.json".into())
+        );
+        assert_eq!(explicit.text_scale, Some(175));
+    }
+    #[test]
+    fn connected_mode_resolves_default_unless_disabled_and_rejects_conflicting_flags() {
+        let live = options(&["--connect", "private.sock"]).unwrap();
+        assert_eq!(
+            live.preference_path(|| Some("owned/preferences.json".into())),
+            Some("owned/preferences.json".into())
+        );
+        let disabled = options(&["--connect", "private.sock", "--no-preferences"]).unwrap();
+        assert!(disabled
+            .preference_path(|| panic!("disabled path must not be resolved"))
+            .is_none());
+        assert!(options(&["--preferences", ""]).is_err());
+        assert!(options(&["--preferences"]).is_err());
+        assert!(options(&["--preferences", "view.json", "--no-preferences"]).is_err());
+    }
 }

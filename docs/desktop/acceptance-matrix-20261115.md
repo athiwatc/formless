@@ -14,12 +14,12 @@ or authorization to merge while substantive gates fail.
 | Ordered streaming / reconnect | `deltas: false`; canonical snapshots and event invalidation; unknown mutations not replayed | Protocol cutoff/watermark/offset or equivalent ordering proof before enabling deltas |
 | Sessions | Directory, New Session, metadata/tags/pin/archive, instructions, persisted export | Remaining actions such as fork/comparisons; native file save/import and full-Profile backup; bounded per-Session view-state restoration |
 | Conversation and large output | Virtualized blocks, bounded previews, whole-output viewer, exact block source copy | Cross-block selection/copy, dedicated code-copy/link opening, richer attachments/artifacts/diagrams and native semantics |
-| Composer | Send/Steer/Queue/Stop, preserved drafts, IME guards, forecast consent; new per-window send-key choice | Attachments/drop/image paste/external editor, remaining Role/model/reference controls and durable send preferences |
+| Composer | Send/Steer/Queue/Stop, preserved drafts, IME guards, forecast consent; new per-window send-key choice | Attachments/drop/image paste/external editor, remaining Role/model/reference controls |
 | Context/resources | Recorded Session usage; bounded read-only Tools/Metrics/Proposals/Settings and exact details copy | General-purpose artifact/Invocation/Run detail selection/pinning/navigation, scoped diff and remaining editable resource actions |
 | Questions/security decisions/Step | Native user questions, forecast consent; approvals and Step explicitly hand off to TUI | Native security-approval parity; restored pending Step identities and reconnect/control parity |
 | Search/navigation | Loaded literal Search and native Find; separate persisted Profile Search | Remaining global action discovery and resource navigation parity; native usability acceptance |
 | Layout/focus/scaling | Responsive panes/overlays, modal traps/restoration, reflow and headless 200% checks | Resizable panel preferences, real selection/input/trackpad, human 200% and multimonitor/HiDPI acceptance |
-| Themes/preferences | Light/dark and 100–200% text; in-memory panel/send-key choices | System/high-contrast/colorblind themes, density/reduced motion/font choices and versioned durable preference storage/recovery |
+| Themes/preferences | Light/dark and 100–200% text; explicit versioned Save/Reload of view, docked-panel and send-key choices; corruption/conflict handling | System/high-contrast/colorblind themes, density/reduced motion/font choices, geometry/per-Session view persistence and native filesystem/latency acceptance |
 | Accessibility and IME | Semantic/headless tests; historical Mac adapter/capture evidence | VoiceOver/NVDA, real Thai/Japanese/dead-key input, current-head native semantics; session position/count adapter limitation |
 | Performance | Historical fixture measurements, bounded caches and virtual lists | Accepted budgets and current-head frontmost/native measurements including accessibility cost; no synthetic pass substitutes for them |
 | Platforms | Mac compilation/headless tests; prior native Mac evidence; historical Windows smoke evidence at older code | Current-head native Windows GUI and Linux build/run/render/accessibility; actual declared support tier |
@@ -39,7 +39,7 @@ That goal does not make the failed or missing evidence above pass.
    recovery is established; do not adopt its unverified edits.
 2. Finish exact-patch reviews of each new isolated commit. Parent-reported
    reviews found no confirmed blocker in `acabff81`, `dfbab768` and
-   `8a18d80a`; those reviews inspected tests/logs without rerunning them.
+   `8a18d80a` and `7658c8b5`; those reviews inspected tests/logs without rerunning them.
 3. Resolve the existing foreground approval and prior uncertain launch/control
    outcome through the supported approval/evidence path. No foreground action
    is repeated or substituted here, and no writer/Claude session is controlled.

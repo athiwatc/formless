@@ -13,6 +13,7 @@ pub mod full_view;
 pub mod memory;
 pub mod model;
 pub mod pages;
+pub mod preferences;
 pub mod profile_search;
 pub mod questions;
 pub mod replies;

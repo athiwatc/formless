@@ -129,6 +129,7 @@ Findings, measurements, the parity inventory and the open blockers are in
 [docs/desktop/phase0-findings.md](../../docs/desktop/phase0-findings.md).
 
 Current continuation evidence and remaining acceptance are recorded in
+[the durable view preferences report](../../docs/desktop/view-preferences-20261115.md),
 [the send-key choice report](../../docs/desktop/composer-send-keys-20261115.md),
 [the remaining acceptance matrix](../../docs/desktop/acceptance-matrix-20261115.md),
 [the native Find shortcut report](../../docs/desktop/native-find-20261115.md),
@@ -146,6 +147,38 @@ Current continuation evidence and remaining acceptance are recorded in
 [the recovery/packaging report](../../docs/desktop/recovery-and-packaging-20261114.md)
 and [the live-client report](../../docs/desktop/live-client-20261114.md). Later
 fixture-only evidence notes below describe historical checkpoints.
+
+## Desktop view preferences
+
+Daemon mode loads `Formless Desktop/preferences-v1.json` beneath the user's
+macOS `~/Library/Application Support`, Windows `%APPDATA%`, or Linux
+`$XDG_CONFIG_HOME` (absolute paths only, otherwise `~/.config`). Fixture mode
+loads no personal settings unless `--preferences PATH` is explicit.
+`--no-preferences` disables all preference reads and writes; use it for
+repeatable daemon diagnostics. `--text-scale P` overrides the saved size for
+this launch. No override is saved automatically.
+
+Commands → Save desktop preferences explicitly writes text size, light/dark
+appearance, docked sidebar/inspector choices and send keys. Reload desktop
+preferences explicitly replaces unsaved view choices; composer and answer
+drafts are untouched. Changes are not automatically saved on editing or exit.
+No Session identity, transcript, draft, daemon endpoint, credentials or
+security decisions are stored. Window geometry, per-Session anchors, font,
+density, reduced motion and system/high-contrast themes are not included.
+Overlays are never reopened from preferences.
+
+The first read creates no files. A missing file uses defaults. Invalid,
+oversized or future-schema files are preserved and Save refuses to replace
+them; repair or move the file, then Reload to recover. Save uses a stable
+advisory lock without waiting, checks the exact file loaded by this window,
+and stages/syncs a new file before replacement. A cooperating window's change
+causes refusal until explicit Reload; no retry or forced overwrite occurs.
+The lock file remains on disk. This is cooperative local-file protection,
+not a guarantee against a noncooperating writer, hostile directory races,
+filesystem stalls or power loss. File operations run only at startup and on
+explicit Save/Reload; no latency or cross-platform filesystem acceptance is
+claimed. Long status notices at minimum size/200% are keyboard-readable with
+Up/Down, Page Up/Down, Home and End while Status holds focus.
 
 ## Development packaging
 
@@ -311,8 +344,9 @@ remains Enter for Send/Steer, Shift+Enter for a newline, and Cmd/Ctrl+Enter
 for Queue during a Run. In newline mode, Enter and Shift+Enter insert newlines,
 Cmd/Ctrl+Enter invokes Send/Steer, and Queue remains a separate button. The
 composer displays the current keys. Changing this per-window choice preserves
-the draft, selection and undo/redo; it survives Session switches but is not
-saved between launches. Finish active input-method composition before changing
+the draft, selection and undo/redo; it survives Session switches. When desktop
+preferences are enabled, Save desktop preferences persists the choice for
+later launches. Finish active input-method composition before changing
 it. Open dialogs cannot be bypassed by the modified Enter chord.
 
 

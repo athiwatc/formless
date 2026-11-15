@@ -34,6 +34,7 @@ use crate::client::{self, Client, Command as ClientCommand, Update as ClientUpda
 use crate::commands::{self, Command};
 use crate::directory::{self, Directory};
 use crate::forecast;
+mod preferences;
 mod profile_search;
 mod questions;
 mod sessions;
@@ -176,6 +177,8 @@ pub fn bind_keys(cx: &mut App) {
                 | Command::ToggleArchived
                 | Command::ToggleTheme
                 | Command::ToggleEnterSends
+                | Command::SaveDesktopPreferences
+                | Command::ReloadDesktopPreferences
                 | Command::GoTo(_) => unreachable!("{command:?} has no global shortcut"),
             })
     });
@@ -297,6 +300,12 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("enter", RunSelectedCommand, Some(PALETTE_INPUT_CONTEXT)),
         KeyBinding::new("escape", ClosePalette, Some(PALETTE_INPUT_CONTEXT)),
         KeyBinding::new("escape", ClosePalette, Some(PALETTE_CONTEXT)),
+        KeyBinding::new("up", ScrollViewerUp, Some("FormlessStatus")),
+        KeyBinding::new("down", ScrollViewerDown, Some("FormlessStatus")),
+        KeyBinding::new("pageup", ScrollViewerPageUp, Some("FormlessStatus")),
+        KeyBinding::new("pagedown", ScrollViewerPageDown, Some("FormlessStatus")),
+        KeyBinding::new("home", ScrollViewerStart, Some("FormlessStatus")),
+        KeyBinding::new("end", ScrollViewerEnd, Some("FormlessStatus")),
         KeyBinding::new("up", ScrollViewerUp, Some(VIEWER_CONTEXT)),
         KeyBinding::new("down", ScrollViewerDown, Some(VIEWER_CONTEXT)),
         KeyBinding::new("pageup", ScrollViewerPageUp, Some(VIEWER_CONTEXT)),
@@ -764,6 +773,8 @@ pub struct Shell {
     block_copy_notice: Option<&'static str>,
     composer: Entity<TextareaState>,
     enter_sends: bool,
+    preferences: Option<crate::preferences::Store>,
+    preference_notice: Option<SharedString>,
     session_scroll: VirtualListScrollHandle,
     session_sizes: Rc<Vec<Size<Pixels>>>,
     sidebar_focus: FocusHandle,
@@ -940,6 +951,7 @@ impl Shell {
                 archived_included: false,
                 composing: false,
                 enter_sends: true,
+                can_preferences: false,
                 sessions_shown: true,
                 context_shown: true,
                 dark: false,
@@ -982,6 +994,8 @@ impl Shell {
             block_copy_notice: None,
             composer,
             enter_sends: true,
+            preferences: None,
+            preference_notice: None,
             session_scroll: VirtualListScrollHandle::new(),
             session_sizes,
             sidebar_focus: cx.focus_handle(),
@@ -2703,6 +2717,7 @@ impl Shell {
             archived_included: self.include_archived,
             composing,
             enter_sends: self.enter_sends,
+            can_preferences: self.preferences.is_some(),
             sessions_shown: layout.sidebar != SidebarMode::Collapsed,
             context_shown: layout.inspector != InspectorMode::Hidden,
             dark: cx.theme().is_dark(),
@@ -2765,6 +2780,28 @@ impl Shell {
         {
             return Some("Confirm or cancel the open forecast first");
         }
+        if matches!(
+            command,
+            Command::SaveDesktopPreferences | Command::ReloadDesktopPreferences
+        ) {
+            if self.background_inert(window) {
+                return Some(
+                    "Close the open dialog before saving or reloading desktop preferences",
+                );
+            }
+            if command == Command::ReloadDesktopPreferences {
+                if let Some(query) = self.browse_query(self.destination).cloned() {
+                    if query.update(cx, |query, cx| {
+                        query.marked_text_range(window, cx).is_some()
+                    }) {
+                        self.preference_notice =
+                            Some("Preferences unchanged: finish composing text first.".into());
+                        cx.notify();
+                        return Some(commands::COMPOSING);
+                    }
+                }
+            }
+        }
         if command == Command::ToggleEnterSends && self.background_inert(window) {
             return Some("Close the open dialog before changing send keys");
         }
@@ -2775,7 +2812,9 @@ impl Shell {
             // Send button or Enter can still be pressed while it runs: the
             // composer says why nothing was recorded.
             if reason == commands::COMPOSING {
-                self.composer_notice = Some(if command == Command::ToggleEnterSends {
+                self.composer_notice = Some(if command == Command::ReloadDesktopPreferences {
+                    format!("Preferences unchanged: {reason}.").into()
+                } else if command == Command::ToggleEnterSends {
                     format!("Send keys unchanged: {reason}.").into()
                 } else {
                     format!("Not sent: {reason}.").into()
@@ -2805,6 +2844,8 @@ impl Shell {
             }
             Command::ToggleSessions => self.toggle_panel(Region::Sidebar, window, cx),
             Command::ToggleContext => self.toggle_panel(Region::Inspector, window, cx),
+            Command::SaveDesktopPreferences => self.save_preferences(cx),
+            Command::ReloadDesktopPreferences => self.reload_preferences(window, cx),
             Command::ToggleEnterSends => {
                 self.invalidate_forecast(cx);
                 self.enter_sends = !self.enter_sends;
@@ -4978,6 +5019,48 @@ impl Shell {
             )
     }
 
+    /// Read a status section taller than the reflowed viewport from the
+    /// keyboard, without changing its focus or moving another region.
+    fn scroll_status(
+        &mut self,
+        to: WindowMove,
+        page: bool,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.fit(window) != Fit::Reflowed
+            || !self.status_focus.is_focused(window)
+            || self.background_inert(window)
+        {
+            return;
+        }
+        let metrics = self.page_metrics();
+        let Some((_, status)) = metrics
+            .sections
+            .iter()
+            .find(|(section, _)| *section == PageSection::Status)
+        else {
+            return;
+        };
+        let end = -self.page_scroll.max_offset().y;
+        let start = (metrics.viewport.top() - status.top()).clamp(end, px(0.));
+        let line = self.scaled(32.);
+        let step = if page {
+            (metrics.viewport.size.height - line).max(line)
+        } else {
+            line
+        };
+        let current = self.page_scroll.offset().y;
+        let y = match to {
+            WindowMove::Start => start,
+            WindowMove::End => end,
+            WindowMove::Earlier => (current + step).clamp(end, start),
+            WindowMove::Later => (current - step).clamp(end, start),
+        };
+        self.page_scroll.set_offset(point(px(0.), y));
+        cx.notify();
+    }
+
     /// The status line. On a reflowed page it can be off screen and nothing
     /// in it takes focus, so there it is a tab stop itself: focus brings it
     /// into view like any other part.
@@ -4988,7 +5071,7 @@ impl Shell {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let reflowed = reflowed || self.client.is_some();
+        let reflowed = reflowed || self.client.is_some() || self.preferences.is_some();
         let intent = if self.client.is_some() {
             self.client_status.clone()
         } else {
@@ -5063,6 +5146,19 @@ impl Shell {
             .text_color(cx.theme().muted_foreground)
             .border_t_1()
             .border_color(cx.theme().border)
+            .when_some(self.preference_notice.clone(), |status, notice| {
+                status.child(
+                    announced(
+                        div()
+                            .id("preferences-notice")
+                            .test_support()
+                            .role(Role::Status)
+                            .aria_value(notice.clone())
+                            .child(Label::new(notice)),
+                    )
+                    .text_xs(),
+                )
+            })
             .when(self.client.is_some() && self.client_attention, |status| {
                 status.child(readable(
                     "status-pending-attention",
@@ -5074,6 +5170,26 @@ impl Shell {
             // nothing is cut off at the side.
             status
                 .track_focus(&self.status_focus)
+                .key_context("FormlessStatus")
+                .aria_description("In a reflowed window, use Up/Down, Page Up/Down, Home and End to read long status text.")
+                .on_action(cx.listener(|this, _: &ScrollViewerUp, window, cx| {
+                    this.scroll_status(WindowMove::Earlier, false, window, cx)
+                }))
+                .on_action(cx.listener(|this, _: &ScrollViewerDown, window, cx| {
+                    this.scroll_status(WindowMove::Later, false, window, cx)
+                }))
+                .on_action(cx.listener(|this, _: &ScrollViewerPageUp, window, cx| {
+                    this.scroll_status(WindowMove::Earlier, true, window, cx)
+                }))
+                .on_action(cx.listener(|this, _: &ScrollViewerPageDown, window, cx| {
+                    this.scroll_status(WindowMove::Later, true, window, cx)
+                }))
+                .on_action(cx.listener(|this, _: &ScrollViewerStart, window, cx| {
+                    this.scroll_status(WindowMove::Start, false, window, cx)
+                }))
+                .on_action(cx.listener(|this, _: &ScrollViewerEnd, window, cx| {
+                    this.scroll_status(WindowMove::End, false, window, cx)
+                }))
                 .border_1()
                 .border_color(region_border(
                     self.status_focus.is_focused(window),

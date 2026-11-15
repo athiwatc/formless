@@ -18,6 +18,8 @@ mod archive_tests;
 mod export_tests;
 #[path = "support/instructions.rs"]
 mod instruction_tests;
+#[path = "support/preferences.rs"]
+mod preference_tests;
 #[path = "support/profile_search.rs"]
 mod profile_search_tests;
 #[path = "support/questions.rs"]
@@ -4788,18 +4790,23 @@ fn arrows_choose_a_row_and_an_unavailable_command_says_why(cx: &mut TestAppConte
         window.render_frame(cx);
         assert_eq!(
             palette_titles(window),
-            ["Larger text", "Smaller text", "Default text size"]
+            [
+                "Larger text",
+                "Smaller text",
+                "Default text size",
+                "Save desktop preferences"
+            ]
         );
         // Up at the top stays there; Down moves one row and no further
         // than the last.
         window.press("up", cx);
         window.render_frame(cx);
-        assert!(palette_status(window).starts_with("1 of 3 commands: Larger text"));
+        assert!(palette_status(window).starts_with("1 of 4 commands: Larger text"));
         window.press("down", cx);
         window.render_frame(cx);
         assert_eq!(window.find("palette-row-1").selected(), Some(true));
         assert_eq!(window.find("palette-row-0").selected(), Some(false));
-        assert!(palette_status(window).starts_with("2 of 3 commands: Smaller text"));
+        assert!(palette_status(window).starts_with("2 of 4 commands: Smaller text"));
         assert!(palette_status(window).ends_with(&format!("unavailable: {}.", commands::SMALLEST)));
         assert_eq!(
             window.find("palette-row-1").description(),
@@ -4809,7 +4816,10 @@ fn arrows_choose_a_row_and_an_unavailable_command_says_why(cx: &mut TestAppConte
             window.press("down", cx);
         }
         window.render_frame(cx);
-        assert!(palette_status(window).starts_with("3 of 3 commands: Default text size"));
+        assert!(palette_status(window).starts_with("4 of 4 commands: Save desktop preferences"));
+        window.press("up", cx);
+        window.render_frame(cx);
+        assert!(palette_status(window).starts_with("3 of 4 commands: Default text size"));
 
         // Enter on an unavailable command: nothing runs, the palette stays
         // and says why.
