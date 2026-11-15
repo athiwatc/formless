@@ -18,6 +18,9 @@ use crate::tools as toolreg;
 use crate::Paths;
 use correction_loop::{CorrectionBatch, CorrectionClass, CorrectionStreak};
 
+#[path = "transcript_attempts.rs"]
+mod transcript_attempts;
+
 // A std mutex (never held across .await) so broadcast() sends synchronously
 // and every subscriber sees events in emission order.
 type Subs = Arc<StdMutex<Vec<Subscriber>>>;
@@ -224,6 +227,17 @@ fn droppable_scope(ev: &Event) -> Option<(GapScope, DroppedEventKind)> {
             None,
             K::MessageDelta,
         ),
+        Event::TranscriptAttempt { update }
+            if matches!(&update.change, TranscriptAttemptChange::Delta { .. }) =>
+        {
+            (
+                update.session_id.as_str(),
+                update.run_id.as_str(),
+                None,
+                None,
+                K::MessageDelta,
+            )
+        }
         Event::ReasoningDelta {
             session_id, run_id, ..
         } => (
@@ -413,6 +427,7 @@ struct EventFilter {
     /// None = every Session.
     sessions: Option<std::collections::HashSet<String>>,
     deltas: bool,
+    transcript_attempts: bool,
     /// What the client calls itself, shown to the others on its Sessions.
     label: Option<String>,
 }
@@ -422,6 +437,7 @@ impl Default for EventFilter {
         Self {
             sessions: None,
             deltas: true,
+            transcript_attempts: false,
             label: None,
         }
     }
@@ -498,6 +514,8 @@ impl EventFilter {
             | Event::SessionDeleted { .. }
             | Event::ApprovalRequested { .. }
             | Event::UserQuestion { .. } => true,
+            Event::TranscriptAttempt { .. } if !self.transcript_attempts => false,
+            Event::StreamRestarted { .. } if self.transcript_attempts => false,
             Event::MessageDelta { .. } | Event::ReasoningDelta { .. } if !self.deltas => false,
             _ => match (ev.session_id(), &self.sessions) {
                 (Some(id), Some(wanted)) => wanted.contains(id),
@@ -851,6 +869,7 @@ pub struct Daemon {
     pub(crate) promotions: Arc<StdMutex<HashMap<String, crate::optimiser::PromotionTicket>>>,
     pub(crate) pending: Arc<StdMutex<HashMap<String, Arc<PendingEntry>>>>,
     subs: Subs,
+    transcript_attempts: Arc<transcript_attempts::Clock>,
     /// One HTTP client (connection pool + TLS sessions) for every provider
     /// call the daemon makes.
     http: reqwest::Client,
@@ -1076,6 +1095,7 @@ impl Daemon {
             promotions: Arc::new(StdMutex::new(HashMap::new())),
             pending: Arc::new(StdMutex::new(HashMap::new())),
             subs: Arc::new(StdMutex::new(Vec::new())),
+            transcript_attempts: Arc::new(transcript_attempts::Clock::default()),
             contexts: StdMutex::new(HashMap::new()),
             config: StdMutex::new(None),
             config_edit: StdMutex::new(()),
@@ -1970,48 +1990,14 @@ impl Daemon {
                 self.broadcast(Event::SessionUpdated { session: s.clone() });
                 Ok(serde_json::to_value(s)?)
             }
-            Request::GetSession { id } => {
-                let (session, messages, queued, last, latest_run, last_recap, running) = self
-                    .with_store(|st| {
-                        st.read_transaction(|st| {
-                            let s = st
-                                .get_session(&id)?
-                                .filter(|_| !st.session_deleted(&id).unwrap_or(false))
-                                .context(RequestFailure::not_found("session not found"))?;
-                            let m = st.list_messages(&id)?;
-                            let q = (st.queued_items(&id)?, st.session_plan_snapshot(&id)?);
-                            let l = st.unfinished_last_run(&id)?;
-                            let latest = st
-                                .last_run(&id)?
-                                .map(|(rid, _)| st.inspect_run(&rid))
-                                .transpose()?
-                                .flatten();
-                            let last_recap = st.latest_recorded_run_recap(&id)?;
-                            // Hold the writer mutex through this sample: terminal
-                            // capture commits its recap before releasing controls.
-                            #[cfg(test)]
-                            if let Some(hook) = self.session_snapshot_test.locked().clone() {
-                                hook();
-                            }
-                            let running = self.runs.locked().contains_key(&id)
-                                || self.session_is_publishing(&id);
-                            Ok((s, m, q, l, latest, last_recap, running))
-                        })
-                    })?;
-                // An unfinished last Run (interrupted/paused) gets a banner
-                // with Resume / Abandon in clients (SPEC §5.4).
-                let last_run = last.filter(|_| !running).map(|(run_id, status, error)| {
-                    json!({"run_id": run_id, "status": status, "error": error})
-                });
-                // `queued`: the texts (as before); `queued_items` adds ids
-                // for editing.
-                let (queued, (plan, plan_state)) = queued;
-                let texts: Vec<&str> = queued.iter().map(|q| q.content.as_str()).collect();
-                Ok(
-                    json!({"session": session, "messages": messages, "queued": texts, "queued_items": queued, "plan": plan, "plan_state": plan_state, "last_recap": last_recap, "step_mode": self.step_sessions.locked().contains(&id), "unfinished_run": last_run, "running": running,
-                        "latest_run": latest_run, "pending_events": self.pending_attention.locked().clone() }),
-                )
+            Request::GetTranscriptBarrier { id } => {
+                // No store lock is held while taking the producer clock. A
+                // start after this sample cannot precede the completed read.
+                let snapshot = self.transcript_snapshot(id)?;
+                let barrier = self.transcript_attempts.barrier();
+                Ok(json!({"snapshot":snapshot,"barrier":barrier,"mode":"future_attempts_only_v1"}))
             }
+            Request::GetSession { id } => self.transcript_snapshot(id),
             Request::ForkSession {
                 id,
                 name,
@@ -2623,7 +2609,9 @@ impl Daemon {
                 Ok(json!({"abandoned": abandoned}))
             }
             // Only meaningful per connection (see `handle_conn`).
-            Request::Subscribe { .. } => Err(anyhow!("subscribe applies to a client connection")),
+            Request::Subscribe { .. } | Request::SubscribeTranscriptAttempts { .. } => {
+                Err(anyhow!("subscribe applies to a client connection"))
+            }
             Request::DiffToolVersions { id, from, to } => {
                 let d = self
                     .with_reader(|st| st.tool_detail(&id))?
@@ -6524,6 +6512,7 @@ impl Daemon {
             let routing_call = crate::routing_observation::Call::responsible_step(
                 self.routing_recorder.call_sink(),
             );
+            let transcript_turn = uuid::Uuid::new_v4().to_string();
             let outcome=crate::routing_observation::scope(routing_call.clone(),async { 'request: loop {
                 let (sid, rid) = (session_id.to_string(), run_id.to_string());
                 let subs = self.subs.clone();
@@ -6532,6 +6521,11 @@ impl Daemon {
                 got_bytes.store(false, Ordering::SeqCst);
                 let hide_candidate = pipeline.as_ref().is_some_and(|p| p.options.has_schema());
                 self.mark_context_consumed(session_id,run_id,consumed_seq);
+                let mut correlated = transcript_attempts::Attempt::start(
+                    self.transcript_attempts.clone(), self.subs.clone(),
+                    session_id, run_id, &transcript_turn, consumed_seq, !hide_candidate,
+                );
+                let correlated_sink = correlated.sink();
                 let (mut request_attempt, mut retry_signal) = retry.begin();
                 let chat_fut = counted(
                     "run",
@@ -6548,6 +6542,11 @@ impl Daemon {
                             got_bytes2.store(true, Ordering::SeqCst);
                             if hide_candidate {
                                 return;
+                            }
+                            match kind {
+                                DeltaKind::Content => correlated_sink.delta(delta),
+                                DeltaKind::Restart => correlated_sink.restart(),
+                                _ => {}
                             }
                             let ev = match kind {
                                 DeltaKind::Bytes => return,
@@ -6578,6 +6577,7 @@ impl Daemon {
                 loop {
                     tokio::select! {
                         r = &mut chat_fut => {
+                            correlated.returned();
                             if !request_attempt.finish() || cancel.is_cancelled() {
                                 break 'request r;
                             }
@@ -14754,6 +14754,35 @@ impl Daemon {
                                 env.protocol
                             ),
                         )
+                    } else if let Request::SubscribeTranscriptAttempts { ref session_id } =
+                        env.request
+                    {
+                        if session_id.is_empty()
+                            || session_id.len() > 256
+                            || session_id.chars().any(char::is_control)
+                        {
+                            ServerMessage::err_code(
+                                env.id,
+                                codes::BAD_REQUEST,
+                                "invalid transcript Session identity".into(),
+                            )
+                        } else {
+                            let before = {
+                                let mut f = filter.locked();
+                                let before = f.sessions.take().unwrap_or_default();
+                                f.sessions =
+                                    Some(std::collections::HashSet::from([session_id.clone()]));
+                                f.deltas = false;
+                                f.transcript_attempts = true;
+                                before
+                            };
+                            let now = filter.locked().sessions.clone().unwrap_or_default();
+                            self.broadcast_clients(before.union(&now));
+                            ServerMessage::ok(
+                                env.id,
+                                json!({"subscribed":true,"conn":conn,"mode":"future_attempts_only_v1"}),
+                            )
+                        }
                     } else if let Request::Subscribe {
                         sessions,
                         deltas,
@@ -14777,6 +14806,7 @@ impl Daemon {
                             *f = EventFilter {
                                 sessions: sessions.map(|s| s.into_iter().collect()),
                                 deltas,
+                                transcript_attempts: false,
                                 label: label.or(f.label.take()),
                             };
                             before

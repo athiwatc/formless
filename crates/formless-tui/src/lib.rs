@@ -5557,6 +5557,9 @@ impl App {
         }
         self.maybe_notify(&ev);
         match ev {
+            // This client keeps legacy Subscribe. Correlated answer frames
+            // belong only to explicit future-attempt consumers.
+            Event::TranscriptAttempt { .. } => {}
             Event::MessageAppended {
                 session_id,
                 message,

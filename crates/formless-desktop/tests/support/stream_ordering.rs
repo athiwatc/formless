@@ -806,3 +806,6 @@ async fn context_window_retry_resets_the_unpersisted_candidate_after_compaction(
         "compaction retry must retire its unpersisted candidate"
     );
 }
+
+#[path = "future_attempts.rs"]
+mod future_attempts;

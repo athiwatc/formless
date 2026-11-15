@@ -500,3 +500,8 @@ open. The two new native gap-notice states compile but have not been run.
 The current-main integration and repaired discarded-candidate retry boundaries
 are recorded in [the reconciliation report](../../docs/desktop/stream-reconciliation-integration-20261115.md).
 They do not enable streaming or discharge the missing snapshot cutoff contract.
+
+An unenabled [future-attempt protocol and admission model](../../docs/desktop/future-attempt-protocol-20261115.md)
+adds a conservative producer barrier, turn/attempt correlation and byte offsets.
+The production desktop remains canonical-only until its reader integration and
+full streaming acceptance schedules pass independent review.

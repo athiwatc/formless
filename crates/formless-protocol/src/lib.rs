@@ -31,7 +31,55 @@ pub const FEATURES: &[&str] = &[
     "explicit_net_subdomains",
     "unsupported_error",
     "dropped_event_kinds",
+    "future_transcript_attempts_v1",
 ];
+
+/// A daemon-lifetime producer boundary, sampled AFTER a canonical snapshot.
+/// This admits future attempt starts only; it cannot replay an active prefix
+/// or classify canonical commits that race with delayed event publication.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TranscriptBarrier {
+    pub epoch: String,
+    pub cursor: u64,
+}
+
+/// Explicit correlation for ephemeral answer text. Canonical messages remain
+/// authoritative and must be obtained through a new owned snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TranscriptAttemptEvent {
+    pub epoch: String,
+    pub cursor: u64,
+    pub session_id: String,
+    pub run_id: String,
+    pub turn_id: String,
+    pub attempt_id: String,
+    #[serde(flatten)]
+    pub change: TranscriptAttemptChange,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "phase", rename_all = "snake_case")]
+pub enum TranscriptAttemptChange {
+    Started {
+        base_seq: i64,
+    },
+    Delta {
+        offset: u64,
+        text: String,
+    },
+    /// Always invalidates the provisional view. Returned means only that the
+    /// provider future ended, not that its candidate was accepted/persisted.
+    Closed {
+        bytes: u64,
+        reason: TranscriptAttemptClose,
+    },
+}
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TranscriptAttemptClose {
+    Returned,
+    Restarted,
+    Dropped,
+}
 
 /// The highest version both peers speak, if any.
 pub fn negotiate(their_min: u32, their_max: u32) -> Option<u32> {
@@ -1988,6 +2036,18 @@ pub enum Request {
         #[serde(default)]
         client: Option<String>,
     },
+    /// Opt in on this connection to correlated answer attempts for one Session.
+    /// Suppresses legacy answer/reasoning chunks. Subscribe resets this mode.
+    /// Requires future_transcript_attempts_v1; use GetTranscriptBarrier next.
+    SubscribeTranscriptAttempts {
+        session_id: String,
+    },
+    /// Canonical GetSession data plus a later producer barrier. Only attempts
+    /// started strictly after that barrier may be admitted. This is NOT a
+    /// canonical event cutoff: never discard canonical invalidations by cursor.
+    GetTranscriptBarrier {
+        id: String,
+    },
     ListSubagents {
         session_id: String,
     },
@@ -2808,6 +2868,10 @@ pub enum DroppedEventKind {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
+    /// Opt-in, correlated ephemeral answer attempt. Not canonical history.
+    TranscriptAttempt {
+        update: TranscriptAttemptEvent,
+    },
     RunStarted {
         session_id: String,
         run_id: String,
@@ -3197,6 +3261,7 @@ impl Event {
     /// The Session this event belongs to, or `None` for global events.
     pub fn session_id(&self) -> Option<&str> {
         match self {
+            Event::TranscriptAttempt { update } => Some(&update.session_id),
             Event::RunStarted { session_id, .. }
             | Event::MessageAppended { session_id, .. }
             | Event::MessageDelta { session_id, .. }
@@ -3776,5 +3841,61 @@ mod tests {
         }
         assert_eq!(sensitive_read_warning("fs:read:/private/project"), None);
         assert_eq!(sensitive_read_warning("fs:write:/private/project"), None);
+    }
+}
+
+#[cfg(test)]
+mod future_attempt_wire_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn future_attempt_requests_are_additive_and_legacy_subscribe_is_unchanged() {
+        for value in [
+            json!({"type":"subscribe_transcript_attempts","session_id":"s"}),
+            json!({"type":"get_transcript_barrier","id":"s"}),
+        ] {
+            let request: Request = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(serde_json::to_value(request).unwrap(), value);
+        }
+        let old = json!({"type":"subscribe","sessions":["s"],"deltas":false,"client":"old client"});
+        assert_eq!(
+            serde_json::to_value(serde_json::from_value::<Request>(old.clone()).unwrap()).unwrap(),
+            old
+        );
+        assert!(FEATURES.contains(&"future_transcript_attempts_v1"));
+    }
+    #[test]
+    fn attempts_have_explicit_scope_identity_offset_and_terminal_semantics() {
+        for change in [
+            TranscriptAttemptChange::Started { base_seq: 0 },
+            TranscriptAttemptChange::Delta {
+                offset: 13,
+                text: "ไทย😀".into(),
+            },
+            TranscriptAttemptChange::Closed {
+                bytes: 26,
+                reason: TranscriptAttemptClose::Returned,
+            },
+        ] {
+            let event = Event::TranscriptAttempt {
+                update: TranscriptAttemptEvent {
+                    epoch: "e".into(),
+                    cursor: u64::MAX,
+                    session_id: "s".into(),
+                    run_id: "r".into(),
+                    turn_id: "t".into(),
+                    attempt_id: "a".into(),
+                    change,
+                },
+            };
+            assert_eq!(event.session_id(), Some("s"));
+            let value = serde_json::to_value(&event).unwrap();
+            assert_eq!(
+                serde_json::to_value(serde_json::from_value::<Event>(value.clone()).unwrap())
+                    .unwrap(),
+                value
+            );
+            assert_eq!(value["type"], "transcript_attempt");
+        }
     }
 }
