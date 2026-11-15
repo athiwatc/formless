@@ -139,7 +139,7 @@ impl Default for TextScale {
     }
 }
 
-/// The seven destinations of the existing clients. Search is transient: it
+/// The main destinations and transient searches. Search is transient: it
 /// is reachable but not part of the persistent navigation order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Destination {
@@ -150,6 +150,7 @@ pub enum Destination {
     Proposals,
     Settings,
     Search,
+    ProfileSearch,
 }
 
 impl Destination {
@@ -172,11 +173,12 @@ impl Destination {
             Destination::Proposals => "Proposals",
             Destination::Settings => "Settings",
             Destination::Search => "Search",
+            Destination::ProfileSearch => "Profile Search",
         }
     }
 
     pub fn is_transient(self) -> bool {
-        self == Destination::Search
+        matches!(self, Destination::Search | Destination::ProfileSearch)
     }
 }
 
@@ -875,13 +877,15 @@ mod tests {
     }
 
     #[test]
-    fn all_seven_destinations_exist_and_only_search_is_transient() {
+    fn navigation_destinations_stay_persistent_and_both_search_scopes_are_transient() {
         let mut all = Destination::NAVIGATION.to_vec();
         all.push(Destination::Search);
-        assert_eq!(all.len(), 7);
-        assert_eq!(all.iter().collect::<HashSet<_>>().len(), 7);
+        all.push(Destination::ProfileSearch);
+        assert_eq!(all.len(), 8);
+        assert_eq!(all.iter().collect::<HashSet<_>>().len(), 8);
         assert!(Destination::NAVIGATION.iter().all(|d| !d.is_transient()));
         assert!(Destination::Search.is_transient());
+        assert!(Destination::ProfileSearch.is_transient());
     }
 
     #[test]

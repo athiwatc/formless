@@ -76,7 +76,25 @@ mod render {
     const WHOLE: Fit = Fit::Whole;
     const REFLOWED: Fit = Fit::Reflowed;
 
-    const STATES: [State; 47] = [
+    const STATES: [State; 49] = [
+        state(
+            "profile-search-light",
+            1440.,
+            900.,
+            LIGHT,
+            100,
+            Some("open-profile-search"),
+            WHOLE,
+        ),
+        state(
+            "minimum-profile-search-dark-200pct",
+            480.,
+            360.,
+            DARK,
+            200,
+            Some("open-profile-search"),
+            REFLOWED,
+        ),
         state(
             "session-archive-light",
             1440.,
@@ -832,7 +850,20 @@ mod render {
         } else if let Some(control) = click {
             cx.update_window(any, |_, window, cx| {
                 window.render_frame(cx);
-                if matches!(control,"open-session-edit"|"open-session-archive") {
+                if control=="open-profile-search" {
+                    use formless_desktop::client::{Update,Command as WireCommand};
+                    let sessions=fixture::sessions(3);
+                    shell.update(cx,|shell,cx|{
+                        shell.connect_recording_daemon(cx);
+                        shell.apply_client_update(Update::Connection{ready:true,notice:"Connected view fixture".into()},window,cx);
+                        shell.apply_client_update(Update::Sessions(sessions.clone()),window,cx);
+                        shell.run_command(Command::GoTo(Destination::ProfileSearch),window,cx);
+                    });
+                    window.input("needle",cx);window.press("enter",cx);
+                    let (operation,query)=shell.update(cx,|shell,_|shell.take_client_commands()).into_iter().find_map(|command|match command {WireCommand::SearchProfile{operation,query,..}=>Some((operation,query)),_=>None}).unwrap();
+                    let hits=(0..50).map(|i|formless_protocol::SearchHit{session_id:sessions[i%3].id.clone(),session_name:format!("Search result {i} ไทย 漢字 😀"),message_id:format!("native-search-message-{i}"),seq:i as i64,role:"assistant".into(),snippet:"A persisted message snippet ไทย 漢字 😀. This is incomplete text, not a full message.".into(),created_at:"2026-11-15".into()}).collect();
+                    shell.update(cx,|shell,cx|shell.apply_client_update(Update::ProfileSearch{connection:0,operation,query,result:Ok(hits)},window,cx));
+                } else if matches!(control,"open-session-edit"|"open-session-archive") {
                     use formless_desktop::client::{Update,Command as WireCommand};
                     let sessions=fixture::sessions(3);
                     shell.update(cx,|shell,cx|{
@@ -982,6 +1013,104 @@ mod render {
             })
             .expect("offscreen window is open");
             cx.run_until_parked();
+            if control == "open-profile-search" {
+                cx.update_window(any, |_, window, cx| {
+                    for _ in 0..5 {
+                        window.render_frame(cx);
+                        window.simulate_next_frame(cx);
+                    }
+                    assert!(
+                        inside(window, "profile-search-submit", viewport),
+                        "{name}: Search outside viewport"
+                    );
+                })
+                .unwrap();
+                capture(&mut cx, "-query");
+                cx.update_window(any, |_, window, cx| {
+                    window.press("down", cx);
+                    for _ in 0..6 {
+                        window.render_frame(cx);
+                        window.simulate_next_frame(cx);
+                    }
+                    assert!(
+                        inside(window, ("profile-search-row", 1usize), viewport),
+                        "{name}: selected result outside viewport: {:?}",
+                        window.find(("profile-search-row", 1usize)).bounds()
+                    );
+                })
+                .unwrap();
+                capture(&mut cx, "-results");
+                cx.update_window(any, |_, window, cx| {
+                    shell.update(cx, |shell, cx| {
+                        shell.apply_client_update(
+                            formless_desktop::client::Update::Connection {
+                                ready: false,
+                                notice: "Disconnected fixture".into(),
+                            },
+                            window,
+                            cx,
+                        );
+                        shell
+                            .profile_query()
+                            .update(cx, |query, cx| query.focus(window, cx));
+                    });
+                    for _ in 0..6 {
+                        window.render_frame(cx);
+                        window.simulate_next_frame(cx);
+                    }
+                    assert_eq!(window.find("profile-search-open").disabled(), Some(true));
+                    assert!(window.try_find(("profile-search-row", 0usize)).is_none());
+                })
+                .unwrap();
+                capture(&mut cx, "-disconnected");
+                cx.update_window(any, |_, window, cx| {
+                    use formless_desktop::client::{Command as WireCommand, Update};
+                    shell.update(cx, |shell, cx| {
+                        shell.apply_client_update(
+                            Update::Connection {
+                                ready: true,
+                                notice: "Reconnected fixture".into(),
+                            },
+                            window,
+                            cx,
+                        )
+                    });
+                    window.press("enter", cx);
+                    let (operation, query) = shell
+                        .update(cx, |shell, _| shell.take_client_commands())
+                        .into_iter()
+                        .find_map(|command| match command {
+                            WireCommand::SearchProfile {
+                                operation, query, ..
+                            } => Some((operation, query)),
+                            _ => None,
+                        })
+                        .unwrap();
+                    shell.update(cx, |shell, cx| {
+                        shell.apply_client_update(
+                            Update::ProfileSearch {
+                                connection: 0,
+                                operation,
+                                query,
+                                result: Err("Native fixture read error".into()),
+                            },
+                            window,
+                            cx,
+                        )
+                    });
+                    for _ in 0..4 {
+                        window.render_frame(cx);
+                        window.simulate_next_frame(cx);
+                    }
+                    assert!(window
+                        .find("profile-search-notice")
+                        .value()
+                        .unwrap()
+                        .contains("Search failed"));
+                })
+                .unwrap();
+                capture(&mut cx, "-error");
+            }
             if control == "open-session-archive" {
                 cx.update_window(any, |_, window, cx| {
                     for _ in 0..30 {
@@ -1459,6 +1588,7 @@ mod render {
                 .expect("offscreen window is open");
             }
             if fit == Fit::Reflowed
+                && control != "open-profile-search"
                 && !control.starts_with("open-daemon-")
                 && control != "open-session-edit"
                 && control != "open-session-archive"
@@ -1489,6 +1619,7 @@ mod render {
                 .expect("offscreen window is open");
             }
             if control != "open-session-edit"
+                && control != "open-profile-search"
                 && control != "open-session-archive"
                 && control != "open-run-forecast"
                 && !control.starts_with("open-profile-questions")

@@ -126,6 +126,9 @@ async fn until(client: &Client, stage: &'static str, mut predicate: impl FnMut(U
     loop {
         for update in client.drain() {
             let summary = match &update {
+                Update::ProfileSearch { query, result, .. } => {
+                    format!("profile search {query}: ok={}", result.is_ok())
+                }
                 Update::Connection { ready, notice } => format!("connection {ready}: {notice}"),
                 Update::Snapshot {
                     generation,
@@ -469,6 +472,32 @@ async fn real_daemon_provider_send_navigation_resources_and_reconnect() {
         1,
         "one user send caused one provider request"
     );
+    // Search is a separate, Profile-wide read: it includes archived stored
+    // messages and never starts another provider request.
+    daemon
+        .handle(Request::SetSessionArchived {
+            id: a.clone(),
+            archived: true,
+        })
+        .await
+        .unwrap();
+    let operation = uuid::Uuid::new_v4();
+    client
+        .send(Command::SearchProfile {
+            connection: client.connection(),
+            operation,
+            query: "Canonical provider".into(),
+        })
+        .unwrap();
+    until(&client,"profile-search-archived",|update|matches!(update,Update::ProfileSearch{operation:ack,result:Ok(hits),..} if ack==operation && hits.iter().any(|hit|hit.session_id==a && hit.role=="assistant" && hit.snippet.contains("Canonical provider reply")))).await;
+    assert_eq!(requests.lock().unwrap().len(), 1);
+    daemon
+        .handle(Request::SetSessionArchived {
+            id: a.clone(),
+            archived: false,
+        })
+        .await
+        .unwrap();
     for abandon in [false, true] {
         let request_count = if abandon { 4 } else { 2 };
         client

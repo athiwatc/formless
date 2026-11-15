@@ -30,6 +30,7 @@ use tokio::sync::{mpsc as queue, watch};
 
 use crate::forecast;
 use crate::model::{Destination, Intent};
+use crate::profile_search;
 use crate::questions;
 use crate::replies::{self, SessionSnapshot};
 use crate::session_edit;
@@ -40,6 +41,12 @@ const REFRESH: Duration = Duration::from_millis(250);
 
 #[derive(Debug)]
 pub enum Update {
+    ProfileSearch {
+        connection: u64,
+        operation: uuid::Uuid,
+        query: String,
+        result: Result<Vec<formless_protocol::SearchHit>, String>,
+    },
     Connection {
         ready: bool,
         notice: String,
@@ -99,6 +106,11 @@ pub enum Update {
 }
 
 pub enum Command {
+    SearchProfile {
+        connection: u64,
+        operation: uuid::Uuid,
+        query: String,
+    },
     Reconnect,
     Select {
         session_id: Option<String>,
@@ -216,6 +228,7 @@ impl Client {
                 | Command::AnswerQuestion { .. }
                 | Command::EditSession { .. }
                 | Command::ReadSessionDetails { .. }
+                | Command::SearchProfile { .. }
         ) && !self.is_ready()
         {
             return Err("Not connected; the action was not queued.");
@@ -304,6 +317,10 @@ fn advance_epoch(epoch: &AtomicU64) {
 
 #[derive(Debug)]
 enum Pending {
+    ProfileSearch {
+        operation: uuid::Uuid,
+        query: String,
+    },
     Ping,
     Subscribe,
     Sessions,
@@ -543,6 +560,44 @@ impl Engine {
 
     fn command(&mut self, command: Command) {
         match command {
+            Command::SearchProfile {
+                connection,
+                operation,
+                query,
+            } => {
+                if !self.ready
+                    || connection != self.connection
+                    || profile_search::query(&query).is_err()
+                {
+                    self.updates.push(Update::ProfileSearch {
+                        connection: self.connection,
+                        operation,
+                        query,
+                        result: Err(
+                            "Connection or query is invalid; search again after connecting.".into(),
+                        ),
+                    });
+                } else if self
+                    .pending
+                    .values()
+                    .filter(|p| matches!(p, Pending::ProfileSearch { .. }))
+                    .count()
+                    >= 2
+                {
+                    self.updates.push(Update::ProfileSearch{connection:self.connection,operation,query,result:Err("Two searches are still outstanding. Wait for their reply or reconnect before searching again.".into())});
+                } else {
+                    let query = profile_search::query(&query)
+                        .expect("query checked above")
+                        .to_string();
+                    self.request(
+                        Request::SearchSessions {
+                            query: query.clone(),
+                            limit: Some(profile_search::LIMIT),
+                        },
+                        Pending::ProfileSearch { operation, query },
+                    );
+                }
+            }
             Command::AnswerQuestion {
                 connection,
                 operation,
@@ -955,6 +1010,14 @@ impl Engine {
                         }),
                     }
                 }
+            }
+            Pending::ProfileSearch { operation, query } => {
+                self.updates.push(Update::ProfileSearch {
+                    connection: self.connection,
+                    operation,
+                    query,
+                    result: result.and_then(profile_search::decode),
+                })
             }
             Pending::Page(destination) => self.updates.push(Update::Page {
                 destination,
@@ -1841,6 +1904,55 @@ mod tests {
         engine.dirty_list = false;
         engine.updates.clear();
         engine
+    }
+
+    #[test]
+    fn profile_search_is_bounded_read_only_and_its_replies_keep_the_original_query() {
+        let mut engine = ready();
+        let operations = [
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+        ];
+        for (i, operation) in operations.into_iter().enumerate() {
+            engine.command(Command::SearchProfile {
+                connection: 0,
+                operation,
+                query: format!(" query-{i} "),
+            });
+        }
+        assert_eq!(engine.outgoing.len(), 2);
+        assert!(engine.updates.iter().any(|u|matches!(u,Update::ProfileSearch{operation,result:Err(_),..} if operation==&operations[2])));
+        let first = engine.outgoing.pop_front().unwrap();
+        let second = engine.outgoing.pop_front().unwrap();
+        assert!(
+            matches!(&first.request,Request::SearchSessions{query,limit:Some(50)} if query=="query-0")
+        );
+        assert!(
+            matches!(&second.request,Request::SearchSessions{query,limit:Some(50)} if query=="query-1")
+        );
+        engine.select(Some("unrelated-session".into()), 99);
+        respond(
+            &mut engine,
+            second.id,
+            json!([{"session_id":"s","session_name":"ไทย 😀","message_id":"m","seq":1,"role":"assistant","snippet":"found","created_at":"now"}]),
+        );
+        assert!(engine.updates.iter().any(|u|matches!(u,Update::ProfileSearch{connection:0,operation,query,result:Ok(hits)} if *operation==operations[1] && query=="query-1" && hits[0].session_id=="s")));
+        respond(&mut engine, first.id, Value::Null);
+        assert!(engine.updates.iter().any(|u|matches!(u,Update::ProfileSearch{operation,query,result:Err(_),..} if *operation==operations[0] && query=="query-0")));
+        engine.outgoing.clear();
+        for (connection, query) in [
+            (1, "valid".to_string()),
+            (0, " ".into()),
+            (0, "x".repeat(257)),
+        ] {
+            engine.command(Command::SearchProfile {
+                connection,
+                operation: uuid::Uuid::new_v4(),
+                query,
+            });
+            assert!(engine.outgoing.is_empty());
+        }
     }
 
     fn snapshot(id: &str, text: &str) -> Value {

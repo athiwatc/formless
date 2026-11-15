@@ -76,6 +76,7 @@ pub struct State {
     /// A current, connected canonical snapshot has a recoverable last Run.
     pub can_recover: bool,
     pub can_questions: bool,
+    pub can_search_profile: bool,
     pub can_edit_session: bool,
     pub can_browse_archived: bool,
     pub archived_included: bool,
@@ -245,6 +246,7 @@ pub fn palette(state: &State) -> Vec<Entry> {
     ]);
     commands.extend(Destination::NAVIGATION.map(Command::GoTo));
     commands.push(Command::GoTo(Destination::Search));
+    commands.push(Command::GoTo(Destination::ProfileSearch));
     commands.extend([
         Command::FocusNextRegion,
         Command::FocusPreviousRegion,
@@ -469,11 +471,14 @@ pub fn entry(command: Command, state: &State) -> Entry {
                 "Browse and filter fixture Sessions (archived Sessions excluded)"
             } else if destination == Destination::Search {
                 "Find literal, case-sensitive text in the loaded transcript only"
+            } else if destination == Destination::ProfileSearch {
+                "Search persisted messages across this connected Profile, including archived Sessions"
             } else {
                 "Scaffold: this destination has no view yet"
             },
             Some(state.destination == destination),
-            None,
+            (destination == Destination::ProfileSearch && !state.can_search_profile)
+                .then_some("Connect to a Profile first"),
         ),
         Command::ShowCommands => (
             "Commands",
@@ -506,6 +511,7 @@ mod tests {
             has_composer: true,
             can_recover: false,
             can_questions: false,
+            can_search_profile: false,
             can_edit_session: false,
             can_browse_archived: false,
             archived_included: false,

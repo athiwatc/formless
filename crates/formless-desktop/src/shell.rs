@@ -34,6 +34,7 @@ use crate::client::{self, Client, Command as ClientCommand, Update as ClientUpda
 use crate::commands::{self, Command};
 use crate::directory::{self, Directory};
 use crate::forecast;
+mod profile_search;
 mod questions;
 mod sessions;
 use crate::full_view;
@@ -92,6 +93,10 @@ gpui_kit::actions!(
         SearchPrevious,
         SearchOpen,
         SearchBack,
+        ProfileSearchNext,
+        ProfileSearchPrevious,
+        ProfileSearchOpen,
+        ProfileSearchBack,
         CloseViewer,
         ResourceNext,
         ResourcePrevious,
@@ -120,6 +125,8 @@ const VIEWER_WIDTH_CACHE: usize = 128;
 /// text input's own, so Up, Down, Enter and Escape there move through and
 /// run the list instead of moving a caret in a one-line field.
 const SEARCH_CONTEXT: &str = "FormlessSearch";
+const PROFILE_SEARCH_CONTEXT: &str = "FormlessProfileSearch";
+const PROFILE_SEARCH_INPUT_CONTEXT: &str = "FormlessProfileSearch > Input";
 const SEARCH_INPUT_CONTEXT: &str = "FormlessSearch > Input";
 const DIRECTORY_CONTEXT: &str = "FormlessDirectory";
 const DIRECTORY_INPUT_CONTEXT: &str = "FormlessDirectory > Input";
@@ -222,6 +229,30 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("up", SearchPrevious, Some(SEARCH_CONTEXT)),
         KeyBinding::new("enter", SearchOpen, Some(SEARCH_CONTEXT)),
         KeyBinding::new("escape", SearchBack, Some(SEARCH_CONTEXT)),
+        KeyBinding::new("down", ProfileSearchNext, Some(PROFILE_SEARCH_CONTEXT)),
+        KeyBinding::new("up", ProfileSearchPrevious, Some(PROFILE_SEARCH_CONTEXT)),
+        KeyBinding::new("enter", ProfileSearchOpen, Some(PROFILE_SEARCH_CONTEXT)),
+        KeyBinding::new("escape", ProfileSearchBack, Some(PROFILE_SEARCH_CONTEXT)),
+        KeyBinding::new(
+            "down",
+            ProfileSearchNext,
+            Some(PROFILE_SEARCH_INPUT_CONTEXT),
+        ),
+        KeyBinding::new(
+            "up",
+            ProfileSearchPrevious,
+            Some(PROFILE_SEARCH_INPUT_CONTEXT),
+        ),
+        KeyBinding::new(
+            "enter",
+            ProfileSearchOpen,
+            Some(PROFILE_SEARCH_INPUT_CONTEXT),
+        ),
+        KeyBinding::new(
+            "escape",
+            ProfileSearchBack,
+            Some(PROFILE_SEARCH_INPUT_CONTEXT),
+        ),
         KeyBinding::new("down", SearchNext, Some(SEARCH_INPUT_CONTEXT)),
         KeyBinding::new("up", SearchPrevious, Some(SEARCH_INPUT_CONTEXT)),
         KeyBinding::new("enter", SearchOpen, Some(SEARCH_INPUT_CONTEXT)),
@@ -694,6 +725,16 @@ pub struct Shell {
     directory_reveal: Option<(String, u8)>,
     search: TranscriptSearch,
     search_query: Entity<InputState>,
+    profile_query: Entity<InputState>,
+    profile_observed: SharedString,
+    profile_search: crate::profile_search::State,
+    profile_return: Destination,
+    profile_scroll: gpui_kit::UniformListScrollHandle,
+    profile_body: ScrollHandle,
+    profile_controls: Vec<FocusHandle>,
+    profile_focus: Option<(Option<FocusHandle>, Size<Pixels>, TextScale)>,
+    profile_frames: u8,
+    profile_show_results: bool,
     search_scroll: gpui_kit::UniformListScrollHandle,
     search_revision: u64,
     search_return: Destination,
@@ -779,6 +820,27 @@ impl Shell {
             },
         ));
         let mut directory = Directory::default();
+        let profile_query = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Search this Profile's persisted messages")
+                .validate(|text, _| {
+                    text.chars()
+                        .take(crate::profile_search::QUERY_CHARS + 1)
+                        .count()
+                        <= crate::profile_search::QUERY_CHARS
+                })
+        });
+        subscriptions.push(cx.observe(&profile_query, |this, _, cx| {
+            let query = this.profile_query.read(cx).value();
+            if query != this.profile_observed {
+                this.profile_search.changed(&query);
+                this.profile_observed = query;
+                this.profile_show_results = false;
+                this.profile_frames = 2;
+            }
+            cx.notify();
+        }));
+        let profile_body = ScrollHandle::new();
         let directory_rows = sidebar.rows().to_vec();
         directory.rebuild(&directory_rows, "");
         composer.update(cx, |composer, cx| composer.focus(window, cx));
@@ -836,6 +898,7 @@ impl Shell {
                 has_composer: true,
                 can_recover: false,
                 can_questions: false,
+                can_search_profile: false,
                 can_edit_session: false,
                 can_browse_archived: false,
                 archived_included: false,
@@ -865,6 +928,16 @@ impl Shell {
             directory_reveal: None,
             search: TranscriptSearch::default(),
             search_query,
+            profile_query,
+            profile_observed: SharedString::default(),
+            profile_search: crate::profile_search::State::default(),
+            profile_return: Destination::Chat,
+            profile_scroll: gpui_kit::UniformListScrollHandle::new(),
+            profile_controls: (0..4).map(|_| cx.focus_handle()).collect(),
+            profile_body,
+            profile_focus: None,
+            profile_frames: 0,
+            profile_show_results: false,
             search_scroll: gpui_kit::UniformListScrollHandle::new(),
             search_revision: 0,
             search_return: Destination::Chat,
@@ -1506,6 +1579,8 @@ impl Shell {
     }
 
     fn attach_client(&mut self, client: Client, cx: &mut Context<Self>) {
+        self.profile_search
+            .retire("Profile attachment changed. Search again after connecting.");
         self.client = Some(client);
         self.client_connected = false;
         self.client_snapshot_ready = false;
@@ -1700,6 +1775,9 @@ impl Shell {
                     self.questions_restored(window, cx);
                 }
                 if !ready {
+                    self.profile_search.retire(
+                        "Connection lost. Results may be stale; search again after connecting.",
+                    );
                     self.questions_disconnected(cx);
                     self.forecast = None;
                     if self.modal == Some(Modal::Forecast) {
@@ -1709,6 +1787,24 @@ impl Shell {
                     self.sidebar
                         .replace(&self.client_sessions, &HashSet::new(), false);
                     self.rebuild_directory(cx);
+                }
+            }
+            ClientUpdate::ProfileSearch {
+                connection,
+                operation,
+                query,
+                result,
+            } => {
+                if self.client_connected
+                    && self
+                        .client
+                        .as_ref()
+                        .is_some_and(|client| client.connection() == connection)
+                {
+                    self.profile_search
+                        .changed(&self.profile_query.read(cx).value());
+                    self.profile_search
+                        .receive(connection, operation, &query, result);
                 }
             }
             ClientUpdate::Questions(state) => {
@@ -2490,6 +2586,7 @@ impl Shell {
                     .as_ref()
                     .is_some_and(|run| run.recoverable()),
             can_questions: self.client.is_some(),
+            can_search_profile: self.client.is_some(),
             can_edit_session: self.client_connected && self.session_edit_target().is_some(),
             can_browse_archived: self.client.is_some(),
             archived_included: self.include_archived,
@@ -2785,7 +2882,7 @@ impl Shell {
     fn activate_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let from_browser = matches!(
             self.destination,
-            Destination::Sessions | Destination::Search
+            Destination::Sessions | Destination::Search | Destination::ProfileSearch
         );
         let previous = self.sidebar.active_id().map(str::to_string);
         let changed = self.sidebar.activate_selected();
@@ -2873,6 +2970,7 @@ impl Shell {
         match destination {
             Destination::Sessions => Some(&self.directory_query),
             Destination::Search => Some(&self.search_query),
+            Destination::ProfileSearch => Some(&self.profile_query),
             _ => None,
         }
     }
@@ -2883,13 +2981,30 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.destination == Destination::ProfileSearch
+            && destination != Destination::ProfileSearch
+            && self.finish_profile_composition(window, cx)
+        {
+            return;
+        }
         self.invalidate_forecast(cx);
         if self.viewer.take().is_some() {
             self.restore_focus = None;
         }
         let previous = self.destination;
+        if destination == Destination::ProfileSearch && previous != Destination::ProfileSearch {
+            self.profile_return = if previous == Destination::Search {
+                self.search_return
+            } else {
+                previous
+            };
+        }
         if destination == Destination::Search && previous != Destination::Search {
-            self.search_return = previous;
+            self.search_return = if previous == Destination::ProfileSearch {
+                self.profile_return
+            } else {
+                previous
+            };
         }
         self.destination = destination;
         if self.client.is_some() {
@@ -4781,6 +4896,9 @@ impl Shell {
         let main = if self.destination == Destination::Search {
             self.render_search(Some(height), window, cx)
                 .into_any_element()
+        } else if self.destination == Destination::ProfileSearch {
+            self.render_profile_search(Some(height), window, cx)
+                .into_any_element()
         } else if self.destination == Destination::Sessions {
             self.render_directory(Some(height), window, cx)
                 .into_any_element()
@@ -4817,6 +4935,7 @@ impl Shell {
 
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.reveal_profile_search(window, cx);
         self.reveal_directory_choice(window, cx);
         self.reveal_session_editor(window, cx);
         self.reveal_question_focus(window, cx);
@@ -5027,6 +5146,9 @@ impl Shell {
     ) -> impl IntoElement {
         let main = if self.destination == Destination::Search {
             self.render_search(None, window, cx).into_any_element()
+        } else if self.destination == Destination::ProfileSearch {
+            self.render_profile_search(None, window, cx)
+                .into_any_element()
         } else if self.destination == Destination::Sessions {
             self.render_directory(None, window, cx).into_any_element()
         } else if self.destination == Destination::Chat {
