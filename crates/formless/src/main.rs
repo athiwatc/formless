@@ -4,6 +4,7 @@ mod cli_commands;
 #[cfg(test)]
 mod cli_help_tests;
 mod cli_mcp_prompts;
+mod cli_mcp_test;
 mod cli_metrics;
 mod cli_models;
 mod cli_modules;
@@ -1198,9 +1199,15 @@ enum McpAction {
         json: bool,
     },
     /// Restart a server and list its tools again
+    #[command(
+        after_help = "Restarts the server. Prints the complete report, then exits 0 for success (including zero tools), or 1 for a reported restart error. Request failures retain their existing exit mapping."
+    )]
     Test {
         /// Configured MCP server name
         name: String,
+        /// Print the complete restart reply as one JSON value
+        #[arg(long)]
+        json: bool,
     },
     /// Authorize Formless with a remote (http) MCP server via OAuth
     Login {
@@ -7370,10 +7377,10 @@ fn mcp_cmd(paths: Paths, action: McpAction) -> Result<()> {
             })?;
             println!("{name}: {tool} is {}", if on { "on" } else { "off" });
         }
-        McpAction::Test { name } => {
-            let r = daemon(Request::RestartMcpServer { name: name.clone() })?;
-            println!("server:  {name}");
-            report(&r);
+        McpAction::Test { name, json } => {
+            if !cli_mcp_test::run(&name, json, daemon, &mut std::io::stdout().lock())? {
+                std::process::exit(1);
+            }
         }
         McpAction::Login { server } => {
             let scfg = cfg
