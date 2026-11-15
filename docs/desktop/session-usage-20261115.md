@@ -124,6 +124,24 @@ cost regression failed in `usage-tiny-cost-reproduction.log`. After correcting
 the formatter, all final ten phases above passed. No failure was overwritten
 or counted as success.
 
+## Fresh development artifact
+
+Packaging ran with ResourceWarning treated as an error, `--profile dev
+--offline`, from clean `3398fe7edf75ff3f50ed28c46f1b783d4027bb8c`. Only README/report
+documentation differs from tested runtime `382baf8`. Output is
+`evidence/gpui-1753-sol/package-3398fe7`.
+
+- Binary SHA256: `a4fba67e2dce8a7a78156ab546bede4d32af19b78d2f298d16820b68ad6081ca`.
+- ZIP SHA256: `7044b8c921216eac4fa609e864752ef798497296d9cb04bc5406de4acbb5f4db`.
+- Provenance/plist, safe archive paths/types, integrity, executable mode/byte
+  identity, hashes and 21 system-library loads passed. Evidence:
+  `usage-final-package.log`, `usage-final-package-verification.json`.
+- 655 archive files, 415 packages / 649 notice files; 46 packages lack root
+  notices. Manual licensing/assets/stdlib review remains.
+- Linker ad-hoc signing, no Team ID, unbound plist, no sealed resources.
+  No installation or launch occurred. Distribution signing/notarization and
+  native installation/launch/update acceptance remain open.
+
 ## Ownership and open gates
 
 Same isolated checkout and `work/sol-gpui-1753-20261115` branch. Main remains
