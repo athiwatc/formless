@@ -19,7 +19,7 @@ enum Part {
     Call(String, String, Option<String>),
 }
 
-fn parts(msgs: &[MessageInfo]) -> Vec<Part> {
+fn parts(msgs: &[MessageInfo], arguments: impl Fn(&str) -> String) -> Vec<Part> {
     let mut out = Vec::new();
     // Tool call id → index in `out`, to attach results.
     let mut calls: HashMap<String, usize> = HashMap::new();
@@ -37,16 +37,11 @@ fn parts(msgs: &[MessageInfo]) -> Vec<Part> {
                 }
                 for c in meta["tool_calls"].as_array().into_iter().flatten() {
                     let args = c["function"]["arguments"].as_str().unwrap_or_default();
-                    // Pretty-print JSON arguments when they parse.
-                    let args = serde_json::from_str::<Value>(args)
-                        .ok()
-                        .and_then(|v| serde_json::to_string_pretty(&v).ok())
-                        .unwrap_or_else(|| args.to_string());
                     if let Some(id) = c["id"].as_str() {
                         calls.insert(id.to_string(), out.len());
                     }
                     let name = c["function"]["name"].as_str().unwrap_or("tool");
-                    out.push(Part::Call(name.to_string(), clip(&args), None));
+                    out.push(Part::Call(name.to_string(), arguments(args), None));
                 }
             }
             "tool" => {
@@ -68,10 +63,10 @@ fn parts(msgs: &[MessageInfo]) -> Vec<Part> {
 }
 
 fn clip(s: &str) -> String {
-    if s.chars().count() <= MAX_CALL_CHARS {
+    let Some((end, _)) = s.char_indices().nth(MAX_CALL_CHARS) else {
         return s.to_string();
-    }
-    let mut out: String = s.chars().take(MAX_CALL_CHARS).collect();
+    };
+    let mut out = s[..end].to_string();
     out.push_str("\n… (cut)");
     out
 }
@@ -83,15 +78,38 @@ fn fenced(lang: &str, s: &str) -> String {
     format!("{fence}{lang}\n{}\n{fence}", s.trim_end())
 }
 
+/// HTML retains its existing pretty-printed, then clipped argument display.
+fn html_arguments(args: &str) -> String {
+    let pretty = serde_json::from_str::<Value>(args)
+        .ok()
+        .and_then(|value| serde_json::to_string_pretty(&value).ok())
+        .unwrap_or_else(|| args.to_string());
+    clip(&pretty)
+}
+
+/// Remove complete leading blank lines, retaining indentation on the first
+/// content line. Keep the existing trailing-boundary policy.
+fn turn_boundaries(mut text: &str) -> &str {
+    while let Some((line, rest)) = text.split_once('\n') {
+        if !line.trim().is_empty() {
+            break;
+        }
+        text = rest;
+    }
+    text.trim_end()
+}
+
 /// The transcript as Markdown: user and assistant turns, notes as quotes,
 /// and each Tool call as a collapsed `<details>` with its result.
 pub fn markdown(name: &str, msgs: &[MessageInfo]) -> String {
     let mut out = format!("# {name}\n");
-    for part in parts(msgs) {
+    for part in parts(msgs, clip) {
         out.push('\n');
         match part {
-            Part::User(t) => out.push_str(&format!("## You\n\n{}\n", t.trim())),
-            Part::Assistant(t) => out.push_str(&format!("## Assistant\n\n{}\n", t.trim())),
+            Part::User(t) => out.push_str(&format!("## You\n\n{}\n", turn_boundaries(&t))),
+            Part::Assistant(t) => {
+                out.push_str(&format!("## Assistant\n\n{}\n", turn_boundaries(&t)))
+            }
             Part::Note(t) => out.push_str(&format!("> *{}*\n", t.trim().replace('\n', " "))),
             Part::Call(tool, args, result) => {
                 out.push_str(&format!(
@@ -170,7 +188,7 @@ fn md_html(s: &str) -> String {
 /// resources).
 pub fn html(name: &str, msgs: &[MessageInfo]) -> String {
     let mut body = String::new();
-    for part in parts(msgs) {
+    for part in parts(msgs, html_arguments) {
         match part {
             Part::User(t) => body.push_str(&format!(
                 "<section class=\"user\"><h2>You</h2>{}</section>\n",
@@ -258,11 +276,41 @@ mod tests {
         assert!(md.starts_with("# TODOs\n"));
         assert!(md.contains("## You\n\ncount the TODOs"));
         assert!(md.contains("<summary>Tool: grep</summary>"));
-        assert!(md.contains("\"q\": \"TODO\""), "{md}");
+        assert!(md.contains("\"q\":\"TODO\""), "{md}");
         // A result with backticks gets a longer fence.
         assert!(md.contains("````\na.rs: 3"), "{md}");
         assert!(md.contains("> *The working directory is now /x.*"));
         assert!(md.trim_end().ends_with("There are **3**."));
+    }
+
+    #[test]
+    fn clipping_preserves_scalar_boundaries_and_both_export_outputs() {
+        for unit in ["x", "é", "e\u{301}x", "👨‍👩‍👧‍👦", "\n… (cut)"] {
+            for count in [0, 3999, 4000, 4001, 100_000] {
+                let source: String = unit.chars().cycle().take(count).collect();
+                let expected = if count <= MAX_CALL_CHARS {
+                    source.clone()
+                } else {
+                    let prefix: String = unit.chars().cycle().take(MAX_CALL_CHARS).collect();
+                    format!("{prefix}\n… (cut)")
+                };
+                assert_eq!(clip(&source), expected, "{unit:?}, {count} scalars");
+                let messages = |text: &str| {
+                    let metadata = serde_json::json!({"tool_calls":[{"id":"clip", "function":{"name":"fixture", "arguments":text}}]}).to_string();
+                    vec![
+                        msg("assistant", "", Some(&metadata)),
+                        msg("tool", text, Some(r#"{"tool_call_id":"clip"}"#)),
+                    ]
+                };
+                let original = messages(&source);
+                let bounded = messages(&expected);
+                assert_eq!(
+                    markdown("fixture", &original),
+                    markdown("fixture", &bounded)
+                );
+                assert_eq!(html("fixture", &original), html("fixture", &bounded));
+            }
+        }
     }
 
     #[test]
@@ -323,3 +371,7 @@ mod tests {
         assert!(page.contains("href=\"notes.md\""), "relative links stay");
     }
 }
+
+#[cfg(test)]
+#[path = "transcript_source_tests.rs"]
+mod transcript_source_tests;
