@@ -1254,7 +1254,12 @@ pasting paths.
   The web composer has a 📎 file picker and accepts pasted images.
 - **`@` mentions:** typing `@` in the input opens a completion popup of
   files under the client's working directory (TUI) or the daemon's (web),
-  fuzzy-matched on the path. `ListFiles {root?, query, limit?}` walks the
+  fuzzy-matched on the path. Ranking prepares the full and basename queries
+  once, folds each path once, and scores its basename from a rebased folded
+  suffix without highlight allocation. Bounded selection keeps score-descending,
+  UTF-8-byte-length-ascending, path-ascending order and stable input order for
+  duplicate ties; directory completion and the Unicode fold stay unchanged.
+  `ListFiles {root?, query, limit?}` walks the
   root once and caches it for 30 s. The walk respects `.gitignore`, skips
   hidden directories and `target`, `node_modules`, `dist`, `build`,
   `__pycache__` and `venv`, and stops at 200,000 entries. Directory
@@ -1263,8 +1268,20 @@ pasting paths.
   loops are skipped. Linked directories have size zero and their
   in-root children can be completed through the link's path. An empty query
   lists the top level, and `dir/` lists that directory, so paths complete
-  step by step. Tab or Enter inserts `@path`. On send, each `@path`
-  mention that names an existing file or directory goes through
+  step by step. Tab or Enter inserts `@path`, or `@"my notes/report.md"`
+  when a path needs delimiters. The `@"..."` form is reserved for quoted
+  paths: whitespace inside is literal, and only `\"` (quote) and `\\`
+  (backslash) are escapes. A complete token ends at its closing quote,
+  followed by whitespace, ordinary trailing mention punctuation, or end
+  of input. Invalid escapes, missing closing quotes and attached word
+  suffixes remain plain text on submission; they never attach a first-word
+  fragment. Directory completion retains the existing `/` marker and places
+  the cursor before a quoted directory's closing quote, so child completion
+  replaces the whole token. Exact indexed leading-space directory spellings
+  take priority before hand-typed query trimming. Extraction, chips, forecast
+  input and submission use the same decoded original paths without case or
+  filesystem normalization. On send, each complete mention that names an
+  existing file or directory goes through
   `AttachPath {session_id, path, root?}` before the message is sent:
   - text files up to 256 KB and images, WAV/MP3 audio and PDFs up to 8 MB are attached as below;
   - larger files and directories go as a reference line,
@@ -4497,7 +4514,7 @@ run_tool = "network_policy"     # a registry Tool, or…
   changes, clamps when removed and scrolls into view. Enter loads the highlighted
   Tool's existing all-time detail; unrelated cached detail stays hidden behind
   an activation hint. Mouse rows use the same identity/order. General paging
-  keys and visible-capacity movement remain a separate concern (#1468).
+  keys and visible-capacity movement follow the list-key rules below.
 - **Bulk actions.** In the TUI Sessions view, Space marks rows (✓, with
   the count in the panel title) and Esc clears the marks. With marks:
   `a` archives them (or restores them if all are archived), `e` exports
@@ -4820,8 +4837,8 @@ undo, redo and replacements invalidate prior asynchronous editor previews.
   cycle list filters. Model, switcher and rollback result pickers support
   PgUp/PgDn and Home/End, clamped to matches, using their rendered row count
   (ten rows before the first draw). Rollback navigation disarms confirmation
-  and keeps its selected version visible. General main-list paging is separate
-  (#1468).
+  and keeps its selected version visible. Main-list paging follows the
+  per-view capacity rules below.
 - **Command palette.** Typing `/` at the start of the input opens a popup
   of commands with one-line descriptions, filtered fuzzily (exact prefixes
   first). ↑/↓ select, Tab completes, Enter runs. A command that still
@@ -4863,11 +4880,19 @@ undo, redo and replacements invalidate prior asynchronous editor previews.
   delete`). They come from a per-view key table with an importance rank,
   and narrow terminals show only the most important hints that fit.
   The table replaces the hand-written panel footers.
-- **List keys (TUI).** Every list view (Sessions, Tools, Metrics,
-  Proposals) takes ↑/↓ and j/k, g/G or Home/End for the first/last row,
-  and Ctrl+D/Ctrl+U for half a page. List views take no typed input, so
-  these don't conflict. In Proposals, `n` now generates a new proposal
-  (it was `g`).
+- **List keys (TUI).** Sessions, Tools, Metrics, Proposals and Search take
+  ↑/↓ and j/k, g/G or Home/End for the first/last row, PgUp/PgDn for a
+  page and Ctrl+D/Ctrl+U for half a page. A page uses the latest rendered
+  list/table body's selectable capacity, excluding borders, column headers,
+  Tool group headers and other split panels. Each view retains its own
+  capacity; resize is reflected after redraw. Before the first draw the
+  fallback is twenty items (ten for a half-page), clamped to the list.
+  Nonempty lists move by at least one item. While a list filter is being
+  edited, PgUp/PgDn are consumed without moving results, Ctrl+D is ignored,
+  Ctrl+U clears the query and printable characters remain query text. Other
+  modal/editor/pager handlers retain priority. Search Enter still opens the
+  selected message and Esc returns to Chat. In Proposals, `n` generates a
+  new proposal (it was `g`).
 - **Mouse (TUI).** While mouse capture is on: clicking a tab switches
   views, clicking a row in the Sessions, Tools or Proposals list selects
   it and a double-click opens it (as Enter), and clicking a tool call's
@@ -5213,10 +5238,10 @@ the TUI. Command-specific arguments and defaults are available through
 | `formless routing` | `--json` | Read currently available daemon routing decisions and returned candidate figures without starting a model request. |
 | `formless runs` | No action: list; `show`, `cancel` | List recent Runs, inspect one by ID/prefix, or cancel that exact Run. |
 | `formless security` | `status` | Inspect the daemon's grants, denials, trusted resources, and exposed interfaces. |
-| `formless sessions` | `fork`, `compare`, `list`, `show`, `files`, `rewind`, `rename`, `rm`, `restore`, `import`, `search`, `templates list/show`, `archive`, `unarchive`, `export` | Manage stored Sessions, follow a Run with `show --follow`, or inspect tracked files. `list --pinned --tag TAG` filters the fetched reply; selectors combine with `--archived`, preserving reply order. |
+| `formless sessions` | `fork`, `compare`, `list`, `show`, `files`, `rewind`, `rename`, `rm`, `restore`, `import`, `search`, `templates list/show`, `archive`, `unarchive`, `pin`, `unpin`, `tag`, `export` | Manage stored Sessions, follow a Run with `show --follow`, or inspect tracked files. `list --pinned --tag TAG` filters the fetched reply; selectors combine with `--archived`, preserving reply order. |
 | `formless skills` | `reviews`, `add`, `remove`, `list`, `enable`, `disable`, `show`, `export`, `import` | Inspect and manage Skills and their retained description reviews. |
 | `formless storage` | `--json` | Report disk usage by data category. |
-| `formless tools` | `reviews`, `list`, `disable`, `enable`, `undo`, `pin`, `unpin`, `tag`, `show`, `retire`, `restore`, `rollback`, `purge`, `run`, `export`, `import` | Inspect, manage, run, or transfer registry Tools. |
+| `formless tools` | `reviews`, `list`, `disable`, `enable`, `undo`, `pin`, `unpin`, `tag`, `show`, `diff`, `retire`, `restore`, `rollback`, `purge`, `run`, `export`, `import` | Inspect, manage, run, or transfer registry Tools. |
 | `formless tui` | `--plain`, `-c` / `--continue`, `--new` | Launch the full-screen terminal client; also the default with no command. |
 | `formless uninstall` | `--keep-data`, `--keep-binary`, `--yes` (alias `--force`) | Remove Formless, optionally retaining data or the binary. |
 | `formless update` | No action, `check`, or `--check`; `--json` | Show newer release notes and the applicable upgrade command; never rewrite the binary. |
@@ -5227,6 +5252,26 @@ the TUI. Command-specific arguments and defaults are available through
 `gc --dry-run --json` to preview without cleanup. Counts are core-reported values,
 not a promise of exact physical space reclaimed. JSON changes only presentation;
 retention, side effects, errors and human output remain unchanged.
+
+`sessions pin ID` and `sessions unpin ID` display the stored pin state returned
+by the daemon. `sessions tag ID` only reads tags; adding positional tags replaces
+the **entire** stored tag list, and `--clear` explicitly replaces it with an empty
+list (conflicting with positional tags). Tags reach storage unchanged for its
+existing normalization; confirmation shows returned stored values. These three
+actions accept `--json` for the selected/returned Session object.
+
+Ambiguous Session prefixes/names remain usage errors and display up to ten
+matching full IDs, bounded names and archive labels. Extra matches are counted,
+with commands for both archive states. Prefix errors suggest extending the ID;
+name errors suggest a displayed ID. Exact-ID priority, prefix-before-name
+resolution and trimmed ASCII-case-insensitive full-name matching are unchanged.
+
+Human Session lists label the last recorded Run status and show stored tags,
+retaining the pin star and existing message preview/count. Empty replies are
+reported separately from an empty archive selection, which names the alternate
+list command and count. Static human `sessions show` includes stored archived,
+pinned, tags and last recorded Run status metadata; absent status is "not
+recorded". JSON and `--follow` retain their existing contracts.
 
 `formless metrics --since 7d --json` reads the three existing metrics reports
 with one checked UTC cutoff. Omit `--since` for all history. Tool rows use stored
