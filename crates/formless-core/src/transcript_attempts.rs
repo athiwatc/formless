@@ -63,10 +63,12 @@ struct State {
     bytes: u64,
     enabled: bool,
     visible: bool,
+    // Owner return/drop is final; a provider-attempt close alone is not.
+    retired: bool,
 }
 impl State {
     fn start(&mut self) {
-        if !self.enabled {
+        if self.retired || !self.enabled {
             return;
         }
         self.bytes = 0;
@@ -80,6 +82,16 @@ impl State {
             },
         );
         self.active = Some(attempt);
+    }
+    fn retire(&mut self, reason: TranscriptAttemptClose) {
+        if self.retired {
+            return;
+        }
+        // Linearize retirement before publishing the final close. Retained
+        // callback sinks cannot enable, restart or append after this point.
+        self.retired = true;
+        self.enabled = false;
+        self.close(reason);
     }
     fn close(&mut self, reason: TranscriptAttemptClose) {
         if let Some(attempt) = self.active.take() {
@@ -100,6 +112,9 @@ pub(super) struct Sink(Arc<StdMutex<State>>);
 impl Sink {
     pub(super) fn delta(&self, text: &str) {
         let mut state = self.0.locked();
+        if state.retired {
+            return;
+        }
         let Some(attempt) = state.active.clone() else {
             return;
         };
@@ -124,6 +139,9 @@ impl Sink {
     }
     pub(super) fn restart(&self) {
         let mut state = self.0.locked();
+        if state.retired {
+            return;
+        }
         state.close(TranscriptAttemptClose::Restarted);
         // A peer that opted in after the old attempt began may admit this
         // fresh retry, but never receive the old attempt's missing prefix.
@@ -161,6 +179,7 @@ impl Attempt {
             bytes: 0,
             enabled,
             visible,
+            retired: false,
         };
         state.start();
         Self(Sink(Arc::new(StdMutex::new(state))))
@@ -169,12 +188,12 @@ impl Attempt {
         self.0.clone()
     }
     pub(super) fn returned(&mut self) {
-        self.0 .0.locked().close(TranscriptAttemptClose::Returned);
+        self.0 .0.locked().retire(TranscriptAttemptClose::Returned);
     }
 }
 impl Drop for Attempt {
     fn drop(&mut self) {
-        self.0 .0.locked().close(TranscriptAttemptClose::Dropped);
+        self.0 .0.locked().retire(TranscriptAttemptClose::Dropped);
     }
 }
 
@@ -344,6 +363,86 @@ mod tests {
         sink.delta("late callback");
         assert!(rx.try_recv().is_err());
     }
+    #[test]
+    fn late_restart_after_return_or_drop_cannot_revive_a_retained_sink() {
+        for initially_opted in [false, true] {
+            for returned in [false, true] {
+                let clock = Arc::new(Clock::default());
+                let (subs, mut rx, _) = subscriber(32, initially_opted);
+                let mut owner = Some(Attempt::start(
+                    clock.clone(),
+                    subs.clone(),
+                    "s",
+                    "r",
+                    "turn",
+                    1,
+                    true,
+                ));
+                let sink = owner.as_ref().unwrap().sink();
+                sink.delta("before retirement");
+                if returned {
+                    owner.as_mut().unwrap().returned();
+                } else {
+                    drop(owner.take());
+                }
+                while rx.try_recv().is_ok() {}
+                let retired_at = clock.barrier();
+                // Retirement must remain final even if a new subscriber joins.
+                subs.locked()[0].filter.locked().transcript_attempts = true;
+                for _ in 0..3 {
+                    sink.restart();
+                    sink.delta("late callback");
+                }
+                assert_eq!(
+                    clock.barrier(),
+                    retired_at,
+                    "retained sink revived: initially_opted={initially_opted}, returned={returned}"
+                );
+                assert!(rx.try_recv().is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn callback_thread_released_after_owner_retirement_remains_inert() {
+        for returned in [false, true] {
+            let clock = Arc::new(Clock::default());
+            let (subs, mut rx, _) = subscriber(32, true);
+            let mut owner = Some(Attempt::start(
+                clock.clone(),
+                subs,
+                "s",
+                "r",
+                "turn",
+                1,
+                true,
+            ));
+            let sink = owner.as_ref().unwrap().sink();
+            let ready = Arc::new(std::sync::Barrier::new(2));
+            std::thread::scope(|scope| {
+                let worker_ready = ready.clone();
+                let worker = scope.spawn(move || {
+                    worker_ready.wait();
+                    for _ in 0..20 {
+                        sink.restart();
+                        sink.delta("late background callback");
+                    }
+                });
+                if returned {
+                    owner.as_mut().unwrap().returned();
+                } else {
+                    drop(owner.take());
+                }
+                while rx.try_recv().is_ok() {}
+                let retired_at = clock.barrier();
+                ready.wait();
+                worker.join().unwrap();
+                assert_eq!(clock.barrier(), retired_at);
+                assert!(rx.try_recv().is_err());
+            });
+        }
+    }
+
     #[test]
     fn legacy_and_schema_hidden_candidates_do_not_publish_the_opt_in_path() {
         for (opted, visible) in [(false, true), (true, false)] {

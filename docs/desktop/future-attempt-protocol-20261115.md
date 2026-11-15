@@ -80,7 +80,13 @@ reconnect and Profile replacement remains the transport's responsibility.
 ## Producer lifecycle, delivery and locks
 
 An attempt owner closes exactly once on return/drop; a callback sink cannot
-publish after that owner closes. An internal provider restart closes the old
+publish after that owner closes. Independent review found that clearing the
+active attempt alone let a retained sink restart after return/drop. A dedicated
+terminal retirement bit now linearizes owner return/drop under the same state
+mutex and guards start, restart and delta. Provider-internal restart remains
+allowed only while the owner is live. Regressions cover return/drop, a subscriber
+joining after retirement, repeated late restarts and a background callback
+released only after owner retirement. An internal provider restart closes the old
 attempt and starts a new identity at byte zero while preserving turn and Run
 identity. Schema visibility is fixed by the existing pipeline policy.
 
