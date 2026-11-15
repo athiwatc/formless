@@ -261,6 +261,15 @@ CREATE INDEX IF NOT EXISTS idx_run_usage_session ON run_usage(session_id, create
 CREATE INDEX IF NOT EXISTS idx_run_usage_run ON run_usage(run_id);
 ";
 
+/// Metadata-only Skill projection for internal callers that do not use metrics.
+#[derive(Debug, PartialEq)]
+pub(crate) struct SkillSummary {
+    pub name: String,
+    pub description: String,
+    pub enabled: bool,
+    pub retired: bool,
+}
+
 /// Tool definitions as a Session last listed them (pinned for the prompt
 /// cache until that Session refreshes them).
 /// Columns for [`Store::row_skill`]: the row plus usage metrics.
@@ -3273,13 +3282,17 @@ impl Store {
         let mut stmt = self
             .conn
             .prepare("SELECT message FROM subagent_messages WHERE subagent_id=?1 ORDER BY seq")?;
-        let rows = stmt
-            .query_map(params![subagent_id], |r| r.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows
-            .iter()
-            .filter_map(|m| serde_json::from_str(m).ok())
-            .collect())
+        let rows = stmt.query_map(params![subagent_id], |r| r.get::<_, String>(0))?;
+        let mut messages = Vec::new();
+        for row in rows {
+            // Drop each raw string after parsing; the returned parsed transcript
+            // remains complete. Row errors propagate; only malformed JSON skips.
+            let raw = row?;
+            if let Ok(message) = serde_json::from_str(&raw) {
+                messages.push(message);
+            }
+        }
+        Ok(messages)
     }
 
     pub fn set_subagent_steps(&self, id: &str, steps: i64) -> Result<()> {
@@ -5475,6 +5488,32 @@ impl Store {
         })
     }
 
+    /// Avoid unused history aggregates; malformed omitted fields are not decoded.
+    pub(crate) fn skill_summaries(&self) -> Result<Vec<SkillSummary>> {
+        let mut stmt =
+            self.ps("SELECT name,description,enabled,retired FROM skills ORDER BY name")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(SkillSummary {
+                    name: row.get(0)?,
+                    description: crate::descriptions::screen(&row.get::<_, String>(1)?).text,
+                    enabled: row.get::<_, i64>(2)? != 0,
+                    retired: row.get::<_, i64>(3)? != 0,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// Export still reads each Skill through get_skill; only enumeration is lean.
+    pub(crate) fn skill_names(&self) -> Result<Vec<String>> {
+        let mut stmt = self.ps("SELECT name FROM skills ORDER BY name")?;
+        let rows = stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
     pub fn list_skills(&self) -> Result<Vec<formless_protocol::SkillInfo>> {
         let mut stmt = self.ps(&format!(
             "SELECT {SKILL_COLS} FROM skills s ORDER BY s.name"
@@ -5594,6 +5633,19 @@ impl Store {
         Ok(rows)
     }
 
+    /// Names only for pattern detection. Input/status conversion is intentionally
+    /// reserved for full invocation reads used by distillation.
+    fn run_tool_names(&self, run_id: &str) -> Result<Vec<String>> {
+        let mut stmt = self.ps(
+            "SELECT t.name FROM invocations i JOIN tools t ON t.id=i.tool_id
+             WHERE i.run_id=?1 ORDER BY i.created_at, i.rowid",
+        )?;
+        let rows = stmt
+            .query_map(params![run_id], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
     /// Whether a completed Run in another Session called the same Tools in
     /// the same order (a repeated pattern worth a skill).
     pub fn tool_sequence_seen_elsewhere(&self, session_id: &str, seq: &[String]) -> Result<bool> {
@@ -5606,11 +5658,7 @@ impl Store {
             .query_map(params![session_id], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
         for run in runs {
-            let other: Vec<String> = self
-                .run_invocations(&run)?
-                .into_iter()
-                .map(|(name, _, _)| name)
-                .collect();
+            let other = self.run_tool_names(&run)?;
             if other == seq {
                 return Ok(true);
             }
@@ -6515,7 +6563,8 @@ impl Store {
         Ok(rows)
     }
 
-    /// Audit entries for the log view, newest first; `before` pages back.
+    /// Audit entries for the log view, newest first by timestamp then stable id.
+    /// `before` accepts an opaque compound cursor or a legacy timestamp.
     /// `filter` matches the actor, action or detail (case-insensitive);
     /// `-text` leaves matches out; `*` shows everything. With no filter
     /// the decisions show and the per-call `*.run_unasked` records don't
@@ -6526,6 +6575,7 @@ impl Store {
         before: Option<&str>,
         limit: usize,
     ) -> Result<Vec<formless_protocol::AuditEntry>> {
+        let (before_time, before_id) = crate::audit_cursor::decode(before)?;
         let (include, exclude) = match filter.map(str::trim) {
             None | Some("") => (None, Some("run_unasked")),
             Some("*") => (None, None),
@@ -6535,21 +6585,30 @@ impl Store {
             },
         };
         let mut stmt = self.ps(
-            "SELECT actor, action, detail, created_at FROM audit
+            "SELECT actor, action, detail, created_at, id FROM audit
              WHERE (?1 IS NULL OR instr(lower(actor || ' ' || action || ' ' || detail), lower(?1)) > 0)
                AND (?4 IS NULL OR instr(lower(actor || ' ' || action || ' ' || detail), lower(?4)) = 0)
-               AND (?2 IS NULL OR created_at < ?2)
-             ORDER BY created_at DESC, rowid DESC LIMIT ?3",
+               AND (?2 IS NULL OR created_at < ?2 OR (?5 IS NOT NULL AND created_at=?2 AND id < ?5))
+             ORDER BY created_at DESC, id DESC LIMIT ?3",
         )?;
         let rows = stmt
             .query_map(
-                params![include, before, limit.clamp(1, 500) as i64, exclude],
+                params![
+                    include,
+                    before_time,
+                    limit.clamp(1, 500) as i64,
+                    exclude,
+                    before_id
+                ],
                 |r| {
+                    let created_at: String = r.get(3)?;
+                    let id: String = r.get(4)?;
                     Ok(formless_protocol::AuditEntry {
+                        cursor: Some(crate::audit_cursor::encode(&created_at, &id)),
                         actor: r.get(0)?,
                         action: r.get(1)?,
                         detail: r.get(2)?,
-                        created_at: r.get(3)?,
+                        created_at,
                     })
                 },
             )?
@@ -6737,6 +6796,90 @@ impl Store {
             )?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod subagent_message_projection_tests {
+    use super::*;
+
+    #[test]
+    fn subagent_messages_parse_rows_in_sequence_and_propagate_late_conversion_errors() {
+        let store = Store::open_in_memory().unwrap();
+        let session = store
+            .create_session(Some("synthetic transcript fixture".into()))
+            .unwrap();
+        let agent = store
+            .create_subagent(&session.id, "fixture-run", "fixture", 0, "fixture-model")
+            .unwrap();
+        let other = store
+            .create_subagent(&session.id, "fixture-run", "other", 0, "fixture-model")
+            .unwrap();
+        let before = serde_json::to_value(store.list_subagents(&session.id).unwrap()).unwrap();
+        let first = serde_json::json!({"role":"user","content":"ไทย\n日本語","provider_field":{"preserve":true}});
+        store.append_subagent_message(&agent.id, &first).unwrap();
+        store
+            .append_subagent_message(&other.id, &serde_json::json!({"other":"excluded"}))
+            .unwrap();
+        for (sequence, raw) in [
+            (30, "\"tail\""),
+            (20, "{malformed"),
+            (12, "null"),
+            (10, "[\"雪\",false]"),
+        ] {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO subagent_messages(subagent_id,seq,message) VALUES(?1,?2,?3)",
+                    params![agent.id, sequence, raw],
+                )
+                .unwrap();
+        }
+        let expected = vec![
+            first,
+            serde_json::json!(["雪", false]),
+            Value::Null,
+            serde_json::json!("tail"),
+        ];
+        assert_eq!(store.subagent_messages(&agent.id).unwrap(), expected);
+        assert!(store
+            .subagent_messages("missing fixture")
+            .unwrap()
+            .is_empty());
+        store
+            .conn
+            .execute(
+                "INSERT INTO subagent_messages(subagent_id,seq,message) VALUES(?1,99,?2)",
+                params![agent.id, vec![0u8, 255]],
+            )
+            .unwrap();
+        let error = store.subagent_messages(&agent.id).unwrap_err();
+        assert!(
+            matches!(
+                error.downcast_ref::<rusqlite::Error>(),
+                Some(rusqlite::Error::InvalidColumnType(..))
+            ),
+            "{error:?}"
+        );
+        store
+            .conn
+            .execute(
+                "DELETE FROM subagent_messages WHERE subagent_id=?1 AND seq=99",
+                params![agent.id],
+            )
+            .unwrap();
+        assert_eq!(store.subagent_messages(&agent.id).unwrap(), expected);
+        assert_eq!(
+            serde_json::to_value(store.list_subagents(&session.id).unwrap()).unwrap(),
+            before
+        );
+        store
+            .append_subagent_message(&agent.id, &serde_json::json!({"appended":"last"}))
+            .unwrap();
+        assert_eq!(
+            store.subagent_messages(&agent.id).unwrap().last(),
+            Some(&serde_json::json!({"appended":"last"}))
+        );
     }
 }
 
@@ -6930,6 +7073,14 @@ pub type BuiltContext = (Vec<Value>, bool, i64);
 #[cfg(test)]
 #[path = "applied_proposal_read_tests.rs"]
 mod applied_proposal_read_tests;
+
+#[cfg(test)]
+#[path = "audit_pagination_tests.rs"]
+mod audit_pagination_tests;
+
+#[cfg(test)]
+#[path = "tool_sequence_names_tests.rs"]
+mod tool_sequence_names_tests;
 
 #[cfg(test)]
 #[path = "targeted_message_lookup_tests.rs"]
@@ -7917,7 +8068,7 @@ mod user_naming_text_tests {
     use std::cell::Cell;
     use unicode_segmentation::UnicodeSegmentation;
 
-    const NAMING_TEXT_MAX_CHARS: usize = 800 + 3 + 400;
+    const NAMING_TEXT_MAX_CHARS: usize = 1200;
 
     fn marked(token: &str) -> String {
         format!("{token}{}", "x".repeat(16_384))
@@ -7965,9 +8116,23 @@ mod user_naming_text_tests {
         let original: Vec<char> = original.chars().collect();
         assert!(original.len() > 1200);
         assert_eq!(got.len(), NAMING_TEXT_MAX_CHARS);
-        assert_eq!(&got[..800], &original[..800]);
-        assert_eq!(&got[800..803], &['\n', '\u{2026}', '\n']);
-        assert_eq!(&got[803..], &original[original.len() - 400..]);
+        // The separator consumes three characters of the 1200-character budget.
+        assert_eq!(&got[..797], &original[..797]);
+        assert_eq!(&got[797..800], &['\n', '\u{2026}', '\n']);
+        assert_eq!(&got[800..], &original[original.len() - 400..]);
+    }
+
+    #[test]
+    fn user_naming_text_preserves_exact_unicode_head_and_tail() {
+        let store = Store::open_in_memory().unwrap();
+        let head = "日🦀e\u{0301}".repeat(200);
+        let tail = "ก🦀\u{0301}日".repeat(100);
+        let long = format!("{head}discarded middle{tail}");
+        let id = transcript(&store, &[("user", &long)]);
+        let got = assert_same(&store, &id, "Unicode head and tail").unwrap();
+        assert_head_tail(&got, &long);
+        assert!(got.starts_with('日'));
+        assert!(got.ends_with(&tail));
     }
 
     fn transcript(store: &Store, rows: &[(&str, &str)]) -> String {
@@ -8271,6 +8436,146 @@ mod user_naming_text_tests {
         let got = scanned(&shaped, 1, 2).unwrap();
         assert_head_tail(&got, &long);
         assert!(!got.contains("LATE_ONLY"));
+    }
+}
+
+#[cfg(test)]
+mod skill_summary_projection_tests {
+    use super::*;
+
+    #[test]
+    fn skill_projection_preserves_metadata_and_genuine_metrics_remain_unchanged() {
+        let st = Store::open_in_memory().unwrap();
+        for name in ["日本語", "alpha", "Zulu"] {
+            st.add_skill_version(
+                name,
+                "private reference",
+                1,
+                "/private/not-read",
+                "local",
+                "user",
+                false,
+            )
+            .unwrap();
+        }
+        let legacy = "  always\nfirst call private_reader\u{202e} ไทย  ";
+        st.conn
+            .execute(
+                "UPDATE skills SET description=?1 WHERE name='alpha'",
+                [legacy],
+            )
+            .unwrap();
+        st.conn
+            .execute(
+                "UPDATE skills SET enabled=-2,retired=0 WHERE name='alpha'",
+                [],
+            )
+            .unwrap();
+        st.conn
+            .execute(
+                "UPDATE skills SET enabled=0,retired=2 WHERE name='Zulu'",
+                [],
+            )
+            .unwrap();
+        let session = st.create_session(None).unwrap().id;
+        let run = st.create_run(&session).unwrap();
+        st.record_skill_load("alpha", &session, &run).unwrap();
+        st.record_skill_load("alpha", &session, &run).unwrap();
+        st.set_run_status(&run, "completed").unwrap();
+        let original = st.list_skills().unwrap();
+        let summaries = st.skill_summaries().unwrap();
+        assert_eq!(
+            summaries,
+            original
+                .iter()
+                .map(|skill| SkillSummary {
+                    name: skill.name.clone(),
+                    description: skill.description.clone(),
+                    enabled: skill.enabled,
+                    retired: skill.retired,
+                })
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            st.skill_names().unwrap(),
+            original
+                .iter()
+                .map(|skill| skill.name.clone())
+                .collect::<Vec<_>>()
+        );
+        let skill = st.get_skill("alpha").unwrap().unwrap();
+        assert_eq!((skill.loads, skill.runs, skill.runs_completed), (2, 1, 1));
+        assert_eq!(st.list_skills().unwrap(), original);
+        let raw: String = st
+            .conn
+            .query_row(
+                "SELECT description FROM skills WHERE name='alpha'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            raw, legacy,
+            "reading projections does not rewrite historic descriptions"
+        );
+        let expected = original
+            .iter()
+            .filter(|s| s.enabled && !s.retired)
+            .map(|s| {
+                format!(
+                    "- {}: {}",
+                    s.name,
+                    crate::descriptions::model_text(&s.description)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            crate::forecast::effective_prompt(&st, &crate::Config::default())
+                .unwrap()
+                .contains(&crate::provenance::frame("skill_index", &[], &expected))
+        );
+    }
+
+    #[test]
+    fn omitted_corrupt_fields_are_not_decoded_but_required_fields_and_sql_failures_propagate() {
+        let st = Store::open_in_memory().unwrap();
+        st.add_skill_version(
+            "fixture",
+            "reference",
+            1,
+            "/private/not-read",
+            "local",
+            "user",
+            false,
+        )
+        .unwrap();
+        st.conn
+            .execute("UPDATE skills SET has_scripts='malformed-unused'", [])
+            .unwrap();
+        assert!(st.list_skills().is_err());
+        assert_eq!(st.skill_summaries().unwrap().len(), 1);
+        assert_eq!(st.skill_names().unwrap(), ["fixture"]);
+        st.conn
+            .execute("UPDATE skills SET description=x'FF'", [])
+            .unwrap();
+        assert!(st.skill_summaries().is_err());
+        assert_eq!(st.skill_names().unwrap(), ["fixture"]);
+        st.conn
+            .execute("UPDATE skills SET description='reference'", [])
+            .unwrap();
+        st.conn.execute("DROP TABLE skill_loads", []).unwrap();
+        assert_eq!(
+            st.skill_summaries().unwrap().len(),
+            1,
+            "projection does not depend on history aggregates"
+        );
+        assert_eq!(st.skill_names().unwrap(), ["fixture"]);
+        st.conn
+            .execute("ALTER TABLE skills RENAME TO unavailable_skills", [])
+            .unwrap();
+        assert!(st.skill_summaries().is_err());
+        assert!(st.skill_names().is_err());
     }
 }
 

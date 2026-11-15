@@ -384,12 +384,27 @@ function __formatValue(x) {
       if (value === undefined) return "undefined";
       if (typeof value === "function" || typeof value === "symbol") return String(value);
       if (value instanceof Error) return value.name + ": " + value.message;
+      let output = value;
       if (value && typeof value === "object") {
-        while (ancestors.length && ancestors[ancestors.length - 1] !== this) ancestors.pop();
-        if (ancestors.includes(value)) return "[Circular]";
-        ancestors.push(value);
+        // JSON walks our generated wrappers, but cycles concern source values.
+        // Unwind by output parent so sibling references are not false cycles.
+        while (ancestors.length && ancestors[ancestors.length - 1].output !== this) ancestors.pop();
+        if (ancestors.some(frame => frame.source === value)) return "[Circular]";
+        if (value instanceof Map) {
+          output = { $type: "Map", entries: Array.from(Map.prototype.entries.call(value)) };
+        } else if (value instanceof Set) {
+          output = { $type: "Set", values: Array.from(Set.prototype.values.call(value)) };
+        }
+        if (output !== value) {
+          // Pairs preserve even a property named __proto__ or toJSON without
+          // turning it into wrapper behavior. JSON already applied toJSON to
+          // the source before invoking this replacer.
+          const properties = Object.entries(value);
+          if (properties.length) output.properties = properties;
+        }
+        ancestors.push({ source: value, output });
       }
-      return value;
+      return output;
     });
     // Match the ordinary console spelling for scalar special values.
     if (x === undefined || typeof x === "bigint" || typeof x === "function" || typeof x === "symbol") return String(x) + (typeof x === "bigint" ? "n" : "");
@@ -4403,6 +4418,102 @@ mod tests {
     }
 
     #[test]
+    fn console_collections_preserve_entries_properties_order_and_normal_return_encoding() {
+        let request = live(
+            r#"function run() {
+          const map = new Map([[2,'two'],[{key:'ไทย'},new Set([1,undefined,12n,new Error('problem')])],['雪','value']]);
+          map.label = 'own';
+          Object.defineProperty(map,'__proto__',{value:{safe:true},enumerable:true});
+          const returns=[];
+          for (const method of ['log','info','warn','error']) returns.push(console[method](map));
+          console.log(new Map()); console.log(new Set()); console.log({});
+          const set = new Set(['b','a']); set.values = 'own property'; console.log(set);
+          return {returns,map};
+        }"#,
+        );
+        let outcome = execute(&request, Arc::new(NoHostOps)).unwrap();
+        let expected = json!({"$type":"Map","entries":[[2,"two"],[{"key":"ไทย"},{"$type":"Set","values":[1,"undefined","12n","Error: problem"]}],["雪","value"]],"properties":[["label","own"],["__proto__",{"safe":true}]]});
+        assert_eq!(outcome.logs.len(), 8);
+        for line in &outcome.logs[..4] {
+            assert_eq!(serde_json::from_str::<Value>(line).unwrap(), expected);
+        }
+        assert_eq!(outcome.logs[4], r#"{"$type":"Map","entries":[]}"#);
+        assert_eq!(outcome.logs[5], r#"{"$type":"Set","values":[]}"#);
+        assert_eq!(outcome.logs[6], "{}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&outcome.logs[7]).unwrap(),
+            json!({"$type":"Set","values":["b","a"],"properties":[["values","own property"]]})
+        );
+        assert_eq!(
+            outcome.output,
+            json!({"returns":[null,null,null,null],"map":{"label":"own","__proto__":{"safe":true}}})
+        );
+    }
+
+    #[test]
+    fn console_collection_cycles_use_source_ancestry_without_false_sibling_cycles() {
+        let request = live(
+            r#"function run() {
+          const direct = new Map(); direct.set('self',direct); direct.self = direct; console.log(direct);
+          const set = new Set(); set.add(set); console.log(set);
+          const indirect = new Map(), nested = new Set(); indirect.set('set',nested); nested.add({back:indirect}); console.log(indirect);
+          const shared = new Map([['n',1]]), sharedSet = new Set([shared]);
+          console.log({left:shared,right:shared,list:[sharedSet,sharedSet]});
+          return 7;
+        }"#,
+        );
+        let outcome = execute(&request, Arc::new(NoHostOps)).unwrap();
+        assert_eq!(outcome.output, json!(7));
+        let values: Vec<Value> = outcome
+            .logs
+            .iter()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            values[0],
+            json!({"$type":"Map","entries":[["self","[Circular]"]],"properties":[["self","[Circular]"]]})
+        );
+        assert_eq!(values[1], json!({"$type":"Set","values":["[Circular]"]}));
+        assert_eq!(
+            values[2],
+            json!({"$type":"Map","entries":[["set",{"$type":"Set","values":[{"back":"[Circular]"}]}]]})
+        );
+        assert_eq!(values[3]["left"], values[3]["right"]);
+        assert_eq!(values[3]["list"][0], values[3]["list"][1]);
+        assert_eq!(values[3]["left"]["entries"], json!([["n", 1]]));
+        assert!(!outcome.logs[3].contains("[Circular]"));
+    }
+
+    #[test]
+    fn console_collection_to_json_precedence_getters_and_fallback_are_preserved() {
+        let request = live(
+            r#"function run() {
+          let calls=0, selfCalls=0, getters=0;
+          const custom=new Map([['hidden',1]]); custom.toJSON=()=>{calls++;return {custom:'kept'};}; console.log(custom);
+          const self=new Map([['n',1]]); self.toJSON=function(){selfCalls++;return this;}; console.log(self);
+          const getter=new Set([2]); Object.defineProperty(getter,'extra',{enumerable:true,get(){getters++;return {nested:4};}}); console.log(getter);
+          const bad=new Map(); Object.defineProperty(bad,'broken',{enumerable:true,get(){throw new Error('fixture');}}); console.log(bad);
+          return {calls,selfCalls,getters};
+        }"#,
+        );
+        let outcome = execute(&request, Arc::new(NoHostOps)).unwrap();
+        assert_eq!(outcome.output, json!({"calls":1,"selfCalls":1,"getters":1}));
+        assert_eq!(outcome.logs[0], r#"{"custom":"kept"}"#);
+        let self_value: Value = serde_json::from_str(&outcome.logs[1]).unwrap();
+        assert_eq!(self_value["entries"], json!([["n", 1]]));
+        assert_eq!(self_value["properties"][0][0], "toJSON");
+        assert!(self_value["properties"][0][1]
+            .as_str()
+            .unwrap()
+            .contains("selfCalls"));
+        assert_eq!(
+            serde_json::from_str::<Value>(&outcome.logs[2]).unwrap(),
+            json!({"$type":"Set","values":[2],"properties":[["extra",{"nested":4}]]})
+        );
+        assert_eq!(outcome.logs[3], "[Unformattable]");
+    }
+
+    #[test]
     fn fs_list_open_keeps_the_first_error_without_consuming_a_later_success() {
         use std::{cell::Cell, collections::VecDeque, io};
         let path = Path::new("synthetic-listing-path");
@@ -4534,11 +4645,21 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStringExt;
-            std::fs::write(
+            match std::fs::write(
                 root.join(std::ffi::OsString::from_vec(vec![b'b', 255])),
                 "fixture",
-            )
-            .unwrap();
+            ) {
+                Ok(()) => {}
+                // Unix paths can contain arbitrary bytes, but not every filesystem
+                // accepts them (for example, APFS rejects this name with EILSEQ).
+                // All listing/overlay assertions above still run on every host;
+                // test invalid-name rejection below wherever creation is supported.
+                Err(error) if error.raw_os_error() == Some(libc::EILSEQ) => {
+                    eprintln!("filesystem rejects non-UTF-8 filename fixture: {error}");
+                    return;
+                }
+                Err(error) => panic!("could not create non-UTF-8 filename fixture: {error}"),
+            }
             for details in [false, true] {
                 let mut req = request(
                     "function run(i) { return fs.list(i.root,{details:i.details}); }",

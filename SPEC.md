@@ -1254,7 +1254,12 @@ pasting paths.
   The web composer has a 📎 file picker and accepts pasted images.
 - **`@` mentions:** typing `@` in the input opens a completion popup of
   files under the client's working directory (TUI) or the daemon's (web),
-  fuzzy-matched on the path. `ListFiles {root?, query, limit?}` walks the
+  fuzzy-matched on the path. Ranking prepares the full and basename queries
+  once, folds each path once, and scores its basename from a rebased folded
+  suffix without highlight allocation. Bounded selection keeps score-descending,
+  UTF-8-byte-length-ascending, path-ascending order and stable input order for
+  duplicate ties; directory completion and the Unicode fold stay unchanged.
+  `ListFiles {root?, query, limit?}` walks the
   root once and caches it for 30 s. The walk respects `.gitignore`, skips
   hidden directories and `target`, `node_modules`, `dist`, `build`,
   `__pycache__` and `venv`, and stops at 200,000 entries. Directory
@@ -1263,8 +1268,20 @@ pasting paths.
   loops are skipped. Linked directories have size zero and their
   in-root children can be completed through the link's path. An empty query
   lists the top level, and `dir/` lists that directory, so paths complete
-  step by step. Tab or Enter inserts `@path`. On send, each `@path`
-  mention that names an existing file or directory goes through
+  step by step. Tab or Enter inserts `@path`, or `@"my notes/report.md"`
+  when a path needs delimiters. The `@"..."` form is reserved for quoted
+  paths: whitespace inside is literal, and only `\"` (quote) and `\\`
+  (backslash) are escapes. A complete token ends at its closing quote,
+  followed by whitespace, ordinary trailing mention punctuation, or end
+  of input. Invalid escapes, missing closing quotes and attached word
+  suffixes remain plain text on submission; they never attach a first-word
+  fragment. Directory completion retains the existing `/` marker and places
+  the cursor before a quoted directory's closing quote, so child completion
+  replaces the whole token. Exact indexed leading-space directory spellings
+  take priority before hand-typed query trimming. Extraction, chips, forecast
+  input and submission use the same decoded original paths without case or
+  filesystem normalization. On send, each complete mention that names an
+  existing file or directory goes through
   `AttachPath {session_id, path, root?}` before the message is sent:
   - text files up to 256 KB and images, WAV/MP3 audio and PDFs up to 8 MB are attached as below;
   - larger files and directories go as a reference line,
@@ -4729,6 +4746,16 @@ undo, redo and replacements invalidate prior asynchronous editor previews.
   (v2 adds `/fork`, `/search`, `/edit`, `/metrics`, `/proposals`,
   `/propose`, `/panes`; later `/retry [--model X]`, `/limit N|off`,
   `/good`, `/bad`, `/unrate`). Plain text is always chat.
+- **Search-hit navigation (TUI).** Enter on a cross-Session search hit opens
+  its stored message after the matching Session load, placing it in view once.
+  Navigation is owned by that Session, message ID and load request; an older
+  response cannot jump to a different selected hit. An absent ID may fall back
+  only to a unique sequence/role match within that loaded Session. A grouped
+  Tool result shows its call header as nearest visible context with a note.
+  A missing/unrenderable target or failed/timed-out load follows the bottom
+  with a note. Session/view changes and manual scrolling abandon a pending
+  jump; End resumes bottom-follow as usual. Chat-find highlighting does not
+  choose the destination.
 - **Local prompt commands.** Plain Markdown templates in the selected profile's
   `<config>/commands/NAME.md` and selected Session working directory's
   `.formless/commands/NAME.md` define `/NAME [ARGUMENTS]`. Discovery records the
@@ -5206,7 +5233,7 @@ the TUI. Command-specific arguments and defaults are available through
 | `formless sessions` | `fork`, `compare`, `list`, `show`, `files`, `rewind`, `rename`, `rm`, `restore`, `import`, `search`, `templates list/show`, `archive`, `unarchive`, `export` | Manage stored Sessions, follow a Run with `show --follow`, or inspect tracked files. `list --pinned --tag TAG` filters the fetched reply; selectors combine with `--archived`, preserving reply order. |
 | `formless skills` | `reviews`, `add`, `remove`, `list`, `enable`, `disable`, `show`, `export`, `import` | Inspect and manage Skills and their retained description reviews. |
 | `formless storage` | `--json` | Report disk usage by data category. |
-| `formless tools` | `reviews`, `list`, `disable`, `enable`, `undo`, `pin`, `unpin`, `tag`, `show`, `retire`, `restore`, `rollback`, `purge`, `run`, `export`, `import` | Inspect, manage, run, or transfer registry Tools. |
+| `formless tools` | `reviews`, `list`, `disable`, `enable`, `undo`, `pin`, `unpin`, `tag`, `show`, `diff`, `retire`, `restore`, `rollback`, `purge`, `run`, `export`, `import` | Inspect, manage, run, or transfer registry Tools. |
 | `formless tui` | `--plain`, `-c` / `--continue`, `--new` | Launch the full-screen terminal client; also the default with no command. |
 | `formless uninstall` | `--keep-data`, `--keep-binary`, `--yes` (alias `--force`) | Remove Formless, optionally retaining data or the binary. |
 | `formless update` | No action, `check`, or `--check`; `--json` | Show newer release notes and the applicable upgrade command; never rewrite the binary. |
