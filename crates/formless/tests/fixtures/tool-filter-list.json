@@ -1,0 +1,82 @@
+[
+  {
+    "id": "tool-alpha",
+    "name": "Alpha",
+    "title": "",
+    "description": "",
+    "retired": false,
+    "disabled": false,
+    "pinned": true,
+    "tags": [
+      "work"
+    ],
+    "current_version": 1,
+    "capabilities": [],
+    "memory_mb": 16,
+    "invocations": 0,
+    "success_rate": null,
+    "needs_attention": false,
+    "created_at": "",
+    "updated_at": ""
+  },
+  {
+    "id": "tool-beta",
+    "name": "Beta",
+    "title": "",
+    "description": "",
+    "retired": false,
+    "disabled": true,
+    "pinned": false,
+    "tags": [
+      "workshop"
+    ],
+    "current_version": 1,
+    "capabilities": [],
+    "memory_mb": 16,
+    "invocations": 1,
+    "success_rate": 0.5,
+    "needs_attention": false,
+    "created_at": "",
+    "updated_at": ""
+  },
+  {
+    "id": "tool-gamma",
+    "name": "Gamma",
+    "title": "",
+    "description": "",
+    "retired": true,
+    "disabled": false,
+    "pinned": true,
+    "tags": [
+      "work"
+    ],
+    "current_version": 1,
+    "capabilities": [],
+    "memory_mb": 16,
+    "invocations": 2,
+    "success_rate": 0.3,
+    "needs_attention": false,
+    "created_at": "",
+    "updated_at": ""
+  },
+  {
+    "id": "tool-delta",
+    "name": "Delta",
+    "title": "",
+    "description": "",
+    "retired": false,
+    "disabled": false,
+    "pinned": false,
+    "tags": [
+      "work"
+    ],
+    "current_version": 1,
+    "capabilities": [],
+    "memory_mb": 16,
+    "invocations": 3,
+    "success_rate": 0.9,
+    "needs_attention": false,
+    "created_at": "",
+    "updated_at": ""
+  }
+]

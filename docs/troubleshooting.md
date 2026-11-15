@@ -91,6 +91,22 @@ Use **Ctrl+J** or **Alt+Enter** otherwise; the TUI footer shows the binding
 that works in the current terminal. `tui.queue_key` is kept only for
 compatibility and does not change these bindings.
 
+## Context pressure or failed compaction
+
+Inspect `/context` for the Session's context window and its contents. Automatic
+compaction runs near the model context limit. For on-demand compaction, wait
+until the Run ends, then use `/compact` or `/compact FOCUS`. It is unavailable
+while a Run is active and reports nothing to compact when no turns are new
+since the last checkpoint.
+
+For the ordinary daemon-side summarizer, an empty or output-limit-cut summary
+fails before saving a checkpoint; the turns remain. Read the reported failure
+and provider diagnostics before retrying. A successful summary is not lossless.
+Provider-side compaction is optional and endpoint-specific. See
+[README context guidance](../README.md#context-and-compaction),
+[the generated commands](keys.md#session), and
+[SPEC §11](../SPEC.md#11-compaction) for the existing contract.
+
 ## Still stuck?
 
 Run `formless bug-report` and open an issue with the file it writes.
