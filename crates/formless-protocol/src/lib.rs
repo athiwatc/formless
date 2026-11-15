@@ -2375,7 +2375,9 @@ pub enum Request {
     /// Models to pick from (SPEC §4.5): `{"models": [id], "roles":
     /// [{"name", "provider", "model"}], "recent": [id], "current": {"model",
     /// "reasoning_effort"}, "error": str?}`. `models` comes from the default
-    /// provider's `GET /models`; `recent` is the Sessions' models, newest first.
+    /// provider's `GET /models`; `recent` deduplicates exact nonempty Session
+    /// model IDs after ordering stored updated_at descending, then Session ID
+    /// ascending. Archived Sessions participate; this is not model-use history.
     ListModels,
     /// Add or replace a named provider; `api_key` goes to the keychain.
     UpsertProvider {

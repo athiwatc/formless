@@ -27,13 +27,59 @@ pub(crate) fn set_line_numbers(on: bool) {
     LINE_NUMBERS.with(|l| l.set(on));
 }
 
-pub(crate) fn render(text: &str, color: bool, indent: &str, width: usize) -> Vec<Line<'static>> {
-    let opts = Options::ENABLE_TABLES
+/// Read the first actual href, skipping other complete attributes so names
+/// in quoted values and data-href cannot become a destination. Values remain
+/// verbatim, as in the existing inline-HTML renderer.
+fn html_href(body: &str) -> Option<&str> {
+    let space = |c: char| matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0c');
+    let mut attrs = &body[body.find(space)?..];
+    loop {
+        attrs = attrs.trim_start_matches(space);
+        if attrs.is_empty() {
+            return None;
+        }
+        let end = attrs
+            .find(|c| space(c) || c == '=' || c == '/')
+            .unwrap_or(attrs.len());
+        if end == 0 {
+            return None;
+        }
+        let name = &attrs[..end];
+        attrs = attrs[end..].trim_start_matches(space);
+        let value = if let Some(after) = attrs.strip_prefix('=') {
+            attrs = after.trim_start_matches(space);
+            if let Some(quote) = attrs.chars().next().filter(|c| *c == '\'' || *c == '"') {
+                let after = &attrs[1..];
+                let end = after.find(quote)?;
+                let value = &after[..end];
+                attrs = &after[end + 1..];
+                value
+            } else {
+                let end = attrs.find(space).unwrap_or(attrs.len());
+                let value = &attrs[..end];
+                attrs = &attrs[end..];
+                value
+            }
+        } else {
+            ""
+        };
+        if name.eq_ignore_ascii_case("href") {
+            return Some(value);
+        }
+    }
+}
+
+fn parser_options() -> Options {
+    Options::ENABLE_TABLES
         | Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_TASKLISTS
         | Options::ENABLE_GFM
         | Options::ENABLE_FOOTNOTES
-        | Options::ENABLE_MATH;
+        | Options::ENABLE_MATH
+}
+
+pub(crate) fn render(text: &str, color: bool, indent: &str, width: usize) -> Vec<Line<'static>> {
+    let opts = parser_options();
     let mut r = Renderer {
         color,
         width: width.max(indent.width() + 16),
@@ -47,6 +93,76 @@ pub(crate) fn render(text: &str, color: bool, indent: &str, width: usize) -> Vec
     r.out
 }
 
+/// A parsed table, with containers already interpreted by the same parser as
+/// chat rendering. Keep inline events and alignments instead of slicing raw
+/// source and guessing how much list/blockquote indentation to remove.
+pub(crate) struct ParsedTable<'a> {
+    events: Vec<Event<'a>>,
+}
+
+impl ParsedTable<'_> {
+    pub(crate) fn render(&self, color: bool, width: usize) -> Vec<Line<'static>> {
+        let mut renderer = Renderer {
+            color,
+            width: width.max(16),
+            ..Default::default()
+        };
+        for event in &self.events {
+            renderer.event(event.clone());
+        }
+        renderer.flush();
+        renderer.out
+    }
+}
+
+pub(crate) fn tables(text: &str) -> Vec<ParsedTable<'_>> {
+    let mut out = Vec::new();
+    let mut current = None;
+    for event in Parser::new_ext(text, parser_options()) {
+        if matches!(event, Event::Start(Tag::Table(_))) {
+            current = Some(Vec::new());
+        }
+        let end = matches!(event, Event::End(TagEnd::Table));
+        if let Some(events) = &mut current {
+            events.push(event);
+        }
+        if end {
+            if let Some(events) = current.take() {
+                out.push(ParsedTable { events });
+            }
+        }
+    }
+    out
+}
+
+/// Copy/pager contract: retain parsed code text, removing exactly the one
+/// final newline removed for chat presentation. Other whitespace stays.
+fn code_body(body: &str) -> &str {
+    body.strip_suffix('\n').unwrap_or(body)
+}
+
+pub(crate) fn code_blocks(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = None;
+    for event in Parser::new_ext(text, parser_options()) {
+        match event {
+            Event::Start(Tag::CodeBlock(_)) => current = Some(String::new()),
+            Event::Text(text) => {
+                if let Some(body) = &mut current {
+                    body.push_str(&text);
+                }
+            }
+            Event::End(TagEnd::CodeBlock) => {
+                if let Some(body) = current.take() {
+                    out.push(code_body(&body).to_owned());
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 /// A line prefix contributed by an enclosing block.
 struct Prefix {
     /// Used once, on the block's first row (a list marker).
@@ -54,11 +170,19 @@ struct Prefix {
     rest: Vec<Span<'static>>,
 }
 
+/// Layout provenance for parsed inline content, independent of its colors.
+#[derive(Clone)]
+struct InlineSpan {
+    content: String,
+    style: Style,
+    literal: bool,
+}
+
 struct Table {
     aligns: Vec<Alignment>,
-    rows: Vec<Vec<Vec<Span<'static>>>>,
-    row: Vec<Vec<Span<'static>>>,
-    cell: Vec<Span<'static>>,
+    rows: Vec<Vec<Vec<InlineSpan>>>,
+    row: Vec<Vec<InlineSpan>>,
+    cell: Vec<InlineSpan>,
     header_rows: usize,
 }
 
@@ -68,7 +192,7 @@ struct Renderer {
     width: usize,
     indent: String,
     out: Vec<Line<'static>>,
-    spans: Vec<Span<'static>>,
+    spans: Vec<InlineSpan>,
     styles: Vec<Style>,
     prefixes: Vec<Prefix>,
     lists: Vec<Option<u64>>,
@@ -107,7 +231,7 @@ impl Renderer {
             let spans = self.table.as_ref().map_or(&self.spans, |t| &t.cell);
             let text: String = spans[at.min(spans.len())..]
                 .iter()
-                .map(|s| s.content.as_ref())
+                .map(|s| s.content.as_str())
                 .collect();
             let bare = url.trim_start_matches("mailto:");
             if !url.is_empty() && text != url && text != bare && !url.starts_with('#') {
@@ -168,18 +292,7 @@ impl Renderer {
                 "code" | "kbd" | "samp" => fg(color, Color::Yellow),
                 "sub" | "sup" | "span" | "small" | "mark" => Style::default(),
                 "a" => {
-                    let href = body
-                        .split("href=")
-                        .nth(1)
-                        .map(|v| {
-                            let q = v.chars().next().filter(|c| *c == '"' || *c == '\'');
-                            match q {
-                                Some(q) => v[1..].split(q).next().unwrap_or_default(),
-                                None => v.split_whitespace().next().unwrap_or_default(),
-                            }
-                        })
-                        .unwrap_or_default()
-                        .to_string();
+                    let href = html_href(body).unwrap_or_default().to_string();
                     if self.link.is_none() && !href.is_empty() {
                         self.link = Some((href, self.mark()));
                     }
@@ -192,7 +305,15 @@ impl Renderer {
     }
 
     fn push_text(&mut self, text: impl Into<String>, extra: Style) {
-        let span = Span::styled(text.into(), self.style().patch(extra));
+        self.push_inline(text, extra, false);
+    }
+
+    fn push_inline(&mut self, text: impl Into<String>, extra: Style, literal: bool) {
+        let span = InlineSpan {
+            content: text.into(),
+            style: self.style().patch(extra),
+            literal,
+        };
         match &mut self.table {
             Some(t) => t.cell.push(span),
             None => self.spans.push(span),
@@ -278,7 +399,7 @@ impl Renderer {
                     self.push_text(t.to_string(), Style::default());
                 }
             }
-            Event::Code(t) => self.push_text(t.to_string(), fg(color, Color::Yellow)),
+            Event::Code(t) => self.push_inline(t.to_string(), fg(color, Color::Yellow), true),
             Event::InlineMath(t) | Event::DisplayMath(t) => self.push_text(
                 t.to_string(),
                 fg(color, Color::LightMagenta).add_modifier(Modifier::ITALIC),
@@ -544,7 +665,7 @@ impl Renderer {
     fn code_block(&mut self, lang: &str, body: &str) {
         let color = self.color;
         let avail = self.width.saturating_sub(self.prefix_width());
-        let body = body.strip_suffix('\n').unwrap_or(body);
+        let body = code_body(body);
         self.code_index += 1;
         let index = self.code_index;
         if lang.eq_ignore_ascii_case("mermaid") {
@@ -640,7 +761,7 @@ impl Renderer {
         if cols == 0 {
             return;
         }
-        let cell_w = |c: &Vec<Span>| c.iter().map(|s| s.content.width()).sum::<usize>();
+        let cell_w = |c: &Vec<InlineSpan>| c.iter().map(|s| s.content.width()).sum::<usize>();
         let mut natural = vec![1usize; cols];
         for row in &t.rows {
             for (i, c) in row.iter().enumerate() {
@@ -680,7 +801,7 @@ impl Renderer {
                 let mut line = vec![Span::styled("│", dim(color))];
                 for (i, w) in widths.iter().enumerate() {
                     let cell = truncate_spans(cells[i].get(k).cloned().unwrap_or_default(), *w);
-                    let pad = w - cell_w(&cell);
+                    let pad = w - cell.iter().map(|span| span.content.width()).sum::<usize>();
                     let (l, r) = match t.aligns.get(i) {
                         Some(Alignment::Right) => (pad, 0),
                         Some(Alignment::Center) => (pad / 2, pad - pad / 2),
@@ -700,7 +821,7 @@ impl Renderer {
     /// A table too wide for the pane, as `key: value` records.
     fn table_records(&mut self, t: Table) {
         let color = self.color;
-        let headers: Vec<Vec<Span<'static>>> = if t.header_rows > 0 {
+        let headers: Vec<Vec<InlineSpan>> = if t.header_rows > 0 {
             t.rows[0].clone()
         } else {
             Vec::new()
@@ -792,7 +913,7 @@ fn fit_widths(natural: &[usize], room: usize) -> Vec<usize> {
 }
 
 /// Greedy word wrap of styled spans; `\n` inside a span forces a break.
-fn wrap(spans: Vec<Span<'static>>, avail: usize) -> Vec<Vec<Span<'static>>> {
+fn wrap(spans: Vec<InlineSpan>, avail: usize) -> Vec<Vec<Span<'static>>> {
     // Split into words (non-space runs, possibly multi-style) and spaces.
     enum Piece {
         Word(Vec<Span<'static>>, usize),
@@ -820,6 +941,13 @@ fn wrap(spans: Vec<Span<'static>>, avail: usize) -> Vec<Vec<Span<'static>>> {
                 _ => pieces.push(Piece::Word(vec![s], w)),
             }
         };
+        if span.literal {
+            // Keep parsed code as one literal run. Move it intact when it fits;
+            // otherwise hard-wrap by grapheme without discarding any spaces.
+            word.push_str(&span.content);
+            flush_word(&mut word, &mut pieces);
+            continue;
+        }
         for g in span.content.graphemes(true) {
             let ch = g.chars().next().unwrap_or(' ');
             if g == "\n" || g == "\r\n" {
@@ -845,11 +973,49 @@ fn wrap(spans: Vec<Span<'static>>, avail: usize) -> Vec<Vec<Span<'static>>> {
         }
         flush_word(&mut word, &mut pieces);
     }
+    // Representative CJK line-edge policy, not a complete UAX #14 or
+    // locale-specific typography implementation. Keep opening brackets with
+    // what follows and closing/trailing marks with what precedes. Apply this
+    // to boundaries after tokenization so styles cannot introduce a break.
+    // An oversized punctuation group still uses the grapheme hard-wrap below.
+    let opening = |c| "（［｛〈《「『【〔〖〘〚".contains(c);
+    let closing = |c| "、。，．：；？！）］｝〉》」』】〕〗〙〛".contains(c);
+    let mut grouped: Vec<Piece> = Vec::with_capacity(pieces.len());
+    let mut iter = pieces.into_iter().peekable();
+    while let Some(piece) = iter.next() {
+        if matches!(piece, Piece::Soft) {
+            let after_open = match grouped.last() {
+                Some(Piece::Word(parts, _)) => parts
+                    .iter()
+                    .rev()
+                    .find_map(|span| span.content.chars().last())
+                    .is_some_and(opening),
+                _ => false,
+            };
+            let before_close = match iter.peek() {
+                Some(Piece::Word(parts, _)) => parts
+                    .iter()
+                    .find_map(|span| span.content.chars().next())
+                    .is_some_and(closing),
+                _ => false,
+            };
+            if after_open || before_close {
+                continue;
+            }
+        }
+        match (grouped.last_mut(), piece) {
+            (Some(Piece::Word(previous, previous_width)), Piece::Word(parts, width)) => {
+                previous.extend(parts);
+                *previous_width += width;
+            }
+            (_, piece) => grouped.push(piece),
+        }
+    }
     let mut rows: Vec<Vec<Span<'static>>> = Vec::new();
     let mut row: Vec<Span<'static>> = Vec::new();
     let mut row_w = 0;
     let mut space: Option<Style> = None;
-    for p in pieces {
+    for p in grouped {
         match p {
             Piece::Break => {
                 rows.push(std::mem::take(&mut row));
@@ -897,6 +1063,9 @@ fn wrap(spans: Vec<Span<'static>>, avail: usize) -> Vec<Vec<Span<'static>>> {
 
 /// Split spans into rows of at most `avail` columns, ignoring words.
 fn hard_wrap(spans: Vec<Span<'static>>, avail: usize) -> Vec<Vec<Span<'static>>> {
+    if avail == 0 {
+        return Vec::new();
+    }
     let mut rows = vec![Vec::new()];
     let mut w = 0;
     for span in spans {
@@ -904,6 +1073,7 @@ fn hard_wrap(spans: Vec<Span<'static>>, avail: usize) -> Vec<Vec<Span<'static>>>
         // By cluster, so a mark never starts a row and an emoji sequence
         // is never cut (#786).
         for g in span.content.graphemes(true) {
+            let g = if g.width() > avail { "…" } else { g };
             let cw = g.width();
             if w + cw > avail && w > 0 {
                 if !buf.is_empty() {
@@ -1051,6 +1221,71 @@ mod tests {
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect()
+    }
+
+    #[test]
+    fn inline_code_retains_parser_spacing_in_paragraphs_and_tables() {
+        for color in [false, true] {
+            for source in [
+                "`echo \"a  b\"`",
+                "*`a  b`*",
+                "**`a  b`**",
+                "` foo  bar `",
+                "`a\nb`",
+                "`   `",
+            ] {
+                let code = Parser::new(source)
+                    .find_map(|event| match event {
+                        Event::Code(text) => Some(text.to_string()),
+                        _ => None,
+                    })
+                    .unwrap();
+                let out = render(source, color, "", 120);
+                assert_eq!(
+                    out.iter().map(Line::to_string).collect::<Vec<_>>().join(""),
+                    code,
+                    "{source:?} color={color}"
+                );
+            }
+            let out = render(
+                "| command | value |\n| --- | --- |\n| `a  b` | data |",
+                color,
+                "",
+                100,
+            );
+            assert!(out.iter().any(|line| line.to_string().contains("a  b")));
+            assert_eq!(render("a   b", color, "", 100)[0].to_string(), "a b");
+        }
+        let out = render("*`a  b`*", true, "", 100);
+        assert!(out[0]
+            .spans
+            .iter()
+            .filter(|s| !s.content.is_empty())
+            .all(|s| s.style.add_modifier.contains(Modifier::ITALIC)));
+    }
+
+    #[test]
+    fn narrow_inline_code_hard_wraps_without_dropping_literal_spaces() {
+        let code = "echo \"a  b\"   && printf ไทย_日本語";
+        for width in 16..40 {
+            let out = render(&format!("`{code}`"), true, "", width);
+            assert!(
+                out.iter().all(|line| line.width() <= width),
+                "width={width}"
+            );
+            assert_eq!(
+                out.iter()
+                    .flat_map(|line| &line.spans)
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>(),
+                code,
+                "width={width}"
+            );
+            assert!(out
+                .iter()
+                .flat_map(|line| &line.spans)
+                .all(|span| span.style.fg == Some(Color::Yellow)));
+        }
     }
 
     #[test]
@@ -1269,6 +1504,77 @@ mod tests {
     }
 
     #[test]
+    fn parsed_tables_preserve_cells_alignment_and_styles_without_containers() {
+        let table = "Name | Value\n:--- | ---:\n**ไทย** | `x\\|y`\n~~old~~ | a\\|b";
+        let expected = render(table, true, "", 100_000);
+        for source in [
+            table.to_owned(),
+            table
+                .lines()
+                .map(|line| format!("> {line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            format!(
+                "- item\n\n{}",
+                table
+                    .lines()
+                    .map(|line| format!("  {line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+            format!(
+                "> - item\n>\n{}",
+                table
+                    .lines()
+                    .map(|line| format!(">   {line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+        ] {
+            let selected = tables(&source);
+            assert_eq!(selected.len(), 1, "{source}");
+            assert_eq!(selected[0].render(true, 100_000), expected, "{source}");
+        }
+        let source = format!("| prose one\n| prose two\n\n~~~\n| fake | table |\n| --- | --- |\n~~~\n\n    | indented | code |\n    | --- | --- |\n\n{table}\n\n| Next | Value |\n| --- | --- |\n| 日本語 | 2 |");
+        let selected = tables(&source);
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].render(true, 100_000), expected);
+        assert!(selected[1]
+            .render(false, 100_000)
+            .iter()
+            .any(|line| line.to_string().contains("日本語")));
+    }
+
+    #[test]
+    fn parsed_code_blocks_preserve_order_containers_and_newline_contract() {
+        let source = "~~~sh\ntilde\n~~~\n\n    indented\n    next\n\n````text\nliteral\n```\nstill code\n````\n\n> - item\n>\n>   ```rust\n>     nested\n>   ```\n\n```mermaid\ngraph LR\nA --> B\n```\n\n```text\nunclosed";
+        assert_eq!(
+            code_blocks(source),
+            [
+                "tilde",
+                "indented\nnext",
+                "literal\n```\nstill code",
+                "  nested",
+                "graph LR\nA --> B",
+                "unclosed"
+            ]
+        );
+        let displayed = render(source, false, "", 200)
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        for label in ["sh [1]", "text [3]", "rust [4]", "text [6]"] {
+            assert!(displayed.contains(label), "{displayed}");
+        }
+        assert!(displayed.contains("mermaid"));
+        assert_eq!(code_blocks("~~~\r\nline\r\n\r\n~~~\r\n"), ["line\n"]);
+        assert_eq!(code_blocks("~~~\n  \n~~~"), ["  "]);
+        assert_eq!(code_blocks("~~~\n~~~"), [""]);
+        assert_eq!(code_blocks("~~~\nline\n\n"), ["line\n"]);
+    }
+
+    #[test]
     fn strips_markers_and_styles_spans() {
         let out = render(
             "# Title\nThe **bold** and `code` and ~~gone~~.",
@@ -1358,6 +1664,212 @@ mod tests {
     /// Thai and Chinese wrap within the width, never starting a row with a
     /// mark or cutting an emoji sequence (#786).
     #[test]
+    fn cjk_wrap_keeps_representative_punctuation_with_its_neighbor() {
+        for (source, width, expected) in [
+            ("中文。", 4, vec!["中", "文。"]),
+            ("中（文", 4, vec!["中", "（文"]),
+            ("中文，字", 4, vec!["中", "文，", "字"]),
+            ("「中文」", 6, vec!["「中", "文」"]),
+        ] {
+            let rows = wrap(
+                vec![InlineSpan {
+                    content: source.into(),
+                    style: Style::default(),
+                    literal: false,
+                }],
+                width,
+            );
+            let actual: Vec<_> = rows
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|span| span.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect();
+            assert_eq!(actual, expected, "{source}, width {width}");
+        }
+    }
+
+    #[test]
+    fn cjk_wrap_respects_styles_newlines_and_oversized_groups() {
+        let span = |text: &str, style| InlineSpan {
+            content: text.into(),
+            style,
+            literal: false,
+        };
+        let bold = Style::default().add_modifier(Modifier::BOLD);
+        let italic = Style::default().add_modifier(Modifier::ITALIC);
+        let rows = wrap(
+            vec![
+                span("中", Style::default()),
+                span("（", bold),
+                span("文", italic),
+            ],
+            4,
+        );
+        let texts: Vec<String> = rows
+            .iter()
+            .map(|row| row.iter().map(|span| span.content.as_ref()).collect())
+            .collect();
+        assert_eq!(texts, ["中", "（文"]);
+        assert_eq!(rows[1][0].style, bold);
+        assert_eq!(rows[1][1].style, italic);
+        for source in [
+            "中文，继续。",
+            "中文「日本語」文章。",
+            "日本語【文章】です！",
+        ] {
+            for width in [4, 6, 8] {
+                let rows = wrap(vec![span(source, Style::default())], width);
+                let texts: Vec<String> = rows
+                    .iter()
+                    .map(|row| row.iter().map(|span| span.content.as_ref()).collect())
+                    .collect();
+                assert_eq!(texts.concat(), source);
+                for row in texts {
+                    assert!(row.width() <= width, "{row}");
+                    assert!(
+                        !row.starts_with(['、', '。', '，', '」', '】', '！']),
+                        "{row}"
+                    );
+                    assert!(!row.ends_with(['「', '【']), "{row}");
+                }
+            }
+        }
+        let rows = wrap(vec![span("中\n。文", bold)], 4);
+        assert_eq!(
+            rows.iter()
+                .map(|row| row
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>())
+                .collect::<Vec<_>>(),
+            ["中", "。文"]
+        );
+        for width in [1, 2, 4] {
+            let rows = wrap(vec![span("（文）", bold)], width);
+            assert_eq!(
+                rows.iter()
+                    .flat_map(|row| row.iter())
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>(),
+                if width == 1 { "………" } else { "（文）" }
+            );
+            assert!(rows.iter().all(|row| row
+                .iter()
+                .map(|span| span.content.width())
+                .sum::<usize>()
+                <= width));
+        }
+        for source in ["กขคง", "ກຂຄງ", "កខគឃ", "ကခဂဃ"] {
+            let rows = wrap(vec![span(source, bold)], 2);
+            let text_rows = |rows: Vec<Vec<Span<'static>>>| {
+                rows.into_iter()
+                    .map(|row| {
+                        row.into_iter()
+                            .map(|span| span.content.into_owned())
+                            .collect::<String>()
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert!(rows.iter().flatten().all(|span| span.style == bold));
+            assert_eq!(
+                text_rows(rows),
+                text_rows(hard_wrap(vec![Span::styled(source, bold)], 2))
+            );
+        }
+    }
+
+    #[test]
+    fn hard_wrap_replaces_clusters_wider_than_the_row_budget() {
+        let span = |text: &str, style| InlineSpan {
+            content: text.into(),
+            style,
+            literal: false,
+        };
+        let bold = Style::default().add_modifier(Modifier::BOLD);
+        let family = "👨\u{200d}👩\u{200d}👧\u{200d}👦";
+        for source in ["界", family, "a界b", "界界", "a\u{301}界b"] {
+            let expected = source
+                .graphemes(true)
+                .map(|g| if g.width() > 1 { "…" } else { g })
+                .collect::<String>();
+            let rows = hard_wrap(vec![Span::styled(source.to_string(), bold)], 1);
+            assert!(
+                rows.iter()
+                    .all(|r| r.iter().map(|s| s.content.width()).sum::<usize>() <= 1),
+                "{rows:?}"
+            );
+            assert_eq!(
+                rows.iter()
+                    .flatten()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>(),
+                expected
+            );
+            assert!(rows.iter().flatten().all(|s| s.style == bold));
+            assert!(hard_wrap(vec![Span::styled(source.to_string(), bold)], 0).is_empty());
+            let rows = wrap(vec![span(source, bold)], 1);
+            assert!(
+                rows.iter()
+                    .all(|r| r.iter().map(|s| s.content.width()).sum::<usize>() <= 1),
+                "{rows:?}"
+            );
+        }
+        let rows = hard_wrap(vec![Span::styled("a", bold), Span::raw("界b")], 1);
+        assert_eq!(
+            rows.iter()
+                .flatten()
+                .map(|s| s.content.as_ref())
+                .collect::<String>(),
+            "a…b"
+        );
+        assert_eq!(rows[0][0].style, bold);
+        assert_eq!(rows[1][0].style, Style::default());
+        let rows = hard_wrap(vec![Span::raw(format!("{family}界"))], 2);
+        assert_eq!(
+            rows.iter()
+                .flatten()
+                .map(|s| s.content.as_ref())
+                .collect::<String>(),
+            format!("{family}界")
+        );
+    }
+
+    #[test]
+    fn narrow_table_record_values_keep_wide_clusters_inside_the_body() {
+        let source =
+            "| Key | Value |\n|---|---|\n| 界界界界界 | 👨\u{200d}👩\u{200d}👧\u{200d}👦界 |";
+        // Exercise the table renderer with a five-column body budget, as
+        // can remain after reserving enclosing prefixes and indentation.
+        let mut renderer = Renderer {
+            width: 5,
+            ..Default::default()
+        };
+        for event in Parser::new_ext(source, parser_options()) {
+            renderer.event(event);
+        }
+        renderer.flush();
+        let rows = renderer.out;
+        // Scope the assertion to wrapped values: the existing fixed row
+        // heading has its own minimum width and is outside hard wrapping.
+        let values: Vec<_> = rows
+            .iter()
+            .filter(|row| row.spans.first().is_some_and(|s| s.content == "    "))
+            .collect();
+        assert!(!values.is_empty());
+        assert!(values.iter().all(|row| row.width() <= 5), "{values:?}");
+        assert!(
+            values
+                .iter()
+                .flat_map(|row| &row.spans)
+                .any(|s| s.content.contains('…')),
+            "{rows:?}"
+        );
+    }
+
+    #[test]
     fn unspaced_scripts_wrap_between_clusters() {
         let marks = |c: char| matches!(c as u32, 0x0E31 | 0x0E34..=0x0E3A | 0x0E47..=0x0E4E);
         let out = lines("สวัสดีครับวันนี้อากาศดีมากเลยนะครับ", 20);
@@ -1437,6 +1949,39 @@ mod tests {
             .find(|s| s.content == "bold")
             .unwrap();
         assert!(span.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn inline_html_anchor_attributes_preserve_destinations() {
+        for attrs in [
+            r#"HREF="https://Case.Example/A%2Fb?TokenAbC#Frag""#,
+            r#"href = 'https://Case.Example/A%2Fb?TokenAbC#Frag'"#,
+            "HrEf\t=\nhttps://Case.Example/A%2Fb?TokenAbC#Frag",
+            r#"title='a href=wrong' data-href="wrong" HREF = "https://Case.Example/A%2Fb?TokenAbC#Frag""#,
+            r#"disabled HREF="https://Case.Example/A%2Fb?TokenAbC#Frag" title="last""#,
+        ] {
+            let source = format!("see <A {attrs}>the docs</A> next");
+            let out = lines(&source, 160).join("\n");
+            assert_eq!(
+                out.trim(),
+                "see the docs (https://Case.Example/A%2Fb?TokenAbC#Frag) next",
+                "{source}"
+            );
+        }
+        for attrs in [
+            r#"data-href="https://wrong.test""#,
+            r#"title="href=https://wrong.test""#,
+            r#"href="" HREF="https://wrong.test""#,
+        ] {
+            let out = lines(&format!("see <a {attrs}>docs</a> next"), 160).join("\n");
+            assert_eq!(out.trim(), "see docs next", "{attrs}");
+        }
+        let out = lines(
+            "see <a HrEf='#local'>docs</a> and <a HREF='mailto:a@example.test'>a@example.test</a>",
+            160,
+        )
+        .join("\n");
+        assert_eq!(out.trim(), "see docs and a@example.test");
     }
 
     #[test]
@@ -1546,6 +2091,21 @@ mod tests {
         assert!(out.iter().any(|l| l.contains("gantt")));
     }
 
+    #[test]
+    fn composite_mermaid_state_uses_labelled_source_instead_of_wrong_flat_diagram() {
+        let source = "stateDiagram-v2\n[*] --> Parent\nstate Parent {\ndirection LR\n[*] --> Inner\nInner --> [*]\n}";
+        let out = lines(&format!("```mermaid\n{source}\n```"), 80);
+        assert!(
+            out.iter().any(|line| line.contains("mermaid [1] (source")),
+            "{out:?}"
+        );
+        assert!(
+            out.iter().any(|line| line.contains("state Parent {")),
+            "{out:?}"
+        );
+        assert!(!out.iter().any(|line| line.contains("◇ mermaid · state")));
+    }
+
     /// A too-wide flowchart: one label of about `22 * n` columns (#1742).
     fn wide_mermaid(n: usize) -> String {
         format!(
@@ -1640,6 +2200,23 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn narrow_mermaid_pie_uses_existing_wide_preview_and_pager_path() {
+        let source = "pie\n\"abcdefghijklmnopqrstuvwxyzab\":1";
+        assert!(mermaid::render(source, false, 28).is_none());
+        let wide = mermaid::render(source, false, 10_000).unwrap();
+        assert_eq!(wide.kind, "pie");
+        let out = fitted(&format!("```mermaid\n{source}\n```"), 30);
+        assert!(out.iter().all(|line| line.width() <= 30));
+        let text = out.join("\n");
+        assert!(text.contains("/pager diagram 1"), "{text}");
+        assert!(text.contains("pie"), "{text}");
+        assert!(
+            !text.contains("source —"),
+            "supported wide pie uses a preview before source fallback"
+        );
     }
 
     #[test]
