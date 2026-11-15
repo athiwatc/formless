@@ -312,6 +312,58 @@ fn example_gate_rejects_removed_flags_and_preserves_shell_arguments() {
 }
 
 #[test]
+fn one_shot_job_help_quotes_only_supported_offsets() {
+    use chrono::TimeZone;
+    let root = command_tree();
+    let at = root
+        .find_subcommand("jobs")
+        .unwrap()
+        .find_subcommand("add")
+        .unwrap()
+        .get_arguments()
+        .find(|arg| arg.get_id() == "at")
+        .unwrap();
+    let help = at.get_help().unwrap().to_string();
+    let now = chrono::Local
+        .with_ymd_and_hms(2026, 1, 15, 12, 0, 0)
+        .unwrap();
+    let examples: Vec<_> = help.split('"').skip(1).step_by(2).collect();
+    assert!(!examples.is_empty(), "{help}");
+    for example in examples {
+        let cli = super::Cli::try_parse_from([
+            "formless",
+            "jobs",
+            "add",
+            "fixture prompt",
+            "--at",
+            example,
+        ])
+        .unwrap();
+        let Some(super::Cmd::Jobs {
+            action: super::JobsAction::Add {
+                at: Some(parsed), ..
+            },
+        }) = cli.cmd
+        else {
+            panic!("wrong command");
+        };
+        assert!(
+            formless_core::jobs::parse_at(&parsed, now).is_ok(),
+            "unsupported help example {parsed:?}: {help}"
+        );
+    }
+    assert!(
+        help.contains("YYYY-MM-DD HH:MM") && help.contains("RFC 3339"),
+        "{help}"
+    );
+    // These are documented format names, not relative-language promises.
+    for absolute in ["2030-01-02 09:00", "2030-01-02T09:00:00Z"] {
+        assert!(formless_core::jobs::parse_at(absolute, now).is_ok());
+    }
+    assert!(!help.contains("tomorrow"), "{help}");
+}
+
+#[test]
 fn docs_no_topic_help_matches_the_gallery_default() {
     let root = command_tree();
     let help = root
@@ -361,7 +413,7 @@ fn docs_long_help_lists_every_topic_name_and_description() {
     let docs = root.find_subcommand("docs").unwrap();
     assert_eq!(
         docs.get_about().map(ToString::to_string).as_deref(),
-        Some("Open the guides in a browser")
+        Some("Open an online guide or read this build's bundled Markdown")
     );
     let error = match super::Cli::try_parse_from(["formless", "docs", "--help"]) {
         Err(error) => error,
@@ -369,7 +421,7 @@ fn docs_long_help_lists_every_topic_name_and_description() {
     };
     assert_eq!(error.kind(), ErrorKind::DisplayHelp);
     let rendered = normalized(&error.to_string());
-    assert!(rendered.contains("Open the guides in a browser"));
+    assert!(rendered.contains("Open an online guide or read this build's bundled Markdown"));
     for (name, _, description) in formless_core::docs::TOPICS {
         assert!(
             rendered.contains(name),
@@ -387,7 +439,9 @@ fn parsed_docs(args: &[&str]) -> (Option<String>, bool, bool) {
         panic!("parser rejected {}: {error}", args.join(" "));
     });
     match cli.cmd {
-        Some(super::Cmd::Docs { topic, print, keys }) => (topic, print, keys),
+        Some(super::Cmd::Docs {
+            topic, print, keys, ..
+        }) => (topic, print, keys),
         _ => panic!("expected docs command"),
     }
 }
@@ -823,5 +877,54 @@ fn naming_pull_metadata_and_validation_share_the_model_registry() {
     let bash = String::from_utf8(bash).unwrap();
     for model in formless_core::namer::MODELS {
         assert!(bash.contains(model.id));
+    }
+}
+
+#[test]
+fn task_guide_examples_parse_without_dispatch_and_schedule_examples_are_valid() {
+    use chrono::TimeZone;
+    let now = chrono::Local
+        .with_ymd_and_hms(2026, 1, 15, 12, 0, 0)
+        .unwrap();
+    for (topic, text) in [
+        ("mcp", include_str!("../../../docs/mcp.md")),
+        ("skills", include_str!("../../../docs/skills.md")),
+        ("jobs", include_str!("../../../docs/jobs.md")),
+    ] {
+        assert!(formless_core::docs::resolve(Some(topic))
+            .unwrap()
+            .ends_with(&format!("docs/{topic}.md")));
+        let problems = example_problems(&format!("Examples:\n{text}"));
+        assert!(problems.is_empty(), "{topic}: {problems:?}");
+        for line in text.lines() {
+            let Some(args) = example_args(line).unwrap() else {
+                continue;
+            };
+            let cli = super::Cli::try_parse_from(args).unwrap();
+            if let Some(super::Cmd::Jobs {
+                action: super::JobsAction::Add { at, cron, .. },
+            }) = cli.cmd
+            {
+                if let Some(at) = at {
+                    assert!(formless_core::jobs::parse_at(&at, now).is_ok(), "{line}");
+                }
+                if let Some(cron) = cron {
+                    assert!(formless_core::jobs::to_cron(&cron).is_ok(), "{line}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn bundled_docs_text_conflicts_with_url_and_keys_modes() {
+    for args in [
+        ["formless", "docs", "--text", "--print"],
+        ["formless", "docs", "--text", "--keys"],
+    ] {
+        let error = super::Cli::try_parse_from(args)
+            .err()
+            .expect("modes must conflict");
+        assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
     }
 }

@@ -47,7 +47,11 @@ def validate_repository_url(url, get):
     parsed = urlsplit(url)
     if (parsed.scheme != "https" or parsed.netloc != "github.com" or parsed.fragment):
         raise ValueError("unsupported private-repository URL form")
-    path = parsed.path[len("/" + REPOSITORY):].rstrip("/")
+    root = "/" + REPOSITORY
+    if parsed.path != root and not parsed.path.startswith(root + "/"):
+        raise ValueError("wrong private repository")
+    raw_path = parsed.path[len(root):]
+    path = raw_path.rstrip("/")
     query = parse_qs(parsed.query, keep_blank_values=True)
     if path == "" and not query:
         get("")
@@ -59,6 +63,24 @@ def validate_repository_url(url, get):
         if not get("").get("has_issues"):
             raise ValueError("repository issues are disabled")
         # These are navigation/form routes, not claims that an issue exists.
+    elif path.startswith("/issues/"):
+        # A numbered issue is an object claim, unlike the index/new form.
+        # Accept only canonical ASCII decimal paths; never normalize an
+        # arbitrary suffix into an authenticated API endpoint.
+        match = re.fullmatch(r"/issues/([1-9][0-9]*)", raw_path)
+        if not match or query:
+            raise ValueError("unsupported numbered issue URL")
+        number = match.group(1)
+        endpoint = "/issues/" + number
+        data = get(endpoint)
+        if (not isinstance(data, dict) or type(data.get("number")) is not int or
+                str(data["number"]) != number or data.get("url") != API + endpoint or
+                data.get("repository_url") != API or
+                data.get("html_url") != "https://github.com/" + REPOSITORY + endpoint or
+                "pull_request" in data):
+            # The issues API also returns PR objects. A PR is not evidence
+            # that the exact /issues/N link names an issue in this repo.
+            raise ValueError("numbered issue identity mismatch or pull request")
     elif path == "/releases" and not query:
         get("/releases?per_page=1")  # An empty list is a valid releases index.
     elif path == "/releases/latest" and not query:

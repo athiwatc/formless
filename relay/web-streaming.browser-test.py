@@ -67,6 +67,7 @@ def expose_script(route):
     hooks = r'''
     const fixture816={S, onEvent, openSession, setView, renderChrome, renderHistory,
       renderLive, scrollToBottom, resetReadingSession, withTranscriptLayout,
+      textState:()=>typeof currentLiveText==='function'?currentLiveText():null,
       scheduleEventRender, cancelEventRender, updateElapsedTimers, setThinking, streamingNode, splitStreaming, markdown, MD_FORMAT_CHARS,
       stats:{history:0,live:0,status:0,composer:0}, diagrams:new Map(), snapshots:new Map(), calls:[]};
     const painted816={renderHistory,renderLive,renderStatus,renderComposer};
@@ -310,6 +311,64 @@ def committed_stream_cases(page, name):
             check(page.evaluate('__stream816.S.running.has(__stream816.S.current)'),name+' Tool-call step commit is tested before Run completion')
 
 
+def live_reasoning_cases(page, name):
+    fixture(page)
+    page.evaluate(r'''() => {
+      const d=__stream816;__raf816.hold();d.S.showThinking=true;
+      d.onEvent({type:'run_started',session_id:'A',run_id:'reason-run'});
+      window.fullReason1537=Array.from({length:100},(_,i)=>'Reasoning '+i+' ไทย '+('readable retained detail '.repeat(4))).join('\n');
+      d.onEvent({type:'reasoning_delta',session_id:'A',run_id:'reason-run',delta:fullReason1537});
+    }''')
+    flush(page);settle(page)
+    toggle=page.get_by_role('button',name='Expand reasoning',exact=True)
+    check(toggle.count()==1,name+' live reasoning has an explicit expand control')
+    check(page.locator('#live .thinking').text_content()==page.evaluate("'… '+fullReason1537.split('\\n').slice(-6).join('\\n')"),name+' collapsed reasoning retains the original last-six-lines rule')
+    check(page.evaluate('__stream816.S.thinking===fullReason1537'),name+' full source remains retained while collapsed')
+    toggle.focus();toggle.press('Enter');settle(page)
+    check(page.get_by_role('button',name='Collapse reasoning',exact=True).get_attribute('aria-expanded')=='true',name+' keyboard expansion exposes state')
+    check(page.locator('#live .thinking').text_content()==page.evaluate('fullReason1537'),name+' expansion displays all retained lines')
+    check(page.locator('#live .thinking').evaluate("e=>e.tabIndex===0 && e.scrollHeight>e.clientHeight && getComputedStyle(e).overflowY==='auto'"),name+' expanded reasoning is a bounded keyboard scrollport')
+    page.locator('#live .thinking').evaluate('e=>{e.scrollTop=100;}')
+    top=page.locator('#live .thinking').evaluate('e=>e.scrollTop')
+    page.evaluate(r'''() => {const d=__stream816;window.reasonNode1537=document.querySelector('#live .thinking');window.reasonText1537=reasonNode1537.firstChild;window.reasonCache1537=d.textState().thinking;window.reasonCachedText1537=reasonCache1537.text;
+      d.onEvent({type:'reasoning_delta',session_id:'A',run_id:'reason-run',delta:'\nMore retained text\n'});
+    }''')
+    flush(page);settle(page)
+    check(page.locator('#live .thinking').evaluate('e=>e.scrollTop')==top,name+' expanded append preserves the inner reading position')
+    check(page.evaluate("reasonNode1537===document.querySelector('#live .thinking') && reasonText1537===reasonNode1537.firstChild"),name+' expanded updates retain element and Text node identity')
+    check(page.evaluate('__stream816.textState().thinking===reasonCache1537 && reasonCache1537.text===reasonCachedText1537'),name+' expanded display does not process the unused collapsed tail')
+    page.get_by_role('button',name='Collapse reasoning',exact=True).press('Space');settle(page)
+    check(page.locator('#live .thinking').text_content()==page.evaluate("'… '+__stream816.S.thinking.split('\\n').slice(-6).join('\\n')"),name+' keyboard collapse catches up to the current six-line tail')
+    page.evaluate("window.hiddenTail1537=__stream816.textState().thinking.text;__stream816.setThinking(false)")
+    page.evaluate("__stream816.onEvent({type:'reasoning_delta',session_id:'A',run_id:'reason-run',delta:'hidden append'})")
+    flush(page);settle(page)
+    check(page.locator('#live .thinking').count()==0,name+' existing thinking preference hides the full block and control')
+    check(page.evaluate('__stream816.textState().thinking.text===hiddenTail1537'),name+' hidden reasoning deltas do not process display tails')
+    page.evaluate('__stream816.setThinking(true)');settle(page)
+    check(page.locator('#live .thinking').text_content()==page.evaluate("'… '+__stream816.S.thinking.split('\\n').slice(-6).join('\\n')"),name+' showing thinking rebuilds the current tail')
+    page.get_by_role('button',name='Expand reasoning',exact=True).click()
+    page.evaluate(r'''() => {const d=__stream816;window.oldStream1537=d.textState().answer;
+      d.onEvent({type:'message_complete',session_id:'A',message:{id:'reason-commit',seq:1000,role:'assistant',content:'Committed step',created_at:'2026-11-02T12:00:00Z',meta:'{}'}});
+      d.onEvent({type:'reasoning_delta',session_id:'A',run_id:'reason-run',delta:'next answer'});
+      d.onEvent({type:'message_delta',session_id:'A',run_id:'reason-run',delta:'```\nopen fence'});
+    }''')
+    flush(page);settle(page)
+    check(page.get_by_role('button',name='Expand reasoning',exact=True).count()==1 and page.locator('#live .thinking').text_content()=='next answer',name+' same-Run committed step resets expansion and reasoning cache')
+    check(page.evaluate('__stream816.textState().answer!==oldStream1537'),name+' same-Run next answer has a distinct parser state')
+    page.evaluate(r'''() => {const d=__stream816;window.retryState1537=d.textState().answer;
+      d.onEvent({type:'stream_restarted',session_id:'A',run_id:'reason-run'});
+      d.onEvent({type:'message_delta',session_id:'A',run_id:'reason-run',delta:'Normal after retry\n\nTail'});
+    }''')
+    flush(page);settle(page)
+    check(page.evaluate("__stream816.textState().answer!==retryState1537 && document.querySelector('#live .streaming .md').textContent.includes('Normal after retry')"),name+' retry clears an unfinished fence checkpoint')
+    page.evaluate("window.runState1537=__stream816.textState().answer;__stream816.onEvent({type:'run_started',session_id:'A',run_id:'reason-run-2'})")
+    flush(page);settle(page)
+    check(page.evaluate('__stream816.textState().answer!==runState1537 && !__stream816.textState().expanded && !__stream816.S.thinking'),name+' new Run clears text and expanded state')
+    page.evaluate("__stream816.openSession('B')");settle(page)
+    check(page.evaluate("__stream816.S.current==='B' && !__stream816.textState().expanded && !__stream816.S.streaming && !__stream816.S.thinking"),name+' Session snapshot opening cannot retain prior live text state')
+    fixture(page)
+
+
 def run_engine(p, name, url, out):
     start=PASSES
     browser=p.chromium.launch(executable_path='/usr/bin/chromium',headless=True,args=['--no-sandbox']) if name=='chromium' else p.webkit.launch(executable_path=p.webkit.executable_path,headless=True)
@@ -319,6 +378,7 @@ def run_engine(p, name, url, out):
     page=context.new_page();page.set_default_timeout(5000)
     errors=[];page.on('pageerror',lambda e:errors.append(str(e)))
     page.goto(url);page.wait_for_function('!!window.__stream816')
+    live_reasoning_cases(page,name)
     parsed=page.evaluate(r'''() => {
       const d=__stream816;d.S.current='parser-fixture';
       const first=d.streamingNode('Independent paragraph.\n\n'),paragraph=first.querySelector('.md').firstChild;

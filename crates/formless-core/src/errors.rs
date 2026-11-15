@@ -31,21 +31,66 @@ impl<'a> ErrorContext<'a> {
 pub fn is_transient(raw: &str) -> bool {
     match status(raw) {
         Some(code) => code == 408 || code == 429 || code >= 500,
-        None => {
-            let t = raw.to_lowercase();
-            [
-                "timed out",
-                "timeout",
-                "connection",
-                "connect error",
-                "stream",
-                "overloaded",
-                "reset",
-            ]
-            .iter()
-            .any(|k| t.contains(k))
-        }
+        None => raw
+            .to_lowercase()
+            .split([':', '\n'])
+            .any(transient_diagnostic),
     }
+}
+
+/// Text-only compatibility for rendered error chains. Unknown prose is not
+/// enough evidence to spend another request. Match diagnostic clauses, not
+/// arbitrary words inside model IDs, parameter names or permanent messages.
+fn transient_diagnostic(clause: &str) -> bool {
+    let clause = clause.trim();
+    if matches!(
+        clause,
+        "timeout" | "timeout_error" | "request_timeout" | "overloaded" | "overloaded_error"
+    ) {
+        return true;
+    }
+    let event_code = clause
+        .strip_prefix("error (")
+        .or_else(|| clause.strip_prefix("response.failed ("))
+        .and_then(|code| code.strip_suffix(')'));
+    if matches!(
+        event_code,
+        Some("timeout" | "timeout_error" | "request_timeout" | "overloaded" | "overloaded_error")
+    ) {
+        return true;
+    }
+    [
+        "timed out",
+        "request timed out",
+        "operation timed out",
+        "connection timed out",
+        "timeout waiting for",
+        "deadline has elapsed",
+        "connection refused",
+        "connection reset",
+        "connection aborted",
+        "connection closed",
+        "connection lost",
+        "broken pipe",
+        "unexpected eof",
+        "unexpected end of file",
+        "end of file before message length reached",
+        "early eof",
+        "temporary failure in name resolution",
+        "stream dropped",
+        "stream ended before message_stop",
+        "stream ended with a content block still open",
+        "server is overloaded",
+        "server overloaded",
+    ]
+    .iter()
+    .any(|prefix| {
+        clause.strip_prefix(prefix).is_some_and(|rest| {
+            rest.is_empty()
+                || rest == "."
+                || rest.starts_with(|c: char| c.is_whitespace() || matches!(c, '(' | '['))
+        })
+    })
 }
 
 fn status(raw: &str) -> Option<u16> {
@@ -84,7 +129,11 @@ pub fn explain(raw: &str, ctx: &ErrorContext) -> ErrorExplained {
         .split('/')
         .next()
         .unwrap_or_default();
-    let local = host.starts_with("localhost") || host.starts_with("127.0.0.1");
+    let parsed_url = reqwest::Url::parse(ctx.base_url).ok();
+    let local = parsed_url
+        .as_ref()
+        .and_then(|url| url.host_str())
+        .is_some_and(crate::config::is_loopback_host);
     let (category, message, action) = if t.starts_with("stuck: repeated daemon correction:") {
         (
             "stuck",
@@ -181,8 +230,8 @@ pub fn explain(raw: &str, ctx: &ErrorContext) -> ErrorExplained {
         || t.contains("error sending request")
         || t.contains("timed out")
     {
-        let port = reqwest::Url::parse(ctx.base_url)
-            .ok()
+        let port = parsed_url
+            .as_ref()
             .and_then(|url| url.port_or_known_default());
         let hint = if port == Some(11434) {
             "Is Ollama running? Start it with `ollama serve`, then /resume"
@@ -274,6 +323,55 @@ mod tests {
             model: "gpt-x",
             alternatives: vec![],
         }
+    }
+
+    #[test]
+    fn loopback_provider_hints_use_parsed_endpoint_identity() {
+        for endpoint in [
+            "http://[::1]:8080/v1",
+            "http://127.0.0.2:8000/v1",
+            "http://app.localhost:8000/v1",
+            "http://demo:placeholder@localhost:8000/v1",
+            "HTTP://LOCALHOST:8000/v1",
+        ] {
+            let raw = "error sending request: tcp connect error: connection refused";
+            let explained = explain(raw, &ctx(endpoint));
+            assert_eq!(explained.category, "unreachable", "{endpoint}");
+            assert_eq!(
+                explained.action.as_deref(),
+                Some("Start the local server, then /resume"),
+                "{endpoint}"
+            );
+            assert_eq!(explained.details, raw);
+        }
+    }
+
+    #[test]
+    fn remote_lookalikes_and_invalid_urls_do_not_get_local_server_hints() {
+        for endpoint in [
+            "http://localhost.example.com:8080/v1",
+            "http://127.0.0.1.nip.io:8080/v1",
+            "http://localhost@remote.invalid:8080/v1",
+            "http://remote.invalid:8080/localhost",
+            "not a URL",
+        ] {
+            let explained = explain("connection refused", &ctx(endpoint));
+            assert_eq!(explained.category, "unreachable");
+            assert!(
+                explained.action.unwrap().starts_with("Check your network"),
+                "{endpoint}"
+            );
+        }
+        assert!(explain("connection refused", &ctx("http://[::1]:11434/v1"))
+            .action
+            .unwrap()
+            .contains("Ollama"));
+        assert!(
+            explain("connection refused", &ctx("http://localhost:1234/v1"))
+                .action
+                .unwrap()
+                .contains("LM Studio")
+        );
     }
 
     #[test]
@@ -501,6 +599,79 @@ mod tests {
 #[cfg(test)]
 mod transient_tests {
     use super::is_transient;
+
+    #[test]
+    fn permanent_words_do_not_trigger_an_extra_retry_or_temporary_advice() {
+        let context = super::ErrorContext {
+            base_url: "https://fixture.invalid/v1",
+            model: "fixture",
+            alternatives: vec![],
+        };
+        for message in [
+            "model does not support streaming",
+            "downstream rejected the schema",
+            "password reset required",
+            "connection field is missing",
+            "timeout parameter must be positive",
+            "overloaded model family is unsupported",
+            "resettable is not a known parameter",
+            "stream droppedness is not supported",
+        ] {
+            for raw in [
+                message.to_string(),
+                format!("provider error: {message}"),
+                format!("prompt evaluation: {message}"),
+            ] {
+                assert!(!is_transient(&raw), "{raw}");
+                let explained = super::explain(&raw, &context);
+                assert!(!explained.message.contains("temporarily"), "{explained:?}");
+                assert!(!explained
+                    .action
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("/resume"));
+                assert_eq!(explained.details, raw);
+            }
+        }
+    }
+
+    #[test]
+    fn specific_transport_diagnostics_and_status_precedence_are_retained() {
+        for raw in [
+            "request timed out",
+            "outer: operation timed out",
+            "connection reset by peer (os error 104)",
+            "error sending request: connection refused (os error 111)",
+            "stream read: unexpected EOF",
+            "stream read: error reading a body from connection: end of file before message length reached",
+            "timeout_error: request expired",
+            "provider error: stream dropped: stream ended before message_stop",
+            "provider error: overloaded_error: Overloaded",
+            "provider error: error (overloaded_error): server busy",
+            "timeout",
+            "deadline has elapsed",
+        ] {
+            assert!(is_transient(raw), "{raw}");
+        }
+        assert!(!is_transient("error sending request: error trying to connect: invalid peer certificate: UnknownIssuer"));
+        assert!(!is_transient(
+            "provider error: error (invalid_timeout_parameter): timeout must be positive"
+        ));
+        for raw in [
+            "400 Bad Request: connection reset",
+            "401 Unauthorized: stream dropped",
+            "404 Not Found: request timed out",
+        ] {
+            assert!(!is_transient(raw), "{raw}");
+        }
+        for raw in [
+            "408 Request Timeout",
+            "429 Too Many Requests",
+            "503 Service Unavailable: unsupported streaming",
+        ] {
+            assert!(is_transient(raw), "{raw}");
+        }
+    }
 
     #[test]
     fn only_transient_failures_are_retried() {
