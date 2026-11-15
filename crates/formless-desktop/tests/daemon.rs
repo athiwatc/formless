@@ -177,6 +177,9 @@ async fn until(client: &Client, stage: &'static str, mut predicate: impl FnMut(U
                         .map(|b| b.markdown().chars().take(80).collect::<String>())
                         .collect::<Vec<_>>()
                 ),
+                Update::SessionStatusInvalidated { session_id, .. } => {
+                    format!("status invalidated {session_id}")
+                }
                 Update::SnapshotError { error, .. } => format!("snapshot error {error}"),
                 Update::Sessions(sessions) => format!("Sessions={}", sessions.len()),
                 Update::Page {
@@ -1231,3 +1234,6 @@ async fn real_daemon_provider_send_navigation_resources_and_reconnect() {
 #[cfg(unix)]
 #[path = "support/native_step_transport.rs"]
 mod native_step_transport;
+
+#[path = "support/status_fence.rs"]
+mod status_fence;

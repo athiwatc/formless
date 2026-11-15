@@ -143,7 +143,7 @@ fn stale_context_and_cancelled_validation_reads_retire_without_a_write() {
                 "session" => e.active = Some("other".into()),
                 _ => ledger.cancel_unsent("closed"),
             }
-            e.retire_step_reviews();
+            e.retire_step_reviews(false);
             assert!(e.outgoing.is_empty());
             assert!(e.pending.is_empty());
             assert!(matches!(
@@ -164,7 +164,7 @@ fn dispatched_receipt_survives_context_turnover_and_ui_delivery_failure() {
     assert!(d.before_write());
     e.epoch += 1;
     e.active = Some("other".into());
-    e.retire_step_reviews();
+    e.retire_step_reviews(false);
     assert!(e.pending.contains_key(&request.id));
     e.receive(ServerMessage::ok(
         request.id,
@@ -284,4 +284,49 @@ fn command_queue_failure_is_known_unsent_and_a_foreign_client_cannot_dispatch_it
             ..
         }
     ));
+}
+
+#[test]
+fn lifecycle_retires_unsent_step_reads_and_writes_but_preserves_sent_receipts() {
+    for phase in 0..3 {
+        let (mut e, ledger, d) = setup(Choice::Continue);
+        let mut id = e.outgoing.front().unwrap().id;
+        if phase > 0 {
+            revalidate(&mut e, &d);
+            id = e.outgoing.front().unwrap().id;
+        }
+        if phase == 2 {
+            assert!(d.before_write());
+        }
+        e.receive(ServerMessage::Event(Event::StepResolved {
+            session_id: "s".into(),
+            step_id: "p".into(),
+        }))
+        .unwrap();
+        if phase == 2 {
+            e.receive(ServerMessage::ok(
+                id,
+                json!({"step_id":"p","action":"continue"}),
+            ))
+            .unwrap();
+            assert!(matches!(
+                ledger.status(),
+                Status::Finished {
+                    outcome: Outcome::Accepted,
+                    ..
+                }
+            ));
+        } else {
+            assert!(e.outgoing.is_empty());
+            e.receive(ServerMessage::ok(id, baseline(&d))).unwrap();
+            assert!(e.outgoing.is_empty());
+            assert!(matches!(
+                ledger.status(),
+                Status::Finished {
+                    outcome: Outcome::Rejected(_),
+                    ..
+                }
+            ));
+        }
+    }
 }

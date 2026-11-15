@@ -1,5 +1,6 @@
 use super::*;
 use formless_desktop::client::{StreamBatch, StreamOwner, StreamStatus, Update};
+use formless_desktop::model::RunState;
 fn future_view(
     cx: &mut TestAppContext,
     handle: WindowHandle<Root>,
@@ -406,5 +407,85 @@ fn reader_view_profile_replacement_rejects_old_client_even_with_matching_counter
             )
         });
         assert_eq!(shell.read(cx).block_count(), 1);
+    });
+}
+
+#[gpui_kit::test]
+fn lifecycle_status_invalidation_preserves_live_rows_draft_and_stream_basis(
+    cx: &mut TestAppContext,
+) {
+    let (handle, shell) = open(cx, WIDE, 0, 0);
+    future_view(cx, handle, &shell);
+    step(cx, handle, |window, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.focus_section(PageSection::Composer, window, cx)
+        });
+        window.input("Unsent ไทย 😀", cx);
+        let composer = shell.read(cx).composer().clone();
+        let current = owner(&shell, cx);
+        let id = current.session_id.clone();
+        shell.update(cx, |shell, cx| {
+            shell.apply_client_update(
+                batch(
+                    current.clone(),
+                    Some(event_snapshot(&id, "Question")),
+                    vec![typed_delta(&id, "live prefix")],
+                    false,
+                ),
+                window,
+                cx,
+            )
+        });
+        let state = |shell: &Shell| {
+            shell
+                .sidebar()
+                .rows()
+                .iter()
+                .find(|row| row.id == id)
+                .unwrap()
+                .run_state
+        };
+        for stale in [true, false] {
+            shell.update(cx, |shell, cx| {
+                shell.apply_client_update(
+                    Update::SessionStatusInvalidated {
+                        client: current.client,
+                        connection: current.connection + u64::from(stale),
+                        generation: current.generation,
+                        session_id: id.clone(),
+                    },
+                    window,
+                    cx,
+                )
+            });
+            if !stale {
+                assert_eq!(state(shell.read(cx)), RunState::Unknown);
+            }
+            assert_eq!(shell.read(cx).composer(), &composer);
+            assert_eq!(composer.read(cx).value().as_ref(), "Unsent ไทย 😀");
+            assert!(shell.read(cx).last_block_preview().contains("live prefix"));
+            assert_eq!(shell.read(cx).live_stream_owner(), Some(current.clone()));
+            assert!(shell.read(cx).transcript_reload_needed().is_none());
+        }
+        shell.update(cx, |shell, cx| {
+            shell.apply_client_update(
+                Update::Transcript(StreamBatch {
+                    owner: current.clone(),
+                    baseline: None,
+                    reload: false,
+                    events: vec![],
+                    status: Some(StreamStatus {
+                        steps: Default::default(),
+                        running: true,
+                        unfinished_run: None,
+                    }),
+                }),
+                window,
+                cx,
+            )
+        });
+        assert_eq!(state(shell.read(cx)), RunState::Running);
+        assert_eq!(shell.read(cx).live_stream_owner(), Some(current));
+        assert_eq!(composer.read(cx).value().as_ref(), "Unsent ไทย 😀");
     });
 }

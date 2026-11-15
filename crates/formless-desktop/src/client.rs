@@ -52,6 +52,12 @@ const REFRESH: Duration = Duration::from_millis(250);
 #[derive(Debug)]
 pub enum Update {
     Transcript(StreamBatch),
+    SessionStatusInvalidated {
+        client: uuid::Uuid,
+        connection: u64,
+        generation: u64,
+        session_id: String,
+    },
     Invocations {
         connection: u64,
         operation: uuid::Uuid,
@@ -530,10 +536,12 @@ enum Pending {
     StreamBarrier {
         owner: StreamOwner,
         questions_revision: u64,
+        status_revision: u64,
     },
     StreamStatus {
         owner: StreamOwner,
         questions_revision: u64,
+        status_revision: u64,
     },
     Invocations {
         operation: uuid::Uuid,
@@ -567,6 +575,7 @@ enum Pending {
         session_id: String,
         generation: u64,
         questions_revision: u64,
+        status_revision: u64,
     },
     Page(Destination),
     Action(Action),
@@ -609,6 +618,7 @@ struct Preparation {
     generation: u64,
     active: Option<String>,
     draft_basis: String,
+    status_revision: u64,
     intent: Intent,
     stage: PreparationStage,
 }
@@ -619,6 +629,7 @@ impl Preparation {
             && self.epoch == engine.epoch
             && self.generation == engine.generation
             && self.active == engine.active
+            && self.status_revision == engine.status_revision
     }
 }
 
@@ -629,6 +640,7 @@ struct Engine {
     instance: uuid::Uuid,
     reader: reader::Reader,
     stream_epoch: u64,
+    status_revision: u64,
     forks: Arc<session_fork::Ledger>,
     connection: u64,
     questions: questions::Directory,
@@ -659,13 +671,19 @@ impl Engine {
             && self.generation == a.generation
             && self.active.as_deref() == Some(a.prompt.session_id.as_str())
     }
-    fn retire_step_reviews(&mut self) {
+    fn retire_step_reviews(&mut self, status_changed: bool) {
         let retired: Vec<_> = self
             .pending
             .iter()
             .filter_map(|(id, p)| match p {
-                Pending::StepInspect(d) if !d.reserved() || !self.step_current(d) => Some(*id),
-                Pending::StepCommit(d) if !d.sent() && (!d.reserved() || !self.step_current(d)) => {
+                Pending::StepInspect(d)
+                    if status_changed || !d.reserved() || !self.step_current(d) =>
+                {
+                    Some(*id)
+                }
+                Pending::StepCommit(d)
+                    if !d.sent() && (status_changed || !d.reserved() || !self.step_current(d)) =>
+                {
                     Some(*id)
                 }
                 _ => None,
@@ -720,9 +738,13 @@ impl Engine {
     }
     fn sync_epoch(&mut self, epoch: u64) {
         self.epoch = epoch;
-        let (generation, active) = (self.generation, self.active.as_ref());
+        let (generation, active, status_revision) =
+            (self.generation, self.active.as_ref(), self.status_revision);
         let current = |work: &Preparation| {
-            work.epoch == epoch && work.generation == generation && work.active.as_ref() == active
+            work.epoch == epoch
+                && work.generation == generation
+                && work.active.as_ref() == active
+                && work.status_revision == status_revision
         };
         if self.prepared.as_ref().is_some_and(|work| !current(work)) {
             self.prepared = None;
@@ -808,6 +830,7 @@ impl Engine {
                         session_id,
                         generation: self.generation,
                         questions_revision: self.questions.revision(),
+                        status_revision: self.status_revision,
                     },
                 );
             }
@@ -1222,6 +1245,7 @@ impl Engine {
                     generation: self.generation,
                     active: self.active.clone(),
                     draft_basis,
+                    status_revision: self.status_revision,
                     intent,
                     stage: PreparationStage::Forecast,
                 };
@@ -1351,6 +1375,33 @@ impl Engine {
     fn receive(&mut self, message: ServerMessage) -> Result<(), String> {
         let (id, result, response_ok) = match message {
             ServerMessage::Event(event) => {
+                if matches!(
+                    event,
+                    Event::RunStarted { .. }
+                        | Event::RunFinished { .. }
+                        | Event::RunPaused { .. }
+                        | Event::StepPending { .. }
+                        | Event::StepResolved { .. }
+                ) && event
+                    .session_id()
+                    .is_some_and(|id| Some(id) == self.active.as_deref())
+                {
+                    self.status_revision = self
+                        .status_revision
+                        .checked_add(1)
+                        .ok_or("Session status revision exhausted")?;
+                    // Retire forecasts synchronously, before any queued UI callback
+                    // can commit one based on the old Run or Step inventory.
+                    self.sync_epoch(self.epoch);
+                    self.retire_step_reviews(true);
+                    self.dirty_session = true;
+                    self.updates.push(Update::SessionStatusInvalidated {
+                        client: self.instance,
+                        connection: self.connection,
+                        generation: self.generation,
+                        session_id: self.active.clone().expect("selected Session"),
+                    });
+                }
                 if let Event::StepPending { session_id, .. } = &event {
                     // Historical event notice only. GetSession separately
                     // restores bounded read-only identities after reconnect;
@@ -1424,11 +1475,13 @@ impl Engine {
             Pending::StreamBarrier {
                 owner,
                 questions_revision,
-            } => self.stream_loaded(owner, questions_revision, result),
+                status_revision,
+            } => self.stream_loaded(owner, questions_revision, status_revision, result),
             Pending::StreamStatus {
                 owner,
                 questions_revision,
-            } => self.stream_status(owner, questions_revision, result),
+                status_revision,
+            } => self.stream_status(owner, questions_revision, status_revision, result),
             Pending::Ping => {
                 let result = result?;
                 let min = result["min_protocol"]
@@ -1479,7 +1532,12 @@ impl Engine {
                 session_id,
                 generation,
                 questions_revision,
+                status_revision,
             } => {
+                if status_revision != self.status_revision {
+                    self.dirty_session = true;
+                    return Ok(());
+                }
                 if let Ok(value) = &result {
                     if let Some(events) = value.get("pending_events").and_then(Value::as_array) {
                         if self.questions.snapshot(events, questions_revision) {
@@ -1973,7 +2031,7 @@ async fn connected<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
             engine.question_recovery_limit = limit;
             engine.emit_questions();
         }
-        engine.retire_step_reviews();
+        engine.retire_step_reviews(false);
         for pending in engine.pending.values() {
             if let Pending::StepCommit(dispatch) = pending {
                 if !dispatch.before_write() {
@@ -2382,6 +2440,57 @@ mod tests {
             engine.dirty_session,
             "profile questions are refreshed after observed read overlap"
         );
+    }
+
+    #[test]
+    fn lifecycle_retires_forecast_and_late_callbacks_without_changing_stream_epoch() {
+        for ready_stage in [false, true] {
+            let mut engine = ready();
+            engine.active = Some("a".into());
+            let id = prepare(&mut engine, false);
+            if ready_stage {
+                engine.command(Command::ConfirmPrepared(id));
+            }
+            let stream_epoch = engine.stream_epoch;
+            engine
+                .receive(ServerMessage::Event(Event::RunStarted {
+                    session_id: "a".into(),
+                    run_id: "run".into(),
+                }))
+                .unwrap();
+            assert!(engine.prepared.is_none());
+            engine.command(Command::ConfirmPrepared(id));
+            engine.command(Command::CommitPrepared(id));
+            assert!(!engine
+                .outgoing
+                .iter()
+                .any(|r| matches!(r.request, Request::SendMessage { .. })));
+            assert_eq!(engine.stream_epoch, stream_epoch);
+        }
+        let mut engine = ready();
+        engine.active = Some("a".into());
+        engine.command(Command::Review {
+            intent: Intent::SendMessage {
+                session_id: "a".into(),
+                content: "draft".into(),
+                mode: SendMode::Queue,
+            },
+            draft_basis: "draft".into(),
+            epoch: engine.epoch,
+        });
+        let pending = engine.outgoing.pop_back().unwrap();
+        engine
+            .receive(ServerMessage::Event(Event::StepResolved {
+                session_id: "a".into(),
+                step_id: "step".into(),
+            }))
+            .unwrap();
+        respond(
+            &mut engine,
+            pending.id,
+            serde_json::to_value(crate::fixture::run_forecast("a", false)).unwrap(),
+        );
+        assert!(engine.prepared.is_none());
     }
 
     fn prepare(engine: &mut Engine, required: bool) -> uuid::Uuid {

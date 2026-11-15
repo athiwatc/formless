@@ -232,6 +232,7 @@ impl Engine {
                 Pending::StreamBarrier {
                     owner,
                     questions_revision: self.questions.revision(),
+                    status_revision: self.status_revision,
                 },
             );
         } else if self.reader.phase == Phase::Watching && self.dirty_session {
@@ -246,6 +247,7 @@ impl Engine {
                 Pending::StreamStatus {
                     owner,
                     questions_revision: self.questions.revision(),
+                    status_revision: self.status_revision,
                 },
             );
         }
@@ -290,11 +292,20 @@ impl Engine {
         &mut self,
         owner: StreamOwner,
         revision: u64,
+        status_revision: u64,
         result: Result<Value, String>,
     ) {
         // Validate request, selection, physical connection and synchronous
         // view invalidation before touching an old reply's JSON.
         if !self.owns_stream(&owner) || self.reader.phase != Phase::Loading {
+            return;
+        }
+        if status_revision != self.status_revision {
+            self.stream_reload();
+            self.reader.failed_loads = self.reader.failed_loads.saturating_add(1);
+            if self.reader.failed_loads >= 3 {
+                self.stream_disable("Live status changed repeatedly; using stored messages.");
+            }
             return;
         }
         let Some(staging) = self.reader.staging.take() else {
@@ -332,9 +343,14 @@ impl Engine {
         &mut self,
         owner: StreamOwner,
         revision: u64,
+        status_revision: u64,
         result: Result<Value, String>,
     ) {
         if !self.owns_stream(&owner) || self.reader.phase != Phase::Watching {
+            return;
+        }
+        if status_revision != self.status_revision {
+            self.dirty_session = true;
             return;
         }
         let Ok(value) = result else {
@@ -514,6 +530,144 @@ mod tests {
                 text: text.into(),
             },
         )
+    }
+    #[test]
+    fn status_reply_sampled_before_run_start_cannot_restore_old_metadata() {
+        let mut engine = watching();
+        engine.dirty_session = true;
+        engine.refresh();
+        let status = request(&mut engine, "get_session");
+        let owner = engine.reader.owner.clone().unwrap();
+        engine
+            .receive(ServerMessage::Event(Event::RunStarted {
+                session_id: "a".into(),
+                run_id: "run".into(),
+            }))
+            .unwrap();
+        engine.receive(ServerMessage::Event(start())).unwrap();
+        engine
+            .receive(ServerMessage::Event(delta(12, 0, "prefix")))
+            .unwrap();
+        engine.updates.clear();
+        respond(&mut engine, status.id, snapshot(1, false));
+        assert!(!engine.updates.iter().any(|update| matches!(update,
+            Update::Transcript(batch) if batch.status.is_some())));
+        assert!(engine.reader.phase == Phase::Watching);
+        assert_eq!(engine.reader.owner.as_ref(), Some(&owner));
+        engine.refresh();
+        let fresh = request(&mut engine, "get_session");
+        respond(&mut engine, fresh.id, snapshot(1, true));
+        assert!(engine.updates.iter().any(|update| matches!(update,
+            Update::Transcript(batch) if batch.status.as_ref().is_some_and(|status| status.running))));
+        engine.updates.clear();
+        engine
+            .receive(ServerMessage::Event(delta(13, 6, " tail")))
+            .unwrap();
+        assert!(engine.updates.iter().any(|update| matches!(update,
+            Update::Transcript(batch) if !batch.reload && !batch.events.is_empty())));
+    }
+    fn lifecycle_event() -> Event {
+        Event::StepResolved {
+            session_id: "a".into(),
+            step_id: "step".into(),
+        }
+    }
+    #[test]
+    fn obsolete_malformed_status_is_ignored_before_decoding() {
+        let mut engine = watching();
+        engine.dirty_session = true;
+        engine.refresh();
+        let status = request(&mut engine, "get_session");
+        engine
+            .receive(ServerMessage::Event(lifecycle_event()))
+            .unwrap();
+        engine.updates.clear();
+        respond(&mut engine, status.id, json!(null));
+        assert!(engine.updates.is_empty());
+        assert!(engine.reader.phase == Phase::Watching);
+        assert!(engine.dirty_session);
+    }
+    #[test]
+    fn overlapped_barrier_retries_before_installing_metadata_and_is_bounded() {
+        let (mut engine, mut id) = loading();
+        for overlap in 0..3 {
+            engine
+                .receive(ServerMessage::Event(lifecycle_event()))
+                .unwrap();
+            engine.updates.clear();
+            respond(&mut engine, id, json!(null));
+            assert!(!engine.updates.iter().any(|u| matches!(u,
+                Update::Transcript(b) if b.baseline.is_some())));
+            if overlap < 2 {
+                assert!(engine.reader.phase == Phase::NeedBarrier);
+                engine.refresh();
+                id = request(&mut engine, "get_transcript_barrier").id;
+            }
+        }
+        assert!(!engine.reader.available);
+        assert!(matches!(
+            request(&mut engine, "subscribe").request,
+            Request::Subscribe { deltas: false, .. }
+        ));
+    }
+    #[test]
+    fn fresh_barrier_after_lifecycle_overlap_establishes_new_status() {
+        let (mut engine, id) = loading();
+        engine
+            .receive(ServerMessage::Event(lifecycle_event()))
+            .unwrap();
+        respond(&mut engine, id, reply(1));
+        engine.refresh();
+        let id = request(&mut engine, "get_transcript_barrier").id;
+        let mut fresh = reply(1);
+        fresh["snapshot"]["running"] = json!(true);
+        engine.updates.clear();
+        respond(&mut engine, id, fresh);
+        assert!(engine.updates.iter().any(|u| matches!(u,
+            Update::Transcript(b) if b.baseline.as_ref().is_some_and(|s| s.running))));
+        assert!(engine.reader.phase == Phase::Watching);
+        assert_eq!(engine.reader.failed_loads, 0);
+    }
+    #[test]
+    fn canonical_reader_also_rejects_pre_lifecycle_snapshot() {
+        let mut engine = setup(false, false);
+        let subscribe = request(&mut engine, "subscribe");
+        respond(&mut engine, subscribe.id, json!({"subscribed":true}));
+        engine.refresh();
+        let stale = request(&mut engine, "get_session");
+        engine
+            .receive(ServerMessage::Event(lifecycle_event()))
+            .unwrap();
+        engine.updates.clear();
+        respond(&mut engine, stale.id, json!(null));
+        assert!(engine.updates.is_empty());
+        engine.refresh();
+        let fresh = request(&mut engine, "get_session");
+        respond(&mut engine, fresh.id, snapshot(1, true));
+        assert!(engine
+            .updates
+            .iter()
+            .any(|u| matches!(u, Update::Snapshot { snapshot, .. } if snapshot.running)));
+    }
+    #[test]
+    fn foreign_lifecycle_does_not_invalidate_selected_status() {
+        let mut engine = watching();
+        let revision = engine.status_revision;
+        engine
+            .receive(ServerMessage::Event(Event::RunStarted {
+                session_id: "other".into(),
+                run_id: "run".into(),
+            }))
+            .unwrap();
+        assert_eq!(engine.status_revision, revision);
+        assert!(!engine
+            .updates
+            .iter()
+            .any(|u| matches!(u, Update::SessionStatusInvalidated { .. })));
+        engine.status_revision = u64::MAX;
+        assert!(engine
+            .receive(ServerMessage::Event(lifecycle_event()))
+            .is_err());
     }
     #[test]
     fn shipping_mode_and_old_or_lying_peers_keep_canonical_subscription() {

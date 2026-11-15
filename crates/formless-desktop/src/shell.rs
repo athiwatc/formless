@@ -2254,6 +2254,39 @@ impl Shell {
                     self.invalidate_search(cx);
                 }
             }
+            ClientUpdate::SessionStatusInvalidated {
+                client,
+                connection,
+                generation,
+                session_id,
+            } => {
+                if generation != self.client_generation
+                    || self.sidebar.active_id() != Some(session_id.as_str())
+                    || !self.client.as_ref().is_some_and(|current| {
+                        current.instance() == client && current.connection() == connection
+                    })
+                {
+                    return;
+                }
+                self.client_snapshot_ready = false;
+                self.client_recovery = None;
+                self.client_steps = Default::default();
+                self.sidebar.set_run_state(&session_id, RunState::Unknown);
+                if let Some(row) = self
+                    .directory_rows
+                    .iter_mut()
+                    .find(|row| row.id == session_id)
+                {
+                    row.run_state = RunState::Unknown;
+                }
+                self.client_status = "Run or Step changed · refreshing Session controls".into();
+                self.invalidate_forecast(cx);
+                if self.resume_focus.is_focused(window) || self.abandon_focus.is_focused(window) {
+                    self.composer
+                        .update(cx, |composer, cx| composer.focus(window, cx));
+                }
+                self.settle(window, cx);
+            }
             ClientUpdate::Snapshot {
                 generation,
                 snapshot,

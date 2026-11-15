@@ -90,3 +90,8 @@ The [bounded stream delivery report](stream-delivery-20261115.md) adds batching
 only for admitted validation-reader live text. It preserves event identity/order
 and fail-closed recovery, while production streaming remains disabled pending
 complete review and acceptance.
+
+Run/Step metadata overlap is additionally fenced by a checked connection-local
+lifecycle revision; see [status read fence](status-read-fence-20261115.md). This
+covers observed same-sequence status/barrier races and retires unsent reviews,
+without clearing the production streaming or native acceptance gates.
