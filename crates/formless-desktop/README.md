@@ -20,9 +20,12 @@ cargo test --no-default-features --features daemon-tests --test daemon --locked
 This mode loads real Sessions, supports New Session, Send/Steer/Queue/Stop and
 Resume/Abandon for a confirmed paused or interrupted Run,
 and displays read-only Tools, recorded Run Metrics, Proposals and Settings.
-Session details (palette or Sessions > Details) edits name, tags or pin using
+Session details (palette or Sessions > Details) edits name, tags, pin or archive using
 one acknowledged setter per Save. It targets the chosen list entry, or the
-open Session outside the list.
+open Session outside the list. The Archived toggle includes archived entries
+in the directory; opening one shows restore details without activating a
+neighbour. Archive hides a Session and retains its history; running work
+continues. Restore returns it to the default list for explicit activation.
 Arrow keys browse resource entries; Copy details copies all returned fields
 as JSON. Loaded-text Search keeps its explicit Session scope. Existing pending
 questions are available in the Profile-wide Questions command/header entry,
@@ -69,7 +72,9 @@ a Session after connecting to restore them; new question events are global.
 Unsupported definitions and exhausted native recovery limits explicitly
 handoff to the TUI. These forms do not implement security approval semantics.
 
-Session details loads a fresh correlated read before enabling Save. These
+Session details loads a fresh correlated Session list, verifies the frozen ID
+and rejects missing or duplicate identities before enabling Save. This avoids
+loading a transcript just to read metadata. These
 existing setters replace a current field; they cannot compare against a
 previous revision, so another client's intervening edit can be overwritten.
 Tags are one per line and use the daemon's normalization. Names/tags inputs
@@ -91,6 +96,7 @@ Findings, measurements, the parity inventory and the open blockers are in
 [docs/desktop/phase0-findings.md](../../docs/desktop/phase0-findings.md).
 
 Current continuation evidence and remaining acceptance are recorded in
+[the archive/restore report](../../docs/desktop/session-archive-20261115.md),
 [the Session metadata/Step report](../../docs/desktop/session-metadata-20261115.md),
 [the native question report](../../docs/desktop/native-questions-20261114.md),
 [the stream-ordering report](../../docs/desktop/stream-ordering-20261114.md),
@@ -137,7 +143,7 @@ not see GPUI. Run every command below from this directory.
 | Path | What it is | GUI dependency |
 |---|---|---|
 | `src/model.rs` | Presentation model: destinations, Run state, composer actions, layout breakpoints and modal overlays, focus regions, Session list selection, text size, drafts bounded by count and bytes | none |
-| `src/directory.rs` | Read-only filtering over the existing unarchived Session projection, selection by ID and bounded visual labels | none |
+| `src/directory.rs` | Read-only title/preview/ID/tag filtering, selection by ID and bounded visual labels; archived scope is opt-in | none |
 | `src/search.rs` | Bounded literal matches in finished loaded text, byte-range results, source-revision validation and bounded grapheme-safe snippets | none |
 | `src/commands.rs` | Typed shell command registry and palette search | none |
 | `src/replies.rs` | Read-only, validated `ListSessions` / `GetSession` decoding | none |

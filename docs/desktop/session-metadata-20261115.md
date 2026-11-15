@@ -4,6 +4,10 @@ Draft #2081 continues epic #1753 after review of `f8c042f3`. This increment
 adds native Session name/tags/pin editing and measures an existing Step
 reconnect gap. Streaming display remains disabled; the epic is incomplete.
 
+The later [archive/restore continuation](session-archive-20261115.md) adds
+archived browsing and changes metadata reads from GetSession to ListSessions.
+The source and checks below describe this earlier checkpoint.
+
 ## Exact source and ownership
 
 - Implementation: `2ecd8a74bbae74dc12c1390cab5dfcbc1f98f3da`.
