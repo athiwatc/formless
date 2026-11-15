@@ -68,7 +68,7 @@ ignored `evidence/gpui-1753-sol/`.
 | GUI/Thai library + shell suites | 180 + 143 passed; final UI source in `profile-search-repeat-final-ui-tests.log` |
 | Real private daemon/local fake provider suite | Five passed; `profile-search-final-daemon-second.log` |
 | Strict clippy (`-- -D warnings`) | GUI-free lib/unit tests; GUI/Thai lib + shell/render; ax-dump/Thai binary; daemon fixture passed. `profile-search-final-clippy-model.log`, `profile-search-repeat-final-clippy.log`, `profile-search-repeat-final-bin-clippy.log`, `profile-search-final-daemon-clippy.log`. 26 existing core dependency warnings remain. |
-| All-feature docs | Passed, zero doctests; `profile-search-final-doc.log` |
+| All-feature docs | Passed, zero doctests; `profile-search-repeat-final-doc.log` |
 | Windows GNU GUI-free all-targets check | Passed; `profile-search-final-windows-model.log`; no GUI/link/execution claim |
 | Native Mac fonts/Metal offscreen renderer | 49 states / 91 captures passed; `profile-search-repeat-native-final.log`, images in `profile-search-repeat-native-final/`, hashes in `profile-search-native-manifest.json` |
 | Formatting/whitespace and unchanged dependency/protocol scope | Passed; no manifest, lockfile, protocol or relay change |
@@ -107,6 +107,28 @@ regression reproduced a duplicate read despite the disabled Search button
 (`profile-search-repeat-enter-reproduction.log`). The handler now checks the
 live query and pending state before starting another read; the complete UI
 suites, strict UI/bin lint and full native renderer passed after that fix.
+
+## Fresh development artifact
+
+The packager ran with ResourceWarning treated as an error, `--profile dev
+--offline`, from clean `78cd9214dd78eab321d35ecb99679b5d8367e7e4`, differing
+from final tested runtime `2ca88d5` only in this report. Output:
+`evidence/gpui-1753-sol/package-78cd921`.
+
+- Binary SHA256:
+  `b55f61337a8c0297beabe18e4f824996695b0fa62ca8269427ac7e0a7bdf8201`.
+- ZIP SHA256:
+  `20399420fe4bb0b8682d9929f240e57ad0dc66482f17772d36b58d22cb6453d3`.
+- Provenance/plist identity, safe archive paths/types, integrity, executable
+  mode/byte identity, hashes and 21 system-library loads passed. Evidence:
+  `profile-search-repeat-final-package.log` and
+  `profile-search-repeat-final-package-verification.json`.
+- 655 archive files; 415 packages / 649 notice files; 46 packages lack root
+  notice files. Manual licensing/assets/stdlib review remains.
+- The bundle has linker ad-hoc signing, no Team ID, an unbound plist and no
+  sealed resources. No app was installed or launched; no distribution signing
+  or notarization occurred. The earlier `47bfe98` bundle predates the repeated
+  Enter fix and is historical, not the final artifact.
 
 ## Ownership and remaining gates
 
