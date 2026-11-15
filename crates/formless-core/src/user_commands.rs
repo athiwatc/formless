@@ -27,6 +27,8 @@ pub struct CommandInfo {
     pub name: String,
     pub description: String,
     pub source: Source,
+    pub max_position: u8,
+    pub uses_arguments: bool,
     #[serde(serialize_with = "serialize_path")]
     pub path: PathBuf,
 }
@@ -35,6 +37,8 @@ pub struct UserCommand {
     pub name: String,
     pub description: String,
     pub source: Source,
+    pub max_position: u8,
+    pub uses_arguments: bool,
     pub path: PathBuf,
     body: String,
 }
@@ -84,6 +88,8 @@ impl Snapshot {
                     name: command.name.clone(),
                     description: command.description.clone(),
                     source: command.source,
+                    max_position: command.max_position,
+                    uses_arguments: command.uses_arguments,
                     path: command.path.clone(),
                 })
                 .collect(),
@@ -118,7 +124,71 @@ impl std::fmt::Display for ExpansionError {
     }
 }
 impl std::error::Error for ExpansionError {}
+
+enum Placeholder<'a> {
+    Literal(&'a str),
+    Arguments,
+    Position(u8),
+}
+// Called only at a dollar. Discovery and expansion consume exactly the same
+// token, including dollar escapes and multi-digit literals.
+fn placeholder(rest: &str) -> (Placeholder<'_>, &str) {
+    if let Some(tail) = rest.strip_prefix("$$") {
+        (Placeholder::Literal("$"), tail)
+    } else if let Some(tail) = rest.strip_prefix("$ARGUMENTS") {
+        if tail
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            (Placeholder::Literal("$ARGUMENTS"), tail)
+        } else {
+            (Placeholder::Arguments, tail)
+        }
+    } else if rest.as_bytes().get(1).is_some_and(u8::is_ascii_digit) {
+        let digits = rest[1..].bytes().take_while(u8::is_ascii_digit).count();
+        let token = if digits == 1 && rest.as_bytes()[1] != b'0' {
+            Placeholder::Position(rest.as_bytes()[1] - b'0')
+        } else {
+            Placeholder::Literal(&rest[..1 + digits])
+        };
+        (token, &rest[1 + digits..])
+    } else {
+        (Placeholder::Literal("$"), &rest[1..])
+    }
+}
+fn argument_metadata(mut body: &str) -> (u8, bool) {
+    let (mut max_position, mut uses_arguments) = (0, false);
+    while let Some(index) = body.find('$') {
+        let (token, tail) = placeholder(&body[index..]);
+        match token {
+            Placeholder::Position(position) => max_position = max_position.max(position),
+            Placeholder::Arguments => uses_arguments = true,
+            Placeholder::Literal(_) => {}
+        }
+        body = tail;
+    }
+    (max_position, uses_arguments)
+}
+fn usage(name: &str, max_position: u8, uses_arguments: bool) -> String {
+    let mut hint = format!("/{name}");
+    for position in 1..=max_position {
+        hint.push_str(&format!(" <arg{position}>"));
+    }
+    if uses_arguments {
+        hint.push_str(" [arguments…]");
+    }
+    hint
+}
+impl CommandInfo {
+    pub fn usage(&self) -> String {
+        usage(&self.name, self.max_position, self.uses_arguments)
+    }
+}
 impl UserCommand {
+    pub fn usage(&self) -> String {
+        usage(&self.name, self.max_position, self.uses_arguments)
+    }
     /// Literal single pass. Positions 1..9 split on Unicode whitespace; all
     /// arguments preserve their original spelling/whitespace in $ARGUMENTS.
     /// `$$` emits a literal dollar; missing positions are errors before send.
@@ -139,30 +209,20 @@ impl UserCommand {
         let mut rest = self.body.as_str();
         while let Some(index) = rest.find('$') {
             push(&mut output, &rest[..index])?;
-            rest = &rest[index..];
-            if let Some(tail) = rest.strip_prefix("$$") {
-                push(&mut output, "$")?;
-                rest = tail;
-            } else if let Some(tail) = rest.strip_prefix("$ARGUMENTS") {
-                push(&mut output, arguments)?;
-                rest = tail;
-            } else if rest.as_bytes().get(1).is_some_and(u8::is_ascii_digit) {
-                let digits = rest[1..].bytes().take_while(u8::is_ascii_digit).count();
-                if digits == 1 && rest.as_bytes()[1] != b'0' {
-                    let position = (rest.as_bytes()[1] - b'1') as usize;
+            let (token, tail) = placeholder(&rest[index..]);
+            match token {
+                Placeholder::Literal(text) => push(&mut output, text)?,
+                Placeholder::Arguments => push(&mut output, arguments)?,
+                Placeholder::Position(number) => {
+                    let position = (number - 1) as usize;
                     let value = positions.get(position).ok_or_else(|| ExpansionError(format!(
                         "{} references ${}, but only {} argument(s) were supplied; provide at least {} or write $${} for a literal ${}",
                         self.path.display(), position + 1, positions.len(), position + 1, position + 1, position + 1,
                     )))?;
                     push(&mut output, value)?;
-                } else {
-                    push(&mut output, &rest[..1 + digits])?;
                 }
-                rest = &rest[1 + digits..];
-            } else {
-                push(&mut output, "$")?;
-                rest = &rest[1..];
             }
+            rest = tail;
         }
         push(&mut output, rest)?;
         Ok(output)
@@ -176,6 +236,7 @@ fn valid_name(name: &str) -> bool {
             byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
         })
 }
+
 fn parse(text: &str) -> Result<(String, String), &'static str> {
     if text.contains('\0') {
         return Err("Template contains a NUL byte");
@@ -205,23 +266,30 @@ fn parse(text: &str) -> Result<(String, String), &'static str> {
         while index < header.len() {
             let line = header[index];
             index += 1;
-            if line.trim().is_empty() || line.starts_with('#') {
+            if line.trim().is_empty() || line.trim_start().starts_with('#') {
                 continue;
             }
-            let Some(value) = line.strip_prefix("description:") else {
+            let key = line.trim_start();
+            let key_indent = line.len() - key.len();
+            let Some(value) = key.strip_prefix("description:") else {
                 return Err("Only description frontmatter is supported");
             };
             if found {
                 return Err("Duplicate frontmatter description");
             }
             found = true;
-            let value = value.trim();
+            let value = crate::frontmatter::scalar_without_comment(value.trim());
             description = if matches!(value, ">" | "|" | ">-" | "|-") {
                 let mut parts = Vec::new();
-                while index < header.len()
-                    && (header[index].starts_with(char::is_whitespace) || header[index].is_empty())
-                {
-                    parts.push(header[index].trim());
+                while index < header.len() {
+                    let line = header[index];
+                    let content = line.trim_start();
+                    // A sibling key/comment ends the block, even when the
+                    // description key itself has leading whitespace.
+                    if !content.is_empty() && line.len() - content.len() <= key_indent {
+                        break;
+                    }
+                    parts.push(line.trim());
                     index += 1;
                 }
                 parts.join(" ")
@@ -359,10 +427,13 @@ pub fn load(config_dir: &Path, project_cwd: Option<&Path>, builtin_names: &[Stri
                     continue;
                 }
             };
+            let (max_position, uses_arguments) = argument_metadata(&body);
             let command = UserCommand {
                 name: name_text.into(),
                 description,
                 source,
+                max_position,
+                uses_arguments,
                 path: path.clone(),
                 body,
             };
@@ -853,13 +924,61 @@ mod tests {
         }
     }
     fn command(body: &str) -> UserCommand {
+        let (max_position, uses_arguments) = argument_metadata(body);
         UserCommand {
             name: "test".into(),
             description: "test".into(),
             source: Source::Global,
+            max_position,
+            uses_arguments,
             path: "test.md".into(),
             body: body.into(),
         }
+    }
+
+    #[test]
+    fn argument_metadata_matches_expansion_and_metadata_projection() {
+        let fixture = Fixture::new();
+        for (body, maximum, arguments) in [
+            ("$1/$2", 2, false),
+            ("$$5", 0, false),
+            ("$10 $0 $100", 0, false),
+            ("$9", 9, false),
+            ("$ARGUMENTS", 0, true),
+            ("$$ARGUMENTS", 0, false),
+            ("$$$3 $ARGUMENTSsuffix", 3, false),
+            ("雪 $1é $9.99", 9, false),
+            ("no arguments $HOME $", 0, false),
+        ] {
+            fixture.global("test.md", body);
+            let snapshot = fixture.load(&[]);
+            let command = snapshot.find("test").unwrap();
+            assert_eq!(
+                (command.max_position, command.uses_arguments),
+                (maximum, arguments),
+                "{body}"
+            );
+            let projection = snapshot.projection();
+            let info = &projection.commands[0];
+            assert_eq!(
+                (info.max_position, info.uses_arguments),
+                (maximum, arguments)
+            );
+            assert_eq!(info.usage(), command.usage());
+            assert_eq!(serde_json::to_value(info).unwrap()["max_position"], maximum);
+            let supplied = (1..=maximum).map(|_| "arg").collect::<Vec<_>>().join(" ");
+            assert!(command.expand(&supplied).is_ok(), "{body}");
+            if maximum > 0 {
+                let too_few = (1..maximum).map(|_| "arg").collect::<Vec<_>>().join(" ");
+                assert!(command.expand(&too_few).is_err(), "{body}");
+            }
+        }
+        assert_eq!(
+            command("$1 $2 $ARGUMENTS").usage(),
+            "/test <arg1> <arg2> [arguments…]"
+        );
+        assert_eq!(command("$$5").usage(), "/test");
+        assert_eq!(command("$ARGUMENTS").usage(), "/test [arguments…]");
     }
 
     #[test]
@@ -880,6 +999,38 @@ mod tests {
             "'two words' x"
         );
     }
+    #[test]
+    fn arguments_placeholder_requires_an_identifier_boundary() {
+        for (body, expected, uses_arguments) in [
+            ("Use $ARGUMENTS_PATH now", "Use $ARGUMENTS_PATH now", false),
+            ("See $ARGUMENTS2.", "See $ARGUMENTS2.", false),
+            ("$ARGUMENTSsuffix", "$ARGUMENTSsuffix", false),
+            (
+                "$ARGUMENTS_FILE $ARGUMENTS9",
+                "$ARGUMENTS_FILE $ARGUMENTS9",
+                false,
+            ),
+            ("See $ARGUMENTS.", "See report.md.", true),
+            ("e-$ARGUMENTS", "e-report.md", true),
+            ("$ARGUMENTSé", "report.mdé", true),
+            ("$$ARGUMENTS_PATH", "$ARGUMENTS_PATH", false),
+            (
+                "$ARGUMENTS_PATH $1PATH $10",
+                "$ARGUMENTS_PATH report.mdPATH $10",
+                false,
+            ),
+        ] {
+            let template = command(body);
+            assert_eq!(template.expand("report.md").unwrap(), expected, "{body}");
+            assert_eq!(template.uses_arguments, uses_arguments, "{body}");
+        }
+        let fixture = Fixture::new();
+        fixture.global("literal.md", "$ARGUMENTS_PATH");
+        let snapshot = fixture.load(&[]);
+        assert_eq!(snapshot.find("literal").unwrap().usage(), "/literal");
+        assert!(!snapshot.projection().commands[0].uses_arguments);
+    }
+
     #[test]
     fn dollar_escapes_preserve_prices_code_and_single_pass_substitution() {
         for (body, expected) in [
@@ -1052,6 +1203,137 @@ mod tests {
             assert!(parse(text).is_err(), "{text:?}");
         }
     }
+    #[test]
+    fn indented_description_keys_load_without_consuming_sibling_keys() {
+        for (header, expected) in [
+            ("  description: Review the diff", "Review the diff"),
+            ("\tdescription: Review the diff", "Review the diff"),
+            (
+                "  # comment\n  description: \"Review # diff\" # note",
+                "Review # diff",
+            ),
+            ("  description: 'It''s useful'", "It's useful"),
+            (
+                "  description: >\n    First line\n    second line",
+                "First line second line",
+            ),
+            (
+                "\tdescription: |-\n\t\tliteral # content",
+                "literal # content",
+            ),
+            ("  description: >\n    text\n  # sibling comment", "text"),
+            (
+                "  description: |\n    description: literal\n    other: content",
+                "description: literal other: content",
+            ),
+        ] {
+            let source = format!("---\n{header}\n---\nReview $1\n$ARGUMENTS_PATH\n");
+            assert_eq!(parse(&source).unwrap().0, expected, "{header}");
+            let fixture = Fixture::new();
+            fixture.global("review.md", &source);
+            let snapshot = fixture.load(&[]);
+            assert!(
+                snapshot.diagnostics.is_empty(),
+                "{:?}",
+                snapshot.diagnostics
+            );
+            let command = snapshot.find("review").unwrap();
+            assert_eq!(command.description, expected);
+            assert_eq!(snapshot.projection().commands[0].description, expected);
+            assert_eq!(command.max_position, 1);
+            assert!(!command.uses_arguments);
+            assert_eq!(
+                command.expand("diff.patch").unwrap(),
+                "Review diff.patch\n$ARGUMENTS_PATH\n"
+            );
+        }
+        for header in [
+            "  other: unsupported",
+            "  description: first\n  description: second",
+            "  description: >\n    first\n  description: second",
+            "  description: >\n    first\n  other: unsupported",
+            "\tdescription: |\n\t\tfirst\n\tother: unsupported",
+            "  description: >\n  not deeper",
+            "  description: # empty",
+            "  description: \"unfinished",
+        ] {
+            let source = format!("---\n{header}\n---\nBody");
+            assert!(parse(&source).is_err(), "{header}");
+            let fixture = Fixture::new();
+            fixture.global("review.md", &source);
+            let snapshot = fixture.load(&[]);
+            assert!(snapshot.find("review").is_none(), "{header}");
+            assert_eq!(snapshot.diagnostics.len(), 1, "{header}");
+        }
+    }
+
+    #[test]
+    fn frontmatter_comments_preserve_scalar_text_and_command_discovery() {
+        for (header, expected) in [
+            (
+                " # review helper\n  # another note\ndescription: Review the diff",
+                "Review the diff",
+            ),
+            ("description: Review the diff # why", "Review the diff"),
+            ("description: \"Review the diff\" # why", "Review the diff"),
+            ("description: 'Review the diff' # why", "Review the diff"),
+            ("description: \"hash # stays\" # annotation", "hash # stays"),
+            (
+                "description: 'It''s # useful' # annotation",
+                "It's # useful",
+            ),
+            (
+                r#"description: "Say \"hi\" # text" # annotation"#,
+                "Say \"hi\" # text",
+            ),
+            ("description: Bob's notes # annotation", "Bob's notes"),
+            (
+                "description: https://example.test/#anchor # annotation",
+                "https://example.test/#anchor",
+            ),
+            ("description: C# helpers # annotation", "C# helpers"),
+            (
+                "description: |- # header annotation\n  literal # content",
+                "literal # content",
+            ),
+            (
+                "description: >- # header annotation\n  first\n  second",
+                "first second",
+            ),
+            ("\t# note\r\ndescription: Simple\t# comment", "Simple"),
+        ] {
+            let source = format!("---\n{header}\n---\n# Body stays literal\n$ARGUMENTS_PATH\n");
+            let (description, body) = parse(&source).unwrap_or_else(|e| panic!("{header}: {e}"));
+            assert_eq!(description, expected, "{header}");
+            assert_eq!(body, "# Body stays literal\n$ARGUMENTS_PATH\n");
+            let fixture = Fixture::new();
+            fixture.global("review.md", &source);
+            let snapshot = fixture.load(&[]);
+            assert!(
+                snapshot.diagnostics.is_empty(),
+                "{header}: {:?}",
+                snapshot.diagnostics
+            );
+            assert_eq!(snapshot.find("review").unwrap().description, expected);
+            assert_eq!(snapshot.projection().commands[0].description, expected);
+        }
+        for header in [
+            "description: \"unfinished # still quoted",
+            "description: 'unfinished # still quoted",
+            "description: \"fine\" trailing # invalid",
+            "description: 'fine' trailing # invalid",
+            "description: # only comment",
+            "description: \"\" # empty",
+            "description: first # comment\ndescription: second",
+            " # note\nother: unsupported",
+        ] {
+            assert!(
+                parse(&format!("---\n{header}\n---\nBody")).is_err(),
+                "{header}"
+            );
+        }
+    }
+
     #[test]
     fn discovery_limits_oversized_and_excess_entries_without_attachment_reads() {
         let fixture = Fixture::new();

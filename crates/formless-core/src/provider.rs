@@ -17,7 +17,7 @@ use crate::Paths;
 /// bootstrap prompt and the optimiser so they never drift apart.
 macro_rules! host_api_doc {
     () => {
-        "Tool code is plain JavaScript defining `function run(input) { ... }` (or `async function run`) returning the output value. On failure, throw an Error: a returned {error: ...} is counted as a failure unless output_schema declares an error property, and swallowing errors hides broken Tools from measurement. Host API (all Capability-gated; data options take encoding \"utf8\" (default) or \"base64\" for binary): fetch(url, {method, headers, body, bodyEncoding, encoding}) -> {status, ok, url, headers, body, text(), json()} (redirects followed only within the granted hosts); fetchChunks(url, opts, size, cb) streams the body in chunks and returns status; fs.read(path, {encoding}), fs.write(path, data, {encoding}), fs.append(path, data, {encoding}), fs.exists(path), fs.stat(path) -> {type, size, modified_ms} or null, fs.list(dir, {details}) -> names or [{name, type, size}], fs.mkdir(path), fs.remove(path, {recursive}), fs.rename(from, to), fs.readChunks(path, size, cb, {encoding}), fs.readLines(path, cb); env.get(key); process.run(cmd, argsArray, {cwd, env, stdin, stdinEncoding, encoding, timeout_ms}) -> {code, signal, stdout, stderr, timed_out, killed, truncated} (no shell; optional timeout kills its group); process.spawn(cmd, argsArray, opts) takes the same options and returns a handle: read(size) -> {stream, data, eof} with stdout/stderr distinguishable, wait()/kill() -> {code, signal, timed_out, killed, truncated}, close(). Read chunks and emit them while work runs; wait discards unread output (truncated: true). Always wait or close in finally; handles cannot outlive this Invocation; tools.call(name, input) -> Promise of the Tool's output (always await it; several in Promise.all run in parallel, and a Tool that returns with a call still pending fails); clipboard.read(), clipboard.write(text); notify(title, body); harness.read() (providers, roles, MCP servers, skills, settings; never keys) and harness.call(op, args, reason) for mcp.add/remove, skills.add/remove/enable, models.set, providers.upsert/remove (no keys; upsert takes base_url or a preset: openai, anthropic, openrouter, gemini, groq, ollama, lmstudio), roles.upsert/delete, config.set: each change is shown to the user with your reason and needs their approval; store.get(key, {ns}), store.set(key, jsonValue, {ns}), store.delete(key, {ns}), store.list(prefix, {ns}) persist small state between Invocations (\"store\" = this Tool's own, \"store:<ns>\" = a shared namespace; 64 KB per value); llm.complete(prompt, {system, model, role, schema}) -> text without schema, or a parsed JSON value validated against schema; agents.run(task, {system, model, role}) -> text (role: a configured Role by name, see the Roles list; it picks the provider and model); requireModule(name) / modules.load(name), modules.list(); emit(chunk) streams large output to an artifact; progress(fraction, label) shows how far long work has got (fraction 0..1 or null; no Capability needed); console.log, sleep(ms), setTimeout/setInterval/clearTimeout (real timers; run() may await them), cryptoRandom(), randomBytes(n) -> base64. Nothing else exists: anything more (URL parsing, base64 decoding to bytes, hashing, compression, formats) you write in JS."
+        "Tool code is plain JavaScript defining `function run(input) { ... }` (or `async function run`) returning the output value. On failure, throw an Error: a returned {error: ...} is counted as a failure unless output_schema declares an error property, and swallowing errors hides broken Tools from measurement. Host API (all Capability-gated; data options take encoding \"utf8\" (default) or \"base64\" for binary): fetch(url, {method, headers, body, bodyEncoding, encoding}) -> {status, ok, url, headers, body, text(), json()} (redirects followed only within the granted hosts); fetchChunks(url, opts, size, cb) streams the body in chunks and returns status; fs.read(path, {encoding}), fs.write(path, data, {encoding}), fs.append(path, data, {encoding}), fs.exists(path), fs.stat(path) -> {type, size, modified_ms} or null, fs.list(dir, {details}) -> names or [{name, type, size}], fs.mkdir(path), fs.remove(path, {recursive}), fs.rename(from, to), fs.readChunks(path, size, cb, {encoding}), fs.readLines(path, cb); env.get(key); process.run(cmd, argsArray, {cwd, env, stdin, stdinEncoding, encoding, timeout_ms}) -> {code, signal, stdout, stderr, timed_out, killed, truncated} (no shell; optional timeout kills its group); process.spawn(cmd, argsArray, opts) takes the same options and returns a handle: read(size) -> {stream, data, eof} with stdout/stderr distinguishable, wait()/kill() -> {code, signal, timed_out, killed, truncated}, close(). Read chunks and emit them while work runs; wait discards unread output (truncated: true). Always wait or close in finally; handles cannot outlive this Invocation; tools.call(name, input) -> Promise of the Tool's output (always await it; several in Promise.all run in parallel, and a Tool that returns with a call still pending fails); clipboard.read(), clipboard.write(text); notify(title, body); harness.read() (providers, roles, MCP servers, skills, settings; never keys) and harness.call(op, args, reason) for mcp.add/remove, skills.add/remove/enable, models.set, providers.upsert/remove (no keys; upsert takes base_url or a preset: openai, anthropic, openrouter, gemini, groq, ollama, lmstudio), roles.upsert/delete, config.set: each change is shown to the user with your reason and needs their approval; store.get(key, {ns}), store.set(key, jsonValue, {ns}), store.delete(key, {ns}), store.list(prefix, {ns}) persist small state between Invocations (\"store\" = this Tool's own, \"store:<ns>\" = a shared namespace; 64 KB per value); llm.complete(prompt, {system, model, role, schema}) -> text without schema, or a parsed JSON value validated against schema; agents.run(task, {system, model, role}) -> text (role: a configured Role by name, see the Roles list; it picks the provider and model); requireModule(name) / modules.load(name), modules.list(); emit(chunk) streams large output to an artifact; progress(fraction, label) shows how far long work has got (fraction 0..1 or null; no Capability needed); console.log, sleep(ms), setTimeout/setInterval/clearTimeout (real timers; run() may await them), cryptoRandom(), randomBytes(n) -> base64 of exactly n bytes. sleep(ms) and randomBytes(n) require finite non-negative safe-integer numbers; invalid inputs and requests above tools.max_sleep_secs/tools.max_random_bytes throw instead of coercing or clamping. Nothing else exists: anything more (URL parsing, base64 decoding to bytes, hashing, compression, formats) you write in JS."
     };
 }
 pub(crate) use host_api_doc;
@@ -150,6 +150,10 @@ pub fn rate_limits() -> HashMap<String, Value> {
 pub struct ModelTest {
     pub model: String,
     pub ok: bool,
+    /// A temporary transport/rate/server/deadline failure, eligible for a
+    /// bounded background retry when the user already opted into auto tests.
+    #[serde(default)]
+    pub transient: bool,
     /// Time to the first streamed token, and to the end of the answer.
     pub first_token_ms: Option<u64>,
     pub total_ms: Option<u64>,
@@ -165,6 +169,113 @@ pub struct ModelTest {
     /// Reported counters across physical probe attempts; missing is unknown.
     #[serde(default)]
     pub probe_usage: Option<Value>,
+}
+
+fn model_test_failure_is_transient(test: &ModelTest, deadline: bool) -> bool {
+    !test.ok
+        && (test.transient
+            || deadline
+            || test
+                .error
+                .as_deref()
+                .is_some_and(crate::errors::is_transient))
+}
+
+#[cfg(test)]
+mod model_test_failure_tests {
+    use super::*;
+    #[test]
+    fn failure_classification_and_legacy_results_keep_their_meaning() {
+        for (error, expected) in [
+            ("provider error: 429 Too Many Requests", true),
+            ("provider error: 503 Unavailable", true),
+            ("connection reset", true),
+            ("request timed out", true),
+            ("provider error: 401 Unauthorized", false),
+            ("provider error: 400 Bad Request", false),
+            ("no tool call returned", false),
+            ("model does not support streaming", false),
+            ("downstream rejected the schema", false),
+            ("password reset required", false),
+        ] {
+            let test = ModelTest {
+                error: Some(error.into()),
+                ..Default::default()
+            };
+            assert_eq!(
+                model_test_failure_is_transient(&test, false),
+                expected,
+                "{error}"
+            );
+        }
+        let mut test = ModelTest::default();
+        assert!(model_test_failure_is_transient(&test, true));
+        test.transient = true;
+        assert!(model_test_failure_is_transient(&test, false));
+        test.ok = true;
+        assert!(!model_test_failure_is_transient(&test, true));
+        let mut legacy = serde_json::to_value(&test).unwrap();
+        legacy.as_object_mut().unwrap().remove("transient");
+        assert!(
+            !serde_json::from_value::<ModelTest>(legacy)
+                .unwrap()
+                .transient
+        );
+    }
+    #[tokio::test]
+    async fn actual_local_probes_classify_http_deadline_and_fallback_failures() {
+        use axum::response::IntoResponse;
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let env = crate::credential_env::EnvGuard::isolated();
+        env.set("NO_PROXY", "127.0.0.1,localhost");
+        for mode in [429u16, 401, 503] {
+            let count = Arc::new(AtomicUsize::new(0));
+            let app=axum::Router::new().route("/chat/completions",axum::routing::post({let count=count.clone();move || {let count=count.clone();async move {
+                let request=count.fetch_add(1,Ordering::SeqCst);
+                if mode==503 && request==0 {
+                    return ([("content-type","text/event-stream")], "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n").into_response();
+                }
+                if mode==503 && request==1 {
+                    return axum::Json(json!({"choices":[{"message":{"content":"no native tool call"}}]})).into_response();
+                }
+                (axum::http::StatusCode::from_u16(mode).unwrap(),axum::Json(json!({"error":{"message":"local fixture failure"}}))).into_response()
+            }}}));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut cfg = ProviderCfg::default();
+            cfg.base_url = format!("http://{}", listener.local_addr().unwrap());
+            cfg.max_retries = 0;
+            cfg.fallback_models.clear();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let provider = Provider::new(cfg, "local-test-key".into()).unwrap();
+            let deadline = provider
+                .test_model_scoped(
+                    "fixture",
+                    crate::probe_policy::ProbePolicy::limited(std::time::Duration::ZERO, 8),
+                )
+                .await;
+            assert!(!deadline.ok && deadline.transient, "{deadline:?}");
+            assert_eq!(count.load(Ordering::SeqCst), 0);
+            let test = provider
+                .test_model_scoped(
+                    "fixture",
+                    crate::probe_policy::ProbePolicy::limited(
+                        std::time::Duration::from_secs(10),
+                        8,
+                    ),
+                )
+                .await;
+            assert!(!test.ok);
+            assert_eq!(test.transient, mode != 401, "{test:?}");
+            assert_eq!(
+                count.load(Ordering::SeqCst),
+                if mode == 503 { 3 } else { 1 }
+            );
+            server.abort();
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -2045,7 +2156,10 @@ impl Provider {
             ..Default::default()
         });
         result.total_ms = Some(started.elapsed().as_millis() as u64);
-        result.probe_usage = Some(policy.report());
+        let usage = policy.report();
+        result.transient =
+            model_test_failure_is_transient(&result, usage["deadline_exceeded"] == true);
+        result.probe_usage = Some(usage);
         result
     }
 
@@ -2102,14 +2216,20 @@ impl Provider {
         match native {
             Ok(true) => t.tool_calling = true,
             other => {
-                if probe_prompt_tool_call(self, model, &tool)
-                    .await
-                    .unwrap_or(false)
-                {
+                let fallback = probe_prompt_tool_call(self, model, &tool).await;
+                if fallback.as_ref().is_ok_and(|called| *called) {
                     t.tool_calling = true;
                     t.prompt_fallback = true;
-                } else if let Err(e) = other {
-                    t.error = Some(format!("tool call: {e:#}"));
+                } else {
+                    // Preserve a temporary fallback failure even when the
+                    // native probe returned false without an error string.
+                    t.transient = fallback
+                        .as_ref()
+                        .err()
+                        .is_some_and(|error| crate::errors::is_transient(&format!("{error:#}")));
+                    if let Err(e) = other {
+                        t.error = Some(format!("tool call: {e:#}"));
+                    }
                 }
             }
         }
@@ -2814,10 +2934,7 @@ impl Provider {
                         let text = self.redact_native_diagnostic(&raw_text, &credential, Some(&b));
                         // Save every rejected response before any recovery can
                         // continue, including the final send at the resend cap.
-                        last_err = match server_wait {
-                            Some(w) => format!("{status} (retry after {}s): {text}", w.as_secs()),
-                            None => format!("{status}: {text}"),
-                        };
+                        last_err = provider_http_error(status, &text, server_wait);
                         // Recovery inspects protocol data, never display text:
                         // masking even a one-character synthetic credential can
                         // remove a keyword or numeric limit from the diagnostic.
@@ -4405,6 +4522,35 @@ fn encoded_image(
 /// A guess at whether a model accepts image input, from its name.
 pub fn is_vision_model(model: &str) -> bool {
     let m = model.to_lowercase();
+    let name = m.rsplit('/').next().unwrap_or(&m);
+    // Known text-only variants take precedence over broad family matches.
+    // Users serving a customized model can still set provider.vision explicitly.
+    let small_gemma3 = (name.contains("gemma-3") || name.contains("gemma3"))
+        && name
+            .split(['-', ':', '_', '.'])
+            .any(|part| matches!(part, "1b" | "270m"));
+    let variant_suffix =
+        |tail: &str| tail.is_empty() || tail.starts_with(['-', ':', '.', '_', '@']);
+    let starts_variant = |prefix: &str| name.strip_prefix(prefix).is_some_and(variant_suffix);
+    if starts_variant("o3-mini")
+        || starts_variant("o1-mini")
+        || starts_variant("o1-preview")
+        || [
+            "claude-instant",
+            "claude-1",
+            "claude-v1",
+            "claude-2",
+            "claude-v2",
+        ]
+        .iter()
+        .any(|old| name.split(*old).skip(1).any(variant_suffix))
+        || small_gemma3
+    {
+        return false;
+    }
+    if name == "o1" || name.starts_with("o1-") {
+        return true;
+    }
     [
         "gpt-4o",
         "gpt-4.1",
@@ -4428,6 +4574,10 @@ pub fn is_vision_model(model: &str) -> bool {
     .iter()
     .any(|k| m.contains(k))
 }
+
+#[cfg(test)]
+#[path = "provider_vision_tests.rs"]
+mod vision_model_tests;
 
 /// What a model can do and costs, per id (SPEC §4.2): from the
 /// listing's own fields (OpenRouter: `pricing`, `context_length`,
@@ -4723,6 +4873,19 @@ pub fn is_model_error_text(t: &str) -> bool {
             || t.contains("invalid model"))
 }
 
+// Round display hints up without changing the provider's actual retry delay.
+fn provider_http_error(status: reqwest::StatusCode, text: &str, wait: Option<Duration>) -> String {
+    match wait {
+        Some(wait) => {
+            let seconds = wait
+                .as_secs()
+                .saturating_add(u64::from(wait.subsec_nanos() != 0));
+            format!("{status} (retry after {seconds}s): {text}")
+        }
+        None => format!("{status}: {text}"),
+    }
+}
+
 /// How long the server asked us to wait: `Retry-After` (seconds or an
 /// HTTP date), else the longest `x-ratelimit-reset-*` (`"1s"`, `"6m0s"`,
 /// `"20ms"`).
@@ -4730,7 +4893,9 @@ fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
     let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
     if let Some(v) = header("retry-after") {
         if let Ok(secs) = v.trim().parse::<f64>() {
-            return Some(Duration::from_secs_f64(secs.max(0.0)));
+            if let Some(wait) = retry_seconds(secs) {
+                return Some(wait);
+            }
         }
         if let Ok(at) = chrono::DateTime::parse_from_rfc2822(v.trim()) {
             let wait = at.signed_duration_since(chrono::Utc::now());
@@ -4743,11 +4908,20 @@ fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
         .max()
 }
 
-/// `"1m30s"`, `"6m0s"`, `"20ms"`, `"0.5s"`, or bare seconds.
+// Finite negatives retain the zero-wait behavior. Non-finite or overflowing
+// hints are unavailable, allowing other headers or ordinary backoff to apply.
+fn retry_seconds(seconds: f64) -> Option<Duration> {
+    if !seconds.is_finite() {
+        return None;
+    }
+    Duration::try_from_secs_f64(seconds.max(0.0)).ok()
+}
+
+/// Unit durations (`"1d 2h"`, `"1m30s"`, `"20ms"`, `"0.5s"`) or bare seconds.
 fn parse_reset_duration(text: &str) -> Option<Duration> {
     let text = text.trim();
     if let Ok(secs) = text.parse::<f64>() {
-        return Some(Duration::from_secs_f64(secs.max(0.0)));
+        return retry_seconds(secs);
     }
     let mut total = 0.0;
     let mut rest = text;
@@ -4761,7 +4935,8 @@ fn parse_reset_duration(text: &str) -> Option<Duration> {
             .find(|c: char| c.is_ascii_digit() || c == '.')
             .unwrap_or(rest.len());
         total += value
-            * match &rest[..unit_len] {
+            * match rest[..unit_len].trim_end() {
+                "d" => 86_400.0,
                 "h" => 3600.0,
                 "m" => 60.0,
                 "s" => 1.0,
@@ -4770,7 +4945,7 @@ fn parse_reset_duration(text: &str) -> Option<Duration> {
             };
         rest = &rest[unit_len..];
     }
-    Some(Duration::from_secs_f64(total))
+    retry_seconds(total)
 }
 
 /// Whether a 400 body rejects the reasoning-effort parameter itself (and
@@ -5719,6 +5894,165 @@ mod tests {
             "The page title is \"Example Domain\".",
         ] {
             assert!(!looks_like_access_refusal(t), "{t}");
+        }
+    }
+
+    #[test]
+    fn stored_retry_hints_round_up_and_explain_the_same_wait() {
+        let context = crate::errors::ErrorContext {
+            base_url: "https://provider.invalid/v1",
+            model: "fixture",
+            alternatives: vec![],
+        };
+        for (wait, seconds) in [
+            (Duration::ZERO, 0),
+            (Duration::from_millis(20), 1),
+            (Duration::from_millis(500), 1),
+            (Duration::from_millis(1900), 2),
+            (Duration::from_secs(30), 30),
+            (Duration::MAX, u64::MAX),
+        ] {
+            let stored = provider_http_error(
+                reqwest::StatusCode::TOO_MANY_REQUESTS,
+                "limited",
+                Some(wait),
+            );
+            assert!(
+                stored.contains(&format!("(retry after {seconds}s)")),
+                "{stored}"
+            );
+            let explained = crate::errors::explain(&stored, &context);
+            assert_eq!(explained.category, "rate_limit");
+            assert!(
+                explained
+                    .message
+                    .ends_with(&format!("Try again in {seconds}s.")),
+                "{}",
+                explained.message
+            );
+        }
+        assert_eq!(
+            provider_http_error(reqwest::StatusCode::BAD_REQUEST, "invalid", None),
+            "400 Bad Request: invalid"
+        );
+    }
+
+    #[test]
+    fn retry_hints_ignore_nonfinite_and_unrepresentable_durations() {
+        use reqwest::header::{HeaderMap, HeaderValue};
+        for invalid in [
+            "inf",
+            "+inf",
+            "-inf",
+            "NaN",
+            "1e100",
+            "18446744073709551616",
+        ] {
+            assert_eq!(parse_reset_duration(invalid), None, "{invalid}");
+            let mut headers = HeaderMap::new();
+            headers.insert("retry-after", HeaderValue::from_str(invalid).unwrap());
+            headers.insert(
+                "x-ratelimit-reset-requests",
+                HeaderValue::from_static("1e100"),
+            );
+            headers.insert("x-ratelimit-reset-tokens", HeaderValue::from_static("3s"));
+            assert_eq!(
+                retry_after(&headers),
+                Some(Duration::from_secs(3)),
+                "{invalid}"
+            );
+        }
+        for invalid in [
+            format!("{}h", "9".repeat(400)),
+            "10000000000000000000h".into(),
+            "10000000000000000000s10000000000000000000s".into(),
+        ] {
+            assert_eq!(parse_reset_duration(&invalid), None, "{invalid}");
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ratelimit-reset-requests", HeaderValue::from_static("5s"));
+        headers.insert("x-ratelimit-reset-tokens", HeaderValue::from_static("2s"));
+        assert_eq!(retry_after(&headers), Some(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn retry_hints_preserve_valid_ranges_precedence_and_negative_clamping() {
+        use reqwest::header::{HeaderMap, HeaderValue};
+        for (text, expected) in [
+            ("0.5", Duration::from_millis(500)),
+            ("-2.5", Duration::ZERO),
+            ("20ms", Duration::from_millis(20)),
+            ("1h30m", Duration::from_secs(5400)),
+            (
+                "18446744073709549568",
+                Duration::from_secs(18_446_744_073_709_549_568),
+            ),
+        ] {
+            assert_eq!(parse_reset_duration(text), Some(expected), "{text}");
+        }
+        for (value, expected) in [
+            ("0.5", Duration::from_millis(500)),
+            ("-2", Duration::ZERO),
+            ("Sun, 06 Nov 1994 08:49:37 GMT", Duration::ZERO),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert("retry-after", HeaderValue::from_static(value));
+            headers.insert("x-ratelimit-reset-tokens", HeaderValue::from_static("9s"));
+            assert_eq!(retry_after(&headers), Some(expected), "{value}");
+        }
+    }
+
+    #[test]
+    fn retry_hints_accept_spaced_compound_reset_units() {
+        use reqwest::header::{HeaderMap, HeaderValue};
+        for (text, expected) in [
+            ("1h 2m", Duration::from_secs(3720)),
+            (" 1h 2m 3s ", Duration::from_secs(3723)),
+            ("1m\t30s", Duration::from_secs(90)),
+        ] {
+            assert_eq!(parse_reset_duration(text), Some(expected), "{text}");
+            for name in ["x-ratelimit-reset-requests", "x-ratelimit-reset-tokens"] {
+                let mut headers = HeaderMap::new();
+                headers.insert(name, HeaderValue::from_str(text).unwrap());
+                assert_eq!(retry_after(&headers), Some(expected), "{name}: {text}");
+                headers.insert("retry-after", HeaderValue::from_static("7"));
+                assert_eq!(retry_after(&headers), Some(Duration::from_secs(7)));
+            }
+        }
+        for text in ["1h 2", "1 h 2m", "1h rubbish", "1h 2m trailing"] {
+            assert_eq!(parse_reset_duration(text), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn retry_hints_accept_days_and_keep_reset_selection_bounded() {
+        use reqwest::header::{HeaderMap, HeaderValue};
+        for (text, expected) in [
+            ("1d", Duration::from_secs(86400)),
+            ("1d2h", Duration::from_secs(93600)),
+            ("1d 2h 3m 4s", Duration::from_secs(93784)),
+            (".5d", Duration::from_secs(43200)),
+        ] {
+            assert_eq!(parse_reset_duration(text), Some(expected), "{text}");
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "x-ratelimit-reset-requests",
+                HeaderValue::from_str(text).unwrap(),
+            );
+            headers.insert("x-ratelimit-reset-tokens", HeaderValue::from_static("20s"));
+            assert_eq!(retry_after(&headers), Some(expected), "{text}");
+            headers.insert(
+                "x-ratelimit-reset-requests",
+                HeaderValue::from_static("soon"),
+            );
+            headers.insert(
+                "x-ratelimit-reset-tokens",
+                HeaderValue::from_str(text).unwrap(),
+            );
+            assert_eq!(retry_after(&headers), Some(expected), "{text}");
+        }
+        for text in ["1day", "1d-2h", "10000000000000000000d", "1d trailing"] {
+            assert_eq!(parse_reset_duration(text), None, "{text}");
         }
     }
 
