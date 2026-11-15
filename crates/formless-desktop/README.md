@@ -31,6 +31,18 @@ as JSON. A queued copy is bound to the displayed destination, page revision
 and selected entry; selection changes, refresh and open dialogs retire that
 action rather than copying a replacement entry. Loaded-text Search keeps its explicit Session scope.
 
+Metrics offers Inspect Run for a selected Run row (or the same command in
+Commands). It reads that exact Run's persisted status/error, message sequence
+bounds, counters and reported spend, keeping both Run and Session IDs explicit.
+The Summary row cannot inspect a Run. Scope's Copy details copies the complete
+returned JSON, including future fields and private error/provider metadata;
+other rows copy one group. Visual previews are limited to 500 characters, and
+the native record limit is 1 MiB. A missing/null cost is unavailable, and no
+complete bill is inferred from reported spend. Refresh is explicit; Back goes
+to Metrics. Leaving, disconnect or Profile replacement retires the inspection;
+no read is replayed after reconnect. This action does not control a Run or call
+a model. See [Run inspection evidence](../../docs/desktop/run-inspection-20261115.md).
+
 This window remembers an older reading message for up to 64 Sessions.
 Returning to a Session waits for its accepted canonical snapshot, then returns
 to that message's sequence identity rather than an old row index. If the

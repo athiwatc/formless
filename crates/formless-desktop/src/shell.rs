@@ -39,6 +39,7 @@ mod preferences;
 mod profile_search;
 mod questions;
 mod reading_positions;
+mod run_inspection;
 mod sessions;
 mod usage;
 use crate::full_view;
@@ -178,6 +179,7 @@ pub fn bind_keys(cx: &mut App) {
                 | Command::SessionDetails
                 | Command::MarkComparisonLeft
                 | Command::CompareMarked
+                | Command::InspectRun
                 | Command::ToggleArchived
                 | Command::ToggleTheme
                 | Command::ToggleEnterSends
@@ -693,11 +695,12 @@ pub struct Shell {
     resource_scroll: gpui_kit::UniformListScrollHandle,
     resource_body: ScrollHandle,
     comparison_controls: Vec<(FocusHandle, gpui_kit::ScrollAnchor)>,
-    resource_controls: Vec<(FocusHandle, gpui_kit::ScrollAnchor)>,
+    resource_controls: Vec<FocusHandle>,
     resource_focus: Option<(Option<FocusHandle>, Size<Pixels>, TextScale)>,
     resource_frames: u8,
     resource_revision: u64,
     comparison: crate::comparison::State,
+    run_inspection: crate::run_inspection::State,
     sidebar: Sidebar,
     /// Shared with the timeline's row renderer.
     blocks: Rc<RefCell<Timeline>>,
@@ -924,14 +927,7 @@ impl Shell {
             forecast_scroll: ScrollHandle::new(),
             resource_pages: HashMap::new(),
             resource_scroll: gpui_kit::UniformListScrollHandle::new(),
-            resource_controls: (0..3)
-                .map(|_| {
-                    (
-                        cx.focus_handle(),
-                        gpui_kit::ScrollAnchor::for_handle(resource_body.clone()),
-                    )
-                })
-                .collect(),
+            resource_controls: (0..4).map(|_| cx.focus_handle()).collect(),
             resource_body,
             resource_focus: None,
             resource_frames: 0,
@@ -945,6 +941,7 @@ impl Shell {
                 .collect(),
             resource_revision: 0,
             comparison: crate::comparison::State::default(),
+            run_inspection: crate::run_inspection::State::default(),
             sidebar,
             blocks: Rc::new(RefCell::new(Timeline::new(blocks))),
             stream: Coalescer::default(),
@@ -992,6 +989,7 @@ impl Shell {
                 can_preferences: false,
                 can_mark_comparison: false,
                 comparison_reason: Some("Mark a left Session first"),
+                run_inspection_reason: Some("Select a Run entry in Metrics first"),
                 sessions_shown: true,
                 context_shown: true,
                 dark: false,
@@ -1685,6 +1683,7 @@ impl Shell {
         self.reading_positions.clear();
         self.reading_restore = None;
         self.reading_notice = None;
+        self.reset_run_inspection("Profile attachment changed. Select a Run in Metrics again; no inspection was replayed.");
         self.retire_session_export_attachment();
         self.reset_comparison(
             "Profile attachment changed. Mark a pair again; nothing was replayed.",
@@ -1889,6 +1888,7 @@ impl Shell {
                     self.questions_restored(window, cx);
                 }
                 if !ready {
+                    self.reset_run_inspection("Connection lost. Select a Run in Metrics after reconnecting; no inspection is replayed.");
                     self.reset_comparison("Connection lost. Mark a pair again after reconnecting; no comparison is replayed.");
                     self.session_usage.retire("Connection lost. Read usage explicitly after reconnecting; nothing was replayed.");
                     if let Some(panel) = &mut self.session_editor {
@@ -1908,6 +1908,12 @@ impl Shell {
                     self.rebuild_directory(cx);
                 }
             }
+            ClientUpdate::RunInspection {
+                connection,
+                operation,
+                target,
+                result,
+            } => self.run_inspection_outcome(connection, operation, &target, result, cx),
             ClientUpdate::SessionComparison {
                 connection,
                 operation,
@@ -2151,7 +2157,10 @@ impl Shell {
                 destination,
                 result,
             } => {
-                if destination == Destination::Comparison {
+                if matches!(
+                    destination,
+                    Destination::Comparison | Destination::RunDetails
+                ) {
                     return;
                 }
 
@@ -2821,6 +2830,7 @@ impl Shell {
             can_mark_comparison: self.comparison_selected_id().is_some()
                 && self.comparison_connected(),
             comparison_reason: self.comparison_disabled_reason(),
+            run_inspection_reason: self.run_inspection_disabled_reason(),
             sessions_shown: layout.sidebar != SidebarMode::Collapsed,
             context_shown: layout.inspector != InspectorMode::Hidden,
             dark: cx.theme().is_dark(),
@@ -2947,6 +2957,17 @@ impl Shell {
             }
             Command::ToggleSessions => self.toggle_panel(Region::Sidebar, window, cx),
             Command::ToggleContext => self.toggle_panel(Region::Inspector, window, cx),
+            Command::InspectRun => {
+                if let Some((target, source)) = self.selected_run_target() {
+                    self.read_run_inspection(
+                        target,
+                        self.run_inspection.revision,
+                        Some(source),
+                        window,
+                        cx,
+                    );
+                }
+            }
             Command::MarkComparisonLeft => {
                 if let Some(id) = self.comparison_selected_id().map(str::to_string) {
                     self.mark_comparison(id, self.comparison.revision, window, cx);
@@ -3284,6 +3305,9 @@ impl Shell {
         }
         let previous = self.destination;
 
+        if previous == Destination::RunDetails && destination != Destination::RunDetails {
+            self.reset_run_inspection("Inspection closed. Select a Run explicitly to read again.");
+        }
         if previous == Destination::Comparison && destination != Destination::Comparison {
             self.comparison
                 .clear_result("Comparison closed. Compare explicitly to read again.");
@@ -4702,7 +4726,12 @@ impl Shell {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        if self.client.is_some() || self.destination == Destination::Comparison {
+        if self.client.is_some()
+            || matches!(
+                self.destination,
+                Destination::Comparison | Destination::RunDetails
+            )
+        {
             return self.render_resource_page(page_height, window, cx);
         }
         let focused = self.conversation_focus.is_focused(window);
@@ -4765,11 +4794,19 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let destination = self.destination;
+        let run_refresh = (
+            self.run_inspection.target.clone(),
+            self.run_inspection.revision,
+        );
+        let inspect_run = self.selected_run_target();
+        let inspection_revision = self.run_inspection.revision;
         let comparison_refresh = (self.comparison.pair.clone(), self.comparison.revision);
         let page = self.resource_pages.get(&destination);
         let count = page.map_or(0, |page| page.rows.len());
         let notice = page.map_or(
-            if destination == Destination::Comparison {
+            if destination == Destination::RunDetails {
+                self.run_inspection.notice.clone()
+            } else if destination == Destination::Comparison {
                 self.comparison.notice.clone()
             } else {
                 "Loading from the Daemon Core…".to_string()
@@ -4851,31 +4888,36 @@ impl Shell {
                     .p_3()
                     .gap_3()
                     .id("resource-body").overflow_y_scroll().track_scroll(&self.resource_body)
-                    .child(
-                        h_flex()
-                            .w_full().min_w_0().gap_2()
-                            .when(page_height.is_some(), |header| header.flex_col().items_start())
-                            .child(Label::new(destination.label()).min_w_0().when(page_height.is_none(), |title| title.flex_1()))
-                            .child(h_flex().min_w_0().gap_2().flex_wrap()
-                                .when(page_height.is_some(), |actions| actions.w_full())
-                                .child(div().id("resource-refresh-anchor").anchor_scroll(Some(self.resource_controls[0].1.clone())).child(Button::new("refresh-resource").track_focus(&self.resource_controls[0].0).small().flex_shrink_0().label("Refresh")
-                                    .disabled(!self.client_connected || (destination == Destination::Comparison && (self.comparison.pending() || self.comparison.pair.is_none())))
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        if this.destination != destination {return;}
-                                        if destination == Destination::Comparison {
-                                            if let Some(pair)=&comparison_refresh.0 {this.read_comparison(pair.clone(),comparison_refresh.1,window,cx);}
-                                        } else {this.client_request(ClientCommand::Refresh,cx);}
-                                    }))))
-                                .child(div().id("resource-back-anchor").anchor_scroll(Some(self.resource_controls[1].1.clone())).child(Button::new("resource-back").track_focus(&self.resource_controls[1].0).small().flex_shrink_0().label(if destination==Destination::Comparison {"Back to Sessions"} else {"Back to Chat"})
-                                    .on_click(cx.listener(|this, _, window, cx| this.set_destination(if this.destination==Destination::Comparison {Destination::Sessions} else {Destination::Chat}, window, cx))))))
-                    )
+                    .child({
+                        let refresh=Button::new("refresh-resource").track_focus(&self.resource_controls[0]).small().flex_shrink_0().label("Refresh")
+                            .disabled(!self.client_connected || (destination==Destination::RunDetails&&(self.run_inspection.pending()||self.run_inspection.target.is_none())) || (destination==Destination::Comparison&&(self.comparison.pending()||self.comparison.pair.is_none())))
+                            .on_click(cx.listener(move |this,_,window,cx|{
+                                if this.destination!=destination{return;}
+                                match destination {
+                                    Destination::RunDetails=>{if let Some(target)=&run_refresh.0 {this.read_run_inspection(target.clone(),run_refresh.1,None,window,cx);}},
+                                    Destination::Comparison=>{if let Some(pair)=&comparison_refresh.0 {this.read_comparison(pair.clone(),comparison_refresh.1,window,cx);}},
+                                    _=>this.client_request(ClientCommand::Refresh,cx),
+                                }
+                            }));
+                        let (back_label,back_destination)=match destination {Destination::Comparison=>("Back to Sessions",Destination::Sessions),Destination::RunDetails=>("Back to Metrics",Destination::Metrics),_=>("Back to Chat",Destination::Chat)};
+                        let back=Button::new("resource-back").track_focus(&self.resource_controls[1]).small().flex_shrink_0().label(back_label)
+                            .on_click(cx.listener(move |this,_,window,cx|{if this.destination==destination {this.set_destination(back_destination,window,cx);}}));
+                        let actions=h_flex().min_w_0().gap_2().flex_wrap().when(page_height.is_some(),|actions|actions.w_full())
+                            .child(div().id("resource-refresh-anchor").child(refresh))
+                            .child(div().id("resource-back-anchor").child(back))
+                            .when(destination==Destination::Metrics,|actions|actions.child(div().id("inspect-run-anchor")
+                                .child(Button::new("inspect-selected-run").small().label("Inspect Run").track_focus(&self.resource_controls[3]).disabled(self.run_inspection_disabled_reason().is_some())
+                                    .on_click(cx.listener(move |this,_,window,cx|{if let Some((target,source))=&inspect_run {this.read_run_inspection(target.clone(),inspection_revision,Some(*source),window,cx);}})))));
+                        h_flex().w_full().min_w_0().gap_2().when(page_height.is_some(),|header|header.flex_col().items_start())
+                            .child(Label::new(destination.label()).min_w_0().when(page_height.is_none(),|title|title.flex_1())).child(actions)
+                    })
                     .child(readable("resource-notice", notice))
                     .child(list)
                     .child(readable("resource-selected", label))
                     .child(readable("resource-detail", detail))
                     .child(
-                        div().id("resource-copy-anchor").anchor_scroll(Some(self.resource_controls[2].1.clone())).child(Button::new("copy-resource")
-                            .track_focus(&self.resource_controls[2].0)
+                        div().id("resource-copy-anchor").child(Button::new("copy-resource")
+                            .track_focus(&self.resource_controls[2])
                             .small()
                             .label("Copy details")
                             .disabled(selected.is_none())
@@ -4898,19 +4940,27 @@ impl Shell {
         }
         if self.resource_frames > 0 {
             self.resource_frames -= 1;
-            let controls = if self.destination == Destination::Sessions {
-                Some(&self.comparison_controls)
-            } else if self.resource_pages.contains_key(&self.destination)
-                || self.destination == Destination::Comparison
-            {
-                Some(&self.resource_controls)
-            } else {
-                None
-            };
-            if let Some(controls) = controls {
-                for (focus, anchor) in controls {
+            if self.destination == Destination::Sessions {
+                for (focus, anchor) in &self.comparison_controls {
                     if focus.contains_focused(window, cx) {
                         anchor.scroll_to(window, cx);
+                        window.request_animation_frame();
+                        break;
+                    }
+                }
+            } else if self.resource_pages.contains_key(&self.destination)
+                || matches!(
+                    self.destination,
+                    Destination::Comparison | Destination::RunDetails
+                )
+            {
+                for (index, focus) in self.resource_controls.iter().enumerate() {
+                    if focus.contains_focused(window, cx) {
+                        // Direct body children: header=0, notice=1, list=2,
+                        // selected label=3, detail=4 and Copy wrapper=5.
+                        // The handle preserves nested ancestor scroll offsets.
+                        self.resource_body
+                            .scroll_to_item(if index == 2 { 5 } else { 0 });
                         window.request_animation_frame();
                         break;
                     }

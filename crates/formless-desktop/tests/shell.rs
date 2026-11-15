@@ -28,6 +28,8 @@ mod profile_search_tests;
 mod question_tests;
 #[path = "support/reading_positions.rs"]
 mod reading_position_tests;
+#[path = "support/run_inspection.rs"]
+mod run_inspection_tests;
 #[path = "support/session_edit.rs"]
 mod session_edit_tests;
 #[path = "support/usage.rs"]

@@ -27,6 +27,7 @@ pub enum Command {
     SessionDetails,
     MarkComparisonLeft,
     CompareMarked,
+    InspectRun,
     ToggleArchived,
     ToggleSessions,
     ToggleContext,
@@ -91,6 +92,7 @@ pub struct State {
     pub can_preferences: bool,
     pub can_mark_comparison: bool,
     pub comparison_reason: Option<&'static str>,
+    pub run_inspection_reason: Option<&'static str>,
     pub sessions_shown: bool,
     pub context_shown: bool,
     pub dark: bool,
@@ -182,6 +184,7 @@ pub fn keys(command: Command) -> &'static [&'static str] {
         | Command::SessionDetails
         | Command::MarkComparisonLeft
         | Command::CompareMarked
+        | Command::InspectRun
         | Command::ToggleArchived
         | Command::ToggleTheme
         | Command::ToggleEnterSends
@@ -267,6 +270,7 @@ pub fn palette(state: &State) -> Vec<Entry> {
         Command::SessionDetails,
         Command::MarkComparisonLeft,
         Command::CompareMarked,
+        Command::InspectRun,
         Command::ToggleArchived,
         Command::ToggleSessions,
         Command::ToggleContext,
@@ -342,6 +346,7 @@ pub fn entry(command: Command, state: &State) -> Entry {
             Some(state.enter_sends),
             if !state.has_composer { Some(NO_COMPOSER) } else if state.composing { Some(COMPOSING) } else { None },
         ),
+        Command::InspectRun => ("Inspect Run", "Inspect selected recorded Run".into(),Group::Navigation,"Read exact persisted Run status, counters and reported spend from Metrics. No Run control or model call",None,state.run_inspection_reason),
         Command::MarkComparisonLeft => (
             "Mark left", "Mark selected Session as comparison left".into(), Group::Session,
             "Choose the left Session for a read-only persisted history comparison. No history is read yet", None,
@@ -578,6 +583,7 @@ mod tests {
             can_preferences: false,
             can_mark_comparison: false,
             comparison_reason: Some("Mark a left Session first"),
+            run_inspection_reason: Some("Select a Run entry in Metrics first"),
             sessions_shown: true,
             context_shown: false,
             dark: false,

@@ -43,6 +43,12 @@ const REFRESH: Duration = Duration::from_millis(250);
 
 #[derive(Debug)]
 pub enum Update {
+    RunInspection {
+        connection: u64,
+        operation: uuid::Uuid,
+        target: crate::run_inspection::Target,
+        result: Result<crate::run_inspection::Report, String>,
+    },
     SessionComparison {
         connection: u64,
         operation: uuid::Uuid,
@@ -126,6 +132,11 @@ pub enum Update {
 }
 
 pub enum Command {
+    InspectRun {
+        connection: u64,
+        operation: uuid::Uuid,
+        target: crate::run_inspection::Target,
+    },
     CompareSessions {
         connection: u64,
         operation: uuid::Uuid,
@@ -354,6 +365,10 @@ fn advance_epoch(epoch: &AtomicU64) {
 
 #[derive(Debug)]
 enum Pending {
+    RunInspection {
+        operation: uuid::Uuid,
+        target: crate::run_inspection::Target,
+    },
     SessionComparison {
         operation: uuid::Uuid,
         pair: crate::comparison::Pair,
@@ -610,6 +625,40 @@ impl Engine {
 
     fn command(&mut self, command: Command) {
         match command {
+            Command::InspectRun {
+                connection,
+                operation,
+                target,
+            } => {
+                let error = if !self.ready || connection != self.connection || !target.valid() {
+                    Some("Connection or Run identity changed. Select the Run again.")
+                } else if self
+                    .pending
+                    .values()
+                    .filter(|pending| matches!(pending, Pending::RunInspection { .. }))
+                    .count()
+                    >= 2
+                {
+                    Some("Two Run inspections remain outstanding. Wait for a reply.")
+                } else {
+                    None
+                };
+                if let Some(error) = error {
+                    self.updates.push(Update::RunInspection {
+                        connection: self.connection,
+                        operation,
+                        target,
+                        result: Err(error.into()),
+                    });
+                } else {
+                    self.request(
+                        Request::GetRun {
+                            run_id: target.run_id.clone(),
+                        },
+                        Pending::RunInspection { operation, target },
+                    );
+                }
+            }
             Command::CompareSessions {
                 connection,
                 operation,
@@ -1171,6 +1220,16 @@ impl Engine {
                         }),
                     }
                 }
+            }
+            Pending::RunInspection { operation, target } => {
+                let result =
+                    result.and_then(|value| crate::run_inspection::Report::decode(&target, value));
+                self.updates.push(Update::RunInspection {
+                    connection: self.connection,
+                    operation,
+                    target,
+                    result,
+                });
             }
             Pending::SessionComparison { operation, pair } => {
                 let result =
@@ -2305,6 +2364,58 @@ mod tests {
     }
 
     #[test]
+    fn run_inspections_bind_exact_run_and_session_with_bounded_outstanding_reads() {
+        use crate::run_inspection::{test_value, Target};
+        let target = Target {
+            run_id: "run-a".into(),
+            session_id: "session-a".into(),
+        };
+        let mut engine = ready();
+        let operations = [
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+        ];
+        for operation in operations {
+            engine.command(Command::InspectRun {
+                connection: 0,
+                operation,
+                target: target.clone(),
+            });
+        }
+        assert_eq!(engine.outgoing.len(), 2);
+        assert!(engine.updates.iter().any(|update|matches!(update,Update::RunInspection{operation,result:Err(_),..} if *operation==operations[2])));
+        let first = engine.outgoing.pop_front().unwrap();
+        let second = engine.outgoing.pop_front().unwrap();
+        assert!(matches!(&first.request,Request::GetRun{run_id} if run_id=="run-a"));
+        engine.select(Some("unrelated".into()), 99);
+        respond(&mut engine, second.id, test_value(&target));
+        assert!(engine.updates.iter().any(|update|matches!(update,Update::RunInspection{connection:0,operation,target:actual,result:Ok(_)} if *operation==operations[1]&&actual==&target)));
+        let count = engine.updates.len();
+        respond(&mut engine, second.id, test_value(&target));
+        assert_eq!(engine.updates.len(), count);
+        let mut foreign = test_value(&target);
+        foreign["session_id"] = "foreign".into();
+        respond(&mut engine, first.id, foreign);
+        assert!(engine.updates.iter().any(|update|matches!(update,Update::RunInspection{operation,result:Err(_),..} if *operation==operations[0])));
+        engine.outgoing.clear();
+        engine.command(Command::InspectRun {
+            connection: 1,
+            operation: uuid::Uuid::new_v4(),
+            target: target.clone(),
+        });
+        engine.command(Command::InspectRun {
+            connection: 0,
+            operation: uuid::Uuid::new_v4(),
+            target: Target {
+                run_id: "".into(),
+                ..target
+            },
+        });
+        assert!(engine.outgoing.is_empty());
+    }
+
+    #[test]
     fn comparisons_are_explicit_bounded_reads_with_request_owned_replies() {
         use crate::comparison::{test_value, Pair};
         let mut engine = ready();
@@ -2792,6 +2903,7 @@ mod tests {
             let export_operation = uuid::Uuid::new_v4();
             let usage_operation = uuid::Uuid::new_v4();
             let comparison_operation = uuid::Uuid::new_v4();
+            let inspection_operation = uuid::Uuid::new_v4();
             let peer = tokio::spawn(async move {
                 let mut server = BufReader::new(server);
                 loop {
@@ -2808,6 +2920,13 @@ mod tests {
                                 events.push(question("q2"));
                             }
                             json!({"subscribed":true})
+                        }
+                        Request::GetRun { run_id } if reconnect => {
+                            assert_eq!(run_id, "run-a");
+                            crate::run_inspection::test_value(&crate::run_inspection::Target {
+                                run_id,
+                                session_id: "a".into(),
+                            })
                         }
                         Request::ListSessions => json!([]),
                         Request::GetSession { id } => snapshot(&id, "canonical"),
@@ -2933,6 +3052,16 @@ mod tests {
                                         })
                                         .unwrap();
                                     command_tx
+                                        .try_send(Command::InspectRun {
+                                            connection: 0,
+                                            operation: inspection_operation,
+                                            target: crate::run_inspection::Target {
+                                                run_id: "run-a".into(),
+                                                session_id: "a".into(),
+                                            },
+                                        })
+                                        .unwrap();
+                                    command_tx
                                         .try_send(answer(
                                             &questions::Open::from_event(&question("q2")).unwrap(),
                                         ))
@@ -2975,9 +3104,10 @@ mod tests {
                 assert!(final_updates.iter().any(|update|matches!(update,Update::SessionExport {operation,result:Ok(_),..} if *operation==export_operation)),"the export reply must actually be processed");
                 assert!(final_updates.iter().any(|update|matches!(update,Update::SessionUsage{operation,result:Ok(_),..} if *operation==usage_operation)),"the usage reply must actually be processed");
                 assert!(final_updates.iter().any(|update|matches!(update,Update::SessionComparison{operation,result:Ok(_),..} if *operation==comparison_operation)),"comparison reply must actually be processed");
+                assert!(final_updates.iter().any(|update|matches!(update,Update::RunInspection{operation,result:Ok(_),..} if *operation==inspection_operation)),"Run inspection reply must actually be processed");
                 assert_eq!(
                     retained.uncertain, before,
-                    "Stop, metadata, export, usage, comparison and q2 ACKs cannot clear either unknown operation"
+                    "Stop, metadata, export, usage, comparison, Run inspection and q2 ACKs cannot clear either unknown operation"
                 );
             } else {
                 assert_eq!(retained.uncertain.len(), 2);

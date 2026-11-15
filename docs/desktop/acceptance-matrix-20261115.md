@@ -15,7 +15,7 @@ or authorization to merge while substantive gates fail.
 | Sessions | Directory, New Session, metadata/tags/pin/archive, instructions, persisted export and bounded new-file Save through the system picker; explicit persisted Session comparison with recorded usage; bounded window-local reading-message restoration | Remaining actions such as fork and paid branch-summary workflows; native import and full-Profile backup; OS picker/volume acceptance; persistent/finer per-Session view-state restoration |
 | Conversation and large output | Virtualized blocks, bounded previews, whole-output viewer, exact block source copy | Cross-block selection/copy, dedicated code-copy/link opening, richer attachments/artifacts/diagrams and native semantics |
 | Composer | Send/Steer/Queue/Stop, preserved drafts, IME guards, forecast consent; new per-window send-key choice | Attachments/drop/image paste/external editor, remaining Role/model/reference controls |
-| Context/resources | Recorded Session usage; bounded read-only Tools/Metrics/Proposals/Settings and exact details copy | General-purpose artifact/Invocation/Run detail selection/pinning/navigation, scoped diff and remaining editable resource actions |
+| Context/resources | Recorded Session usage; bounded read-only Tools/Metrics/Proposals/Settings and exact details copy; explicit exact-identity recorded Run inspection | General-purpose artifact/Invocation detail selection, Run pinning/navigation, scoped diff and remaining editable resource actions |
 | Questions/security decisions/Step | Native user questions, forecast consent; approvals and Step explicitly hand off to TUI | Native security-approval parity; restored pending Step identities and reconnect/control parity |
 | Search/navigation | Loaded literal Search and native Find; separate persisted Profile Search | Remaining global action discovery and resource navigation parity; native usability acceptance |
 | Layout/focus/scaling | Responsive panes/overlays, modal traps/restoration, reflow and headless 200% checks | Resizable panel preferences, real selection/input/trackpad, human 200% and multimonitor/HiDPI acceptance |
@@ -39,7 +39,7 @@ That goal does not make the failed or missing evidence above pass.
    recovery is established; do not adopt its unverified edits.
 2. Finish exact-patch reviews of each new isolated commit. Parent-reported
    reviews found no confirmed blocker in `acabff81`, `dfbab768` and
-   `8a18d80a`, `7658c8b5`, `f750cc2b`, `852932ef` and `bbde4a25`; those reviews inspected tests/logs without rerunning them.
+   `8a18d80a`, `7658c8b5`, `f750cc2b`, `852932ef`, `bbde4a25` and `b0d85263`; those reviews inspected tests/logs without rerunning them.
 3. Resolve the existing foreground approval and prior uncertain launch/control
    outcome through the supported approval/evidence path. No foreground action
    is repeated or substituted here, and no writer/Claude session is controlled.

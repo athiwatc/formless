@@ -126,6 +126,12 @@ async fn until(client: &Client, stage: &'static str, mut predicate: impl FnMut(U
     loop {
         for update in client.drain() {
             let summary = match &update {
+                Update::RunInspection { target, result, .. } => format!(
+                    "Run inspection {} / {}: ok={}",
+                    target.run_id,
+                    target.session_id,
+                    result.is_ok()
+                ),
                 Update::SessionComparison { pair, result, .. } => format!(
                     "comparison {} / {}: ok={}",
                     pair.left,
@@ -571,6 +577,60 @@ async fn real_daemon_provider_send_navigation_resources_and_reconnect() {
         requests.lock().unwrap().len(),
         1,
         "comparison never calls a provider"
+    );
+    let metrics = daemon
+        .handle(Request::RunMetrics {
+            limit: Some(100),
+            session_id: Some(a.clone()),
+            since: None,
+        })
+        .await
+        .unwrap();
+    let target = formless_desktop::run_inspection::Target::from_metric(&metrics["runs"][0])
+        .expect("a recorded Run for A");
+    let raw = daemon
+        .handle(Request::GetRun {
+            run_id: target.run_id.clone(),
+        })
+        .await
+        .unwrap();
+    let expected = formless_desktop::run_inspection::Report::decode(&target, raw.clone())
+        .unwrap()
+        .page
+        .rows[0]
+        .detail
+        .clone();
+    let operation = uuid::Uuid::new_v4();
+    client
+        .send(Command::InspectRun {
+            connection: client.connection(),
+            operation,
+            target: target.clone(),
+        })
+        .unwrap();
+    until(&client,"inspect-running-run",|update|matches!(update,Update::RunInspection{operation:ack,target:actual,result:Ok(report),..} if ack==operation&&actual==target&&report.page.rows[0].detail==expected)).await;
+    assert_eq!(
+        daemon
+            .handle(Request::GetRun {
+                run_id: target.run_id.clone()
+            })
+            .await
+            .unwrap(),
+        raw,
+        "inspection does not mutate the stored Run"
+    );
+    assert_eq!(
+        daemon
+            .handle(Request::GetSession { id: a.clone() })
+            .await
+            .unwrap(),
+        before,
+        "inspection does not mutate the Session or running state"
+    );
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        1,
+        "inspection must not call a provider"
     );
     first_answer.notify_one();
     observer
