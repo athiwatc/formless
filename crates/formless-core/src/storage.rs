@@ -7071,10 +7071,6 @@ pub fn estimate_tokens(text: &str) -> usize {
 pub type BuiltContext = (Vec<Value>, bool, i64);
 
 #[cfg(test)]
-#[path = "applied_proposal_read_tests.rs"]
-mod applied_proposal_read_tests;
-
-#[cfg(test)]
 #[path = "audit_pagination_tests.rs"]
 mod audit_pagination_tests;
 
@@ -8637,3 +8633,7 @@ mod fork_projection_tests;
 #[cfg(test)]
 #[path = "thinking_metadata_tests.rs"]
 mod thinking_metadata_tests;
+
+#[cfg(test)]
+#[path = "applied_proposal_read_tests.rs"]
+mod applied_proposal_read_tests;
