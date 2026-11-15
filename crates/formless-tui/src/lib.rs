@@ -26919,6 +26919,7 @@ mod tests {
             .data_dir
             .join(format!("mention-fixture-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(root.join("my notes")).unwrap();
+        let root = root.canonicalize().unwrap();
         let right = b"right-data";
         std::fs::write(root.join("my notes/report.md"), right).unwrap();
         std::fs::write(root.join("my"), b"wrong").unwrap();
