@@ -18,7 +18,7 @@ pub fn effective_prompt(st: &Store, cfg: &Config) -> Result<String> {
         &st.effective_system_prompt(crate::provider::SYSTEM_PROMPT)?,
     );
     let skills: Vec<_> = st
-        .list_skills()?
+        .skill_summaries()?
         .into_iter()
         .filter(|s| s.enabled && !s.retired)
         .map(|s| {
