@@ -1190,7 +1190,21 @@ async fn real_daemon_provider_send_navigation_resources_and_reconnect() {
     })
     .await
     .expect("old fixture daemon tasks retained the Profile lease");
-    let daemon2 = Arc::new(formless_core::daemon::Daemon::new(paths.clone()).unwrap());
+    // Arc's strong count reaches zero before its destructor finishes dropping
+    // fields. The private old daemon's Profile lease can therefore still be
+    // releasing here. Retry only that exact lock error for this owned fixture;
+    // other errors fail immediately and no other process is stopped.
+    let daemon2 = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match formless_core::daemon::Daemon::new(paths.clone()) {
+                Ok(daemon) => break Arc::new(daemon),
+                Err(error) if error.to_string() == "profile is owned by a daemon or maintenance operation; stop it and try again" => {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                Err(error) => panic!("private restored daemon: {error:#}"),
+            }
+        }
+    }).await.expect("old private fixture Profile lease did not retire");
     let serving2 = tokio::spawn(daemon2.clone().serve());
     until(&client, "stage-9", |u| {
         matches!(u, Update::Connection { ready: true, .. })
