@@ -34,11 +34,15 @@ impl Fixture {
         Self::with_tool_details(false)
     }
     fn with_tool_details(tool_details: bool) -> Self {
-        Self::with_tools(
+        Self::with_tool_rows_and_details(
             json!([{"id":"full-tool-id","name":"FetchPage","description":"","retired":false,"current_version":1,"capabilities":[],"memory_mb":16,"invocations":0,"success_rate":null,"needs_attention":false,"created_at":"","updated_at":""}]),
+            tool_details,
         )
     }
     fn with_tools(tool_rows: Value) -> Self {
+        Self::with_tool_rows_and_details(tool_rows, false)
+    }
+    fn with_tool_rows_and_details(tool_rows: Value, tool_details: bool) -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let root = std::path::PathBuf::from("/tmp").join(format!(
             "f1009-{}-{}-{}",
