@@ -1037,15 +1037,32 @@ impl Engine {
                 change,
             } => {
                 let outcome = match result {
-                    Ok(value) => serde_json::from_value::<SessionInfo>(value)
-                        .ok()
-                        .filter(|session| session.id == session_id)
-                        .and_then(|session| session_edit::Metadata::from_session(&session).ok())
-                        .filter(|metadata| change.matches(metadata))
-                        .map_or(
-                            session_edit::Outcome::Unknown,
-                            session_edit::Outcome::Applied,
-                        ),
+                    Ok(value) => {
+                        let exposes_instructions = value.get("instructions").is_some();
+                        let field = match &change {
+                            session_edit::Change::Name(_) => "name",
+                            session_edit::Change::Tags(_) => "tags",
+                            session_edit::Change::Pin(_) => "pinned",
+                            session_edit::Change::Archive(_) => "archived",
+                            session_edit::Change::Instructions(_) => "instructions",
+                        };
+                        let exposes_changed_field = value.get(field).is_some();
+                        serde_json::from_value::<SessionInfo>(value)
+                            .ok()
+                            .filter(|session| exposes_changed_field && session.id == session_id)
+                            .and_then(|session| {
+                                session_edit::Metadata::from_session_reply(
+                                    &session,
+                                    exposes_instructions,
+                                )
+                                .ok()
+                            })
+                            .filter(|metadata| change.matches(metadata))
+                            .map_or(
+                                session_edit::Outcome::Unknown,
+                                session_edit::Outcome::Applied,
+                            )
+                    }
                     Err(_) if response_ok => session_edit::Outcome::Unknown,
                     Err(error) => session_edit::Outcome::Rejected(error),
                 };
@@ -1062,6 +1079,12 @@ impl Engine {
                 session_id,
             } => {
                 let result = result.and_then(|value| {
+                    let exposes_instructions = value.as_array().is_some_and(|rows| {
+                        rows.iter().any(|row| {
+                            row["id"].as_str() == Some(session_id.as_str())
+                                && row.get("instructions").is_some()
+                        })
+                    });
                     let sessions =
                         replies::session_list(&value).map_err(|error| error.to_string())?;
                     let mut matching = sessions
@@ -1077,7 +1100,8 @@ impl Engine {
                                 .into(),
                         );
                     }
-                    session_edit::Metadata::from_session(&session).map_err(str::to_string)
+                    session_edit::Metadata::from_session_reply(&session, exposes_instructions)
+                        .map_err(str::to_string)
                 });
                 self.updates.push(Update::SessionDetails {
                     connection: self.connection,
@@ -1904,6 +1928,128 @@ mod tests {
         engine.dirty_list = false;
         engine.updates.clear();
         engine
+    }
+
+    #[test]
+    fn clearing_instructions_requires_an_explicit_matching_acknowledgement_field() {
+        for mode in [
+            "missing",
+            "null",
+            "wrong",
+            "oversized",
+            "foreign",
+            "malformed",
+        ] {
+            let mut engine = ready();
+            let session = crate::fixture::sessions(1).remove(0);
+            let id = session.id.clone();
+            let operation = uuid::Uuid::new_v4();
+            engine.command(Command::EditSession {
+                connection: 0,
+                operation,
+                session_id: id.clone(),
+                change: session_edit::Change::Instructions(None),
+            });
+            let request = engine.outgoing.pop_front().unwrap();
+            assert!(
+                matches!(request.request,Request::SetSessionInstructions{id:target,instructions:None} if target==id)
+            );
+            let mut value = serde_json::to_value(session).unwrap();
+            match mode {
+                "missing" => {
+                    value.as_object_mut().unwrap().remove("instructions");
+                }
+                "null" => value["instructions"] = Value::Null,
+                "wrong" => value["instructions"] = json!("different"),
+                "oversized" => {
+                    value["instructions"] = json!("x".repeat(session_edit::MAX_INPUT + 1))
+                }
+                "foreign" => value["id"] = json!("other"),
+                _ => value["instructions"] = json!(false),
+            }
+            respond(&mut engine, request.id, value);
+            assert!(engine.updates.iter().any(|u|matches!(u,Update::SessionEdited{operation:ack,outcome,..} if *ack==operation && match outcome {session_edit::Outcome::Applied(_)=>mode=="null",session_edit::Outcome::Unknown=>mode!="null",_=>false})),"{mode}");
+        }
+    }
+
+    #[test]
+    fn default_valued_setters_require_their_field_but_accept_explicit_defaults() {
+        for (change, key, value) in [
+            (session_edit::Change::Pin(false), "pinned", json!(false)),
+            (
+                session_edit::Change::Archive(false),
+                "archived",
+                json!(false),
+            ),
+            (session_edit::Change::Tags(Vec::new()), "tags", json!([])),
+            (
+                session_edit::Change::Instructions(None),
+                "instructions",
+                Value::Null,
+            ),
+        ] {
+            for exposed in [false, true] {
+                let mut engine = ready();
+                let session = crate::fixture::sessions(1).remove(0);
+                let id = session.id.clone();
+                let operation = uuid::Uuid::new_v4();
+                engine.command(Command::EditSession {
+                    connection: 0,
+                    operation,
+                    session_id: id,
+                    change: change.clone(),
+                });
+                let request = engine.outgoing.pop_front().unwrap();
+                let mut reply = serde_json::to_value(session).unwrap();
+                reply[key] = value.clone();
+                if !exposed {
+                    reply.as_object_mut().unwrap().remove(key);
+                }
+                respond(&mut engine, request.id, reply);
+                assert!(engine.updates.iter().any(|update|matches!(update,Update::SessionEdited{operation:ack,outcome,..} if *ack==operation && match outcome {session_edit::Outcome::Applied(_)=>exposed,session_edit::Outcome::Unknown=>!exposed,_=>false})),"{key} exposed={exposed}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_missing_instructions_read_disables_only_that_field_and_is_not_an_empty_value() {
+        for exposed in [false, true] {
+            let mut engine = ready();
+            let session = crate::fixture::sessions(1).remove(0);
+            let id = session.id.clone();
+            let operation = uuid::Uuid::new_v4();
+            engine.command(Command::ReadSessionDetails {
+                connection: 0,
+                operation,
+                session_id: id,
+            });
+            let request = engine.outgoing.pop_front().unwrap();
+            let mut value = serde_json::to_value(session).unwrap();
+            value["instructions"] = Value::Null;
+            if !exposed {
+                value.as_object_mut().unwrap().remove("instructions");
+            }
+            respond(&mut engine, request.id, json!([value]));
+            let metadata = engine
+                .updates
+                .iter()
+                .find_map(|update| match update {
+                    Update::SessionDetails {
+                        operation: ack,
+                        result: Ok(metadata),
+                        ..
+                    } if *ack == operation => Some(metadata),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(metadata.instructions.text(), exposed.then_some(""));
+            assert!(session_edit::Change::from_input(
+                session_edit::Field::Name,
+                "Name remains editable",
+                metadata
+            )
+            .is_ok());
+        }
     }
 
     #[test]

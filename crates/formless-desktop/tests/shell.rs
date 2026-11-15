@@ -14,6 +14,8 @@ use std::time::{Duration, Instant};
 
 #[path = "support/archive.rs"]
 mod archive_tests;
+#[path = "support/instructions.rs"]
+mod instruction_tests;
 #[path = "support/profile_search.rs"]
 mod profile_search_tests;
 #[path = "support/questions.rs"]

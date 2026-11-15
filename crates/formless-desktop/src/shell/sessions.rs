@@ -22,6 +22,7 @@ pub(super) struct Panel {
     field: Field,
     name: String,
     tags: String,
+    instructions: Option<String>,
     input: Option<Entity<TextareaState>>,
     _subscription: Option<Subscription>,
     accepted: String,
@@ -118,6 +119,7 @@ impl Shell {
             field,
             name: String::new(),
             tags: String::new(),
+            instructions: None,
             input: None,
             _subscription: None,
             accepted: String::new(),
@@ -127,7 +129,7 @@ impl Shell {
             notice: String::new(),
             focus: cx.focus_handle(),
             cancel: cx.focus_handle(),
-            controls: (0..6)
+            controls: (0..7)
                 .map(|_| {
                     (
                         cx.focus_handle(),
@@ -148,9 +150,17 @@ impl Shell {
 
     fn rebuild_session_edit_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let panel = self.session_editor.as_mut().unwrap();
+        if panel.field == Field::Instructions && panel.instructions.is_none() {
+            panel.accepted.clear();
+            panel.input = None;
+            panel._subscription = None;
+            panel.frames = 2;
+            return;
+        }
         let text = match panel.field {
             Field::Name => &panel.name,
             Field::Tags => &panel.tags,
+            Field::Instructions => panel.instructions.as_deref().unwrap_or_default(),
             Field::Pin | Field::Archive => "",
         };
         panel.accepted = text.into();
@@ -175,7 +185,7 @@ impl Shell {
                                 let Some(panel)=this.session_editor.as_mut() else {return;};
                                 if panel.input.as_ref()!=Some(&input) || input.update(cx,|input,cx|input.marked_text_range(window,cx).is_some()) || input.read(cx).value().len()<=MAX_INPUT {return;}
                                 let focused=input.focus_handle(cx).contains_focused(window,cx);
-                                match panel.field {Field::Name=>panel.name=accepted,Field::Tags=>panel.tags=accepted,Field::Pin|Field::Archive=>{}}
+                                match panel.field {Field::Name=>panel.name=accepted,Field::Tags=>panel.tags=accepted,Field::Instructions=>panel.instructions=Some(accepted),Field::Pin|Field::Archive=>{}}
                                 panel.notice="Edit exceeds 16 KiB and was rejected whole. Earlier text kept; undo history cleared.".into();
                                 this.rebuild_session_edit_input(window,cx);
                                 if focused {this.session_editor.as_ref().unwrap().input.as_ref().unwrap().update(cx,|input,cx|input.focus(window,cx));}
@@ -214,6 +224,7 @@ impl Shell {
         match panel.field {
             Field::Name => panel.name = text,
             Field::Tags => panel.tags = text,
+            Field::Instructions => panel.instructions = Some(text),
             Field::Pin | Field::Archive => {}
         }
         true
@@ -319,6 +330,7 @@ impl Shell {
         let text = match panel.field {
             Field::Name => &panel.name,
             Field::Tags => &panel.tags,
+            Field::Instructions => panel.instructions.as_deref().unwrap_or_default(),
             Field::Pin | Field::Archive => "",
         };
         let change = match crate::session_edit::Change::from_input(panel.field, text, metadata) {
@@ -386,6 +398,7 @@ impl Shell {
             Ok(metadata) if metadata.id == id => {
                 panel.name = metadata.name.clone();
                 panel.tags = metadata.tags.join("\n");
+                panel.instructions = metadata.instructions.text().map(str::to_string);
                 panel.metadata = Some(metadata);
                 panel.retired = false;
                 panel.notice =
@@ -564,6 +577,11 @@ impl Shell {
             && !busy
             && !panel.retired
             && panel.metadata.is_some()
+            && (panel.field != Field::Instructions
+                || panel
+                    .metadata
+                    .as_ref()
+                    .is_some_and(|metadata| metadata.instructions.text().is_some()))
             && self
                 .client
                 .as_ref()
@@ -572,9 +590,15 @@ impl Shell {
             .child(readable("session-edit-id",format!("Session: {}",panel.id)))
             .child(readable("session-edit-help","Saves replace the current field, including changes made by another client. Cancel discards unsaved metadata edits; it does not undo a sent save. Reload also replaces these edits."));
         let mut tabs = h_flex().flex_wrap().gap_2();
-        for (index, field) in [Field::Name, Field::Tags, Field::Pin, Field::Archive]
-            .into_iter()
-            .enumerate()
+        for (index, field) in [
+            Field::Name,
+            Field::Tags,
+            Field::Pin,
+            Field::Archive,
+            Field::Instructions,
+        ]
+        .into_iter()
+        .enumerate()
         {
             tabs = tabs.child(
                 div()
@@ -601,7 +625,31 @@ impl Shell {
             );
         }
         body = body.child(tabs);
-        if panel.field == Field::Pin {
+        if panel.field == Field::Instructions {
+            body=body.child(readable("session-edit-instructions-help","Standing instructions for this Session. Saved changes take effect at the next agent step, including during a Run. Leading/trailing whitespace is trimmed; blank clears. Save replaces the whole field."));
+            if let Some(crate::session_edit::Instructions::TooLarge(bytes)) = panel
+                .metadata
+                .as_ref()
+                .map(|metadata| &metadata.instructions)
+            {
+                body=body.child(readable("session-edit-instructions-unavailable",format!("The current instructions contain {bytes} bytes, above the native 16 KiB limit. They were not truncated into an edit. Use Formless TUI to inspect or replace them. Other fields remain editable; any earlier draft shown here is still copyable.")));
+            }
+            if panel.metadata.as_ref().is_some_and(|metadata| {
+                metadata.instructions == crate::session_edit::Instructions::Unavailable
+            }) {
+                body=body.child(readable("session-edit-instructions-unavailable","This daemon did not expose standing instructions. Use Formless TUI to inspect or change them. Other fields remain editable; any earlier draft shown here is still copyable."));
+            }
+            if let Some(input) = &panel.input {
+                body = body.child(
+                    div()
+                        .id("session-edit-input-anchor")
+                        .test_support()
+                        .pt_1()
+                        .anchor_scroll(Some(panel.input_anchor.clone()))
+                        .child(Textarea::new(input).aria_label("Session standing instructions")),
+                );
+            }
+        } else if panel.field == Field::Pin {
             if let Some(metadata) = &panel.metadata {
                 body = body.child(readable(
                     "session-edit-pin-value",
@@ -633,13 +681,21 @@ impl Shell {
                         div()
                             .id("session-edit-copy-anchor")
                             .pt_1()
-                            .anchor_scroll(Some(panel.controls[4].1.clone()))
+                            .anchor_scroll(Some(panel.controls[5].1.clone()))
                             .child(
                                 Button::new("session-edit-copy")
                                     .label("Copy edit")
-                                    .track_focus(&panel.controls[4].0)
+                                    .disabled(
+                                        panel.field == Field::Instructions && panel.input.is_none(),
+                                    )
+                                    .track_focus(&panel.controls[5].0)
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         if let Some(panel) = &this.session_editor {
+                                            if panel.field == Field::Instructions
+                                                && panel.input.is_none()
+                                            {
+                                                return;
+                                            }
                                             let text = if matches!(
                                                 panel.field,
                                                 Field::Pin | Field::Archive
@@ -665,7 +721,7 @@ impl Shell {
                         div()
                             .id("session-edit-reload-anchor")
                             .pt_1()
-                            .anchor_scroll(Some(panel.controls[5].1.clone()))
+                            .anchor_scroll(Some(panel.controls[6].1.clone()))
                             .child(
                                 Button::new("session-edit-reload")
                                     .label("Reload")
@@ -675,7 +731,7 @@ impl Shell {
                                             .as_ref()
                                             .is_none_or(|client| !client.is_ready()),
                                     )
-                                    .track_focus(&panel.controls[5].0)
+                                    .track_focus(&panel.controls[6].0)
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.reload_session_details(window, cx)
                                     })),
@@ -778,6 +834,9 @@ impl Shell {
                             .accessibility_label(match save_label {
                                 "Archive" => "Archive this Session",
                                 "Restore" => "Restore this Session",
+                                _ if panel.field == Field::Instructions => {
+                                    "Save Session standing instructions"
+                                }
                                 _ => "Save displayed Session field",
                             })
                             .primary()

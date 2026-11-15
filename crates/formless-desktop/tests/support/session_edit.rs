@@ -3,7 +3,7 @@ use formless_desktop::client::{Command as WireCommand, Update};
 use formless_desktop::session_edit::{Change, Metadata, Outcome, MAX_INPUT};
 use gpui_kit::EntityInputHandler as _;
 
-fn show(
+pub(super) fn show(
     cx: &mut TestAppContext,
     handle: WindowHandle<Root>,
     shell: &Entity<Shell>,

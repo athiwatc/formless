@@ -76,7 +76,25 @@ mod render {
     const WHOLE: Fit = Fit::Whole;
     const REFLOWED: Fit = Fit::Reflowed;
 
-    const STATES: [State; 49] = [
+    const STATES: [State; 51] = [
+        state(
+            "session-instructions-unavailable-light",
+            1440.,
+            900.,
+            LIGHT,
+            100,
+            Some("open-session-instructions-unavailable"),
+            WHOLE,
+        ),
+        state(
+            "minimum-session-instructions-unavailable-dark-200pct",
+            480.,
+            360.,
+            DARK,
+            200,
+            Some("open-session-instructions-unavailable"),
+            REFLOWED,
+        ),
         state(
             "profile-search-light",
             1440.,
@@ -863,9 +881,10 @@ mod render {
                     let (operation,query)=shell.update(cx,|shell,_|shell.take_client_commands()).into_iter().find_map(|command|match command {WireCommand::SearchProfile{operation,query,..}=>Some((operation,query)),_=>None}).unwrap();
                     let hits=(0..50).map(|i|formless_protocol::SearchHit{session_id:sessions[i%3].id.clone(),session_name:format!("Search result {i} ไทย 漢字 😀"),message_id:format!("native-search-message-{i}"),seq:i as i64,role:"assistant".into(),snippet:"A persisted message snippet ไทย 漢字 😀. This is incomplete text, not a full message.".into(),created_at:"2026-11-15".into()}).collect();
                     shell.update(cx,|shell,cx|shell.apply_client_update(Update::ProfileSearch{connection:0,operation,query,result:Ok(hits)},window,cx));
-                } else if matches!(control,"open-session-edit"|"open-session-archive") {
+                } else if matches!(control,"open-session-edit"|"open-session-archive"|"open-session-instructions-unavailable") {
                     use formless_desktop::client::{Update,Command as WireCommand};
-                    let sessions=fixture::sessions(3);
+                    let mut sessions=fixture::sessions(3);
+                    if control=="open-session-instructions-unavailable" {sessions[0].instructions=Some("x".repeat(formless_desktop::session_edit::MAX_INPUT+1));}
                     shell.update(cx,|shell,cx|{
                         shell.connect_recording_daemon(cx);
                         shell.apply_client_update(Update::Connection {ready:true,notice:"Connected view fixture".into()},window,cx);
@@ -1013,6 +1032,51 @@ mod render {
             })
             .expect("offscreen window is open");
             cx.run_until_parked();
+            if control == "open-session-instructions-unavailable" {
+                cx.update_window(any, |_, window, cx| {
+                    for _ in 0..40 {
+                        window.render_frame(cx);
+                        if window.find("session-edit-instructions").focused() == Some(true) {
+                            break;
+                        }
+                        window.press("tab", cx);
+                    }
+                    for _ in 0..3 {
+                        window.render_frame(cx);
+                        window.simulate_next_frame(cx);
+                    }
+                    window.click("session-edit-instructions", cx);
+                    window.render_frame(cx);
+                    assert!(shell.read(cx).session_edit_input().is_none());
+                    assert_eq!(window.find("session-edit-save").disabled(), Some(true));
+                    assert_eq!(window.find("session-edit-copy").disabled(), Some(true));
+                    let body = window.find("session-edit-body").bounds();
+                    let warning = window
+                        .find("session-edit-instructions-unavailable")
+                        .bounds();
+                    window.scroll(
+                        "session-edit-body",
+                        ScrollDelta::Pixels(point(px(0.), body.top() - warning.top())),
+                        cx,
+                    );
+                    window.render_frame(cx);
+                    assert!(window
+                        .find("session-edit-instructions-unavailable")
+                        .bounds()
+                        .intersects(&window.find("session-edit-body").bounds()));
+                    for id in [
+                        "session-edit-dialog",
+                        "session-edit-cancel",
+                        "session-edit-save",
+                    ] {
+                        assert!(
+                            inside(window, id, viewport),
+                            "{name}: {id} outside viewport"
+                        );
+                    }
+                })
+                .unwrap();
+            }
             if control == "open-profile-search" {
                 cx.update_window(any, |_, window, cx| {
                     for _ in 0..5 {
@@ -1223,6 +1287,11 @@ mod render {
                 for (field, label, suffix) in [
                     ("session-edit-name", "Session name", ""),
                     ("session-edit-tags", "Session tags, one per line", "-tags"),
+                    (
+                        "session-edit-instructions",
+                        "Session standing instructions",
+                        "-instructions",
+                    ),
                 ] {
                     cx.update_window(any, |_, window, cx| {
                         for _ in 0..30 {
@@ -1243,8 +1312,10 @@ mod render {
                             input.set_value(
                                 if suffix.is_empty() {
                                     "Native renamed ไทย 漢字 😀"
-                                } else {
+                                } else if suffix=="-tags" {
                                     "one ไทย\ntwo 漢字\nthree 😀\nfour\nfive\nsix"
+                                } else {
+                                    "Standing instructions ไทย 漢字 😀\n\tKeep interior whitespace.\nNext agent step.\nFourth line.\nFifth line.\nSixth line."
                                 },
                                 window,
                                 cx,
@@ -1588,6 +1659,7 @@ mod render {
                 .expect("offscreen window is open");
             }
             if fit == Fit::Reflowed
+                && control != "open-session-instructions-unavailable"
                 && control != "open-profile-search"
                 && !control.starts_with("open-daemon-")
                 && control != "open-session-edit"

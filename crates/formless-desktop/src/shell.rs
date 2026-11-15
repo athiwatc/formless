@@ -179,6 +179,13 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("escape", CloseForecast, Some(FORECAST_CONTEXT)),
         KeyBinding::new("escape", CloseQuestions, Some(QUESTIONS_CONTEXT)),
         KeyBinding::new("escape", CloseSessionEditor, Some(SESSION_EDITOR_CONTEXT)),
+        // Input's Escape unmarks and then propagates. Intercept it before
+        // that happens so one key cannot both finish preedit and cancel.
+        KeyBinding::new(
+            "escape",
+            CloseSessionEditor,
+            Some("FormlessSessionEditor > Input"),
+        ),
         KeyBinding::new(
             "up",
             ScrollViewerUp,

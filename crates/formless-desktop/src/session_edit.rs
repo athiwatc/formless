@@ -6,15 +6,42 @@ use formless_protocol::{Request, SessionInfo};
 pub const MAX_INPUT: usize = 16 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Instructions {
+    Text(String),
+    TooLarge(usize),
+    Unavailable,
+}
+
+impl Instructions {
+    pub fn text(&self) -> Option<&str> {
+        match self {
+            Self::Text(text) => Some(text),
+            Self::TooLarge(_) | Self::Unavailable => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Metadata {
     pub id: String,
     pub name: String,
     pub tags: Vec<String>,
     pub pinned: bool,
     pub archived: bool,
+    pub instructions: Instructions,
 }
 
 impl Metadata {
+    pub(crate) fn from_session_reply(
+        session: &SessionInfo,
+        exposes_instructions: bool,
+    ) -> Result<Self, &'static str> {
+        let mut metadata = Self::from_session(session)?;
+        if !exposes_instructions {
+            metadata.instructions = Instructions::Unavailable;
+        }
+        Ok(metadata)
+    }
     pub fn from_session(session: &SessionInfo) -> Result<Self, &'static str> {
         if session.id.is_empty()
             || session.id.len() > 256
@@ -34,6 +61,10 @@ impl Metadata {
             tags: session.tags.clone(),
             pinned: session.pinned,
             archived: session.archived,
+            instructions: match session.instructions.as_deref().unwrap_or_default() {
+                text if text.len() <= MAX_INPUT => Instructions::Text(text.into()),
+                text => Instructions::TooLarge(text.len()),
+            },
         })
     }
 }
@@ -44,6 +75,7 @@ pub enum Field {
     Tags,
     Pin,
     Archive,
+    Instructions,
 }
 
 impl Field {
@@ -53,6 +85,7 @@ impl Field {
             Self::Tags => "Tags",
             Self::Pin => "Pin",
             Self::Archive => "Archive",
+            Self::Instructions => "Instructions",
         }
     }
     pub fn value(self, metadata: &Metadata) -> String {
@@ -71,6 +104,13 @@ impl Field {
                 "Unarchived"
             }
             .into(),
+            Self::Instructions => metadata
+                .instructions
+                .text()
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    "Instructions are unavailable in this editor; use Formless TUI for the complete value.".into()
+                }),
         }
     }
 }
@@ -81,6 +121,7 @@ pub enum Change {
     Tags(Vec<String>),
     Pin(bool),
     Archive(bool),
+    Instructions(Option<String>),
 }
 
 impl Change {
@@ -93,12 +134,22 @@ impl Change {
             Field::Tags => Self::Tags(text.lines().map(str::to_string).collect()),
             Field::Pin => Self::Pin(!metadata.pinned),
             Field::Archive => Self::Archive(!metadata.archived),
+            Field::Instructions => {
+                if metadata.instructions.text().is_none() {
+                    return Err("Current instructions are unavailable in this editor. Use Formless TUI; no replacement was sent.");
+                }
+                let text = text.trim();
+                Self::Instructions((!text.is_empty()).then(|| text.into()))
+            }
         };
         change.validate()?;
         Ok(change)
     }
     pub fn validate(&self) -> Result<(), &'static str> {
         match self {
+            Self::Instructions(Some(text)) if text.len() > MAX_INPUT => {
+                Err("Use at most 16 KiB of standing instructions.")
+            }
             Self::Name(name)
                 if name.is_empty() || name.len() > MAX_INPUT || name.contains(['\r', '\n']) =>
             {
@@ -134,6 +185,10 @@ impl Change {
                 id: id.into(),
                 archived: *archived,
             },
+            Self::Instructions(instructions) => Request::SetSessionInstructions {
+                id: id.into(),
+                instructions: instructions.clone(),
+            },
         }
     }
     pub fn matches(&self, metadata: &Metadata) -> bool {
@@ -141,6 +196,10 @@ impl Change {
             Self::Name(name) => name == &metadata.name,
             Self::Pin(pinned) => pinned == &metadata.pinned,
             Self::Archive(archived) => archived == &metadata.archived,
+            Self::Instructions(instructions) => metadata
+                .instructions
+                .text()
+                .is_some_and(|text| text == instructions.as_deref().unwrap_or_default().trim()),
             Self::Tags(tags) => {
                 // Existing storage setter semantics; the acknowledged values
                 // are displayed, never inferred as an optimistic local update.
@@ -168,6 +227,57 @@ pub enum Outcome {
 mod tests {
     use super::*;
     #[test]
+    fn instructions_use_the_existing_trim_and_clear_contract_without_normalizing_interior_text() {
+        let session = crate::fixture::sessions(1).remove(0);
+        let mut metadata = Metadata::from_session(&session).unwrap();
+        let change = Change::from_input(
+            Field::Instructions,
+            " \nFirst ไทย\n\tIndented 漢字 😀\n ",
+            &metadata,
+        )
+        .unwrap();
+        assert_eq!(
+            change,
+            Change::Instructions(Some("First ไทย\n\tIndented 漢字 😀".into()))
+        );
+        assert!(
+            matches!(change.request(&metadata.id),Request::SetSessionInstructions{id,instructions:Some(text)} if id==metadata.id && text=="First ไทย\n\tIndented 漢字 😀")
+        );
+        metadata.instructions = Instructions::Text("First ไทย\n\tIndented 漢字 😀".into());
+        assert!(change.matches(&metadata));
+        let clear = Change::from_input(Field::Instructions, " \n\t ", &metadata).unwrap();
+        assert_eq!(clear, Change::Instructions(None));
+        assert!(!clear.matches(&metadata));
+        metadata.instructions = Instructions::Text(String::new());
+        assert!(clear.matches(&metadata));
+        for unsupported in [
+            Instructions::Unavailable,
+            Instructions::TooLarge(MAX_INPUT + 1),
+        ] {
+            metadata.instructions = unsupported;
+            assert!(!clear.matches(&metadata));
+            assert!(
+                Change::from_input(Field::Instructions, "small replacement", &metadata).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_instructions_never_become_a_truncated_edit_or_block_other_fields() {
+        let mut session = crate::fixture::sessions(1).remove(0);
+        session.instructions = Some("😀".repeat(MAX_INPUT / 4 + 1));
+        let metadata = Metadata::from_session(&session).unwrap();
+        assert_eq!(metadata.instructions, Instructions::TooLarge(MAX_INPUT + 4));
+        assert!(Change::from_input(Field::Name, "Still editable", &metadata).is_ok());
+        assert!(Change::from_input(Field::Instructions, "", &metadata).is_err());
+        assert!(Change::Instructions(Some("x".repeat(MAX_INPUT + 1)))
+            .validate()
+            .is_err());
+        let missing = Metadata::from_session_reply(&session, false).unwrap();
+        assert_eq!(missing.instructions, Instructions::Unavailable);
+        assert!(Change::from_input(Field::Tags, "work", &missing).is_ok());
+    }
+    #[test]
     fn archive_and_restore_are_explicit_boolean_setters() {
         let mut session = crate::fixture::sessions(1).remove(0);
         session.archived = false;
@@ -194,6 +304,7 @@ mod tests {
             tags: vec![],
             pinned: false,
             archived: false,
+            instructions: Instructions::Text(String::new()),
         };
         let change =
             Change::from_input(Field::Tags, "#Work\nwork\n  ไทย 漢字 😀 \n", &metadata).unwrap();

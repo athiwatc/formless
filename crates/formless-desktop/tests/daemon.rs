@@ -410,6 +410,51 @@ async fn real_daemon_provider_send_navigation_resources_and_reconnect() {
             "archiving/restoring is not a Run control"
         );
     }
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while requests.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    for instructions in [
+        Some("  DESKTOP_STANDING_INSTRUCTIONS_1753\nไทย 😀  ".to_string()),
+        None,
+        Some("DESKTOP_STANDING_INSTRUCTIONS_1753\n\tไทย 漢字 😀".to_string()),
+    ] {
+        let operation = uuid::Uuid::new_v4();
+        let change = formless_desktop::session_edit::Change::Instructions(instructions.clone());
+        let expected = change.clone();
+        client
+            .send(Command::EditSession {
+                connection: client.connection(),
+                operation,
+                session_id: a.clone(),
+                change,
+            })
+            .unwrap();
+        until(&client,"instructions-running-session",|update|matches!(update,Update::SessionEdited{operation:ack,session_id,outcome:formless_desktop::session_edit::Outcome::Applied(metadata),..} if ack==operation && session_id==a && expected.matches(&metadata))).await;
+        let current = daemon
+            .handle(Request::GetSession { id: a.clone() })
+            .await
+            .unwrap();
+        assert_eq!(
+            current["session"]["instructions"],
+            json!(instructions
+                .as_deref()
+                .map(str::trim)
+                .filter(|text| !text.is_empty()))
+        );
+        assert_eq!(
+            current["running"], true,
+            "editing instructions does not stop the held Run"
+        );
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            1,
+            "instruction setters must not call the provider"
+        );
+    }
     first_answer.notify_one();
     observer
         .until(|event| {
@@ -521,6 +566,14 @@ async fn real_daemon_provider_send_navigation_resources_and_reconnect() {
         })
         .await
         .expect("provider request did not reach its interruption gate");
+        if !abandon {
+            assert!(
+                requests.lock().unwrap()[1]["system"]
+                    .to_string()
+                    .contains("DESKTOP_STANDING_INSTRUCTIONS_1753"),
+                "the next Run must receive the saved standing instructions"
+            );
+        }
         client
             .send(Command::Intent(Intent::InterruptRun {
                 session_id: a.clone(),
