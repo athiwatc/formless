@@ -1459,7 +1459,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_missing_or_mismatched_success_is_unknown_and_cannot_clear_unknown_send() {
+    fn metadata_missing_or_mismatched_success_is_unknown() {
         for reply in [
             Value::Null,
             json!({"pinned":true}),
@@ -1468,16 +1468,6 @@ mod tests {
             let mut engine = ready();
             let session = crate::fixture::sessions(1).remove(0);
             let id = session.id;
-            let unknown = Action {
-                id: uuid::Uuid::new_v4(),
-                session_id: id.clone(),
-                question_id: None,
-            };
-            let uncertain = HashSet::from([unknown]);
-            let send = Command::Intent(Intent::ResumeRun {
-                session_id: id.clone(),
-            });
-            assert!(engine.blocked_by_unknown(&send, &uncertain));
             engine.command(Command::EditSession {
                 connection: 0,
                 operation: uuid::Uuid::new_v4(),
@@ -1493,7 +1483,6 @@ mod tests {
                     ..
                 }
             )));
-            assert!(engine.blocked_by_unknown(&send, &uncertain));
         }
     }
 
@@ -2142,7 +2131,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_question_answer_survives_reconnect_stop_and_an_unrelated_question_ack() {
+    async fn unknown_send_and_question_survive_stop_metadata_and_another_question_ack() {
         let mut retained = disconnect_after_unacknowledged_send().await;
         let original_send = retained.uncertain.clone();
         for reconnect in [false, true] {
@@ -2155,6 +2144,7 @@ mod tests {
             let ready = AtomicBool::new(false);
             let epoch = AtomicU64::new(0);
             let connection = AtomicU64::new(0);
+            let metadata_operation = uuid::Uuid::new_v4();
             let peer = tokio::spawn(async move {
                 let mut server = BufReader::new(server);
                 loop {
@@ -2187,6 +2177,14 @@ mod tests {
                             json!({"answered":true})
                         }
                         Request::InterruptRun { .. } if reconnect => json!({"interrupted":true}),
+                        Request::SetSessionPinned { id, pinned } if reconnect => {
+                            assert_eq!(id, "a");
+                            assert!(pinned);
+                            let mut session = crate::fixture::sessions(1).remove(0);
+                            session.id = id;
+                            session.pinned = pinned;
+                            serde_json::to_value(session).unwrap()
+                        }
                         Request::SendMessage { .. } => {
                             panic!("an unrelated answer ACK cleared the unknown Send")
                         }
@@ -2235,6 +2233,14 @@ mod tests {
                                         }))
                                         .unwrap();
                                     command_tx
+                                        .try_send(Command::EditSession {
+                                            connection: 0,
+                                            operation: metadata_operation,
+                                            session_id: "a".into(),
+                                            change: session_edit::Change::Pin(true),
+                                        })
+                                        .unwrap();
+                                    command_tx
                                         .try_send(answer(
                                             &questions::Open::from_event(&question("q2")).unwrap(),
                                         ))
@@ -2269,12 +2275,13 @@ mod tests {
             .await
             .unwrap();
             peer.await.unwrap();
-            let _receiver = driver.await.unwrap();
+            let receiver = driver.await.unwrap();
             assert!(result.unwrap_err().contains("disconnected"));
             if reconnect {
+                assert!(receiver.try_iter().any(|update|matches!(update,Update::SessionEdited {operation,outcome:session_edit::Outcome::Applied(_),..} if operation==metadata_operation)),"the metadata ACK must actually be processed");
                 assert_eq!(
                     retained.uncertain, before,
-                    "Stop and q2 ACKs cannot clear either unknown operation"
+                    "Stop, metadata and q2 ACKs cannot clear either unknown operation"
                 );
             } else {
                 assert_eq!(retained.uncertain.len(), 2);
