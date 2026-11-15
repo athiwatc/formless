@@ -47,18 +47,19 @@ pub struct Placed {
     pub path: String,
 }
 
-/// Longest side of an image transcoded for kitty: a thumbnail, so a phone
+/// Longest side of a decoded terminal preview: a thumbnail, so a phone
 /// photo doesn't become megabytes of escape sequence.
 const THUMB_PX: u32 = 800;
 
-/// The bytes kitty can take: PNG as is, anything else the decoder reads
-/// (JPEG, GIF, WebP) transcoded to a PNG thumbnail (#881).
-fn kitty_png(data: &[u8]) -> Option<std::borrow::Cow<'_, [u8]>> {
-    if data.starts_with(b"\x89PNG") {
+/// Both protocols use bounded decoded previews. Small iTerm images keep
+/// their original format (including animations); kitty requires PNG.
+fn preview_bytes(proto: Protocol, data: &[u8]) -> Option<std::borrow::Cow<'_, [u8]>> {
+    let img = image::load_from_memory(data).ok()?;
+    let oversized = img.width().max(img.height()) > THUMB_PX;
+    if !oversized && (proto == Protocol::ITerm || data.starts_with(b"\x89PNG\r\n\x1a\n")) {
         return Some(std::borrow::Cow::Borrowed(data));
     }
-    let img = image::load_from_memory(data).ok()?;
-    let img = if img.width().max(img.height()) > THUMB_PX {
+    let img = if oversized {
         img.thumbnail(THUMB_PX, THUMB_PX)
     } else {
         img
@@ -70,8 +71,8 @@ fn kitty_png(data: &[u8]) -> Option<std::borrow::Cow<'_, [u8]>> {
 }
 
 /// Whether the image at `path` can be drawn with `proto`, so its rows are
-/// worth reserving (#881). Checked once per file: kitty needs a format the
-/// decoder reads (only the header is looked at); iTerm2 takes any image.
+/// worth reserving (#881). Both previews need a supported decoder format;
+/// only the header is checked, once per file.
 pub fn drawable(proto: Protocol, path: &str) -> bool {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
@@ -81,14 +82,11 @@ pub fn drawable(proto: Protocol, path: &str) -> bool {
     if let Some(&known) = seen.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
         return known;
     }
-    let ok = match proto {
-        Protocol::ITerm => std::path::Path::new(path).is_file(),
-        Protocol::Kitty => image::ImageReader::open(path)
-            .and_then(|r| r.with_guessed_format())
-            .ok()
-            .and_then(|r| r.into_dimensions().ok())
-            .is_some(),
-    };
+    let ok = image::ImageReader::open(path)
+        .and_then(|r| r.with_guessed_format())
+        .ok()
+        .and_then(|r| r.into_dimensions().ok())
+        .is_some();
     seen.lock()
         .unwrap_or_else(|e| e.into_inner())
         .insert(key, ok);
@@ -96,14 +94,11 @@ pub fn drawable(proto: Protocol, path: &str) -> bool {
 }
 
 /// The escape sequence that draws `data` (the file's bytes) into a box of
-/// `cols` × `ROWS` cells at the cursor. Kitty takes PNG only, so other
-/// formats are transcoded first; None when the image can't be read.
+/// `cols` × `ROWS` cells at the cursor. Oversized images are downscaled
+/// before encoding; None when the supported decoder can't read the image.
 pub fn sequence(proto: Protocol, data: &[u8], cols: u16) -> Option<String> {
     use base64::Engine;
-    let data = match proto {
-        Protocol::Kitty => kitty_png(data)?,
-        Protocol::ITerm => std::borrow::Cow::Borrowed(data),
-    };
+    let data = preview_bytes(proto, data)?;
     let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
     match proto {
         Protocol::ITerm => Some(format!(
@@ -158,11 +153,75 @@ pub fn paint(out: &mut impl Write, proto: Protocol, placed: &[Placed]) -> std::i
 mod tests {
     use super::*;
 
+    fn fixture_png(width: u32, height: u32) -> Vec<u8> {
+        let mut png = Vec::new();
+        image::RgbaImage::from_pixel(width, height, image::Rgba([200, 30, 30, 100]))
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        png
+    }
+
+    fn payload(proto: Protocol, seq: &str) -> Vec<u8> {
+        use base64::Engine;
+        let encoded = match proto {
+            Protocol::Kitty => seq
+                .split("\x1b\\")
+                .filter_map(|chunk| chunk.split_once(';').map(|(_, data)| data))
+                .collect::<String>(),
+            Protocol::ITerm => seq
+                .split_once(':')
+                .unwrap()
+                .1
+                .strip_suffix('\x07')
+                .unwrap()
+                .to_string(),
+        };
+        let data = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap();
+        if proto == Protocol::ITerm {
+            assert!(seq.contains(&format!(";size={};", data.len())));
+        }
+        data
+    }
+
+    fn assert_png_preview_bound(proto: Protocol) {
+        for (width, height, expected) in [(1200, 900, (800, 600)), (900, 1200, (600, 800))] {
+            let png = fixture_png(width, height);
+            let seq = sequence(proto, &png, 30).unwrap();
+            let thumb = image::load_from_memory(&payload(proto, &seq))
+                .unwrap()
+                .to_rgba8();
+            assert_eq!(thumb.dimensions(), expected, "{proto:?}");
+            assert_eq!(
+                thumb.get_pixel(0, 0).0[3],
+                100,
+                "PNG transparency is retained"
+            );
+        }
+        let small = fixture_png(20, 10);
+        let seq = sequence(proto, &small, 30).unwrap();
+        assert_eq!(payload(proto, &seq), small, "small PNG needs no transcode");
+    }
+
+    #[test]
+    fn kitty_png_previews_are_bounded() {
+        assert_png_preview_bound(Protocol::Kitty);
+    }
+
+    #[test]
+    fn iterm_png_previews_are_bounded() {
+        assert_png_preview_bound(Protocol::ITerm);
+    }
+
     #[test]
     fn sequences_per_protocol() {
-        let png = b"\x89PNG\r\n\x1a\nrest".to_vec();
+        let png = fixture_png(20, 10);
         let iterm = sequence(Protocol::ITerm, &png, 30).unwrap();
-        assert!(iterm.starts_with("\x1b]1337;File=inline=1;size=12;width=30;height=8;"));
+        assert!(iterm.starts_with(&format!(
+            "\x1b]1337;File=inline=1;size={};width=30;height=8;",
+            png.len()
+        )));
         let kitty = sequence(Protocol::Kitty, &png, 30).unwrap();
         assert!(kitty.starts_with("\x1b_Ga=T,f=100,q=2,C=1,c=30,r=8,m=0;"));
         assert!(
@@ -170,9 +229,26 @@ mod tests {
             "kitty: unreadable bytes draw nothing"
         );
         // Big images go in 4096-byte chunks.
-        let big = [png.clone(), vec![0u8; 9000]].concat();
+        let mut state = 0x12345678u32;
+        let noisy = image::RgbImage::from_fn(128, 128, |_, _| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            image::Rgb([state as u8, (state >> 8) as u8, (state >> 16) as u8])
+        });
+        let mut big = Vec::new();
+        noisy
+            .write_to(&mut std::io::Cursor::new(&mut big), image::ImageFormat::Png)
+            .unwrap();
         let k = sequence(Protocol::Kitty, &big, 30).unwrap();
-        assert_eq!(k.matches("\x1b_G").count(), 3);
+        assert!(k.matches("\x1b_G").count() > 1);
+        for chunk in k.split("\x1b\\").filter(|s| !s.is_empty()) {
+            assert!(chunk.split_once(';').unwrap().1.len() <= 4096);
+        }
+        assert_eq!(payload(Protocol::Kitty, &k), big);
+        for proto in [Protocol::Kitty, Protocol::ITerm] {
+            assert!(sequence(proto, b"\x89PNG\r\n\x1a\nrest", 30).is_none());
+        }
         assert!(k.contains(",m=1;") && k.contains("\x1b_Gm=0;"));
         assert_eq!(detect("off"), None);
     }
@@ -192,16 +268,29 @@ mod tests {
         let seq = sequence(Protocol::Kitty, &jpeg, 30).expect("drawable");
         assert!(seq.starts_with("\x1b_Ga=T,f=100,"));
         // The payload is a PNG thumbnail.
-        let payload: String = seq
+        let encoded: String = seq
             .split("\x1b\\")
             .filter_map(|c| c.split_once(';').map(|(_, d)| d))
             .collect();
         let png = base64::engine::general_purpose::STANDARD
-            .decode(payload)
+            .decode(encoded)
             .unwrap();
         assert!(png.starts_with(b"\x89PNG"));
         let thumb = image::load_from_memory(&png).unwrap();
         assert_eq!((thumb.width(), thumb.height()), (800, 600));
+
+        let iterm = sequence(Protocol::ITerm, &jpeg, 30).unwrap();
+        let thumb = image::load_from_memory(&payload(Protocol::ITerm, &iterm)).unwrap();
+        assert_eq!((thumb.width(), thumb.height()), (800, 600));
+        let mut small = Vec::new();
+        image::RgbImage::from_pixel(20, 10, image::Rgb([200, 30, 30]))
+            .write_to(
+                &mut std::io::Cursor::new(&mut small),
+                image::ImageFormat::Jpeg,
+            )
+            .unwrap();
+        let seq = sequence(Protocol::ITerm, &small, 30).unwrap();
+        assert_eq!(payload(Protocol::ITerm, &seq), small);
 
         let dir = std::env::temp_dir().join(format!("fl-img-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -210,6 +299,8 @@ mod tests {
         std::fs::write(&bad, b"not an image").unwrap();
         assert!(drawable(Protocol::Kitty, good.to_str().unwrap()));
         assert!(!drawable(Protocol::Kitty, bad.to_str().unwrap()));
+        assert!(drawable(Protocol::ITerm, good.to_str().unwrap()));
+        assert!(!drawable(Protocol::ITerm, bad.to_str().unwrap()));
         assert!(!drawable(
             Protocol::ITerm,
             dir.join("missing.png").to_str().unwrap()

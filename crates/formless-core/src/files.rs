@@ -4,8 +4,11 @@
 
 use crate::fuzzy::{fold, PreparedQuery};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::path::Path;
 use std::{cmp::Ordering, collections::BinaryHeap};
+
+use unicode_normalization::UnicodeNormalization;
 
 /// Most entries one walk collects.
 pub const MAX_WALK: usize = 200_000;
@@ -100,12 +103,18 @@ pub fn walk(root: &Path) -> (Vec<FileEntry>, bool) {
 /// level; a query ending in `/` lists that directory's children, so
 /// `@dir/` completes step by step. Otherwise entries are ranked by fuzzy
 /// match on the path, with a bonus when the file name itself matches.
+/// Directory spelling is exact first, then uniquely canonical-equivalent.
+/// Ambiguous canonical spellings require an exact spelling; children are
+/// never merged. Directory fallback remains case/accent-sensitive.
 pub fn search<'a>(entries: &'a [FileEntry], query: &str, limit: usize) -> Vec<&'a FileEntry> {
     let query = query.trim();
     if query.is_empty() || query.ends_with('/') {
+        let Some(prefix) = directory_prefix(entries, query) else {
+            return Vec::new();
+        };
         let mut kids: Vec<&FileEntry> = entries
             .iter()
-            .filter(|e| match e.path.strip_prefix(query) {
+            .filter(|e| match e.path.strip_prefix(prefix.as_ref()) {
                 Some(rest) => !rest.is_empty() && !rest.contains('/'),
                 None => false,
             })
@@ -182,6 +191,39 @@ impl PartialEq for Ranked<'_> {
     }
 }
 impl Eq for Ranked<'_> {}
+
+fn directory_prefix<'a>(entries: &[FileEntry], query: &'a str) -> Option<Cow<'a, str>> {
+    let directory = query.strip_suffix('/').unwrap_or(query);
+    if query.is_empty()
+        || entries
+            .iter()
+            .any(|e| (e.dir && e.path == directory) || e.path.starts_with(query))
+    {
+        return Some(Cow::Borrowed(query));
+    }
+    let normalized: String = directory.nfc().collect();
+    let depth = query.bytes().filter(|b| *b == b'/').count();
+    let mut found: Option<&str> = None;
+    for entry in entries {
+        // Resolve an original directory boundary before slicing children.
+        // Ancestors are considered even if a partial index has no dir row.
+        let mut separators = entry.path.match_indices('/');
+        let candidate = match separators.nth(depth.saturating_sub(1)) {
+            Some((byte, _)) => &entry.path[..byte],
+            None if entry.dir && entry.path.bytes().filter(|b| *b == b'/').count() + 1 == depth => {
+                &entry.path
+            }
+            None => continue,
+        };
+        if candidate.nfc().eq(normalized.chars()) {
+            if found.is_some_and(|previous| previous != candidate) {
+                return None;
+            }
+            found = Some(candidate);
+        }
+    }
+    found.map(|original| Cow::Owned(format!("{original}/")))
+}
 
 /// `@path` mentions in a message: an `@` at the start or after whitespace,
 /// followed by a non-empty path (trailing punctuation dropped).
@@ -308,6 +350,83 @@ mod tests {
         }
         std::fs::remove_dir_all(root).unwrap();
         std::fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn directory_completion_prefers_exact_then_unique_canonical_spelling_without_merging() {
+        let e = |path: &str, dir| FileEntry {
+            path: path.into(),
+            dir,
+            bytes: if dir { 0 } else { 7 },
+        };
+        let paths = |entries: &[FileEntry], query: &str, limit| {
+            search(entries, query, limit)
+                .into_iter()
+                .map(|e| e.path.clone())
+                .collect::<Vec<_>>()
+        };
+        let nfd = "cafe\u{301}";
+        let entries = vec![
+            e(nfd, true),
+            e(&format!("{nfd}/menu.txt"), false),
+            e(&format!("{nfd}/sub"), true),
+            e(&format!("{nfd}/sub/deep.txt"), false),
+            e("cafe2/menu.txt", false),
+            e("other", false),
+        ];
+        let expected = vec![format!("{nfd}/sub"), format!("{nfd}/menu.txt")];
+        assert_eq!(paths(&entries, "café/", 20), expected);
+        assert_eq!(paths(&entries, &format!("{nfd}/"), 20), expected);
+        assert_eq!(paths(&entries, "café/", 1), expected[..1]);
+        assert!(paths(&entries, "café/", 0).is_empty());
+        assert_eq!(
+            paths(&entries, "", 20),
+            vec![nfd.to_string(), "other".into()]
+        );
+        let nfc = vec![
+            e("nested/café/menu.txt", false),
+            e("nested/café2/other.txt", false),
+            e("nested/café/sub/deep.txt", false),
+        ];
+        assert_eq!(
+            paths(&nfc, "nested/cafe\u{301}/", 20),
+            vec!["nested/café/menu.txt"]
+        );
+        let mut collision = entries.clone();
+        collision.push(e("café", true));
+        assert!(
+            paths(&collision, "café/", 20).is_empty(),
+            "exact empty dir wins over canonical populated dir"
+        );
+        collision.push(e("café/exact.txt", false));
+        assert_eq!(paths(&collision, "café/", 20), vec!["café/exact.txt"]);
+        assert_eq!(paths(&collision, &format!("{nfd}/"), 20), expected);
+        let collision = vec![
+            e("Å", true),
+            e("Å/one", false),
+            e("A\u{30a}", true),
+            e("A\u{30a}/two", false),
+        ];
+        assert!(
+            paths(&collision, "Å/", 20).is_empty(),
+            "ambiguous canonical lookup must require exact spelling"
+        );
+        assert_eq!(paths(&collision, "Å/", 20), vec!["Å/one"]);
+        assert_eq!(paths(&collision, "A\u{30a}/", 20), vec!["A\u{30a}/two"]);
+        let different = vec![
+            e("cafe", true),
+            e("cafe/plain", false),
+            e("Café", true),
+            e("Café/case", false),
+            e("café", true),
+            e("café/accent", false),
+        ];
+        assert_eq!(paths(&different, "Cafe\u{301}/", 20), vec!["Café/case"]);
+        assert!(paths(&different, "CAFÉ/", 20).is_empty());
+        assert!(paths(&different, "CAFE/", 20).is_empty());
+        assert_eq!(paths(&different, "cafe/", 20), vec!["cafe/plain"]);
+        assert_eq!(entries[1].bytes, 7);
+        assert_eq!(entries[1].path, format!("{nfd}/menu.txt"));
     }
 
     #[test]

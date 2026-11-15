@@ -150,7 +150,9 @@ impl Daemon {
         };
         if !matches!(
             failure.downcast_ref::<StructuredOutputError>(),
-            Some(StructuredOutputError::InvalidJson | StructuredOutputError::SchemaViolation)
+            Some(
+                StructuredOutputError::InvalidJson { .. } | StructuredOutputError::SchemaViolation
+            )
         ) {
             return Err(anyhow!("schema: {failure}"));
         }
@@ -222,7 +224,7 @@ impl Daemon {
                     if matches!(
                         error.downcast_ref::<StructuredOutputError>(),
                         Some(
-                            StructuredOutputError::InvalidJson
+                            StructuredOutputError::InvalidJson { .. }
                                 | StructuredOutputError::SchemaViolation
                         )
                     ) {
