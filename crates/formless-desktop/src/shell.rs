@@ -673,6 +673,8 @@ pub struct Shell {
     client_questions: crate::questions::State,
     question_panel: Option<questions::Panel>,
     session_editor: Option<sessions::Panel>,
+    export_save_prompt: Option<sessions::ExportSavePrompt>,
+    export_save_notice: Option<SharedString>,
     question_drafts: Drafts,
     question_draft_ids: Vec<String>,
     questions_toggle_focus: FocusHandle,
@@ -894,6 +896,8 @@ impl Shell {
             client_questions: crate::questions::State::default(),
             question_panel: None,
             session_editor: None,
+            export_save_prompt: None,
+            export_save_notice: None,
             question_drafts: Drafts::new(16, 4 * 1024 * 1024),
             question_draft_ids: Vec::new(),
             questions_toggle_focus: cx.focus_handle(),
@@ -1639,6 +1643,7 @@ impl Shell {
     }
 
     fn attach_client(&mut self, client: Client, cx: &mut Context<Self>) {
+        self.retire_session_export_attachment();
         self.profile_search
             .retire("Profile attachment changed. Search again after connecting.");
         self.session_usage
@@ -5146,6 +5151,19 @@ impl Shell {
             .text_color(cx.theme().muted_foreground)
             .border_t_1()
             .border_color(cx.theme().border)
+            .when_some(self.export_save_notice.clone(), |status, notice| {
+                status.child(
+                    announced(
+                        div()
+                            .id("export-save-notice")
+                            .test_support()
+                            .role(Role::Status)
+                            .aria_value(notice.clone())
+                            .child(Label::new(notice)),
+                    )
+                    .text_xs(),
+                )
+            })
             .when_some(self.preference_notice.clone(), |status, notice| {
                 status.child(
                     announced(

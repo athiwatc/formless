@@ -359,3 +359,332 @@ fn export_controls_remain_reachable_at_two_hundred_percent(cx: &mut TestAppConte
         assert!(!shell.read(cx).background_inert(window));
     });
 }
+
+struct SaveDirectory(std::path::PathBuf);
+impl SaveDirectory {
+    fn new() -> Self {
+        let path =
+            std::env::temp_dir().join(format!("formless-shell-export-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&path).unwrap();
+        Self(path)
+    }
+    fn file(&self, name: &str) -> std::path::PathBuf {
+        self.0.join(name)
+    }
+}
+impl Drop for SaveDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn ready_file_export(
+    cx: &mut TestAppContext,
+    handle: WindowHandle<Root>,
+    shell: &Entity<Shell>,
+    id: &str,
+    format: Format,
+    text: &str,
+) -> uuid::Uuid {
+    step(cx, handle, |window, cx| {
+        let revision = shell.read(cx).session_export_revision().unwrap();
+        shell.update(cx, |shell, cx| {
+            shell.request_presented_session_export(id, 0, revision, format, window, cx)
+        });
+        let operation = requested(shell, cx, id, format);
+        reply(
+            shell,
+            window,
+            cx,
+            0,
+            operation,
+            id,
+            format,
+            Ok(Document {
+                name: "../../private name".into(),
+                text: text.into(),
+            }),
+        );
+        window.render_frame(cx);
+        shell.read(cx).session_export_revision().unwrap()
+    })
+}
+
+#[gpui_kit::test]
+fn export_save_uses_the_platform_picker_and_writes_complete_exact_source_only_after_choice(
+    cx: &mut TestAppContext,
+) {
+    let directory = SaveDirectory::new();
+    let path = directory.file("chosen.html");
+    let (handle, shell) = open(cx, WIDE, 0, 0);
+    let sessions = daemon_view(cx, handle, &shell);
+    step(cx, handle, |window, cx| {
+        window.click(session_row_id(&sessions[0].id), cx);
+        shell.update(cx, |shell, cx| {
+            shell.focus_section(PageSection::Composer, window, cx)
+        });
+        window.input("private composer draft", cx);
+    });
+    show(cx, handle, &shell, &sessions[1]);
+    let text = "<script>not opened ไทย 👩‍💻</script>\r\n\t  \n".repeat(200);
+    let revision = ready_file_export(cx, handle, &shell, &sessions[1].id, Format::Html, &text);
+    step(cx, handle, |window, cx| {
+        let input = shell.read(cx).session_edit_input().unwrap();
+        input.update(cx, |input, cx| {
+            input.set_value("unsaved private name", window, cx)
+        });
+        focus_control(&shell, window, cx, "session-export-save-file");
+        window.press("enter", cx);
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("session-export-save-file").disabled(),
+            Some(true)
+        );
+        // A queued duplicate cannot start a second system dialog.
+        shell.update(cx, |shell, cx| {
+            shell.save_presented_session_export(&sessions[1].id, 0, revision, window, cx)
+        });
+        assert!(shell
+            .update(cx, |shell, _| shell.take_client_commands())
+            .is_empty());
+    });
+    cx.run_until_parked();
+    assert!(cx.did_prompt_for_new_path());
+    assert!(!path.exists());
+    assert_eq!(std::fs::read_dir(&directory.0).unwrap().count(), 0);
+    cx.simulate_new_path_selection(|initial| {
+        assert!(initial.is_absolute());
+        Some(path.clone())
+    });
+    cx.run_until_parked();
+    assert!(!cx.did_prompt_for_new_path());
+    assert_eq!(std::fs::read(&path).unwrap(), text.as_bytes());
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        assert!(window
+            .find("session-export-notice")
+            .value()
+            .unwrap()
+            .contains("Saved complete HTML source"));
+        assert_eq!(
+            window.find("session-export-notice").role(),
+            Some(gpui_kit::Role::Status)
+        );
+        assert_eq!(shell.read(cx).draft(cx).as_ref(), "private composer draft");
+        assert_eq!(
+            shell
+                .read(cx)
+                .session_edit_input()
+                .unwrap()
+                .read(cx)
+                .value()
+                .as_ref(),
+            "unsaved private name"
+        );
+        assert!(shell
+            .update(cx, |shell, _| shell.take_client_commands())
+            .is_empty());
+    });
+}
+
+#[gpui_kit::test]
+fn export_save_cancel_and_existing_file_preserve_data_and_stale_buttons_cannot_reopen_picker(
+    cx: &mut TestAppContext,
+) {
+    let directory = SaveDirectory::new();
+    let path = directory.file("existing.md");
+    std::fs::write(&path, b"existing owner's bytes").unwrap();
+    let (handle, shell) = open(cx, WIDE, 0, 0);
+    let sessions = daemon_view(cx, handle, &shell);
+    show(cx, handle, &shell, &sessions[0]);
+    let revision = ready_file_export(
+        cx,
+        handle,
+        &shell,
+        &sessions[0].id,
+        Format::Markdown,
+        "new exact\r\n",
+    );
+    step(cx, handle, |window, cx| {
+        focus_control(&shell, window, cx, "session-export-save-file");
+        window.press("enter", cx);
+    });
+    assert!(cx.did_prompt_for_new_path());
+    cx.simulate_new_path_selection(|_| None);
+    cx.run_until_parked();
+    assert!(!cx.did_prompt_for_new_path());
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        assert!(window
+            .find("session-export-notice")
+            .value()
+            .unwrap()
+            .contains("canceled"));
+        shell.update(cx, |shell, cx| {
+            shell.save_presented_session_export(&sessions[0].id, 0, revision, window, cx)
+        });
+    });
+    assert!(!cx.did_prompt_for_new_path());
+    step(cx, handle, |window, cx| {
+        focus_control(&shell, window, cx, "session-export-save-file");
+        window.press("enter", cx);
+    });
+    cx.simulate_new_path_selection(|_| Some(path.clone()));
+    cx.run_until_parked();
+    assert_eq!(std::fs::read(&path).unwrap(), b"existing owner's bytes");
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        assert!(window
+            .find("session-export-notice")
+            .value()
+            .unwrap()
+            .contains("already exists"));
+        focus_control(&shell, window, cx, "session-export-copy");
+        window.press("enter", cx);
+        assert_eq!(
+            cx.read_from_clipboard().unwrap().text().unwrap(),
+            "new exact\r\n"
+        );
+    });
+    assert_eq!(std::fs::read_dir(&directory.0).unwrap().count(), 1);
+}
+
+#[gpui_kit::test]
+fn export_save_late_dialog_choices_cannot_write_after_panel_or_connection_replacement(
+    cx: &mut TestAppContext,
+) {
+    let directory = SaveDirectory::new();
+    let first = directory.file("old-session.json");
+    let second = directory.file("old-connection.md");
+    let (handle, shell) = open(cx, WIDE, 0, 0);
+    let sessions = daemon_view(cx, handle, &shell);
+    show(cx, handle, &shell, &sessions[0]);
+    ready_file_export(cx, handle, &shell, &sessions[0].id, Format::Json, "{}\n");
+    step(cx, handle, |window, cx| {
+        focus_control(&shell, window, cx, "session-export-save-file");
+        window.press("enter", cx);
+        window.press("escape", cx);
+        let query = shell.read(cx).directory_query().clone();
+        query.update(cx, |input, cx| input.set_value("", window, cx));
+    });
+    show(cx, handle, &shell, &sessions[1]);
+    cx.simulate_new_path_selection(|_| Some(first.clone()));
+    cx.run_until_parked();
+    assert!(!first.exists());
+    ready_file_export(
+        cx,
+        handle,
+        &shell,
+        &sessions[1].id,
+        Format::Markdown,
+        "second",
+    );
+    step(cx, handle, |window, cx| {
+        focus_control(&shell, window, cx, "session-export-save-file");
+        window.press("enter", cx);
+        // Actual connection atomic advances before its UI update is drained.
+        assert_eq!(shell.read(cx).retire_recording_question_connection(), 1);
+    });
+    cx.simulate_new_path_selection(|_| Some(second.clone()));
+    cx.run_until_parked();
+    assert!(!second.exists());
+    assert!(!cx.did_prompt_for_new_path());
+    assert_eq!(std::fs::read_dir(&directory.0).unwrap().count(), 0);
+}
+
+#[gpui_kit::test]
+fn export_save_respects_preedit_and_is_keyboard_reachable_at_two_hundred_percent(
+    cx: &mut TestAppContext,
+) {
+    let directory = SaveDirectory::new();
+    let path = directory.file("small.md");
+    let (handle, shell) = open(cx, size(px(480.), px(360.)), 0, 0);
+    let sessions = daemon_view(cx, handle, &shell);
+    step(cx, handle, |window, cx| {
+        shell.update(cx, |shell, cx| {
+            shell.set_text_scale(TextScale::LARGEST, window, cx)
+        });
+    });
+    show(cx, handle, &shell, &sessions[0]);
+    let revision = ready_file_export(
+        cx,
+        handle,
+        &shell,
+        &sessions[0].id,
+        Format::Markdown,
+        "ไทย\r\n\t  ",
+    );
+    step(cx, handle, |window, cx| {
+        let input = shell.read(cx).session_edit_input().unwrap();
+        input.update(cx, |input, cx| {
+            input.focus(window, cx);
+            input.replace_and_mark_text_in_range(None, "กำลัง", None, window, cx);
+        });
+        shell.update(cx, |shell, cx| {
+            shell.save_presented_session_export(&sessions[0].id, 0, revision, window, cx)
+        });
+        assert!(input.update(cx, |input, cx| input
+            .marked_text_range(window, cx)
+            .is_some()));
+        input.update(cx, |input, cx| input.unmark_text(window, cx));
+    });
+    assert!(!cx.did_prompt_for_new_path());
+    step(cx, handle, |window, cx| {
+        focus_control(&shell, window, cx, "session-export-save-file");
+        window.press("enter", cx);
+    });
+    cx.simulate_new_path_selection(|_| Some(path.clone()));
+    cx.run_until_parked();
+    assert_eq!(std::fs::read(path).unwrap(), "ไทย\r\n\t  ".as_bytes());
+    step(cx, handle, |window, cx| {
+        focus_control(&shell, window, cx, "session-export-save-file");
+        let bounds = window.find("session-export-save-file").bounds();
+        assert!(bounds.left() >= px(0.) && bounds.right() <= px(480.));
+        assert_eq!(
+            window.find("session-export-save-file").focused(),
+            Some(true)
+        );
+        window.press("escape", cx);
+        assert!(window.try_find("session-edit-dialog").is_none());
+    });
+}
+
+#[gpui_kit::test]
+fn export_save_cannot_cross_profile_attachment_even_when_connection_and_session_ids_repeat(
+    cx: &mut TestAppContext,
+) {
+    let directory = SaveDirectory::new();
+    let path = directory.file("old-profile.md");
+    let (handle, shell) = open(cx, WIDE, 0, 0);
+    let sessions = daemon_view(cx, handle, &shell);
+    show(cx, handle, &shell, &sessions[0]);
+    ready_file_export(
+        cx,
+        handle,
+        &shell,
+        &sessions[0].id,
+        Format::Markdown,
+        "old profile canary",
+    );
+    step(cx, handle, |window, cx| {
+        focus_control(&shell, window, cx, "session-export-save-file");
+        window.press("enter", cx);
+    });
+    assert!(cx.did_prompt_for_new_path());
+    let replacement = daemon_view(cx, handle, &shell);
+    assert_eq!(sessions[0].id, replacement[0].id);
+    cx.simulate_new_path_selection(|_| Some(path.clone()));
+    cx.run_until_parked();
+    assert!(
+        !path.exists(),
+        "a new client attachment must retire the old export even if counters repeat"
+    );
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("session-export-copy").disabled(), Some(true));
+        assert_eq!(
+            window.find("session-export-save-file").disabled(),
+            Some(true)
+        );
+    });
+}

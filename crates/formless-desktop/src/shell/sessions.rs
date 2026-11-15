@@ -17,6 +17,15 @@ struct PresentedSave {
     toggle: Option<Change>,
 }
 
+#[derive(Clone)]
+pub(super) struct ExportSavePrompt {
+    token: uuid::Uuid,
+    id: String,
+    connection: u64,
+    revision: uuid::Uuid,
+    format: Format,
+}
+
 pub(super) struct Panel {
     pub export: session_export::State,
     id: String,
@@ -44,6 +53,15 @@ pub(super) struct Panel {
 }
 
 impl Shell {
+    pub(super) fn retire_session_export_attachment(&mut self) {
+        if let Some(panel) = &mut self.session_editor {
+            panel.export.retire(
+                "Profile attachment changed. Read another export; nothing was replayed or saved.",
+            );
+            panel.frames = 2;
+        }
+    }
+
     pub(super) fn session_edit_target(&self) -> Option<&str> {
         self.client.as_ref()?;
         if self.destination == Destination::Sessions {
@@ -132,7 +150,7 @@ impl Shell {
             notice: String::new(),
             focus: cx.focus_handle(),
             cancel: cx.focus_handle(),
-            controls: (0..11)
+            controls: (0..12)
                 .map(|_| {
                     (
                         cx.focus_handle(),
@@ -579,6 +597,9 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.export_save_prompt.is_some() {
+            return;
+        }
         let Some(panel) = &self.session_editor else {
             return;
         };
@@ -655,6 +676,9 @@ impl Shell {
         revision: uuid::Uuid,
         cx: &mut Context<Self>,
     ) {
+        if self.export_save_prompt.is_some() {
+            return;
+        }
         let Some(panel) = &self.session_editor else {
             return;
         };
@@ -671,6 +695,144 @@ impl Shell {
                 cx.write_to_clipboard(ClipboardItem::new_string(document.text.clone()));
             }
         }
+    }
+
+    fn export_save_current(&self, id: &str, connection: u64, revision: uuid::Uuid) -> bool {
+        self.client_connected
+            && self
+                .client
+                .as_ref()
+                .is_some_and(|client| client.is_ready() && client.connection() == connection)
+            && self.session_editor.as_ref().is_some_and(|panel| {
+                panel.id == id
+                    && panel.connection == connection
+                    && panel.export.revision == revision
+                    && !panel.retired
+                    && panel.metadata.is_some()
+                    && panel.waiting.is_none()
+                    && !panel.export.pending()
+                    && panel.export.format().is_some()
+                    && panel
+                        .export
+                        .document
+                        .as_ref()
+                        .is_some_and(|document| document.text.len() <= session_export::MAX_BYTES)
+            })
+    }
+
+    fn save_session_export(
+        &mut self,
+        id: &str,
+        connection: u64,
+        revision: uuid::Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.export_save_prompt.is_some()
+            || !self.export_save_current(id, connection, revision)
+            || self.current_modal(self.layout(window)) != Some(Modal::SessionEditor)
+            || !self.keep_session_edit_input(window, cx)
+        {
+            return;
+        }
+        let home = std::env::var_os(if cfg!(target_os = "windows") {
+            "USERPROFILE"
+        } else {
+            "HOME"
+        });
+        let directory = home
+            .map(std::path::PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .or_else(|| std::env::current_dir().ok());
+        let Some(directory) = directory else {
+            self.session_editor.as_mut().unwrap().export.notice =
+                "Cannot open Save dialog without an initial directory. No file was written.".into();
+            cx.notify();
+            return;
+        };
+        let panel = self.session_editor.as_mut().unwrap();
+        let format = panel.export.format().unwrap();
+        panel.export.revision = uuid::Uuid::new_v4();
+        panel.export.notice = "Choose a NEW file for this persisted export. Private conversation/Tool data may be included. Existing files are never overwritten; cancel writes nothing.".into();
+        panel.frames = 2;
+        let ticket = ExportSavePrompt {
+            token: uuid::Uuid::new_v4(),
+            id: id.into(),
+            connection,
+            revision: panel.export.revision,
+            format,
+        };
+        self.export_save_prompt = Some(ticket.clone());
+        self.export_save_notice = None;
+        let dialog = cx.prompt_for_new_path(&directory, Some(format.file_name()));
+        cx.spawn_in(window, async move |this, cx| {
+            let choice = match dialog.await {
+                Ok(Ok(path)) => Ok(path),
+                _ => Err("Save dialog unavailable or closed unexpectedly. No file was written."),
+            };
+            let _ = this.update_in(cx, |this, _, cx| {
+                this.finish_export_save(ticket, choice, cx)
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn finish_export_save(
+        &mut self,
+        ticket: ExportSavePrompt,
+        choice: Result<Option<std::path::PathBuf>, &'static str>,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .export_save_prompt
+            .as_ref()
+            .is_none_or(|prompt| prompt.token != ticket.token)
+        {
+            return;
+        }
+        self.export_save_prompt = None;
+        if !self.export_save_current(&ticket.id, ticket.connection, ticket.revision)
+            || self
+                .session_editor
+                .as_ref()
+                .and_then(|panel| panel.export.format())
+                != Some(ticket.format)
+        {
+            self.export_save_notice = Some(
+                "Export save canceled: Session, export or connection changed. No file was written."
+                    .into(),
+            );
+            cx.notify();
+            return;
+        }
+        let panel = self.session_editor.as_mut().unwrap();
+        let document = panel.export.document.as_ref().unwrap();
+        let notice = match choice {
+            Ok(None) => "Export save canceled. No file was written.".to_string(),
+            Err(error) => error.to_string(),
+            Ok(Some(path)) => match session_export::save_new(&path, &document.text) {
+                Ok(()) => format!("Saved complete {} export ({} bytes) to the chosen new file. No file was opened.", ticket.format.label(), document.text.len()),
+                Err(error) => error.to_string(),
+            },
+        };
+        panel.export.revision = uuid::Uuid::new_v4();
+        panel.export.notice = notice.clone();
+        panel.frames = 2;
+        self.export_save_notice = Some(notice.into());
+        cx.notify();
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn save_presented_session_export(
+        &mut self,
+        id: &str,
+        connection: u64,
+        revision: uuid::Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.save_session_export(id, connection, revision, window, cx);
     }
 
     #[cfg(feature = "test-support")]
@@ -889,6 +1051,7 @@ impl Shell {
             && !panel.retired
             && panel.metadata.is_some()
             && !panel.export.pending()
+            && self.export_save_prompt.is_none()
             && self
                 .client
                 .as_ref()
@@ -925,9 +1088,10 @@ impl Shell {
                     ),
             );
         }
-        body=body.child(readable("session-export-help","Export persisted history. JSON is the daemon's re-importable bundle; Markdown/HTML contain its transcript. Exports may include private conversation, Tool data, plans and checkpoints. Reading writes no file. Native copies are limited to 1 MiB; use Formless TUI for larger exports. HTML is displayed as source and never executed. Unsaved edits are excluded; native import/Save file are unavailable."))
+        body=body.child(readable("session-export-help","Export persisted history. JSON is the daemon's re-importable bundle; Markdown/HTML contain its transcript. Exports may include private conversation, Tool data, plans and checkpoints. Reading writes no file. Native copies are limited to 1 MiB; use Formless TUI for larger exports. HTML is displayed as source and never executed. Unsaved edits are excluded. Save export writes the complete returned text to a new file chosen in the system dialog, up to 1 MiB. Existing files are never overwritten; native import remains unavailable."))
             .child(exports)
-            .child(readable("session-export-notice",panel.export.notice.clone()));
+            .child(announced(div().id("session-export-notice").test_support().role(Role::Status)
+                .aria_value(panel.export.notice.clone()).child(Label::new(panel.export.notice.clone()))));
         if let Some(document) = &panel.export.document {
             body = body
                 .child(readable(
@@ -956,6 +1120,7 @@ impl Shell {
                         .accessibility_label("Copy complete Session export to system clipboard")
                         .disabled(
                             panel.export.document.is_none()
+                                || self.export_save_prompt.is_some()
                                 || !self.client_connected
                                 || self.client.as_ref().is_none_or(|client| {
                                     !client.is_ready() || client.connection() != panel.connection
@@ -967,6 +1132,18 @@ impl Shell {
                         })),
                 ),
         );
+        let id = panel.id.clone();
+        let connection = panel.connection;
+        let revision = panel.export.revision;
+        body = body.child(div().id("session-export-save-anchor").pt_1()
+            .anchor_scroll(Some(panel.controls[11].1.clone()))
+            .child(Button::new("session-export-save-file")
+                .label("Save export…")
+                .accessibility_label("Save complete persisted Session export as a new file")
+                .tooltip("Choose a new file in the system Save dialog. May contain private data. Existing files are never overwritten.")
+                .disabled(self.export_save_prompt.is_some() || !self.export_save_current(&id, connection, revision))
+                .track_focus(&panel.controls[11].0)
+                .on_click(cx.listener(move |this, _, window, cx| this.save_session_export(&id, connection, revision, window, cx)))));
         let expected_toggle = panel
             .metadata
             .as_ref()

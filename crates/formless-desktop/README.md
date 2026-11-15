@@ -113,7 +113,17 @@ are available up to 1 MiB; HTML source is never executed. Copy goes to the
 system clipboard and may include private conversation/Tool/plan data. Unsaved
 edits are excluded. Replies are scoped to Session, connection, operation and
 format, retire on disconnect, and are never replayed. This is a past read;
-native Save file/import and full-Profile backup remain unavailable.
+Save export opens the system Save dialog and writes the complete accepted
+result to a new file, up to the same 1 MiB bound. Existing files are never
+overwritten, and no file is opened afterward. Cancel, a stale panel/export or
+connection change writes nothing. Only one Save dialog may be pending in this
+window. Native import and full-Profile backup remain unavailable.
+
+Save export stages and syncs bytes in the selected directory and publishes
+with an exclusive new-file link. Unsupported volumes fail without a direct-write
+fallback; choose a volume with hard-link support or use Formless TUI. Directory
+creation, replacement and automatic retry are not performed. This is not a
+power-loss, latency or native OS picker/filesystem acceptance claim.
 
 New Step prompts for the subscribed Session produce an explicit Formless TUI
 handoff notice. The current protocol does not restore pending Step identities
@@ -129,6 +139,7 @@ Findings, measurements, the parity inventory and the open blockers are in
 [docs/desktop/phase0-findings.md](../../docs/desktop/phase0-findings.md).
 
 Current continuation evidence and remaining acceptance are recorded in
+[the native export-file report](../../docs/desktop/export-file-20261115.md),
 [the durable view preferences report](../../docs/desktop/view-preferences-20261115.md),
 [the send-key choice report](../../docs/desktop/composer-send-keys-20261115.md),
 [the remaining acceptance matrix](../../docs/desktop/acceptance-matrix-20261115.md),

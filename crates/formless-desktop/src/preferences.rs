@@ -1,7 +1,7 @@
 //! Explicitly saved view preferences. No Profile, Session, draft or credential data.
 //! A bounded, versioned file; cooperating windows lock and compare before replacing it.
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -129,6 +129,12 @@ fn lock(path: &Path) -> Result<File, String> {
 }
 
 struct Temporary(PathBuf);
+impl Temporary {
+    fn create(path: PathBuf) -> io::Result<(Self, File)> {
+        let file = private_options().create_new(true).open(&path)?;
+        Ok((Self(path), file))
+    }
+}
 impl Drop for Temporary {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.0);
@@ -205,17 +211,13 @@ impl Store {
         bytes.push(b'\n');
         let mut name = self.path.as_os_str().to_os_string();
         name.push(format!(".{}.tmp", uuid::Uuid::new_v4()));
-        let temporary = Temporary(PathBuf::from(name));
-        let mut file = private_options()
-            .create_new(true)
-            .open(&temporary.0)
+        let (temporary, mut file) = Temporary::create(PathBuf::from(name))
             .map_err(|_| "Cannot stage desktop preferences. Nothing saved.".to_string())?;
-        file.write_all(&bytes)
-            .and_then(|_| file.sync_all())
-            .map_err(|_| {
-                "Cannot write desktop preferences. Original file unchanged.".to_string()
-            })?;
+        let written = file.write_all(&bytes).and_then(|_| file.sync_all());
         drop(file);
+        written.map_err(|_| {
+            "Cannot write desktop preferences. Original file unchanged.".to_string()
+        })?;
         fs::rename(&temporary.0, &self.path).map_err(|_| {
             "Cannot replace desktop preferences. Original file unchanged.".to_string()
         })?;
@@ -262,6 +264,15 @@ mod tests {
     }
     fn chosen() -> Settings {
         Settings::for_view(TextScale::LARGEST, true, false, true, false)
+    }
+
+    #[test]
+    fn staging_collision_never_arms_cleanup_for_an_unowned_file() {
+        let directory = Directory::new();
+        let path = directory.0.join("existing-stage");
+        fs::write(&path, b"owned by another writer").unwrap();
+        assert!(Temporary::create(path.clone()).is_err());
+        assert_eq!(fs::read(path).unwrap(), b"owned by another writer");
     }
 
     #[test]
