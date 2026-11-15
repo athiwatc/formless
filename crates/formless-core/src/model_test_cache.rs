@@ -16,6 +16,27 @@ pub(crate) struct Reservation {
     cache: Arc<ModelTestCache>,
     key: String,
 }
+// Success stays cached. Explicit failures can be retried on a later selected
+// model, with a cooldown rather than an automatic loop. Unknown timestamps or
+// malformed records retain the conservative manual-Test-only behavior.
+fn cached_result_is_fresh(test: &Value, now: chrono::DateTime<chrono::Utc>) -> bool {
+    if test["ok"].as_bool() != Some(false) {
+        return true;
+    }
+    let Some(tested) = test["tested_at"]
+        .as_str()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+    else {
+        return true;
+    };
+    let cooldown = if test["transient"] == true {
+        chrono::Duration::minutes(5)
+    } else {
+        chrono::Duration::hours(24)
+    };
+    now.signed_duration_since(tested.with_timezone(&chrono::Utc)) < cooldown
+}
+
 impl Drop for Reservation {
     fn drop(&mut self) {
         self.cache.active.locked().remove(&self.key);
@@ -54,9 +75,24 @@ impl ModelTestCache {
         endpoint: &str,
         model: &str,
     ) -> Result<Option<Reservation>> {
+        self.reserve_at(endpoint, model, chrono::Utc::now())
+    }
+    fn reserve_at(
+        self: &Arc<Self>,
+        endpoint: &str,
+        model: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<Reservation>> {
         let key = Self::key(endpoint, model);
         let mut active = self.active.locked();
-        if active.contains(&key) || self.read_unlocked()?.contains_key(&key) {
+        if active.contains(&key) {
+            return Ok(None);
+        }
+        if self
+            .read_unlocked()?
+            .get(&key)
+            .is_some_and(|test| cached_result_is_fresh(test, now))
+        {
             return Ok(None);
         }
         active.insert(key.clone());
@@ -119,6 +155,77 @@ mod tests {
             ..Default::default()
         }
     }
+    #[test]
+    fn retry_windows_keep_successes_fresh_and_deduplicate_expired_failures() {
+        use chrono::TimeZone;
+        let now = chrono::Utc.with_ymd_and_hms(2026, 1, 15, 12, 0, 0).unwrap();
+        let f = Fixture::new();
+        let cache = f.cache();
+        let mut test = result("model");
+        test.tested_at = (now - chrono::Duration::days(100)).to_rfc3339();
+        cache.remember("https://one", &test).unwrap();
+        assert!(cache
+            .reserve_at("https://one", "model", now)
+            .unwrap()
+            .is_none());
+        test.ok = false;
+        test.transient = true;
+        for (age, expected) in [(299, false), (300, true)] {
+            test.tested_at = (now - chrono::Duration::seconds(age)).to_rfc3339();
+            cache.remember("https://one", &test).unwrap();
+            let reservation = cache.reserve_at("https://one", "model", now).unwrap();
+            assert_eq!(reservation.is_some(), expected);
+            if reservation.is_some() {
+                assert!(cache
+                    .reserve_at("https://one", "model", now)
+                    .unwrap()
+                    .is_none());
+            }
+            drop(reservation);
+        }
+        test.transient = false;
+        for (age, expected) in [(86399, false), (86400, true)] {
+            test.tested_at = (now - chrono::Duration::seconds(age)).to_rfc3339();
+            cache.remember("https://one", &test).unwrap();
+            assert_eq!(
+                cache
+                    .reserve_at("https://one", "model", now)
+                    .unwrap()
+                    .is_some(),
+                expected
+            );
+        }
+        test.tested_at = (now + chrono::Duration::hours(1)).to_rfc3339();
+        cache.remember("https://one", &test).unwrap();
+        assert!(cache
+            .reserve_at("https://one", "model", now)
+            .unwrap()
+            .is_none());
+        test.tested_at = "invalid timestamp".into();
+        cache.remember("https://one", &test).unwrap();
+        assert!(cache
+            .reserve_at("https://one", "model", now)
+            .unwrap()
+            .is_none());
+        let legacy = serde_json::json!({"ok":false,"tested_at":(now-chrono::Duration::hours(25)).to_rfc3339()});
+        assert!(!cached_result_is_fresh(&legacy, now));
+        assert!(cached_result_is_fresh(
+            &serde_json::json!({"unknown":true}),
+            now
+        ));
+    }
+
+    #[test]
+    fn stale_failed_result_can_be_reserved_again() {
+        let f = Fixture::new();
+        let cache = f.cache();
+        let mut failed = result("model");
+        failed.ok = false;
+        failed.tested_at = (chrono::Utc::now() - chrono::Duration::hours(25)).to_rfc3339();
+        cache.remember("https://one", &failed).unwrap();
+        assert!(cache.reserve("https://one", "model").unwrap().is_some());
+    }
+
     #[test]
     fn reservations_deduplicate_only_the_same_key_and_release_on_drop() {
         let f = Fixture::new();

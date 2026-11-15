@@ -90,12 +90,12 @@ pub(super) fn render_result(
         RunOutput::Json => serde_json::to_vec(
             &serde_json::json!({"session_id":session,"status":status,"answer":answer,"result":result,"error":error}),
         )?,
-        RunOutput::Text | RunOutput::Final => {
-            answer.unwrap_or_default().trim_end().as_bytes().to_vec()
-        }
+        RunOutput::Text | RunOutput::Final => answer.unwrap_or_default().as_bytes().to_vec(),
         RunOutput::JsonlEvents => anyhow::bail!("event output must use its bounded event buffer"),
     };
-    bytes.push(b'\n');
+    if !bytes.ends_with(b"\n") {
+        bytes.push(b'\n');
+    }
     anyhow::ensure!(
         bytes.len() <= formless_core::pipeline::MAX_RESULT_FILE_BYTES,
         "Run output exceeds the 8 MiB result limit"
@@ -105,6 +105,45 @@ pub(super) fn render_result(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn buffered_answers_keep_all_whitespace_and_only_add_a_missing_lf() {
+        for output in [RunOutput::Text, RunOutput::Final] {
+            for (answer, expected) in [
+                ("hello  \n", "hello  \n"),
+                ("hello\n\n", "hello\n\n"),
+                ("hello\t", "hello\t\n"),
+                ("ไทย\u{a0}", "ไทย\u{a0}\n"),
+                ("ไทย\r\n", "ไทย\r\n"),
+                ("ไทย", "ไทย\n"),
+                ("", "\n"),
+            ] {
+                assert_eq!(
+                    render_result(output, "s", "completed", Some(answer), None, None).unwrap(),
+                    expected.as_bytes()
+                );
+            }
+            assert_eq!(
+                render_result(output, "s", "completed", None, None, None).unwrap(),
+                b"\n"
+            );
+            let oversized = " ".repeat(formless_core::pipeline::MAX_RESULT_FILE_BYTES);
+            assert!(render_result(output, "s", "completed", Some(&oversized), None, None).is_err());
+        }
+        let answer = "hello  \n\n";
+        let json = render_result(
+            RunOutput::Json,
+            "s",
+            "completed",
+            Some(answer),
+            Some(&serde_json::json!({"n": 2})),
+            None,
+        )
+        .unwrap();
+        let value: Value = serde_json::from_slice(&json).unwrap();
+        assert_eq!(value["answer"], answer);
+        assert_eq!(value["result"], serde_json::json!({"n": 2}));
+    }
+
     #[test]
     fn bom_schema_stdin_matches_plain_and_keeps_the_raw_byte_limit() {
         let args = Args {

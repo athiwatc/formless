@@ -179,6 +179,8 @@ impl Fixture {
         env.remove("FORMLESS_MODEL");
         let root = std::path::PathBuf::from("/tmp").join(format!("fl-rc-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
+        // Capability scopes canonicalize existing ancestors (including macOS /tmp).
+        let root = std::fs::canonicalize(root).unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
         let paths = Paths::from_dirs(root.join("d"), root.join("c")).unwrap();
