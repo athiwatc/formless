@@ -18,6 +18,7 @@ pub mod questions;
 pub mod replies;
 pub mod search;
 pub mod session_edit;
+pub mod session_export;
 #[cfg(feature = "gui")]
 pub mod shell;
 pub mod snapshot_guard;

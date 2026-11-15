@@ -1351,6 +1351,41 @@ mod render {
                     .unwrap();
                     capture(&mut cx, suffix);
                 }
+                for (format, suffix, oversized) in [
+                    (
+                        formless_desktop::session_export::Format::Html,
+                        "-export-html",
+                        false,
+                    ),
+                    (
+                        formless_desktop::session_export::Format::Json,
+                        "-export-too-large",
+                        true,
+                    ),
+                ] {
+                    cx.update_window(any,|_,window,cx|{
+                        use formless_desktop::client::{Command as WireCommand,Update};
+                        let button=gpui_kit::SharedString::from(format!("session-export-{}",format.wire()));
+                        for _ in 0..35 {window.render_frame(cx);if window.find(button.clone()).focused()==Some(true) {break;}window.press("tab",cx);}
+                        for _ in 0..4 {window.render_frame(cx);window.simulate_next_frame(cx);}
+                        window.press("enter",cx);
+                        let (operation,session_id)=shell.update(cx,|shell,_|shell.take_client_commands()).into_iter().find_map(|command|match command {WireCommand::ExportSession{operation,session_id,..}=>Some((operation,session_id)),_=>None}).unwrap();
+                        let result=if oversized {formless_desktop::session_export::decode(format,serde_json::json!({"name":"Too large","format":"formless.session/1","messages":[{"content":"x".repeat(formless_desktop::session_export::MAX_BYTES)}],"checkpoints":[]}))}
+                            else {Ok(formless_desktop::session_export::Document{name:"Native export ไทย 😀".into(),text:"<script>Source only, never executed ไทย 漢字 😀</script>\n".repeat(120)})};
+                        shell.update(cx,|shell,cx|shell.apply_client_update(Update::SessionExport{connection:0,operation,session_id,format,result},window,cx));
+                        window.render_frame(cx);
+                        assert_eq!(window.find("session-export-copy").disabled()==Some(true),oversized);
+                        // Reveal the last enabled export control, or Copy for a successful reply.
+                        let target=if oversized {button} else {gpui_kit::SharedString::from("session-export-copy")};
+                        for _ in 0..35 {window.render_frame(cx);if window.find(target.clone()).focused()==Some(true) {break;}window.press("tab",cx);}
+                        for _ in 0..4 {window.render_frame(cx);window.simulate_next_frame(cx);}
+                        let body=window.find("session-edit-body").bounds();
+                        let bounds=window.find(target).bounds();
+                        assert!(bounds.top()>=body.top()&&bounds.bottom()<=body.bottom(),"{name}: export control outside body: {bounds:?} / {body:?}");
+                        for id in ["session-edit-dialog","session-edit-save","session-edit-cancel"] {assert!(inside(window,id,viewport),"{name}: {id} outside viewport");}
+                    }).unwrap();
+                    capture(&mut cx, suffix);
+                }
                 cx.update_window(any, |_, window, cx| {
                     for _ in 0..30 {
                         window.render_frame(cx);

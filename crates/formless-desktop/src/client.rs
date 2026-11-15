@@ -34,6 +34,7 @@ use crate::profile_search;
 use crate::questions;
 use crate::replies::{self, SessionSnapshot};
 use crate::session_edit;
+use crate::session_export;
 
 const QUEUE: usize = 16;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -41,6 +42,13 @@ const REFRESH: Duration = Duration::from_millis(250);
 
 #[derive(Debug)]
 pub enum Update {
+    SessionExport {
+        connection: u64,
+        operation: uuid::Uuid,
+        session_id: String,
+        format: session_export::Format,
+        result: Result<session_export::Document, String>,
+    },
     ProfileSearch {
         connection: u64,
         operation: uuid::Uuid,
@@ -106,6 +114,12 @@ pub enum Update {
 }
 
 pub enum Command {
+    ExportSession {
+        connection: u64,
+        operation: uuid::Uuid,
+        session_id: String,
+        format: session_export::Format,
+    },
     SearchProfile {
         connection: u64,
         operation: uuid::Uuid,
@@ -229,6 +243,7 @@ impl Client {
                 | Command::EditSession { .. }
                 | Command::ReadSessionDetails { .. }
                 | Command::SearchProfile { .. }
+                | Command::ExportSession { .. }
         ) && !self.is_ready()
         {
             return Err("Not connected; the action was not queued.");
@@ -317,6 +332,11 @@ fn advance_epoch(epoch: &AtomicU64) {
 
 #[derive(Debug)]
 enum Pending {
+    SessionExport {
+        operation: uuid::Uuid,
+        session_id: String,
+        format: session_export::Format,
+    },
     ProfileSearch {
         operation: uuid::Uuid,
         query: String,
@@ -560,6 +580,49 @@ impl Engine {
 
     fn command(&mut self, command: Command) {
         match command {
+            Command::ExportSession {
+                connection,
+                operation,
+                session_id,
+                format,
+            } => {
+                let error = if !self.ready || connection != self.connection {
+                    Some("Connection changed; request a new export after connecting.")
+                } else if session_id.is_empty() || session_id.len() > 256 {
+                    Some("Unsupported Session identity. Use Formless TUI.")
+                } else if self
+                    .pending
+                    .values()
+                    .filter(|p| matches!(p, Pending::SessionExport { .. }))
+                    .count()
+                    >= 2
+                {
+                    Some("Two exports are still outstanding. Wait for their replies or reconnect before exporting again.")
+                } else {
+                    None
+                };
+                if let Some(error) = error {
+                    self.updates.push(Update::SessionExport {
+                        connection: self.connection,
+                        operation,
+                        session_id,
+                        format,
+                        result: Err(error.into()),
+                    });
+                } else {
+                    self.request(
+                        Request::ExportSession {
+                            id: session_id.clone(),
+                            format: Some(format.wire().into()),
+                        },
+                        Pending::SessionExport {
+                            operation,
+                            session_id,
+                            format,
+                        },
+                    );
+                }
+            }
             Command::SearchProfile {
                 connection,
                 operation,
@@ -1010,6 +1073,19 @@ impl Engine {
                         }),
                     }
                 }
+            }
+            Pending::SessionExport {
+                operation,
+                session_id,
+                format,
+            } => {
+                self.updates.push(Update::SessionExport {
+                    connection: self.connection,
+                    operation,
+                    session_id,
+                    format,
+                    result: result.and_then(|value| session_export::decode(format, value)),
+                });
             }
             Pending::ProfileSearch { operation, query } => {
                 self.updates.push(Update::ProfileSearch {
@@ -2053,6 +2129,58 @@ mod tests {
     }
 
     #[test]
+    fn exports_use_request_identity_not_selected_session_and_bound_outstanding_reads() {
+        use session_export::Format;
+        let mut engine = ready();
+        let operations = [
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+        ];
+        for (index, operation) in operations.into_iter().enumerate() {
+            engine.command(Command::ExportSession {
+                connection: 0,
+                operation,
+                session_id: format!("target-{index}"),
+                format: Format::Markdown,
+            });
+        }
+        assert_eq!(engine.outgoing.len(), 2);
+        assert!(engine.updates.iter().any(|u|matches!(u,Update::SessionExport{operation,result:Err(_),..} if *operation==operations[2])));
+        let a = engine.outgoing.pop_front().unwrap();
+        let b = engine.outgoing.pop_front().unwrap();
+        assert!(
+            matches!(&a.request,Request::ExportSession{id,format:Some(format)} if id=="target-0"&&format=="markdown")
+        );
+        engine.select(Some("unrelated".into()), 99);
+        respond(
+            &mut engine,
+            b.id,
+            json!({"name":"B","format":"markdown","content":"exact ไทย 😀"}),
+        );
+        assert!(engine.updates.iter().any(|u|matches!(u,Update::SessionExport{connection:0,operation,session_id,format:Format::Markdown,result:Ok(document)} if *operation==operations[1]&&session_id=="target-1"&&document.text=="exact ไทย 😀")));
+        respond(&mut engine, a.id, Value::Null);
+        assert!(engine.updates.iter().any(|u|matches!(u,Update::SessionExport{operation,session_id,result:Err(_),..} if *operation==operations[0]&&session_id=="target-0")));
+        let count = engine.updates.len();
+        respond(
+            &mut engine,
+            b.id,
+            json!({"name":"B","format":"markdown","content":"duplicate"}),
+        );
+        assert_eq!(count, engine.updates.len());
+        engine.outgoing.clear();
+        for (connection, id) in [(1, "valid"), (0, "")] {
+            engine.command(Command::ExportSession {
+                connection,
+                operation: uuid::Uuid::new_v4(),
+                session_id: id.into(),
+                format: Format::Json,
+            });
+            assert!(engine.outgoing.is_empty());
+        }
+    }
+
+    #[test]
     fn profile_search_is_bounded_read_only_and_its_replies_keep_the_original_query() {
         let mut engine = ready();
         let operations = [
@@ -2416,7 +2544,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_send_and_question_survive_stop_metadata_and_another_question_ack() {
+    async fn unknown_send_and_question_survive_stop_metadata_export_and_another_question_ack() {
         let mut retained = disconnect_after_unacknowledged_send().await;
         let original_send = retained.uncertain.clone();
         for reconnect in [false, true] {
@@ -2430,6 +2558,7 @@ mod tests {
             let epoch = AtomicU64::new(0);
             let connection = AtomicU64::new(0);
             let metadata_operation = uuid::Uuid::new_v4();
+            let export_operation = uuid::Uuid::new_v4();
             let peer = tokio::spawn(async move {
                 let mut server = BufReader::new(server);
                 loop {
@@ -2462,6 +2591,11 @@ mod tests {
                             json!({"answered":true})
                         }
                         Request::InterruptRun { .. } if reconnect => json!({"interrupted":true}),
+                        Request::ExportSession { id, format } if reconnect => {
+                            assert_eq!(id, "a");
+                            assert_eq!(format.as_deref(), Some("markdown"));
+                            json!({"name":"a","format":"markdown","content":"Persisted export"})
+                        }
                         Request::SetSessionPinned { id, pinned } if reconnect => {
                             assert_eq!(id, "a");
                             assert!(pinned);
@@ -2526,6 +2660,14 @@ mod tests {
                                         })
                                         .unwrap();
                                     command_tx
+                                        .try_send(Command::ExportSession {
+                                            connection: 0,
+                                            operation: export_operation,
+                                            session_id: "a".into(),
+                                            format: session_export::Format::Markdown,
+                                        })
+                                        .unwrap();
+                                    command_tx
                                         .try_send(answer(
                                             &questions::Open::from_event(&question("q2")).unwrap(),
                                         ))
@@ -2563,10 +2705,12 @@ mod tests {
             let receiver = driver.await.unwrap();
             assert!(result.unwrap_err().contains("disconnected"));
             if reconnect {
-                assert!(receiver.try_iter().any(|update|matches!(update,Update::SessionEdited {operation,outcome:session_edit::Outcome::Applied(_),..} if operation==metadata_operation)),"the metadata ACK must actually be processed");
+                let final_updates: Vec<_> = receiver.try_iter().collect();
+                assert!(final_updates.iter().any(|update|matches!(update,Update::SessionEdited {operation,outcome:session_edit::Outcome::Applied(_),..} if *operation==metadata_operation)),"the metadata ACK must actually be processed");
+                assert!(final_updates.iter().any(|update|matches!(update,Update::SessionExport {operation,result:Ok(_),..} if *operation==export_operation)),"the export reply must actually be processed");
                 assert_eq!(
                     retained.uncertain, before,
-                    "Stop, metadata and q2 ACKs cannot clear either unknown operation"
+                    "Stop, metadata, export and q2 ACKs cannot clear either unknown operation"
                 );
             } else {
                 assert_eq!(retained.uncertain.len(), 2);

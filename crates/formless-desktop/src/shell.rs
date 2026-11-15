@@ -1782,6 +1782,9 @@ impl Shell {
                     self.questions_restored(window, cx);
                 }
                 if !ready {
+                    if let Some(panel) = &mut self.session_editor {
+                        panel.export.retire("Connection lost. Request another export after reconnecting; nothing was replayed.");
+                    }
                     self.profile_search.retire(
                         "Connection lost. Results may be stale; search again after connecting.",
                     );
@@ -1795,6 +1798,15 @@ impl Shell {
                         .replace(&self.client_sessions, &HashSet::new(), false);
                     self.rebuild_directory(cx);
                 }
+            }
+            ClientUpdate::SessionExport {
+                connection,
+                operation,
+                session_id,
+                format,
+                result,
+            } => {
+                self.session_export_outcome(connection, operation, &session_id, format, result, cx);
             }
             ClientUpdate::ProfileSearch {
                 connection,

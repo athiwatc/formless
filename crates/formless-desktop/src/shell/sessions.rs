@@ -1,6 +1,7 @@
 use super::*;
 use crate::questions::preview;
 use crate::session_edit::{Change, Field, Metadata, Outcome, MAX_INPUT};
+use crate::session_export::{self, Format};
 
 #[derive(Clone, Copy)]
 enum Waiting {
@@ -17,6 +18,7 @@ struct PresentedSave {
 }
 
 pub(super) struct Panel {
+    pub export: session_export::State,
     id: String,
     metadata: Option<Metadata>,
     field: Field,
@@ -114,6 +116,7 @@ impl Shell {
             Field::Name
         };
         self.session_editor = Some(Panel {
+            export: session_export::State::default(),
             id,
             metadata: None,
             field,
@@ -129,7 +132,7 @@ impl Shell {
             notice: String::new(),
             focus: cx.focus_handle(),
             cancel: cx.focus_handle(),
-            controls: (0..7)
+            controls: (0..11)
                 .map(|_| {
                     (
                         cx.focus_handle(),
@@ -511,6 +514,9 @@ impl Shell {
             if client.connection() != panel.connection {
                 let unknown = matches!(panel.waiting, Some(Waiting::Write(_)));
                 panel.connection = client.connection();
+                panel
+                    .export
+                    .retire("Connection changed. Request another export; nothing was replayed.");
                 panel.waiting = None;
                 panel.retired = true;
                 panel.notice=if unknown {"Connection changed; save outcome unknown. No retry. Copy edits before reloading current values."} else {"Connection changed. Edits kept; reload current values before saving."}.into();
@@ -562,6 +568,139 @@ impl Shell {
         let y = (offset.y + amount * lines).clamp(-panel.scroll.max_offset().y, px(0.));
         panel.scroll.set_offset(point(offset.x, y));
         cx.notify();
+    }
+
+    fn request_session_export(
+        &mut self,
+        id: &str,
+        connection: u64,
+        revision: uuid::Uuid,
+        format: Format,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(panel) = &self.session_editor else {
+            return;
+        };
+        if panel.id != id
+            || panel.connection != connection
+            || panel.export.revision != revision
+            || panel.export.pending()
+            || panel.waiting.is_some()
+            || panel.retired
+            || panel.metadata.is_none()
+            || !self.client_connected
+            || self
+                .client
+                .as_ref()
+                .is_none_or(|client| !client.is_ready() || client.connection() != connection)
+        {
+            return;
+        }
+        if !self.keep_session_edit_input(window, cx) {
+            return;
+        }
+        let operation = uuid::Uuid::new_v4();
+        let panel = self.session_editor.as_mut().unwrap();
+        panel.export.start(operation, format);
+        if let Err(error) = self
+            .client
+            .as_ref()
+            .unwrap()
+            .send(ClientCommand::ExportSession {
+                connection,
+                operation,
+                session_id: id.into(),
+                format,
+            })
+        {
+            panel.export.receive(operation, format, Err(error.into()));
+        }
+        panel.frames = 2;
+        cx.notify();
+    }
+
+    pub(super) fn session_export_outcome(
+        &mut self,
+        connection: u64,
+        operation: uuid::Uuid,
+        id: &str,
+        format: Format,
+        result: Result<session_export::Document, String>,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.client_connected
+            || self
+                .client
+                .as_ref()
+                .is_none_or(|client| client.connection() != connection)
+        {
+            return;
+        }
+        let Some(panel) = &mut self.session_editor else {
+            return;
+        };
+        if panel.id == id && panel.connection == connection {
+            panel.export.receive(operation, format, result);
+            panel.frames = 2;
+            cx.notify();
+        }
+    }
+
+    /// Stale rendered buttons cannot copy a replacement export or another Session.
+    fn copy_session_export(
+        &self,
+        id: &str,
+        connection: u64,
+        revision: uuid::Uuid,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(panel) = &self.session_editor else {
+            return;
+        };
+        if panel.id == id
+            && panel.connection == connection
+            && panel.export.revision == revision
+            && self.client_connected
+            && self
+                .client
+                .as_ref()
+                .is_some_and(|client| client.is_ready() && client.connection() == connection)
+        {
+            if let Some(document) = &panel.export.document {
+                cx.write_to_clipboard(ClipboardItem::new_string(document.text.clone()));
+            }
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn request_presented_session_export(
+        &mut self,
+        id: &str,
+        connection: u64,
+        revision: uuid::Uuid,
+        format: Format,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.request_session_export(id, connection, revision, format, window, cx);
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn copy_presented_session_export(
+        &self,
+        id: &str,
+        connection: u64,
+        revision: uuid::Uuid,
+        cx: &mut Context<Self>,
+    ) {
+        self.copy_session_export(id, connection, revision, cx);
+    }
+    #[cfg(feature = "test-support")]
+    pub fn session_export_revision(&self) -> Option<uuid::Uuid> {
+        self.session_editor
+            .as_ref()
+            .map(|panel| panel.export.revision)
     }
 
     pub(super) fn render_session_editor(
@@ -745,6 +884,89 @@ impl Shell {
                     .aria_value(panel.notice.clone())
                     .child(panel.notice.clone()),
             );
+        let can_export = self.client_connected
+            && !busy
+            && !panel.retired
+            && panel.metadata.is_some()
+            && !panel.export.pending()
+            && self
+                .client
+                .as_ref()
+                .is_some_and(|client| client.is_ready() && client.connection() == panel.connection);
+        let mut exports = h_flex().flex_wrap().gap_2();
+        for (index, format) in [Format::Json, Format::Markdown, Format::Html]
+            .into_iter()
+            .enumerate()
+        {
+            let id = panel.id.clone();
+            let connection = panel.connection;
+            let revision = panel.export.revision;
+            exports = exports.child(
+                div()
+                    .id(SharedString::from(format!("session-export-anchor-{index}")))
+                    .pt_1()
+                    .anchor_scroll(Some(panel.controls[7 + index].1.clone()))
+                    .child(
+                        Button::new(SharedString::from(format!(
+                            "session-export-{}",
+                            format.wire()
+                        )))
+                        .label(format.label())
+                        .accessibility_label(format!("Read Session export as {}", format.label()))
+                        .disabled(!can_export)
+                        .track_focus(&panel.controls[7 + index].0)
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| {
+                                this.request_session_export(
+                                    &id, connection, revision, format, window, cx,
+                                )
+                            },
+                        )),
+                    ),
+            );
+        }
+        body=body.child(readable("session-export-help","Export persisted history. JSON is the daemon's re-importable bundle; Markdown/HTML contain its transcript. Exports may include private conversation, Tool data, plans and checkpoints. Reading writes no file. Native copies are limited to 1 MiB; use Formless TUI for larger exports. HTML is displayed as source and never executed. Unsaved edits are excluded; native import/Save file are unavailable."))
+            .child(exports)
+            .child(readable("session-export-notice",panel.export.notice.clone()));
+        if let Some(document) = &panel.export.document {
+            body = body
+                .child(readable(
+                    "session-export-name",
+                    format!(
+                        "Exported name: {}",
+                        session_export::excerpt(&document.name, 256)
+                    ),
+                ))
+                .child(readable(
+                    "session-export-preview",
+                    session_export::excerpt(&document.text, 4000),
+                ));
+        }
+        let id = panel.id.clone();
+        let connection = panel.connection;
+        let revision = panel.export.revision;
+        body = body.child(
+            div()
+                .id("session-export-copy-anchor")
+                .pt_1()
+                .anchor_scroll(Some(panel.controls[10].1.clone()))
+                .child(
+                    Button::new("session-export-copy")
+                        .label("Copy export")
+                        .accessibility_label("Copy complete Session export to system clipboard")
+                        .disabled(
+                            panel.export.document.is_none()
+                                || !self.client_connected
+                                || self.client.as_ref().is_none_or(|client| {
+                                    !client.is_ready() || client.connection() != panel.connection
+                                }),
+                        )
+                        .track_focus(&panel.controls[10].0)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.copy_session_export(&id, connection, revision, cx)
+                        })),
+                ),
+        );
         let expected_toggle = panel
             .metadata
             .as_ref()

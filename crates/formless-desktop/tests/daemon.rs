@@ -126,6 +126,16 @@ async fn until(client: &Client, stage: &'static str, mut predicate: impl FnMut(U
     loop {
         for update in client.drain() {
             let summary = match &update {
+                Update::SessionExport {
+                    session_id,
+                    format,
+                    result,
+                    ..
+                } => format!(
+                    "export {session_id} {}: ok={}",
+                    format.wire(),
+                    result.is_ok()
+                ),
                 Update::ProfileSearch { query, result, .. } => {
                     format!("profile search {query}: ok={}", result.is_ok())
                 }
@@ -453,6 +463,56 @@ async fn real_daemon_provider_send_navigation_resources_and_reconnect() {
             requests.lock().unwrap().len(),
             1,
             "instruction setters must not call the provider"
+        );
+    }
+    // The connected client exports A while B is selected and A's provider
+    // response is held. Export must read persisted data without Run control.
+    for format in [
+        formless_desktop::session_export::Format::Json,
+        formless_desktop::session_export::Format::Markdown,
+        formless_desktop::session_export::Format::Html,
+    ] {
+        let expected = formless_desktop::session_export::decode(
+            format,
+            daemon
+                .handle(Request::ExportSession {
+                    id: a.clone(),
+                    format: Some(format.wire().into()),
+                })
+                .await
+                .unwrap(),
+        )
+        .unwrap()
+        .text;
+        assert!(
+            expected.contains("Desktop real transport request"),
+            "persisted user text is included"
+        );
+        assert!(
+            !expected.contains("Canonical provider reply"),
+            "held provider output is not yet persisted"
+        );
+        let operation = uuid::Uuid::new_v4();
+        client
+            .send(Command::ExportSession {
+                connection: client.connection(),
+                operation,
+                session_id: a.clone(),
+                format,
+            })
+            .unwrap();
+        until(&client,"export-running-session",|update|matches!(update,Update::SessionExport{operation:ack,session_id,format:actual,result:Ok(document),..} if ack==operation&&session_id==a&&actual==format&&document.text==expected)).await;
+        assert_eq!(
+            daemon
+                .handle(Request::GetSession { id: a.clone() })
+                .await
+                .unwrap()["running"],
+            true
+        );
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            1,
+            "export must not call the provider"
         );
     }
     first_answer.notify_one();
