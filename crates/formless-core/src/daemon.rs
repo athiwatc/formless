@@ -6778,7 +6778,15 @@ impl Daemon {
                         )
                         .await
                     {
-                        Ok(_) => continue,
+                        Ok(_) => {
+                            // A successful compaction retries without storing
+                            // this candidate. End its live text before retrying.
+                            self.broadcast(Event::StreamRestarted {
+                                session_id: session_id.to_string(),
+                                run_id: run_id.to_string(),
+                            });
+                            continue;
+                        }
                         // Keep the partial answer (stored below with its
                         // stop reason) rather than fail the Run (#1091).
                         Err(e) => self.broadcast(Event::Note {
@@ -6841,6 +6849,12 @@ impl Daemon {
                 && crate::provider::looks_like_access_refusal(&result.content)
             {
                 nudged_refusal = true;
+                // This candidate is not persisted. Reset live text before the
+                // next provider turn, rather than joining two attempts.
+                self.broadcast(Event::StreamRestarted {
+                    session_id: session_id.to_string(),
+                    run_id: run_id.to_string(),
+                });
                 let msg = self.with_store(|st| {
                     st.append_message(session_id, "system-note", crate::provider::REFUSAL_NUDGE)
                 })?;
@@ -6859,6 +6873,12 @@ impl Daemon {
                 if !live.is_empty() {
                     if !reminded_pending {
                         reminded_pending = true;
+                        // The premature answer is discarded, not a canonical
+                        // assistant boundary for the next attempt.
+                        self.broadcast(Event::StreamRestarted {
+                            session_id: session_id.to_string(),
+                            run_id: run_id.to_string(),
+                        });
                         let handles: Vec<String> =
                             live.iter().map(|(h, n)| format!("{n} ({h})")).collect();
                         let note = format!(

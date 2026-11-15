@@ -601,3 +601,208 @@ async fn profile_question_restores_on_another_session_after_reconnect_and_answer
     drop(observer);
     fixture.finish().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn candidate_retries_reset_unpersisted_refusal_and_pending_tool_text() {
+    let env = credential_env::EnvGuard::isolated();
+    env.set("FORMLESS_API_KEY", "private-candidate-ordering-key");
+    for pending_tool in [false, true] {
+        let complete = Arc::new(Notify::new());
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let discarded = if pending_tool {
+            "Premature final while private work is running."
+        } else {
+            "I cannot access files on your computer."
+        };
+        let fixture = Fixture::start(
+            app(axum::routing::post({
+                let complete = complete.clone();
+                let requests = requests.clone();
+                move || {
+                    let number = requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    let complete = complete.clone();
+                    async move {
+                        match number {
+                            1 => {
+                                let gate = Arc::new(Notify::new());
+                                gate.notify_one();
+                                gated_response(prefix(discarded), Some(tail("")), gate)
+                            }
+                            2 => gated_response(
+                                prefix("Accepted candidate ไทย "),
+                                Some(tail("😀")),
+                                complete,
+                            ),
+                            _ => panic!("unexpected candidate retry {number}"),
+                        }
+                    }
+                }
+            })),
+            0,
+        )
+        .await;
+        let tool = if pending_tool {
+            let created = fixture.daemon.call_tool_direct(&fixture.session, "create_tool", json!({
+                "name":"desktop_candidate_ordering_fixture", "description":"private ordering fixture",
+                "input_schema":{"type":"object"},"output_schema":{},"capabilities":[],
+                "implementation_js":"async function run(){ await sleep(8000); return {done:true}; }"
+            })).await;
+            assert!(created.contains("created"), "{created}");
+            let daemon = fixture.daemon.clone();
+            let session = fixture.session.clone();
+            let tool = tokio::spawn(async move {
+                daemon
+                    .call_tool_direct(&session, "desktop_candidate_ordering_fixture", json!({}))
+                    .await
+            });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while fixture
+                .daemon
+                .handle(Request::ListInvocations)
+                .await
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .is_empty()
+            {
+                assert!(Instant::now() < deadline, "private Tool did not start");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Some(tool)
+        } else {
+            None
+        };
+        let mut observer = Observer::connect(&fixture.endpoint, &fixture.session).await;
+        send(&mut observer, &fixture.session).await;
+        wait(&mut observer,|event| matches!(event,Event::MessageDelta{delta,..} if delta=="Accepted candidate ไทย ")).await;
+        let before = snapshot(&mut observer, &fixture.session).await;
+        assert!(
+            assistant_messages(&before).is_empty(),
+            "discarded candidate is not persisted"
+        );
+        let discarded_index = observer
+            .events
+            .iter()
+            .position(|event| matches!(event,Event::MessageDelta{delta,..} if delta==discarded))
+            .unwrap();
+        let accepted_index=observer.events.iter().position(|event| matches!(event,Event::MessageDelta{delta,..} if delta=="Accepted candidate ไทย ")).unwrap();
+        let resets = observer.events[discarded_index + 1..accepted_index]
+            .iter()
+            .filter(|event| matches!(event, Event::StreamRestarted { .. }))
+            .count();
+        if let Some(tool) = tool {
+            assert!(tokio::time::timeout(Duration::from_secs(15), tool)
+                .await
+                .unwrap()
+                .unwrap()
+                .contains("done"));
+        }
+        complete.notify_one();
+        wait(&mut observer, |event| {
+            matches!(event, Event::RunFinished { .. })
+        })
+        .await;
+        let final_snapshot = snapshot(&mut observer, &fixture.session).await;
+        let messages = assistant_messages(&final_snapshot);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["content"], "Accepted candidate ไทย 😀");
+        assert_eq!(run_ids(&observer).len(), 1);
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 2);
+        drop(observer);
+        fixture.finish().await;
+        assert_eq!(
+            resets, 1,
+            "unpersisted candidate must reset before the next attempt: pending_tool={pending_tool}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn context_window_retry_resets_the_unpersisted_candidate_after_compaction() {
+    let env = credential_env::EnvGuard::isolated();
+    env.set("FORMLESS_API_KEY", "private-context-ordering-key");
+    let complete = Arc::new(Notify::new());
+    let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let fixture=Fixture::start(app(axum::routing::post({
+        let complete=complete.clone();let requests=requests.clone();
+        move |axum::Json(body):axum::Json<Value>| {
+            let complete=complete.clone();
+            let number=requests.fetch_add(1,std::sync::atomic::Ordering::SeqCst)+1;
+            async move {
+                let gate=Arc::new(Notify::new());gate.notify_one();
+                match number {
+                    1|2=>gated_response(prefix("Private seed history."),Some(tail("")),gate),
+                    3=>gated_response(prefix("Discard context-limited candidate."),Some(tail("").replace("end_turn","model_context_window_exceeded")),gate),
+                    4=>if body["stream"]==true {
+                        gated_response(prefix("Compacted private history."),Some(tail("")),gate)
+                    } else { axum::response::IntoResponse::into_response(axum::Json(json!({
+                        "id":"private-summary","type":"message","role":"assistant",
+                        "content":[{"type":"text","text":"Compacted private history."}],
+                        "stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":10}
+                    }))) },
+                    5=>gated_response(prefix("After compaction ไทย "),Some(tail("😀")),complete),
+                    _=>panic!("unexpected context retry request {number}"),
+                }
+            }
+        }
+    })),0).await;
+    let mut observer = Observer::connect(&fixture.endpoint, &fixture.session).await;
+    // ContextCache preserves short histories; two completed turns plus the
+    // next user input supply a real whole-turn compaction cut.
+    for _ in 0..2 {
+        send(&mut observer, &fixture.session).await;
+        observer
+            .until(|event| matches!(event, Event::RunFinished { .. }))
+            .await;
+        observer.events.clear();
+    }
+    send(&mut observer, &fixture.session).await;
+    observer
+        .until(|event| {
+            matches!(event,Event::MessageDelta{delta,..} if delta=="After compaction ไทย ")
+                || matches!(event, Event::RunFinished { .. })
+        })
+        .await;
+    assert!(
+        observer.events.iter().any(
+            |event| matches!(event,Event::MessageDelta{delta,..} if delta=="After compaction ไทย ")
+        ),
+        "context retry ended without next attempt: {:?}",
+        observer.events
+    );
+    let discarded=observer.events.iter().position(|event| matches!(event,Event::MessageDelta{delta,..} if delta=="Discard context-limited candidate.")).unwrap();
+    let accepted = observer
+        .events
+        .iter()
+        .position(
+            |event| matches!(event,Event::MessageDelta{delta,..} if delta=="After compaction ไทย "),
+        )
+        .unwrap();
+    let resets = observer.events[discarded + 1..accepted]
+        .iter()
+        .filter(|event| matches!(event, Event::StreamRestarted { .. }))
+        .count();
+    let before = snapshot(&mut observer, &fixture.session).await;
+    assert_eq!(
+        assistant_messages(&before).len(),
+        2,
+        "only the seed turns are persisted while retry is held"
+    );
+    complete.notify_one();
+    wait(&mut observer, |event| {
+        matches!(event, Event::RunFinished { .. })
+    })
+    .await;
+    let final_snapshot = snapshot(&mut observer, &fixture.session).await;
+    let messages = assistant_messages(&final_snapshot);
+    assert_eq!(messages.len(), 3);
+    assert_eq!(messages[2]["content"], "After compaction ไทย 😀");
+    assert_eq!(run_ids(&observer).len(), 1);
+    assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 5);
+    drop(observer);
+    fixture.finish().await;
+    assert_eq!(
+        resets, 1,
+        "compaction retry must retire its unpersisted candidate"
+    );
+}

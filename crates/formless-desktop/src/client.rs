@@ -3108,6 +3108,47 @@ mod tests {
     }
 
     #[test]
+    fn delayed_delta_and_duplicate_completion_after_snapshot_never_create_a_phantom_turn() {
+        let mut engine = ready();
+        engine.select(Some("a".into()), 1);
+        let id = snapshot_request(&mut engine);
+        let canonical = snapshot("a", "already persisted ไทย 😀");
+        respond(&mut engine, id, canonical.clone());
+        // Persistence and publication have separate producer boundaries.
+        // Neither the delta nor this duplicate completion supplies a cutoff.
+        engine
+            .receive(ServerMessage::Event(Event::MessageDelta {
+                session_id: "a".into(),
+                run_id: "same-run".into(),
+                delta: "already persisted".into(),
+            }))
+            .unwrap();
+        engine
+            .receive(ServerMessage::Event(Event::MessageComplete {
+                session_id: "a".into(),
+                run_id: "same-run".into(),
+                message: serde_json::from_value(canonical["messages"][0].clone()).unwrap(),
+            }))
+            .unwrap();
+        assert!(engine.dirty_session);
+        let id = snapshot_request(&mut engine);
+        respond(&mut engine, id, canonical);
+        let snapshots = engine
+            .updates
+            .iter()
+            .filter_map(|update| match update {
+                Update::Snapshot { snapshot, .. } => Some(snapshot),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(snapshots.len(), 2);
+        for snapshot in snapshots {
+            assert_eq!(snapshot.blocks.len(), 1);
+            assert_eq!(snapshot.blocks[0].markdown(), "already persisted ไทย 😀");
+        }
+    }
+
+    #[test]
     fn a_b_a_and_same_id_reattachment_refuse_retired_replies_before_decoding() {
         let mut engine = ready();
         engine.select(Some("a".into()), 1);

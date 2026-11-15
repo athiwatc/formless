@@ -11,7 +11,7 @@ or authorization to merge while substantive gates fail.
 |---|---|---|
 | Optional native target; existing headless clients compatible | Detached desktop workspace; unchanged root/desktop manifests and lockfiles in this continuation; kit facade | Revalidate combined main after integration; supported platform policy |
 | Daemon connection and canonical Sessions/transcripts | Existing client, request ownership and snapshots; local suites; prior real daemon/fake-Provider evidence | Latest native/live acceptance; general delta replay still unproved |
-| Ordered streaming / reconnect | `deltas: false`; canonical snapshots and event invalidation; unknown mutations not replayed | Protocol cutoff/watermark/offset or equivalent ordering proof before enabling deltas |
+| Ordered streaming / reconnect | `deltas: false`; canonical snapshots and event invalidation; unknown mutations not replayed; reconciliation failure now freezes further events until a trusted snapshot | Protocol cutoff/watermark/offset or equivalent ordering proof before enabling deltas |
 | Sessions | Directory, New Session, metadata/tags/pin/archive, instructions, persisted export and bounded new-file Save through the system picker; explicit persisted Session comparison with recorded usage; bounded window-local reading-message restoration; explicitly reviewed full-history forks with client-lifetime unknown-outcome protection | Bounded-prefix/custom-name forks and paid branch-summary workflows; native import and full-Profile backup; OS picker/volume acceptance; persistent/finer per-Session view-state restoration |
 | Conversation and large output | Virtualized blocks, bounded previews, whole-output viewer, exact block source copy | Cross-block selection/copy, dedicated code-copy/link opening, richer attachments/artifacts/diagrams and native semantics |
 | Composer | Send/Steer/Queue/Stop, preserved drafts, IME guards, forecast consent; new per-window send-key choice | Attachments/drop/image paste/external editor, remaining Role/model/reference controls |
@@ -54,3 +54,7 @@ remains on the separate local branch; a published draft or PR update is not
 performed merely to represent progress. No unverified clean-main or all-PRs
 merge claim is made. Local patches and hash manifests remain reviewable in
 the sibling task evidence directory.
+
+Current-main local integration and the concrete remaining streaming contract are
+recorded in [the reconciliation report](stream-reconciliation-integration-20261115.md).
+A conflict-free local merge is not combined acceptance or publication approval.

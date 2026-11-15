@@ -484,8 +484,8 @@ live tail; persisted assistant text replaces it canonically. Structural
 changes splice the changed suffix to preserve an earlier reading anchor,
 and invalidate old source views/Search results.
 A missed, edited, restarted or conflicting transcript gets a sticky reload
-notice in Chat, Search and whole output. Later events do not clear it; only
-a trusted replacement snapshot does. Foreign Sessions are ignored and
+notice in Chat, Search and whole output. Later events are ignored until
+a trusted replacement snapshot replaces the failed state. Foreign Sessions are ignored and
 switching Session drops the reducer. Synthetic fixture-stream callbacks
 cannot write into decoded or unloaded Sessions. Run/composer state and
 outgoing intents are not taken from transcript events.
@@ -496,3 +496,7 @@ overlap, not protocol ordering or recovered state. Neither seam should be
 connected directly to asynchronous replies/events. The client transport
 choice, event/snapshot ordering, native acceptance and platform gates remain
 open. The two new native gap-notice states compile but have not been run.
+
+The current-main integration and repaired discarded-candidate retry boundaries
+are recorded in [the reconciliation report](../../docs/desktop/stream-reconciliation-integration-20261115.md).
+They do not enable streaming or discharge the missing snapshot cutoff contract.

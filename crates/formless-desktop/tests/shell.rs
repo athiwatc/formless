@@ -6623,6 +6623,14 @@ fn typed_transcript_gap_notices_stay_visible_until_a_trusted_snapshot_replaces_t
                 .apply_transcript_event(&typed_delta(&id, "missed partial"), cx)
                 .unwrap();
             shell.apply_transcript_event(&typed_gap(&id), cx).unwrap();
+            let frozen_count = shell.block_count();
+            assert!(
+                !shell
+                    .apply_transcript_event(&typed_delta(&id, "unsafe suffix"), cx)
+                    .unwrap()
+                    .timeline_changed
+            );
+            assert_eq!(shell.block_count(), frozen_count);
             shell
                 .apply_transcript_event(
                     &formless_protocol::Event::MessagesEdited {

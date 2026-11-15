@@ -185,6 +185,12 @@ impl TranscriptState {
         if !affects_transcript(event, &self.session_id) {
             return Change::default();
         }
+        // A failed boundary is not a baseline for a later suffix. Once
+        // reconciliation is lost, only an owned, trusted snapshot can resume
+        // application; later completions cannot repair missing history.
+        if self.reload.is_some() {
+            return Change::default();
+        }
         match event {
             Event::MessageAppended { message, .. } => self.persisted(timeline, message, None),
             Event::MessageComplete {
@@ -555,9 +561,12 @@ mod tests {
             assert_eq!(t.reload_needed(), Some(&reason));
             assert_eq!(t.timeline().len(), 1);
             assert!(!t.apply(&event).reload_changed);
-            t.apply(&delta("r1", "fresh"));
-            assert_eq!(shown(&t)[1].2, "fresh");
-            t.apply(&complete("r1", 2, "fresh final"));
+            assert_eq!(t.apply(&delta("r1", "fresh")), Change::default());
+            assert_eq!(t.timeline().len(), 1);
+            assert_eq!(
+                t.apply(&complete("r1", 2, "fresh final")),
+                Change::default()
+            );
             assert_eq!(t.reload_needed(), Some(&reason));
             t.replace_snapshot(snapshot(&[message(1, "user", "edited question")]))
                 .unwrap();
@@ -589,6 +598,70 @@ mod tests {
             assert_eq!(t.timeline().len(), 1);
             t.apply(&complete("r1", 2, "complete text"));
             assert!(t.reload_needed().is_some());
+        }
+    }
+
+    #[test]
+    fn a_latched_reconciliation_failure_freezes_all_later_events_until_snapshot() {
+        for failure in [
+            Event::MessagesEdited {
+                session_id: "s1".into(),
+            },
+            Event::StreamRestarted {
+                session_id: "s1".into(),
+                run_id: "r1".into(),
+            },
+            gap("s1", "r1", vec![DroppedEventKind::MessageDelta]),
+            complete("other-run", 2, "wrong Run"),
+            appended(-1, "assistant", "invalid sequence"),
+            appended(1, "user", "conflicting question"),
+        ] {
+            let mut t = transcript();
+            t.apply(&delta("r1", "partial before failure"));
+            assert!(t.apply(&failure).reload_changed);
+            let reason = t.reload_needed().cloned().unwrap();
+            let before = shown(&t)
+                .into_iter()
+                .map(|(id, kind, text)| (id, kind, text.to_owned()))
+                .collect::<Vec<_>>();
+            let sequence = t.state.last_seq;
+            for event in [
+                delta("r1", &"unsafe suffix".repeat(100_000)),
+                appended(2, "tool", "untrusted boundary"),
+                complete("r1", 3, "untrusted complete"),
+                Event::MessagesEdited {
+                    session_id: "s1".into(),
+                },
+                Event::StreamRestarted {
+                    session_id: "s1".into(),
+                    run_id: "r1".into(),
+                },
+                gap("", "", vec![]),
+            ] {
+                assert_eq!(
+                    t.apply(&event),
+                    Change::default(),
+                    "a gap is not a new baseline"
+                );
+            }
+            assert_eq!(t.reload_needed(), Some(&reason));
+            assert_eq!(t.state.last_seq, sequence);
+            assert_eq!(
+                shown(&t)
+                    .into_iter()
+                    .map(|(id, kind, text)| (id, kind, text.to_owned()))
+                    .collect::<Vec<_>>(),
+                before
+            );
+            t.replace_snapshot(snapshot(&[message(1, "user", "trusted question")]))
+                .unwrap();
+            assert!(t.reload_needed().is_none());
+            assert!(t.apply(&delta("r2", "fresh suffix")).timeline_changed);
+            assert!(
+                t.apply(&complete("r2", 2, "fresh canonical"))
+                    .timeline_changed
+            );
+            assert_eq!(shown(&t)[1].2, "fresh canonical");
         }
     }
 
@@ -650,8 +723,10 @@ mod tests {
     #[test]
     fn a_foreign_snapshot_is_refused_without_clearing_a_gap_or_partial() {
         let mut t = transcript();
-        t.apply(&gap("", "", vec![]));
         t.apply(&delta("r1", "keep"));
+        // A different Run's gap latches reload without discarding this partial.
+        t.apply(&gap("s1", "other-run", vec![]));
+        assert_eq!(t.apply(&delta("r1", "ignored suffix")), Change::default());
         let mut snapshot = snapshot(&[]);
         snapshot.session_id = "s2".into();
         assert!(matches!(
