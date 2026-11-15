@@ -1827,7 +1827,7 @@ impl Shell {
         self.reading_restore = None;
         self.reading_notice = None;
         self.reset_run_inspection("Profile attachment changed. Select a Run in Metrics again; no inspection was replayed.");
-        self.retire_session_export_attachment();
+        self.retire_session_editor_attachment(client.instance(), client.connection());
         self.reset_comparison(
             "Profile attachment changed. Mark a pair again; nothing was replayed.",
         );

@@ -234,3 +234,100 @@ fn session_model_form_and_paid_test_notice_are_reachable_at_200_percent_minimum_
         assert!(change.is_selection());
     });
 }
+
+#[gpui_kit::test]
+fn session_model_profile_replacement_with_reused_ids_and_connection_needs_explicit_reload(
+    cx: &mut TestAppContext,
+) {
+    for sent in [false, true] {
+        let (h, s, _) = setup(cx);
+        let old = step(cx, h, |window, cx| {
+            window.click("session-edit-model", cx);
+            s.read(cx)
+                .session_edit_input()
+                .unwrap()
+                .update(cx, |i, cx| i.set_value("role:reviewer", window, cx));
+            let revision = s.read(cx).session_edit_revision().unwrap();
+            if sent {
+                window.click("session-edit-save", cx);
+                let _ = saved(&s, cx);
+            }
+            revision
+        });
+        let mut other = daemon_view(cx, h, &s);
+        other[1].model = Some("old-model".into());
+        other[1].reasoning_effort = Some("low".into());
+        step(cx, h, |window, cx| {
+            s.update(cx, |s, cx| {
+                s.apply_client_update(Update::Sessions(other.clone()), window, cx)
+            });
+            s.update(cx, |s, _| s.take_client_commands());
+            if sent {
+                assert!(window
+                    .find("session-edit-notice")
+                    .value()
+                    .unwrap()
+                    .contains("save outcome is unknown"));
+            }
+            s.update(cx, |s, cx| {
+                s.save_presented_session_selection(old, window, cx)
+            });
+            let current = s.read(cx).session_edit_revision().unwrap();
+            s.update(cx, |s, cx| {
+                s.save_presented_session_selection(current, window, cx)
+            });
+            assert!(s.update(cx,|s,_|s.take_client_commands()).is_empty(),"no model save may cross Profile attachment even when IDs and connection counters match");
+            assert_eq!(
+                s.read(cx)
+                    .session_edit_input()
+                    .unwrap()
+                    .read(cx)
+                    .value()
+                    .as_ref(),
+                "role:reviewer"
+            );
+            assert_eq!(window.find("session-edit-save").disabled(), Some(true));
+            window.click("session-edit-reload", cx);
+            let commands = s.update(cx, |s, _| s.take_client_commands());
+            let Wire::ReadSessionDetails {
+                operation,
+                session_id,
+                ..
+            } = &commands[0]
+            else {
+                panic!("explicit reload required")
+            };
+            assert_eq!(session_id, &other[1].id);
+            s.update(cx, |s, cx| {
+                s.apply_client_update(
+                    Update::SessionDetails {
+                        connection: 0,
+                        operation: *operation,
+                        session_id: other[1].id.clone(),
+                        result: Ok(Metadata::from_session(&other[1]).unwrap()),
+                    },
+                    window,
+                    cx,
+                )
+            });
+            assert_eq!(
+                s.read(cx)
+                    .session_edit_input()
+                    .unwrap()
+                    .read(cx)
+                    .value()
+                    .as_ref(),
+                "old-model"
+            );
+            s.read(cx)
+                .session_edit_input()
+                .unwrap()
+                .update(cx, |i, cx| i.set_value("role:new-profile", window, cx));
+            window.click("session-edit-save", cx);
+            let (_op, c) = saved(&s, cx);
+            assert!(
+                matches!(c.request(&other[1].id),formless_protocol::Request::SetSessionModel{model:Some(m),..}if m=="role:new-profile")
+            );
+        });
+    }
+}

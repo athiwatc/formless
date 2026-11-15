@@ -11,6 +11,7 @@ enum Waiting {
 
 #[derive(Clone)]
 struct PresentedSave {
+    instance: uuid::Uuid,
     revision: uuid::Uuid,
     id: String,
     connection: u64,
@@ -30,6 +31,7 @@ pub(super) struct ExportSavePrompt {
 pub(super) struct Panel {
     pub export: session_export::State,
     revision: uuid::Uuid,
+    instance: uuid::Uuid,
     model: String,
     effort: String,
     id: String,
@@ -57,8 +59,19 @@ pub(super) struct Panel {
 }
 
 impl Shell {
-    pub(super) fn retire_session_export_attachment(&mut self) {
+    pub(super) fn retire_session_editor_attachment(
+        &mut self,
+        instance: uuid::Uuid,
+        connection: u64,
+    ) {
         if let Some(panel) = &mut self.session_editor {
+            let unknown = matches!(panel.waiting, Some(Waiting::Write(_)));
+            panel.instance = instance;
+            panel.connection = connection;
+            panel.revision = uuid::Uuid::new_v4();
+            panel.waiting = None;
+            panel.retired = true;
+            panel.notice=if unknown {"Profile attachment changed; the previous Profile's save outcome is unknown. It was not replayed. Drafts are kept read-only; copy them before reloading the new Profile's current values."} else {"Profile attachment changed. Previous metadata and drafts are kept read-only; copy them before reloading the new Profile's current values. Nothing was replayed."}.into();
             panel.export.retire(
                 "Profile attachment changed. Read another export; nothing was replayed or saved.",
             );
@@ -99,6 +112,7 @@ impl Shell {
         };
         assert!(matches!(p.field, Field::Model | Field::Effort));
         let presented = PresentedSave {
+            instance: p.instance,
             revision,
             id: p.id.clone(),
             connection: p.connection,
@@ -125,6 +139,7 @@ impl Shell {
         };
         self.save_session_edit(
             PresentedSave {
+                instance: self.session_editor.as_ref().unwrap().instance,
                 revision: self.session_editor.as_ref().unwrap().revision,
                 id: id.into(),
                 connection,
@@ -165,6 +180,7 @@ impl Shell {
         self.session_editor = Some(Panel {
             export: session_export::State::default(),
             revision: uuid::Uuid::new_v4(),
+            instance: self.client.as_ref().unwrap().instance(),
             model: String::new(),
             effort: String::new(),
             id,
@@ -329,6 +345,7 @@ impl Shell {
         }
         let operation = uuid::Uuid::new_v4();
         panel.connection = client.connection();
+        panel.instance = client.instance();
         panel.revision = uuid::Uuid::new_v4();
         panel.retired = true;
         match client.send(ClientCommand::ReadSessionDetails {
@@ -357,7 +374,8 @@ impl Shell {
         let Some(panel) = self.session_editor.as_mut() else {
             return;
         };
-        if panel.revision != presented.revision
+        if panel.instance != presented.instance
+            || panel.revision != presented.revision
             || panel.id != presented.id
             || panel.connection != presented.connection
             || panel.field != presented.field
@@ -378,6 +396,7 @@ impl Shell {
             || panel.waiting.is_some()
             || !client.is_ready()
             || client.connection() != panel.connection
+            || client.instance() != panel.instance
         {
             panel.notice =
                 "Not saved. Reload current details after connecting; your edits were kept.".into();
@@ -578,9 +597,10 @@ impl Shell {
             return;
         };
         if let Some(client) = &self.client {
-            if client.connection() != panel.connection {
+            if client.instance() != panel.instance || client.connection() != panel.connection {
                 let unknown = matches!(panel.waiting, Some(Waiting::Write(_)));
                 panel.connection = client.connection();
+                panel.instance = client.instance();
                 panel.revision = uuid::Uuid::new_v4();
                 panel
                     .export
@@ -938,10 +958,11 @@ impl Shell {
                     .metadata
                     .as_ref()
                     .is_some_and(|m| m.selection.is_some()))
-            && self
-                .client
-                .as_ref()
-                .is_some_and(|client| client.is_ready() && client.connection() == panel.connection);
+            && self.client.as_ref().is_some_and(|client| {
+                client.is_ready()
+                    && client.connection() == panel.connection
+                    && client.instance() == panel.instance
+            });
         let mut body=v_flex().id("session-edit-body").test_support().flex_1().min_h_0().overflow_y_scroll().track_scroll(&panel.scroll).gap_2()
             .child(readable("session-edit-id",format!("Session: {}",panel.id)))
             .child(readable("session-edit-help","Saves replace the current field, including changes made by another client. Cancel discards unsaved metadata edits; it does not undo a requested save. Reload also replaces these edits."));
@@ -1255,6 +1276,7 @@ impl Shell {
             _ => "Save",
         };
         let presented = PresentedSave {
+            instance: panel.instance,
             revision: panel.revision,
             id: panel.id.clone(),
             connection: panel.connection,
