@@ -160,11 +160,19 @@ async fn snapshot(observer: &mut Observer, session: &str) -> Value {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn step_prompt_has_a_live_handoff_and_restored_snapshot_inventory() {
+async fn native_step_choices_restore_revalidate_and_receive_exact_ack() {
     let env = credential_env::EnvGuard::isolated();
     env.set("FORMLESS_API_KEY", "private-step-fixture-key");
-    exercise_step_handoff(false).await;
-    exercise_step_handoff(true).await;
+    for future in [false, true] {
+        for choice in [
+            formless_desktop::step_decision::Choice::Continue,
+            formless_desktop::step_decision::Choice::Skip,
+            formless_desktop::step_decision::Choice::Edit(" {\"native\":\"ไทย\"} ".into()),
+            formless_desktop::step_decision::Choice::All,
+        ] {
+            exercise_step_handoff(future, choice).await;
+        }
+    }
 }
 
 fn step_inventory(update: &Update) -> Option<&formless_desktop::steps::Inventory> {
@@ -179,7 +187,10 @@ fn step_inventory(update: &Update) -> Option<&formless_desktop::steps::Inventory
     }
 }
 
-async fn exercise_step_handoff(future_reader: bool) {
+async fn exercise_step_handoff(
+    future_reader: bool,
+    choice: formless_desktop::step_decision::Choice,
+) {
     let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let fixture=Fixture::start(app(axum::routing::post({let requests=requests.clone();move|| {
         let number=requests.fetch_add(1,std::sync::atomic::Ordering::SeqCst)+1;
@@ -193,7 +204,7 @@ async fn exercise_step_handoff(future_reader: bool) {
                     json!({"type":"content_block_stop","index":1}),
                     json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":10}}),json!({"type":"message_stop"})
                 ])),gate),
-                2=>gated_response(prefix("Step was skipped. "),Some(tail("Done 😀")),gate),
+                2=>gated_response(prefix("Tool gate finished. "),Some(tail("Done 😀")),gate),
                 _=>panic!("unexpected provider replay {number}"),
             }
         }
@@ -287,20 +298,55 @@ async fn exercise_step_handoff(future_reader: bool) {
             .any(|event| matches!(event, Event::StepPending { .. })),
         "Subscribe/GetSession do not replay the missing prompt"
     );
-    let result = observer
-        .request(Request::StepDecision {
-            step_id: step.clone(),
-            action: "skip".into(),
-            arguments: None,
-        })
-        .await;
-    assert_eq!(result["step_id"], step);
-    assert_eq!(result["action"], "skip");
+    let prompt: formless_protocol::PendingStep =
+        serde_json::from_value(after["pending_steps"]["prompts"][0].clone()).unwrap();
+    let action = formless_desktop::step_decision::Action {
+        client: restored.instance(),
+        connection: restored.connection(),
+        generation: 1,
+        epoch: restored.epoch(),
+        operation: uuid::Uuid::new_v4(),
+        prompt,
+        choice: choice.clone(),
+    };
+    restored.decide_step(action.clone()).unwrap();
+    assert!(
+        restored
+            .decide_step(formless_desktop::step_decision::Action {
+                operation: uuid::Uuid::new_v4(),
+                ..action
+            })
+            .is_err(),
+        "pending choice cannot be resubmitted"
+    );
     wait(&mut observer, |event| {
         matches!(event, Event::RunFinished { .. })
     })
     .await;
-    future_cases::canonical(&restored, "Step was skipped. Done 😀", &[]).await;
+    future_cases::canonical(&restored, "Tool gate finished. Done 😀", &[]).await;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if matches!(
+            restored.step_status(),
+            formless_desktop::step_decision::Status::Finished {
+                outcome: formless_desktop::step_decision::Outcome::Accepted,
+                ..
+            }
+        ) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "native Step receipt deadline: {:?}",
+            restored.step_status()
+        );
+        restored.drain().for_each(drop);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        snapshot(&mut observer, &fixture.session).await["step_mode"],
+        !matches!(choice, formless_desktop::step_decision::Choice::All)
+    );
     until(&restored,"step-resolved-client-inventory",|update| {
         matches!(step_inventory(&update),Some(formless_desktop::steps::Inventory::Snapshot(s)) if s.prompts.is_empty() && !s.more)
     }).await;

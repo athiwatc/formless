@@ -7537,3 +7537,6 @@ mod reader_tests;
 
 #[path = "support/steps.rs"]
 mod step_inventory_tests;
+
+#[path = "support/native_step.rs"]
+mod native_step_tests;

@@ -145,6 +145,7 @@ pub enum Update {
 }
 
 pub enum Command {
+    DecideStep(crate::step_decision::Dispatch),
     ReadInvocations {
         connection: u64,
         operation: uuid::Uuid,
@@ -216,6 +217,7 @@ pub enum Command {
 pub struct Endpoint(pub PathBuf);
 
 pub struct Client {
+    step_ledger: Arc<crate::step_decision::Ledger>,
     commands: queue::Sender<Command>,
     updates: Receiver<Update>,
     stop: watch::Sender<bool>,
@@ -291,6 +293,7 @@ impl Client {
             }
         });
         Self {
+            step_ledger: Arc::new(crate::step_decision::Ledger::default()),
             commands,
             updates,
             stop,
@@ -306,7 +309,56 @@ impl Client {
         }
     }
 
+    #[cfg(feature = "test-support")]
+    pub fn record_step_write(&self, dispatch: &crate::step_decision::Dispatch) -> bool {
+        assert!(self.recorded.is_some());
+        assert!(dispatch.owned_by(&self.step_ledger));
+        dispatch.before_write()
+    }
+    #[cfg(feature = "test-support")]
+    pub fn record_step_outcome(
+        &self,
+        dispatch: &crate::step_decision::Dispatch,
+        value: Value,
+        response_ok: bool,
+    ) {
+        assert!(self.recorded.is_some());
+        assert!(dispatch.owned_by(&self.step_ledger));
+        dispatch.finish(crate::step_decision::decode(
+            dispatch.action(),
+            Ok(value),
+            response_ok,
+        ));
+    }
+    pub fn step_status(&self) -> crate::step_decision::Status {
+        self.step_ledger.status()
+    }
+    pub fn cancel_unsent_step(&self) {
+        self.step_ledger
+            .cancel_unsent("Step review closed before writing; no decision was sent.");
+    }
+    pub fn decide_step(&self, action: crate::step_decision::Action) -> Result<(), &'static str> {
+        if !self.is_ready()
+            || action.client != self.instance()
+            || action.connection != self.connection()
+            || action.epoch != self.epoch()
+        {
+            return Err("Connection or review changed; no decision was queued.");
+        }
+        self.send(Command::DecideStep(self.step_ledger.reserve(action)?))
+    }
     pub fn send(&self, command: Command) -> Result<(), &'static str> {
+        if let Command::DecideStep(dispatch) = &command {
+            if !dispatch.owned_by(&self.step_ledger)
+                || !self.is_ready()
+                || dispatch.action().client != self.instance()
+                || dispatch.action().connection != self.connection()
+                || dispatch.action().epoch != self.epoch()
+            {
+                dispatch.reject("Step review attachment changed; no decision was queued.");
+                return Err("Step review attachment changed; no decision was queued.");
+            }
+        }
         if matches!(command, Command::Select { .. } | Command::Reconnect) {
             self.invalidate_context();
             advance_epoch(&self.stream_epoch);
@@ -411,6 +463,7 @@ impl Client {
         let (_, updates) = mpsc::sync_channel(QUEUE);
         let (stop, _) = watch::channel(false);
         Self {
+            step_ledger: Arc::new(crate::step_decision::Ledger::default()),
             commands,
             updates,
             stop,
@@ -470,6 +523,8 @@ fn advance_epoch(epoch: &AtomicU64) {
 
 #[derive(Debug)]
 enum Pending {
+    StepInspect(crate::step_decision::Dispatch),
+    StepCommit(crate::step_decision::Dispatch),
     StreamSubscribe(StreamOwner),
     StreamBarrier {
         owner: StreamOwner,
@@ -593,6 +648,36 @@ struct Engine {
 }
 
 impl Engine {
+    fn step_current(&self, dispatch: &crate::step_decision::Dispatch) -> bool {
+        let a = dispatch.action();
+        self.ready
+            && a.valid()
+            && self.instance == a.client
+            && self.connection == a.connection
+            && self.epoch == a.epoch
+            && self.generation == a.generation
+            && self.active.as_deref() == Some(a.prompt.session_id.as_str())
+    }
+    fn retire_step_reviews(&mut self) {
+        let retired: Vec<_> = self
+            .pending
+            .iter()
+            .filter_map(|(id, p)| match p {
+                Pending::StepInspect(d) if !d.reserved() || !self.step_current(d) => Some(*id),
+                Pending::StepCommit(d) if !d.sent() && (!d.reserved() || !self.step_current(d)) => {
+                    Some(*id)
+                }
+                _ => None,
+            })
+            .collect();
+        for id in retired {
+            self.outgoing.retain(|r| r.id != id);
+            if let Some(Pending::StepInspect(d) | Pending::StepCommit(d)) = self.pending.remove(&id)
+            {
+                d.reject("Step review changed before writing; no decision was sent.");
+            }
+        }
+    }
     fn emit_questions(&mut self) {
         let mut state = self
             .questions
@@ -779,6 +864,19 @@ impl Engine {
                     });
                 } else {
                     self.request(Request::ListInvocations, Pending::Invocations { operation });
+                }
+            }
+            Command::DecideStep(dispatch) => {
+                if self.pending.values().any(|p|matches!(p,Pending::StepInspect(d)|Pending::StepCommit(d) if d.action().operation==dispatch.action().operation)){return;}
+                if !self.step_current(&dispatch) || !dispatch.reserved() {
+                    dispatch.reject("Step review context changed; no decision was sent.");
+                } else {
+                    self.request(
+                        Request::GetSession {
+                            id: dispatch.action().prompt.session_id.clone(),
+                        },
+                        Pending::StepInspect(dispatch),
+                    );
                 }
             }
             Command::ForkSession(action) => {
@@ -1256,7 +1354,7 @@ impl Engine {
                     // Historical event notice only. GetSession separately
                     // restores bounded read-only identities after reconnect;
                     // neither a preview nor an event authorizes a decision.
-                    self.updates.push(Update::Notice(format!("Step review requested for Session {}. Continue in Formless TUI; native Step decisions are not available.",questions::preview(session_id,200))));
+                    self.updates.push(Update::Notice(format!("Step review requested for Session {}. Review the complete arguments using Review Step; oversized or unsupported prompts require Formless TUI.",questions::preview(session_id,200))));
                 }
                 if matches!(
                     event,
@@ -1427,6 +1525,26 @@ impl Engine {
                     operation,
                     result: result.and_then(crate::invocations::Report::decode),
                 });
+            }
+            Pending::StepInspect(dispatch) => {
+                let action = dispatch.action();
+                let valid=result.as_ref().is_ok_and(|value| {
+                    value["session"]["id"].as_str()==Some(action.prompt.session_id.as_str()) &&
+                    matches!(crate::steps::Inventory::decode(&action.prompt.session_id,value.get("pending_steps")),crate::steps::Inventory::Snapshot(snapshot) if !snapshot.more && snapshot.prompts.len()==1 && snapshot.prompts.first()==Some(&action.prompt))
+                });
+                if !self.step_current(&dispatch) || !dispatch.reserved() || !valid {
+                    dispatch.reject("The exact complete Step prompt could not be revalidated. No decision was sent; inspect Formless TUI or review again.");
+                } else {
+                    self.request(dispatch.action().request(), Pending::StepCommit(dispatch));
+                }
+            }
+            Pending::StepCommit(dispatch) => {
+                dispatch.finish(crate::step_decision::decode(
+                    dispatch.action(),
+                    result,
+                    response_ok,
+                ));
+                self.dirty_session = true;
             }
             Pending::ForkSession(action) => {
                 let outcome = session_fork::decode(&action, result);
@@ -1842,7 +1960,15 @@ async fn connected<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
             engine.question_recovery_limit = limit;
             engine.emit_questions();
         }
+        engine.retire_step_reviews();
         for pending in engine.pending.values() {
+            if let Pending::StepCommit(dispatch) = pending {
+                if !dispatch.before_write() {
+                    return Err(
+                        "Step reservation retired before writing; no retry was sent.".into(),
+                    );
+                }
+            }
             if let Pending::ForkSession(action) = pending {
                 if !forks.before_write(action) {
                     return Err(
@@ -2395,6 +2521,7 @@ mod tests {
         let (_, updates) = mpsc::sync_channel(QUEUE);
         let (stop, _) = watch::channel(false);
         let client = Client {
+            step_ledger: Arc::new(crate::step_decision::Ledger::default()),
             commands,
             updates,
             stop,
@@ -2748,6 +2875,7 @@ mod tests {
         let (_, updates) = mpsc::sync_channel(QUEUE);
         let (stop, _) = watch::channel(false);
         let client = Client {
+            step_ledger: Arc::new(crate::step_decision::Ledger::default()),
             commands,
             updates,
             stop,
@@ -3919,3 +4047,7 @@ mod tests {
         assert!(frames.partial.len() <= formless_protocol::MAX_FRAME_BYTES);
     }
 }
+
+#[cfg(test)]
+#[path = "client/native_steps_tests.rs"]
+mod native_steps_tests;

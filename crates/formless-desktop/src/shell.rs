@@ -44,6 +44,7 @@ mod reading_positions;
 mod run_inspection;
 mod session_fork;
 mod sessions;
+mod step_review;
 mod usage;
 use crate::full_view;
 use crate::memory::{
@@ -88,6 +89,7 @@ gpui_kit::actions!(
         ClosePalette,
         CloseForecast,
         CloseQuestions,
+        CloseStepReview,
         CloseSessionEditor,
         ScrollViewerUp,
         ScrollViewerDown,
@@ -203,6 +205,34 @@ pub fn bind_keys(cx: &mut App) {
         ),
         KeyBinding::new("escape", CloseForecast, Some(FORECAST_CONTEXT)),
         KeyBinding::new("escape", CloseQuestions, Some(QUESTIONS_CONTEXT)),
+        KeyBinding::new("escape", CloseStepReview, Some("FormlessStepReview")),
+        KeyBinding::new(
+            "escape",
+            CloseStepReview,
+            Some("FormlessStepReview > Input"),
+        ),
+        KeyBinding::new("up", ScrollViewerUp, Some("FormlessStepReview && !Input")),
+        KeyBinding::new(
+            "down",
+            ScrollViewerDown,
+            Some("FormlessStepReview && !Input"),
+        ),
+        KeyBinding::new(
+            "pageup",
+            ScrollViewerPageUp,
+            Some("FormlessStepReview && !Input"),
+        ),
+        KeyBinding::new(
+            "pagedown",
+            ScrollViewerPageDown,
+            Some("FormlessStepReview && !Input"),
+        ),
+        KeyBinding::new(
+            "home",
+            ScrollViewerStart,
+            Some("FormlessStepReview && !Input"),
+        ),
+        KeyBinding::new("end", ScrollViewerEnd, Some("FormlessStepReview && !Input")),
         KeyBinding::new("escape", CloseSessionEditor, Some(SESSION_EDITOR_CONTEXT)),
         // Input's Escape unmarks and then propagates. Intercept it before
         // that happens so one key cannot both finish preedit and cancel.
@@ -527,6 +557,7 @@ enum Modal {
     Viewer,
     Forecast,
     Questions,
+    Step,
     SessionEditor,
 }
 
@@ -696,6 +727,9 @@ pub struct Shell {
     question_drafts: Drafts,
     question_draft_ids: Vec<String>,
     questions_toggle_focus: FocusHandle,
+    step_panel: Option<step_review::Panel>,
+    step_draft: Option<(uuid::Uuid, formless_protocol::PendingStep, String)>,
+    step_open_focus: FocusHandle,
     client_steps: crate::steps::Inventory,
     client_recovery: Option<crate::replies::UnfinishedRun>,
     client_sessions: Vec<SessionInfo>,
@@ -941,6 +975,9 @@ impl Shell {
             question_drafts: Drafts::new(16, 4 * 1024 * 1024),
             question_draft_ids: Vec::new(),
             questions_toggle_focus: cx.focus_handle(),
+            step_panel: None,
+            step_draft: None,
+            step_open_focus: cx.focus_handle(),
             client_steps: Default::default(),
             client_recovery: None,
             client_sessions: Vec::new(),
@@ -1409,6 +1446,8 @@ impl Shell {
     fn current_modal(&self, layout: Layout) -> Option<Modal> {
         if self.session_editor.is_some() {
             Some(Modal::SessionEditor)
+        } else if self.step_panel.is_some() {
+            Some(Modal::Step)
         } else if self.question_panel.is_some() {
             Some(Modal::Questions)
         } else if self.forecast.is_some() {
@@ -1741,6 +1780,14 @@ impl Shell {
             .retire("Profile attachment changed. Search again after connecting.");
         self.session_usage
             .retire("Profile attachment changed. Read usage after selecting a Session.");
+        if let Some(previous) = &self.client {
+            previous.cancel_unsent_step();
+        }
+        if self.step_panel.is_some() {
+            self.restore_focus = None;
+        }
+        self.step_panel = None;
+        self.step_draft = None;
         self.client = Some(client);
         self.client_connected = false;
         self.client_snapshot_ready = false;
@@ -1908,6 +1955,7 @@ impl Shell {
     /// here because a reply can already be queued when navigation happens.
     pub fn poll_client(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.sync_fork_status(cx);
+        self.sync_step_status(cx);
         self.validate_stream_view(cx);
         let updates: Vec<_> = self
             .client
@@ -2954,6 +3002,19 @@ impl Shell {
         {
             return Some("Close Session details before changing the underlying view");
         }
+        if self.step_panel.is_some()
+            && !matches!(
+                command,
+                Command::FocusNextRegion
+                    | Command::FocusPreviousRegion
+                    | Command::IncreaseTextSize
+                    | Command::DecreaseTextSize
+                    | Command::ResetTextSize
+                    | Command::ToggleTheme
+            )
+        {
+            return Some("Close Step review before changing the underlying view");
+        }
         if self.question_panel.is_some()
             && !matches!(
                 command,
@@ -3544,6 +3605,12 @@ impl Shell {
                 window.focus(&self.forecast_cancel_focus, cx);
                 cx.notify();
             }
+            Modal::Step => {
+                if let Some(panel) = &self.step_panel {
+                    window.focus(&panel.close, cx);
+                }
+                cx.notify();
+            }
             Modal::Questions => {
                 if let Some(panel) = &self.question_panel {
                     window.focus(&panel.close_focus, cx);
@@ -3566,6 +3633,7 @@ impl Shell {
             | Modal::Viewer
             | Modal::Forecast
             | Modal::Questions
+            | Modal::Step
             | Modal::SessionEditor),
         ) = self.current_modal(self.layout(window))
         {
@@ -4098,6 +4166,8 @@ impl Shell {
             .when_some(self.client_steps.summary(), |region, summary| region.child(
                 readable("daemon-step-inventory", summary).text_sm().px_2().py_1().max_h(px(120.)).overflow_y_hidden()
             ))
+            .when_some(self.client.as_ref().and_then(|c|c.step_status().notice()),|region,text|region.child(readable("native-step-receipt",text).text_sm().px_2().py_1()))
+            .when(self.step_prompt().is_some(), |region|region.child(Button::new("step-review-open").track_focus(&self.step_open_focus).label("Review Step").on_click(cx.listener(|this,_,window,cx|this.open_step_review(window,cx)))))
             .when(self.client.is_some() && self.client_attention, |region| region.child(
                 readable("daemon-pending-attention", "This Profile has pending decisions. Use Questions for user questions; approvals remain in the Formless TUI.").text_sm().px_2().py_1()
             ))
@@ -5664,6 +5734,7 @@ impl Render for Shell {
         self.reveal_session_usage(window, cx);
         self.reveal_resource_control(window, cx);
         self.reveal_question_focus(window, cx);
+        self.reveal_step_focus(window, cx);
         if self
             .forecast
             .as_ref()
@@ -5761,6 +5832,9 @@ impl Render for Shell {
             })
             .when(self.forecast.is_some(), |shell| {
                 shell.child(self.render_forecast(window, cx))
+            })
+            .when(self.step_panel.is_some(), |shell| {
+                shell.child(self.render_step_review(window, cx))
             })
             .when(self.question_panel.is_some(), |shell| {
                 shell.child(self.render_questions(window, cx))

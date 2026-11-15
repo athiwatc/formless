@@ -1227,3 +1227,7 @@ async fn real_daemon_provider_send_navigation_resources_and_reconnect() {
     // Keep private fixture evidence on panic; remove only this test's tree.
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[cfg(unix)]
+#[path = "support/native_step_transport.rs"]
+mod native_step_transport;

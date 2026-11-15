@@ -67,7 +67,7 @@ impl Inventory {
             Self::Unsupported => Some("Step inventory could not be read. Use Formless TUI to inspect pending Steps; no native decision was sent.".into()),
             Self::Snapshot(s) if s.prompts.is_empty() && !s.more => None,
             Self::Snapshot(s) => {
-                let mut text = "Step prompts at last canonical refresh · read only; may have changed. Use Formless TUI to inspect full arguments and decide.".to_string();
+                let mut text = "Step prompts at last canonical refresh · read only; may have changed. Review Step is available only for a complete supported prompt. Use Formless TUI for truncated or unsupported arguments.".to_string();
                 for p in s.prompts.iter().take(3) {
                     use std::fmt::Write;
                     let preview: String = p.arguments_preview.chars().take(256).map(|c| if c.is_control() { '�' } else { c }).collect();
