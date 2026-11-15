@@ -41,6 +41,7 @@ const SESSIONS: &[Hint] = &[
     h("/", "filter", 4),
     h("s", "sort", 6),
     h("v", "running/archived", 6),
+    h("PgUp/PgDn", "page", 4),
 ];
 
 const TOOLS: &[Hint] = &[
@@ -59,6 +60,7 @@ const TOOLS: &[Hint] = &[
     h("s", "sort", 6),
     h("v", "show", 6),
     h("c", "group", 6),
+    h("PgUp/PgDn", "page", 4),
 ];
 
 const METRICS: &[Hint] = &[
@@ -68,6 +70,7 @@ const METRICS: &[Hint] = &[
     h("r", "range", 1),
     h("b", "tokens by", 2),
     h("Tab", "views", 1),
+    h("PgUp/PgDn", "page", 4),
 ];
 
 const PROPOSALS: &[Hint] = &[
@@ -79,6 +82,7 @@ const PROPOSALS: &[Hint] = &[
     h("/", "filter", 3),
     h("s", "sort", 4),
     h("v", "status", 4),
+    h("PgUp/PgDn", "page", 4),
 ];
 
 const SETTINGS: &[Hint] = &[
@@ -92,6 +96,9 @@ const SEARCH: &[Hint] = &[
     h("↑↓", "move", 0),
     h("Enter", "open", 0),
     h("Esc", "back", 1),
+    h("PgUp/PgDn", "page", 4),
+    h("j k", "move", 2),
+    h("g G", "top/bottom", 3),
 ];
 
 pub fn table(view: View) -> &'static [Hint] {
