@@ -719,7 +719,7 @@ covers every visible root command, including `help`. Use `formless COMMAND --hel
 | `formless logs` | `--follow`, `--level`, `--since`, `--lines` | Read or follow the daemon log and rotated files. |
 | `formless mcp` | `add`, `remove`, `list`, `test`, `login`, `logout`, `catalog`, `import`, `log`, `tools`, `tool`, `prompts`, `prompt` | Manage external MCP servers and inspect their tools/logs. |
 | `formless metrics` | `--since DURATION`, `--json` | Read recorded model, Tool and built-in statistics through independent reports at one cutoff. |
-| `formless memory` | `list`, `add`, `rm`, `edit` | Inspect or change saved user-memory notes. |
+| `formless memory` | `list`, `add`, `rm`, `edit`, `used` | Inspect or change saved user-memory notes. |
 | `formless models` | `list [--json]` | Fetch the default-provider model catalog and existing picker report; a non-null listing error prints a partial report and exits 1. |
 | `formless modules` | `list`, `show`; `show --version N` | Read all modules, inspect metadata/history/dependents, or emit an exact stored source version. |
 | `formless naming` | `status`, `pull`, `test` | Inspect, install, or preview the embedded Session-naming model. |
@@ -735,7 +735,7 @@ covers every visible root command, including `help`. Use `formless COMMAND --hel
 | `formless routing` | `--json` | Read currently available daemon routing decisions and returned candidate figures without starting a model request. |
 | `formless runs` | No action: list; `show`, `cancel` | List recent Runs, inspect one by ID/prefix, or cancel that exact Run. |
 | `formless security` | `status` | Inspect the daemon's grants, denials, trusted resources, and exposed interfaces. |
-| `formless sessions` | `fork`, `compare`, `list`, `show`, `usage`, `files`, `rewind`, `rename`, `rm`, `restore`, `import`, `search`, `templates list/show`, `archive`, `unarchive`, `pin`, `unpin`, `tag`, `export` | Manage stored Sessions, follow a Run with `show --follow`, or inspect tracked files. `list --pinned --tag TAG` filters the fetched reply; selectors combine with `--archived`, preserving reply order. |
+| `formless sessions` | `subagents`, `subagent`, `fork`, `compare`, `list`, `show`, `usage`, `files`, `rewind`, `rename`, `rm`, `restore`, `import`, `search`, `templates list/show`, `archive`, `unarchive`, `pin`, `unpin`, `tag`, `export` | Manage stored Sessions, follow a Run with `show --follow`, or inspect tracked files. `list --pinned --tag TAG` filters the fetched reply; selectors combine with `--archived`, preserving reply order. |
 | `formless skills` | `reviews`, `add`, `remove`, `list`, `enable`, `disable`, `show`, `export`, `import` | Inspect and manage Skills and their retained description reviews. |
 | `formless storage` | `--json` | Report disk usage by data category. |
 | `formless tools` | `reviews`, `list`, `disable`, `enable`, `undo`, `pin`, `unpin`, `tag`, `show`, `diff`, `retire`, `restore`, `rollback`, `purge`, `run`, `export`, `import` | Inspect, manage, run, or transfer registry Tools. |
@@ -801,6 +801,36 @@ Tool selectors use an exact name or full ID. After a miss, up to three
 ranked partial-name suggestions can help you retry with the original exact
 spelling; these use folded subsequence matching, not edit-distance spelling
 correction. A suggestion never selects or runs a Tool automatically.
+
+`formless memory used (--session SESSION | --run RUN_ID) [--json]` reports
+current note fields associated with the selected Run, in daemon order.
+Session selectors use normal exact-id/prefix/name resolution and select its
+latest Run, including one still running; Run ids are sent unchanged without
+existence validation. Retained associations may outlive a Run, while backend
+lookup/association failures can produce empty or partial reports. These are
+reported current notes, not verified historical prompt contents. Disabled
+notes remain present; JSON is the full returned array. Other daemon errors
+retain ordinary exit behavior without a partial report.
+
+```sh
+formless memory used --session SESSION --json
+formless memory used --run exact-run-id
+```
+
+`formless sessions subagents SESSION [--json]` inventories stored sub-agents
+using normal Session exact-id/prefix/name resolution. Full sub-agent ids can
+be passed unchanged to `formless sessions subagent SUBAGENT_ID [--json]`,
+which uses exact ids with no prefix lookup. Inventory order and null versus
+empty results are retained. Human detail labels the record and pretty-prints
+the entire returned provider-shaped messages array; JSON preserves the full
+daemon report. This is the existing unpaged transcript projection, whose
+handler skips malformed stored JSON rows, with no extra integrity check,
+Run start or Session mutation. Request failures produce no partial report.
+
+```sh
+formless sessions subagents SESSION --json
+formless sessions subagent exact-subagent-id
+```
 
 `update --json`, `update check --json`, and `update --check --json` emit one
 object: `{installed, status, newer_releases: [{tag, url, notes}]}`. Notes retain
