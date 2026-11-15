@@ -123,18 +123,53 @@ pub fn context_diff(old: &str, new: &str) -> Vec<String> {
     if skipped && !out.is_empty() {
         out.push("  …".into());
     }
-    // Lines alike but the texts differ: only the final newline changed.
-    if !old.eq(new) && lines.iter().all(|(k, _)| *k == ' ') {
-        out.push(
-            match (old.ends_with('\n'), new.ends_with('\n')) {
-                (true, false) => "\\ the final newline was removed",
-                (false, true) => "\\ a final newline was added",
-                _ => "\\ only whitespace at line ends changed",
+    // Ending facts are independent of content hunks: an edited line must
+    // not hide a final-newline or LF/CRLF change elsewhere in the file.
+    if old != new {
+        match (old.ends_with('\n'), new.ends_with('\n')) {
+            (true, false) => out.push("\\ the final newline was removed".into()),
+            (false, true) => out.push("\\ a final newline was added".into()),
+            _ => {}
+        }
+        match (ending_profile(old), ending_profile(new)) {
+            (Some(a), Some(b)) if a != b => {
+                out.push(format!("\\ line endings changed from {a} to {b}"));
             }
-            .into(),
-        );
+            (Some("mixed LF/CRLF"), Some("mixed LF/CRLF"))
+                if !line_endings(old).eq(line_endings(new)) =>
+            {
+                out.push("\\ line ending layout changed (mixed LF/CRLF)".into());
+            }
+            _ => {}
+        }
     }
     out
+}
+
+fn line_endings(text: &str) -> impl Iterator<Item = bool> + '_ {
+    let bytes = text.as_bytes();
+    bytes
+        .iter()
+        .enumerate()
+        .filter(|(_, byte)| **byte == b'\n')
+        .map(move |(i, _)| i > 0 && bytes[i - 1] == b'\r')
+}
+
+fn ending_profile(text: &str) -> Option<&'static str> {
+    let (mut lf, mut crlf) = (false, false);
+    for carriage_return in line_endings(text) {
+        if carriage_return {
+            crlf = true;
+        } else {
+            lf = true;
+        }
+    }
+    match (lf, crlf) {
+        (true, true) => Some("mixed LF/CRLF"),
+        (true, false) => Some("LF"),
+        (false, true) => Some("CRLF"),
+        _ => None,
+    }
 }
 
 fn pretty(json: &str) -> String {
@@ -350,6 +385,56 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn content_edits_do_not_hide_final_newline_or_line_ending_changes() {
+        let added = context_diff("a\nb", "a\nc\n");
+        assert!(added.contains(&"- b".into()) && added.contains(&"+ c".into()));
+        assert!(
+            added.contains(&"\\ a final newline was added".into()),
+            "{added:?}"
+        );
+        let both = context_diff("a\r\nb\r\n", "a\nc");
+        assert!(
+            both.contains(&"\\ the final newline was removed".into()),
+            "{both:?}"
+        );
+        assert!(
+            both.contains(&"\\ line endings changed from CRLF to LF".into()),
+            "{both:?}"
+        );
+        let mixed = context_diff("a\r\nb\n", "a\nc\r\n");
+        assert!(
+            mixed.contains(&"\\ line ending layout changed (mixed LF/CRLF)".into()),
+            "{mixed:?}"
+        );
+    }
+
+    #[test]
+    fn ending_notes_are_precise_without_inventing_whitespace_changes() {
+        assert_eq!(
+            context_diff("a\r\n", "a\n"),
+            ["\\ line endings changed from CRLF to LF"]
+        );
+        assert_eq!(
+            context_diff("a\n", "a\r\n"),
+            ["\\ line endings changed from LF to CRLF"]
+        );
+        assert!(context_diff("a\nb\n", "a\nc\n")
+            .iter()
+            .all(|line| !line.starts_with("\\ ")));
+        assert!(context_diff("a ", "a")
+            .iter()
+            .all(|line| !line.starts_with("\\ ")));
+        assert!(context_diff("a\r\nb\r\n", "a\r\nb\r\n").is_empty());
+        assert_eq!(
+            context_diff("a\r\nb\n", "a\nb\r\n"),
+            ["\\ line ending layout changed (mixed LF/CRLF)"]
+        );
+        assert!(context_diff("a\n", "a\nb\n")
+            .iter()
+            .all(|line| !line.starts_with("\\ ")));
     }
 
     /// A newline-only change says so, and a skipped tail is marked (#828).

@@ -8,7 +8,7 @@
 
 <p>
   <a href="https://github.com/athiwatc/formless/blob/main/Cargo.toml"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License: Apache-2.0"></a>
-  <a href="https://github.com/athiwatc/formless/releases/latest"><img src="https://img.shields.io/github/v/release/athiwatc/formless?sort=semver" alt="Latest release"></a>
+  <a href="https://github.com/athiwatc/formless/releases"><img src="https://img.shields.io/github/v/release/athiwatc/formless?sort=semver" alt="Releases"></a>
   <a href="#32-install"><img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg" alt="Platforms: macOS, Linux, Windows"></a>
   <a href="#10-security-and-privacy"><img src="https://img.shields.io/badge/telemetry-none-success.svg" alt="Telemetry: none"></a>
 </p>
@@ -68,6 +68,9 @@ Illustrative, not scripted: the Tools an agent builds are whatever the task need
 | [packaging/README.md](packaging/README.md) | Release process, installer, Homebrew/winget templates |
 | [docs/gallery.md](docs/gallery.md) | What Formless can do: 15 example tasks |
 | [docs/capabilities.md](docs/capabilities.md) | What Tools can access, the risks, recommended trust settings |
+| [docs/mcp.md](docs/mcp.md) | Connect, authorize, inspect and remove MCP servers |
+| [docs/skills.md](docs/skills.md) | Install, review, enable and share Skills |
+| [docs/jobs.md](docs/jobs.md) | Schedule tasks, receive results and manage Jobs |
 | [docs/keys.md](docs/keys.md) | Every key and command (generated: `formless docs --keys`) |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | Common problems and their fixes |
 | [docs/docker.md](docs/docker.md) | Running the daemon in Docker |
@@ -119,6 +122,9 @@ Illustrative, not scripted: the Tools an agent builds are whatever the task need
         <li><a href="#54-capabilities-closed-taxonomy">Capabilities (closed taxonomy)</a></li>
         <li><a href="#55-the-host-api-inside-a-tool">The host API inside a Tool</a></li>
         <li><a href="#56-composition-rules">Composition rules</a></li>
+        <li><a href="#mcp-servers">MCP servers</a></li>
+        <li><a href="#skills">Skills</a></li>
+        <li><a href="#memory">Memory</a></li>
       </ul>
     </li>
     <li><a href="#6-invocations-async-by-design">Invocations: async by design</a></li>
@@ -144,7 +150,7 @@ Illustrative, not scripted: the Tools an agent builds are whatever the task need
 
 1. **A small, fixed boot set.** A fresh install exposes 25 built-in Tools and nothing else: the registry, memory, MCP, skills and planning primitives ([§5.1](#51-the-built-in-tools)). No domain Tool ships — web access, files, shell work and everything task-specific is built by the agent, then persisted and reused.
 2. **Measured, never vibes.** Self-Optimisation is triggered and judged only by recorded Invocation outcomes. No silent or untested mutation, ever.
-3. **No time-based killing.** Runs and Invocations have no step, token or time limits. The only terminators are completion, fault or the user.
+3. **Opt-in Run step controls.** Runs have no step cap by default. Existing [step controls](#run-controls) let you choose a pause threshold.
 4. **Deny by default.** Tools run sandboxed with only their declared Capabilities. The runtime offers nothing a Tool was not granted.
 5. **Local-first, zero telemetry.** Nothing leaves the machine except calls to the configured provider endpoint.
 6. **One core, many clients.** All behaviour lives in the Daemon Core. TUI, CLI and future frontends are interchangeable clients of one protocol.
@@ -171,7 +177,7 @@ Illustrative, not scripted: the Tools an agent builds are whatever the task need
                                     └─────────────────┘   └────────────────┘
 ```
 
-* **One binary:** `formless`. The daemon is not a separate executable — it is `formless daemon` running in daemon mode, spawned automatically by clients. No system service on any OS.
+* **One binary:** `formless`. The daemon is not a separate executable — it is `formless daemon` running in daemon mode, spawned automatically by clients. Ordinary startup needs no separately installed service; [optional per-user autostart](#36-daemon-diagnostics-and-reset) is supported.
 * **One Daemon Core per data dir**, enforced by a lock file. `--profile <name>` runs an additional isolated daemon with its own data and config dirs.
 * **Transport:** a Unix domain socket in the data dir (dir mode `0700`) on macOS/Linux, a named pipe with an owner-only ACL on Windows. No localhost-TCP fallback in v1.
 * **Clients are stateless.** The daemon persists everything; killing the TUI never kills a Run.
@@ -245,7 +251,7 @@ cargo build --release          # binary at ./target/release/formless
 
 **Docker.** `ghcr.io/athiwatc/formless` runs the daemon headless on a server, reachable through the relay; volumes, the API key as a secret and profiles are in [docs/docker.md](docs/docker.md).
 
-**Homebrew / winget.** Releases render a Homebrew formula and winget manifests and publish them once the maintainer's tap and tokens are set up ([packaging/README.md](packaging/README.md)): then `brew install athiwatc/tap/formless` and `winget install athiwatc.formless`. Until then, use the installer or a source build. **Windows:** download the release archive and unzip it, or build from source.
+**Homebrew / winget.** Releases render a Homebrew formula and winget manifests and publish them once the maintainer's tap and tokens are set up ([packaging/README.md](packaging/README.md)): then `brew install athiwatc/tap/formless` and `winget install athiwatc.formless`. Until then, use the installer on macOS/Linux or build from source. **Windows:** follow the [manual ZIP walkthrough](docs/windows-install.md) for checksum verification, the nested executable directory and optional user PATH setup, or build from source.
 
 **Uninstall.** `formless uninstall` stops the daemon, removes the login service, deletes keychain entries and every profile's data, and removes the binary (or names the package-manager command). `--keep-data` keeps Sessions, Tools and config; `formless export-all` keeps a copy first.
 
@@ -277,6 +283,11 @@ command to open it. `formless profiles list` lists the available profiles.
 
 Type a task at the bottom and press **Enter**. Formless starts with the built-in Tools ([§5.1](#51-the-built-in-tools)) and builds whatever else the task needs with `create_tool`.
 
+Essential keys to get started are below. For the generated main-keys and
+command reference, see [Keys and commands](docs/keys.md), run
+`formless docs --keys`, or open `/help` in the TUI. Views, lists and dialogs
+also show their own keys in the footer.
+
 | Key | Action |
 |---|---|
 | `Enter` | send the message, or steer the Run that is in flight |
@@ -287,12 +298,12 @@ Type a task at the bottom and press **Enter**. Formless starts with the built-in
 | `Tab` / `Shift+Tab` | cycle views (Chat, Sessions, Tools, Metrics, Proposals, Settings) — the bar at the top shows where you are |
 | `Shift+E` (Tools view) | edit the selected Tool's JS (open it with `Enter` first); `Ctrl+S` saves it as a new version through the smoke gate |
 | `PgUp` / `PgDn` | scroll the transcript |
-| `↑` / `↓` | earlier messages of this Session (on the input's first/last line); `Ctrl+R` searches them |
+| `↑` / `↓` | move through wrapped draft rows; earlier messages of this Session at the first/last row (non-Vim); `Ctrl+R` searches them |
 | `Shift+Enter` or `\` then `Enter` | new line in the message |
 | `←` `→` `Home` `End`, `Ctrl+A/E/W/U/K`, `Alt+B/F/D` | edit the message (readline keys) |
 | `Ctrl+C` | clear the typed message; press again within 2 s to detach (the daemon keeps running, nothing is lost) |
 
-Slash commands: `/help /new /sessions /fork /search /edit /tools /metrics /proposals /propose /panes /settings /model [ID] /thinking /stop /cancel /resend /resume /abandon /agents /quit`. Type `/` for a command palette (fuzzy filter, Tab completes, Enter runs); `/help` or `?` on an empty input lists every command grouped by area. Ctrl+V or `/paste` attaches a screenshot from the clipboard, and dragging a file into the terminal attaches it. Type `@` to reference files: a popup completes paths under the current directory (respecting `.gitignore`), and on send small files are attached while large files and directories go as a reference the agent reads with its Tools. `/model` opens a picker: type to filter (fuzzy, so `son4` finds `claude-sonnet-4`), Tab changes reasoning effort, Enter switches the current Session, Ctrl+Enter / Alt+Enter / Ctrl+D sets the global default. `/agents` lists the Session's sub-agents (started by `agents.run`) and `/agents <n>` shows one's stored transcript; their steps also show live as activity. `/cancel` stops just the running Tool the daemon flagged as pending or stalled, without stopping the Run. `/resend` aborts and re-sends a stalled provider request (clients flag a stream that has sent nothing for `provider.stall_notice_secs`, default 120). `/resume` continues a Session whose last Run was interrupted (crash, Esc) or paused (provider error) from its transcript; `/abandon` drops it. On terminals at least 110 columns wide, `/panes` switches to a dashboard with Sessions and Tools beside the chat and Metrics on the right; the choice is remembered (`tui` settings).
+Common slash commands: `/help /new /sessions /fork /search /edit /tools /metrics /proposals /propose /panes /settings /model [ID] /thinking /stop /cancel /resend /resume /abandon /agents /quit`. Type `/` for a command palette (fuzzy filter, Tab completes, Enter runs); `/help` or `?` on an empty input lists every command grouped by area. Ctrl+V or `/paste` attaches a screenshot from the clipboard, and dragging a file into the terminal attaches it. Type `@` to reference files: a popup completes paths under the current directory (respecting `.gitignore`), and on send small files are attached while large files and directories go as a reference the agent reads with its Tools. `/model` opens a picker: type to filter (fuzzy, so `son4` finds `claude-sonnet-4`), Tab changes reasoning effort, Enter switches the current Session, Ctrl+Enter / Alt+Enter / Ctrl+D sets the global default. `/agents` lists the Session's sub-agents (started by `agents.run`) and `/agents <n>` shows one's stored transcript; their steps also show live as activity. `/cancel` stops just the running Tool the daemon flagged as pending or stalled, without stopping the Run. `/resend` aborts and re-sends a stalled provider request (clients flag a stream that has sent nothing for `provider.stall_notice_secs`, default 120). `/resume` continues a Session whose last Run was interrupted (crash, Esc) or paused (provider error) from its transcript; `/abandon` drops it. On terminals at least 110 columns wide, `/panes` switches to a dashboard with Sessions and Tools beside the chat and Metrics on the right; the choice is remembered (`tui` settings).
 
 You can add your own prompt commands as Markdown files in the current profile's
 `<config>/commands/` directory or the current project's `.formless/commands/`.
@@ -328,6 +339,11 @@ a repaired file becomes invalid again.
 files; `formless commands list --json` returns the same shared metadata projection
 used by the TUI. Listing is read-only: it does not start a daemon, create a
 profile, expand a template or open its referenced attachments.
+TUI/plain `/help`, the TUI picker and `commands list` show required positions
+(for example `/workflow <arg1>`) and `[arguments…]` when `$ARGUMENTS` is used.
+Positions count whitespace-separated words; `$ARGUMENTS` may be empty. JSON
+metadata includes `max_position` and `uses_arguments`. Escaped `$$5` and literal
+multi-digit `$10` do not add required arguments.
 
 For red/green colour blindness, set `formless config set tui.theme colorblind`
 (or choose **colorblind** in Settings). The TUI and CLI share an Okabe–Ito-derived
@@ -336,9 +352,31 @@ blue/orange status palette. Diffs keep bold `+`/`-` gutters; CLI status cells ad
 `NO_COLOR` suppresses ANSI styling without removing status information; printable
 Unicode is preserved. JSON output retains its original machine-readable values.
 
+For interface language, open **Settings → Interface → language** in the TUI,
+or run `formless config set tui.language th` for Thai. Use
+`formless config set tui.language en` for English or
+`formless config set tui.language auto` to follow the locale. Auto uses the
+first nonempty `LC_ALL`, `LC_MESSAGES`, then `LANG` value in the TUI, and the
+browser language on the web; Thai locales select Thai, otherwise English.
+Supported interface text and date/number formatting follow that choice, but
+catalog coverage is partial: untranslated strings and some daemon messages
+remain English. Web dates retain the Gregorian calendar and Latin digits.
+This setting does not translate agent answers; asking for answers in Thai is
+a separate preference. See [SPEC §10.8](SPEC.md#108-language) for details.
+
 
 
 Approvals for broad Capabilities appear as a modal — the request names the exact host, path or binary, and the agent waits. Purging a Tool's code and history is user-only and lives in the Tools view ([§5.3](#53-lifecycle-and-versioning)).
+
+#### Plain terminals and screen readers
+
+After first-run setup, `formless --plain` opens a line-oriented client with
+no alternate screen, redraws or spinners. `formless chat` opens the same
+client as its own command; use `formless chat --new` for a fresh Session or
+`formless chat --session ID` to select one. This suits screen readers, dumb
+terminals and SSH sessions with limited terminal support. Events print in
+order, and approvals and questions are answered on the next line. See the
+[plain-client commands](docs/plain.md), or type `/help` in that client.
 
 ### 3.5 Headless runs (no TUI)
 
@@ -400,7 +438,7 @@ usage, errors and coverage; interrupted or incomplete usage stays unknown.
 
 Piped stdin is read only when stdin isn't a terminal; from a script that leaves stdin open without writing to it, add `< /dev/null`.
 
-Approvals are **opt-in**: by default (`security.secure = false`) Tools run without asking, and each sensitive call is recorded in the audit log (`tool.run_unasked`). With approvals on (`formless --secure`, or `security.secure = true` in `config.toml`), they are not skipped by scripting: without `--yes` a sensitive Invocation **fails closed** with a clear error instead of being silently granted. `--timeout 10m` (also `90s`, `1h30m`) interrupts a Run that takes too long. Exit codes: `0` answered, `1` Run errored/paused, `2` usage/config error, `124` timed out, `130` interrupted.
+Approvals are **opt-in**: by default (`security.secure = false`) Tools run without asking, and each sensitive call is recorded in the audit log (`tool.run_unasked`). With approvals on (`formless --secure`, or `security.secure = true` in `config.toml`), they are not skipped by scripting: without `--yes` a sensitive Invocation **fails closed** with a clear error instead of being silently granted. `--timeout 10m` (also `90s`, `1h30m`) interrupts a Run that takes too long. Exit codes: `0` answered, `1` Run errored/paused, `2` usage/config error, `3` Run paused because schema validation failed (see `--schema` above), `124` Run timed out (see `--timeout` above), `130` interrupted.
 
 ### Sessions from the command line
 
@@ -457,9 +495,18 @@ formless completions zsh > ~/.zfunc/_formless      # also bash, fish, powershell
 ```bash
 formless config path                       # where config.toml is
 formless config get tools.inline_limit     # effective value (env overrides applied)
+formless config get provider.model --json # one JSON value, with its type preserved
 formless config set tui.notify_min_secs 30 # validated, audited, applied at once
 formless config edit                       # $EDITOR; saved only if it still parses
 ```
+
+`config get KEY` reads locally loaded effective configuration, including this
+client's applicable environment overrides. Add `--json` for one compact JSON
+value followed by a newline; strings remain quoted, including text such as
+`true`, quotes and newlines. The default human output is unchanged. This is
+not a snapshot of the running daemon or a whole-configuration backup. JSON
+encoding preserves the selected value's type; Set still applies its supported
+key validation, optional/null behavior and map merge or `--replace` rules.
 
 Map settings (`provider.prices`, `provider.model_context_tokens`,
 `provider.model_audio_input`, `provider.model_pdf_input`, `tui.colors`) merge
@@ -496,7 +543,47 @@ formless tools run fetch_page --input '{"url":"https://example.com"}' --yes
 formless reset --force    # destructive: config, key, whole data dir
 ```
 
-There is one daemon per profile, reachable over a unix socket (`<data dir>/daemon.sock`) or a named pipe on Windows. It exits on its own after `daemon.idle_grace_secs` (default 60 s) with no clients and no pending Invocations, and the next client starts it again — so there is nothing to supervise.
+There is one daemon per profile, reachable over a unix socket (`<data dir>/daemon.sock`) or a named pipe on Windows. By default it exits after `daemon.idle_grace_secs` (60 s) with no clients and no pending Invocations; the next client starts it again when needed.
+
+#### Optional per-user autostart
+
+Preview the login entry and manager commands without installing them:
+
+```sh
+formless daemon install-service --dry-run
+```
+
+Install only when you want per-user startup at login:
+
+```sh
+formless daemon install-service
+```
+
+For a named profile, preview and install with the same profile name:
+
+```sh
+formless --profile work daemon install-service --dry-run
+```
+
+```sh
+formless --profile work daemon install-service
+```
+
+Remove that profile's login entry with:
+
+```sh
+formless --profile work daemon uninstall-service
+```
+
+For the default profile, use `formless daemon uninstall-service`. These are
+per-user login entries (launchd agent, systemd user unit or Windows logon task).
+`formless doctor` reports installed-state diagnostics; an installed entry alone
+does not establish service health. See [SPEC §9.1](SPEC.md#91-lifecycle).
+
+The entry uses `daemon serve --stay`, which prevents idle exit while the daemon
+is running. It does not guarantee scheduled delivery through logout, sleep,
+shutdown, network failure or reboot without login. Linux session/logout
+lifecycle guidance is tracked separately in [#1406](https://github.com/athiwatc/formless/issues/1406).
 
 ### 3.7 Browser access via the relay (v2)
 
@@ -583,27 +670,30 @@ the client's own environment applied.
 
 ### 3.10 Troubleshooting
 
+Start with `formless doctor`, inspect the daemon log with `formless logs`,
+and use `formless bug-report` to collect a redacted report for an issue.
+The maintained [Troubleshooting guide](docs/troubleshooting.md) covers startup,
+keychain, provider and recovery problems by symptom. Open that topic from the
+CLI with `formless docs troubleshooting`.
+
 | Symptom | Fix |
 |---|---|
 | `not configured; run formless for the wizard` | headless runs need a configured provider first — launch the TUI once |
 | "does not support tool-calling" during onboarding | pick another model or endpoint; tool calling is mandatory |
 | TUI renders garbage or does not respond | it needs a real TTY; run it interactively rather than through a pipe |
-| "the daemon is vX but this formless is vY" | an old daemon is still running after an upgrade: `formless daemon restart` (or `/restart-daemon` in the TUI) |
-| Daemon will not start | read `<data dir>/daemon.log`, then `formless doctor` and `formless daemon status` |
-| Keychain prompt on every launch | the `0600` `api_key` file in the config dir exists exactly for this; check it is present |
-| macOS refuses to run the binary | `xattr -d com.apple.quarantine formless` (releases are unsigned) |
-| Everything is wedged | `formless reset --force` (destroys config, key and data dir) |
 
 ### 3.11 CLI reference
 
 With no command, `formless` launches the TUI and auto-starts its daemon.
-The table covers every visible root command, including Clap's generated
-`help` command. Use `formless COMMAND --help` for arguments and defaults;
+Root commands appear alphabetically in `--help` and the generated man page;
+Clap appends its generated `help` command at the end of root help. The table
+covers every visible root command, including `help`. Use `formless COMMAND --help` for arguments and defaults;
 `formless help COMMAND SUBCOMMAND` also opens nested help.
 
 | Command | Actions / useful options | Purpose |
 |---|---|---|
 | `formless approvals` | `pending`, `approve`, `deny`, `list`, `revoke`, `denials` | Inspect pending requests, answer one, or inspect and manage existing grants/denials. |
+| `formless artifacts` | `show ID [--offset CHARS] [--length CHARS] [--json]` | Read decoded artifact text in Unicode scalar slices; not a byte-exact download. |
 | `formless auth` | `login`, `status`, `logout` | Manage provider credentials (API key or OAuth). |
 | `formless backup` | No action: create; `list`, `verify`, `restore`, `drill` | Create, inspect, verify, restore, or rehearse database snapshots. |
 | `formless bug-report` | `-o FILE` / `--output FILE` | Write a redacted Markdown diagnostic report. |
@@ -612,7 +702,7 @@ The table covers every visible root command, including Clap's generated
 | `formless completions` | `bash`, `zsh`, `fish`, `powershell`, `elvish` | Print a shell completion script. |
 | `formless config` | `path`, `get`, `set`, `edit` | Locate, inspect, validate, or edit configuration. |
 | `formless daemon` | `start`, `stop`, `restart`, `status`, `serve`, `install-service`, `uninstall-service` | Manage the daemon and its optional login service. |
-| `formless docs` | Optional topic; `--print`, `--keys` | Open a guide (gallery by default), print its URL, or print the embedded keyboard reference. |
+| `formless docs` | Optional topic; `--text`, `--print`, `--keys` | Read bundled Markdown, open the current online guide (gallery by default), print its URL, or print the keyboard reference. |
 | `formless doctor` | `--json`, `--fix`, `--restore-drill` | Diagnose setup, apply safe fixes, or rehearse the newest backup. |
 | `formless export-all` | `--sessions`, `-o FILE` / `--output FILE` | Write a portable setup bundle, optionally including Session transcripts. |
 | `formless gc` | `--dry-run` | Free reclaimable storage or preview what would be freed. |
@@ -620,27 +710,31 @@ The table covers every visible root command, including Clap's generated
 | `formless import-all` | `FILE` | Add a portable setup bundle without overwriting existing entries. |
 | `formless jobs` | `list`, `add`, `run`, `history`, `enable`, `disable`, `rm` | Manage scheduled prompts and inspect their history. |
 | `formless logs` | `--follow`, `--level`, `--since`, `--lines` | Read or follow the daemon log and rotated files. |
-| `formless mcp` | `add`, `remove`, `list`, `test`, `login`, `logout`, `catalog`, `import`, `log`, `tools`, `tool` | Manage external MCP servers and inspect their tools/logs. |
+| `formless mcp` | `add`, `remove`, `list`, `test`, `login`, `logout`, `catalog`, `import`, `log`, `tools`, `tool`, `prompts`, `prompt` | Manage external MCP servers and inspect their tools/logs. |
+| `formless metrics` | `--since DURATION`, `--json` | Read recorded model, Tool and built-in statistics through independent reports at one cutoff. |
 | `formless memory` | `list`, `add`, `rm`, `edit` | Inspect or change saved user-memory notes. |
+| `formless models` | `list [--json]` | Fetch the default-provider model catalog and existing picker report; a non-null listing error prints a partial report and exits 1. |
+| `formless modules` | `list`, `show`; `show --version N` | Read all modules, inspect metadata/history/dependents, or emit an exact stored source version. |
 | `formless naming` | `status`, `pull`, `test` | Inspect, install, or preview the embedded Session-naming model. |
 | `formless prices` | `import` | Import a model-price catalog for cost and spending limits. |
 | `formless profiles` | `list`, `rm` | List or remove isolated profiles. |
-| `formless prompts` | `list`, `generate`, `apply`, `reject`, `rollback` | Inspect and manage measured prompt/memory proposals. |
+| `formless prompts` | `list`, `diff`, `generate`, `apply`, `reject`, `rollback` | Inspect existing proposal comparisons and manage measured prompt/memory proposals. |
 | `formless providers` | `list`, `add`, `remove`, `test` | Manage named model providers and test a connection. |
 | `formless relay` | `enable`, `disable`, `status` | Manage encrypted browser access through the relay. |
 | `formless reset` | `--force` | Wipe configuration, credentials, and the current profile's data. |
 | `formless restore` | `FILE` | Replace the database from a backup, preserving the current database. |
 | `formless roles` | `list`, `add`, `rm` | Map named purposes to a provider and model. |
 | `formless run` | `TASK`; `--estimate`, `--session`, `--output`, `--attach` and other Run options | Run one headless task, or print its local forecast without starting it. |
+| `formless routing` | `--json` | Read currently available daemon routing decisions and returned candidate figures without starting a model request. |
 | `formless runs` | No action: list; `show`, `cancel` | List recent Runs, inspect one by ID/prefix, or cancel that exact Run. |
 | `formless security` | `status` | Inspect the daemon's grants, denials, trusted resources, and exposed interfaces. |
-| `formless sessions` | `fork`, `compare`, `list`, `show`, `files`, `rewind`, `rename`, `rm`, `restore`, `import`, `search`, `archive`, `unarchive`, `export` | Manage stored Sessions, follow a Run with `show --follow`, or inspect tracked files. |
+| `formless sessions` | `fork`, `compare`, `list`, `show`, `files`, `rewind`, `rename`, `rm`, `restore`, `import`, `search`, `templates list/show`, `archive`, `unarchive`, `export` | Manage stored Sessions, follow a Run with `show --follow`, or inspect tracked files. `list --pinned --tag TAG` filters the fetched reply; selectors combine with `--archived`, preserving reply order. |
 | `formless skills` | `reviews`, `add`, `remove`, `list`, `enable`, `disable`, `show`, `export`, `import` | Inspect and manage Skills and their retained description reviews. |
 | `formless storage` | `--json` | Report disk usage by data category. |
 | `formless tools` | `reviews`, `list`, `disable`, `enable`, `undo`, `pin`, `unpin`, `tag`, `show`, `retire`, `restore`, `rollback`, `purge`, `run`, `export`, `import` | Inspect, manage, run, or transfer registry Tools. |
-| `formless tui` | No action | Launch the full-screen terminal client; also the default with no command. |
+| `formless tui` | `--plain`, `-c` / `--continue`, `--new` | Launch the full-screen terminal client; also the default with no command. |
 | `formless uninstall` | `--keep-data`, `--keep-binary`, `--yes` (alias `--force`) | Remove Formless, optionally retaining data or the binary. |
-| `formless update` | No action, `check`, or `--check` | Show newer release notes and the applicable upgrade command; never rewrite the binary. |
+| `formless update` | No action, `check`, or `--check`; `--json` | Show newer release notes and the applicable upgrade command; never rewrite the binary. |
 | `formless web` | `--port`, `--no-open`, `--stop` | Open, print a link for, or stop the local browser UI. |
 
 Human Session lists label the last recorded Run status and show stored tags,
@@ -649,6 +743,42 @@ reported separately from an empty archive selection, which names the alternate
 list command and count. Static human `sessions show` includes stored archived,
 pinned, tags and last recorded Run status metadata; absent status is "not
 recorded". JSON and `--follow` retain their existing contracts.
+
+`tools list --filter FILTER` selects one stored-state predicate: `not-retired`
+(including disabled Tools), `retired`, `failing` (known success rate below 0.8),
+`needs-attention`, `off` (disabled) or `pinned`. It combines by AND with
+`--tag TAG`, retaining exact stored-tag matching after the existing argument
+lowercasing/leading-# removal. Unknown rates do not count as failing; states
+may overlap. JSON uses the same selection and existing ToolInfo schema.
+Human output distinguishes an empty registry from no matching rows and names
+the flags to clear. `--show-pinned` adds a human PINNED yes/no column; default
+piped cells and row order remain unchanged. These flags never mutate a Tool.
+
+`formless metrics --since 7d --json` reads the three existing metrics reports
+with one checked UTC cutoff. Omit `--since` for all history. Tool rows use stored
+`tool_id` values; reports retain their own row order and are independent reads,
+not a transactional snapshot. Runs and daily usage remain separate surfaces.
+
+`formless sessions list --pinned --tag WORK --json` selects active pinned Sessions
+whose stored tags contain exactly `work`. Only the tag argument is lowercased;
+a leading `#` is not stripped. Add `--archived` to select the archived partition.
+These selectors filter the existing reply on the client.
+
+Tool selectors use an exact name or full ID. After a miss, up to three
+ranked partial-name suggestions can help you retry with the original exact
+spelling; these use folded subsequence matching, not edit-distance spelling
+correction. A suggestion never selects or runs a Tool automatically.
+
+`update --json`, `update check --json`, and `update --check --json` emit one
+object: `{installed, status, newer_releases: [{tag, url, notes}]}`. Notes retain
+the existing trimmed body and oldest-first order; `installed` has no `v` prefix.
+`update_available` means the fetched page contains newer stable releases;
+`up_to_date` means none in that single 50-release response, without pagination.
+`release_check_unavailable` maps to an actual HTTP 404 response,
+not verified absence of releases. Error text alone never selects this status.
+Completed checks exit 0; other fetch or JSON parse failures remain errors with
+no success JSON. Human output stays unchanged, and the JSON form never runs
+an updater.
 
 #### Root and global flags
 
@@ -845,6 +975,25 @@ function run(input) {
 
 ### MCP servers
 
+`formless mcp prompts [--json]` reports prompts from reachable enabled servers,
+in daemon order. Discovery can start configured servers and silently skips
+connection/list failures, so results may be incomplete. `formless mcp prompt
+SERVER NAME --arg key=value [--arg empty=] [--json]` sends named string values
+to the selected server. Values preserve spaces, additional equals and empty
+strings; missing separators, empty keys and duplicate keys are usage errors
+before daemon contact. Human output is the returned text verbatim, including
+its trailing-newline state. The daemon projects `content.text` strings joined
+with blank lines; roles and non-text parts are absent. JSON preserves the full
+discovery array or daemon text report, not raw MCP messages. These commands do
+not submit to a Session or change server configuration; server/daemon errors
+retain their ordinary exit behavior, without promised local required/unknown
+argument checks.
+
+```sh
+formless mcp prompts --json
+formless mcp prompt docs summarize --arg 'topic=Unicode notes' --arg suffix=
+```
+
 Formless can also call the tools of external [MCP](https://modelcontextprotocol.io) servers. Add a stdio server to `config.toml`:
 
 ```toml
@@ -888,6 +1037,8 @@ formless skills export pdf -o pdf.skill.json   # files only, no metrics
 formless skills import pdf.skill.json          # imported disabled, contents printed
 ```
 
+### Memory
+
 The agent remembers stable preferences you state ("use pnpm", "answer in Thai") as short notes. You see every one, and you can edit them.
 
 A note's scope is `global` (the default) or `project:/absolute/path`. The memory
@@ -920,12 +1071,38 @@ formless memory rm m1a2b3c4
 ## 7. Sessions, Runs and Steer
 
 * **Session** — a resumable conversation plus Run history; many run concurrently against one Daemon Core. Deleting a Session removes payloads but keeps anonymised tallies.
-* **Run** — one unit of work: user message → final answer. No step, token or time limit; it ends on completion, fault or interruption.
+* **Run** — one unit of work: user message → final answer. No step cap by default; it ends on completion, fault or interruption.
 * **Steer** — a user message sent while a Run is active, injected at the next step boundary.
 * **Auto-naming** — when an `Untitled` Session finishes its first Run, the daemon gives it a short title (for example "Fixing Rust Error E0502"). A small model, [LFM2.5-230M](https://huggingface.co/LiquidAI/LFM2.5-230M) (153 MB, Q4_K_M), runs in-process on the CPU, so naming spends no provider tokens and sends nothing off the machine. It runs in the background, never delays a Run, and never replaces a name you set. The model downloads once into `<data dir>/models/` on first use (pinned revision, SHA-256 verified) or with `formless naming pull`. Until it is installed, or if it fails or exceeds `naming.timeout_secs`, the title is the first few words of your message. Set `naming.enabled = false` to turn naming off, or `naming.auto_download = false` to keep the model off the network. The model is licensed under the [LFM Open License v1.0](https://huggingface.co/LiquidAI/LFM2.5-230M/blob/main/LICENSE), which limits commercial use above a revenue threshold; building without the default `embedded-llm` cargo feature removes it and leaves only first-words titles.
 * **Compaction** — a persisted summary checkpoint that replaces old history and Tool output as context grows, so long Sessions keep going without losing the trail.
 * **Artifacts** — large Tool output is written to an artifact file; only a bounded preview enters model context.
 * **Tracked path changes** — `/files` lists paths captured by live host filesystem operations, including directories created with `fs.mkdir`. `/rewind` attempts safe restoration and reports skipped paths with reasons. Programs launched by Tools and MCP tools can write outside this tracking; when those capabilities are invoked, file notes and recaps warn that untracked writes are possible, including when no paths were captured. Counts describe tracked paths only. Paths whose recovery images expired remain listed with the reason; rewind never substitutes an older Run silently. Windows restoration also requires retained original objects and live object or directory proofs where applicable. Lost or expired proofs, including process-local proofs lost on restart, leave those paths read-only rather than reconstructing authority from stored hashes.
+
+### Context and compaction
+
+Use `/context` to inspect the Session's context window and what fills it.
+Formless automatically compacts as a Run approaches its model's context limit.
+When the Session is idle, `/compact` requests a summary now; add a focus, for
+example `/compact Keep repository constraints and unresolved decisions`, to
+say what the summary should emphasize. A summary can omit detail; compaction
+is not lossless.
+
+On-demand compaction is refused while a Run is active or when nothing is new
+since the last checkpoint. The ordinary daemon-side summarizer rejects an
+empty or output-limit-cut summary before saving a checkpoint, retaining the
+turns. Read any failure note before trying again. Provider-side compaction is
+an opt-in endpoint-specific path, not a capability every provider supplies.
+See [the generated command reference](docs/keys.md#session),
+[SPEC §11](SPEC.md#11-compaction), and the
+[context troubleshooting guidance](docs/troubleshooting.md#context-pressure-or-failed-compaction).
+
+### Run controls
+
+Set a profile default with `limits.run_steps`, use `/limit N` or `/limit off`
+in the TUI, or pass `formless run --max-steps N`. Reaching a step threshold
+pauses that Run. See the existing [step-limit and resume/abandon behavior](SPEC.md#54-interruption-and-resumption)
+and [spending-limit rules](SPEC.md#52-run-lifecycle). The client's `--timeout`
+is a separate interruption option.
 
 ---
 
@@ -1002,6 +1179,31 @@ formless/
 
 ## 12. Development
 
+The [CI workflow](.github/workflows/ci.yml) runs on self-hosted macOS ARM64 and Linux x64
+runners for pushes to `main`, same-repository pull requests targeting `main`, and
+manual dispatches. It checks Rust formatting and Clippy, runs workspace tests
+(including doc tests), relay/web Node tests, relay wire conformance and offline
+documentation/tooling tests, then builds the release workspace and smoke-tests
+the CLI, man page and shell completions. Tested binaries, generated assets and
+diagnostic logs are retained as workflow artifacts for seven days. Clippy uses
+the development command below; existing warnings are reported without being
+promoted to errors. Fork pull requests are skipped on the persistent runners.
+
+Runners need the standard `self-hosted` label plus `macOS`/`ARM64` or
+`Linux`/`X64`, and outbound access for GitHub Actions and dependency downloads.
+The Mac needs Xcode Command Line Tools, Git, Rustup and Python 3.9+. The Linux
+runner needs Git and a Debian/Ubuntu-compatible environment; CI verifies the C
+compiler, Python and D-Bus development headers/pkg-config, installing missing
+build dependencies through apt as root or with noninteractive sudo. Both
+platforms run native jobs, including Linux runners themselves hosted in Docker.
+CI installs stable Rust with rustfmt/Clippy and Node 24. Cargo dependencies are cached;
+application data/config and logs use private temporary directories cleaned after
+the job. Test debug artifacts are removed before release compilation to limit disk use.
+The workflow does not deploy or publish a release; release packaging remains in
+`release.yml`. Live external-link checks remain in `docs.yml`; Playwright browser
+checks in `relay/README.md` remain separate manual checks. AUR packaging tests
+run only in the Linux job because they require GNU install.
+
 ```bash
 cargo build --workspace                # debug build of the single binary
 cargo test --workspace                 # unit + integration tests
@@ -1018,8 +1220,12 @@ definitions with the README §3.11 and SPEC §12 reference tables. It runs as pa
 of the workspace tests and rejects missing, stale, or duplicate entries.
 Examples are shell-split and parsed by the real CLI without dispatching
 operations, so obsolete flags fail locally. Documentation topic checks reject
-ambiguous prefixes and unknown names; `docs --print` never needs a profile or
-browser.
+ambiguous prefixes and unknown names. `formless docs jobs --text` reads the
+Markdown compiled into this build, without a profile, daemon or browser;
+`docs --print` retains bare online-URL output. Terminal `/docs --text jobs`
+reads the same bundled content (a pager in the TUI, printed lines in plain
+mode). A failed/unavailable desktop opener falls back to bundled text; the
+current online copy is labeled separately because it may differ from this build.
 
 Rules of the road: **no behaviour may live only in a client** — the CLI and TUI are both clients of the daemon protocol. Every Tool is validated and smoke-tested at creation, and every behavioural change should be reflected in `SPEC.md` first.
 
@@ -1037,7 +1243,7 @@ Release work is documented separately in [`packaging/README.md`](packaging/READM
 ## 13. Non-goals
 
 * Hosted or multi-user mode, accounts, sharing servers.
-* System services, localhost-TCP transport, cloud sync or telemetry.
+* System-wide services, localhost-TCP transport, cloud sync or telemetry. Optional per-user login autostart is supported ([§3.6](#36-daemon-diagnostics-and-reset)).
 * Publishing signed/notarised binaries and submitting the Homebrew/winget packages (the workflow, installer and templates are in [`packaging/`](packaging/README.md); signing needs maintainer certificates).
 
 v2 shipped what v1 left out: the encrypted Relay and Web frontend ([§3.7](#37-browser-access-via-the-relay-v2), [`relay/`](relay/README.md)), the Responses API, prompt-based tool calling, failover and measured routing, OAuth providers ([§3.8](#38-provider-options-v2)), shared modules, sub-agents, prompt/memory self-optimisation, the Tool editor and the multi-pane TUI.

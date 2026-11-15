@@ -48,8 +48,8 @@ pub(super) fn help_lines(snapshot: &Snapshot) -> Vec<String> {
     }
     for command in &snapshot.commands {
         out.push(format!(
-            "  /{} [ARGUMENTS]  {}",
-            command.name,
+            "  {}  {}",
+            command.usage(),
             display_label(&command.description)
         ));
         out.push(format!(
@@ -371,7 +371,7 @@ impl App {
         rows.into_iter()
             .map(|(_, command)| PaletteItem {
                 insert: format!("/{} ", command.name),
-                label: format!("/{} [ARGUMENTS]", command.name),
+                label: command.usage(),
                 desc: command.description.clone(),
                 runnable: true,
             })
@@ -419,6 +419,26 @@ mod refresh_tests {
     fn expire(app: &App) {
         app.user_commands.borrow_mut().checked = Some(Instant::now() - Duration::from_millis(251));
     }
+    #[test]
+    fn help_and_palette_show_required_arguments_without_changing_inserted_command() {
+        let mut fixture = fixture();
+        let path = fixture.root.join("project/.formless/commands/workflow.md");
+        for (body, label) in [
+            ("$1 then $2", "/workflow <arg1> <arg2>"),
+            ("$$5 $10", "/workflow"),
+            ("$ARGUMENTS", "/workflow [arguments…]"),
+        ] {
+            std::fs::write(&path, body).unwrap();
+            let help = fixture.app.user_command_help();
+            assert!(help
+                .iter()
+                .any(|line| line == &format!("  {label}  User command")));
+            let rows = fixture.app.user_command_palette("work");
+            assert_eq!(rows[0].label, label);
+            assert_eq!(rows[0].insert, "/workflow ");
+        }
+    }
+
     #[test]
     fn unchanged_idle_templates_are_loaded_once_not_every_tick() {
         let mut fixture = fixture();

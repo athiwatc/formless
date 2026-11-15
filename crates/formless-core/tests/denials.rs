@@ -1,15 +1,25 @@
 //! Remembered denials, the security overview, and the broad-capability
 //! notice on create_tool (SPEC §10.3).
 
+#[path = "support/env.rs"]
+mod credential_env;
+
 use formless_core::{Config, Paths, Store};
 use formless_protocol::Request;
 use formless_runtime::Capabilities;
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 
-fn setup(tag: &str) -> (Paths, std::path::PathBuf) {
-    let short = &uuid::Uuid::new_v4().to_string()[..8];
-    let dir = std::path::PathBuf::from(format!("/tmp/fl-{tag}-{short}"));
-    let paths = Paths::from_dirs(dir.join("d"), dir.join("c")).unwrap();
+fn setup(_env: &credential_env::EnvGuard, tag: &str) -> (Paths, std::path::PathBuf) {
+    // Status resolves credentials even though these tests never call a provider.
+    // Keep the whole test process on an in-memory backend, never the user's store.
+    static MOCK: Once = Once::new();
+    MOCK.call_once(|| {
+        keyring::set_default_credential_builder(keyring::mock::default_credential_builder());
+    });
+    let id = uuid::Uuid::new_v4();
+    let dir = std::env::temp_dir().join(format!("fl-{tag}-{id}"));
+    let mut paths = Paths::from_dirs(dir.join("d"), dir.join("c")).unwrap();
+    paths.profile = format!("test-denials-{id}");
     let mut cfg = Config::default();
     cfg.provider.base_url = "http://127.0.0.1:9".into();
     cfg.provider.model = "m".into();
@@ -20,7 +30,8 @@ fn setup(tag: &str) -> (Paths, std::path::PathBuf) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_remembered_denial_refuses_without_asking_and_says_why() {
-    let (paths, dir) = setup("deny");
+    let env = credential_env::EnvGuard::isolated();
+    let (paths, dir) = setup(&env, "deny");
     let (id, session) = {
         let store = Store::open(&paths.db_file()).unwrap();
         let caps = Capabilities::parse(&["net:api.example.com".to_string()]).unwrap();
@@ -68,7 +79,8 @@ async fn a_remembered_denial_refuses_without_asking_and_says_why() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn creating_a_broad_tool_suggests_least_privilege() {
-    let (paths, dir) = setup("broad");
+    let env = credential_env::EnvGuard::isolated();
+    let (paths, dir) = setup(&env, "broad");
     let sid = Store::open(&paths.db_file())
         .unwrap()
         .create_session(None)
@@ -97,7 +109,8 @@ async fn creating_a_broad_tool_suggests_least_privilege() {
 /// nobody to ask, and it is on record (SPEC §10.3).
 #[tokio::test(flavor = "multi_thread")]
 async fn by_default_sensitive_calls_run_unasked_and_are_logged() {
-    let (paths, dir) = setup("open");
+    let env = credential_env::EnvGuard::isolated();
+    let (paths, dir) = setup(&env, "open");
     let (id, session) = {
         let store = Store::open(&paths.db_file()).unwrap();
         let caps = Capabilities::parse(&["net:api.example.com".to_string()]).unwrap();
@@ -135,5 +148,6 @@ async fn by_default_sensitive_calls_run_unasked_and_are_logged() {
     );
     let status = daemon.handle(Request::Status).await.unwrap();
     assert_eq!(status["secure"], false);
+    assert_eq!(status["auth"]["credential_present"], false);
     let _ = std::fs::remove_dir_all(dir);
 }
