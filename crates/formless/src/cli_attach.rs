@@ -11,6 +11,12 @@ use std::{
 
 #[derive(Subcommand)]
 pub(super) enum RunsAction {
+    /// Read one live Invocation snapshot (not stored Run metrics)
+    Running {
+        /// Print the original Invocation array as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Inspect a stored Run (full id or unambiguous prefix)
     Show {
         /// Stored Run ID or unambiguous prefix to inspect
@@ -157,7 +163,9 @@ impl Connection {
 pub(super) fn runs(paths: &Paths, action: RunsAction, outer_json: bool) -> Result<()> {
     let mut conn = Connection::connect(paths)?;
     let inspect = matches!(&action, RunsAction::Show { .. });
+    let running = matches!(&action, RunsAction::Running { .. });
     let (value, json) = match action {
+        RunsAction::Running { json } => (conn.request(Request::ListInvocations)?, json),
         RunsAction::Show { id, json } => (conn.request(Request::GetRun { run_id: id })?, json),
         RunsAction::Cancel { id, json } => {
             (conn.request(Request::CancelRunId { run_id: id })?, json)
@@ -165,6 +173,8 @@ pub(super) fn runs(paths: &Paths, action: RunsAction, outer_json: bool) -> Resul
     };
     if json || outer_json {
         println!("{}", serde_json::to_string_pretty(&value)?);
+    } else if running {
+        print!("{}", invocation_snapshot(&value)?);
     } else {
         print!(
             "{}",
@@ -185,6 +195,87 @@ pub(super) fn runs(paths: &Paths, action: RunsAction, outer_json: bool) -> Resul
         }
     }
     Ok(())
+}
+
+pub(super) fn validate_runs_limit(cli: &Cli) -> Result<()> {
+    if matches!(
+        &cli.cmd,
+        Some(Cmd::Runs {
+            action: Some(RunsAction::Running { .. }),
+            limit: Some(_),
+            ..
+        })
+    ) {
+        return Err(super::usage(
+            "--limit applies to the stored Run list, not the live Invocation snapshot",
+        ));
+    }
+    Ok(())
+}
+
+fn invocation_snapshot(value: &Value) -> Result<String> {
+    use std::fmt::Write;
+    let entries = value
+        .as_array()
+        .context("live Invocation response was not an array")?;
+    let mut out = String::from("Live Invocations (one snapshot)\n");
+    if entries.is_empty() {
+        out.push_str("No live Invocations.\n");
+    }
+    for entry in entries {
+        writeln!(
+            out,
+            "\nHandle: {}\n  Tool: {}\n  Session: {}",
+            text(entry, "handle"),
+            text(entry, "tool_name"),
+            text(entry, "session_id")
+        )?;
+        if entry["invocation_id"].is_string() {
+            writeln!(out, "  Invocation ID: {}", text(entry, "invocation_id"))?;
+        }
+        for (label, key) in [("Elapsed", "elapsed_ms"), ("Silent", "silent_ms")] {
+            let milliseconds = entry[key]
+                .as_u64()
+                .context("Invocation duration was not an unsigned millisecond value")?;
+            writeln!(
+                out,
+                "  {label}: {}.{:03}s",
+                milliseconds / 1000,
+                milliseconds % 1000
+            )?;
+        }
+        writeln!(
+            out,
+            "  Stalled: {}",
+            if entry["stalled"]
+                .as_bool()
+                .context("Invocation stalled flag was not a boolean")?
+            {
+                "yes"
+            } else {
+                "no"
+            }
+        )?;
+        writeln!(
+            out,
+            "  Abandoned: {}",
+            if entry["abandoned"]
+                .as_bool()
+                .context("Invocation abandoned flag was not a boolean")?
+            {
+                "yes — no longer awaited; may still finish"
+            } else {
+                "no"
+            }
+        )?;
+        if entry["last_fraction"].is_number() {
+            writeln!(out, "  Progress fraction: {}", entry["last_fraction"])?;
+        }
+        if entry["last_label"].is_string() {
+            writeln!(out, "  Progress label: {}", text(entry, "last_label"))?;
+        }
+    }
+    Ok(out)
 }
 pub(super) fn pending(paths: &Paths, json: bool) -> Result<()> {
     let mut conn = Connection::connect(paths)?;
@@ -553,6 +644,52 @@ fn follow_inner(paths: &Paths, query: &str, json: bool) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn live_snapshot_json_placements_and_explicit_limit_validation() {
+        for args in [
+            vec!["formless", "runs", "running"],
+            vec!["formless", "runs", "running", "--json"],
+            vec!["formless", "runs", "--json", "running"],
+        ] {
+            let cli = Cli::try_parse_from(&args).unwrap();
+            validate_runs_limit(&cli).unwrap();
+            let Some(Cmd::Runs {
+                action: Some(RunsAction::Running { json }),
+                json: outer,
+                limit,
+                ..
+            }) = cli.cmd
+            else {
+                panic!("wrong action")
+            };
+            assert_eq!(json || outer, args.contains(&"--json"));
+            assert!(limit.is_none());
+        }
+        for limit in ["0", "20", "100"] {
+            let cli =
+                Cli::try_parse_from(["formless", "runs", "--limit", limit, "running"]).unwrap();
+            let error = validate_runs_limit(&cli).unwrap_err();
+            assert_eq!(super::super::exit_code(&error), 2);
+        }
+        let cli = Cli::try_parse_from(["formless", "runs", "--limit", "7", "--json"]).unwrap();
+        validate_runs_limit(&cli).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Some(Cmd::Runs {
+                limit: Some(7),
+                action: None,
+                ..
+            })
+        ));
+        assert!(Cli::try_parse_from(["formless", "runs", "running", "--limit", "20"]).is_err());
+    }
+
+    #[test]
+    fn malformed_snapshot_never_yields_a_partial_report() {
+        assert!(invocation_snapshot(&serde_json::json!({})).is_err());
+        assert!(invocation_snapshot(&serde_json::json!([{"handle":"first","elapsed_ms":1,"silent_ms":2,"stalled":false,"abandoned":false},{"handle":"broken"}])).is_err());
+    }
+
     #[test]
     fn cli_parsing_preserves_listing_and_new_commands() {
         for args in [
