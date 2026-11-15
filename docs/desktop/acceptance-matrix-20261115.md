@@ -1,0 +1,56 @@
+# GPUI completion and integration acceptance matrix
+
+This is an implementation/evidence inventory for epic #1753, starting from
+published draft #2081 head `cc1d0c9805230d7807a4a871396f91c0ebeec91a` and the
+isolated local continuation. It is not acceptance, a complete parity claim,
+or authorization to merge while substantive gates fail.
+
+## Current implementation versus completion
+
+| Requirement | Present evidence / implementation | Still needed |
+|---|---|---|
+| Optional native target; existing headless clients compatible | Detached desktop workspace; unchanged root/desktop manifests and lockfiles in this continuation; kit facade | Revalidate combined main after integration; supported platform policy |
+| Daemon connection and canonical Sessions/transcripts | Existing client, request ownership and snapshots; local suites; prior real daemon/fake-Provider evidence | Latest native/live acceptance; general delta replay still unproved |
+| Ordered streaming / reconnect | `deltas: false`; canonical snapshots and event invalidation; unknown mutations not replayed | Protocol cutoff/watermark/offset or equivalent ordering proof before enabling deltas |
+| Sessions | Directory, New Session, metadata/tags/pin/archive, instructions, persisted export | Remaining actions such as fork/comparisons; native file save/import and full-Profile backup; bounded per-Session view-state restoration |
+| Conversation and large output | Virtualized blocks, bounded previews, whole-output viewer, exact block source copy | Cross-block selection/copy, dedicated code-copy/link opening, richer attachments/artifacts/diagrams and native semantics |
+| Composer | Send/Steer/Queue/Stop, preserved drafts, IME guards, forecast consent; new per-window send-key choice | Attachments/drop/image paste/external editor, remaining Role/model/reference controls and durable send preferences |
+| Context/resources | Recorded Session usage; bounded read-only Tools/Metrics/Proposals/Settings and exact details copy | General-purpose artifact/Invocation/Run detail selection/pinning/navigation, scoped diff and remaining editable resource actions |
+| Questions/security decisions/Step | Native user questions, forecast consent; approvals and Step explicitly hand off to TUI | Native security-approval parity; restored pending Step identities and reconnect/control parity |
+| Search/navigation | Loaded literal Search and native Find; separate persisted Profile Search | Remaining global action discovery and resource navigation parity; native usability acceptance |
+| Layout/focus/scaling | Responsive panes/overlays, modal traps/restoration, reflow and headless 200% checks | Resizable panel preferences, real selection/input/trackpad, human 200% and multimonitor/HiDPI acceptance |
+| Themes/preferences | Light/dark and 100–200% text; in-memory panel/send-key choices | System/high-contrast/colorblind themes, density/reduced motion/font choices and versioned durable preference storage/recovery |
+| Accessibility and IME | Semantic/headless tests; historical Mac adapter/capture evidence | VoiceOver/NVDA, real Thai/Japanese/dead-key input, current-head native semantics; session position/count adapter limitation |
+| Performance | Historical fixture measurements, bounded caches and virtual lists | Accepted budgets and current-head frontmost/native measurements including accessibility cost; no synthetic pass substitutes for them |
+| Platforms | Mac compilation/headless tests; prior native Mac evidence; historical Windows smoke evidence at older code | Current-head native Windows GUI and Linux build/run/render/accessibility; actual declared support tier |
+| Distribution | Existing reproducible development-bundle helper; notices/provenance/hashes | Manual dependency/assets/stdlib licence audit, icons, signing/notarization, install/launch/update/clean-install acceptance |
+
+Inventory sources: the desktop README, source modules and continuation reports
+linked there, plus the published epic's screen/interaction and validation plan.
+A row's existing implementation is not evidence that all its behaviors are
+production-ready. The local continuation has no fresh real OS execution.
+
+## Integration holds
+
+The user's goal is a finished GPUI client and clean main with PRs integrated.
+That goal does not make the failed or missing evidence above pass.
+
+1. Preserve the conflicting original partial tree until ownership or safe
+   recovery is established; do not adopt its unverified edits.
+2. Finish exact-patch reviews of each new isolated commit. Parent-reported
+   reviews found no confirmed blocker in `acabff81`, `dfbab768` and
+   `8a18d80a`; those reviews inspected tests/logs without rerunning them.
+3. Resolve the existing foreground approval and prior uncertain launch/control
+   outcome through the supported approval/evidence path. No foreground action
+   is repeated or substituted here, and no writer/Claude session is controlled.
+4. Obtain the required native/platform, product-parity, performance and
+   distribution evidence above; fix failures before claiming completion.
+5. Recheck live main/#1776/#2081 and ownership, choose the agreed integration
+   branch, review the combined diff, then rerun appropriate aggregate and
+   native checks there. Only merge when substantive gates pass.
+
+No remote branch/PR state was modified by this continuation. All new work
+remains on the separate local branch; a published draft or PR update is not
+performed merely to represent progress. No unverified clean-main or all-PRs
+merge claim is made. Local patches and hash manifests remain reviewable in
+the sibling task evidence directory.

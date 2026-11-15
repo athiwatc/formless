@@ -29,6 +29,7 @@ pub enum Command {
     ToggleSessions,
     ToggleContext,
     ToggleTheme,
+    ToggleEnterSends,
     IncreaseTextSize,
     DecreaseTextSize,
     ResetTextSize,
@@ -82,6 +83,7 @@ pub struct State {
     pub archived_included: bool,
     /// Whether an input method is composing text in the composer.
     pub composing: bool,
+    pub enter_sends: bool,
     pub sessions_shown: bool,
     pub context_shown: bool,
     pub dark: bool,
@@ -173,7 +175,17 @@ pub fn keys(command: Command) -> &'static [&'static str] {
         | Command::SessionDetails
         | Command::ToggleArchived
         | Command::ToggleTheme
+        | Command::ToggleEnterSends
         | Command::GoTo(_) => &[],
+    }
+}
+
+/// Native modified Enter, scoped to the composer rather than global.
+pub fn composer_submit_key() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "cmd-enter"
+    } else {
+        "ctrl-enter"
     }
 }
 
@@ -256,6 +268,7 @@ pub fn palette(state: &State) -> Vec<Entry> {
         Command::DecreaseTextSize,
         Command::ResetTextSize,
         Command::ToggleTheme,
+        Command::ToggleEnterSends,
     ]);
     commands
         .into_iter()
@@ -306,6 +319,14 @@ pub fn entry(command: Command, state: &State) -> Entry {
                 composer_reason(reason),
             )
         }
+        Command::ToggleEnterSends => (
+            "Enter sends",
+            if state.enter_sends { "Use Enter for newlines" } else { "Use Enter to send" }.to_string(),
+            Group::Composer,
+            "Change send keys for this window; drafts and undo stay intact. Not saved between launches",
+            Some(state.enter_sends),
+            if !state.has_composer { Some(NO_COMPOSER) } else if state.composing { Some(COMPOSING) } else { None },
+        ),
         Command::Stop => (
             "Stop",
             "Stop".to_string(),
@@ -518,6 +539,7 @@ mod tests {
             can_browse_archived: false,
             archived_included: false,
             composing: false,
+            enter_sends: true,
             sessions_shown: true,
             context_shown: false,
             dark: false,
@@ -525,6 +547,23 @@ mod tests {
             destination: Destination::Chat,
             palette_open: false,
         }
+    }
+
+    #[test]
+    fn send_key_choice_is_explicit_and_cannot_change_during_composition_or_outside_chat() {
+        let mut s = state(RunState::Idle, true);
+        let command = Command::ToggleEnterSends;
+        assert_eq!(entry(command, &s).title, "Use Enter for newlines");
+        assert_eq!(entry(command, &s).checked, Some(true));
+        s.enter_sends = false;
+        assert_eq!(entry(command, &s).title, "Use Enter to send");
+        assert_eq!(entry(command, &s).checked, Some(false));
+        s.composing = true;
+        assert_eq!(entry(command, &s).disabled_reason, Some(COMPOSING));
+        s.has_composer = false;
+        assert_eq!(entry(command, &s).disabled_reason, Some(NO_COMPOSER));
+        assert!(keys(command).is_empty());
+        assert!(palette(&s).iter().any(|e| e.command == command));
     }
 
     #[test]

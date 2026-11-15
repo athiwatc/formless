@@ -129,6 +129,8 @@ Findings, measurements, the parity inventory and the open blockers are in
 [docs/desktop/phase0-findings.md](../../docs/desktop/phase0-findings.md).
 
 Current continuation evidence and remaining acceptance are recorded in
+[the send-key choice report](../../docs/desktop/composer-send-keys-20261115.md),
+[the remaining acceptance matrix](../../docs/desktop/acceptance-matrix-20261115.md),
 [the native Find shortcut report](../../docs/desktop/native-find-20261115.md),
 [the resource-copy follow-up](../../docs/desktop/resource-copy-20261115.md),
 [the isolated source-copy report](../../docs/desktop/source-copy-20261115.md),
@@ -300,7 +302,18 @@ is being streamed, and has Start, Earlier, Later and End controls when
 there is more. In the Sessions list, Up/Down move
 the selection and Enter opens it. In the composer, Enter is the primary
 action, Shift+Enter adds a line, Cmd/Ctrl+Enter is Queue during a Run.
-Composer actions are recorded in the status line and never sent.
+In fixture mode, composer actions are recorded in the status line and never sent.
+In daemon mode they retain the existing forecast/consent and acknowledgement
+path described above.
+
+Commands offers Use Enter for newlines / Use Enter to send. The default
+remains Enter for Send/Steer, Shift+Enter for a newline, and Cmd/Ctrl+Enter
+for Queue during a Run. In newline mode, Enter and Shift+Enter insert newlines,
+Cmd/Ctrl+Enter invokes Send/Steer, and Queue remains a separate button. The
+composer displays the current keys. Changing this per-window choice preserves
+the draft, selection and undo/redo; it survives Session switches but is not
+saved between launches. Finish active input-method composition before changing
+it. Open dialogs cannot be bypassed by the modified Enter chord.
 
 
 The Sessions destination is a read-only fixture directory, not Session

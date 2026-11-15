@@ -6825,12 +6825,16 @@ fn typed_transcript_structural_updates_preserve_a_scrolled_up_reading_anchor(
             .update(cx, |shell, cx| shell.show_session_snapshot(snapshot, cx))
             .unwrap();
         settle_frames(window, cx);
-        window.scroll(
-            "timeline-area",
-            ScrollDelta::Pixels(point(px(0.), px(1600.))),
-            cx,
-        );
-        settle_frames(window, cx);
+        // Wheel movement is clamped per event. Use two gestures so setup
+        // is well away from the tail even if the composer changes height.
+        for _ in 0..2 {
+            window.scroll(
+                "timeline-area",
+                ScrollDelta::Pixels(point(px(0.), px(1600.))),
+                cx,
+            );
+            settle_frames(window, cx);
+        }
         let area = window.find("timeline-area").bounds();
         let reading = (1..=100usize)
             .find(|seq| {
@@ -7280,6 +7284,222 @@ fn native_find_shortcut_keeps_modals_and_composition_owned_by_the_current_contro
         assert!(query.update(cx, |input, cx| input
             .marked_text_range(window, cx)
             .is_some()));
+        assert!(shell.read(cx).last_intent().is_none());
+    });
+}
+
+#[gpui_kit::test]
+fn composer_send_key_choice_keeps_exact_draft_and_survives_rebuilds(cx: &mut TestAppContext) {
+    let (handle, shell) = open(cx, WIDE, 20, 4);
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        window.input("first ไทย", cx);
+        let composer = shell.read(cx).composer().clone();
+        assert_eq!(
+            shell.update(cx, |shell, cx| shell.run_command(
+                Command::ToggleEnterSends,
+                window,
+                cx
+            )),
+            None
+        );
+        assert_eq!(shell.read(cx).composer().entity_id(), composer.entity_id());
+        window.render_frame(cx);
+        assert!(window
+            .find("composer-send-keys")
+            .value()
+            .unwrap()
+            .contains("Enter / Shift+Enter: newline"));
+        window.press("enter", cx);
+        window.press("shift-enter", cx);
+        assert_eq!(shell.read(cx).draft(cx).as_ref(), "first ไทย\n\n");
+        assert!(shell.read(cx).last_intent().is_none());
+        window.press(commands::composer_submit_key(), cx);
+        assert_eq!(
+            shell.read(cx).last_intent().unwrap().kind,
+            IntentKind::Send(SendMode::Send)
+        );
+        assert_eq!(shell.read(cx).draft(cx).as_ref(), "first ไทย\n\n");
+        let first = shell.read(cx).sidebar().active_id().unwrap().to_string();
+        window.click(session_row_id("fixture-session-7"), cx);
+        window.render_frame(cx);
+        assert!(
+            !shell
+                .update(cx, |shell, cx| shell.command_state(window, cx))
+                .enter_sends
+        );
+        window.click_at("region-composer", point(px(40.), px(20.)), cx);
+        window.input("steer", cx);
+        window.press(commands::composer_submit_key(), cx);
+        assert_eq!(
+            shell.read(cx).last_intent().unwrap().kind,
+            IntentKind::Send(SendMode::Steer)
+        );
+        assert_eq!(shell.read(cx).draft(cx).as_ref(), "steer");
+        window.click("composer-secondary", cx);
+        assert_eq!(
+            shell.read(cx).last_intent().unwrap().kind,
+            IntentKind::Send(SendMode::Queue)
+        );
+        shell.update(cx, |shell, cx| {
+            shell.run_command(Command::ToggleEnterSends, window, cx)
+        });
+        window.render_frame(cx);
+        window.click_at("region-composer", point(px(40.), px(20.)), cx);
+        window.press(commands::composer_submit_key(), cx);
+        assert_eq!(
+            shell.read(cx).last_intent().unwrap().kind,
+            IntentKind::Send(SendMode::Queue)
+        );
+        window.click(session_row_id(&first), cx);
+        window.render_frame(cx);
+        assert_eq!(shell.read(cx).draft(cx).as_ref(), "first ไทย\n\n");
+        assert!(
+            shell
+                .update(cx, |shell, cx| shell.command_state(window, cx))
+                .enter_sends
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn composer_send_key_choice_refuses_composition_and_modal_changes(cx: &mut TestAppContext) {
+    let (handle, shell) = open(cx, WIDE, 20, 4);
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        let composer = shell.read(cx).composer().clone();
+        let bounds = window.find_by_label("Message").bounds();
+        TestInput::new(ElementInputHandler::new(bounds, composer.clone()), window).compose_text(
+            None,
+            "にほんご",
+            None,
+            cx,
+        );
+        assert_eq!(
+            shell.update(cx, |shell, cx| shell.run_command(
+                Command::ToggleEnterSends,
+                window,
+                cx
+            )),
+            Some(commands::COMPOSING)
+        );
+        window.press(commands::composer_submit_key(), cx);
+        assert!(shell.read(cx).last_intent().is_none());
+        assert!(composer.update(cx, |input, cx| input
+            .marked_text_range(window, cx)
+            .is_some()));
+        composer.update(cx, |input, cx| input.unmark_text(window, cx));
+        window.press(palette_key(), cx);
+        window.render_frame(cx);
+        assert!(shell
+            .update(cx, |shell, cx| shell.run_command(
+                Command::ToggleEnterSends,
+                window,
+                cx
+            ))
+            .is_some());
+        assert!(
+            shell
+                .update(cx, |shell, cx| shell.command_state(window, cx))
+                .enter_sends
+        );
+        window.input("Use Enter for newlines", cx);
+        window.render_frame(cx);
+        window.press("enter", cx);
+        window.render_frame(cx);
+        assert!(window.try_find("palette").is_none());
+        assert!(
+            !shell
+                .update(cx, |shell, cx| shell.command_state(window, cx))
+                .enter_sends
+        );
+        assert_eq!(shell.read(cx).draft(cx).as_ref(), "にほんご");
+    });
+}
+
+#[gpui_kit::test]
+fn composer_send_key_choice_uses_one_existing_forecast_request_without_optimistic_send(
+    cx: &mut TestAppContext,
+) {
+    use formless_desktop::client::{Command as WireCommand, Update};
+    let (handle, shell) = open(cx, WIDE, 0, 0);
+    let sessions = daemon_view(cx, handle, &shell);
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        window.click(session_row_id(&sessions[0].id), cx);
+        let id = sessions[0].id.clone();
+        let generation = shell.read(cx).client_generation();
+        shell.update(cx, |shell, cx| {
+            shell.apply_client_update(
+                Update::Snapshot {
+                    generation,
+                    snapshot: replies::session_snapshot(
+                        &id,
+                        &serde_json::json!({"session":{"id":id},"running":false,"messages":[]}),
+                    )
+                    .unwrap(),
+                },
+                window,
+                cx,
+            );
+            shell.run_command(Command::ToggleEnterSends, window, cx);
+            shell.focus_section(PageSection::Composer, window, cx);
+            shell.take_client_commands();
+        });
+        window.render_frame(cx);
+        window.input("line", cx);
+        window.press("enter", cx);
+        window.input("next ไทย", cx);
+        assert!(shell
+            .update(cx, |shell, _| shell.take_client_commands())
+            .iter()
+            .all(|c| !matches!(
+                c,
+                WireCommand::Review { .. }
+                    | WireCommand::Intent(_)
+                    | WireCommand::CommitPrepared(_)
+            )));
+        window.press(commands::composer_submit_key(), cx);
+        let commands = shell.update(cx, |shell, _| shell.take_client_commands());
+        let reviews = commands
+            .iter()
+            .filter(|c| matches!(c, WireCommand::Review { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reviews.len(),
+            1,
+            "modified Enter must prepare exactly one action"
+        );
+        assert!(
+            matches!(reviews[0], WireCommand::Review { intent: formless_desktop::model::Intent::SendMessage { session_id, content, mode: SendMode::Send }, draft_basis, .. } if session_id == &id && content == "line\nnext ไทย" && content == draft_basis)
+        );
+        assert!(!commands
+            .iter()
+            .any(|c| matches!(c, WireCommand::Intent(_) | WireCommand::CommitPrepared(_))));
+        assert_eq!(shell.read(cx).draft(cx).as_ref(), "line\nnext ไทย");
+        assert_eq!(shell.read(cx).block_count(), 0);
+    });
+}
+
+#[gpui_kit::test]
+fn composer_send_key_choice_preserves_selection_and_existing_undo_redo(cx: &mut TestAppContext) {
+    let (handle, shell) = open(cx, WIDE, 20, 4);
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        window.input("original", cx);
+        shell.update(cx, |shell, cx| {
+            shell.run_command(Command::ToggleEnterSends, window, cx)
+        });
+        window.press(&chord("z"), cx);
+        assert_eq!(shell.read(cx).draft(cx).as_ref(), "");
+        window.press(&chord("shift-z"), cx);
+        assert_eq!(shell.read(cx).draft(cx).as_ref(), "original");
+        window.press("shift-left", cx);
+        shell.update(cx, |shell, cx| {
+            shell.run_command(Command::ToggleEnterSends, window, cx)
+        });
+        window.input("X", cx);
+        assert_eq!(shell.read(cx).draft(cx).as_ref(), "originaX");
         assert!(shell.read(cx).last_intent().is_none());
     });
 }

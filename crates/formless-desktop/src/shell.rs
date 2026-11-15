@@ -74,6 +74,7 @@ gpui_kit::actions!(
         ScrollInspectorPageDown,
         ShowCommands,
         FindLoadedText,
+        ComposerModifiedEnter,
         SelectPreviousCommand,
         SelectNextCommand,
         RunSelectedCommand,
@@ -174,11 +175,17 @@ pub fn bind_keys(cx: &mut App) {
                 | Command::SessionDetails
                 | Command::ToggleArchived
                 | Command::ToggleTheme
+                | Command::ToggleEnterSends
                 | Command::GoTo(_) => unreachable!("{command:?} has no global shortcut"),
             })
     });
     cx.bind_keys(global.collect::<Vec<_>>());
     cx.bind_keys([
+        KeyBinding::new(
+            commands::composer_submit_key(),
+            ComposerModifiedEnter,
+            Some("FormlessComposer > Input"),
+        ),
         KeyBinding::new("escape", CloseForecast, Some(FORECAST_CONTEXT)),
         KeyBinding::new("escape", CloseQuestions, Some(QUESTIONS_CONTEXT)),
         KeyBinding::new("escape", CloseSessionEditor, Some(SESSION_EDITOR_CONTEXT)),
@@ -756,6 +763,7 @@ pub struct Shell {
     search_notice: Option<&'static str>,
     block_copy_notice: Option<&'static str>,
     composer: Entity<TextareaState>,
+    enter_sends: bool,
     session_scroll: VirtualListScrollHandle,
     session_sizes: Rc<Vec<Size<Pixels>>>,
     sidebar_focus: FocusHandle,
@@ -794,7 +802,7 @@ impl Shell {
         sidebar.activate_selected();
 
         let timeline = cx.new(|cx| MessageScrollerState::new(blocks.len(), cx));
-        let (composer, composer_subscriptions) = Self::build_composer("", window, cx);
+        let (composer, composer_subscriptions) = Self::build_composer("", true, window, cx);
         // A resize can end an overlay (the panel docks again) or hide the
         // panel that holds focus.
         let mut subscriptions =
@@ -931,6 +939,7 @@ impl Shell {
                 can_browse_archived: false,
                 archived_included: false,
                 composing: false,
+                enter_sends: true,
                 sessions_shown: true,
                 context_shown: true,
                 dark: false,
@@ -972,6 +981,7 @@ impl Shell {
             search_notice: None,
             block_copy_notice: None,
             composer,
+            enter_sends: true,
             session_scroll: VirtualListScrollHandle::new(),
             session_sizes,
             sidebar_focus: cx.focus_handle(),
@@ -993,13 +1003,14 @@ impl Shell {
     /// routes its events and its changes to the shell.
     fn build_composer(
         text: &str,
+        enter_sends: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> (Entity<TextareaState>, [Subscription; 2]) {
         let composer = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .auto_grow(2, 8)
-                .submit_on_enter(true)
+                .submit_on_enter(enter_sends)
                 .placeholder("Message Formless")
                 .default_value(text.to_string())
         });
@@ -1015,6 +1026,12 @@ impl Shell {
                     shift: false,
                 } = event
                 {
+                    // In newline mode the kit inserted a newline already.
+                    // Modified Enter has its own scoped action, before the
+                    // kit's multiline handler can insert anything.
+                    if !this.enter_sends {
+                        return;
+                    }
                     let command = if *secondary {
                         Command::SendSecondary
                     } else {
@@ -1048,7 +1065,7 @@ impl Shell {
     ) {
         self.invalidate_forecast(cx);
         let had_focus = self.composer.focus_handle(cx).contains_focused(window, cx);
-        let (composer, subscriptions) = Self::build_composer(text, window, cx);
+        let (composer, subscriptions) = Self::build_composer(text, self.enter_sends, window, cx);
         self.composer = composer;
         self.composer_subscriptions = subscriptions;
         // An open overlay may be waiting to hand focus back to the composer
@@ -2685,6 +2702,7 @@ impl Shell {
             can_browse_archived: self.client.is_some(),
             archived_included: self.include_archived,
             composing,
+            enter_sends: self.enter_sends,
             sessions_shown: layout.sidebar != SidebarMode::Collapsed,
             context_shown: layout.inspector != InspectorMode::Hidden,
             dark: cx.theme().is_dark(),
@@ -2747,6 +2765,9 @@ impl Shell {
         {
             return Some("Confirm or cancel the open forecast first");
         }
+        if command == Command::ToggleEnterSends && self.background_inert(window) {
+            return Some("Close the open dialog before changing send keys");
+        }
         let state = self.command_state(window, cx);
         if let Some(reason) = commands::entry(command, &state).disabled_reason {
             // Other refusals are as silent as they always were, but a
@@ -2754,7 +2775,11 @@ impl Shell {
             // Send button or Enter can still be pressed while it runs: the
             // composer says why nothing was recorded.
             if reason == commands::COMPOSING {
-                self.composer_notice = Some(format!("Not sent: {reason}.").into());
+                self.composer_notice = Some(if command == Command::ToggleEnterSends {
+                    format!("Send keys unchanged: {reason}.").into()
+                } else {
+                    format!("Not sent: {reason}.").into()
+                });
                 cx.notify();
             }
             return Some(reason);
@@ -2780,6 +2805,14 @@ impl Shell {
             }
             Command::ToggleSessions => self.toggle_panel(Region::Sidebar, window, cx),
             Command::ToggleContext => self.toggle_panel(Region::Inspector, window, cx),
+            Command::ToggleEnterSends => {
+                self.invalidate_forecast(cx);
+                self.enter_sends = !self.enter_sends;
+                self.composer.update(cx, |composer, cx| {
+                    composer.set_submit_on_enter(self.enter_sends, cx)
+                });
+                cx.notify();
+            }
             Command::ToggleTheme => {
                 let next = if cx.theme().is_dark() {
                     ThemeMode::Light
@@ -4725,6 +4758,8 @@ impl Shell {
             .map(|_| button("composer-secondary", Command::SendSecondary, cx).outline());
         // Stop keeps its own fixed slot, apart from the primary action.
         let stop = button("composer-stop", Command::Stop, cx).danger();
+        let modified_enter = commands::shortcut_text(commands::composer_submit_key());
+        let primary_label = send_mode_label(self.commands.composer.primary);
         v_flex()
             .id("region-composer")
             .test_support()
@@ -4751,7 +4786,7 @@ impl Shell {
                         .child(div().id("abandon-anchor").pt_1().anchor_scroll(Some(self.abandon_anchor.clone())).child(button("run-abandon", Command::AbandonRun, cx).outline().track_focus(&self.abandon_focus))))
             }))
             .child(
-                div().id("composer-input-anchor").when(self.client_recovery.is_some(), |field| field.pt_1()).anchor_scroll(Some(self.composer_anchor.clone())).child(Textarea::new(&self.composer)
+                div().id("composer-input-anchor").key_context("FormlessComposer").when(self.client_recovery.is_some(), |field| field.pt_1()).anchor_scroll(Some(self.composer_anchor.clone())).child(Textarea::new(&self.composer)
                     .aria_label("Message")
                     .on_paste({
                         let shell = cx.entity();
@@ -4759,6 +4794,11 @@ impl Shell {
                     })
                     .w_full()),
             )
+            .child(readable("composer-send-keys", if self.enter_sends {
+                format!("Enter: {primary_label} · Shift+Enter: newline · {modified_enter}: Queue during a Run")
+            } else {
+                format!("Enter / Shift+Enter: newline · {modified_enter}: {primary_label} · Queue remains a separate button")
+            }).text_xs().text_color(cx.theme().muted_foreground))
             // A refusal or a change to the draft is announced as it appears.
             .children(self.composer_notice.clone().map(|notice| {
                 announced(div().id("composer-notice"))
@@ -5174,6 +5214,22 @@ impl Render for Shell {
                 cx,
             ))
             .on_action(Self::on_command::<ShowCommands>(Command::ShowCommands, cx))
+            .on_action(cx.listener(|this, _: &ComposerModifiedEnter, window, cx| {
+                if this.destination == Destination::Chat
+                    && !this.background_inert(window)
+                    && this.composer.focus_handle(cx).contains_focused(window, cx)
+                {
+                    this.run_command(
+                        if this.enter_sends {
+                            Command::SendSecondary
+                        } else {
+                            Command::Send
+                        },
+                        window,
+                        cx,
+                    );
+                }
+            }))
             .on_action(
                 cx.listener(|this, _: &FindLoadedText, window, cx| {
                     this.find_loaded_text(window, cx)
