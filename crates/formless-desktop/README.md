@@ -129,6 +129,7 @@ Findings, measurements, the parity inventory and the open blockers are in
 [docs/desktop/phase0-findings.md](../../docs/desktop/phase0-findings.md).
 
 Current continuation evidence and remaining acceptance are recorded in
+[the native Find shortcut report](../../docs/desktop/native-find-20261115.md),
 [the resource-copy follow-up](../../docs/desktop/resource-copy-20261115.md),
 [the isolated source-copy report](../../docs/desktop/source-copy-20261115.md),
 [the recorded usage report](../../docs/desktop/session-usage-20261115.md),
@@ -313,8 +314,11 @@ that transcript rather than relabeling it; an empty loaded snapshot is kept
 distinct from an unloaded one. No rename, archive, delete or daemon request
 is performed.
 
-Commands → Go to Search searches only finished text already loaded in this
-window, including Markdown source. It is literal, case-sensitive and
+Cmd+F on macOS or Ctrl+F elsewhere (also Commands → Go to Search) searches
+only finished text already loaded in this window, including Markdown source.
+The shortcut leaves open dialogs and active input-method composition alone.
+When Search is already open, it refocuses the query without resetting its
+text or selected result. It is literal, case-sensitive and
 non-overlapping, not a global-history or daemon search. The scope says
 shared synthetic fixture, loaded Session or not loaded. A query has at
 most 256 Unicode scalar values. At most 200 result positions are retained,

@@ -163,6 +163,7 @@ pub fn keys(command: Command) -> &'static [&'static str] {
         Command::FocusNextRegion => &["f6"],
         Command::FocusPreviousRegion => &["shift-f6"],
         Command::ShowCommands => &[primary!("shift-p")],
+        Command::GoTo(Destination::Search) => &[primary!("f")],
         Command::Send
         | Command::SendSecondary
         | Command::Stop
@@ -177,7 +178,7 @@ pub fn keys(command: Command) -> &'static [&'static str] {
 }
 
 /// Every command that has a global shortcut.
-pub const GLOBAL: [Command; 8] = [
+pub const GLOBAL: [Command; 9] = [
     Command::ToggleSessions,
     Command::ToggleContext,
     Command::IncreaseTextSize,
@@ -186,6 +187,7 @@ pub const GLOBAL: [Command; 8] = [
     Command::FocusNextRegion,
     Command::FocusPreviousRegion,
     Command::ShowCommands,
+    Command::GoTo(Destination::Search),
 ];
 
 /// A GPUI keystroke as people write it: `cmd-shift-p` is `⌘⇧P` on macOS and

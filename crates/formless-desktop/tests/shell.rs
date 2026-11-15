@@ -40,6 +40,7 @@ use formless_protocol::SendMode;
 use gpui_kit::base::test_support::texts;
 use gpui_kit::base::Root;
 use gpui_kit::test::{TestInput, TestQueryExt as _, TestWindowExt as _};
+use gpui_kit::EntityInputHandler as _;
 use gpui_kit::{
     point, px, size, App, AppContext as _, Bounds, ClipboardItem, ElementInputHandler, Entity,
     InputEvent as _, MouseMoveEvent, Pixels, Point, Role, ScrollDelta, ScrollEvent, Size,
@@ -7142,5 +7143,143 @@ fn resource_copy_details_rejects_queued_selection_refresh_navigation_and_modal_c
         assert!(shell.read(cx).resource_copy_target().is_none());
         assert!(!shell.update(cx, |shell, cx| shell
             .copy_resource_details(fresh, window, cx)));
+    });
+}
+
+#[gpui_kit::test]
+fn native_find_shortcut_opens_loaded_search_and_refocuses_without_losing_drafts_or_selection(
+    cx: &mut TestAppContext,
+) {
+    let find = commands::keys(Command::GoTo(Destination::Search))[0];
+    let (handle, shell) = open_blocks(
+        cx,
+        WIDE,
+        vec![TimelineBlock::new(
+            1,
+            BlockKind::User,
+            "needle needle".into(),
+        )],
+    );
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        window.input("unsent f", cx);
+        assert_eq!(shell.read(cx).destination(), Destination::Chat);
+        window.press(find, cx);
+        window.render_frame(cx);
+        assert_eq!(shell.read(cx).destination(), Destination::Search);
+        assert_eq!(
+            window.find_by_label("Search loaded transcript").focused(),
+            Some(true)
+        );
+        assert_eq!(shell.read(cx).draft(cx).as_ref(), "unsent f");
+        assert!(
+            command_entry(&shell, Command::GoTo(Destination::Search), window, cx)
+                .shortcut()
+                .is_some()
+        );
+        window.input("needle", cx);
+    });
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        assert_eq!(shell.read(cx).search_hits().len(), 2);
+        window.press("down", cx);
+        window.render_frame(cx);
+        let chosen = shell.read(cx).search_hits()[1];
+        assert_eq!(window.find(search_row_id(chosen)).selected(), Some(true));
+        shell.update(cx, |shell, cx| {
+            shell.focus_section(PageSection::Conversation, window, cx)
+        });
+        window.press(find, cx);
+        window.render_frame(cx);
+        assert_eq!(
+            window.find_by_label("Search loaded transcript").focused(),
+            Some(true)
+        );
+        assert_eq!(
+            shell.read(cx).search_query().read(cx).value().as_ref(),
+            "needle"
+        );
+        assert_eq!(window.find(search_row_id(chosen)).selected(), Some(true));
+        window.press("escape", cx);
+        window.render_frame(cx);
+        assert_eq!(shell.read(cx).destination(), Destination::Chat);
+        assert_eq!(shell.read(cx).draft(cx).as_ref(), "unsent f");
+        assert!(shell.read(cx).last_intent().is_none());
+    });
+}
+
+#[gpui_kit::test]
+fn native_find_shortcut_keeps_modals_and_composition_owned_by_the_current_control(
+    cx: &mut TestAppContext,
+) {
+    let find = commands::keys(Command::GoTo(Destination::Search))[0];
+    let (handle, shell) = open_blocks(
+        cx,
+        WIDE,
+        vec![TimelineBlock::new(1, BlockKind::User, "にほんご".into())],
+    );
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        let composer = shell.read(cx).composer().clone();
+        let bounds = window.find_by_label("Message").bounds();
+        TestInput::new(ElementInputHandler::new(bounds, composer.clone()), window).compose_text(
+            None,
+            "にほんご",
+            None,
+            cx,
+        );
+        window.press(find, cx);
+        assert_eq!(shell.read(cx).destination(), Destination::Chat);
+        assert!(composer.update(cx, |input, cx| input
+            .marked_text_range(window, cx)
+            .is_some()));
+        composer.update(cx, |input, cx| input.unmark_text(window, cx));
+        window.press(find, cx);
+        window.render_frame(cx);
+        let query = shell.read(cx).search_query().clone();
+        let bounds = window.find_by_label("Search loaded transcript").bounds();
+        TestInput::new(ElementInputHandler::new(bounds, query.clone()), window).compose_text(
+            None,
+            "にほんご",
+            None,
+            cx,
+        );
+        window.press(find, cx);
+        assert!(query.update(cx, |input, cx| input
+            .marked_text_range(window, cx)
+            .is_some()));
+        query.update(cx, |input, cx| input.unmark_text(window, cx));
+        window.press(palette_key(), cx);
+        window.render_frame(cx);
+        window.press(find, cx);
+        window.render_frame(cx);
+        assert!(window.try_find("palette").is_some());
+        window.press("escape", cx);
+        shell
+            .update(cx, |shell, cx| shell.view_block(1, window, cx))
+            .unwrap();
+        window.render_frame(cx);
+        window.press(find, cx);
+        assert!(shell.read(cx).viewer_rows().is_some());
+        window.press("escape", cx);
+        shell.update(cx, |shell, cx| {
+            shell.run_command(Command::GoTo(Destination::Sessions), window, cx)
+        });
+        window.render_frame(cx);
+        let query = shell.read(cx).directory_query().clone();
+        let bounds = window.find_by_label("Filter Sessions").bounds();
+        TestInput::new(ElementInputHandler::new(bounds, query.clone()), window).compose_text(
+            None,
+            "にほんご",
+            None,
+            cx,
+        );
+        window.press(find, cx);
+        assert_eq!(shell.read(cx).destination(), Destination::Sessions);
+        assert!(query.update(cx, |input, cx| input
+            .marked_text_range(window, cx)
+            .is_some()));
+        assert!(shell.read(cx).last_intent().is_none());
     });
 }

@@ -73,6 +73,7 @@ gpui_kit::actions!(
         ScrollInspectorPageUp,
         ScrollInspectorPageDown,
         ShowCommands,
+        FindLoadedText,
         SelectPreviousCommand,
         SelectNextCommand,
         RunSelectedCommand,
@@ -163,6 +164,7 @@ pub fn bind_keys(cx: &mut App) {
                 Command::FocusNextRegion => KeyBinding::new(key, FocusNextRegion, None),
                 Command::FocusPreviousRegion => KeyBinding::new(key, FocusPreviousRegion, None),
                 Command::ShowCommands => KeyBinding::new(key, ShowCommands, None),
+                Command::GoTo(Destination::Search) => KeyBinding::new(key, FindLoadedText, None),
                 Command::Send
                 | Command::SendSecondary
                 | Command::Stop
@@ -3879,6 +3881,27 @@ impl Shell {
         }
     }
 
+    /// Native Find opens only loaded-text Search. It must not replace a
+    /// dialog or move focus away while an input method owns preedit text.
+    fn find_loaded_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.background_inert(window) || self.command_state(window, cx).composing {
+            return;
+        }
+        if let Some(query) = self.browse_query(self.destination).cloned() {
+            if query.update(cx, |query, cx| {
+                query.marked_text_range(window, cx).is_some()
+            }) {
+                return;
+            }
+        }
+        if self.destination == Destination::Search {
+            self.search_query
+                .update(cx, |query, cx| query.focus(window, cx));
+        } else {
+            self.run_command(Command::GoTo(Destination::Search), window, cx);
+        }
+    }
+
     fn search_navigation_focused(&self, window: &Window, cx: &App) -> bool {
         self.conversation_focus.is_focused(window)
             || self.search_query.focus_handle(cx).is_focused(window)
@@ -5151,6 +5174,11 @@ impl Render for Shell {
                 cx,
             ))
             .on_action(Self::on_command::<ShowCommands>(Command::ShowCommands, cx))
+            .on_action(
+                cx.listener(|this, _: &FindLoadedText, window, cx| {
+                    this.find_loaded_text(window, cx)
+                }),
+            )
             .map(|shell| {
                 if reflowed {
                     shell
