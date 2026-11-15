@@ -149,3 +149,129 @@ async fn find_tools_and_the_background_check_flag_duplicates() {
         serde_json::json!(["file_read", "read_file"])
     );
 }
+
+#[test]
+fn acronym_name_similarity_retains_duplicate_threshold_and_reason() {
+    for (name, snake) in [
+        ("HTTPGetJson", "http_get_json"),
+        ("getHTTPResponse", "get_http_response"),
+    ] {
+        let a = tool(name, "", "{}", "return 1;");
+        let b = tool(snake, "", "{}", "return 2;");
+        let (score, reason) = similarity((&a.0, &a.1), (&b.0, &b.1));
+        assert!(
+            score >= formless_core::dupes::THRESHOLD,
+            "{name}: {score} {reason}"
+        );
+        assert!(reason.contains("similar names"));
+        assert_eq!(near_duplicates(&[a, b]).len(), 1);
+    }
+}
+
+#[test]
+fn comment_only_tool_copies_keep_the_identical_code_verdict() {
+    for (left, right) in [
+        (
+            "function run(i) { // don't retry\n return i.value; }",
+            "function run(i){ // different comment\nreturn  i.value ;}",
+        ),
+        (
+            "function run() { /* version one */ return 42; }",
+            "function run(){/* version two's note */return 42;}",
+        ),
+        (
+            r"function run() { const re = /'/g; return re.test('x'); }",
+            r"function run(){const re=/'/g;return re.test('x');}",
+        ),
+        (
+            r#"function run() { const re = /[\"']/g; return re.test('x'); }"#,
+            r#"function run(){const re=/[\"']/g;return re.test('x');}"#,
+        ),
+    ] {
+        let a = tool("first", "unrelated alpha", "{}", left);
+        let b = tool("second", "unrelated beta", "{}", right);
+        assert_eq!(
+            similarity((&a.0, &a.1), (&b.0, &b.1)),
+            (1.0, "identical code".into()),
+            "{left}"
+        );
+        assert_eq!(near_duplicates(&[a, b])[0].reason, "identical code");
+    }
+}
+
+#[test]
+fn literal_and_line_break_changes_are_not_identical_tools() {
+    for (left, right) in [
+        (
+            "function run(){return 'a b';}",
+            "function run(){return 'ab';}",
+        ),
+        (
+            "function run(){return /a b/g;}",
+            "function run(){return /ab/g;}",
+        ),
+        (
+            "function run(){return /ab/g;}",
+            "function run(){return /ab/i;}",
+        ),
+        (
+            "function run(){return `a b`;}",
+            "function run(){return `ab`; }",
+        ),
+        ("function run(){return 1;}", "function run(){return 2;}"),
+        ("function run(){return\n1;}", "function run(){return 1;}"),
+        (
+            "function run(){let a=1,b=2; a\n++b; return [a,b];}",
+            "function run(){let a=1,b=2; a++\nb; return [a,b];}",
+        ),
+    ] {
+        let a = tool("alpha", "", "{}", left);
+        let b = tool("beta", "", "{}", right);
+        let (score, reason) = similarity((&a.0, &a.1), (&b.0, &b.1));
+        assert!(score < 1.0, "{left}: {reason}");
+        assert!(!reason.contains("identical code"));
+    }
+}
+
+#[test]
+fn post_merge_debugger_regex_values_are_not_identical() {
+    let left = "function run(){let result=false;debugger\n/a b/.test('a b')&&(result=true);return result;}";
+    let right = left.replace("/a b/", "/a   b/");
+    let a = tool("alpha", "", "{}", left);
+    let b = tool("beta", "", "{}", &right);
+    let (score, reason) = similarity((&a.0, &a.1), (&b.0, &b.1));
+    assert!(
+        score < 1.0 && reason != "identical code",
+        "{score}: {reason}"
+    );
+}
+
+#[test]
+fn post_merge_numeric_boundaries_ignore_comments_and_layout() {
+    for (left, right) in [
+        (
+            "function run(){return 1..toString();}",
+            "function run(){return 1. /* note */ .toString();}",
+        ),
+        (
+            "function run(){return 0x1e+2;}",
+            "function run(){return 0x1e + 2;}",
+        ),
+        (
+            "function run(){return 1e+2.toString();}",
+            "function run(){return 1e+2 .toString();}",
+        ),
+        (
+            "function run(){return .5.toString();}",
+            "function run(){return .5 .toString();}",
+        ),
+    ] {
+        let a = tool("alpha", "", "{}", left);
+        let b = tool("beta", "", "{}", right);
+        assert_eq!(
+            similarity((&a.0, &a.1), (&b.0, &b.1)),
+            (1.0, "identical code".into()),
+            "{left}"
+        );
+    }
+}

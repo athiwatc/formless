@@ -5,7 +5,7 @@ use crate::input::InputLine;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::ops::Range;
 
-pub(crate) const HELP: &str = "Vim editing: i/a/I/A insert; Esc returns to Normal. h/j/k/l, w/b/e, W/B/E, 0/$, gg/G move. d/c/y + motion; dd/cc/yy operate on lines. iw/aw/iW/aW, quotes and ()/[]/{}/<> text objects. x deletes; p/P paste the private yank register; . repeats the last change. Counts 1–999; counted inserts repeat on Esc. Normal Esc stops a Run; editor Ctrl+S saves and Ctrl+Q cancels. List-view keys are unchanged.";
+pub(crate) const HELP: &str = "Vim editing: i/a/I/A insert; Esc returns to Normal. h/j/k/l, w/b/e, W/B/E, 0/$, gg/G move. d/c/y + motion; dd/cc/yy operate on lines. iw/aw/iW/aW, quotes and ()/[]/{}/<> text objects. x deletes; u undoes; p/P paste the private yank register; . repeats the last change. Counts 1–999; counted inserts repeat on Esc. Normal Esc stops a Run; editor Ctrl+S saves and Ctrl+Q cancels. List-view keys are unchanged.";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum Mode {
     Normal,
@@ -26,16 +26,30 @@ pub(crate) enum Outcome {
 }
 #[derive(Debug, Clone)]
 enum Command {
-    Operator(char, String, usize),
+    // The final flag preserves an explicitly supplied motion/operator count.
+    Operator(char, String, usize, bool),
     Insert(char, usize),
     Put(bool, String, bool, bool, usize),
     Delete(usize),
 }
 #[derive(Debug, Clone)]
+enum InsertEdit {
+    Key {
+        key: KeyEvent,
+        insertion: Option<Range<usize>>,
+    },
+    /// Own byte range before cursor snapping can include a neighbor.
+    Paste {
+        text: String,
+        insertion: Range<usize>,
+    },
+}
+#[derive(Debug, Clone)]
 struct Change {
+    edited: bool,
     literal: bool,
     command: Command,
-    edits: Vec<KeyEvent>,
+    edits: Vec<InsertEdit>,
 }
 #[derive(Debug, Default, Clone)]
 pub(crate) struct Vim {
@@ -63,23 +77,27 @@ impl Vim {
         if self.mode == Mode::Normal {
             self.apply(line, Command::Insert('i', 1));
         }
-        for c in text.replace("\r\n", "\n").replace('\r', "\n").chars() {
-            let key = if c == '\n' {
-                KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)
-            } else {
-                KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
-            };
-            insert_key(line, key, Surface::Editor);
-            self.inserting
-                .get_or_insert(Change {
-                    literal: line.is_literal(),
-                    command: Command::Insert('i', 1),
-                    edits: vec![],
-                })
-                .edits
-                .push(key);
-            self.inserting.as_mut().unwrap().literal = line.is_literal();
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        if text.is_empty() {
+            return;
         }
+        let changed = line.selection().is_none_or(|range| line[range] != text);
+        let start = line
+            .selection()
+            .map_or(line.cursor_byte(), |range| range.start);
+        let insertion = start..start + text.len();
+        // Snapping after each scalar can cross an existing neighbor joined by
+        // a Prepend/ZWJ/RI character and reorder later pasted characters.
+        line.insert_modal_paste(&text);
+        let change = self.inserting.get_or_insert(Change {
+            edited: false,
+            literal: line.is_literal(),
+            command: Command::Insert('i', 1),
+            edits: Vec::new(),
+        });
+        change.edits.push(InsertEdit::Paste { text, insertion });
+        change.literal = line.is_literal();
+        change.edited |= changed;
     }
 
     pub(crate) fn key(&mut self, line: &mut InputLine, key: KeyEvent, surface: Surface) -> Outcome {
@@ -88,7 +106,7 @@ impl Vim {
             if self.mode == Mode::Insert {
                 self.mode = Mode::Normal;
                 if let Some(change) = self.inserting.take() {
-                    if !change.edits.is_empty()
+                    if change.edited
                         || matches!(
                             change.command,
                             Command::Operator(..) | Command::Insert('o' | 'O', _)
@@ -121,17 +139,24 @@ impl Vim {
             return Outcome::Pass;
         }
         if self.mode == Mode::Insert {
-            let handled = insert_key(line, key, surface);
-            if handled {
+            let insertion = match key.code {
+                KeyCode::Char(c) if c != '\n' && line.selection().is_none() => {
+                    Some(line.cursor_byte()..line.cursor_byte() + c.len_utf8())
+                }
+                _ => None,
+            };
+            if let Some(changed) = insert_key(line, key, surface) {
                 self.inserting
                     .get_or_insert(Change {
+                        edited: false,
                         literal: line.is_literal(),
                         command: Command::Insert('i', 1),
                         edits: Vec::new(),
                     })
                     .edits
-                    .push(key);
+                    .push(InsertEdit::Key { key, insertion });
                 self.inserting.as_mut().unwrap().literal = line.is_literal();
+                self.inserting.as_mut().unwrap().edited |= changed;
                 return Outcome::Handled;
             }
             return Outcome::Pass;
@@ -149,6 +174,11 @@ impl Vim {
             KeyCode::Enter if surface == Surface::Editor => 'j',
             _ => return Outcome::Pass,
         };
+        if c == 'u' && self.pending.is_empty() {
+            line.undo();
+            normal_cursor(line);
+            return Outcome::Handled;
+        }
         if c == '?' && self.pending.is_empty() {
             return Outcome::Help;
         }
@@ -159,6 +189,7 @@ impl Vim {
         }
         self.pending.push(c);
         let (count, rest) = count_prefix(&self.pending);
+        let explicit_count = rest.len() != self.pending.len();
         if rest.is_empty() {
             return Outcome::Handled;
         }
@@ -168,8 +199,11 @@ impl Vim {
             if let Some(mut change) = self.last.clone() {
                 if let Some(count) = override_count {
                     match &mut change.command {
-                        Command::Operator(_, _, n)
-                        | Command::Insert(_, n)
+                        Command::Operator(_, _, n, explicit) => {
+                            *n = count;
+                            *explicit = true;
+                        }
+                        Command::Insert(_, n)
                         | Command::Put(_, _, _, _, n)
                         | Command::Delete(n) => *n = count,
                     }
@@ -211,6 +245,7 @@ impl Vim {
             );
             if self.apply(line, cmd.clone()) {
                 self.last = Some(Change {
+                    edited: false,
                     literal: line.is_literal(),
                     command: cmd,
                     edits: vec![],
@@ -228,11 +263,13 @@ impl Vim {
                 op,
                 motion.to_string(),
                 count.saturating_mul(motion_count).min(999),
+                explicit_count || tail.len() != motion.len(),
             );
             self.pending.clear();
             let changed = self.apply(line, cmd.clone());
             if changed && op != 'y' && self.mode != Mode::Insert {
                 self.last = Some(Change {
+                    edited: false,
                     literal: line.is_literal(),
                     command: cmd,
                     edits: vec![],
@@ -248,6 +285,7 @@ impl Vim {
             self.pending.clear();
             if self.apply(line, cmd.clone()) {
                 self.last = Some(Change {
+                    edited: false,
                     literal: line.is_literal(),
                     command: cmd,
                     edits: vec![],
@@ -257,7 +295,16 @@ impl Vim {
         }
         let motion = rest.to_string();
         self.pending.clear();
-        if let Some((target, _, _)) = motion_target(line, line.cursor_byte(), &motion, count) {
+        if motion == "j" || motion == "k" {
+            for _ in 0..count {
+                line.vertical(motion == "j");
+            }
+            normal_cursor(line);
+            return Outcome::Handled;
+        }
+        if let Some((target, _, _)) =
+            motion_target(line, line.cursor_byte(), &motion, count, explicit_count)
+        {
             line.set_modal_cursor(target);
             normal_cursor(line);
         }
@@ -287,6 +334,7 @@ impl Vim {
                 }
                 self.mode = Mode::Insert;
                 self.inserting = Some(Change {
+                    edited: false,
                     literal: line.is_literal(),
                     command: command.clone(),
                     edits: vec![],
@@ -364,10 +412,15 @@ impl Vim {
                 }
                 normal_cursor(line);
             }
-            Command::Operator(op, motion, count) => {
-                let Some((mut range, includes_last_line)) =
-                    operator_range(line, line.cursor_byte(), *op, motion, *count)
-                else {
+            Command::Operator(op, motion, count, explicit_count) => {
+                let Some((mut range, includes_last_line)) = operator_range(
+                    line,
+                    line.cursor_byte(),
+                    *op,
+                    motion,
+                    *count,
+                    *explicit_count,
+                ) else {
                     return false;
                 };
                 let linewise =
@@ -395,6 +448,7 @@ impl Vim {
                 if *op == 'c' {
                     self.mode = Mode::Insert;
                     self.inserting = Some(Change {
+                        edited: false,
                         literal: line.is_literal(),
                         command: command.clone(),
                         edits: vec![],
@@ -436,39 +490,150 @@ fn replay_edits(line: &mut InputLine, change: &Change, surface: Surface, skip_fi
         Command::Insert(_, count) => count,
         _ => 1,
     };
+    // A trailing Prepend/ZWJ/RI can snap the visible cursor past an old
+    // neighbor. Repeat a verified contiguous insertion as one payload, using
+    // only its own byte range for the already-applied first iteration.
+    if count > 1 && matches!(change.command, Command::Insert('i' | 'a' | 'I' | 'A', _)) {
+        if let Some((range, text)) = contiguous_paste_insert(&change.edits) {
+            let repeated = text.repeat(count);
+            if !skip_first {
+                line.insert_modal_paste(&repeated);
+                return;
+            }
+            if line.replace_modal_inserted(range, &text, &repeated) {
+                return;
+            }
+            // Navigation made the old insertion range ineligible. Keep the
+            // already-applied first copy and put remaining copies together
+            // at the current cursor, respecting its new undo boundary.
+            line.insert_modal_paste(&text.repeat(count - 1));
+            return;
+        }
+    }
     for n in usize::from(skip_first)..count {
         if n > 0 {
             if let Command::Insert(kind @ ('o' | 'O'), _) = change.command {
                 open_line(line, kind);
             }
         }
-        for key in &change.edits {
-            insert_key(line, *key, surface);
+        for edit in &change.edits {
+            match edit {
+                InsertEdit::Key { key, .. } => {
+                    let _ = insert_key(line, *key, surface);
+                }
+                InsertEdit::Paste { text, .. } => line.insert_modal_paste(text),
+            }
         }
     }
 }
 
-fn insert_key(line: &mut InputLine, key: KeyEvent, surface: Surface) -> bool {
-    match key.code {
-        KeyCode::Char(c) => line.insert_char(c),
-        KeyCode::Backspace => line.backspace(),
-        KeyCode::Delete => line.delete(),
-        KeyCode::Left => line.left(),
-        KeyCode::Right => line.right(),
-        KeyCode::Up => line.vertical(false),
-        KeyCode::Down => line.vertical(true),
-        KeyCode::Home => line.home(),
-        KeyCode::End => line.end(),
+/// Only straight, byte-contiguous insertions containing a bracketed paste.
+/// Motions/deletions and other editing keys retain their ordinary replay.
+fn contiguous_paste_insert(edits: &[InsertEdit]) -> Option<(Range<usize>, String)> {
+    if !edits
+        .iter()
+        .any(|edit| matches!(edit, InsertEdit::Paste { .. }))
+    {
+        return None;
+    }
+    let mut start = None;
+    let mut end = 0;
+    let mut text = String::new();
+    for edit in edits {
+        let (range, length) = match edit {
+            InsertEdit::Paste { text, insertion } => (insertion, text.len()),
+            InsertEdit::Key {
+                key:
+                    KeyEvent {
+                        code: KeyCode::Char(c),
+                        ..
+                    },
+                insertion: Some(range),
+            } => (range, c.len_utf8()),
+            _ => return None,
+        };
+        if range.end.checked_sub(range.start)? != length || start.is_some() && range.start != end {
+            return None;
+        }
+        start.get_or_insert(range.start);
+        end = range.end;
+        match edit {
+            InsertEdit::Paste { text: part, .. } => text.push_str(part),
+            InsertEdit::Key {
+                key:
+                    KeyEvent {
+                        code: KeyCode::Char(c),
+                        ..
+                    },
+                ..
+            } => text.push(*c),
+            _ => return None,
+        }
+    }
+    Some((start?..end, text))
+}
+
+/// Some records a handled key and whether it changed text. Motion keys remain
+/// in a genuine edit's replay, without making a movement-only visit a change.
+fn insert_key(line: &mut InputLine, key: KeyEvent, surface: Surface) -> Option<bool> {
+    let before_len = line.len();
+    let inserted = match key.code {
+        KeyCode::Char(c) => {
+            let mut bytes = [0; 4];
+            let text = c.encode_utf8(&mut bytes);
+            let changed = line.selection().is_none_or(|range| &line[range] != text);
+            line.insert_char(c);
+            changed
+        }
+        KeyCode::Backspace => {
+            line.backspace();
+            false
+        }
+        KeyCode::Delete => {
+            line.delete();
+            false
+        }
+        KeyCode::Left => {
+            line.left();
+            false
+        }
+        KeyCode::Right => {
+            line.right();
+            false
+        }
+        KeyCode::Up => {
+            line.vertical(false);
+            false
+        }
+        KeyCode::Down => {
+            line.vertical(true);
+            false
+        }
+        KeyCode::Home => {
+            line.home();
+            false
+        }
+        KeyCode::End => {
+            line.end();
+            false
+        }
         KeyCode::Enter
             if surface == Surface::Editor || key.modifiers.contains(KeyModifiers::SHIFT) =>
         {
-            line.newline()
+            let changed = line.selection().is_none_or(|range| &line[range] != "\n");
+            line.newline();
+            changed
         }
-        KeyCode::Tab if surface == Surface::Editor => line.insert_str("  "),
-        _ => return false,
-    }
-    true
+        KeyCode::Tab if surface == Surface::Editor => {
+            let changed = line.selection().is_none_or(|range| &line[range] != "  ");
+            line.insert_str("  ");
+            changed
+        }
+        _ => return None,
+    };
+    Some(inserted || line.len() != before_len)
 }
+
 fn count_prefix(s: &str) -> (usize, &str) {
     let end = s
         .char_indices()
@@ -505,7 +670,7 @@ fn normal_cursor(line: &mut InputLine) {
     let start = line_start(line, at);
     let end = line_end(line, at);
     if at == end && end > start {
-        line.set_modal_cursor(prev(line, end))
+        line.clamp_modal_cursor(prev(line, end))
     }
 }
 fn kind(g: &str, big: bool) -> u8 {
@@ -579,7 +744,25 @@ fn word_end(s: &str, mut at: usize, big: bool) -> usize {
     }
     at
 }
-fn motion_target(s: &str, at: usize, motion: &str, count: usize) -> Option<(usize, bool, bool)> {
+// One-based absolute line target, clamped to the last (possibly empty) line.
+fn numbered_line_start(s: &str, number: usize) -> usize {
+    let mut at = 0;
+    for _ in 1..number {
+        let end = line_end(s, at);
+        if end == s.len() {
+            break;
+        }
+        at = end + 1;
+    }
+    at
+}
+fn motion_target(
+    s: &str,
+    at: usize,
+    motion: &str,
+    count: usize,
+    explicit_count: bool,
+) -> Option<(usize, bool, bool)> {
     let mut to = at;
     let mut inclusive = false;
     let mut linewise = false;
@@ -616,15 +799,26 @@ fn motion_target(s: &str, at: usize, motion: &str, count: usize) -> Option<(usiz
         }
         "0" => to = line_start(s, at),
         "$" => {
-            to = line_end(s, at);
+            for _ in 1..count {
+                let end = line_end(s, to);
+                if end == s.len() {
+                    break;
+                }
+                to = end + 1;
+            }
+            to = line_end(s, to);
             inclusive = false
         }
         "gg" => {
-            to = 0;
+            to = numbered_line_start(s, count);
             linewise = true
         }
         "G" => {
-            to = line_start(s, s.len());
+            to = if explicit_count {
+                numbered_line_start(s, count)
+            } else {
+                line_start(s, s.len())
+            };
             linewise = true
         }
         "j" | "k" => {
@@ -648,6 +842,7 @@ fn operator_range(
     op: char,
     motion: &str,
     count: usize,
+    explicit_count: bool,
 ) -> Option<(Range<usize>, bool)> {
     if motion == op.to_string() {
         let start = line_start(s, at);
@@ -690,7 +885,7 @@ fn operator_range(
         }
         return Some((at..end, false));
     }
-    let (target, inclusive, linewise) = motion_target(s, at, motion, count)?;
+    let (target, inclusive, linewise) = motion_target(s, at, motion, count, explicit_count)?;
     if linewise {
         let start = line_start(s, at.min(target));
         let end = line_end(s, at.max(target));
@@ -854,6 +1049,226 @@ mod tests {
         (vim, line)
     }
     #[test]
+    fn composer_vim_vertical_goal_survives_separate_and_counted_motions() {
+        for (text, goal) in [
+            ("abcd\nx\nabcd", 3),
+            ("ab\n界界\nab", 1),
+            ("abcd\n\nabcd", 3),
+        ] {
+            for keys in ["jj", "2j"] {
+                let (mut vim, mut line) = normal(text);
+                line.set_modal_cursor(goal);
+                commands(&mut vim, &mut line, keys);
+                assert_eq!(
+                    line.cursor_byte(),
+                    text.rfind('\n').unwrap() + 1 + goal,
+                    "{keys} {text:?}"
+                );
+                commands(&mut vim, &mut line, "kk");
+                assert_eq!(line.cursor_byte(), goal);
+            }
+        }
+        let (mut vim, mut line) = normal("abcd\nx\nabcd");
+        line.set_modal_cursor(3);
+        commands(&mut vim, &mut line, "jhj");
+        assert_eq!(line.cursor_byte(), 7);
+    }
+
+    #[test]
+    fn counted_line_motion_unicode_and_operator_forms_keep_boundaries() {
+        let (mut v, mut l) = normal("👩‍💻\ne\u{301}\n中\n");
+        commands(&mut v, &mut l, "2$");
+        assert_eq!(l.cursor_byte(), "👩‍💻\n".len());
+        commands(&mut v, &mut l, "3G");
+        assert_eq!(l.cursor_byte(), "👩‍💻\ne\u{301}\n".len());
+        commands(&mut v, &mut l, "999G");
+        assert_eq!(l.cursor_byte(), l.len());
+        let (mut v, mut l) = normal("a\nb\nc\nd");
+        commands(&mut v, &mut l, "y2G");
+        assert_eq!(&*l, "a\nb\nc\nd");
+        assert_eq!(v.register, "a\nb\n");
+        commands(&mut v, &mut l, "d2$");
+        assert_eq!(&*l, "\nc\nd");
+        assert_eq!(v.register, "a\nb");
+        let (mut v, mut l) = normal("a\nb\nc\nd");
+        l.set_modal_cursor(4);
+        commands(&mut v, &mut l, "d1G");
+        assert_eq!(&*l, "d");
+        assert_eq!(v.register, "a\nb\nc\n");
+        for (change, expected) in [("dG", ""), ("d2G", "g")] {
+            let (mut v, mut l) = normal("a\nb\nc\nd");
+            commands(&mut v, &mut l, change);
+            l.set("e\nf\ng");
+            l.set_modal_cursor(0);
+            commands(&mut v, &mut l, ".");
+            assert_eq!(&*l, expected);
+        }
+    }
+
+    #[test]
+    fn counted_line_motions_target_absolute_lines_or_relative_end_on_both_surfaces() {
+        for surface in [Surface::Composer, Surface::Editor] {
+            for start in [0, 2, 4] {
+                for (keys, expected) in [
+                    ("G", 6),
+                    ("1G", 0),
+                    ("3gg", 4),
+                    ("99gg", 6),
+                    ("99G", 6),
+                    ("gg", 0),
+                    ("2$", (start + 2).min(6)),
+                ] {
+                    let (mut v, mut l) = normal("a\nb\nc\nd");
+                    l.set_modal_cursor(start);
+                    for c in keys.chars() {
+                        v.key(&mut l, key(c), surface);
+                    }
+                    assert_eq!(l.cursor_byte(), expected, "{surface:?} {keys} from {start}");
+                    assert_eq!(&*l, "a\nb\nc\nd");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn counted_line_operators_preserve_ranges_registers_and_explicit_dot_count() {
+        for keys in ["d2G", "2dG", "d2gg", "2dgg"] {
+            let (mut v, mut l) = normal("a\nb\nc\nd");
+            commands(&mut v, &mut l, keys);
+            assert_eq!(&*l, "c\nd", "{keys}");
+            assert_eq!(v.register, "a\nb\n");
+            assert!(v.register_linewise);
+            assert_eq!(l.cursor_byte(), 0);
+        }
+        let (mut v, mut l) = normal("a\nb\nc\nd");
+        commands(&mut v, &mut l, "2d2G");
+        assert_eq!(&*l, "");
+        assert_eq!(v.register, "a\nb\nc\nd");
+        let (mut v, mut l) = normal("a\nb\nc\nd");
+        commands(&mut v, &mut l, "dG");
+        l.set("e\nf\ng");
+        l.set_modal_cursor(0);
+        commands(&mut v, &mut l, "1.");
+        assert_eq!(&*l, "f\ng", "explicit dot count selects line one");
+        assert_eq!(v.register, "e\n");
+    }
+
+    #[test]
+    fn normal_u_undoes_on_both_surfaces_and_preserves_dot_and_register() {
+        use unicode_segmentation::UnicodeSegmentation;
+        for surface in [Surface::Composer, Surface::Editor] {
+            for command in ["x", "dw"] {
+                let (mut v, mut l) = normal("👩‍💻e\u{301} one two");
+                for c in command.chars() {
+                    v.key(&mut l, key(c), surface);
+                }
+                let edited = l.to_string();
+                let register = v.register.clone();
+                assert_ne!(edited, "👩‍💻e\u{301} one two");
+                v.key(&mut l, key('u'), surface);
+                assert_eq!(&*l, "👩‍💻e\u{301} one two");
+                assert_eq!(v.register, register);
+                assert!(l
+                    .grapheme_indices(true)
+                    .any(|(at, _)| at == l.cursor_byte()));
+                v.key(&mut l, key('.'), surface);
+                assert_eq!(&*l, edited);
+            }
+            let (mut v, mut l) = normal("");
+            assert_eq!(v.key(&mut l, key('u'), surface), Outcome::Handled);
+            assert_eq!(&*l, "");
+            assert_eq!(l.cursor_byte(), 0);
+            v.key(&mut l, key('i'), surface);
+            v.key(&mut l, key('u'), surface);
+            assert_eq!(&*l, "u", "Insert u remains typing");
+        }
+    }
+
+    #[test]
+    fn insert_noops_keep_prior_dot_change_on_both_surfaces() {
+        for surface in [Surface::Composer, Surface::Editor] {
+            for keys in [
+                vec![KeyCode::Backspace],
+                vec![KeyCode::Right, KeyCode::Home],
+                vec![KeyCode::End, KeyCode::Delete, KeyCode::Home],
+            ] {
+                let (mut v, mut l) = normal("a b c");
+                for c in "dwi".chars() {
+                    v.key(&mut l, key(c), surface);
+                }
+                for code in keys {
+                    v.key(&mut l, KeyEvent::new(code, KeyModifiers::NONE), surface);
+                }
+                v.key(
+                    &mut l,
+                    KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                    surface,
+                );
+                l.set_modal_cursor(0);
+                v.key(&mut l, key('.'), surface);
+                assert_eq!(&*l, "c", "{surface:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn real_insert_keeps_movements_and_empty_open_changes_remain_repeatable() {
+        let (mut v, mut l) = normal("ab");
+        commands(&mut v, &mut l, "iX");
+        for code in [KeyCode::Left, KeyCode::Right, KeyCode::Esc] {
+            v.key(
+                &mut l,
+                KeyEvent::new(code, KeyModifiers::NONE),
+                Surface::Composer,
+            );
+        }
+        commands(&mut v, &mut l, ".");
+        assert_eq!(&*l, "XXab");
+        for open in ["o", "O", "cw"] {
+            let (mut v, mut l) = normal("a b c");
+            commands(&mut v, &mut l, open);
+            v.key(
+                &mut l,
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                Surface::Composer,
+            );
+            let before = l.to_string();
+            commands(&mut v, &mut l, ".");
+            assert_ne!(&*l, before, "{open} must still repeat without Insert keys");
+        }
+    }
+
+    #[test]
+    fn combined_counted_delete_undo_noop_insert_and_dot_preserve_state() {
+        for surface in [Surface::Composer, Surface::Editor] {
+            let (mut v, mut l) = normal("a\nb\nc\nd");
+            for c in "d2G".chars() {
+                v.key(&mut l, key(c), surface);
+            }
+            assert_eq!(&*l, "c\nd");
+            v.key(&mut l, key('u'), surface);
+            assert_eq!(&*l, "a\nb\nc\nd");
+            v.key(&mut l, key('i'), surface);
+            v.key(
+                &mut l,
+                KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+                surface,
+            );
+            v.key(
+                &mut l,
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                surface,
+            );
+            v.key(&mut l, key('.'), surface);
+            assert_eq!(&*l, "c\nd");
+            assert_eq!(v.register, "a\nb\n");
+            assert!(v.register_linewise);
+            assert_eq!(l.cursor_byte(), 0);
+            assert_eq!(v.mode, Mode::Normal);
+        }
+    }
+
+    #[test]
     fn motions_and_operator_ranges_work_on_actual_multiline_input() {
         let (mut v, mut l) = normal("one two\nlast line");
         commands(&mut v, &mut l, "w");
@@ -979,6 +1394,196 @@ mod tests {
             l.is_empty(),
             "yank must not replace the previous delete for dot repeat"
         );
+    }
+
+    #[test]
+    fn bracketed_paste_and_replay_preserve_atomic_unicode_and_literal_controls() {
+        use unicode_segmentation::UnicodeSegmentation;
+        for surface in [Surface::Composer, Surface::Editor] {
+            for (original, at, pasted) in [
+                ("ab", 1, "\u{0600}X"),
+                ("👩💻", "👩".len(), "\u{200d}X"),
+                ("🇦🇧", 0, "🇨X"),
+                ("ab", 1, "dw\r\n\tX\rY"),
+            ] {
+                let (mut vim, mut line) = normal(original);
+                line.set_literal(surface == Surface::Editor);
+                line.set_modal_cursor(at);
+                let expected = format!(
+                    "{}{}{}",
+                    &original[..at],
+                    pasted.replace("\r\n", "\n").replace('\r', "\n"),
+                    &original[at..]
+                );
+                vim.paste(&mut line, pasted);
+                assert_eq!(&*line, expected, "{surface:?}: {pasted:?}");
+                assert!(
+                    line.cursor_byte() == line.len()
+                        || line
+                            .grapheme_indices(true)
+                            .any(|(at, _)| at == line.cursor_byte())
+                );
+                vim.key(
+                    &mut line,
+                    KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                    surface,
+                );
+                vim.key(&mut line, key('u'), surface);
+                assert_eq!(&*line, original);
+                line.set_modal_cursor(at);
+                vim.key(&mut line, key('.'), surface);
+                assert_eq!(&*line, expected, "replay {surface:?}: {pasted:?}");
+                vim.key(&mut line, key('u'), surface);
+                assert_eq!(&*line, original);
+            }
+        }
+    }
+
+    #[test]
+    fn counted_paste_after_mouse_uses_current_target_and_keeps_undo_and_dot() {
+        for surface in [Surface::Composer, Surface::Editor] {
+            for (original, target_prefix, target_suffix, payload) in [
+                ("abc", "ab", "c", "X\u{0600}"),
+                ("abc", "ab", "c", "👩\u{200d}"),
+                ("a🇦🇧", "a", "🇦🇧", "X🇨"),
+            ] {
+                let (mut vim, mut line) = normal(original);
+                for c in ['3', 'i'] {
+                    vim.key(&mut line, key(c), surface);
+                }
+                vim.paste(&mut line, payload);
+                line.mouse_cursor(payload.len() + target_prefix.len(), false);
+                vim.key(
+                    &mut line,
+                    KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                    surface,
+                );
+                assert_eq!(
+                    &*line,
+                    format!(
+                        "{payload}{target_prefix}{}{target_suffix}",
+                        payload.repeat(2)
+                    )
+                );
+                vim.key(&mut line, key('u'), surface);
+                assert_eq!(&*line, format!("{payload}{original}"));
+                vim.key(&mut line, key('.'), surface);
+                assert_eq!(
+                    &*line,
+                    format!(
+                        "{payload}{target_prefix}{}{target_suffix}",
+                        payload.repeat(3)
+                    )
+                );
+                vim.key(&mut line, key('u'), surface);
+                assert_eq!(&*line, format!("{payload}{original}"));
+                vim.key(&mut line, key('u'), surface);
+                assert_eq!(&*line, original);
+            }
+        }
+    }
+
+    #[test]
+    fn counted_paste_replay_keeps_trailing_joiners_and_owned_insertions_together() {
+        use unicode_segmentation::UnicodeSegmentation;
+        for surface in [Surface::Composer, Surface::Editor] {
+            for (original, at, pasted) in [
+                ("ab", 1, "X\u{0600}"),
+                ("ab", 1, "\u{0600}"),
+                ("💻", 0, "👩\u{200d}"),
+                ("🇦🇧", 0, "X🇨"),
+                ("ab", 1, "x\n\u{0600}"),
+            ] {
+                for split in [false, true] {
+                    for with_key in [false, true] {
+                        let (mut vim, mut line) = normal(original);
+                        line.set_modal_cursor(at);
+                        for c in ['3', 'i'] {
+                            vim.key(&mut line, key(c), surface);
+                        }
+                        if with_key {
+                            vim.key(&mut line, key('L'), surface);
+                        }
+                        if split {
+                            let last = pasted.char_indices().last().unwrap().0;
+                            vim.paste(&mut line, &pasted[..last]);
+                            vim.paste(&mut line, &pasted[last..]);
+                        } else {
+                            vim.paste(&mut line, pasted);
+                        }
+                        vim.key(
+                            &mut line,
+                            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                            surface,
+                        );
+                        let payload = format!("{}{pasted}", if with_key { "L" } else { "" });
+                        let expected = format!(
+                            "{}{}{}",
+                            &original[..at],
+                            payload.repeat(3),
+                            &original[at..]
+                        );
+                        assert_eq!(
+                            &*line, expected,
+                            "{surface:?}, {pasted:?}, split={split}, key={with_key}"
+                        );
+                        assert!(
+                            line.cursor_byte() == line.len()
+                                || line
+                                    .grapheme_indices(true)
+                                    .any(|(at, _)| at == line.cursor_byte())
+                        );
+                        vim.key(&mut line, key('u'), surface);
+                        assert_eq!(&*line, original);
+                        assert!(line.redo());
+                        assert_eq!(&*line, expected);
+                        assert!(line.undo());
+                        vim.key(&mut line, key('.'), surface);
+                        assert_eq!(&*line, expected);
+                        vim.key(&mut line, key('u'), surface);
+                        for c in ['2', '.'] {
+                            vim.key(&mut line, key(c), surface);
+                        }
+                        assert_eq!(
+                            &*line,
+                            format!(
+                                "{}{}{}",
+                                &original[..at],
+                                payload.repeat(2),
+                                &original[at..]
+                            )
+                        );
+                        vim.key(&mut line, key('u'), surface);
+                        assert_eq!(&*line, original);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn atomic_paste_keeps_surrounding_insert_keys_in_undo_and_dot() {
+        for surface in [Surface::Composer, Surface::Editor] {
+            let (mut vim, mut line) = normal("ab");
+            line.set_modal_cursor(1);
+            vim.key(&mut line, key('i'), surface);
+            vim.key(&mut line, key('L'), surface);
+            vim.paste(&mut line, "\u{0600}X");
+            vim.key(&mut line, key('R'), surface);
+            vim.key(
+                &mut line,
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                surface,
+            );
+            assert_eq!(&*line, "aL\u{0600}XRb");
+            vim.key(&mut line, key('u'), surface);
+            assert_eq!(&*line, "ab");
+            line.set_modal_cursor(1);
+            vim.key(&mut line, key('.'), surface);
+            assert_eq!(&*line, "aL\u{0600}XRb");
+            vim.key(&mut line, key('u'), surface);
+            assert_eq!(&*line, "ab");
+        }
     }
 
     #[test]

@@ -150,6 +150,7 @@ Without a secret, that step is skipped and the release still completes.
   `FORMLESS_FROM_SOURCE=1`).
 - Homebrew: `brew install athiwatc/tap/formless` (once the tap exists).
 - Winget: `winget install athiwatc.formless` (once submitted).
+- Windows manual ZIP: [verify and extract the matching release asset](../docs/windows-install.md); the PATH entry is the nested directory containing `formless.exe`.
 - Debian/Ubuntu: `sudo apt install ./formless_<version>_amd64.deb` from the
   release; Fedora/RHEL: `sudo dnf install ./formless-<version>.x86_64.rpm`.
 - Arch: `yay -S formless-bin` (AUR).

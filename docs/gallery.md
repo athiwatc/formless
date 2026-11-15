@@ -1,7 +1,8 @@
 # What can Formless do?
 
-Formless starts with no Tools. You ask for something; when the agent has no
-Tool for it, it writes one (a small JavaScript program with only the access
+A fresh install includes 25 built-in Tools and no starter domain Tools
+([the built-in set](../README.md#51-the-built-in-tools)). You ask for something;
+when the agent has no registry Tool for it, it writes one (a small JavaScript program with only the access
 it declares, see [Capabilities](capabilities.md)), uses it, and keeps it. The
 next similar request reuses that Tool, and the optimiser improves it over
 time. These examples show the kind of Tools that come out, and the commands
@@ -19,9 +20,16 @@ headless with `formless run "…"`.
    Paperwhite on these three sites and make a table." → reuses `fetch_page`
    and adds an `extract_price` Tool; the table is the answer.
 3. **Track a changelog.** "Every Monday at 9, tell me what's new in the
-   Rust release notes." → a scheduled job (`/jobs`, or `formless jobs add
-   --every "monday at 9am"`) that runs the same request weekly and delivers
-   the answer as a notification (`--notify`) or into a file (`--to-file`).
+   Rust release notes." → a scheduled job (`/jobs`, or the complete command
+   below) that runs the same request weekly. For notification delivery:
+
+   ```sh
+   formless jobs add "Tell me what's new in the Rust release notes" --every "monday at 9am" --notify
+   ```
+
+   For file delivery, replace `--notify` with
+   `--to-file "./rust-release-notes.txt"`. Delivery requires the daemon and
+   computer to be available when the job runs.
 
 ## Your repositories
 
@@ -105,6 +113,15 @@ headless with `formless run "…"`.
 15. **Plan a bigger task.** "Migrate this project from Jest to Vitest." The
     agent keeps a checklist pinned above the input (`update_plan`) and a
     "What I did" recap when it finishes.
+
+## Long conversations
+
+16. **Make room for the next task.** Inspect `/context`, then, when the Run
+    has ended, use `/compact Keep repository constraints and unresolved decisions`
+    to request a focused summary. `/compact` without a focus is also supported.
+    Summaries can omit details; review the result and failure notes. See the
+    [context guide](../README.md#context-and-compaction) and
+    [command reference](keys.md#session).
 
 ## Seeing what it built
 

@@ -313,6 +313,7 @@ fn hunk_tool_editor(app: &mut App) {
         mode: EditMode::Code,
     });
     app.editor_review = Some(EditorReview {
+        scroll: Default::default(),
         diff: "-old\n+new".into(),
         verdict: "Passes checks".into(),
         ok: true,
