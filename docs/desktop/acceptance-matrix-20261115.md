@@ -59,3 +59,9 @@ the sibling task evidence directory.
 Current-main local integration and the concrete remaining streaming contract are
 recorded in [the reconciliation report](stream-reconciliation-integration-20261115.md).
 A conflict-free local merge is not combined acceptance or publication approval.
+
+The later [headless completion report](headless-completion-gates-20261115.md)
+classifies checks that can run safely without the unresolved foreground action,
+records concrete model performance limits, and prepares integration with main
+`c410af9`. Package notice/determinism checks improve development evidence without
+clearing native, product-parity, performance or distribution acceptance.

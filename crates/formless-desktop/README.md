@@ -271,6 +271,8 @@ From this crate's directory, with tracked changes committed:
 
 ```sh
 python3 scripts/package-desktop.py --profile dev --offline --output /new/path/formless-package
+# Temporary-file checks only; no Cargo build or application launch.
+python3 -W error::ResourceWarning scripts/test_package_desktop.py
 ```
 
 The standard-library-only helper (Python 3.9+) builds the optional binary with
@@ -279,6 +281,13 @@ hashes, gathers Cargo dependency notices, and verifies the ZIP's executable
 against the built bytes. It refuses an existing output directory. Use
 `--allow-dirty` only for an explicitly marked development inspection; the
 record then says `dirty: true`. Omit `--offline` if dependencies are not cached.
+Clean-source commit and cleanliness checks run again after building and before
+publishing staged output. ZIP timestamps use the commit time in UTC and file
+modes are normalized, making archives repeatable for identical built bytes and
+inputs under the same ZIP toolchain. This does not establish reproducible Rust
+builds across hosts. Notice collection includes lowercase filenames and notices
+under embedded data/assets/fonts; each copied source path and hash is recorded.
+Collection is an inventory, not a complete licensing audit.
 
 macOS gets a `Formless Development.app`; Windows and Linux get a portable
 development directory. Each also gets a ZIP and SHA256SUMS. The helper never

@@ -6,12 +6,14 @@ native acceptance are separate gates. Existing output directories are refused.
 """
 
 import argparse
+import datetime
 import hashlib
 import json
 from pathlib import Path
 import plistlib
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -34,6 +36,48 @@ def write_json(path, value):
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def ensure_source(repository, commit, dirty, stage=None):
+    if run(["git", "rev-parse", "HEAD"], repository) != commit:
+        raise ValueError("source commit changed during packaging")
+    status = ["git", "status", "--porcelain", "--untracked-files=normal"]
+    if stage is not None:
+        try:
+            relative = stage.relative_to(repository)
+        except ValueError:
+            pass
+        else:
+            # An output inside the checkout creates our own untracked temp
+            # directory. Exclude only that exact owned directory, not its
+            # parent or unrelated new source files.
+            status += ["--", ".", ":(top,literal,exclude)" + relative.as_posix()]
+    if bool(run(status, repository)) != dirty:
+        raise ValueError("source cleanliness changed during packaging")
+
+
+def write_archive(bundle, executable, archive, epoch):
+    # Normalize ZIP timestamps/modes rather than recording staging mtimes.
+    # Reproducible archive bytes require the same built binary and inputs;
+    # this does not claim a reproducible Rust build across hosts/toolchains.
+    earliest = datetime.datetime(1980, 1, 1, tzinfo=datetime.timezone.utc).timestamp()
+    latest = datetime.datetime(2107, 12, 31, 23, 59, 58, tzinfo=datetime.timezone.utc).timestamp()
+    timestamp = datetime.datetime.fromtimestamp(max(earliest, min(latest, epoch)), datetime.timezone.utc)
+    date_time = (timestamp.year, timestamp.month, timestamp.day, timestamp.hour, timestamp.minute, timestamp.second // 2 * 2)
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as target:
+        for source in sorted(bundle.rglob("*")):
+            if source.is_symlink():
+                raise ValueError("symlink in staged bundle: " + source.name)
+            if not source.is_file():
+                continue
+            source.resolve().relative_to(bundle.resolve())
+            info = zipfile.ZipInfo(source.relative_to(bundle.parent).as_posix(), date_time)
+            info.create_system = 3
+            info.compress_type = zipfile.ZIP_DEFLATED
+            mode = 0o755 if source == executable else 0o644
+            info.external_attr = (stat.S_IFREG | mode) << 16
+            with source.open("rb") as contents, target.open(info, "w") as entry:
+                shutil.copyfileobj(contents, entry)
+
+
 def collect_notices(packages, built, destination):
     inventory = []
     for package in sorted(packages, key=lambda item: (item["name"], item["version"])):
@@ -41,30 +85,40 @@ def collect_notices(packages, built, destination):
             continue
         root = Path(package["manifest_path"]).parent.resolve()
         candidates = set()
-        for pattern in ("LICENSE*", "LICENCE*", "COPYING*", "NOTICE*"):
-            candidates.update(root.glob(pattern))
+        def notice(path):
+            return re.fullmatch(r"(?:licen[cs]e|copying|notice)(?:[-_.][A-Za-z0-9][A-Za-z0-9_.-]*)?", path.name, re.I)
+        candidates.update(path for path in root.iterdir() if notice(path))
+        # Embedded data/assets may carry a different licence from crate code
+        # (for example the protocol's pinned MPL Public Suffix List).
+        for name in ("data", "assets", "fonts"):
+            directory = root / name
+            if directory.is_dir() and not directory.is_symlink():
+                candidates.update(path for path in directory.rglob("*") if notice(path))
         if package.get("license_file"):
             candidates.add(root / package["license_file"])
         copied = []
+        sources = []
         for source in sorted(candidates):
             # Manifest paths and symlinks must not make packaging read files
             # outside a dependency's package root.
             if source.is_symlink() or not source.is_file():
                 continue
             try:
-                source.resolve().relative_to(root)
+                relative = source.resolve().relative_to(root)
             except ValueError:
                 continue
             if source.stat().st_size > 2 * 1024 * 1024:
                 raise ValueError("oversized dependency notice: " + source.name)
-            target = destination / (package["name"] + "-" + package["version"]) / source.name
+            target = destination / (package["name"] + "-" + package["version"]) / relative
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(source, target)
             copied.append(str(target.relative_to(destination)))
+            sources.append({"source": relative.as_posix(), "sha256": digest(target)})
         inventory.append({
             "name": package["name"], "version": package["version"],
             "license": package.get("license"), "repository": package.get("repository"),
             "notice_files": copied,
+            "notice_sources": sources,
         })
     return inventory
 
@@ -77,6 +131,7 @@ def package(args):
         raise ValueError("output already exists; choose a new directory: " + str(output))
     output.parent.mkdir(parents=True, exist_ok=True)
     commit = run(["git", "rev-parse", "HEAD"], repository)
+    epoch = int(run(["git", "show", "-s", "--format=%ct", commit], repository))
     dirty = bool(run(["git", "status", "--porcelain", "--untracked-files=normal"], repository))
     if dirty and not args.allow_dirty:
         raise ValueError("source changes exist; commit them or explicitly use --allow-dirty for a development bundle")
@@ -107,6 +162,7 @@ def package(args):
         raise ValueError("desktop build failed; no package published")
     if binary is None or not binary.is_file():
         raise ValueError("Cargo did not report the desktop executable")
+    ensure_source(repository, commit, dirty)
     with binary.open("rb") as source:
         magic = source.read(4)
     valid = {"macos": magic in (b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf", b"\xca\xfe\xba\xbe"),
@@ -153,20 +209,19 @@ def package(args):
                       "lockfile_sha256": digest(desktop / "Cargo.lock"), "build_command": command,
                       "distribution": "development only; no distribution signing performed",
                       "native_acceptance": False,
+                      "archive_timestamp_source": "git commit time, UTC, normalized to ZIP range/granularity",
                       "license_review": "Cargo dependency notices collected; manual asset/stdlib and distribution review still required",
                       "packages_without_notice_files": [p["name"] + "-" + p["version"] for p in inventory if not p["notice_files"]]}
         write_json(resources / "BUILD.json", provenance)
         archive = stage / ("formless-desktop-" + version + "-" + host + ".zip")
-        with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as target:
-            for source in sorted(bundle.rglob("*")):
-                if source.is_file():
-                    target.write(source, source.relative_to(stage).as_posix())
+        write_archive(bundle, executable, archive, epoch)
         with zipfile.ZipFile(archive) as target:
             if target.testzip() is not None:
                 raise ValueError("archive integrity check failed")
             if hashlib.sha256(target.read(executable.relative_to(stage).as_posix())).hexdigest() != provenance["binary_sha256"]:
                 raise ValueError("archive executable differs from built executable")
         (stage / "SHA256SUMS").write_text(digest(archive) + "  " + archive.name + "\n", encoding="ascii")
+        ensure_source(repository, commit, dirty, stage)
         output.mkdir()  # Refuse any output that appeared while the build ran.
         for source in stage.iterdir():
             source.rename(output / source.name)
