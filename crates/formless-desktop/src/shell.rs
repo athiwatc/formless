@@ -4566,6 +4566,7 @@ impl Shell {
         .h(self.scaled(220.))
         .track_scroll(&self.resource_scroll);
         let selected = page.and_then(|page| page.selected.and_then(|index| page.rows.get(index)));
+        let copy_target = self.resource_copy_target();
         let label = selected.map_or("Select an entry".into(), |row| {
             directory::visual_text(&row.label)
         });
@@ -4626,20 +4627,41 @@ impl Shell {
                             .small()
                             .label("Copy details")
                             .disabled(selected.is_none())
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                if let Some(row) = this
-                                    .resource_pages
-                                    .get(&this.destination)
-                                    .and_then(|p| p.selected.and_then(|i| p.rows.get(i)))
-                                {
-                                    cx.write_to_clipboard(ClipboardItem::new_string(
-                                        row.detail.clone(),
-                                    ));
+                            .tooltip("Copy the selected entry's complete returned JSON to the system clipboard. May contain private data.")
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                if let Some(target) = copy_target {
+                                    this.copy_resource_details(target, window, cx);
                                 }
                             })),
                     ),
             )
             .into_any_element()
+    }
+
+    /// The exact destination, page and selection shown by Copy details.
+    /// No JSON copy is retained in the callback while the user navigates.
+    pub fn resource_copy_target(&self) -> Option<(Destination, u64, usize)> {
+        let page = self.resource_pages.get(&self.destination)?;
+        let selected = page.selected?;
+        page.rows.get(selected)?;
+        Some((self.destination, page.revision, selected))
+    }
+
+    /// Refuse a queued click if refresh, selection or navigation replaced
+    /// the entry the user saw, or if a newer dialog owns interaction.
+    pub fn copy_resource_details(
+        &mut self,
+        target: (Destination, u64, usize),
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.background_inert(window) || self.resource_copy_target() != Some(target) {
+            return false;
+        }
+        let (destination, _, selected) = target;
+        let row = &self.resource_pages[&destination].rows[selected];
+        cx.write_to_clipboard(ClipboardItem::new_string(row.detail.clone()));
+        true
     }
 
     fn move_resource(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {

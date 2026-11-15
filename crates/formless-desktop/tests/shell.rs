@@ -7035,3 +7035,112 @@ fn block_copy_source_is_keyboard_reachable_at_minimum_size_and_two_hundred_perce
         );
     });
 }
+
+#[gpui_kit::test]
+fn resource_copy_details_rejects_queued_selection_refresh_navigation_and_modal_changes(
+    cx: &mut TestAppContext,
+) {
+    use formless_desktop::client::Update;
+    let (handle, shell) = open(cx, WIDE, 0, 0);
+    daemon_view(cx, handle, &shell);
+    step(cx, handle, |window, cx| {
+        let initial =
+            serde_json::json!([{"id":"a","text":"ไทย\r\n\t  "},{"id":"b","text":"private B"}]);
+        shell.update(cx, |shell, cx| {
+            shell.apply_client_update(
+                Update::Page {
+                    destination: Destination::Tools,
+                    result: Ok(initial.clone()),
+                },
+                window,
+                cx,
+            );
+            shell.run_command(Command::GoTo(Destination::Tools), window, cx);
+            shell.focus_section(PageSection::Conversation, window, cx);
+        });
+        window.render_frame(cx);
+        let first = shell.read(cx).resource_copy_target().unwrap();
+        cx.write_to_clipboard(ClipboardItem::new_string("sentinel".into()));
+        window.press("down", cx);
+        assert!(!shell.update(cx, |shell, cx| shell
+            .copy_resource_details(first, window, cx)));
+        let second = shell.read(cx).resource_copy_target().unwrap();
+        assert!(shell.update(cx, |shell, cx| shell
+            .copy_resource_details(second, window, cx)));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(
+                &cx.read_from_clipboard().unwrap().text().unwrap()
+            )
+            .unwrap(),
+            initial[1]
+        );
+        cx.write_to_clipboard(ClipboardItem::new_string("sentinel".into()));
+        shell.update(cx, |shell, cx| {
+            shell.apply_client_update(
+                Update::Page {
+                    destination: Destination::Tools,
+                    result: Ok(initial.clone()),
+                },
+                window,
+                cx,
+            )
+        });
+        assert!(!shell.update(cx, |shell, cx| shell
+            .copy_resource_details(first, window, cx)));
+        let fresh = shell.read(cx).resource_copy_target().unwrap();
+        shell.update(cx, |shell, cx| {
+            shell.apply_client_update(
+                Update::Page {
+                    destination: Destination::Settings,
+                    result: Ok(serde_json::json!({"config":{"text":"private settings"}})),
+                },
+                window,
+                cx,
+            );
+            shell.run_command(Command::GoTo(Destination::Settings), window, cx);
+        });
+        assert!(!shell.update(cx, |shell, cx| shell
+            .copy_resource_details(fresh, window, cx)));
+        shell.update(cx, |shell, cx| {
+            shell.run_command(Command::GoTo(Destination::Tools), window, cx)
+        });
+        window.press(palette_key(), cx);
+        window.render_frame(cx);
+        assert!(window.try_find("palette").is_some());
+        assert!(!shell.update(cx, |shell, cx| shell
+            .copy_resource_details(fresh, window, cx)));
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("sentinel".into())
+        );
+        window.press("escape", cx);
+        window.render_frame(cx);
+        // The current actual control still copies the complete original JSON.
+        window.click("copy-resource", cx);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(
+                &cx.read_from_clipboard().unwrap().text().unwrap()
+            )
+            .unwrap(),
+            initial[0]
+        );
+        shell.update(cx, |shell, cx| {
+            shell.apply_client_update(
+                Update::Page {
+                    destination: Destination::Tools,
+                    result: Err("unavailable".into()),
+                },
+                window,
+                cx,
+            )
+        });
+        assert!(shell.read(cx).resource_copy_target().is_none());
+        assert!(!shell.update(cx, |shell, cx| shell
+            .copy_resource_details(fresh, window, cx)));
+        // Changing Profile clears old resource identities, including a same destination.
+        shell.update(cx, |shell, cx| shell.connect_recording_daemon(cx));
+        assert!(shell.read(cx).resource_copy_target().is_none());
+        assert!(!shell.update(cx, |shell, cx| shell
+            .copy_resource_details(fresh, window, cx)));
+    });
+}

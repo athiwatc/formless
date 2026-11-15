@@ -27,7 +27,9 @@ in the directory; opening one shows restore details without activating a
 neighbour. Archive hides a Session and retains its history; running work
 continues. Restore returns it to the default list for explicit activation.
 Arrow keys browse resource entries; Copy details copies all returned fields
-as JSON. Loaded-text Search keeps its explicit Session scope.
+as JSON. A queued copy is bound to the displayed destination, page revision
+and selected entry; selection changes, refresh and open dialogs retire that
+action rather than copying a replacement entry. Loaded-text Search keeps its explicit Session scope.
 
 Profile Search is a separate command in the palette (Go to Profile Search).
 It explicitly searches persisted messages across the connected Profile,
@@ -127,6 +129,7 @@ Findings, measurements, the parity inventory and the open blockers are in
 [docs/desktop/phase0-findings.md](../../docs/desktop/phase0-findings.md).
 
 Current continuation evidence and remaining acceptance are recorded in
+[the resource-copy follow-up](../../docs/desktop/resource-copy-20261115.md),
 [the isolated source-copy report](../../docs/desktop/source-copy-20261115.md),
 [the recorded usage report](../../docs/desktop/session-usage-20261115.md),
 [the Session export report](../../docs/desktop/session-export-20261115.md),
