@@ -16,6 +16,7 @@ mod images;
 mod input;
 mod keys;
 mod links;
+mod list_paging;
 mod lists;
 mod markdown;
 mod mermaid;
@@ -1721,6 +1722,7 @@ struct App {
     run_tool_changes: Vec<ToolChange>,
     tool_idx: usize,
     tool_filter: lists::ListFilter,
+    list_page_rows: std::cell::Cell<[Option<usize>; 5]>,
     tool_detail: Option<ToolDetail>,
     /// The Metrics view's range (`METRIC_RANGES`), and per-Tool (calls,
     /// success rate) in it.
@@ -2092,6 +2094,7 @@ impl App {
             tool_idx: 0,
             run_tool_changes: Vec::new(),
             tool_filter: lists::ListFilter::default(),
+            list_page_rows: std::cell::Cell::new([None; 5]),
             tool_detail: None,
             metrics_range: 0,
             metrics_tools: Default::default(),
@@ -9771,11 +9774,6 @@ impl App {
         match self.view {
             View::Settings => self.settings_key(key),
             View::Search => match key.code {
-                KeyCode::Up => self.search_idx = self.search_idx.saturating_sub(1),
-                KeyCode::Down => {
-                    self.search_idx =
-                        (self.search_idx + 1).min(self.search_hits.len().saturating_sub(1))
-                }
                 KeyCode::Enter => {
                     if let Some(hit) = self.search_hits.get(self.search_idx).cloned() {
                         self.switch_session(hit.session_id.clone());
@@ -10583,6 +10581,20 @@ impl App {
     /// Vim-style movement in every list view (SPEC §10.5): j/k, g/G (or
     /// Home/End) and Ctrl+D/Ctrl+U by half a page; true when used.
     fn list_nav_key(&mut self, key: &KeyEvent) -> bool {
+        let editing = match self.view {
+            View::Sessions => self.session_filter.editing,
+            View::Tools => self.tool_filter.editing,
+            View::Proposals => self.proposal_filter.editing,
+            _ => false,
+        };
+        if editing && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) {
+            return true;
+        }
+        let plain = query::plain(key);
+        let ctrl = key.modifiers == KeyModifiers::CONTROL;
+        if !plain && !ctrl {
+            return false;
+        }
         let metrics = (self.view == View::Metrics).then(|| self.metrics_rows());
         let mut metrics_index = metrics
             .as_ref()
@@ -10593,27 +10605,35 @@ impl App {
             View::Tools => self.visible_tools().len(),
             View::Metrics => metrics.as_ref().unwrap().len(),
             View::Proposals => self.visible_proposals().len(),
+            View::Search => self.search_hits.len(),
             _ => return false,
         };
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let page = self.list_capacity(self.view);
         let idx = match self.view {
             View::Sessions => &mut self.session_idx,
             View::Proposals => &mut self.proposal_idx,
             View::Metrics => &mut metrics_index,
+            View::Search => &mut self.search_idx,
             _ => &mut self.tool_idx,
         };
         let last = len.saturating_sub(1);
-        let half = 10;
+        let half = (page / 2).max(1);
         *idx = match key.code {
-            KeyCode::Char('j') if !ctrl => (*idx + 1).min(last),
-            KeyCode::Char('k') if !ctrl => idx.saturating_sub(1),
-            KeyCode::Char('d') if ctrl => (*idx + half).min(last),
+            KeyCode::Char('j') if plain => idx.saturating_add(1).min(last),
+            KeyCode::Char('k') if plain => idx.saturating_sub(1),
+            KeyCode::Char('d') if ctrl => idx.saturating_add(half).min(last),
             KeyCode::Char('u') if ctrl => idx.saturating_sub(half),
-            KeyCode::Char('g') | KeyCode::Home => 0,
-            KeyCode::Char('G') | KeyCode::End => last,
+            KeyCode::Char('g') | KeyCode::Home if plain => 0,
+            KeyCode::Char('G') | KeyCode::End if plain => last,
+            KeyCode::PageUp if plain => idx.saturating_sub(page),
+            KeyCode::PageDown if plain => idx.saturating_add(page).min(last),
             // The Metrics view had no list keys of its own.
-            KeyCode::Down if self.view == View::Metrics => (*idx + 1).min(last),
-            KeyCode::Up if self.view == View::Metrics => idx.saturating_sub(1),
+            KeyCode::Down if plain && matches!(self.view, View::Metrics | View::Search) => {
+                idx.saturating_add(1).min(last)
+            }
+            KeyCode::Up if plain && matches!(self.view, View::Metrics | View::Search) => {
+                idx.saturating_sub(1)
+            }
             _ => return false,
         };
         if let Some(rows) = metrics {
@@ -16413,6 +16433,10 @@ fn draw_sessions(f: &mut Frame, area: Rect, app: &App) {
         &mut state,
     );
     clickable_rows(app, area, 0, state.offset(), count, Click::Session);
+    app.record_list_capacity(
+        View::Sessions,
+        count.min(area.height.saturating_sub(2) as usize),
+    );
 }
 
 fn draw_settings(f: &mut Frame, area: Rect, app: &App) {
@@ -16563,6 +16587,12 @@ fn draw_settings_form(f: &mut Frame, form: &settings::Form, color: bool) {
 }
 
 fn draw_search(f: &mut Frame, area: Rect, app: &App) {
+    app.record_list_capacity(
+        View::Search,
+        app.search_hits
+            .len()
+            .min(area.height.saturating_sub(2) as usize),
+    );
     let items: Vec<ListItem> = if app.search_hits.is_empty() {
         vec![ListItem::new(Line::styled(
             "No hits. /search to try again.",
@@ -16864,6 +16894,7 @@ fn model_metrics_pager(stats: &[formless_protocol::ModelStatInfo], color: bool) 
 }
 
 fn draw_metrics(f: &mut Frame, area: Rect, app: &App) {
+    app.record_list_capacity(View::Metrics, 0);
     let tools = app.metrics_rows();
     let selected = app.metrics_selection(&tools);
     let detail = app
@@ -17030,6 +17061,10 @@ fn draw_metrics(f: &mut Frame, area: Rect, app: &App) {
         let offset = state.table.offset();
         drop(state);
         let height = parts[0].height.saturating_sub(3) as usize;
+        app.record_list_capacity(
+            View::Metrics,
+            tools.len().saturating_sub(offset).min(height),
+        );
         for (index, tool) in tools.iter().enumerate().skip(offset).take(height) {
             clickable(
                 app,
@@ -17190,6 +17225,10 @@ fn proposal_status_style(color: bool, status: &str) -> Style {
 
 fn draw_proposals(f: &mut Frame, area: Rect, app: &App) {
     let visible = app.visible_proposals();
+    app.record_list_capacity(
+        View::Proposals,
+        visible.len().min(area.height.saturating_sub(3) as usize),
+    );
     let mut title = app.proposal_filter.title(
         "Prompt proposals",
         visible.len(),
@@ -17681,6 +17720,7 @@ fn module_detail_lines(d: &ModuleDetail, color: bool) -> Vec<Line<'static>> {
 }
 
 fn draw_tools(f: &mut Frame, area: Rect, app: &App) {
+    app.record_list_capacity(View::Tools, 0);
     let visible = app.visible_tools();
     let groups = lists::tool_groups(&app.tools, &app.tool_filter);
     let list_h = ((visible.len() + groups.len()).max(1) as u16 + 3)
@@ -17790,6 +17830,15 @@ fn draw_tools(f: &mut Frame, area: Rect, app: &App) {
         // Clicks select Tools; headers between them take rows too.
         let top = parts[0].y + 2;
         let height = parts[0].height.saturating_sub(3) as usize;
+        app.record_list_capacity(
+            View::Tools,
+            layout
+                .iter()
+                .skip(state.offset())
+                .take(height)
+                .filter(|row| row.is_ok())
+                .count(),
+        );
         for (k, r) in layout.iter().enumerate().skip(state.offset()).take(height) {
             if let Ok(p) = r {
                 clickable(
@@ -19268,6 +19317,7 @@ mod tests {
             tool_idx: 0,
             run_tool_changes: Vec::new(),
             tool_filter: lists::ListFilter::default(),
+            list_page_rows: std::cell::Cell::new([None; 5]),
             tool_detail: None,
             metrics_range: 0,
             metrics_tools: Default::default(),

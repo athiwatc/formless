@@ -4522,7 +4522,7 @@ run_tool = "network_policy"     # a registry Tool, or…
   changes, clamps when removed and scrolls into view. Enter loads the highlighted
   Tool's existing all-time detail; unrelated cached detail stays hidden behind
   an activation hint. Mouse rows use the same identity/order. General paging
-  keys and visible-capacity movement remain a separate concern (#1468).
+  keys and visible-capacity movement follow the list-key rules below.
 - **Bulk actions.** In the TUI Sessions view, Space marks rows (✓, with
   the count in the panel title) and Esc clears the marks. With marks:
   `a` archives them (or restores them if all are archived), `e` exports
@@ -4845,8 +4845,8 @@ undo, redo and replacements invalidate prior asynchronous editor previews.
   cycle list filters. Model, switcher and rollback result pickers support
   PgUp/PgDn and Home/End, clamped to matches, using their rendered row count
   (ten rows before the first draw). Rollback navigation disarms confirmation
-  and keeps its selected version visible. General main-list paging is separate
-  (#1468).
+  and keeps its selected version visible. Main-list paging follows the
+  per-view capacity rules below.
 - **Command palette.** Typing `/` at the start of the input opens a popup
   of commands with one-line descriptions, filtered fuzzily (exact prefixes
   first). ↑/↓ select, Tab completes, Enter runs. A command that still
@@ -4888,11 +4888,19 @@ undo, redo and replacements invalidate prior asynchronous editor previews.
   delete`). They come from a per-view key table with an importance rank,
   and narrow terminals show only the most important hints that fit.
   The table replaces the hand-written panel footers.
-- **List keys (TUI).** Every list view (Sessions, Tools, Metrics,
-  Proposals) takes ↑/↓ and j/k, g/G or Home/End for the first/last row,
-  and Ctrl+D/Ctrl+U for half a page. List views take no typed input, so
-  these don't conflict. In Proposals, `n` now generates a new proposal
-  (it was `g`).
+- **List keys (TUI).** Sessions, Tools, Metrics, Proposals and Search take
+  ↑/↓ and j/k, g/G or Home/End for the first/last row, PgUp/PgDn for a
+  page and Ctrl+D/Ctrl+U for half a page. A page uses the latest rendered
+  list/table body's selectable capacity, excluding borders, column headers,
+  Tool group headers and other split panels. Each view retains its own
+  capacity; resize is reflected after redraw. Before the first draw the
+  fallback is twenty items (ten for a half-page), clamped to the list.
+  Nonempty lists move by at least one item. While a list filter is being
+  edited, PgUp/PgDn are consumed without moving results, Ctrl+D is ignored,
+  Ctrl+U clears the query and printable characters remain query text. Other
+  modal/editor/pager handlers retain priority. Search Enter still opens the
+  selected message and Esc returns to Chat. In Proposals, `n` generates a
+  new proposal (it was `g`).
 - **Mouse (TUI).** While mouse capture is on: clicking a tab switches
   views, clicking a row in the Sessions, Tools or Proposals list selects
   it and a double-click opens it (as Enter), and clicking a tool call's
@@ -5246,6 +5254,13 @@ the TUI. Command-specific arguments and defaults are available through
 | `formless uninstall` | `--keep-data`, `--keep-binary`, `--yes` (alias `--force`) | Remove Formless, optionally retaining data or the binary. |
 | `formless update` | No action, `check`, or `--check`; `--json` | Show newer release notes and the applicable upgrade command; never rewrite the binary. |
 | `formless web` | `--port`, `--no-open`, `--stop` | Open, print a link for, or stop the local browser UI. |
+
+Human Session lists label the last recorded Run status and show stored tags,
+retaining the pin star and existing message preview/count. Empty replies are
+reported separately from an empty archive selection, which names the alternate
+list command and count. Static human `sessions show` includes stored archived,
+pinned, tags and last recorded Run status metadata; absent status is "not
+recorded". JSON and `--follow` retain their existing contracts.
 
 `formless metrics --since 7d --json` reads the three existing metrics reports
 with one checked UTC cutoff. Omit `--since` for all history. Tool rows use stored

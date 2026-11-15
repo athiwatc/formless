@@ -744,6 +744,13 @@ covers every visible root command, including `help`. Use `formless COMMAND --hel
 | `formless update` | No action, `check`, or `--check`; `--json` | Show newer release notes and the applicable upgrade command; never rewrite the binary. |
 | `formless web` | `--port`, `--no-open`, `--stop` | Open, print a link for, or stop the local browser UI. |
 
+Human Session lists label the last recorded Run status and show stored tags,
+retaining the pin star and existing message preview/count. Empty replies are
+reported separately from an empty archive selection, which names the alternate
+list command and count. Static human `sessions show` includes stored archived,
+pinned, tags and last recorded Run status metadata; absent status is "not
+recorded". JSON and `--follow` retain their existing contracts.
+
 `tools list --filter FILTER` selects one stored-state predicate: `not-retired`
 (including disabled Tools), `retired`, `failing` (known success rate below 0.8),
 `needs-attention`, `off` (disabled) or `pinned`. It combines by AND with
