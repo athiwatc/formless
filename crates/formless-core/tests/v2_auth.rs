@@ -641,7 +641,20 @@ fn newer_copy_wins_and_delete_reports_leftovers() {
     let text = stale.to_string().replace("second", "stale");
     stale = serde_json::from_str(&text).unwrap();
     std::fs::write(&file, stale.to_string()).unwrap();
-    let expect = if formless_core::auth::keychain_available() {
+    // This is a native-persistence test. Probe only the synthetic slot this
+    // fixture saved, never the application's shared availability-probe account.
+    let slot = file
+        .file_stem()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .strip_prefix("oauth_tokens-")
+        .unwrap();
+    let fixture_user = format!("oauth-tokens-{}-{slot}", paths.profile);
+    let native_copy = keyring::Entry::new("formless", &fixture_user)
+        .ok()
+        .and_then(|entry| entry.get_password().ok());
+    let expect = if native_copy.is_some() {
         "second"
     } else {
         "stale"

@@ -1000,6 +1000,7 @@ mod tests {
                 bytes: Some(bytes.to_vec()),
                 mode: Some(file.metadata().unwrap().file_attributes()),
                 windows_identity: Some(identity(&file).unwrap()),
+                unix_metadata: None,
                 ..Default::default()
             };
             (path, file, image)

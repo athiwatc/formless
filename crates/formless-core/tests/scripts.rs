@@ -345,3 +345,50 @@ fn a_scripts_step_tokens_are_split_over_the_tools_it_called() {
     assert_eq!((tokens(&a), tokens(&b)), (25, 25));
     assert_eq!(tokens(&nested), 0);
 }
+
+/// Division must not erase which local Tool a script calls from recurrence.
+#[tokio::test(flavor = "multi_thread")]
+async fn division_scripts_count_distinct_tool_calls_and_exact_repeats() {
+    let env = credential_env::EnvGuard::isolated();
+    for prefix in ["let count=4; count++", "const ratio={n:1}"] {
+        let mut cfg = Config::default();
+        cfg.naming.enabled = false;
+        cfg.scripts.recurrence_threshold = 2;
+        let (_paths, store, first, daemon) = setup(&env, "division-recur", cfg);
+        seed(&store, "first_tool", "function run(){ return 1; }", &[]);
+        seed(&store, "second_tool", "function run(){ return 2; }", &[]);
+        let run = |session: String, tool: &'static str| {
+            let daemon = daemon.clone();
+            let code = format!("{prefix} / 2; return await tools.{tool}({{n:1}});");
+            async move {
+                let out = script(
+                    &daemon,
+                    &session,
+                    json!({"code":code,"uses":["first_tool","second_tool"]}),
+                )
+                .await;
+                serde_json::from_str::<Value>(&out).unwrap()
+            }
+        };
+        let a = run(first, "first_tool").await;
+        assert_eq!(a["result"], 1, "{prefix}: {a}");
+        assert!(a.get("hint").is_none());
+        let second = store.create_session(None).unwrap().id;
+        let b = run(second, "second_tool").await;
+        assert_eq!(b["result"], 2, "{prefix}: {b}");
+        assert!(
+            b.get("hint").is_none(),
+            "different Tool was falsely counted as recurrence: {prefix}: {b}"
+        );
+        let third = store.create_session(None).unwrap().id;
+        let c = run(third, "second_tool").await;
+        assert_eq!(c["result"], 2, "{prefix}: {c}");
+        assert!(
+            c["hint"].as_str().unwrap().contains("2 sessions"),
+            "{prefix}: {c}"
+        );
+        let recurring = store.recurring_scripts(2, 5).unwrap();
+        assert_eq!(recurring.len(), 1, "{prefix}: {recurring:?}");
+        assert_eq!(recurring[0].0, 2);
+    }
+}
