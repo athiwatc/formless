@@ -109,7 +109,7 @@ under ignored `evidence/gpui-1753-sol/`.
 | `cargo test --features test-support,thai-breaks --test shell` | 135 passed; `metadata-ime-final-shell.log` |
 | `cargo test --no-default-features --features daemon-tests --test daemon` | 5 passed; `metadata-ime-final-daemon.log` |
 | `cargo test --all-features --doc` | Passed, zero doctests; `metadata-ime-final-doc.log` |
-| Strict clippy (`-- -D warnings`) | Passed: GUI-free lib, GUI/Thai lib + shell/render targets, ax-dump/Thai binary, daemon fixture. `metadata-ime-final-clippy-{model,gui,bin,daemon}.log`; 26 existing core dependency warnings remain. |
+| Strict clippy (`-- -D warnings`) | Passed: GUI-free lib/unit tests, GUI/Thai lib + shell/render targets, ax-dump/Thai binary, daemon fixture. `metadata-ime-final-clippy-{model,gui,bin,daemon}.log`; 26 existing core dependency warnings remain. |
 | Windows GNU GUI-free all-targets cross-check | Passed; `metadata-ime-final-windows-model.log`. No linking/native GUI execution. |
 | Native fonts/Metal offscreen renderer | 43 states / 75 captures; `metadata-ime-final-native.log`, PNGs in `metadata-ime-final-native/`. |
 | Formatting, whitespace, normal dependency isolation | Passed; `metadata-ime-final-{model,gui}-normal-tree.txt`. |
@@ -153,13 +153,33 @@ The full `2ecd8a7` shell run found a real regression: metadata's “Go to” gro
 made it match “go sessions” before navigation. `b19e296` gives it a Session
 group; the existing regression test and all 135 shell tests pass unchanged.
 Earlier captures/artifacts and failed logs are not substitutes for final checks.
+An initial oversized-composition case combined Save/Escape and assumed preedit
+would remain active; its assertion failed. The corrected case isolates the
+unmark/notification boundary, while Save/marked-text guards have separate
+coverage. The notification-observer fix and complete final checks include both.
 
-## Development artifact status
+## Fresh development artifact
 
-The earlier clean `b19e296` bundle and its static verification remain historical
-artifacts under `evidence/gpui-1753-sol/package-b19e296`. They do not validate
-the later composition fix. A fresh clean final-source artifact is recorded in
-the subsequent packaging evidence update; none has been launched or installed.
+The packager ran with ResourceWarning treated as an error, `--profile dev
+--offline`, output `evidence/gpui-1753-sol/package-3b739d2`, from clean
+`3b739d214e59fbc0eec965657b67013baca725e3`. Its only changes from tested
+`52a33ee` are README/report documentation; the implementation and tests match.
+
+- Binary SHA256:
+  `7e739ff6dafc76094639fce676facd6a3969e0e673e700c319f8e55519a6f045`.
+- ZIP SHA256:
+  `ac767b781301dadf5e924f337cb0eafb8fb19637892d7e533612a0d62a78092d`.
+- Plist identity, safe archive paths/types, integrity, executable mode/byte
+  identity and hashes passed; 655 archive files. Evidence:
+  `metadata-ime-final-package.log`, `metadata-ime-final-package-verification.json`.
+- 415 build packages / 649 notice files; 46 packages have no root notice file.
+  Manual licensing/assets/stdlib review remains.
+- Static inspection reports 21 system-library loads and linker ad-hoc signing,
+  no Team ID, unbound plist and no sealed resources. Nothing was installed or
+  launched; no distribution signing/notarization occurred.
+
+Earlier `2ecd8a7`/`b19e296` artifacts and verification remain historical and
+are not substitutes for this final composition-fix bundle.
 
 ## Remaining gates and blocked actions
 
