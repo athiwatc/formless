@@ -18440,7 +18440,13 @@ fn draw_editor_review(
         .partition_point(|&start| start <= top)
         .saturating_sub(1);
     let offset = top.saturating_sub(starts.get(first).copied().unwrap_or(0));
-    if offset <= u16::MAX as usize {
+    // Paragraph adds the viewport height and origin to its u16 row counter
+    // before subtracting scroll. Keep those intermediate sums in range too.
+    if offset
+        .saturating_add(height)
+        .saturating_add(inner.y as usize)
+        <= u16::MAX as usize
+    {
         f.render_widget(
             Paragraph::new(lines.into_iter().skip(first).collect::<Vec<_>>())
                 .wrap(Wrap { trim: false })
@@ -18448,7 +18454,7 @@ fn draw_editor_review(
             inner,
         );
     } else {
-        // One logical line can itself exceed Paragraph's u16 scroll range.
+        // One logical line or its visible window can exceed Paragraph's u16 range.
         // Reflow only this rare visible window with its matching word wrapper,
         // retaining usize row positions and the original grapheme styles.
         let mut visible = Vec::new();
@@ -23285,6 +23291,54 @@ mod tests {
             screen.contains('Q'),
             "later logical lines remain visible: {screen}"
         );
+    }
+
+    #[test]
+    fn editor_review_viewport_crossing_u16_boundary_renders_every_row() {
+        let ed = viewport_editor("function run() {}", 0);
+        for (offset, origin) in [
+            (65_525usize, 0),
+            (65_526, 0),
+            (65_527, 0),
+            (65_530, 0),
+            (65_535, 0),
+            (65_536, 0),
+            (65_526, 3),
+        ] {
+            let review = EditorReview {
+                scroll: std::cell::Cell::new(EditorReviewScroll {
+                    top: offset + 2, // verdict and blank logical lines
+                    rows: 0,
+                    height: 0,
+                }),
+                diff: "x".repeat(70_000),
+                verdict: "v".into(),
+                ok: true,
+            };
+            let backend = ratatui::backend::TestBackend::new(3, origin + 12);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal
+                .draw(|f| {
+                    draw_editor_review(
+                        f,
+                        Rect::new(0, origin, 3, 11),
+                        Rect::new(0, origin + 11, 3, 1),
+                        &ed,
+                        &review,
+                        false,
+                    )
+                })
+                .unwrap();
+            assert_eq!(review.scroll.get().height, 9);
+            assert_eq!(review.scroll.get().top, offset + 2);
+            for y in origin + 1..origin + 10 {
+                assert_eq!(
+                    terminal.backend().buffer()[(1, y)].symbol(),
+                    "x",
+                    "offset {offset}, row {y}"
+                );
+            }
+        }
     }
 
     #[test]
