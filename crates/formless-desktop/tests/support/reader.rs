@@ -485,6 +485,11 @@ fn lifecycle_status_invalidation_preserves_live_rows_draft_and_stream_basis(
             )
         });
         assert_eq!(state(shell.read(cx)), RunState::Running);
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("status-intent").value(),
+            Some("Connected · live reader validation · stored-message fallback")
+        );
         assert_eq!(shell.read(cx).live_stream_owner(), Some(current));
         assert_eq!(composer.read(cx).value().as_ref(), "Unsent ไทย 😀");
     });

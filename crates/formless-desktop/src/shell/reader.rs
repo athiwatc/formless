@@ -87,6 +87,10 @@ impl Shell {
         }
         self.client_steps = status.steps;
         self.client_recovery = status.unfinished_run;
+        if !self.client_snapshot_ready {
+            self.client_status =
+                "Connected · live reader validation · stored-message fallback".into();
+        }
         self.client_snapshot_ready = true;
         cx.notify();
     }
