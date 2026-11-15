@@ -98,3 +98,15 @@ uncertain launch/control are neither repeated nor bypassed. No writer or Claude
 session is controlled, and no remote branch/PR/main is modified. The new native
 controller and complete combined runtime/protocol range need independent review
 before any publication/integration.
+
+## Current-main local reconciliation
+
+The native implementation is preserved independently at
+`2428ca294b90059b313b470bcc7f87f3e15de551`. A separate local integration branch
+merges fetched main `afc89c1bb634bbae4df256eeb1af565ae4242432` without conflicts.
+Main adds stable-ID current-module snapshot reads and their focused storage
+checks. The merge changes no native Step implementation, desktop test, protocol,
+lockfile, manifest, packaging or notice content. Combined-head checks and source
+identity receipts are frozen separately from earlier logs; prior review of
+`144ab335` does not clear this controller or the complete combined runtime range.
+No remote publication or main/PR update accompanies this local merge.
