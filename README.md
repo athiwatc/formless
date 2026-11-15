@@ -712,7 +712,7 @@ covers every visible root command, including `help`. Use `formless COMMAND --hel
 | `formless docs` | Optional topic; `--text`, `--print`, `--keys` | Read bundled Markdown, open the current online guide (gallery by default), print its URL, or print the keyboard reference. |
 | `formless doctor` | `--json`, `--fix`, `--restore-drill` | Diagnose setup, apply safe fixes, or rehearse the newest backup. |
 | `formless export-all` | `--sessions`, `-o FILE` / `--output FILE` | Write a portable setup bundle, optionally including Session transcripts. |
-| `formless gc` | `--dry-run` | Free reclaimable storage or preview what would be freed. |
+| `formless gc` | `--dry-run`, `--json` | Free reclaimable storage or preview what would be freed. |
 | `formless help` | Optional command path, such as `sessions show` | Print help for the CLI or a nested command. |
 | `formless import-all` | `FILE` | Add a portable setup bundle without overwriting existing entries. |
 | `formless jobs` | `list`, `add`, `run`, `history`, `enable`, `disable`, `rm` | Manage scheduled prompts and inspect their history. |
@@ -743,6 +743,12 @@ covers every visible root command, including `help`. Use `formless COMMAND --hel
 | `formless uninstall` | `--keep-data`, `--keep-binary`, `--yes` (alias `--force`) | Remove Formless, optionally retaining data or the binary. |
 | `formless update` | No action, `check`, or `--check`; `--json` | Show newer release notes and the applicable upgrade command; never rewrite the binary. |
 | `formless web` | `--port`, `--no-open`, `--stop` | Open, print a link for, or stop the local browser UI. |
+
+`gc --json` prints the complete single daemon/offline result, including its
+`dry_run`, integer `total_bytes`, `kinds` and any extra details. Use
+`gc --dry-run --json` to preview without cleanup. Counts are core-reported values,
+not a promise of exact physical space reclaimed. JSON changes only presentation;
+retention, side effects, errors and human output remain unchanged.
 
 `sessions pin ID` and `sessions unpin ID` display the stored pin state returned
 by the daemon. `sessions tag ID` only reads tags; adding positional tags replaces
