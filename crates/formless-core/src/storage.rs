@@ -12,6 +12,10 @@ use std::path::{Path, PathBuf};
 #[path = "job_schedule_tests.rs"]
 mod job_schedule_tests;
 
+#[cfg(test)]
+#[path = "pin_batch_tests.rs"]
+mod pin_batch_tests;
+
 /// Token use for one key and model: (key, model, prompt, completion,
 /// cached, provider-reported USD when every request reported one).
 /// (key, provider, model, prompt, completion, cached, cache-write, reported cost).
@@ -1715,6 +1719,17 @@ impl Store {
             .optional()?)
     }
 
+    /// Fork source prefix, decoded within the existing fork transaction.
+    fn list_messages_up_to(&self, session_id: &str, limit: i64) -> Result<Vec<MessageInfo>> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT * FROM messages WHERE session_id=?1 AND seq<=?2 ORDER BY seq")?;
+        let rows = statement
+            .query_map(params![session_id, limit], Self::row_msg)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// Messages with `seq > after`, in order (incremental context builds).
     pub fn list_messages_after(&self, session_id: &str, after: i64) -> Result<Vec<MessageInfo>> {
         let mut stmt = self
@@ -1833,12 +1848,13 @@ impl Store {
         if self.session_deleted(id)? {
             return Ok(None);
         }
-        let limit = up_to_seq.unwrap_or(i64::MAX);
-        let messages: Vec<MessageInfo> = self
-            .list_messages(id)?
-            .into_iter()
-            .filter(|m| m.seq <= limit)
-            .collect();
+        // Decode only the requested prefix, inside this same transaction.
+        // Conversion errors in excluded later rows no longer abort a bounded
+        // fork; included rows still use the ordinary row_msg contract.
+        let messages = match up_to_seq {
+            Some(limit) => self.list_messages_up_to(id, limit)?,
+            None => self.list_messages(id)?,
+        };
         let point = messages.last().map(|message| message.seq).unwrap_or(0);
         let checkpoints: Vec<(String, String, i64)> = self.ps(
             "SELECT id,summary,up_to_seq FROM checkpoints WHERE session_id=?1 AND up_to_seq<=?2 ORDER BY up_to_seq,rowid"
@@ -3458,10 +3474,27 @@ impl Store {
     /// Forget the Anthropic thinking stored on a Session's tool-call turns
     /// (the endpoint rejected it): it is not replayed again.
     pub fn drop_thinking_blocks(&self, session_id: &str) -> Result<usize> {
+        // Collect before any writes, in the original sequence order. Keep id
+        // conversion strict and meta conversion-to-missing like row_msg.
+        // Unused message columns (including corrupt content) are no longer
+        // decoded; this deliberately narrows the corrupt-row error surface.
+        let messages = {
+            let mut statement = self
+                .conn
+                .prepare("SELECT id, meta FROM messages WHERE session_id=?1 ORDER BY seq")?;
+            let rows = statement
+                .query_map(params![session_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1).ok().flatten(),
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
         let mut changed = 0;
-        for m in self.list_messages(session_id)? {
-            let Some(mut meta) = m
-                .meta
+        for (id, metadata) in messages {
+            let Some(mut meta) = metadata
                 .as_deref()
                 .and_then(|s| serde_json::from_str::<Value>(s).ok())
             else {
@@ -3474,7 +3507,7 @@ impl Store {
             {
                 changed += self.ex(
                     "UPDATE messages SET meta=?3 WHERE session_id=?1 AND id=?2",
-                    params![session_id, m.id, meta.to_string()],
+                    params![session_id, id, meta.to_string()],
                 )?;
             }
         }
@@ -4738,6 +4771,49 @@ impl Store {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .ok())
+    }
+
+    /// Per-listing active snapshots for only the shown IDs. Decode errors in
+    /// an individual pin remain missing, like pinned_definition. SQL/iteration
+    /// errors propagate so the caller can retain the legacy per-Tool path.
+    pub(crate) fn pinned_definitions_for(
+        &self,
+        session_id: &str,
+        tool_ids: &[&str],
+    ) -> Result<std::collections::HashMap<String, (i64, String)>> {
+        let mut pins = std::collections::HashMap::new();
+        // Stay below SQLite's conservative parameter limit; no query for [].
+        for chunk in tool_ids.chunks(128) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql = format!(
+                "SELECT tool_id, pinned_version, pinned_def FROM session_tools
+                 WHERE session_id=? AND tool_id IN ({placeholders}) AND pinned_def IS NOT NULL"
+            );
+            let mut stmt = self.ps(&sql)?;
+            let rows = stmt.query_map(
+                rusqlite::params_from_iter(
+                    std::iter::once(session_id).chain(chunk.iter().copied()),
+                ),
+                |row| {
+                    let id: String = row.get(0)?;
+                    let pin = row
+                        .get::<_, i64>(1)
+                        .and_then(|version| {
+                            row.get::<_, String>(2)
+                                .map(|definition| (version, definition))
+                        })
+                        .ok();
+                    Ok((id, pin))
+                },
+            )?;
+            for row in rows {
+                let (id, pin) = row?;
+                if let Some(pin) = pin {
+                    pins.insert(id, pin);
+                }
+            }
+        }
+        Ok(pins)
     }
 
     /// Pinned definitions of a Session's Tools that are no longer active
@@ -8239,3 +8315,11 @@ mod recent_failure_order_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "fork_projection_tests.rs"]
+mod fork_projection_tests;
+
+#[cfg(test)]
+#[path = "thinking_metadata_tests.rs"]
+mod thinking_metadata_tests;

@@ -41,5 +41,5 @@ export function installHistoryFixture(context, fn) {
   // Intent fixtures omit diagram/layout DOM; real lifecycle runs in Chromium.
   context.refreshDiagrams ??= () => {};
   vm.runInContext('const historyRender = { session: undefined, turns: new Map(), live: null, welcome: null, banner: null };\n'
-    + ['reconcileChildren', 'updateText'].map(fn).join('\n'), context);
+    + ['reconcileChildren', 'updateText', 'sessionLoadNotice'].map(fn).join('\n'), context);
 }

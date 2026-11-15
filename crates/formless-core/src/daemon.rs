@@ -42,6 +42,109 @@ const CLIENT_QUEUE: usize = 4096;
 /// reading.
 const MAX_FRAME: usize = formless_protocol::MAX_FRAME_BYTES;
 
+/// Session-update recency, independent of list pin/archive grouping. This is
+/// not measured model-use history; equal stored timestamps use Session IDs.
+fn recent_session_models(sessions: &[SessionInfo]) -> Vec<String> {
+    let mut ordered: Vec<_> = sessions.iter().collect();
+    ordered.sort_by(|left, right| {
+        right
+            .updated_at
+            .cmp(&left.updated_at)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    let mut recent = Vec::new();
+    for session in ordered {
+        if let Some(model) = session.model.as_ref().filter(|model| !model.is_empty()) {
+            if !recent.contains(model) {
+                recent.push(model.clone());
+            }
+        }
+    }
+    recent
+}
+
+#[cfg(test)]
+mod recent_model_order_tests {
+    use super::*;
+
+    #[test]
+    fn recent_models_follow_session_updates_with_exact_membership_and_id_ties() {
+        let row = |id: &str, model: Option<&str>, time: &str, pinned: bool, archived: bool| {
+            serde_json::from_value::<SessionInfo>(json!({"id":id,"name":id,"model":model,
+                "created_at":"", "updated_at":time,"pinned":pinned,"archived":archived}))
+            .unwrap()
+        };
+        let sessions = vec![
+            row(
+                "pinned-old",
+                Some("pinned-old"),
+                "2026-01-01T00:00:00Z",
+                true,
+                false,
+            ),
+            row(
+                "older-shared",
+                Some("shared"),
+                "2026-01-02T00:00:00Z",
+                true,
+                false,
+            ),
+            row("z-tie", Some("tie-z"), "2026-01-03T00:00:00Z", false, false),
+            row("a-tie", Some("tie-a"), "2026-01-03T00:00:00Z", true, false),
+            row(
+                "m-tie",
+                Some("模型-ไทย"),
+                "2026-01-03T00:00:00Z",
+                false,
+                true,
+            ),
+            row(
+                "newer-unpinned",
+                Some("shared"),
+                "2026-01-04T00:00:00Z",
+                false,
+                false,
+            ),
+            row(
+                "newest-archived",
+                Some("archived-newest"),
+                "2026-01-05T00:00:00Z",
+                false,
+                true,
+            ),
+            row("empty", Some(""), "2026-01-07T00:00:00Z", false, false),
+            row("none", None, "2026-01-06T00:00:00Z", false, false),
+            row("space", Some(" "), "2025-01-01T00:00:00Z", false, true),
+        ];
+        let expected = [
+            "archived-newest",
+            "shared",
+            "tie-a",
+            "模型-ไทย",
+            "tie-z",
+            "pinned-old",
+            " ",
+        ];
+        let before = serde_json::to_value(&sessions).unwrap();
+        assert_eq!(recent_session_models(&sessions), expected);
+        assert_eq!(
+            serde_json::to_value(&sessions).unwrap(),
+            before,
+            "list order and fields stay untouched"
+        );
+        let reversed = sessions.into_iter().rev().collect::<Vec<_>>();
+        assert_eq!(recent_session_models(&reversed), expected);
+        assert!(recent_session_models(&[]).is_empty());
+        assert_eq!(
+            recent_session_models(&[
+                row("a", Some("Model"), "same", false, false),
+                row("b", Some("model"), "same", false, false)
+            ]),
+            ["Model", "model"]
+        );
+    }
+}
+
 /// A request's machine-readable classification is chosen at its failure
 /// site and survives anyhow context wrappers; wording never chooses a code.
 #[derive(Debug, thiserror::Error)]
@@ -3312,15 +3415,8 @@ impl Daemon {
                                "model": r.model})
                     })
                     .collect();
-                // Sessions come newest first; keep each model once.
-                let mut recent: Vec<String> = Vec::new();
-                for s in self.with_reader(|st| st.list_sessions())? {
-                    if let Some(m) = s.model.filter(|m| !m.is_empty()) {
-                        if !recent.contains(&m) {
-                            recent.push(m);
-                        }
-                    }
-                }
+                let sessions = self.with_reader(|st| st.list_sessions())?;
+                let recent = recent_session_models(&sessions);
                 Ok(json!({
                     "models": models,
                     "meta": meta,
@@ -16739,6 +16835,11 @@ pub fn credential_path(path: &std::path::Path) -> Option<&'static str> {
         }
     }
     let name = path.file_name()?.to_string_lossy().to_lowercase();
+    let env_template = formless_runtime::sensitive_paths::is_env_template_file(path)
+        && matches!(
+            formless_runtime::sensitive_paths::PathPolicy::default().classify(path, path),
+            Ok(formless_runtime::sensitive_paths::PathDecision::Ordinary)
+        );
     let secret_file = [
         ".netrc",
         ".npmrc",
@@ -16747,8 +16848,7 @@ pub fn credential_path(path: &std::path::Path) -> Option<&'static str> {
         ".git-credentials",
     ]
     .contains(&name.as_str())
-        || name == ".env"
-        || name.starts_with(".env.")
+        || ((name == ".env" || name.starts_with(".env.")) && !env_template)
         || name.starts_with("id_rsa")
         || name.starts_with("id_ed25519")
         || name.starts_with("id_ecdsa")
@@ -18803,3 +18903,7 @@ mod summary_search_handler_tests;
 #[cfg(test)]
 #[path = "model_text_failure_tests.rs"]
 mod model_text_failure_tests;
+
+#[cfg(test)]
+#[path = "daemon_provider_url_tests.rs"]
+mod provider_url_tests;
