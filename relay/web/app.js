@@ -5255,7 +5255,8 @@
   async function loadAudit(older) {
     const seq = ++auditSeq;
     const filter = S.auditFilter || null;
-    const before = older && S.audit && S.audit.length ? S.audit[S.audit.length - 1].created_at : null;
+    const last = older && S.audit && S.audit.length ? S.audit[S.audit.length - 1] : null;
+    const before = last ? (last.cursor || last.created_at) : null;
     const page = (await request({ type: "list_audit", filter, limit: 50, before }).catch(() => null)) || [];
     if (seq !== auditSeq || filter !== (S.auditFilter || null)) return;
     S.audit = older ? (S.audit || []).concat(page) : page;

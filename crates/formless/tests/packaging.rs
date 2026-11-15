@@ -157,6 +157,41 @@ fn sh() -> &'static str {
     }
 }
 
+// Only a direct property of this job counts, regardless of how many settings
+// precede it. Steps and neighboring jobs cannot satisfy the dependency.
+fn job_needs_version_check(workflow: &str, job: &str) -> bool {
+    let header = format!("  {job}:");
+    let mut lines = workflow.lines();
+    if !lines.any(|line| line == header) {
+        return false;
+    }
+    lines
+        .take_while(|line| {
+            line.trim().is_empty() || line.trim_start().starts_with('#') || line.starts_with("    ")
+        })
+        .any(|line| line.trim_end() == "    needs: version-check")
+}
+
+#[test]
+fn version_check_dependency_is_scoped_to_the_job() {
+    let settings = format!("    env:\n      LONG_SETTING: {}\n", "x".repeat(300));
+    let workflow = format!(
+        "jobs:\n  build:\n    needs: version-check\n  docker:\n{settings}    needs: version-check\n  publish:\n    needs: docker\n"
+    );
+    assert!(job_needs_version_check(&workflow, "docker"));
+    let missing = workflow.replace(&format!("{settings}    needs: version-check\n"), &settings);
+    assert!(!job_needs_version_check(&missing, "docker"));
+    assert!(!job_needs_version_check(
+        "jobs:\n  docker:\n    runs-on: ubuntu-latest\n  publish:\n    needs: version-check\n",
+        "docker"
+    ));
+    assert!(!job_needs_version_check(
+        "jobs:\n  docker:\n    # needs: version-check\n    steps:\n      - run: |\n          needs: version-check\n",
+        "docker"
+    ));
+    assert!(!job_needs_version_check(&workflow, "missing"));
+}
+
 /// A release whose tag is not the Cargo.toml version is refused before
 /// any build; the real tag for this tree passes (#842).
 #[cfg(unix)]
@@ -184,10 +219,9 @@ fn release_tags_must_match_the_cargo_version() {
 
     let release = std::fs::read_to_string(root().join(".github/workflows/release.yml")).unwrap();
     assert!(release.contains("scripts/release-check.sh \"$GITHUB_REF_NAME\""));
-    for job in ["build:", "linux:", "docker:"] {
-        let at = release.find(&format!("\n  {job}")).unwrap();
+    for job in ["build", "linux", "docker"] {
         assert!(
-            release[at..at + 200].contains("needs: version-check"),
+            job_needs_version_check(&release, job),
             "{job} waits for the check"
         );
     }
