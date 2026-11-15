@@ -1,5 +1,8 @@
 # Native Profile questions continuation
 
+Later Session editing, Step recovery characterization and fresh full-source
+checks are recorded in [the metadata report](session-metadata-20261115.md).
+
 Draft #2081 continues epic #1753 with native question forms. Security approvals
 still use Formless TUI. Streaming display remains disabled. Neither this
 increment nor its offscreen checks completes the epic.

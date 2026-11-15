@@ -91,6 +91,7 @@ Findings, measurements, the parity inventory and the open blockers are in
 [docs/desktop/phase0-findings.md](../../docs/desktop/phase0-findings.md).
 
 Current continuation evidence and remaining acceptance are recorded in
+[the Session metadata/Step report](../../docs/desktop/session-metadata-20261115.md),
 [the native question report](../../docs/desktop/native-questions-20261114.md),
 [the stream-ordering report](../../docs/desktop/stream-ordering-20261114.md),
 [the forecast report](../../docs/desktop/forecast-confirmation-20261114.md),
