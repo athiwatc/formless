@@ -21,14 +21,21 @@ pub(crate) fn used(
                 run_id: None,
                 session_id: Some(id.clone()),
             },
-            format!("Latest-Run memory report for Session {name} ({id})"),
+            format!(
+                "Latest-Run memory report for Session {} ({})",
+                crate::comparison_terminal_text(&name),
+                crate::comparison_terminal_text(&id)
+            ),
         ),
         Selector::Run(id) => (
             Request::RunMemories {
                 run_id: Some(id.clone()),
                 session_id: None,
             },
-            format!("Memory report for requested Run id {id}"),
+            format!(
+                "Memory report for requested Run id {}",
+                crate::comparison_terminal_text(&id)
+            ),
         ),
     };
     let value = fetch(request)?;
@@ -44,16 +51,24 @@ pub(crate) fn used(
         }
         for note in notes {
             let source = if let Some(session) = note["session_id"].as_str() {
-                format!("from session {session}")
+                format!("from session {}", crate::comparison_terminal_text(session))
             } else {
-                note["author"].as_str().unwrap_or_default().into()
+                crate::comparison_terminal_text(note["author"].as_str().unwrap_or_default())
             };
             text.push_str(&format!(
                 "{:<10} {:<8} {:<20} {}  ({source})\n",
-                note["id"].as_str().unwrap_or_default(),
+                crate::comparison_terminal_text(note["id"].as_str().unwrap_or_default()),
                 if note["enabled"] == true { "on" } else { "off" },
-                note["scope"].as_str().unwrap_or_default(),
-                note["text"].as_str().unwrap_or_default()
+                crate::comparison_terminal_text(note["scope"].as_str().unwrap_or_default()),
+                // Preserve note line breaks while applying the existing control policy
+                // to each line, including ESC/OSC, CR, C1 and bidi controls.
+                note["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .split('\n')
+                    .map(crate::comparison_terminal_text)
+                    .collect::<Vec<_>>()
+                    .join("\n")
             ));
         }
         text
@@ -150,5 +165,75 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.to_string(), "daemon failure");
         assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn human_reports_escape_terminal_controls_in_every_field_but_json_stays_exact() {
+        let unsafe_field = "ไทย\u{1b}[31m\u{1b}]52;c;payload\u{7}\u{9d}title\u{9c}\r\t\u{202e}";
+        let note_text = format!("first {unsafe_field}\nsecond 日本語\n");
+        let report = json!([
+            {"id":unsafe_field,"scope":unsafe_field,"text":note_text,"enabled":false,"session_id":unsafe_field,"author":"unused"},
+            {"id":"second","scope":"global","text":"normal","enabled":true,"session_id":null,"author":unsafe_field}
+        ]);
+        let visible = crate::comparison_terminal_text(unsafe_field);
+        for session_selector in [true, false] {
+            for json in [false, true] {
+                let selector = if session_selector {
+                    Selector::Session {
+                        id: unsafe_field.into(),
+                        name: unsafe_field.into(),
+                    }
+                } else {
+                    Selector::Run(unsafe_field.into())
+                };
+                let mut bytes = Vec::new();
+                used(
+                    selector,
+                    json,
+                    |request| {
+                        match request {
+                            Request::RunMemories {
+                                session_id: Some(id),
+                                run_id: None,
+                            } if session_selector => assert_eq!(id, unsafe_field),
+                            Request::RunMemories {
+                                run_id: Some(id),
+                                session_id: None,
+                            } if !session_selector => assert_eq!(id, unsafe_field),
+                            other => panic!("unexpected selector: {other:?}"),
+                        }
+                        Ok(report.clone())
+                    },
+                    &mut bytes,
+                )
+                .unwrap();
+                if json {
+                    assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), report);
+                } else {
+                    let text = String::from_utf8(bytes).unwrap();
+                    assert!(
+                        !text
+                            .chars()
+                            .any(|c| c != '\n' && crate::table::terminal_control(c)),
+                        "{text:?}"
+                    );
+                    assert!(text.contains(&format!("first {visible}\nsecond 日本語\n")));
+                    assert!(text.contains(&format!("from session {visible}")));
+                    assert!(text.contains(&format!("({visible})")));
+                    // Heading, note ID, scope, note text, source Session and author
+                    // all retain visible controls rather than emitting terminal actions.
+                    assert_eq!(
+                        text.matches(&visible).count(),
+                        if session_selector { 7 } else { 6 }
+                    );
+                    assert!(text.contains("\\u{1b}]52;c;payload\\u{7}"));
+                    if session_selector {
+                        assert!(text.contains(&format!("Session {visible} ({visible})")));
+                    } else {
+                        assert!(text.contains(&format!("requested Run id {visible}")));
+                    }
+                }
+            }
+        }
     }
 }
