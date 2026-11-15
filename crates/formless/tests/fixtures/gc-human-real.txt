@@ -1,0 +1,4 @@
+KIND       ITEMS  FREES      WHAT
+MCP logs   2      1.2 MB     รายละเอียด 日本語
+artifacts  0      9007.2 TB  stored metadata
+freed about 9007.2 TB
