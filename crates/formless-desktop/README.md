@@ -96,6 +96,15 @@ omitted field cannot acknowledge a default `false`, empty list or cleared value.
 Cancel and Reload discard unsaved metadata edits explicitly; neither undoes
 an already sent save. Errors retain the edit. A disconnect or ambiguous ACK
 freezes Save until an explicit fresh Reload; no mutation is replayed.
+Context now explicitly reads recorded Session usage for the open, loaded
+Session. It labels unavailable cost and omitted optional counters, and keeps
+small nonzero estimates nonzero. The reply is a past read: totals, last Run
+and the capped recent-Profile Run count are sampled separately. Copy usage
+contains the validated displayed projection only. This is not live billing
+or a current-context meter. Session/Profile changes, snapshot invalidation and
+connection loss retire results without replay; a newer snapshot in the same
+selection generation does not refresh usage. No provider request is issued.
+
 Session details also reads the existing persisted JSON bundle, Markdown or
 HTML export on explicit request. A bounded plain-text preview and Copy export
 are available up to 1 MiB; HTML source is never executed. Copy goes to the
@@ -118,6 +127,7 @@ Findings, measurements, the parity inventory and the open blockers are in
 [docs/desktop/phase0-findings.md](../../docs/desktop/phase0-findings.md).
 
 Current continuation evidence and remaining acceptance are recorded in
+[the recorded usage report](../../docs/desktop/session-usage-20261115.md),
 [the Session export report](../../docs/desktop/session-export-20261115.md),
 [the standing instructions report](../../docs/desktop/session-instructions-20261115.md),
 [the Profile Search report](../../docs/desktop/profile-search-20261115.md),
