@@ -44,22 +44,36 @@ pub fn path_and_line(word: &str) -> (&str, Option<u32>) {
 pub fn find_urls(text: &str) -> Vec<(usize, usize, String)> {
     let chars: Vec<char> = text.chars().collect();
     let s: String = chars.iter().collect();
+    let search = s.to_ascii_lowercase();
     let mut out = Vec::new();
     let mut from = 0;
-    while let Some(rel) = ["https://", "http://"]
+    while let Some((rel, prefix_len)) = ["https://", "http://"]
         .iter()
-        .filter_map(|p| s[byte_of(&chars, from)..].find(p))
-        .min()
+        .filter_map(|p| {
+            search[byte_of(&chars, from)..]
+                .find(p)
+                .map(|rel| (rel, p.len()))
+        })
+        .min_by_key(|(rel, _)| *rel)
     {
         let start = from + s[byte_of(&chars, from)..][..rel].chars().count();
         let end = url_end(&chars, start, run_end(&chars, start));
         let url: String = chars[start..end].iter().collect();
-        if url.len() > "https://".len() {
-            out.push((start, end, url));
+        if url.len() > prefix_len {
+            out.push((start, end, http_target(url)));
         }
         from = end.max(start + 1);
     }
     out
+}
+
+/// Normalize only the HTTP(S) scheme for terminal targets; visible text and
+/// the case-sensitive path, query, fragment and escapes stay unchanged.
+fn http_target(mut url: String) -> String {
+    if let Some(colon) = url.find(':') {
+        url[..colon].make_ascii_lowercase();
+    }
+    url
 }
 
 /// Path-looking words in a line, as (start char, end char exclusive,
@@ -207,6 +221,7 @@ pub fn scan(
                 let end = url_end(&joined, 0, joined.len());
                 joined[..end].iter().collect()
             };
+            let target = http_target(target);
             let mut left = target.chars().count();
             for &(r, pa, pb) in &pieces {
                 let n = (pb - pa).min(left);
@@ -403,6 +418,101 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn urls_use_the_matched_scheme_minimum() {
+        for url in [
+            "http://a",
+            "http://a/",
+            "https://a",
+            "https://a/",
+            "http://é",
+        ] {
+            let text = format!("日本 ({url}). next");
+            assert_eq!(
+                find_urls(&text),
+                vec![(4, 4 + url.chars().count(), url.into())]
+            );
+        }
+        for bare in ["http://", "https://", "http://.", "https://."] {
+            assert!(find_urls(bare).is_empty(), "{bare}");
+        }
+        assert_eq!(
+            find_urls("http://a https://b"),
+            vec![(0, 8, "http://a".into()), (9, 18, "https://b".into())]
+        );
+    }
+
+    #[test]
+    fn mixed_case_schemes_keep_text_offsets_and_target_remainders() {
+        let text = "日本 (HTTPS://Case.Example/A%2Fb?Token=AbC#Frag), HTTP://a HtTp://é.";
+        let got = find_urls(text);
+        let targets: Vec<_> = got.iter().map(|(_, _, url)| url.as_str()).collect();
+        assert_eq!(
+            targets,
+            [
+                "https://Case.Example/A%2Fb?Token=AbC#Frag",
+                "http://a",
+                "http://é"
+            ]
+        );
+        for ((start, end, _), original) in got.iter().zip([
+            "HTTPS://Case.Example/A%2Fb?Token=AbC#Frag",
+            "HTTP://a",
+            "HtTp://é",
+        ]) {
+            assert_eq!(
+                text.chars()
+                    .skip(*start)
+                    .take(end - start)
+                    .collect::<String>(),
+                original
+            );
+        }
+        for bare in [
+            "HTTP://",
+            "hTtPs://.",
+            "FTP://example.test",
+            "https:example.test",
+        ] {
+            assert!(find_urls(bare).is_empty(), "{bare}");
+        }
+        assert!(find_paths(text).is_empty());
+    }
+
+    #[test]
+    fn mixed_case_wrapped_links_paint_original_text_with_normalized_targets() {
+        let original = "HtTpS://Case.Example/Long/Path%2FCase?Token=AbC#Frag";
+        let target = "https://Case.Example/Long/Path%2FCase?Token=AbC#Frag";
+        let lines = crate::markdown::render(original, false, "", 24);
+        let area = Rect::new(0, 0, 24, lines.len() as u16);
+        let mut buf = Buffer::empty(area);
+        for (y, line) in lines.iter().enumerate() {
+            buf.set_line(0, y as u16, line, 24);
+        }
+        let links = scan(&buf, area, &mut |_| panic!("URL is not a file path"));
+        assert!(links.len() >= 2, "{links:?}");
+        assert!(links.iter().all(|link| link.url == target), "{links:?}");
+        assert_eq!(
+            links
+                .iter()
+                .map(|link| (link.x1 - link.x0 + 1) as usize)
+                .sum::<usize>(),
+            original.len()
+        );
+        let mut out = Vec::new();
+        paint(&mut out, &buf, &links).unwrap();
+        let painted = String::from_utf8(out).unwrap();
+        assert!(
+            painted.contains(&format!("\x1b]8;;{target}\x1b\\")),
+            "{painted:?}"
+        );
+        let visible: String = links
+            .iter()
+            .flat_map(|link| (link.x0..=link.x1).map(|x| buf[(x, link.y)].symbol()))
+            .collect();
+        assert_eq!(visible, original);
+    }
 
     #[test]
     fn finds_urls_without_trailing_punctuation() {

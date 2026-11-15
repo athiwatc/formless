@@ -48,10 +48,19 @@ fn assignment() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| {
         Regex::new(
-            r#"(?i)\b((?:password|passwd|pwd|passphrase|secret|client[_-]?secret|token|access[_-]?token|refresh[_-]?token|api[_-]?key|apikey|access[_-]?key|private[_-]?key|cookie|credentials?)"?(?:\s*[:=]\s*|\s+is\s+)["']?)([^\s"',;&<>]{4,})"#,
+            r#"(?i)\b((?:password|passwd|pwd|passphrase|secret|client[_-]?secret|token|access[_-]?token|refresh[_-]?token|api[_-]?key|apikey|access[_-]?key|private[_-]?key|cookie|credentials?)"?(\s*[:=]\s*|\s+is\s+)(["']?))([^\s"',;&<>]{4,})"#,
         )
         .expect("valid")
     })
+}
+
+/// Unquoted `is` also introduces ordinary English prose. Require a secret
+/// shape there; explicit delimiters and quotes retain conservative masking.
+/// A leading capital alone is ordinary sentence case.
+fn prose_secret(value: &str) -> bool {
+    value.chars().any(char::is_numeric)
+        || (value.chars().any(char::is_lowercase) && value.chars().skip(1).any(char::is_uppercase))
+        || word_kind(value).is_some()
 }
 
 fn configured() -> &'static RwLock<Vec<Regex>> {
@@ -195,7 +204,9 @@ pub fn redact(text: &str) -> (String, Option<&'static str>) {
         let mut any = false;
         out = assignment()
             .replace_all(&out, |c: &regex::Captures| {
-                if c[2].starts_with('[') {
+                let value = &c[4];
+                let explicit = c[2].contains([':', '=']) || !c[3].is_empty();
+                if value.starts_with('[') || (!explicit && !prose_secret(value)) {
                     return c[0].to_string();
                 }
                 any = true;
@@ -280,6 +291,72 @@ mod tests {
         }
         // Already redacted stays as it is.
         assert_eq!(redact("token=[REDACTED]").1, None);
+    }
+
+    #[test]
+    fn ordinary_is_prose_is_not_a_credential_assignment() {
+        for text in [
+            "The token is refreshed nightly",
+            "password is required before login",
+            "The secret is stored in the keychain",
+            "cookie is httponly",
+            "the passphrase is correct",
+            "The token IS Refreshed nightly",
+            "PASSWORD IS REQUIRED before login",
+            "tokenizer is faster",
+            "credential is optional",
+            "The secret\nis\nstored in the keychain",
+        ] {
+            assert_eq!(redact(text), (text.to_string(), None), "{text}");
+            assert_eq!(scan(text), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn explicit_and_secret_shaped_is_assignments_are_still_redacted() {
+        for (text, value) in [
+            ("my password is hunter2", "hunter2"),
+            ("password IS 123456", "123456"),
+            ("password is １２３４", "１２３４"),
+            ("the passphrase is hUnTeR", "hUnTeR"),
+            (
+                "token is sk-abcdefghijklmnopqrstuvwxyz",
+                "sk-abcdefghijklmnopqrstuvwxyz",
+            ),
+            (
+                "token is aB3dE5gH7jK9mN1pQ3sT5vW7yZ9bC1dF3h",
+                "aB3dE5gH7jK9mN1pQ3sT5vW7yZ9bC1dF3h",
+            ),
+            ("password is 'sunshine'", "sunshine"),
+            ("password is \"sunshine\"", "sunshine"),
+            ("token=refreshed", "refreshed"),
+            ("password: required", "required"),
+            (r#"{"client_secret": "stored"}"#, "stored"),
+            ("https://example.test/?token=correct&x=1", "correct"),
+        ] {
+            let (out, kind) = redact(text);
+            assert_eq!(kind, Some("credential"), "{text}: {out}");
+            assert!(!out.contains(value), "{text}: {out}");
+            assert!(out.contains(MARK), "{text}: {out}");
+            assert_eq!(scan(text), Some("credential"), "{text}");
+            assert_eq!(
+                redact(&out),
+                (out.clone(), None),
+                "redaction stays idempotent"
+            );
+        }
+    }
+
+    #[test]
+    fn known_values_still_mask_plain_words_in_is_prose() {
+        assert_eq!(
+            redact_known("password is sunshine", &["sunshine"]),
+            "password is [REDACTED]"
+        );
+        assert_eq!(
+            redact("password is [REDACTED]"),
+            ("password is [REDACTED]".into(), None)
+        );
     }
 
     #[test]

@@ -263,3 +263,168 @@ fn unsupported_arm_linux_names_prerequisites_before_any_download() {
     assert!(!fixture.dir.join("install-calls").exists());
     assert!(!fixture.dir.join("binary-calls").exists());
 }
+
+#[test]
+fn failed_or_empty_completions_keep_old_files_and_try_every_shell() {
+    for mode in ["failure", "empty"] {
+        let fixture = Fixture::new();
+        let paths = [
+            "share/bash-completion/completions/formless",
+            "share/zsh/site-functions/_formless",
+            "share/fish/vendor_completions.d/formless.fish",
+        ];
+        for path in paths {
+            let path = fixture.prefix.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "old completion\n").unwrap();
+        }
+        executable(
+            &fixture.dir.join("mock-formless"),
+            r#"#!/bin/sh
+printf '%s %s\n' "$1" "${2:-}" >> "$BINARY_CALLS"
+if [ "$2" = zsh ]; then
+  if [ "$FAIL_MODE" = failure ]; then printf 'partial output'; exit 9; fi
+  exit 0
+fi
+printf '# updated %s completion\n' "$2"
+"#,
+        );
+        let output = fixture
+            .command(Some("/bin/sh"))
+            .env("FAIL_MODE", mode)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("for: zsh"));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("Next: run formless"));
+        for (index, path) in paths.iter().enumerate() {
+            let path = fixture.prefix.join(path);
+            let text = std::fs::read_to_string(&path).unwrap();
+            if index == 1 {
+                assert_eq!(text, "old completion\n");
+            } else {
+                assert!(text.starts_with("# updated"));
+            }
+            assert_eq!(
+                std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+                1,
+                "temporary file leaked"
+            );
+        }
+        let calls = std::fs::read_to_string(fixture.dir.join("binary-calls")).unwrap();
+        assert!(
+            calls.contains("completions bash")
+                && calls.contains("completions zsh")
+                && calls.contains("completions fish")
+        );
+    }
+}
+
+#[test]
+fn optional_share_failures_keep_successful_binary_install_and_guidance() {
+    for (source, blocked) in [(true, "share"), (false, "share"), (false, "share/man")] {
+        let fixture = Fixture::new();
+        let block = fixture.prefix.join(blocked);
+        std::fs::create_dir_all(block.parent().unwrap()).unwrap();
+        std::fs::write(&block, "not a directory").unwrap();
+        let mut command = fixture.command(Some("/bin/sh"));
+        if !source {
+            let asset = "formless-v9.8.7-fixture-target.tar.gz";
+            let release = fixture.dir.join("release");
+            let folder = release.join("formless-v9.8.7-fixture-target");
+            std::fs::create_dir_all(&folder).unwrap();
+            std::fs::copy(fixture.dir.join("mock-formless"), folder.join("formless")).unwrap();
+            std::fs::write(folder.join("formless.1"), "fixture man page").unwrap();
+            let archive = fixture.dir.join(asset);
+            assert!(Command::new("tar")
+                .args(["-czf"])
+                .arg(&archive)
+                .arg("-C")
+                .arg(&release)
+                .arg("formless-v9.8.7-fixture-target")
+                .status()
+                .unwrap()
+                .success());
+            let hash = Command::new("shasum")
+                .args(["-a", "256"])
+                .arg(&archive)
+                .output()
+                .unwrap();
+            assert!(hash.status.success());
+            let sum = String::from_utf8(hash.stdout)
+                .unwrap()
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .to_owned();
+            std::fs::write(
+                fixture.dir.join(format!("{asset}.sha256")),
+                format!("{sum}  {asset}\n"),
+            )
+            .unwrap();
+            executable(
+                &fixture.dir.join("mock-bin/curl"),
+                r#"#!/bin/sh
+output=; url=
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = -o ]; then output="$2"; shift 2; else url="$1"; shift; fi
+done
+case "$url" in *.sha256) cp "$MOCK_ARCHIVE.sha256" "$output";; *) cp "$MOCK_ARCHIVE" "$output";; esac
+"#,
+            );
+            command
+                .env_remove("FORMLESS_FROM_SOURCE")
+                .env("FORMLESS_VERSION", "v9.8.7")
+                .env("FORMLESS_TARGET", "fixture-target")
+                .env("MOCK_ARCHIVE", archive);
+        }
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stdout.contains("installed:") && stdout.contains("Next: run formless"),
+            "{stdout}"
+        );
+        assert!(stderr.contains("note:"), "{stderr}");
+        assert!(fixture.prefix.join("bin/formless").is_file());
+        assert_eq!(std::fs::read_to_string(block).unwrap(), "not a directory");
+    }
+}
+
+#[test]
+fn zsh_discovery_hint_is_quoted_and_omitted_for_known_fpath() {
+    let fixture = Fixture::new();
+    let completion_dir = fixture.prefix.join("share/zsh/site-functions");
+    let text = fixture.success(
+        fixture
+            .command(Some("/bin/zsh"))
+            .env("FPATH", fixture.dir.join("unrelated"))
+            .output()
+            .unwrap(),
+    );
+    assert!(
+        text.contains("before compinit") && text.contains("fpath=("),
+        "{text}"
+    );
+    assert!(
+        text.contains("quote'\\''s"),
+        "literal single quote must be escaped: {text}"
+    );
+    let text = fixture.success(
+        fixture
+            .command(Some("/bin/zsh"))
+            .env(
+                "FPATH",
+                format!("/other:{}:/more", completion_dir.display()),
+            )
+            .output()
+            .unwrap(),
+    );
+    assert!(
+        !text.contains("fpath=("),
+        "directory is already discoverable: {text}"
+    );
+    let text = fixture.success(fixture.command(Some("/bin/bash")).output().unwrap());
+    assert!(text.contains("XDG_DATA_HOME/XDG_DATA_DIRS"), "{text}");
+}

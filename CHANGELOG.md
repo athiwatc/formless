@@ -5,7 +5,7 @@ All notable changes to Formless are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## Unreleased
 
 ### Added
 
@@ -13,6 +13,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from its first release onward.
 
 ### Changed
+
+- Cron day fields now follow Cronie’s leading-wildcard rule, including
+  `*/N` and mixed lists beginning with `*`. This changes future computed
+  matches and previews for affected existing expressions (for example,
+  `*/1` now has the same day-field flag as `*`); stored expressions are
+  not rewritten.
 
 - `.gitignore` now ignores local agent scratch state (`.opencode/`) and
   automation screenshots (`.screenshots/`), so generated files stop showing up
@@ -29,7 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the description of the shipped system prompt quotes the built-ins it
   actually names.
 
-## [0.1.0] - 2026-10-30
+## 0.1.0 - 2026-10-30
 
 The first release. Formless is a general-purpose agent harness that boots with
 a single bootstrap Tool and grows the rest of its capabilities on demand: a
@@ -347,5 +353,3 @@ clients of it.
   setting descriptions; `/docs` in the CLI; `doctor --json` and `bug-report`
   documented.
 
-[Unreleased]: https://github.com/athiwatc/formless/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/athiwatc/formless/releases/tag/v0.1.0
