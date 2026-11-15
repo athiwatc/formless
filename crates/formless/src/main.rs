@@ -4,6 +4,7 @@ mod cli_commands;
 #[cfg(test)]
 mod cli_help_tests;
 mod cli_mcp_prompts;
+mod cli_mcp_test;
 mod cli_metrics;
 mod cli_models;
 mod cli_modules;
@@ -7332,23 +7333,8 @@ fn mcp_cmd(paths: Paths, action: McpAction) -> Result<()> {
             println!("{name}: {tool} is {}", if on { "on" } else { "off" });
         }
         McpAction::Test { name, json } => {
-            let r = daemon(Request::RestartMcpServer { name: name.clone() })?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&r)?);
-            } else {
-                println!("server:  {name}");
-                report(&r);
-            }
-            std::io::stdout().flush()?;
-            match r.get("error") {
-                Some(Value::String(_)) => std::process::exit(1),
-                Some(Value::Null)
-                    if r["restarted"].as_str() == Some(name.as_str())
-                        && r["tools"].as_u64().is_some() => {}
-                _ => bail!(
-                    "invalid MCP restart reply for '{}'",
-                    comparison_terminal_text(&name)
-                ),
+            if !cli_mcp_test::run(&name, json, daemon, &mut std::io::stdout().lock())? {
+                std::process::exit(1);
             }
         }
         McpAction::Login { server } => {
