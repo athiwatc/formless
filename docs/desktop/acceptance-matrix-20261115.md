@@ -101,3 +101,10 @@ floor even for ignored idle Delta/Closed frames. Repeated or decreasing future
 cursors fail closed before a delayed Start can revive a prefix; see
 [observed cursor schedules](observed-cursor-20261115.md). This adversarial-ordering
 hardening does not enable production streaming or clear native acceptance gates.
+
+The [minimum production streaming plan](production-streaming-plan-20261115.md)
+states the future-only versus seamless-recovery owner decision, maps implemented
+ordering obligations to evidence, and sequences combined review, portable/native
+acceptance and the eventual separately reviewed production-policy change. New
+deterministic model schedules cover cutoff/receipt staging, ownership retirement,
+canonical storage/publication and wire permutations; production remains disabled.

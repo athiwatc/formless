@@ -616,3 +616,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "attempt_admission_schedules.rs"]
+mod schedules;

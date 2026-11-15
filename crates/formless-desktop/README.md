@@ -522,3 +522,7 @@ adds a conservative producer barrier, turn/attempt correlation and byte offsets.
 A [serialized reader and view adapter](../../docs/desktop/future-reader-20261115.md)
 now exist behind validation-only constructors. The production desktop remains
 canonical-only until independent review and full streaming acceptance pass.
+
+The [minimum production streaming plan](../../docs/desktop/production-streaming-plan-20261115.md)
+records the required future-only recovery scope decision, implemented guarantees,
+deterministic cutoff/publication schedules and remaining enablement gates.
