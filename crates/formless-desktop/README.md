@@ -96,6 +96,14 @@ omitted field cannot acknowledge a default `false`, empty list or cleared value.
 Cancel and Reload discard unsaved metadata edits explicitly; neither undoes
 an already sent save. Errors retain the edit. A disconnect or ambiguous ACK
 freezes Save until an explicit fresh Reload; no mutation is replayed.
+Session details also reads the existing persisted JSON bundle, Markdown or
+HTML export on explicit request. A bounded plain-text preview and Copy export
+are available up to 1 MiB; HTML source is never executed. Copy goes to the
+system clipboard and may include private conversation/Tool/plan data. Unsaved
+edits are excluded. Replies are scoped to Session, connection, operation and
+format, retire on disconnect, and are never replayed. This is a past read;
+native Save file/import and full-Profile backup remain unavailable.
+
 New Step prompts for the subscribed Session produce an explicit Formless TUI
 handoff notice. The current protocol does not restore pending Step identities
 in Subscribe/GetSession;
@@ -110,6 +118,7 @@ Findings, measurements, the parity inventory and the open blockers are in
 [docs/desktop/phase0-findings.md](../../docs/desktop/phase0-findings.md).
 
 Current continuation evidence and remaining acceptance are recorded in
+[the Session export report](../../docs/desktop/session-export-20261115.md),
 [the standing instructions report](../../docs/desktop/session-instructions-20261115.md),
 [the Profile Search report](../../docs/desktop/profile-search-20261115.md),
 [the archive/restore report](../../docs/desktop/session-archive-20261115.md),
