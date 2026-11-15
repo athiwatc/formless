@@ -171,6 +171,25 @@ fn secrets_are_refused() {
         assert_eq!(find_secret(fine), None, "false positive: {fine}");
     }
     let store = Store::open_in_memory().unwrap();
+    let (prose, _) = store
+        .add_memory("The token is refreshed nightly", "global", "user", None)
+        .unwrap();
+    assert_eq!(
+        store.get_memory(&prose.id).unwrap().unwrap().text,
+        "The token is refreshed nightly"
+    );
+    store
+        .update_memory(
+            &prose.id,
+            Some("password is required before login"),
+            None,
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        store.get_memory(&prose.id).unwrap().unwrap().text,
+        "password is required before login"
+    );
     let err = store
         .add_memory("my password is hunter22", "global", "user", None)
         .unwrap_err();

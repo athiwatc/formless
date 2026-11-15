@@ -136,7 +136,8 @@ h3 { font-size: 0.9375rem; margin: 1.375rem 0 0.5rem; }
 /* App shell */
 .app { container: app / inline-size; height: 100dvh; display: grid; grid-template-rows: auto minmax(0, 1fr) auto; grid-template-columns: minmax(0, 1fr); }
 .topbar { display: flex; flex-wrap: wrap; align-items: center; gap: 0.75rem; padding: 0.5rem 1rem; border-bottom: 1px solid var(--line); background: var(--panel); min-width: 0; }
-.tabs { flex: 1; display: flex; gap: 0.125rem; overflow-x: auto; scrollbar-width: none; min-width: 0; }
+/* Wrap the views into visible rows when space is tight; keep one row when it fits. */
+.tabs { flex: 1 1 24rem; display: flex; flex-wrap: wrap; gap: 0.125rem; min-width: 0; }
 .tabs button { border: 0; background: none; padding: 0.375rem 0.75rem; border-radius: 0.4375rem; cursor: pointer; color: var(--muted); font-weight: 600; white-space: nowrap; }
 .tabs button:hover { color: var(--text); background: var(--panel-2); }
 .tabs button[aria-current="page"] { color: var(--accent-strong, var(--accent)); background: var(--accent-soft); }
@@ -246,6 +247,7 @@ h3 { font-size: 0.9375rem; margin: 1.375rem 0 0.5rem; }
 /* Mermaid */
 .diagram .lang { display: flex; align-items: center; gap: 0.25rem; padding: 0.1875rem 0.375rem 0.1875rem 0.625rem; }
 .diagram .lang .btn, .diagram .lang .copy { position: static; opacity: 1; font-size: 0.6875rem; padding: 0.125rem 0.5rem; }
+.diagram-error { padding: 0.5rem 0.75rem; }
 .diagram-view { padding: 0.75rem; overflow: auto; text-align: center; background: var(--panel); }
 .diagram-img { max-width: 100%; height: auto; cursor: zoom-in; }
 .diagram.zoom .diagram-img { max-width: none; cursor: zoom-out; }
@@ -258,7 +260,7 @@ h3 { font-size: 0.9375rem; margin: 1.375rem 0 0.5rem; }
 .codeblock pre { margin: 0; padding: 0.625rem 0.75rem; overflow: auto; }
 .codeblock code { background: none; padding: 0; }
 .copy { position: absolute; top: 0.1875rem; right: 0.25rem; font-size: 0.6875rem; padding: 0.125rem 0.5rem; opacity: 0; }
-.codeblock:hover .copy { opacity: 1; }
+.codeblock:hover .copy, .codeblock:focus-within .copy, .copy:focus-visible { opacity: 1; }
 .chip { margin: 0.375rem 0; border: 1px solid var(--line); border-radius: 0.5rem; background: var(--panel); font-size: 0.8125rem; }
 .chip summary { display: flex; align-items: center; gap: 0.5rem; padding: 0.375rem 0.625rem; cursor: pointer; list-style: none; min-width: 0; }
 .chip summary::-webkit-details-marker { display: none; }
@@ -266,6 +268,11 @@ h3 { font-size: 0.9375rem; margin: 1.375rem 0 0.5rem; }
 .chip[open] summary::before { content: "▾"; }
 .chip .tname { font-family: var(--mono); font-weight: 650; color: var(--warn); white-space: nowrap; }
 .chip .targs { font-family: var(--mono); color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+/* Historical calls keep full names; argument previews remain finite/ellipsized. */
+.chip.tool-call > summary { flex-wrap: wrap; }
+.chip.tool-call > summary::before { flex: 0 0 1em; }
+.chip.tool-call > summary .tname { min-width: 0; max-width: calc(100% - 1em - 0.5rem); white-space: normal; overflow-wrap: anywhere; }
+.chip.tool-call > summary .targs { flex: 1 1 auto; max-width: 100%; }
 .chip .tstat { margin-left: auto; white-space: nowrap; color: var(--muted); }
 .chip pre { margin: 0; padding: 0.5rem 0.75rem; border-top: 1px solid var(--line); max-height: 22.5rem; overflow: auto; font-size: 0.75rem; white-space: pre-wrap; word-break: break-all; }
 .chip.result .tname { color: var(--accent); }
@@ -273,6 +280,8 @@ h3 { font-size: 0.9375rem; margin: 1.375rem 0 0.5rem; }
 .chip.failed .tname { color: var(--err); }
 .chip.live { border-color: var(--warn); }
 .thinking { color: var(--think); font-style: italic; font-size: 0.875rem; border-left: 2px solid var(--think); padding: 0.125rem 0 0.125rem 0.75rem; margin: 0.375rem 0; white-space: pre-wrap; opacity: .9; max-height: 9.5em; overflow: hidden; }
+.thinking.expanded { max-height: min(55vh, 32rem); overflow: auto; }
+.live-thinking > button { margin-top: 0.375rem; }
 .activity { color: var(--warn); font-size: 0.875rem; display: flex; align-items: center; gap: 0.5rem; }
 .spinner { width: 0.75rem; height: 0.75rem; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: spin .8s linear infinite; display: inline-block; }
 .welcome { max-width: 35rem; margin: 10vh auto 0; text-align: center; }
@@ -516,6 +525,7 @@ h3 { font-size: 0.9375rem; margin: 1.375rem 0 0.5rem; }
 .queue { margin-bottom: 0.375rem; font-size: 0.8125rem; }
 .plan { margin-bottom: 0.375rem; font-size: 0.8125rem; }
 .plan ul { list-style: none; margin: 0.25rem 0 0; padding-left: 0.25rem; }
+.plan li { overflow-wrap: anywhere; }
 .plan li.completed { color: var(--muted); text-decoration: line-through; }
 .plan li.in_progress { font-weight: 600; }
 .recap { margin-top: 0.5rem; font-size: 0.8125rem; }
@@ -967,3 +977,8 @@ mark.find { background: var(--accent-soft); color: inherit; border-radius: 0.187
 }
 
 :root[data-viewport-zoomed] .compose-hint { display: none; }
+
+/* Warnings remain available by keyboard/touch outside the live hint region. */
+.forecast-warnings { font-size: 0.875rem; overflow-wrap: anywhere; }
+.forecast-warnings summary { cursor: pointer; }
+.forecast-warnings ul { max-height: 10rem; overflow-y: auto; margin: 0.25rem 0; padding-inline-start: 1.5rem; }

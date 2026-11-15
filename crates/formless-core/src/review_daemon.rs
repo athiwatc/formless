@@ -512,6 +512,7 @@ impl Daemon {
                         // this incomplete comparison image.
                         let comparison = original.clone().unwrap_or_else(|| ReviewImage {
                             bytes: record.before.clone(),
+                            unix_metadata: None,
                             ..Default::default()
                         });
                         match store.lookup(
@@ -794,6 +795,7 @@ impl Daemon {
                     bytes: Some(candidate.as_bytes().to_vec()),
                     mode: None,
                     readonly: false,
+                    unix_metadata: None,
                     ..Default::default()
                 },
             )]),

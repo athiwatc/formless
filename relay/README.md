@@ -117,6 +117,13 @@ See [room-budget-design.md](room-budget-design.md) and
 | `room.test.mjs` | `node relay/room.test.mjs` (room teardown, disconnect codes, CSP) |
 | `push.test.mjs`, `push.dev-test.mjs` | `node relay/push.test.mjs` (signing), `node relay/push.dev-test.mjs` (end to end through `dev.mjs`) |
 
+An explicit conformance `BASE` must be an HTTP(S) origin, such as
+`http://127.0.0.1:8797`, with an optional trailing slash. Paths, queries,
+fragments, credentials and `ws://`/`wss://` input are rejected before connecting.
+HTTP probes and WebSocket checks derive their targets from the same origin.
+`node --test relay/conformance-base.test.mjs` checks argument validation and
+both trailing-slash forms against an owned local relay.
+
 ## Use
 
 ```sh
@@ -254,6 +261,42 @@ and the push service learn nothing about any Session; the notification
 just says something is waiting. `dev.mjs` reads the same variables from
 its environment.
 
+#### Push endpoint allowlist
+
+Normal push endpoints must use HTTPS and a trusted hostname. The built-in list
+in `push.mjs` allows `fcm.googleapis.com`,
+`updates.push.services.mozilla.com`, subdomains of `push.apple.com`, and
+subdomains of `notify.windows.com`.
+
+`PUSH_HOSTS` adds comma-separated hostnames to that list; it does not replace
+the built-ins. An entry such as `push.example.com` matches exactly that host.
+A leading-dot entry such as `.push.example.com` matches its subdomains
+(for example `eu.push.example.com`), but **not** the apex `push.example.com`.
+Use narrow, trusted hosts: adding entries expands where the relay may send
+push requests.
+
+For a self-hosted Worker, add the variable to `relay/wrangler.toml` (merge
+into an existing `[vars]` table if present), then use the deployment steps above:
+
+```toml
+[vars]
+PUSH_HOSTS = "push.example.com,.push.example.com"
+```
+
+For local development, pass it in the process environment:
+
+```sh
+PUSH_HOSTS='push.example.com,.push.example.com' node relay/dev.mjs --port 8797
+```
+
+The Worker also recognizes `ALLOW_LOCAL_PUSH=1`, which permits HTTP endpoints
+only when the parsed hostname is the literal `127.0.0.1`; `localhost` and
+`[::1]` do not qualify. This exception bypasses the host allowlist for that
+loopback HTTP endpoint. Reserve it for local fixtures/development and leave it
+unset in production. `dev.mjs` already sets `ALLOW_LOCAL_PUSH` to `"1"` for its
+local test push service, regardless of the process environment. Subscription
+key validation and size limits still apply.
+
 ## Vendored Mermaid
 
 `web/vendor/mermaid.min.js` is Mermaid 11.4.1 (MIT, see
@@ -282,6 +325,19 @@ The browser suite uses local fixture replies and performs no real settings,
 provider, daemon or Tool operations. WebKit is engine coverage, not physical
 Safari or assistive-technology evidence. `node --test relay/*.test.mjs` also
 checks dynamic row generation and typed/cancelled/invalid Edit requests.
+
+Existing diagram blocks follow explicit and Auto/OS theme changes without
+rebuilding messages. Source/zoom choices and focus remain on the retained block;
+SVG downloads use its current render. Asset-load failures offer **Retry** and
+evict failed loader jobs, while invalid source keeps a visible error and source
+fallback without paint-time retries. Generation checks discard stale completions.
+
+Run `python relay/web-mermaid.browser-test.py /tmp/formless-mermaid-check` for
+real vendored load/retry checks plus controlled theme/queue/layout races in
+Chromium. It also checks source/zoom/focus, SVG downloads, retained messages,
+paused reading anchors and cached/recreated blocks. This uses owned local UI
+fixtures; no daemon, provider, deployment or physical screen-reader is involved.
+
 ### Job history browser checks
 
 Run `python relay/web-job-history.browser-test.py /tmp/formless-job-history`
