@@ -335,6 +335,13 @@ name the file and reason; typo suggestions include local and shadowed templates.
 Diagnostics are announced once while present and can be announced again after
 a repaired file becomes invalid again.
 
+TUI file completion quotes spaced or delimited names, for example
+`@"my notes/report.md"`. Inside that reserved form, only `\"` and `\\`
+are escapes; whitespace is literal. Unclosed or invalid quoted mentions stay
+plain text and attach no first-word fragment. Directory completion keeps the
+cursor before its closing quote for child completion. Chips, forecast and
+submission all decode the same path; existing file eligibility rules apply.
+
 `formless commands list` shows the available metadata, diagnostics and shadowed
 files; `formless commands list --json` returns the same shared metadata projection
 used by the TUI. Listing is read-only: it does not start a daemon, create a
@@ -743,6 +750,19 @@ the **entire** stored tag list, and `--clear` explicitly replaces it with an emp
 list (conflicting with positional tags). Tags reach storage unchanged for its
 existing normalization; confirmation shows returned stored values. These three
 actions accept `--json` for the selected/returned Session object.
+
+Ambiguous Session prefixes/names remain usage errors and display up to ten
+matching full IDs, bounded names and archive labels. Extra matches are counted,
+with commands for both archive states. Prefix errors suggest extending the ID;
+name errors suggest a displayed ID. Exact-ID priority, prefix-before-name
+resolution and trimmed ASCII-case-insensitive full-name matching are unchanged.
+
+Human Session lists label the last recorded Run status and show stored tags,
+retaining the pin star and existing message preview/count. Empty replies are
+reported separately from an empty archive selection, which names the alternate
+list command and count. Static human `sessions show` includes stored archived,
+pinned, tags and last recorded Run status metadata; absent status is "not
+recorded". JSON and `--follow` retain their existing contracts.
 
 `tools list --filter FILTER` selects one stored-state predicate: `not-retired`
 (including disabled Tools), `retired`, `failing` (known success rate below 0.8),
