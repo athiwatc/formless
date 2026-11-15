@@ -22,7 +22,6 @@ struct Active {
     run: String,
     turn: String,
     attempt: String,
-    cursor: u64,
     bytes: u64,
 }
 #[derive(Debug)]
@@ -31,6 +30,7 @@ pub struct Gate {
     session: String,
     base_seq: i64,
     barrier: TranscriptBarrier,
+    observed_cursor: u64,
     active: Option<Active>,
     retired: bool,
 }
@@ -52,6 +52,7 @@ impl Gate {
             attachment,
             session: snapshot.session_id.clone(),
             base_seq,
+            observed_cursor: barrier.cursor,
             barrier,
             active: None,
             retired: false,
@@ -120,6 +121,13 @@ impl Gate {
         if self.active.is_none() && update.cursor <= self.barrier.cursor {
             return Change::Ignore;
         }
+        // Even an ignored future Delta/Closed proves a later scoped cursor
+        // was received. It must not permit a delayed Start to revive a prefix.
+        // Gaps are valid because other Sessions consume global cursor values.
+        if update.cursor <= self.observed_cursor {
+            return self.fail();
+        }
+        self.observed_cursor = update.cursor;
         match &update.change {
             Phase::Started { base_seq } => {
                 if self.active.is_some() || *base_seq != self.base_seq {
@@ -129,7 +137,6 @@ impl Gate {
                     run: update.run_id.clone(),
                     turn: update.turn_id.clone(),
                     attempt: update.attempt_id.clone(),
-                    cursor: update.cursor,
                     bytes: 0,
                 });
                 Change::Started
@@ -141,7 +148,6 @@ impl Gate {
                 if active.run != update.run_id
                     || active.turn != update.turn_id
                     || active.attempt != update.attempt_id
-                    || update.cursor <= active.cursor
                     || *offset != active.bytes
                 {
                     return self.fail();
@@ -154,7 +160,6 @@ impl Gate {
                     return self.fail();
                 };
                 active.bytes = bytes;
-                active.cursor = update.cursor;
                 Change::Append(text)
             }
             Phase::Closed { .. } => {
@@ -324,6 +329,67 @@ mod tests {
                 text: text.into(),
             },
         )
+    }
+    #[test]
+    fn ignored_future_frames_cannot_be_followed_by_a_lower_cursor_start() {
+        for prior in [
+            delta(12, 0, "missing prefix"),
+            event(
+                12,
+                Phase::Closed {
+                    bytes: 0,
+                    reason: TranscriptAttemptClose::Returned,
+                },
+            ),
+        ] {
+            let (tag, mut gate) = gate();
+            assert_eq!(gate.event(&tag, &prior), Change::Ignore);
+            assert_eq!(gate.event(&tag, &start(11)), Change::Reload);
+            assert!(gate.retired());
+            assert_eq!(
+                gate.event(&tag, &delta(13, 0, "must not appear")),
+                Change::Ignore
+            );
+        }
+    }
+    #[test]
+    fn ignored_future_frames_advance_floor_without_requiring_contiguous_cursors() {
+        let (tag, mut gate) = gate();
+        assert_eq!(
+            gate.event(&tag, &delta(12, 0, "not replayed")),
+            Change::Ignore
+        );
+        assert_eq!(gate.event(&tag, &start(20)), Change::Started);
+        assert_eq!(
+            gate.event(&tag, &delta(99, 0, "new prefix")),
+            Change::Append("new prefix")
+        );
+    }
+    #[test]
+    fn duplicate_scoped_future_frames_retire_even_without_an_active_attempt() {
+        let (tag, mut gate) = gate();
+        assert_eq!(gate.event(&tag, &delta(12, 0, "ignored")), Change::Ignore);
+        assert_eq!(gate.event(&tag, &delta(12, 0, "duplicate")), Change::Reload);
+    }
+    #[test]
+    fn old_barrier_frames_and_foreign_owners_do_not_poison_future_cursor_floor() {
+        let (tag, mut gate) = gate();
+        assert_eq!(gate.event(&tag, &delta(12, 0, "ignored")), Change::Ignore);
+        let mut foreign = start(999);
+        if let Event::TranscriptAttempt { update } = &mut foreign {
+            update.session_id = "other".into();
+        }
+        assert_eq!(gate.event(&tag, &foreign), Change::Ignore);
+        assert_eq!(
+            gate.event(&Attachment::default(), &start(999)),
+            Change::Ignore
+        );
+        assert_eq!(gate.event(&tag, &start(10)), Change::Ignore);
+        assert_eq!(gate.event(&tag, &start(13)), Change::Started);
+        assert_eq!(
+            gate.event(&tag, &delta(14, 0, "current")),
+            Change::Append("current")
+        );
     }
     #[test]
     fn only_a_future_start_can_admit_text_and_offsets_count_utf8_bytes() {

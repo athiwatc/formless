@@ -670,6 +670,47 @@ mod tests {
             .is_err());
     }
     #[test]
+    fn reordered_start_after_ignored_future_frame_retires_live_and_staged_admission() {
+        for staged in [false, true] {
+            let (mut engine, load) = if staged { loading() } else { (watching(), 0) };
+            engine
+                .receive(ServerMessage::Event(delta(12, 0, "missing")))
+                .unwrap();
+            engine.receive(ServerMessage::Event(start())).unwrap();
+            engine
+                .receive(ServerMessage::Event(delta(13, 0, "must not appear")))
+                .unwrap();
+            if staged {
+                respond(&mut engine, load, reply(1));
+            }
+            assert!(engine
+                .updates
+                .iter()
+                .any(|u| matches!(u, Update::Transcript(b) if b.reload)));
+            assert!(!engine
+                .updates
+                .iter()
+                .any(|u| matches!(u, Update::Transcript(b)
+                if b.events.iter().any(|e| matches!(e, Event::MessageDelta { .. })))));
+            assert!(engine.reader.phase == Phase::NeedBarrier);
+            engine.refresh();
+            let fresh = request(&mut engine, "get_transcript_barrier");
+            let mut value = reply(1);
+            value["barrier"]["cursor"] = json!(20);
+            respond(&mut engine, fresh.id, value);
+            let mut next = start();
+            if let Event::TranscriptAttempt { update } = &mut next {
+                update.cursor = 21;
+            }
+            engine.receive(ServerMessage::Event(next)).unwrap();
+            engine
+                .receive(ServerMessage::Event(delta(22, 0, "fresh")))
+                .unwrap();
+            assert!(engine.updates.iter().any(|u| matches!(u, Update::Transcript(b)
+                if b.events.iter().any(|e| matches!(e, Event::MessageDelta { delta, .. } if delta == "fresh")))));
+        }
+    }
+    #[test]
     fn shipping_mode_and_old_or_lying_peers_keep_canonical_subscription() {
         for (requested, capable) in [(false, true), (true, false)] {
             let mut engine = setup(requested, capable);

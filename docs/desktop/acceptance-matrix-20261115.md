@@ -95,3 +95,9 @@ Run/Step metadata overlap is additionally fenced by a checked connection-local
 lifecycle revision; see [status read fence](status-read-fence-20261115.md). This
 covers observed same-sequence status/barrier races and retires unsent reviews,
 without clearing the production streaming or native acceptance gates.
+
+The future-only admission gate now retains an observed scoped producer cursor
+floor even for ignored idle Delta/Closed frames. Repeated or decreasing future
+cursors fail closed before a delayed Start can revive a prefix; see
+[observed cursor schedules](observed-cursor-20261115.md). This adversarial-ordering
+hardening does not enable production streaming or clear native acceptance gates.

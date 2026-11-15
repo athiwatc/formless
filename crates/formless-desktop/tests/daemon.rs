@@ -1237,3 +1237,6 @@ mod native_step_transport;
 
 #[path = "support/status_fence.rs"]
 mod status_fence;
+
+#[path = "support/cursor_order.rs"]
+mod cursor_order;
