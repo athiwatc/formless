@@ -40,7 +40,7 @@ function fixture() {
     setSessionModel: (m, e) => applied.push([m, e]), note: () => {}, uiMoney: v => String(v),
     fuzzyMatch: (q, id) => (id.includes(q.trim()) ? [1, []] : null),
   });
-  vm.runInContext(['modelDetail', 'modelTestText', 'openModelPicker'].map(fn).join('\n'), c);
+  vm.runInContext(['modelContextLabel', 'modelDetail', 'modelTestText', 'openModelPicker'].map(fn).join('\n'), c);
   c.done = vm.runInContext('openModelPicker()', c);
   const find = (n, pred) => (pred(n) ? n : n.children.map(k => find(k, pred)).find(Boolean));
   c.status = () => find(c.dialog, n => n.cls.has('modal-actions')).children[0];
@@ -111,4 +111,22 @@ test('closing first, or newer status text, is never overwritten by a late failur
   assert.equal(t.status().textContent, 'testing free…', 'list failure keeps the newer label');
   t.calls[1].resolve(null); await tick();
   assert.equal(t.status().textContent, '✗ free: test did not complete');
+});
+
+test('temporary model-test failures name the explicit retry without changing legacy labels',async()=>{
+  const c=fixture();
+  assert.match(c.modelDetail({}, {ok:false,transient:true}),/temporary test failure \(use Test to retry\)/);
+  assert.equal(c.modelDetail({}, {ok:false}),'✗ test failed');
+  assert.equal(c.modelDetail({}, {ok:false,transient:'false'}),'✗ test failed');
+  assert.equal(c.modelDetail({}, {ok:true,transient:true}),'✓ tested');
+  c.calls[0].resolve(null); await c.done;
+});
+
+
+test('context labels preserve exact binary, decimal and irregular token windows', () => {
+  const c = fixture();
+  const cases = JSON.parse(readFileSync(new URL('../crates/formless-tui/tests/fixtures/model-context-labels.json', import.meta.url), 'utf8'));
+  for (const [context, expected] of cases) assert.equal(c.modelDetail({context}, null), expected, String(context));
+  for (const context of [undefined,null,'131072',-1,1.5,NaN,Infinity,Number.MAX_SAFE_INTEGER+1]) assert.equal(c.modelDetail({context}, null), '');
+  assert.equal(c.modelDetail({context:131072,vision:true,tools:true}, {ok:true}), '128Ki ctx · vision · tools · ✓ tested');
 });

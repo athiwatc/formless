@@ -42,6 +42,109 @@ const CLIENT_QUEUE: usize = 4096;
 /// reading.
 const MAX_FRAME: usize = formless_protocol::MAX_FRAME_BYTES;
 
+/// Session-update recency, independent of list pin/archive grouping. This is
+/// not measured model-use history; equal stored timestamps use Session IDs.
+fn recent_session_models(sessions: &[SessionInfo]) -> Vec<String> {
+    let mut ordered: Vec<_> = sessions.iter().collect();
+    ordered.sort_by(|left, right| {
+        right
+            .updated_at
+            .cmp(&left.updated_at)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    let mut recent = Vec::new();
+    for session in ordered {
+        if let Some(model) = session.model.as_ref().filter(|model| !model.is_empty()) {
+            if !recent.contains(model) {
+                recent.push(model.clone());
+            }
+        }
+    }
+    recent
+}
+
+#[cfg(test)]
+mod recent_model_order_tests {
+    use super::*;
+
+    #[test]
+    fn recent_models_follow_session_updates_with_exact_membership_and_id_ties() {
+        let row = |id: &str, model: Option<&str>, time: &str, pinned: bool, archived: bool| {
+            serde_json::from_value::<SessionInfo>(json!({"id":id,"name":id,"model":model,
+                "created_at":"", "updated_at":time,"pinned":pinned,"archived":archived}))
+            .unwrap()
+        };
+        let sessions = vec![
+            row(
+                "pinned-old",
+                Some("pinned-old"),
+                "2026-01-01T00:00:00Z",
+                true,
+                false,
+            ),
+            row(
+                "older-shared",
+                Some("shared"),
+                "2026-01-02T00:00:00Z",
+                true,
+                false,
+            ),
+            row("z-tie", Some("tie-z"), "2026-01-03T00:00:00Z", false, false),
+            row("a-tie", Some("tie-a"), "2026-01-03T00:00:00Z", true, false),
+            row(
+                "m-tie",
+                Some("模型-ไทย"),
+                "2026-01-03T00:00:00Z",
+                false,
+                true,
+            ),
+            row(
+                "newer-unpinned",
+                Some("shared"),
+                "2026-01-04T00:00:00Z",
+                false,
+                false,
+            ),
+            row(
+                "newest-archived",
+                Some("archived-newest"),
+                "2026-01-05T00:00:00Z",
+                false,
+                true,
+            ),
+            row("empty", Some(""), "2026-01-07T00:00:00Z", false, false),
+            row("none", None, "2026-01-06T00:00:00Z", false, false),
+            row("space", Some(" "), "2025-01-01T00:00:00Z", false, true),
+        ];
+        let expected = [
+            "archived-newest",
+            "shared",
+            "tie-a",
+            "模型-ไทย",
+            "tie-z",
+            "pinned-old",
+            " ",
+        ];
+        let before = serde_json::to_value(&sessions).unwrap();
+        assert_eq!(recent_session_models(&sessions), expected);
+        assert_eq!(
+            serde_json::to_value(&sessions).unwrap(),
+            before,
+            "list order and fields stay untouched"
+        );
+        let reversed = sessions.into_iter().rev().collect::<Vec<_>>();
+        assert_eq!(recent_session_models(&reversed), expected);
+        assert!(recent_session_models(&[]).is_empty());
+        assert_eq!(
+            recent_session_models(&[
+                row("a", Some("Model"), "same", false, false),
+                row("b", Some("model"), "same", false, false)
+            ]),
+            ["Model", "model"]
+        );
+    }
+}
+
 /// A request's machine-readable classification is chosen at its failure
 /// site and survives anyhow context wrappers; wording never chooses a code.
 #[derive(Debug, thiserror::Error)]
@@ -3241,12 +3344,13 @@ impl Daemon {
                     .with_context(|| RequestFailure::not_found(format!("no artifact '{id}'")))?;
                 let source =
                     crate::attachment_access::read_artifact_record(&self.paths, &path, bytes)?;
-                let text = String::from_utf8_lossy(&source).into_owned();
-                let total = text.chars().count();
+                let text = String::from_utf8_lossy(&source);
                 let offset = offset.unwrap_or(0);
                 let length = length.unwrap_or(200_000).min(1_000_000);
-                let slice: String = text.chars().skip(offset).take(length).collect();
-                let end = offset + slice.chars().count();
+                let page = crate::artifact_text::page(&text, offset, length);
+                let total = page.total;
+                let slice = page.text;
+                let end = offset + page.selected;
                 // Never the filesystem path (SPEC §9.6).
                 Ok(json!({"id": id, "session_id": session, "bytes": bytes,
                           "total_chars": total, "offset": offset, "end": end, "text": slice}))
@@ -3311,15 +3415,8 @@ impl Daemon {
                                "model": r.model})
                     })
                     .collect();
-                // Sessions come newest first; keep each model once.
-                let mut recent: Vec<String> = Vec::new();
-                for s in self.with_reader(|st| st.list_sessions())? {
-                    if let Some(m) = s.model.filter(|m| !m.is_empty()) {
-                        if !recent.contains(&m) {
-                            recent.push(m);
-                        }
-                    }
-                }
+                let sessions = self.with_reader(|st| st.list_sessions())?;
+                let recent = recent_session_models(&sessions);
                 Ok(json!({
                     "models": models,
                     "meta": meta,
@@ -3509,7 +3606,12 @@ impl Daemon {
             }
             Request::JobRuns { id, limit } => {
                 Ok(serde_json::to_value(self.with_reader(|st| {
-                    st.job_runs(&id, limit.unwrap_or(20).clamp(1, 500))
+                    let runs = st.job_runs(&id, limit.unwrap_or(20).clamp(1, 500))?;
+                    if runs.is_empty() {
+                        st.get_job(&id)?
+                            .with_context(|| RequestFailure::not_found(format!("no job '{id}'")))?;
+                    }
+                    Ok(runs)
                 })?)?)
             }
             Request::SetJobOptions {
@@ -6557,7 +6659,7 @@ impl Daemon {
                             matches!(
                                 error.downcast_ref::<crate::provider::StructuredOutputError>(),
                                 Some(
-                                    crate::provider::StructuredOutputError::InvalidJson
+                                    crate::provider::StructuredOutputError::InvalidJson { .. }
                                         | crate::provider::StructuredOutputError::SchemaViolation
                                 )
                             )
@@ -10137,31 +10239,21 @@ impl Daemon {
             .collect();
         // Shared modules match too, so the agent reuses (and reads, with
         // read_module) a helper instead of rewriting it.
-        let words: Vec<String> = query
-            .split(|c: char| !c.is_alphanumeric())
-            .filter(|w| w.len() >= 3)
-            .map(str::to_lowercase)
-            .collect();
-        let modules: Vec<Value> = self
+        let matcher = crate::summary_search::Query::new(query);
+        let modules = self
             .with_store(|st| st.list_modules())?
             .into_iter()
-            .filter(|m| !m.retired)
-            .filter(|m| {
-                let hay = format!("{} {}", m.name, m.description).to_lowercase();
-                words.iter().any(|w| hay.contains(w.as_str()))
-            })
-            .take(limit)
+            .filter(|m| !m.retired);
+        let modules: Vec<Value> = matcher.rank(modules, limit, |module| (module.name.as_str(), module.description.as_str()))
+            .into_iter()
             .map(|m| json!({"name": m.name, "description": m.description, "version": m.current_version}))
             .collect();
-        let skills: Vec<Value> = self
+        let skills = self
             .with_store(|st| st.list_skills())?
             .into_iter()
-            .filter(|s| s.enabled && !s.retired)
-            .filter(|s| {
-                let hay = format!("{} {}", s.name, s.description).to_lowercase();
-                words.iter().any(|w| hay.contains(w.as_str()))
-            })
-            .take(limit)
+            .filter(|s| s.enabled && !s.retired);
+        let skills: Vec<Value> = matcher.rank(skills, limit, |skill| (skill.name.as_str(), skill.description.as_str()))
+            .into_iter()
             .map(|s| json!({"name": s.name, "description": s.description, "load_with": "load_skill"}))
             .collect();
         // Repeated raw MCP chains among the hits (SPEC §8.3).
@@ -10843,12 +10935,16 @@ impl Daemon {
                     json!({"actor": actor, "action": action, "detail": detail.chars().take(300).collect::<String>(), "at": at})
                 }).collect::<Vec<_>>()}))
             }
-            "models" => Ok(json!({"models": st.list_model_stats()?.into_iter().map(|m| json!({
-                "model": m.model, "calls": m.samples(), "success_rate": m.success_rate(),
-                "avg_ms": (m.samples() > 0).then(|| m.total_ms / m.samples()),
-            })).collect::<Vec<_>>()})),
+            "models" => {
+                let models = st.list_model_stats()?;
+                let total = models.len();
+                Ok(json!({"models": models.into_iter().take(limit).map(|m| json!({
+                    "model": m.model, "calls": m.samples(), "success_rate": m.success_rate(),
+                    "avg_ms": (m.samples() > 0).then(|| m.total_ms / m.samples()),
+                })).collect::<Vec<_>>(), "total": total}))
+            }
             "runs" => {
-                let runs = st.run_metrics(limit.max(50))?;
+                let runs = st.run_metrics(limit)?;
                 Ok(json!({"summary": crate::runs::summarize(&runs)}))
             }
             "builtins" => Ok(json!({"builtins": st.builtin_stats(None)?})),
@@ -12273,23 +12369,24 @@ impl Daemon {
                 RequestFailure::not_found(format!("no artifact '{id}' in this session"))
             })?;
         let source = crate::attachment_access::read_artifact_record(&self.paths, &path, bytes)?;
-        let text = String::from_utf8_lossy(&source).into_owned();
+        let text = String::from_utf8_lossy(&source);
         if let Some(needle) = args["grep"].as_str().filter(|g| !g.is_empty()) {
             let needle = needle.to_lowercase();
             let hits: Vec<Value> = text
                 .lines()
                 .enumerate()
-                .filter(|(_, l)| l.to_lowercase().contains(&needle))
+                .filter(|(_, l)| crate::artifact_text::contains_lowercase(l, &needle))
                 .take(200)
                 .map(|(i, l)| json!({"line": i + 1, "text": l.chars().take(500).collect::<String>()}))
                 .collect();
             return Ok(json!({"id": id, "matches": hits}).to_string());
         }
-        let total = text.chars().count();
         let offset = args["offset"].as_u64().unwrap_or(0) as usize;
         let length = args["length"].as_u64().unwrap_or(20_000).min(100_000) as usize;
-        let slice: String = text.chars().skip(offset).take(length).collect();
-        let end = (offset + slice.chars().count()).min(total);
+        let page = crate::artifact_text::page(&text, offset, length);
+        let total = page.total;
+        let slice = page.text;
+        let end = (offset + page.selected).min(total);
         Ok(
             json!({"id": id, "offset": offset, "end": end, "total_chars": total, "text": slice})
                 .to_string(),
@@ -12301,16 +12398,17 @@ impl Daemon {
         let (info, _) = self
             .with_store(|st| st.get_module_by_name(name))?
             .with_context(|| RequestFailure::not_found(format!("no module named '{name}'")))?;
+        let want = args["version"].as_i64().unwrap_or(info.current_version);
         let (versions, dependents) = self.with_store(|st| {
             Ok((
-                st.module_versions(&info.id)?,
+                st.module_versions_for_read(&info.id, want)?,
                 st.module_dependents(&info.name)?,
             ))
         })?;
-        let want = args["version"].as_i64().unwrap_or(info.current_version);
         let (version, code, ..) = versions.iter().find(|v| v.0 == want).with_context(|| {
             RequestFailure::not_found(format!("module '{name}' has no version {want}"))
         })?;
+        let code = code.as_ref().context("selected module code is missing")?;
         Ok(json!({
             "name": info.name,
             "description": info.description,
@@ -13733,23 +13831,22 @@ impl Daemon {
         let preview: String = text.chars().take(cap).collect();
         // The stored copy outlives the Run: secrets in it are redacted (#709).
         if std::fs::write(&path, crate::secrets::redact(&text).0).is_ok() {
-            let id = self
-                .with_store(|st| {
-                    st.save_artifact(
-                        Some(session_id),
-                        &path.to_string_lossy(),
-                        &preview,
-                        text.len() as i64,
-                    )
-                })
-                .unwrap_or_default();
-            // No filesystem path: transcripts reach remote clients too.
-            return format!(
-                "{preview}\n[full output ({} bytes) stored as artifact {id}; read it with read_artifact]",
-                text.len()
-            );
+            if let Ok(id) = self.with_store(|st| {
+                st.save_artifact(
+                    Some(session_id),
+                    &path.to_string_lossy(),
+                    &preview,
+                    text.len() as i64,
+                )
+            }) {
+                // No filesystem path: transcripts reach remote clients too.
+                return format!(
+                    "{preview}\n[full output ({} bytes) stored as artifact {id}; read it with read_artifact]",
+                    text.len()
+                );
+            }
         }
-        preview
+        format!("{preview}\n[output truncated to {cap} characters (Unicode scalar values); full output ({} UTF-8 bytes) could not be stored as an artifact]", text.len())
     }
 
     /// Execute one registry Tool and record the Invocation. Boxed to break
@@ -14580,7 +14677,10 @@ impl Daemon {
             memory.mark_started();
         }
         let mut reader = BufReader::new(read_half);
+        let mut relay_controls = tokio::task::JoinSet::new();
         loop {
+            // Completed control handles must not accumulate on a long-lived CID.
+            while relay_controls.try_join_next().is_some() {}
             let (line, mut input_lease) = tokio::select! {
                 _ = kick.cancelled() => break,
                 r = async {
@@ -14682,7 +14782,7 @@ impl Daemon {
                         let held = input_lease.take();
                         let (this, tx, who, kick) =
                             (self.clone(), tx.clone(), client(), kick.clone());
-                        tokio::spawn(async move {
+                        let control = async move {
                             let _permit = permit;
                             let _input_lease = held;
                             let result = tokio::select! {
@@ -14697,7 +14797,12 @@ impl Daemon {
                                 _ = kick.cancelled() => {}
                                 _ = tx.send(resp) => {}
                             }
-                        });
+                        };
+                        if relay_memory.is_some() {
+                            relay_controls.spawn(control);
+                        } else {
+                            tokio::spawn(control);
+                        }
                         continue;
                     } else {
                         let queued = tokio::select! {
@@ -14752,6 +14857,9 @@ impl Daemon {
             worker.abort();
         }
         let _ = worker.await;
+        // Keep the same control/cancellation behavior, but wait for each relay
+        // task to drop its input/output leases before reporting teardown done.
+        while relay_controls.join_next().await.is_some() {}
         self.sent_keys
             .locked()
             .retain(|(client, _, _), _| *client != Some(conn));
@@ -16406,7 +16514,7 @@ impl HostOps for NestedOps {
         );
         if matches!(
             &value,
-            Err(crate::provider::StructuredOutputError::InvalidJson
+            Err(crate::provider::StructuredOutputError::InvalidJson { .. }
                 | crate::provider::StructuredOutputError::SchemaViolation)
         ) {
             routing_call.claim_contract(identity.clone());
@@ -16741,6 +16849,11 @@ pub fn credential_path(path: &std::path::Path) -> Option<&'static str> {
         }
     }
     let name = path.file_name()?.to_string_lossy().to_lowercase();
+    let env_template = formless_runtime::sensitive_paths::is_env_template_file(path)
+        && matches!(
+            formless_runtime::sensitive_paths::PathPolicy::default().classify(path, path),
+            Ok(formless_runtime::sensitive_paths::PathDecision::Ordinary)
+        );
     let secret_file = [
         ".netrc",
         ".npmrc",
@@ -16749,8 +16862,7 @@ pub fn credential_path(path: &std::path::Path) -> Option<&'static str> {
         ".git-credentials",
     ]
     .contains(&name.as_str())
-        || name == ".env"
-        || name.starts_with(".env.")
+        || ((name == ".env" || name.starts_with(".env.")) && !env_template)
         || name.starts_with("id_rsa")
         || name.starts_with("id_ed25519")
         || name.starts_with("id_ecdsa")
@@ -18721,3 +18833,141 @@ mod provider_error_guidance_tests;
 #[cfg(test)]
 #[path = "job_state_daemon_tests.rs"]
 mod job_state_daemon_tests;
+
+#[cfg(test)]
+mod read_metrics_limit_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn model_and_run_reports_honor_limits_without_changing_arithmetic() {
+        let _env = crate::credential_env::EnvGuard::isolated();
+        let root = std::env::temp_dir().join(format!("fl-metrics-limits-{}", uuid::Uuid::new_v4()));
+        let paths = Paths::from_dirs(root.join("data"), root.join("config")).unwrap();
+        let mut config = Config::default();
+        config.provider.base_url = "http://127.0.0.1:9/v1".into();
+        config.provider.model = "private-unused".into();
+        config.naming.enabled = false;
+        config.save(&paths).unwrap();
+        let daemon = Daemon::new(paths).unwrap();
+        assert_eq!(
+            daemon
+                .read_metrics_impl(&json!({"kind":"models","limit":5}))
+                .unwrap(),
+            json!({"models":[],"total":0})
+        );
+        assert_eq!(
+            daemon
+                .read_metrics_impl(&json!({"kind":"runs","limit":10}))
+                .unwrap()["summary"]["runs"],
+            0
+        );
+        daemon
+            .with_store(|st| {
+                for index in (0..7).rev() {
+                    let model = format!("model-{index:02}-ไทย");
+                    st.record_model_outcome(&model, true, 3)?;
+                    st.record_model_outcome(&model, false, 4)?;
+                }
+                let session = st.create_session(None)?.id;
+                // Explicit timestamps determine the newest window independently
+                // of clock granularity, without any model or Tool execution.
+                let conn = rusqlite::Connection::open(daemon.paths.db_file())?;
+                for index in 0..60 {
+                    let run = st.create_run(&session)?;
+                    conn.execute(
+                        "UPDATE runs SET created_at=?2,status=?3,steps=?4 WHERE id=?1",
+                        rusqlite::params![
+                            run,
+                            format!("2026-01-01T00:{index:02}:00Z"),
+                            if index >= 50 {
+                                "interrupted"
+                            } else {
+                                "completed"
+                            },
+                            if index >= 50 { 11 } else { 1 }
+                        ],
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let models = daemon
+            .read_metrics_impl(&json!({"kind":"models","limit":5}))
+            .unwrap();
+        assert_eq!(models["total"], 7);
+        let rows = models["models"].as_array().unwrap();
+        assert_eq!(rows.len(), 5);
+        for (index, row) in rows.iter().enumerate() {
+            assert_eq!(row["model"], format!("model-{index:02}-ไทย"));
+            assert_eq!(row["calls"], 2);
+            assert_eq!(row["success_rate"], 0.5);
+            assert_eq!(
+                row["avg_ms"].as_i64(),
+                Some(3),
+                "integer latency representation is preserved"
+            );
+        }
+        assert_eq!(
+            daemon
+                .read_metrics_impl(&json!({"kind":"models","limit":0}))
+                .unwrap()["models"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            daemon.read_metrics_impl(&json!({"kind":"models"})).unwrap()["models"]
+                .as_array()
+                .unwrap()
+                .len(),
+            7
+        );
+        let ten = daemon
+            .read_metrics_impl(&json!({"kind":"runs","limit":10}))
+            .unwrap();
+        assert_eq!(ten["summary"]["runs"], 10);
+        assert_eq!(ten["summary"]["interrupted"], 1.0);
+        assert_eq!(ten["summary"]["avg_steps"], 11.0);
+        let default = daemon.read_metrics_impl(&json!({"kind":"runs"})).unwrap();
+        assert_eq!(default["summary"]["runs"], 50);
+        assert_eq!(default["summary"]["interrupted"], 0.2);
+        assert_eq!(default["summary"]["avg_steps"], 3.0);
+        assert_eq!(
+            daemon
+                .read_metrics_impl(&json!({"kind":"runs","limit":0}))
+                .unwrap()["summary"]["runs"],
+            1
+        );
+        assert_eq!(
+            daemon
+                .read_metrics_impl(&json!({"kind":"runs","limit":999}))
+                .unwrap()["summary"]["runs"],
+            60
+        );
+        assert_eq!(
+            daemon
+                .read_metrics_impl(&json!({"kind":"tools","limit":5}))
+                .unwrap(),
+            json!({"tools":[],"total":0})
+        );
+        drop(daemon);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+#[path = "module_read_projection_tests.rs"]
+mod module_read_projection_tests;
+
+#[cfg(test)]
+#[path = "summary_search_handler_tests.rs"]
+mod summary_search_handler_tests;
+
+#[cfg(test)]
+#[path = "model_text_failure_tests.rs"]
+mod model_text_failure_tests;
+
+#[cfg(test)]
+#[path = "daemon_provider_url_tests.rs"]
+mod provider_url_tests;

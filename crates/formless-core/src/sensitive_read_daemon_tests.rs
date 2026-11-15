@@ -599,7 +599,10 @@ async fn answer_claimed_before_cancel_cleanup_is_acknowledged_and_applied_once()
     );
     assert_eq!(
         denials[0].capability,
-        format!("fs:read-sensitive:{}", key.display())
+        format!(
+            "fs:read-sensitive:{}",
+            key.canonicalize().unwrap().display()
+        )
     );
     assert_eq!(denials[0].denied_by, "private answer fixture");
     assert!(!f.daemon().pending_attention.locked().iter().any(
