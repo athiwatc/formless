@@ -107,7 +107,15 @@ pub fn walk(root: &Path) -> (Vec<FileEntry>, bool) {
 /// Ambiguous canonical spellings require an exact spelling; children are
 /// never merged. Directory fallback remains case/accent-sensitive.
 pub fn search<'a>(entries: &'a [FileEntry], query: &str, limit: usize) -> Vec<&'a FileEntry> {
-    let query = query.trim();
+    // A delimited mention can supply an indexed directory whose first
+    // component starts with whitespace. Prefer that exact spelling before
+    // applying the existing hand-typed-query trimming fallback.
+    let exact_directory = query.ends_with('/')
+        && entries.iter().any(|entry| {
+            entry.path.starts_with(query)
+                || (entry.dir && Some(entry.path.as_str()) == query.strip_suffix('/'))
+        });
+    let query = if exact_directory { query } else { query.trim() };
     if query.is_empty() || query.ends_with('/') {
         let Some(prefix) = directory_prefix(entries, query) else {
             return Vec::new();
@@ -225,24 +233,12 @@ fn directory_prefix<'a>(entries: &[FileEntry], query: &'a str) -> Option<Cow<'a,
     found.map(|original| Cow::Owned(format!("{original}/")))
 }
 
-/// `@path` mentions in a message: an `@` at the start or after whitespace,
-/// followed by a non-empty path (trailing punctuation dropped).
-pub fn mentions(text: &str) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    let mut prev = ' ';
-    for (i, c) in text.char_indices() {
-        if c == '@' && prev.is_whitespace() {
-            let rest = &text[i + 1..];
-            let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
-            let path = rest[..end].trim_end_matches([',', '.', ';', ':', '!', '?', ')', '"', '\'']);
-            if !path.is_empty() && !out.iter().any(|p| p == path) {
-                out.push(path.to_string());
-            }
-        }
-        prev = c;
-    }
-    out
-}
+#[path = "file_mentions.rs"]
+mod file_mentions;
+pub use file_mentions::{
+    encode_mention, mention_completion, mention_ranges, mentions, MentionCompletion,
+    MentionInsertion,
+};
 
 #[cfg(test)]
 mod tests {
