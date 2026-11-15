@@ -4729,6 +4729,16 @@ undo, redo and replacements invalidate prior asynchronous editor previews.
   (v2 adds `/fork`, `/search`, `/edit`, `/metrics`, `/proposals`,
   `/propose`, `/panes`; later `/retry [--model X]`, `/limit N|off`,
   `/good`, `/bad`, `/unrate`). Plain text is always chat.
+- **Search-hit navigation (TUI).** Enter on a cross-Session search hit opens
+  its stored message after the matching Session load, placing it in view once.
+  Navigation is owned by that Session, message ID and load request; an older
+  response cannot jump to a different selected hit. An absent ID may fall back
+  only to a unique sequence/role match within that loaded Session. A grouped
+  Tool result shows its call header as nearest visible context with a note.
+  A missing/unrenderable target or failed/timed-out load follows the bottom
+  with a note. Session/view changes and manual scrolling abandon a pending
+  jump; End resumes bottom-follow as usual. Chat-find highlighting does not
+  choose the destination.
 - **Local prompt commands.** Plain Markdown templates in the selected profile's
   `<config>/commands/NAME.md` and selected Session working directory's
   `.formless/commands/NAME.md` define `/NAME [ARGUMENTS]`. Discovery records the
@@ -5206,7 +5216,7 @@ the TUI. Command-specific arguments and defaults are available through
 | `formless sessions` | `fork`, `compare`, `list`, `show`, `files`, `rewind`, `rename`, `rm`, `restore`, `import`, `search`, `templates list/show`, `archive`, `unarchive`, `pin`, `unpin`, `tag`, `export` | Manage stored Sessions, follow a Run with `show --follow`, or inspect tracked files. `list --pinned --tag TAG` filters the fetched reply; selectors combine with `--archived`, preserving reply order. |
 | `formless skills` | `reviews`, `add`, `remove`, `list`, `enable`, `disable`, `show`, `export`, `import` | Inspect and manage Skills and their retained description reviews. |
 | `formless storage` | `--json` | Report disk usage by data category. |
-| `formless tools` | `reviews`, `list`, `disable`, `enable`, `undo`, `pin`, `unpin`, `tag`, `show`, `retire`, `restore`, `rollback`, `purge`, `run`, `export`, `import` | Inspect, manage, run, or transfer registry Tools. |
+| `formless tools` | `reviews`, `list`, `disable`, `enable`, `undo`, `pin`, `unpin`, `tag`, `show`, `diff`, `retire`, `restore`, `rollback`, `purge`, `run`, `export`, `import` | Inspect, manage, run, or transfer registry Tools. |
 | `formless tui` | `--plain`, `-c` / `--continue`, `--new` | Launch the full-screen terminal client; also the default with no command. |
 | `formless uninstall` | `--keep-data`, `--keep-binary`, `--yes` (alias `--force`) | Remove Formless, optionally retaining data or the binary. |
 | `formless update` | No action, `check`, or `--check`; `--json` | Show newer release notes and the applicable upgrade command; never rewrite the binary. |
