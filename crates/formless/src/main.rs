@@ -13,6 +13,8 @@ mod cli_price_import;
 mod cli_proposal_diff;
 mod cli_routing;
 mod cli_run_identity;
+#[cfg(test)]
+mod cli_runs_filter_tests;
 mod cli_session_lookup;
 mod cli_session_org;
 mod cli_session_report;
@@ -422,7 +424,7 @@ enum Cmd {
     },
     /// Recent Runs and their outcomes: steps, tool calls, tokens (SPEC §8.7)
     #[command(
-        after_help = "Examples:\n  formless runs --limit 10\n  formless runs show RUN_ID --json"
+        after_help = "Examples:\n  formless runs --limit 10\n  formless runs --session SESSION --since 24h\n  formless runs show RUN_ID --json"
     )]
     Runs {
         #[command(subcommand)]
@@ -430,6 +432,12 @@ enum Cmd {
         /// Maximum number of recent Runs to list
         #[arg(long, default_value_t = 20)]
         limit: usize,
+        /// Only this Session's Runs (existing ID/prefix/name selector)
+        #[arg(long, value_name = "SESSION")]
+        session: Option<String>,
+        /// Only Runs since this duration ago; omitted: all history
+        #[arg(long,value_name="DURATION",value_parser=parse_since_cutoff)]
+        since: Option<String>,
         /// Print machine-readable JSON instead of human-readable output
         #[arg(long)]
         json: bool,
@@ -1968,6 +1976,7 @@ fn validate_tui_start(cli: &mut Cli) -> Result<()> {
 }
 
 fn run_cli(mut cli: Cli) -> Result<()> {
+    validate_runs_filters(&cli)?;
     validate_tui_start(&mut cli)?;
     // Export usage errors must precede profile setup, Session lookup and any
     // daemon connection. sessions_cmd validates again for direct callers.
@@ -2303,9 +2312,11 @@ fn run_cli(mut cli: Cli) -> Result<()> {
             limit,
             json,
             action,
+            session,
+            since,
         }) => match action {
             Some(action) => cli_attach::runs(&paths, action, json),
-            None => runs_cmd(paths, limit, json),
+            None => runs_cmd(paths, limit, json, session, since),
         },
         Some(Cmd::Jobs { action }) => jobs_cmd(paths, action),
         Some(Cmd::Metrics { since, json }) => {
@@ -6917,14 +6928,34 @@ fn jobs_cmd(paths: Paths, action: JobsAction) -> Result<()> {
     Ok(())
 }
 
-fn runs_cmd(paths: Paths, limit: usize, json: bool) -> Result<()> {
+fn validate_runs_filters(cli: &Cli) -> Result<()> {
+    if matches!(&cli.cmd,Some(Cmd::Runs{action:Some(_),session,since,..}) if session.is_some() || since.is_some())
+    {
+        return Err(usage(
+            "--session and --since apply only to the Runs list, not its subcommands",
+        ));
+    }
+    Ok(())
+}
+
+fn runs_cmd(
+    paths: Paths,
+    limit: usize,
+    json: bool,
+    session: Option<String>,
+    since: Option<String>,
+) -> Result<()> {
     formless_core::daemon::ensure_daemon(&paths)?;
+    let session_id = session
+        .as_deref()
+        .map(|selector| find_session(&paths, selector).map(|session| session.id))
+        .transpose()?;
     let v = formless_tui::client::request_once(
         &paths,
         Request::RunMetrics {
             limit: Some(limit),
-            session_id: None,
-            since: None,
+            session_id,
+            since,
         },
     )?;
     if json {

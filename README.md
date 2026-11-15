@@ -813,6 +813,16 @@ Completed checks exit 0; other fetch or JSON parse failures remain errors with
 no success JSON. Human output stays unchanged, and the JSON form never runs
 an updater.
 
+`runs --session SESSION --since DURATION [--limit N] [--json]` sends the
+existing Session/time filters to RunMetrics before its newest-N limit. Each
+selector is optional; Session lookup keeps the existing exact-ID, unambiguous
+prefix and name rules. Durations use checked arithmetic and one UTC RFC3339
+cutoff in the existing stored TEXT representation. The returned runs and their
+summary describe that filtered, limited subset; JSON forecasts remain
+independently scoped and unchanged. With neither selector, request/output
+behavior is unchanged. Filters with any Runs subaction are usage errors before
+connection; unknown/ambiguous Sessions necessarily fail after ListSessions.
+
 `sessions usage SESSION [--json]` uses the existing Session selector and
 buffers SessionUsage plus ContextUsage before output. Human records label
 total/latest-Run counters, estimated USD cost, unpriced models and the current
