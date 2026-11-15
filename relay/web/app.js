@@ -95,6 +95,7 @@
     sessions: [],
     current: null,
     messages: [],
+    sessionLoad: null, // { id, status: pending | failed | loaded }
     streaming: "",
     thinking: "",
     running: new Set(),
@@ -105,6 +106,7 @@
     modules: [],
     selectedTool: null,
     toolDetail: null,
+    toolDetailError: null, // id of the selected Tool whose detail fetch failed
     editingCode: null, // { toolId, code }
     metricTool: null,
     modelStats: [],
@@ -372,10 +374,31 @@
   const pct = (r) => (r == null ? "-" : uiFormat(r, { style: "percent", maximumFractionDigits: 0 }));
   // Same thresholds as the TUI: green at the optimiser trigger (90%).
   const rateClass = (r) => (r == null ? "muted" : r >= 0.9 ? "rate-good" : r >= 0.7 ? "rate-mid" : "rate-bad");
-  const truncate = (s, n) => {
+  // Keep the existing UTF-16 budget, including the ellipsis. Older engines
+  // without Segmenter retain code points, but cannot guarantee whole graphemes.
+  const summarySegments = typeof Intl.Segmenter === "function"
+    ? new Intl.Segmenter(undefined, { granularity: "grapheme" }) : null;
+  function truncate(s, n) {
     s = String(s || "").replace(/\s+/g, " ").trim();
-    return s.length > n ? s.slice(0, n - 1) + "…" : s;
-  };
+    if (s.length <= n) return s;
+    if (n <= 0) return "";
+    let end = 0;
+    const segments = summarySegments ? summarySegments.segment(s) : s;
+    for (const part of segments) {
+      const length = summarySegments ? part.segment.length : part.length;
+      if (end + length > n - 1) break;
+      end += length;
+    }
+    return s.slice(0, end) + "…";
+  }
+  // Rust str::lines(): a final LF ends a line instead of adding an empty one.
+  // CRLF has the same count; lone CR is ordinary content.
+  function logicalLineCount(text) {
+    if (!text.length) return 0;
+    let count = text.endsWith("\n") ? 0 : 1;
+    for (let i = 0; i < text.length; i++) if (text[i] === "\n") count++;
+    return count;
+  }
   function rateCell(r) {
     return h("span", { class: rateClass(r) }, pct(r));
   }
@@ -395,11 +418,13 @@
       return k + "=" + v;
     }).join("  "), 200);
   }
-  /** <pre> for a Tool payload: JSON is pretty-printed and highlighted. */
+  /** Original Tool payload text, with syntax highlighting for valid JSON.
+   * Parsing only classifies the text: stringify would round large integers,
+   * discard repeated keys and change numeric spellings/whitespace. */
   function payload(text) {
     try {
-      const p = JSON.stringify(JSON.parse(text), null, 2);
-      return h("pre", null, highlight(p, "json"));
+      JSON.parse(text);
+      return h("pre", null, highlight(text, "json"));
     } catch (_) {
       return h("pre", null, text);
     }
@@ -674,6 +699,7 @@
     const conn = $("conn");
     conn.title = "";
     conn.onclick = null;
+    const localConnected = S.local && S.ws?.readyState === 1 && S.daemonOnline;
     if (S.reconnect) {
       // Visible backoff with a manual retry (SPEC §12).
       const secs = Math.max(0, Math.ceil((S.reconnect.at - Date.now()) / 1000));
@@ -681,12 +707,12 @@
       conn.textContent = (S.local ? "daemon" : "relay") + " offline · retry in " + secs + "s";
       conn.title = "Retry now";
       conn.onclick = retryNow;
-    } else if (!navigator.onLine) {
+    } else if (!navigator.onLine && !localConnected) {
       conn.className = "pill off";
       conn.textContent = "offline · daemon unreachable";
     } else if (!S.ws || S.ws.readyState !== 1) {
       conn.className = "pill off";
-      conn.textContent = S.ws && S.ws.readyState === 0 ? "connecting…" : "relay disconnected";
+      conn.textContent = S.ws && S.ws.readyState === 0 ? "connecting…" : (S.local ? "daemon disconnected" : "relay disconnected");
     } else if (!S.daemonOnline) {
       conn.className = "pill off";
       conn.textContent = "daemon offline";
@@ -696,7 +722,7 @@
       conn.textContent = S.handshakeFailed ? "couldn't secure the connection" : "securing the connection…";
     } else {
       conn.className = "pill on";
-      conn.textContent = "● connected";
+      conn.textContent = "● connected" + (!navigator.onLine ? " · browser offline" : "");
     }
   }
 
@@ -809,6 +835,7 @@
    * Keep typography and the main layout width native; only the keyboard's
    * available height and floating controls follow the visible rectangle. */
   let viewportFrame = 0;
+  let composerInputWidth = 0;
   let viewportPrinting = false;
   function viewportBounds() {
     const viewport = window.visualViewport;
@@ -934,15 +961,22 @@
         const inputStyle = getComputedStyle(input);
         const oneLine = (parseFloat(inputStyle.lineHeight) || parseFloat(inputStyle.fontSize) * 1.45)
           + parseFloat(inputStyle.paddingTop) + parseFloat(inputStyle.paddingBottom) + parseFloat(inputStyle.borderTopWidth) + parseFloat(inputStyle.borderBottomWidth);
-        if (viewportVariable("--composer-input-limit", Math.max(oneLine, Math.min(viewport.height * .35, available * .45)))) autosize();
+        const inputLimitChanged = viewportVariable("--composer-input-limit", Math.max(oneLine, Math.min(viewport.height * .35, available * .45)));
+        // Measure after applying the width for the current viewport mode. The
+        // existing observers batch another frame when height changes; comparing
+        // only width prevents that notification from repeatedly autosizing.
+        if (zoomed) composer.style.width = Math.max(0, bounds.right - bounds.left) + "px";
+        else for (const property of ["left", "top", "right", "bottom", "width"]) composer.style.removeProperty(property);
+        const inputWidth = input.getBoundingClientRect().width;
+        const inputWidthChanged = inputWidth !== composerInputWidth;
+        composerInputWidth = inputWidth;
+        if (inputLimitChanged || inputWidthChanged) autosize();
         if (zoomed) {
-          composer.style.width = Math.max(0, bounds.right - bounds.left) + "px";
           const height = composer.getBoundingClientRect().height;
           const bottom = Math.min(bounds.bottom, rect.bottom);
           positionFixedBox(composer, bounds.left, Math.max(bounds.top, bottom - height));
           viewportVariable("--floating-composer-height", height + fontSize * .5);
         } else {
-          for (const property of ["left", "top", "right", "bottom", "width"]) composer.style.removeProperty(property);
           viewportVariable("--floating-composer-height", 0);
         }
         if (composing) revealViewportControl(document.activeElement, composer, bounds);
@@ -1254,6 +1288,12 @@
   function renderSessions() {
     const list = $("sessions");
     list.replaceChildren();
+    S.marked = S.marked || new Set();
+    if (S.marked.size) {
+      // Index the backing list, including filter-hidden and archived Sessions.
+      const loadedIds = new Set(S.sessions.map((s) => s.id));
+      for (const id of S.marked) if (!loadedIds.has(id)) S.marked.delete(id);
+    }
     if (!S.sessions.length) {
       list.append(h("li", { class: "muted", style: "padding:0.5rem" }, "No sessions yet."));
       return;
@@ -1268,8 +1308,6 @@
           onclick: () => { S.tagFilter = S.tagFilter === t ? null : t; renderSessions(); } }, "#" + t))));
     }
     // Bulk actions on checked Sessions (SPEC §10.4).
-    S.marked = S.marked || new Set();
-    for (const id of [...S.marked]) if (!S.sessions.some((s) => s.id === id)) S.marked.delete(id);
     if (S.marked.size) {
       const ids = [...S.marked];
       const btn = (label, run, cls) => h("button", { type: "button", class: "btn small" + (cls ? " " + cls : ""), onclick: run }, label);
@@ -1349,17 +1387,19 @@
   // output cannot inject markup. Mermaid diagrams render via a vendored,
   // lazily loaded mermaid.js into <img> data URLs (see renderMermaid).
   const SAFE_URL = /^(https?:|mailto:)/i;
+  // Asterisk emphasis consumes escapes as pairs before closing delimiters: an
+  // odd backslash run escapes the delimiter while an even run does not.
   const INLINE = new RegExp([
     /(`+)([^`]|[^`][\s\S]*?[^`])\1(?!`)/.source, // 1,2 code
-    /\*\*(?=\S)([\s\S]*?\S)\*\*/.source, // 3 strong
+    /\*\*(?=\S)((?:\\[\s\S]|[^\\])*?(?:\\\S|[^\\\s]))\*\*/.source, // 3 strong
     /__(?=\S)([\s\S]*?\S)__(?!\w)/.source, // 4 strong
     /~~(?=\S)([\s\S]*?\S)~~/.source, // 5 strike
-    /\*(?=[^\s*])((?:[^*]|\*\*[^*]+\*\*)*?[^\s*])\*/.source, // 6 em
+    /\*(?=[^\s*])((?:\\[\s\S]|[^*\\]|\*\*[^*]+\*\*)*?(?:\\\S|[^\\\s*]))\*/.source, // 6 em
     /(?<![\w\\])_(?=[^\s_])([^_]*?[^\s_])_(?!\w)/.source, // 7 em
     /!\[([^\]]*)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/.source, // 8,9 image
     /\[((?:[^\]\\]|\\.)+)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/.source, // 10,11 link
-    /<((?:https?:\/\/|mailto:)[^>\s]+)>/.source, // 12 autolink
-    /(https?:\/\/[^\s<]*[^\s<.,:;"')\]!?*_~])/.source, // 13 bare url
+    /<((?:[hH][tT][tT][pP][sS]?:\/\/|[mM][aA][iI][lL][tT][oO]:)[^>\s]+)>/.source, // 12 autolink
+    /([hH][tT][tT][pP][sS]?:\/\/[^\s<]*[^\s<.,:;"')\]!?*_~])/.source, // 13 bare url
     /\$(?=\S)([^$\n]*?\S)\$(?!\d)/.source, // 14 math
     /\\([\\`*_{}\[\]()#+\-.!~|$<>])/.source, // 15 escape
   ].join("|"), "g");
@@ -1401,11 +1441,12 @@
   const HL = {
     rust: { lc: ["//"], bc: ["/*", "*/"], q: "\"", kw: W("as async await break const continue crate dyn else enum extern fn for if impl in let loop match mod move mut pub ref return static struct trait type unsafe use where while"), lit: W("true false self Self None Some Ok Err super") },
     js: { lc: ["//"], bc: ["/*", "*/"], q: "\"'`", kw: W("as async await break case catch class const continue debugger default delete do else enum export extends finally for from function if implements import in instanceof interface let new of private protected public readonly return static switch throw try type typeof var void while with yield"), lit: W("true false null undefined NaN this super") },
-    py: { lc: ["#"], q: "\"'", kw: W("and as assert async await break case class continue def del elif else except finally for from global if import in is lambda match nonlocal not or pass raise return try while with yield"), lit: W("True False None self cls") },
+    py: { lc: ["#"], hashAnywhere: true, q: "\"'", kw: W("and as assert async await break case class continue def del elif else except finally for from global if import in is lambda match nonlocal not or pass raise return try while with yield"), lit: W("True False None self cls") },
     go: { lc: ["//"], bc: ["/*", "*/"], q: "\"`'", kw: W("break case chan const continue default defer else fallthrough for func go goto if import interface map package range return select struct switch type var"), lit: W("true false nil iota") },
     sh: { lc: ["#"], q: "\"'", kw: W("alias case cd do done echo elif else end esac exit export fi for function if in local return set source then unset while"), lit: W("true false") },
     c: { lc: ["//"], bc: ["/*", "*/"], q: "\"'", kw: W("abstract auto break case catch class const continue default do else enum extends extern final for fun func goto if implements import include interface let namespace new override package private protected public return sizeof static struct switch template throw throws try typedef union using val var virtual void volatile while"), lit: W("true false null nullptr nil this self super") },
     json: { q: "\"", kw: W(""), lit: W("true false null") },
+    config: { lc: ["#"], q: "\"'", kw: W(""), lit: W("true false null yes no on off"), key: true },
     conf: { lc: ["#", ";"], q: "\"'", kw: W(""), lit: W("true false null yes no on off"), key: true },
     sql: { lc: ["--"], bc: ["/*", "*/"], q: "'", ci: true, kw: W("add all alter and as asc begin by case commit create default delete desc distinct drop else end exists foreign from group having in index inner insert into is join key left like limit not offset on or order outer primary references returning right select set table then union update values when where with"), lit: W("null true false") },
     html: { bc: ["<!--", "-->"], q: "\"'", kw: W(""), lit: W(""), tags: true },
@@ -1415,7 +1456,7 @@
     rs: "rust", javascript: "js", jsx: "js", mjs: "js", cjs: "js", ts: "js", typescript: "js", tsx: "js",
     python: "py", python3: "py", golang: "go", bash: "sh", zsh: "sh", fish: "sh", shell: "sh", console: "sh", powershell: "sh", ps: "sh",
     h: "c", cpp: "c", "c++": "c", cc: "c", hpp: "c", java: "c", kotlin: "c", kt: "c", swift: "c", cs: "c", csharp: "c", scala: "c", dart: "c", php: "c", zig: "c",
-    jsonc: "json", json5: "json", yaml: "conf", yml: "conf", toml: "conf", ini: "conf", env: "conf", dotenv: "conf", properties: "conf",
+    jsonc: "json", json5: "json", yaml: "config", yml: "config", toml: "config", ini: "conf", env: "config", dotenv: "config", properties: "conf",
     sqlite: "sql", postgres: "sql", postgresql: "sql", mysql: "sql", xml: "html", svg: "html", vue: "html", svelte: "html", scss: "css", less: "css",
   };
   function highlight(code, lang) {
@@ -1457,7 +1498,7 @@
         i = stop;
         continue;
       }
-      if ((L.lc || []).some((p) => code.startsWith(p, i)) && (c !== "#" || i === 0 || /\s/.test(code[i - 1]))) {
+      if ((L.lc || []).some((p) => code.startsWith(p, i)) && (c !== "#" || L.hashAnywhere || i === 0 || /\s/.test(code[i - 1]))) {
         const end = code.indexOf("\n", i);
         const stop = end < 0 ? code.length : end;
         tok("tok-com", code.slice(i, stop));
@@ -1865,13 +1906,19 @@
     const ordered = /\d/.test(first[2]);
     const el = h(ordered ? "ol" : "ul");
     if (ordered && parseInt(first[2], 10) !== 1) el.setAttribute("start", String(parseInt(first[2], 10)));
+    // A marker before the current item's content column is a sibling, even
+    // when its indentation varies within the ordinary 0–3-space margin.
+    const sibling = (m, limit) => m && /\d/.test(m[2]) === ordered
+      && (indentOf(m[1]) <= 3 || indentOf(m[1]) === base) && indentOf(m[1]) < limit;
+    let siblingLimit = Infinity;
     let loose = false, stopped = false;
     while (i < lines.length) {
       const itemStart = i;
       let looseAfter = Infinity;
       const m = lines[i].match(ITEM);
-      if (!m || indentOf(m[1]) !== base || /\d/.test(m[2]) !== ordered) break;
-      const contentIndent = base + m[2].length + Math.max(1, Math.min(4, m[3].length));
+      if (RULE.test(lines[i]) || !sibling(m, siblingLimit)) break;
+      const contentIndent = indentOf(m[1]) + m[2].length + Math.max(1, Math.min(4, m[3].length));
+      siblingLimit = contentIndent;
       const body = [m[4]], bodyLazy = [lazy[i]];
       i++;
       while (i < lines.length) {
@@ -1879,20 +1926,20 @@
         if (!l.trim()) {
           let j = i + 1;
           while (j < lines.length && !lines[j].trim()) j++;
-          if (j < lines.length && indentOf(lines[j]) > base) {
+          if (j < lines.length && indentOf(lines[j]) >= contentIndent) {
             if (!ITEM.test(lines[j])) looseAfter = Math.min(looseAfter, body.length + 1);
             body.push(""); bodyLazy.push(false); i++; continue;
           }
-          const sibling = j < lines.length && lines[j].match(ITEM);
-          if (sibling && !RULE.test(lines[j]) && indentOf(sibling[1]) === base && /\d/.test(sibling[2]) === ordered) {
+          const next = j < lines.length && lines[j].match(ITEM);
+          if (sibling(next, contentIndent) && !RULE.test(lines[j])) {
             looseAfter = Math.min(looseAfter, body.length);
             i = j;
           }
           break;
         }
         const ind = indentOf(l);
-        if (ind > base) {
-          bodyLazy.push(lazy[i] || ind < contentIndent);
+        if (ind >= contentIndent) {
+          bodyLazy.push(lazy[i]);
           body.push(" ".repeat(Math.max(0, ind - contentIndent)) + l.trim()); i++; continue;
         }
         if (ITEM.test(l) || startsBlock(lines, i) || !body[body.length - 1].trim()) break;
@@ -1932,13 +1979,13 @@
 
   function toolCallChip(call) {
     const f = call.function || {};
-    return h("details", { class: "chip" },
+    return h("details", { class: "chip tool-call" },
       h("summary", null, h("span", { class: "tname" }, "⚙ " + (f.name || "tool")), h("span", { class: "targs" }, summarizeArgs(f.arguments || ""))),
       payload(f.arguments || ""));
   }
   function toolResultChip(content) {
     const failed = /"ok"\s*:\s*false/.test(content) || /^\s*error/i.test(content);
-    const lines = content.split("\n").length;
+    const lines = logicalLineCount(content);
     const refs = artifactRefs(content);
     const chip = h("details", { class: "chip result" + (failed ? " failed" : "") },
       h("summary", null,
@@ -2230,15 +2277,32 @@
   /** `/model`: filter models as you type; Enter sets this Session's model,
    * Ctrl/⌘+Enter the global default. */
   // "200k ctx · $3/$15 per M · vision · tools · ✗ test failed" (SPEC §4.2).
+  function modelContextLabel(value) {
+    if (!Number.isSafeInteger(value) || value < 0) return null;
+    const raw = String(value);
+    if (value < 1000) return raw + " ctx";
+    // Keep decimal windows such as 128000 in familiar decimal units.
+    if (value % 1000 !== 0) {
+      if (value % 1048576 === 0) return value / 1048576 + "Mi ctx";
+      if (value % 1024 === 0) return value / 1024 + "Ki ctx";
+    }
+    // Split integer digits instead of rounding floating-point quotients.
+    const places = value >= 1e6 ? 6 : 3;
+    const whole = raw.slice(0, -places);
+    const fraction = raw.slice(-places).replace(/0+$/, "");
+    const compact = whole + (fraction ? "." + fraction : "") + (places === 6 ? "M" : "k");
+    return (compact.length <= raw.length ? compact : raw) + " ctx";
+  }
   function modelDetail(m, t) {
     const parts = [];
     m = m || {};
-    if (m.context) parts.push(m.context >= 1e6 ? Math.floor(m.context / 1e6) + "M ctx" : Math.floor(m.context / 1000) + "k ctx");
+    const context = modelContextLabel(m.context);
+    if (context !== null) parts.push(context);
     if (m.input_price != null && m.output_price != null) parts.push(uiMoney(m.input_price, null) + "/" + uiMoney(m.output_price, null) + " per M");
     if (m.vision) parts.push("vision");
     if (m.tools === true) parts.push("tools");
     if (m.tools === false) parts.push("no tools");
-    if (t) parts.push(t.ok ? "✓ tested" : "✗ test failed");
+    if (t) parts.push(t.ok ? "✓ tested" : t.transient === true ? "✗ temporary test failure (use Test to retry)" : "✗ test failed");
     return parts.join(" · ");
   }
   function modelTestText(t) {
@@ -2420,6 +2484,22 @@
   function copy(text, what) {
     navigator.clipboard.writeText(text).then(() => toast("Copied " + what), () => toast("Copy failed", true));
   }
+  // Read rendered line breaks from an inert, offscreen copy so generated
+  // controls never enter the clipboard and the live message stays untouched.
+  function messageCopyText(node) {
+    const source = node.querySelector(".bubble, .md") || node;
+    const clone = source.cloneNode(true);
+    for (const control of clone.querySelectorAll("button, [role=button]")) control.remove();
+    clone.inert = true;
+    clone.setAttribute("aria-hidden", "true");
+    clone.style.cssText += ";position:fixed;left:-100000px;top:0;opacity:0;pointer-events:none;width:" + source.getBoundingClientRect().width + "px";
+    // User/system-note ancestors supply pre-wrap; preserve the source's
+    // computed whitespace when the clone leaves that ancestor context.
+    clone.style.whiteSpace = getComputedStyle(source).whiteSpace;
+    document.body.append(clone);
+    try { return clone.innerText; }
+    finally { clone.remove(); }
+  }
   /** Actions on one message (SPEC §10.2): copy it (as text or Markdown),
    * edit and re-run a user message, fork the Session from it, and copy a
    * Tool call's input or a result. */
@@ -2431,7 +2511,7 @@
     const items = [];
     if (m.role === "tool") items.push(item("Copy output", () => copy(m.content || "", "the output")));
     else if (m.content) {
-      const text = (node.querySelector(".bubble, .md") || node).innerText;
+      const text = messageCopyText(node);
       items.push(item("Copy", () => copy(text, "the message")));
       items.push(item("Copy as Markdown", () => copy(m.content, "as Markdown")));
     }
@@ -2469,6 +2549,26 @@
     };
     return notes[reason] || "The answer ended early (" + reason + ").";
   }
+  function sessionLoadNotice() {
+    const load = S.sessionLoad;
+    if (!S.current || load?.id !== S.current || load.status === "loaded") {
+      historyRender.loadNotice = null;
+      return null;
+    }
+    const key = load.id + ":" + load.status;
+    // Reuse the notice across ordinary paints, avoiding repeated status
+    // announcements and preserving the Retry control while it owns focus.
+    if (historyRender.loadNotice?.key !== key) {
+      const pending = load.status === "pending";
+      const node = h("div", { class: "banner", "data-session-load": load.status,
+        role: pending ? "status" : "group", "aria-label": pending ? null : "Transcript load failed" },
+        pending ? "Loading transcript…" : [
+          h("p", null, "Could not load the transcript."),
+          h("button", { class: "btn small", type: "button", onclick: () => openSession(load.id, true) }, "Retry loading transcript")]);
+      historyRender.loadNotice = { key, node };
+    }
+    return historyRender.loadNotice.node;
+  }
   function renderHistory({ newContent = false } = {}) {
     const box = $("transcript");
     withTranscriptLayout(() => {
@@ -2481,7 +2581,9 @@
         rendered.clear();
       }
       const wanted = [];
-      if (!S.current || (!S.messages.length && !isRunning())) {
+      const loadNotice = sessionLoadNotice();
+      if (loadNotice) wanted.push(loadNotice);
+      if (!S.current || (!S.messages.length && !isRunning() && !loadNotice)) {
         historyRender.turns.clear();
         rendered.clear();
         if (!historyRender.welcome) historyRender.welcome = welcome();
@@ -2730,10 +2832,16 @@
    * unfinished tail (the TUI's complete-prefix rule): blocks end at a blank
    * line outside a code fence or display math. An unfinished block stays
    * plain text, and completed blocks above it keep their DOM identity. */
-  function splitStreaming(text) {
-    let fence = null, math = false, cut = 0, at = 0;
-    for (const line of text.split("\n")) {
-      const next = at + line.length + 1;
+  function splitStreaming(text, state = {}, trustedAppend = false) {
+    if (state.text === text) return state.value;
+    const append = typeof state.text === "string" && text.length >= state.text.length
+      && (trustedAppend || text.startsWith(state.text));
+    let { fence = null, math = false, cut = 0, at = 0, search = 0 } = append ? state : {};
+    // Checkpoint before the unfinished line. Its delimiter meaning is only
+    // committed when its newline arrives; extending it must not keep a
+    // provisional fence/math decision. Search only the newly appended suffix.
+    for (let end; (end = text.indexOf("\n", search)) >= 0;) {
+      const line = text.slice(at, end), next = end + 1;
       if (math) math = mathBlockOpen(line, true);
       else if (fence) {
         if (fenceCloses(line, fence)) fence = null;
@@ -2741,11 +2849,59 @@
         const marker = line.match(FENCE);
         if (marker) fence = marker[2];
         else if (MATH_BLOCK.test(line)) math = mathBlockOpen(line);
-        else if (!line.trim() && next <= text.length) cut = next;
+        else if (!line.trim()) cut = next;
       }
-      at = next;
+      at = search = next;
     }
-    return [text.slice(0, cut), text.slice(cut)];
+    const done = append && cut === state.cut ? state.value[0] : text.slice(0, cut);
+    Object.assign(state, { text, fence, math, cut, at, search: text.length, value: [done, text.slice(cut)] });
+    return state.value;
+  }
+  function thinkingTail(text, state = {}, trustedAppend = false) {
+    if (state.text === text) return state.value;
+    const append = typeof state.text === "string" && text.length >= state.text.length
+      && (trustedAppend || text.startsWith(state.text));
+    if (!append) { state.lines = [""]; state.more = false; }
+    let at = append ? state.text.length : 0;
+    for (let end; (end = text.indexOf("\n", at)) >= 0;) {
+      state.lines[state.lines.length - 1] += text.slice(at, end);
+      state.lines.push("");
+      if (state.lines.length > 6) { state.lines.shift(); state.more = true; }
+      at = end + 1;
+    }
+    state.lines[state.lines.length - 1] += text.slice(at);
+    state.text = text;
+    state.value = (state.more ? "… " : "") + state.lines.join("\n");
+    return state.value;
+  }
+  // Per-stream caches, not Session-wide caches: a Session can emit many
+  // answers in one Run. Every clear/commit/retry invalidates them explicitly.
+  const liveText = { session: undefined, run: undefined, answer: {}, thinking: {}, answerSource: undefined, thinkingSource: undefined, expanded: false };
+  function currentLiveText() {
+    if (liveText.session !== S.current || liveText.run !== S.liveRun?.id) {
+      Object.assign(liveText, { session: S.current, run: S.liveRun?.id, answer: {}, thinking: {}, answerSource: undefined, thinkingSource: undefined, expanded: false });
+    }
+    return liveText;
+  }
+  function appendLiveText(kind, delta) {
+    const state = currentLiveText(), key = kind === "streaming" ? "answer" : "thinking";
+    const source = key + "Source";
+    // Only our append reducer supplies this proof. A snapshot/direct source
+    // replacement invalidates it, without comparing growing prefixes per RAF.
+    if (state[source] !== S[kind]) state[key] = {};
+    S[kind] += delta;
+    state[source] = S[kind];
+  }
+  function cachedLiveText(kind, text) {
+    const state = currentLiveText(), source = kind + "Source";
+    const value = (kind === "answer" ? splitStreaming : thinkingTail)(text, state[kind], state[source] === text);
+    state[source] = text;
+    return value;
+  }
+  function clearLiveText() {
+    S.streaming = "";
+    S.thinking = "";
+    Object.assign(liveText, { session: undefined, run: undefined, answer: {}, thinking: {}, answerSource: undefined, thinkingSource: undefined, expanded: false });
   }
   function reuseStreamingBlock(previous, node) {
     if (previous?.isEqualNode(node)) return previous;
@@ -2777,7 +2933,7 @@
       liveDone.node = h("div", { class: "streaming" }, liveDone.done, liveDone.tail);
       liveDone.plainText = null;
     }
-    const [done, tail] = splitStreaming(text);
+    const [done, tail] = cachedLiveText("answer", text);
     if (liveDone.src !== done) {
       const extra = done.startsWith(liveDone.src) ? done.slice(liveDone.src.length) : null;
       const last = liveDone.done.lastElementChild;
@@ -2896,12 +3052,20 @@
     const live = $("live");
     if (!live) return;
     withTranscriptLayout(() => {
+      const textState = currentLiveText();
       if (liveRender.session !== S.current || liveRender.root !== live) {
         liveRender.session = S.current;
         liveRender.root = live;
         liveRender.who = h("div", { class: "who assistant" }, "Formless");
         liveRender.thinkingText = document.createTextNode("");
-        liveRender.thinking = h("div", { class: "thinking" }, liveRender.thinkingText);
+        liveRender.thinking = h("div", { class: "thinking", id: "live-reasoning", "aria-label": "Live reasoning" }, liveRender.thinkingText);
+        liveRender.thinkingToggleText = document.createTextNode("");
+        liveRender.thinkingToggle = h("button", { type: "button", class: "btn ghost small", "aria-controls": "live-reasoning", onclick: () => {
+          const state = currentLiveText();
+          state.expanded = !state.expanded;
+          renderLive();
+        } }, liveRender.thinkingToggleText);
+        liveRender.thinkingBox = h("div", { class: "live-thinking" }, liveRender.thinkingToggle, liveRender.thinking);
         liveRender.activityText = document.createTextNode("");
         liveRender.activity = h("div", { class: "activity" }, h("span", { class: "spinner" }), h("span", { "data-live-activity": "" }, liveRender.activityText));
         liveRender.rows.clear();
@@ -2912,9 +3076,20 @@
       if (running || S.streaming || tools.length) {
         children.push(liveRender.who);
         if (S.showThinking && S.thinking) {
-          const lines = S.thinking.split("\n");
-          updateText(liveRender.thinkingText, lines.length > 6 ? "… " + lines.slice(-6).join("\n") : S.thinking);
-          children.push(liveRender.thinking);
+          const expanded = textState.expanded;
+          const top = liveRender.thinking.scrollTop;
+          const className = "thinking" + (expanded ? " expanded" : "");
+          if (liveRender.thinking.className !== className) liveRender.thinking.className = className;
+          const tabIndex = expanded ? 0 : -1;
+          if (liveRender.thinking.tabIndex !== tabIndex) liveRender.thinking.tabIndex = tabIndex;
+          if (liveRender.thinkingToggle.getAttribute("aria-expanded") !== String(expanded)) {
+            liveRender.thinkingToggle.setAttribute("aria-expanded", String(expanded));
+          }
+          updateText(liveRender.thinkingToggleText, expanded ? "Collapse reasoning" : "Expand reasoning");
+          updateText(liveRender.thinkingText, expanded ? S.thinking : cachedLiveText("thinking", S.thinking));
+          // Updating the retained full text must not follow its growing end.
+          liveRender.thinking.scrollTop = expanded ? top : 0;
+          children.push(liveRender.thinkingBox);
         }
         for (const [tool, folded] of liveTree(S.liveTools)) {
           const row = liveToolRow(tool);
@@ -3390,14 +3565,26 @@
     const session = S.sessions.find((s) => s.id === S.current);
     return JSON.stringify([S.current, S.editMessageId, draft, session && session.model, session && session.cwd, S.chips[S.current] || [], S.daemonOnline, S.hello, forecastRevision]);
   }
+  function renderForecastPreview(result) {
+    const hint = $("forecast-hint");
+    if (hint) {
+      hint.textContent = result ? result.hint : "";
+      hint.removeAttribute("title");
+    }
+    const disclosure = $("forecast-warnings"), list = $("forecast-warning-list");
+    if (!disclosure || !list) return;
+    const warnings = Array.isArray(result?.warnings) ? result.warnings.filter(text => typeof text === "string") : [];
+    list.replaceChildren(...warnings.map(text => h("li", null, text)));
+    disclosure.hidden = warnings.length === 0;
+    if (!warnings.length) disclosure.open = false;
+  }
   function scheduleForecast() {
     const stamp = forecastStamp();
     if (stamp === forecastStampLast) return;
     forecastStampLast = stamp;
     const sequence = ++forecastSequence;
     clearTimeout(forecastTimer);
-    const box = $("forecast-hint");
-    if (box) box.textContent = "";
+    renderForecastPreview(null);
     const draft = $("input").value.trim();
     if (!S.daemonOnline || !S.current || !draft || draft.startsWith("/") || isRunning()) return;
     const sid = S.current;
@@ -3405,7 +3592,7 @@
       try {
         const result = await request({type:"forecast_run",input:{session_id:sid,draft,edit_message_id:S.editMessageId || null}});
         if (sequence !== forecastSequence || stamp !== forecastStamp()) return;
-        if (box) { box.textContent = result.hint; box.title = (result.warnings || []).join("\n"); }
+        renderForecastPreview(result);
       } catch (_) { /* A failed preview never executes or clears a draft. */ }
     }, 300);
   }
@@ -4086,7 +4273,7 @@
     box.replaceChildren();
     const d = S.toolDetail;
     if (!d || d.tool.id !== S.selectedTool) {
-      box.append(h("p", { class: "placeholder" }, S.selectedTool ? "Loading Tool details…" : S.tools.length ? "Select a Tool for its versions, metrics, optimiser history, and code." : "Tools appear here once the agent creates them."));
+      box.append(toolDetailFailure(S.selectedTool) || h("p", { class: "placeholder" }, S.selectedTool ? "Loading Tool details…" : S.tools.length ? "Select a Tool for its versions, metrics, optimiser history, and code." : "Tools appear here once the agent creates them."));
     } else {
       renderToolDetail(box, d);
     }
@@ -4557,6 +4744,9 @@
     const d = S.toolDetail;
     if (d && d.tool.id === S.metricTool) {
       box.append(h("div", { class: "detail" }, h("h3", null, d.tool.name), metricsBlock(d.metrics)));
+    } else {
+      const failure = toolDetailFailure(S.metricTool);
+      if (failure) box.append(failure);
     }
     const rt = $("routing-table");
     rt.replaceChildren(h("thead", null, h("tr", null, ["Model", "Calls", "Success", "Avg latency", "Prompt tokens", "Cached"].map((c, i) => h("th", { class: i ? "num" : null }, c)))));
@@ -4671,6 +4861,8 @@
 
   function renderSettings() {
     const box = $("settings");
+    const focused = document.activeElement;
+    const focusedKey = box.contains(focused) ? focused.getAttribute("data-setting-control") : null;
     box.replaceChildren();
     // A row is [label, value] or [label, value, settingKey, kind]: the
     // latter gets an Edit control (SetSetting, validated by the daemon).
@@ -4686,7 +4878,7 @@
       rows.map(([k, v, key, kind, choices]) => [h("dt", { title: key || "", "data-setting-key": key || "" }, k), h("dd", null,
         v === "" || v == null ? h("span", { class: "muted" }, "(not set)") : settingDisplay(v),
         key && onTuiStart.has(key) ? h("span", { class: "tag", title: "A running TUI keeps the old value until it restarts" }, "applies when the TUI starts") : null,
-        key && kind ? h("button", { class: "btn ghost small", type: "button", "aria-label": "Edit " + key, onclick: (event) => {
+        key && kind ? h("button", { class: "btn ghost small", type: "button", "data-setting-control": key, "aria-label": "Edit " + key, onclick: (event) => {
           // A pointer click need not focus a native button on macOS. Give the
           // prompt a stable invoker to restore when it closes.
           event.currentTarget.focus({ preventScroll: true });
@@ -4849,6 +5041,13 @@
         h("button", { class: "btn danger small", type: "button", onclick: forget }, "Disconnect and forget this device"))));
     box.append(grid, h("p", { class: "muted" }, "Edits are validated and applied by the daemon; rows marked for TUI startup need a TUI restart. Credentials, endpoint and relay configuration use config.toml or their CLI. Manage MCP servers above."));
     filterSettings();
+    // Restore only a control removed by this synchronous redraw. A user who
+    // moved elsewhere while an asynchronous save was pending keeps that focus.
+    if (focusedKey && (document.activeElement === document.body || document.activeElement === focused)) {
+      const replacement = [...box.querySelectorAll("[data-setting-control]")].find(node => node.getAttribute("data-setting-control") === focusedKey);
+      const target = focusVisible(replacement) ? replacement : $("settings-filter");
+      if (focusVisible(target)) target.focus({ preventScroll: true });
+    }
   }
   /** The Settings filter: rows whose label, key, value or description
    * contain the words stay (matches marked); sections with none left hide,
@@ -5036,11 +5235,15 @@
       value = select.value || null;
     } else {
       const initial = current == null ? "" : kind === "json" || kind === "list" ? JSON.stringify(current) : String(current);
-      const text = await ask({ title: "Set " + key, inputKind: "machine", input: true, value: initial, ok: "Save",
-        text: "Leave empty for the default. " + (kind === "list" ? "Comma-separated strings or a JSON array (numbers stay numeric)." : kind === "json" ? "JSON value (quote strings; maps and numeric lists use JSON)." : "") });
-      if (text == null) return;
-      try { value = parseSettingInput(text, kind); }
-      catch (error) { toast(error.message || "invalid value", true); return; }
+      let draft = initial, error = "";
+      while (true) {
+        const text = await ask({ title: "Set " + key, inputKind: "machine", input: true, value: draft, ok: "Save",
+          text: "Leave empty for the default. " + (kind === "list" ? "Comma-separated strings or a JSON array (numbers stay numeric)." : kind === "json" ? "JSON value (quote strings; maps and numeric lists use JSON)." : ""),
+          body: error ? h("p", { class: "error", role: "alert" }, error) : null });
+        if (text == null) return;
+        try { value = parseSettingInput(text, kind); break; }
+        catch (cause) { draft = text; error = cause.message || "Invalid value"; }
+      }
     }
     const r = await act({ type: "set_setting", key, value });
     if (!r) return;
@@ -5346,16 +5549,22 @@
   /** A 5-field cron in words where it's a common shape, else as is. */
   function describeCron(expr) {
     const e = expr.trim();
-    const named = { "@hourly": "every hour", "@daily": "every day at 0:00", "@weekly": "every Sunday at 0:00", "@monthly": "on the 1st of each month at 0:00" };
+    const named = {
+      "@hourly": "every hour", "@daily": "every day at 0:00", "@midnight": "every day at 0:00",
+      "@weekly": "every Sunday at 0:00", "@monthly": "on the 1st of each month at 0:00",
+      "@yearly": "every year on January 1 at 0:00", "@annually": "every year on January 1 at 0:00",
+    };
     if (named[e]) return named[e];
     const f = e.split(/\s+/);
     if (f.length !== 5) return e;
     const [m, hr, dom, mon, dow] = f;
     const step = m.match(/^\*\/(\d+)$/);
     if (step && hr === "*" && dom === "*" && mon === "*" && dow === "*") return "every " + step[1] + " minutes";
-    if (/^\d+$/.test(m) && hr === "*" && dom === "*" && mon === "*" && dow === "*") return "every hour at :" + m.padStart(2, "0");
-    if (!/^\d+$/.test(m) || !/^\d+$/.test(hr) || mon !== "*") return e;
+    if (/^\d+$/.test(m) && hr === "*" && dom === "*" && mon === "*" && dow === "*") return Number(m) === 0 ? "every hour" : "every hour at minute " + m.padStart(2, "0");
+    if (!/^\d+$/.test(m) || !/^\d+$/.test(hr)) return e;
     const time = hr + ":" + m.padStart(2, "0");
+    if (dom === "1" && mon === "1" && dow === "*") return "every year on January 1 at " + time;
+    if (mon !== "*") return e;
     if (dom === "*" && dow === "*") return "every day at " + time;
     if (dom === "*" && dow === "1-5") return "every weekday at " + time;
     if (dom === "*" && /^[0-7](,[0-7])*$/.test(dow)) return "every " + dow.split(",").map((d) => DAYS[Number(d) % 7]).join(", ") + " at " + time;
@@ -5435,7 +5644,7 @@
     const desc = h("input", { type: "text", value: r.description || "", placeholder: "When to use it, written for the agent" });
     const prov = h("select", null, providers.map((p) => h("option", { value: p, selected: (r.provider || "default") === p }, p)));
     const model = h("input", { type: "text", value: r.model || "", placeholder: "model (blank = the provider's default)", spellcheck: "false" });
-    const effort = h("select", null, ["", "low", "medium", "high"].map((e) => h("option", { value: e, selected: (r.reasoning_effort || "") === e }, e || "default effort")));
+    const effort = h("select", null, ["", "minimal", "low", "medium", "high"].map((e) => h("option", { value: e, selected: (r.reasoning_effort || "") === e }, e || "default effort")));
     const body = h("div", { class: "try-form" }, field("Name", name), field("Description", desc), field("Provider", prov), field("Model", model), field("Reasoning effort", effort));
     if (!(await ask({ title: existing ? "Edit role " + existing : "Add role", body, ok: "Save" }))) return;
     const role = Object.assign({}, r, { description: desc.value.trim(), provider: prov.value === "default" ? null : prov.value, model: model.value.trim(), reasoning_effort: effort.value || null });
@@ -5482,15 +5691,23 @@
       selectTool(t.id, true);
     }
   }
+  function toolDetailFailure(id) {
+    if (!id || S.toolDetailError !== id) return null;
+    return h("div", { class: "placeholder" },
+      h("p", { class: "error" }, "Could not load Tool details."),
+      h("button", { class: "btn small", type: "button", onclick: () => selectTool(id, true) }, "Retry"));
+  }
   let toolSeq = 0;
   async function selectTool(id, quiet) {
     const seq = ++toolSeq;
     S.selectedTool = id;
+    S.toolDetailError = null;
     renderView();
     if (!quiet && S.editingCode && S.editingCode.toolId !== id) S.editingCode = null;
     const d = await act({ type: "get_tool", id });
     if (seq !== toolSeq || S.selectedTool !== id) return;
     if (d) S.toolDetail = d;
+    else S.toolDetailError = id;
     renderView();
   }
 
@@ -5516,12 +5733,14 @@
     invalidateBranchSummary();
     ++sessionSeq; // invalidate a snapshot requested on the old connection
     S.sessionSnapshot = null;
+    if (S.sessionLoad?.status === "pending" && S.sessionLoad.id === S.current) {
+      S.sessionLoad = { id: S.current, status: "failed" };
+    }
     S.approvals = [];
     clearQuestions();
     S.running.clear();
     S.activity = null;
-    S.streaming = "";
-    S.thinking = "";
+    clearLiveText();
     S.liveTools = []; S.liveRun = null;
     renderApproval();
   }
@@ -5596,10 +5815,10 @@
     closeSidebar();
     if (!stay && S.view !== "chat") setView("chat");
     S.current = id;
+    S.sessionLoad = { id, status: "pending" };
     const snapshot = S.sessionSnapshot = { events: [] };
     S.messages = [];
-    S.streaming = "";
-    S.thinking = "";
+    clearLiveText();
     S.liveTools = []; S.liveRun = null;
     renderHistory();
     S.runTools = null;
@@ -5635,6 +5854,7 @@
     const r = await act({ type: "get_session", id });
     if (seq !== sessionSeq || S.current !== id) return;
     S.sessionSnapshot = null;
+    S.sessionLoad = { id, status: r ? "loaded" : "failed" };
     if (r) {
       applySessionLiveState(id, r, snapshot.events);
       const live = S.messages;
@@ -6029,7 +6249,7 @@
     } },
     { name: "docs", args: "[TOPIC]", group: "App", desc: "open the guides: gallery, capabilities, approvals, keys, troubleshooting", run: (arg) => {
       const base = "https://github.com/athiwatc/formless/blob/main/";
-      const topics = { gallery: "docs/gallery.md", capabilities: "docs/capabilities.md", approvals: "docs/capabilities.md#are-you-asked", keys: "docs/keys.md", troubleshooting: "docs/troubleshooting.md", mcp: "SPEC.md#79-external-mcp-servers", skills: "SPEC.md#710-skills", jobs: "SPEC.md#97-scheduled-jobs", spec: "SPEC.md" };
+      const topics = { gallery: "docs/gallery.md", capabilities: "docs/capabilities.md", approvals: "docs/capabilities.md#are-you-asked", keys: "docs/keys.md", troubleshooting: "docs/troubleshooting.md", docker: "docs/docker.md", mcp: "docs/mcp.md", skills: "docs/skills.md", jobs: "docs/jobs.md", spec: "SPEC.md" };
       const t = (arg || "").trim().toLowerCase();
       const key = !t ? "gallery" : Object.keys(topics).find((k) => k === t) || Object.keys(topics).find((k) => k.startsWith(t));
       if (!key) return note("docs topics: " + Object.keys(topics).join(", "), true);
@@ -6467,7 +6687,7 @@
       case "run_started":
         S.running.add(ev.session_id);
         if (here) { S.unfinished = null; renderRunBanner(); S.runTools = null; renderRunTools(); S.rated = null; S.recap = null; S.recapRunId = null; }
-        if (here) { S.streaming = ""; S.thinking = ""; S.liveTools = (S.liveTools || []).filter(t => t.status === "running" && t.handle); S.liveRun = { id: ev.run_id, ended: false }; setActivity("waiting for model"); }
+        if (here) { clearLiveText(); S.liveTools = (S.liveTools || []).filter(t => t.status === "running" && t.handle); S.liveRun = { id: ev.run_id, ended: false }; setActivity("waiting for model"); }
         break;
       case "run_recap":
         if (here && (!S.liveRun || S.liveRun.id === ev.run_id)) {
@@ -6487,7 +6707,7 @@
         // A persisted assistant step (e.g. text before a Tool call) replaces
         // the live stream, so the next step starts fresh.
         if (ev.message.role === "assistant") commitReadingStream(ev.session_id, ev.message);
-        if (here && (ev.type === "message_complete" || ev.message.role === "assistant")) { S.streaming = ""; S.thinking = ""; }
+        if (here && (ev.type === "message_complete" || ev.message.role === "assistant")) { clearLiveText(); }
         if (here) {
           const index = S.messages.findIndex((m) => m.id === ev.message.id);
           if (index < 0) S.messages.push(ev.message);
@@ -6496,7 +6716,7 @@
         }
         break;
       case "message_delta":
-        if (here) { S.streaming += ev.delta; if (!S.activity || S.activity.label !== "responding") setActivity("responding"); else scheduleEventRender({ live: true }); }
+        if (here) { appendLiveText("streaming", ev.delta); if (!S.activity || S.activity.label !== "responding") setActivity("responding"); else scheduleEventRender({ live: true }); }
         break;
       case "provider_stalled":
         if (here) { setActivity("provider stalled"); note("no data from the provider for " + ev.idle_secs + "s; /resend re-sends the request", true); }
@@ -6539,10 +6759,10 @@
         }
         break;
       case "stream_restarted":
-        if (here) { S.streaming = ""; S.thinking = ""; note("provider stream dropped; retrying"); scheduleEventRender({ live: true }); }
+        if (here) { clearLiveText(); note("provider stream dropped; retrying"); scheduleEventRender({ live: true }); }
         break;
       case "reasoning_delta":
-        if (here) { S.thinking += ev.delta; if (!S.activity || S.activity.label !== "thinking") setActivity("thinking"); else scheduleEventRender({ live: true }); }
+        if (here) { appendLiveText("thinking", ev.delta); if (!S.activity || S.activity.label !== "thinking") setActivity("thinking"); else scheduleEventRender({ live: true }); }
         break;
       case "run_finished":
       case "run_paused":
@@ -6559,8 +6779,7 @@
           renderRunBanner();
         }
         if (here) {
-          S.streaming = "";
-          S.thinking = "";
+          clearLiveText();
           S.liveTools = (S.liveTools || []).filter(t => t.status === "running" && t.handle); S.liveRun = { id: ev.run_id, ended: true };
           setActivity(null);
           if (ev.type === "run_paused") note("run paused: " + ((ev.explained && ev.explained.message) || ev.error), true);
@@ -7250,12 +7469,15 @@
   /** The current Session's pending attachments, each removable (×). */
   function renderChips() {
     const box = $("attach-chips");
+    const previous = [...box.querySelectorAll("button[data-attachment-key]")];
+    const focusIndex = previous.indexOf(document.activeElement);
+    const focusKey = focusIndex >= 0 ? previous[focusIndex].dataset.attachmentKey : null;
     const list = S.chips[S.current] || [];
     box.classList.toggle("hidden", !list.length);
     box.replaceChildren(...list.map((a) => h("span", { class: "tag attach-chip", title: (a.mime || "file") + " · " + Math.max(1, Math.round(a.bytes / 1024)) + " KB" },
       h("span", { class: "attach-icon" }, (a.mime || "").startsWith("image/") ? "🖼" : "📄"),
       h("span", { class: "attach-name" }, a.name),
-      h("button", { class: "btn ghost small", type: "button", "aria-label": "Remove " + a.name, onclick: async () => {
+      h("button", { class: "btn ghost small", type: "button", "data-attachment-key": a.id || a.path || a.name || "", "aria-label": "Remove " + a.name, onclick: async () => {
         const sid = S.current;
         // A referenced file (too big to attach) is named by its path.
         if (await act({ type: "detach_file", session_id: sid, id: a.id || a.path })) {
@@ -7264,6 +7486,13 @@
           renderChips();
         }
       } }, "×"))));
+    if (focusIndex >= 0) {
+      const next = [...box.querySelectorAll("button[data-attachment-key]")];
+      // Keep a deliberately focused remaining chip. Otherwise use the next
+      // chip, then the previous one, then the composer after the final removal.
+      (next.find(button => button.dataset.attachmentKey === focusKey)
+        || next[Math.min(focusIndex, next.length - 1)] || $("input")).focus({ preventScroll: true });
+    }
   }
   // Drop files anywhere on the chat to attach them.
   {
