@@ -251,6 +251,10 @@ impl Fixture {
                                 ])
                             }
                         }
+                        Request::Subscribe { .. } => json!({"conn":1}),
+                        Request::GetRun { run_id } => inspected_run(run_id),
+                        Request::CancelRunId { run_id } => cancellation_reply(run_id),
+                        Request::UsageByDay { .. } => grouped_usage(),
                         _ => panic!("unexpected private RPC: {:?}", envelope.request),
                     };
                     let fail = match &envelope.request {
@@ -1530,6 +1534,177 @@ fn shipped_memory_used_preserves_exact_selectors_current_notes_and_qualified_emp
     assert_eq!(seen.iter().filter(|req|matches!(req,Request::RunMemories{run_id:Some(id),session_id:None} if id=="retained-missing-run")).count(),2);
 }
 
+fn inspected_run(status: &str) -> Value {
+    let mut value = json!({"run_id":"full-run-日本語-id","session_id":"session-ไทย","status":status,"error":if status=="failed" {Some("failure\n\u{1b}[31mไทย")} else {None},"created_at":"stored-created","updated_at":"stored-updated","start_message_seq":0,"end_message_seq":null,"steps":2,"tool_calls":3,"prompt_tokens":0,"completion_tokens":0,"future":{"retained":true}});
+    if status == "paused" {
+        value["spend"] = json!({"known_usd":0.25,"total_usd":null,"usage_complete":false,"spend_complete":false,"unpriced":["モデル"]});
+    }
+    value
+}
+fn cancellation_reply(id: &str) -> Value {
+    json!({"run_id":"full-run-日本語-id","interrupted":id=="yes","future":7})
+}
+
+#[test]
+fn shipped_run_inspection_reports_precede_existing_exits_and_json_stays_complete() {
+    let fixture = Fixture::new();
+    for (status, exit) in [
+        ("running", 0),
+        ("completed", 0),
+        ("paused", 1),
+        ("failed", 1),
+        ("abandoned", 1),
+        ("interrupted", 130),
+        ("unknown", 0),
+    ] {
+        for mode in 0..3 {
+            fixture.requests.lock().unwrap().clear();
+            let args = match mode {
+                0 => vec!["runs", "show", status],
+                1 => vec!["runs", "show", status, "--json"],
+                _ => vec!["runs", "--json", "show", status],
+            };
+            let out = fixture.run(&args);
+            assert_eq!(
+                out.status.code(),
+                Some(exit),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            if mode > 0 {
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&out.stdout).unwrap(),
+                    inspected_run(status)
+                );
+            } else {
+                let text = String::from_utf8(out.stdout).unwrap();
+                assert!(
+                    text.contains("Run ID: full-run-日本語-id")
+                        && text.contains(&format!("Stored status: {status}"))
+                );
+                assert!(text.contains("Recorded prompt tokens: 0"));
+                if status == "failed" {
+                    assert!(!text.contains('\u{1b}'));
+                    assert!(text.contains("failure\\u{a}\\u{1b}[31mไทย"));
+                }
+                if status == "paused" {
+                    assert!(
+                        text.contains("Known USD subtotal: 0.25")
+                            && text.contains("Total USD: -")
+                            && text.contains("Spend complete: false")
+                    );
+                }
+            }
+            assert!(
+                matches!(&fixture.requests.lock().unwrap()[..],[Request::Subscribe{..},Request::GetRun{run_id}] if run_id==status)
+            );
+        }
+    }
+    for id in ["yes", "no"] {
+        for mode in 0..3 {
+            fixture.requests.lock().unwrap().clear();
+            let args = match mode {
+                0 => vec!["runs", "cancel", id],
+                1 => vec!["runs", "cancel", id, "--json"],
+                _ => vec!["runs", "--json", "cancel", id],
+            };
+            let out = fixture.run(&args);
+            assert!(out.status.success());
+            if mode > 0 {
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&out.stdout).unwrap(),
+                    cancellation_reply(id)
+                );
+            } else {
+                let text = String::from_utf8(out.stdout).unwrap();
+                assert!(text.contains(if id == "yes" {
+                    "Cancellation requested"
+                } else {
+                    "No active accepting Run"
+                }));
+                assert!(!text.contains("stopped") && !text.contains("finished"));
+            }
+            assert!(
+                matches!(&fixture.requests.lock().unwrap()[..],[Request::Subscribe{..},Request::CancelRunId{run_id}] if run_id==id)
+            );
+        }
+    }
+}
+fn grouped_usage() -> Value {
+    json!([
+        {"key":"日本語","prompt_tokens":7,"completion_tokens":8,"cached_tokens":2,"cost":null,"future":true},
+        {"key":"ไทย","prompt_tokens":3,"completion_tokens":4,"cached_tokens":1,"cost":0.125}
+    ])
+}
+
+#[test]
+fn shipped_grouped_usage_sends_one_read_and_keeps_all_daemon_values() {
+    let fixture = Fixture::new();
+    for group in [
+        None,
+        Some("day"),
+        Some("model"),
+        Some("provider"),
+        Some("purpose"),
+        Some("role"),
+        Some("session"),
+    ] {
+        for json in [false, true] {
+            fixture.requests.lock().unwrap().clear();
+            let mut args = vec!["usage"];
+            if let Some(group) = group {
+                args.extend(["--by", group]);
+            }
+            if json {
+                args.push("--json");
+            }
+            let out = fixture.run(&args);
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            if json {
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&out.stdout).unwrap(),
+                    grouped_usage()
+                );
+            } else {
+                let text = String::from_utf8(out.stdout).unwrap();
+                assert!(text.find("日本語").unwrap() < text.find("ไทย").unwrap());
+                assert!(text.contains('-') && text.contains("0.125"));
+                assert!(
+                    !text.contains('\x1b'),
+                    "redirected usage must be plain: {text:?}"
+                );
+            }
+            let requests = fixture.requests.lock().unwrap();
+            let [Request::UsageByDay { since, by }] = &requests[..] else {
+                panic!("{requests:?}")
+            };
+            assert!(since.is_none());
+            assert_eq!(by.as_deref(), group.filter(|value| *value != "day"));
+        }
+    }
+    fixture.requests.lock().unwrap().clear();
+    let earliest = chrono::Utc::now() - chrono::Duration::days(30);
+    let out = fixture.run(&["usage", "--since", "30d", "--json"]);
+    let latest = chrono::Utc::now() - chrono::Duration::days(30);
+    assert!(out.status.success());
+    let requests = fixture.requests.lock().unwrap();
+    let [Request::UsageByDay {
+        since: Some(since),
+        by: None,
+    }] = &requests[..]
+    else {
+        panic!("{requests:?}")
+    };
+    let cutoff = chrono::DateTime::parse_from_rfc3339(since)
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    assert!(cutoff >= earliest && cutoff <= latest);
+    assert_eq!(since, &cutoff.to_rfc3339());
+}
 impl Drop for Fixture {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);

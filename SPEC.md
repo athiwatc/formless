@@ -5253,6 +5253,7 @@ the TUI. Command-specific arguments and defaults are available through
 | `formless tui` | `--plain`, `-c` / `--continue`, `--new` | Launch the full-screen terminal client; also the default with no command. |
 | `formless uninstall` | `--keep-data`, `--keep-binary`, `--yes` (alias `--force`) | Remove Formless, optionally retaining data or the binary. |
 | `formless update` | No action, `check`, or `--check`; `--json` | Show newer release notes and the applicable upgrade command; never rewrite the binary. |
+| `formless usage` | `--by GROUP`, `--since DURATION`, `--json` | Read full-range grouped tokens and currently computed cost estimates. |
 | `formless web` | `--port`, `--no-open`, `--stop` | Open, print a link for, or stop the local browser UI. |
 
 `mcp test NAME [--json]` restarts the server and prints the full report before
@@ -6594,6 +6595,15 @@ stored message boundaries display a Note and the initial Session snapshot only;
 follow never invents a boundary or refreshes that legacy transcript without one.
 Connection loss is an error.
 
+Human `runs show` uses labeled stored identifiers, status/error, timestamps,
+message boundaries, counters and recorded token sums. Available spend is
+labeled as a report of estimates, with known subtotal, optional total and
+returned completeness flags; unavailable amounts are not invented as zero.
+Human `runs cancel` reports a cancellation request for a matching accepting
+controller, or that none was found; neither acknowledgment proves a terminal
+outcome. There is no polling or additional cancellation request. JSON and the
+existing status-based show exits remain unchanged.
+
 `tools list --filter FILTER` selects one stored-state predicate: `not-retired`
 (including disabled Tools), `retired`, `failing` (known success rate below 0.8),
 `needs-attention`, `off` (disabled) or `pinned`. It combines by AND with
@@ -6626,6 +6636,19 @@ and conflicts with `--version`. Invalid versions/conflicts fail before contact.
 GetModule still fetches every version's code even for metadata-only output;
 client projection does not reduce backend work (see #889). No module mutation
 is exposed by these commands.
+
+`usage [--by day|model|provider|purpose|role|session] [--since DURATION] [--json]`
+reads the existing full-range UsageByDay aggregation once, independently of
+the bounded recent Run list. Default/explicit day sends no group key and keeps
+the daemon's oldest-first day order; other groups keep its descending total-token
+order. No since means all history; durations use the shared checked parser
+and one UTC RFC3339 cutoff matching the existing stored TEXT representation.
+Human tables fit terminal columns and show unknown cost as `-`; JSON preserves
+the complete array and null costs. Cost is the daemon's current estimate, not a
+billing guarantee. Session grouping currently uses display names and merges
+equal-named Sessions (#1585); this caller cannot recover missing identities.
+Unknown grouping keys and invalid/overflowing/unrepresentable durations fail
+before contact. Aggregation, pricing and recording remain unchanged.
 
 `runs --session SESSION --since DURATION [--limit N] [--json]` sends the
 existing Session/time filters to RunMetrics before its newest-N limit. Each

@@ -742,7 +742,17 @@ covers every visible root command, including `help`. Use `formless COMMAND --hel
 | `formless tui` | `--plain`, `-c` / `--continue`, `--new` | Launch the full-screen terminal client; also the default with no command. |
 | `formless uninstall` | `--keep-data`, `--keep-binary`, `--yes` (alias `--force`) | Remove Formless, optionally retaining data or the binary. |
 | `formless update` | No action, `check`, or `--check`; `--json` | Show newer release notes and the applicable upgrade command; never rewrite the binary. |
+| `formless usage` | `--by GROUP`, `--since DURATION`, `--json` | Read full-range grouped tokens and currently computed cost estimates. |
 | `formless web` | `--port`, `--no-open`, `--stop` | Open, print a link for, or stop the local browser UI. |
+
+Human `runs show` uses labeled stored identifiers, status/error, timestamps,
+message boundaries, counters and recorded token sums. Available spend is
+labeled as a report of estimates, with known subtotal, optional total and
+returned completeness flags; unavailable amounts are not invented as zero.
+Human `runs cancel` reports a cancellation request for a matching accepting
+controller, or that none was found; neither acknowledgment proves a terminal
+outcome. There is no polling or additional cancellation request. JSON and the
+existing status-based show exits remain unchanged.
 
 `mcp test NAME [--json]` restarts the server and prints the full report before
 returning its verdict: exit 0 for a successful reply (including zero tools),
