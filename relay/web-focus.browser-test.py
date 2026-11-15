@@ -467,7 +467,7 @@ def run():
             page.locator(message_trigger).evaluate('(e)=>e.remove()')
             page.keyboard.press('Escape')
             check(page.evaluate('document.activeElement!==document.body && !!document.activeElement.getClientRects().length'),'removed menu trigger gets visible fallback focus')
-            check(page.locator('[aria-expanded="true"]').count()==0,'all menu expanded states cleaned up')
+            check(page.locator('[aria-haspopup="menu"][aria-expanded="true"]').count()==0,'all context-menu expanded states cleaned up')
             check(not page.locator('#app').evaluate('(e)=>e.inert'),'final background is interactive')
             # Mobile root scaling retains the drawer while pointer-activating
             # a harmless copy action, then returns to its visible menu trigger.

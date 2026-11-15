@@ -29,10 +29,7 @@ pub(super) fn run(paths: &Paths, action: &Action) -> Result<()> {
             let mut table = Table::new(&["COMMAND", "DESCRIPTION", "SOURCE", "FILE"]);
             for command in &projection.commands {
                 table.row(vec![
-                    t(
-                        comparison_terminal_text(&format!("/{}", command.name)),
-                        Tone::Strong,
-                    ),
+                    t(comparison_terminal_text(&command.usage()), Tone::Strong),
                     c(comparison_terminal_text(&command.description)),
                     c(serde_json::to_value(&command.source)?
                         .as_str()
