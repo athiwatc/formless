@@ -335,6 +335,13 @@ name the file and reason; typo suggestions include local and shadowed templates.
 Diagnostics are announced once while present and can be announced again after
 a repaired file becomes invalid again.
 
+TUI file completion quotes spaced or delimited names, for example
+`@"my notes/report.md"`. Inside that reserved form, only `\"` and `\\`
+are escapes; whitespace is literal. Unclosed or invalid quoted mentions stay
+plain text and attach no first-word fragment. Directory completion keeps the
+cursor before its closing quote for child completion. Chips, forecast and
+submission all decode the same path; existing file eligibility rules apply.
+
 `formless commands list` shows the available metadata, diagnostics and shadowed
 files; `formless commands list --json` returns the same shared metadata projection
 used by the TUI. Listing is read-only: it does not start a daemon, create a
@@ -705,7 +712,7 @@ covers every visible root command, including `help`. Use `formless COMMAND --hel
 | `formless docs` | Optional topic; `--text`, `--print`, `--keys` | Read bundled Markdown, open the current online guide (gallery by default), print its URL, or print the keyboard reference. |
 | `formless doctor` | `--json`, `--fix`, `--restore-drill` | Diagnose setup, apply safe fixes, or rehearse the newest backup. |
 | `formless export-all` | `--sessions`, `-o FILE` / `--output FILE` | Write a portable setup bundle, optionally including Session transcripts. |
-| `formless gc` | `--dry-run` | Free reclaimable storage or preview what would be freed. |
+| `formless gc` | `--dry-run`, `--json` | Free reclaimable storage or preview what would be freed. |
 | `formless help` | Optional command path, such as `sessions show` | Print help for the CLI or a nested command. |
 | `formless import-all` | `FILE` | Add a portable setup bundle without overwriting existing entries. |
 | `formless jobs` | `list`, `add`, `run`, `history`, `enable`, `disable`, `rm` | Manage scheduled prompts and inspect their history. |
@@ -728,7 +735,7 @@ covers every visible root command, including `help`. Use `formless COMMAND --hel
 | `formless routing` | `--json` | Read currently available daemon routing decisions and returned candidate figures without starting a model request. |
 | `formless runs` | No action: list; `show`, `cancel` | List recent Runs, inspect one by ID/prefix, or cancel that exact Run. |
 | `formless security` | `status` | Inspect the daemon's grants, denials, trusted resources, and exposed interfaces. |
-| `formless sessions` | `fork`, `compare`, `list`, `show`, `usage`, `files`, `rewind`, `rename`, `rm`, `restore`, `import`, `search`, `templates list/show`, `archive`, `unarchive`, `export` | Manage stored Sessions, follow a Run with `show --follow`, or inspect tracked files. `list --pinned --tag TAG` filters the fetched reply; selectors combine with `--archived`, preserving reply order. |
+| `formless sessions` | `fork`, `compare`, `list`, `show`, `usage`, `files`, `rewind`, `rename`, `rm`, `restore`, `import`, `search`, `templates list/show`, `archive`, `unarchive`, `pin`, `unpin`, `tag`, `export` | Manage stored Sessions, follow a Run with `show --follow`, or inspect tracked files. `list --pinned --tag TAG` filters the fetched reply; selectors combine with `--archived`, preserving reply order. |
 | `formless skills` | `reviews`, `add`, `remove`, `list`, `enable`, `disable`, `show`, `export`, `import` | Inspect and manage Skills and their retained description reviews. |
 | `formless storage` | `--json` | Report disk usage by data category. |
 | `formless tools` | `reviews`, `list`, `disable`, `enable`, `undo`, `pin`, `unpin`, `tag`, `show`, `diff`, `retire`, `restore`, `rollback`, `purge`, `run`, `export`, `import` | Inspect, manage, run, or transfer registry Tools. |
@@ -736,6 +743,39 @@ covers every visible root command, including `help`. Use `formless COMMAND --hel
 | `formless uninstall` | `--keep-data`, `--keep-binary`, `--yes` (alias `--force`) | Remove Formless, optionally retaining data or the binary. |
 | `formless update` | No action, `check`, or `--check`; `--json` | Show newer release notes and the applicable upgrade command; never rewrite the binary. |
 | `formless web` | `--port`, `--no-open`, `--stop` | Open, print a link for, or stop the local browser UI. |
+
+`mcp test NAME [--json]` restarts the server and prints the full report before
+returning its verdict: exit 0 for a successful reply (including zero tools),
+exit 1 for an embedded restart error. JSON preserves the reply as one value
+without an extra generic error line for that reported failure. Request failures
+keep their existing error mapping; unexpected replies are errors. `--json` does
+not make the restart read-only. `mcp add` retains its existing behavior.
+
+`gc --json` prints the complete single daemon/offline result, including its
+`dry_run`, integer `total_bytes`, `kinds` and any extra details. Use
+`gc --dry-run --json` to preview without cleanup. Counts are core-reported values,
+not a promise of exact physical space reclaimed. JSON changes only presentation;
+retention, side effects, errors and human output remain unchanged.
+
+`sessions pin ID` and `sessions unpin ID` display the stored pin state returned
+by the daemon. `sessions tag ID` only reads tags; adding positional tags replaces
+the **entire** stored tag list, and `--clear` explicitly replaces it with an empty
+list (conflicting with positional tags). Tags reach storage unchanged for its
+existing normalization; confirmation shows returned stored values. These three
+actions accept `--json` for the selected/returned Session object.
+
+Ambiguous Session prefixes/names remain usage errors and display up to ten
+matching full IDs, bounded names and archive labels. Extra matches are counted,
+with commands for both archive states. Prefix errors suggest extending the ID;
+name errors suggest a displayed ID. Exact-ID priority, prefix-before-name
+resolution and trimmed ASCII-case-insensitive full-name matching are unchanged.
+
+Human Session lists label the last recorded Run status and show stored tags,
+retaining the pin star and existing message preview/count. Empty replies are
+reported separately from an empty archive selection, which names the alternate
+list command and count. Static human `sessions show` includes stored archived,
+pinned, tags and last recorded Run status metadata; absent status is "not
+recorded". JSON and `--follow` retain their existing contracts.
 
 `tools list --filter FILTER` selects one stored-state predicate: `not-retired`
 (including disabled Tools), `retired`, `failing` (known success rate below 0.8),
@@ -784,6 +824,17 @@ and `context`; this is not a common-snapshot guarantee. Existing context-window
 discovery may contact the configured provider, so the command is not promised
 offline. Reported Run count retains the backend's newest-100,000 global-window
 limitation (#1458); aggregation/estimation/accounting behavior is unchanged.
+
+`tools show NAME_OR_ID` includes stored pin state, the newest ten version
+summaries (explicit numeric order) and up to five of the returned recent-call
+metadata rows. Omitted counts point to `--json`, which retains the existing
+complete detail contract. No new call inputs/outputs are added to these
+summaries; the existing schema/example sections remain. `--code` conflicts
+with JSON and writes only the exact current version source, preserving its
+trailing newline state; a missing current version is an error. This intentional
+human-detail layout change leaves fetching, metrics and security fields intact.
+The existing GetTool all-version payload remains until protocol selectors
+are addressed separately (#889).
 
 #### Root and global flags
 
