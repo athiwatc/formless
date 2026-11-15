@@ -43,22 +43,60 @@ pub struct JsonOutputSchema {
     validator: jsonschema::Validator,
 }
 
+/// Fixed parser facts only, without response/schema text or a cause diagnosis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JsonParserCategory {
+    Io,
+    Syntax,
+    Data,
+    Eof,
+}
+
+impl fmt::Display for JsonParserCategory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Io => "io",
+            Self::Syntax => "syntax",
+            Self::Data => "data",
+            Self::Eof => "eof",
+        })
+    }
+}
+
+/// Fixed evidence retained only at existing incomplete-response exits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IncompleteReason {
+    Unknown,
+    OutputLimit,
+    ContextWindow,
+    Truncated,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StructuredOutputError {
     SchemaLimit(&'static str),
     UnsupportedSchema(&'static str),
     InvalidSchema,
     OutputLimit(&'static str),
-    InvalidJson,
+    InvalidJson {
+        category: JsonParserCategory,
+        line: usize,
+        column: usize,
+    },
     SchemaViolation,
-    IncompleteResponse,
+    IncompleteResponse(IncompleteReason),
     RefusedResponse,
 }
 
 impl fmt::Display for StructuredOutputError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::IncompleteResponse => f.write_str("structured output response was incomplete"),
+            Self::IncompleteResponse(reason) => f.write_str(match reason {
+                IncompleteReason::Unknown => "structured output response was incomplete",
+                IncompleteReason::OutputLimit => "structured output response was incomplete (output limit reached)",
+                IncompleteReason::ContextWindow => "structured output response was incomplete (model context window exceeded)",
+                IncompleteReason::Truncated => "structured output response was incomplete (response was truncated)",
+            }),
             Self::RefusedResponse => f.write_str("structured output request was refused"),
             Self::SchemaLimit(limit) => write!(f, "structured output schema exceeds {limit} limit"),
             Self::UnsupportedSchema(reason) => {
@@ -66,7 +104,8 @@ impl fmt::Display for StructuredOutputError {
             }
             Self::InvalidSchema => f.write_str("invalid structured output JSON Schema"),
             Self::OutputLimit(limit) => write!(f, "structured output exceeds {limit} limit"),
-            Self::InvalidJson => f.write_str("structured output is not one complete JSON value"),
+            Self::InvalidJson { category, line, column } => write!(f,
+                "structured output is not one complete JSON value (parser: {category}, line {line}, column {column})"),
             Self::SchemaViolation => {
                 f.write_str("structured output does not satisfy its JSON Schema")
             }
@@ -75,6 +114,22 @@ impl fmt::Display for StructuredOutputError {
 }
 
 impl std::error::Error for StructuredOutputError {}
+
+impl StructuredOutputError {
+    fn invalid_json(error: serde_json::Error) -> Self {
+        let category = match error.classify() {
+            serde_json::error::Category::Io => JsonParserCategory::Io,
+            serde_json::error::Category::Syntax => JsonParserCategory::Syntax,
+            serde_json::error::Category::Data => JsonParserCategory::Data,
+            serde_json::error::Category::Eof => JsonParserCategory::Eof,
+        };
+        Self::InvalidJson {
+            category,
+            line: error.line(),
+            column: error.column(),
+        }
+    }
+}
 
 impl JsonOutputSchema {
     pub fn compile(schema: Value) -> Result<Self, StructuredOutputError> {
@@ -123,7 +178,7 @@ impl JsonOutputSchema {
         if text.len() > MAX_OUTPUT_BYTES {
             return Err(StructuredOutputError::OutputLimit("bytes"));
         }
-        let value = serde_json::from_str(text).map_err(|_| StructuredOutputError::InvalidJson)?;
+        let value = serde_json::from_str(text).map_err(StructuredOutputError::invalid_json)?;
         measure(&value, MAX_OUTPUT_NODES, MAX_OUTPUT_DEPTH, MAX_OUTPUT_BYTES)
             .map_err(StructuredOutputError::OutputLimit)?;
         if self.validator.validate(&value).is_err() {
@@ -405,15 +460,101 @@ mod tests {
             "NaN",
             "",
         ] {
-            assert_eq!(
+            assert!(matches!(
                 schema.parse_and_validate(invalid),
-                Err(StructuredOutputError::InvalidJson)
-            );
+                Err(StructuredOutputError::InvalidJson { .. })
+            ));
         }
         assert_eq!(
             schema.parse_and_validate(r#""{\"n\":2,\"s\":\"ok\"}""#),
             Err(StructuredOutputError::SchemaViolation)
         );
+    }
+
+    #[test]
+    fn invalid_json_reports_only_allowlisted_parser_facts_without_source_text() {
+        let schema =
+            JsonOutputSchema::compile(json!({"description":"private-schema-ไทย"})).unwrap();
+        for text in [
+            "",
+            "{",
+            "{\n  \"private-response-日本語\":",
+            "```json\n{}\n```",
+            "{} {}",
+            "NaN",
+        ] {
+            let parser = serde_json::from_str::<Value>(text).unwrap_err();
+            let expected = match parser.classify() {
+                serde_json::error::Category::Eof => JsonParserCategory::Eof,
+                serde_json::error::Category::Syntax => JsonParserCategory::Syntax,
+                other => panic!("unexpected Value parser fixture category: {other:?}"),
+            };
+            let error = schema.parse_and_validate(text).unwrap_err();
+            assert_eq!(
+                error,
+                StructuredOutputError::InvalidJson {
+                    category: expected,
+                    line: parser.line(),
+                    column: parser.column()
+                }
+            );
+            let diagnostic = format!("{error} {error:?}");
+            assert!(
+                !diagnostic.contains("private-")
+                    && !diagnostic.contains("日本語")
+                    && !diagnostic.contains("ไทย")
+            );
+            assert!(diagnostic.len() < 240);
+        }
+        assert!(matches!(
+            schema.parse_and_validate(""),
+            Err(StructuredOutputError::InvalidJson {
+                category: JsonParserCategory::Eof,
+                ..
+            })
+        ));
+        assert!(matches!(
+            schema.parse_and_validate("?"),
+            Err(StructuredOutputError::InvalidJson {
+                category: JsonParserCategory::Syntax,
+                ..
+            })
+        ));
+        assert_eq!(
+            schema
+                .parse_and_validate(" \n{\"answer\":\"ไทย\"}\t")
+                .unwrap(),
+            json!({"answer":"ไทย"})
+        );
+        // Even a serde data-category error carrying an arbitrary message is
+        // reduced to fixed facts. parse_and_validate itself still parses Value.
+        let planted =
+            <serde_json::Error as serde::de::Error>::custom("private-parser-payload-日本語");
+        let error = StructuredOutputError::invalid_json(planted);
+        assert!(matches!(
+            error,
+            StructuredOutputError::InvalidJson {
+                category: JsonParserCategory::Data,
+                ..
+            }
+        ));
+        assert!(!format!("{error} {error:?}").contains("private-parser"));
+        struct FailedReader;
+        impl std::io::Read for FailedReader {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("private-io-payload"))
+            }
+        }
+        let io = serde_json::from_reader::<_, Value>(FailedReader).unwrap_err();
+        let error = StructuredOutputError::invalid_json(io);
+        assert!(matches!(
+            error,
+            StructuredOutputError::InvalidJson {
+                category: JsonParserCategory::Io,
+                ..
+            }
+        ));
+        assert!(!format!("{error} {error:?}").contains("private-io"));
     }
 
     #[test]

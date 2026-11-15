@@ -312,6 +312,7 @@ impl Access {
                 && logical_single_link
                 && streams_complete
                 && windows_identity.is_some(),
+            unix_metadata: None,
             ..Default::default()
         })
     }

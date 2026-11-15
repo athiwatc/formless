@@ -1563,7 +1563,9 @@ pub struct ToolDetail {
 }
 
 /// One concrete call of a Tool: its (redacted) input and output, as
-/// recorded, the output cut to a few KB.
+/// recorded. Each field is a UTF-8 prefix of at most 4,000 bytes plus a cut
+/// marker when oversized: an illustrative preview, not necessarily valid JSON
+/// or a complete replayable call. Original records are unchanged.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ToolExample {
     pub version: i64,
@@ -2373,7 +2375,9 @@ pub enum Request {
     /// Models to pick from (SPEC §4.5): `{"models": [id], "roles":
     /// [{"name", "provider", "model"}], "recent": [id], "current": {"model",
     /// "reasoning_effort"}, "error": str?}`. `models` comes from the default
-    /// provider's `GET /models`; `recent` is the Sessions' models, newest first.
+    /// provider's `GET /models`; `recent` deduplicates exact nonempty Session
+    /// model IDs after ordering stored updated_at descending, then Session ID
+    /// ascending. Archived Sessions participate; this is not model-use history.
     ListModels,
     /// Add or replace a named provider; `api_key` goes to the keychain.
     UpsertProvider {
