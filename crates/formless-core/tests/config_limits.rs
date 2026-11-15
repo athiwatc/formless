@@ -44,7 +44,7 @@ async fn nesting_and_sleep_limits_come_from_config() {
         .await;
     assert!(r.contains("tools.max_tool_depth (2)"), "{r}");
 
-    daemon
+    let rejected = daemon
         .call_tool_direct(
             &sid,
             "create_tool",
@@ -54,14 +54,27 @@ async fn nesting_and_sleep_limits_come_from_config() {
             ),
         )
         .await;
+    assert!(rejected.contains("tools.max_sleep_secs"), "{rejected}");
+    assert!(rejected.contains("5000 exceeds limit 1000"), "{rejected}");
+    let created = daemon
+        .call_tool_direct(
+            &sid,
+            "create_tool",
+            mk(
+                "allowed_napper",
+                "async function run(i){ await sleep(10); return {}; }",
+            ),
+        )
+        .await;
+    assert!(!created.starts_with("error"), "{created}");
     let started = std::time::Instant::now();
     let r = daemon
-        .call_tool_direct(&sid, "napper", serde_json::json!({}))
+        .call_tool_direct(&sid, "allowed_napper", serde_json::json!({}))
         .await;
     assert!(!r.starts_with("error"), "{r}");
     assert!(
         started.elapsed() < std::time::Duration::from_secs(4),
-        "sleep capped at 1s"
+        "allowed sleep completes"
     );
 }
 
