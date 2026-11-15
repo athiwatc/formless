@@ -7908,7 +7908,7 @@ mod user_naming_text_tests {
     use std::cell::Cell;
     use unicode_segmentation::UnicodeSegmentation;
 
-    const NAMING_TEXT_MAX_CHARS: usize = 800 + 3 + 400;
+    const NAMING_TEXT_MAX_CHARS: usize = 1200;
 
     fn marked(token: &str) -> String {
         format!("{token}{}", "x".repeat(16_384))
@@ -7956,9 +7956,23 @@ mod user_naming_text_tests {
         let original: Vec<char> = original.chars().collect();
         assert!(original.len() > 1200);
         assert_eq!(got.len(), NAMING_TEXT_MAX_CHARS);
-        assert_eq!(&got[..800], &original[..800]);
-        assert_eq!(&got[800..803], &['\n', '\u{2026}', '\n']);
-        assert_eq!(&got[803..], &original[original.len() - 400..]);
+        // The separator consumes three characters of the 1200-character budget.
+        assert_eq!(&got[..797], &original[..797]);
+        assert_eq!(&got[797..800], &['\n', '\u{2026}', '\n']);
+        assert_eq!(&got[800..], &original[original.len() - 400..]);
+    }
+
+    #[test]
+    fn user_naming_text_preserves_exact_unicode_head_and_tail() {
+        let store = Store::open_in_memory().unwrap();
+        let head = "日🦀e\u{0301}".repeat(200);
+        let tail = "ก🦀\u{0301}日".repeat(100);
+        let long = format!("{head}discarded middle{tail}");
+        let id = transcript(&store, &[("user", &long)]);
+        let got = assert_same(&store, &id, "Unicode head and tail").unwrap();
+        assert_head_tail(&got, &long);
+        assert!(got.starts_with('日'));
+        assert!(got.ends_with(&tail));
     }
 
     fn transcript(store: &Store, rows: &[(&str, &str)]) -> String {
