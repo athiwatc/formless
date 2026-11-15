@@ -9806,6 +9806,8 @@ impl App {
                 } else if key.code == KeyCode::Char('b') {
                     self.usage_by = (self.usage_by + 1) % USAGE_BY.len();
                     self.load_metrics();
+                } else if key.code == KeyCode::Char('m') && !self.model_stats.is_empty() {
+                    self.pager = Some(model_metrics_pager(&self.model_stats, self.color));
                 }
             }
             View::Proposals => match key.code {
@@ -16807,6 +16809,57 @@ fn table_header(cols: &[&'static str], color: bool) -> Row<'static> {
     Row::new(cols.iter().map(|c| Cell::from(*c))).style(ui::dim(color).add_modifier(Modifier::BOLD))
 }
 
+/// The preview spends only spare rows after the existing section requests
+/// and Tool minimum. Its size stops growing after five model rows.
+fn model_preview_height(height: u16, reserved: u16, count: usize) -> u16 {
+    let spare = height.saturating_sub(reserved);
+    if count == 0 || spare < 4 {
+        0
+    } else {
+        spare.min(count.min(5) as u16 + 3)
+    }
+}
+
+fn model_preview_hint(shown: usize, total: usize, width: u16) -> String {
+    [
+        format!("Models {shown}/{total} · m full list"),
+        format!("Models {shown}/{total} · m"),
+        format!("{shown}/{total} m"),
+        "m models".into(),
+        "m".into(),
+    ]
+    .into_iter()
+    .find(|text| text::width(text) <= width as usize)
+    .unwrap_or_default()
+}
+
+fn model_metrics_pager(stats: &[formless_protocol::ModelStatInfo], color: bool) -> Pager {
+    let mut lines = Vec::new();
+    for st in stats {
+        let n = st.successes + st.failures;
+        let rate = (n > 0).then(|| st.successes as f64 / n as f64);
+        let avg = if n > 0 {
+            format!("{:.0}ms", st.total_ms as f64 / n as f64)
+        } else {
+            "-".into()
+        };
+        lines.push(st.model.clone());
+        lines.push(format!(
+            "  CALLS {n} · SUCCESS {} · AVG {avg} · CACHED {}",
+            ui::rate_display(color, rate),
+            cache_hit_text(st)
+        ));
+        lines.push(String::new());
+    }
+    Pager {
+        title: format!("Model routing (measured) · {} models", stats.len()),
+        lines,
+        top: 0,
+        left: 0,
+        styled: Vec::new(),
+    }
+}
+
 fn draw_metrics(f: &mut Frame, area: Rect, app: &App) {
     let tools = app.metrics_rows();
     let selected = app.metrics_selection(&tools);
@@ -16815,11 +16868,6 @@ fn draw_metrics(f: &mut Frame, area: Rect, app: &App) {
         .as_ref()
         .filter(|detail| selected.is_some_and(|index| tools[index].id == detail.tool.id));
     let detail_h = if tools.is_empty() { 0 } else { 5 };
-    let routing_h = if app.model_stats.is_empty() {
-        0
-    } else {
-        app.model_stats.len() as u16 + 3
-    };
     let builtins_h = if app.builtin_stats.is_empty() {
         0
     } else {
@@ -16827,6 +16875,16 @@ fn draw_metrics(f: &mut Frame, area: Rect, app: &App) {
     };
     let usage_stride = if theme::redundant(app.color) { 2 } else { 1 };
     let usage_h = app.usage_rows.len().clamp(1, 10) as u16 * usage_stride + 2;
+    let hint_h = u16::from(!app.model_stats.is_empty() && area.height > 0);
+    let content = Rect {
+        height: area.height.saturating_sub(hint_h),
+        ..area
+    };
+    let routing_h = model_preview_height(
+        content.height,
+        5 + detail_h + usage_h + builtins_h,
+        app.model_stats.len(),
+    );
     let parts = Layout::vertical([
         Constraint::Min(5),
         Constraint::Length(detail_h),
@@ -16834,7 +16892,7 @@ fn draw_metrics(f: &mut Frame, area: Rect, app: &App) {
         Constraint::Length(routing_h),
         Constraint::Length(builtins_h),
     ])
-    .split(area);
+    .split(content);
     {
         let by = USAGE_BY[app.usage_by % USAGE_BY.len()];
         let total: i64 = app
@@ -17051,10 +17109,22 @@ fn draw_metrics(f: &mut Frame, area: Rect, app: &App) {
             parts[1],
         );
     }
-    if !app.model_stats.is_empty() {
+    let shown = app
+        .model_stats
+        .len()
+        .min(parts[3].height.saturating_sub(3) as usize);
+    if hint_h > 0 {
+        f.render_widget(
+            Paragraph::new(model_preview_hint(shown, app.model_stats.len(), area.width))
+                .style(ui::dim(app.color)),
+            Rect::new(area.x, content.bottom(), area.width, hint_h),
+        );
+    }
+    if parts[3].height >= 4 {
         let rows: Vec<Row> = app
             .model_stats
             .iter()
+            .take(shown)
             .map(|st| {
                 let n = st.successes + st.failures;
                 let rate = (n > 0).then(|| st.successes as f64 / n as f64);
@@ -27819,6 +27889,148 @@ mod tests {
         );
         assert!(sent.try_recv().is_err());
     }
+    #[test]
+    fn metrics_model_preview_is_bounded_and_keeps_crowded_full_list_action() {
+        for height in [0, 1, 5, 12, 24, 40, 100] {
+            assert!(model_preview_height(height, 8, 1000) <= 8);
+            assert_eq!(
+                model_preview_height(height, 8, 100),
+                model_preview_height(height, 8, 1000)
+            );
+            assert_eq!(model_preview_height(height, 8, 0), 0);
+        }
+        assert_eq!(model_preview_height(40, 8, 1), 4);
+        for (theme_name, color) in [("dark", true), ("dark", false), ("colorblind", true)] {
+            let _theme = theme::test_theme(theme_name);
+            let mut app = test_app();
+            app.color = color;
+            app.view = View::Metrics;
+            app.model_stats = (0..100)
+                .map(|i| formless_protocol::ModelStatInfo {
+                    model: format!("model-{i:03}-日本語"),
+                    successes: 3,
+                    failures: 1,
+                    total_ms: 1234,
+                    prompt_tokens: 10,
+                    completion_tokens: 5,
+                    cached_tokens: 2,
+                })
+                .collect();
+            let mut tool = description_fixture_detail().tool;
+            tool.name = "tool-minimum".into();
+            tool.title.clear();
+            app.tools = vec![tool];
+            for crowded in [false, true] {
+                app.usage_rows = (0..if crowded { 10 } else { 1 })
+                    .map(|i| UsageRow {
+                        key: format!("day-{i}"),
+                        prompt_tokens: 10,
+                        completion_tokens: 5,
+                        cached_tokens: 2,
+                        cost: None,
+                    })
+                    .collect();
+                app.builtin_stats = if crowded {
+                    (0..8)
+                        .map(|i| formless_protocol::BuiltinStatInfo {
+                            name: format!("builtin-{i}"),
+                            calls: 1,
+                            failures: 0,
+                            total_ms: 1.0,
+                            avg_ms: 1.0,
+                            kinds: Default::default(),
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                app.tool_detail = crowded.then(description_fixture_detail);
+                for (width, height) in [(120, 40), (80, 24), (40, 12), (20, 6), (1, 1)] {
+                    let mut terminal =
+                        Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+                    terminal
+                        .draw(|frame| draw_metrics(frame, frame.area(), &app))
+                        .unwrap();
+                    let buffer = terminal.backend().buffer();
+                    let rows = (0..height)
+                        .map(|y| {
+                            (0..width)
+                                .map(|x| buffer[(x, y)].symbol())
+                                .collect::<String>()
+                        })
+                        .collect::<Vec<_>>();
+                    if width >= 40 {
+                        assert!(
+                            rows.last().unwrap().contains("/100")
+                                && rows.last().unwrap().contains("m"),
+                            "{rows:?}"
+                        );
+                        assert!(rows[..5].iter().any(|row| row.contains("v1")), "{rows:?}");
+                    }
+                    assert!(rows.iter().filter(|row| row.contains("model-")).count() <= 5);
+                    if crowded && height <= 24 && width >= 40 {
+                        assert!(rows.last().unwrap().contains("0/100"), "{rows:?}");
+                    }
+                }
+            }
+            app.model_stats.clear();
+            assert!(!render(&mut app, 120, 40).contains("m full list"));
+        }
+    }
+
+    #[test]
+    fn metrics_models_pager_reaches_every_full_identifier_without_requests_or_selection_changes() {
+        let (client, rx) = DaemonClient::recording();
+        let mut app = test_app();
+        app.client = Some(client);
+        app.view = View::Metrics;
+        app.model_stats = (0..100)
+            .map(|i| formless_protocol::ModelStatInfo {
+                model: format!("model-{i:03}-{}", "日本語🦀".repeat(40)),
+                successes: 3,
+                failures: 1,
+                total_ms: 1234,
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                cached_tokens: 2,
+            })
+            .collect();
+        let original = app.model_stats.clone();
+        let index = app.tool_idx;
+        app.key(key(KeyCode::Char('m')));
+        assert!(rx.try_recv().is_err());
+        let lines = app.pager.as_ref().unwrap().lines.clone();
+        for (i, model) in original.iter().enumerate() {
+            assert_eq!(lines[i * 3], model.model);
+            assert!(lines[i * 3 + 1].contains("CALLS 4"));
+            assert!(lines[i * 3 + 1].contains("75%"));
+            assert!(lines[i * 3 + 1].contains("AVG 308ms"));
+            assert!(lines[i * 3 + 1].contains(&cache_hit_text(model)));
+        }
+        for i in 0..lines.len() {
+            let p = app.pager.as_ref().unwrap();
+            assert_eq!(p.top, i);
+            assert_eq!(p.lines[p.top], lines[i]);
+            app.key(key(KeyCode::Down));
+        }
+        app.key(key(KeyCode::Right));
+        assert_eq!(app.pager.as_ref().unwrap().left, 8);
+        for size in [(80, 24), (40, 12), (120, 40)] {
+            let _ = render(&mut app, size.0, size.1);
+        }
+        app.key(key(KeyCode::Home));
+        assert_eq!(app.pager.as_ref().unwrap().top, 0);
+        app.key(key(KeyCode::End));
+        assert_eq!(app.pager.as_ref().unwrap().top, lines.len() - 1);
+        app.key(key(KeyCode::Esc));
+        assert!(app.pager.is_none());
+        assert_eq!(app.tool_idx, index);
+        assert_eq!(app.model_stats, original);
+        assert!(rx.try_recv().is_err());
+        app.key(key(KeyCode::Char('f')));
+        assert_eq!(app.pager.as_ref().unwrap().title, "Forecast versus actual");
+    }
+
     #[test]
     fn metrics_shortcuts_keep_range_and_forecast_actions_visible_at_standard_width() {
         let mut app = test_app();
