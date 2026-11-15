@@ -1,8 +1,8 @@
 //! Filtering and sorting the Tools, Sessions and Proposals lists (SPEC
-//! §10.4): `/` types a fuzzy filter, `s` cycles the sort, `v` cycles the
-//! quick filters. Views select by position in the visible rows.
+//! §10.4): `/` filters identifiers fuzzily and prose contiguously; `s`
+//! cycles the tie-break sort, `v` cycles the quick filters. Views select by position in the visible rows.
 
-use formless_core::fuzzy::fuzzy_match;
+use formless_core::fuzzy::{find_folded, fuzzy_match};
 use formless_protocol::{PromptProposalInfo, SessionInfo, ToolInfo};
 use std::collections::HashSet;
 
@@ -21,9 +21,51 @@ pub struct ListFilter {
 }
 
 impl ListFilter {
-    /// Whether `text` (several fields joined) matches the query.
-    fn hit(&self, fields: &[&str]) -> bool {
-        self.query.trim().is_empty() || fields.iter().any(|f| fuzzy_match(&self.query, f).is_some())
+    /// Ordinary text ranks inside the existing groups/pins. Leading-# queries
+    /// keep the selected sort; Tools/Sessions retain their dedicated tag rules.
+    fn relevance(&self) -> bool {
+        let query = self.query.trim();
+        !query.is_empty() && !query.starts_with('#')
+    }
+
+    /// Primary identifiers outrank secondary identifiers, then prose. Prefer
+    /// a contiguous identifier before its fuzzy score. Prose must contain the
+    /// trimmed query literally under the shared accent fold: inner whitespace
+    /// is retained, while identifier fuzzy admission still ignores whitespace.
+    fn score(
+        &self,
+        primary: &[&str],
+        secondary: &[&str],
+        prose: &[&str],
+    ) -> Option<(u8, bool, i64)> {
+        let query = self.query.trim();
+        if query.is_empty() {
+            return Some((0, false, 0));
+        }
+        let identifiers = |fields: &[&str], tier| {
+            fields
+                .iter()
+                .filter_map(|field| {
+                    fuzzy_match(query, field)
+                        .map(|(score, _)| (tier, find_folded(field, query).is_some(), score))
+                })
+                .max()
+        };
+        // A lower tier cannot beat a matched identifier. In particular, do
+        // not fold a potentially large description after a name already won.
+        if let Some(score) = identifiers(primary, 2) {
+            return Some(score);
+        }
+        if let Some(score) = identifiers(secondary, 1) {
+            return Some(score);
+        }
+        prose
+            .iter()
+            .filter_map(|field| {
+                find_folded(field, query)
+                    .map(|range| (0, true, -i64::try_from(range.start).unwrap_or(i64::MAX)))
+            })
+            .max()
     }
 
     pub fn active(&self) -> bool {
@@ -45,7 +87,12 @@ impl ListFilter {
         } else {
             t.push_str(&format!("{shown}/{total}"));
         }
-        if self.sort != 0 {
+        if self.relevance() {
+            t.push_str(&format!(
+                " · sort: relevance (ties: {})",
+                sorts[self.sort % sorts.len()]
+            ));
+        } else if self.sort != 0 {
             t.push_str(&format!(" · sort: {}", sorts[self.sort % sorts.len()]));
         }
         if self.quick != 0 {
@@ -120,6 +167,7 @@ pub const PROPOSAL_QUICK: &[&str] = &["all", "pending", "applied", "rejected"];
 
 /// Indices into `tools`, filtered and sorted.
 pub fn tools(tools: &[ToolInfo], f: &ListFilter) -> Vec<usize> {
+    let mut scores = vec![None; tools.len()];
     let mut idx: Vec<usize> = (0..tools.len())
         .filter(|&i| {
             let t = &tools[i];
@@ -131,11 +179,20 @@ pub fn tools(tools: &[ToolInfo], f: &ListFilter) -> Vec<usize> {
                 _ => true,
             };
             // `#git` filters by tag; anything else also matches tags.
-            let text = match f.query.trim().strip_prefix('#') {
-                Some(tag) => t.tags.iter().any(|g| g.starts_with(&tag.to_lowercase())),
-                None => f.hit(&[&t.name, &t.title, &t.description, &t.tags.join(" ")]),
+            if !quick {
+                return false;
+            }
+            scores[i] = match f.query.trim().strip_prefix('#') {
+                Some(tag) => (tag.is_empty()
+                    || t.tags.iter().any(|g| g.starts_with(&tag.to_lowercase())))
+                .then_some((0, false, 0)),
+                None => f.score(
+                    &[&t.name],
+                    &[&t.title, &t.tags.join(" ")],
+                    &[&t.description],
+                ),
             };
-            quick && text
+            scores[i].is_some()
         })
         .collect();
     match f.sort % TOOL_SORTS.len() {
@@ -146,6 +203,9 @@ pub fn tools(tools: &[ToolInfo], f: &ListFilter) -> Vec<usize> {
         2 => idx.sort_by(|&a, &b| tools[b].updated_at.cmp(&tools[a].updated_at)),
         3 => idx.sort_by_key(|&i| std::cmp::Reverse(tools[i].invocations)),
         _ => idx.sort_by(|&a, &b| tools[a].name.cmp(&tools[b].name)),
+    }
+    if f.relevance() {
+        idx.sort_by_key(|&i| std::cmp::Reverse(scores[i]));
     }
     // Grouped: by group (stable, so the sort holds inside each), without
     // the collapsed groups' Tools.
@@ -183,6 +243,7 @@ pub fn tool_groups(tools: &[ToolInfo], f: &ListFilter) -> Vec<(String, usize)> {
 
 /// Indices into `sessions` (newest activity first by default).
 pub fn sessions(sessions: &[SessionInfo], running: &HashSet<String>, f: &ListFilter) -> Vec<usize> {
+    let mut scores = vec![None; sessions.len()];
     let mut idx: Vec<usize> = (0..sessions.len())
         .filter(|&i| {
             let s = &sessions[i];
@@ -193,17 +254,27 @@ pub fn sessions(sessions: &[SessionInfo], running: &HashSet<String>, f: &ListFil
                 _ => !s.archived,
             };
             // `#tag` matches a tag exactly; other queries also search tags.
-            let hit = match f.query.trim().strip_prefix('#') {
-                Some(tag) if !tag.is_empty() => s.tags.iter().any(|t| t == &tag.to_lowercase()),
-                _ => f.hit(&[&s.name, &s.tags.join(" ")]),
+            if !quick {
+                return false;
+            }
+            scores[i] = match f.query.trim().strip_prefix('#') {
+                Some(tag) if !tag.is_empty() => s
+                    .tags
+                    .iter()
+                    .any(|t| t == &tag.to_lowercase())
+                    .then_some((0, false, 0)),
+                _ => f.score(&[&s.name], &[&s.tags.join(" ")], &[]),
             };
-            quick && hit
+            scores[i].is_some()
         })
         .collect();
     match f.sort % SESSION_SORTS.len() {
         1 => idx.sort_by(|&a, &b| sessions[b].created_at.cmp(&sessions[a].created_at)),
         2 => idx.sort_by_key(|&i| sessions[i].name.to_lowercase()),
         _ => idx.sort_by(|&a, &b| sessions[b].updated_at.cmp(&sessions[a].updated_at)),
+    }
+    if f.relevance() {
+        idx.sort_by_key(|&i| std::cmp::Reverse(scores[i]));
     }
     // Pinned Sessions first, whatever the sort (a stable sort keeps the
     // order within each group).
@@ -213,6 +284,7 @@ pub fn sessions(sessions: &[SessionInfo], running: &HashSet<String>, f: &ListFil
 
 /// Indices into `proposals` (as listed, newest first, by default).
 pub fn proposals(props: &[PromptProposalInfo], f: &ListFilter) -> Vec<usize> {
+    let mut scores = vec![None; props.len()];
     let mut idx: Vec<usize> = (0..props.len())
         .filter(|&i| {
             let p = &props[i];
@@ -222,7 +294,11 @@ pub fn proposals(props: &[PromptProposalInfo], f: &ListFilter) -> Vec<usize> {
                 3 => p.status == "rejected",
                 _ => true,
             };
-            quick && f.hit(&[&p.content, &p.rationale, &p.kind])
+            if !quick {
+                return false;
+            }
+            scores[i] = f.score(&[&p.kind], &[], &[&p.content, &p.rationale]);
+            scores[i].is_some()
         })
         .collect();
     if f.sort % PROPOSAL_SORTS.len() == 1 {
@@ -230,6 +306,9 @@ pub fn proposals(props: &[PromptProposalInfo], f: &ListFilter) -> Vec<usize> {
             let s = |i: usize| props[i].candidate_score.unwrap_or(-1.0);
             s(b).total_cmp(&s(a))
         });
+    }
+    if f.relevance() {
+        idx.sort_by_key(|&i| std::cmp::Reverse(scores[i]));
     }
     idx
 }
@@ -280,6 +359,258 @@ pub fn key(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn session(id: &str, name: &str, pinned: bool, tags: &[&str]) -> SessionInfo {
+        serde_json::from_value(
+            serde_json::json!({"id":id,"name":name,"model":null,"reasoning_effort":null,
+            "created_at":id,"updated_at":id,"pinned":pinned,"tags":tags}),
+        )
+        .unwrap()
+    }
+    fn proposal(id: &str, content: &str, score: f64) -> PromptProposalInfo {
+        serde_json::from_value(serde_json::json!({"id":id,"kind":"memory","content":content,"rationale":"plain",
+            "status":"pending","baseline_score":null,"candidate_score":score,"eval_total":1,"est_tokens":1,
+            "created_at":id,"applied_at":null})).unwrap()
+    }
+
+    #[test]
+    fn prose_matches_are_contiguous_and_primary_names_outrank_secondary_text() {
+        let mut items = vec![
+            tool("aaa_transport", None, 99, false),
+            tool("aaa_notes", None, 100, false),
+            tool("r_e_a_d", None, 1, false),
+            tool("read_file", None, 2, false),
+        ];
+        items[0].description = "rotate every answer daily".into();
+        items[1].description = "read records".into();
+        let filter = ListFilter {
+            query: "read".into(),
+            sort: 3,
+            ..Default::default()
+        };
+        assert_eq!(tools(&items, &filter), [3, 2, 1]);
+        assert_eq!(tools(&items, &ListFilter::default()), [1, 0, 2, 3]);
+        let props = vec![
+            proposal("new", "rotate every answer daily", 9.0),
+            proposal("old", "read records", 1.0),
+        ];
+        assert_eq!(
+            proposals(
+                &props,
+                &ListFilter {
+                    query: "read".into(),
+                    ..Default::default()
+                }
+            ),
+            [1]
+        );
+        assert_eq!(proposals(&props, &ListFilter::default()), [0, 1]);
+    }
+
+    #[test]
+    fn prose_fold_preserves_accents_normal_forms_and_literal_inner_whitespace() {
+        let mut items = vec![tool("transport", None, 1, false)];
+        for (text, query) in [
+            ("CAFÉ record", "cafe\u{301}"),
+            ("cafe\u{301} record", "CAFÉ"),
+            ("İstanbul record", "istanbul"),
+            ("read file", " read file "),
+        ] {
+            items[0].description = text.into();
+            assert_eq!(
+                tools(
+                    &items,
+                    &ListFilter {
+                        query: query.into(),
+                        ..Default::default()
+                    }
+                ),
+                [0],
+                "{text:?} {query:?}"
+            );
+        }
+        items[0].description = "read   file".into();
+        assert!(tools(
+            &items,
+            &ListFilter {
+                query: "read file".into(),
+                ..Default::default()
+            }
+        )
+        .is_empty());
+        items[0].name = "read_file".into();
+        assert_eq!(
+            tools(
+                &items,
+                &ListFilter {
+                    query: "read file".into(),
+                    ..Default::default()
+                }
+            ),
+            [0],
+            "identifier fuzzy matching still ignores query whitespace"
+        );
+    }
+
+    #[test]
+    fn relevance_preserves_selected_sort_ties_groups_collapses_and_tag_mode() {
+        let mut items = vec![
+            tool("notes_a", None, 1, false),
+            tool("read_file", None, 2, false),
+            tool("notes_b", None, 8, false),
+        ];
+        for item in &mut items {
+            item.description = "read records".into();
+            item.tags = vec!["work".into()];
+        }
+        items[1].author = "user".into();
+        let mut filter = ListFilter {
+            query: "read".into(),
+            sort: 3,
+            group: 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            tools(&items, &filter),
+            [2, 0, 1],
+            "group order overrides cross-group relevance"
+        );
+        assert_eq!(
+            tool_groups(&items, &filter),
+            [("agent".into(), 2), ("user".into(), 1)]
+        );
+        filter.collapsed.insert("agent".into());
+        assert_eq!(tools(&items, &filter), [1]);
+        assert_eq!(tool_groups(&items, &filter).len(), 2);
+        filter.group = 0;
+        filter.query = "#WOrK".into();
+        assert_eq!(
+            tools(&items, &filter),
+            [2, 1, 0],
+            "tag mode retains selected sort"
+        );
+        filter.query = "read".into();
+        filter.quick = 2;
+        assert!(
+            tools(&items, &filter).is_empty(),
+            "quick filters still apply"
+        );
+        filter.quick = 0;
+        filter.group = 0;
+        assert_eq!(
+            tools(&items, &filter),
+            [1, 2, 0],
+            "selected calls sort breaks equal prose relevance"
+        );
+    }
+
+    #[test]
+    fn session_relevance_keeps_pins_tag_semantics_archive_and_tree_structure() {
+        let mut items = vec![
+            session("a", "read_file", false, &[]),
+            session("b", "notes", true, &["read"]),
+            session("c", "r_e_a_d", false, &[]),
+            session("d", "read_file", false, &[]),
+        ];
+        items[3].archived = true;
+        let running = HashSet::from(["a".into()]);
+        let mut filter = ListFilter {
+            query: "read".into(),
+            ..Default::default()
+        };
+        assert_eq!(sessions(&items, &running, &filter), [1, 0, 2]);
+        assert_eq!(
+            sessions(&items, &running, &ListFilter::default()),
+            [1, 2, 0]
+        );
+        filter.query = "#READ".into();
+        assert_eq!(sessions(&items, &running, &filter), [1]);
+        filter.query = "read".into();
+        filter.quick = 1;
+        assert_eq!(sessions(&items, &running, &filter), [0]);
+        filter.quick = 2;
+        assert_eq!(sessions(&items, &running, &filter), [3]);
+        filter.quick = 0;
+        filter.tree = true;
+        items[0].forked_from = Some("c".into());
+        let visible = sessions(&items, &running, &filter);
+        let rows = crate::session_ui::rows(&items, &visible, true);
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.index, row.depth))
+                .collect::<Vec<_>>(),
+            [(1, 0), (2, 0), (0, 1)]
+        );
+    }
+
+    #[test]
+    fn proposal_relevance_retains_score_ties_and_quick_filters() {
+        let mut items = vec![
+            proposal("a", "read records", 1.0),
+            proposal("b", "read records", 9.0),
+            proposal("c", "rotate every answer daily", 10.0),
+        ];
+        let mut filter = ListFilter {
+            query: "read".into(),
+            sort: 1,
+            ..Default::default()
+        };
+        assert_eq!(proposals(&items, &filter), [1, 0]);
+        items[1].status = "applied".into();
+        filter.quick = 1;
+        assert_eq!(proposals(&items, &filter), [0]);
+        filter.quick = 2;
+        assert_eq!(proposals(&items, &filter), [1]);
+    }
+
+    #[test]
+    fn titles_explain_relevance_and_rationale_uses_the_same_prose_rule() {
+        let mut filter = ListFilter {
+            query: "read".into(),
+            sort: 3,
+            ..Default::default()
+        };
+        assert!(filter
+            .title("Tools", 2, 5, TOOL_SORTS, TOOL_QUICK)
+            .contains("sort: relevance (ties: calls)"));
+        filter.query = "#work".into();
+        assert!(!filter
+            .title("Tools", 2, 5, TOOL_SORTS, TOOL_QUICK)
+            .contains("relevance"));
+        let mut props = vec![proposal("a", "body", 1.0), proposal("b", "body", 2.0)];
+        props[0].rationale = "rotate every answer daily".into();
+        props[1].rationale = "CAFÉ record".into();
+        assert!(proposals(
+            &props,
+            &ListFilter {
+                query: "read".into(),
+                ..Default::default()
+            }
+        )
+        .is_empty());
+        assert_eq!(
+            proposals(
+                &props,
+                &ListFilter {
+                    query: "cafe\u{301}".into(),
+                    ..Default::default()
+                }
+            ),
+            [1]
+        );
+        let sessions_ = [session("a", "İstanbul CAFÉ", false, &[])];
+        assert_eq!(
+            sessions(
+                &sessions_,
+                &HashSet::new(),
+                &ListFilter {
+                    query: "istanbul cafe\u{301}".into(),
+                    ..Default::default()
+                }
+            ),
+            [0]
+        );
+    }
+
     #[test]
     fn full_key_events_keep_control_and_alt_chords_out_of_filters() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -344,6 +675,60 @@ mod tests {
             recent: String::new(),
             author: "agent".into(),
         }
+    }
+
+    #[test]
+    fn bare_tool_tag_prefix_keeps_untagged_tools_under_every_quick_filter() {
+        let mut items = vec![
+            tool("plain", Some(0.7), 1, false),
+            tool("tagged", Some(0.9), 2, false),
+            tool("retired", None, 3, true),
+        ];
+        items[0].needs_attention = true;
+        items[1].tags = vec!["work".into()];
+        items[2].tags = vec!["workshop".into()];
+        for quick in 0..TOOL_QUICK.len() {
+            for sort in 0..TOOL_SORTS.len() {
+                let empty = ListFilter {
+                    quick,
+                    sort,
+                    ..Default::default()
+                };
+                let bare = ListFilter {
+                    query: " # ".into(),
+                    ..empty.clone()
+                };
+                assert_eq!(tools(&items, &bare), tools(&items, &empty));
+            }
+        }
+        assert_eq!(
+            tools(
+                &items,
+                &ListFilter {
+                    query: "#WOrK".into(),
+                    ..Default::default()
+                }
+            ),
+            vec![2, 1]
+        );
+        assert!(tools(
+            &items,
+            &ListFilter {
+                query: "#missing".into(),
+                ..Default::default()
+            }
+        )
+        .is_empty());
+        assert_eq!(
+            tools(
+                &items,
+                &ListFilter {
+                    query: "pl".into(),
+                    ..Default::default()
+                }
+            ),
+            vec![0]
+        );
     }
 
     #[test]

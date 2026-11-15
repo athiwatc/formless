@@ -211,6 +211,8 @@ jobs:
       - name: Storage after release build
         run: bash scripts/ci-storage-budget.sh snapshot release-built
       - run: target/release/formless man > target/formless.1
+      - name: Generate package shell completions
+        run: sh scripts/generate-package-completions.sh target/release/formless target/completions
       - name: Local archive
         shell: bash
         run: |
@@ -333,6 +335,18 @@ jobs:
             fi
             formless --version
             test -f /usr/share/doc/formless/copyright || test -f /usr/share/licenses/formless/LICENSE
+            for completion in \
+              /usr/share/bash-completion/completions/formless \
+              /usr/share/zsh/site-functions/_formless \
+              /usr/share/fish/vendor_completions.d/formless.fish; do
+              test -s "$completion"
+              test "$(stat -c '%a' "$completion")" = 644
+              if command -v dpkg-query >/dev/null; then
+                dpkg-query -L formless | grep -Fx -- "$completion"
+              else
+                test "$(rpm -qf --qf '%{NAME}' "$completion")" = formless
+              fi
+            done
           }
 
       - name: Restore runner ownership of generated files

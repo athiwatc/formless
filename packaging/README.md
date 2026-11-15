@@ -26,8 +26,13 @@ platform app-dirs (SPEC §9.4).
      recognizes an existing directory and appends its metadata-derived package
      name, version, release and architecture filename; a missing directory path
      would instead be treated as a filename;
+   - generates Bash, Zsh and Fish completions from the just-built Linux binary
+     with `sh scripts/generate-package-completions.sh target/release/formless target/completions`
+     before packaging, refusing failed generators or empty output. Debian/RPM
+     packages install them in the standard system completion directories;
    - installs the packages in clean Debian, Ubuntu and Rocky containers
-     and runs `formless --version`;
+     and runs `formless --version`, checking that all three completion files
+     are nonempty, mode 644 and owned by the installed package;
    - builds the Docker image, runs it and checks the daemon answers, then
      pushes `ghcr.io/athiwatc/formless:<tag>` and `:latest` (`Dockerfile`,
      [docs/docker.md](../docs/docker.md)); nothing is published if that
@@ -145,6 +150,7 @@ Without a secret, that step is skipped and the release still completes.
   `FORMLESS_FROM_SOURCE=1`).
 - Homebrew: `brew install athiwatc/tap/formless` (once the tap exists).
 - Winget: `winget install athiwatc.formless` (once submitted).
+- Windows manual ZIP: [verify and extract the matching release asset](../docs/windows-install.md); the PATH entry is the nested directory containing `formless.exe`.
 - Debian/Ubuntu: `sudo apt install ./formless_<version>_amd64.deb` from the
   release; Fedora/RHEL: `sudo dnf install ./formless-<version>.x86_64.rpm`.
 - Arch: `yay -S formless-bin` (AUR).
