@@ -16,7 +16,13 @@ enum Part {
     Assistant(String),
     Note(String),
     /// A Tool call: name, arguments, and its result once it came back.
-    Call(String, String, Option<String>),
+    Call(String, String, Option<CallResult>),
+}
+
+/// Text and the explicit stored failure marker always travel together.
+struct CallResult {
+    text: String,
+    failed: bool,
 }
 
 fn parts(msgs: &[MessageInfo], arguments: impl Fn(&str) -> String) -> Vec<Part> {
@@ -45,14 +51,23 @@ fn parts(msgs: &[MessageInfo], arguments: impl Fn(&str) -> String) -> Vec<Part> 
                 }
             }
             "tool" => {
-                let result = clip(&m.content);
+                let result = CallResult {
+                    text: clip(&m.content),
+                    failed: meta["is_error"].as_bool() == Some(true),
+                };
                 match meta["tool_call_id"].as_str().and_then(|id| calls.get(id)) {
                     Some(&i) => {
                         if let Part::Call(_, _, r) = &mut out[i] {
                             *r = Some(result);
                         }
                     }
-                    None => out.push(Part::Call("tool".into(), String::new(), Some(result))),
+                    None => {
+                        let name = meta["data_source_tool"]
+                            .as_str()
+                            .or_else(|| meta["name"].as_str())
+                            .unwrap_or("tool");
+                        out.push(Part::Call(name.into(), String::new(), Some(result)));
+                    }
                 }
             }
             "system-note" => out.push(Part::Note(m.content.clone())),
@@ -113,8 +128,13 @@ pub fn markdown(name: &str, msgs: &[MessageInfo]) -> String {
             Part::Note(t) => out.push_str(&format!("> *{}*\n", t.trim().replace('\n', " "))),
             Part::Call(tool, args, result) => {
                 out.push_str(&format!(
-                    "<details>\n<summary>Tool: {}</summary>\n\n",
-                    escape(&tool)
+                    "<details>\n<summary>Tool: {}{}</summary>\n\n",
+                    escape(&tool),
+                    if result.as_ref().is_some_and(|r| r.failed) {
+                        " (failed)"
+                    } else {
+                        ""
+                    }
                 ));
                 if !args.is_empty() {
                     out.push_str(&fenced("json", &args));
@@ -122,7 +142,7 @@ pub fn markdown(name: &str, msgs: &[MessageInfo]) -> String {
                 }
                 if let Some(r) = result {
                     out.push_str("Result:\n\n");
-                    out.push_str(&fenced("", &r));
+                    out.push_str(&fenced("", &r.text));
                     out.push_str("\n\n");
                 }
                 out.push_str("</details>\n");
@@ -201,14 +221,19 @@ pub fn html(name: &str, msgs: &[MessageInfo]) -> String {
             Part::Note(t) => body.push_str(&format!("<p class=\"note\">{}</p>\n", escape(&t))),
             Part::Call(tool, args, result) => {
                 body.push_str(&format!(
-                    "<details><summary>Tool: {}</summary>",
-                    escape(&tool)
+                    "<details><summary>Tool: {}{}</summary>",
+                    escape(&tool),
+                    if result.as_ref().is_some_and(|r| r.failed) {
+                        " (failed)"
+                    } else {
+                        ""
+                    }
                 ));
                 if !args.is_empty() {
                     body.push_str(&format!("<pre>{}</pre>", escape(&args)));
                 }
                 if let Some(r) = result {
-                    body.push_str(&format!("<p>Result:</p><pre>{}</pre>", escape(&r)));
+                    body.push_str(&format!("<p>Result:</p><pre>{}</pre>", escape(&r.text)));
                 }
                 body.push_str("</details>\n");
             }
@@ -371,6 +396,10 @@ mod tests {
         assert!(page.contains("href=\"notes.md\""), "relative links stay");
     }
 }
+
+#[cfg(test)]
+#[path = "transcript_result_tests.rs"]
+mod transcript_result_tests;
 
 #[cfg(test)]
 #[path = "transcript_source_tests.rs"]
