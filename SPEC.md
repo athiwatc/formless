@@ -1254,7 +1254,12 @@ pasting paths.
   The web composer has a 📎 file picker and accepts pasted images.
 - **`@` mentions:** typing `@` in the input opens a completion popup of
   files under the client's working directory (TUI) or the daemon's (web),
-  fuzzy-matched on the path. `ListFiles {root?, query, limit?}` walks the
+  fuzzy-matched on the path. Ranking prepares the full and basename queries
+  once, folds each path once, and scores its basename from a rebased folded
+  suffix without highlight allocation. Bounded selection keeps score-descending,
+  UTF-8-byte-length-ascending, path-ascending order and stable input order for
+  duplicate ties; directory completion and the Unicode fold stay unchanged.
+  `ListFiles {root?, query, limit?}` walks the
   root once and caches it for 30 s. The walk respects `.gitignore`, skips
   hidden directories and `target`, `node_modules`, `dist`, `build`,
   `__pycache__` and `venv`, and stops at 200,000 entries. Directory
@@ -1263,8 +1268,20 @@ pasting paths.
   loops are skipped. Linked directories have size zero and their
   in-root children can be completed through the link's path. An empty query
   lists the top level, and `dir/` lists that directory, so paths complete
-  step by step. Tab or Enter inserts `@path`. On send, each `@path`
-  mention that names an existing file or directory goes through
+  step by step. Tab or Enter inserts `@path`, or `@"my notes/report.md"`
+  when a path needs delimiters. The `@"..."` form is reserved for quoted
+  paths: whitespace inside is literal, and only `\"` (quote) and `\\`
+  (backslash) are escapes. A complete token ends at its closing quote,
+  followed by whitespace, ordinary trailing mention punctuation, or end
+  of input. Invalid escapes, missing closing quotes and attached word
+  suffixes remain plain text on submission; they never attach a first-word
+  fragment. Directory completion retains the existing `/` marker and places
+  the cursor before a quoted directory's closing quote, so child completion
+  replaces the whole token. Exact indexed leading-space directory spellings
+  take priority before hand-typed query trimming. Extraction, chips, forecast
+  input and submission use the same decoded original paths without case or
+  filesystem normalization. On send, each complete mention that names an
+  existing file or directory goes through
   `AttachPath {session_id, path, root?}` before the message is sent:
   - text files up to 256 KB and images, WAV/MP3 audio and PDFs up to 8 MB are attached as below;
   - larger files and directories go as a reference line,
@@ -4497,7 +4514,7 @@ run_tool = "network_policy"     # a registry Tool, or…
   changes, clamps when removed and scrolls into view. Enter loads the highlighted
   Tool's existing all-time detail; unrelated cached detail stays hidden behind
   an activation hint. Mouse rows use the same identity/order. General paging
-  keys and visible-capacity movement remain a separate concern (#1468).
+  keys and visible-capacity movement follow the list-key rules below.
 - **Bulk actions.** In the TUI Sessions view, Space marks rows (✓, with
   the count in the panel title) and Esc clears the marks. With marks:
   `a` archives them (or restores them if all are archived), `e` exports
@@ -4820,8 +4837,8 @@ undo, redo and replacements invalidate prior asynchronous editor previews.
   cycle list filters. Model, switcher and rollback result pickers support
   PgUp/PgDn and Home/End, clamped to matches, using their rendered row count
   (ten rows before the first draw). Rollback navigation disarms confirmation
-  and keeps its selected version visible. General main-list paging is separate
-  (#1468).
+  and keeps its selected version visible. Main-list paging follows the
+  per-view capacity rules below.
 - **Command palette.** Typing `/` at the start of the input opens a popup
   of commands with one-line descriptions, filtered fuzzily (exact prefixes
   first). ↑/↓ select, Tab completes, Enter runs. A command that still
@@ -4863,11 +4880,19 @@ undo, redo and replacements invalidate prior asynchronous editor previews.
   delete`). They come from a per-view key table with an importance rank,
   and narrow terminals show only the most important hints that fit.
   The table replaces the hand-written panel footers.
-- **List keys (TUI).** Every list view (Sessions, Tools, Metrics,
-  Proposals) takes ↑/↓ and j/k, g/G or Home/End for the first/last row,
-  and Ctrl+D/Ctrl+U for half a page. List views take no typed input, so
-  these don't conflict. In Proposals, `n` now generates a new proposal
-  (it was `g`).
+- **List keys (TUI).** Sessions, Tools, Metrics, Proposals and Search take
+  ↑/↓ and j/k, g/G or Home/End for the first/last row, PgUp/PgDn for a
+  page and Ctrl+D/Ctrl+U for half a page. A page uses the latest rendered
+  list/table body's selectable capacity, excluding borders, column headers,
+  Tool group headers and other split panels. Each view retains its own
+  capacity; resize is reflected after redraw. Before the first draw the
+  fallback is twenty items (ten for a half-page), clamped to the list.
+  Nonempty lists move by at least one item. While a list filter is being
+  edited, PgUp/PgDn are consumed without moving results, Ctrl+D is ignored,
+  Ctrl+U clears the query and printable characters remain query text. Other
+  modal/editor/pager handlers retain priority. Search Enter still opens the
+  selected message and Esc returns to Chat. In Proposals, `n` generates a
+  new proposal (it was `g`).
 - **Mouse (TUI).** While mouse capture is on: clicking a tab switches
   views, clicking a row in the Sessions, Tools or Proposals list selects
   it and a double-click opens it (as Enter), and clicking a tool call's
@@ -5190,14 +5215,14 @@ the TUI. Command-specific arguments and defaults are available through
 | `formless docs` | Optional topic; `--print`, `--keys` | Open a guide (gallery by default), print its URL, or print the embedded keyboard reference. |
 | `formless doctor` | `--json`, `--fix`, `--restore-drill` | Diagnose setup, apply safe fixes, or rehearse the newest backup. |
 | `formless export-all` | `--sessions`, `-o FILE` / `--output FILE` | Write a portable setup bundle, optionally including Session transcripts. |
-| `formless gc` | `--dry-run` | Free reclaimable storage or preview what would be freed. |
+| `formless gc` | `--dry-run`, `--json` | Free reclaimable storage or preview what would be freed. |
 | `formless help` | Optional command path, such as `sessions show` | Print help for the CLI or a nested command. |
 | `formless import-all` | `FILE` | Add a portable setup bundle without overwriting existing entries. |
 | `formless jobs` | `list`, `add`, `run`, `history`, `enable`, `disable`, `rm` | Manage scheduled prompts and inspect their history. |
 | `formless logs` | `--follow`, `--level`, `--since`, `--lines` | Read or follow the daemon log and rotated files. |
 | `formless mcp` | `add`, `remove`, `list`, `test`, `login`, `logout`, `catalog`, `import`, `log`, `tools`, `tool`, `prompts`, `prompt` | Manage external MCP servers and inspect their tools/logs. |
 | `formless metrics` | `--since DURATION`, `--json` | Read recorded model, Tool and built-in statistics through independent reports at one cutoff. |
-| `formless memory` | `list`, `add`, `rm`, `edit` | Inspect or change saved user-memory notes. |
+| `formless memory` | `list`, `add`, `rm`, `edit`, `used` | Inspect or change saved user-memory notes. |
 | `formless models` | `list [--json]` | Fetch the default-provider model catalog and existing picker report; a non-null listing error prints a partial report and exits 1. |
 | `formless modules` | `list`, `show`; `show --version N` | Read all modules, inspect metadata/history/dependents, or emit an exact stored source version. |
 | `formless naming` | `status`, `pull`, `test` | Inspect, install, or preview the embedded Session-naming model. |
@@ -5213,7 +5238,7 @@ the TUI. Command-specific arguments and defaults are available through
 | `formless routing` | `--json` | Read currently available daemon routing decisions and returned candidate figures without starting a model request. |
 | `formless runs` | No action: list; `show`, `cancel` | List recent Runs, inspect one by ID/prefix, or cancel that exact Run. |
 | `formless security` | `status` | Inspect the daemon's grants, denials, trusted resources, and exposed interfaces. |
-| `formless sessions` | `fork`, `compare`, `list`, `show`, `files`, `rewind`, `rename`, `rm`, `restore`, `import`, `search`, `templates list/show`, `archive`, `unarchive`, `export` | Manage stored Sessions, follow a Run with `show --follow`, or inspect tracked files. `list --pinned --tag TAG` filters the fetched reply; selectors combine with `--archived`, preserving reply order. |
+| `formless sessions` | `subagents`, `subagent`, `fork`, `compare`, `list`, `show`, `usage`, `files`, `rewind`, `rename`, `rm`, `restore`, `import`, `search`, `templates list/show`, `archive`, `unarchive`, `pin`, `unpin`, `tag`, `export` | Manage stored Sessions, follow a Run with `show --follow`, or inspect tracked files. `list --pinned --tag TAG` filters the fetched reply; selectors combine with `--archived`, preserving reply order. |
 | `formless skills` | `reviews`, `add`, `remove`, `list`, `enable`, `disable`, `show`, `export`, `import` | Inspect and manage Skills and their retained description reviews. |
 | `formless storage` | `--json` | Report disk usage by data category. |
 | `formless tools` | `reviews`, `list`, `disable`, `enable`, `undo`, `pin`, `unpin`, `tag`, `show`, `diff`, `retire`, `restore`, `rollback`, `purge`, `run`, `export`, `import` | Inspect, manage, run, or transfer registry Tools. |
@@ -5221,6 +5246,39 @@ the TUI. Command-specific arguments and defaults are available through
 | `formless uninstall` | `--keep-data`, `--keep-binary`, `--yes` (alias `--force`) | Remove Formless, optionally retaining data or the binary. |
 | `formless update` | No action, `check`, or `--check`; `--json` | Show newer release notes and the applicable upgrade command; never rewrite the binary. |
 | `formless web` | `--port`, `--no-open`, `--stop` | Open, print a link for, or stop the local browser UI. |
+
+`mcp test NAME [--json]` restarts the server and prints the full report before
+returning its verdict: exit 0 for a successful reply (including zero tools),
+exit 1 for an embedded restart error. JSON preserves the reply as one value
+without an extra generic error line for that reported failure. Request failures
+keep their existing error mapping; unexpected replies are errors. `--json` does
+not make the restart read-only. `mcp add` retains its existing behavior.
+
+`gc --json` prints the complete single daemon/offline result, including its
+`dry_run`, integer `total_bytes`, `kinds` and any extra details. Use
+`gc --dry-run --json` to preview without cleanup. Counts are core-reported values,
+not a promise of exact physical space reclaimed. JSON changes only presentation;
+retention, side effects, errors and human output remain unchanged.
+
+`sessions pin ID` and `sessions unpin ID` display the stored pin state returned
+by the daemon. `sessions tag ID` only reads tags; adding positional tags replaces
+the **entire** stored tag list, and `--clear` explicitly replaces it with an empty
+list (conflicting with positional tags). Tags reach storage unchanged for its
+existing normalization; confirmation shows returned stored values. These three
+actions accept `--json` for the selected/returned Session object.
+
+Ambiguous Session prefixes/names remain usage errors and display up to ten
+matching full IDs, bounded names and archive labels. Extra matches are counted,
+with commands for both archive states. Prefix errors suggest extending the ID;
+name errors suggest a displayed ID. Exact-ID priority, prefix-before-name
+resolution and trimmed ASCII-case-insensitive full-name matching are unchanged.
+
+Human Session lists label the last recorded Run status and show stored tags,
+retaining the pin star and existing message preview/count. Empty replies are
+reported separately from an empty archive selection, which names the alternate
+list command and count. Static human `sessions show` includes stored archived,
+pinned, tags and last recorded Run status metadata; absent status is "not
+recorded". JSON and `--follow` retain their existing contracts.
 
 `formless metrics --since 7d --json` reads the three existing metrics reports
 with one checked UTC cutoff. Omit `--since` for all history. Tool rows use stored
@@ -5231,6 +5289,36 @@ not a transactional snapshot. Runs and daily usage remain separate surfaces.
 whose stored tags contain exactly `work`. Only the tag argument is lowercased;
 a leading `#` is not stripped. Add `--archived` to select the archived partition.
 These selectors filter the existing reply on the client.
+
+`formless memory used (--session SESSION | --run RUN_ID) [--json]` reports
+current note fields associated with the selected Run, in daemon order.
+Session selectors use normal exact-id/prefix/name resolution and select its
+latest Run, including one still running; Run ids are sent unchanged without
+existence validation. Retained associations may outlive a Run, while backend
+lookup/association failures can produce empty or partial reports. These are
+reported current notes, not verified historical prompt contents. Disabled
+notes remain present; JSON is the full returned array. Other daemon errors
+retain ordinary exit behavior without a partial report.
+
+```sh
+formless memory used --session SESSION --json
+formless memory used --run exact-run-id
+```
+
+`formless sessions subagents SESSION [--json]` inventories stored sub-agents
+using normal Session exact-id/prefix/name resolution. Full sub-agent ids can
+be passed unchanged to `formless sessions subagent SUBAGENT_ID [--json]`,
+which uses exact ids with no prefix lookup. Inventory order and null versus
+empty results are retained. Human detail labels the record and pretty-prints
+the entire returned provider-shaped messages array; JSON preserves the full
+daemon report. This is the existing unpaged transcript projection, whose
+handler skips malformed stored JSON rows, with no extra integrity check,
+Run start or Session mutation. Request failures produce no partial report.
+
+```sh
+formless sessions subagents SESSION --json
+formless sessions subagent exact-subagent-id
+```
 
 `update --json`, `update check --json`, and `update --check --json` emit one
 object: `{installed, status, newer_releases: [{tag, url, notes}]}`. Notes retain
@@ -6539,6 +6627,39 @@ and conflicts with `--version`. Invalid versions/conflicts fail before contact.
 GetModule still fetches every version's code even for metadata-only output;
 client projection does not reduce backend work (see #889). No module mutation
 is exposed by these commands.
+
+`runs --session SESSION --since DURATION [--limit N] [--json]` sends the
+existing Session/time filters to RunMetrics before its newest-N limit. Each
+selector is optional; Session lookup keeps the existing exact-ID, unambiguous
+prefix and name rules. Durations use checked arithmetic and one UTC RFC3339
+cutoff in the existing stored TEXT representation. The returned runs and their
+summary describe that filtered, limited subset; JSON forecasts remain
+independently scoped and unchanged. With neither selector, request/output
+behavior is unchanged. Filters with any Runs subaction are usage errors before
+connection; unknown/ambiguous Sessions necessarily fail after ListSessions.
+
+`sessions usage SESSION [--json]` uses the existing Session selector and
+buffers SessionUsage plus ContextUsage before output. Human records label
+total/latest-Run counters, estimated USD cost, unpriced models and the current
+prompt/context estimates. Attachment entries count stored metadata-array
+entries, not tokens, unique files or pending attachments. A null latest report
+means usage unavailable, not no prior Runs or a completed-Run guarantee.
+JSON preserves both complete independent replies under `session_id`, `usage`
+and `context`; this is not a common-snapshot guarantee. Existing context-window
+discovery may contact the configured provider, so the command is not promised
+offline. Reported Run count retains the backend's newest-100,000 global-window
+limitation (#1458); aggregation/estimation/accounting behavior is unchanged.
+
+`tools show NAME_OR_ID` includes stored pin state, the newest ten version
+summaries (explicit numeric order) and up to five of the returned recent-call
+metadata rows. Omitted counts point to `--json`, which retains the existing
+complete detail contract. No new call inputs/outputs are added to these
+summaries; the existing schema/example sections remain. `--code` conflicts
+with JSON and writes only the exact current version source, preserving its
+trailing newline state; a missing current version is an error. This intentional
+human-detail layout change leaves fetching, metrics and security fields intact.
+The existing GetTool all-version payload remains until protocol selectors
+are addressed separately (#889).
 
 `runs show ID [--json]` inspects any stored Run; `runs cancel ID [--json]`
 cancels only that exact active Run, never a later Run in the same Session. IDs

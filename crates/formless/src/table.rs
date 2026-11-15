@@ -262,7 +262,7 @@ pub(super) fn terminal_control(c: char) -> bool {
 
 /// One visible line, with whitespace collapsed and input controls escaped.
 /// Apply this to piped text too: redirected tables may be displayed later.
-fn cell_text(text: &str) -> String {
+pub(super) fn cell_text(text: &str) -> String {
     let mut visible = String::with_capacity(text.len());
     let mut space = false;
     for c in text.chars() {
@@ -289,7 +289,7 @@ pub fn color_allowed() -> bool {
 }
 
 /// `text` cut to `w` columns with an ellipsis.
-fn fit(text: &str, w: usize) -> String {
+pub(super) fn fit(text: &str, w: usize) -> String {
     if w == 0 {
         return String::new();
     }
