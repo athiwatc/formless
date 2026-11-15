@@ -21,9 +21,15 @@ with debug assertions and overflow checks still enabled.
 
 | Fixture | Before median | After median | Output |
 |---|---:|---:|---|
-| Words, 32,798 bytes | 8.427 ms | 1.471 ms | Same length/digest |
-| Markdown, 32,802 bytes | 132.496 ms | 4.891 ms | Same length/digest |
-| Lists/table/links, 32,844 bytes | 267.694 ms | 28.614 ms | Same length/digest |
+| Words, 32,798 bytes | 7.266 ms | 1.460 ms | Same length/digest |
+| Markdown, 32,802 bytes | 102.192 ms | 4.899 ms | Same length/digest |
+| Lists/table/links, 32,844 bytes | 239.854 ms | 26.493 ms | Same length/digest |
+
+The table is a controlled comparison at immutable `f91cec7`, overriding only
+the dev Markdown opt-level to 0 for the baseline. Earlier exploratory values are
+retained separately. These are approximately 32 KiB function fixtures; Markdown
+and structured cases can exceed the row's separate 400-line preview cap, so they
+are not direct frame measurements or claims about a typical visible row.
 
 This improves the observed debug blocker without changing parser options,
 source, AST traversal or accessibility semantics. Existing correctness and
