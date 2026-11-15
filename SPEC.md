@@ -6586,6 +6586,15 @@ stored message boundaries display a Note and the initial Session snapshot only;
 follow never invents a boundary or refreshes that legacy transcript without one.
 Connection loss is an error.
 
+Human `runs show` uses labeled stored identifiers, status/error, timestamps,
+message boundaries, counters and recorded token sums. Available spend is
+labeled as a report of estimates, with known subtotal, optional total and
+returned completeness flags; unavailable amounts are not invented as zero.
+Human `runs cancel` reports a cancellation request for a matching accepting
+controller, or that none was found; neither acknowledgment proves a terminal
+outcome. There is no polling or additional cancellation request. JSON and the
+existing status-based show exits remain unchanged.
+
 `tools list --filter FILTER` selects one stored-state predicate: `not-retired`
 (including disabled Tools), `retired`, `failing` (known success rate below 0.8),
 `needs-attention`, `off` (disabled) or `pinned`. It combines by AND with
