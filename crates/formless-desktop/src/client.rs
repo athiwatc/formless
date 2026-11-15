@@ -57,6 +57,18 @@ pub const FUTURE_ATTEMPT_STATUS: &str =
 #[derive(Debug)]
 pub enum Update {
     Transcript(StreamBatch),
+    ApprovalInventory {
+        client: uuid::Uuid,
+        connection: u64,
+        operation: uuid::Uuid,
+        revision: u64,
+        result: Result<Option<crate::approvals::Prompt>, String>,
+    },
+    ApprovalInvalidated {
+        client: uuid::Uuid,
+        connection: u64,
+        revision: u64,
+    },
     SessionStatusInvalidated {
         client: uuid::Uuid,
         connection: u64,
@@ -159,6 +171,11 @@ pub enum Update {
 pub enum Command {
     DecideStep(crate::step_decision::Dispatch),
     EnableStepMode(crate::step_mode::Dispatch),
+    ReadApprovals {
+        connection: u64,
+        operation: uuid::Uuid,
+    },
+    DecideApproval(crate::approvals::Dispatch),
     ReadInvocations {
         connection: u64,
         operation: uuid::Uuid,
@@ -232,6 +249,7 @@ pub struct Endpoint(pub PathBuf);
 pub struct Client {
     step_ledger: Arc<crate::step_decision::Ledger>,
     mode_ledger: Arc<crate::step_mode::Ledger>,
+    approval_ledger: Arc<crate::approvals::Ledger>,
     commands: queue::Sender<Command>,
     updates: Receiver<Update>,
     stop: watch::Sender<bool>,
@@ -311,6 +329,7 @@ impl Client {
         Self {
             step_ledger: Arc::new(crate::step_decision::Ledger::default()),
             mode_ledger: Arc::new(crate::step_mode::Ledger::default()),
+            approval_ledger: Arc::new(crate::approvals::Ledger::default()),
             commands,
             updates,
             stop,
@@ -387,7 +406,44 @@ impl Client {
         }
         self.send(Command::EnableStepMode(self.mode_ledger.reserve(action)?))
     }
+    #[cfg(feature = "test-support")]
+    pub fn finish_recorded_approval(&self, d: &crate::approvals::Dispatch, value: Value) {
+        assert!(self.recorded.is_some() && d.owned_by(&self.approval_ledger));
+        assert!(d.before_write());
+        d.finish(crate::approvals::decode(Ok(value), true));
+    }
+    pub fn approval_status(&self) -> crate::approvals::Status {
+        self.approval_ledger.status()
+    }
+    pub fn cancel_unsent_approval(&self) {
+        self.approval_ledger
+            .cancel_unsent("Approval review closed before writing; no decision was sent.");
+    }
+    pub fn decide_approval(&self, action: crate::approvals::Action) -> Result<(), &'static str> {
+        if !self.is_ready()
+            || action.client != self.instance()
+            || action.connection != self.connection()
+            || action.epoch != self.epoch()
+        {
+            return Err("Profile connection or review changed; no approval decision was queued.");
+        }
+        self.send(Command::DecideApproval(
+            self.approval_ledger.reserve(action)?,
+        ))
+    }
     pub fn send(&self, command: Command) -> Result<(), &'static str> {
+        if let Command::DecideApproval(d) = &command {
+            if !d.owned_by(&self.approval_ledger)
+                || !self.is_ready()
+                || d.action().client != self.instance()
+                || d.action().connection != self.connection()
+                || d.action().epoch != self.epoch()
+            {
+                d.reject("Profile connection or review changed; no decision was queued.");
+                return Err("Profile connection or review changed; no decision was queued.");
+            }
+        }
+
         if let Command::EnableStepMode(d) = &command {
             if !d.owned_by(&self.mode_ledger)
                 || !self.is_ready()
@@ -502,6 +558,8 @@ impl Client {
         advance_epoch(&self.epoch);
         self.step_ledger
             .cancel_unsent("Review context changed before writing; no Step decision was sent.");
+        self.approval_ledger
+            .cancel_unsent("Review context changed before writing; no approval decision was sent.");
     }
 
     pub fn review(&self, intent: Intent, draft_basis: String) -> Result<(), &'static str> {
@@ -521,6 +579,7 @@ impl Client {
         Self {
             step_ledger: Arc::new(crate::step_decision::Ledger::default()),
             mode_ledger: Arc::new(crate::step_mode::Ledger::default()),
+            approval_ledger: Arc::new(crate::approvals::Ledger::default()),
             commands,
             updates,
             stop,
@@ -580,6 +639,18 @@ fn advance_epoch(epoch: &AtomicU64) {
 
 #[derive(Debug)]
 enum Pending {
+    ApprovalRead {
+        operation: uuid::Uuid,
+        revision: u64,
+    },
+    ApprovalInspect {
+        dispatch: crate::approvals::Dispatch,
+        revision: u64,
+    },
+    ApprovalCommit {
+        dispatch: crate::approvals::Dispatch,
+        revision: u64,
+    },
     ModeInspect {
         dispatch: crate::step_mode::Dispatch,
         revision: u64,
@@ -699,6 +770,7 @@ struct Engine {
     reader: reader::Reader,
     stream_epoch: u64,
     status_revision: u64,
+    approval_revision: u64,
     forks: Arc<session_fork::Ledger>,
     connection: u64,
     questions: questions::Directory,
@@ -719,6 +791,108 @@ struct Engine {
 }
 
 impl Engine {
+    fn approval_current(&self, d: &crate::approvals::Dispatch) -> bool {
+        let a = d.action();
+        self.ready
+            && a.valid()
+            && a.client == self.instance
+            && a.connection == self.connection
+            && a.epoch == self.epoch
+    }
+    fn retire_approval_work(&mut self) {
+        let ids = self
+            .pending
+            .iter()
+            .filter_map(|(id, p)| match p {
+                Pending::ApprovalRead { revision, .. } if *revision != self.approval_revision => {
+                    Some(*id)
+                }
+                Pending::ApprovalInspect {
+                    dispatch: d,
+                    revision,
+                } if !d.reserved()
+                    || !self.approval_current(d)
+                    || *revision != self.approval_revision =>
+                {
+                    Some(*id)
+                }
+                Pending::ApprovalCommit {
+                    dispatch: d,
+                    revision,
+                } if !d.sent()
+                    && (!d.reserved()
+                        || !self.approval_current(d)
+                        || *revision != self.approval_revision) =>
+                {
+                    Some(*id)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for id in ids {
+            self.outgoing.retain(|r| r.id != id);
+            match self.pending.remove(&id) {
+                Some(
+                    Pending::ApprovalInspect { dispatch, .. }
+                    | Pending::ApprovalCommit { dispatch, .. },
+                ) => dispatch.reject(
+                    "Approval inventory or review changed before writing; no decision was sent.",
+                ),
+                Some(Pending::ApprovalRead { operation, .. }) => {
+                    self.updates.push(Update::ApprovalInventory {
+                        client: self.instance,
+                        connection: self.connection,
+                        operation,
+                        revision: self.approval_revision,
+                        result: Err(
+                            "Approvals changed while reading; reload the current inventory.".into(),
+                        ),
+                    })
+                }
+                _ => {}
+            }
+        }
+    }
+    fn invalidate_approvals(&mut self) -> Result<(), String> {
+        self.approval_revision = self
+            .approval_revision
+            .checked_add(1)
+            .ok_or("Approval revision exhausted")?;
+        self.retire_approval_work();
+        self.updates.push(Update::ApprovalInvalidated {
+            client: self.instance,
+            connection: self.connection,
+            revision: self.approval_revision,
+        });
+        Ok(())
+    }
+    fn before_approval_writes(&mut self) -> Result<(), String> {
+        self.retire_approval_work();
+        let work = self
+            .pending
+            .values()
+            .filter_map(|p| match p {
+                Pending::ApprovalCommit { dispatch, .. } if !dispatch.sent() => {
+                    Some(dispatch.clone())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for d in work {
+            if self.approval_revision == u64::MAX || self.status_revision == u64::MAX {
+                return Err("Approval status revision exhausted".into());
+            }
+            if !d.before_write() {
+                return Err(
+                    "Approval reservation retired before writing; nothing was retried.".into(),
+                );
+            }
+            self.invalidate_approvals()?;
+            self.invalidate_mode_metadata()?;
+        }
+        Ok(())
+    }
+
     fn mode_current(&self, d: &crate::step_mode::Dispatch) -> bool {
         let a = d.action();
         self.ready
@@ -1034,6 +1208,54 @@ impl Engine {
                     });
                 } else {
                     self.request(Request::ListInvocations, Pending::Invocations { operation });
+                }
+            }
+            Command::ReadApprovals {
+                connection,
+                operation,
+            } => {
+                if self.ready
+                    && connection == self.connection
+                    && !operation.is_nil()
+                    && self
+                        .pending
+                        .values()
+                        .filter(|p| matches!(p, Pending::ApprovalRead { .. }))
+                        .count()
+                        < 2
+                {
+                    self.request(
+                        Request::PendingApprovals,
+                        Pending::ApprovalRead {
+                            operation,
+                            revision: self.approval_revision,
+                        },
+                    );
+                } else {
+                    self.updates.push(Update::ApprovalInventory {
+                        client: self.instance,
+                        connection: self.connection,
+                        operation,
+                        revision: self.approval_revision,
+                        result: Err(
+                            "Approval reads unavailable or already pending; nothing was requested."
+                                .into(),
+                        ),
+                    });
+                }
+            }
+            Command::DecideApproval(dispatch) => {
+                if self.pending.values().any(|p|matches!(p,Pending::ApprovalInspect{dispatch:d,..}|Pending::ApprovalCommit{dispatch:d,..} if d.action().operation==dispatch.action().operation)){return}
+                if !self.approval_current(&dispatch) || !dispatch.reserved() {
+                    dispatch.reject("Approval review is stale; no decision was sent.");
+                } else {
+                    self.request(
+                        Request::PendingApprovals,
+                        Pending::ApprovalInspect {
+                            dispatch,
+                            revision: self.approval_revision,
+                        },
+                    );
                 }
             }
             Command::EnableStepMode(dispatch) => {
@@ -1538,6 +1760,16 @@ impl Engine {
         let (id, result, response_ok) = match message {
             ServerMessage::Event(event) => {
                 if matches!(
+                    &event,
+                    Event::ApprovalRequested { .. }
+                        | Event::ApprovalClosed { .. }
+                        | Event::ApprovalAnswered { .. }
+                        | Event::SessionDeleted { .. }
+                ) {
+                    self.invalidate_approvals()?;
+                }
+
+                if matches!(
                     event,
                     Event::RunStarted { .. }
                         | Event::RunFinished { .. }
@@ -1793,6 +2025,50 @@ impl Engine {
                     self.invalidate_mode_metadata()?;
                 }
                 self.dirty_session = true;
+            }
+            Pending::ApprovalRead {
+                operation,
+                revision,
+            } => {
+                let result = if revision == self.approval_revision {
+                    result.and_then(|v| {
+                        crate::approvals::Prompt::from_list(&v).map_err(str::to_string)
+                    })
+                } else {
+                    Err("Approvals changed while reading; reload the current inventory.".into())
+                };
+                self.updates.push(Update::ApprovalInventory {
+                    client: self.instance,
+                    connection: self.connection,
+                    operation,
+                    revision: self.approval_revision,
+                    result,
+                });
+            }
+            Pending::ApprovalInspect { dispatch, revision } => {
+                let exact = result
+                    .as_ref()
+                    .ok()
+                    .and_then(|v| crate::approvals::Prompt::from_list(v).ok().flatten())
+                    .is_some_and(|p| p == dispatch.action().prompt);
+                if !self.approval_current(&dispatch)
+                    || !dispatch.reserved()
+                    || revision != self.approval_revision
+                    || !exact
+                {
+                    dispatch.reject("The exact complete approval could not be revalidated. No decision was sent; use a fresh review or Formless TUI.");
+                } else {
+                    self.request(
+                        dispatch.action().request(),
+                        Pending::ApprovalCommit { dispatch, revision },
+                    );
+                }
+            }
+            Pending::ApprovalCommit { dispatch, .. } => {
+                dispatch.finish(crate::approvals::decode(result, response_ok));
+                self.invalidate_approvals()?;
+                self.invalidate_mode_metadata()?;
+                self.dirty_list = true;
             }
             Pending::StepInspect(dispatch) => {
                 let action = dispatch.action();
@@ -2240,6 +2516,7 @@ async fn connected<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
             engine.question_recovery_limit = limit;
             engine.emit_questions();
         }
+        engine.before_approval_writes()?;
         engine.retire_step_reviews(false);
         engine.retire_mode_enables();
         engine.before_mode_writes()?;
@@ -2868,6 +3145,7 @@ mod tests {
         let client = Client {
             step_ledger: Arc::new(crate::step_decision::Ledger::default()),
             mode_ledger: Arc::new(crate::step_mode::Ledger::default()),
+            approval_ledger: Arc::new(crate::approvals::Ledger::default()),
             commands,
             updates,
             stop,
@@ -3223,6 +3501,7 @@ mod tests {
         let client = Client {
             step_ledger: Arc::new(crate::step_decision::Ledger::default()),
             mode_ledger: Arc::new(crate::step_mode::Ledger::default()),
+            approval_ledger: Arc::new(crate::approvals::Ledger::default()),
             commands,
             updates,
             stop,
@@ -4402,3 +4681,7 @@ mod native_steps_tests;
 #[cfg(test)]
 #[path = "client/step_mode_tests.rs"]
 mod step_mode_tests;
+
+#[cfg(test)]
+#[path = "client/approval_tests.rs"]
+mod approval_tests;

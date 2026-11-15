@@ -34,6 +34,7 @@ use crate::client::{self, Client, Command as ClientCommand, Update as ClientUpda
 use crate::commands::{self, Command};
 use crate::directory::{self, Directory};
 use crate::forecast;
+mod approval_review;
 mod comparison;
 mod invocations;
 mod preferences;
@@ -91,6 +92,7 @@ gpui_kit::actions!(
         CloseForecast,
         CloseQuestions,
         CloseStepReview,
+        CloseApprovalReview,
         CloseSessionEditor,
         ScrollViewerUp,
         ScrollViewerDown,
@@ -182,6 +184,7 @@ pub fn bind_keys(cx: &mut App) {
                 | Command::ResumeRun
                 | Command::AbandonRun
                 | Command::Questions
+                | Command::Approvals
                 | Command::SessionDetails
                 | Command::MarkComparisonLeft
                 | Command::CompareMarked
@@ -199,6 +202,21 @@ pub fn bind_keys(cx: &mut App) {
     });
     cx.bind_keys(global.collect::<Vec<_>>());
     cx.bind_keys([
+        KeyBinding::new(
+            "escape",
+            CloseApprovalReview,
+            Some("FormlessApprovalReview"),
+        ),
+        KeyBinding::new("up", ScrollViewerUp, Some("FormlessApprovalReview")),
+        KeyBinding::new("down", ScrollViewerDown, Some("FormlessApprovalReview")),
+        KeyBinding::new("pageup", ScrollViewerPageUp, Some("FormlessApprovalReview")),
+        KeyBinding::new(
+            "pagedown",
+            ScrollViewerPageDown,
+            Some("FormlessApprovalReview"),
+        ),
+        KeyBinding::new("home", ScrollViewerStart, Some("FormlessApprovalReview")),
+        KeyBinding::new("end", ScrollViewerEnd, Some("FormlessApprovalReview")),
         KeyBinding::new(
             commands::composer_submit_key(),
             ComposerModifiedEnter,
@@ -559,6 +577,7 @@ enum Modal {
     Forecast,
     Questions,
     Step,
+    Approvals,
     SessionEditor,
 }
 
@@ -729,6 +748,8 @@ pub struct Shell {
     question_draft_ids: Vec<String>,
     questions_toggle_focus: FocusHandle,
     step_panel: Option<step_review::Panel>,
+    approval_panel: Option<approval_review::Panel>,
+    approval_open_focus: FocusHandle,
     step_draft: Option<(uuid::Uuid, formless_protocol::PendingStep, String)>,
     step_open_focus: FocusHandle,
     mode_enable_focus: FocusHandle,
@@ -981,6 +1002,8 @@ impl Shell {
             question_draft_ids: Vec::new(),
             questions_toggle_focus: cx.focus_handle(),
             step_panel: None,
+            approval_panel: None,
+            approval_open_focus: cx.focus_handle(),
             step_draft: None,
             step_open_focus: cx.focus_handle(),
             mode_enable_focus: cx.focus_handle(),
@@ -1058,6 +1081,7 @@ impl Shell {
                 has_composer: true,
                 can_recover: false,
                 can_questions: false,
+                can_approvals: false,
                 can_search_profile: false,
                 can_edit_session: false,
                 can_browse_archived: false,
@@ -1455,6 +1479,8 @@ impl Shell {
     fn current_modal(&self, layout: Layout) -> Option<Modal> {
         if self.session_editor.is_some() {
             Some(Modal::SessionEditor)
+        } else if self.approval_panel.is_some() {
+            Some(Modal::Approvals)
         } else if self.step_panel.is_some() {
             Some(Modal::Step)
         } else if self.question_panel.is_some() {
@@ -1817,6 +1843,10 @@ impl Shell {
         }
         self.step_panel = None;
         self.step_draft = None;
+        if self.approval_panel.is_some() {
+            self.restore_focus = None;
+        }
+        self.approval_panel = None;
         self.client = Some(client);
         self.mode_observed = Default::default();
         self.client_connected = false;
@@ -1989,6 +2019,7 @@ impl Shell {
         self.sync_fork_status(cx);
         self.sync_step_status(cx);
         self.sync_mode_status(cx);
+        self.sync_approval_status(cx);
         self.validate_stream_view(cx);
         let updates: Vec<_> = self
             .client
@@ -2111,6 +2142,20 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         match update {
+            ClientUpdate::ApprovalInventory {
+                client,
+                connection,
+                operation,
+                revision,
+                result,
+            } => {
+                self.approval_inventory(client, connection, operation, revision, result, window, cx)
+            }
+            ClientUpdate::ApprovalInvalidated {
+                client,
+                connection,
+                revision,
+            } => self.approval_invalidated(client, connection, revision, cx),
             ClientUpdate::Transcript(batch) => self.apply_stream_batch(batch, window, cx),
             ClientUpdate::Connection { ready, notice } => {
                 self.client_connected = ready;
@@ -3026,6 +3071,8 @@ impl Shell {
                     .as_ref()
                     .is_some_and(|run| run.recoverable()),
             can_questions: self.client.is_some(),
+            can_approvals: self.client_connected
+                && self.client.as_ref().is_some_and(Client::is_ready),
             can_search_profile: self.client.is_some(),
             can_edit_session: self.client_connected && self.session_edit_target().is_some(),
             can_browse_archived: self.client.is_some(),
@@ -3071,6 +3118,19 @@ impl Shell {
             )
         {
             return Some("Close Session details before changing the underlying view");
+        }
+        if self.approval_panel.is_some()
+            && !matches!(
+                command,
+                Command::FocusNextRegion
+                    | Command::FocusPreviousRegion
+                    | Command::IncreaseTextSize
+                    | Command::DecreaseTextSize
+                    | Command::ResetTextSize
+                    | Command::ToggleTheme
+            )
+        {
+            return Some("Close approval review before changing the underlying view");
         }
         if self.step_panel.is_some()
             && !matches!(
@@ -3160,6 +3220,7 @@ impl Shell {
         }
         match command {
             Command::Questions => self.open_questions(window, cx),
+            Command::Approvals => self.open_approvals(window, cx),
             Command::SessionDetails => self.open_session_editor(window, cx),
             Command::ToggleArchived => self.toggle_archived_directory(window, cx),
             Command::Send => self.submit(false, cx),
@@ -3675,6 +3736,12 @@ impl Shell {
                 window.focus(&self.forecast_cancel_focus, cx);
                 cx.notify();
             }
+            Modal::Approvals => {
+                if let Some(p) = &self.approval_panel {
+                    window.focus(&p.close, cx);
+                }
+                cx.notify();
+            }
             Modal::Step => {
                 if let Some(panel) = &self.step_panel {
                     window.focus(&panel.close, cx);
@@ -3704,6 +3771,7 @@ impl Shell {
             | Modal::Forecast
             | Modal::Questions
             | Modal::Step
+            | Modal::Approvals
             | Modal::SessionEditor),
         ) = self.current_modal(self.layout(window))
         {
@@ -4247,9 +4315,10 @@ impl Shell {
                 readable("daemon-step-inventory", summary).text_sm().px_2().py_1().max_h(px(120.)).overflow_y_hidden()
             ))
             .when_some(self.client.as_ref().and_then(|c|c.step_status().notice()),|region,text|region.child(readable("native-step-receipt",text).text_sm().px_2().py_1()))
+            .when(self.client_attention && self.client.as_ref().is_some_and(Client::is_ready),|region|region.child(Button::new("approval-review-open").track_focus(&self.approval_open_focus).label("Review security approval").on_click(Self::on_command(Command::Approvals,cx))))
             .when(self.step_prompt().is_some(), |region|region.child(Button::new("step-review-open").track_focus(&self.step_open_focus).label("Review Step").on_click(cx.listener(|this,_,window,cx|this.open_step_review(window,cx)))))
             .when(self.client.is_some() && self.client_attention, |region| region.child(
-                readable("daemon-pending-attention", "This Profile has pending decisions. Use Questions for user questions; approvals remain in the Formless TUI.").text_sm().px_2().py_1()
+                readable("daemon-pending-attention", "This Profile has pending decisions. Use Questions for user questions or Approvals for one complete supported Tool call; other decisions require Formless TUI.").text_sm().px_2().py_1()
             ))
             .when(self.client.is_some() && !self.client_snapshot_ready, |region| region.child(
                 readable("daemon-session-state", if self.sidebar.active_id().is_none() {
@@ -5821,6 +5890,7 @@ impl Render for Shell {
         self.reveal_resource_control(window, cx);
         self.reveal_question_focus(window, cx);
         self.reveal_step_focus(window, cx);
+        self.reveal_approval_focus(window, cx);
         if self
             .forecast
             .as_ref()
@@ -5918,6 +5988,9 @@ impl Render for Shell {
             })
             .when(self.forecast.is_some(), |shell| {
                 shell.child(self.render_forecast(window, cx))
+            })
+            .when(self.approval_panel.is_some(), |shell| {
+                shell.child(self.render_approval_review(window, cx))
             })
             .when(self.step_panel.is_some(), |shell| {
                 shell.child(self.render_step_review(window, cx))

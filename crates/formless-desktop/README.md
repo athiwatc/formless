@@ -115,7 +115,10 @@ No search is replayed after reconnect. Existing pending
 questions are available in the Profile-wide Questions command/header entry,
 with structured single/multi-choice and multiline free text. Their Session
 identity stays explicit even while another Session is displayed. Existing
-approvals retain their TUI handoff. The desktop never starts a daemon
+security approvals are available through the Profile-wide Approvals command.
+One complete, bounded Tool request supports explicit Allow once or Deny, after
+a fresh exact inventory comparison. Multiple requests, batches, promotions and
+wider scopes retain their TUI handoff. The desktop never starts a daemon
 or reads its database, credentials or configuration files.
 
 The current protocol has no snapshot watermark or token offset. This client
@@ -207,7 +210,8 @@ this daemon lifetime; it never approves or releases a Tool. Missing sampled
 mode disables the control, and an uncertain write blocks further native enables
 for that Client without replay. See the [enable report](../../docs/desktop/step-mode-enable-20261115.md)
 for ownership, receipt limits and validation. Native OS acceptance and full Step
-and security-approval parity remain open.
+and security-approval parity remain open. See the
+[native approval report](../../docs/desktop/native-approval-20261115.md).
 
 The optional `daemon-tests` feature links the daemon only into the test build.
 The normal desktop graph does not embed the daemon or depend on the TUI.

@@ -24,6 +24,7 @@ pub enum Command {
     ResumeRun,
     AbandonRun,
     Questions,
+    Approvals,
     SessionDetails,
     MarkComparisonLeft,
     CompareMarked,
@@ -85,6 +86,7 @@ pub struct State {
     /// A current, connected canonical snapshot has a recoverable last Run.
     pub can_recover: bool,
     pub can_questions: bool,
+    pub can_approvals: bool,
     pub can_search_profile: bool,
     pub can_edit_session: bool,
     pub can_browse_archived: bool,
@@ -187,6 +189,7 @@ pub fn keys(command: Command) -> &'static [&'static str] {
         | Command::ResumeRun
         | Command::AbandonRun
         | Command::Questions
+        | Command::Approvals
         | Command::SessionDetails
         | Command::MarkComparisonLeft
         | Command::CompareMarked
@@ -276,6 +279,7 @@ pub fn palette(state: &State) -> Vec<Entry> {
         Command::ResumeRun,
         Command::AbandonRun,
         Command::Questions,
+        Command::Approvals,
         Command::SessionDetails,
         Command::MarkComparisonLeft,
         Command::CompareMarked,
@@ -422,6 +426,11 @@ pub fn entry(command: Command, state: &State) -> Entry {
             } else {
                 None
             },
+        ),
+        Command::Approvals => (
+            "Approvals", "Review Profile security approval".into(), Group::Run,
+            "Read one complete pending Tool call; allow once or deny without persistent grants", None,
+            if state.composing { Some(COMPOSING) } else { (!state.can_approvals).then_some("Wait for a ready Profile connection") },
         ),
         Command::Questions => (
             "Questions",
@@ -589,6 +598,7 @@ mod tests {
             has_composer: true,
             can_recover: false,
             can_questions: false,
+            can_approvals: false,
             can_search_profile: false,
             can_edit_session: false,
             can_browse_archived: false,
@@ -856,6 +866,22 @@ mod tests {
         assert_eq!(
             sessions.shortcut(),
             Some(shortcut_text(keys(Command::ToggleSessions)[0]))
+        );
+    }
+    #[test]
+    fn approval_review_is_profile_scoped_ready_only_and_composition_safe() {
+        let mut s = state(crate::model::RunState::Idle, true);
+        s.can_approvals = false;
+        assert!(!entry(Command::Approvals, &s).enabled());
+        s.can_approvals = true;
+        s.has_composer = false;
+        assert!(entry(Command::Approvals, &s).enabled());
+        assert!(palette(&s).iter().any(|e| e.command == Command::Approvals));
+        assert!(keys(Command::Approvals).is_empty());
+        s.composing = true;
+        assert_eq!(
+            entry(Command::Approvals, &s).disabled_reason,
+            Some(COMPOSING)
         );
     }
 }

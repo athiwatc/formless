@@ -188,6 +188,12 @@ async fn until(client: &Client, stage: &'static str, mut predicate: impl FnMut(U
                 } => format!("page {destination:?} ok={}", result.is_ok()),
                 Update::Action { result, .. } => format!("action {result:?}"),
                 Update::Notice(notice) => notice.clone(),
+                Update::ApprovalInventory {
+                    result, revision, ..
+                } => format!("approval inventory {revision}: ok={}", result.is_ok()),
+                Update::ApprovalInvalidated { revision, .. } => {
+                    format!("approval invalidated {revision}")
+                }
                 Update::Attention { pending, .. } => format!("attention pending={pending}"),
                 Update::Questions(state) => format!(
                     "profile questions={} blocked={}",
@@ -1244,3 +1250,7 @@ mod cursor_order;
 #[cfg(unix)]
 #[path = "support/step_mode_transport.rs"]
 mod step_mode_transport;
+
+#[cfg(unix)]
+#[path = "support/native_approval_transport.rs"]
+mod native_approval_transport;
