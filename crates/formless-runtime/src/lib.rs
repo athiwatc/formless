@@ -4534,11 +4534,21 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStringExt;
-            std::fs::write(
+            match std::fs::write(
                 root.join(std::ffi::OsString::from_vec(vec![b'b', 255])),
                 "fixture",
-            )
-            .unwrap();
+            ) {
+                Ok(()) => {}
+                // Unix paths can contain arbitrary bytes, but not every filesystem
+                // accepts them (for example, APFS rejects this name with EILSEQ).
+                // All listing/overlay assertions above still run on every host;
+                // test invalid-name rejection below wherever creation is supported.
+                Err(error) if error.raw_os_error() == Some(libc::EILSEQ) => {
+                    eprintln!("filesystem rejects non-UTF-8 filename fixture: {error}");
+                    return;
+                }
+                Err(error) => panic!("could not create non-UTF-8 filename fixture: {error}"),
+            }
             for details in [false, true] {
                 let mut req = request(
                     "function run(i) { return fs.list(i.root,{details:i.details}); }",

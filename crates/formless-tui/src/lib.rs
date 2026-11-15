@@ -29,6 +29,7 @@ mod profile_context_tests;
 pub mod qr;
 mod query;
 mod review_wrap;
+mod search_jump;
 mod session_ui;
 mod settings;
 mod tab_view;
@@ -1921,6 +1922,7 @@ struct App {
     /// shown before saving (SPEC §10.4).
     editor_review: Option<EditorReview>,
     search_hits: Vec<SearchHit>,
+    search_jump: Option<search_jump::Target>,
     search_idx: usize,
     search_mode: bool,
     editing_id: Option<String>,
@@ -2199,6 +2201,7 @@ impl App {
             editor: None,
             editor_review: None,
             search_hits: Vec::new(),
+            search_jump: None,
             search_idx: 0,
             search_mode: false,
             editing_id: None,
@@ -2771,6 +2774,14 @@ impl App {
                 _ => None,
             };
             let id = c.send(req);
+            if let Some(target) = self.search_jump.as_mut().filter(|target| {
+                target.request.is_none()
+                    && state_read
+                        .as_ref()
+                        .is_some_and(|(session, _)| session == &target.session)
+            }) {
+                target.request = Some(id);
+            }
             if let Some(read) = state_read {
                 self.run_state_reads.insert(id, read);
             }
@@ -2788,6 +2799,7 @@ impl App {
             .map(|(id, _)| *id)
             .collect();
         for id in late {
+            self.failed_search_jump(id);
             self.pending_since.remove(&id);
             self.run_state_reads.remove(&id);
             let Some(kind) = self.pending.remove(&id) else {
@@ -3023,6 +3035,9 @@ impl App {
                     }
                     self.pending_since.remove(&id);
                     let state_read = self.run_state_reads.remove(&id);
+                    if !ok {
+                        self.failed_search_jump(id);
+                    }
                     let Some(kind) = self.pending.remove(&id) else {
                         continue;
                     };
@@ -4931,7 +4946,10 @@ impl App {
                                             call.status == "running" && call.handle.is_some()
                                         });
                                     }
+                                    let search_jump = self.search_jump.take();
                                     self.follow_chat_bottom();
+                                    self.search_jump = search_jump;
+                                    self.loaded_search_jump(id);
                                 }
                             }
                             self.run_banner = result["unfinished_run"].as_object().map(|r| {
@@ -5348,12 +5366,14 @@ impl App {
     }
 
     fn scroll_chat_up(&mut self, lines: usize) {
+        self.search_jump = None;
         let max_top = self.chat_max_top();
         let cur = self.chat_scroll_top.unwrap_or(max_top);
         self.chat_scroll_top = Some(cur.saturating_sub(lines));
     }
 
     fn scroll_chat_down(&mut self, lines: usize) {
+        self.search_jump = None;
         if let Some(top) = self.chat_scroll_top {
             let next = top + lines;
             self.chat_scroll_top = if next >= self.chat_max_top() {
@@ -5365,6 +5385,7 @@ impl App {
     }
 
     fn follow_chat_bottom(&mut self) {
+        self.search_jump = None;
         self.chat_scroll_top = None;
     }
 
@@ -7276,21 +7297,16 @@ impl App {
         true
     }
 
-    /// Open, refresh or close the `@` popup for the input's last word.
+    /// Open, refresh or close the popup for the shared mention token at the cursor.
     fn update_mention(&mut self) {
-        let word = self
-            .input
-            .before_cursor()
-            .rsplit(char::is_whitespace)
-            .next()
-            .unwrap_or("");
-        let query = match word.strip_prefix('@') {
-            Some(q) if !self.input.starts_with('/') => q.to_string(),
-            _ => {
-                self.mention = None;
-                return;
-            }
-        };
+        let query =
+            match formless_core::files::mention_completion(&self.input, self.input.cursor_byte()) {
+                Some(completion) if !self.input.starts_with('/') => completion.query,
+                _ => {
+                    self.mention = None;
+                    return;
+                }
+            };
         if self.mention.as_ref().is_some_and(|m| m.query == query) {
             return;
         }
@@ -7327,19 +7343,17 @@ impl App {
             KeyCode::Esc => m.dismissed = true,
             KeyCode::Tab | KeyCode::Enter if key.modifiers.is_empty() => {
                 let f = m.files[m.sel.min(m.files.len() - 1)].clone();
-                let word_chars = self
-                    .input
-                    .before_cursor()
-                    .rsplit(char::is_whitespace)
-                    .next()
-                    .unwrap_or("")
-                    .chars()
-                    .count();
-                for _ in 0..word_chars {
-                    self.input.backspace();
+                let Some(completion) =
+                    formless_core::files::mention_completion(&self.input, self.input.cursor_byte())
+                else {
+                    self.mention = None;
+                    return true;
+                };
+                let insertion = formless_core::files::encode_mention(&f.path, f.dir);
+                let start = completion.range.start;
+                if self.input.modal_replace(completion.range, &insertion.text) {
+                    self.input.set_modal_cursor(start + insertion.cursor);
                 }
-                self.input
-                    .insert_str(&format!("@{}{}", f.path, if f.dir { '/' } else { ' ' }));
                 self.update_mention();
             }
             _ => return false,
@@ -7349,6 +7363,9 @@ impl App {
 
     /// Switch view and fetch what it shows.
     fn open_view(&mut self, view: View) {
+        if view != View::Chat {
+            self.search_jump = None;
+        }
         self.view = view;
         match view {
             View::Sessions => self.request(Pending::ListSessions, Request::ListSessions),
@@ -9759,10 +9776,18 @@ impl App {
                 KeyCode::Enter => {
                     if let Some(hit) = self.search_hits.get(self.search_idx).cloned() {
                         self.switch_session(hit.session_id.clone());
+                        self.start_search_jump(hit.clone());
                         self.request(
                             Pending::GetSession,
                             Request::GetSession { id: hit.session_id },
                         );
+                        if self
+                            .search_jump
+                            .as_ref()
+                            .is_some_and(|target| target.request.is_none())
+                        {
+                            self.search_jump = None;
+                        }
                         self.view = View::Chat;
                     }
                 }
@@ -10913,6 +10938,7 @@ impl App {
     /// Scroll to the previous/next user message (SPEC §10.2); past the
     /// last one, follow the live bottom again.
     fn jump_user_message(&mut self, forward: bool) {
+        self.search_jump = None;
         let max_top = self.chat_line_count.saturating_sub(self.chat_view_height);
         let top = self.chat_scroll_top.unwrap_or(max_top);
         let target = if forward {
@@ -11312,7 +11338,10 @@ impl App {
             KeyCode::Down if ctrl => self.jump_user_message(true),
             KeyCode::Char('{') if empty => self.jump_user_message(false),
             KeyCode::Char('}') if empty => self.jump_user_message(true),
-            KeyCode::Home if empty => self.chat_scroll_top = Some(0),
+            KeyCode::Home if empty => {
+                self.search_jump = None;
+                self.chat_scroll_top = Some(0);
+            }
             KeyCode::PageUp => self.scroll_chat_up(page),
             KeyCode::PageDown => self.scroll_chat_down(page),
             KeyCode::Up
@@ -11901,18 +11930,16 @@ fn highlight_matches(
 /// A user-message line with `@path` mentions highlighted.
 fn mention_line(text: &str, color: bool) -> Line<'static> {
     let mut spans = vec![Span::raw("  ")];
-    for word in text.split_inclusive(char::is_whitespace) {
-        let bare = word.trim_end();
-        if bare.len() > 1 && bare.starts_with('@') {
-            spans.push(Span::styled(
-                bare.to_string(),
-                fg(color, Color::Cyan).add_modifier(Modifier::UNDERLINED),
-            ));
-            spans.push(Span::raw(word[bare.len()..].to_string()));
-        } else {
-            spans.push(Span::raw(word.to_string()));
-        }
+    let mut at = 0;
+    for range in formless_core::files::mention_ranges(text) {
+        spans.push(Span::raw(text[at..range.start].to_owned()));
+        spans.push(Span::styled(
+            text[range.clone()].to_owned(),
+            fg(color, Color::Cyan).add_modifier(Modifier::UNDERLINED),
+        ));
+        at = range.end;
     }
+    spans.push(Span::raw(text[at..].to_owned()));
     Line::from(spans)
 }
 
@@ -15583,6 +15610,8 @@ fn tool_call_block(
 struct ChatRender {
     lines: Vec<Line<'static>>,
     focus_line: Option<usize>,
+    search_line: Option<usize>,
+    search_nearby: bool,
     user_lines: Vec<usize>,
     image_lines: Vec<(usize, String)>,
     /// Persisted tool calls' header lines, for clicks.
@@ -15592,6 +15621,12 @@ struct ChatRender {
 fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
     let mut lines: Vec<Line> = Vec::new();
     let mut focus_line = None;
+    let mut search_line = None;
+    let mut search_nearby = false;
+    let search_target = app
+        .search_jump
+        .as_ref()
+        .filter(|target| target.ready && app.is_current(&target.session));
     let mut user_lines = Vec::new();
     // Rows reserved for image thumbnails: (first line, file).
     let mut image_lines: Vec<(usize, String)> = Vec::new();
@@ -15644,6 +15679,7 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
             }
             day = Some(d);
         }
+        let first_line = lines.len();
         match m.role.as_str() {
             "user" => {
                 user_lines.push(lines.len());
@@ -15741,8 +15777,27 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
                 }
             }
         }
+        if search_target
+            .is_some_and(|target| target.session == m.session_id && target.message == m.id)
+        {
+            if lines.len() > first_line {
+                search_line = Some(first_line);
+            } else {
+                search_line = first_line.checked_sub(1);
+                search_nearby = true;
+            }
+        }
         if let Some(footer) = footers.get(&mi) {
             lines.push(Line::styled(format!("  {footer}"), ui::dim(app.color)));
+        }
+    }
+    if search_line.is_none() {
+        if let Some(call) = search_target.and_then(|target| target.call.as_ref()) {
+            search_line = call_lines
+                .iter()
+                .find(|(_, id)| id == call)
+                .map(|(line, _)| *line);
+            search_nearby = search_line.is_some();
         }
     }
     // Live call tree (persisted lines above keep the history): running
@@ -15942,6 +15997,8 @@ fn chat_lines(app: &App, width: usize, height: usize) -> ChatRender {
     ChatRender {
         lines,
         focus_line,
+        search_line,
+        search_nearby,
         user_lines,
         image_lines,
         call_lines,
@@ -15958,6 +16015,8 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
     let ChatRender {
         mut lines,
         focus_line,
+        search_line,
+        search_nearby,
         user_lines,
         image_lines,
         call_lines,
@@ -16014,6 +16073,27 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
         find.rows = match_lines.iter().map(|&i| line_rows[i]).collect();
     }
     // Bring a newly focused tool call into view (rows before it, wrapped).
+    let search_ready = app
+        .search_jump
+        .as_ref()
+        .is_some_and(|target| target.ready && app.is_current(&target.session));
+    let search_row = search_ready
+        .then(|| search_line.and_then(|line| line_rows.get(line).copied()))
+        .flatten();
+    if search_ready {
+        app.search_jump = None;
+        if search_row.is_none() {
+            app.follow_chat_bottom();
+            app.notes.push(
+                "Search hit could not be shown in this view; following the Session bottom.".into(),
+            );
+        } else if search_nearby {
+            app.notes.push(
+                "Search hit is grouped with other content; showing its nearest visible context."
+                    .into(),
+            );
+        }
+    }
     let focus_row = focus_line
         .filter(|_| std::mem::take(&mut app.scroll_to_focus))
         .map(|i| line_rows[i]);
@@ -16031,7 +16111,7 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
             find_row = f.rows.get(f.current).copied();
         }
     }
-    if let Some(row) = focus_row.or(find_row) {
+    if let Some(row) = search_row.or(focus_row).or(find_row) {
         let top = app.chat_scroll_top.unwrap_or(max_top);
         if row < top || row >= top + height {
             app.chat_scroll_top = Some(row.saturating_sub(height / 3).min(max_top));
@@ -18370,7 +18450,13 @@ fn draw_editor_review(
         .partition_point(|&start| start <= top)
         .saturating_sub(1);
     let offset = top.saturating_sub(starts.get(first).copied().unwrap_or(0));
-    if offset <= u16::MAX as usize {
+    // Paragraph adds the viewport height and origin to its u16 row counter
+    // before subtracting scroll. Keep those intermediate sums in range too.
+    if offset
+        .saturating_add(height)
+        .saturating_add(inner.y as usize)
+        <= u16::MAX as usize
+    {
         f.render_widget(
             Paragraph::new(lines.into_iter().skip(first).collect::<Vec<_>>())
                 .wrap(Wrap { trim: false })
@@ -18378,7 +18464,7 @@ fn draw_editor_review(
             inner,
         );
     } else {
-        // One logical line can itself exceed Paragraph's u16 scroll range.
+        // One logical line or its visible window can exceed Paragraph's u16 range.
         // Reflow only this rare visible window with its matching word wrapper,
         // retaining usize row positions and the original grapheme styles.
         let mut visible = Vec::new();
@@ -19172,6 +19258,7 @@ mod tests {
             editor: None,
             editor_review: None,
             search_hits: Vec::new(),
+            search_jump: None,
             search_idx: 0,
             search_mode: false,
             editing_id: None,
@@ -23218,6 +23305,54 @@ mod tests {
     }
 
     #[test]
+    fn editor_review_viewport_crossing_u16_boundary_renders_every_row() {
+        let ed = viewport_editor("function run() {}", 0);
+        for (offset, origin) in [
+            (65_525usize, 0),
+            (65_526, 0),
+            (65_527, 0),
+            (65_530, 0),
+            (65_535, 0),
+            (65_536, 0),
+            (65_526, 3),
+        ] {
+            let review = EditorReview {
+                scroll: std::cell::Cell::new(EditorReviewScroll {
+                    top: offset + 2, // verdict and blank logical lines
+                    rows: 0,
+                    height: 0,
+                }),
+                diff: "x".repeat(70_000),
+                verdict: "v".into(),
+                ok: true,
+            };
+            let backend = ratatui::backend::TestBackend::new(3, origin + 12);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal
+                .draw(|f| {
+                    draw_editor_review(
+                        f,
+                        Rect::new(0, origin, 3, 11),
+                        Rect::new(0, origin + 11, 3, 1),
+                        &ed,
+                        &review,
+                        false,
+                    )
+                })
+                .unwrap();
+            assert_eq!(review.scroll.get().height, 9);
+            assert_eq!(review.scroll.get().top, offset + 2);
+            for y in origin + 1..origin + 10 {
+                assert_eq!(
+                    terminal.backend().buffer()[(1, y)].symbol(),
+                    "x",
+                    "offset {offset}, row {y}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn the_code_editor_reviews_before_saving() {
         let mut app = test_app();
         app.editor = Some(EditorState {
@@ -26753,6 +26888,184 @@ mod tests {
         assert!(app.palette_items().is_empty());
         app.key(key(KeyCode::Char('d')));
         assert!(!app.palette_items().is_empty());
+    }
+
+    #[test]
+    fn spaced_mentions_complete_whole_tokens_and_keep_directory_queries_decoded() {
+        use formless_core::files::{encode_mention, mentions, FileEntry};
+        let mut app = test_app();
+        let (client, sent) = DaemonClient::recording();
+        app.client = Some(client);
+        app.input.set("explain @my");
+        app.update_mention();
+        app.mention.as_mut().unwrap().files = vec![FileEntry {
+            path: "my notes".into(),
+            dir: true,
+            bytes: 0,
+        }];
+        assert!(app.mention_key(&key(KeyCode::Tab)));
+        assert_eq!(&*app.input, "explain @\"my notes/\"");
+        assert_eq!(app.input.cursor_byte(), app.input.len() - 1);
+        assert_eq!(app.mention.as_ref().unwrap().query, "my notes/");
+        app.mention.as_mut().unwrap().files = vec![FileEntry {
+            path: "my notes/report.md".into(),
+            dir: false,
+            bytes: 10,
+        }];
+        assert!(app.mention_key(&key(KeyCode::Enter)));
+        assert_eq!(&*app.input, "explain @\"my notes/report.md\" ");
+        assert!(app.mention.is_none());
+        assert_eq!(mentions(&app.input), vec!["my notes/report.md"]);
+        let queries = std::iter::from_fn(|| sent.try_recv().ok())
+            .filter_map(|line| {
+                let request: RequestEnvelope = serde_json::from_str(&line).unwrap();
+                if let Request::ListFiles { query, .. } = request.request {
+                    Some(query)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(queries, vec!["my", "my notes/"]);
+        for (before, path) in [
+            ("explain @\"my notes/re", "my notes/report.md"),
+            ("read @", "ไทย notes/a\"b\\c.md"),
+        ] {
+            app.input.set(before);
+            app.update_mention();
+            app.mention.as_mut().unwrap().files = vec![FileEntry {
+                path: path.into(),
+                dir: false,
+                bytes: 1,
+            }];
+            assert!(app.mention_key(&key(KeyCode::Tab)));
+            assert_eq!(mentions(&app.input), vec![path]);
+            assert!(app.input.ends_with(&encode_mention(path, false).text));
+        }
+        app.input.set("read @\"my notes/re\" tail");
+        app.input.set_modal_cursor("read @\"my notes/re".len());
+        app.update_mention();
+        app.mention.as_mut().unwrap().files = vec![FileEntry {
+            path: "my notes/report.md".into(),
+            dir: false,
+            bytes: 1,
+        }];
+        app.mention_key(&key(KeyCode::Tab));
+        assert_eq!(&*app.input, "read @\"my notes/report.md\"  tail");
+        assert_eq!(mentions(&app.input), vec!["my notes/report.md"]);
+        let source = "read @\"ไทย notes/report.md\" and mail a@b.c";
+        let rendered = mention_line(source, true);
+        assert_eq!(
+            rendered
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>(),
+            format!("  {source}")
+        );
+        assert_eq!(
+            rendered
+                .spans
+                .iter()
+                .filter(|s| s.style.add_modifier.contains(Modifier::UNDERLINED))
+                .map(|s| s.content.as_ref())
+                .collect::<Vec<_>>(),
+            vec!["@\"ไทย notes/report.md\""]
+        );
+    }
+
+    #[test]
+    fn mention_completion_clears_backward_selection_before_typing() {
+        use formless_core::files::FileEntry;
+        for (before, path, dir) in [
+            ("read @very_long_path_name", "a", false),
+            ("read @x", "ไทย notes/report.md", false),
+            ("read @very_long_directory_name", "a b", true),
+        ] {
+            let mut app = test_app();
+            app.input.set(before);
+            app.key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
+            assert!(app.input.selection().is_some());
+            app.update_mention();
+            app.mention.as_mut().unwrap().files = vec![FileEntry {
+                path: path.into(),
+                dir,
+                bytes: 0,
+            }];
+            assert!(app.mention_key(&key(KeyCode::Tab)));
+            assert!(app.input.selection().is_none());
+            let mut expected = app.input.to_string();
+            expected.insert(app.input.cursor_byte(), 'z');
+            app.key(key(KeyCode::Char('z')));
+            assert_eq!(&*app.input, expected);
+        }
+    }
+
+    #[test]
+    fn quoted_mentions_share_full_paths_for_chips_forecast_and_submit() {
+        let mut app = test_app();
+        let root = app
+            .paths
+            .data_dir
+            .join(format!("mention-fixture-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("my notes")).unwrap();
+        let root = root.canonicalize().unwrap();
+        let right = b"right-data";
+        std::fs::write(root.join("my notes/report.md"), right).unwrap();
+        std::fs::write(root.join("my"), b"wrong").unwrap();
+        app.sessions = vec![serde_json::from_value(serde_json::json!({"id":"mention-session","name":"mentions","created_at":"","updated_at":"","cwd":root.to_string_lossy()})).unwrap()];
+        app.current = Some("mention-session".into());
+        let (client, sent) = DaemonClient::recording();
+        app.client = Some(client);
+        app.input.set("read @\"my notes/report.md\"");
+        assert!(render(&mut app, 180, 24).contains("[@my notes/report.md]"));
+        let input = app.forecast_input();
+        assert_eq!(input.attachments.len(), 1);
+        let expected = formless_core::forecast::attachment("report.md".into(), right);
+        assert_eq!(input.attachments[0].name, expected.name);
+        assert_eq!(input.attachments[0].bytes, expected.bytes);
+        assert_eq!(input.attachments[0].sha256, expected.sha256);
+        app.submit_chat(false);
+        let requests = std::iter::from_fn(|| sent.try_recv().ok())
+            .map(|line| {
+                serde_json::from_str::<RequestEnvelope>(&line)
+                    .unwrap()
+                    .request
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(
+                    |r| matches!(r,Request::AttachPath { path, .. } if path=="my notes/report.md")
+                )
+                .count(),
+            1,
+            "{requests:?}"
+        );
+        assert!(!requests
+            .iter()
+            .any(|r| matches!(r,Request::AttachPath { path, .. } if path=="my")));
+        assert_eq!(app.pending_send.as_ref().unwrap().waiting, 1);
+        app.pending_send = None;
+        app.input.set("read @\"my notes/report.md");
+        assert!(app.forecast_input().attachments.is_empty());
+        assert!(!render(&mut app, 180, 24).contains("[@my]"));
+        app.submit_chat(false);
+        let requests = std::iter::from_fn(|| sent.try_recv().ok())
+            .map(|line| {
+                serde_json::from_str::<RequestEnvelope>(&line)
+                    .unwrap()
+                    .request
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !requests
+                .iter()
+                .any(|r| matches!(r, Request::AttachPath { .. })),
+            "{requests:?}"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
