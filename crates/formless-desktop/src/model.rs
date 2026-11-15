@@ -153,6 +153,7 @@ pub enum Destination {
     ProfileSearch,
     Comparison,
     RunDetails,
+    ForkReview,
 }
 
 impl Destination {
@@ -178,6 +179,7 @@ impl Destination {
             Destination::ProfileSearch => "Profile Search",
             Destination::Comparison => "Session comparison",
             Destination::RunDetails => "Run inspection",
+            Destination::ForkReview => "Review fork",
         }
     }
 
@@ -188,6 +190,7 @@ impl Destination {
                 | Destination::ProfileSearch
                 | Destination::Comparison
                 | Destination::RunDetails
+                | Destination::ForkReview
         )
     }
 }

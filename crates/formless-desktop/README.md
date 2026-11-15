@@ -31,6 +31,25 @@ as JSON. A queued copy is bound to the displayed destination, page revision
 and selected entry; selection changes, refresh and open dialogs retire that
 action rather than copying a replacement entry. Loaded-text Search keeps its explicit Session scope.
 
+Commands → Review a new Session fork reviews the open Session in Chat or
+the chosen entry in Sessions. Review writes nothing. Create fork then submits
+one full-history fork using the daemon's default name. It copies history
+persisted when the daemon executes, including applicable stored Session
+context; unsent drafts and unpublished live output are excluded. The open
+Session/draft stay unchanged, and the new child is not activated or started.
+Its verified ID and copied-through sequence appear in the receipt/status;
+choose it explicitly from Sessions and rename through Details if desired.
+
+A shared client-lifetime reservation prevents duplicate confirmation and
+reconnect replay. Known queue/preflight failures remain unsent. Once a request
+is marked for writing, a lost, negative or malformed acknowledgement blocks
+all further native forks and directs the user to inspect Sessions/TUI. Checking
+the list does not automatically clear the guard. This is in-memory protection,
+not server deduplication across new attachments/app restarts; check uncertain
+outcomes before doing a fork elsewhere or starting a new client lifetime.
+Bounded-prefix forks and custom-name review remain unavailable. See
+[Session fork evidence](../../docs/desktop/session-fork-20261115.md).
+
 Metrics offers Inspect Run for a selected Run row (or the same command in
 Commands). It reads that exact Run's persisted status/error, message sequence
 bounds, counters and reported spend, keeping both Run and Session IDs explicit.

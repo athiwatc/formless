@@ -35,6 +35,7 @@ use crate::questions;
 use crate::replies::{self, SessionSnapshot};
 use crate::session_edit;
 use crate::session_export;
+use crate::session_fork;
 use crate::session_usage;
 
 const QUEUE: usize = 16;
@@ -132,6 +133,7 @@ pub enum Update {
 }
 
 pub enum Command {
+    ForkSession(session_fork::Action),
     InspectRun {
         connection: u64,
         operation: uuid::Uuid,
@@ -204,6 +206,7 @@ pub struct Client {
     ready: Arc<AtomicBool>,
     epoch: Arc<AtomicU64>,
     connection: Arc<AtomicU64>,
+    forks: Arc<session_fork::Ledger>,
     #[cfg(feature = "test-support")]
     recorded: Option<queue::Receiver<Command>>,
 }
@@ -226,6 +229,8 @@ impl Client {
         let worker_epoch = epoch.clone();
         let connection = Arc::new(AtomicU64::new(0));
         let worker_connection = connection.clone();
+        let forks = Arc::new(session_fork::Ledger::default());
+        let worker_forks = forks.clone();
         std::thread::spawn(move || {
             match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -236,9 +241,12 @@ impl Client {
                     rx,
                     tx,
                     cancelled,
-                    worker_ready,
-                    worker_epoch,
-                    worker_connection,
+                    WorkerState {
+                        ready: worker_ready,
+                        epoch: worker_epoch,
+                        connection: worker_connection,
+                        forks: worker_forks,
+                    },
                 )),
                 Err(error) => {
                     let _ = tx.try_send(Update::Connection {
@@ -255,6 +263,7 @@ impl Client {
             ready,
             epoch,
             connection,
+            forks,
             #[cfg(feature = "test-support")]
             recorded: None,
         }
@@ -281,9 +290,44 @@ impl Client {
         {
             return Err("Not connected; the action was not queued.");
         }
-        self.commands
-            .try_send(command)
-            .map_err(|_| "The daemon command queue is unavailable; nothing was queued.")
+        let fork = if let Command::ForkSession(action) = &command {
+            if !self.is_ready() || self.connection() != action.connection {
+                return Err("Connection changed; no fork was queued. Review again.");
+            }
+            self.forks.reserve(action.clone())?;
+            Some(action.clone())
+        } else {
+            None
+        };
+        if self.commands.try_send(command).is_err() {
+            if let Some(action) = fork {
+                self.forks
+                    .reject_unsent(&action, "Command queue unavailable; no fork was queued.");
+            }
+            return Err("The daemon command queue is unavailable; nothing was queued.");
+        }
+        Ok(())
+    }
+    pub fn fork_status(&self) -> session_fork::Status {
+        self.forks.status()
+    }
+    #[cfg(feature = "test-support")]
+    pub fn record_fork_write(&self, action: &session_fork::Action) {
+        assert!(self.recorded.is_some());
+        assert!(self.forks.before_write(action));
+    }
+    #[cfg(feature = "test-support")]
+    pub fn record_fork_outcome(
+        &self,
+        action: &session_fork::Action,
+        outcome: session_fork::Outcome,
+    ) {
+        assert!(
+            self.recorded.is_some(),
+            "only a recording boundary can simulate a fork receipt"
+        );
+        self.forks.before_write(action);
+        self.forks.finish(action, outcome);
     }
 
     pub fn drain(&self) -> impl Iterator<Item = Update> + '_ {
@@ -326,6 +370,7 @@ impl Client {
             ready: Arc::new(AtomicBool::new(true)),
             epoch: Arc::new(AtomicU64::new(0)),
             connection: Arc::new(AtomicU64::new(0)),
+            forks: Arc::new(session_fork::Ledger::default()),
             recorded: Some(recorded),
         }
     }
@@ -346,6 +391,10 @@ impl Client {
             self.recorded.is_some(),
             "only a serialized view fixture can retire its connection without I/O"
         );
+        drop(session_fork::ConnectionGuard::new(
+            self.forks.clone(),
+            self.connection(),
+        ));
         advance_epoch(&self.connection);
     }
 }
@@ -365,6 +414,7 @@ fn advance_epoch(epoch: &AtomicU64) {
 
 #[derive(Debug)]
 enum Pending {
+    ForkSession(session_fork::Action),
     RunInspection {
         operation: uuid::Uuid,
         target: crate::run_inspection::Target,
@@ -452,6 +502,7 @@ impl Preparation {
 /// replaces this on reconnect; selection generations belong to the window.
 #[derive(Default)]
 struct Engine {
+    forks: Arc<session_fork::Ledger>,
     connection: u64,
     questions: questions::Directory,
     blocked_questions: HashSet<String>,
@@ -625,6 +676,32 @@ impl Engine {
 
     fn command(&mut self, command: Command) {
         match command {
+            Command::ForkSession(action) => {
+                if self.pending.values().any(
+                    |pending| matches!(pending,Pending::ForkSession(current) if current==&action),
+                ) {
+                    return;
+                }
+                if !self.ready
+                    || self.connection != action.connection
+                    || !action.valid()
+                    || !self.forks.reserved(&action)
+                {
+                    self.forks.reject_unsent(
+                        &action,
+                        "Fork was not sent: connection or reservation changed. Review again.",
+                    );
+                } else {
+                    self.request(
+                        Request::ForkSession {
+                            id: action.source_id.clone(),
+                            name: None,
+                            up_to_seq: None,
+                        },
+                        Pending::ForkSession(action),
+                    );
+                }
+            }
             Command::InspectRun {
                 connection,
                 operation,
@@ -1221,6 +1298,14 @@ impl Engine {
                     }
                 }
             }
+            Pending::ForkSession(action) => {
+                let outcome = session_fork::decode(&action, result);
+                let applied = matches!(outcome, session_fork::Outcome::Applied(_));
+                self.forks.finish(&action, outcome);
+                if applied {
+                    self.dirty_list = true;
+                }
+            }
             Pending::RunInspection { operation, target } => {
                 let result =
                     result.and_then(|value| crate::run_inspection::Report::decode(&target, value));
@@ -1541,6 +1626,7 @@ struct Retained {
     active: (Option<String>, u64),
     page: Option<Destination>,
     uncertain: HashSet<Action>,
+    forks: Arc<session_fork::Ledger>,
 }
 
 struct ConnectionState<'a> {
@@ -1566,10 +1652,14 @@ async fn connected<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
         active,
         page,
         uncertain,
+        forks,
     } = retained;
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = Frames::new(BufReader::new(reader));
+    let _fork_connection_guard =
+        session_fork::ConnectionGuard::new(forks.clone(), connection.load(Ordering::Acquire));
     let mut engine = Engine {
+        forks: forks.clone(),
         connection: connection.load(Ordering::Acquire),
         blocked_questions: uncertain
             .iter()
@@ -1612,6 +1702,15 @@ async fn connected<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
             engine.question_recovery_limit = limit;
             engine.emit_questions();
         }
+        for pending in engine.pending.values() {
+            if let Pending::ForkSession(action) = pending {
+                if !forks.before_write(action) {
+                    return Err(
+                        "Fork reservation changed before writing; nothing was retried.".into(),
+                    );
+                }
+            }
+        }
         write_requests(&mut writer, &mut engine)
             .await
             .map_err(|e| e.to_string())?;
@@ -1653,16 +1752,30 @@ async fn connected<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
     }
 }
 
+struct WorkerState {
+    ready: Arc<AtomicBool>,
+    epoch: Arc<AtomicU64>,
+    connection: Arc<AtomicU64>,
+    forks: Arc<session_fork::Ledger>,
+}
+
 async fn worker(
     endpoint: Endpoint,
     mut commands: queue::Receiver<Command>,
     tx: SyncSender<Update>,
     mut stop: watch::Receiver<bool>,
-    ready: Arc<AtomicBool>,
-    epoch: Arc<AtomicU64>,
-    connection: Arc<AtomicU64>,
+    state: WorkerState,
 ) {
-    let mut retained = Retained::default();
+    let WorkerState {
+        ready,
+        epoch,
+        connection,
+        forks,
+    } = state;
+    let mut retained = Retained {
+        forks,
+        ..Default::default()
+    };
     let mut delay = Duration::from_millis(250);
     loop {
         ready.store(false, Ordering::Release);
@@ -1675,6 +1788,10 @@ async fn worker(
                     generation,
                 } => retained.active = (session_id, generation),
                 Command::Page(destination) => retained.page = Some(destination),
+                Command::ForkSession(action) => retained.forks.reject_unsent(
+                    &action,
+                    "Fork was not written before disconnect. Review again explicitly.",
+                ),
                 _ => {
                     let _ = tx.try_send(Update::Notice(
                         "A queued action was not sent after disconnect. Draft kept.".into(),
@@ -2133,6 +2250,7 @@ mod tests {
             ready: Arc::new(AtomicBool::new(true)),
             epoch: Arc::new(AtomicU64::new(0)),
             connection: Arc::new(AtomicU64::new(0)),
+            forks: Arc::new(session_fork::Ledger::default()),
             #[cfg(feature = "test-support")]
             recorded: None,
         };
@@ -2361,6 +2479,268 @@ mod tests {
             });
             assert!(engine.outgoing.is_empty());
         }
+    }
+
+    #[test]
+    fn session_fork_engine_requires_a_reservation_and_exact_lineage_receipt() {
+        use session_fork::{Action as Fork, Outcome, Status};
+        let mut engine = ready();
+        let action = Fork {
+            connection: 0,
+            operation: uuid::Uuid::new_v4(),
+            source_id: "source".into(),
+        };
+        engine.command(Command::ForkSession(action.clone()));
+        assert!(engine.outgoing.is_empty());
+        engine.forks.reserve(action.clone()).unwrap();
+        engine.command(Command::ForkSession(action.clone()));
+        engine.command(Command::ForkSession(action.clone()));
+        assert_eq!(
+            engine.outgoing.len(),
+            1,
+            "a duplicate reserved command must not create a second request"
+        );
+        let request = engine.outgoing.pop_front().unwrap();
+        assert!(
+            matches!(&request.request,Request::ForkSession{id,name:None,up_to_seq:None} if id=="source")
+        );
+        assert!(engine.forks.before_write(&action));
+        respond(
+            &mut engine,
+            request.id,
+            json!({"id":"child","forked_from":"source","fork_point_seq":7}),
+        );
+        assert!(matches!(
+            engine.forks.status(),
+            Status::Finished {
+                outcome: Outcome::Applied(session_fork::Receipt {
+                    fork_point_seq: 7,
+                    ..
+                }),
+                ..
+            }
+        ));
+        assert!(
+            engine.forks.reserve(action.clone()).is_err(),
+            "a completed operation UUID cannot be reused"
+        );
+        let second = Fork {
+            operation: uuid::Uuid::new_v4(),
+            ..action
+        };
+        engine.forks.reserve(second.clone()).unwrap();
+        engine.command(Command::ForkSession(second.clone()));
+        let request = engine.outgoing.pop_front().unwrap();
+        assert!(engine.forks.before_write(&second));
+        respond(
+            &mut engine,
+            request.id,
+            json!({"id":"foreign","forked_from":"other","fork_point_seq":1}),
+        );
+        assert!(matches!(
+            engine.forks.status(),
+            Status::Finished {
+                outcome: Outcome::Unknown(_),
+                ..
+            }
+        ));
+        assert!(engine
+            .forks
+            .reserve(Fork {
+                operation: uuid::Uuid::new_v4(),
+                ..second
+            })
+            .is_err());
+    }
+    #[test]
+    fn session_fork_full_queue_is_known_unsent_and_never_clears_a_sent_reservation() {
+        let (commands, mut receiver) = queue::channel(QUEUE);
+        let (_, updates) = mpsc::sync_channel(QUEUE);
+        let (stop, _) = watch::channel(false);
+        let client = Client {
+            commands,
+            updates,
+            stop,
+            ready: Arc::new(AtomicBool::new(true)),
+            epoch: Arc::new(AtomicU64::new(0)),
+            connection: Arc::new(AtomicU64::new(0)),
+            forks: Arc::new(session_fork::Ledger::default()),
+            #[cfg(feature = "test-support")]
+            recorded: None,
+        };
+        for _ in 0..QUEUE {
+            client.send(Command::Refresh).unwrap();
+        }
+        let action = session_fork::Action {
+            connection: 0,
+            operation: uuid::Uuid::new_v4(),
+            source_id: "source".into(),
+        };
+        assert!(client.send(Command::ForkSession(action.clone())).is_err());
+        assert!(matches!(
+            client.fork_status(),
+            session_fork::Status::Finished {
+                outcome: session_fork::Outcome::Rejected(_),
+                ..
+            }
+        ));
+        while let Ok(command) = receiver.try_recv() {
+            assert!(!matches!(command, Command::ForkSession(_)));
+        }
+        let next = session_fork::Action {
+            operation: uuid::Uuid::new_v4(),
+            ..action
+        };
+        client.send(Command::ForkSession(next.clone())).unwrap();
+        assert!(client.send(Command::ForkSession(next.clone())).is_err());
+        assert!(client.forks.before_write(&next));
+        client.forks.reject_unsent(&next, "late error");
+        assert!(matches!(
+            client.fork_status(),
+            session_fork::Status::Sent(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn session_fork_unknown_write_survives_reconnect_and_unrelated_acknowledgements() {
+        let mut retained = Retained::default();
+        let frames = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let action = session_fork::Action {
+            connection: 0,
+            operation: uuid::Uuid::new_v4(),
+            source_id: "source".into(),
+        };
+        for reconnect in [false, true] {
+            let (stream, server) = tokio::io::duplex(32768);
+            let (commands_tx, mut commands) = queue::channel(QUEUE);
+            let (updates, _receiver) = mpsc::sync_channel(QUEUE);
+            let (_stop, mut cancelled) = watch::channel(false);
+            let ready = Arc::new(AtomicBool::new(false));
+            let epoch = AtomicU64::new(0);
+            let connection = AtomicU64::new(u64::from(reconnect));
+            let fork_ledger = retained.forks.clone();
+            let driver_ready = ready.clone();
+            let driver_action = action.clone();
+            let driver = tokio::spawn(async move {
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while !driver_ready.load(Ordering::Acquire) {
+                    assert!(std::time::Instant::now() < deadline);
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                if !reconnect {
+                    fork_ledger.reserve(driver_action.clone()).unwrap();
+                    commands_tx
+                        .send(Command::ForkSession(driver_action))
+                        .await
+                        .unwrap();
+                } else {
+                    assert!(fork_ledger
+                        .reserve(session_fork::Action {
+                            connection: 1,
+                            operation: uuid::Uuid::new_v4(),
+                            source_id: "different-source".into()
+                        })
+                        .is_err());
+                    // Even a command bypassing the normal Client reservation
+                    // cannot replay an old fork into a new Engine.
+                    commands_tx
+                        .send(Command::ForkSession(driver_action))
+                        .await
+                        .unwrap();
+                    commands_tx
+                        .send(Command::Intent(Intent::InterruptRun {
+                            session_id: "source".into(),
+                        }))
+                        .await
+                        .unwrap();
+                    commands_tx
+                        .send(Command::InspectRun {
+                            connection: 1,
+                            operation: uuid::Uuid::new_v4(),
+                            target: crate::run_inspection::Target {
+                                run_id: "run".into(),
+                                session_id: "source".into(),
+                            },
+                        })
+                        .await
+                        .unwrap();
+                }
+                commands_tx
+            });
+            let counted = frames.clone();
+            let peer = tokio::spawn(async move {
+                let mut server = BufReader::new(server);
+                let mut stopped = false;
+                let mut inspected = false;
+                loop {
+                    let mut line = String::new();
+                    assert_ne!(server.read_line(&mut line).await.unwrap(), 0);
+                    let request: RequestEnvelope = serde_json::from_str(&line).unwrap();
+                    let result = match request.request {
+                        Request::Ping => json!({"min_protocol":1,"max_protocol":1}),
+                        Request::Subscribe { deltas: false, .. } => json!({"subscribed":true}),
+                        Request::ListSessions => json!([]),
+                        Request::ForkSession {
+                            id,
+                            name: None,
+                            up_to_seq: None,
+                        } => {
+                            assert!(!reconnect, "fork replayed after reconnect");
+                            assert_eq!(id, "source");
+                            counted.fetch_add(1, Ordering::SeqCst);
+                            break;
+                        }
+                        Request::InterruptRun { .. } if reconnect => {
+                            stopped = true;
+                            json!({"interrupted":true})
+                        }
+                        Request::GetRun { run_id } if reconnect => {
+                            inspected = true;
+                            crate::run_inspection::test_value(&crate::run_inspection::Target {
+                                run_id,
+                                session_id: "source".into(),
+                            })
+                        }
+                        other => panic!("unexpected fork fixture request {other:?}"),
+                    };
+                    let mut frame =
+                        serde_json::to_vec(&ServerMessage::ok(request.id, result)).unwrap();
+                    frame.push(b'\n');
+                    server.get_mut().write_all(&frame).await.unwrap();
+                    if stopped && inspected {
+                        break;
+                    }
+                }
+            });
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                connected(
+                    stream,
+                    &mut commands,
+                    &updates,
+                    &mut cancelled,
+                    &mut retained,
+                    ConnectionState {
+                        ready: &ready,
+                        epoch: &epoch,
+                        connection: &connection,
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+            assert!(result.is_err());
+            peer.await.unwrap();
+            let _keep_sender = driver.await.unwrap();
+            assert!(matches!(
+                retained.forks.status(),
+                session_fork::Status::Finished {
+                    outcome: session_fork::Outcome::Unknown(_),
+                    ..
+                }
+            ));
+        }
+        assert_eq!(frames.load(Ordering::SeqCst), 1);
     }
 
     #[test]

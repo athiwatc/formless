@@ -632,6 +632,95 @@ async fn real_daemon_provider_send_navigation_resources_and_reconnect() {
         1,
         "inspection must not call a provider"
     );
+    // One explicit durable fork, with A's Provider response held. The shared
+    // receipt is independent of the bounded UI update queue.
+    let source_before = daemon
+        .handle(Request::GetSession { id: a.clone() })
+        .await
+        .unwrap();
+    let fork_action = formless_desktop::session_fork::Action {
+        connection: client.connection(),
+        operation: uuid::Uuid::new_v4(),
+        source_id: a.clone(),
+    };
+    client
+        .send(Command::ForkSession(fork_action.clone()))
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let receipt = loop {
+        match client.fork_status() {
+            formless_desktop::session_fork::Status::Finished {
+                action,
+                outcome: formless_desktop::session_fork::Outcome::Applied(receipt),
+            } if action == fork_action => break receipt,
+            formless_desktop::session_fork::Status::Finished { outcome, .. } => {
+                panic!("fork receipt failed: {outcome:?}")
+            }
+            _ => {}
+        }
+        assert!(Instant::now() < deadline, "fork receipt deadline");
+        for _ in client.drain() {}
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+    let child = daemon
+        .handle(Request::GetSession {
+            id: receipt.child_id.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(child["session"]["forked_from"], a);
+    assert_eq!(
+        child["session"]["fork_point_seq"].as_u64(),
+        Some(receipt.fork_point_seq)
+    );
+    assert_eq!(child["running"], false);
+    assert!(child["unfinished_run"].is_null());
+    assert_eq!(child["queued_items"], json!([]));
+    let transcript = |value: &Value| {
+        value["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|message| {
+                (
+                    message["seq"].clone(),
+                    message["role"].clone(),
+                    message["content"].clone(),
+                    message["meta"].clone(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        transcript(&child),
+        transcript(&source_before),
+        "fork copies persisted messages exactly, with independent message identities"
+    );
+    assert_eq!(
+        daemon
+            .handle(Request::GetSession { id: a.clone() })
+            .await
+            .unwrap(),
+        source_before,
+        "fork leaves its source and Run untouched"
+    );
+    assert_eq!(
+        daemon
+            .handle(Request::RunMetrics {
+                limit: Some(100),
+                session_id: Some(receipt.child_id.clone()),
+                since: None
+            })
+            .await
+            .unwrap()["runs"],
+        json!([]),
+        "fork starts no Run"
+    );
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        1,
+        "fork never calls a provider"
+    );
     first_answer.notify_one();
     observer
         .until(|event| {
@@ -968,7 +1057,7 @@ async fn real_daemon_provider_send_navigation_resources_and_reconnect() {
     until(
         &client,
         "stage-7",
-        |u| matches!(u, Update::Sessions(sessions) if sessions.len() == 3),
+        |u| matches!(u, Update::Sessions(sessions) if sessions.len() == 4 && [&a,&b,&receipt.child_id].iter().all(|id|sessions.iter().any(|session|&session.id==*id))),
     )
     .await;
 

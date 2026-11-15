@@ -40,6 +40,7 @@ mod profile_search;
 mod questions;
 mod reading_positions;
 mod run_inspection;
+mod session_fork;
 mod sessions;
 mod usage;
 use crate::full_view;
@@ -180,6 +181,7 @@ pub fn bind_keys(cx: &mut App) {
                 | Command::MarkComparisonLeft
                 | Command::CompareMarked
                 | Command::InspectRun
+                | Command::ReviewFork
                 | Command::ToggleArchived
                 | Command::ToggleTheme
                 | Command::ToggleEnterSends
@@ -297,6 +299,12 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("enter", ActivateSession, Some(SESSION_LIST_CONTEXT)),
         // The inspector holds text only, so with focus in it the arrow and
         // page keys scroll it: in a short window it is taller than its panel.
+        KeyBinding::new("up", ScrollViewerUp, Some("FormlessForkReview")),
+        KeyBinding::new("down", ScrollViewerDown, Some("FormlessForkReview")),
+        KeyBinding::new("pageup", ScrollViewerPageUp, Some("FormlessForkReview")),
+        KeyBinding::new("pagedown", ScrollViewerPageDown, Some("FormlessForkReview")),
+        KeyBinding::new("home", ScrollViewerStart, Some("FormlessForkReview")),
+        KeyBinding::new("end", ScrollViewerEnd, Some("FormlessForkReview")),
         KeyBinding::new("up", ScrollInspectorUp, Some(INSPECTOR_CONTEXT)),
         KeyBinding::new("down", ScrollInspectorDown, Some(INSPECTOR_CONTEXT)),
         KeyBinding::new("pageup", ScrollInspectorPageUp, Some(INSPECTOR_CONTEXT)),
@@ -701,6 +709,13 @@ pub struct Shell {
     resource_revision: u64,
     comparison: crate::comparison::State,
     run_inspection: crate::run_inspection::State,
+    fork_review: Option<session_fork::Review>,
+    fork_observed: crate::session_fork::Status,
+    fork_local_error: Option<SharedString>,
+    fork_scroll: ScrollHandle,
+    fork_controls: Vec<FocusHandle>,
+    fork_focus: Option<(Option<FocusHandle>, Size<Pixels>, TextScale)>,
+    fork_frames: u8,
     sidebar: Sidebar,
     /// Shared with the timeline's row renderer.
     blocks: Rc<RefCell<Timeline>>,
@@ -942,6 +957,13 @@ impl Shell {
             resource_revision: 0,
             comparison: crate::comparison::State::default(),
             run_inspection: crate::run_inspection::State::default(),
+            fork_review: None,
+            fork_observed: crate::session_fork::Status::Idle,
+            fork_local_error: None,
+            fork_scroll: ScrollHandle::new(),
+            fork_controls: (0..2).map(|_| cx.focus_handle()).collect(),
+            fork_focus: None,
+            fork_frames: 0,
             sidebar,
             blocks: Rc::new(RefCell::new(Timeline::new(blocks))),
             stream: Coalescer::default(),
@@ -990,6 +1012,7 @@ impl Shell {
                 can_mark_comparison: false,
                 comparison_reason: Some("Mark a left Session first"),
                 run_inspection_reason: Some("Select a Run entry in Metrics first"),
+                fork_reason: Some("Choose a connected Session first"),
                 sessions_shown: true,
                 context_shown: true,
                 dark: false,
@@ -1680,6 +1703,9 @@ impl Shell {
     }
 
     fn attach_client(&mut self, client: Client, cx: &mut Context<Self>) {
+        self.fork_review = None;
+        self.fork_observed = crate::session_fork::Status::Idle;
+        self.fork_local_error = None;
         self.reading_positions.clear();
         self.reading_restore = None;
         self.reading_notice = None;
@@ -1856,6 +1882,7 @@ impl Shell {
     /// Drained on the UI thread, outside render. Selection is checked again
     /// here because a reply can already be queued when navigation happens.
     pub fn poll_client(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_fork_status(cx);
         let updates: Vec<_> = self
             .client
             .as_ref()
@@ -2831,6 +2858,7 @@ impl Shell {
                 && self.comparison_connected(),
             comparison_reason: self.comparison_disabled_reason(),
             run_inspection_reason: self.run_inspection_disabled_reason(),
+            fork_reason: self.fork_disabled_reason(),
             sessions_shown: layout.sidebar != SidebarMode::Collapsed,
             context_shown: layout.inspector != InspectorMode::Hidden,
             dark: cx.theme().is_dark(),
@@ -2957,6 +2985,7 @@ impl Shell {
             }
             Command::ToggleSessions => self.toggle_panel(Region::Sidebar, window, cx),
             Command::ToggleContext => self.toggle_panel(Region::Inspector, window, cx),
+            Command::ReviewFork => self.review_fork(window, cx),
             Command::InspectRun => {
                 if let Some((target, source)) = self.selected_run_target() {
                     self.read_run_inspection(
@@ -3305,6 +3334,10 @@ impl Shell {
         }
         let previous = self.destination;
 
+        if previous == Destination::ForkReview && destination != Destination::ForkReview {
+            self.fork_review = None;
+            self.fork_local_error = None;
+        }
         if previous == Destination::RunDetails && destination != Destination::RunDetails {
             self.reset_run_inspection("Inspection closed. Select a Run explicitly to read again.");
         }
@@ -4726,6 +4759,9 @@ impl Shell {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        if self.destination == Destination::ForkReview {
+            return self.render_session_fork(page_height, window, cx);
+        }
         if self.client.is_some()
             || matches!(
                 self.destination,
@@ -5406,6 +5442,16 @@ impl Shell {
                     .text_xs(),
                 )
             })
+            .when_some(self.render_fork_status(), |status, notice| {
+                status.child(
+                    announced(div().id("fork-status"))
+                        .test_support()
+                        .role(Role::Status)
+                        .aria_value(notice.clone())
+                        .child(notice)
+                        .text_xs(),
+                )
+            })
             .when(self.client.is_some() && self.client_attention, |status| {
                 status.child(readable(
                     "status-pending-attention",
@@ -5519,6 +5565,7 @@ impl Shell {
 
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.reveal_fork_control(window, cx);
         self.reveal_profile_search(window, cx);
         self.reveal_directory_choice(window, cx);
         self.reveal_session_editor(window, cx);

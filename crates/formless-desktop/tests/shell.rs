@@ -32,6 +32,8 @@ mod reading_position_tests;
 mod run_inspection_tests;
 #[path = "support/session_edit.rs"]
 mod session_edit_tests;
+#[path = "support/session_fork.rs"]
+mod session_fork_tests;
 #[path = "support/usage.rs"]
 mod usage_tests;
 
