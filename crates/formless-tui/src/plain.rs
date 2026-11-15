@@ -1,4 +1,4 @@
-//! Plain, line-oriented mode for screen readers (SPEC §10.7): no
+//! Plain, line-oriented mode for screen readers (SPEC §10.5): no
 //! alternate screen, redraws, spinners or borders. New messages and events
 //! are printed once, in order, and approvals and questions become plain
 //! prompts answered on the next line.
@@ -15,16 +15,35 @@ use std::time::{Duration, Instant};
 #[path = "plain_commands.rs"]
 mod templates;
 
-fn docs_lines(topic: &str) -> Vec<String> {
-    let result = match formless_core::docs::resolve(Some(topic)) {
-        Ok(url) => format!("The guide is at {url}"),
-        Err(error) => error.to_string(),
+fn docs_lines(input: &str) -> Vec<String> {
+    let (topic, text) = formless_core::docs::text_option(input);
+    let mut lines = match formless_core::docs::resolve(Some(&topic)) {
+        Ok(url) if text => match formless_core::docs::text(Some(&topic)) {
+            Ok(body) => {
+                let mut out = vec![format!(
+                    "Bundled guide (Formless {}).",
+                    env!("CARGO_PKG_VERSION")
+                )];
+                out.extend(body.lines().map(str::to_owned));
+                out.push(format!(
+                    "Current online copy (may differ from this build): {url}"
+                ));
+                out
+            }
+            Err(error) => vec![error.to_string()],
+        },
+        Ok(url) => vec![format!(
+            "Current online copy (may differ from this build): {url}"
+        )],
+        Err(error) => vec![error.to_string()],
     };
     let topics = formless_core::docs::TOPICS
         .iter()
         .map(|(name, _, what)| format!("{name} ({what})"))
         .collect::<Vec<_>>();
-    vec![result, format!("Topics: {}.", topics.join(", "))]
+    lines.push(format!("Topics: {}.", topics.join(", ")));
+    lines.push("Read bundled Markdown with /docs --text [topic].".into());
+    lines
 }
 
 fn display_text(text: &str) -> String {
@@ -786,7 +805,7 @@ pub enum ChatStart {
 }
 
 /// The line-oriented client: the TUI's `--plain`/screen-reader mode and
-/// `formless chat` (SPEC §10.7).
+/// `formless chat` (SPEC §10.5).
 pub fn run_with(paths: Paths, start: ChatStart, label: &str) -> Result<()> {
     let cfg = Config::load(&paths)?;
     if !cfg.provider.is_configured() {
@@ -1108,7 +1127,7 @@ pub fn run_with(paths: Paths, start: ChatStart, label: &str) -> Result<()> {
             "" => {}
             "/quit" | "/exit" => break,
             "/help" => {
-                say("Commands: /new starts a Session, /sessions lists them, /switch N opens one, /stop stops the Run, /files [RUN] shows tracked changes, /rewind [PATH] attempts safe restoration, /recap shows the recorded recap, /docs [topic] gives the guides' addresses, /quit exits (Runs keep going in the daemon). Anything else is sent as a message; to send text that starts with /, begin it with //.");
+                say("Commands: /new starts a Session, /sessions lists them, /switch N opens one, /stop stops the Run, /files [RUN] shows tracked changes, /rewind [PATH] attempts safe restoration, /recap shows the recorded recap, /docs [topic] gives the guides' addresses; /docs --text [topic] reads bundled Markdown, /quit exits (Runs keep going in the daemon). Anything else is sent as a message; to send text that starts with /, begin it with //.");
                 for line in crate::user_commands_ui::help_lines(&templates) {
                     say(&line);
                 }
@@ -1599,6 +1618,22 @@ mod pause_restore_tests;
 
 #[cfg(test)]
 mod docs_topic_tests {
+    #[test]
+    fn plain_docs_reads_bundled_text_with_either_flag_position() {
+        for input in ["--text docker", "docker --text"] {
+            let lines = super::docs_lines(input);
+            assert!(lines[0].starts_with("Bundled guide"));
+            assert!(lines
+                .join("\n")
+                .contains(include_str!("../../../docs/docker.md").trim_end()));
+            assert!(lines
+                .iter()
+                .any(|line| line.contains("Current online copy")));
+        }
+        assert!(super::docs_lines("--text nope")[0].contains("unknown docs topic"));
+        assert!(super::docs_lines("s --text")[0].contains("ambiguous docs topic"));
+    }
+
     #[test]
     fn plain_docs_reports_unknown_ambiguous_and_the_gallery_without_launching() {
         let unknown = super::docs_lines("nope");

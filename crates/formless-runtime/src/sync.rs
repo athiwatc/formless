@@ -23,15 +23,16 @@ impl<T> LockExt<T> for Mutex<T> {
 }
 
 fn report_poison(at: &'static std::panic::Location<'static>) {
-    static SEEN: Mutex<Vec<(&str, u32)>> = Mutex::new(Vec::new());
+    static SEEN: Mutex<Vec<(&str, u32, u32)>> = Mutex::new(Vec::new());
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    let key = (at.file(), at.line());
+    let key = (at.file(), at.line(), at.column());
     if !seen.contains(&key) {
         seen.push(key);
         eprintln!(
-            "formless: recovered a lock poisoned by an earlier panic at {}:{}",
+            "formless: {}:{}:{} recovered a lock poisoned by an earlier panic; continuing with its last state",
             at.file(),
-            at.line()
+            at.line(),
+            at.column()
         );
     }
 }
