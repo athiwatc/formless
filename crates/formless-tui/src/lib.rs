@@ -13066,44 +13066,91 @@ fn draw_switcher(f: &mut Frame, app: &App, query: &str, sel: usize) {
 /// "Runs are still working" before quitting.
 fn draw_quit_confirm(f: &mut Frame, app: &App) {
     let n = app.running_sessions.len();
-    let lines = vec![
-        Line::raw(""),
-        Line::raw(format!(
-            "  {n} Run{} still working in the daemon. {} keep going if you quit.",
-            if n == 1 { " is" } else { "s are" },
-            if n == 1 { "It will" } else { "They'll" }
-        )),
-        Line::raw(""),
-        Line::from(vec![
-            Span::styled(
-                " q ",
-                bold_fg(app.color, Color::Green).add_modifier(Modifier::REVERSED),
-            ),
-            Span::raw(" quit    "),
-            Span::styled(
-                " s ",
-                bold_fg(app.color, Color::Red).add_modifier(Modifier::REVERSED),
-            ),
-            Span::raw(" stop them and quit    "),
-            Span::styled(" Esc ", ui::dim(app.color).add_modifier(Modifier::REVERSED)),
-            Span::raw(" cancel"),
-        ]),
-    ];
+    let warning = Line::raw(format!(
+        "  {n} Run{} still working in the daemon. {} keep going if you quit.",
+        if n == 1 { " is" } else { "s are" },
+        if n == 1 { "It will" } else { "They'll" }
+    ));
+    let actions = Line::from(vec![
+        Span::styled(
+            " q ",
+            bold_fg(app.color, Color::Green).add_modifier(Modifier::REVERSED),
+        ),
+        Span::raw(" quit    "),
+        Span::styled(
+            " s ",
+            bold_fg(app.color, Color::Red).add_modifier(Modifier::REVERSED),
+        ),
+        Span::raw(" stop them and quit    "),
+        Span::styled(" Esc ", ui::dim(app.color).add_modifier(Modifier::REVERSED)),
+        Span::raw(" cancel"),
+    ]);
     let area = f.area();
-    let w = 66.min(area.width.saturating_sub(2)).max(1);
-    let h = 6.min(area.height);
+    let w = 66.min(area.width.saturating_sub(2)).max(1).min(area.width);
+    let width = w.saturating_sub(2);
+    // Measure the exact styled Paragraph wrapping, without a block: borders
+    // are charged once below, independently of the warning and key labels.
+    let warning_rows = Paragraph::new(warning.clone())
+        .wrap(Wrap { trim: false })
+        .line_count(width) as u16;
+    let action_rows = Paragraph::new(actions.clone())
+        .wrap(Wrap { trim: false })
+        .line_count(width) as u16;
+    let required = warning_rows.saturating_add(action_rows);
+    let available = area.height.saturating_sub(2);
+    let fits = width > 0 && required <= available;
+    let gaps = if fits {
+        available.saturating_sub(required).min(2)
+    } else {
+        0
+    };
+    let h = if fits {
+        required + gaps + 2
+    } else {
+        area.height.min(4)
+    };
     let rect = Rect::new(
         area.x + area.width.saturating_sub(w) / 2,
         area.y + area.height.saturating_sub(h) / 2,
         w,
         h,
     );
+    let block = ui::panel(
+        if fits { " Quit? " } else { " Quit? Resize " },
+        app.color,
+        Color::Yellow,
+    );
+    let inner = block.inner(rect);
     f.render_widget(Clear, rect);
+    f.render_widget(block, rect);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    if !fits {
+        let fallback = if inner.height >= 2 && inner.width >= 9 {
+            "Resize\nEsc cancel"
+        } else if inner.width >= 9 {
+            "Esc cancel"
+        } else {
+            "Esc"
+        };
+        f.render_widget(Paragraph::new(fallback).style(ui::dim(app.color)), inner);
+        return;
+    }
+    let top_gap = u16::from(gaps == 2);
+    let between = gaps - top_gap;
     f.render_widget(
-        Paragraph::new(lines)
-            .block(ui::panel(" Quit? ", app.color, Color::Yellow))
-            .wrap(Wrap { trim: false }),
-        rect,
+        Paragraph::new(warning).wrap(Wrap { trim: false }),
+        Rect::new(inner.x, inner.y + top_gap, inner.width, warning_rows),
+    );
+    f.render_widget(
+        Paragraph::new(actions).wrap(Wrap { trim: false }),
+        Rect::new(
+            inner.x,
+            inner.y + top_gap + warning_rows + between,
+            inner.width,
+            action_rows,
+        ),
     );
 }
 
@@ -26266,6 +26313,70 @@ mod tests {
             .lines
             .iter()
             .any(|l| l.contains("\"title\": \"Example\"")));
+    }
+
+    #[test]
+    fn quit_dialog_reserves_wrapped_warning_and_all_action_labels() {
+        let mut app = test_app();
+        for count in [1, 2] {
+            app.running_sessions = (0..count).map(|index| format!("private-{index}")).collect();
+            for (width, height) in [(80, 24), (120, 24), (40, 24), (80, 5), (40, 7)] {
+                let mut terminal =
+                    Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+                terminal
+                    .draw(|frame| draw_quit_confirm(frame, &app))
+                    .unwrap();
+                let buffer = terminal.backend().buffer();
+                let screen = (0..height)
+                    .map(|y| {
+                        (0..width)
+                            .map(|x| buffer[(x, y)].symbol())
+                            .collect::<String>()
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let text = screen
+                    .chars()
+                    .filter(|c| !"╭╮╰╯─│".contains(*c))
+                    .collect::<String>()
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let warning = format!(
+                    "{count} Run{} still working in the daemon. {} keep going if you quit.",
+                    if count == 1 { " is" } else { "s are" },
+                    if count == 1 { "It will" } else { "They'll" }
+                );
+                assert!(text.contains(&warning), "{width}x{height}: {text}");
+                assert!(
+                    text.contains("q quit s stop them and quit Esc cancel"),
+                    "{width}x{height}: {text}"
+                );
+                assert!(!text.contains("Resize"));
+            }
+        }
+        for (width, height) in [(80, 4), (20, 4), (12, 3), (1, 1)] {
+            let mut terminal =
+                Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| draw_quit_confirm(frame, &app))
+                .unwrap();
+            let screen = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            if width >= 20 {
+                assert!(
+                    screen.contains("Resize") && screen.contains("Esc cancel"),
+                    "{screen}"
+                );
+            } else if width >= 12 {
+                assert!(screen.contains("Esc"));
+            }
+        }
     }
 
     #[test]
