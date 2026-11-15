@@ -288,7 +288,8 @@ jobs:
       RELEASE_CONTAINER: formless-release-${{ github.run_id }}-${{ github.run_attempt }}
     timeout-minutes: 30
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: version-check
+    # A failed build/test/install must prevent every public image tag update.
+    needs: [version-check, build, linux, linux-install-test]
     runs-on: [self-hosted, Linux, X64]
     steps:
       - uses: actions/checkout@v4
@@ -339,15 +340,9 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Push
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          cache-from: type=gha
-          tags: |
-            ghcr.io/athiwatc/formless:${{ github.ref_name }}
-            ghcr.io/athiwatc/formless:latest
+      - name: Push the smoke-tested image
+        shell: bash
+        run: bash scripts/push-release-image.sh
       - name: Always remove owned smoke fixture
         if: always()
         shell: bash
@@ -380,6 +375,7 @@ jobs:
       - name: Release notes
         run: scripts/release-notes.sh "$GITHUB_REF_NAME" > release-notes.md
       - uses: softprops/action-gh-release@v2
+        id: release
         with:
           body_path: release-notes.md
           generate_release_notes: true
@@ -453,18 +449,7 @@ jobs:
       - name: Channel summary
         if: always()
         shell: bash
-        run: |
-          state() { case "$1" in success) echo published;; failure) echo FAILED;; *) echo "skipped (no secret)";; esac; }
-          {
-            echo "### Publish channels"
-            echo "| Channel | Result |"
-            echo "|---|---|"
-            echo "| GitHub Release | published |"
-            echo "| Docker (ghcr.io) | published |"
-            echo "| Homebrew tap | $(state '${{ steps.tap.outcome }}') |"
-            echo "| winget | $(state '${{ steps.winget.outcome }}') |"
-            echo "| AUR | $(state '${{ steps.aur.outcome }}') |"
-          } >> "$GITHUB_STEP_SUMMARY"
-          for o in '${{ steps.tap.outcome }}' '${{ steps.winget.outcome }}' '${{ steps.aur.outcome }}'; do
-            [ "$o" != failure ] || { echo "a publish channel failed (see the summary)"; exit 1; }
-          done
+        run: >-
+          bash scripts/release-channel-summary.sh
+          '${{ steps.release.outcome }}' '${{ steps.tap.outcome }}'
+          '${{ steps.winget.outcome }}' '${{ steps.aur.outcome }}'
