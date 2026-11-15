@@ -10,7 +10,7 @@ use std::{
     os::unix::net::UnixListener,
     process::{Command, Stdio},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     time::{Duration, Instant},
@@ -27,16 +27,24 @@ struct Fixture {
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
     requests: Arc<Mutex<Vec<Request>>>,
+    connections: Arc<AtomicUsize>,
 }
 impl Fixture {
     fn new() -> Self {
+        Self::with_tools(
+            json!([{"id":"full-tool-id","name":"FetchPage","description":"","retired":false,"current_version":1,"capabilities":[],"memory_mb":16,"invocations":0,"success_rate":null,"needs_attention":false,"created_at":"","updated_at":""}]),
+        )
+    }
+    fn with_tools(tool_rows: Value) -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
         let root = std::path::PathBuf::from("/tmp").join(format!(
-            "f1009-{}-{}",
+            "f1009-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         let paths = Paths {
             data_dir: root.join("d/p"),
@@ -53,6 +61,8 @@ impl Fixture {
         let stopped = stop.clone();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let seen = requests.clone();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let connected = connections.clone();
         let thread = std::thread::spawn(move || {
             while !stopped.load(Ordering::SeqCst) {
                 let (socket, _) = match listener.accept() {
@@ -63,6 +73,7 @@ impl Fixture {
                     }
                     Err(e) => panic!("{e}"),
                 };
+                connected.fetch_add(1, Ordering::SeqCst);
                 let mut socket = FixtureStream::new(
                     socket,
                     stopped.clone(),
@@ -75,10 +86,6 @@ impl Fixture {
                 while reader.read_line(&mut line).unwrap_or(0) > 0 {
                     let envelope: RequestEnvelope = serde_json::from_str(&line).unwrap();
                     let result = match &envelope.request {
-                        Request::ListSessions => json!([
-                            {"id":"abc-one","name":"First","created_at":"","updated_at":""},
-                            {"id":"abc-two","name":"Second","created_at":"","updated_at":""}
-                        ]),
                         Request::ListSubagents { session_id } => {
                             assert_eq!(session_id, "abc-one");
                             json!([
@@ -88,6 +95,28 @@ impl Fixture {
                         }
                         Request::GetSubagent { id } => {
                             json!({"subagent":{"id":id,"session_id":"abc-one","run_id":"run-one","task":"Task 日本語","depth":1,"model":"role · model","status":"running","steps":2,"result":null,"created_at":"first","updated_at":"last"},"messages":[{"provider-special":{"part":["🦀",3]},"role":"assistant"},{"unknown":"ไทย"}],"future":7})
+                        }
+                        Request::ListModules => module_list(),
+                        Request::GetModule { .. } => module_detail(),
+                        Request::ListTools => tool_rows.clone(),
+                        Request::ExportTool { id } => {
+                            assert_eq!(id, "full-tool-id");
+                            json!({"fixture":"unchanged bundle"})
+                        }
+                        Request::ProposalDiff { id } => proposal_comparison(id),
+                        Request::ListSessions => json!([
+                            {"id":"abc-one","name":"First","created_at":"","updated_at":""},
+                            {"id":"abc-two","name":"Second","created_at":"","updated_at":""},
+                            {"id":"sel-z","name":"ไทย 日本語","preview":"ข้อความ 日本語","created_at":"","updated_at":"","pinned":true,"tags":["work","ไทย"]},
+                            {"id":"sel-a","name":"Alpha","created_at":"","updated_at":"","tags":["workshop"]},
+                            {"id":"sel-q","name":"Archived","created_at":"","updated_at":"","pinned":true,"archived":true,"tags":["work"]},
+                            {"id":"sel-b","name":"Gamma","created_at":"","updated_at":"","pinned":true,"tags":["work"]}
+                        ]),
+                        Request::ListMcpPrompts => json!([
+                            {"server":"server-日本語","name":"prompt-ไทย","description":"first line\nsecond line","arguments":[{"name":"topic","required":true}],"future":["🦀",3]}
+                        ]),
+                        Request::GetMcpPrompt { arguments, .. } => {
+                            json!({"text":arguments.get("text").and_then(Value::as_str).unwrap_or("rendered 日本語\n\n"),"future":"preserved"})
                         }
                         Request::RunMetrics {
                             limit,
@@ -109,18 +138,41 @@ impl Fixture {
                         }
                         _ => panic!("unexpected private RPC: {:?}", envelope.request),
                     };
-                    let failed = matches!(&envelope.request,Request::GetSubagent{id} if id=="fixture-not-found");
-                    seen.lock().unwrap().push(envelope.request);
-                    let reply = if failed {
+                    let reply = if matches!(&envelope.request, Request::GetSubagent {id} if id=="fixture-not-found")
+                    {
                         serde_json::to_value(formless_protocol::ServerMessage::err_code(
                             envelope.id,
                             formless_protocol::codes::NOT_FOUND,
                             "sub-agent fixture missing".into(),
                         ))
                         .unwrap()
+                    } else if matches!(&envelope.request,Request::GetModule{id} if id=="missing") {
+                        serde_json::to_value(formless_protocol::ServerMessage::err_code(
+                            envelope.id,
+                            formless_protocol::codes::NOT_FOUND,
+                            "module not found".into(),
+                        ))
+                        .unwrap()
+                    } else if matches!(&envelope.request,Request::ProposalDiff{id} if id=="missing")
+                    {
+                        serde_json::to_value(formless_protocol::ServerMessage::err_code(
+                            envelope.id,
+                            formless_protocol::codes::NOT_FOUND,
+                            "proposal not found".into(),
+                        ))
+                        .unwrap()
+                    } else if matches!(&envelope.request, Request::GetMcpPrompt {name,..} if name=="fixture-failure")
+                    {
+                        serde_json::to_value(formless_protocol::ServerMessage::err_code(
+                            envelope.id,
+                            formless_protocol::codes::NOT_FOUND,
+                            "server fixture failure".into(),
+                        ))
+                        .unwrap()
                     } else {
                         json!({"kind":"response", "id":envelope.id, "ok":true, "result":result})
                     };
+                    seen.lock().unwrap().push(envelope.request);
                     if writeln!(socket, "{reply}").is_err() {
                         break;
                     }
@@ -133,6 +185,7 @@ impl Fixture {
             stop,
             thread: Some(thread),
             requests,
+            connections,
         }
     }
     fn command(&self, args: &[&str]) -> Command {
@@ -187,71 +240,131 @@ impl Fixture {
         }
     }
 }
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
-        if let Some(thread) = self.thread.take() {
-            thread.join().unwrap();
-        }
-        let _ = std::fs::remove_dir_all(&self.root);
-    }
+
+fn module_list() -> Value {
+    json!([
+        {"id":"full-module-id","name":"日本語 module","description":"完整 description","current_version":2,"retired":false,"created_at":"first","updated_at":"last","future":7},
+        {"id":"retired-id","name":"retired module","description":"retired description","current_version":4,"retired":true,"created_at":"first","updated_at":"last"}
+    ])
+}
+fn module_detail() -> Value {
+    json!({"module":module_list()[0],"versions":[
+        {"version":1,"author":"user","created_at":"first","code":"// source 日本語\n"},
+        {"version":2,"author":"agent","created_at":"last","code":"// source ไทย"}
+    ],"used_by":["alpha","日本語 tool"],"future":{"preserved":true}})
 }
 
 #[test]
-fn shipped_files_and_rewind_use_owned_rpc_prefix_resolution_and_json_contract() {
+fn shipped_module_reports_preserve_json_exact_source_and_read_only_requests() {
     let fixture = Fixture::new();
-    let files = fixture.run(&["sessions", "files", "abc-o", "--run", "run-one", "--json"]);
-    assert!(
-        files.status.success(),
-        "{}",
-        String::from_utf8_lossy(&files.stderr)
-    );
-    let files: Value = serde_json::from_slice(&files.stdout).unwrap();
-    assert_eq!(files["files"][0]["path"], "dir/a.txt");
-    assert_eq!(files["run_id"], "run-one");
-    let files_text = fixture.run(&["sessions", "files", "abc-o"]);
-    assert!(
-        files_text.status.success(),
-        "{}",
-        String::from_utf8_lossy(&files_text.stderr)
-    );
-    let text = String::from_utf8(files_text.stdout).unwrap();
-    assert!(text.contains("dir/a.txt"));
-    assert!(text.contains("Untracked writes"));
-    let rewind = fixture.run(&[
-        "sessions",
-        "rewind",
-        "abc-o",
-        "dir/a.txt",
-        "--run",
-        "run-one",
-        "--json",
-    ]);
-    assert!(
-        rewind.status.success(),
-        "{}",
-        String::from_utf8_lossy(&rewind.stderr)
-    );
-    let rewind: Value = serde_json::from_slice(&rewind.stdout).unwrap();
-    assert_eq!(rewind["skipped"][0]["reason"], "changed since Run");
-    assert!(fixture.requests.lock().unwrap().iter().any(|request| matches!(request, Request::RewindRun { session_id, run_id: Some(run), path: Some(path) } if session_id == "abc-one" && run == "run-one" && path == "dir/a.txt")));
-    let ambiguous = fixture.run(&["sessions", "rewind", "abc"]);
-    assert!(!ambiguous.status.success());
-    assert!(String::from_utf8_lossy(&ambiguous.stderr).contains("matches 2 Sessions"));
-    let forced = fixture.run(&["sessions", "rewind", "abc-one", "--force"]);
-    assert!(!forced.status.success());
-    assert_eq!(
-        fixture
-            .requests
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|r| matches!(r, Request::RewindRun { .. }))
-            .count(),
-        1
-    );
+    for json in [false, true] {
+        fixture.requests.lock().unwrap().clear();
+        let args = if json {
+            vec!["modules", "list", "--json"]
+        } else {
+            vec!["modules", "list"]
+        };
+        let out = fixture.run(&args);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        if json {
+            assert_eq!(
+                serde_json::from_slice::<Value>(&out.stdout).unwrap(),
+                module_list()
+            );
+        } else {
+            let text = String::from_utf8(out.stdout).unwrap();
+            for expected in [
+                "日本語 module",
+                "retired module",
+                "active",
+                "retired",
+                "完整 description",
+            ] {
+                assert!(text.contains(expected), "{text}");
+            }
+        }
+        assert!(matches!(
+            &fixture.requests.lock().unwrap()[..],
+            [Request::ListModules]
+        ));
+    }
+    for selector in ["日本語 module", "full-module-id"] {
+        for json in [false, true] {
+            fixture.requests.lock().unwrap().clear();
+            let mut args = vec!["modules", "show", selector];
+            if json {
+                args.push("--json");
+            }
+            let out = fixture.run(&args);
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            if json {
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&out.stdout).unwrap(),
+                    module_detail()
+                );
+            } else {
+                let text = String::from_utf8(out.stdout).unwrap();
+                for expected in [
+                    "Module: 日本語 module",
+                    "ID: full-module-id",
+                    "Current version: 2",
+                    "完整 description",
+                    "v1 · user · first",
+                    "v2 · agent · last",
+                    "alpha",
+                    "日本語 tool",
+                ] {
+                    assert!(text.contains(expected), "{text}");
+                }
+                assert!(!text.contains("// source"));
+            }
+            assert!(
+                matches!(&fixture.requests.lock().unwrap()[..],[Request::GetModule{id}] if id==selector)
+            );
+        }
+    }
+    for (version, expected) in [("1", "// source 日本語\n"), ("2", "// source ไทย")] {
+        let out = fixture.run(&["modules", "show", "full-module-id", "--version", version]);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(out.stdout, expected.as_bytes());
+    }
+    for (selector, version, message) in [
+        ("missing", None, "module not found"),
+        ("full-module-id", Some("99"), "no stored version 99"),
+    ] {
+        let mut args = vec!["modules", "show", selector];
+        if let Some(version) = version {
+            args.extend(["--version", version]);
+        }
+        let out = fixture.run(&args);
+        assert_eq!(out.status.code(), Some(2));
+        assert!(out.stdout.is_empty());
+        assert!(String::from_utf8(out.stderr).unwrap().contains(message));
+    }
+    let before = fixture.connections.load(Ordering::SeqCst);
+    for args in [
+        vec!["modules", "show", "name", "--version", "1", "--json"],
+        vec!["modules", "show", "name", "--version", "0"],
+        vec!["modules", "show", "name", "--version", "bad"],
+    ] {
+        let out = fixture.run(&args);
+        assert_eq!(out.status.code(), Some(2));
+        assert!(out.stdout.is_empty());
+    }
+    assert_eq!(fixture.connections.load(Ordering::SeqCst), before);
 }
-
 #[test]
 fn shipped_subagent_reports_preserve_session_resolution_exact_ids_and_provider_json() {
     let fixture = Fixture::new();
@@ -329,6 +442,434 @@ fn shipped_subagent_reports_preserve_session_resolution_exact_ids_and_provider_j
             .count(),
         2
     );
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            thread.join().unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+#[test]
+fn shipped_tool_lookup_misses_never_continue_to_an_action_and_export_stays_exact() {
+    let fixture = Fixture::new();
+    for action in ["show", "disable", "export"] {
+        fixture.requests.lock().unwrap().clear();
+        let out = fixture.run(&["tools", action, "FP"]);
+        assert_eq!(out.status.code(), Some(2));
+        assert!(out.stdout.is_empty());
+        let error = String::from_utf8(out.stderr).unwrap();
+        assert!(
+            error.contains("Partial-name suggestions") && error.contains("\"FetchPage\""),
+            "{error}"
+        );
+        assert!(matches!(
+            &fixture.requests.lock().unwrap()[..],
+            [Request::ListTools]
+        ));
+    }
+    for query in ["full", "unknown", ""] {
+        let out = fixture.run(&["tools", "export", query]);
+        assert_eq!(out.status.code(), Some(2));
+        assert!(out.stdout.is_empty());
+        assert!(String::from_utf8(out.stderr)
+            .unwrap()
+            .contains("formless tools list"));
+    }
+    for query in ["FetchPage", "full-tool-id"] {
+        fixture.requests.lock().unwrap().clear();
+        let out = fixture.run(&["tools", "export", query]);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&out.stdout).unwrap(),
+            json!({"fixture":"unchanged bundle"})
+        );
+        assert!(
+            matches!(&fixture.requests.lock().unwrap()[..],[Request::ListTools,Request::ExportTool{id}] if id=="full-tool-id")
+        );
+    }
+}
+
+fn proposal_comparison(id: &str) -> Value {
+    json!({"target":if id=="memory" {"memory"} else {"learned guidance"},"applied":id=="memory","diff":[["-","old 日本語"],["+","ไทย long full line ".repeat(80)],[" ",""]],"future":{"preserved":true}})
+}
+
+#[test]
+fn shipped_proposal_diff_is_read_only_and_preserves_the_complete_comparison() {
+    let fixture = Fixture::new();
+    for id in ["guidance", "memory"] {
+        for json in [false, true] {
+            fixture.requests.lock().unwrap().clear();
+            let mut args = vec!["prompts", "diff", id];
+            if json {
+                args.push("--json");
+            }
+            let out = fixture.run(&args);
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let expected = proposal_comparison(id);
+            if json {
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&out.stdout).unwrap(),
+                    expected
+                );
+            } else {
+                let text = String::from_utf8(out.stdout).unwrap();
+                assert!(text.contains(&format!("Target: {}", expected["target"].as_str().unwrap())));
+                assert!(text.contains(if id == "memory" {
+                    "Already applied: yes"
+                } else {
+                    "Already applied: no"
+                }));
+                assert!(text.ends_with(&format!(
+                    "-old 日本語\n+{}\n \n",
+                    "ไทย long full line ".repeat(80)
+                )));
+            }
+            let requests = fixture.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1, "{requests:?}");
+            assert!(matches!(&requests[0],Request::ProposalDiff{id:actual} if actual==id));
+        }
+    }
+    let missing = fixture.run(&["prompts", "diff", "missing"]);
+    assert_eq!(missing.status.code(), Some(2));
+    assert!(missing.stdout.is_empty());
+    assert!(String::from_utf8(missing.stderr)
+        .unwrap()
+        .contains("proposal not found"));
+}
+fn tool_filter_rows() -> Value {
+    serde_json::from_str(include_str!("fixtures/tool-filter-list.json")).unwrap()
+}
+
+#[test]
+fn shipped_tool_filters_keep_default_pipe_bytes_and_apply_the_same_json_selection() {
+    let fixture = Fixture::with_tools(tool_filter_rows());
+    let default = fixture.run(&["tools", "list"]);
+    assert!(
+        default.status.success(),
+        "{}",
+        String::from_utf8_lossy(&default.stderr)
+    );
+    assert_eq!(
+        default.stdout,
+        include_bytes!("fixtures/tool-list-default.txt")
+    );
+    let pinned = fixture.run(&["tools", "list", "--show-pinned"]);
+    assert!(pinned.status.success());
+    let text = String::from_utf8(pinned.stdout).unwrap();
+    assert!(text.contains("PINNED") && text.contains("yes") && text.contains("no"));
+    for (flags, expected) in [
+        (
+            vec!["--filter", "not-retired"],
+            vec!["Alpha", "Beta", "Delta"],
+        ),
+        (vec!["--filter", "failing"], vec!["Beta", "Gamma"]),
+        (
+            vec!["--filter", "pinned", "--tag", "#WORK"],
+            vec!["Alpha", "Gamma"],
+        ),
+        (vec!["--filter", "off", "--tag", "work"], vec![]),
+    ] {
+        for json in [false, true] {
+            fixture.requests.lock().unwrap().clear();
+            let mut args = vec!["tools", "list"];
+            args.extend(flags.iter().copied());
+            if json {
+                args.push("--json");
+            }
+            let out = fixture.run(&args);
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            if json {
+                let rows: Value = serde_json::from_slice(&out.stdout).unwrap();
+                assert_eq!(
+                    rows.as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|row| row["name"].as_str().unwrap())
+                        .collect::<Vec<_>>(),
+                    expected
+                );
+                for row in rows.as_array().unwrap() {
+                    let original: formless_protocol::ToolInfo = serde_json::from_value(
+                        tool_filter_rows()
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .find(|old| old["id"] == row["id"])
+                            .unwrap()
+                            .clone(),
+                    )
+                    .unwrap();
+                    assert_eq!(row, &serde_json::to_value(original).unwrap());
+                }
+            } else {
+                let text = String::from_utf8(out.stdout).unwrap();
+                if expected.is_empty() {
+                    assert!(text.contains("No Tools match --filter off and --tag \"work\""));
+                    assert!(!text.contains("no tools yet"));
+                }
+                for name in ["Alpha", "Beta", "Gamma", "Delta"] {
+                    assert_eq!(text.contains(name), expected.contains(&name), "{text}");
+                }
+            }
+            assert!(matches!(
+                &fixture.requests.lock().unwrap()[..],
+                [Request::ListTools]
+            ));
+        }
+    }
+    let invalid = fixture.run(&["tools", "list", "--filter", "active"]);
+    assert_eq!(invalid.status.code(), Some(2));
+    assert!(invalid.stdout.is_empty());
+}
+
+#[test]
+fn shipped_files_and_rewind_use_owned_rpc_prefix_resolution_and_json_contract() {
+    let fixture = Fixture::new();
+    let files = fixture.run(&["sessions", "files", "abc-o", "--run", "run-one", "--json"]);
+    assert!(
+        files.status.success(),
+        "{}",
+        String::from_utf8_lossy(&files.stderr)
+    );
+    let files: Value = serde_json::from_slice(&files.stdout).unwrap();
+    assert_eq!(files["files"][0]["path"], "dir/a.txt");
+    assert_eq!(files["run_id"], "run-one");
+    let files_text = fixture.run(&["sessions", "files", "abc-o"]);
+    assert!(
+        files_text.status.success(),
+        "{}",
+        String::from_utf8_lossy(&files_text.stderr)
+    );
+    let text = String::from_utf8(files_text.stdout).unwrap();
+    assert!(text.contains("dir/a.txt"));
+    assert!(text.contains("Untracked writes"));
+    let rewind = fixture.run(&[
+        "sessions",
+        "rewind",
+        "abc-o",
+        "dir/a.txt",
+        "--run",
+        "run-one",
+        "--json",
+    ]);
+    assert!(
+        rewind.status.success(),
+        "{}",
+        String::from_utf8_lossy(&rewind.stderr)
+    );
+    let rewind: Value = serde_json::from_slice(&rewind.stdout).unwrap();
+    assert_eq!(rewind["skipped"][0]["reason"], "changed since Run");
+    assert!(fixture.requests.lock().unwrap().iter().any(|request| matches!(request, Request::RewindRun { session_id, run_id: Some(run), path: Some(path) } if session_id == "abc-one" && run == "run-one" && path == "dir/a.txt")));
+    let ambiguous = fixture.run(&["sessions", "rewind", "abc"]);
+    assert!(!ambiguous.status.success());
+    assert!(String::from_utf8_lossy(&ambiguous.stderr).contains("matches 2 Sessions"));
+    let forced = fixture.run(&["sessions", "rewind", "abc-one", "--force"]);
+    assert!(!forced.status.success());
+    assert_eq!(
+        fixture
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| matches!(r, Request::RewindRun { .. }))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn shipped_mcp_prompt_commands_preserve_text_json_named_args_and_errors() {
+    let fixture = Fixture::new();
+    for args in [
+        vec!["mcp", "prompt", "s", "p", "--arg", "missing"],
+        vec!["mcp", "prompt", "s", "p", "--arg", "=empty"],
+        vec!["mcp", "prompt", "s", "p", "--arg", "x=1", "--arg", "x=2"],
+    ] {
+        let output = fixture.run(&args);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+    }
+    std::thread::sleep(Duration::from_millis(20));
+    assert_eq!(
+        fixture.connections.load(Ordering::SeqCst),
+        0,
+        "usage errors must precede any daemon contact"
+    );
+    assert!(fixture.requests.lock().unwrap().is_empty());
+    let list = fixture.run(&["mcp", "prompts", "--json"]);
+    assert!(
+        list.status.success(),
+        "{}",
+        String::from_utf8_lossy(&list.stderr)
+    );
+    let value: Value = serde_json::from_slice(&list.stdout).unwrap();
+    assert_eq!(value[0]["future"], json!(["🦀", 3]));
+    let list = fixture.run(&["mcp", "prompts"]);
+    assert!(list.status.success());
+    let text = String::from_utf8(list.stdout).unwrap();
+    assert!(text.contains("server-日本語"));
+    assert!(text.contains("prompt-ไทย"));
+    assert!(text.contains("may be incomplete"));
+    assert!(!text.contains("second line"));
+    for text in ["", "no trailing newline", "Unicode ไทย = value\n\n"] {
+        let arg = format!("text={text}");
+        for json in [false, true] {
+            let mut args = vec![
+                "mcp",
+                "prompt",
+                "server-日本語",
+                "prompt-ไทย",
+                "--arg",
+                &arg,
+                "--arg",
+                "empty=",
+                "--arg",
+                "nested=a=b",
+            ];
+            if json {
+                args.push("--json");
+            }
+            let output = fixture.run(&args);
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if json {
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+                    json!({"text":text,"future":"preserved"})
+                );
+            } else {
+                assert_eq!(output.stdout, text.as_bytes());
+            }
+        }
+    }
+    for json in [false, true] {
+        let mut args = vec!["mcp", "prompt", "server-日本語", "fixture-failure"];
+        if json {
+            args.push("--json");
+        }
+        let output = fixture.run(&args);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("server fixture failure"));
+    }
+    let seen = fixture.requests.lock().unwrap();
+    assert!(
+        seen.iter()
+            .all(|req| matches!(req, Request::ListMcpPrompts | Request::GetMcpPrompt { .. })),
+        "no Session/Run/configuration request: {seen:?}"
+    );
+    for req in seen.iter() {
+        if let Request::GetMcpPrompt {
+            server,
+            name,
+            arguments,
+            positional,
+        } = req
+        {
+            assert_eq!(server, "server-日本語");
+            assert!(positional.is_empty());
+            if name == "prompt-ไทย" {
+                assert_eq!(arguments["empty"], "");
+                assert_eq!(arguments["nested"], "a=b");
+                assert!(arguments["text"].is_string());
+            }
+        }
+    }
+}
+
+#[test]
+fn session_list_selectors_preserve_order_and_use_only_the_existing_read_request() {
+    let fixture = Fixture::new();
+    let base = fixture.run(&["sessions", "list", "--json"]);
+    assert!(base.status.success(), "{base:?}");
+    let original: Vec<Value> = serde_json::from_slice(&base.stdout).unwrap();
+    assert_eq!(
+        original
+            .iter()
+            .map(|s| s["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["abc-one", "abc-two", "sel-z", "sel-a", "sel-b"]
+    );
+    for (flags, ids) in [
+        (vec!["--pinned"], vec!["sel-z", "sel-b"]),
+        (vec!["--tag", "WoRK"], vec!["sel-z", "sel-b"]),
+        (
+            vec!["--archived", "--tag", "work", "--pinned"],
+            vec!["sel-q"],
+        ),
+        (vec!["--tag", "ไทย"], vec!["sel-z"]),
+        (vec!["--tag", "wor"], vec![]),
+        (vec!["--tag", "#work"], vec![]),
+    ] {
+        let mut args = vec!["sessions", "list"];
+        args.extend(flags.clone());
+        let human = fixture.run(&args);
+        assert!(human.status.success(), "{human:?}");
+        let text = String::from_utf8(human.stdout).unwrap();
+        if ids.is_empty() {
+            assert!(
+                text.contains("no Sessions match --tag") && text.contains(flags[1]),
+                "{text}"
+            );
+        } else {
+            let positions: Vec<_> = ids.iter().map(|id| text.find(id).unwrap()).collect();
+            assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+            if ids.contains(&"sel-z") {
+                assert!(text.contains("★ ไทย 日本語") && text.contains("ข้อความ 日本語"));
+            }
+            for excluded in ["abc-one", "abc-two", "sel-z", "sel-a", "sel-q", "sel-b"]
+                .into_iter()
+                .filter(|id| !ids.contains(id))
+            {
+                assert!(!text.contains(excluded), "excluded {excluded}: {text}");
+            }
+        }
+        args.push("--json");
+        let out = fixture.run(&args);
+        assert!(out.status.success(), "{out:?}");
+        let rows: Vec<Value> = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|s| s["id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ids
+        );
+        for row in rows.iter().filter(|row| row["archived"] == false) {
+            assert_eq!(
+                row,
+                original
+                    .iter()
+                    .find(|original| original["id"] == row["id"])
+                    .unwrap()
+            );
+        }
+    }
+    assert!(fixture
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|request| matches!(request, Request::ListSessions)));
 }
 
 #[test]

@@ -50,7 +50,8 @@ without redesign.
   - `formless-tui` — ratatui TUI client.
   - CLI commands live in the binary entrypoint (no separate crates/binaries).
 - The daemon is not a separate executable: it is `formless` running in daemon
-  mode, spawned by clients (see §9). No system service on any OS.
+  mode, spawned by clients (see §9). Ordinary startup needs no separately installed service; optional per-user
+  autostart is supported (§9.1).
 
 ### 2.2 Processes and clients
 
@@ -229,6 +230,9 @@ without redesign.
   - Presets also work later: `formless providers add NAME --preset ID`,
     a preset id in Settings → Providers' base_url field, and
     `providers.upsert` with `preset` (or a preset id as `base_url`).
+    These URL-or-preset inputs accept case-insensitive HTTP(S) schemes;
+    only the scheme is lowercased. The remaining URL preserves its case
+    and escaping, apart from existing outer-whitespace and trailing-slash trimming.
 - Onboarding collects `base_url` + API key, then fetches `/models`; the user
   picks a **model** and a **reasoning effort**. If `/models` fails, manual
   model-name entry is offered. Model + effort are a daemon default,
@@ -237,11 +241,14 @@ without redesign.
 - **Model picker.** The wizard, `/model` and the web client share one
   picker. Typing filters the list by fuzzy (subsequence) match on the id:
   word starts and runs of consecutive matches rank higher, matched
-  characters are highlighted, and recently used models come first. Roles
+  characters are highlighted, and models reported by Sessions are prioritized
+  as recent. Roles
   show up as `role:<name>` rows with the provider and model they map to.
   `ListModels` returns `{models, roles, recent, current, error}`: `models`
-  comes from the default provider's `/models`, `recent` from the Sessions'
-  models, newest first. When the list can't be fetched, the typed text is
+  comes from the default provider's `/models`. `recent` deduplicates exact
+  nonempty stored Session model IDs, including archived Sessions, after sorting
+  stored `updated_at` descending and Session ID ascending for ties. This is
+  Session-update recency, not measured model-use history. When the list can't be fetched, the typed text is
   used as a free-form model id. In `/model`, Enter sets the **current
   Session**'s model and effort (`SetSessionModel`). Ctrl+Enter, Alt+Enter
   or Ctrl+D (Ctrl/⌘+Enter on the web) sets the global default instead
@@ -409,7 +416,16 @@ without redesign.
   `supported_parameters`), else a built-in table for well-known families
   (GPT-5, o-series, GPT-4o/4.1, Claude, Gemini, reasoning-only models).
   The TUI and web pickers show it on each row (`200k ctx · $3/$15 per M ·
-  vision · tools`). `efforts` limits the effort choices to what the model
+  vision · tools`). TUI model prices retain the metadata's thousandths of
+  USD per million tokens (0.075/0.007/0.001), trimming unused trailing zeros;
+  an actual zero and whole-dollar prices remain distinct and unpadded.
+  Context labels retain exact token counts: decimal multiples
+  keep k/M units (200000 → 200k, 1500000 → 1.5M); other exact binary multiples
+  use explicit Ki/Mi (131072 → 128Ki, 65536 → 64Ki). Smaller or irregular
+  windows use exact decimal fractions only when no longer than the whole count,
+  otherwise the whole count, never a rounded-down zero or integer. Missing or
+  invalid context metadata is omitted (web numbers must be safe integers).
+  `efforts` limits the effort choices to what the model
   accepts (`[]` hides the picker: effort has no effect; absent offers all).
 - **Aliases.** `[provider.aliases] fast = "…"` names models; an alias is
   accepted wherever a model id is (`/model fast`, `--model`, Roles,
@@ -463,10 +479,16 @@ an empty listing just asks for one.
   the answer streamed, whether reasoning streamed, and whether tool calls
   work (natively, or only through the prompt-based fallback). Results are
   kept per (endpoint, model) in `<data>/model_tests.json` and shown in the
-  pickers (`✓ tested` / `✗ test failed`). Choosing a model does not start a
+  pickers (`✓ tested` / `✗ test failed`; temporary failures name the manual
+  retry action). Results include a backward-compatible `transient` flag for
+  transport, rate/server and logical-deadline failures. Choosing a model does not start a
   paid test by default. `provider.auto_test_models = true` opts into testing
   previously untested selected models in the background; explicit Test actions
-  stay available without this setting. Background tests deduplicate concurrent
+  stay available without this setting. Within this opt-in path, a later
+  selection may retry a transient failure after five minutes or another
+  failure after 24 hours, based on `tested_at`. Successes stay cached.
+  Unknown records or unreadable timestamps retain manual-Test-only behavior;
+  future timestamps wait rather than causing repeated background probes. Background tests deduplicate concurrent
   picks by endpoint/model and release their reservation on completion or abort.
   Result merges are serialized and written privately through a synced temporary
   file and atomic replacement; save failures are reported, never silently lost.
@@ -1128,6 +1150,19 @@ pasting paths.
   web the first Send turns it into a chip and stops), reaches only the
   working folder (or `~/…` when written so), and never a credential
   (`.ssh`, `.aws`, `.env`, private keys, …), whoever wrote it.
+  The exact leaf template names `.env.example`, `.env.sample`,
+  `.env.template` and `.env.dist` are ordinary for regular files and
+  prospective new files. Existing directories, symbolic links and special
+  files retain credential classification. This convention does not certify their contents;
+  credential ancestors, resolved secret targets, protected profile/key sources
+  and configured sensitive-path rules still take precedence.
+- **Image capability guess.** With `provider.vision` unset, image-part
+  preparation and the TUI attachment warning share the model-name heuristic.
+  Full o1/o1-pro are included; o1-mini/preview, o3-mini, Gemma 3 270M/1B
+  (including Ollama size tags), and Claude 1/2/Instant names are text-only
+  exceptions before broad family matches. Explicit true/false overrides remain
+  available for custom endpoints or renamed models. Prompt-tool image policy
+  is unchanged; a name guess does not prove endpoint availability or support.
 - **Provider file authority.** Stored or imported attachment metadata is not
   permission to read a host path. Native image projection requires an artifact
   ID and path/size matching this profile's artifact registry, a regular file
@@ -1202,6 +1237,15 @@ pasting paths.
     Wayland, `xclip` on X11, PowerShell on Windows.
   - A file dragged into the terminal (pasted as an absolute path, quoted,
     `\`-escaped or `file://`) is attached instead of typed.
+    Exact literal files take precedence; otherwise a single shell-quoted word
+    is decoded (including escaped metacharacters, quotes and backslashes).
+    Native Windows separators are retained when decoding the legacy
+    backslash-space form, after exact-file checks.
+    No variables, globs or commands are expanded or executed; relative,
+    incomplete, multiple-path or multiline inputs remain composer text. A
+    shell-style trailing comment also keeps the complete paste as text; no
+    instructions are discarded to recognize one file. Quoted/escaped hashes
+    and hashes within a filename remain literal, with exact-file precedence.
     File URLs preserve native drive/UNC paths and percent-encode reserved
     characters; dropping the URL resolves back to the same local file.
   - Attaching an image when the current model doesn't look vision-capable
@@ -1210,7 +1254,12 @@ pasting paths.
   The web composer has a 📎 file picker and accepts pasted images.
 - **`@` mentions:** typing `@` in the input opens a completion popup of
   files under the client's working directory (TUI) or the daemon's (web),
-  fuzzy-matched on the path. `ListFiles {root?, query, limit?}` walks the
+  fuzzy-matched on the path. Ranking prepares the full and basename queries
+  once, folds each path once, and scores its basename from a rebased folded
+  suffix without highlight allocation. Bounded selection keeps score-descending,
+  UTF-8-byte-length-ascending, path-ascending order and stable input order for
+  duplicate ties; directory completion and the Unicode fold stay unchanged.
+  `ListFiles {root?, query, limit?}` walks the
   root once and caches it for 30 s. The walk respects `.gitignore`, skips
   hidden directories and `target`, `node_modules`, `dist`, `build`,
   `__pycache__` and `venv`, and stops at 200,000 entries. Directory
@@ -1219,8 +1268,20 @@ pasting paths.
   loops are skipped. Linked directories have size zero and their
   in-root children can be completed through the link's path. An empty query
   lists the top level, and `dir/` lists that directory, so paths complete
-  step by step. Tab or Enter inserts `@path`. On send, each `@path`
-  mention that names an existing file or directory goes through
+  step by step. Tab or Enter inserts `@path`, or `@"my notes/report.md"`
+  when a path needs delimiters. The `@"..."` form is reserved for quoted
+  paths: whitespace inside is literal, and only `\"` (quote) and `\\`
+  (backslash) are escapes. A complete token ends at its closing quote,
+  followed by whitespace, ordinary trailing mention punctuation, or end
+  of input. Invalid escapes, missing closing quotes and attached word
+  suffixes remain plain text on submission; they never attach a first-word
+  fragment. Directory completion retains the existing `/` marker and places
+  the cursor before a quoted directory's closing quote, so child completion
+  replaces the whole token. Exact indexed leading-space directory spellings
+  take priority before hand-typed query trimming. Extraction, chips, forecast
+  input and submission use the same decoded original paths without case or
+  filesystem normalization. On send, each complete mention that names an
+  existing file or directory goes through
   `AttachPath {session_id, path, root?}` before the message is sent:
   - text files up to 256 KB and images, WAV/MP3 audio and PDFs up to 8 MB are attached as below;
   - larger files and directories go as a reference line,
@@ -1346,7 +1407,18 @@ pasting paths.
   its finished blocks (up to the last blank line outside a code fence) as
   Markdown, reusing that render, and shows the unfinished tail as plain
   text. Open code fences, tables and lists don't reflow, and the view stays
-  anchored.
+  anchored. Completed-line split state is reused within the current answer;
+  unchanged source does not repeat split work. A commit, retry, new Run or
+  Session/snapshot opening resets the live text caches. Verified event appends
+  reuse checkpoints; other source replacements are checked or rebuilt.
+  String operations, unfinished-block formatting and DOM/layout work remain
+  separate costs; this is not a guarantee of linear total rendering.
+  With thinking visible, the web shows the latest six logical reasoning
+  lines by default. **Expand reasoning** opens all currently retained live
+  text in a bounded keyboard-accessible scrollport; appends preserve its
+  reading position. **Collapse reasoning** returns to the current tail.
+  Hiding thinking hides both text and control. Expansion resets with the
+  current answer and does not add reasoning persistence.
 - **Web `@` mentions.** `@` in the web composer completes Tool names
   (labelled "Tool"; inserted as `@name` for the agent to see) and files
   from the Session's working directory, through the daemon. A chosen file
@@ -1446,8 +1518,11 @@ pasting paths.
   or unreadable state remains unknown. Versioned before-metadata binds the exact
   bytes and metadata with an integrity checksum (not a MAC). Newly captured
   deleted ordinary files can be rejected back to their original bytes, mode and
-  ownership, then explicitly undone back to absence. Unsupported ACLs/xattrs,
-  unverifiable Windows security and legacy missing metadata remain read-only.
+  ownership, then explicitly undone back to absence. Exact `user.*` maps can be
+  restored, and macOS `com.apple.provenance` is compared but never written,
+  removed, or adopted. Other ACLs/xattrs, nonzero BSD flags, hidden attribute
+  lists, unverifiable Windows security, and legacy missing metadata remain
+  read-only.
   Whole-file byte-only snapshots remain available for authorized regular files
   with hard links or unsupported metadata, including a legitimate symlink-parent
   alias: both the requested name and canonical target must pass path policy,
@@ -1509,8 +1584,11 @@ pasting paths.
   Symlinks/reparse points, multiple hard links, protected profile/credential
   paths, read-only/set-ID files, and permission metadata that cannot be preserved
   remain noneditable. Legacy deleted-file snapshots have no original metadata and
-  are therefore read-only. Unix UID/GID and mode are preserved; extended
-  attributes/ACLs are refused rather than silently discarded. Windows special
+  are therefore read-only. Unix UID/GID and mode are preserved. Exact `user.*`
+  attributes are restored on a private stage; `com.apple.provenance` is only
+  compared. Any other extended attribute, nonempty ACL, nonzero BSD flags, or
+  hidden Darwin attribute list is refused rather than discarded. Absence is not
+  a wildcard for an automatically stamped provenance. Windows special
   attributes, nondefault streams and unsupported access-control entries are
   refused. On Windows, ordinary existing-file inverse edits and Undo retain the
   same file object with an attribute-only HANDLE for the active review's existing
@@ -1985,7 +2063,10 @@ pattern (§4.4).
   reads, stay quiet. Builtin credential directories (`.ssh`, `.aws`, `.gnupg`,
   `.pki`, `.kube`, `.docker`, `.password-store`), `.env*`, `*.pem`, `*.key`,
   shell histories and native/browser
-  credential stores require separate exact-path consent. This gate applies
+  credential stores require separate exact-path consent. Only the four exact
+  regular-file env-template names listed in §5.6 are exempt from the builtin
+  `.env*` filename rule; template-named symlinks, directories and their descendants
+  remain sensitive, and user rules/protected paths still apply. This gate applies
   even with `security.secure = false`; broad read grants and trusted folders
   cannot cover it. Its synthetic Capability grants no file, network or process
   authority. The prompt uses the actual Invocation's Tool/version, Run/source
@@ -2202,6 +2283,15 @@ pattern (§4.4).
     deliberately becomes null. A result's `toJSON` is invoked only once.
   - `console`, timers, `JSON`, `cryptoRandom()` (UUID), `randomBytes(n)`
     (base64). Nothing else.
+
+    `sleep(ms)` and `randomBytes(n)` require finite non-negative safe-integer
+    numbers. Invalid inputs throw; requests over `tools.max_sleep_secs` or
+    `tools.max_random_bytes` throw with that setting named, instead of silently
+    coercing, wrapping or shortening. This changes the older permissive API:
+    generated Tools must supply numeric integer values and handle limit errors.
+    Successful `randomBytes(n)` returns base64 decoding to exactly `n` bytes
+    (including zero), subject to supported allocation bounds. Valid sleep keeps
+    cancellation behavior; its wall time still depends on scheduling.
 - Memory cap: the JS heap is capped at the Tool's declared `memory_mb`.
   Exceeding it faults **only that Invocation**, tagged `resource`. The cap is
   a heap cap, not a data-size cap: streaming APIs exist so data Tools
@@ -2227,6 +2317,7 @@ pattern (§4.4).
 - Modules in the UIs: `GetModule {id|name}` returns a `ModuleDetail`: the
   module, its versions oldest first with code and author, and `used_by`,
   the active Tools whose current code loads it.
+
   - **Editing:** `UpdateModuleCode` saves new code as a new version
     (author `user`) through the same syntax and load check as
     `create_module`. Module code needs no `run()`.
@@ -2341,6 +2432,25 @@ are unchanged.
   installed **disabled**; the CLI prints its contents to review first.
 
 ### 7.9 External MCP servers
+
+`formless mcp prompts [--json]` reports prompts from reachable enabled servers,
+in daemon order. Discovery can start configured servers and silently skips
+connection/list failures, so results may be incomplete. `formless mcp prompt
+SERVER NAME --arg key=value [--arg empty=] [--json]` sends named string values
+to the selected server. Values preserve spaces, additional equals and empty
+strings; missing separators, empty keys and duplicate keys are usage errors
+before daemon contact. Human output is the returned text verbatim, including
+its trailing-newline state. The daemon projects `content.text` strings joined
+with blank lines; roles and non-text parts are absent. JSON preserves the full
+discovery array or daemon text report, not raw MCP messages. These commands do
+not submit to a Session or change server configuration; server/daemon errors
+retain their ordinary exit behavior, without promised local required/unknown
+argument checks.
+
+```sh
+formless mcp prompts --json
+formless mcp prompt docs summarize --arg 'topic=Unicode notes' --arg suffix=
+```
 
 Formless can use the tools of external MCP servers alongside its own.
 None ship by default (principle 1).
@@ -2514,8 +2624,12 @@ Tools fill capability gaps; skills say how to use them well.
 
 - **Format:** the Agent Skills `SKILL.md` convention: YAML frontmatter with
   `name` (1-64 lowercase letters, digits, `-`) and `description` (1-1024
-  chars), a Markdown body, and optional extra files. Existing skills
-  install as-is.
+  chars), a Markdown body, and optional extra files. Header comments outside
+  scalar content are ignored; whitespace-separated inline `#` comments leave
+  quoted hashes and URL fragments intact. Only a complete quoted scalar is
+  decoded (JSON-compatible double-quote escapes or doubled single quotes);
+  literal quote fragments and block content retain their characters. Existing
+  skills install as-is; historical installed metadata is not rewritten.
 - **Install:** from a folder, a git URL (`--ref`, `--subdir`) or a
   `.zip`; validated, then stored versioned under
   `<data>/skills/<name>/v<N>/` (10 MB max). A `.zip` is extracted
@@ -2528,6 +2642,13 @@ Tools fill capability gaps; skills say how to use them well.
   version, starts **disabled**: the user reviews the body and files
   (`GetSkill`, `formless skills show`) and enables it. Skills that bundle
   scripts are flagged.
+- **Source selection:** existing local folders always copy working files,
+  even when their name ends in `.git`; use an explicit `file://` URL to clone
+  a local repository. Existing local ZIP files are extracted. Git URL schemes
+  `http`, `https`, `ssh`, `git` and `file` are recognized case-insensitively,
+  lowercasing only the scheme for transport lookup; other URL bytes and recorded
+  source stay as supplied. Existing `git@` and `.git` source spellings remain
+  delegated to native Git validation and transport policy.
 - **Progressive disclosure:** only enabled skills' `name: description`
   lines go into the system prompt, as a sorted "Skills" block that is part
   of the per-Session prompt snapshot (§11), so installing or enabling a
@@ -2626,7 +2747,8 @@ suite cannot measure preferences.
   Detection covers:
   - known key and token formats (`sk-`, `ghp_`, `AKIA`, `xoxb-`, …)
   - private keys, bearer tokens and JWTs
-  - `password/token/api_key is|:|= …` assignments
+  - explicit `password/token/api_key :|= …` assignments, quoted `is` values,
+    and unquoted `is` values with a secret shape
   - long mixed-case random-looking strings
   `remember` also refuses text of 40 or more characters copied verbatim
   from the Session's recent Tool results; the agent must restate the
@@ -2681,6 +2803,11 @@ Decision: [ADR 0005](docs/adr/0005-run-script-orchestration.md).
     when the nested Invocation ends (§7.5). Each call runs on its own
     thread (§6.1), so `Promise.all` really runs them in parallel. This is
     the same `tools.call` every Tool has.
+    Nested return values retain JSON data semantics, including own `__proto__`
+    properties through callee and caller serialization. Settlement parses the
+    result envelope as JSON and calls the context's settlement function; parse,
+    lookup and call failures use the existing execution-error path.
+
   - At most `scripts.max_parallel` (8) calls per sandbox are in flight;
     the rest queue.
   - A script that returns while a call is still pending fails, as a Tool
@@ -2723,8 +2850,14 @@ Decision: [ADR 0005](docs/adr/0005-run-script-orchestration.md).
   - Each script is fingerprinted: SHA-256 over its tokens, with
     whitespace and comments dropped and string, template, regex and
     number literals blanked; a template's `${…}` interpolations count as
-    code. Recurrence is keyed on the fingerprint plus the sorted `uses`
-    list.
+    code. When a slash follows `++`, `--` or `}`, the lightweight lexer
+    cannot reliably distinguish division from a regex or block context:
+    it hashes the exact source with a separate marker instead. This may
+    miss recurrence across literal/formatting changes in those scripts,
+    rather than merge scripts that execute different code. Unambiguous
+    fingerprints keep their existing encoding; old stored counts are not
+    rewritten. Recurrence is keyed on the fingerprint plus the sorted
+    `uses` list.
   - Once one fingerprint has run successfully in
     `scripts.recurrence_threshold` (3) distinct Sessions, the
     `run_script` result carries a `hint` to save it.
@@ -2967,7 +3100,14 @@ it says.
   are perfect.
 - **Measurement failures.** A model call in the eval is retried once
   only when the error is transient (429, 408, 5xx, a dropped or timed-out
-  connection); an auth error or bad request fails at once. A proposal
+  connection); an auth error or bad request fails at once. With no HTTP status,
+  an extra measurement retry or temporary-failure explanation requires a known
+  transport diagnostic at the start of an error clause (e.g. request timed out,
+  connection reset/refused, stream dropped or explicit server overload).
+  Generic words such as stream, connection, timeout or reset inside model,
+  schema, authentication or parameter errors do not establish transience;
+  unknown prose gets no extra retry. Explicit probe/deadline metadata retains
+  its existing meaning. A proposal
   whose measurement fails is kept as `rejected` (never applied, listed as
   such) and the error is audit-logged as `proposal.discard_unmeasured`.
 
@@ -3051,7 +3191,18 @@ Generic-Tool guidance helps, but registries still collect near-duplicates
 such as `read_file`, `read_text_file` and `file_read`.
 
 - **Scoring:** a pair of active, non-MCP Tools scores 1.0 for identical
-  code, ignoring whitespace. Otherwise the score is 0.4 × the name-token
+  code tokens, ignoring comments and layout whitespace while retaining literal
+  spellings, token boundaries and restricted-production/postfix line breaks.
+  Strings, regexes and whole templates (including interpolations) remain
+  value-sensitive. Numeric literals stop before property dots and binary
+  operators (including hex digits e/E followed by + or -), keeping their
+  original spelling; legacy leading-zero forms use raw-source comparison.
+  Uncertain slash goals (e.g. after a closing parenthesis or
+  brace, or after a line break that may end a statement through automatic
+  semicolon insertion), unsupported syntax and unfinished literals compare
+  raw source; they can miss a duplicate rather than guess an identical-code
+  verdict. This exact key is separate from lossy script recurrence fingerprints.
+  Otherwise the score is 0.4 × the name-token
   overlap + 0.3 × the description-word overlap + 0.3 × the input-field
   overlap (all Jaccard, with simple plural folding). Pairs scoring at
   least 0.6 are flagged, with a reason.
@@ -3100,9 +3251,10 @@ such as `read_file`, `read_text_file` and `file_read`.
   before writing. Systemd executable paths containing quotes or backslashes
   are also refused because its command parser cannot represent them; this
   restriction does not apply to data, config or log paths.
-  The service runs `formless daemon serve --stay`,
-  which never stops for being idle, so scheduled jobs (§9.7) fire on
-  time. `uninstall-service` unloads and removes it; `formless doctor`
+  The service runs `formless daemon serve --stay`, which prevents idle exit
+  while the daemon is running. Scheduled delivery still depends on host,
+  daemon and network availability; logout, sleep, shutdown or reboot without
+  login can prevent it (Linux lifecycle guidance: [#1406](https://github.com/athiwatc/formless/issues/1406)). `uninstall-service` unloads and removes it; `formless doctor`
   shows whether it is installed, and the jobs warning suggests it.
 - **Back-pressure (#605).** A request line over 32 MB closes the
   connection while it is being read (nothing larger is buffered). Each
@@ -3502,7 +3654,11 @@ refresh a cache, nightly cleanup.
     names such as `JAN-MAR` and `MON,WED,FRI`, including in ranges/lists/steps;
     Sunday is `SUN`, 0 or 7). Aliases are `@hourly`, `@daily`/`@midnight`,
     `@weekly`, `@monthly`, and `@yearly`/`@annually` (January 1 at midnight).
-    When both day fields are restricted, either may match. Invalid field
+    Day fields follow Cronie: if either starts with `*` (including `*/N`
+    or `*,…`), both parsed day sets must match; otherwise either may match.
+    A later wildcard (`1,*`) or an explicit full range does not set that
+    leading-wildcard flag. For example, `0 9 */2 * 1` runs on Mondays
+    with odd day-of-month numbers, rather than every 48 hours. Invalid field
     values and range endpoints identify their field in both entry points.
     `at` is RFC 3339, `YYYY-MM-DD HH:MM` or `in 30m|2h|1d`.
   - The user uses `AddJob` or `formless jobs add PROMPT --every … |
@@ -3749,12 +3905,16 @@ run_tool = "network_policy"     # a registry Tool, or…
   clickable in terminals that support OSC 8 hyperlinks. After each draw,
   the TUI repaints the visible URL cells wrapped in OSC 8, keeping their
   style, but only when the set of visible links changed
-  (`tui.hyperlinks`). A URL ends where its brackets balance
+  (`tui.hyperlinks`). HTTP(S) schemes are matched case-insensitively;
+  targets lowercase only the scheme while visible text and the remaining
+  URL keep their original spelling. A URL ends where its brackets balance
   (`…/f_(x))` keeps one `)`), and a long URL hard-wrapped across rows is
   one link on every fragment, never a link to its first piece. In the
   Markdown, an image inside a link shows both addresses, and inline HTML
   shows its text: `<b>`, `<i>`, `<s>`, `<code>`, `<kbd>` and `<a href>`
-  style it, other tags and comments are dropped. `/open link [N]` opens the Nth link in the last
+  style it, other tags and comments are dropped. Anchor attribute names
+  are ASCII case-insensitive, allow whitespace around `=`, and retain
+  quoted or unquoted destinations. `/open link [N]` opens the Nth link in the last
   answer with the system opener (`open`, `xdg-open`, `start`).
   File paths in the chat (`src/main.rs`, `./a/b.txt:42`, `Cargo.toml`)
   that exist under the TUI's working directory are linked the same way,
@@ -3763,14 +3923,20 @@ run_tool = "network_policy"     # a registry Tool, or…
   `/open path FILE[:LINE]`
   opens one in `$VISUAL`/`$EDITOR` at that line: `+LINE` for terminal
   editors (which get the terminal until they exit), `FILE:LINE` for
-  Helix, and `-g` for VS Code and its forks.
+  Helix/Sublime/Zed, `-g FILE:LINE` for VS Code and its forks,
+  `-l LINE FILE` for TextMate, `+LINE FILE` for gedit, and
+  `--line LINE FILE` for Kate.
 - **Inline images (TUI).** Image attachments the TUI can read get an
   8-row thumbnail under their message. After each draw, thumbnails whose
   rows are all on screen are sent with the terminal's own protocol, which
   scales the image into the box: iTerm2's inline images (iTerm2,
   WezTerm) or the kitty graphics protocol (kitty, Ghostty), which takes
-  PNG: JPEG, GIF and WebP are transcoded to a PNG thumbnail (at most
-  800 px) first. Rows are reserved only for an image that can be drawn;
+  PNG. Both protocols decode PNG, JPEG, GIF or WebP and downscale oversized
+  images to at most 800 px on the long side, preserving aspect ratio and
+  PNG transparency. Oversized previews and non-PNG kitty inputs are encoded
+  as PNG; small supported iTerm images and small PNGs keep their original
+  bytes. Resized animated images show a still preview. Rows are reserved
+  only for a supported image header;
   one that can't keeps its reference line, marked "can't be shown in
   this terminal".
   When thumbnails move, the screen is redrawn first so none linger. Other
@@ -3811,18 +3977,34 @@ run_tool = "network_policy"     # a registry Tool, or…
   block comments (nested in Rust) and multi-line strings (Python `"""`,
   JS/Go backticks, Rust raw strings) across lines and tells a JS regex
   from a comment; `diff`/`patch` (any case) are coloured as diffs; other
-  languages are plain text in the default colour.
+  languages are plain text in the default colour. In both clients, Python
+  hash comments need no preceding whitespace; YAML/TOML/env values retain
+  semicolons, while INI/conf/properties keep semicolon comments.
   Each block's top border names its language and its index in the
   message (`╭─ rust [2]`), which is the number `/copy code 2` and
   `/pager code 2` use. `tui.code_line_numbers` adds dim line numbers.
+  Code copy and paging use the same parser options and source order as chat,
+  including tilde fences, indented blocks, longer and unclosed fences, and
+  Mermaid among other code blocks. Commands target the last nonblank
+  assistant answer, default to its last block, and use one-based indices.
+  The body has Markdown containers/indentation interpreted by the parser;
+  copying removes exactly one final parser newline, as chat presentation
+  does, and preserves other whitespace. Diagram-command numbering is
+  separate and unchanged.
 - **Tables in narrow terminals (TUI).** Markdown tables wider than the
   pane shrink: columns narrower than an equal share keep their width, and
   the rest share the room in proportion. Cell text wraps inside its
   column instead of being cut. When the pane can't give every column 4
   characters, the table is shown as one `key: value` record per row,
-  each value wrapping under itself with a hanging indent.
+  each value wrapping under itself with a hanging indent. Hard-wrapped
+  text keeps grapheme clusters whole; a cluster wider than its row budget
+  is represented by `…`, and a zero-column hard-wrap budget emits no rows.
   `/table [N]` opens the last answer's Nth table at full width in the
   pager, where ←/→ scroll sideways.
+  Selection uses parsed table order within the last nonblank assistant
+  answer, defaults to table 1, accepts optional outer pipes, and excludes
+  pipe-like prose or code. Parsed cells, alignment and inline formatting
+  survive enclosing lists/quotes; the full-width pager omits those containers.
 - **Tool calls in the TUI chat.** Persisted calls start collapsed to one
   line: `▸ ⚙ name ✓`, an input summary, and the first line of the result
   (✗ on failure, … while there is none). Their separate result lines are
@@ -3852,8 +4034,11 @@ run_tool = "network_policy"     # a registry Tool, or…
   buffer and undo history. Non-Vim editor Esc uses the same confirmation.
   Supported Normal commands: h/j/k/l, w/b/e and W/B/E, 0/$, gg/G; d/c/y with
   those motions, dd/cc/yy, iw/aw/iW/aW, single/double/backtick quotes and nested
-  ()/[]/{}/<> objects; i/a/I/A/o/O, x, p/P and dot repeat. Word/character and
-  operator counts are bounded to 999. Counts also apply to i/a/I/A/o/O,
+  ()/[]/{}/<> objects; i/a/I/A/o/O, x, bare u for undo, p/P and dot repeat.
+  Word/character and operator counts are bounded to 999. Bare G targets the
+  last line; explicit G/gg counts select a one-based absolute line, clamped to
+  the last line. A $ count reaches the end of that many lines including the
+  current line. Counts also apply to i/a/I/A/o/O,
   p/P and dot: insert edits repeat on Esc (open-line commands also repeat
   their new lines), puts repeat the register, and an explicit dot count
   replaces the prior change's count. Counted changes insert replacement text
@@ -3881,7 +4066,13 @@ run_tool = "network_policy"     # a registry Tool, or…
     forward. Ctrl+U and Ctrl+K delete to the start and end of the line.
   - Shift+Enter, where the terminal reports it, or `\` + Enter inserts a
     newline. The box grows to 8 rows.
-  - ↑/↓ move between lines. On the first or last line they walk the
+  - In the non-Vim composer, ↑/↓ move between visual rows, including soft
+    wraps and explicit newlines, keeping a preferred display column across
+    shorter rows. Shift+↑/↓ extend selection across the same rows. Width comes
+    from the drawn composer after its prompt/border; resizing resets the
+    preferred-column basis. Vim and shared Tool-editor movement retain their
+    existing logical-line behavior. On the first or last visual row, ordinary
+    non-Vim arrows walk the
     current Session's earlier messages, and Down past the newest returns
     the draft. Ctrl+R searches that history. History entries are borrowed from
     the selected Session; typing/searching does not copy every message's text
@@ -4024,8 +4215,8 @@ run_tool = "network_policy"     # a registry Tool, or…
 - **Path scope.** Each new `fs:read:`/`fs:write:` path on a prompt can
   be granted wider: the path itself (default), its folder, or the
   repository it lies in (the nearest folder holding `.git` (a folder or
-  a file, so worktrees count), `.hg`, `.jj`, `.svn`, `.pijul`, `_darcs`
-  or `.fossil`), else the project (`Cargo.toml`, `package.json`,
+  a file, so worktrees count), `.hg`, `.jj`, `.svn`, `.pijul`, `_darcs`,
+  `.fslckout` or `_FOSSIL_`), else the project (`Cargo.toml`, `package.json`,
   `pyproject.toml`, `go.mod`). `ApprovalRequested.path_options` lists
   them; the answer's `paths` maps a requested spec to the chosen folder.
   - **Read and write apart:** each Capability has its own pick (TUI: `r`
@@ -4367,17 +4558,25 @@ run_tool = "network_policy"     # a registry Tool, or…
   `message_count`, `preview` and `last_run_status` for this. The web
   sidebar shows the preview under the name.
 - **Filtering lists.** In the TUI's Tools, Sessions and Proposals
-  views, `/` types a fuzzy filter: on name and description for Tools,
-  name for Sessions, and content, rationale and kind for Proposals. Enter
-  keeps it and Esc clears it. `s` cycles the sort and `v` the quick
-  filters:
+  views, `/` filters identifiers fuzzily (Tool/Session name, Tool title
+  and tags, or Proposal kind). Descriptions and Proposal content/rationale
+  require a contiguous match under the shared accent-insensitive fold.
+  Query edges are trimmed; inner whitespace is literal in prose, while
+  identifier fuzzy matching ignores query whitespace. Primary names/kind
+  rank above secondary fields, then prose; contiguous identifiers rank
+  above scattered matches, and earlier prose matches rank first. The selected
+  sort breaks equal relevance inside existing Tool groups and pinned Session
+  ordering. Empty queries and queries beginning with `#` keep their selected
+  sort; the Tools/Session `#tag` rules are unchanged. Quick filters, collapsed groups and parent-before-child Session
+  trees still apply. Enter keeps the filter and Esc clears it. `s` cycles
+  the tie-break sort and `v` the quick filters:
   - Tools sort by name, success rate, last used or calls; show all,
     active, retired, failing (<80%) or needing attention.
   - Sessions sort by last activity, created or name; show all or running.
   - Proposals sort newest first or by score; show all, pending, applied
     or rejected.
   The panel title shows the match count and the active sort, filter and
-  query (`Tools · 12/240 · sort: calls · failing · /csv`), and the
+  query (`Tools · 12/240 · sort: relevance (ties: calls) · failing · /csv`), and the
   selection follows the visible rows. The web Tools and Proposals views
   have the same filter box, sort and show menus; web Sessions use the
   sidebar search.
@@ -4389,6 +4588,9 @@ run_tool = "network_policy"     # a registry Tool, or…
   model/effort. Safely hot-reloadable values apply immediately; data-dir /
   transport-class changes state “restart required”. Includes the full-reset
   action (§15).
+  - Reasoning-effort choices in terminal Settings and the web Role editor
+    include default/unset, minimal, low, medium and high. Editing only a Role's
+    description preserves its stored effort; explicitly selecting default clears it.
   - No settable key needs a daemon restart: the daemon re-reads the file,
     and running TUIs reload their `tui.*` display settings on
     `SettingsChanged` (theme, colours, line numbers, images, panes,
@@ -4462,7 +4664,10 @@ programs: Unix shell-style quoting, Windows double-quote/backslash command-line
 quoting. No variable, tilde, wildcard or pipeline expansion occurs. An explicit
 configured shell is the owner's command. Known GUI editors use a wait option for
 composition (Code-family --wait, Sublime/Mate/Zed/Gedit --wait, Kate --block,
-GVim/MacVim --nofork). Other GUI commands must themselves wait until this file
+GVim/MacVim --nofork). The captured 1-based cursor line uses the same
+editor-specific location arguments as `/open path`, independently of the wait
+option. With no line or an unknown editor, the file path is passed unchanged.
+Other GUI commands must themselves wait until this file
 closes; detaching file-open launchers are refused. Ordinary `/open path` keeps
 its existing nonblocking GUI behavior.
 
@@ -4541,14 +4746,30 @@ undo, redo and replacements invalidate prior asynchronous editor previews.
   (v2 adds `/fork`, `/search`, `/edit`, `/metrics`, `/proposals`,
   `/propose`, `/panes`; later `/retry [--model X]`, `/limit N|off`,
   `/good`, `/bad`, `/unrate`). Plain text is always chat.
+- **Search-hit navigation (TUI).** Enter on a cross-Session search hit opens
+  its stored message after the matching Session load, placing it in view once.
+  Navigation is owned by that Session, message ID and load request; an older
+  response cannot jump to a different selected hit. An absent ID may fall back
+  only to a unique sequence/role match within that loaded Session. A grouped
+  Tool result shows its call header as nearest visible context with a note.
+  A missing/unrenderable target or failed/timed-out load follows the bottom
+  with a note. Session/view changes and manual scrolling abandon a pending
+  jump; End resumes bottom-follow as usual. Chat-find highlighting does not
+  choose the destination.
 - **Local prompt commands.** Plain Markdown templates in the selected profile's
   `<config>/commands/NAME.md` and selected Session working directory's
-  `.formless/commands/NAME.md` define `/NAME [ARGUMENTS]`. Names are 1–64 lowercase
+  `.formless/commands/NAME.md` define `/NAME [ARGUMENTS]`. Discovery records the
+  highest required single-digit position and whether `$ARGUMENTS` occurs, using
+  the same token rules as expansion. TUI/plain help, the TUI picker and CLI
+  metadata listings show `<arg1> … <argN>` and optional `[arguments…]` hints;
+  `commands list --json` exposes `max_position` and `uses_arguments` without
+  exposing template bodies. Names are 1–64 lowercase
   ASCII letters/digits/underscores/hyphens, starting with a letter. Optional
   frontmatter accepts only a nonempty `description` string (plain, quoted or
-  block text); malformed templates are excluded with a stable diagnostic, never
-  executed. Valid project templates override global templates. Built-in slash
-  roots always win, including their subcommands; `/help` groups custom commands
+  block text). The key may have leading spaces or tabs; block content must be
+  indented more deeply than its key, so sibling keys remain subject to validation.
+  Malformed templates are excluded with a stable diagnostic, never executed.
+  Valid project templates override global templates. Built-in slash roots always win, including their subcommands; `/help` groups custom commands
   under **Yours** and identifies shadowed files.
   The shared Core loader supplies the TUI palette/help, plain-client expansion/help and
   `formless commands list [--json]`. JSON contains command metadata, diagnostics
@@ -4576,8 +4797,14 @@ undo, redo and replacements invalidate prior asynchronous editor previews.
   reparse points, symlinks, hardlinked files and unsupported namespaces. Each
   directory is bounded to 256 entries and 128 Markdown templates; files are at
   most 64 KiB, combined template bytes 1 MiB, and diagnostics at most 64.
+  Description frontmatter permits indented comment lines and trailing
+  whitespace-separated `#` comments outside quoted values. Literal hashes in
+  quoted or block scalar content and URL fragments remain description text;
+  malformed quotes, unsupported fields and duplicate descriptions still fail.
   Expansion is a single literal pass: `$ARGUMENTS` preserves the text after the
-  invocation's first separator; `$1` through `$9` select Unicode-whitespace
+  invocation's first separator only when no ASCII letter, digit or underscore
+  immediately follows its name; `$ARGUMENTS_PATH` and `$ARGUMENTS2` remain
+  literal, while `$ARGUMENTS.` still expands. `$1` through `$9` select Unicode-whitespace
   separated positions. `$$` emits one literal `$`, so `$$1`, `$$5` and
   `$$9.99` preserve shell examples or prices. Escaped dollars and inserted
   arguments are not re-expanded. Missing referenced positions stop expansion
@@ -4674,9 +4901,15 @@ undo, redo and replacements invalidate prior asynchronous editor previews.
     plain-language meaning; the next line answers it (y, o or n).
     Questions list numbered options and are answered the same way, one at
     a time.
-  - Commands: `/new`, `/sessions`, `/switch N`, `/stop`, `/help`, `/quit`.
-    Anything else is a message (a steer while a Run is active). It opens
-    the most recent Session.
+  - Commands: `/new`, `/sessions`, `/switch N`, `/stop`, `/files [RUN]`,
+    `/rewind [PATH]`, `/recap`, `/docs [topic]`, `/help`, `/quit` (alias
+    `/exit`). `/files` shows tracked changes, `/rewind` attempts restoration,
+    `/recap` shows the recorded recap, and `/docs` prints guide addresses.
+    `/quit` and `/exit` leave Runs going in the daemon. Ordinary text is a
+    message (a steer while a Run is active); unknown slash commands are
+    reported locally. Begin with `//` to send a literal leading slash.
+    The client opens the most recent Session. See [the plain-client
+    reference](docs/plain.md) for launch forms and current command usage.
   - `formless chat [--session ID | --new]` is the same line-mode client
     as its own command, a REPL between the full-screen TUI and one-shot
     `run`, for dumb terminals and SSH sessions with poor TERM support. It
@@ -4728,7 +4961,12 @@ undo, redo and replacements invalidate prior asynchronous editor previews.
     unpriced models. `formless prices import [--provider NAME] [--all]
     [--dry-run]` copies the endpoint's own `/models` prices (OpenRouter
     publishes them) for the models in use, dated, and `doctor` flags
-    imported prices older than 90 days. Usage rows record their provider,
+    imported prices older than 90 days. Import compares all four rates,
+    ignoring a timestamp-only change, and shows old/new values for updates.
+    A changed record replaces the full listed record: an absent cache rate
+    is shown as unset and uses the input rate locally, rather than zero.
+    `--dry-run` reports the same changes without saving price configuration.
+    Usage rows record their provider,
     so `UsageByDay {by: "provider"}` works; rows stay when their Session
     is deleted (spend history).
 - **Colour:** roles, statuses, list selections, borders, and approval
@@ -4836,10 +5074,12 @@ undo, redo and replacements invalidate prior asynchronous editor previews.
 ### 10.9 Guides
 
 - The user guides live in `docs/`: a gallery of example tasks, the
-  Capabilities in plain words, the main keys and every command, troubleshooting,
-  and Docker. `/docs [topic]` (TUI and web) and `formless docs [topic]
-  [--print]` open one (`gallery`, `capabilities`, `approvals`, `keys`,
-  `troubleshooting`, `mcp`, `skills`, `jobs`, `spec`; a unique prefix works;
+  Capabilities in plain words, task-oriented MCP/Skills/Jobs how-to guides,
+  the main keys and every command, troubleshooting, and Docker. The `mcp`,
+  `skills` and `jobs` topics open `docs/mcp.md`, `docs/skills.md` and
+  `docs/jobs.md`; each links to its full specification section. `/docs [topic]` (TUI and web) and `formless docs [topic]
+  [--print|--text]` access one (`gallery`, `capabilities`, `approvals`, `keys`,
+  `troubleshooting`, `docker`, `mcp`, `skills`, `jobs`, `spec`; a unique prefix works;
   none opens the gallery). `formless doctor` prints the troubleshooting link, and
   `/help` points to `/docs`.
 - `docs/keys.md` is generated from the same key and command tables `/help`
@@ -4850,12 +5090,26 @@ Terminal docs commands default to the gallery. Exact topic names win;
 otherwise a unique prefix is required. Unknown names and ambiguous prefixes
 are reported explicitly (CLI usage exit 2 with available topics; TUI/plain
 notes name the error and candidates). CLI help examples are shell-tokenized
-and checked against the real parser without dispatch. SSH sessions and
-headless Linux print the URL without launching an opener; desktop openers
-must exit successfully within two seconds, and every child is reaped
-(stalled launchers are stopped). An opener's success does not prove browser
-navigation; the URL is retained in every result. `formless docs --print` and
-topic errors need no profile/config or daemon.
+and checked against the real parser without dispatch. `formless docs TOPIC
+--text` prints the bundled Markdown exactly, without config/profile, daemon,
+network or browser access. All topics have embedded content; `spec` is the
+full bundled SPEC and anchored topics select a top-level Markdown heading's
+subtree through the next same-or-higher-level heading. A Markdown parser
+supplies byte offsets and rendered heading labels, ignoring code/quoted
+examples; missing or duplicate bundled anchors are explicit errors.
+
+Desktop defaults still open the current online copy. A failed or unavailable
+opener (including SSH/headless hosts) falls back to bundled text in the CLI
+or a TUI pager, retaining a separately labeled current online URL that may
+differ from the installed build. An opener must exit successfully within two
+seconds and is reaped; success cannot prove browser navigation. Terminal
+`/docs --text TOPIC` (or `TOPIC --text`) explicitly reads the bundle in the
+TUI pager or plain output; plain mode's default retains its online address.
+The web topic table includes Docker and continues to open online pages.
+`--print` keeps bare online-URL output and conflicts with `--text`; `--keys`
+conflicts with topic, `--print` and `--text`. These CLI modes and topic errors
+need no profile/config or daemon. `--text` is version-matched to the compiled
+source; online URLs remain on `main`.
 
 ## 11. Compaction
 
@@ -4923,6 +5177,13 @@ original main thread. Verification hash buffers live on the heap; correctness
 checks run through actual CLI child processes without test-stack overrides.
 
 
+### Session selectors
+
+CLI Session lookup resolves an exact ID first, then a unique ID prefix.
+If no ID prefix matches, it looks for a unique ASCII-case-insensitive
+Session name. Unknown or ambiguous selectors return an error;
+`formless sessions list` shows the stored Sessions.
+
 ### Root command inventory
 
 The following table is synchronized with the visible Clap command definitions
@@ -4934,6 +5195,7 @@ the TUI. Command-specific arguments and defaults are available through
 | Command | Actions / useful options | Purpose |
 |---|---|---|
 | `formless approvals` | `pending`, `approve`, `deny`, `list`, `revoke`, `denials` | Inspect pending requests, answer one, or inspect and manage existing grants/denials. |
+| `formless artifacts` | `show ID [--offset CHARS] [--length CHARS] [--json]` | Read decoded artifact text in Unicode scalar slices; not a byte-exact download. |
 | `formless auth` | `login`, `status`, `logout` | Manage provider credentials (API key or OAuth). |
 | `formless backup` | No action: create; `list`, `verify`, `restore`, `drill` | Create, inspect, verify, restore, or rehearse database snapshots. |
 | `formless bug-report` | `-o FILE` / `--output FILE` | Write a redacted Markdown diagnostic report. |
@@ -4950,12 +5212,15 @@ the TUI. Command-specific arguments and defaults are available through
 | `formless import-all` | `FILE` | Add a portable setup bundle without overwriting existing entries. |
 | `formless jobs` | `list`, `add`, `run`, `history`, `enable`, `disable`, `rm` | Manage scheduled prompts and inspect their history. |
 | `formless logs` | `--follow`, `--level`, `--since`, `--lines` | Read or follow the daemon log and rotated files. |
-| `formless mcp` | `add`, `remove`, `list`, `test`, `login`, `logout`, `catalog`, `import`, `log`, `tools`, `tool` | Manage external MCP servers and inspect their tools/logs. |
+| `formless mcp` | `add`, `remove`, `list`, `test`, `login`, `logout`, `catalog`, `import`, `log`, `tools`, `tool`, `prompts`, `prompt` | Manage external MCP servers and inspect their tools/logs. |
+| `formless metrics` | `--since DURATION`, `--json` | Read recorded model, Tool and built-in statistics through independent reports at one cutoff. |
 | `formless memory` | `list`, `add`, `rm`, `edit` | Inspect or change saved user-memory notes. |
+| `formless models` | `list [--json]` | Fetch the default-provider model catalog and existing picker report; a non-null listing error prints a partial report and exits 1. |
+| `formless modules` | `list`, `show`; `show --version N` | Read all modules, inspect metadata/history/dependents, or emit an exact stored source version. |
 | `formless naming` | `status`, `pull`, `test` | Inspect, install, or preview the embedded Session-naming model. |
 | `formless prices` | `import` | Import a model-price catalog for cost and spending limits. |
 | `formless profiles` | `list`, `rm` | List or remove isolated profiles. |
-| `formless prompts` | `list`, `generate`, `apply`, `reject`, `rollback` | Inspect and manage measured prompt/memory proposals. |
+| `formless prompts` | `list`, `diff`, `generate`, `apply`, `reject`, `rollback` | Inspect existing proposal comparisons and manage measured prompt/memory proposals. |
 | `formless providers` | `list`, `add`, `remove`, `test` | Manage named model providers and test a connection. |
 | `formless relay` | `enable`, `disable`, `status` | Manage encrypted browser access through the relay. |
 | `formless reset` | `--force` | Wipe configuration, credentials, and the current profile's data. |
@@ -4965,14 +5230,24 @@ the TUI. Command-specific arguments and defaults are available through
 | `formless routing` | `--json` | Read currently available daemon routing decisions and returned candidate figures without starting a model request. |
 | `formless runs` | No action: list; `show`, `cancel` | List recent Runs, inspect one by ID/prefix, or cancel that exact Run. |
 | `formless security` | `status` | Inspect the daemon's grants, denials, trusted resources, and exposed interfaces. |
-| `formless sessions` | `subagents`, `subagent`, `fork`, `compare`, `list`, `show`, `files`, `rewind`, `rename`, `rm`, `restore`, `import`, `search`, `archive`, `unarchive`, `export` | Manage stored Sessions, follow a Run with `show --follow`, or inspect tracked files. |
+| `formless sessions` | `subagents`, `subagent`, `fork`, `compare`, `list`, `show`, `files`, `rewind`, `rename`, `rm`, `restore`, `import`, `search`, `templates list/show`, `archive`, `unarchive`, `export` | Manage stored Sessions, follow a Run with `show --follow`, or inspect tracked files. `list --pinned --tag TAG` filters the fetched reply; selectors combine with `--archived`, preserving reply order. |
 | `formless skills` | `reviews`, `add`, `remove`, `list`, `enable`, `disable`, `show`, `export`, `import` | Inspect and manage Skills and their retained description reviews. |
 | `formless storage` | `--json` | Report disk usage by data category. |
-| `formless tools` | `reviews`, `list`, `disable`, `enable`, `undo`, `pin`, `unpin`, `tag`, `show`, `retire`, `restore`, `rollback`, `purge`, `run`, `export`, `import` | Inspect, manage, run, or transfer registry Tools. |
-| `formless tui` | No action | Launch the full-screen terminal client; also the default with no command. |
+| `formless tools` | `reviews`, `list`, `disable`, `enable`, `undo`, `pin`, `unpin`, `tag`, `show`, `diff`, `retire`, `restore`, `rollback`, `purge`, `run`, `export`, `import` | Inspect, manage, run, or transfer registry Tools. |
+| `formless tui` | `--plain`, `-c` / `--continue`, `--new` | Launch the full-screen terminal client; also the default with no command. |
 | `formless uninstall` | `--keep-data`, `--keep-binary`, `--yes` (alias `--force`) | Remove Formless, optionally retaining data or the binary. |
 | `formless update` | No action, `check`, or `--check`; `--json` | Show newer release notes and the applicable upgrade command; never rewrite the binary. |
 | `formless web` | `--port`, `--no-open`, `--stop` | Open, print a link for, or stop the local browser UI. |
+
+`formless metrics --since 7d --json` reads the three existing metrics reports
+with one checked UTC cutoff. Omit `--since` for all history. Tool rows use stored
+`tool_id` values; reports retain their own row order and are independent reads,
+not a transactional snapshot. Runs and daily usage remain separate surfaces.
+
+`formless sessions list --pinned --tag WORK --json` selects active pinned Sessions
+whose stored tags contain exactly `work`. Only the tag argument is lowercased;
+a leading `#` is not stripped. Add `--archived` to select the archived partition.
+These selectors filter the existing reply on the client.
 
 `formless sessions subagents SESSION [--json]` inventories stored sub-agents
 using normal Session exact-id/prefix/name resolution. Full sub-agent ids can
@@ -5322,8 +5597,11 @@ Web approval and promotion decisions remain pending locally until the daemon
 confirms resolution; failures report that the decision was not delivered and
 remain answerable. Recap and rating controls are rebuilt from current Run state
 outside the cached message body, so live completion and rating changes appear
-immediately and only the current last answer has controls. Markdown formatting
-is limited to 32 nesting levels, 4096 characters per inline parse, and 128 KiB
+immediately and only the current last answer has controls. Web Markdown
+recognizes HTTP(S) schemes case-insensitively in bare and angle autolinks,
+and MAILTO in angle autolinks. URL text and mail-address case are retained;
+existing safe-target filtering and trailing-punctuation behavior still apply.
+Markdown formatting is limited to 32 nesting levels, 4096 characters per inline parse, and 128 KiB
 per formatted message. Content beyond these limits is displayed verbatim as
 plain text, preserving access to persisted messages without recursive parsing.
 
@@ -5436,7 +5714,10 @@ during its snapshot fetch, deduplicated by message id.
   path, zip or git URL on the daemon's machine, or a bundle uploaded from
   the browser); and New job: a task, a schedule from presets (every day,
   every weekday, every week at a time, hourly, once) or cron, previewed in
-  words, and a target Session; a top-bar theme switch, Auto (the system's)
+  words (hourly schedules name the minute without a bare colon, midnight
+  aliases match daily labels, and January 1 yearly schedules name the date;
+  unsupported shapes retain the cron text), and a target Session; a
+  top-bar theme switch, Auto (the system's)
   / Light / Dark, remembered per browser) — over the
   same daemon protocol, decrypted in the browser. `GetSettings` returns a
   read-only configuration summary for remote clients and never includes
@@ -5570,6 +5851,11 @@ during its snapshot fetch, deduplicated by message id.
   a null `override_source`. Both setting operations return `effective_value`.
   The CLI names the saved and effective values and source. Its own environment
   is independent of the daemon's; `config get` uses the client's environment.
+  `config get KEY --json` emits the same locally loaded effective value as one
+  compact JSON value followed by a newline, preserving string quoting and
+  other JSON types. Human output and unknown-key errors are unchanged. This
+  is neither the daemon's current snapshot nor a whole-config backup; Set's
+  supported-key validation, optional/null and map merge/replace rules remain.
   Credentials, `base_url`, `extra_headers`, auth, the relay, MCP servers and
   hooks are never settable this way, locally or over the relay. The TUI
   (`/panes`) and the web Settings view (Edit) use `SetSetting`.
@@ -5603,11 +5889,11 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
 | `provider.model` / `reasoning_effort` | — (wizard) | Daemon-wide defaults (§4.2) |
 | `provider.context_tokens` (per model) | 128000 | Compaction trigger basis (§4.2, §11) |
 | `provider.model_context_tokens` | {} | Context size per model id, overriding the endpoint-reported size and `context_tokens` for that model (§4.2, §11) |
-| `provider.auto_test_models` | false | Opt into background testing when choosing a previously untested model; tests can spend paid tokens. Explicit Test actions remain available when off (§4.3) |
+| `provider.auto_test_models` | false | Opt into background testing of untested or retry-eligible failed selected models; tests can spend paid tokens. Explicit Test actions remain available when off (§4.3) |
 | `provider.max_retries` | 5 | Bounded backoff attempts (§4.4) |
 | `provider.cache_control` | `auto` | Prompt-cache breakpoints (`cache_control`) on the system prompt and last stable message: `auto` for Claude models, `on`, `off`. Decided per model tried, so a fallback that isn't Claude gets plain content; applied to one-shot completions (compaction, `llm.complete`) too; a 400 naming `cache_control` resends once without them (§4.2) |
 | `provider.cache_key` | `session` | Send a per-Session `prompt_cache_key` for better cache routing (`off` never sends it; dropped automatically if the endpoint rejects it) |
-| `provider.max_backoff_secs` | 30 | Cap for exponential backoff with full jitter; a server's `Retry-After` / `x-ratelimit-reset-*` is honoured instead (up to 5 min) |
+| `provider.max_backoff_secs` | 30 | Cap for exponential backoff with full jitter; a server's `Retry-After` / `x-ratelimit-reset-*` is honoured instead (up to 5 min); reset durations accept ms/s/m/h/d units, contiguous or separated by whitespace |
 | `provider.tool_use_nudge` | true | Push models to build Tools: a GPT-family system-prompt addendum, and one nudge per step when an answer refuses for lack of access before using any Tool (§5.2) |
 | `provider.stall_notice_secs` | 120 | Flag an open stream that sent no bytes for this many seconds (`ProviderStalled`; `/resend` re-sends); 0 = never |
 | `provider.first_byte_timeout_secs` | 0 | Auto re-send when no first byte arrives in time (up to `max_retries`); 0 = off |
@@ -5639,8 +5925,8 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
 | `tools.inline_limit` | 40 | Tools listed in a Session's frozen first-step listing; others load via `find_tools` (§7.1) |
 | `tools.max_agent_depth` | 1 | How deep `agents.run` sub-agents may nest (§7.6) |
 | `tools.max_tool_depth` | 8 | How deep `tools.call` composition may nest (cycle guard, §7.6) |
-| `tools.max_sleep_secs` | 60 | Longest single `sleep(ms)` in a Tool (§7.5) |
-| `tools.max_random_bytes` | 1048576 | Largest `randomBytes(n)` (§7.5) |
+| `tools.max_sleep_secs` | 60 | Longest single `sleep(ms)` in a Tool; excess is an error (§7.5) |
+| `tools.max_random_bytes` | 1048576 | Largest decoded `randomBytes(n)` result; excess is an error (§7.5) |
 | `tools.fetch_connect_timeout_secs` | 10 | Tool `fetch`/`fetchChunks` connection deadline, clamped to 1–86400 seconds; applies to shared and DNS-pinned clients. DNS admission/resolution waits on each hop are bounded by the smaller of this budget and the remaining total deadline |
 | `tools.fetch_timeout_secs` | 60 | Total Tool HTTP deadline across DNS waits, redirects and response-body reads, clamped to 1–86400 seconds; trickling data does not reset it. Cancellation returns promptly and HTTP workers retain this deadline. OS DNS uses one fixed pool of four workers with at most sixteen queued lookups: expired queued work is skipped and late results discarded. OS lookups cannot be forcibly cancelled; a stalled lookup may retain one of those four fixed workers, while fetch callers still stop waiting at their deadlines. Timeout errors say `fetch timed out`, distinct from connection failures |
 | `tools.max_read_bytes` | 67108864 | Largest `fs.read` or `fetch` body (64 MB): larger fails as a resource error pointing to `fs.readChunks` / `fetchChunks` (§7.5) |
@@ -5802,7 +6088,13 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
   provider for approval summaries. It looks for secret shapes (provider
   key prefixes, JWTs, private keys, bearer tokens, `password = …`,
   `token=…`, `cookie: …` assignments, long random-looking tokens) rather
-  than key names, plus `security.secret_patterns`. A Tool result holding
+  than key names, plus `security.secret_patterns`. For unquoted `keyword is
+  value` phrases, a value needs a number, internal mixed case, or a recognized
+  secret shape; ordinary prose such as "token is refreshed" stays intact.
+  `:`/`=` and quoted assignments keep conservative masking. This heuristic
+  cannot distinguish an unquoted plain-word secret from ordinary prose;
+  masking known submitted credential values and configured patterns remains
+  unconditional. A Tool result holding
   one is still sent to the model, with a one-time note per Tool and kind
   in the Run.
   Recorded payloads never leave the data dir except redacted, to the user's
@@ -6149,7 +6441,9 @@ configuration interface): `FORMLESS_DOCS_OPENER_FIXTURE`,
 `FORMLESS_TEST_MAINTENANCE_CONFIG`, `FORMLESS_TEST_MAINTENANCE_DATA`,
 `FORMLESS_TEST_MAINTENANCE_ISOLATION`, `FORMLESS_TEST_MAINTENANCE_OPERATION`,
 `FORMLESS_TEST_OWNERSHIP_CONFIG`, `FORMLESS_TEST_OWNERSHIP_DATA`,
-`FORMLESS_TEST_PANIC_MARKER`.
+`FORMLESS_TEST_PANIC_MARKER`, and `FORMLESS_TEST_DOCTOR_ARGS` (JSON CLI arguments
+for the test-only doctor subprocess, which installs an in-memory credential
+backend before read-only dispatch; the shipped binary does not read this variable).
 
 `FORMLESS_EXPORT_DESCRIPTOR_FIXTURE` is a Linux-only export test hook pointing
 to an owned redirected-stdout alias; it verifies that descriptor output preserves
@@ -6235,6 +6529,39 @@ An already terminal Run exits after replay. Historical terminal Runs without
 stored message boundaries display a Note and the initial Session snapshot only;
 follow never invents a boundary or refreshes that legacy transcript without one.
 Connection loss is an error.
+
+`tools list --filter FILTER` selects one stored-state predicate: `not-retired`
+(including disabled Tools), `retired`, `failing` (known success rate below 0.8),
+`needs-attention`, `off` (disabled) or `pinned`. It combines by AND with
+`--tag TAG`, retaining exact stored-tag matching after the existing argument
+lowercasing/leading-# removal. Unknown rates do not count as failing; states
+may overlap. JSON uses the same selection and existing ToolInfo schema.
+Human output distinguishes an empty registry from no matching rows and names
+the flags to clear. `--show-pinned` adds a human PINNED yes/no column; default
+piped cells and row order remain unchanged. These flags never mutate a Tool.
+
+`prompts diff ID [--json]` reads the existing daemon proposal comparison:
+target, already-applied state and ordered operation/line pairs. Human output
+does not fit or clip lines to terminal width; JSON preserves the complete
+response. This is a hypothetical without/with comparison, not an application
+dry run or guarantee of permission/success. It performs no proposal evaluation
+or decision; unknown IDs retain the standard not-found usage error.
+
+Tool selectors use an exact name or full ID. After a miss, up to three
+ranked partial-name suggestions can help you retry with the original exact
+spelling; these use folded subsequence matching, not edit-distance spelling
+correction. A suggestion never selects or runs a Tool automatically.
+
+`modules list [--json]` reads all ModuleInfo rows, including retired modules.
+`modules show NAME_OR_ID [--json] [--version N]` uses the daemon's existing
+name/full-ID resolution. Default human detail shows metadata, version summaries
+and sorted active Tool dependents without code bodies. `--version N` emits
+exactly that stored source, preserving its existing trailing newline; missing
+versions are usage errors. `--json` returns the complete existing ModuleDetail
+and conflicts with `--version`. Invalid versions/conflicts fail before contact.
+GetModule still fetches every version's code even for metadata-only output;
+client projection does not reduce backend work (see #889). No module mutation
+is exposed by these commands.
 
 `runs show ID [--json]` inspects any stored Run; `runs cancel ID [--json]`
 cancels only that exact active Run, never a later Run in the same Session. IDs

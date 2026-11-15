@@ -350,6 +350,7 @@ mod tests {
                 file: [7; 16],
             }),
             security: Some(vec![1, 2, 3]),
+            unix_metadata: None,
             ..Default::default()
         }
     }
