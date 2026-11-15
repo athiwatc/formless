@@ -102,6 +102,28 @@ touched. Reclamation inventories are `archive-cache-reclamation.json`,
 `archive-static-cache-reclamation.json` and, after all corresponding test
 processes exited successfully, `archive-final-test-cache-reclamation.json`.
 
+## Fresh development artifact
+
+The packager ran with ResourceWarning treated as an error, `--profile dev
+--offline`, from clean `1d97c6f7995f93ced7caa21364a788e4e5f928e1`. Only README
+and evidence documentation differ from tested runtime `77ad3c5`.
+Output: `evidence/gpui-1753-sol/package-1d97c6f`.
+
+- Binary SHA256:
+  `acfee8370c9b6bb53d85f8462563599d0a71109c37c82948456f10dcbe32f3c7`.
+- ZIP SHA256:
+  `094820c8e3d832280c4fe762ccd5eb67f04ae414f1573f1aec67ce3b54769db2`.
+- Provenance/plist identity, safe archive paths/types, integrity, executable
+  mode and byte identity, hashes and 21 system-library loads passed.
+  Evidence: `archive-final-package.log`, `archive-final-package-verification.json`.
+- 655 archive files; 415 packages / 649 notice files; 46 packages lack root
+  notice files. Manual licensing/assets/stdlib review remains.
+- Static signature inspection reports linker ad-hoc signing, no Team ID,
+  an unbound plist and no sealed resources. No app was installed or launched;
+  no distribution signing or notarization occurred.
+
+Earlier bundles/captures remain historical and do not validate this code.
+
 ## Ownership and remaining gates
 
 The same isolated clone and `work/sol-gpui-1753-20261115` branch are used.
