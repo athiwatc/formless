@@ -6523,7 +6523,8 @@ impl Store {
         Ok(rows)
     }
 
-    /// Audit entries for the log view, newest first; `before` pages back.
+    /// Audit entries for the log view, newest first by timestamp then stable id.
+    /// `before` accepts an opaque compound cursor or a legacy timestamp.
     /// `filter` matches the actor, action or detail (case-insensitive);
     /// `-text` leaves matches out; `*` shows everything. With no filter
     /// the decisions show and the per-call `*.run_unasked` records don't
@@ -6534,6 +6535,7 @@ impl Store {
         before: Option<&str>,
         limit: usize,
     ) -> Result<Vec<formless_protocol::AuditEntry>> {
+        let (before_time, before_id) = crate::audit_cursor::decode(before)?;
         let (include, exclude) = match filter.map(str::trim) {
             None | Some("") => (None, Some("run_unasked")),
             Some("*") => (None, None),
@@ -6543,21 +6545,30 @@ impl Store {
             },
         };
         let mut stmt = self.ps(
-            "SELECT actor, action, detail, created_at FROM audit
+            "SELECT actor, action, detail, created_at, id FROM audit
              WHERE (?1 IS NULL OR instr(lower(actor || ' ' || action || ' ' || detail), lower(?1)) > 0)
                AND (?4 IS NULL OR instr(lower(actor || ' ' || action || ' ' || detail), lower(?4)) = 0)
-               AND (?2 IS NULL OR created_at < ?2)
-             ORDER BY created_at DESC, rowid DESC LIMIT ?3",
+               AND (?2 IS NULL OR created_at < ?2 OR (?5 IS NOT NULL AND created_at=?2 AND id < ?5))
+             ORDER BY created_at DESC, id DESC LIMIT ?3",
         )?;
         let rows = stmt
             .query_map(
-                params![include, before, limit.clamp(1, 500) as i64, exclude],
+                params![
+                    include,
+                    before_time,
+                    limit.clamp(1, 500) as i64,
+                    exclude,
+                    before_id
+                ],
                 |r| {
+                    let created_at: String = r.get(3)?;
+                    let id: String = r.get(4)?;
                     Ok(formless_protocol::AuditEntry {
+                        cursor: Some(crate::audit_cursor::encode(&created_at, &id)),
                         actor: r.get(0)?,
                         action: r.get(1)?,
                         detail: r.get(2)?,
-                        created_at: r.get(3)?,
+                        created_at,
                     })
                 },
             )?
@@ -7018,6 +7029,10 @@ pub fn estimate_tokens(text: &str) -> usize {
 }
 
 pub type BuiltContext = (Vec<Value>, bool, i64);
+
+#[cfg(test)]
+#[path = "audit_pagination_tests.rs"]
+mod audit_pagination_tests;
 
 #[cfg(test)]
 #[path = "tool_sequence_names_tests.rs"]
