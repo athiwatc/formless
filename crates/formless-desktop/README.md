@@ -31,6 +31,17 @@ as JSON. A queued copy is bound to the displayed destination, page revision
 and selected entry; selection changes, refresh and open dialogs retire that
 action rather than copying a replacement entry. Loaded-text Search keeps its explicit Session scope.
 
+This window remembers an older reading message for up to 64 Sessions.
+Returning to a Session waits for its accepted canonical snapshot, then returns
+to that message's sequence identity rather than an old row index. If the
+message is missing, it follows latest and says why. Returning to latest before
+leaving forgets the older position. Normal canonical refreshes preserve the
+current reading message when replacement overlaps it. Positions contain no
+transcript or pixel/text-selection offsets; they are not saved across launches,
+and Profile replacement clears them. Modal dialogs, whole-output windows and
+preview-page ranges are not restored. See
+[reading-position evidence](../../docs/desktop/reading-positions-20261115.md).
+
 In the connected Sessions directory, Mark left chooses a comparison's left
 Session without opening it or reading history. Select another entry with the
 arrow keys, then Compare to read stored lineage, whole-message differences,

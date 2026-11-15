@@ -38,6 +38,7 @@ mod comparison;
 mod preferences;
 mod profile_search;
 mod questions;
+mod reading_positions;
 mod sessions;
 mod usage;
 use crate::full_view;
@@ -755,6 +756,9 @@ pub struct Shell {
     /// What had focus when the current overlay came up.
     restore_focus: Option<FocusOrigin>,
     timeline: Entity<MessageScrollerState>,
+    reading_positions: crate::reading_positions::Positions,
+    reading_restore: Option<String>,
+    reading_notice: Option<&'static str>,
     /// A loaded empty snapshot is different from a Session not loaded yet.
     transcript_source: TranscriptSource,
     transcript_state: Option<TranscriptState>,
@@ -1002,6 +1006,9 @@ impl Shell {
             palette_scroll: ScrollHandle::new(),
             restore_focus: None,
             timeline,
+            reading_positions: crate::reading_positions::Positions::default(),
+            reading_restore: None,
+            reading_notice: None,
             transcript_source: TranscriptSource::Fixture,
             transcript_state: None,
             directory,
@@ -1675,6 +1682,9 @@ impl Shell {
     }
 
     fn attach_client(&mut self, client: Client, cx: &mut Context<Self>) {
+        self.reading_positions.clear();
+        self.reading_restore = None;
+        self.reading_notice = None;
         self.retire_session_export_attachment();
         self.reset_comparison(
             "Profile attachment changed. Mark a pair again; nothing was replayed.",
@@ -1981,6 +1991,9 @@ impl Shell {
                         .any(|session| &session.id == id && !session.archived)
                 });
                 if vanished {
+                    if let Some(id) = previous.as_deref() {
+                        self.park_reading_position(id, cx);
+                    }
                     let evicted = previous
                         .as_ref()
                         .map(|id| self.drafts.set(id, &self.accepted_draft))
@@ -1989,6 +2002,11 @@ impl Shell {
                     self.composer_notice = Some(format!("The open Session is no longer available. Its unsent draft was kept for this window. {} older drafts were evicted by the draft retention limit.", evicted.len()).into());
                 }
                 self.client_sessions = sessions;
+                self.reading_positions.retain_available(
+                    self.client_sessions
+                        .iter()
+                        .map(|session| session.id.as_str()),
+                );
 
                 let missing = self
                     .comparison
@@ -2013,6 +2031,8 @@ impl Shell {
                 self.session_sizes = Self::row_sizes(self.sidebar.rows().len(), self.text_scale);
                 self.rebuild_directory(cx);
                 if vanished {
+                    self.reading_restore = None;
+                    self.reading_notice = None;
                     self.invalidate_source_view();
                     self.transcript_state = None;
                     self.transcript_source = TranscriptSource::NotLoaded;
@@ -2033,6 +2053,7 @@ impl Shell {
                 {
                     return;
                 }
+                self.reading_notice = None;
                 let state = if snapshot.running {
                     RunState::Running
                 } else if snapshot
@@ -2076,6 +2097,12 @@ impl Shell {
                     .zip(&snapshot.blocks)
                     .take_while(|(old, new)| old == new)
                     .count();
+                // A replacement overlapping the visible row cannot retain
+                // a positional list anchor. Preserve its persisted identity.
+                let reading = (self.reading_restore.is_none()
+                    && prefix <= self.timeline.read(cx).logical_scroll_top().item_ix)
+                    .then(|| self.current_reading_message(cx))
+                    .flatten();
                 let old_count = self.blocks.borrow().len();
                 let count = snapshot.blocks.len();
                 if prefix != old_count
@@ -2093,7 +2120,11 @@ impl Shell {
                         timeline.splice(prefix..known, count - prefix, cx);
                     });
                     self.invalidate_search(cx);
+                    if let Some(message) = reading {
+                        self.scroll_to_reading_message(message, cx);
+                    }
                 }
+                self.restore_reading_position(cx);
             }
             ClientUpdate::SnapshotError {
                 generation,
@@ -2266,6 +2297,7 @@ impl Shell {
         if self.sidebar.active_id() != Some(snapshot.session_id.as_str()) {
             return Err("the snapshot is not for the open Session");
         }
+        self.reading_notice = None;
         self.invalidate_source_view();
         self.transcript_source = TranscriptSource::Snapshot;
         let (state, blocks) = Transcript::new(snapshot).into_parts();
@@ -2274,6 +2306,7 @@ impl Shell {
         *self.blocks.borrow_mut() = blocks;
         self.timeline
             .update(cx, |timeline, cx| timeline.reset(count, cx));
+        self.restore_reading_position(cx);
         self.invalidate_search(cx);
         cx.notify();
         Ok(())
@@ -3125,8 +3158,9 @@ impl Shell {
     }
 
     /// Open the selected Session in Chat. If it is a different Session, park
-    /// the outgoing draft, restore the incoming one and return the timeline
-    /// to its tail. An overlay that was used to pick it closes.
+    /// the outgoing draft, restore the incoming one and begin loading its
+    /// timeline. A saved reading message is restored after its snapshot arrives.
+    /// An overlay that was used to pick it closes.
     fn activate_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let from_browser = matches!(
             self.destination,
@@ -3135,6 +3169,15 @@ impl Shell {
         let previous = self.sidebar.active_id().map(str::to_string);
         let changed = self.sidebar.activate_selected();
         if changed {
+            if let Some(id) = previous.as_deref() {
+                self.park_reading_position(id, cx);
+            }
+            self.reading_restore = self
+                .sidebar
+                .active_id()
+                .filter(|id| !id.is_empty() && id.len() <= crate::reading_positions::MAX_ID_BYTES)
+                .map(str::to_string);
+            self.reading_notice = None;
             // A full-output view must never outlive its Session/source.
             if self.viewer.take().is_some() {
                 self.restore_focus = None;
@@ -3884,6 +3927,9 @@ impl Shell {
                             .text_color(cx.theme().muted_foreground),
                     ),
             )
+            .when_some(self.reading_notice, |region, notice| {
+                region.child(announced(div().id("reading-position-notice")).test_support().role(Role::Status).aria_value(notice).px_2().py_1().text_xs().child(notice))
+            })
             .when_some(self.block_copy_notice, |region, notice| {
                 region.child(
                     announced(div().id("block-copy-notice"))

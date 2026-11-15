@@ -29,3 +29,5 @@ pub mod snapshot_guard;
 pub mod thai;
 pub mod timeline;
 pub mod transcript;
+
+pub mod reading_positions;
