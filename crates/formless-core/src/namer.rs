@@ -258,16 +258,20 @@ fn trivial(message: &str) -> bool {
 }
 
 /// `text` is already trimmed. A long message keeps the head and the tail
-/// (`MAX_PROMPT_CHARS * 2 / 3` and `MAX_PROMPT_CHARS / 3`).
+/// (one third for the tail, with the separator included in the budget).
 fn shape_naming_text(text: &str) -> String {
     if text.chars().count() <= MAX_PROMPT_CHARS {
         return text.to_string();
     }
-    let head = truncate_chars(text, MAX_PROMPT_CHARS * 2 / 3);
+    let separator = "\n…\n";
     let tail_chars = MAX_PROMPT_CHARS / 3;
+    let head = truncate_chars(
+        text,
+        MAX_PROMPT_CHARS - tail_chars - separator.chars().count(),
+    );
     let skip = text.chars().count() - tail_chars;
     let tail_at = text.char_indices().nth(skip).map_or(text.len(), |(i, _)| i);
-    format!("{head}\n…\n{}", &text[tail_at..])
+    format!("{head}{separator}{}", &text[tail_at..])
 }
 
 /// What to name a Session from (#871): its first substantive user message
@@ -763,7 +767,27 @@ mod tests {
         let selected = naming_text(&["hi".into(), log.clone()]).unwrap();
         assert_eq!(selected, shape_naming_text(&log));
         assert!(selected.ends_with("Private log tail"));
-        assert!(selected.chars().count() <= MAX_PROMPT_CHARS + 3);
+        assert!(selected.chars().count() <= MAX_PROMPT_CHARS);
+    }
+
+    #[test]
+    fn shaped_naming_tail_reaches_every_supported_prompt_intact() {
+        let ending = "Now: summarise the bug above ไทย 日本語 🦀";
+        let long = format!("{}\n{ending}", "context 日本語\n".repeat(200));
+        let shaped = naming_text(&[long]).unwrap();
+        assert!(shaped.chars().count() <= MAX_PROMPT_CHARS);
+        for spec in MODELS {
+            assert!(prompt(spec, &shaped).contains(ending), "{}", spec.id);
+        }
+        for length in [1, MAX_PROMPT_CHARS - 1, MAX_PROMPT_CHARS] {
+            let short = "日".repeat(length);
+            let shaped = naming_text(std::slice::from_ref(&short)).unwrap();
+            assert_eq!(shaped, short);
+            assert_eq!(
+                prompt(&QWEN2_5_0_5B, &shaped),
+                prompt(&QWEN2_5_0_5B, &short)
+            );
+        }
     }
 
     #[test]
@@ -784,7 +808,7 @@ mod tests {
             t.ends_with("Now: summarise the bug above"),
             "the tail is kept"
         );
-        assert!(t.chars().count() <= MAX_PROMPT_CHARS + 3);
+        assert!(t.chars().count() <= MAX_PROMPT_CHARS);
     }
 
     #[test]

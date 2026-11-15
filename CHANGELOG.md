@@ -14,6 +14,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Cron day fields now follow Cronie’s leading-wildcard rule, including
+  `*/N` and mixed lists beginning with `*`. This changes future computed
+  matches and previews for affected existing expressions (for example,
+  `*/1` now has the same day-field flag as `*`); stored expressions are
+  not rewritten.
+
 - `.gitignore` now ignores local agent scratch state (`.opencode/`) and
   automation screenshots (`.screenshots/`), so generated files stop showing up
   as untracked changes. `.screenshots` was already excluded from the Docker
