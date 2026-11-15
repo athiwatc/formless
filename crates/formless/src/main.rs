@@ -12,6 +12,7 @@ mod cli_price_import;
 mod cli_proposal_diff;
 mod cli_routing;
 mod cli_run_identity;
+mod cli_session_report;
 mod cli_session_templates;
 mod cli_tool_diff;
 mod cli_tool_filters;
@@ -5821,37 +5822,14 @@ fn sessions_cmd(paths: Paths, action: SessionsAction) -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&shown)?);
                 return Ok(());
             }
-            if shown.is_empty() && !list.is_empty() && (pinned || tag.is_some()) {
-                let mut filters = Vec::new();
-                if archived {
-                    filters.push("--archived".to_string());
-                }
-                if pinned {
-                    filters.push("--pinned".to_string());
-                }
-                if let Some(tag) = tag {
-                    filters.push(format!("--tag {}", comparison_terminal_text(&tag)));
-                }
+            if shown.is_empty() {
                 println!(
-                    "no Sessions match {} (formless sessions list)",
-                    filters.join(" ")
+                    "{}",
+                    cli_session_report::selection_empty(&list, archived, pinned, tag.as_deref())
                 );
-                return Ok(());
+            } else {
+                cli_session_report::list_table(&shown).print();
             }
-            let mut tbl = Table::new(&["ID", "UPDATED", "MSGS", "NAME", "LAST MESSAGE"]);
-            for s in shown {
-                tbl.row(vec![
-                    t(&s.id[..8.min(s.id.len())], Tone::Dim),
-                    c(s.updated_at.get(..16).unwrap_or(&s.updated_at)),
-                    c(s.message_count.to_string()),
-                    t(
-                        format!("{}{}", if s.pinned { "★ " } else { "" }, s.name),
-                        Tone::Strong,
-                    ),
-                    t(s.preview.clone().unwrap_or_default(), Tone::Dim),
-                ]);
-            }
-            tbl.print();
         }
         SessionsAction::Show { id, json, .. } => {
             let s = find_session(&paths, &id)?;
@@ -5877,6 +5855,7 @@ fn sessions_cmd(paths: Paths, action: SessionsAction) -> Result<()> {
                     .map(|c| format!(" · in {c}"))
                     .unwrap_or_default()
             );
+            print!("{}", cli_session_report::metadata(&s));
             let messages: Vec<formless_protocol::MessageInfo> =
                 serde_json::from_value(r["messages"].clone()).unwrap_or_default();
             for m in messages {
