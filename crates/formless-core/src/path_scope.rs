@@ -13,7 +13,7 @@ const VCS: &[(&str, &str)] = &[
     (".svn", "Subversion"),
     (".pijul", "Pijul"),
     ("_darcs", "Darcs"),
-    (".fossil", "Fossil"),
+    (".fslckout", "Fossil"),
     ("_FOSSIL_", "Fossil"),
 ];
 
@@ -233,6 +233,73 @@ mod tests {
             assert_eq!(c[2].label, kind);
             let _ = std::fs::remove_dir_all(root);
         }
+    }
+
+    #[test]
+    fn fossil_checkout_files_offer_repo_choices() {
+        for marker in [".fslckout", "_FOSSIL_"] {
+            let home = tmp("fossil-home");
+            let root = home.join("checkout");
+            std::fs::create_dir_all(root.join("src")).unwrap();
+            std::fs::write(root.join(marker), "checkout database fixture").unwrap();
+            let file = root.join("src/new.rs");
+            let choices = choices_with_root(
+                file.to_str().unwrap(),
+                Some(&home),
+                canonical_scope,
+                |start| {
+                    enclosing_root_from_dirs(
+                        start.ancestors().take_while(|dir| dir.starts_with(&home)),
+                    )
+                },
+            );
+            assert_eq!(
+                choices
+                    .iter()
+                    .map(|choice| choice.kind.as_str())
+                    .collect::<Vec<_>>(),
+                ["file", "folder", "repo"],
+                "{marker}"
+            );
+            assert_eq!(choices[2].label, "Fossil");
+            assert_eq!(Path::new(&choices[2].path), root);
+            std::fs::remove_dir_all(home).unwrap();
+        }
+    }
+
+    #[test]
+    fn fossil_global_config_is_not_a_checkout_or_a_project_shadow() {
+        let home = tmp("fossil-global");
+        let project = home.join("project");
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        std::fs::write(project.join(".fossil"), "configuration database fixture").unwrap();
+        assert!(enclosing_root_from_dirs(std::iter::once(project.as_path())).is_none());
+        std::fs::remove_file(project.join(".fossil")).unwrap();
+        std::fs::write(
+            home.join(".fossil"),
+            "global configuration database fixture",
+        )
+        .unwrap();
+        std::fs::write(project.join("Cargo.toml"), "").unwrap();
+        let file = project.join("src/new.rs");
+        let choices = choices_with_root(
+            file.to_str().unwrap(),
+            Some(&home),
+            canonical_scope,
+            |start| {
+                enclosing_root_from_dirs(start.ancestors().take_while(|dir| dir.starts_with(&home)))
+            },
+        );
+        assert_eq!(
+            choices
+                .iter()
+                .map(|choice| choice.kind.as_str())
+                .collect::<Vec<_>>(),
+            ["file", "folder", "project"]
+        );
+        assert_eq!(Path::new(&choices[2].path), project);
+        assert_eq!(choices[2].label, "Cargo.toml");
+        std::fs::remove_dir_all(home).unwrap();
     }
 
     #[test]

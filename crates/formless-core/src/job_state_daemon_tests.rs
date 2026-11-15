@@ -409,3 +409,68 @@ async fn job_state_late_completion_cannot_erase_pause_but_normal_or_resumed_jobs
     assert!(!f.job(&once.id).enabled);
     assert_eq!(f.job(&once.id).last_status, "completed");
 }
+
+#[tokio::test]
+async fn history_distinguishes_unknown_jobs_from_empty_and_populated_jobs() {
+    let env = crate::credential_env::EnvGuard::isolated();
+    let fixture = Fixture::new(&env);
+    let daemon = fixture.daemon();
+    let missing = "unknown-ไทย-日本語";
+    let error = daemon
+        .handle(Request::JobRuns {
+            id: missing.into(),
+            limit: None,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.to_string(), format!("no job '{missing}'"));
+    assert!(error.downcast_ref::<RequestFailure>().is_some());
+    let job = daemon
+        .with_store(|st| {
+            st.create_job(
+                "private history fixture",
+                None,
+                None,
+                "2999-01-01T00:00:00Z",
+                false,
+                "user",
+            )
+        })
+        .unwrap();
+    assert_eq!(
+        daemon
+            .handle(Request::JobRuns {
+                id: job.id.clone(),
+                limit: None
+            })
+            .await
+            .unwrap(),
+        json!([])
+    );
+    daemon
+        .with_store(|st| {
+            st.job_run_start(&job.id, None, "schedule", "failed", "รายละเอียด 日本語")?;
+            st.job_run_start(&job.id, None, "manual", "completed", "finished fixture")?;
+            Ok(())
+        })
+        .unwrap();
+    for limit in [None, Some(1), Some(0), Some(999)] {
+        let expected = daemon
+            .with_reader(|st| st.job_runs(&job.id, limit.unwrap_or(20).clamp(1, 500)))
+            .unwrap();
+        let actual = daemon
+            .handle(Request::JobRuns {
+                id: job.id.clone(),
+                limit,
+            })
+            .await
+            .unwrap();
+        assert_eq!(actual, serde_json::to_value(expected).unwrap());
+    }
+    let unchanged = daemon
+        .with_store(|st| st.get_job(&job.id))
+        .unwrap()
+        .unwrap();
+    assert!(!unchanged.enabled);
+    assert!(unchanged.last_run.is_none());
+}

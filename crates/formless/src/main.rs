@@ -1,10 +1,24 @@
+mod cli_artifacts;
 mod cli_attach;
 mod cli_commands;
 #[cfg(test)]
 mod cli_help_tests;
+mod cli_mcp_prompts;
+mod cli_metrics;
+mod cli_models;
+mod cli_modules;
 mod cli_pipeline;
+mod cli_price_import;
+mod cli_proposal_diff;
+mod cli_routing;
 mod cli_run_identity;
+mod cli_session_templates;
+mod cli_tool_filters;
+
+mod cli_runs_list;
+mod cli_tool_lookup;
 mod cli_tool_success;
+mod cli_update;
 #[cfg(test)]
 mod session_export_tests;
 mod table;
@@ -66,15 +80,47 @@ struct Cli {
     cmd: Option<Cmd>,
 }
 
+// Root commands are alphabetical; Clap appends its generated help command.
+// Keep complete variants in this order so help, man and completions agree.
 #[derive(Subcommand)]
 enum Cmd {
-    /// Launch the TUI (default)
-    Tui,
-    /// Manage the background daemon and its login service
-    #[command(after_help = "Examples:\n  formless daemon status\n  formless daemon status --json")]
-    Daemon {
+    /// Every approval grant, and revoking them
+    #[command(
+        after_help = "Examples:\n  formless approvals pending\n  formless approvals list --json"
+    )]
+    Approvals {
         #[command(subcommand)]
-        action: DaemonAction,
+        action: ApprovalsAction,
+    },
+    /// Read stored artifact text by ID (decoded text, not a binary download)
+    #[command(
+        after_help = "Examples:\n  formless artifacts show ARTIFACT_ID\n  formless artifacts show ARTIFACT_ID --offset 0 --length 128 --json\n\nOffsets and lengths count Unicode scalar values; invalid UTF-8 is replaced. The daemon reads and decodes the full source before slicing; a small page does not make that read streaming. JSON bytes is stored byte metadata, not slice length."
+    )]
+    Artifacts {
+        #[command(subcommand)]
+        action: cli_artifacts::Action,
+    },
+    /// Provider credential login/status/logout (API key or OAuth)
+    #[command(
+        after_help = "Examples:\n  formless auth status\n  formless auth status --provider local --json"
+    )]
+    Auth {
+        #[command(subcommand)]
+        action: AuthAction,
+    },
+    /// Back up the database now (kept with the daily ones in <data>/backups)
+    #[command(
+        after_help = "Examples:\n  formless backup list\n  formless backup verify backup.sqlite\n  formless backup drill backup.sqlite"
+    )]
+    Backup {
+        #[command(subcommand)]
+        action: Option<BackupAction>,
+    },
+    /// Write a redacted bug report (doctor, versions, OS, recent log) to attach to an issue
+    BugReport {
+        /// Where to write it (default: ./formless-bug-report-<time>.md)
+        #[arg(short, long)]
+        output: Option<std::path::PathBuf>,
     },
     /// Line-mode chat: no full screen, for dumb terminals, SSH and screen
     /// readers (approvals and questions are answered inline)
@@ -86,28 +132,47 @@ enum Cmd {
         #[arg(long)]
         new: bool,
     },
-    /// Every approval grant, and revoking them
-    #[command(
-        after_help = "Examples:\n  formless approvals pending\n  formless approvals list --json"
-    )]
-    Approvals {
+    /// List local user-defined slash commands without starting a daemon
+    #[command(after_help = "Examples:\n  formless commands list\n  formless commands list --json")]
+    Commands {
         #[command(subcommand)]
-        action: ApprovalsAction,
+        action: cli_commands::Action,
     },
-    /// What the daemon can reach: grants, denials, trusted folders, MCP
-    /// servers, trusted hooks, relay and web UI
-    #[command(
-        after_help = "Examples:\n  formless security status\n  formless security status --json"
-    )]
-    Security {
-        #[command(subcommand)]
-        action: SecurityAction,
+    /// Print a shell completion script (bash, zsh, fish, powershell, elvish)
+    Completions {
+        /// Shell that will load the generated completion script
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
     },
-    /// List or remove profiles (isolated data dirs made with --profile)
-    #[command(after_help = "Examples:\n  formless profiles list\n  formless profiles list --json")]
-    Profiles {
+    /// Settings: get, set (validated by the daemon), edit or locate config.toml
+    #[command(
+        after_help = "Examples:\n  formless config path\n  formless config get provider.model\n  formless config get provider.model --json"
+    )]
+    Config {
         #[command(subcommand)]
-        action: ProfilesAction,
+        action: ConfigAction,
+    },
+    /// Manage the background daemon and its login service
+    #[command(after_help = "Examples:\n  formless daemon status\n  formless daemon status --json")]
+    Daemon {
+        #[command(subcommand)]
+        action: DaemonAction,
+    },
+    /// Open an online guide or read this build's bundled Markdown
+    Docs {
+        /// Guide name to open; omit to open the gallery
+        #[arg(value_parser = DocsTopicParser::new())]
+        topic: Option<String>,
+        /// Print the current online URL (may differ from this build)
+        #[arg(long)]
+        print: bool,
+        /// Print bundled Markdown without a browser, config or daemon
+        #[arg(long, conflicts_with_all = ["print", "keys"])]
+        text: bool,
+        /// Print the keyboard and command reference as Markdown
+        /// (docs/keys.md)
+        #[arg(long, conflicts_with_all = ["topic", "print", "text"])]
+        keys: bool,
     },
     /// Diagnostics: config, dirs, keychain, endpoint probe
     Doctor {
@@ -122,65 +187,36 @@ enum Cmd {
         #[arg(long, conflicts_with = "fix")]
         json: bool,
     },
-    /// Write a redacted bug report (doctor, versions, OS, recent log) to attach to an issue
-    BugReport {
-        /// Where to write it (default: ./formless-bug-report-<time>.md)
+    /// Everything for a new machine in one file: Tools, modules, Skills,
+    /// memories, jobs, providers/Roles/MCP servers (no keys or secrets)
+    ExportAll {
+        /// Include every Session's transcript
+        #[arg(long)]
+        sessions: bool,
+        /// Where to write it (default: ./formless-export-<date>.json)
         #[arg(short, long)]
         output: Option<std::path::PathBuf>,
     },
-    /// List local user-defined slash commands without starting a daemon
-    #[command(after_help = "Examples:\n  formless commands list\n  formless commands list --json")]
-    Commands {
-        #[command(subcommand)]
-        action: cli_commands::Action,
-    },
-    /// Skills: SKILL.md know-how the agent loads on demand (SPEC §7.10)
-    #[command(
-        after_help = "Examples:\n  formless skills list\n  formless skills show example-skill"
-    )]
-    Skills {
-        #[command(subcommand)]
-        action: SkillsAction,
-    },
-    /// Open the web UI from this machine's daemon on 127.0.0.1 (SPEC §12)
-    Web {
-        /// Port (default: a free one)
+    /// Free disk space: old artifacts and snapshots, long MCP logs, old
+    /// migration copies, database free space
+    Gc {
+        /// List what would be freed without removing anything
         #[arg(long)]
-        port: Option<u16>,
-        /// Print the one-time link instead of opening a browser
-        #[arg(long)]
-        no_open: bool,
-        /// Stop serving the web UI
-        #[arg(long, conflicts_with_all = ["port", "no_open"])]
-        stop: bool,
+        dry_run: bool,
     },
-    /// Extra model providers (SPEC §4.5)
+    /// Load a file from `formless export-all` (adds; never overwrites)
+    ImportAll {
+        /// Path to a bundle produced by export-all
+        file: std::path::PathBuf,
+    },
+    /// Scheduled jobs: prompts that run later or on a cron (SPEC §9.7)
     #[command(
-        after_help = "Examples:\n  formless providers list\n  formless providers test local"
+        after_help = "Examples:\n  formless jobs list\n  formless jobs history JOB_ID --json"
     )]
-    Providers {
+    Jobs {
         #[command(subcommand)]
-        action: ProvidersAction,
+        action: JobsAction,
     },
-    /// Model prices for spending limits and cost (provider.prices)
-    #[command(
-        after_help = "Examples:\n  formless prices import --dry-run\n  formless prices import --provider local --dry-run"
-    )]
-    Prices {
-        #[command(subcommand)]
-        action: PricesAction,
-    },
-    /// Sessions: list, show, search, rename, delete, export or import them
-    #[command(
-        after_help = "Examples:\n  formless sessions list\n  formless sessions show SESSION_ID\n  formless sessions export SESSION_ID --format markdown"
-    )]
-    Sessions {
-        #[command(subcommand)]
-        action: SessionsAction,
-    },
-    /// Print the man page (roff), for packaging: `formless man > formless.1`
-    #[command(hide = true)]
-    Man,
     /// Show the daemon log (daemon.log and its rotated files)
     Logs {
         /// Keep printing new lines as they're written
@@ -196,47 +232,16 @@ enum Cmd {
         #[arg(short = 'n', long, default_value_t = 200)]
         lines: usize,
     },
-    /// Print a shell completion script (bash, zsh, fish, powershell, elvish)
-    Completions {
-        /// Shell that will load the generated completion script
-        #[arg(value_enum)]
-        shell: clap_complete::Shell,
-    },
-    /// Settings: get, set (validated by the daemon), edit or locate config.toml
+    /// Print the man page (roff), for packaging: `formless man > formless.1`
+    #[command(hide = true)]
+    Man,
+    /// External MCP servers (SPEC §7.9)
     #[command(
-        after_help = "Examples:\n  formless config path\n  formless config get provider.model"
+        after_help = "Examples:\n  formless mcp list\n  formless mcp catalog\n  formless mcp tools SERVER_NAME\n  formless mcp prompts --json\n  formless mcp prompt SERVER NAME --arg key=value"
     )]
-    Config {
+    Mcp {
         #[command(subcommand)]
-        action: ConfigAction,
-    },
-    /// Roles: a purpose mapped to a provider + model (SPEC §4.5)
-    #[command(after_help = "Examples:\n  formless roles list\n  formless roles list --json")]
-    Roles {
-        #[command(subcommand)]
-        action: RolesAction,
-    },
-    /// Scheduled jobs: prompts that run later or on a cron (SPEC §9.7)
-    #[command(
-        after_help = "Examples:\n  formless jobs list\n  formless jobs history JOB_ID --json"
-    )]
-    Jobs {
-        #[command(subcommand)]
-        action: JobsAction,
-    },
-    /// Recent Runs and their outcomes: steps, tool calls, tokens (SPEC §8.7)
-    #[command(
-        after_help = "Examples:\n  formless runs --limit 10\n  formless runs show RUN_ID --json"
-    )]
-    Runs {
-        #[command(subcommand)]
-        action: Option<cli_attach::RunsAction>,
-        /// Maximum number of recent Runs to list
-        #[arg(long, default_value_t = 20)]
-        limit: usize,
-        /// Print machine-readable JSON instead of human-readable output
-        #[arg(long)]
-        json: bool,
+        action: McpAction,
     },
     /// User memory: notes the agent keeps about your preferences (SPEC §7.11)
     #[command(after_help = "Examples:\n  formless memory list\n  formless memory list --json")]
@@ -244,52 +249,31 @@ enum Cmd {
         #[command(subcommand)]
         action: MemoryAction,
     },
-    /// External MCP servers (SPEC §7.9)
+    /// Read recorded model, Tool and built-in metrics without a model call
     #[command(
-        after_help = "Examples:\n  formless mcp list\n  formless mcp catalog\n  formless mcp tools SERVER_NAME"
+        after_help = "Examples:\n  formless metrics --since 7d\n  formless metrics --json\n\nTool rows identify stored tool_id values. Reports are independent reads at one cutoff, not a transactional snapshot."
     )]
-    Mcp {
-        #[command(subcommand)]
-        action: McpAction,
-    },
-    /// Provider credential login/status/logout (API key or OAuth)
-    #[command(
-        after_help = "Examples:\n  formless auth status\n  formless auth status --provider local --json"
-    )]
-    Auth {
-        #[command(subcommand)]
-        action: AuthAction,
-    },
-    /// Hosted relay + web frontend (SPEC §12, v2)
-    #[command(
-        after_help = "Examples:\n  formless relay status --json\n  formless relay status --qr"
-    )]
-    Relay {
-        #[command(subcommand)]
-        action: RelayAction,
-    },
-    /// Prompt/memory self-optimisation proposals
-    #[command(after_help = "Examples:\n  formless prompts list\n  formless prompts list --json")]
-    Prompts {
-        #[command(subcommand)]
-        action: PromptsAction,
-    },
-    /// Check for a newer release, show what changed, and how to upgrade
-    #[command(after_help = "Examples:\n  formless update check\n  formless update --check")]
-    Update {
-        #[command(subcommand)]
-        action: Option<UpdateAction>,
-        /// Only report (same as `update check`)
+    Metrics {
+        /// Only records since this duration ago (7d, 24h, 1h30m); omitted: all history
+        #[arg(long, value_name = "DURATION", value_parser = parse_since_cutoff)]
+        since: Option<String>,
+        /// Print all three complete replies as one JSON object
         #[arg(long)]
-        check: bool,
+        json: bool,
     },
-    /// Tool registry inspection/transfer (SPEC §7.8, §12)
-    #[command(
-        after_help = "Examples:\n  formless tools list\n  formless tools show TOOL_NAME --json\n  formless tools export TOOL_NAME --output tool.json"
-    )]
-    Tools {
+    /// List the default provider's endpoint models and existing picker report
+    #[command(after_help = "Examples:\n  formless models list\n  formless models list --json")]
+    Models {
         #[command(subcommand)]
-        action: ToolsAction,
+        action: cli_models::Action,
+    },
+    /// Read the module inventory, metadata and stored source versions
+    #[command(
+        after_help = "Examples:\n  formless modules list --json\n  formless modules show MODULE_NAME\n  formless modules show MODULE_NAME --version 1"
+    )]
+    Modules {
+        #[command(subcommand)]
+        action: cli_modules::Action,
     },
     /// Embedded session-naming model: status, install, try it out
     #[command(
@@ -299,54 +283,49 @@ enum Cmd {
         #[command(subcommand)]
         action: NamingAction,
     },
-    /// Open the guides in a browser
-    Docs {
-        /// Guide name to open; omit to open the gallery
-        #[arg(value_parser = DocsTopicParser::new())]
-        topic: Option<String>,
-        /// Print the URL instead of opening it
-        #[arg(long)]
-        print: bool,
-        /// Print the keyboard and command reference as Markdown
-        /// (docs/keys.md)
-        #[arg(long, conflicts_with_all = ["topic", "print"])]
-        keys: bool,
-    },
-    /// Disk used by Sessions, artifacts, Tool versions, logs, backups
-    Storage {
-        /// Print machine-readable JSON instead of human-readable output
-        #[arg(long)]
-        json: bool,
-    },
-    /// Free disk space: old artifacts and snapshots, long MCP logs, old
-    /// migration copies, database free space
-    Gc {
-        /// List what would be freed without removing anything
-        #[arg(long)]
-        dry_run: bool,
-    },
-    /// Back up the database now (kept with the daily ones in <data>/backups)
+    /// Model prices for spending limits and cost (provider.prices)
     #[command(
-        after_help = "Examples:\n  formless backup list\n  formless backup verify backup.sqlite\n  formless backup drill backup.sqlite"
+        after_help = "Examples:\n  formless prices import --dry-run\n  formless prices import --provider local --dry-run"
     )]
-    Backup {
+    Prices {
         #[command(subcommand)]
-        action: Option<BackupAction>,
+        action: PricesAction,
     },
-    /// Everything for a new machine in one file: Tools, modules, Skills,
-    /// memories, jobs, providers/Roles/MCP servers (no keys or secrets)
-    ExportAll {
-        /// Include every Session's transcript
+    /// List or remove profiles (isolated data dirs made with --profile)
+    #[command(after_help = "Examples:\n  formless profiles list\n  formless profiles list --json")]
+    Profiles {
+        #[command(subcommand)]
+        action: ProfilesAction,
+    },
+    /// Prompt/memory self-optimisation proposals
+    #[command(
+        after_help = "Examples:\n  formless prompts list\n  formless prompts list --json\n  formless prompts diff PROPOSAL_ID --json"
+    )]
+    Prompts {
+        #[command(subcommand)]
+        action: PromptsAction,
+    },
+    /// Extra model providers (SPEC §4.5)
+    #[command(
+        after_help = "Examples:\n  formless providers list\n  formless providers test local"
+    )]
+    Providers {
+        #[command(subcommand)]
+        action: ProvidersAction,
+    },
+    /// Hosted relay + web frontend (SPEC §12, v2)
+    #[command(
+        after_help = "Examples:\n  formless relay status --json\n  formless relay status --qr"
+    )]
+    Relay {
+        #[command(subcommand)]
+        action: RelayAction,
+    },
+    /// Wipe config, keychain entry, and the entire data dir (SPEC §15)
+    Reset {
+        /// Skip the interactive reset confirmation
         #[arg(long)]
-        sessions: bool,
-        /// Where to write it (default: ./formless-export-<date>.json)
-        #[arg(short, long)]
-        output: Option<std::path::PathBuf>,
-    },
-    /// Load a file from `formless export-all` (adds; never overwrites)
-    ImportAll {
-        /// Path to a bundle produced by export-all
-        file: std::path::PathBuf,
+        force: bool,
     },
     /// Replace the database with a backup (stop the daemon first); the
     /// current one is saved next to the backups
@@ -354,26 +333,17 @@ enum Cmd {
         /// Path to the database backup to restore
         file: std::path::PathBuf,
     },
-    /// Remove Formless from this machine: stop the daemon, remove the login
-    /// service, delete keychain entries and every profile's data, and the
-    /// binary (SPEC §15)
-    Uninstall {
-        /// Keep Sessions, Tools and config (remove only the service,
-        /// secrets and binary)
-        #[arg(long)]
-        keep_data: bool,
-        /// Leave the binary in place
-        #[arg(long)]
-        keep_binary: bool,
-        /// Don't ask for confirmation (required when not on a terminal)
-        #[arg(long, short, visible_alias = "force")]
-        yes: bool,
+    /// Roles: a purpose mapped to a provider + model (SPEC §4.5)
+    #[command(after_help = "Examples:\n  formless roles list\n  formless roles list --json")]
+    Roles {
+        #[command(subcommand)]
+        action: RolesAction,
     },
-    /// Wipe config, keychain entry, and the entire data dir (SPEC §15)
-    Reset {
-        /// Skip the interactive reset confirmation
+    /// Read the daemon's currently available routing decisions without a model call
+    Routing {
+        /// Print the complete daemon reply as one JSON value
         #[arg(long)]
-        force: bool,
+        json: bool,
     },
     /// Headless single Run (SPEC §12). Approvals fail closed unless --yes.
     /// A message queued while an earlier Run closes exits 2 without a
@@ -440,6 +410,115 @@ enum Cmd {
         #[command(flatten)]
         pipeline: cli_pipeline::Args,
     },
+    /// Recent Runs and their outcomes: steps, tool calls, tokens (SPEC §8.7)
+    #[command(
+        after_help = "Examples:\n  formless runs --limit 10\n  formless runs show RUN_ID --json"
+    )]
+    Runs {
+        #[command(subcommand)]
+        action: Option<cli_attach::RunsAction>,
+        /// Maximum number of recent Runs to list
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Print machine-readable JSON instead of human-readable output
+        #[arg(long)]
+        json: bool,
+    },
+    /// What the daemon can reach: grants, denials, trusted folders, MCP
+    /// servers, trusted hooks, relay and web UI
+    #[command(
+        after_help = "Examples:\n  formless security status\n  formless security status --json"
+    )]
+    Security {
+        #[command(subcommand)]
+        action: SecurityAction,
+    },
+    /// Sessions: list, show, search, rename, delete, export or import them
+    #[command(
+        after_help = "Examples:\n  formless sessions list\n  formless sessions show SESSION_ID\n  formless sessions export SESSION_ID --format markdown"
+    )]
+    Sessions {
+        #[command(subcommand)]
+        action: SessionsAction,
+    },
+    /// Skills: SKILL.md know-how the agent loads on demand (SPEC §7.10)
+    #[command(
+        after_help = "Examples:\n  formless skills list\n  formless skills show example-skill"
+    )]
+    Skills {
+        #[command(subcommand)]
+        action: SkillsAction,
+    },
+    /// Disk used by Sessions, artifacts, Tool versions, logs, backups
+    Storage {
+        /// Print machine-readable JSON instead of human-readable output
+        #[arg(long)]
+        json: bool,
+    },
+    /// Tool registry inspection/transfer (SPEC §7.8, §12)
+    #[command(
+        after_help = "Examples:\n  formless tools list\n  formless tools list --filter not-retired --tag work --show-pinned\n  formless tools show TOOL_NAME --json\n  formless tools export TOOL_NAME --output tool.json"
+    )]
+    Tools {
+        #[command(subcommand)]
+        action: ToolsAction,
+    },
+    /// Launch the TUI (default)
+    #[command(
+        after_help = "Examples:\n  formless tui --new\n  formless tui -c\n  formless tui --plain"
+    )]
+    Tui {
+        /// Use the existing line-oriented screen-reader client
+        #[arg(long)]
+        plain: bool,
+        /// Open the most recently active Session; conflicts with --new
+        #[arg(short = 'c', long = "continue", conflicts_with = "new")]
+        continue_last: bool,
+        /// Start a fresh Session; conflicts with --continue
+        #[arg(long)]
+        new: bool,
+    },
+    /// Remove Formless from this machine: stop the daemon, remove the login
+    /// service, delete keychain entries and every profile's data, and the
+    /// binary (SPEC §15)
+    Uninstall {
+        /// Keep Sessions, Tools and config (remove only the service,
+        /// secrets and binary)
+        #[arg(long)]
+        keep_data: bool,
+        /// Leave the binary in place
+        #[arg(long)]
+        keep_binary: bool,
+        /// Don't ask for confirmation (required when not on a terminal)
+        #[arg(long, short, visible_alias = "force")]
+        yes: bool,
+    },
+    /// Check for a newer release, show what changed, and how to upgrade
+    #[command(
+        after_help = "Examples:\n  formless update check\n  formless update --check\n  formless update check --json\n\nJSON: {installed, status, newer_releases: [{tag, url, notes}]}. Status is update_available, up_to_date (within the fetched page), or release_check_unavailable (HTTP 404 status). Checks never execute an updater."
+    )]
+    Update {
+        #[command(subcommand)]
+        action: Option<UpdateAction>,
+        /// Only report (same as `update check`)
+        #[arg(long)]
+        check: bool,
+        /// One JSON report with installed version, response status and ordered release notes
+        #[arg(long, global = true)]
+        json: bool,
+    },
+    /// Open the web UI from this machine's daemon on 127.0.0.1 (SPEC §12)
+    Web {
+        /// Port (default: a free one)
+        #[arg(long)]
+        port: Option<u16>,
+        /// Print the one-time link instead of opening a browser
+        #[arg(long)]
+        no_open: bool,
+        /// Stop serving the web UI
+        #[arg(long, conflicts_with_all = ["port", "no_open"])]
+        stop: bool,
+    },
 }
 
 #[derive(clap::Subcommand)]
@@ -500,14 +579,36 @@ enum AuthAction {
 
 /// The pairing link as a terminal QR code, for a phone's camera; only on a
 /// terminal (it holds the secret, so it never goes into a pipe or a log).
+fn pairing_qr_columns(lines: &[String]) -> usize {
+    use unicode_width::UnicodeWidthStr;
+    lines.iter().map(|line| line.width()).max().unwrap_or(0)
+}
+
+fn pairing_qr_fits(lines: &[String], width: Option<u16>) -> bool {
+    !lines.is_empty() && width.is_some_and(|width| pairing_qr_columns(lines) <= width as usize)
+}
+
 fn print_pairing_qr(url: &str) {
     use std::io::IsTerminal;
     if !std::io::stdout().is_terminal() || !table::color_allowed() {
         return;
     }
-    if let Some(code) = formless_tui::qr::ansi(url) {
+    if let Some(lines) = formless_tui::qr::lines(url) {
+        let width = crossterm::terminal::size().ok().map(|(width, _)| width);
+        if !pairing_qr_fits(&lines, width) {
+            if width.is_some() {
+                println!("Widen the terminal to at least {} columns to show the pairing QR code, or open the link above.", pairing_qr_columns(&lines));
+            } else {
+                println!(
+                    "Open the link above; terminal width is unavailable for the pairing QR code."
+                );
+            }
+            return;
+        }
         println!();
-        print!("{code}");
+        for line in lines {
+            println!("\x1b[97;40m{line}\x1b[0m");
+        }
         println!("            Scan with your phone. This code contains the pairing secret:");
         println!(
             "            anyone who sees it can use your daemon. Rotate with --rotate if it leaks."
@@ -552,6 +653,14 @@ enum UpdateAction {
 
 #[derive(Subcommand)]
 enum PromptsAction {
+    /// Show the existing proposal comparison without applying it
+    Diff {
+        /// ID of the prompt or memory proposal to compare
+        id: String,
+        /// Print the complete daemon response as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// List proposals with eval scores
     List {
         /// One JSON value instead of a table
@@ -598,6 +707,12 @@ enum ToolsAction {
         /// Only Tools with this tag
         #[arg(long)]
         tag: Option<String>,
+        /// Select a stored-state predicate, combined with the exact tag by AND
+        #[arg(long, value_enum)]
+        filter: Option<cli_tool_filters::Filter>,
+        /// Add a PINNED column to human output (changes the displayed layout)
+        #[arg(long)]
+        show_pinned: bool,
     },
     /// Switch a Tool off: hidden from the agent and uncallable, nothing else changes
     Disable {
@@ -908,7 +1023,7 @@ enum JobsAction {
             required_unless_present = "at"
         )]
         cron: Option<String>,
-        /// Once: "in 30m", "tomorrow at 9am" or a time
+        /// Once: relative offset ("in 30m", "2h"), local YYYY-MM-DD HH:MM, or RFC 3339
         #[arg(long)]
         at: Option<String>,
         /// Run in this Session (default: a new Session each time)
@@ -1007,6 +1122,14 @@ enum MemoryAction {
     },
 }
 
+fn parse_mcp_log_lines(value: &str) -> std::result::Result<usize, String> {
+    value
+        .parse::<usize>()
+        .ok()
+        .filter(|lines| (1..=1000).contains(lines))
+        .ok_or_else(|| "--lines must be between 1 and 1000".into())
+}
+
 #[derive(Subcommand)]
 enum McpAction {
     /// Add a server: `add NAME -- COMMAND [ARGS]` (stdio), `add NAME --url
@@ -1081,14 +1204,39 @@ enum McpAction {
     Log {
         /// Configured MCP server name
         name: String,
-        /// Maximum number of recent stderr log lines to show
-        #[arg(long, default_value_t = 50)]
+        /// Recent stderr log lines to show (minimum 1, maximum 1000)
+        #[arg(long, default_value_t = 50, value_parser = parse_mcp_log_lines)]
         lines: usize,
     },
     /// A server's tools, on or off, with their token cost
     Tools {
         /// Configured MCP server name
         name: String,
+    },
+    /// Report prompts from reachable enabled servers (discovery may be incomplete)
+    #[command(
+        long_about = "Report prompts through live daemon MCP connections. This can start configured servers; disabled or unreachable servers and discovery failures are skipped, so discovery may be incomplete."
+    )]
+    Prompts {
+        /// Preserve the full daemon discovery array as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Retrieve a live server prompt as the daemon's text projection (no Session submission)
+    #[command(
+        long_about = "Retrieve a live prompt through the daemon; this can start the configured server and sends named string arguments to it. Output is the daemon's text projection: content.text strings joined by blank lines, without roles or non-text parts. JSON preserves this text report, not raw MCP messages. Server/daemon errors are preserved; no local required/unknown argument check is promised."
+    )]
+    Prompt {
+        /// Configured MCP server name
+        server: String,
+        /// Complete prompt identifier reported by the server
+        name: String,
+        /// Named string argument KEY=VALUE (repeatable; empty values and extra equals are preserved)
+        #[arg(long = "arg", value_parser = cli_mcp_prompts::parse_arg)]
+        args: Vec<cli_mcp_prompts::NamedArg>,
+        /// Preserve the complete daemon text report as JSON
+        #[arg(long)]
+        json: bool,
     },
     /// Turn one of a server's tools on or off
     Tool {
@@ -1115,7 +1263,8 @@ enum NamingAction {
     },
     /// Download the model (default: the configured one)
     Pull {
-        /// Model id: qwen2.5-0.5b or lfm2.5-350m
+        /// Model ID to download; omit to use the configured model
+        #[arg(value_parser = NamingModelParser::new())]
         model: Option<String>,
     },
     /// Print the title the namer would give a first message
@@ -1638,25 +1787,103 @@ impl clap::builder::TypedValueParser for DocsTopicParser {
     }
 }
 
-fn docs_cmd(topic: Option<&str>, print: bool, keys: bool) -> Result<()> {
-    if keys {
-        print!("{}", formless_tui::keys_reference());
-        return Ok(());
+#[derive(Clone)]
+struct NamingModelParser(clap::builder::StringValueParser);
+
+impl NamingModelParser {
+    fn new() -> Self {
+        Self(clap::builder::StringValueParser::new())
     }
-    let url = formless_core::docs::resolve(topic).map_err(|error| {
-        let topics = formless_core::docs::TOPICS
+}
+
+impl clap::builder::TypedValueParser for NamingModelParser {
+    type Value = String;
+
+    fn parse_ref(
+        &self,
+        cmd: &clap::Command,
+        arg: Option<&clap::Arg>,
+        value: &std::ffi::OsStr,
+    ) -> Result<String, clap::Error> {
+        let value = self.0.parse_ref(cmd, arg, value)?;
+        if formless_core::namer::spec(&value).is_some() {
+            return Ok(value);
+        }
+        let choices = formless_core::namer::MODELS
             .iter()
-            .map(|(name, _, what)| format!("  {name:<16} {what}"))
+            .map(|model| model.id)
             .collect::<Vec<_>>()
-            .join("\n");
-        usage(format!("{error}\n\nTOPIC            WHAT\n{topics}"))
-    })?;
-    if print || !formless_core::docs::open_url(&url) {
-        println!("{url}");
-    } else {
-        println!("opened {url}");
+            .join(", ");
+        Err(cmd.clone().error(
+            clap::error::ErrorKind::InvalidValue,
+            format!("unknown naming model '{value}'; valid model IDs: {choices}"),
+        ))
     }
-    Ok(())
+
+    fn possible_values(
+        &self,
+    ) -> Option<Box<dyn Iterator<Item = clap::builder::PossibleValue> + '_>> {
+        Some(Box::new(
+            formless_core::namer::MODELS
+                .iter()
+                .map(|model| clap::builder::PossibleValue::new(model.id)),
+        ))
+    }
+}
+
+fn docs_cmd(topic: Option<&str>, print: bool, keys: bool, text: bool) -> Result<()> {
+    let result: Result<()> = (|| {
+        let mut out = std::io::stdout().lock();
+        if keys {
+            write!(out, "{}", formless_tui::keys_reference())?;
+            return Ok(());
+        }
+        let url = formless_core::docs::resolve(topic).map_err(|error| {
+            let topics = formless_core::docs::TOPICS
+                .iter()
+                .map(|(name, _, what)| format!("  {name:<16} {what}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            usage(format!("{error}\n\nTOPIC            WHAT\n{topics}"))
+        })?;
+        if print {
+            writeln!(out, "{url}")?;
+        } else if text {
+            write!(out, "{}", formless_core::docs::text(topic)?)?;
+        } else {
+            let guide = formless_core::docs::present(topic, false)?;
+            if let Some(body) = guide.text {
+                writeln!(
+                    out,
+                    "Bundled guide (Formless {}).\n",
+                    env!("CARGO_PKG_VERSION")
+                )?;
+                write!(out, "{body}")?;
+                if !body.ends_with('\n') {
+                    writeln!(out)?;
+                }
+                writeln!(
+                    out,
+                    "\nCurrent online copy (may differ from this build): {}",
+                    guide.url
+                )?;
+            } else {
+                writeln!(out, "opened current online copy: {}", guide.url)?;
+            }
+        }
+        Ok(())
+    })();
+    match result {
+        // Readers such as `head` may finish before the full bundled SPEC.
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::BrokenPipe) =>
+        {
+            Ok(())
+        }
+        result => result,
+    }
 }
 
 fn main() {
@@ -1667,16 +1894,49 @@ fn main() {
     }
 }
 
-fn run_cli(cli: Cli) -> Result<()> {
+fn validate_mcp_prompt_args(cli: &Cli) -> Result<()> {
+    if let Some(Cmd::Mcp {
+        action: McpAction::Prompt { args, .. },
+    }) = &cli.cmd
+    {
+        cli_mcp_prompts::arguments(args)?;
+    }
+    Ok(())
+}
+
+fn validate_tui_start(cli: &mut Cli) -> Result<()> {
+    if let Some(Cmd::Tui {
+        plain,
+        continue_last,
+        new,
+    }) = &cli.cmd
+    {
+        cli.plain |= *plain;
+        cli.continue_last |= *continue_last;
+        cli.new |= *new;
+    }
+    if cli.continue_last && cli.new {
+        return Err(usage(
+            "--continue and --new cannot be used together, including across tui",
+        ));
+    }
     // The TUI's own flags mean nothing to other commands (#897).
-    if !matches!(cli.cmd, None | Some(Cmd::Tui)) && (cli.plain || cli.continue_last || cli.new) {
+    if !matches!(cli.cmd, None | Some(Cmd::Tui { .. }))
+        && (cli.plain || cli.continue_last || cli.new)
+    {
         return Err(usage(
             "--plain, -c/--continue and --new start the TUI; use them without a command (or `formless tui`)",
         ));
     }
+    Ok(())
+}
+
+fn run_cli(mut cli: Cli) -> Result<()> {
+    validate_tui_start(&mut cli)?;
     // Export usage errors must precede profile setup, Session lookup and any
     // daemon connection. sessions_cmd validates again for direct callers.
     validate_cli_export_format(&cli)?;
+    validate_mcp_prompt_args(&cli)?;
     // The daemon logs warnings and info to daemon.log (`formless logs`);
     // other commands only errors. RUST_LOG overrides both. Colour codes
     // only on a terminal, never into the log file.
@@ -1698,8 +1958,14 @@ fn run_cli(cli: Cli) -> Result<()> {
             .init();
     }
     // Documentation needs no profile/config/daemon, even for invalid topics.
-    if let Some(Cmd::Docs { topic, print, keys }) = &cli.cmd {
-        return docs_cmd(topic.as_deref(), *print, *keys);
+    if let Some(Cmd::Docs {
+        topic,
+        print,
+        keys,
+        text,
+    }) = &cli.cmd
+    {
+        return docs_cmd(topic.as_deref(), *print, *keys, *text);
     }
     // Completions and the man page need nothing else: no profile, config
     // or daemon.
@@ -1954,8 +2220,8 @@ fn run_cli(cli: Cli) -> Result<()> {
             .unwrap_or_default(),
     );
     match cli.cmd {
-        None | Some(Cmd::Tui) if cli.plain => formless_tui::plain::run(paths),
-        None | Some(Cmd::Tui) => formless_tui::run_with(
+        None | Some(Cmd::Tui { .. }) if cli.plain => formless_tui::plain::run(paths),
+        None | Some(Cmd::Tui { .. }) => formless_tui::run_with(
             paths,
             match (cli.continue_last, cli.new) {
                 (true, _) => Some("last"),
@@ -1987,6 +2253,15 @@ fn run_cli(cli: Cli) -> Result<()> {
         Some(Cmd::BugReport { output }) => bug_report(&paths, output),
         Some(Cmd::Mcp { action }) => mcp_cmd(paths, action),
         Some(Cmd::Skills { action }) => skills_cmd(paths, action),
+        Some(Cmd::Artifacts { action }) => cli_artifacts::run(&paths, action),
+        Some(Cmd::Models { action }) => {
+            let code = cli_models::run(&paths, action)?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
+        Some(Cmd::Modules { action }) => cli_modules::run(&paths, action),
         Some(Cmd::Memory { action }) => memory_cmd(paths, action),
         Some(Cmd::Runs {
             limit,
@@ -1997,6 +2272,18 @@ fn run_cli(cli: Cli) -> Result<()> {
             None => runs_cmd(paths, limit, json),
         },
         Some(Cmd::Jobs { action }) => jobs_cmd(paths, action),
+        Some(Cmd::Metrics { since, json }) => {
+            formless_core::daemon::ensure_daemon(&paths)?;
+            cli_metrics::write_report(&mut std::io::stdout().lock(), since, json, |request| {
+                formless_tui::client::request_once(&paths, request)
+            })
+        }
+        Some(Cmd::Routing { json }) => {
+            formless_core::daemon::ensure_daemon(&paths)?;
+            cli_routing::write_report(&mut std::io::stdout().lock(), json, |request| {
+                formless_tui::client::request_once(&paths, request)
+            })
+        }
         Some(Cmd::Security {
             action: SecurityAction::Status { json },
         }) => {
@@ -2031,9 +2318,11 @@ fn run_cli(cli: Cli) -> Result<()> {
         Some(Cmd::Auth { action }) => auth_cmd(paths, action),
         Some(Cmd::Relay { action }) => relay_cmd(paths, action),
         Some(Cmd::Prompts { action }) => prompts_cmd(paths, action),
-        Some(Cmd::Update { action, check }) => {
-            update_cmd(check || matches!(action, Some(UpdateAction::Check)))
-        }
+        Some(Cmd::Update {
+            action,
+            check,
+            json,
+        }) => update_cmd(check || matches!(action, Some(UpdateAction::Check)), json),
         Some(Cmd::Tools { action }) => tools_cmd(paths, action),
         Some(Cmd::Naming { action }) => naming_cmd(paths, action),
         Some(Cmd::Reset { force }) => reset_cmd(paths, force),
@@ -2043,7 +2332,12 @@ fn run_cli(cli: Cli) -> Result<()> {
             yes,
         }) => uninstall_cmd(&paths, keep_data, keep_binary, yes),
         Some(Cmd::Storage { json }) => storage_cmd(&paths, json),
-        Some(Cmd::Docs { topic, print, keys }) => docs_cmd(topic.as_deref(), print, keys),
+        Some(Cmd::Docs {
+            topic,
+            print,
+            keys,
+            text,
+        }) => docs_cmd(topic.as_deref(), print, keys, text),
         Some(Cmd::Gc { dry_run }) => gc_cmd(&paths, dry_run),
         Some(Cmd::Backup { action }) => match action {
             None => backup_cmd(&paths),
@@ -2384,55 +2678,22 @@ const INSTALL_COMMAND: &str = concat!(
 
 /// `formless update`: what's newer than this build and what changed in
 /// each release, then how to upgrade (`--check` stops after the report).
-fn update_cmd(check: bool) -> Result<()> {
-    let current = env!("CARGO_PKG_VERSION");
-    let body = match update_http::get(
-        "https://api.github.com/repos/athiwatc/formless/releases?per_page=50",
-    ) {
-        Ok(b) => b,
-        Err(e) if e.to_string().contains("404") => {
-            println!("installed: v{current}");
-            println!("latest:    (no published releases yet)");
-            return Ok(());
-        }
-        Err(e) => return Err(e),
-    };
-    let releases: Value = serde_json::from_str(&body).context("parse releases")?;
-    let newer = newer_releases(&releases, current);
-    println!("installed: v{current}");
-    let Some((latest, _, url)) = newer.last() else {
-        println!("up to date");
-        return Ok(());
-    };
-    println!("latest:    {latest}  ({url})");
-    println!();
-    for (tag, notes, _) in &newer {
-        println!("── {tag} ──");
-        println!(
-            "{}",
-            if notes.is_empty() {
-                "(no release notes)"
-            } else {
-                notes
-            }
-        );
-        println!();
-    }
-    if check {
-        println!(
-            "{} newer release(s); `formless update` shows how to upgrade.",
-            newer.len()
-        );
-    } else {
-        println!("To upgrade to {latest}:\n  {}", upgrade_command());
-    }
-    Ok(())
+fn update_cmd(check: bool, json: bool) -> Result<()> {
+    cli_update::report(
+        &mut std::io::stdout().lock(),
+        check,
+        json,
+        env!("CARGO_PKG_VERSION"),
+        upgrade_command(),
+        || update_http::get("https://api.github.com/repos/athiwatc/formless/releases?per_page=50"),
+    )
 }
 
 fn prompts_cmd(paths: Paths, action: PromptsAction) -> Result<()> {
     use formless_tui::client::request_once;
     formless_core::daemon::ensure_daemon(&paths)?;
     match action {
+        PromptsAction::Diff { id, json } => cli_proposal_diff::show(&paths, id, json),
         PromptsAction::List { json } => {
             let v = request_once(&paths, Request::ListProposals)?;
             if json {
@@ -3942,18 +4203,35 @@ fn parse_duration(s: &str) -> Result<std::time::Duration, String> {
         }
         let n: u64 = num.parse().map_err(|_| bad())?;
         num.clear();
-        total += n * match c {
+        let unit = match c {
             's' => 1,
             'm' => 60,
             'h' => 3600,
             'd' => 86_400,
             _ => return Err(bad()),
         };
+        total = n
+            .checked_mul(unit)
+            .and_then(|part| total.checked_add(part))
+            .ok_or_else(bad)?;
     }
     if !num.is_empty() || total == 0 {
         return Err(bad());
     }
     Ok(std::time::Duration::from_secs(total))
+}
+
+fn cutoff_at(value: &str, now: chrono::DateTime<chrono::Utc>) -> Result<String, String> {
+    let duration = parse_duration(value)?;
+    let delta = chrono::Duration::from_std(duration)
+        .map_err(|_| "duration exceeds the supported time range".to_string())?;
+    now.checked_sub_signed(delta)
+        .map(|cutoff| cutoff.to_rfc3339())
+        .ok_or_else(|| "duration produces an unrepresentable UTC cutoff".to_string())
+}
+
+fn parse_since_cutoff(value: &str) -> Result<String, String> {
+    cutoff_at(value, chrono::Utc::now())
 }
 
 /// `1h30m`, `10m`, `45s`.
@@ -5339,6 +5617,12 @@ enum SessionsAction {
         /// List archived Sessions instead of active Sessions
         #[arg(long)]
         archived: bool,
+        /// Keep only pinned Sessions (client-side, combined with other filters)
+        #[arg(long)]
+        pinned: bool,
+        /// Exact stored tag after lowercasing TAG; a leading # is not stripped
+        #[arg(long)]
+        tag: Option<String>,
         /// One JSON array of SessionInfo
         #[arg(long)]
         json: bool,
@@ -5407,12 +5691,20 @@ enum SessionsAction {
     Search {
         /// Text to find in stored Session messages
         query: String,
-        /// Maximum number of matching messages to return
-        #[arg(long, default_value_t = 20)]
+        /// Maximum matching messages (1–200; default 20)
+        #[arg(long, default_value_t = 20, value_parser = parse_session_search_limit)]
         limit: usize,
         /// Print machine-readable JSON instead of human-readable output
         #[arg(long)]
         json: bool,
+    },
+    /// Read saved Session templates (separate from local commands list)
+    #[command(
+        after_help = "Examples:\n  formless sessions templates list --json\n  formless sessions templates show NAME\n\nNames are exact and case-sensitive. List order comes from the daemon; show prints complete stored instructions and first message. Unset and empty values are distinct. These commands only read saved templates."
+    )]
+    Templates {
+        #[command(subcommand)]
+        action: cli_session_templates::Action,
     },
     /// Hide a Session from the default list (kept and searchable)
     Archive {
@@ -5489,16 +5781,47 @@ fn sessions_cmd(paths: Paths, action: SessionsAction) -> Result<()> {
             }
         }
         SessionsAction::Compare { .. } => unreachable!("handled before daemon startup"),
-        SessionsAction::List { archived, json } => {
+        SessionsAction::List {
+            archived,
+            pinned,
+            tag,
+            json,
+        } => {
             let list: Vec<SessionInfo> = serde_json::from_value(daemon(Request::ListSessions)?)?;
+            let normalized_tag = tag.as_ref().map(|tag| tag.to_lowercase());
+            let shown: Vec<&SessionInfo> = list
+                .iter()
+                .filter(|session| {
+                    session.archived == archived
+                        && (!pinned || session.pinned)
+                        && normalized_tag
+                            .as_ref()
+                            .is_none_or(|tag| session.tags.contains(tag))
+                })
+                .collect();
             if json {
-                let shown: Vec<&SessionInfo> =
-                    list.iter().filter(|s| s.archived == archived).collect();
                 println!("{}", serde_json::to_string_pretty(&shown)?);
                 return Ok(());
             }
+            if shown.is_empty() && !list.is_empty() && (pinned || tag.is_some()) {
+                let mut filters = Vec::new();
+                if archived {
+                    filters.push("--archived".to_string());
+                }
+                if pinned {
+                    filters.push("--pinned".to_string());
+                }
+                if let Some(tag) = tag {
+                    filters.push(format!("--tag {}", comparison_terminal_text(&tag)));
+                }
+                println!(
+                    "no Sessions match {} (formless sessions list)",
+                    filters.join(" ")
+                );
+                return Ok(());
+            }
             let mut tbl = Table::new(&["ID", "UPDATED", "MSGS", "NAME", "LAST MESSAGE"]);
-            for s in list.iter().filter(|s| s.archived == archived) {
+            for s in shown {
                 tbl.row(vec![
                     t(&s.id[..8.min(s.id.len())], Tone::Dim),
                     c(s.updated_at.get(..16).unwrap_or(&s.updated_at)),
@@ -5622,19 +5945,9 @@ fn sessions_cmd(paths: Paths, action: SessionsAction) -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&hits)?);
                 return Ok(());
             }
-            if hits.is_empty() {
-                println!("no messages match '{query}'");
-            }
-            for h in hits {
-                println!(
-                    "{}  {}  [{}] {}",
-                    &h.session_id[..8.min(h.session_id.len())],
-                    h.session_name,
-                    h.role,
-                    h.snippet.replace('\n', " ")
-                );
-            }
+            print!("{}", session_search_text(&query, limit, &hits));
         }
+        SessionsAction::Templates { action } => cli_session_templates::run(&paths, action)?,
         SessionsAction::Archive { id } => set_archived(&paths, &id, true)?,
         SessionsAction::Unarchive { id } => set_archived(&paths, &id, false)?,
         SessionsAction::Export { id, format, output } => {
@@ -5664,10 +5977,13 @@ fn sessions_cmd(paths: Paths, action: SessionsAction) -> Result<()> {
 enum ConfigAction {
     /// Print where config.toml is
     Path,
-    /// Print a setting's value (with FORMLESS_* overrides applied)
+    /// Print a locally loaded setting (with FORMLESS_* overrides applied)
     Get {
         /// Dotted setting name, for example provider.model
         key: String,
+        /// Encode the value as compact JSON, preserving its type
+        #[arg(long)]
+        json: bool,
     },
     /// Set a setting through the daemon: validated, audited and applied at
     /// once. VALUE is JSON when it parses as JSON (5, true, ["a"]), else text
@@ -5684,12 +6000,22 @@ enum ConfigAction {
     Edit,
 }
 
+/// Single-value encoding only; callers retain key lookup and error semantics.
+fn config_get_output(value: &serde_json::Value, json: bool) -> serde_json::Result<String> {
+    if json {
+        serde_json::to_string(value)
+    } else if let serde_json::Value::String(text) = value {
+        Ok(text.clone())
+    } else {
+        serde_json::to_string_pretty(value)
+    }
+}
+
 fn config_cmd(paths: Paths, action: ConfigAction) -> Result<()> {
     match action {
         ConfigAction::Path => println!("{}", paths.config_file().display()),
-        ConfigAction::Get { key } => match Config::load(&paths)?.setting_value(&key)? {
-            Some(serde_json::Value::String(s)) => println!("{s}"),
-            Some(v) => println!("{}", serde_json::to_string_pretty(&v)?),
+        ConfigAction::Get { key, json } => match Config::load(&paths)?.setting_value(&key)? {
+            Some(value) => println!("{}", config_get_output(&value, json)?),
             None => {
                 eprintln!("no setting '{key}' (see SPEC §13, or `formless config edit`)");
                 std::process::exit(2);
@@ -5803,6 +6129,59 @@ fn config_edit(paths: &Paths) -> Result<()> {
 }
 
 /// The Session with this id or id prefix.
+fn parse_session_search_limit(value: &str) -> std::result::Result<usize, String> {
+    value
+        .parse::<usize>()
+        .ok()
+        .filter(|limit| (1..=200).contains(limit))
+        .ok_or_else(|| "search limit must be an integer from 1 to 200".into())
+}
+
+fn session_search_text(query: &str, limit: usize, hits: &[formless_protocol::SearchHit]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    if hits.is_empty() {
+        if query.trim().is_empty() {
+            out.push_str("empty search query\n");
+        } else {
+            let _ = writeln!(
+                out,
+                "no messages match '{}'",
+                comparison_terminal_text(query)
+            );
+        }
+        return out;
+    }
+    for hit in hits {
+        // Same boundary-safe stored date/time presentation as other CLI rows.
+        let time = hit
+            .created_at
+            .get(..16)
+            .unwrap_or(&hit.created_at)
+            .replace('T', " ");
+        let short_id: String = hit.session_id.chars().take(8).collect();
+        let _ = writeln!(
+            out,
+            "{}  {}  #{} {} [{}] {}",
+            comparison_terminal_text(&short_id),
+            comparison_terminal_text(&hit.session_name),
+            hit.seq,
+            comparison_terminal_text(&time),
+            comparison_terminal_text(&hit.role),
+            comparison_terminal_text(&hit.snippet.replace('\n', " "))
+        );
+    }
+    if hits.len() >= limit {
+        let _ = writeln!(out, "Result limit {limit} reached; more matches may exist.");
+        if limit < 200 {
+            out.push_str("Increase --limit up to 200, or narrow the query.\n");
+        } else {
+            out.push_str("Narrow the query to find other matches.\n");
+        }
+    }
+    out
+}
+
 fn find_session(paths: &Paths, id: &str) -> Result<SessionInfo> {
     let list: Vec<SessionInfo> = serde_json::from_value(formless_tui::client::request_once(
         paths,
@@ -5812,7 +6191,7 @@ fn find_session(paths: &Paths, id: &str) -> Result<SessionInfo> {
 }
 
 fn find_session_in(list: &[SessionInfo], id: &str) -> Result<SessionInfo> {
-    // An exact id, else an id prefix, else a name (SPEC §10.7).
+    // An exact id, else an id prefix, else a name (SPEC §12, Session selectors).
     if let Some(s) = list.iter().find(|s| s.id == id) {
         return Ok(s.clone());
     }
@@ -6034,18 +6413,8 @@ fn prices_cmd(paths: Paths, action: PricesAction) -> Result<()> {
             continue;
         }
         let old = target.prices.get(&model);
-        let same = old.is_some_and(|o| {
-            o.input == price.input
-                && o.output == price.output
-                && o.cached_input == price.cached_input
-        });
-        if !same {
-            changed.push(format!(
-                "{model}: ${:.4} in / ${:.4} out per 1M tokens{}",
-                price.input,
-                price.output,
-                if old.is_some() { " (updated)" } else { "" }
-            ));
+        if let Some(change) = cli_price_import::change(&model, old, &price) {
+            changed.push(change);
             if !dry_run {
                 target.prices.insert(model, price);
             }
@@ -6487,24 +6856,16 @@ fn runs_cmd(paths: Paths, limit: usize, json: bool) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&v)?);
         return Ok(());
     }
-    let summary: formless_protocol::RunSummary = serde_json::from_value(v["summary"].clone())?;
-    println!("{}", formless_core::runs::summary_line(&summary));
-    for r in v["runs"].as_array().into_iter().flatten() {
-        println!(
-            "{}  {}  {:<11} {:>3} steps {:>3} tools {:>8} tokens {:>6.1}s",
-            r["run_id"].as_str().unwrap_or_default(),
-            r["created_at"]
-                .as_str()
-                .unwrap_or_default()
-                .get(..19)
-                .unwrap_or_default(),
-            r["outcome"].as_str().unwrap_or_default(),
-            r["steps"],
-            r["tool_calls"],
-            r["prompt_tokens"].as_i64().unwrap_or(0) + r["completion_tokens"].as_i64().unwrap_or(0),
-            r["duration_ms"].as_i64().unwrap_or(0) as f64 / 1000.0
-        );
-    }
+    use std::io::IsTerminal;
+    let width = std::io::stdout()
+        .is_terminal()
+        .then(|| {
+            crossterm::terminal::size()
+                .ok()
+                .map(|(width, _)| width as usize)
+        })
+        .flatten();
+    print!("{}", cli_runs_list::render(&v, width)?);
     Ok(())
 }
 
@@ -6566,6 +6927,9 @@ fn memory_cmd(paths: Paths, action: MemoryAction) -> Result<()> {
 }
 
 fn mcp_cmd(paths: Paths, action: McpAction) -> Result<()> {
+    if let McpAction::Prompt { args, .. } = &action {
+        cli_mcp_prompts::arguments(args)?;
+    }
     let cfg = Config::load(&paths)?;
     let daemon = |req: Request| -> Result<serde_json::Value> {
         formless_core::daemon::ensure_daemon(&paths)?;
@@ -6704,6 +7068,24 @@ fn mcp_cmd(paths: Paths, action: McpAction) -> Result<()> {
         McpAction::Remove { name } => {
             let r = daemon(Request::RemoveMcpServer { name: name.clone() })?;
             println!("removed: {name} ({} tool(s) retired)", r["retired_tools"]);
+        }
+        McpAction::Prompts { json } => {
+            cli_mcp_prompts::list(json, daemon, &mut std::io::stdout().lock())?;
+        }
+        McpAction::Prompt {
+            server,
+            name,
+            args,
+            json,
+        } => {
+            cli_mcp_prompts::prompt(
+                server,
+                name,
+                cli_mcp_prompts::arguments(&args)?,
+                json,
+                daemon,
+                &mut std::io::stdout().lock(),
+            )?;
         }
         McpAction::List { json } => {
             let list = daemon(Request::ListMcpServers)?;
@@ -7123,21 +7505,28 @@ fn tools_cmd(paths: Paths, action: ToolsAction) -> Result<()> {
         ToolsAction::Reviews { name, kind, json } => {
             description_reviews_cmd(&paths, kind, name, json)
         }
-        ToolsAction::List { json, tag } => {
+        ToolsAction::List {
+            json,
+            tag,
+            filter,
+            show_pinned,
+        } => {
             let v = request_once(&paths, Request::ListTools)?;
             let mut tools: Vec<formless_protocol::ToolInfo> = serde_json::from_value(v)?;
-            if let Some(tag) = tag {
-                let tag = tag.trim_start_matches('#').to_lowercase();
-                tools.retain(|t| t.tags.contains(&tag));
-            }
+            let original_count = tools.len();
+            cli_tool_filters::select(&mut tools, filter, tag.as_deref());
             if json {
                 println!("{}", serde_json::to_string_pretty(&tools)?);
                 return Ok(());
             }
             if tools.is_empty() {
-                println!("(no tools yet - the agent builds them via create_tool)");
+                println!(
+                    "{}",
+                    cli_tool_filters::empty_message(original_count, filter, tag.as_deref())
+                );
+                return Ok(());
             }
-            let mut tbl = Table::new(&[
+            let mut headers = vec![
                 "TOOL",
                 "TITLE",
                 "TAGS",
@@ -7146,7 +7535,11 @@ fn tools_cmd(paths: Paths, action: ToolsAction) -> Result<()> {
                 "SUCCESS",
                 "STATUS",
                 "CAPABILITIES",
-            ]);
+            ];
+            if show_pinned {
+                headers.push("PINNED");
+            }
+            let mut tbl = Table::new(&headers);
             for tool in tools {
                 let status = if tool.retired {
                     t("retired", Tone::Dim)
@@ -7159,7 +7552,7 @@ fn tools_cmd(paths: Paths, action: ToolsAction) -> Result<()> {
                 };
                 let rate = tool.success_rate;
                 let (success_label, success_tone) = cli_tool_success::tool_success_cell(rate);
-                tbl.row(vec![
+                let mut cells = vec![
                     t(tool.name, Tone::Strong),
                     c(tool.title),
                     t(tool.tags.join(" "), Tone::Dim),
@@ -7168,7 +7561,11 @@ fn tools_cmd(paths: Paths, action: ToolsAction) -> Result<()> {
                     t(success_label, success_tone),
                     status,
                     t(tool.capabilities.join(", "), Tone::Dim),
-                ]);
+                ];
+                if show_pinned {
+                    cells.push(c(if tool.pinned { "yes" } else { "no" }));
+                }
+                tbl.row(cells);
             }
             if !tbl.is_empty() {
                 tbl.print();
@@ -7183,10 +7580,7 @@ fn tools_cmd(paths: Paths, action: ToolsAction) -> Result<()> {
                 // Resolve name -> id via the list.
                 let v = request_once(&paths, Request::ListTools)?;
                 let tools: Vec<formless_protocol::ToolInfo> = serde_json::from_value(v)?;
-                let tool = tools
-                    .iter()
-                    .find(|t| t.name == name || t.id == name)
-                    .ok_or_else(|| usage(format!("no tool '{name}'")))?;
+                let tool = cli_tool_lookup::resolve(&tools, &name)?;
                 request_once(
                     &paths,
                     Request::ExportTool {
@@ -7619,10 +8013,7 @@ fn find_tool(paths: &Paths, name: &str) -> Result<formless_protocol::ToolInfo> {
     let tools: Vec<formless_protocol::ToolInfo> = serde_json::from_value(
         formless_tui::client::request_once(paths, Request::ListTools)?,
     )?;
-    tools
-        .into_iter()
-        .find(|t| t.name == name || t.id == name)
-        .ok_or_else(|| usage(format!("no tool '{name}' (formless tools list)")))
+    cli_tool_lookup::resolve(&tools, name).cloned()
 }
 
 fn print_tool_detail(d: &formless_protocol::ToolDetail) {
@@ -7885,7 +8276,7 @@ fn tool_run(
     }
 }
 
-/// `formless man`: the top-level page, then every subcommand (two levels
+/// `formless man`: the top-level page, then every subcommand (three levels
 /// deep) with its synopsis and options, so `--timeout` and friends are in
 /// the one page that ships (#895).
 fn render_man(out: &mut dyn std::io::Write) -> Result<()> {
@@ -7921,7 +8312,7 @@ fn render_man(out: &mut dyn std::io::Write) -> Result<()> {
                     .replace(".SH OPTIONS\n", ".PP\nOptions:\n");
                 out.write_all(text.as_bytes())?;
             }
-            if depth < 2 {
+            if depth < 3 {
                 section(sub, &name, depth + 1, out)?;
             }
         }
@@ -8264,6 +8655,9 @@ fn ask_on_terminal(q: &Question) -> QuestionAnswer {
 #[cfg(test)]
 #[path = "../../formless-core/tests/support/env.rs"]
 mod oauth_credential_env;
+
+#[cfg(test)]
+mod cli_doctor_tests;
 
 #[cfg(test)]
 mod tests {
@@ -8915,6 +9309,70 @@ mod tests {
         );
     }
 
+    /// Root presentation order is deliberate (#1609), independently of inventory.
+    #[test]
+    fn root_help_and_man_use_alphabetical_command_order() {
+        use clap::CommandFactory;
+        let mut cli = super::Cli::command().term_width(160);
+        cli.build();
+        let mut expected: Vec<_> = cli
+            .get_subcommands()
+            .filter(|command| !command.is_hide_set() && command.get_name() != "help")
+            .map(|command| command.get_name().to_owned())
+            .collect();
+        expected.sort();
+        expected.push("help".into());
+        for help in [
+            cli.render_help().to_string(),
+            cli.render_long_help().to_string(),
+        ] {
+            let commands = help
+                .split("Commands:\n")
+                .nth(1)
+                .unwrap()
+                .split("\nOptions:")
+                .next()
+                .unwrap();
+            let actual: Vec<_> = commands
+                .lines()
+                .filter_map(|line| {
+                    let line = line.strip_prefix("  ")?;
+                    if line.starts_with(' ') {
+                        return None;
+                    }
+                    line.split_whitespace().next()
+                })
+                .collect();
+            assert_eq!(actual, expected, "{help}");
+        }
+        let mut man = Vec::new();
+        clap_mangen::Man::new(cli)
+            .render_subcommands_section(&mut man)
+            .unwrap();
+        let man = String::from_utf8(man).unwrap();
+        let positions: Vec<_> = expected
+            .iter()
+            .map(|name| {
+                let escaped = name.replace('-', "\\-");
+                man.find(&format!("formless\\-{escaped}(1)"))
+                    .unwrap_or_else(|| panic!("missing {name}: {man}"))
+            })
+            .collect();
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]), "{man}");
+        let mut page = Vec::new();
+        super::render_man(&mut page).unwrap();
+        let page = String::from_utf8(page).unwrap();
+        let positions: Vec<_> = expected
+            .iter()
+            .filter(|name| name.as_str() != "help")
+            .map(|name| {
+                page.find(&format!(".SH \"FORMLESS {}\"", name.to_uppercase()))
+                    .unwrap()
+            })
+            .collect();
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
     /// The man page documents nested options (#895).
     #[test]
     fn the_man_page_has_subcommand_options() {
@@ -9155,3 +9613,100 @@ mod tests {
 #[cfg(test)]
 #[path = "log_cli_tests.rs"]
 mod log_cli_tests;
+
+#[cfg(test)]
+mod pairing_qr_width_tests {
+    #[test]
+    fn pairing_qr_fit_counts_display_columns_and_includes_the_quiet_zone() {
+        use unicode_width::UnicodeWidthStr;
+        let lines = formless_tui::qr::lines("https://example.invalid/#k=private-fixture").unwrap();
+        let required = super::pairing_qr_columns(&lines);
+        assert_eq!(required, lines[0].width());
+        assert!(
+            required < lines[0].len(),
+            "block glyph bytes must not count as columns"
+        );
+        assert!(super::pairing_qr_fits(
+            &lines,
+            Some(required.try_into().unwrap())
+        ));
+        assert!(super::pairing_qr_fits(
+            &lines,
+            Some((required + 1).try_into().unwrap())
+        ));
+        assert!(!super::pairing_qr_fits(
+            &lines,
+            Some((required - 1).try_into().unwrap())
+        ));
+        assert!(!super::pairing_qr_fits(&lines, None));
+        assert!(!super::pairing_qr_fits(&[], Some(80)));
+    }
+}
+
+#[cfg(test)]
+#[path = "session_search_tests.rs"]
+mod session_search_tests;
+
+#[cfg(test)]
+#[path = "tui_start_cli_tests.rs"]
+mod tui_start_cli_tests;
+
+#[cfg(test)]
+mod config_get_json_tests {
+    use super::*;
+    use serde_json::{json, Value};
+
+    #[test]
+    fn config_get_json_preserves_value_type_content_and_flag_defaults() {
+        for value in [
+            json!("true"),
+            json!("ไทย \"quoted\"\nnext"),
+            json!("{\"x\":true}"),
+            json!(true),
+            json!(1),
+            json!([1, "x"]),
+            json!({"key": true}),
+            Value::Null,
+        ] {
+            let encoded = config_get_output(&value, true).unwrap();
+            assert_eq!(serde_json::from_str::<Value>(&encoded).unwrap(), value);
+            if let Value::String(text) = &value {
+                assert_eq!(config_get_output(&value, false).unwrap(), *text);
+            } else {
+                assert_eq!(
+                    config_get_output(&value, false).unwrap(),
+                    serde_json::to_string_pretty(&value).unwrap()
+                );
+            }
+        }
+        for (args, expected) in [
+            (vec!["formless", "config", "get", "provider.model"], false),
+            (
+                vec!["formless", "config", "get", "provider.model", "--json"],
+                true,
+            ),
+        ] {
+            let parsed = Cli::try_parse_from(args).unwrap();
+            assert!(
+                matches!(parsed.cmd, Some(Cmd::Config { action: ConfigAction::Get { json, .. } }) if json == expected)
+            );
+        }
+    }
+
+    #[test]
+    fn config_get_json_string_survives_existing_typed_setting_validation() {
+        for text in ["true", "ไทย \"quoted\"\nnext", "{\"x\":true}"] {
+            let value = json!(text);
+            let output = config_get_output(&value, true).unwrap();
+            let parsed =
+                serde_json::from_str(&output).unwrap_or_else(|_| Value::String(output.clone()));
+            let mut config = Config::default();
+            config.set_key("provider.model", parsed).unwrap();
+            assert_eq!(config.provider.model, text);
+            assert_eq!(config.setting_value("provider.model").unwrap(), Some(value));
+        }
+        assert!(Config::default()
+            .set_key("provider.model", json!(true))
+            .is_err());
+    }
+}

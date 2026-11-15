@@ -241,6 +241,31 @@ fn directory_namespace_prefix(path: &Path) -> bool {
     })
 }
 
+/// Conventional env-template leaf names. This is only a builtin filename
+/// exception, not a content check or an override of protected/custom rules.
+/// Directories and symlinks retain their namespace protection, including
+/// during relocation. Missing leaves remain eligible for ordinary creation.
+pub fn is_env_template_file(path: &Path) -> bool {
+    let known_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            matches!(
+                name.to_ascii_lowercase().as_str(),
+                ".env.example" | ".env.sample" | ".env.template" | ".env.dist"
+            )
+        });
+    if !known_name {
+        return false;
+    }
+    match path.symlink_metadata() {
+        Ok(meta) => meta.file_type().is_file(),
+        // New template files can be created normally; existing symlinks,
+        // directories, special files and metadata errors stay conservative.
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+
 fn builtin(path: &Path) -> Option<&'static str> {
     let parts: Vec<_> = path
         .components()
@@ -252,14 +277,17 @@ fn builtin(path: &Path) -> Option<&'static str> {
             }
         })
         .collect();
-    for name in &parts {
+    for (index, name) in parts.iter().enumerate() {
         if matches!(
             name.as_str(),
             ".ssh" | ".aws" | ".gnupg" | ".pki" | ".kube" | ".docker" | ".password-store"
         ) {
             return Some("credential directory");
         }
-        if name.starts_with(".env") || name.ends_with(".pem") || name.ends_with(".key") {
+        if (name.starts_with(".env") && !(index + 1 == parts.len() && is_env_template_file(path)))
+            || name.ends_with(".pem")
+            || name.ends_with(".key")
+        {
             return Some("credential-shaped filename");
         }
     }
@@ -351,6 +379,110 @@ mod tests {
         }
     }
     #[test]
+    fn env_template_files_are_ordinary_without_declassifying_directories_or_rules() {
+        struct Owned(PathBuf);
+        impl Drop for Owned {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = std::env::temp_dir().join(format!("fl-env-template-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let _owned = Owned(root.clone());
+        let policy = PathPolicy::default();
+        for name in [".env.example", ".env.sample", ".env.template", ".env.dist"] {
+            let path = root.join(name);
+            std::fs::write(&path, "OPTION=placeholder").unwrap();
+            assert_eq!(
+                policy.classify(&path, &path).unwrap(),
+                PathDecision::Ordinary,
+                "{name}"
+            );
+            let custom = PathPolicy::new(
+                vec![],
+                vec![SensitivePathRule::BasenamePrefix(".env".into())],
+            )
+            .unwrap();
+            assert!(
+                matches!(
+                    custom.classify(&path, &path).unwrap(),
+                    PathDecision::Sensitive(_)
+                ),
+                "custom rule: {name}"
+            );
+            let protected = PathPolicy::new(vec![root.clone()], vec![]).unwrap();
+            assert_eq!(
+                protected.classify(&path, &path).unwrap(),
+                PathDecision::Forbidden
+            );
+        }
+        let upper = root.join(".ENV.EXAMPLE");
+        std::fs::write(&upper, "OPTION=placeholder").unwrap();
+        assert_eq!(
+            policy.classify(&upper, &upper).unwrap(),
+            PathDecision::Ordinary
+        );
+        for name in [
+            ".env",
+            ".env.local",
+            ".env.production",
+            ".env.unknown",
+            ".env.local.example",
+            ".env.example.bak",
+            ".env.example:stream",
+            ".environment",
+            ".ssh/.env.example",
+            ".env.template/notes.txt",
+        ] {
+            let path = root.join(name);
+            assert!(
+                matches!(
+                    policy.classify(&path, &path).unwrap(),
+                    PathDecision::Sensitive(_)
+                ),
+                "{name}"
+            );
+        }
+        let directory = root.join("nested/.env.example");
+        std::fs::create_dir_all(&directory).unwrap();
+        assert!(matches!(
+            policy.classify(&directory, &directory).unwrap(),
+            PathDecision::Sensitive(_)
+        ));
+        assert!(!policy
+            .relocation_allowed(&directory, &directory, &root.join("ordinary"))
+            .unwrap());
+        #[cfg(unix)]
+        {
+            let link = root.join("links/.env.sample");
+            std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+            let target = root.join("notes.txt");
+            std::fs::write(&target, "ordinary fixture").unwrap();
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            assert!(matches!(
+                policy.classify(&link, &target).unwrap(),
+                PathDecision::Sensitive(_)
+            ));
+        }
+        let template = root.join(".env.example");
+        let actual_secret = root.join(".env.local");
+        assert!(
+            matches!(
+                policy.classify(&template, &actual_secret).unwrap(),
+                PathDecision::Sensitive(_)
+            ),
+            "canonical secret still wins"
+        );
+        assert!(
+            matches!(
+                policy.classify(&actual_secret, &template).unwrap(),
+                PathDecision::Sensitive(_)
+            ),
+            "raw secret still wins"
+        );
+    }
+
+    #[test]
     fn typed_extensions_do_not_remove_builtins_and_invalid_grammar_is_refused() {
         let policy = PathPolicy::new(
             vec![],
@@ -377,13 +509,16 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         let policy = PathPolicy::new(vec![root.clone()], vec![]).unwrap();
         let file = root.join("missing-child");
+        // The second argument is the resolved destination, including when
+        // Darwin's temporary-directory spelling traverses /var -> /private/var.
+        let canonical = crate::caps::canonical_path(file.to_str().unwrap()).unwrap();
         assert_eq!(
-            policy.classify(&file, &file).unwrap(),
+            policy.classify(&file, &canonical).unwrap(),
             PathDecision::Forbidden
         );
         assert_eq!(
             policy
-                .classify(&std::env::temp_dir().join("alias"), &file)
+                .classify(&std::env::temp_dir().join("alias"), &canonical)
                 .unwrap(),
             PathDecision::Forbidden
         );

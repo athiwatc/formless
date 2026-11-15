@@ -2,6 +2,8 @@
 //! older Run whose events arrived while SendMessage was outstanding.
 //! A private fake daemon owns the only socket; no provider or service is used.
 #![cfg(unix)]
+#[path = "support/unix_fixture_io.rs"]
+mod unix_fixture_io;
 use formless_core::{Config, Paths, Store};
 use formless_protocol::{Event, Request, RequestEnvelope, ServerMessage};
 use serde_json::{json, Value};
@@ -15,6 +17,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
+use unix_fixture_io::FixtureStream;
 struct Fixture {
     root: std::path::PathBuf,
     paths: Paths,
@@ -164,22 +167,18 @@ impl Drop for Fixture {
         let _ = std::fs::remove_dir_all(&self.root);
     }
 }
-fn frame(stream: &mut UnixStream, message: ServerMessage) {
+fn frame(stream: &mut FixtureStream, message: ServerMessage) {
     writeln!(stream, "{}", serde_json::to_string(&message).unwrap()).unwrap();
 }
 fn serve_peer(
-    mut stream: UnixStream,
+    stream: UnixStream,
     stop: Arc<AtomicBool>,
     session: formless_protocol::SessionInfo,
     events: Vec<Event>,
 ) {
-    stream
-        .set_read_timeout(Some(Duration::from_millis(50)))
-        .unwrap();
-    stream
-        .set_write_timeout(Some(Duration::from_secs(2)))
-        .unwrap();
     let deadline = Instant::now() + Duration::from_secs(15);
+    let mut stream =
+        FixtureStream::new(stream, stop.clone(), deadline, Duration::from_millis(50)).unwrap();
     let mut pending = Vec::new();
     let mut chunk = [0u8; 4096];
     while !stop.load(Ordering::SeqCst) && Instant::now() < deadline {
@@ -260,11 +259,13 @@ fn queued_headless_ack_has_no_target_run_or_answer_in_any_output_mode() {
                 );
                 if mode == "json" && !file {
                     let value: Value = serde_json::from_slice(&output.stdout).unwrap();
-                    assert_eq!(value["status"], "queued");
-                    assert!(value["answer"].is_null());
-                    assert!(value["error"].is_null());
-                    assert_eq!(value["session_id"], fixture.session.id);
-                    assert_eq!(value.as_object().unwrap().len(), 4);
+                    assert_eq!(
+                        value,
+                        json!({
+                            "status": "queued", "answer": null, "result": null,
+                            "error": null, "session_id": fixture.session.id,
+                        })
+                    );
                 } else {
                     assert!(output.stdout.is_empty(),"queued request cannot stream old events, invent a Run, or produce an answer: {}",String::from_utf8_lossy(&output.stdout));
                 }
