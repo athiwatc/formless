@@ -37,6 +37,7 @@ use crate::forecast;
 mod profile_search;
 mod questions;
 mod sessions;
+mod usage;
 use crate::full_view;
 use crate::memory::{
     edit_span, format_bytes, limits, paste_can_never_fit, snap_to_graphemes, within_composer_limit,
@@ -685,6 +686,10 @@ pub struct Shell {
     reveal_frames: u8,
     /// Scrolls the inspector's details in a panel too short for them.
     inspector_scroll: ScrollHandle,
+    session_usage: crate::session_usage::State,
+    usage_controls: Vec<(FocusHandle, gpui_kit::ScrollAnchor)>,
+    usage_focus: Option<(Option<FocusHandle>, Size<Pixels>, TextScale)>,
+    usage_frames: u8,
     revealed: Option<Reveal>,
     destination: Destination,
     /// What the last composer action was. Sizes only: no message text is
@@ -855,6 +860,7 @@ impl Shell {
         let session_sizes = Self::row_sizes(sidebar.rows().len(), TextScale::default());
         let page_scroll = ScrollHandle::new();
         let directory_anchor = gpui_kit::ScrollAnchor::for_handle(page_scroll.clone());
+        let inspector_scroll = ScrollHandle::new();
         Self {
             client: None,
             client_connected: false,
@@ -890,7 +896,18 @@ impl Shell {
             composer_anchor: gpui_kit::ScrollAnchor::for_handle(page_scroll.clone()),
             page_scroll,
             reveal_frames: 0,
-            inspector_scroll: ScrollHandle::new(),
+            usage_controls: (0..2)
+                .map(|_| {
+                    (
+                        cx.focus_handle(),
+                        gpui_kit::ScrollAnchor::for_handle(inspector_scroll.clone()),
+                    )
+                })
+                .collect(),
+            inspector_scroll,
+            session_usage: crate::session_usage::State::default(),
+            usage_focus: None,
+            usage_frames: 0,
             revealed: None,
             destination: Destination::Chat,
             last_intent: None,
@@ -1588,6 +1605,8 @@ impl Shell {
     fn attach_client(&mut self, client: Client, cx: &mut Context<Self>) {
         self.profile_search
             .retire("Profile attachment changed. Search again after connecting.");
+        self.session_usage
+            .retire("Profile attachment changed. Read usage after selecting a Session.");
         self.client = Some(client);
         self.client_connected = false;
         self.client_snapshot_ready = false;
@@ -1727,6 +1746,8 @@ impl Shell {
     }
 
     fn client_select(&mut self, cx: &mut Context<Self>) {
+        self.session_usage
+            .retire("Session changed. Read recorded usage explicitly for the open Session.");
         self.invalidate_forecast(cx);
         self.client_snapshot_ready = false;
         self.client_recovery = None;
@@ -1782,6 +1803,7 @@ impl Shell {
                     self.questions_restored(window, cx);
                 }
                 if !ready {
+                    self.session_usage.retire("Connection lost. Read usage explicitly after reconnecting; nothing was replayed.");
                     if let Some(panel) = &mut self.session_editor {
                         panel.export.retire("Connection lost. Request another export after reconnecting; nothing was replayed.");
                     }
@@ -1799,6 +1821,11 @@ impl Shell {
                     self.rebuild_directory(cx);
                 }
             }
+            ClientUpdate::SessionUsage {
+                target,
+                operation,
+                result,
+            } => self.receive_session_usage(target, operation, result, cx),
             ClientUpdate::SessionExport {
                 connection,
                 operation,
@@ -4677,7 +4704,10 @@ impl Shell {
                 "Last message",
                 row.and_then(|row| row.preview.clone())
                     .unwrap_or_else(|| "None".to_string()),
-            ));
+            ))
+            .when(self.client.is_some(), |details| {
+                details.child(self.render_session_usage(cx))
+            });
         let panel = div()
             .id("region-inspector")
             .test_support()
@@ -4957,6 +4987,7 @@ impl Render for Shell {
         self.reveal_profile_search(window, cx);
         self.reveal_directory_choice(window, cx);
         self.reveal_session_editor(window, cx);
+        self.reveal_session_usage(window, cx);
         self.reveal_question_focus(window, cx);
         if self
             .forecast

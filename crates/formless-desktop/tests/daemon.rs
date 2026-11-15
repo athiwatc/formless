@@ -126,6 +126,11 @@ async fn until(client: &Client, stage: &'static str, mut predicate: impl FnMut(U
     loop {
         for update in client.drain() {
             let summary = match &update {
+                Update::SessionUsage { target, result, .. } => format!(
+                    "recorded usage {}: ok={}",
+                    target.session_id,
+                    result.is_ok()
+                ),
                 Update::SessionExport {
                     session_id,
                     format,
@@ -576,6 +581,36 @@ async fn real_daemon_provider_send_navigation_resources_and_reconnect() {
         requests.lock().unwrap().len(),
         1,
         "one user send caused one provider request"
+    );
+    let recorded = daemon
+        .handle(Request::SessionUsage {
+            session_id: a.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(recorded["total"]["prompt_tokens"], 2000);
+    assert_eq!(recorded["total"]["completion_tokens"], 100);
+    assert!((recorded["total"]["cost"].as_f64().unwrap() - 0.0022).abs() < 1e-10);
+    let expected = formless_desktop::session_usage::Report::decode(recorded)
+        .unwrap()
+        .copy();
+    let usage_operation = uuid::Uuid::new_v4();
+    let target = formless_desktop::session_usage::Target {
+        session_id: a.clone(),
+        connection: client.connection(),
+        generation: 3,
+    };
+    client
+        .send(Command::ReadSessionUsage {
+            target: target.clone(),
+            operation: usage_operation,
+        })
+        .unwrap();
+    until(&client,"recorded-session-usage",|update|matches!(update,Update::SessionUsage{target:actual,operation,result:Ok(report)} if actual==target&&operation==usage_operation&&report.copy()==expected)).await;
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        1,
+        "recorded usage must not contact the Provider"
     );
     // Search is a separate, Profile-wide read: it includes archived stored
     // messages and never starts another provider request.

@@ -76,7 +76,25 @@ mod render {
     const WHOLE: Fit = Fit::Whole;
     const REFLOWED: Fit = Fit::Reflowed;
 
-    const STATES: [State; 51] = [
+    const STATES: [State; 53] = [
+        state(
+            "session-usage-light",
+            1440.,
+            900.,
+            LIGHT,
+            100,
+            Some("open-session-usage"),
+            WHOLE,
+        ),
+        state(
+            "minimum-session-usage-dark-200pct",
+            480.,
+            360.,
+            DARK,
+            200,
+            Some("open-session-usage"),
+            REFLOWED,
+        ),
         state(
             "session-instructions-unavailable-light",
             1440.,
@@ -868,7 +886,21 @@ mod render {
         } else if let Some(control) = click {
             cx.update_window(any, |_, window, cx| {
                 window.render_frame(cx);
-                if control=="open-profile-search" {
+                if control=="open-session-usage" {
+                    use formless_desktop::client::Update;
+                    let sessions=fixture::sessions(3);
+                    shell.update(cx,|shell,cx|{
+                        shell.connect_recording_daemon(cx);
+                        shell.apply_client_update(Update::Connection{ready:true,notice:"Connected view fixture".into()},window,cx);
+                        shell.apply_client_update(Update::Sessions(sessions.clone()),window,cx);
+                    });
+                    window.render_frame(cx);
+                    if window.try_find(shell::session_row_id(&sessions[0].id)).is_none() {window.click("toggle-sidebar",cx);window.render_frame(cx);}
+                    window.click(shell::session_row_id(&sessions[0].id),cx);
+                    let generation=shell.read(cx).client_generation();
+                    let snapshot=formless_desktop::replies::session_snapshot(&sessions[0].id,&serde_json::json!({"session":{"id":sessions[0].id},"running":false,"messages":[]})).unwrap();
+                    shell.update(cx,|shell,cx|{shell.apply_client_update(Update::Snapshot{generation,snapshot},window,cx);shell.open_panel(false,window,cx);shell.take_client_commands();});
+                } else if control=="open-profile-search" {
                     use formless_desktop::client::{Update,Command as WireCommand};
                     let sessions=fixture::sessions(3);
                     shell.update(cx,|shell,cx|{
@@ -1032,6 +1064,100 @@ mod render {
             })
             .expect("offscreen window is open");
             cx.run_until_parked();
+            if control == "open-session-usage" {
+                let mut target = None;
+                let mut operation = uuid::Uuid::nil();
+                cx.update_window(any, |_, window, cx| {
+                    use formless_desktop::client::Command as WireCommand;
+                    for _ in 0..40 {
+                        window.render_frame(cx);
+                        if window.find("session-usage-read").focused() == Some(true) {
+                            break;
+                        }
+                        window.press("tab", cx);
+                    }
+                    for _ in 0..4 {
+                        window.render_frame(cx);
+                        window.simulate_next_frame(cx);
+                    }
+                    window.press("enter", cx);
+                    let read = shell
+                        .update(cx, |shell, _| shell.take_client_commands())
+                        .into_iter()
+                        .find_map(|command| match command {
+                            WireCommand::ReadSessionUsage { target, operation } => {
+                                Some((target, operation))
+                            }
+                            _ => None,
+                        })
+                        .unwrap();
+                    target = Some(read.0);
+                    operation = read.1;
+                    window.render_frame(cx);
+                    assert_eq!(window.find("session-usage-read").disabled(), Some(true));
+                    assert_eq!(window.find("session-usage-copy").disabled(), Some(true));
+                })
+                .unwrap();
+                capture(&mut cx, "-pending");
+                cx.update_window(any,|_,window,cx|{
+                    let report=formless_desktop::session_usage::Report::decode(serde_json::json!({"runs":2,"total":{"steps":3,"prompt_tokens":2000,"completion_tokens":100,"cached_tokens":200,"cache_write_tokens":300,"cost":null,"unpriced":["model ไทย 漢字 😀"]},"last_run":{"steps":1,"prompt_tokens":1000,"completion_tokens":50,"cached_tokens":100,"cost":0.00123456}})).unwrap();
+                    shell.update(cx,|shell,cx|shell.apply_client_update(formless_desktop::client::Update::SessionUsage{target:target.clone().unwrap(),operation,result:Ok(report)},window,cx));
+                    for _ in 0..40 {window.render_frame(cx);if window.find("session-usage-copy").focused()==Some(true){break;}window.press("tab",cx);}
+                    for _ in 0..4 {window.render_frame(cx);window.simulate_next_frame(cx);}
+                    let button=window.find("session-usage-copy").bounds();let body=window.find("inspector-details").bounds();
+                    assert!(button.top()>=body.top()&&button.bottom()<=body.bottom(),"{name}: copy outside inspector: {button:?}/{body:?}");
+                    assert!(inside(window,"region-inspector",viewport));
+                    assert_ne!(window.find("session-usage-copy").disabled(),Some(true));
+                }).unwrap();
+                capture(&mut cx, "-ready");
+                cx.update_window(any, |_, window, cx| {
+                    use formless_desktop::client::Command as WireCommand;
+                    for _ in 0..40 {
+                        window.render_frame(cx);
+                        if window.find("session-usage-read").focused() == Some(true) {
+                            break;
+                        }
+                        window.press("tab", cx);
+                    }
+                    for _ in 0..4 {
+                        window.render_frame(cx);
+                        window.simulate_next_frame(cx);
+                    }
+                    window.press("enter", cx);
+                    let (target, operation) = shell
+                        .update(cx, |shell, _| shell.take_client_commands())
+                        .into_iter()
+                        .find_map(|command| match command {
+                            WireCommand::ReadSessionUsage { target, operation } => {
+                                Some((target, operation))
+                            }
+                            _ => None,
+                        })
+                        .unwrap();
+                    shell.update(cx, |shell, cx| {
+                        shell.apply_client_update(
+                            formless_desktop::client::Update::SessionUsage {
+                                target,
+                                operation,
+                                result: Err(
+                                    "Recorded usage unavailable. Read again explicitly to retry."
+                                        .into(),
+                                ),
+                            },
+                            window,
+                            cx,
+                        )
+                    });
+                    window.render_frame(cx);
+                    assert_eq!(window.find("session-usage-copy").disabled(), Some(true));
+                    assert!(window
+                        .find("session-usage-notice")
+                        .bounds()
+                        .intersects(&window.find("inspector-details").bounds()));
+                })
+                .unwrap();
+                capture(&mut cx, "-error");
+            }
             if control == "open-session-instructions-unavailable" {
                 cx.update_window(any, |_, window, cx| {
                     for _ in 0..40 {
@@ -1725,7 +1851,8 @@ mod render {
                 })
                 .expect("offscreen window is open");
             }
-            if control != "open-session-edit"
+            if control != "open-session-usage"
+                && control != "open-session-edit"
                 && control != "open-profile-search"
                 && control != "open-session-archive"
                 && control != "open-run-forecast"

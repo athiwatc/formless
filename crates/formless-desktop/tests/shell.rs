@@ -24,6 +24,8 @@ mod profile_search_tests;
 mod question_tests;
 #[path = "support/session_edit.rs"]
 mod session_edit_tests;
+#[path = "support/usage.rs"]
+mod usage_tests;
 
 use formless_desktop::commands::{self, Command};
 use formless_desktop::fixture;

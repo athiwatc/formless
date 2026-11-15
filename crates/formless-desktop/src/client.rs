@@ -35,6 +35,7 @@ use crate::questions;
 use crate::replies::{self, SessionSnapshot};
 use crate::session_edit;
 use crate::session_export;
+use crate::session_usage;
 
 const QUEUE: usize = 16;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -42,6 +43,11 @@ const REFRESH: Duration = Duration::from_millis(250);
 
 #[derive(Debug)]
 pub enum Update {
+    SessionUsage {
+        target: session_usage::Target,
+        operation: uuid::Uuid,
+        result: Result<session_usage::Report, String>,
+    },
     SessionExport {
         connection: u64,
         operation: uuid::Uuid,
@@ -114,6 +120,10 @@ pub enum Update {
 }
 
 pub enum Command {
+    ReadSessionUsage {
+        target: session_usage::Target,
+        operation: uuid::Uuid,
+    },
     ExportSession {
         connection: u64,
         operation: uuid::Uuid,
@@ -244,6 +254,7 @@ impl Client {
                 | Command::ReadSessionDetails { .. }
                 | Command::SearchProfile { .. }
                 | Command::ExportSession { .. }
+                | Command::ReadSessionUsage { .. }
         ) && !self.is_ready()
         {
             return Err("Not connected; the action was not queued.");
@@ -332,6 +343,10 @@ fn advance_epoch(epoch: &AtomicU64) {
 
 #[derive(Debug)]
 enum Pending {
+    SessionUsage {
+        target: session_usage::Target,
+        operation: uuid::Uuid,
+    },
     SessionExport {
         operation: uuid::Uuid,
         session_id: String,
@@ -580,6 +595,39 @@ impl Engine {
 
     fn command(&mut self, command: Command) {
         match command {
+            Command::ReadSessionUsage { target, operation } => {
+                let error = if !self.ready
+                    || self.connection != target.connection
+                    || self.generation != target.generation
+                    || self.active.as_deref() != Some(target.session_id.as_str())
+                {
+                    Some("Session or connection changed. Read usage again for the open Session.")
+                } else if self
+                    .pending
+                    .values()
+                    .filter(|p| matches!(p, Pending::SessionUsage { .. }))
+                    .count()
+                    >= 2
+                {
+                    Some("Two usage reads remain outstanding. Wait for their replies or reconnect.")
+                } else {
+                    None
+                };
+                if let Some(error) = error {
+                    self.updates.push(Update::SessionUsage {
+                        target,
+                        operation,
+                        result: Err(error.into()),
+                    });
+                } else {
+                    self.request(
+                        Request::SessionUsage {
+                            session_id: target.session_id.clone(),
+                        },
+                        Pending::SessionUsage { target, operation },
+                    );
+                }
+            }
             Command::ExportSession {
                 connection,
                 operation,
@@ -1073,6 +1121,13 @@ impl Engine {
                         }),
                     }
                 }
+            }
+            Pending::SessionUsage { target, operation } => {
+                self.updates.push(Update::SessionUsage {
+                    target,
+                    operation,
+                    result: result.and_then(session_usage::Report::decode),
+                });
             }
             Pending::SessionExport {
                 operation,
@@ -2129,6 +2184,67 @@ mod tests {
     }
 
     #[test]
+    fn usage_reads_validate_current_target_but_replies_keep_their_original_target() {
+        let mut engine = ready();
+        engine.select(Some("a".into()), 7);
+        engine.outgoing.clear();
+        let target = session_usage::Target {
+            session_id: "a".into(),
+            connection: 0,
+            generation: 7,
+        };
+        let operations = [
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+        ];
+        for operation in operations {
+            engine.command(Command::ReadSessionUsage {
+                target: target.clone(),
+                operation,
+            });
+        }
+        assert_eq!(engine.outgoing.len(), 2);
+        assert!(engine.updates.iter().any(|u|matches!(u,Update::SessionUsage{operation,result:Err(_),..} if *operation==operations[2])));
+        let a = engine.outgoing.pop_front().unwrap();
+        let b = engine.outgoing.pop_front().unwrap();
+        assert!(matches!(&a.request,Request::SessionUsage{session_id} if session_id=="a"));
+        engine.select(Some("b".into()), 8);
+        engine.outgoing.clear();
+        let counters = json!({"steps":1,"prompt_tokens":30,"completion_tokens":4,"cached_tokens":10,"cost":null});
+        respond(
+            &mut engine,
+            b.id,
+            json!({"total":counters,"last_run":null,"runs":1}),
+        );
+        assert!(engine.updates.iter().any(|u|matches!(u,Update::SessionUsage{target:actual,operation,result:Ok(_)} if *actual==target&&*operation==operations[1])));
+        respond(&mut engine, a.id, Value::Null);
+        assert!(engine.updates.iter().any(|u|matches!(u,Update::SessionUsage{operation,result:Err(_),..} if *operation==operations[0])));
+        let count = engine.updates.len();
+        respond(&mut engine, b.id, Value::Null);
+        assert_eq!(count, engine.updates.len());
+        for wrong in [
+            target.clone(),
+            session_usage::Target {
+                session_id: "b".into(),
+                connection: 1,
+                generation: 8,
+            },
+            session_usage::Target {
+                session_id: "b".into(),
+                connection: 0,
+                generation: 9,
+            },
+        ] {
+            engine.command(Command::ReadSessionUsage {
+                target: wrong,
+                operation: uuid::Uuid::new_v4(),
+            });
+            assert!(engine.outgoing.is_empty());
+        }
+    }
+
+    #[test]
     fn exports_use_request_identity_not_selected_session_and_bound_outstanding_reads() {
         use session_export::Format;
         let mut engine = ready();
@@ -2544,7 +2660,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_send_and_question_survive_stop_metadata_export_and_another_question_ack() {
+    async fn unknown_send_and_question_survive_stop_metadata_export_usage_and_another_question_ack()
+    {
         let mut retained = disconnect_after_unacknowledged_send().await;
         let original_send = retained.uncertain.clone();
         for reconnect in [false, true] {
@@ -2559,6 +2676,7 @@ mod tests {
             let connection = AtomicU64::new(0);
             let metadata_operation = uuid::Uuid::new_v4();
             let export_operation = uuid::Uuid::new_v4();
+            let usage_operation = uuid::Uuid::new_v4();
             let peer = tokio::spawn(async move {
                 let mut server = BufReader::new(server);
                 loop {
@@ -2591,6 +2709,13 @@ mod tests {
                             json!({"answered":true})
                         }
                         Request::InterruptRun { .. } if reconnect => json!({"interrupted":true}),
+                        Request::SessionUsage { session_id } if reconnect => {
+                            assert_eq!(session_id, "a");
+                            let counters =
+                                serde_json::to_value(formless_protocol::UsageInfo::default())
+                                    .unwrap();
+                            json!({"total":counters,"last_run":null,"runs":0})
+                        }
                         Request::ExportSession { id, format } if reconnect => {
                             assert_eq!(id, "a");
                             assert_eq!(format.as_deref(), Some("markdown"));
@@ -2668,6 +2793,16 @@ mod tests {
                                         })
                                         .unwrap();
                                     command_tx
+                                        .try_send(Command::ReadSessionUsage {
+                                            target: session_usage::Target {
+                                                session_id: "a".into(),
+                                                connection: 0,
+                                                generation: 1,
+                                            },
+                                            operation: usage_operation,
+                                        })
+                                        .unwrap();
+                                    command_tx
                                         .try_send(answer(
                                             &questions::Open::from_event(&question("q2")).unwrap(),
                                         ))
@@ -2708,9 +2843,10 @@ mod tests {
                 let final_updates: Vec<_> = receiver.try_iter().collect();
                 assert!(final_updates.iter().any(|update|matches!(update,Update::SessionEdited {operation,outcome:session_edit::Outcome::Applied(_),..} if *operation==metadata_operation)),"the metadata ACK must actually be processed");
                 assert!(final_updates.iter().any(|update|matches!(update,Update::SessionExport {operation,result:Ok(_),..} if *operation==export_operation)),"the export reply must actually be processed");
+                assert!(final_updates.iter().any(|update|matches!(update,Update::SessionUsage{operation,result:Ok(_),..} if *operation==usage_operation)),"the usage reply must actually be processed");
                 assert_eq!(
                     retained.uncertain, before,
-                    "Stop, metadata, export and q2 ACKs cannot clear either unknown operation"
+                    "Stop, metadata, export, usage and q2 ACKs cannot clear either unknown operation"
                 );
             } else {
                 assert_eq!(retained.uncertain.len(), 2);
