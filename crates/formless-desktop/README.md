@@ -20,7 +20,7 @@ cargo test --no-default-features --features daemon-tests --test daemon --locked
 This mode loads real Sessions, supports New Session, Send/Steer/Queue/Stop and
 Resume/Abandon for a confirmed paused or interrupted Run,
 and displays read-only Tools, recorded Run Metrics, Proposals and Settings.
-Session details (palette or Sessions > Details) edits name, tags, pin or archive using
+Session details (palette or Sessions > Details) edits name, tags, pin, archive or standing instructions using
 one acknowledged setter per Save. It targets the chosen list entry, or the
 open Session outside the list. The Archived toggle includes archived entries
 in the directory; opening one shows restore details without activating a
@@ -87,6 +87,12 @@ existing setters replace a current field; they cannot compare against a
 previous revision, so another client's intervening edit can be overwritten.
 Tags are one per line and use the daemon's normalization. Names/tags inputs
 are limited to 16 KiB; at most 128 tags of 256 bytes each are editable here.
+Standing instructions also have a 16 KiB native limit. Saved changes take
+effect at the next agent step, including during a Run; edges are trimmed and
+blank clears. Missing or oversized instruction data disables that field,
+with a TUI handoff, while other metadata fields and owned drafts remain usable.
+Each success reply must explicitly contain the field it acknowledges; an
+omitted field cannot acknowledge a default `false`, empty list or cleared value.
 Cancel and Reload discard unsaved metadata edits explicitly; neither undoes
 an already sent save. Errors retain the edit. A disconnect or ambiguous ACK
 freezes Save until an explicit fresh Reload; no mutation is replayed.
@@ -104,6 +110,7 @@ Findings, measurements, the parity inventory and the open blockers are in
 [docs/desktop/phase0-findings.md](../../docs/desktop/phase0-findings.md).
 
 Current continuation evidence and remaining acceptance are recorded in
+[the standing instructions report](../../docs/desktop/session-instructions-20261115.md),
 [the Profile Search report](../../docs/desktop/profile-search-20261115.md),
 [the archive/restore report](../../docs/desktop/session-archive-20261115.md),
 [the Session metadata/Step report](../../docs/desktop/session-metadata-20261115.md),
