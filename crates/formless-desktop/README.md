@@ -27,7 +27,15 @@ in the directory; opening one shows restore details without activating a
 neighbour. Archive hides a Session and retains its history; running work
 continues. Restore returns it to the default list for explicit activation.
 Arrow keys browse resource entries; Copy details copies all returned fields
-as JSON. Loaded-text Search keeps its explicit Session scope. Existing pending
+as JSON. Loaded-text Search keeps its explicit Session scope.
+
+Profile Search is a separate command in the palette (Go to Profile Search).
+It explicitly searches persisted messages across the connected Profile,
+including archived Sessions, using the daemon's query/ranking semantics.
+Enter in its query submits a read; arrows choose a returned snippet and Enter
+in the results opens its Session without jumping to the message. An archived
+or missing Session must be restored/refreshed in Sessions before opening.
+No search is replayed after reconnect. Existing pending
 questions are available in the Profile-wide Questions command/header entry,
 with structured single/multi-choice and multiline free text. Their Session
 identity stays explicit even while another Session is displayed. Existing
@@ -96,6 +104,7 @@ Findings, measurements, the parity inventory and the open blockers are in
 [docs/desktop/phase0-findings.md](../../docs/desktop/phase0-findings.md).
 
 Current continuation evidence and remaining acceptance are recorded in
+[the Profile Search report](../../docs/desktop/profile-search-20261115.md),
 [the archive/restore report](../../docs/desktop/session-archive-20261115.md),
 [the Session metadata/Step report](../../docs/desktop/session-metadata-20261115.md),
 [the native question report](../../docs/desktop/native-questions-20261114.md),
@@ -145,6 +154,8 @@ not see GPUI. Run every command below from this directory.
 | `src/model.rs` | Presentation model: destinations, Run state, composer actions, layout breakpoints and modal overlays, focus regions, Session list selection, text size, drafts bounded by count and bytes | none |
 | `src/directory.rs` | Read-only title/preview/ID/tag filtering, selection by ID and bounded visual labels; archived scope is opt-in | none |
 | `src/search.rs` | Bounded literal matches in finished loaded text, byte-range results, source-revision validation and bounded grapheme-safe snippets | none |
+| `src/profile_search.rs` | Explicit persisted Profile search, bounded results and query/operation/connection ownership | none |
+| `src/shell/profile_search.rs` | Native Profile search page, selection, copy, input and focus behavior | `gui` feature |
 | `src/commands.rs` | Typed shell command registry and palette search | none |
 | `src/replies.rs` | Read-only, validated `ListSessions` / `GetSession` decoding | none |
 | `src/forecast.rs` | Validation and bounded presentation of daemon forecast quotes; estimates and consent remain daemon-owned | none |
