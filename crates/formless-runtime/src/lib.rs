@@ -3,9 +3,12 @@
 //! `__host(op, argsJson)` bridge, checked against declared Capabilities.
 
 pub mod caps;
+mod clipboard_diagnostics;
 mod dns;
 mod process_executable;
 mod processes;
+mod read_size;
+use read_size::ReadSize;
 pub mod sensitive_paths;
 pub mod structured_output;
 pub mod sync;
@@ -197,18 +200,18 @@ pub fn set_io_limits(read: u64, process_output: u64, log: u64) {
     MAX_LOG_BYTES.store(log.max(1), Ordering::Relaxed);
 }
 
-/// "fs.read: 80 MB is over the 64 MB resource limit (tools.max_read_bytes); use fs.readChunks".
-fn over_limit(what: &str, size: u64, setting: &str, instead: &str) -> String {
-    let mb = |b: u64| format!("{:.1} MB", b as f64 / 1_048_576.0);
-    format!(
-        "{what}: {} is over the {} resource limit ({setting}); {instead}",
-        mb(size),
-        mb(MAX_READ_BYTES.load(Ordering::Relaxed))
+/// Whole-read errors retain byte-exact observations and their source.
+fn over_limit(what: &str, size: ReadSize, setting: &str, instead: &str) -> String {
+    size.over_limit(
+        what,
+        MAX_READ_BYTES.load(Ordering::Relaxed),
+        setting,
+        instead,
     )
 }
 
-fn check_read_size(len: u64) -> Result<(), String> {
-    if len > MAX_READ_BYTES.load(Ordering::Relaxed) {
+fn check_read_size(len: ReadSize) -> Result<(), String> {
+    if len.bytes() > MAX_READ_BYTES.load(Ordering::Relaxed) {
         return Err(over_limit(
             "fs.read",
             len,
@@ -227,14 +230,14 @@ fn read_capped(p: &std::path::Path) -> Result<Vec<u8>, String> {
     let cap = MAX_READ_BYTES.load(Ordering::Relaxed);
     // Fast early error for files that already say they're too big.
     if let Ok(m) = std::fs::metadata(p) {
-        check_read_size(m.len())?;
+        check_read_size(ReadSize::Reported(m.len()))?;
     }
     let f = std::fs::File::open(p).map_err(|e| format!("{}: {e}", p.display()))?;
     let mut out = Vec::new();
     f.take(cap + 1)
         .read_to_end(&mut out)
         .map_err(|e| format!("{}: {e}", p.display()))?;
-    check_read_size(out.len() as u64)?;
+    check_read_size(ReadSize::AtLeast(out.len() as u64))?;
     Ok(out)
 }
 
@@ -546,9 +549,19 @@ globalThis.modules = { load: globalThis.requireModule, list: () => __call("modul
 globalThis.emit = (chunk) => __call("emit", { chunk: String(chunk) });
 // Progress for long work: a fraction 0..1 (or null when unknown) and a
 // short label; the daemon decides whether it represents advancing work.
+function __progressLabel(label) {
+  const text = label == null ? "" : String(label);
+  if (text.length <= 120) return text;
+  // Reserve one UTF-16 unit for the visible truncation marker. Do not cut
+  // between the high and low surrogates of a supplementary code point.
+  let end = 119;
+  const before = text.charCodeAt(end - 1), after = text.charCodeAt(end);
+  if (before >= 0xd800 && before <= 0xdbff && after >= 0xdc00 && after <= 0xdfff) end--;
+  return text.slice(0, end) + "…";
+}
 globalThis.progress = (fraction, label) => __call("progress", {
   fraction: typeof fraction === "number" && isFinite(fraction) ? Math.min(1, Math.max(0, fraction)) : null,
-  label: label == null ? "" : String(label).slice(0, 120),
+  label: __progressLabel(label),
 });
 function __nonnegativeSafeInteger(api, n) {
   if (typeof n !== "number" || !Number.isSafeInteger(n) || n < 0)
@@ -1533,7 +1546,7 @@ impl State {
                 let p = self.resolve(a["path"].as_str().unwrap_or_default(), false)?;
                 match self.overlay_get(&p) {
                     Some(Some(bytes)) => {
-                        check_read_size(bytes.len() as u64)?;
+                        check_read_size(ReadSize::Exact(bytes.len() as u64))?;
                         return Ok(encode(&bytes, enc));
                     }
                     Some(None) => return Err(format!("not found: {}", p.display())),
@@ -1567,7 +1580,7 @@ impl State {
                         Vec::new()
                     };
                     full.extend_from_slice(&data);
-                    check_read_size(full.len() as u64)?;
+                    check_read_size(ReadSize::Exact(full.len() as u64))?;
                     if self.mode == HostMode::DryRun {
                         self.would(format!(
                             "{} {} bytes to {}",
@@ -2062,7 +2075,7 @@ impl State {
             if let Some(len) = resp.content_length().filter(|l| *l > cap) {
                 return Err(over_limit(
                     "fetch",
-                    len,
+                    ReadSize::Reported(len),
                     "tools.max_read_bytes",
                     "stream it with fetchChunks",
                 ));
@@ -2075,7 +2088,7 @@ impl State {
             if bytes.len() as u64 > cap {
                 return Err(over_limit(
                     "fetch",
-                    bytes.len() as u64,
+                    ReadSize::AtLeast(bytes.len() as u64),
                     "tools.max_read_bytes",
                     "stream it with fetchChunks",
                 ));
@@ -2732,21 +2745,53 @@ fn scoped_model<'a>(
 }
 
 fn run_capture(cmd: &str, args: &[&str], stdin_text: Option<&str>) -> Result<String, String> {
+    run_capture_impl(cmd, args, stdin_text, false)
+}
+
+fn run_capture_impl(
+    cmd: &str,
+    args: &[&str],
+    stdin_text: Option<&str>,
+    detailed: bool,
+) -> Result<String, String> {
     use std::io::Write;
+    // All stdin-bearing callers are clipboard writes. Protect their errors
+    // on every platform, including the legacy non-detailed helper path.
+    let protected_diagnostics = detailed || stdin_text.is_some();
     let mut child = std::process::Command::new(cmd)
         .args(args)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .map_err(|e| format!("{cmd}: {e}"))?;
+        .map_err(|e| {
+            if protected_diagnostics {
+                clipboard_diagnostics::failure(cmd, "could not spawn", &e.to_string(), stdin_text)
+            } else {
+                format!("{cmd}: {e}")
+            }
+        })?;
     if let Some(text) = stdin_text {
         if let Some(mut stdin) = child.stdin.take() {
             let _ = stdin.write_all(text.as_bytes());
         }
     }
-    let out = child.wait_with_output().map_err(|e| e.to_string())?;
+    let out = child.wait_with_output().map_err(|e| {
+        if protected_diagnostics {
+            clipboard_diagnostics::failure(cmd, "could not wait", &e.to_string(), stdin_text)
+        } else {
+            e.to_string()
+        }
+    })?;
     if !out.status.success() {
+        if protected_diagnostics {
+            return Err(clipboard_diagnostics::failure(
+                cmd,
+                &format!("exited unsuccessfully ({})", out.status),
+                &String::from_utf8_lossy(&out.stderr),
+                stdin_text,
+            ));
+        }
         return Err(format!(
             "{cmd} failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
@@ -2770,9 +2815,7 @@ fn clipboard_read() -> Result<String, String> {
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        run_capture("wl-paste", &[], None)
-            .or_else(|_| run_capture("xclip", &["-selection", "clipboard", "-o"], None))
-            .or_else(|_| run_capture("xsel", &["--clipboard", "--output"], None))
+        clipboard_diagnostics::read()
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -2797,10 +2840,7 @@ pub fn clipboard_write(text: &str) -> Result<(), String> {
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        run_capture("wl-copy", &[], Some(text))
-            .or_else(|_| run_capture("xclip", &["-selection", "clipboard"], Some(text)))
-            .or_else(|_| run_capture("xsel", &["--clipboard", "--input"], Some(text)))
-            .map(|_| ())
+        clipboard_diagnostics::write(text)
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -3371,6 +3411,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn whole_read_limit_errors_distinguish_exact_byte_counts() {
+        let cap = MAX_READ_BYTES.load(Ordering::Relaxed);
+        let error = over_limit(
+            "fs.read",
+            ReadSize::AtLeast(cap + 1),
+            "tools.max_read_bytes",
+            "use fs.readChunks or fs.readLines",
+        );
+        assert!(error.contains(&(cap + 1).to_string()), "{error}");
+        assert!(error.contains(&cap.to_string()), "{error}");
+        assert!(
+            error.contains("at least"),
+            "bounded probes are not a total size: {error}"
+        );
+        assert!(
+            error.contains("tools.max_read_bytes")
+                && error.contains("fs.readChunks")
+                && error.contains("fs.readLines")
+        );
+    }
+
+    #[test]
     fn structured_incomplete_reasons_keep_runtime_error_classification() {
         use structured_output::{IncompleteReason, StructuredOutputError};
         for (reason, expected) in [
@@ -3453,6 +3515,62 @@ mod tests {
     impl HostOps for ProgressOps {
         fn progress(&self, fraction: Option<f64>, label: &str) {
             self.0.locked().push((fraction, label.to_string()));
+        }
+    }
+
+    #[test]
+    fn progress_label_json_bridge_preserves_codepoints_within_utf16_budget() {
+        // Evaluate only the host prelude with a recording JSON bridge. No Tool
+        // source, Run, host dispatch or progress scheduler is started.
+        let runtime = Runtime::new().unwrap();
+        runtime.set_memory_limit(8 * 1024 * 1024);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        runtime.set_interrupt_handler(Some(Box::new(move || {
+            std::time::Instant::now() >= deadline
+        })));
+        let context = Context::full(&runtime).unwrap();
+        let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+        context.with(|ctx| {
+            let recorded = calls.clone();
+            let host = Function::new(ctx.clone(), move |op: String, args: String| {
+                recorded.locked().push(format!("{op}\n{args}"));
+                r#"{"ok":true,"value":null}"#.to_string()
+            })
+            .unwrap();
+            ctx.globals().set("__host", host).unwrap();
+            ctx.eval::<(), _>(PRELUDE).unwrap();
+            ctx.eval::<(), _>(
+                r#"
+                progress(0.5, "a".repeat(120));
+                progress(7, "a".repeat(119) + "😀");
+                progress(-1, "a".repeat(118) + "😀x");
+                progress(Infinity, "a".repeat(118) + "😀");
+                progress("x", null);
+                progress(NaN, "ไทย\n\"quoted\"");
+                progress(0, "😀".repeat(60));
+                progress(1, "😀".repeat(61));
+            "#,
+            )
+            .unwrap();
+        });
+        let expected = [
+            (json!(0.5), "a".repeat(120)),
+            (json!(1), format!("{}…", "a".repeat(119))),
+            (json!(0), format!("{}…", "a".repeat(118))),
+            (Value::Null, format!("{}😀", "a".repeat(118))),
+            (Value::Null, String::new()),
+            (Value::Null, "ไทย\n\"quoted\"".to_string()),
+            (json!(0), "😀".repeat(60)),
+            (json!(1), format!("{}…", "😀".repeat(59))),
+        ];
+        let calls = calls.locked();
+        assert_eq!(calls.len(), expected.len());
+        for (call, (fraction, label)) in calls.iter().zip(expected) {
+            let args = call.strip_prefix("progress\n").unwrap();
+            let parsed: Value = serde_json::from_str(args)
+                .expect("bridge JSON must decode without lone surrogates");
+            assert_eq!(parsed, json!({"fraction": fraction, "label": label}));
+            assert!(label.encode_utf16().count() <= 120);
         }
     }
 

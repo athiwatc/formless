@@ -25,7 +25,7 @@ struct CallResult {
     failed: bool,
 }
 
-fn parts(msgs: &[MessageInfo]) -> Vec<Part> {
+fn parts(msgs: &[MessageInfo], arguments: impl Fn(&str) -> String) -> Vec<Part> {
     let mut out = Vec::new();
     // Tool call id → index in `out`, to attach results.
     let mut calls: HashMap<String, usize> = HashMap::new();
@@ -43,16 +43,11 @@ fn parts(msgs: &[MessageInfo]) -> Vec<Part> {
                 }
                 for c in meta["tool_calls"].as_array().into_iter().flatten() {
                     let args = c["function"]["arguments"].as_str().unwrap_or_default();
-                    // Pretty-print JSON arguments when they parse.
-                    let args = serde_json::from_str::<Value>(args)
-                        .ok()
-                        .and_then(|v| serde_json::to_string_pretty(&v).ok())
-                        .unwrap_or_else(|| args.to_string());
                     if let Some(id) = c["id"].as_str() {
                         calls.insert(id.to_string(), out.len());
                     }
                     let name = c["function"]["name"].as_str().unwrap_or("tool");
-                    out.push(Part::Call(name.to_string(), clip(&args), None));
+                    out.push(Part::Call(name.to_string(), arguments(args), None));
                 }
             }
             "tool" => {
@@ -98,15 +93,38 @@ fn fenced(lang: &str, s: &str) -> String {
     format!("{fence}{lang}\n{}\n{fence}", s.trim_end())
 }
 
+/// HTML retains its existing pretty-printed, then clipped argument display.
+fn html_arguments(args: &str) -> String {
+    let pretty = serde_json::from_str::<Value>(args)
+        .ok()
+        .and_then(|value| serde_json::to_string_pretty(&value).ok())
+        .unwrap_or_else(|| args.to_string());
+    clip(&pretty)
+}
+
+/// Remove complete leading blank lines, retaining indentation on the first
+/// content line. Keep the existing trailing-boundary policy.
+fn turn_boundaries(mut text: &str) -> &str {
+    while let Some((line, rest)) = text.split_once('\n') {
+        if !line.trim().is_empty() {
+            break;
+        }
+        text = rest;
+    }
+    text.trim_end()
+}
+
 /// The transcript as Markdown: user and assistant turns, notes as quotes,
 /// and each Tool call as a collapsed `<details>` with its result.
 pub fn markdown(name: &str, msgs: &[MessageInfo]) -> String {
     let mut out = format!("# {name}\n");
-    for part in parts(msgs) {
+    for part in parts(msgs, clip) {
         out.push('\n');
         match part {
-            Part::User(t) => out.push_str(&format!("## You\n\n{}\n", t.trim())),
-            Part::Assistant(t) => out.push_str(&format!("## Assistant\n\n{}\n", t.trim())),
+            Part::User(t) => out.push_str(&format!("## You\n\n{}\n", turn_boundaries(&t))),
+            Part::Assistant(t) => {
+                out.push_str(&format!("## Assistant\n\n{}\n", turn_boundaries(&t)))
+            }
             Part::Note(t) => out.push_str(&format!("> *{}*\n", t.trim().replace('\n', " "))),
             Part::Call(tool, args, result) => {
                 out.push_str(&format!(
@@ -190,7 +208,7 @@ fn md_html(s: &str) -> String {
 /// resources).
 pub fn html(name: &str, msgs: &[MessageInfo]) -> String {
     let mut body = String::new();
-    for part in parts(msgs) {
+    for part in parts(msgs, html_arguments) {
         match part {
             Part::User(t) => body.push_str(&format!(
                 "<section class=\"user\"><h2>You</h2>{}</section>\n",
@@ -283,7 +301,7 @@ mod tests {
         assert!(md.starts_with("# TODOs\n"));
         assert!(md.contains("## You\n\ncount the TODOs"));
         assert!(md.contains("<summary>Tool: grep</summary>"));
-        assert!(md.contains("\"q\": \"TODO\""), "{md}");
+        assert!(md.contains("\"q\":\"TODO\""), "{md}");
         // A result with backticks gets a longer fence.
         assert!(md.contains("````\na.rs: 3"), "{md}");
         assert!(md.contains("> *The working directory is now /x.*"));
@@ -382,3 +400,7 @@ mod tests {
 #[cfg(test)]
 #[path = "transcript_result_tests.rs"]
 mod transcript_result_tests;
+
+#[cfg(test)]
+#[path = "transcript_source_tests.rs"]
+mod transcript_source_tests;
