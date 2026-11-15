@@ -442,7 +442,7 @@ pub fn entry(command: Command, state: &State) -> Entry {
         ),
         Command::SessionDetails => (
             "Session details",
-            "Edit Session name, tags or pin".into(),
+            "Edit Session name, tags, pin, model/Role or effort".into(),
             Group::Session,
             "Edit the chosen Sessions-list entry, or the open Session outside that list",
             None,

@@ -547,3 +547,12 @@ until the answer completes or the next eligible attempt; this is not seamless
 recovery. Production remains disabled. The
 [real daemon-to-headless-view continuation](../../docs/desktop/v1-end-to-end-20261115.md)
 checks that path and older-peer fallback without a native launch.
+
+Session details also edits the selected Session's model/`role:name` and
+reasoning-effort overrides. Blank inherits the configured default. Each Save
+preserves the confirmed companion value, freshly checks the pair and blocks
+new work preparation while pending. Saving may start the daemon's configured
+paid background model test; the form keeps this notice visible. It does not
+automatically fetch a catalog or validate provider support. See the
+[model selection contract](../../docs/desktop/session-model-selection-20261115.md)
+for partial-reply, stale callback, no-op and unknown-outcome limits.

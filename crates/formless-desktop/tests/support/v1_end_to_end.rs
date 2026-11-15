@@ -6,7 +6,7 @@ use formless_protocol::Request;
 use serde_json::{json, Value};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 use tokio::sync::Notify;
 
@@ -45,6 +45,7 @@ struct Fixture {
     endpoint: Endpoint,
     session: String,
     calls: Arc<AtomicUsize>,
+    models: Arc<Mutex<Vec<String>>>,
     complete: Vec<Arc<Notify>>,
     extra: Arc<Notify>,
 }
@@ -58,6 +59,7 @@ impl Fixture {
         let complete = (0..3).map(|_| Arc::new(Notify::new())).collect::<Vec<_>>();
         let extra = Arc::new(Notify::new());
         let calls = Arc::new(AtomicUsize::new(0));
+        let models = Arc::new(Mutex::new(Vec::new()));
         #[cfg(unix)]
         let temp = std::path::PathBuf::from("/tmp");
         #[cfg(windows)]
@@ -81,7 +83,12 @@ impl Fixture {
                         let complete = complete.clone();
                         let extra = extra.clone();
                         let calls = calls.clone();
-                        move || {
+                        let models = models.clone();
+                        move |axum::Json(body): axum::Json<Value>| {
+                            models
+                                .lock()
+                                .unwrap()
+                                .push(body["model"].as_str().expect("provider model").to_string());
                             let number = calls.fetch_add(1, Ordering::SeqCst);
                             assert!(number < 3, "unexpected provider request");
                             let complete = complete[number].clone();
@@ -132,6 +139,11 @@ impl Fixture {
             config.provider.api_style = "anthropic".into();
             config.provider.model = "v1-test".into();
             config.provider.max_retries = 0;
+            config.provider.auto_test_models = false;
+            config.roles.insert(
+                "desktop-fixture".into(),
+                serde_json::from_value(json!({"model":"v1-test"})).unwrap(),
+            );
             config.naming.enabled = false;
             config.skills.auto_create = false;
             config.daemon.idle_grace_secs = 3600;
@@ -165,6 +177,7 @@ impl Fixture {
             endpoint,
             session,
             calls,
+            models,
             complete,
             extra,
         }
@@ -609,4 +622,127 @@ fn native_step_mode_changes_reach_real_daemon_without_starting_work_and_preserve
         });
         f.finish();
     }
+}
+
+#[gpui_kit::test]
+fn native_session_model_role_effort_and_clear_follow_real_daemon_next_run_contract(
+    cx: &mut TestAppContext,
+) {
+    let env = credential_env::EnvGuard::isolated();
+    env.set("FORMLESS_API_KEY", "private-session-model-key");
+    let f = Fixture::start();
+    let (h, shell) = open(cx, WIDE, 0, 0);
+    step(cx, h, |_, cx| {
+        shell.update(cx, |s, cx| s.connect_daemon(f.endpoint.clone(), cx))
+    });
+    until(cx, h, &shell, "model Session list", |s, _| {
+        s.sidebar().rows().iter().any(|r| r.id == f.session)
+    });
+    step(cx, h, |window, cx| {
+        window.click(session_row_id(&f.session), cx)
+    });
+    until(cx, h, &shell, "model canonical baseline", |s, _| {
+        s.step_mode_enable_target().is_some()
+    });
+    let composer = step(cx, h, |window, cx| {
+        shell.update(cx, |s, cx| {
+            s.focus_section(PageSection::Composer, window, cx)
+        });
+        window.input("Model draft ไทย 😀", cx);
+        shell.read(cx).composer().clone()
+    });
+    let open_form = |cx: &mut TestAppContext| {
+        step(cx, h, |window, cx| {
+            assert!(shell
+                .update(cx, |s, cx| s.run_command(
+                    Command::SessionDetails,
+                    window,
+                    cx
+                ))
+                .is_none())
+        });
+        until(cx, h, &shell, "model metadata loaded", |s, _| {
+            s.session_edit_input().is_some()
+        });
+    };
+    let save = |cx: &mut TestAppContext, field: &'static str, value: &str| {
+        step(cx, h, |window, cx| {
+            window.click(field, cx);
+            let i = shell.read(cx).session_edit_input().unwrap();
+            i.update(cx, |i, cx| i.set_value(value, window, cx));
+            assert!(window.find("session-model-paid-footer").visible());
+            window.click("session-edit-save", cx);
+        });
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            pump(cx, h, &shell);
+            let done = step(cx, h, |window, _| {
+                window.find("session-edit-notice").value().is_some_and(|n| {
+                    n.starts_with("Saved and acknowledged")
+                        || n.starts_with("The current model/effort pair already matches")
+                })
+            });
+            if done {
+                break;
+            }
+            assert!(Instant::now() < deadline, "model save receipt");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    };
+    open_form(cx);
+    save(cx, "session-edit-model", "role:desktop-fixture");
+    assert_eq!(f.snapshot()["session"]["model"], "role:desktop-fixture");
+    assert_eq!(
+        f.calls.load(Ordering::SeqCst),
+        0,
+        "auto-test disabled; saving must not start work"
+    );
+    step(cx, h, |window, cx| window.click("session-edit-cancel", cx));
+    let _ = f.send();
+    f.wait("role resolved to provider model", || {
+        f.models.lock().unwrap().len() == 1
+    });
+    assert_eq!(f.models.lock().unwrap()[0], "v1-test");
+    open_form(cx);
+    save(cx, "session-edit-model", "v1-other-test");
+    assert_eq!(f.snapshot()["session"]["model"], "v1-other-test");
+    assert_eq!(
+        f.calls.load(Ordering::SeqCst),
+        1,
+        "changing selection must not start or replace the active Run"
+    );
+    step(cx, h, |window, cx| window.click("session-edit-cancel", cx));
+    f.complete[0].notify_one();
+    until(cx, h, &shell, "old-model Run completes", |s, _| {
+        s.last_block_preview() == "A prefix before attachment A final 😀"
+    });
+    f.wait("first model Run idle", || f.snapshot()["running"] == false);
+    let _ = f.send();
+    f.wait("next Run uses saved model", || {
+        f.models.lock().unwrap().len() == 2
+    });
+    assert_eq!(f.models.lock().unwrap()[1], "v1-other-test");
+    f.extra.notify_one();
+    f.complete[1].notify_one();
+    until(cx, h, &shell, "new-model Run completes", |s, _| {
+        s.last_block_preview() == "B future prefix B suffix after reconnect B final 漢字"
+    });
+    f.wait("second model Run idle", || f.snapshot()["running"] == false);
+    open_form(cx);
+    save(cx, "session-edit-effort", "high");
+    assert_eq!(f.snapshot()["session"]["reasoning_effort"], "high");
+    assert_eq!(f.snapshot()["session"]["model"], "v1-other-test");
+    save(cx, "session-edit-model", "");
+    assert!(f.snapshot()["session"]["model"].is_null());
+    assert_eq!(f.snapshot()["session"]["reasoning_effort"], "high");
+    save(cx, "session-edit-effort", "");
+    assert!(f.snapshot()["session"]["reasoning_effort"].is_null());
+    assert_eq!(f.calls.load(Ordering::SeqCst), 2);
+    step(cx, h, |window, cx| {
+        window.click("session-edit-cancel", cx);
+        assert_eq!(shell.read(cx).composer(), &composer);
+        assert_eq!(composer.read(cx).value().as_ref(), "Model draft ไทย 😀");
+        shell.update(cx, |s, cx| s.connect_recording_daemon(cx));
+    });
+    f.finish();
 }

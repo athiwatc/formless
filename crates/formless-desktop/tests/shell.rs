@@ -7558,3 +7558,6 @@ mod approval_end_to_end;
 #[cfg(feature = "daemon-tests")]
 #[path = "../../formless-core/tests/support/env.rs"]
 mod credential_env;
+
+#[path = "support/session_model.rs"]
+mod session_model_tests;

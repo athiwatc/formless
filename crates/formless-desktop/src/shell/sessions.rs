@@ -11,6 +11,7 @@ enum Waiting {
 
 #[derive(Clone)]
 struct PresentedSave {
+    revision: uuid::Uuid,
     id: String,
     connection: u64,
     field: Field,
@@ -28,6 +29,9 @@ pub(super) struct ExportSavePrompt {
 
 pub(super) struct Panel {
     pub export: session_export::State,
+    revision: uuid::Uuid,
+    model: String,
+    effort: String,
     id: String,
     metadata: Option<Metadata>,
     field: Field,
@@ -79,6 +83,30 @@ impl Shell {
         self.session_editor.as_ref()?.input.clone()
     }
 
+    #[cfg(feature = "test-support")]
+    pub fn session_edit_revision(&self) -> Option<uuid::Uuid> {
+        Some(self.session_editor.as_ref()?.revision)
+    }
+    #[cfg(feature = "test-support")]
+    pub fn save_presented_session_selection(
+        &mut self,
+        revision: uuid::Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(p) = &self.session_editor else {
+            return;
+        };
+        assert!(matches!(p.field, Field::Model | Field::Effort));
+        let presented = PresentedSave {
+            revision,
+            id: p.id.clone(),
+            connection: p.connection,
+            field: p.field,
+            toggle: None,
+        };
+        self.save_session_edit(presented, window, cx);
+    }
     /// Exercise the same callback with an action captured by an earlier render.
     /// TestWindow::click redraws first, so it cannot deliver a stale callback.
     #[cfg(feature = "test-support")]
@@ -97,6 +125,7 @@ impl Shell {
         };
         self.save_session_edit(
             PresentedSave {
+                revision: self.session_editor.as_ref().unwrap().revision,
                 id: id.into(),
                 connection,
                 field,
@@ -135,6 +164,9 @@ impl Shell {
         };
         self.session_editor = Some(Panel {
             export: session_export::State::default(),
+            revision: uuid::Uuid::new_v4(),
+            model: String::new(),
+            effort: String::new(),
             id,
             metadata: None,
             field,
@@ -150,7 +182,7 @@ impl Shell {
             notice: String::new(),
             focus: cx.focus_handle(),
             cancel: cx.focus_handle(),
-            controls: (0..12)
+            controls: (0..14)
                 .map(|_| {
                     (
                         cx.focus_handle(),
@@ -179,6 +211,8 @@ impl Shell {
             return;
         }
         let text = match panel.field {
+            Field::Model => &panel.model,
+            Field::Effort => &panel.effort,
             Field::Name => &panel.name,
             Field::Tags => &panel.tags,
             Field::Instructions => panel.instructions.as_deref().unwrap_or_default(),
@@ -206,7 +240,7 @@ impl Shell {
                                 let Some(panel)=this.session_editor.as_mut() else {return;};
                                 if panel.input.as_ref()!=Some(&input) || input.update(cx,|input,cx|input.marked_text_range(window,cx).is_some()) || input.read(cx).value().len()<=MAX_INPUT {return;}
                                 let focused=input.focus_handle(cx).contains_focused(window,cx);
-                                match panel.field {Field::Name=>panel.name=accepted,Field::Tags=>panel.tags=accepted,Field::Instructions=>panel.instructions=Some(accepted),Field::Pin|Field::Archive=>{}}
+                                match panel.field {Field::Model=>panel.model=accepted,Field::Effort=>panel.effort=accepted,Field::Name=>panel.name=accepted,Field::Tags=>panel.tags=accepted,Field::Instructions=>panel.instructions=Some(accepted),Field::Pin|Field::Archive=>{}}
                                 panel.notice="Edit exceeds 16 KiB and was rejected whole. Earlier text kept; undo history cleared.".into();
                                 this.rebuild_session_edit_input(window,cx);
                                 if focused {this.session_editor.as_ref().unwrap().input.as_ref().unwrap().update(cx,|input,cx|input.focus(window,cx));}
@@ -243,6 +277,8 @@ impl Shell {
             return false;
         }
         match panel.field {
+            Field::Model => panel.model = text,
+            Field::Effort => panel.effort = text,
             Field::Name => panel.name = text,
             Field::Tags => panel.tags = text,
             Field::Instructions => panel.instructions = Some(text),
@@ -264,6 +300,7 @@ impl Shell {
         }
         let panel = self.session_editor.as_mut().unwrap();
         panel.field = field;
+        panel.revision = uuid::Uuid::new_v4();
         // A fresh entity keeps undo history scoped to the displayed field.
         self.rebuild_session_edit_input(window, cx);
         self.session_editor
@@ -292,6 +329,7 @@ impl Shell {
         }
         let operation = uuid::Uuid::new_v4();
         panel.connection = client.connection();
+        panel.revision = uuid::Uuid::new_v4();
         panel.retired = true;
         match client.send(ClientCommand::ReadSessionDetails {
             connection: panel.connection,
@@ -319,7 +357,8 @@ impl Shell {
         let Some(panel) = self.session_editor.as_mut() else {
             return;
         };
-        if panel.id != presented.id
+        if panel.revision != presented.revision
+            || panel.id != presented.id
             || panel.connection != presented.connection
             || panel.field != presented.field
         {
@@ -349,6 +388,8 @@ impl Shell {
             return;
         };
         let text = match panel.field {
+            Field::Model => &panel.model,
+            Field::Effort => &panel.effort,
             Field::Name => &panel.name,
             Field::Tags => &panel.tags,
             Field::Instructions => panel.instructions.as_deref().unwrap_or_default(),
@@ -417,6 +458,10 @@ impl Shell {
         panel.waiting = None;
         match result {
             Ok(metadata) if metadata.id == id => {
+                if let Some(selection) = &metadata.selection {
+                    panel.model = selection.model.clone().unwrap_or_default();
+                    panel.effort = selection.reasoning_effort.clone().unwrap_or_default();
+                }
                 panel.name = metadata.name.clone();
                 panel.tags = metadata.tags.join("\n");
                 panel.instructions = metadata.instructions.text().map(str::to_string);
@@ -468,10 +513,14 @@ impl Shell {
             return;
         }
         panel.waiting = None;
+        panel.revision = uuid::Uuid::new_v4();
+        let observed = matches!(&outcome, Outcome::ObservedSelection(_));
         match outcome {
-            Outcome::Applied(metadata) if metadata.id == id => {
+            Outcome::Applied(metadata) | Outcome::ObservedSelection(metadata)
+                if metadata.id == id =>
+            {
                 panel.metadata = Some(metadata);
-                panel.notice = "Saved and acknowledged. Other unsaved fields are unchanged.".into();
+                panel.notice = if observed {"The current model/effort pair already matches. No setting was written or model test started. Other unsaved fields are unchanged."} else {"Saved and acknowledged. Other unsaved fields are unchanged."}.into();
             }
             Outcome::Rejected(error) => {
                 panel.notice = format!(
@@ -532,6 +581,7 @@ impl Shell {
             if client.connection() != panel.connection {
                 let unknown = matches!(panel.waiting, Some(Waiting::Write(_)));
                 panel.connection = client.connection();
+                panel.revision = uuid::Uuid::new_v4();
                 panel
                     .export
                     .retire("Connection changed. Request another export; nothing was replayed.");
@@ -883,24 +933,28 @@ impl Shell {
                     .metadata
                     .as_ref()
                     .is_some_and(|metadata| metadata.instructions.text().is_some()))
+            && (!matches!(panel.field, Field::Model | Field::Effort)
+                || panel
+                    .metadata
+                    .as_ref()
+                    .is_some_and(|m| m.selection.is_some()))
             && self
                 .client
                 .as_ref()
                 .is_some_and(|client| client.is_ready() && client.connection() == panel.connection);
         let mut body=v_flex().id("session-edit-body").test_support().flex_1().min_h_0().overflow_y_scroll().track_scroll(&panel.scroll).gap_2()
             .child(readable("session-edit-id",format!("Session: {}",panel.id)))
-            .child(readable("session-edit-help","Saves replace the current field, including changes made by another client. Cancel discards unsaved metadata edits; it does not undo a sent save. Reload also replaces these edits."));
+            .child(readable("session-edit-help","Saves replace the current field, including changes made by another client. Cancel discards unsaved metadata edits; it does not undo a requested save. Reload also replaces these edits."));
         let mut tabs = h_flex().flex_wrap().gap_2();
         for (index, field) in [
-            Field::Name,
-            Field::Tags,
-            Field::Pin,
-            Field::Archive,
-            Field::Instructions,
-        ]
-        .into_iter()
-        .enumerate()
-        {
+            (0, Field::Name),
+            (1, Field::Tags),
+            (2, Field::Pin),
+            (3, Field::Archive),
+            (4, Field::Instructions),
+            (12, Field::Model),
+            (13, Field::Effort),
+        ] {
             tabs = tabs.child(
                 div()
                     .id(SharedString::from(format!(
@@ -926,6 +980,35 @@ impl Shell {
             );
         }
         body = body.child(tabs);
+        if matches!(panel.field, Field::Model | Field::Effort) {
+            body=body.child(readable("session-model-help","Per-Session override for future Runs. Enter a model ID, alias or role:name; blank inherits the default. A running Run keeps its current model. This form does not validate provider/model/Role availability. Changing one field preserves the last confirmed other value; unsaved edits in that other field are not applied."))
+                .child(readable("session-model-cost","Saving may start the daemon's configured paid background model test. No conversation message or Run is started by this form. No model-catalog request is made automatically."));
+            if let Some(choice) = panel.metadata.as_ref().and_then(|m| m.selection.as_ref()) {
+                body = body.child(readable(
+                    "session-model-confirmed",
+                    format!(
+                        "Last confirmed model/Role: {} · effort: {}",
+                        preview(
+                            &crate::directory::visual_text(
+                                choice.model.as_deref().unwrap_or("Inherited default")
+                            ),
+                            160
+                        ),
+                        preview(
+                            &crate::directory::visual_text(
+                                choice
+                                    .reasoning_effort
+                                    .as_deref()
+                                    .unwrap_or("Inherited default")
+                            ),
+                            80
+                        )
+                    ),
+                ));
+            } else {
+                body=body.child(readable("session-model-unavailable","This reply did not expose a complete bounded model/effort pair. Saving either field is disabled. Any draft remains available to copy; reload or use Formless TUI."));
+            }
+        }
         if panel.field == Field::Instructions {
             body=body.child(readable("session-edit-instructions-help","Standing instructions for this Session. Saved changes take effect at the next agent step, including during a Run. Leading/trailing whitespace is trimmed; blank clears. Save replaces the whole field."));
             if let Some(crate::session_edit::Instructions::TooLarge(bytes)) = panel
@@ -970,8 +1053,22 @@ impl Shell {
                 body=body.child(readable("session-edit-archive-value",if metadata.archived {"Last confirmed: archived. Restore returns this Session to the default list."} else {"Last confirmed: unarchived. Archive hides this Session from the default list and retains its history. Running work continues."}));
             }
         } else if let Some(input) = &panel.input {
-            body=body.child(readable("session-edit-field-label",if panel.field==Field::Name {"Session name (one line)"} else {"Tags (one per line; blank clears). The daemon normalizes case, # prefixes and duplicates."}))
-                .child(div().id("session-edit-input-anchor").test_support().pt_1().anchor_scroll(Some(panel.input_anchor.clone())).child(Textarea::new(input).aria_label(if panel.field==Field::Name {"Session name"} else {"Session tags, one per line"})));
+            let (label,aria)=match panel.field {
+                Field::Name=>("Session name (one line)","Session name"),
+                Field::Model=>("Session model ID, alias or role:name (one line; blank inherits)","Session model or Role"),
+                Field::Effort=>("Provider-specific reasoning effort, such as low, medium or high (one line; blank inherits). Unsupported values can fail when used.","Session reasoning effort"),
+                _=>("Tags (one per line; blank clears). The daemon normalizes case, # prefixes and duplicates.","Session tags, one per line"),
+            };
+            body = body
+                .child(readable("session-edit-field-label", label))
+                .child(
+                    div()
+                        .id("session-edit-input-anchor")
+                        .test_support()
+                        .pt_1()
+                        .anchor_scroll(Some(panel.input_anchor.clone()))
+                        .child(Textarea::new(input).aria_label(aria)),
+                );
         }
         body = body
             .child(
@@ -1158,6 +1255,7 @@ impl Shell {
             _ => "Save",
         };
         let presented = PresentedSave {
+            revision: panel.revision,
             id: panel.id.clone(),
             connection: panel.connection,
             field: panel.field,
@@ -1214,6 +1312,7 @@ impl Shell {
                     .flex_shrink_0(),
             )
             .child(body)
+            .when(matches!(panel.field,Field::Model|Field::Effort),|dialog|dialog.child(readable("session-model-paid-footer","Saving may run a paid model test.").text_sm().flex_shrink_0()))
             .child(
                 h_flex()
                     .flex_shrink_0()
@@ -1236,6 +1335,7 @@ impl Shell {
                                 _ if panel.field == Field::Instructions => {
                                     "Save Session standing instructions"
                                 }
+                                _ if matches!(panel.field,Field::Model|Field::Effort) => "Save Session model and reasoning effort; configured paid model test may run",
                                 _ => "Save displayed Session field",
                             })
                             .primary()

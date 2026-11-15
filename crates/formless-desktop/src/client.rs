@@ -451,6 +451,9 @@ impl Client {
         ))
     }
     pub fn send(&self, command: Command) -> Result<(), &'static str> {
+        if matches!(&command,Command::EditSession{change,..} if change.is_selection()) {
+            self.invalidate_context();
+        }
         if let Command::DecideApproval(d) = &command {
             if !d.owned_by(&self.approval_ledger)
                 || !self.is_ready()
@@ -733,6 +736,11 @@ enum Pending {
     Create,
     Answer(Action),
     EditSession {
+        operation: uuid::Uuid,
+        session_id: String,
+        change: session_edit::Change,
+    },
+    InspectModelSelection {
         operation: uuid::Uuid,
         session_id: String,
         change: session_edit::Change,
@@ -1219,6 +1227,42 @@ impl Engine {
     }
 
     fn command(&mut self, command: Command) {
+        let model_pending = self.pending.values().any(|p| {
+            matches!(p, Pending::InspectModelSelection { .. })
+                || matches!(p,Pending::EditSession{change,..} if change.is_selection())
+        });
+        let starts_work = matches!(
+            &command,
+            Command::Review { .. } | Command::ConfirmPrepared(_) | Command::CommitPrepared(_)
+        ) || matches!(&command,Command::Intent(intent) if intent.starts_work());
+        if model_pending && starts_work {
+            let epoch = match &command {
+                Command::Review { epoch, .. } => Some(*epoch),
+                Command::ConfirmPrepared(id) | Command::CommitPrepared(id) => self
+                    .prepared
+                    .as_ref()
+                    .filter(|p| p.id == *id)
+                    .map(|p| p.epoch),
+                _ => None,
+            };
+            self.prepared = None;
+            let error =
+                "Wait for the Session model/effort save receipt before starting work. Draft kept."
+                    .to_string();
+            if let Some(epoch) = epoch {
+                self.updates.push(Update::PreparationFailed {
+                    id: match &command {
+                        Command::ConfirmPrepared(id) | Command::CommitPrepared(id) => *id,
+                        _ => uuid::Uuid::new_v4(),
+                    },
+                    epoch,
+                    error,
+                });
+            } else {
+                self.updates.push(Update::Notice(error));
+            }
+            return;
+        }
         match command {
             Command::ReadInvocations {
                 connection,
@@ -1603,11 +1647,14 @@ impl Engine {
                 session_id,
                 change,
             } if self.ready => {
+                if change.is_selection() && self.pending.values().any(|p|matches!(p,Pending::EditSession{operation:op,session_id:id,..}|Pending::InspectModelSelection{operation:op,session_id:id,..} if *op==operation && id==&session_id)) {return;}
                 let error = if connection != self.connection {
                     Some("Connection changed; reload Session details before editing.".into())
                 } else if session_id.is_empty() || session_id.len() > 256 {
                     Some("Invalid Session identity; no change was sent.".into())
-                } else if self.pending.values().any(|pending| matches!(pending, Pending::EditSession { session_id: id, .. } if id == &session_id)) {
+                } else if change.is_selection() && self.pending.values().any(|p|matches!(p,Pending::Action(a) if a.session_id==session_id)) {
+                    Some("Wait for the Session's previous action receipt before changing its model. No setting was sent.".into())
+                } else if self.pending.values().any(|pending| matches!(pending, Pending::EditSession { session_id: id, .. } | Pending::InspectModelSelection {session_id:id,..} if id == &session_id)) {
                     Some("A metadata change for this Session is already waiting.".into())
                 } else { change.validate().err().map(str::to_string) };
                 if let Some(error) = error {
@@ -1617,6 +1664,24 @@ impl Engine {
                         session_id,
                         outcome: session_edit::Outcome::Rejected(error),
                     });
+                } else if change.is_selection() {
+                    if let Err(error) = self.invalidate_mode_metadata() {
+                        self.updates.push(Update::SessionEdited {
+                            connection: self.connection,
+                            operation,
+                            session_id,
+                            outcome: session_edit::Outcome::Rejected(error),
+                        });
+                    } else {
+                        self.request(
+                            Request::ListSessions,
+                            Pending::InspectModelSelection {
+                                operation,
+                                session_id,
+                                change,
+                            },
+                        );
+                    }
                 } else {
                     self.request(
                         change.request(&session_id),
@@ -1782,6 +1847,42 @@ impl Engine {
     fn receive(&mut self, message: ServerMessage) -> Result<(), String> {
         let (id, result, response_ok) = match message {
             ServerMessage::Event(event) => {
+                let changed = match &event {
+                    Event::SessionUpdated { session } => Some((
+                        session.id.as_str(),
+                        Some((
+                            session.model.as_deref(),
+                            session.reasoning_effort.as_deref(),
+                        )),
+                    )),
+                    Event::SessionDeleted { id } => Some((id.as_str(), None)),
+                    _ => None,
+                };
+                if let Some((changed, observed)) = changed {
+                    let retired=self.pending.iter().filter_map(|(id,p)| {
+                        let unsent=self.outgoing.iter().any(|r|r.id==*id);
+                        let pair_changed=|change:&session_edit::Change|matches!(change,session_edit::Change::Selection{expected,..} if observed!=Some((expected.model.as_deref(),expected.reasoning_effort.as_deref())));
+                        match p {Pending::InspectModelSelection{session_id,change,..} if session_id==changed && pair_changed(change)=>Some(*id),Pending::EditSession{session_id,change,..} if session_id==changed && change.is_selection() && unsent && pair_changed(change)=>Some(*id),_=>None}
+                    }).collect::<Vec<_>>();
+                    for id in retired {
+                        self.outgoing.retain(|r| r.id != id);
+                        if let Some(
+                            Pending::InspectModelSelection {
+                                operation,
+                                session_id,
+                                ..
+                            }
+                            | Pending::EditSession {
+                                operation,
+                                session_id,
+                                ..
+                            },
+                        ) = self.pending.remove(&id)
+                        {
+                            self.updates.push(Update::SessionEdited{connection:self.connection,operation,session_id,outcome:session_edit::Outcome::Rejected("Session model/effort changed before the setting was written. Reload current values; nothing was sent.".into())});
+                        }
+                    }
+                }
                 if matches!(
                     &event,
                     Event::ApprovalRequested { .. }
@@ -2187,22 +2288,47 @@ impl Engine {
                     result: result.map(|_| ()),
                 });
             }
+            Pending::InspectModelSelection {
+                operation,
+                session_id,
+                change,
+            } => {
+                let fresh =
+                    result.and_then(|v| session_edit::Metadata::from_list_reply(&session_id, &v));
+                match fresh {
+                    Ok(metadata) if change.matches(&metadata) => {
+                        self.invalidate_mode_metadata()?;
+                        self.dirty_list=true;
+                        self.updates.push(Update::SessionEdited{connection:self.connection,operation,session_id,outcome:session_edit::Outcome::ObservedSelection(metadata)});
+                    }
+                    Ok(metadata) if matches!(&change,session_edit::Change::Selection{expected,..} if metadata.selection.as_ref()==Some(expected)) => {
+                        self.invalidate_mode_metadata()?;
+                        self.request(change.request(&session_id),Pending::EditSession{operation,session_id,change});
+                    }
+                    _ => self.updates.push(Update::SessionEdited{connection:self.connection,operation,session_id,outcome:session_edit::Outcome::Rejected("The paired model/effort selection changed or could not be revalidated. Reload current details; no setting was sent.".into())}),
+                }
+            }
             Pending::EditSession {
                 operation,
                 session_id,
                 change,
             } => {
+                let model_selection = change.is_selection();
                 let outcome = match result {
                     Ok(value) => {
                         let exposes_instructions = value.get("instructions").is_some();
+                        let exposes_selection =
+                            value.get("model").is_some() && value.get("reasoning_effort").is_some();
                         let field = match &change {
                             session_edit::Change::Name(_) => "name",
                             session_edit::Change::Tags(_) => "tags",
                             session_edit::Change::Pin(_) => "pinned",
                             session_edit::Change::Archive(_) => "archived",
                             session_edit::Change::Instructions(_) => "instructions",
+                            session_edit::Change::Selection { .. } => "model",
                         };
-                        let exposes_changed_field = value.get(field).is_some();
+                        let exposes_changed_field =
+                            value.get(field).is_some() && (!model_selection || exposes_selection);
                         serde_json::from_value::<SessionInfo>(value)
                             .ok()
                             .filter(|session| exposes_changed_field && session.id == session_id)
@@ -2210,6 +2336,7 @@ impl Engine {
                                 session_edit::Metadata::from_session_reply(
                                     &session,
                                     exposes_instructions,
+                                    exposes_selection,
                                 )
                                 .ok()
                             })
@@ -2222,6 +2349,12 @@ impl Engine {
                     Err(_) if response_ok => session_edit::Outcome::Unknown,
                     Err(error) => session_edit::Outcome::Rejected(error),
                 };
+                if model_selection {
+                    self.invalidate_mode_metadata()?;
+                    if matches!(outcome, session_edit::Outcome::Unknown) {
+                        self.updates.push(Update::Notice(format!("Session {session_id} model/effort save outcome unknown. Nothing was retried; reload its current selection before saving again.")));
+                    }
+                }
                 self.updates.push(Update::SessionEdited {
                     connection: self.connection,
                     operation,
@@ -2234,31 +2367,8 @@ impl Engine {
                 operation,
                 session_id,
             } => {
-                let result = result.and_then(|value| {
-                    let exposes_instructions = value.as_array().is_some_and(|rows| {
-                        rows.iter().any(|row| {
-                            row["id"].as_str() == Some(session_id.as_str())
-                                && row.get("instructions").is_some()
-                        })
-                    });
-                    let sessions =
-                        replies::session_list(&value).map_err(|error| error.to_string())?;
-                    let mut matching = sessions
-                        .into_iter()
-                        .filter(|session| session.id == session_id);
-                    let session = matching.next().ok_or_else(|| {
-                        "This Session is no longer listed. Refresh Sessions before editing."
-                            .to_string()
-                    })?;
-                    if matching.next().is_some() {
-                        return Err(
-                            "The metadata list repeats this Session identity; no edit is allowed."
-                                .into(),
-                        );
-                    }
-                    session_edit::Metadata::from_session_reply(&session, exposes_instructions)
-                        .map_err(str::to_string)
-                });
+                let result = result
+                    .and_then(|value| session_edit::Metadata::from_list_reply(&session_id, &value));
                 self.updates.push(Update::SessionDetails {
                     connection: self.connection,
                     operation,
@@ -4714,3 +4824,7 @@ mod step_mode_tests;
 #[cfg(test)]
 #[path = "client/approval_tests.rs"]
 mod approval_tests;
+
+#[cfg(test)]
+#[path = "client/session_model_tests.rs"]
+mod session_model_tests;

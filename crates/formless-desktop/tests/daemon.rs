@@ -1268,3 +1268,7 @@ mod step_mode_transport;
 #[cfg(unix)]
 #[path = "support/native_approval_transport.rs"]
 mod native_approval_transport;
+
+#[cfg(unix)]
+#[path = "support/session_model_transport.rs"]
+mod session_model_transport;
