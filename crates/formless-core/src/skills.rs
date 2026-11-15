@@ -243,7 +243,10 @@ pub fn extract_zip(archive: &Path, dest: &Path) -> Result<u64> {
     let mut total = 0u64;
     for i in 0..zip.len() {
         let mut entry = zip.by_index(i)?;
-        let name = entry.name().to_string();
+        let name = entry
+            .name()
+            .context("zip entry name could not be decoded")?
+            .into_owned();
         if entry.is_symlink() {
             bail!("zip entry '{name}' is a symbolic link; skills may not contain links");
         }
