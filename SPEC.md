@@ -5222,7 +5222,7 @@ the TUI. Command-specific arguments and defaults are available through
 | `formless logs` | `--follow`, `--level`, `--since`, `--lines` | Read or follow the daemon log and rotated files. |
 | `formless mcp` | `add`, `remove`, `list`, `test`, `login`, `logout`, `catalog`, `import`, `log`, `tools`, `tool`, `prompts`, `prompt` | Manage external MCP servers and inspect their tools/logs. |
 | `formless metrics` | `--since DURATION`, `--json` | Read recorded model, Tool and built-in statistics through independent reports at one cutoff. |
-| `formless memory` | `list`, `add`, `rm`, `edit` | Inspect or change saved user-memory notes. |
+| `formless memory` | `list`, `add`, `rm`, `edit`, `used` | Inspect or change saved user-memory notes. |
 | `formless models` | `list [--json]` | Fetch the default-provider model catalog and existing picker report; a non-null listing error prints a partial report and exits 1. |
 | `formless modules` | `list`, `show`; `show --version N` | Read all modules, inspect metadata/history/dependents, or emit an exact stored source version. |
 | `formless naming` | `status`, `pull`, `test` | Inspect, install, or preview the embedded Session-naming model. |
@@ -5289,6 +5289,21 @@ not a transactional snapshot. Runs and daily usage remain separate surfaces.
 whose stored tags contain exactly `work`. Only the tag argument is lowercased;
 a leading `#` is not stripped. Add `--archived` to select the archived partition.
 These selectors filter the existing reply on the client.
+
+`formless memory used (--session SESSION | --run RUN_ID) [--json]` reports
+current note fields associated with the selected Run, in daemon order.
+Session selectors use normal exact-id/prefix/name resolution and select its
+latest Run, including one still running; Run ids are sent unchanged without
+existence validation. Retained associations may outlive a Run, while backend
+lookup/association failures can produce empty or partial reports. These are
+reported current notes, not verified historical prompt contents. Disabled
+notes remain present; JSON is the full returned array. Other daemon errors
+retain ordinary exit behavior without a partial report.
+
+```sh
+formless memory used --session SESSION --json
+formless memory used --run exact-run-id
+```
 
 `formless sessions subagents SESSION [--json]` inventories stored sub-agents
 using normal Session exact-id/prefix/name resolution. Full sub-agent ids can

@@ -237,6 +237,20 @@ impl Fixture {
                         Request::GetSubagent { id } => {
                             json!({"subagent":{"id":id,"session_id":"abc-one","run_id":"run-one","task":"Task 日本語","depth":1,"model":"role · model","status":"running","steps":2,"result":null,"created_at":"first","updated_at":"last"},"messages":[{"provider-special":{"part":["🦀",3]},"role":"assistant"},{"unknown":"ไทย"}],"future":7})
                         }
+                        Request::RunMemories { run_id, session_id } => {
+                            assert!(run_id.is_some() != session_id.is_some());
+                            if let Some(session) = session_id {
+                                assert_eq!(session, "abc-one");
+                            }
+                            if run_id.as_deref() == Some("unmatched-run") {
+                                json!([])
+                            } else {
+                                json!([
+                                    {"id":"disabled-first","text":"ไทย\ncurrent text","scope":"project:/日本語","enabled":false,"author":"agent","session_id":"source-日本語","last_used":"different-run-time","future":{"x":1}},
+                                    {"id":"enabled-second","text":"second note","scope":"global","enabled":true,"author":"user","session_id":null}
+                                ])
+                            }
+                        }
                         _ => panic!("unexpected private RPC: {:?}", envelope.request),
                     };
                     let fail = match &envelope.request {
@@ -244,7 +258,15 @@ impl Fixture {
                         Request::ContextUsage { .. } => failure.load(Ordering::SeqCst) == 2,
                         _ => false,
                     };
-                    let reply = if matches!(&envelope.request, Request::GetSubagent {id} if id=="fixture-not-found")
+                    let reply = if matches!(&envelope.request, Request::RunMemories {run_id:Some(id),..} if id=="fixture-failure")
+                    {
+                        serde_json::to_value(formless_protocol::ServerMessage::err_code(
+                            envelope.id,
+                            formless_protocol::codes::NOT_FOUND,
+                            "daemon fixture failure".into(),
+                        ))
+                        .unwrap()
+                    } else if matches!(&envelope.request, Request::GetSubagent {id} if id=="fixture-not-found")
                     {
                         serde_json::to_value(formless_protocol::ServerMessage::err_code(
                             envelope.id,
@@ -1424,6 +1446,88 @@ fn shipped_subagent_reports_preserve_session_resolution_exact_ids_and_provider_j
             .count(),
         2
     );
+}
+
+#[test]
+fn shipped_memory_used_preserves_exact_selectors_current_notes_and_qualified_empty_reports() {
+    let fixture = Fixture::new();
+    for args in [
+        vec!["memory", "used"],
+        vec!["memory", "used", "--session", "abc-one", "--run", "exact"],
+    ] {
+        let output = fixture.run(&args);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+    }
+    std::thread::sleep(Duration::from_millis(20));
+    assert_eq!(fixture.connections.load(Ordering::SeqCst), 0);
+    assert!(fixture.requests.lock().unwrap().is_empty());
+    for selector in ["abc-one", "abc-o", "First"] {
+        let output = fixture.run(&["memory", "used", "--session", selector]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(text.contains("Latest-Run memory report for Session First (abc-one)"));
+        assert!(text.contains("ไทย\ncurrent text"));
+        assert!(text.contains("off"));
+        assert!(text.contains("source-日本語"));
+        assert!(!text.contains("different-run-time"));
+    }
+    let before = fixture.requests.lock().unwrap().len();
+    for selector in ["abc", "missing"] {
+        let output = fixture.run(&["memory", "used", "--session", selector, "--json"]);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+    }
+    assert!(fixture.requests.lock().unwrap()[before..]
+        .iter()
+        .all(|req| matches!(req, Request::ListSessions)));
+    for id in ["retained-missing-run", "unmatched-run"] {
+        for json in [false, true] {
+            let mut args = vec!["memory", "used", "--run", id];
+            if json {
+                args.push("--json");
+            }
+            let output = fixture.run(&args);
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if json {
+                let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+                if id == "unmatched-run" {
+                    assert_eq!(value, json!([]));
+                } else {
+                    assert_eq!(value[0]["future"], json!({"x":1}));
+                    assert_eq!(value[0]["enabled"], false);
+                    assert_eq!(value[1]["id"], "enabled-second");
+                }
+            } else {
+                let text = String::from_utf8(output.stdout).unwrap();
+                assert!(text.contains(&format!("requested Run id {id}")));
+                if id == "unmatched-run" {
+                    assert!(text.contains("no carried memories reported for this selector"));
+                } else {
+                    assert!(text.contains("ไทย\ncurrent text"));
+                }
+            }
+        }
+    }
+    let output = fixture.run(&["memory", "used", "--run", "fixture-failure", "--json"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("daemon fixture failure"));
+    let seen = fixture.requests.lock().unwrap();
+    assert!(
+        seen.iter()
+            .all(|req| matches!(req, Request::ListSessions | Request::RunMemories { .. })),
+        "{seen:?}"
+    );
+    assert_eq!(seen.iter().filter(|req|matches!(req,Request::RunMemories{run_id:Some(id),session_id:None} if id=="retained-missing-run")).count(),2);
 }
 
 impl Drop for Fixture {
