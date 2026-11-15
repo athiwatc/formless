@@ -136,7 +136,7 @@
     },
     {
       "collection_limitations": [
-        "Collected upstream licensing explanation, not a full licence-grant text. External terms and upstream Apple SDK implications remain unresolved; not distribution clearance."
+        "Pinned release licensing explanation retained. Later upstream full grant texts are supplemental references for declared options only; their complete applicability and contributor attribution for this earlier release are unconfirmed. Apple SDK scope remains unresolved; not distribution clearance."
       ],
       "files": [
         {
@@ -147,6 +147,28 @@
           "source": "LICENSE.md",
           "symlink_chain": [],
           "url": "https://raw.githubusercontent.com/madsmtm/objc2/b4167b582b2f75f9a1be75495c41b765344fd03c/LICENSE.md"
+        },
+        {
+          "git_blob": "ce8c4c17fd88f6cf5f3720c08fa685434e3cbcbb",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt",
+          "resolved_source": "LICENSE-MIT.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "f6a2e783669a0dd7a2c3b8a4f76db40ae49033e66e1bdc30f3aa25fe5577b070",
+          "source": "LICENSE-MIT.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt"
+        },
+        {
+          "git_blob": "e9ab3babc0d8602b83dccde8a462f8f3dc1e52ad",
+          "local": "upstream/madsmtm/objc2/757cd841d0293341dbefd9b99d7548dec244ffde/LICENSE.txt",
+          "resolved_source": "LICENSE.txt",
+          "revision": "757cd841d0293341dbefd9b99d7548dec244ffde",
+          "role": "retained-ancestor-notice",
+          "sha256": "e353f37b12aefbb9f9b29490e837cfee05d9bda70804b3562839a3285c1df1e5",
+          "source": "LICENSE.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/757cd841d0293341dbefd9b99d7548dec244ffde/LICENSE.txt"
         }
       ],
       "license": "MIT",
@@ -158,14 +180,14 @@
       "repository_field": "repository",
       "repository_metadata_value": "https://github.com/madsmtm/objc2",
       "revision": "b4167b582b2f75f9a1be75495c41b765344fd03c",
-      "scope": "Published crate VCS receipt and registry archive verified; closest ancestor/root notices from that immutable upstream tree. Scope still subject to distribution review.",
+      "scope": "Published release identity remains bound to its locked archive and VCS receipt. Supplemental files have their own explicit upstream revisions and roles; they do not replace the release notices or establish complete attribution.",
       "source_kind": "registry",
       "vcs_sha256": "5b87885cad87999d141e83cc8af4b073192f584b2b92cea77e2d87636621a264",
       "version": "0.6.2"
     },
     {
       "collection_limitations": [
-        "Collected upstream licensing explanation, not a full licence-grant text. External terms and upstream Apple SDK implications remain unresolved; not distribution clearance."
+        "Pinned release licensing explanation retained. Later upstream full grant texts are supplemental references for declared options only; their complete applicability and contributor attribution for this earlier release are unconfirmed. Apple SDK scope remains unresolved; not distribution clearance."
       ],
       "files": [
         {
@@ -176,6 +198,39 @@
           "source": "LICENSE.md",
           "symlink_chain": [],
           "url": "https://raw.githubusercontent.com/madsmtm/objc2/8852b424193ca41602281b3d7540d7c8ed51e49a/LICENSE.md"
+        },
+        {
+          "git_blob": "ce8c4c17fd88f6cf5f3720c08fa685434e3cbcbb",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt",
+          "resolved_source": "LICENSE-MIT.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "f6a2e783669a0dd7a2c3b8a4f76db40ae49033e66e1bdc30f3aa25fe5577b070",
+          "source": "LICENSE-MIT.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt"
+        },
+        {
+          "git_blob": "367635181689ec6e1efadf43eaa48503acaf34a8",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-APACHE.txt",
+          "resolved_source": "LICENSE-APACHE.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "0c9a5f6fe28e27015e12506ffe58c9e007cead169af9670ec15c1df0d14e4f2a",
+          "source": "LICENSE-APACHE.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-APACHE.txt"
+        },
+        {
+          "git_blob": "e53b4121d96c9c337cc7fee57c0177e4a63b1da0",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-ZLIB.txt",
+          "resolved_source": "LICENSE-ZLIB.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "fced3e7fedc235fa83ed0108b0df74d86b435d06436356f46917a903cbadd80a",
+          "source": "LICENSE-ZLIB.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-ZLIB.txt"
         }
       ],
       "license": "Zlib OR Apache-2.0 OR MIT",
@@ -187,7 +242,7 @@
       "repository_field": "repository",
       "repository_metadata_value": "https://github.com/madsmtm/objc2",
       "revision": "8852b424193ca41602281b3d7540d7c8ed51e49a",
-      "scope": "Published crate VCS receipt and registry archive verified; closest ancestor/root notices from that immutable upstream tree. Scope still subject to distribution review.",
+      "scope": "Published release identity remains bound to its locked archive and VCS receipt. Supplemental files have their own explicit upstream revisions and roles; they do not replace the release notices or establish complete attribution.",
       "source_kind": "registry",
       "vcs_sha256": "26f5e6d699ba3ce13b8eea253ad7a7f7feb9345e9da3c01bb9b9bd911a6a7dba",
       "version": "0.3.1"
@@ -470,7 +525,7 @@
     },
     {
       "collection_limitations": [
-        "Collected upstream licensing explanation, not a full licence-grant text. External terms and upstream Apple SDK implications remain unresolved; not distribution clearance."
+        "Pinned release licensing explanation retained. Later upstream full grant texts are supplemental references for declared options only; their complete applicability and contributor attribution for this earlier release are unconfirmed. Apple SDK scope remains unresolved; not distribution clearance."
       ],
       "files": [
         {
@@ -481,6 +536,28 @@
           "source": "LICENSE.md",
           "symlink_chain": [],
           "url": "https://raw.githubusercontent.com/madsmtm/objc2/d7d2fa23ceaa5e6096c923b081040e5d81b3b9df/LICENSE.md"
+        },
+        {
+          "git_blob": "ce8c4c17fd88f6cf5f3720c08fa685434e3cbcbb",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt",
+          "resolved_source": "LICENSE-MIT.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "f6a2e783669a0dd7a2c3b8a4f76db40ae49033e66e1bdc30f3aa25fe5577b070",
+          "source": "LICENSE-MIT.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt"
+        },
+        {
+          "git_blob": "e9ab3babc0d8602b83dccde8a462f8f3dc1e52ad",
+          "local": "upstream/madsmtm/objc2/757cd841d0293341dbefd9b99d7548dec244ffde/LICENSE.txt",
+          "resolved_source": "LICENSE.txt",
+          "revision": "757cd841d0293341dbefd9b99d7548dec244ffde",
+          "role": "retained-ancestor-notice",
+          "sha256": "e353f37b12aefbb9f9b29490e837cfee05d9bda70804b3562839a3285c1df1e5",
+          "source": "LICENSE.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/757cd841d0293341dbefd9b99d7548dec244ffde/LICENSE.txt"
         }
       ],
       "license": "MIT",
@@ -492,7 +569,7 @@
       "repository_field": "repository",
       "repository_metadata_value": "https://github.com/madsmtm/objc2",
       "revision": "d7d2fa23ceaa5e6096c923b081040e5d81b3b9df",
-      "scope": "Published crate VCS receipt and registry archive verified; closest ancestor/root notices from that immutable upstream tree. Scope still subject to distribution review.",
+      "scope": "Published release identity remains bound to its locked archive and VCS receipt. Supplemental files have their own explicit upstream revisions and roles; they do not replace the release notices or establish complete attribution.",
       "source_kind": "registry",
       "vcs_sha256": "5f7c8e095d3933c477ff1f71021b551cbfe497a62346a1dc8615debd9846e257",
       "version": "0.6.5"
@@ -525,7 +602,7 @@
     },
     {
       "collection_limitations": [
-        "Collected upstream licensing explanation, not a full licence-grant text. External terms and upstream Apple SDK implications remain unresolved; not distribution clearance."
+        "Pinned release licensing explanation retained. Later upstream full grant texts are supplemental references for declared options only; their complete applicability and contributor attribution for this earlier release are unconfirmed. Apple SDK scope remains unresolved; not distribution clearance."
       ],
       "files": [
         {
@@ -536,6 +613,39 @@
           "source": "LICENSE.md",
           "symlink_chain": [],
           "url": "https://raw.githubusercontent.com/madsmtm/objc2/7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md"
+        },
+        {
+          "git_blob": "ce8c4c17fd88f6cf5f3720c08fa685434e3cbcbb",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt",
+          "resolved_source": "LICENSE-MIT.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "f6a2e783669a0dd7a2c3b8a4f76db40ae49033e66e1bdc30f3aa25fe5577b070",
+          "source": "LICENSE-MIT.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt"
+        },
+        {
+          "git_blob": "367635181689ec6e1efadf43eaa48503acaf34a8",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-APACHE.txt",
+          "resolved_source": "LICENSE-APACHE.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "0c9a5f6fe28e27015e12506ffe58c9e007cead169af9670ec15c1df0d14e4f2a",
+          "source": "LICENSE-APACHE.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-APACHE.txt"
+        },
+        {
+          "git_blob": "e53b4121d96c9c337cc7fee57c0177e4a63b1da0",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-ZLIB.txt",
+          "resolved_source": "LICENSE-ZLIB.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "fced3e7fedc235fa83ed0108b0df74d86b435d06436356f46917a903cbadd80a",
+          "source": "LICENSE-ZLIB.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-ZLIB.txt"
         }
       ],
       "license": "Zlib OR Apache-2.0 OR MIT",
@@ -547,14 +657,14 @@
       "repository_field": "repository",
       "repository_metadata_value": "https://github.com/madsmtm/objc2",
       "revision": "7b1abfd750a2cacaea71d6a56ecfb83cb7de560b",
-      "scope": "Published crate VCS receipt and registry archive verified; closest ancestor/root notices from that immutable upstream tree. Scope still subject to distribution review.",
+      "scope": "Published release identity remains bound to its locked archive and VCS receipt. Supplemental files have their own explicit upstream revisions and roles; they do not replace the release notices or establish complete attribution.",
       "source_kind": "registry",
       "vcs_sha256": "07762c2a438c287ac124300928c9da0f96cefc1932ff8cadac13716fd1e195eb",
       "version": "0.3.2"
     },
     {
       "collection_limitations": [
-        "Collected upstream licensing explanation, not a full licence-grant text. External terms and upstream Apple SDK implications remain unresolved; not distribution clearance."
+        "Pinned release licensing explanation retained. Later upstream full grant texts are supplemental references for declared options only; their complete applicability and contributor attribution for this earlier release are unconfirmed. Apple SDK scope remains unresolved; not distribution clearance."
       ],
       "files": [
         {
@@ -565,6 +675,39 @@
           "source": "LICENSE.md",
           "symlink_chain": [],
           "url": "https://raw.githubusercontent.com/madsmtm/objc2/7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md"
+        },
+        {
+          "git_blob": "ce8c4c17fd88f6cf5f3720c08fa685434e3cbcbb",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt",
+          "resolved_source": "LICENSE-MIT.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "f6a2e783669a0dd7a2c3b8a4f76db40ae49033e66e1bdc30f3aa25fe5577b070",
+          "source": "LICENSE-MIT.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt"
+        },
+        {
+          "git_blob": "367635181689ec6e1efadf43eaa48503acaf34a8",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-APACHE.txt",
+          "resolved_source": "LICENSE-APACHE.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "0c9a5f6fe28e27015e12506ffe58c9e007cead169af9670ec15c1df0d14e4f2a",
+          "source": "LICENSE-APACHE.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-APACHE.txt"
+        },
+        {
+          "git_blob": "e53b4121d96c9c337cc7fee57c0177e4a63b1da0",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-ZLIB.txt",
+          "resolved_source": "LICENSE-ZLIB.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "fced3e7fedc235fa83ed0108b0df74d86b435d06436356f46917a903cbadd80a",
+          "source": "LICENSE-ZLIB.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-ZLIB.txt"
         }
       ],
       "license": "Zlib OR Apache-2.0 OR MIT",
@@ -576,14 +719,14 @@
       "repository_field": "repository",
       "repository_metadata_value": "https://github.com/madsmtm/objc2",
       "revision": "7b1abfd750a2cacaea71d6a56ecfb83cb7de560b",
-      "scope": "Published crate VCS receipt and registry archive verified; closest ancestor/root notices from that immutable upstream tree. Scope still subject to distribution review.",
+      "scope": "Published release identity remains bound to its locked archive and VCS receipt. Supplemental files have their own explicit upstream revisions and roles; they do not replace the release notices or establish complete attribution.",
       "source_kind": "registry",
       "vcs_sha256": "62f199c0f8876bdc6d78976603201d3684c925632b1fe158f2d6816b28baf121",
       "version": "0.3.2"
     },
     {
       "collection_limitations": [
-        "Collected upstream licensing explanation, not a full licence-grant text. External terms and upstream Apple SDK implications remain unresolved; not distribution clearance."
+        "Pinned release licensing explanation retained. Later upstream full grant texts are supplemental references for declared options only; their complete applicability and contributor attribution for this earlier release are unconfirmed. Apple SDK scope remains unresolved; not distribution clearance."
       ],
       "files": [
         {
@@ -594,6 +737,39 @@
           "source": "LICENSE.md",
           "symlink_chain": [],
           "url": "https://raw.githubusercontent.com/madsmtm/objc2/7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md"
+        },
+        {
+          "git_blob": "ce8c4c17fd88f6cf5f3720c08fa685434e3cbcbb",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt",
+          "resolved_source": "LICENSE-MIT.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "f6a2e783669a0dd7a2c3b8a4f76db40ae49033e66e1bdc30f3aa25fe5577b070",
+          "source": "LICENSE-MIT.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt"
+        },
+        {
+          "git_blob": "367635181689ec6e1efadf43eaa48503acaf34a8",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-APACHE.txt",
+          "resolved_source": "LICENSE-APACHE.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "0c9a5f6fe28e27015e12506ffe58c9e007cead169af9670ec15c1df0d14e4f2a",
+          "source": "LICENSE-APACHE.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-APACHE.txt"
+        },
+        {
+          "git_blob": "e53b4121d96c9c337cc7fee57c0177e4a63b1da0",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-ZLIB.txt",
+          "resolved_source": "LICENSE-ZLIB.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "fced3e7fedc235fa83ed0108b0df74d86b435d06436356f46917a903cbadd80a",
+          "source": "LICENSE-ZLIB.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-ZLIB.txt"
         }
       ],
       "license": "Zlib OR Apache-2.0 OR MIT",
@@ -605,14 +781,14 @@
       "repository_field": "repository",
       "repository_metadata_value": "https://github.com/madsmtm/objc2",
       "revision": "7b1abfd750a2cacaea71d6a56ecfb83cb7de560b",
-      "scope": "Published crate VCS receipt and registry archive verified; closest ancestor/root notices from that immutable upstream tree. Scope still subject to distribution review.",
+      "scope": "Published release identity remains bound to its locked archive and VCS receipt. Supplemental files have their own explicit upstream revisions and roles; they do not replace the release notices or establish complete attribution.",
       "source_kind": "registry",
       "vcs_sha256": "7f8e9d957f5352b458a53d6e594c3f0f9033433224c6fb77823a6f0f421ef9e8",
       "version": "0.3.2"
     },
     {
       "collection_limitations": [
-        "Collected upstream licensing explanation, not a full licence-grant text. External terms and upstream Apple SDK implications remain unresolved; not distribution clearance."
+        "Pinned release licensing explanation retained. Later upstream full grant texts are supplemental references for declared options only; their complete applicability and contributor attribution for this earlier release are unconfirmed. Apple SDK scope remains unresolved; not distribution clearance."
       ],
       "files": [
         {
@@ -623,6 +799,39 @@
           "source": "LICENSE.md",
           "symlink_chain": [],
           "url": "https://raw.githubusercontent.com/madsmtm/objc2/7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md"
+        },
+        {
+          "git_blob": "ce8c4c17fd88f6cf5f3720c08fa685434e3cbcbb",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt",
+          "resolved_source": "LICENSE-MIT.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "f6a2e783669a0dd7a2c3b8a4f76db40ae49033e66e1bdc30f3aa25fe5577b070",
+          "source": "LICENSE-MIT.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt"
+        },
+        {
+          "git_blob": "367635181689ec6e1efadf43eaa48503acaf34a8",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-APACHE.txt",
+          "resolved_source": "LICENSE-APACHE.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "0c9a5f6fe28e27015e12506ffe58c9e007cead169af9670ec15c1df0d14e4f2a",
+          "source": "LICENSE-APACHE.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-APACHE.txt"
+        },
+        {
+          "git_blob": "e53b4121d96c9c337cc7fee57c0177e4a63b1da0",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-ZLIB.txt",
+          "resolved_source": "LICENSE-ZLIB.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "fced3e7fedc235fa83ed0108b0df74d86b435d06436356f46917a903cbadd80a",
+          "source": "LICENSE-ZLIB.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-ZLIB.txt"
         }
       ],
       "license": "Zlib OR Apache-2.0 OR MIT",
@@ -634,14 +843,14 @@
       "repository_field": "repository",
       "repository_metadata_value": "https://github.com/madsmtm/objc2",
       "revision": "7b1abfd750a2cacaea71d6a56ecfb83cb7de560b",
-      "scope": "Published crate VCS receipt and registry archive verified; closest ancestor/root notices from that immutable upstream tree. Scope still subject to distribution review.",
+      "scope": "Published release identity remains bound to its locked archive and VCS receipt. Supplemental files have their own explicit upstream revisions and roles; they do not replace the release notices or establish complete attribution.",
       "source_kind": "registry",
       "vcs_sha256": "1c1a87985a2bd25015f5e2413f4041379bea0172b2fce88dae3e6482b50aab26",
       "version": "0.3.2"
     },
     {
       "collection_limitations": [
-        "Collected upstream licensing explanation, not a full licence-grant text. External terms and upstream Apple SDK implications remain unresolved; not distribution clearance."
+        "Pinned release licensing explanation retained. Later upstream full grant texts are supplemental references for declared options only; their complete applicability and contributor attribution for this earlier release are unconfirmed. Apple SDK scope remains unresolved; not distribution clearance."
       ],
       "files": [
         {
@@ -652,6 +861,39 @@
           "source": "LICENSE.md",
           "symlink_chain": [],
           "url": "https://raw.githubusercontent.com/madsmtm/objc2/7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md"
+        },
+        {
+          "git_blob": "ce8c4c17fd88f6cf5f3720c08fa685434e3cbcbb",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt",
+          "resolved_source": "LICENSE-MIT.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "f6a2e783669a0dd7a2c3b8a4f76db40ae49033e66e1bdc30f3aa25fe5577b070",
+          "source": "LICENSE-MIT.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt"
+        },
+        {
+          "git_blob": "367635181689ec6e1efadf43eaa48503acaf34a8",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-APACHE.txt",
+          "resolved_source": "LICENSE-APACHE.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "0c9a5f6fe28e27015e12506ffe58c9e007cead169af9670ec15c1df0d14e4f2a",
+          "source": "LICENSE-APACHE.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-APACHE.txt"
+        },
+        {
+          "git_blob": "e53b4121d96c9c337cc7fee57c0177e4a63b1da0",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-ZLIB.txt",
+          "resolved_source": "LICENSE-ZLIB.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "fced3e7fedc235fa83ed0108b0df74d86b435d06436356f46917a903cbadd80a",
+          "source": "LICENSE-ZLIB.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-ZLIB.txt"
         }
       ],
       "license": "Zlib OR Apache-2.0 OR MIT",
@@ -663,14 +905,14 @@
       "repository_field": "repository",
       "repository_metadata_value": "https://github.com/madsmtm/objc2",
       "revision": "7b1abfd750a2cacaea71d6a56ecfb83cb7de560b",
-      "scope": "Published crate VCS receipt and registry archive verified; closest ancestor/root notices from that immutable upstream tree. Scope still subject to distribution review.",
+      "scope": "Published release identity remains bound to its locked archive and VCS receipt. Supplemental files have their own explicit upstream revisions and roles; they do not replace the release notices or establish complete attribution.",
       "source_kind": "registry",
       "vcs_sha256": "264ea4e6453d508410c33c7e5c05ef71f067cac56efc06603862b36d1fe5dfc3",
       "version": "0.3.2"
     },
     {
       "collection_limitations": [
-        "Collected upstream licensing explanation, not a full licence-grant text. External terms and upstream Apple SDK implications remain unresolved; not distribution clearance."
+        "Pinned release licensing explanation retained. Later upstream full grant texts are supplemental references for declared options only; their complete applicability and contributor attribution for this earlier release are unconfirmed. Apple SDK scope remains unresolved; not distribution clearance."
       ],
       "files": [
         {
@@ -681,6 +923,39 @@
           "source": "LICENSE.md",
           "symlink_chain": [],
           "url": "https://raw.githubusercontent.com/madsmtm/objc2/7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md"
+        },
+        {
+          "git_blob": "ce8c4c17fd88f6cf5f3720c08fa685434e3cbcbb",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt",
+          "resolved_source": "LICENSE-MIT.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "f6a2e783669a0dd7a2c3b8a4f76db40ae49033e66e1bdc30f3aa25fe5577b070",
+          "source": "LICENSE-MIT.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt"
+        },
+        {
+          "git_blob": "367635181689ec6e1efadf43eaa48503acaf34a8",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-APACHE.txt",
+          "resolved_source": "LICENSE-APACHE.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "0c9a5f6fe28e27015e12506ffe58c9e007cead169af9670ec15c1df0d14e4f2a",
+          "source": "LICENSE-APACHE.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-APACHE.txt"
+        },
+        {
+          "git_blob": "e53b4121d96c9c337cc7fee57c0177e4a63b1da0",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-ZLIB.txt",
+          "resolved_source": "LICENSE-ZLIB.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "fced3e7fedc235fa83ed0108b0df74d86b435d06436356f46917a903cbadd80a",
+          "source": "LICENSE-ZLIB.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-ZLIB.txt"
         }
       ],
       "license": "Zlib OR Apache-2.0 OR MIT",
@@ -692,14 +967,14 @@
       "repository_field": "repository",
       "repository_metadata_value": "https://github.com/madsmtm/objc2",
       "revision": "7b1abfd750a2cacaea71d6a56ecfb83cb7de560b",
-      "scope": "Published crate VCS receipt and registry archive verified; closest ancestor/root notices from that immutable upstream tree. Scope still subject to distribution review.",
+      "scope": "Published release identity remains bound to its locked archive and VCS receipt. Supplemental files have their own explicit upstream revisions and roles; they do not replace the release notices or establish complete attribution.",
       "source_kind": "registry",
       "vcs_sha256": "c894249d194f6678eab85405db96965489b93eba3863198439f1014a21421c31",
       "version": "0.3.2"
     },
     {
       "collection_limitations": [
-        "Collected upstream licensing explanation, not a full licence-grant text. External terms and upstream Apple SDK implications remain unresolved; not distribution clearance."
+        "Pinned release licensing explanation retained. Later upstream full grant texts are supplemental references for declared options only; their complete applicability and contributor attribution for this earlier release are unconfirmed. Apple SDK scope remains unresolved; not distribution clearance."
       ],
       "files": [
         {
@@ -710,6 +985,39 @@
           "source": "LICENSE.md",
           "symlink_chain": [],
           "url": "https://raw.githubusercontent.com/madsmtm/objc2/7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md"
+        },
+        {
+          "git_blob": "ce8c4c17fd88f6cf5f3720c08fa685434e3cbcbb",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt",
+          "resolved_source": "LICENSE-MIT.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "f6a2e783669a0dd7a2c3b8a4f76db40ae49033e66e1bdc30f3aa25fe5577b070",
+          "source": "LICENSE-MIT.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt"
+        },
+        {
+          "git_blob": "367635181689ec6e1efadf43eaa48503acaf34a8",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-APACHE.txt",
+          "resolved_source": "LICENSE-APACHE.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "0c9a5f6fe28e27015e12506ffe58c9e007cead169af9670ec15c1df0d14e4f2a",
+          "source": "LICENSE-APACHE.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-APACHE.txt"
+        },
+        {
+          "git_blob": "e53b4121d96c9c337cc7fee57c0177e4a63b1da0",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-ZLIB.txt",
+          "resolved_source": "LICENSE-ZLIB.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "fced3e7fedc235fa83ed0108b0df74d86b435d06436356f46917a903cbadd80a",
+          "source": "LICENSE-ZLIB.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-ZLIB.txt"
         }
       ],
       "license": "Zlib OR Apache-2.0 OR MIT",
@@ -721,14 +1029,14 @@
       "repository_field": "repository",
       "repository_metadata_value": "https://github.com/madsmtm/objc2",
       "revision": "7b1abfd750a2cacaea71d6a56ecfb83cb7de560b",
-      "scope": "Published crate VCS receipt and registry archive verified; closest ancestor/root notices from that immutable upstream tree. Scope still subject to distribution review.",
+      "scope": "Published release identity remains bound to its locked archive and VCS receipt. Supplemental files have their own explicit upstream revisions and roles; they do not replace the release notices or establish complete attribution.",
       "source_kind": "registry",
       "vcs_sha256": "291451d0b2f737993ae289f232ae5959ea61bbefbf2ba1c4f6354369e4253851",
       "version": "0.3.2"
     },
     {
       "collection_limitations": [
-        "Collected upstream licensing explanation, not a full licence-grant text. External terms and upstream Apple SDK implications remain unresolved; not distribution clearance."
+        "Pinned release licensing explanation retained. Later upstream full grant texts are supplemental references for declared options only; their complete applicability and contributor attribution for this earlier release are unconfirmed. Apple SDK scope remains unresolved; not distribution clearance."
       ],
       "files": [
         {
@@ -739,6 +1047,39 @@
           "source": "LICENSE.md",
           "symlink_chain": [],
           "url": "https://raw.githubusercontent.com/madsmtm/objc2/7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md"
+        },
+        {
+          "git_blob": "ce8c4c17fd88f6cf5f3720c08fa685434e3cbcbb",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt",
+          "resolved_source": "LICENSE-MIT.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "f6a2e783669a0dd7a2c3b8a4f76db40ae49033e66e1bdc30f3aa25fe5577b070",
+          "source": "LICENSE-MIT.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt"
+        },
+        {
+          "git_blob": "367635181689ec6e1efadf43eaa48503acaf34a8",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-APACHE.txt",
+          "resolved_source": "LICENSE-APACHE.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "0c9a5f6fe28e27015e12506ffe58c9e007cead169af9670ec15c1df0d14e4f2a",
+          "source": "LICENSE-APACHE.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-APACHE.txt"
+        },
+        {
+          "git_blob": "e53b4121d96c9c337cc7fee57c0177e4a63b1da0",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-ZLIB.txt",
+          "resolved_source": "LICENSE-ZLIB.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "fced3e7fedc235fa83ed0108b0df74d86b435d06436356f46917a903cbadd80a",
+          "source": "LICENSE-ZLIB.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-ZLIB.txt"
         }
       ],
       "license": "Zlib OR Apache-2.0 OR MIT",
@@ -750,14 +1091,14 @@
       "repository_field": "repository",
       "repository_metadata_value": "https://github.com/madsmtm/objc2",
       "revision": "7b1abfd750a2cacaea71d6a56ecfb83cb7de560b",
-      "scope": "Published crate VCS receipt and registry archive verified; closest ancestor/root notices from that immutable upstream tree. Scope still subject to distribution review.",
+      "scope": "Published release identity remains bound to its locked archive and VCS receipt. Supplemental files have their own explicit upstream revisions and roles; they do not replace the release notices or establish complete attribution.",
       "source_kind": "registry",
       "vcs_sha256": "505aa6c21bf36109e6e050055d239bcaf791b18e63cdefb7d601922b9f864545",
       "version": "0.3.2"
     },
     {
       "collection_limitations": [
-        "Collected upstream licensing explanation, not a full licence-grant text. External terms and upstream Apple SDK implications remain unresolved; not distribution clearance."
+        "Pinned release licensing explanation retained. Later upstream full grant texts are supplemental references for declared options only; their complete applicability and contributor attribution for this earlier release are unconfirmed. Apple SDK scope remains unresolved; not distribution clearance."
       ],
       "files": [
         {
@@ -768,6 +1109,39 @@
           "source": "LICENSE.md",
           "symlink_chain": [],
           "url": "https://raw.githubusercontent.com/madsmtm/objc2/7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md"
+        },
+        {
+          "git_blob": "ce8c4c17fd88f6cf5f3720c08fa685434e3cbcbb",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt",
+          "resolved_source": "LICENSE-MIT.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "f6a2e783669a0dd7a2c3b8a4f76db40ae49033e66e1bdc30f3aa25fe5577b070",
+          "source": "LICENSE-MIT.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt"
+        },
+        {
+          "git_blob": "367635181689ec6e1efadf43eaa48503acaf34a8",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-APACHE.txt",
+          "resolved_source": "LICENSE-APACHE.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "0c9a5f6fe28e27015e12506ffe58c9e007cead169af9670ec15c1df0d14e4f2a",
+          "source": "LICENSE-APACHE.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-APACHE.txt"
+        },
+        {
+          "git_blob": "e53b4121d96c9c337cc7fee57c0177e4a63b1da0",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-ZLIB.txt",
+          "resolved_source": "LICENSE-ZLIB.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "fced3e7fedc235fa83ed0108b0df74d86b435d06436356f46917a903cbadd80a",
+          "source": "LICENSE-ZLIB.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-ZLIB.txt"
         }
       ],
       "license": "Zlib OR Apache-2.0 OR MIT",
@@ -779,14 +1153,14 @@
       "repository_field": "repository",
       "repository_metadata_value": "https://github.com/madsmtm/objc2",
       "revision": "7b1abfd750a2cacaea71d6a56ecfb83cb7de560b",
-      "scope": "Published crate VCS receipt and registry archive verified; closest ancestor/root notices from that immutable upstream tree. Scope still subject to distribution review.",
+      "scope": "Published release identity remains bound to its locked archive and VCS receipt. Supplemental files have their own explicit upstream revisions and roles; they do not replace the release notices or establish complete attribution.",
       "source_kind": "registry",
       "vcs_sha256": "05c4588ec0cd5ff712e111b6a56224d5c9fef6b63bc11fc069ff0f2fa7f96b2a",
       "version": "0.3.2"
     },
     {
       "collection_limitations": [
-        "Collected upstream licensing explanation, not a full licence-grant text. External terms and upstream Apple SDK implications remain unresolved; not distribution clearance."
+        "Pinned release licensing explanation retained. Later upstream full grant texts are supplemental references for declared options only; their complete applicability and contributor attribution for this earlier release are unconfirmed. Apple SDK scope remains unresolved; not distribution clearance."
       ],
       "files": [
         {
@@ -797,6 +1171,28 @@
           "source": "LICENSE.md",
           "symlink_chain": [],
           "url": "https://raw.githubusercontent.com/madsmtm/objc2/8d214f5477365ffcbcbb7de058c86ed9a518efb7/LICENSE.md"
+        },
+        {
+          "git_blob": "ce8c4c17fd88f6cf5f3720c08fa685434e3cbcbb",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt",
+          "resolved_source": "LICENSE-MIT.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "f6a2e783669a0dd7a2c3b8a4f76db40ae49033e66e1bdc30f3aa25fe5577b070",
+          "source": "LICENSE-MIT.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt"
+        },
+        {
+          "git_blob": "e9ab3babc0d8602b83dccde8a462f8f3dc1e52ad",
+          "local": "upstream/madsmtm/objc2/757cd841d0293341dbefd9b99d7548dec244ffde/LICENSE.txt",
+          "resolved_source": "LICENSE.txt",
+          "revision": "757cd841d0293341dbefd9b99d7548dec244ffde",
+          "role": "retained-ancestor-notice",
+          "sha256": "e353f37b12aefbb9f9b29490e837cfee05d9bda70804b3562839a3285c1df1e5",
+          "source": "LICENSE.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/757cd841d0293341dbefd9b99d7548dec244ffde/LICENSE.txt"
         }
       ],
       "license": "MIT",
@@ -808,7 +1204,7 @@
       "repository_field": "repository",
       "repository_metadata_value": "https://github.com/madsmtm/objc2",
       "revision": "8d214f5477365ffcbcbb7de058c86ed9a518efb7",
-      "scope": "Published crate VCS receipt and registry archive verified; closest ancestor/root notices from that immutable upstream tree. Scope still subject to distribution review.",
+      "scope": "Published release identity remains bound to its locked archive and VCS receipt. Supplemental files have their own explicit upstream revisions and roles; they do not replace the release notices or establish complete attribution.",
       "source_kind": "registry",
       "vcs_sha256": "b23c761215887d90ac44e18b18c8b386f93139c65a4a14f110e22405830cb3f1",
       "version": "4.1.0"
@@ -841,7 +1237,7 @@
     },
     {
       "collection_limitations": [
-        "Collected upstream licensing explanation, not a full licence-grant text. External terms and upstream Apple SDK implications remain unresolved; not distribution clearance."
+        "Pinned release licensing explanation retained. Later upstream full grant texts are supplemental references for declared options only; their complete applicability and contributor attribution for this earlier release are unconfirmed. Apple SDK scope remains unresolved; not distribution clearance."
       ],
       "files": [
         {
@@ -852,6 +1248,28 @@
           "source": "LICENSE.md",
           "symlink_chain": [],
           "url": "https://raw.githubusercontent.com/madsmtm/objc2/7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md"
+        },
+        {
+          "git_blob": "ce8c4c17fd88f6cf5f3720c08fa685434e3cbcbb",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt",
+          "resolved_source": "LICENSE-MIT.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "f6a2e783669a0dd7a2c3b8a4f76db40ae49033e66e1bdc30f3aa25fe5577b070",
+          "source": "LICENSE-MIT.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt"
+        },
+        {
+          "git_blob": "e9ab3babc0d8602b83dccde8a462f8f3dc1e52ad",
+          "local": "upstream/madsmtm/objc2/757cd841d0293341dbefd9b99d7548dec244ffde/LICENSE.txt",
+          "resolved_source": "LICENSE.txt",
+          "revision": "757cd841d0293341dbefd9b99d7548dec244ffde",
+          "role": "retained-ancestor-notice",
+          "sha256": "e353f37b12aefbb9f9b29490e837cfee05d9bda70804b3562839a3285c1df1e5",
+          "source": "LICENSE.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/757cd841d0293341dbefd9b99d7548dec244ffde/LICENSE.txt"
         }
       ],
       "license": "MIT",
@@ -863,14 +1281,14 @@
       "repository_field": "repository",
       "repository_metadata_value": "https://github.com/madsmtm/objc2",
       "revision": "7b1abfd750a2cacaea71d6a56ecfb83cb7de560b",
-      "scope": "Published crate VCS receipt and registry archive verified; closest ancestor/root notices from that immutable upstream tree. Scope still subject to distribution review.",
+      "scope": "Published release identity remains bound to its locked archive and VCS receipt. Supplemental files have their own explicit upstream revisions and roles; they do not replace the release notices or establish complete attribution.",
       "source_kind": "registry",
       "vcs_sha256": "de34f3c84d7cb1cafcedb4e83b7efdd64047872566827477b954f8a853536bb1",
       "version": "0.3.2"
     },
     {
       "collection_limitations": [
-        "Collected upstream licensing explanation, not a full licence-grant text. External terms and upstream Apple SDK implications remain unresolved; not distribution clearance."
+        "Pinned release licensing explanation retained. Later upstream full grant texts are supplemental references for declared options only; their complete applicability and contributor attribution for this earlier release are unconfirmed. Apple SDK scope remains unresolved; not distribution clearance."
       ],
       "files": [
         {
@@ -881,6 +1299,39 @@
           "source": "LICENSE.md",
           "symlink_chain": [],
           "url": "https://raw.githubusercontent.com/madsmtm/objc2/7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md"
+        },
+        {
+          "git_blob": "ce8c4c17fd88f6cf5f3720c08fa685434e3cbcbb",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt",
+          "resolved_source": "LICENSE-MIT.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "f6a2e783669a0dd7a2c3b8a4f76db40ae49033e66e1bdc30f3aa25fe5577b070",
+          "source": "LICENSE-MIT.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt"
+        },
+        {
+          "git_blob": "367635181689ec6e1efadf43eaa48503acaf34a8",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-APACHE.txt",
+          "resolved_source": "LICENSE-APACHE.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "0c9a5f6fe28e27015e12506ffe58c9e007cead169af9670ec15c1df0d14e4f2a",
+          "source": "LICENSE-APACHE.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-APACHE.txt"
+        },
+        {
+          "git_blob": "e53b4121d96c9c337cc7fee57c0177e4a63b1da0",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-ZLIB.txt",
+          "resolved_source": "LICENSE-ZLIB.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "fced3e7fedc235fa83ed0108b0df74d86b435d06436356f46917a903cbadd80a",
+          "source": "LICENSE-ZLIB.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-ZLIB.txt"
         }
       ],
       "license": "Zlib OR Apache-2.0 OR MIT",
@@ -892,14 +1343,14 @@
       "repository_field": "repository",
       "repository_metadata_value": "https://github.com/madsmtm/objc2",
       "revision": "7b1abfd750a2cacaea71d6a56ecfb83cb7de560b",
-      "scope": "Published crate VCS receipt and registry archive verified; closest ancestor/root notices from that immutable upstream tree. Scope still subject to distribution review.",
+      "scope": "Published release identity remains bound to its locked archive and VCS receipt. Supplemental files have their own explicit upstream revisions and roles; they do not replace the release notices or establish complete attribution.",
       "source_kind": "registry",
       "vcs_sha256": "ea5eaec8d2785ebed65a43cdf097051d8900c7547797cea4bb3c7ba4476e052a",
       "version": "0.3.2"
     },
     {
       "collection_limitations": [
-        "Collected upstream licensing explanation, not a full licence-grant text. External terms and upstream Apple SDK implications remain unresolved; not distribution clearance."
+        "Pinned release licensing explanation retained. Later upstream full grant texts are supplemental references for declared options only; their complete applicability and contributor attribution for this earlier release are unconfirmed. Apple SDK scope remains unresolved; not distribution clearance."
       ],
       "files": [
         {
@@ -910,6 +1361,39 @@
           "source": "LICENSE.md",
           "symlink_chain": [],
           "url": "https://raw.githubusercontent.com/madsmtm/objc2/7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md"
+        },
+        {
+          "git_blob": "ce8c4c17fd88f6cf5f3720c08fa685434e3cbcbb",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt",
+          "resolved_source": "LICENSE-MIT.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "f6a2e783669a0dd7a2c3b8a4f76db40ae49033e66e1bdc30f3aa25fe5577b070",
+          "source": "LICENSE-MIT.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt"
+        },
+        {
+          "git_blob": "367635181689ec6e1efadf43eaa48503acaf34a8",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-APACHE.txt",
+          "resolved_source": "LICENSE-APACHE.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "0c9a5f6fe28e27015e12506ffe58c9e007cead169af9670ec15c1df0d14e4f2a",
+          "source": "LICENSE-APACHE.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-APACHE.txt"
+        },
+        {
+          "git_blob": "e53b4121d96c9c337cc7fee57c0177e4a63b1da0",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-ZLIB.txt",
+          "resolved_source": "LICENSE-ZLIB.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "fced3e7fedc235fa83ed0108b0df74d86b435d06436356f46917a903cbadd80a",
+          "source": "LICENSE-ZLIB.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-ZLIB.txt"
         }
       ],
       "license": "Zlib OR Apache-2.0 OR MIT",
@@ -921,14 +1405,14 @@
       "repository_field": "repository",
       "repository_metadata_value": "https://github.com/madsmtm/objc2",
       "revision": "7b1abfd750a2cacaea71d6a56ecfb83cb7de560b",
-      "scope": "Published crate VCS receipt and registry archive verified; closest ancestor/root notices from that immutable upstream tree. Scope still subject to distribution review.",
+      "scope": "Published release identity remains bound to its locked archive and VCS receipt. Supplemental files have their own explicit upstream revisions and roles; they do not replace the release notices or establish complete attribution.",
       "source_kind": "registry",
       "vcs_sha256": "d18b21bb115491577880f7f8c491ac10dd8d9947bd27fdc3f6dafcf4cf92b2e9",
       "version": "0.3.2"
     },
     {
       "collection_limitations": [
-        "Collected upstream licensing explanation, not a full licence-grant text. External terms and upstream Apple SDK implications remain unresolved; not distribution clearance."
+        "Pinned release licensing explanation retained. Later upstream full grant texts are supplemental references for declared options only; their complete applicability and contributor attribution for this earlier release are unconfirmed. Apple SDK scope remains unresolved; not distribution clearance."
       ],
       "files": [
         {
@@ -939,6 +1423,39 @@
           "source": "LICENSE.md",
           "symlink_chain": [],
           "url": "https://raw.githubusercontent.com/madsmtm/objc2/7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md"
+        },
+        {
+          "git_blob": "ce8c4c17fd88f6cf5f3720c08fa685434e3cbcbb",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt",
+          "resolved_source": "LICENSE-MIT.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "f6a2e783669a0dd7a2c3b8a4f76db40ae49033e66e1bdc30f3aa25fe5577b070",
+          "source": "LICENSE-MIT.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt"
+        },
+        {
+          "git_blob": "367635181689ec6e1efadf43eaa48503acaf34a8",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-APACHE.txt",
+          "resolved_source": "LICENSE-APACHE.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "0c9a5f6fe28e27015e12506ffe58c9e007cead169af9670ec15c1df0d14e4f2a",
+          "source": "LICENSE-APACHE.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-APACHE.txt"
+        },
+        {
+          "git_blob": "e53b4121d96c9c337cc7fee57c0177e4a63b1da0",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-ZLIB.txt",
+          "resolved_source": "LICENSE-ZLIB.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "fced3e7fedc235fa83ed0108b0df74d86b435d06436356f46917a903cbadd80a",
+          "source": "LICENSE-ZLIB.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-ZLIB.txt"
         }
       ],
       "license": "Zlib OR Apache-2.0 OR MIT",
@@ -950,14 +1467,14 @@
       "repository_field": "repository",
       "repository_metadata_value": "https://github.com/madsmtm/objc2",
       "revision": "7b1abfd750a2cacaea71d6a56ecfb83cb7de560b",
-      "scope": "Published crate VCS receipt and registry archive verified; closest ancestor/root notices from that immutable upstream tree. Scope still subject to distribution review.",
+      "scope": "Published release identity remains bound to its locked archive and VCS receipt. Supplemental files have their own explicit upstream revisions and roles; they do not replace the release notices or establish complete attribution.",
       "source_kind": "registry",
       "vcs_sha256": "7984dc30856267fc3fa55dcfafe860b9baf79c417ae43881859b7aa2838236a3",
       "version": "0.3.2"
     },
     {
       "collection_limitations": [
-        "Collected upstream licensing explanation, not a full licence-grant text. External terms and upstream Apple SDK implications remain unresolved; not distribution clearance."
+        "Pinned release licensing explanation retained. Later upstream full grant texts are supplemental references for declared options only; their complete applicability and contributor attribution for this earlier release are unconfirmed. Apple SDK scope remains unresolved; not distribution clearance."
       ],
       "files": [
         {
@@ -968,6 +1485,39 @@
           "source": "LICENSE.md",
           "symlink_chain": [],
           "url": "https://raw.githubusercontent.com/madsmtm/objc2/7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md"
+        },
+        {
+          "git_blob": "ce8c4c17fd88f6cf5f3720c08fa685434e3cbcbb",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt",
+          "resolved_source": "LICENSE-MIT.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "f6a2e783669a0dd7a2c3b8a4f76db40ae49033e66e1bdc30f3aa25fe5577b070",
+          "source": "LICENSE-MIT.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt"
+        },
+        {
+          "git_blob": "367635181689ec6e1efadf43eaa48503acaf34a8",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-APACHE.txt",
+          "resolved_source": "LICENSE-APACHE.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "0c9a5f6fe28e27015e12506ffe58c9e007cead169af9670ec15c1df0d14e4f2a",
+          "source": "LICENSE-APACHE.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-APACHE.txt"
+        },
+        {
+          "git_blob": "e53b4121d96c9c337cc7fee57c0177e4a63b1da0",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-ZLIB.txt",
+          "resolved_source": "LICENSE-ZLIB.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "fced3e7fedc235fa83ed0108b0df74d86b435d06436356f46917a903cbadd80a",
+          "source": "LICENSE-ZLIB.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-ZLIB.txt"
         }
       ],
       "license": "Zlib OR Apache-2.0 OR MIT",
@@ -979,14 +1529,14 @@
       "repository_field": "repository",
       "repository_metadata_value": "https://github.com/madsmtm/objc2",
       "revision": "7b1abfd750a2cacaea71d6a56ecfb83cb7de560b",
-      "scope": "Published crate VCS receipt and registry archive verified; closest ancestor/root notices from that immutable upstream tree. Scope still subject to distribution review.",
+      "scope": "Published release identity remains bound to its locked archive and VCS receipt. Supplemental files have their own explicit upstream revisions and roles; they do not replace the release notices or establish complete attribution.",
       "source_kind": "registry",
       "vcs_sha256": "024671701b8939b14fd6f30542019a7223a8e92f54f91565e88983d6f0b1a71c",
       "version": "0.3.2"
     },
     {
       "collection_limitations": [
-        "Collected upstream licensing explanation, not a full licence-grant text. External terms and upstream Apple SDK implications remain unresolved; not distribution clearance."
+        "Pinned release licensing explanation retained. Later upstream full grant texts are supplemental references for declared options only; their complete applicability and contributor attribution for this earlier release are unconfirmed. Apple SDK scope remains unresolved; not distribution clearance."
       ],
       "files": [
         {
@@ -997,6 +1547,39 @@
           "source": "LICENSE.md",
           "symlink_chain": [],
           "url": "https://raw.githubusercontent.com/madsmtm/objc2/7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md"
+        },
+        {
+          "git_blob": "ce8c4c17fd88f6cf5f3720c08fa685434e3cbcbb",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt",
+          "resolved_source": "LICENSE-MIT.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "f6a2e783669a0dd7a2c3b8a4f76db40ae49033e66e1bdc30f3aa25fe5577b070",
+          "source": "LICENSE-MIT.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-MIT.txt"
+        },
+        {
+          "git_blob": "367635181689ec6e1efadf43eaa48503acaf34a8",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-APACHE.txt",
+          "resolved_source": "LICENSE-APACHE.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "0c9a5f6fe28e27015e12506ffe58c9e007cead169af9670ec15c1df0d14e4f2a",
+          "source": "LICENSE-APACHE.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-APACHE.txt"
+        },
+        {
+          "git_blob": "e53b4121d96c9c337cc7fee57c0177e4a63b1da0",
+          "local": "upstream/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-ZLIB.txt",
+          "resolved_source": "LICENSE-ZLIB.txt",
+          "revision": "ee9a7ada2131f5944b8750428e265c15632f2a19",
+          "role": "supplemental-reference",
+          "sha256": "fced3e7fedc235fa83ed0108b0df74d86b435d06436356f46917a903cbadd80a",
+          "source": "LICENSE-ZLIB.txt",
+          "symlink_chain": [],
+          "url": "https://raw.githubusercontent.com/madsmtm/objc2/ee9a7ada2131f5944b8750428e265c15632f2a19/LICENSE-ZLIB.txt"
         }
       ],
       "license": "Zlib OR Apache-2.0 OR MIT",
@@ -1008,7 +1591,7 @@
       "repository_field": "repository",
       "repository_metadata_value": "https://github.com/madsmtm/objc2",
       "revision": "7b1abfd750a2cacaea71d6a56ecfb83cb7de560b",
-      "scope": "Published crate VCS receipt and registry archive verified; closest ancestor/root notices from that immutable upstream tree. Scope still subject to distribution review.",
+      "scope": "Published release identity remains bound to its locked archive and VCS receipt. Supplemental files have their own explicit upstream revisions and roles; they do not replace the release notices or establish complete attribution.",
       "source_kind": "registry",
       "vcs_sha256": "f9f9fc21b411afa8a20002f259187760b838f8fb6db54814db214c1682a14344",
       "version": "0.3.2"

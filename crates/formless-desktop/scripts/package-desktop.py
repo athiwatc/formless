@@ -143,7 +143,8 @@ def reviewed_notices(package, root, upstream, entry):
             if digest(upstream.parent.parents[1] / "LICENSE") != notice["sha256"]:
                 raise ValueError("workspace license changed; refresh notice review")
         result.append((source, dict(source=notice["source"], sha256=notice["sha256"],
-            url=notice.get("url"), revision=entry.get("revision"),
+            url=notice.get("url"), revision=notice.get("revision", entry.get("revision")),
+            role=notice.get("role", "pinned-release-notice"),
             git_blob=notice.get("git_blob"), registry_checksum=entry.get("registry_checksum"),
             reviewed_local=notice["local"])))
     return result

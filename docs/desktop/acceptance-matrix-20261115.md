@@ -71,3 +71,9 @@ improves the measured dev/test parser cost without changing semantics and adds
 version-bound upstream/Rust notices. Three empty inventories, nineteen
 licensing-note-only cases and native/performance/distribution acceptance remain
 explicitly unresolved.
+
+The [licensing scope follow-up](licensing-scope-20261115.md) retains later full
+upstream texts and an earlier MIT notice with separate provenance, preserving
+all nineteen scope flags and all three empty-notice flags. It identifies exact
+archive evidence and owner decisions without treating file counts or partial
+review receipts as release acceptance.

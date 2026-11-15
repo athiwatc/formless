@@ -116,6 +116,27 @@ class Packaging(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     package.collect_notices([metadata], {"test-id"}, root / "out", upstream, lock)
 
+    def test_supplemental_notice_keeps_its_own_revision_and_review_limitation(self):
+        root, upstream, lock, metadata, document, source = self.reviewed_fixture()
+        entry = document["packages"][0]
+        entry["collection_limitations"] = ["Earlier release attribution remains open"]
+        supplemental = source.with_name("LICENSE-REFERENCE")
+        supplemental.write_text("fixture later upstream text")
+        entry["files"].append(dict(local=supplemental.relative_to(upstream).as_posix(),
+            source="LICENSE-REFERENCE", sha256=package.digest(supplemental),
+            revision="later reference revision", role="supplemental-reference"))
+        (upstream / "UPSTREAM.json").write_text(json.dumps(document))
+        inventory = package.collect_notices([metadata], {"test-id"}, root / "out", upstream, lock)
+        receipts = inventory[0]["notice_sources"]
+        self.assertEqual([receipt["revision"] for receipt in receipts],
+                         ["fixture revision", "later reference revision"])
+        self.assertEqual([receipt["role"] for receipt in receipts],
+                         ["pinned-release-notice", "supplemental-reference"])
+        self.assertEqual(inventory[0]["notice_review_limitations"], entry["collection_limitations"])
+        supplemental.write_text("changed reference")
+        with self.assertRaisesRegex(ValueError, "hash/size changed"):
+            package.collect_notices([metadata], {"test-id"}, root / "changed-out", upstream, lock)
+
     def test_reviewed_notice_paths_and_symlinks_cannot_escape(self):
         for local in ["../outside", "/absolute", "C:\\outside"]:
             with self.subTest(local=local):
