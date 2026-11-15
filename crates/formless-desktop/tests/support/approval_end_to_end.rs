@@ -9,8 +9,6 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
 };
-#[path = "../../../formless-core/tests/support/env.rs"]
-mod credential_env;
 struct Fixture {
     runtime: tokio::runtime::Runtime,
     root: std::path::PathBuf,
@@ -24,7 +22,7 @@ struct Fixture {
     calls: Arc<AtomicUsize>,
 }
 fn response(n: usize) -> axum::response::Response {
-    let value = if n % 2 == 0 {
+    let value = if n.is_multiple_of(2) {
         json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":format!("private-call-{n}"),"type":"function","function":{"name":"native_approval_fixture","arguments":"{}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1}})
     } else {
         json!({"choices":[{"delta":{"content":format!("Private flow {} complete",n/2+1)},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}})

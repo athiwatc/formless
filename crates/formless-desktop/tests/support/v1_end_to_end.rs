@@ -9,8 +9,6 @@ use std::sync::{
     Arc,
 };
 use tokio::sync::Notify;
-#[path = "../../../formless-core/tests/support/env.rs"]
-mod credential_env;
 
 fn sse(events: &[Value]) -> String {
     events
