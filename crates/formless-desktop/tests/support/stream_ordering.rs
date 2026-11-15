@@ -163,6 +163,11 @@ async fn snapshot(observer: &mut Observer, session: &str) -> Value {
 async fn step_prompt_has_a_live_handoff_but_no_snapshot_or_reconnect_inventory() {
     let env = credential_env::EnvGuard::isolated();
     env.set("FORMLESS_API_KEY", "private-step-fixture-key");
+    exercise_step_handoff(false).await;
+    exercise_step_handoff(true).await;
+}
+
+async fn exercise_step_handoff(future_reader: bool) {
     let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let fixture=Fixture::start(app(axum::routing::post({let requests=requests.clone();move|| {
         let number=requests.fetch_add(1,std::sync::atomic::Ordering::SeqCst)+1;
@@ -181,7 +186,11 @@ async fn step_prompt_has_a_live_handoff_but_no_snapshot_or_reconnect_inventory()
             }
         }
     }})),0).await;
-    let client = Client::start(fixture.endpoint.clone());
+    let client = if future_reader {
+        Client::start_future_attempts_for_validation(fixture.endpoint.clone())
+    } else {
+        Client::start(fixture.endpoint.clone())
+    };
     until(&client, "step-desktop-connect", |update| {
         matches!(update, Update::Connection { ready: true, .. })
     })
@@ -192,8 +201,10 @@ async fn step_prompt_has_a_live_handoff_but_no_snapshot_or_reconnect_inventory()
             generation: 1,
         })
         .unwrap();
-    until(&client, "step-subscription-ready", |update| {
-        matches!(update, Update::Snapshot { generation: 1, .. })
+    until(&client, "step-subscription-ready", |update| match update {
+        Update::Snapshot { generation: 1, .. } => true,
+        Update::Transcript(batch) => batch.owner.generation == 1 && batch.baseline.is_some(),
+        _ => false,
     })
     .await;
     let mut observer = Observer::connect(&fixture.endpoint, &fixture.session).await;
@@ -228,6 +239,11 @@ async fn step_prompt_has_a_live_handoff_but_no_snapshot_or_reconnect_inventory()
         .all(|event| event["step_id"].as_str() != Some(step.as_str())));
     drop(client);
     drop(observer);
+    let future = if future_reader {
+        Some(future_cases::reader(&fixture).await)
+    } else {
+        None
+    };
     let mut observer = Observer::connect(&fixture.endpoint, &fixture.session).await;
     let after = snapshot(&mut observer, &fixture.session).await;
     assert_eq!(after["step_mode"], true);
@@ -257,6 +273,10 @@ async fn step_prompt_has_a_live_handoff_but_no_snapshot_or_reconnect_inventory()
         matches!(event, Event::RunFinished { .. })
     })
     .await;
+    if let Some(client) = future {
+        future_cases::canonical(&client, "Step was skipped. Done 😀", &[]).await;
+        drop(client);
+    }
     assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 2);
     drop(observer);
     fixture.finish().await;
@@ -375,6 +395,11 @@ async fn retry_replaces_partial_attempt_without_a_new_run_or_persisted_prefix() 
 async fn tool_turn_and_final_answer_share_a_run_but_have_distinct_canonical_boundaries() {
     let env = credential_env::EnvGuard::isolated();
     env.set("FORMLESS_API_KEY", "private-ordering-fixture-key");
+    exercise_tool_turn(false).await;
+    exercise_tool_turn(true).await;
+}
+
+async fn exercise_tool_turn(future_reader: bool) {
     let tool_done = Arc::new(Notify::new());
     let final_done = Arc::new(Notify::new());
     let requests: Arc<Mutex<Vec<Value>>> = Arc::default();
@@ -401,9 +426,17 @@ async fn tool_turn_and_final_answer_share_a_run_but_have_distinct_canonical_boun
             }
         }
     })), 0).await;
+    let future = if future_reader {
+        Some(future_cases::reader(&fixture).await)
+    } else {
+        None
+    };
     let mut observer = Observer::connect(&fixture.endpoint, &fixture.session).await;
     send(&mut observer, &fixture.session).await;
     wait(&mut observer, |event| matches!(event, Event::MessageDelta { delta, .. } if delta == "Checking fixture Tool ไทย. ")).await;
+    if let Some(client) = &future {
+        future_cases::live(client, "Checking fixture Tool ไทย. ").await;
+    }
     assert!(assistant_messages(&snapshot(&mut observer, &fixture.session).await).is_empty());
     tool_done.notify_one();
     wait(
@@ -444,6 +477,10 @@ async fn tool_turn_and_final_answer_share_a_run_but_have_distinct_canonical_boun
     );
     assert_eq!(requests.lock().unwrap().len(), 2);
     eprintln!("ordering tool turn: 2 requests, 1 Run, MessageAppended then MessageComplete, 2 distinct canonical assistants");
+    if let Some(client) = future {
+        future_cases::canonical(&client, "Final answer 漢字 😀", &[]).await;
+        drop(client);
+    }
     drop(observer);
     fixture.finish().await;
 }
@@ -721,6 +758,11 @@ async fn candidate_retries_reset_unpersisted_refusal_and_pending_tool_text() {
 async fn context_window_retry_resets_the_unpersisted_candidate_after_compaction() {
     let env = credential_env::EnvGuard::isolated();
     env.set("FORMLESS_API_KEY", "private-context-ordering-key");
+    exercise_context_compaction(false).await;
+    exercise_context_compaction(true).await;
+}
+
+async fn exercise_context_compaction(future_reader: bool) {
     let complete = Arc::new(Notify::new());
     let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let fixture=Fixture::start(app(axum::routing::post({
@@ -756,6 +798,11 @@ async fn context_window_retry_resets_the_unpersisted_candidate_after_compaction(
             .await;
         observer.events.clear();
     }
+    let future = if future_reader {
+        Some(future_cases::reader(&fixture).await)
+    } else {
+        None
+    };
     send(&mut observer, &fixture.session).await;
     observer
         .until(|event| {
@@ -799,6 +846,15 @@ async fn context_window_retry_resets_the_unpersisted_candidate_after_compaction(
     assert_eq!(messages[2]["content"], "After compaction ไทย 😀");
     assert_eq!(run_ids(&observer).len(), 1);
     assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 5);
+    if let Some(client) = future {
+        future_cases::canonical(
+            &client,
+            "After compaction ไทย 😀",
+            &["Compacted private history."],
+        )
+        .await;
+        drop(client);
+    }
     drop(observer);
     fixture.finish().await;
     assert_eq!(
@@ -809,3 +865,6 @@ async fn context_window_retry_resets_the_unpersisted_candidate_after_compaction(
 
 #[path = "future_attempts.rs"]
 mod future_attempts;
+
+#[path = "future_cases.rs"]
+mod future_cases;
