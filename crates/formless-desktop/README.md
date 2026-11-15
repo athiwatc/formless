@@ -127,6 +127,7 @@ Findings, measurements, the parity inventory and the open blockers are in
 [docs/desktop/phase0-findings.md](../../docs/desktop/phase0-findings.md).
 
 Current continuation evidence and remaining acceptance are recorded in
+[the isolated source-copy report](../../docs/desktop/source-copy-20261115.md),
 [the recorded usage report](../../docs/desktop/session-usage-20261115.md),
 [the Session export report](../../docs/desktop/session-export-20261115.md),
 [the standing instructions report](../../docs/desktop/session-instructions-20261115.md),
@@ -274,6 +275,17 @@ monospace/fallback font advances, not a count of ASCII-width characters.
 If one character cannot fit the window or safe layout bound, the view
 explains the limit and keeps Copy all available. A new Session snapshot
 closes the old view rather than applying old byte offsets to new text.
+Every completed conversation block has a keyboard-reachable Copy source
+control. It copies the complete exact source (Markdown, Unicode and whitespace),
+including text outside the row preview, to the system clipboard. This may
+include private conversation or Tool data. Direct copy is limited to 1 MiB;
+larger blocks retain the existing View whole / Copy all path. Streaming tails
+and transcripts requiring reload cannot be copied directly. Queued copy actions
+are checked against the current source revision and modal state; they cannot
+copy a same-ID replacement after navigation or snapshot changes. A status
+notice confirms the clipboard write; focus and composer drafts stay in place.
+This does not provide cross-block selection or a separate code-fence copy action.
+
 The text is always the
 size asked for. A window smaller than that size needs (480 x 360 times the
 size) is reflowed: every part is as wide as the window, the parts stack,

@@ -319,6 +319,7 @@ pub fn session_row_id(session_id: &str) -> ElementId {
     ElementId::from(SharedString::from(format!("session-row-{session_id}")))
 }
 
+const BLOCK_COPY_MAX_BYTES: usize = 1024 * 1024;
 const VIEWER_STREAMING: &str = "Available once the block has finished arriving";
 
 /// For a row that shows less than its whole block: what is missing on each
@@ -751,6 +752,7 @@ pub struct Shell {
     search_revision: u64,
     search_return: Destination,
     search_notice: Option<&'static str>,
+    block_copy_notice: Option<&'static str>,
     composer: Entity<TextareaState>,
     session_scroll: VirtualListScrollHandle,
     session_sizes: Rc<Vec<Size<Pixels>>>,
@@ -966,6 +968,7 @@ impl Shell {
             search_revision: 0,
             search_return: Destination::Chat,
             search_notice: None,
+            block_copy_notice: None,
             composer,
             session_scroll: VirtualListScrollHandle::new(),
             session_sizes,
@@ -2456,6 +2459,49 @@ impl Shell {
         cx.notify();
     }
 
+    /// The finished-corpus revision captured by a rendered Copy source control.
+    /// Session/snapshot replacement and structural transcript changes retire it.
+    pub fn block_copy_revision(&self) -> u64 {
+        self.search_revision
+    }
+
+    /// Copy exact source, never rendered Markdown or a partial row preview.
+    /// Recheck ownership and modal state at dispatch time before touching the
+    /// clipboard. This local action does not send an intent to the daemon.
+    pub fn copy_block_source(
+        &mut self,
+        block_id: u64,
+        revision: u64,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if revision != self.search_revision
+            || self.destination != Destination::Chat
+            || self.background_inert(window)
+            || self.transcript_reload_needed().is_some()
+        {
+            return false;
+        }
+        let blocks = self.blocks.borrow();
+        let Some(index) = blocks
+            .blocks()
+            .iter()
+            .position(|block| block.id == block_id)
+        else {
+            return false;
+        };
+        let block = &blocks.blocks()[index];
+        if (blocks.is_streaming() && index + 1 == blocks.len())
+            || block.total_bytes() > BLOCK_COPY_MAX_BYTES
+        {
+            return false;
+        }
+        cx.write_to_clipboard(ClipboardItem::new_string(block.markdown().to_string()));
+        self.block_copy_notice = Some("Copied complete block source to the system clipboard.");
+        cx.notify();
+        true
+    }
+
     fn copy_viewed_block(&mut self, cx: &mut Context<Self>) {
         let Some(viewer) = &mut self.viewer else {
             return;
@@ -3550,6 +3596,8 @@ impl Shell {
         let shell = cx.entity();
         let reading_width = self.scaled(tokens::READING_MAX);
         let focused = self.conversation_focus.is_focused(window);
+        let revision = self.block_copy_revision();
+        let copy_stale = self.transcript_reload_needed().is_some();
         let timeline = MessageScroller::new("timeline", self.timeline.clone(), {
             move |index, window, cx| {
                 // A frame drawn between two flushes still shows the newest
@@ -3582,10 +3630,35 @@ impl Shell {
                     .py_2()
                     .gap_1()
                     .child(
-                        div()
+                        h_flex()
+                            .flex_wrap()
+                            .gap_1()
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
-                            .child(block.kind.label()),
+                            .child(Label::new(block.kind.label()))
+                            .child({
+                                let shell = shell.clone();
+                                Button::new(SharedString::from(format!("block-{id}-copy-source")))
+                                    .xsmall()
+                                    .ghost()
+                                    .label("Copy source")
+                                    .accessibility_label("Copy complete block source")
+                                    .disabled(streaming || copy_stale || block.total_bytes() > BLOCK_COPY_MAX_BYTES)
+                                    .tooltip(if streaming {
+                                        VIEWER_STREAMING
+                                    } else if copy_stale {
+                                        "Reload the transcript before copying source"
+                                    } else if block.total_bytes() > BLOCK_COPY_MAX_BYTES {
+                                        "Direct copy is limited to 1 MiB; use View whole for larger blocks"
+                                    } else {
+                                        "Copy the complete source, including Markdown and whitespace, to the system clipboard. May contain private data."
+                                    })
+                                    .on_click(move |_, window, cx| {
+                                        shell.update(cx, |this, cx| {
+                                            this.copy_block_source(id as u64, revision, window, cx);
+                                        });
+                                    })
+                            }),
                     )
                     .children(above)
                     .child({
@@ -3649,6 +3722,19 @@ impl Shell {
                             .text_color(cx.theme().muted_foreground),
                     ),
             )
+            .when_some(self.block_copy_notice, |region, notice| {
+                region.child(
+                    announced(div().id("block-copy-notice"))
+                        .flex_shrink_0()
+                        .test_support()
+                        .role(Role::Status)
+                        .aria_value(notice)
+                        .px_2()
+                        .py_1()
+                        .text_xs()
+                        .child(Label::new(notice)),
+                )
+            })
             .when_some(self.transcript_reload_needed(), |region, reason| {
                 region.child(
                     announced(div().id("transcript-reload"))
@@ -3787,6 +3873,7 @@ impl Shell {
         self.search_revision = self.search_revision.wrapping_add(1);
         self.search.clear(self.search_revision);
         self.search_notice = None;
+        self.block_copy_notice = None;
         if self.destination == Destination::Search {
             self.refresh_search(cx);
         }

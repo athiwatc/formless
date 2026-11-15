@@ -6866,3 +6866,172 @@ fn typed_transcript_structural_updates_preserve_a_scrolled_up_reading_anchor(
         assert_eq!(shell.read(cx).block_count(), 102);
     });
 }
+
+// ---- Exact source copying --------------------------------------------------
+
+#[gpui_kit::test]
+fn block_copy_source_keeps_markdown_unicode_whitespace_and_the_complete_previewed_block(
+    cx: &mut TestAppContext,
+) {
+    let text = format!(
+        "# ไทย 日本語 👩‍💻\r\n```rust\r\n\tlet x = 1;  \r\n```\r\n{}",
+        "tail  \n".repeat(6000)
+    );
+    let (handle, shell) = open_blocks(
+        cx,
+        WIDE,
+        vec![TimelineBlock::new(1, BlockKind::Assistant, text.clone())],
+    );
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("block-1-top-window").is_some());
+        let control = window.find("block-1-copy-source");
+        assert_eq!(control.label(), Some("Copy complete block source"));
+        tab_to(window, "block-1-copy-source", cx);
+        window.press("enter", cx);
+        window.render_frame(cx);
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some(text.clone())
+        );
+        assert_eq!(window.find("block-1-copy-source").focused(), Some(true));
+        assert!(window
+            .find("block-copy-notice")
+            .value()
+            .unwrap()
+            .contains("complete block source"));
+        assert!(shell.read(cx).viewer_rows().is_none());
+        assert!(shell.read(cx).last_intent().is_none());
+    });
+}
+
+#[gpui_kit::test]
+fn block_copy_source_rejects_stale_replacements_modals_reload_and_live_tail(
+    cx: &mut TestAppContext,
+) {
+    let (handle, shell) = open_blocks(
+        cx,
+        WIDE,
+        vec![TimelineBlock::new(1, BlockKind::User, "old".into())],
+    );
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        cx.write_to_clipboard(ClipboardItem::new_string("sentinel".into()));
+        let stale = shell.read(cx).block_copy_revision();
+        let id = load_event_snapshot(&shell, "new", cx);
+        assert!(!shell.update(cx, |shell, cx| shell
+            .copy_block_source(1, stale, window, cx)));
+        let current = shell.read(cx).block_copy_revision();
+        shell.update(cx, |shell, cx| {
+            shell.run_command(Command::GoTo(Destination::Tools), window, cx)
+        });
+        assert!(!shell.update(cx, |shell, cx| shell
+            .copy_block_source(1, current, window, cx)));
+        shell.update(cx, |shell, cx| {
+            shell.run_command(Command::GoTo(Destination::Chat), window, cx)
+        });
+        window.press(palette_key(), cx);
+        window.render_frame(cx);
+        assert!(window.try_find("palette").is_some());
+        assert!(!shell.update(cx, |shell, cx| shell
+            .copy_block_source(1, current, window, cx)));
+        window.press("escape", cx);
+        shell
+            .update(cx, |shell, cx| {
+                shell.apply_transcript_event(&typed_gap(&id), cx)
+            })
+            .unwrap();
+        assert!(!shell.update(cx, |shell, cx| shell
+            .copy_block_source(1, current, window, cx)));
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("sentinel".into())
+        );
+        load_event_snapshot(&shell, "restored", cx);
+        shell
+            .update(cx, |shell, cx| {
+                shell.apply_transcript_event(&typed_delta(&id, "live"), cx)
+            })
+            .unwrap();
+        let current = shell.read(cx).block_copy_revision();
+        // The reducer reserves this ID outside the persisted sequence range.
+        let tail = u64::MAX;
+        assert!(!shell.update(cx, |shell, cx| shell
+            .copy_block_source(tail, current, window, cx)));
+        assert!(shell.update(cx, |shell, cx| shell
+            .copy_block_source(1, current, window, cx)));
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("restored".into())
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn block_copy_source_enforces_a_whole_one_mib_limit(cx: &mut TestAppContext) {
+    let accepted = "ก".repeat(349525) + "x"; // Exactly 1 MiB, valid UTF-8.
+    let (handle, shell) = open_blocks(
+        cx,
+        WIDE,
+        vec![TimelineBlock::new(
+            1,
+            BlockKind::ToolSummary,
+            accepted.clone(),
+        )],
+    );
+    step(cx, handle, |window, cx| {
+        let revision = shell.read(cx).block_copy_revision();
+        assert!(shell.update(cx, |shell, cx| shell
+            .copy_block_source(1, revision, window, cx)));
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some(accepted.clone())
+        );
+        load_event_snapshot(&shell, &(accepted.clone() + "x"), cx);
+        let revision = shell.read(cx).block_copy_revision();
+        assert!(!shell.update(cx, |shell, cx| shell
+            .copy_block_source(1, revision, window, cx)));
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some(accepted.clone())
+        );
+        window.render_frame(cx);
+        assert_eq!(window.find("block-1-copy-source").disabled(), Some(true));
+    });
+}
+
+#[gpui_kit::test]
+fn block_copy_source_is_keyboard_reachable_at_minimum_size_and_two_hundred_percent(
+    cx: &mut TestAppContext,
+) {
+    let (handle, shell) = open_blocks(
+        cx,
+        WIDE,
+        vec![TimelineBlock::new(
+            1,
+            BlockKind::User,
+            "# ไทย 日本語\n\tcode  ".into(),
+        )],
+    );
+    set_text_scale(cx, handle, &shell, 200);
+    cx.simulate_window_resize(handle.into(), size(px(480.), px(360.)));
+    cx.run_until_parked();
+    step(cx, handle, |window, cx| {
+        window.render_frame(cx);
+        tab_to(window, "block-1-copy-source", cx);
+        window.render_frame(cx);
+        let viewport = Bounds::new(Point::default(), window.viewport_size());
+        let button = window.find("block-1-copy-source");
+        assert_eq!(button.focused(), Some(true));
+        assert!(button.bounds().left() >= viewport.left());
+        assert!(button.bounds().right() <= viewport.right());
+        assert!(button.bounds().top() >= viewport.top());
+        assert!(button.bounds().bottom() <= viewport.bottom());
+        window.press("enter", cx);
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("# ไทย 日本語\n\tcode  ".into())
+        );
+    });
+}
