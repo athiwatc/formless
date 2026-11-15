@@ -5247,6 +5247,12 @@ the TUI. Command-specific arguments and defaults are available through
 | `formless update` | No action, `check`, or `--check`; `--json` | Show newer release notes and the applicable upgrade command; never rewrite the binary. |
 | `formless web` | `--port`, `--no-open`, `--stop` | Open, print a link for, or stop the local browser UI. |
 
+Ambiguous Session prefixes/names remain usage errors and display up to ten
+matching full IDs, bounded names and archive labels. Extra matches are counted,
+with commands for both archive states. Prefix errors suggest extending the ID;
+name errors suggest a displayed ID. Exact-ID priority, prefix-before-name
+resolution and trimmed ASCII-case-insensitive full-name matching are unchanged.
+
 Human Session lists label the last recorded Run status and show stored tags,
 retaining the pin star and existing message preview/count. Empty replies are
 reported separately from an empty archive selection, which names the alternate
