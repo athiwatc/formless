@@ -37,7 +37,17 @@ if [[ -f "$zip" ]]; then
     || { echo "error: $zip does not hold $nested (the manifest's RelativeFilePath)" >&2; exit 1; }
 fi
 src_url="https://github.com/athiwatc/formless/archive/refs/tags/v$version.tar.gz"
-src_sha="${SRC_SHA:-$(curl -fsSL "$src_url" | shasum -a 256 | cut -d' ' -f1)}"
+src_sha="${SRC_SHA:-}"
+if [[ -z "$src_sha" ]]; then
+  src_archive=$(mktemp)
+  trap 'rm -f -- "$src_archive"' EXIT
+  if ! curl -fsSL --connect-timeout 15 --max-time 120 --retry 3 --retry-all-errors \
+      -o "$src_archive" "$src_url"; then
+    echo "error: could not download $src_url to compute its checksum (set SRC_SHA to skip)" >&2
+    exit 1
+  fi
+  src_sha=$(shasum -a 256 < "$src_archive" | cut -d' ' -f1)
+fi
 [[ "$src_sha" =~ ^[0-9a-f]{64}$ ]] || { echo "error: no checksum for $src_url" >&2; exit 1; }
 # Field-scoped edits: the url line and the formula's top-level sha256.
 awk -v url="$src_url" -v sha="$src_sha" '

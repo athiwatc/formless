@@ -2059,6 +2059,10 @@ fn parse_proposal(v: &Value) -> Result<(String, String, String)> {
 }
 
 #[cfg(test)]
+#[path = "optimiser_retry_tests.rs"]
+mod retry_tests;
+
+#[cfg(test)]
 #[path = "optimiser_holdout_tests.rs"]
 mod holdout_tests;
 

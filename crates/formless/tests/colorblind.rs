@@ -331,7 +331,12 @@ fn shipped_real_terminal_uses_shared_colorblind_rgb_and_no_color_keeps_identical
     }
     let ansi = regex::Regex::new(r"\x1b\[[0-9;]*m").unwrap();
     let visible = ansi.replace_all(&colored, "");
-    for no_color in ["1", ""] {
+    assert_eq!(
+        terminal(&f, Some("")),
+        colored,
+        "empty NO_COLOR keeps terminal colors"
+    );
+    for no_color in ["1", "0"] {
         let plain = terminal(&f, Some(no_color));
         assert!(!plain.contains('\x1b'));
         assert_eq!(
@@ -341,4 +346,74 @@ fn shipped_real_terminal_uses_shared_colorblind_rgb_and_no_color_keeps_identical
     }
     f.no_provider_contact();
     drop(daemon);
+}
+
+#[test]
+fn jobs_history_distinguishes_missing_empty_and_populated_jobs_in_both_formats() {
+    let fixture = Fixture::new();
+    let store = Store::open(&fixture.paths.db_file()).unwrap();
+    let job = store
+        .create_job(
+            "private history fixture",
+            None,
+            None,
+            "2999-01-01T00:00:00Z",
+            false,
+            "user",
+        )
+        .unwrap();
+    let _daemon = fixture.daemon();
+    for json in [false, true] {
+        let mut args = vec!["jobs", "history", "unknown-ไทย-日本語"];
+        if json {
+            args.push("--json");
+        }
+        let out = fixture.run(&args, Some("1"));
+        assert_eq!(out.status.code(), Some(2));
+        assert!(out.stdout.is_empty());
+        assert!(String::from_utf8(out.stderr)
+            .unwrap()
+            .contains("no job 'unknown-ไทย-日本語'"));
+        args[2] = &job.id;
+        let out = fixture.run(&args, Some("1"));
+        assert!(out.status.success(), "{out:?}");
+        if json {
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap(),
+                serde_json::json!([])
+            );
+        } else {
+            assert!(String::from_utf8(out.stdout)
+                .unwrap()
+                .contains(&format!("{} has not run yet", job.id)));
+        }
+    }
+    store
+        .job_run_start(&job.id, None, "manual", "completed", "รายละเอียด 日本語")
+        .unwrap();
+    for json in [false, true] {
+        let mut args = vec!["jobs", "history", &job.id];
+        if json {
+            args.push("--json");
+        }
+        let out = fixture.run(&args, Some("1"));
+        assert!(out.status.success(), "{out:?}");
+        if json {
+            let expected = serde_json::to_value(store.job_runs(&job.id, 20).unwrap()).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap(),
+                expected
+            );
+        } else {
+            let text = String::from_utf8(out.stdout).unwrap();
+            assert!(
+                text.contains("completed") && text.contains("รายละเอียด 日本語"),
+                "{text}"
+            );
+        }
+    }
+    assert_eq!(
+        fixture.provider.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
 }
