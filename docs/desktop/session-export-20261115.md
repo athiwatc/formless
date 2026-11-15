@@ -112,6 +112,26 @@ run in `export-verified-native.log` stopped because an enabled control reports
 no disabled flag rather than `false`; the corrected renderer passed in full.
 No failing evidence was overwritten or counted as successful validation.
 
+## Fresh development artifact
+
+Packaging ran with ResourceWarning treated as an error, `--profile dev
+--offline`, from clean `99f3dcc21aaa413f0e8e9bbd6955df2eb333c4e3`. Only README
+and this report differ from tested runtime `8d74bd2`. Output is
+`evidence/gpui-1753-sol/package-99f3dcc`.
+
+- Binary SHA256:
+  `bb48e00363f4a843f1fd0a21e792434909d671af390e4bce71eeac0015d9c3ca`.
+- ZIP SHA256:
+  `69789f601d5bc3ee2a070bcb5e595f3b19ebdf2467e981c299df8dbc9ea84ad4`.
+- Provenance/plist identity, safe archive paths/types, integrity, executable
+  mode/byte identity, hashes and 21 system-library loads passed. Evidence:
+  `export-final-package.log`, `export-final-package-verification.json`.
+- 655 archive files, 415 packages / 649 notice files; 46 packages lack root
+  notices. Manual licensing/assets/stdlib review remains.
+- Linker ad-hoc signing, no Team ID, unbound plist, no sealed resources.
+  No app was installed or launched; distribution signing/notarization and
+  native installation/launch/update acceptance remain open.
+
 ## Ownership and open gates
 
 Same isolated checkout and `work/sol-gpui-1753-20261115` branch. Main remains
