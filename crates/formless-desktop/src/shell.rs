@@ -35,6 +35,7 @@ use crate::commands::{self, Command};
 use crate::directory::{self, Directory};
 use crate::forecast;
 mod comparison;
+mod invocations;
 mod preferences;
 mod profile_search;
 mod questions;
@@ -182,6 +183,8 @@ pub fn bind_keys(cx: &mut App) {
                 | Command::CompareMarked
                 | Command::InspectRun
                 | Command::ReviewFork
+                | Command::ViewInvocations
+                | Command::OpenInvocationSession
                 | Command::ToggleArchived
                 | Command::ToggleTheme
                 | Command::ToggleEnterSends
@@ -709,6 +712,7 @@ pub struct Shell {
     resource_revision: u64,
     comparison: crate::comparison::State,
     run_inspection: crate::run_inspection::State,
+    invocations: crate::invocations::State,
     fork_review: Option<session_fork::Review>,
     fork_observed: crate::session_fork::Status,
     fork_local_error: Option<SharedString>,
@@ -957,6 +961,7 @@ impl Shell {
             resource_revision: 0,
             comparison: crate::comparison::State::default(),
             run_inspection: crate::run_inspection::State::default(),
+            invocations: crate::invocations::State::default(),
             fork_review: None,
             fork_observed: crate::session_fork::Status::Idle,
             fork_local_error: None,
@@ -1013,6 +1018,8 @@ impl Shell {
                 comparison_reason: Some("Mark a left Session first"),
                 run_inspection_reason: Some("Select a Run entry in Metrics first"),
                 fork_reason: Some("Choose a connected Session first"),
+                invocations_reason: Some("Connect to a Profile first"),
+                invocation_open_reason: Some("Select an Invocation record first"),
                 sessions_shown: true,
                 context_shown: true,
                 dark: false,
@@ -1703,6 +1710,9 @@ impl Shell {
     }
 
     fn attach_client(&mut self, client: Client, cx: &mut Context<Self>) {
+        self.retire_invocations(
+            "Profile attachment changed. Read Invocations again; no read was replayed.",
+        );
         self.fork_review = None;
         self.fork_observed = crate::session_fork::Status::Idle;
         self.fork_local_error = None;
@@ -1915,6 +1925,7 @@ impl Shell {
                     self.questions_restored(window, cx);
                 }
                 if !ready {
+                    self.retire_invocations("Connection lost. Read Invocations explicitly after reconnecting; no read is replayed.");
                     self.reset_run_inspection("Connection lost. Select a Run in Metrics after reconnecting; no inspection is replayed.");
                     self.reset_comparison("Connection lost. Mark a pair again after reconnecting; no comparison is replayed.");
                     self.session_usage.retire("Connection lost. Read usage explicitly after reconnecting; nothing was replayed.");
@@ -1935,6 +1946,11 @@ impl Shell {
                     self.rebuild_directory(cx);
                 }
             }
+            ClientUpdate::Invocations {
+                connection,
+                operation,
+                result,
+            } => self.invocations_outcome(connection, operation, result, cx),
             ClientUpdate::RunInspection {
                 connection,
                 operation,
@@ -2186,7 +2202,7 @@ impl Shell {
             } => {
                 if matches!(
                     destination,
-                    Destination::Comparison | Destination::RunDetails
+                    Destination::Comparison | Destination::RunDetails | Destination::Invocations
                 ) {
                     return;
                 }
@@ -2859,6 +2875,8 @@ impl Shell {
             comparison_reason: self.comparison_disabled_reason(),
             run_inspection_reason: self.run_inspection_disabled_reason(),
             fork_reason: self.fork_disabled_reason(),
+            invocations_reason: self.invocations_disabled_reason(),
+            invocation_open_reason: self.invocation_open_reason(),
             sessions_shown: layout.sidebar != SidebarMode::Collapsed,
             context_shown: layout.inspector != InspectorMode::Hidden,
             dark: cx.theme().is_dark(),
@@ -2985,6 +3003,12 @@ impl Shell {
             }
             Command::ToggleSessions => self.toggle_panel(Region::Sidebar, window, cx),
             Command::ToggleContext => self.toggle_panel(Region::Inspector, window, cx),
+            Command::ViewInvocations => self.view_invocations(window, cx),
+            Command::OpenInvocationSession => {
+                if let Some(source) = self.selected_invocation() {
+                    self.open_invocation_session(source, self.invocations.revision, window, cx);
+                }
+            }
             Command::ReviewFork => self.review_fork(window, cx),
             Command::InspectRun => {
                 if let Some((target, source)) = self.selected_run_target() {
@@ -3293,6 +3317,7 @@ impl Shell {
                 .update(cx, |timeline, cx| timeline.reset(count, cx));
             self.last_intent = None;
         }
+        self.retire_transient_destination(Destination::Chat);
         self.destination = Destination::Chat;
         if changed {
             self.invalidate_search(cx);
@@ -3316,6 +3341,28 @@ impl Shell {
         }
     }
 
+    fn retire_transient_destination(&mut self, destination: Destination) {
+        if self.destination == destination {
+            return;
+        }
+        match self.destination {
+            Destination::Invocations => self
+                .retire_invocations("Snapshot closed. View Invocations explicitly for a new read."),
+            Destination::ForkReview => {
+                self.fork_review = None;
+                self.fork_local_error = None;
+            }
+            Destination::RunDetails => self
+                .reset_run_inspection("Inspection closed. Select a Run explicitly to read again."),
+            Destination::Comparison => {
+                self.comparison
+                    .clear_result("Comparison closed. Compare explicitly to read again.");
+                self.resource_pages.remove(&Destination::Comparison);
+            }
+            _ => {}
+        }
+    }
+
     fn set_destination(
         &mut self,
         destination: Destination,
@@ -3334,18 +3381,7 @@ impl Shell {
         }
         let previous = self.destination;
 
-        if previous == Destination::ForkReview && destination != Destination::ForkReview {
-            self.fork_review = None;
-            self.fork_local_error = None;
-        }
-        if previous == Destination::RunDetails && destination != Destination::RunDetails {
-            self.reset_run_inspection("Inspection closed. Select a Run explicitly to read again.");
-        }
-        if previous == Destination::Comparison && destination != Destination::Comparison {
-            self.comparison
-                .clear_result("Comparison closed. Compare explicitly to read again.");
-            self.resource_pages.remove(&Destination::Comparison);
-        }
+        self.retire_transient_destination(destination);
         if destination == Destination::ProfileSearch && previous != Destination::ProfileSearch {
             self.profile_return = if previous == Destination::Search {
                 self.search_return
@@ -4765,7 +4801,7 @@ impl Shell {
         if self.client.is_some()
             || matches!(
                 self.destination,
-                Destination::Comparison | Destination::RunDetails
+                Destination::Comparison | Destination::RunDetails | Destination::Invocations
             )
         {
             return self.render_resource_page(page_height, window, cx);
@@ -4830,6 +4866,8 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let destination = self.destination;
+        let invocation_refresh = (self.invocations.revision, self.invocations.connection);
+        let invocation_source = self.selected_invocation();
         let run_refresh = (
             self.run_inspection.target.clone(),
             self.run_inspection.revision,
@@ -4840,7 +4878,9 @@ impl Shell {
         let page = self.resource_pages.get(&destination);
         let count = page.map_or(0, |page| page.rows.len());
         let notice = page.map_or(
-            if destination == Destination::RunDetails {
+            if destination == Destination::Invocations {
+                self.invocations.notice.clone()
+            } else if destination == Destination::RunDetails {
                 self.run_inspection.notice.clone()
             } else if destination == Destination::Comparison {
                 self.comparison.notice.clone()
@@ -4926,16 +4966,17 @@ impl Shell {
                     .id("resource-body").overflow_y_scroll().track_scroll(&self.resource_body)
                     .child({
                         let refresh=Button::new("refresh-resource").track_focus(&self.resource_controls[0]).small().flex_shrink_0().label("Refresh")
-                            .disabled(!self.client_connected || (destination==Destination::RunDetails&&(self.run_inspection.pending()||self.run_inspection.target.is_none())) || (destination==Destination::Comparison&&(self.comparison.pending()||self.comparison.pair.is_none())))
+                            .disabled(!self.client_connected || (destination==Destination::Invocations&&(self.invocations.pending()||self.invocations.connection.is_none())) || (destination==Destination::RunDetails&&(self.run_inspection.pending()||self.run_inspection.target.is_none())) || (destination==Destination::Comparison&&(self.comparison.pending()||self.comparison.pair.is_none())))
                             .on_click(cx.listener(move |this,_,window,cx|{
                                 if this.destination!=destination{return;}
                                 match destination {
+                                    Destination::Invocations=>{if let Some(connection)=invocation_refresh.1{this.read_invocations(invocation_refresh.0,connection,window,cx);}},
                                     Destination::RunDetails=>{if let Some(target)=&run_refresh.0 {this.read_run_inspection(target.clone(),run_refresh.1,None,window,cx);}},
                                     Destination::Comparison=>{if let Some(pair)=&comparison_refresh.0 {this.read_comparison(pair.clone(),comparison_refresh.1,window,cx);}},
                                     _=>this.client_request(ClientCommand::Refresh,cx),
                                 }
                             }));
-                        let (back_label,back_destination)=match destination {Destination::Comparison=>("Back to Sessions",Destination::Sessions),Destination::RunDetails=>("Back to Metrics",Destination::Metrics),_=>("Back to Chat",Destination::Chat)};
+                        let (back_label,back_destination)=match destination {Destination::Comparison=>("Back to Sessions",Destination::Sessions),Destination::RunDetails=>("Back to Metrics",Destination::Metrics),Destination::Invocations=>("Back to Tools",Destination::Tools),_=>("Back to Chat",Destination::Chat)};
                         let back=Button::new("resource-back").track_focus(&self.resource_controls[1]).small().flex_shrink_0().label(back_label)
                             .on_click(cx.listener(move |this,_,window,cx|{if this.destination==destination {this.set_destination(back_destination,window,cx);}}));
                         let actions=h_flex().min_w_0().gap_2().flex_wrap().when(page_height.is_some(),|actions|actions.w_full())
@@ -4944,6 +4985,9 @@ impl Shell {
                             .when(destination==Destination::Metrics,|actions|actions.child(div().id("inspect-run-anchor")
                                 .child(Button::new("inspect-selected-run").small().label("Inspect Run").track_focus(&self.resource_controls[3]).disabled(self.run_inspection_disabled_reason().is_some())
                                     .on_click(cx.listener(move |this,_,window,cx|{if let Some((target,source))=&inspect_run {this.read_run_inspection(target.clone(),inspection_revision,Some(*source),window,cx);}})))));
+                        let actions=actions
+                            .when(destination==Destination::Tools,|actions|actions.child(Button::new("view-invocations").small().label("Invocations").track_focus(&self.resource_controls[3]).disabled(self.invocations_disabled_reason().is_some()).on_click(cx.listener(|this,_,window,cx|{this.run_command(Command::ViewInvocations,window,cx);}))))
+                            .when(destination==Destination::Invocations,|actions|actions.child(Button::new("open-invocation-session").small().label("Open Session").track_focus(&self.resource_controls[3]).disabled(self.invocation_open_reason().is_some()).on_click(cx.listener(move|this,_,window,cx|{if let Some(source)=&invocation_source {this.open_invocation_session(source.clone(),invocation_refresh.0,window,cx);}}))));
                         h_flex().w_full().min_w_0().gap_2().when(page_height.is_some(),|header|header.flex_col().items_start())
                             .child(Label::new(destination.label()).min_w_0().when(page_height.is_none(),|title|title.flex_1())).child(actions)
                     })
@@ -4987,7 +5031,7 @@ impl Shell {
             } else if self.resource_pages.contains_key(&self.destination)
                 || matches!(
                     self.destination,
-                    Destination::Comparison | Destination::RunDetails
+                    Destination::Comparison | Destination::RunDetails | Destination::Invocations
                 )
             {
                 for (index, focus) in self.resource_controls.iter().enumerate() {

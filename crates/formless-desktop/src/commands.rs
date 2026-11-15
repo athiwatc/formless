@@ -29,6 +29,8 @@ pub enum Command {
     CompareMarked,
     InspectRun,
     ReviewFork,
+    ViewInvocations,
+    OpenInvocationSession,
     ToggleArchived,
     ToggleSessions,
     ToggleContext,
@@ -95,6 +97,8 @@ pub struct State {
     pub comparison_reason: Option<&'static str>,
     pub run_inspection_reason: Option<&'static str>,
     pub fork_reason: Option<&'static str>,
+    pub invocations_reason: Option<&'static str>,
+    pub invocation_open_reason: Option<&'static str>,
     pub sessions_shown: bool,
     pub context_shown: bool,
     pub dark: bool,
@@ -188,6 +192,8 @@ pub fn keys(command: Command) -> &'static [&'static str] {
         | Command::CompareMarked
         | Command::InspectRun
         | Command::ReviewFork
+        | Command::ViewInvocations
+        | Command::OpenInvocationSession
         | Command::ToggleArchived
         | Command::ToggleTheme
         | Command::ToggleEnterSends
@@ -275,6 +281,8 @@ pub fn palette(state: &State) -> Vec<Entry> {
         Command::CompareMarked,
         Command::InspectRun,
         Command::ReviewFork,
+        Command::ViewInvocations,
+        Command::OpenInvocationSession,
         Command::ToggleArchived,
         Command::ToggleSessions,
         Command::ToggleContext,
@@ -350,6 +358,8 @@ pub fn entry(command: Command, state: &State) -> Entry {
             Some(state.enter_sends),
             if !state.has_composer { Some(NO_COMPOSER) } else if state.composing { Some(COMPOSING) } else { None },
         ),
+        Command::ViewInvocations=>("Invocations", "View unfinished Tool Invocations".into(),Group::Navigation,"Read a Profile-wide snapshot of unfinished Tool work. No cancel, abandon or model call",None,if state.composing {Some(COMPOSING)}else{state.invocations_reason}),
+        Command::OpenInvocationSession=>("Open Session", "Open selected Invocation's Session".into(),Group::Navigation,"Navigate to the available unarchived Session associated with the selected read-only record",None,if state.composing {Some(COMPOSING)}else{state.invocation_open_reason}),
         Command::ReviewFork=>("Review fork", "Review a new Session fork".into(),Group::Session,"Review copying stored history into a new Session. Confirmation creates it; no model call or Run starts",None,if state.composing {Some(COMPOSING)}else{state.fork_reason}),
         Command::InspectRun => ("Inspect Run", "Inspect selected recorded Run".into(),Group::Navigation,"Read exact persisted Run status, counters and reported spend from Metrics. No Run control or model call",None,state.run_inspection_reason),
         Command::MarkComparisonLeft => (
@@ -590,6 +600,8 @@ mod tests {
             comparison_reason: Some("Mark a left Session first"),
             run_inspection_reason: Some("Select a Run entry in Metrics first"),
             fork_reason: Some("Choose a connected Session first"),
+            invocations_reason: Some("Connect to a Profile first"),
+            invocation_open_reason: Some("Select an Invocation record first"),
             sessions_shown: true,
             context_shown: false,
             dark: false,

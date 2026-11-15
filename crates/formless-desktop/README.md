@@ -62,6 +62,22 @@ to Metrics. Leaving, disconnect or Profile replacement retires the inspection;
 no read is replayed after reconnect. This action does not control a Run or call
 a model. See [Run inspection evidence](../../docs/desktop/run-inspection-20261115.md).
 
+Commands → View Invocations or Tools → Invocations explicitly reads unfinished
+Tool work across the connected Profile. Select a record for its Session,
+recorded elapsed/silent time, reported progress and daemon status flags.
+Refresh explicitly for another snapshot; values do not tick locally and a
+Tool may finish after the read. Missing progress is unknown; 100% does not
+prove completion, and abandoned does not necessarily mean cancelled. Legacy
+records without durable Invocation IDs remain read only. Scope Copy details
+preserves the whole returned JSON, including future fields and private labels;
+other rows copy a complete record. Open Session navigates only to the selected
+record's available, unarchived Session and preserves other drafts. No Tool
+control or model call is made; Cancel/Abandon remains in TUI. Leaving through
+Back, Commands or the Session sidebar, disconnecting or replacing the Profile
+retires the snapshot and its callbacks. Reconnect never repeats this read.
+Native limits are 1 MiB and 1,000 records, with no partial snapshot on error.
+See [Invocation evidence](../../docs/desktop/invocations-20261115.md).
+
 This window remembers an older reading message for up to 64 Sessions.
 Returning to a Session waits for its accepted canonical snapshot, then returns
 to that message's sequence identity rather than an old row index. If the

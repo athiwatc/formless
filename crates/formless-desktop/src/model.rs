@@ -154,6 +154,7 @@ pub enum Destination {
     Comparison,
     RunDetails,
     ForkReview,
+    Invocations,
 }
 
 impl Destination {
@@ -180,6 +181,7 @@ impl Destination {
             Destination::Comparison => "Session comparison",
             Destination::RunDetails => "Run inspection",
             Destination::ForkReview => "Review fork",
+            Destination::Invocations => "Invocations",
         }
     }
 
@@ -191,6 +193,7 @@ impl Destination {
                 | Destination::Comparison
                 | Destination::RunDetails
                 | Destination::ForkReview
+                | Destination::Invocations
         )
     }
 }

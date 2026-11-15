@@ -126,6 +126,9 @@ async fn until(client: &Client, stage: &'static str, mut predicate: impl FnMut(U
     loop {
         for update in client.drain() {
             let summary = match &update {
+                Update::Invocations { result, .. } => {
+                    format!("Invocation snapshot: ok={}", result.is_ok())
+                }
                 Update::RunInspection { target, result, .. } => format!(
                     "Run inspection {} / {}: ok={}",
                     target.run_id,
@@ -720,6 +723,96 @@ async fn real_daemon_provider_send_navigation_resources_and_reconnect() {
         requests.lock().unwrap().len(),
         1,
         "fork never calls a provider"
+    );
+    // A safe private Tool sleeps without capabilities or Provider access.
+    // The native client only observes it; it issues no Tool control request.
+    let created=daemon.call_tool_direct(&b,"create_tool",json!({"name":"desktop_invocation_fixture","description":"private snapshot fixture","input_schema":{"type":"object"},"output_schema":{},"implementation_js":"async function run(){ progress(0.5, 'private fixture running'); await sleep(8000); return {done:true}; }","capabilities":[]})).await;
+    assert!(created.contains("created"), "{created}");
+    let tool_call = tokio::spawn({
+        let daemon = daemon.clone();
+        let session = b.clone();
+        async move {
+            daemon
+                .call_tool_direct(&session, "desktop_invocation_fixture", json!({}))
+                .await
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let expected = loop {
+        let raw = daemon.handle(Request::ListInvocations).await.unwrap();
+        let report = formless_desktop::invocations::Report::decode(raw.clone()).unwrap();
+        if let Some(key) = report
+            .keys
+            .iter()
+            .find(|key| key.tool_name == "desktop_invocation_fixture")
+        {
+            if raw.as_array().unwrap().iter().any(|record| {
+                record["handle"].as_str() == Some(key.handle.as_str())
+                    && record["last_fraction"] == 0.5
+            }) {
+                break key.clone();
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "private Invocation did not expose progress"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    let operation = uuid::Uuid::new_v4();
+    client
+        .send(Command::ReadInvocations {
+            connection: client.connection(),
+            operation,
+        })
+        .unwrap();
+    until(&client, "invocations-active", |update| match update {
+        Update::Invocations {
+            operation: ack,
+            result: Ok(report),
+            ..
+        } if ack == operation => {
+            let index = report
+                .keys
+                .iter()
+                .position(|key| key == &expected)
+                .expect("the exact active Invocation is present");
+            let record: Value = serde_json::from_str(&report.page.rows[index + 1].detail).unwrap();
+            assert_eq!(record["session_id"], b);
+            assert_eq!(record["last_fraction"], 0.5);
+            assert_eq!(record["last_label"], "private fixture running");
+            assert_eq!(record["abandoned"], false);
+            true
+        }
+        _ => false,
+    })
+    .await;
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        1,
+        "Invocation reads never call a Provider"
+    );
+    let completed = tokio::time::timeout(Duration::from_secs(15), tool_call)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(completed.contains("done"), "{completed}");
+    assert_eq!(
+        daemon.handle(Request::ListInvocations).await.unwrap(),
+        json!([])
+    );
+    let operation = uuid::Uuid::new_v4();
+    client
+        .send(Command::ReadInvocations {
+            connection: client.connection(),
+            operation,
+        })
+        .unwrap();
+    until(&client,"invocations-empty",|update|matches!(update,Update::Invocations{operation:ack,result:Ok(report),..} if ack==operation&&report.keys.is_empty()&&report.page.rows[0].detail=="[]")).await;
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        1,
+        "normal Tool completion needs no Provider call or native cancellation"
     );
     first_answer.notify_one();
     observer

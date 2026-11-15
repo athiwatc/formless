@@ -44,6 +44,11 @@ const REFRESH: Duration = Duration::from_millis(250);
 
 #[derive(Debug)]
 pub enum Update {
+    Invocations {
+        connection: u64,
+        operation: uuid::Uuid,
+        result: Result<crate::invocations::Report, String>,
+    },
     RunInspection {
         connection: u64,
         operation: uuid::Uuid,
@@ -133,6 +138,10 @@ pub enum Update {
 }
 
 pub enum Command {
+    ReadInvocations {
+        connection: u64,
+        operation: uuid::Uuid,
+    },
     ForkSession(session_fork::Action),
     InspectRun {
         connection: u64,
@@ -414,6 +423,9 @@ fn advance_epoch(epoch: &AtomicU64) {
 
 #[derive(Debug)]
 enum Pending {
+    Invocations {
+        operation: uuid::Uuid,
+    },
     ForkSession(session_fork::Action),
     RunInspection {
         operation: uuid::Uuid,
@@ -676,6 +688,33 @@ impl Engine {
 
     fn command(&mut self, command: Command) {
         match command {
+            Command::ReadInvocations {
+                connection,
+                operation,
+            } => {
+                let error = if !self.ready || connection != self.connection {
+                    Some("Connection changed. Read Invocations again explicitly.")
+                } else if self
+                    .pending
+                    .values()
+                    .filter(|pending| matches!(pending, Pending::Invocations { .. }))
+                    .count()
+                    >= 2
+                {
+                    Some("Two Invocation reads remain outstanding. Wait for a reply.")
+                } else {
+                    None
+                };
+                if let Some(error) = error {
+                    self.updates.push(Update::Invocations {
+                        connection: self.connection,
+                        operation,
+                        result: Err(error.into()),
+                    });
+                } else {
+                    self.request(Request::ListInvocations, Pending::Invocations { operation });
+                }
+            }
             Command::ForkSession(action) => {
                 if self.pending.values().any(
                     |pending| matches!(pending,Pending::ForkSession(current) if current==&action),
@@ -1297,6 +1336,13 @@ impl Engine {
                         }),
                     }
                 }
+            }
+            Pending::Invocations { operation } => {
+                self.updates.push(Update::Invocations {
+                    connection: self.connection,
+                    operation,
+                    result: result.and_then(crate::invocations::Report::decode),
+                });
             }
             Pending::ForkSession(action) => {
                 let outcome = session_fork::decode(&action, result);
@@ -2482,6 +2528,42 @@ mod tests {
     }
 
     #[test]
+    fn invocations_are_bounded_explicit_reads_with_owned_out_of_order_replies() {
+        let mut engine = ready();
+        let operations = [
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+        ];
+        for operation in operations {
+            engine.command(Command::ReadInvocations {
+                connection: 0,
+                operation,
+            });
+        }
+        assert_eq!(engine.outgoing.len(), 2);
+        assert!(engine.updates.iter().any(|update|matches!(update,Update::Invocations{operation,result:Err(_),..} if *operation==operations[2])));
+        let a = engine.outgoing.pop_front().unwrap();
+        let b = engine.outgoing.pop_front().unwrap();
+        assert!(matches!(a.request, Request::ListInvocations));
+        assert!(matches!(b.request, Request::ListInvocations));
+        engine.select(Some("another-session".into()), 99);
+        respond(&mut engine, b.id, crate::invocations::test_value());
+        assert!(engine.updates.iter().any(|update|matches!(update,Update::Invocations{connection:0,operation,result:Ok(report)} if *operation==operations[1]&&report.keys[0].session_id=="session-a")));
+        let count = engine.updates.len();
+        respond(&mut engine, b.id, crate::invocations::test_value());
+        assert_eq!(engine.updates.len(), count);
+        respond(&mut engine, a.id, Value::Null);
+        assert!(engine.updates.iter().any(|update|matches!(update,Update::Invocations{operation,result:Err(_),..} if *operation==operations[0])));
+        engine.outgoing.clear();
+        engine.command(Command::ReadInvocations {
+            connection: 1,
+            operation: uuid::Uuid::new_v4(),
+        });
+        assert!(engine.outgoing.is_empty());
+    }
+
+    #[test]
     fn session_fork_engine_requires_a_reservation_and_exact_lineage_receipt() {
         use session_fork::{Action as Fork, Outcome, Status};
         let mut engine = ready();
@@ -3284,6 +3366,7 @@ mod tests {
             let usage_operation = uuid::Uuid::new_v4();
             let comparison_operation = uuid::Uuid::new_v4();
             let inspection_operation = uuid::Uuid::new_v4();
+            let invocation_operation = uuid::Uuid::new_v4();
             let peer = tokio::spawn(async move {
                 let mut server = BufReader::new(server);
                 loop {
@@ -3308,6 +3391,7 @@ mod tests {
                                 session_id: "a".into(),
                             })
                         }
+                        Request::ListInvocations if reconnect => crate::invocations::test_value(),
                         Request::ListSessions => json!([]),
                         Request::GetSession { id } => snapshot(&id, "canonical"),
                         Request::AnswerQuestion { question_id, .. } => {
@@ -3442,6 +3526,12 @@ mod tests {
                                         })
                                         .unwrap();
                                     command_tx
+                                        .try_send(Command::ReadInvocations {
+                                            connection: 0,
+                                            operation: invocation_operation,
+                                        })
+                                        .unwrap();
+                                    command_tx
                                         .try_send(answer(
                                             &questions::Open::from_event(&question("q2")).unwrap(),
                                         ))
@@ -3485,9 +3575,10 @@ mod tests {
                 assert!(final_updates.iter().any(|update|matches!(update,Update::SessionUsage{operation,result:Ok(_),..} if *operation==usage_operation)),"the usage reply must actually be processed");
                 assert!(final_updates.iter().any(|update|matches!(update,Update::SessionComparison{operation,result:Ok(_),..} if *operation==comparison_operation)),"comparison reply must actually be processed");
                 assert!(final_updates.iter().any(|update|matches!(update,Update::RunInspection{operation,result:Ok(_),..} if *operation==inspection_operation)),"Run inspection reply must actually be processed");
+                assert!(final_updates.iter().any(|update|matches!(update,Update::Invocations{operation,result:Ok(_),..} if *operation==invocation_operation)),"Invocation snapshot reply must actually be processed");
                 assert_eq!(
                     retained.uncertain, before,
-                    "Stop, metadata, export, usage, comparison, Run inspection and q2 ACKs cannot clear either unknown operation"
+                    "Stop, metadata, export, usage, comparison, Run inspection, Invocation read and q2 ACKs cannot clear either unknown operation"
                 );
             } else {
                 assert_eq!(retained.uncertain.len(), 2);

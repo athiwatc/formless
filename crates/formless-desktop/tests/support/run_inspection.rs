@@ -434,3 +434,27 @@ fn run_inspection_is_keyboard_reachable_at_minimum_size_and_two_hundred_percent(
         assert_eq!(shell.read(cx).destination(), Destination::Metrics);
     });
 }
+
+#[gpui_kit::test]
+fn run_inspection_sidebar_activation_retires_pending_reads(cx: &mut TestAppContext) {
+    let (handle, shell) = open(cx, WIDE, 0, 0);
+    let sessions = daemon_view(cx, handle, &shell);
+    let target = target(1);
+    step(cx, handle, |window, cx| {
+        metrics(&shell, window, cx);
+        choose_first(&shell, window, cx);
+        window.click("inspect-selected-run", cx);
+        let old = requested(&shell, cx, &target);
+        window.click(session_row_id(&sessions[0].id), cx);
+        shell.update(cx, |shell, _| shell.take_client_commands());
+        metrics(&shell, window, cx);
+        choose_first(&shell, window, cx);
+        window.click("inspect-selected-run", cx);
+        let current = requested(&shell, cx, &target);
+        assert_ne!(old, current);
+        reply(&shell, &target, 0, old, window, cx);
+        assert!(shell.read(cx).resource_copy_target().is_none());
+        reply(&shell, &target, 0, current, window, cx);
+        assert!(shell.read(cx).resource_copy_target().is_some());
+    });
+}

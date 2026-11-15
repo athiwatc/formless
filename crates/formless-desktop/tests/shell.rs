@@ -20,6 +20,8 @@ mod comparison_tests;
 mod export_tests;
 #[path = "support/instructions.rs"]
 mod instruction_tests;
+#[path = "support/invocations.rs"]
+mod invocation_tests;
 #[path = "support/preferences.rs"]
 mod preference_tests;
 #[path = "support/profile_search.rs"]

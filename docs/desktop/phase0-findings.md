@@ -580,6 +580,7 @@ One stated position per place the shell holds user text (`src/memory.rs`):
 | Stored drafts | At most 64 Sessions, and at most 4 MiB in total provided no single draft exceeds 4 MiB. The shell only stores drafts within the composer limit, so the precondition holds. |
 | Recorded intent | No message text at all: kind, Session id, byte and character counts. |
 | A timeline row | At most 32 KiB and 400 lines laid out, whatever the block's size. |
+| Unfinished Invocation snapshot | Raw JSON and complete pretty JSON each at most 1 MiB; at most 1,000 records; retained detail text at most 3 MiB, plus 500-character previews and bounded identity keys. Retired on leaving, disconnect or Profile replacement. Input/retention limits only; no measured peak RAM/CPU guarantee. |
 | Composer undo and redo history | **No bound is claimed.** What the kit retains was not measured and is excluded from every figure here. |
 | The transcript | Not a view policy. How much is loaded is a protocol question (§5.3). |
 
