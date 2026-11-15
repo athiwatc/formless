@@ -72,67 +72,104 @@ pub fn folded_match_ranges(s: &str, needle: &str) -> Vec<std::ops::Range<usize>>
     ranges
 }
 
+/// Reusable whitespace-free query keys using the existing Unicode fold.
+/// Candidate slices may be rebased basename views of a path's folded keys.
+pub struct PreparedQuery {
+    chars: Vec<char>,
+}
+
+impl PreparedQuery {
+    pub fn new(query: &str) -> Self {
+        Self {
+            chars: fold_chars(query).filter(|c| !c.is_whitespace()).collect(),
+        }
+    }
+
+    /// Score pre-folded keys without allocating any match-position vectors.
+    pub fn score_folded(&self, candidate: &[(usize, char)]) -> Option<i64> {
+        if self.chars.is_empty() {
+            return Some(0);
+        }
+        self.best_start(candidate)
+            .map(|(score, _)| score - (candidate.len() / 8) as i64)
+    }
+
+    fn best_start(&self, candidate: &[(usize, char)]) -> Option<(i64, usize)> {
+        let mut best: Option<(i64, usize)> = None;
+        for start in (0..candidate.len()).filter(|&i| candidate[i].1 == self.chars[0]) {
+            let Some(score) = match_from(&self.chars, candidate, start, |_| {}) else {
+                // Preserve the original stop after the first failed start.
+                break;
+            };
+            if best.is_none_or(|(previous, _)| score > previous) {
+                best = Some((score, start));
+            }
+        }
+        best
+    }
+
+    fn positions(&self, candidate: &[(usize, char)]) -> Option<(i64, Vec<usize>)> {
+        if self.chars.is_empty() {
+            return Some((0, Vec::new()));
+        }
+        let (score, start) = self.best_start(candidate)?;
+        let mut positions = Vec::with_capacity(self.chars.len());
+        match_from(&self.chars, candidate, start, |i| {
+            let original = candidate[i].0;
+            if positions.last() != Some(&original) {
+                positions.push(original);
+            }
+        })?;
+        Some((score - (candidate.len() / 8) as i64, positions))
+    }
+}
+
 /// Score `candidate` against `query` as a case-insensitive subsequence;
 /// higher is better. Returns the matched char positions for highlighting.
 /// Each place the first query char occurs is tried as a start, so a
 /// contiguous match later in the id beats a scattered one earlier.
 pub fn fuzzy_match(query: &str, candidate: &str) -> Option<(i64, Vec<usize>)> {
-    let q: Vec<char> = fold(query)
-        .into_iter()
-        .map(|(_, c)| c)
-        .filter(|c| !c.is_whitespace())
-        .collect();
-    if q.is_empty() {
+    let query = PreparedQuery::new(query);
+    // An empty folded query must not acquire a candidate length penalty.
+    if query.chars.is_empty() {
         return Some((0, Vec::new()));
     }
-    let folded = fold(candidate);
-    let c: Vec<char> = folded.iter().map(|(_, c)| *c).collect();
-    let mut best: Option<(i64, Vec<usize>)> = None;
-    for start in (0..c.len()).filter(|&i| c[i] == q[0]) {
-        let Some(found) = match_from(&q, &c, start) else {
-            // No later start can finish the match either.
-            break;
-        };
-        if best.as_ref().is_none_or(|b| found.0 > b.0) {
-            best = Some(found);
-        }
-    }
-    // Prefer shorter ids among equal matches. Positions are the original
-    // chars', so highlighting lands on the right glyphs.
-    best.map(|(score, pos)| {
-        let mut orig: Vec<usize> = pos.into_iter().map(|p| folded[p].0).collect();
-        orig.dedup();
-        (score - (c.len() / 8) as i64, orig)
-    })
+    query.positions(&fold(candidate))
 }
 
-/// Greedy left-most match of `q` in `c` from `start`.
-fn match_from(q: &[char], c: &[char], start: usize) -> Option<(i64, Vec<usize>)> {
-    let mut positions = Vec::with_capacity(q.len());
+/// Greedy left-most match. Position recording is optional and never needed
+/// while choosing the first best start or doing file-search ranking.
+fn match_from(
+    q: &[char],
+    c: &[(usize, char)],
+    start: usize,
+    mut position: impl FnMut(usize),
+) -> Option<i64> {
+    let mut matched = 0;
     let mut score = 0i64;
     let mut prev: Option<usize> = None;
-    for (i, ch) in c.iter().enumerate().skip(start) {
-        if positions.len() == q.len() {
+    for (i, (_, ch)) in c.iter().enumerate().skip(start) {
+        if matched == q.len() {
             break;
         }
-        if *ch != q[positions.len()] {
+        if *ch != q[matched] {
             continue;
         }
         score += 1;
-        // Runs of consecutive matches and matches at word starts count most.
         if prev.is_some_and(|p| p + 1 == i) {
             score += 5;
         }
-        if i == 0 || !c[i - 1].is_alphanumeric() {
+        if i == 0 || !c[i - 1].1.is_alphanumeric() {
             score += 8;
         }
         if let Some(p) = prev {
             score -= (i - p - 1).min(10) as i64;
         }
-        positions.push(i);
+        position(i);
+        matched += 1;
         prev = Some(i);
     }
-    (positions.len() == q.len()).then_some((score, positions))
+    (matched == q.len()).then_some(score)
 }
 
 #[cfg(test)]

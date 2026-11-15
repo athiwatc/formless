@@ -106,7 +106,14 @@ impl Fixture {
                         Request::ProposalDiff { id } => proposal_comparison(id),
                         Request::ListSessions => sessions.lock().unwrap().clone(),
                         Request::GetSession { id } => {
-                            json!({"session_id":id,"messages":[],"future":true})
+                            let rows = sessions.lock().unwrap();
+                            let session = rows
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .find(|s| s["id"] == *id)
+                                .unwrap();
+                            session_snapshot(session.clone())
                         }
                         Request::ListMcpPrompts => json!([
                             {"server":"server-日本語","name":"prompt-ไทย","description":"first line\nsecond line","arguments":[{"name":"topic","required":true}],"future":["🦀",3]}
@@ -355,6 +362,144 @@ fn shipped_module_reports_preserve_json_exact_source_and_read_only_requests() {
     }
     assert_eq!(fixture.connections.load(Ordering::SeqCst), before);
 }
+fn session_snapshot(session: Value) -> Value {
+    json!({"session":session,"messages":[{"id":"msg-user","session_id":"session","seq":1,"role":"user","content":"Unicode transcript 日本語\nsecond line","created_at":""},{"id":"msg-tool","session_id":"session","seq":2,"role":"tool","content":"tool first\nsecond tool","created_at":""}],"unfinished_run":{"run_id":"paused-run","status":"paused","error":null},"future":{"retained":true}})
+}
+
+#[test]
+fn shipped_sessions_explain_archive_emptiness_and_present_stored_metadata() {
+    let fixture = Fixture::new();
+    let rows = json!([
+        {"id":"session-active","name":"日本語 ไทย","created_at":"","updated_at":"2026-11-01T12:34:56Z","message_count":7,"preview":"preview 日本語","last_run_status":"paused","pinned":true,"archived":false,"tags":["work","ไทย\u{1b}[31m"]},
+        {"id":"session-archived","name":"Old","created_at":"","updated_at":"","message_count":0,"archived":true,"tags":[]}
+    ]);
+    *fixture.session_rows.lock().unwrap() = rows.clone();
+    for archived in [false, true] {
+        let mut args = vec!["sessions", "list"];
+        if archived {
+            args.push("--archived");
+        }
+        fixture.requests.lock().unwrap().clear();
+        let out = fixture.run(&args);
+        assert!(out.status.success());
+        let text = String::from_utf8(out.stdout).unwrap();
+        assert!(
+            text.contains("LAST RECORDED RUN") && text.contains("TAGS"),
+            "{text}"
+        );
+        if archived {
+            assert!(text.contains("not recorded") && text.contains("Old"));
+        } else {
+            for expected in [
+                "★ 日本語 ไทย",
+                "paused",
+                "work, ไทย\\u{1b}[31m",
+                "preview 日本語",
+                "7",
+                "2026-11-01T12:34",
+            ] {
+                assert!(text.contains(expected), "{text}");
+            }
+            assert!(!text.contains('\u{1b}'));
+        }
+        assert!(matches!(
+            &fixture.requests.lock().unwrap()[..],
+            [Request::ListSessions]
+        ));
+        args.push("--json");
+        let out = fixture.run(&args);
+        assert!(out.status.success());
+        let actual: Vec<formless_protocol::SessionInfo> =
+            serde_json::from_slice(&out.stdout).unwrap();
+        let expected: Vec<formless_protocol::SessionInfo> =
+            serde_json::from_value(json!([rows[usize::from(archived)].clone()])).unwrap();
+        assert_eq!(
+            serde_json::to_value(actual).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+    }
+    for (id, index) in [("session-active", 0), ("session-archived", 1)] {
+        fixture.requests.lock().unwrap().clear();
+        let out = fixture.run(&["sessions", "show", id]);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let text = String::from_utf8(out.stdout).unwrap();
+        for expected in [
+            "Unicode transcript 日本語\nsecond line",
+            "tool result: tool first",
+            "Run paused\nResume this Session in the TUI or web after reviewing the cause.",
+        ] {
+            assert!(text.contains(expected), "{text}");
+        }
+        if index == 0 {
+            for expected in [
+                "Archived: no",
+                "Pinned: yes",
+                "Tags: work, ไทย\\u{1b}[31m",
+                "Last recorded Run status: paused",
+            ] {
+                assert!(text.contains(expected), "{text}");
+            }
+        } else {
+            for expected in [
+                "Archived: yes",
+                "Pinned: no",
+                "Tags: none",
+                "Last recorded Run status: not recorded",
+            ] {
+                assert!(text.contains(expected), "{text}");
+            }
+        }
+        assert!(!text.contains('\u{1b}'));
+        assert!(
+            matches!(&fixture.requests.lock().unwrap()[..],[Request::ListSessions,Request::GetSession{id:requested}] if requested==id)
+        );
+        let out = fixture.run(&["sessions", "show", id, "--json"]);
+        assert!(out.status.success());
+        assert_eq!(
+            serde_json::from_slice::<Value>(&out.stdout).unwrap(),
+            session_snapshot(rows[index].clone())
+        );
+    }
+    for archived in [false, true] {
+        for empty in [false, true] {
+            *fixture.session_rows.lock().unwrap() = if empty {
+                json!([])
+            } else {
+                json!([
+                    rows[usize::from(!archived)].clone(),
+                    rows[usize::from(!archived)].clone()
+                ])
+            };
+            let mut args = vec!["sessions", "list"];
+            if archived {
+                args.push("--archived");
+            }
+            let out = fixture.run(&args);
+            assert!(out.status.success());
+            let text = String::from_utf8(out.stdout).unwrap();
+            let expected = if empty {
+                "No Sessions in this response."
+            } else if archived {
+                "No archived Sessions. 2 active Sessions; use formless sessions list."
+            } else {
+                "No active Sessions. 2 archived Sessions; use formless sessions list --archived."
+            };
+            assert_eq!(text, format!("{expected}\n"));
+            args.push("--json");
+            let out = fixture.run(&args);
+            assert!(out.status.success());
+            assert_eq!(
+                serde_json::from_slice::<Value>(&out.stdout).unwrap(),
+                json!([])
+            );
+        }
+    }
+}
+
 #[test]
 fn shipped_ambiguous_session_selectors_show_ids_and_never_dispatch_an_action() {
     let fixture = Fixture::new();
@@ -415,7 +560,18 @@ fn shipped_ambiguous_session_selectors_show_ids_and_never_dispatch_an_action() {
         assert!(out.status.success());
         assert_eq!(
             serde_json::from_slice::<Value>(&out.stdout).unwrap(),
-            json!({"session_id":id,"messages":[],"future":true})
+            session_snapshot(
+                fixture
+                    .session_rows
+                    .lock()
+                    .unwrap()
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|row| row["id"] == id)
+                    .unwrap()
+                    .clone()
+            )
         );
         assert!(
             matches!(&fixture.requests.lock().unwrap()[..],[Request::ListSessions,Request::GetSession{id:requested}] if requested==id)
