@@ -3273,13 +3273,17 @@ impl Store {
         let mut stmt = self
             .conn
             .prepare("SELECT message FROM subagent_messages WHERE subagent_id=?1 ORDER BY seq")?;
-        let rows = stmt
-            .query_map(params![subagent_id], |r| r.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows
-            .iter()
-            .filter_map(|m| serde_json::from_str(m).ok())
-            .collect())
+        let rows = stmt.query_map(params![subagent_id], |r| r.get::<_, String>(0))?;
+        let mut messages = Vec::new();
+        for row in rows {
+            // Drop each raw string after parsing; the returned parsed transcript
+            // remains complete. Row errors propagate; only malformed JSON skips.
+            let raw = row?;
+            if let Ok(message) = serde_json::from_str(&raw) {
+                messages.push(message);
+            }
+        }
+        Ok(messages)
     }
 
     pub fn set_subagent_steps(&self, id: &str, steps: i64) -> Result<()> {
@@ -5589,6 +5593,19 @@ impl Store {
         Ok(rows)
     }
 
+    /// Names only for pattern detection. Input/status conversion is intentionally
+    /// reserved for full invocation reads used by distillation.
+    fn run_tool_names(&self, run_id: &str) -> Result<Vec<String>> {
+        let mut stmt = self.ps(
+            "SELECT t.name FROM invocations i JOIN tools t ON t.id=i.tool_id
+             WHERE i.run_id=?1 ORDER BY i.created_at, i.rowid",
+        )?;
+        let rows = stmt
+            .query_map(params![run_id], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
     /// Whether a completed Run in another Session called the same Tools in
     /// the same order (a repeated pattern worth a skill).
     pub fn tool_sequence_seen_elsewhere(&self, session_id: &str, seq: &[String]) -> Result<bool> {
@@ -5601,11 +5618,7 @@ impl Store {
             .query_map(params![session_id], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
         for run in runs {
-            let other: Vec<String> = self
-                .run_invocations(&run)?
-                .into_iter()
-                .map(|(name, _, _)| name)
-                .collect();
+            let other = self.run_tool_names(&run)?;
             if other == seq {
                 return Ok(true);
             }
@@ -6736,6 +6749,90 @@ impl Store {
 }
 
 #[cfg(test)]
+mod subagent_message_projection_tests {
+    use super::*;
+
+    #[test]
+    fn subagent_messages_parse_rows_in_sequence_and_propagate_late_conversion_errors() {
+        let store = Store::open_in_memory().unwrap();
+        let session = store
+            .create_session(Some("synthetic transcript fixture".into()))
+            .unwrap();
+        let agent = store
+            .create_subagent(&session.id, "fixture-run", "fixture", 0, "fixture-model")
+            .unwrap();
+        let other = store
+            .create_subagent(&session.id, "fixture-run", "other", 0, "fixture-model")
+            .unwrap();
+        let before = serde_json::to_value(store.list_subagents(&session.id).unwrap()).unwrap();
+        let first = serde_json::json!({"role":"user","content":"ไทย\n日本語","provider_field":{"preserve":true}});
+        store.append_subagent_message(&agent.id, &first).unwrap();
+        store
+            .append_subagent_message(&other.id, &serde_json::json!({"other":"excluded"}))
+            .unwrap();
+        for (sequence, raw) in [
+            (30, "\"tail\""),
+            (20, "{malformed"),
+            (12, "null"),
+            (10, "[\"雪\",false]"),
+        ] {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO subagent_messages(subagent_id,seq,message) VALUES(?1,?2,?3)",
+                    params![agent.id, sequence, raw],
+                )
+                .unwrap();
+        }
+        let expected = vec![
+            first,
+            serde_json::json!(["雪", false]),
+            Value::Null,
+            serde_json::json!("tail"),
+        ];
+        assert_eq!(store.subagent_messages(&agent.id).unwrap(), expected);
+        assert!(store
+            .subagent_messages("missing fixture")
+            .unwrap()
+            .is_empty());
+        store
+            .conn
+            .execute(
+                "INSERT INTO subagent_messages(subagent_id,seq,message) VALUES(?1,99,?2)",
+                params![agent.id, vec![0u8, 255]],
+            )
+            .unwrap();
+        let error = store.subagent_messages(&agent.id).unwrap_err();
+        assert!(
+            matches!(
+                error.downcast_ref::<rusqlite::Error>(),
+                Some(rusqlite::Error::InvalidColumnType(..))
+            ),
+            "{error:?}"
+        );
+        store
+            .conn
+            .execute(
+                "DELETE FROM subagent_messages WHERE subagent_id=?1 AND seq=99",
+                params![agent.id],
+            )
+            .unwrap();
+        assert_eq!(store.subagent_messages(&agent.id).unwrap(), expected);
+        assert_eq!(
+            serde_json::to_value(store.list_subagents(&session.id).unwrap()).unwrap(),
+            before
+        );
+        store
+            .append_subagent_message(&agent.id, &serde_json::json!({"appended":"last"}))
+            .unwrap();
+        assert_eq!(
+            store.subagent_messages(&agent.id).unwrap().last(),
+            Some(&serde_json::json!({"appended":"last"}))
+        );
+    }
+}
+
+#[cfg(test)]
 mod recurring_script_projection_tests {
     use super::*;
 
@@ -6921,6 +7018,10 @@ pub fn estimate_tokens(text: &str) -> usize {
 }
 
 pub type BuiltContext = (Vec<Value>, bool, i64);
+
+#[cfg(test)]
+#[path = "tool_sequence_names_tests.rs"]
+mod tool_sequence_names_tests;
 
 #[cfg(test)]
 #[path = "targeted_message_lookup_tests.rs"]
