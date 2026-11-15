@@ -13,6 +13,7 @@ mod cli_proposal_diff;
 mod cli_routing;
 mod cli_run_identity;
 mod cli_session_lookup;
+mod cli_session_org;
 mod cli_session_report;
 mod cli_session_templates;
 mod cli_tool_diff;
@@ -5647,6 +5648,38 @@ enum SessionsAction {
         #[arg(long)]
         json: bool,
     },
+    /// Pin a Session using its stored returned state
+    Pin {
+        /// Session ID, unambiguous prefix or full name
+        id: String,
+        /// Print the returned Session as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Unpin a Session using its stored returned state
+    Unpin {
+        /// Session ID, unambiguous prefix or full name
+        id: String,
+        /// Print the returned Session as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Read tags, or replace the entire stored tag list
+    #[command(
+        after_help = "Examples:\n  formless sessions tag ID                 # read only\n  formless sessions tag ID work travel     # replace all tags\n  formless sessions tag ID --clear         # replace with no tags"
+    )]
+    Tag {
+        /// Session ID, unambiguous prefix or full name
+        id: String,
+        /// Replacement tags, passed unchanged to storage; omission only reads
+        tags: Vec<String>,
+        /// Explicitly replace all tags with an empty list
+        #[arg(long, conflicts_with = "tags")]
+        clear: bool,
+        /// Print the stored or returned Session as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Show a Session's transcript
     Show {
         /// Session ID or unambiguous prefix
@@ -5801,6 +5834,14 @@ fn sessions_cmd(paths: Paths, action: SessionsAction) -> Result<()> {
             }
         }
         SessionsAction::Compare { .. } => unreachable!("handled before daemon startup"),
+        SessionsAction::Pin { id, json } => cli_session_org::pin(&paths, &id, true, json)?,
+        SessionsAction::Unpin { id, json } => cli_session_org::pin(&paths, &id, false, json)?,
+        SessionsAction::Tag {
+            id,
+            tags,
+            clear,
+            json,
+        } => cli_session_org::tag(&paths, &id, tags, clear, json)?,
         SessionsAction::List {
             archived,
             pinned,

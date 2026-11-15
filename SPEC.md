@@ -5238,7 +5238,7 @@ the TUI. Command-specific arguments and defaults are available through
 | `formless routing` | `--json` | Read currently available daemon routing decisions and returned candidate figures without starting a model request. |
 | `formless runs` | No action: list; `show`, `cancel` | List recent Runs, inspect one by ID/prefix, or cancel that exact Run. |
 | `formless security` | `status` | Inspect the daemon's grants, denials, trusted resources, and exposed interfaces. |
-| `formless sessions` | `fork`, `compare`, `list`, `show`, `files`, `rewind`, `rename`, `rm`, `restore`, `import`, `search`, `templates list/show`, `archive`, `unarchive`, `export` | Manage stored Sessions, follow a Run with `show --follow`, or inspect tracked files. `list --pinned --tag TAG` filters the fetched reply; selectors combine with `--archived`, preserving reply order. |
+| `formless sessions` | `fork`, `compare`, `list`, `show`, `files`, `rewind`, `rename`, `rm`, `restore`, `import`, `search`, `templates list/show`, `archive`, `unarchive`, `pin`, `unpin`, `tag`, `export` | Manage stored Sessions, follow a Run with `show --follow`, or inspect tracked files. `list --pinned --tag TAG` filters the fetched reply; selectors combine with `--archived`, preserving reply order. |
 | `formless skills` | `reviews`, `add`, `remove`, `list`, `enable`, `disable`, `show`, `export`, `import` | Inspect and manage Skills and their retained description reviews. |
 | `formless storage` | `--json` | Report disk usage by data category. |
 | `formless tools` | `reviews`, `list`, `disable`, `enable`, `undo`, `pin`, `unpin`, `tag`, `show`, `diff`, `retire`, `restore`, `rollback`, `purge`, `run`, `export`, `import` | Inspect, manage, run, or transfer registry Tools. |
@@ -5246,6 +5246,13 @@ the TUI. Command-specific arguments and defaults are available through
 | `formless uninstall` | `--keep-data`, `--keep-binary`, `--yes` (alias `--force`) | Remove Formless, optionally retaining data or the binary. |
 | `formless update` | No action, `check`, or `--check`; `--json` | Show newer release notes and the applicable upgrade command; never rewrite the binary. |
 | `formless web` | `--port`, `--no-open`, `--stop` | Open, print a link for, or stop the local browser UI. |
+
+`sessions pin ID` and `sessions unpin ID` display the stored pin state returned
+by the daemon. `sessions tag ID` only reads tags; adding positional tags replaces
+the **entire** stored tag list, and `--clear` explicitly replaces it with an empty
+list (conflicting with positional tags). Tags reach storage unchanged for its
+existing normalization; confirmation shows returned stored values. These three
+actions accept `--json` for the selected/returned Session object.
 
 Ambiguous Session prefixes/names remain usage errors and display up to ten
 matching full IDs, bounded names and archive labels. Extra matches are counted,
