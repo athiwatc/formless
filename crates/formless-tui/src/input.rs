@@ -22,6 +22,10 @@ pub struct InputLine {
     history_notice: Option<&'static str>,
     /// Byte offset, always on a char boundary.
     cursor: usize,
+    /// Preferred display column for consecutive wrapped-row moves, by width.
+    visual_goal: Option<(usize, usize)>,
+    /// Preferred display column across logical-line vertical moves.
+    logical_goal: Option<usize>,
     /// Placeholder shown in `text` -> the pasted text it stands for.
     pastes: Vec<(String, String)>,
     /// Browsing history: (index into the history, the draft to restore).
@@ -113,6 +117,8 @@ impl InputLine {
         }
     }
     fn restore(&mut self, s: EditSnapshot) {
+        self.visual_goal = None;
+        self.logical_goal = None;
         self.literal = s.literal;
         self.text = s.text;
         self.cursor = s.cursor;
@@ -124,6 +130,8 @@ impl InputLine {
         self.last_kill = false;
     }
     fn before_edit(&mut self, typing: bool) {
+        self.visual_goal = None;
+        self.logical_goal = None;
         self.history_notice = None;
         if !self.history.coalesces(typing) {
             let current = self.snapshot();
@@ -133,6 +141,8 @@ impl InputLine {
         self.last_kill = false;
     }
     pub(crate) fn break_edit_group(&mut self) {
+        self.visual_goal = None;
+        self.logical_goal = None;
         self.history.break_group();
         self.yank = None;
         self.last_kill = false;
@@ -256,6 +266,13 @@ impl InputLine {
 
     /// Modal editors use whole grapheme boundaries, not byte/char fragments.
     pub(crate) fn set_modal_cursor(&mut self, at: usize) {
+        self.visual_goal = None;
+        self.logical_goal = None;
+        self.clamp_modal_cursor(at);
+    }
+
+    /// Normal-mode end clamping is normalization, not a new horizontal goal.
+    pub(crate) fn clamp_modal_cursor(&mut self, at: usize) {
         self.cursor = self
             .text
             .grapheme_indices(true)
@@ -291,6 +308,7 @@ impl InputLine {
     /// Vim works on actual text. Expand paste placeholders before modal
     /// editing so a partial operator cannot strand or silently discard a paste.
     pub(crate) fn modal_expand_pastes(&mut self) {
+        let mut expanded = false;
         for (placeholder, full) in std::mem::take(&mut self.pastes) {
             if let Some(start) = self.text.find(&placeholder) {
                 let end = start + placeholder.len();
@@ -311,9 +329,17 @@ impl InputLine {
                     self.cursor
                 };
                 self.text.replace_range(start..end, &full);
+                expanded = true;
             }
         }
-        self.set_modal_cursor(self.cursor);
+        if expanded {
+            self.visual_goal = None;
+            self.logical_goal = None;
+            self.snap_after_insert();
+            self.anchor = self.anchor.map(|at| self.boundary_at_or_after(at));
+        } else {
+            self.clamp_modal_cursor(self.cursor);
+        }
     }
 
     pub(crate) fn is_literal(&self) -> bool {
@@ -366,6 +392,7 @@ impl InputLine {
         self.remove_selection();
         self.text.insert(self.cursor, c);
         self.cursor += c.len_utf8();
+        self.snap_after_insert();
         self.browsing = None;
     }
 
@@ -378,10 +405,75 @@ impl InputLine {
         self.insert_raw(s);
     }
 
+    /// One Vim bracketed-paste operation, coalescing with insert keys and
+    /// counted/dot replay while snapping only after the complete payload.
+    pub(crate) fn insert_modal_paste(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        if self.selection().is_some() {
+            self.break_edit_group();
+        }
+        self.before_edit(true);
+        self.remove_selection();
+        self.insert_raw(text);
+    }
+
+    /// Replace only bytes owned by a recorded modal insertion. Its trailing
+    /// boundary can now lie inside a cluster joined with an existing neighbor;
+    /// keep that neighbor and restore a full-text cursor boundary afterward.
+    pub(crate) fn replace_modal_inserted(
+        &mut self,
+        range: std::ops::Range<usize>,
+        expected: &str,
+        replacement: &str,
+    ) -> bool {
+        // Mouse/navigation breaks the insertion undo group. Even unchanged
+        // bytes then belong to an old location, not the current repeat target.
+        if !self.history.coalesces(true) || self.text.get(range.clone()) != Some(expected) {
+            return false;
+        }
+        self.before_edit(true);
+        self.text.replace_range(range.clone(), replacement);
+        self.cursor = range.start + replacement.len();
+        self.anchor = None;
+        self.snap_after_insert();
+        self.browsing = None;
+        true
+    }
+
     fn insert_raw(&mut self, s: &str) {
         self.text.insert_str(self.cursor, s);
         self.cursor += s.len();
+        self.snap_after_insert();
         self.browsing = None;
+    }
+
+    /// Insertion can join neighbors on both sides. Keep the cursor after the
+    /// completed full-text cluster, without altering the inserted text.
+    fn snap_after_insert(&mut self) {
+        self.cursor = self.boundary_at_or_after(self.cursor);
+    }
+
+    fn boundary_at_or_after(&self, at: usize) -> usize {
+        let mut cursor = unicode_segmentation::GraphemeCursor::new(at, self.text.len(), true);
+        match cursor.is_boundary(&self.text, 0) {
+            Ok(true) => return at,
+            Ok(false) => {
+                if let Ok(Some(next)) = cursor.next_boundary(&self.text, 0) {
+                    return next;
+                }
+            }
+            Err(_) => {}
+        }
+        // Full text is normally sufficient for GraphemeCursor; retain a
+        // boundary-safe fallback for any unexpected context request.
+        self.text
+            .grapheme_indices(true)
+            .map(|(i, _)| i)
+            .chain(std::iter::once(self.text.len()))
+            .find(|&i| i >= at)
+            .unwrap_or(self.text.len())
     }
 
     /// A bracketed paste: inserted as one block, never as Enter presses.
@@ -641,7 +733,8 @@ impl InputLine {
         let start = self.cursor;
         self.insert_raw(&text);
         self.literal = base_literal || self.ring.literal(0);
-        self.yank = Some((start, self.cursor, 0, base_literal));
+        // Track inserted bytes, not a cursor snapped across a neighboring cluster.
+        self.yank = Some((start, start + text.len(), 0, base_literal));
         true
     }
 
@@ -663,7 +756,7 @@ impl InputLine {
         self.remove(start, end);
         self.insert_raw(&text);
         self.literal = base_literal || self.ring.literal(index + 1);
-        self.yank = Some((start, self.cursor, index + 1, base_literal));
+        self.yank = Some((start, start + text.len(), index + 1, base_literal));
         true
     }
 
@@ -681,8 +774,11 @@ impl InputLine {
 
     /// Up/Down inside a multi-line input, keeping the screen column.
     pub fn vertical(&mut self, down: bool) {
+        let col = self
+            .logical_goal
+            .unwrap_or_else(|| text::width(&self.text[self.line_start()..self.cursor]));
         self.break_edit_group();
-        let col = text::width(&self.text[self.line_start()..self.cursor]);
+        self.logical_goal = Some(col);
         let target = if down {
             if self.on_last_line() {
                 return;
@@ -806,36 +902,92 @@ impl InputLine {
     /// both in screen columns: a wide CJK character takes two, a Thai mark
     /// none (#785).
     pub fn layout(&self, width: usize) -> (Vec<String>, (usize, usize)) {
-        let width = width.max(1);
         let mut rows = Vec::new();
+        let cursor = self.walk_layout(width, |row| rows.push(row.to_owned()), |_, _| {});
+        (rows, cursor)
+    }
+
+    /// Move through exactly the grapheme rows used by rendering. False means
+    /// there is no adjacent visual row, so ordinary arrows may browse history.
+    pub(crate) fn vertical_wrapped(&mut self, down: bool, width: usize) -> bool {
+        let width = width.max(1);
+        let mut points = Vec::new();
+        let cursor = self.walk_layout(
+            width,
+            |_| {},
+            |byte, position| points.push((byte, position)),
+        );
+        let goal = self
+            .visual_goal
+            .filter(|(previous, _)| *previous == width)
+            .map_or(cursor.1, |(_, column)| column);
+        self.break_edit_group();
+        self.visual_goal = Some((width, goal));
+        let target = if down {
+            cursor.0.checked_add(1)
+        } else {
+            cursor.0.checked_sub(1)
+        };
+        let Some(target) = target else {
+            return false;
+        };
+        let Some((byte, _)) = points
+            .into_iter()
+            .rev()
+            .find(|(_, (row, column))| *row == target && *column <= goal)
+        else {
+            return false;
+        };
+        self.cursor = byte;
+        true
+    }
+
+    fn walk_layout(
+        &self,
+        width: usize,
+        mut emit_row: impl FnMut(&str),
+        mut boundary: impl FnMut(usize, (usize, usize)),
+    ) -> (usize, usize) {
+        let width = width.max(1);
+        let mut row_index = 0;
         let mut cursor = (0, 0);
         let mut offset = 0;
         for line in self.text.split('\n') {
-            let mut row = String::new();
+            let mut row_start = 0;
             let mut col = 0;
             for (i, g) in line.grapheme_indices(true) {
                 let w = text::width(g);
                 if col + w > width && col > 0 {
-                    rows.push(std::mem::take(&mut row));
+                    emit_row(&line[row_start..i]);
+                    row_index += 1;
+                    row_start = i;
                     col = 0;
                 }
+                boundary(offset + i, (row_index, col));
                 if offset + i == self.cursor {
-                    cursor = (rows.len(), col);
+                    cursor = (row_index, col);
                 }
-                row.push_str(g);
                 col += w;
             }
             if offset + line.len() == self.cursor {
                 if col == width {
-                    rows.push(std::mem::take(&mut row));
+                    emit_row(&line[row_start..]);
+                    row_index += 1;
+                    row_start = line.len();
                     col = 0;
                 }
-                cursor = (rows.len(), col);
+                cursor = (row_index, col);
             }
-            rows.push(row);
+            // A full row's trailing boundary belongs to the next wrapped row;
+            // only a drawn end-of-input caret row may own it here.
+            if col < width || offset + line.len() == self.cursor {
+                boundary(offset + line.len(), (row_index, col));
+            }
+            emit_row(&line[row_start..]);
+            row_index += 1;
             offset += line.len() + 1;
         }
-        (rows, cursor)
+        cursor
     }
 }
 
@@ -871,6 +1023,136 @@ fn find_back(history: &[impl AsRef<str>], query: &str, before: usize) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn modal_insert_range_replacement_refuses_after_mouse_navigation() {
+        let mut line = InputLine::from("ab");
+        line.set_modal_cursor(0);
+        line.insert_modal_paste("X");
+        line.mouse_cursor(line.len(), false);
+        assert!(!line.replace_modal_inserted(0..1, "X", "XX"));
+        assert_eq!(&*line, "Xab");
+        assert_eq!(line.cursor_byte(), line.len());
+    }
+
+    #[test]
+    fn modal_insert_range_replacement_preserves_joined_neighbor_and_refuses_stale_bytes() {
+        let mut line = InputLine::from("ab");
+        line.set_modal_cursor(1);
+        line.insert_modal_paste("X\u{0600}");
+        let before = line.to_string();
+        let cursor = line.cursor_byte();
+        assert!(!line.replace_modal_inserted(1..4, "stale", "replacement"));
+        assert!(!line.replace_modal_inserted(1..3, "X\u{0600}", "replacement"));
+        assert_eq!(&*line, before);
+        assert_eq!(line.cursor_byte(), cursor);
+        let repeated = "X\u{0600}".repeat(3);
+        assert!(line.replace_modal_inserted(1..4, "X\u{0600}", &repeated));
+        assert_eq!(&*line, format!("a{repeated}b"));
+        assert_eq!(line.cursor_byte(), line.len());
+        assert!(line.undo());
+        assert_eq!(&*line, "ab");
+    }
+
+    #[test]
+    fn composer_joining_insertions_keep_full_grapheme_boundaries() {
+        for (before, at_byte, inserted, after, cursor) in [
+            ("👩💻x", "👩".len(), '\u{200d}', "👩‍💻x", "👩‍💻".len()),
+            ("🇦🇧🇨x", "🇦🇧".len(), '🇩', "🇦🇧🇩🇨x", "🇦🇧🇩🇨".len()),
+            ("abx", 1, '\u{301}', "a\u{301}bx", "a\u{301}".len()),
+            ("abx", 1, '\u{600}', "a\u{600}bx", "a\u{600}b".len()),
+        ] {
+            for mode in 0..4 {
+                let mut line = at(before, at_byte);
+                let text = inserted.to_string();
+                match mode {
+                    0 => line.insert_char(inserted),
+                    1 => line.insert_str(&text),
+                    2 => line.paste(&text),
+                    _ => {
+                        assert!(line.modal_replace(at_byte..at_byte, &text));
+                    }
+                }
+                assert_eq!(line.expanded(), after);
+                assert_eq!(line.cursor_byte(), cursor, "{before:?} mode={mode}");
+                let mut back = line.clone();
+                back.backspace();
+                assert!(
+                    back.cursor_byte() == back.len()
+                        || back
+                            .grapheme_indices(true)
+                            .any(|(at, _)| at == back.cursor_byte())
+                );
+                let mut forward = line.clone();
+                forward.delete();
+                assert!(
+                    forward.cursor_byte() == forward.len()
+                        || forward
+                            .grapheme_indices(true)
+                            .any(|(at, _)| at == forward.cursor_byte())
+                );
+                assert!(line.undo());
+                assert_eq!(line.expanded(), before);
+                assert_eq!(line.cursor_byte(), at_byte);
+                assert!(line.redo());
+                assert_eq!(line.expanded(), after);
+                assert_eq!(line.cursor_byte(), cursor);
+            }
+        }
+        let mut line = at("👩💻x", "👩".len());
+        line.insert_char('\u{200d}');
+        let mut forward = line.clone();
+        forward.delete();
+        assert_eq!(forward.expanded(), "👩‍💻");
+        line.backspace();
+        assert_eq!(line.expanded(), "x");
+    }
+
+    #[test]
+    fn composer_logical_vertical_goal_survives_short_wide_and_empty_lines() {
+        for (text, goal) in [
+            ("abcd\nx\nabcd", 3),
+            ("ab\n界界\nab", 1),
+            ("abcd\n\nabcd", 3),
+        ] {
+            let last = text.rfind('\n').unwrap() + 1;
+            let mut line = at(text, goal);
+            for _ in 0..2 {
+                line.prepare_selection(false);
+                line.vertical(true);
+            }
+            assert_eq!(line.cursor_byte(), last + goal, "{text:?}");
+            for _ in 0..2 {
+                line.prepare_selection(false);
+                line.vertical(false);
+            }
+            assert_eq!(line.cursor_byte(), goal, "{text:?}");
+        }
+        let mut line = at("abcd\nx\nabcd", 3);
+        line.vertical(true);
+        line.left();
+        line.vertical(true);
+        assert_eq!(line.cursor_byte(), 7);
+        line.set("abcd\nx\nabcd");
+        line.set_modal_cursor(3);
+        line.vertical(true);
+        line.insert_char('y');
+        line.vertical(true);
+        assert_eq!(line.cursor_byte(), 10);
+    }
+
+    #[test]
+    fn composer_joining_yank_cycle_preserves_neighboring_text() {
+        let mut line = at("👩💻", "👩".len());
+        line.ring.kill("X".into(), false, false, false);
+        line.ring.kill("\u{200d}".into(), false, false, false);
+        assert!(line.yank());
+        assert_eq!(line.expanded(), "👩‍💻");
+        assert_eq!(line.cursor_byte(), "👩‍💻".len());
+        assert!(line.cycle_yank());
+        assert_eq!(line.expanded(), "👩X💻");
+        assert_eq!(line.cursor_byte(), "👩X".len());
+    }
 
     #[test]
     fn history_search_accept_after_shrink_preserves_the_draft() {
@@ -1161,6 +1443,78 @@ mod tests {
             InputLine::default().layout(4),
             (vec![String::new()], (0, 0))
         );
+    }
+
+    #[test]
+    fn wrapped_vertical_moves_preserve_text_column_and_explicit_newline_rows() {
+        let mut input = InputLine::from("abcdefghijklmn");
+        assert_eq!(input.layout(5).1, (2, 4));
+        assert!(input.vertical_wrapped(false, 5));
+        assert_eq!(input.layout(5).1, (1, 4));
+        assert!(input.vertical_wrapped(false, 5));
+        assert_eq!(input.layout(5).1, (0, 4));
+        assert!(!input.vertical_wrapped(false, 5));
+        assert_eq!(&*input, "abcdefghijklmn");
+
+        let mut input = at("abcdef\nx\nuvwxyz", 5);
+        assert_eq!(input.layout(4).1, (1, 1));
+        assert!(input.vertical_wrapped(true, 4));
+        assert_eq!(input.layout(4).1, (2, 1));
+        assert!(input.vertical_wrapped(true, 4));
+        assert_eq!(input.layout(4).1, (3, 1));
+        assert!(input.vertical_wrapped(true, 4));
+        assert_eq!(input.layout(4).1, (4, 1));
+        assert_eq!(&*input, "abcdef\nx\nuvwxyz");
+    }
+
+    #[test]
+    fn wrapped_vertical_goal_survives_short_rows_and_resets_for_edit_move_and_resize() {
+        let mut input = at("abcdef\nx\nuvwxyz", 3);
+        assert!(input.vertical_wrapped(true, 6));
+        assert_eq!(input.layout(6).1, (1, 1));
+        assert!(input.vertical_wrapped(true, 6));
+        assert_eq!(input.layout(6).1, (2, 3));
+        input.left();
+        assert!(input.vertical_wrapped(false, 6));
+        assert!(input.vertical_wrapped(false, 6));
+        assert_eq!(input.layout(6).1, (0, 2));
+        input.insert_char('!');
+        assert!(input.visual_goal.is_none());
+        input.vertical_wrapped(true, 6);
+        input.vertical_wrapped(true, 4);
+        assert_eq!(input.visual_goal.unwrap().0, 4);
+        input.set("fresh");
+        assert!(input.visual_goal.is_none());
+    }
+
+    #[test]
+    fn wrapped_vertical_keeps_wide_and_joining_clusters_whole_including_exact_width_ends() {
+        for text in [
+            "表a表a表a",
+            "สวัสดีครับสวัสดีครับ",
+            "a👩🏽‍💻b👨‍👩‍👧‍👦c",
+            "abcd\n表e\u{301}z\n",
+        ] {
+            let boundaries: Vec<_> = text
+                .grapheme_indices(true)
+                .map(|(byte, _)| byte)
+                .chain(std::iter::once(text.len()))
+                .collect();
+            for width in [1, 2, 3, 4, 7] {
+                for &byte in &boundaries {
+                    for down in [false, true] {
+                        let mut input = at(text, byte);
+                        input.vertical_wrapped(down, width);
+                        assert!(boundaries.contains(&input.cursor), "{text:?} width={width}");
+                        assert_eq!(&*input, text);
+                    }
+                }
+            }
+        }
+        let mut input = InputLine::from("abcdefgh");
+        assert_eq!(input.layout(4).1, (2, 0));
+        assert!(input.vertical_wrapped(false, 4));
+        assert_eq!(input.layout(4).1, (1, 0));
     }
 
     /// Steps and deletions take whole clusters (#784).

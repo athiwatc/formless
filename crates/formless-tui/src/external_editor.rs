@@ -126,16 +126,23 @@ impl EditorCommand {
                 path.push(format!(":{line}"));
                 cmd.arg("-g").arg(path);
             }
-            (Some(line), "hx" | "helix") => {
+            (Some(line), "hx" | "helix" | "subl" | "sublime_text" | "zed") => {
                 let mut path = file.as_os_str().to_os_string();
                 path.push(format!(":{line}"));
                 cmd.arg(path);
             }
             (
                 Some(line),
-                "vi" | "vim" | "nvim" | "nano" | "emacs" | "emacsclient" | "gvim" | "mvim",
+                "vi" | "vim" | "nvim" | "nano" | "emacs" | "emacsclient" | "gvim" | "mvim"
+                | "gedit",
             ) => {
                 cmd.arg(format!("+{line}")).arg(file);
+            }
+            (Some(line), "mate") => {
+                cmd.arg("-l").arg(line.to_string()).arg(file);
+            }
+            (Some(line), "kate") => {
+                cmd.arg("--line").arg(line.to_string()).arg(file);
             }
             _ => {
                 cmd.arg(file);
@@ -889,6 +896,72 @@ pub(crate) mod tests {
             .is_ok());
         assert!(EditorCommand::parse("'unclosed\"").is_err());
         assert!(EditorCommand::parse("x\0y").is_err());
+    }
+    #[test]
+    fn known_editors_keep_cursor_lines_wait_modes_and_literal_arguments() {
+        let file = Path::new("ไทย draft ; $(literal):part.md");
+        let suffix = || {
+            let mut path = file.as_os_str().to_os_string();
+            path.push(":42");
+            path
+        };
+        for (name, wait, location) in [
+            ("subl", "--wait", vec![suffix()]),
+            ("sublime_text", "--wait", vec![suffix()]),
+            ("SUBL.EXE", "--wait", vec![suffix()]),
+            (
+                "mate",
+                "--wait",
+                vec!["-l".into(), "42".into(), file.into()],
+            ),
+            ("zed", "--wait", vec![suffix()]),
+            ("gedit", "--wait", vec!["+42".into(), file.into()]),
+            (
+                "kate",
+                "--block",
+                vec!["--line".into(), "42".into(), file.into()],
+            ),
+            ("code", "--wait", vec!["-g".into(), suffix()]),
+            ("hx", "", vec![suffix()]),
+            ("vim", "", vec!["+42".into(), file.into()]),
+            ("unknown-editor", "", vec![file.into()]),
+        ] {
+            let spec = EditorCommand::parse(&format!("{name} --configured-option")).unwrap();
+            for roundtrip in [false, true] {
+                for line in [None, Some(42)] {
+                    let command = spec.command(file, line, roundtrip).unwrap();
+                    let mut expected: Vec<OsString> = vec!["--configured-option".into()];
+                    if roundtrip && !wait.is_empty() {
+                        expected.push(wait.into());
+                    }
+                    expected.extend(if line.is_some() {
+                        location.clone()
+                    } else {
+                        vec![file.into()]
+                    });
+                    assert_eq!(
+                        command.get_args().collect::<Vec<_>>(),
+                        expected,
+                        "{name}, line={line:?}, roundtrip={roundtrip}"
+                    );
+                }
+            }
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn cursor_location_preserves_non_utf8_path_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+        let file = PathBuf::from(OsString::from_vec(b"/tmp/draft \xff.md".to_vec()));
+        for name in ["subl", "sublime_text", "zed", "mate", "gedit", "kate"] {
+            let spec = EditorCommand::parse(name).unwrap();
+            let command = spec.command(&file, Some(42), true).unwrap();
+            let mut expected = file.as_os_str().to_os_string();
+            if matches!(name, "subl" | "sublime_text" | "zed") {
+                expected.push(":42");
+            }
+            assert_eq!(command.get_args().last().unwrap(), expected);
+        }
     }
     #[test]
     fn windows_quoting_preserves_path_backslashes_and_empty_arguments() {

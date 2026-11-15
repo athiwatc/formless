@@ -56,11 +56,17 @@ pub const LINE_OFFSET: usize = 14;
 /// whitespace and comments dropped and string, template, regex and number
 /// literals blanked, so the same script with other paths or values
 /// matches. A template's `${…}` interpolations are code and count (#832).
+/// Ambiguous slash contexts use a domain-marked exact-source hash instead:
+/// missing a shape match is safer than erasing different executable code.
 pub fn fingerprint(source: &str) -> String {
     let chars: Vec<char> = source.chars().collect();
     let mut out = String::with_capacity(source.len());
     let mut i = 0;
-    shape(&chars, &mut i, &mut out, false);
+    if shape(&chars, &mut i, &mut out, false).is_none() {
+        out.clear();
+        out.push_str("\0source\0");
+        out.push_str(source);
+    }
     Sha256::digest(out.as_bytes())
         .iter()
         .map(|b| format!("{b:02x}"))
@@ -82,7 +88,7 @@ pub fn recurrence_key(source: &str, uses: &[String]) -> String {
 
 /// Append the shape of code from `*i` to `out`. Inside an interpolation
 /// (`nested`), stops after the `}` that closes it.
-fn shape(chars: &[char], i: &mut usize, out: &mut String, nested: bool) {
+fn shape(chars: &[char], i: &mut usize, out: &mut String, nested: bool) -> Option<()> {
     let ident = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
     let mut depth = 0usize;
     while *i < chars.len() {
@@ -104,6 +110,12 @@ fn shape(chars: &[char], i: &mut usize, out: &mut String, nested: bool) {
                 *i += 1;
             }
             *i += 2;
+        } else if c == '/' && (out.ends_with("++") || out.ends_with("--") || out.ends_with('}')) {
+            // ++/-- can end an expression; } can close an object or a block.
+            // Without syntactic context, blanking a guessed regex can swallow
+            // divisors and subsequent Tool calls. Propagate fallback even from
+            // nested template interpolations. Comments were handled above.
+            return None;
         } else if c == '/' && regex_allowed(out) {
             // A regex literal: its `//`, `/*` and quotes are text.
             let mut class = false;
@@ -133,7 +145,7 @@ fn shape(chars: &[char], i: &mut usize, out: &mut String, nested: bool) {
                 } else if chars[*i] == '$' && chars.get(*i + 1) == Some(&'{') {
                     *i += 2;
                     out.push_str("${");
-                    shape(chars, i, out, true);
+                    shape(chars, i, out, true)?;
                     out.push('}');
                 } else {
                     *i += 1;
@@ -162,7 +174,7 @@ fn shape(chars: &[char], i: &mut usize, out: &mut String, nested: bool) {
                 } else if c == '}' {
                     if depth == 0 {
                         *i += 1;
-                        return;
+                        return Some(());
                     }
                     depth -= 1;
                 }
@@ -171,6 +183,7 @@ fn shape(chars: &[char], i: &mut usize, out: &mut String, nested: bool) {
             *i += 1;
         }
     }
+    Some(())
 }
 
 /// Whether a `/` here starts a regex rather than dividing: it follows an
@@ -250,6 +263,80 @@ mod tests {
         assert_eq!(
             recurrence_key(a, &uses(&["b", "a"])),
             recurrence_key(a, &uses(&["a", "b"]))
+        );
+    }
+
+    #[test]
+    fn postfix_division_preserves_following_code_and_divisors() {
+        let uses = vec!["grep".into(), "find".into()];
+        for end in ["count++", "count--", "count /* trailing */ ++", "count++\n"] {
+            let a = format!("{end} / limit; return await tools.grep(q)");
+            let b = format!("{end} / limit; return await tools.find(q)");
+            assert_ne!(fingerprint(&a), fingerprint(&b), "{end}");
+            assert_ne!(
+                recurrence_key(&a, &uses),
+                recurrence_key(&b, &uses),
+                "{end}"
+            );
+            assert_ne!(
+                fingerprint(&format!("{end} / left / scale")),
+                fingerprint(&format!("{end} / right / scale")),
+                "{end}"
+            );
+        }
+    }
+
+    #[test]
+    fn closing_brace_division_preserves_following_code_and_divisors() {
+        let uses = vec!["grep".into(), "find".into()];
+        for end in [
+            "const x = {a:1}",
+            "const x = {a:{n:1}}",
+            "const x = {a:1} /* note */",
+        ] {
+            let a = format!("{end} / limit; return await tools.grep(q)");
+            let b = format!("{end} / limit; return await tools.find(q)");
+            assert_ne!(fingerprint(&a), fingerprint(&b), "{end}");
+            assert_ne!(
+                recurrence_key(&a, &uses),
+                recurrence_key(&b, &uses),
+                "{end}"
+            );
+            assert_ne!(
+                fingerprint(&format!("{end} / left / scale")),
+                fingerprint(&format!("{end} / right / scale")),
+                "{end}"
+            );
+        }
+    }
+
+    #[test]
+    fn ambiguous_slashes_use_exact_source_even_inside_templates() {
+        for source in [
+            "count++ / limit; return await tools.grep(q)",
+            "const x = {a:1} / limit; return await tools.grep(q)",
+            "function f(){} /pattern/.test(s); return await tools.grep(q)",
+            "const x = `text ${count++ / limit}`; return await tools.grep(q)",
+        ] {
+            assert_ne!(
+                fingerprint(source),
+                fingerprint(&format!(" {source}")),
+                "conservative fallback: {source}"
+            );
+            assert_ne!(
+                fingerprint(source),
+                fingerprint(&source.replace("grep", "find")),
+                "{source}"
+            );
+        }
+        // Unambiguous regex/literal normalization stays available.
+        assert_eq!(
+            fingerprint("return /alpha/.test('one')"),
+            fingerprint(" return /beta/.test('two') ")
+        );
+        assert_eq!(
+            fingerprint("let x = ++count / 2"),
+            fingerprint("let x=++count/3")
         );
     }
 

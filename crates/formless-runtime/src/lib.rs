@@ -3,9 +3,12 @@
 //! `__host(op, argsJson)` bridge, checked against declared Capabilities.
 
 pub mod caps;
+mod clipboard_diagnostics;
 mod dns;
 mod process_executable;
 mod processes;
+mod read_size;
+use read_size::ReadSize;
 pub mod sensitive_paths;
 pub mod structured_output;
 pub mod sync;
@@ -197,18 +200,18 @@ pub fn set_io_limits(read: u64, process_output: u64, log: u64) {
     MAX_LOG_BYTES.store(log.max(1), Ordering::Relaxed);
 }
 
-/// "fs.read: 80 MB is over the 64 MB resource limit (tools.max_read_bytes); use fs.readChunks".
-fn over_limit(what: &str, size: u64, setting: &str, instead: &str) -> String {
-    let mb = |b: u64| format!("{:.1} MB", b as f64 / 1_048_576.0);
-    format!(
-        "{what}: {} is over the {} resource limit ({setting}); {instead}",
-        mb(size),
-        mb(MAX_READ_BYTES.load(Ordering::Relaxed))
+/// Whole-read errors retain byte-exact observations and their source.
+fn over_limit(what: &str, size: ReadSize, setting: &str, instead: &str) -> String {
+    size.over_limit(
+        what,
+        MAX_READ_BYTES.load(Ordering::Relaxed),
+        setting,
+        instead,
     )
 }
 
-fn check_read_size(len: u64) -> Result<(), String> {
-    if len > MAX_READ_BYTES.load(Ordering::Relaxed) {
+fn check_read_size(len: ReadSize) -> Result<(), String> {
+    if len.bytes() > MAX_READ_BYTES.load(Ordering::Relaxed) {
         return Err(over_limit(
             "fs.read",
             len,
@@ -227,14 +230,14 @@ fn read_capped(p: &std::path::Path) -> Result<Vec<u8>, String> {
     let cap = MAX_READ_BYTES.load(Ordering::Relaxed);
     // Fast early error for files that already say they're too big.
     if let Ok(m) = std::fs::metadata(p) {
-        check_read_size(m.len())?;
+        check_read_size(ReadSize::Reported(m.len()))?;
     }
     let f = std::fs::File::open(p).map_err(|e| format!("{}: {e}", p.display()))?;
     let mut out = Vec::new();
     f.take(cap + 1)
         .read_to_end(&mut out)
         .map_err(|e| format!("{}: {e}", p.display()))?;
-    check_read_size(out.len() as u64)?;
+    check_read_size(ReadSize::AtLeast(out.len() as u64))?;
     Ok(out)
 }
 
@@ -546,9 +549,19 @@ globalThis.modules = { load: globalThis.requireModule, list: () => __call("modul
 globalThis.emit = (chunk) => __call("emit", { chunk: String(chunk) });
 // Progress for long work: a fraction 0..1 (or null when unknown) and a
 // short label; the daemon decides whether it represents advancing work.
+function __progressLabel(label) {
+  const text = label == null ? "" : String(label);
+  if (text.length <= 120) return text;
+  // Reserve one UTF-16 unit for the visible truncation marker. Do not cut
+  // between the high and low surrogates of a supplementary code point.
+  let end = 119;
+  const before = text.charCodeAt(end - 1), after = text.charCodeAt(end);
+  if (before >= 0xd800 && before <= 0xdbff && after >= 0xdc00 && after <= 0xdfff) end--;
+  return text.slice(0, end) + "…";
+}
 globalThis.progress = (fraction, label) => __call("progress", {
   fraction: typeof fraction === "number" && isFinite(fraction) ? Math.min(1, Math.max(0, fraction)) : null,
-  label: label == null ? "" : String(label).slice(0, 120),
+  label: __progressLabel(label),
 });
 function __nonnegativeSafeInteger(api, n) {
   if (typeof n !== "number" || !Number.isSafeInteger(n) || n < 0)
@@ -1533,7 +1546,7 @@ impl State {
                 let p = self.resolve(a["path"].as_str().unwrap_or_default(), false)?;
                 match self.overlay_get(&p) {
                     Some(Some(bytes)) => {
-                        check_read_size(bytes.len() as u64)?;
+                        check_read_size(ReadSize::Exact(bytes.len() as u64))?;
                         return Ok(encode(&bytes, enc));
                     }
                     Some(None) => return Err(format!("not found: {}", p.display())),
@@ -1567,7 +1580,7 @@ impl State {
                         Vec::new()
                     };
                     full.extend_from_slice(&data);
-                    check_read_size(full.len() as u64)?;
+                    check_read_size(ReadSize::Exact(full.len() as u64))?;
                     if self.mode == HostMode::DryRun {
                         self.would(format!(
                             "{} {} bytes to {}",
@@ -1781,7 +1794,9 @@ impl State {
         let details = a["details"].as_bool().unwrap_or(false);
         let mut entries: std::collections::BTreeMap<String, Value> = Default::default();
         if self.overlay_get(&p) != Some(None) {
-            if let Ok(rd) = std::fs::read_dir(&p) {
+            if let Some(rd) =
+                listing_directory(&p, self.mode.is_overlay(), |path| std::fs::read_dir(path))?
+            {
                 for e in rd {
                     let e = e.map_err(|e| e.to_string())?;
                     let name = e.file_name().to_string_lossy().to_string();
@@ -1796,7 +1811,7 @@ impl State {
                         continue;
                     }
                     if !details {
-                        entries.insert(name.clone(), json!({"name":name}));
+                        entries.insert(name, Value::Null);
                         continue;
                     }
                     self.guard_read(raw_entry, &canonical_entry, "directory entry metadata")?;
@@ -1806,8 +1821,6 @@ impl State {
                     };
                     entries.insert(name, info);
                 }
-            } else if !self.mode.is_overlay() {
-                std::fs::read_dir(&p).map_err(|e| format!("{}: {e}", p.display()))?;
             }
         }
         if self.mode.is_overlay() {
@@ -1838,10 +1851,12 @@ impl State {
                 }
                 match bytes {
                     Some(bytes) => {
-                        entries.insert(
-                            name.clone(),
-                            json!({"name":name,"type":"file","size":bytes}),
-                        );
+                        let info = if details {
+                            json!({"name":name,"type":"file","size":bytes})
+                        } else {
+                            Value::Null
+                        };
+                        entries.insert(name, info);
                     }
                     None => {
                         entries.remove(&name);
@@ -2060,7 +2075,7 @@ impl State {
             if let Some(len) = resp.content_length().filter(|l| *l > cap) {
                 return Err(over_limit(
                     "fetch",
-                    len,
+                    ReadSize::Reported(len),
                     "tools.max_read_bytes",
                     "stream it with fetchChunks",
                 ));
@@ -2073,7 +2088,7 @@ impl State {
             if bytes.len() as u64 > cap {
                 return Err(over_limit(
                     "fetch",
-                    bytes.len() as u64,
+                    ReadSize::AtLeast(bytes.len() as u64),
                     "tools.max_read_bytes",
                     "stream it with fetchChunks",
                 ));
@@ -2730,21 +2745,53 @@ fn scoped_model<'a>(
 }
 
 fn run_capture(cmd: &str, args: &[&str], stdin_text: Option<&str>) -> Result<String, String> {
+    run_capture_impl(cmd, args, stdin_text, false)
+}
+
+fn run_capture_impl(
+    cmd: &str,
+    args: &[&str],
+    stdin_text: Option<&str>,
+    detailed: bool,
+) -> Result<String, String> {
     use std::io::Write;
+    // All stdin-bearing callers are clipboard writes. Protect their errors
+    // on every platform, including the legacy non-detailed helper path.
+    let protected_diagnostics = detailed || stdin_text.is_some();
     let mut child = std::process::Command::new(cmd)
         .args(args)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .map_err(|e| format!("{cmd}: {e}"))?;
+        .map_err(|e| {
+            if protected_diagnostics {
+                clipboard_diagnostics::failure(cmd, "could not spawn", &e.to_string(), stdin_text)
+            } else {
+                format!("{cmd}: {e}")
+            }
+        })?;
     if let Some(text) = stdin_text {
         if let Some(mut stdin) = child.stdin.take() {
             let _ = stdin.write_all(text.as_bytes());
         }
     }
-    let out = child.wait_with_output().map_err(|e| e.to_string())?;
+    let out = child.wait_with_output().map_err(|e| {
+        if protected_diagnostics {
+            clipboard_diagnostics::failure(cmd, "could not wait", &e.to_string(), stdin_text)
+        } else {
+            e.to_string()
+        }
+    })?;
     if !out.status.success() {
+        if protected_diagnostics {
+            return Err(clipboard_diagnostics::failure(
+                cmd,
+                &format!("exited unsuccessfully ({})", out.status),
+                &String::from_utf8_lossy(&out.stderr),
+                stdin_text,
+            ));
+        }
         return Err(format!(
             "{cmd} failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
@@ -2768,9 +2815,7 @@ fn clipboard_read() -> Result<String, String> {
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        run_capture("wl-paste", &[], None)
-            .or_else(|_| run_capture("xclip", &["-selection", "clipboard", "-o"], None))
-            .or_else(|_| run_capture("xsel", &["--clipboard", "--output"], None))
+        clipboard_diagnostics::read()
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -2795,10 +2840,7 @@ pub fn clipboard_write(text: &str) -> Result<(), String> {
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        run_capture("wl-copy", &[], Some(text))
-            .or_else(|_| run_capture("xclip", &["-selection", "clipboard"], Some(text)))
-            .or_else(|_| run_capture("xsel", &["--clipboard", "--input"], Some(text)))
-            .map(|_| ())
+        clipboard_diagnostics::write(text)
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -2826,6 +2868,18 @@ fn notify(title: &str, body: &str) -> Result<(), String> {
     {
         let _ = (title, body);
         Err("notifications unsupported on this platform".into())
+    }
+}
+
+fn listing_directory<T>(
+    path: &Path,
+    overlay: bool,
+    open: impl FnOnce(&Path) -> std::io::Result<T>,
+) -> Result<Option<T>, String> {
+    match open(path) {
+        Ok(entries) => Ok(Some(entries)),
+        Err(_) if overlay => Ok(None),
+        Err(error) => Err(format!("{}: {error}", path.display())),
     }
 }
 
@@ -3080,10 +3134,10 @@ pub fn check_syntax(code: &str) -> Result<(), String> {
 }
 
 const RUNNER: &str = r#"
-  (function () {
+  (function (heapLimitBytes) {
     // QuickJS throws null when it cannot even allocate the out-of-memory
     // error, so a null exception is reported as out of memory.
-    const fail = (e) => { globalThis.__result_json = JSON.stringify({ ok: false, error: e === null ? "out of memory (heap limit reached)" : String((e && e.message) || e) + "\n" + String((e && e.stack) || ""), nested: __nestedError(e) }); };
+    const fail = (e) => { globalThis.__result_json = JSON.stringify({ ok: false, error: e === null ? "out of memory (heap limit reached) (configured limit: " + heapLimitBytes + " bytes)" : String((e && e.message) || e) + "\n" + String((e && e.stack) || ""), nested: __nestedError(e) }); };
     const done = (v) => {
       try {
         const encoded = JSON.stringify(v === undefined ? null : v);
@@ -3098,8 +3152,12 @@ const RUNNER: &str = r#"
       const out = run(JSON.parse(globalThis.__input_json));
       if (out && typeof out.then === "function") out.then(done, fail); else done(out);
     } catch (e) { fail(e); }
-  })();
+  })
 "#;
+
+fn effective_heap_limit_bytes(memory_mb: u32) -> usize {
+    (memory_mb as usize).saturating_mul(1024 * 1024)
+}
 
 fn nested_error<'js>(
     ctx: &rquickjs::Ctx<'js>,
@@ -3201,7 +3259,8 @@ pub fn execute(req: &ExecRequest, ops: Arc<dyn HostOps>) -> Result<ExecOutcome, 
         },
     )));
 
-    runtime.set_memory_limit((req.memory_mb as usize).saturating_mul(1024 * 1024));
+    let heap_limit_bytes = effective_heap_limit_bytes(req.memory_mb);
+    runtime.set_memory_limit(heap_limit_bytes);
     runtime.set_max_stack_size(1024 * 1024);
     let cancel = req.cancel.clone();
     runtime.set_interrupt_handler(Some(Box::new(move || cancel.load(Ordering::SeqCst))));
@@ -3241,8 +3300,11 @@ pub fn execute(req: &ExecRequest, ops: Arc<dyn HostOps>) -> Result<ExecOutcome, 
             .map_err(|e| err(&e))?;
         let mut runner_options = EvalOptions::default();
         runner_options.filename = Some("formless-runner.js".into());
-        ctx.eval_with_options::<(), _>(RUNNER, runner_options)
-            .map_err(|e| err(&e))
+        ctx.eval_with_options::<(), _>(
+            format!("{}({heap_limit_bytes});", RUNNER.trim()),
+            runner_options,
+        )
+        .map_err(|e| err(&e))
     })?;
     // Event loop: drain the job queue (an async run() settles through it),
     // then fire due timers, waiting until the next one or a nested call's
@@ -3349,6 +3411,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn whole_read_limit_errors_distinguish_exact_byte_counts() {
+        let cap = MAX_READ_BYTES.load(Ordering::Relaxed);
+        let error = over_limit(
+            "fs.read",
+            ReadSize::AtLeast(cap + 1),
+            "tools.max_read_bytes",
+            "use fs.readChunks or fs.readLines",
+        );
+        assert!(error.contains(&(cap + 1).to_string()), "{error}");
+        assert!(error.contains(&cap.to_string()), "{error}");
+        assert!(
+            error.contains("at least"),
+            "bounded probes are not a total size: {error}"
+        );
+        assert!(
+            error.contains("tools.max_read_bytes")
+                && error.contains("fs.readChunks")
+                && error.contains("fs.readLines")
+        );
+    }
+
+    #[test]
     fn structured_incomplete_reasons_keep_runtime_error_classification() {
         use structured_output::{IncompleteReason, StructuredOutputError};
         for (reason, expected) in [
@@ -3431,6 +3515,62 @@ mod tests {
     impl HostOps for ProgressOps {
         fn progress(&self, fraction: Option<f64>, label: &str) {
             self.0.locked().push((fraction, label.to_string()));
+        }
+    }
+
+    #[test]
+    fn progress_label_json_bridge_preserves_codepoints_within_utf16_budget() {
+        // Evaluate only the host prelude with a recording JSON bridge. No Tool
+        // source, Run, host dispatch or progress scheduler is started.
+        let runtime = Runtime::new().unwrap();
+        runtime.set_memory_limit(8 * 1024 * 1024);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        runtime.set_interrupt_handler(Some(Box::new(move || {
+            std::time::Instant::now() >= deadline
+        })));
+        let context = Context::full(&runtime).unwrap();
+        let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+        context.with(|ctx| {
+            let recorded = calls.clone();
+            let host = Function::new(ctx.clone(), move |op: String, args: String| {
+                recorded.locked().push(format!("{op}\n{args}"));
+                r#"{"ok":true,"value":null}"#.to_string()
+            })
+            .unwrap();
+            ctx.globals().set("__host", host).unwrap();
+            ctx.eval::<(), _>(PRELUDE).unwrap();
+            ctx.eval::<(), _>(
+                r#"
+                progress(0.5, "a".repeat(120));
+                progress(7, "a".repeat(119) + "😀");
+                progress(-1, "a".repeat(118) + "😀x");
+                progress(Infinity, "a".repeat(118) + "😀");
+                progress("x", null);
+                progress(NaN, "ไทย\n\"quoted\"");
+                progress(0, "😀".repeat(60));
+                progress(1, "😀".repeat(61));
+            "#,
+            )
+            .unwrap();
+        });
+        let expected = [
+            (json!(0.5), "a".repeat(120)),
+            (json!(1), format!("{}…", "a".repeat(119))),
+            (json!(0), format!("{}…", "a".repeat(118))),
+            (Value::Null, format!("{}😀", "a".repeat(118))),
+            (Value::Null, String::new()),
+            (Value::Null, "ไทย\n\"quoted\"".to_string()),
+            (json!(0), "😀".repeat(60)),
+            (json!(1), format!("{}…", "😀".repeat(59))),
+        ];
+        let calls = calls.locked();
+        assert_eq!(calls.len(), expected.len());
+        for (call, (fraction, label)) in calls.iter().zip(expected) {
+            let args = call.strip_prefix("progress\n").unwrap();
+            let parsed: Value = serde_json::from_str(args)
+                .expect("bridge JSON must decode without lone surrogates");
+            assert_eq!(parsed, json!({"fraction": fraction, "label": label}));
+            assert!(label.encode_utf16().count() <= 120);
         }
     }
 
@@ -4012,6 +4152,51 @@ mod tests {
         }
     }
 
+    #[test]
+    fn generated_heap_diagnostic_reports_only_the_configured_effective_cap() {
+        for (memory_mb, expected_bytes) in [(32, 33_554_432), (96, 100_663_296)] {
+            // Exercise the existing null-exception branch without exhausting a
+            // heap. This does not assert that a null throw proves genuine OOM.
+            let mut request = live("function run() { console.log('fixture log'); throw null; }");
+            request.memory_mb = memory_mb;
+            let error = execute(&request, Arc::new(NoHostOps)).unwrap_err();
+            assert_eq!(
+                error.message,
+                format!(
+                    "out of memory (heap limit reached) (configured limit: {} bytes)",
+                    expected_bytes
+                )
+            );
+            assert!(matches!(error.kind, ExecErrorKind::Resource));
+            assert_eq!(error.logs, vec!["fixture log"]);
+            let mut ordinary =
+                live("function run() { throw new Error('out of memory from the Tool'); }");
+            ordinary.memory_mb = memory_mb;
+            let error = execute(&ordinary, Arc::new(NoHostOps)).unwrap_err();
+            assert!(error.message.starts_with("out of memory from the Tool"));
+            assert!(!error.message.contains("configured limit"));
+            assert_eq!(
+                execute(&live("function run() { return 7; }"), Arc::new(NoHostOps))
+                    .unwrap()
+                    .output,
+                json!(7)
+            );
+        }
+        for memory_mb in [0, 1, 32, u32::MAX] {
+            let mathematical_bytes = u128::from(memory_mb) * 1_048_576;
+            assert_eq!(
+                effective_heap_limit_bytes(memory_mb),
+                mathematical_bytes.min(usize::MAX as u128) as usize
+            );
+        }
+        let unrelated = classify("resource limit: read cap reached", false);
+        assert!(matches!(unrelated.kind, ExecErrorKind::Resource));
+        assert_eq!(unrelated.message, "resource limit: read cap reached");
+        let cancelled = classify("out of memory (heap limit reached)", true);
+        assert!(matches!(cancelled.kind, ExecErrorKind::Cancelled));
+        assert_eq!(cancelled.message, "interrupted");
+    }
+
     /// A real callee serializes a value constructed with JSON.parse, so
     /// __proto__ is already an own data key before nested settlement begins.
     struct JsonCalleeOps;
@@ -4215,6 +4400,157 @@ mod tests {
             out.output["returns"],
             json!([null, null, null, null, null, null, null, null])
         );
+    }
+
+    #[test]
+    fn fs_list_open_keeps_the_first_error_without_consuming_a_later_success() {
+        use std::{cell::Cell, collections::VecDeque, io};
+        let path = Path::new("synthetic-listing-path");
+        let mut results = VecDeque::from([
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "original-open-failure",
+            )),
+            Ok(vec!["later-success"]),
+        ]);
+        let calls = Cell::new(0);
+        let error = listing_directory(path, false, |_| {
+            calls.set(calls.get() + 1);
+            results.pop_front().unwrap()
+        })
+        .unwrap_err();
+        assert_eq!(calls.get(), 1);
+        assert_eq!(error, "synthetic-listing-path: original-open-failure");
+        assert_eq!(
+            results.len(),
+            1,
+            "Err-then-Ok cannot become an empty success through a second open"
+        );
+        for mode in [HostMode::Smoke, HostMode::Replay, HostMode::DryRun] {
+            let result = listing_directory::<()>(path, mode.is_overlay(), |_| {
+                Err(io::Error::new(io::ErrorKind::NotFound, "fixture"))
+            })
+            .unwrap();
+            assert!(
+                result.is_none(),
+                "overlay disk-open failure still falls through"
+            );
+        }
+        assert_eq!(
+            listing_directory(path, false, |_| Ok(vec!["a", "b"])).unwrap(),
+            Some(vec!["a", "b"])
+        );
+    }
+
+    #[test]
+    fn fs_list_names_details_and_overlays_keep_sorted_merge_and_tombstone_results() {
+        struct PrivateDir(PathBuf);
+        impl Drop for PrivateDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let fixture = PrivateDir(
+            std::env::temp_dir().join(format!("fl-list-fixture-{}", uuid::Uuid::new_v4())),
+        );
+        std::fs::create_dir_all(&fixture.0).unwrap();
+        let root = fixture.0.canonicalize().unwrap();
+        std::fs::write(root.join("a.txt"), "aa").unwrap();
+        std::fs::write(root.join("b.txt"), "bbb").unwrap();
+        std::fs::create_dir(root.join("目录")).unwrap();
+        let request = |code: &str, mode| {
+            let mut req = live(code);
+            req.mode = mode;
+            req.input = json!({"root":root});
+            req.caps = Capabilities::parse(&[
+                format!("fs:read:{}", root.display()),
+                format!("fs:write:{}", root.display()),
+            ])
+            .unwrap();
+            req
+        };
+        let out = execute(&request("function run(i) { return {names:fs.list(i.root), details:fs.list(i.root,{details:true})}; }", HostMode::Live), Arc::new(NoHostOps)).unwrap().output;
+        assert_eq!(out["names"], json!(["a.txt", "b.txt", "目录"]));
+        let details = out["details"].as_array().unwrap();
+        assert_eq!(details[0], json!({"name":"a.txt","type":"file","size":2}));
+        assert_eq!(details[1], json!({"name":"b.txt","type":"file","size":3}));
+        assert_eq!(details[2]["name"], "目录");
+        assert_eq!(details[2]["type"], "dir");
+        for mode in [HostMode::Smoke, HostMode::Replay, HostMode::DryRun] {
+            let out = execute(&request(r#"function run(i) {
+              fs.write(i.root+'/b.txt','replacement'); fs.remove(i.root+'/a.txt'); fs.write(i.root+'/added.txt','new');
+              return {names:fs.list(i.root),details:fs.list(i.root,{details:true})};
+            }"#, mode), Arc::new(NoHostOps)).unwrap().output;
+            assert_eq!(out["names"], json!(["added.txt", "b.txt", "目录"]));
+            assert_eq!(
+                out["details"][0],
+                json!({"name":"added.txt","type":"file","size":3})
+            );
+            assert_eq!(
+                out["details"][1],
+                json!({"name":"b.txt","type":"file","size":11})
+            );
+            let out = execute(&request(r#"function run(i) {
+              const path=i.root+'/missing'; const before=fs.list(path); fs.write(path+'/made','new');
+              return {before,after:fs.list(path),details:fs.list(path,{details:true})};
+            }"#, mode), Arc::new(NoHostOps)).unwrap().output;
+            assert_eq!(
+                out,
+                json!({"before":[],"after":["made"],"details":[{"name":"made","type":"file","size":3}]})
+            );
+        }
+        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "aa");
+        assert_eq!(std::fs::read_to_string(root.join("b.txt")).unwrap(), "bbb");
+        assert!(!root.join("added.txt").exists() && !root.join("missing").exists());
+        let error = execute(
+            &request(
+                "function run(i) { return fs.list(i.root+'/missing'); }",
+                HostMode::Live,
+            ),
+            Arc::new(NoHostOps),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .message
+                .contains(&root.join("missing").display().to_string()),
+            "{}",
+            error.message
+        );
+        let mut tombstone = request(
+            "function run(i) { return fs.list(i.root); }",
+            HostMode::Replay,
+        );
+        let overlay = new_overlay();
+        overlay
+            .lock()
+            .unwrap()
+            .insert(root.to_string_lossy().into_owned(), None);
+        tombstone.overlay = Some(overlay);
+        assert_eq!(
+            execute(&tombstone, Arc::new(NoHostOps)).unwrap().output,
+            json!([])
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            std::fs::write(
+                root.join(std::ffi::OsString::from_vec(vec![b'b', 255])),
+                "fixture",
+            )
+            .unwrap();
+            for details in [false, true] {
+                let mut req = request(
+                    "function run(i) { return fs.list(i.root,{details:i.details}); }",
+                    HostMode::Live,
+                );
+                req.input["details"] = json!(details);
+                assert!(execute(&req, Arc::new(NoHostOps))
+                    .unwrap_err()
+                    .message
+                    .contains("directory entry path is not UTF-8"));
+            }
+        }
     }
 
     #[test]

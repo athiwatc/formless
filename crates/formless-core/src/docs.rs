@@ -1,5 +1,5 @@
-//! The user docs (SPEC §10.9): topics `/docs` and `formless docs` open,
-//! and opening a URL in the user's browser.
+//! Build-matched Markdown, current online guide topics (SPEC §10.9),
+//! and bounded browser opening.
 
 /// Where the docs live (the repository's `docs/` and SPEC).
 pub const BASE: &str = "https://github.com/athiwatc/formless/blob/main/";
@@ -27,9 +27,10 @@ pub const TOPICS: &[(&str, &str, &str)] = &[
         "docs/troubleshooting.md",
         "common problems and fixes",
     ),
-    ("mcp", "SPEC.md#79-external-mcp-servers", "MCP servers"),
-    ("skills", "SPEC.md#710-skills", "Skills"),
-    ("jobs", "SPEC.md#97-scheduled-jobs", "scheduled jobs"),
+    ("docker", "docs/docker.md", "running the daemon in Docker"),
+    ("mcp", "docs/mcp.md", "MCP servers"),
+    ("skills", "docs/skills.md", "Skills"),
+    ("jobs", "docs/jobs.md", "scheduled jobs"),
     ("spec", "SPEC.md", "the full specification"),
 ];
 
@@ -59,6 +60,10 @@ impl std::error::Error for TopicError {}
 
 /// Resolve an exact name or an unambiguous prefix; omitted/blank means gallery.
 pub fn resolve(topic: Option<&str>) -> Result<String, TopicError> {
+    resolve_path(topic).map(|path| format!("{BASE}{path}"))
+}
+
+fn resolve_path(topic: Option<&str>) -> Result<&'static str, TopicError> {
     let input = topic.unwrap_or("gallery").trim().to_ascii_lowercase();
     let input = if input.is_empty() {
         "gallery".to_string()
@@ -66,20 +71,181 @@ pub fn resolve(topic: Option<&str>) -> Result<String, TopicError> {
         input
     };
     if let Some((_, path, _)) = TOPICS.iter().find(|(name, _, _)| *name == input) {
-        return Ok(format!("{BASE}{path}"));
+        return Ok(path);
     }
     let matching: Vec<_> = TOPICS
         .iter()
         .filter(|(name, _, _)| name.starts_with(&input))
         .collect();
     match matching.as_slice() {
-        [(_, path, _)] => Ok(format!("{BASE}{path}")),
+        [(_, path, _)] => Ok(path),
         [] => Err(TopicError::Unknown(input)),
         _ => Err(TopicError::Ambiguous {
             input,
             candidates: matching.iter().map(|(name, _, _)| *name).collect(),
         }),
     }
+}
+
+/// Bundled content failures stay distinct from topic-usage mistakes.
+#[derive(Debug)]
+pub enum TextError {
+    Topic(TopicError),
+    Unavailable(String),
+    MissingAnchor(String),
+    DuplicateAnchor(String),
+}
+impl std::fmt::Display for TextError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Topic(error) => error.fmt(f),
+            Self::Unavailable(path) => write!(f, "no bundled guide for {path:?}"),
+            Self::MissingAnchor(anchor) => write!(f, "bundled guide heading {anchor:?} is missing"),
+            Self::DuplicateAnchor(anchor) => {
+                write!(f, "bundled guide heading {anchor:?} is ambiguous")
+            }
+        }
+    }
+}
+impl std::error::Error for TextError {}
+
+fn embedded(path: &str) -> Option<&'static str> {
+    Some(match path {
+        "docs/gallery.md" => include_str!("../../../docs/gallery.md"),
+        "docs/capabilities.md" => include_str!("../../../docs/capabilities.md"),
+        "docs/keys.md" => include_str!("../../../docs/keys.md"),
+        "docs/troubleshooting.md" => include_str!("../../../docs/troubleshooting.md"),
+        "docs/docker.md" => include_str!("../../../docs/docker.md"),
+        "docs/mcp.md" => include_str!("../../../docs/mcp.md"),
+        "docs/skills.md" => include_str!("../../../docs/skills.md"),
+        "docs/jobs.md" => include_str!("../../../docs/jobs.md"),
+        "SPEC.md" => include_str!("../../../SPEC.md"),
+        _ => return None,
+    })
+}
+
+/// Markdown compiled into this build: no config, filesystem or network access.
+pub fn text(topic: Option<&str>) -> Result<&'static str, TextError> {
+    let path = resolve_path(topic).map_err(TextError::Topic)?;
+    let (file, anchor) = path
+        .split_once('#')
+        .map_or((path, None), |(file, anchor)| (file, Some(anchor)));
+    let content = embedded(file).ok_or_else(|| TextError::Unavailable(file.into()))?;
+    match anchor {
+        Some(anchor) => section(content, anchor),
+        None => Ok(content),
+    }
+}
+
+/// Select top-level CommonMark heading subtrees from original byte offsets.
+/// Inline markup/entities contribute rendered heading text; fenced/indented
+/// code and headings quoted inside examples cannot terminate a section.
+/// Bundled URL anchors are punctuation-stripped heading labels. Duplicate
+/// labels are errors, rather than guessing a host's generated suffix policy.
+fn section<'a>(content: &'a str, anchor: &str) -> Result<&'a str, TextError> {
+    use pulldown_cmark::{Event, Parser, Tag, TagEnd};
+    let mut headings = Vec::new();
+    let mut current = None;
+    let mut depth = 0usize;
+    for (event, range) in Parser::new(content).into_offset_iter() {
+        match event {
+            Event::Start(tag) => {
+                if let Tag::Heading { level, .. } = tag {
+                    if depth == 0 {
+                        current = Some((range.start, level, String::new()));
+                    }
+                }
+                depth += 1;
+            }
+            Event::End(tag) => {
+                depth = depth.saturating_sub(1);
+                if matches!(tag, TagEnd::Heading(_)) && depth == 0 {
+                    if let Some((start, level, title)) = current.take() {
+                        let slug: String = title
+                            .chars()
+                            .filter_map(|c| match c {
+                                ' ' | '-' => Some('-'),
+                                c if c.is_alphanumeric() || c == '_' => {
+                                    Some(c.to_ascii_lowercase())
+                                }
+                                _ => None,
+                            })
+                            .collect();
+                        headings.push((start, level, slug));
+                    }
+                }
+            }
+            Event::Text(text) | Event::Code(text) => {
+                if let Some((_, _, title)) = current.as_mut() {
+                    title.push_str(&text);
+                }
+            }
+            Event::SoftBreak | Event::HardBreak => {
+                if let Some((_, _, title)) = current.as_mut() {
+                    title.push(' ');
+                }
+            }
+            _ => {}
+        }
+    }
+    let matches: Vec<_> = headings
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, _, slug))| slug == anchor)
+        .map(|(i, _)| i)
+        .collect();
+    let index = match matches.as_slice() {
+        [index] => *index,
+        [] => return Err(TextError::MissingAnchor(anchor.into())),
+        _ => return Err(TextError::DuplicateAnchor(anchor.into())),
+    };
+    let (start, level, _) = &headings[index];
+    let end = headings[index + 1..]
+        .iter()
+        .find(|(_, next, _)| next <= level)
+        .map_or(content.len(), |(start, _, _)| *start);
+    Ok(&content[*start..end])
+}
+
+/// The slash clients accept --text before or after the existing topic. Without
+/// the flag the original topic text passes through, retaining usage mistakes.
+pub fn text_option(input: &str) -> (String, bool) {
+    if input.split_whitespace().any(|word| word == "--text") {
+        (
+            input
+                .split_whitespace()
+                .filter(|word| *word != "--text")
+                .collect::<Vec<_>>()
+                .join(" "),
+            true,
+        )
+    } else {
+        (input.trim().into(), false)
+    }
+}
+
+pub struct Presentation {
+    pub url: String,
+    pub text: Option<&'static str>,
+}
+
+/// Explicit text never launches an opener. A failed/unavailable opener returns
+/// bundled text too; callers retain and label the current online URL separately.
+pub fn present(topic: Option<&str>, explicit_text: bool) -> Result<Presentation, TextError> {
+    present_with(topic, explicit_text, open_url)
+}
+fn present_with(
+    topic: Option<&str>,
+    explicit_text: bool,
+    open: impl FnOnce(&str) -> bool,
+) -> Result<Presentation, TextError> {
+    let url = resolve(topic).map_err(TextError::Topic)?;
+    let text = if !explicit_text && open(&url) {
+        None
+    } else {
+        Some(text(topic)?)
+    };
+    Ok(Presentation { url, text })
 }
 
 /// A compatibility lookup for callers that only need a valid URL.
@@ -181,7 +347,7 @@ mod tests {
         assert_eq!(resolve(None), resolve(Some("  ")));
         assert!(resolve(Some(" SKILLS "))
             .unwrap()
-            .ends_with("SPEC.md#710-skills"));
+            .ends_with("docs/skills.md"));
         assert!(resolve(Some("spe")).unwrap().ends_with("SPEC.md"));
         assert_eq!(
             resolve(Some("s")),
@@ -337,3 +503,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "docs_text_tests.rs"]
+mod text_tests;

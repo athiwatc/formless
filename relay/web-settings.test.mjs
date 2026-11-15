@@ -12,6 +12,7 @@ function fixture() {
   const calls = [], notes = [], errors = [];
   const c = vm.createContext({
     uiFormat: value => String(value), calls, notes, errors,
+    h: (tag, attrs, ...kids) => ({tag, attrs, kids}),
     act: async req => { calls.push(JSON.parse(JSON.stringify(req))); return { applies: req.key === 'tui.on_start' ? 'on_tui_start' : 'now' }; },
     note: text => notes.push(text), toast: text => errors.push(text), refreshSettings: () => {},
   });
@@ -86,7 +87,22 @@ test('Edit submits existing SetSetting requests with typed values and correct st
 test('cancelled or malformed edits never submit requests', async () => {
   const c = fixture();
   c.ask = async () => null; await c.editSetting('provider.model', 'old', 'text');
-  c.ask = async () => 'NaN'; await c.editSetting('provider.max_retries', 5, 'number');
-  c.ask = async () => '{bad'; await c.editSetting('provider.prices', {}, 'json');
-  assert.deepEqual(c.calls, []); assert.equal(c.errors.length, 2);
+  for (const [kind, current, invalid] of [['number',5,'NaN'], ['json',{},'{bad'], ['list',[],'[bad']]) {
+    const prompts=[];const replies=[invalid,null];
+    c.ask = async opts => {prompts.push(opts);return replies.shift();};
+    await c.editSetting('fixture.value',current,kind);
+    assert.equal(prompts[1].value,invalid);
+    assert.equal(prompts[1].body.attrs.role,'alert');
+    assert.ok(prompts[1].body.kids[0]);
+  }
+  assert.deepEqual(c.calls, []); assert.equal(c.errors.length, 0);
+});
+
+
+test('invalid Settings text can be corrected before the only update request', async () => {
+  const c=fixture();const replies=['  {bad  ','{"fixed":[1,2]}'];const prompts=[];
+  c.ask=async opts=>{assert.equal(c.calls.length,0);prompts.push(opts);return replies.shift();};
+  await c.editSetting('fixture.value',{},'json');
+  assert.equal(prompts[1].value,'  {bad  ');
+  assert.deepEqual(plain(c.calls),[{type:'set_setting',key:'fixture.value',value:{fixed:[1,2]}}]);
 });

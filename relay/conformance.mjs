@@ -3,11 +3,21 @@ import assert from 'node:assert/strict';
 import {daemonClaim,claimRoom,claimAuthorization} from './daemon-claim.mjs';
 import {wireOpen,wireWait} from './test-wire.mjs';
 import {server,endpoints,EndpointPeer,deadline} from './test-bounded-wire.mjs';
+import {conformanceBase} from './conformance-base.mjs';
 let s,base=process.argv[2];
-if(!base){s=await server();base=new URL(s.base).origin.replace(/^ws/,'http');}
+let explicit;
+try {
+ if(process.argv.length>3)throw new Error('expected at most one BASE argument');
+ if(base!==undefined)explicit=conformanceBase(base);
+}catch(error){
+ console.error('Usage: node relay/conformance.mjs [HTTP(S)_ORIGIN]\n'+error.message);
+ process.exit(2);
+}
+if(!explicit){s=await server();base=new URL(s.base).origin.replace(/^ws/,'http');}
 else{
+ base=explicit.http;
  const claim=await daemonClaim(crypto.getRandomValues(new Uint8Array(32))),room=await claimRoom(claim),authorization=claimAuthorization(claim),peers=[];
- const target=base.replace(/^http/,'ws').replace(/\/$/,'')+'/relay/'+room;
+ const target=explicit.websocket+'/relay/'+room;
  s={base:target,authorization,async open(role){const peer=await wireOpen(target+`?role=${role}&mux=1&transport=1`,role==='daemon'?authorization:undefined);peers.push(peer);return peer;},async close(){for(const p of peers)p.terminate();}};
 }
 try{

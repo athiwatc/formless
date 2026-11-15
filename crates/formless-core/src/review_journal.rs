@@ -34,6 +34,8 @@ struct Image {
     security_complete: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     windows_identity: Option<crate::review_file_io::WindowsIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    unix_metadata: Option<crate::review_unix_metadata::UnixMetadata>,
 }
 impl Image {
     fn capture(image: &ReviewImage) -> Result<Self> {
@@ -50,6 +52,7 @@ impl Image {
         {
             bail!("Security metadata exceeds review receipt limit");
         }
+        image.ensure_consistent()?;
         Ok(Self {
             integrity: image.integrity_hash()?,
             security_complete: image.security_complete,
@@ -66,6 +69,7 @@ impl Image {
                 .security
                 .as_ref()
                 .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes)),
+            unix_metadata: image.unix_metadata.clone(),
         })
     }
     fn decode_bounded(&self, limit: usize) -> Result<ReviewImage> {
@@ -103,7 +107,8 @@ impl Image {
                 || self.owner.is_some()
                 || self.group.is_some()
                 || security.is_some()
-                || self.windows_identity.is_some())
+                || self.windows_identity.is_some()
+                || self.unix_metadata.is_some())
         {
             bail!("Missing review image contains invalid mode metadata");
         }
@@ -116,11 +121,13 @@ impl Image {
             security,
             security_complete: self.security_complete,
             windows_identity: self.windows_identity.clone(),
+            unix_metadata: self.unix_metadata.clone(),
             ..Default::default()
         };
         if image.integrity_hash()? != self.integrity {
             bail!("Private recovery image integrity mismatch");
         }
+        image.ensure_consistent()?;
         Ok(image)
     }
 }
@@ -872,6 +879,7 @@ mod tests {
             bytes: Some(text.to_vec()),
             mode: Some(if cfg!(unix) { 0o100600 } else { 32 }),
             readonly: false,
+            unix_metadata: None,
             ..Default::default()
         }
     }
@@ -2031,5 +2039,112 @@ mod tests {
                 })
             },
         );
+    }
+
+    #[test]
+    fn unix_metadata_unknown_version_and_missing_image_fail_closed() {
+        let valid = crate::review_unix_metadata::UnixMetadata::try_new(
+            crate::review_unix_metadata::UnixPlatform::Linux,
+            vec![("user.a".into(), b"b".to_vec())],
+        )
+        .unwrap();
+        let bad = valid.clone().with_version_for_test(2);
+        let mut review = image(b"kept");
+        review.unix_metadata = Some(bad.clone());
+        assert!(Image::capture(&review).is_err());
+        let integrity = review.integrity_hash().unwrap();
+        let record = Image {
+            base64: Some(base64::engine::general_purpose::STANDARD.encode(b"kept")),
+            mode: review.mode,
+            readonly: review.readonly,
+            owner: review.owner,
+            group: review.group,
+            security: None,
+            integrity,
+            security_complete: review.security_complete,
+            windows_identity: None,
+            unix_metadata: Some(bad),
+        };
+        assert!(record
+            .decode_bounded(MAX_REVIEW_BYTES)
+            .unwrap_err()
+            .to_string()
+            .contains("Unsupported Unix metadata version"));
+        let mut missing = ReviewImage::missing();
+        missing.unix_metadata = Some(valid);
+        assert!(Image::capture(&missing).is_err());
+        let integrity = missing.integrity_hash().unwrap();
+        let record = Image {
+            base64: None,
+            mode: None,
+            readonly: false,
+            owner: None,
+            group: None,
+            security: None,
+            integrity,
+            security_complete: true,
+            windows_identity: None,
+            unix_metadata: missing.unix_metadata,
+        };
+        assert!(record
+            .decode_bounded(MAX_REVIEW_BYTES)
+            .unwrap_err()
+            .to_string()
+            .contains("Missing review image"));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn unix_metadata_receipt_roundtrip_tamper_and_ambiguous_phase() {
+        let plain = image(b"plain");
+        let metadata = crate::review_unix_metadata::UnixMetadata::try_new(
+            crate::review_unix_metadata::UnixPlatform::current().unwrap(),
+            vec![
+                ("user.formless_a".into(), b"\0\xff".to_vec()),
+                ("user.formless_empty".into(), Vec::new()),
+            ],
+        )
+        .unwrap();
+        let mut with = plain.clone();
+        with.unix_metadata = Some(metadata);
+        let untouched = receipt(&plain, &plain);
+        let json = serde_json::to_string(&untouched).unwrap();
+        assert!(!json.contains("unix_metadata"));
+        let loaded: Receipt = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.checksum().unwrap(), untouched.integrity);
+        assert!(loaded.images().unwrap().0.unix_metadata.is_none());
+        let action = receipt(&with, &with);
+        assert_eq!(action.format_version, 1);
+        assert_eq!(action.images().unwrap(), (with.clone(), with.clone()));
+        assert!(serde_json::to_string(&action)
+            .unwrap()
+            .contains("unix_metadata"));
+        let mut value = serde_json::to_value(&action).unwrap();
+        value["before"]["unix_metadata"]["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<Receipt>(value).is_err());
+        let mut value = serde_json::to_value(&action).unwrap();
+        value["before"]["unix_metadata"]["entries"][0]["value_b64"] = serde_json::json!("Yg==");
+        let mut tampered: Receipt = serde_json::from_value(value).unwrap();
+        assert!(tampered.images().is_err());
+        tampered.refresh_integrity().unwrap();
+        assert!(tampered
+            .images()
+            .unwrap_err()
+            .to_string()
+            .contains("image integrity"));
+        let mut other = with.clone();
+        other.unix_metadata = Some(
+            crate::review_unix_metadata::UnixMetadata::try_new(
+                crate::review_unix_metadata::UnixPlatform::current().unwrap(),
+                vec![("user.formless_a".into(), b"zz".to_vec())],
+            )
+            .unwrap(),
+        );
+        assert_eq!(action.observed_phase(&other).unwrap(), Phase::Ambiguous);
+        assert_eq!(action.phase, Phase::Prepared);
+        let mut format = action.clone();
+        format.format_version = 3;
+        format.refresh_integrity().unwrap();
+        assert!(format.images().is_err());
     }
 }
