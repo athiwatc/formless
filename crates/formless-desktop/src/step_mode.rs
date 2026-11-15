@@ -1,4 +1,4 @@
-//! Explicit, restrictive Session Step-mode enabling. Never approves/releases a Tool.
+//! Explicit Session Step-mode changes. Never approves or releases a waiting Tool.
 use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -11,6 +11,7 @@ pub struct Action {
     pub view_epoch: u64,
     pub operation: uuid::Uuid,
     pub session_id: String,
+    pub on: bool,
 }
 impl Action {
     pub fn valid(&self) -> bool {
@@ -25,6 +26,8 @@ impl Action {
 pub enum Outcome {
     Enabled,
     ObservedEnabled,
+    Disabled,
+    ObservedDisabled,
     Rejected(String),
     Unknown,
 }
@@ -53,14 +56,16 @@ impl Status {
     }
     pub fn notice(&self) -> Option<&str> {
         match self {
-        Self::Idle=>None,
-        Self::Reserved(_)=>Some("Revalidating Step mode; Enable has not been written."),
-        Self::Sent(_)=>Some("Enable Step mode may have been written; awaiting its receipt. No automatic retry."),
-        Self::Finished{outcome:Outcome::Enabled,..}=>Some("Step mode enabled for the reviewed Session. No Tool was approved or released."),
-        Self::Finished{outcome:Outcome::ObservedEnabled,..}=>Some("A fresh read already shows Step mode enabled. No setting was sent."),
-        Self::Finished{outcome:Outcome::Rejected(reason),..}=>Some(reason),
-        Self::Finished{outcome:Outcome::Unknown,..}=>Some("Step-mode outcome unknown. Inspect fresh state or Formless TUI; native enables are blocked for this client. Nothing is replayed."),
-    }
+            Self::Idle => None,
+            Self::Reserved(a) => Some(if a.on { "Revalidating Step mode; Enable has not been written." } else { "Revalidating idle Session and empty Step inventory; Disable has not been written." }),
+            Self::Sent(a) => Some(if a.on { "Enable Step mode may have been written; awaiting its receipt. No automatic retry." } else { "Disable Step mode may have been written; awaiting its receipt. No automatic retry." }),
+            Self::Finished { outcome: Outcome::Enabled, .. } => Some("Step mode enabled for the reviewed Session. No Tool was approved or released."),
+            Self::Finished { outcome: Outcome::ObservedEnabled, .. } => Some("A fresh read already shows Step mode enabled. No setting was sent."),
+            Self::Finished { outcome: Outcome::Disabled, .. } => Some("Step mode disabled for the reviewed Session. Future Tool calls will not pause; existing waiting Steps remain pending. No Tool security approval was granted."),
+            Self::Finished { outcome: Outcome::ObservedDisabled, .. } => Some("A fresh read already shows Step mode disabled. No setting was sent."),
+            Self::Finished { outcome: Outcome::Rejected(reason), .. } => Some(reason),
+            Self::Finished { outcome: Outcome::Unknown, .. } => Some("Step-mode outcome unknown. Inspect fresh state or Formless TUI; native mode changes are blocked for this Client. Nothing is replayed."),
+        }
     }
     pub fn action(&self) -> Option<&Action> {
         match self {
@@ -95,14 +100,14 @@ impl Ledger {
     }
     pub(crate) fn reserve(self: &Arc<Self>, action: Action) -> Result<Dispatch, &'static str> {
         if !action.valid() {
-            return Err("Invalid Session or operation; Enable was not queued.");
+            return Err("Invalid Session or operation; no mode change was queued.");
         }
         let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
         if state.status.blocked() {
-            return Err("A mode enable is pending or unknown. Inspect the receipt/TUI; no retry was queued.");
+            return Err("A mode change is pending or unknown. Inspect the receipt/TUI; no retry was queued.");
         }
         if state.operations.contains(&action.operation) {
-            return Err("This enable operation was already spent; use a fresh control.");
+            return Err("This mode operation was already spent; use a fresh control.");
         }
         if state.operations.len() >= MAX_OPERATIONS {
             return Err("Native mode receipt capacity reached for this client; use Formless TUI or a new attachment.");
@@ -125,7 +130,7 @@ impl Drop for Owner {
         let mut s = self.ledger.0.lock().unwrap_or_else(|e| e.into_inner());
         let outcome = match &s.status {
             Status::Reserved(a) if a == &self.action => Some(Outcome::Rejected(
-                "Enable was not written; review again explicitly.".into(),
+                "Mode change was not written; review again explicitly.".into(),
             )),
             Status::Sent(a) if a == &self.action => Some(Outcome::Unknown),
             _ => None,
@@ -165,8 +170,12 @@ impl Dispatch {
             };
         }
     }
-    pub(crate) fn observed_enabled(&self) {
-        self.finish_reserved(Outcome::ObservedEnabled);
+    pub(crate) fn observed_target(&self) {
+        self.finish_reserved(if self.action().on {
+            Outcome::ObservedEnabled
+        } else {
+            Outcome::ObservedDisabled
+        });
     }
     pub(crate) fn before_write(&self) -> bool {
         let mut s = self.0.ledger.0.lock().unwrap_or_else(|e| e.into_inner());
@@ -189,8 +198,16 @@ impl Dispatch {
 }
 pub(crate) fn decode(action: &Action, result: Result<Value, String>, ok: bool) -> Outcome {
     match result {
-        Ok(v) if ok && v["session_id"].as_str() == Some(&action.session_id) && v["on"] == true => {
-            Outcome::Enabled
+        Ok(v)
+            if ok
+                && v["session_id"].as_str() == Some(&action.session_id)
+                && v["on"].as_bool() == Some(action.on) =>
+        {
+            if action.on {
+                Outcome::Enabled
+            } else {
+                Outcome::Disabled
+            }
         }
         Err(e) if !ok => Outcome::Rejected(e.chars().take(500).collect()),
         _ => Outcome::Unknown,
@@ -208,6 +225,7 @@ mod tests {
             view_epoch: 3,
             operation: uuid::Uuid::new_v4(),
             session_id: "s".into(),
+            on: true,
         }
     }
     #[test]
@@ -266,7 +284,7 @@ mod tests {
         let l = Arc::new(Ledger::default());
         let first = action();
         let d = l.reserve(first.clone()).unwrap();
-        d.observed_enabled();
+        d.observed_target();
         drop(d);
         for _ in 1..MAX_OPERATIONS {
             let d = l.reserve(action()).unwrap();
@@ -281,7 +299,7 @@ mod tests {
         let l = Arc::new(Ledger::default());
         let d = l.reserve(action()).unwrap();
         assert!(l.reserve(action()).is_err());
-        d.observed_enabled();
+        d.observed_target();
         assert!(!d.before_write());
         assert!(matches!(
             l.status(),
@@ -304,6 +322,7 @@ mod boundary_tests {
             view_epoch: 0,
             operation: uuid::Uuid::new_v4(),
             session_id: "s".into(),
+            on: true,
         }
     }
     #[test]
@@ -337,5 +356,49 @@ mod boundary_tests {
                 ..
             }
         ));
+    }
+}
+
+#[cfg(test)]
+mod disable_receipt_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn false_receipt_is_exact_and_operations_cannot_be_reused_by_flipping_target() {
+        let a = Action {
+            client: uuid::Uuid::new_v4(),
+            connection: 1,
+            generation: 1,
+            view_epoch: 1,
+            operation: uuid::Uuid::new_v4(),
+            session_id: "s".into(),
+            on: false,
+        };
+        assert_eq!(
+            decode(&a, Ok(json!({"session_id":"s","on":false})), true),
+            Outcome::Disabled
+        );
+        for v in [
+            json!({"session_id":"s","on":true}),
+            json!({"session_id":"other","on":false}),
+            json!({"session_id":"s","on":"false"}),
+            json!({"session_id":"s"}),
+        ] {
+            assert_eq!(decode(&a, Ok(v), true), Outcome::Unknown);
+        }
+        let ledger = Arc::new(Ledger::default());
+        let d = ledger.reserve(a.clone()).unwrap();
+        d.observed_target();
+        assert!(matches!(
+            ledger.status(),
+            Status::Finished {
+                outcome: Outcome::ObservedDisabled,
+                ..
+            }
+        ));
+        let mut flipped = a;
+        flipped.on = true;
+        assert!(ledger.reserve(flipped).is_err());
+        assert!(!d.before_write());
     }
 }

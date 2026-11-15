@@ -207,9 +207,14 @@ prompt can be reviewed with native Continue, Skip, Edit or Session Step-off;
 unsupported and multiple prompts use the Formless TUI. Enable Step mode is an
 explicit, freshly revalidated Session control. It only turns the mode on for
 this daemon lifetime; it never approves or releases a Tool. Missing sampled
-mode disables the control, and an uncertain write blocks further native enables
+mode disables the control, and an uncertain write blocks further native mode changes
 for that Client without replay. See the [enable report](../../docs/desktop/step-mode-enable-20261115.md)
-for ownership, receipt limits and validation. Native OS acceptance and full Step
+for ownership, receipt limits and validation. Idle Disable now changes future
+Step pauses after a fresh idle/empty-inventory read; it does not release waiting
+Steps or approve Tools. Its observed-event fences are not an atomic idle
+guarantee against other clients. See the
+[idle Step-off report](../../docs/desktop/idle-step-off-20261115.md).
+Native OS acceptance and full Step
 and security-approval parity remain open. See the
 [native approval report](../../docs/desktop/native-approval-20261115.md).
 

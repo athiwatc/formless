@@ -171,6 +171,7 @@ pub enum Update {
 pub enum Command {
     DecideStep(crate::step_decision::Dispatch),
     EnableStepMode(crate::step_mode::Dispatch),
+    DisableStepMode(crate::step_mode::Dispatch),
     ReadApprovals {
         connection: u64,
         operation: uuid::Uuid,
@@ -269,7 +270,7 @@ impl Drop for Client {
         self.invalidate_context();
         advance_epoch(&self.stream_epoch);
         self.mode_ledger
-            .cancel_unsent("Client closed before writing; Enable was not sent.");
+            .cancel_unsent("Client closed before writing; no mode setting was sent.");
         let _ = self.stop.send(true);
     }
 }
@@ -397,14 +398,32 @@ impl Client {
         self.mode_ledger.status()
     }
     pub fn enable_step_mode(&self, action: crate::step_mode::Action) -> Result<(), &'static str> {
-        if !self.is_ready()
+        self.queue_mode_change(action, true)
+    }
+    pub fn disable_step_mode(&self, action: crate::step_mode::Action) -> Result<(), &'static str> {
+        self.queue_mode_change(action, false)
+    }
+    fn queue_mode_change(
+        &self,
+        action: crate::step_mode::Action,
+        on: bool,
+    ) -> Result<(), &'static str> {
+        if action.on != on
+            || !self.is_ready()
             || action.client != self.instance()
             || action.connection != self.connection()
             || action.view_epoch != self.stream_epoch()
         {
-            return Err("Session view or connection changed; Enable was not queued.");
+            return Err(
+                "Session view, mode target or connection changed; no mode change was queued.",
+            );
         }
-        self.send(Command::EnableStepMode(self.mode_ledger.reserve(action)?))
+        let dispatch = self.mode_ledger.reserve(action)?;
+        self.send(if on {
+            Command::EnableStepMode(dispatch)
+        } else {
+            Command::DisableStepMode(dispatch)
+        })
     }
     #[cfg(feature = "test-support")]
     pub fn finish_recorded_approval(&self, d: &crate::approvals::Dispatch, value: Value) {
@@ -444,15 +463,16 @@ impl Client {
             }
         }
 
-        if let Command::EnableStepMode(d) = &command {
-            if !d.owned_by(&self.mode_ledger)
+        if let Command::EnableStepMode(d) | Command::DisableStepMode(d) = &command {
+            if d.action().on != matches!(&command, Command::EnableStepMode(_))
+                || !d.owned_by(&self.mode_ledger)
                 || !self.is_ready()
                 || d.action().client != self.instance()
                 || d.action().connection != self.connection()
                 || d.action().view_epoch != self.stream_epoch()
             {
-                d.reject("Session view or connection changed; Enable was not queued.");
-                return Err("Session view or connection changed; Enable was not queued.");
+                d.reject("Session view or connection changed; no mode setting was queued.");
+                return Err("Session view or connection changed; no mode setting was queued.");
             }
         }
         if let Command::DecideStep(dispatch) = &command {
@@ -470,7 +490,7 @@ impl Client {
             self.invalidate_context();
             advance_epoch(&self.stream_epoch);
             self.mode_ledger.cancel_unsent(
-                "Selection or connection changed before writing; Enable was not sent.",
+                "Selection or connection changed before writing; no mode setting was sent.",
             );
         }
         if matches!(
@@ -893,6 +913,22 @@ impl Engine {
         Ok(())
     }
 
+    fn begin_mode_change(&mut self, dispatch: crate::step_mode::Dispatch, on: bool) {
+        if self.pending.values().any(|p|matches!(p,Pending::ModeInspect{dispatch:d,..}|Pending::ModeCommit{dispatch:d,..} if d.action().operation==dispatch.action().operation)){return;}
+        if dispatch.action().on != on || !self.mode_current(&dispatch) || !dispatch.reserved() {
+            dispatch.reject("Session view or mode target changed; no setting was sent.");
+        } else {
+            self.request(
+                Request::GetSession {
+                    id: dispatch.action().session_id.clone(),
+                },
+                Pending::ModeInspect {
+                    dispatch,
+                    revision: self.status_revision,
+                },
+            );
+        }
+    }
     fn mode_current(&self, d: &crate::step_mode::Dispatch) -> bool {
         let a = d.action();
         self.ready
@@ -903,7 +939,7 @@ impl Engine {
             && a.view_epoch == self.stream_epoch
             && self.active.as_deref() == Some(a.session_id.as_str())
     }
-    fn retire_mode_enables(&mut self) {
+    fn retire_mode_changes(&mut self) {
         let ids = self
             .pending
             .iter()
@@ -936,7 +972,8 @@ impl Engine {
                 Pending::ModeInspect { dispatch, .. } | Pending::ModeCommit { dispatch, .. },
             ) = self.pending.remove(&id)
             {
-                dispatch.reject("Session/Run/Step changed before writing; Enable was not sent.");
+                dispatch
+                    .reject("Session/Run/Step changed before writing; no mode setting was sent.");
             }
         }
     }
@@ -947,7 +984,7 @@ impl Engine {
             .ok_or("Session status revision exhausted")?;
         self.sync_epoch(self.epoch);
         self.retire_step_reviews(true);
-        self.retire_mode_enables();
+        self.retire_mode_changes();
         self.dirty_session = true;
         if let Some(session_id) = self.active.clone() {
             self.updates.push(Update::SessionStatusInvalidated {
@@ -1258,22 +1295,8 @@ impl Engine {
                     );
                 }
             }
-            Command::EnableStepMode(dispatch) => {
-                if self.pending.values().any(|p|matches!(p,Pending::ModeInspect{dispatch:d,..}|Pending::ModeCommit{dispatch:d,..} if d.action().operation==dispatch.action().operation)){return;}
-                if !self.mode_current(&dispatch) || !dispatch.reserved() {
-                    dispatch.reject("Session view changed; Enable was not sent.");
-                } else {
-                    self.request(
-                        Request::GetSession {
-                            id: dispatch.action().session_id.clone(),
-                        },
-                        Pending::ModeInspect {
-                            dispatch,
-                            revision: self.status_revision,
-                        },
-                    );
-                }
-            }
+            Command::EnableStepMode(dispatch) => self.begin_mode_change(dispatch, true),
+            Command::DisableStepMode(dispatch) => self.begin_mode_change(dispatch, false),
             Command::DecideStep(dispatch) => {
                 if self.pending.values().any(|p|matches!(p,Pending::StepInspect(d)|Pending::StepCommit(d) if d.action().operation==dispatch.action().operation)){return;}
                 if !self.step_current(&dispatch) || !dispatch.reserved() {
@@ -1789,7 +1812,7 @@ impl Engine {
                     // can commit one based on the old Run or Step inventory.
                     self.sync_epoch(self.epoch);
                     self.retire_step_reviews(true);
-                    self.retire_mode_enables();
+                    self.retire_mode_changes();
                     self.dirty_session = true;
                     self.updates.push(Update::SessionStatusInvalidated {
                         client: self.instance,
@@ -1986,28 +2009,34 @@ impl Engine {
                     || !dispatch.reserved()
                     || revision != self.status_revision
                 {
-                    dispatch.reject("Session/Run/Step changed; Enable was not sent.");
+                    dispatch.reject("Session/Run/Step changed; no mode setting was sent.");
                 } else {
-                    match result
-                        .as_ref()
-                        .ok()
-                        .filter(|v| {
-                            v["session"]["id"].as_str() == Some(&dispatch.action().session_id)
-                        })
+                    let value = result.as_ref().ok().filter(|v| {
+                        v["session"]["id"].as_str() == Some(&dispatch.action().session_id)
+                    });
+                    let sampled = value
                         .and_then(|v| v.get("step_mode"))
-                        .and_then(Value::as_bool)
-                    {
-                        Some(true) => {
-                            dispatch.observed_enabled();
+                        .and_then(Value::as_bool);
+                    match sampled {
+                        Some(on) if on == dispatch.action().on => {
+                            dispatch.observed_target();
                             self.invalidate_mode_metadata()?;
                         }
-                        Some(false) => self.request(
-                            Request::SetStepMode {
-                                session_id: dispatch.action().session_id.clone(),
-                                on: true,
-                            },
-                            Pending::ModeCommit { dispatch, revision },
-                        ),
+                        Some(_) => {
+                            let idle = value.is_some_and(|v| v["running"].as_bool() == Some(false) && v["unfinished_run"].is_null() && matches!(crate::steps::Inventory::decode(&dispatch.action().session_id,v.get("pending_steps")),crate::steps::Inventory::Snapshot(p) if p.prompts.is_empty() && !p.more));
+                            if !dispatch.action().on && !idle {
+                                dispatch.reject("Disable requires a fresh idle Session and complete empty Step inventory. No setting was sent.");
+                                self.invalidate_mode_metadata()?;
+                            } else {
+                                self.request(
+                                    Request::SetStepMode {
+                                        session_id: dispatch.action().session_id.clone(),
+                                        on: dispatch.action().on,
+                                    },
+                                    Pending::ModeCommit { dispatch, revision },
+                                );
+                            }
+                        }
                         None => {
                             dispatch.reject("Current Step mode is unavailable or unsupported; no setting was sent.");
                             self.invalidate_mode_metadata()?;
@@ -2518,7 +2547,7 @@ async fn connected<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
         }
         engine.before_approval_writes()?;
         engine.retire_step_reviews(false);
-        engine.retire_mode_enables();
+        engine.retire_mode_changes();
         engine.before_mode_writes()?;
         for pending in engine.pending.values() {
             if let Pending::StepCommit(dispatch) = pending {

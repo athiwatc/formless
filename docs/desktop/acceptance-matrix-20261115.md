@@ -16,7 +16,7 @@ or authorization to merge while substantive gates fail.
 | Conversation and large output | Virtualized blocks, bounded previews, whole-output viewer, exact block source copy | Cross-block selection/copy, dedicated code-copy/link opening, richer attachments/artifacts/diagrams and native semantics |
 | Composer | Send/Steer/Queue/Stop, preserved drafts, IME guards, forecast consent; new per-window send-key choice | Attachments/drop/image paste/external editor, remaining Role/model/reference controls |
 | Context/resources | Recorded Session usage; bounded read-only Tools/Metrics/Proposals/Settings and exact details copy; explicit exact-identity recorded Run inspection; bounded read-only unfinished Tool Invocation snapshots, exact details and associated Session navigation | Artifact detail selection, Invocation control/history, Run pinning/navigation, scoped diff and remaining editable resource actions |
-| Questions/security decisions/Step | Native user questions, forecast consent; bounded Step inventory restored after reconnect; native Continue/Skip/Edit/Session-Step-off for one complete supported prompt; freshly validated Session Step-mode enable; approvals and unsupported Step review hand off to TUI | Native security-approval parity; larger/multiple prompt controls and idle Step-off; native decision/IME and remaining reconnect/control acceptance |
+| Questions/security decisions/Step | Native user questions, forecast consent; bounded Step inventory restored after reconnect; native Continue/Skip/Edit/Session-Step-off for one complete supported prompt; freshly validated Session Step-mode enable and idle Step-off; one complete Tool request supports Allow once or Deny; unsupported Step/security review hands off to TUI | Full security-approval parity; larger/multiple prompt controls; native decision/IME and remaining reconnect/control acceptance |
 | Search/navigation | Loaded literal Search and native Find; separate persisted Profile Search | Remaining global action discovery and resource navigation parity; native usability acceptance |
 | Layout/focus/scaling | Responsive panes/overlays, modal traps/restoration, reflow and headless 200% checks | Resizable panel preferences, real selection/input/trackpad, human 200% and multimonitor/HiDPI acceptance |
 | Themes/preferences | Light/dark and 100–200% text; explicit versioned Save/Reload of view, docked-panel and send-key choices; corruption/conflict handling | System/high-contrast/colorblind themes, density/reduced motion/font choices, geometry/per-Session view persistence and native filesystem/latency acceptance |
@@ -37,10 +37,11 @@ That goal does not make the failed or missing evidence above pass.
 
 1. Preserve the conflicting original partial tree until ownership or safe
    recovery is established; do not adopt its unverified edits.
-2. Finish exact-patch reviews of each new isolated commit. Parent-reported
-   reviews found no confirmed blocker in `acabff81`, `dfbab768` and
-   `8a18d80a`, `7658c8b5`, `f750cc2b`, `852932ef`, `bbde4a25`, `b0d85263`,
-   `16f62823`, `714948b6` and combined `4445d8b`; those reviews inspected tests/logs without rerunning them.
+2. Combined independent source review is complete at published `fd1e8ec`,
+   including prior runtime/protocol, failure-schedule, packaging, native Tool
+   approval and historical-compatibility correction scopes. Reviewers checked
+   hashes/logs without independently rerunning tests. The later isolated idle
+   Step-off increment requires its own exact-head review before publication.
 3. Resolve the existing foreground approval and prior uncertain launch/control
    outcome through the supported approval/evidence path. No foreground action
    is repeated or substituted here, and no writer/Claude session is controlled.
@@ -50,11 +51,16 @@ That goal does not make the failed or missing evidence above pass.
    branch, review the combined diff, then rerun appropriate aggregate and
    native checks there. Only merge when substantive gates pass.
 
-No remote branch/PR state was modified by this continuation. All new work
-remains on the separate local branch; a published draft or PR update is not
-performed merely to represent progress. No unverified clean-main or all-PRs
-merge claim is made. Local patches and hash manifests remain reviewable in
-the sibling task evidence directory.
+Draft #2081 now contains reviewed `fd1e8ec`, published as a guarded normal
+fast-forward and still unmerged, with main `9810f8f2` included. Root CI
+`43765829218` passed on macOS/Linux at checkout `9e141f8c`, whose tree matches
+`fd1e8ec`; the root workspace excludes the optional desktop. Desktop run
+`43765829247` never started any job because of account payment/spending
+restrictions. No blocked job was retried or runner/billing configuration
+changed. Later idle Step-off work stays on a separate local branch for review.
+The original conflicting checkout and all previous branches/evidence remain
+preserved. Neither this inventory nor successful source review is native or
+full-product acceptance, and no clean-main/all-PRs merge claim is made.
 
 Current-main local integration and the concrete remaining streaming contract are
 recorded in [the reconciliation report](stream-reconciliation-integration-20261115.md).
@@ -119,3 +125,10 @@ The [Step-mode enable report](step-mode-enable-20261115.md) adds an explicit
 ON-only Session setting with fresh validation, a bounded Client-lifetime receipt
 ledger and no replay after uncertain writes. Native controls, OS accessibility,
 platform execution and full parity remain acceptance gates.
+
+The [idle Step-off report](idle-step-off-20261115.md) adds the missing Session
+mode control when fresh idle and complete empty-Step metadata is available.
+It changes future pauses, leaves existing waiters pending, shares non-replayed
+Client-lifetime receipts with Enable, and explicitly does not promise atomic
+idle-only application against unseen work from other clients. Native/full
+parity and platform, performance and distribution acceptance remain open.

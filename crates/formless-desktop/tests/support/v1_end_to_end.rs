@@ -498,7 +498,7 @@ fn v1_older_peer_uses_only_canonical_subscription_through_the_actual_view(cx: &m
 }
 
 #[gpui_kit::test]
-fn native_step_mode_enable_reaches_real_daemon_without_starting_work_and_preserves_live_text(
+fn native_step_mode_changes_reach_real_daemon_without_starting_work_and_preserve_live_text(
     cx: &mut TestAppContext,
 ) {
     use formless_desktop::step_mode::{Outcome, Status};
@@ -577,6 +577,33 @@ fn native_step_mode_enable_reaches_real_daemon_without_starting_work_and_preserv
             });
             f.wait("mode Run idle", || f.snapshot()["running"] == false);
         }
+        until(cx, handle, &shell, "idle mode disable control", |s, _| {
+            s.step_mode_disable_target().is_some()
+        });
+        let calls_before_off = f.calls.load(Ordering::SeqCst);
+        step(cx, handle, |window, cx| {
+            window.click("step-mode-disable", cx);
+        });
+        until(cx, handle, &shell, "mode disabled and sampled", |s, _| {
+            s.sampled_step_mode() == Some(false)
+                && matches!(
+                    s.mode_enable_status(),
+                    Status::Finished {
+                        outcome: Outcome::Disabled,
+                        ..
+                    }
+                )
+        });
+        assert_eq!(f.snapshot()["step_mode"], false);
+        assert_eq!(
+            f.calls.load(Ordering::SeqCst),
+            calls_before_off,
+            "Disable must not start provider work"
+        );
+        step(cx, handle, |_, cx| {
+            assert_eq!(shell.read(cx).composer(), &composer);
+            assert_eq!(composer.read(cx).value().as_ref(), "Mode draft ไทย 😀");
+        });
         step(cx, handle, |_, cx| {
             shell.update(cx, |s, cx| s.connect_recording_daemon(cx))
         });

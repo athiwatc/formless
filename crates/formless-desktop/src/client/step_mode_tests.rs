@@ -2,6 +2,9 @@ use super::*;
 use crate::step_mode::{Action as ModeAction, Dispatch, Ledger, Outcome, Status};
 use serde_json::json;
 fn setup() -> (Engine, Arc<Ledger>, Dispatch) {
+    setup_target(true)
+}
+fn setup_target(on: bool) -> (Engine, Arc<Ledger>, Dispatch) {
     let instance = uuid::Uuid::new_v4();
     let l = Arc::new(Ledger::default());
     let d = l
@@ -12,6 +15,7 @@ fn setup() -> (Engine, Arc<Ledger>, Dispatch) {
             view_epoch: 3,
             operation: uuid::Uuid::new_v4(),
             session_id: "s".into(),
+            on,
         })
         .unwrap();
     let mut e = Engine {
@@ -23,7 +27,11 @@ fn setup() -> (Engine, Arc<Ledger>, Dispatch) {
         active: Some("s".into()),
         ..Default::default()
     };
-    e.command(Command::EnableStepMode(d.clone()));
+    e.command(if on {
+        Command::EnableStepMode(d.clone())
+    } else {
+        Command::DisableStepMode(d.clone())
+    });
     (e, l, d)
 }
 fn value(on: bool) -> Value {
@@ -109,7 +117,7 @@ fn mode_enable_retires_every_changed_owner_or_lifecycle_before_write() {
                 5 => e.instance = uuid::Uuid::new_v4(),
                 _ => e.status_revision += 1,
             };
-            e.retire_mode_enables();
+            e.retire_mode_changes();
             assert!(e.outgoing.is_empty());
             assert!(matches!(
                 l.status(),
@@ -122,7 +130,7 @@ fn mode_enable_retires_every_changed_owner_or_lifecycle_before_write() {
     }
     let (mut e, _, d) = setup();
     e.sync_epoch(99);
-    e.retire_mode_enables();
+    e.retire_mode_changes();
     assert!(
         d.reserved(),
         "ordinary draft/forecast changes do not retarget a Session setting"
@@ -189,7 +197,8 @@ fn mode_enable_owner_drop_after_possible_write_is_unknown_not_replayed() {
             generation: 2,
             view_epoch: 4,
             operation: uuid::Uuid::new_v4(),
-            session_id: "s".into()
+            session_id: "s".into(),
+            on: true,
         })
         .is_err());
 }
@@ -222,6 +231,7 @@ fn mode_enable_queue_failure_is_unsent_and_foreign_dispatch_cannot_be_sent() {
         view_epoch: 0,
         operation: uuid::Uuid::new_v4(),
         session_id: "s".into(),
+        on: true,
     };
     client.send(Command::Refresh).unwrap();
     assert!(client.enable_step_mode(a.clone()).is_err());
@@ -277,6 +287,7 @@ fn mode_enable_view_retirement_cancels_unsent_synchronously_but_draft_edits_do_n
         view_epoch: client.stream_epoch(),
         operation: uuid::Uuid::new_v4(),
         session_id: "s".into(),
+        on: true,
     };
     let d = client.mode_ledger.reserve(a).unwrap();
     client.invalidate_context();
@@ -333,4 +344,143 @@ fn mode_enable_observed_session_delete_retires_inspection_before_any_setting() {
             ..
         }
     ));
+}
+
+fn idle_off_value() -> Value {
+    let mut v = value(true);
+    v["pending_steps"] = json!({"prompts":[],"more":false});
+    v
+}
+fn inspect_off(e: &mut Engine, value: Value) {
+    let r = e.outgoing.pop_front().unwrap();
+    assert!(matches!(r.request,Request::GetSession{id} if id=="s"));
+    e.receive(ServerMessage::ok(r.id, value)).unwrap();
+}
+#[test]
+fn mode_disable_requires_a_fresh_idle_empty_inventory_and_writes_only_false_once() {
+    let (mut e, l, d) = setup_target(false);
+    e.command(Command::DisableStepMode(d.clone()));
+    assert_eq!(e.outgoing.len(), 1);
+    inspect_off(&mut e, idle_off_value());
+    e.before_mode_writes().unwrap();
+    let revision = e.status_revision;
+    e.before_mode_writes().unwrap();
+    assert_eq!(e.status_revision, revision);
+    let r = e.outgoing.pop_front().unwrap();
+    assert!(matches!(r.request,Request::SetStepMode{session_id,on:false} if session_id=="s"));
+    e.command(Command::DisableStepMode(d.clone()));
+    assert!(e.outgoing.is_empty());
+    e.receive(ServerMessage::ok(
+        r.id,
+        json!({"session_id":"s","on":false}),
+    ))
+    .unwrap();
+    assert!(matches!(
+        l.status(),
+        Status::Finished {
+            outcome: Outcome::Disabled,
+            ..
+        }
+    ));
+    e.command(Command::DisableStepMode(d));
+    assert!(e.outgoing.is_empty());
+}
+#[test]
+fn mode_disable_rejects_running_recoverable_pending_missing_and_partial_state() {
+    for field in 0..9 {
+        let (mut e, l, _d) = setup_target(false);
+        let mut v = idle_off_value();
+        match field {
+            0 => v["running"] = json!(true),
+            1 => {
+                v.as_object_mut().unwrap().remove("running");
+            }
+            2 => v["unfinished_run"] = json!({"id":"unfinished"}),
+            3 => {
+                v.as_object_mut().unwrap().remove("pending_steps");
+            }
+            4 => v["pending_steps"]["more"] = json!(true),
+            5 => {
+                v["pending_steps"]["prompts"] = json!([{"session_id":"s","run_id":"r","step_id":"p","tool_name":"tool","arguments_preview":"{}","arguments_bytes":2,"index":0,"count":1}])
+            }
+            6 => v["pending_steps"] = json!({"prompts":[],"more":"false"}),
+            7 => v["session"]["id"] = json!("other"),
+            _ => v["step_mode"] = json!("true"),
+        }
+        inspect_off(&mut e, v);
+        assert!(e.outgoing.is_empty(), "{field}");
+        assert!(
+            matches!(
+                l.status(),
+                Status::Finished {
+                    outcome: Outcome::Rejected(_),
+                    ..
+                }
+            ),
+            "{field}"
+        );
+    }
+    let (mut e, l, _d) = setup_target(false);
+    let mut v = value(false);
+    v["running"] = json!(true);
+    inspect_off(&mut e, v);
+    assert!(e.outgoing.is_empty());
+    assert!(matches!(
+        l.status(),
+        Status::Finished {
+            outcome: Outcome::ObservedDisabled,
+            ..
+        }
+    ));
+}
+#[test]
+fn mode_disable_retires_all_changed_owners_and_status_before_write() {
+    for commit in [false, true] {
+        for field in 0..7 {
+            let (mut e, l, _d) = setup_target(false);
+            if commit {
+                inspect_off(&mut e, idle_off_value());
+            }
+            match field {
+                0 => e.connection += 1,
+                1 => e.generation += 1,
+                2 => e.active = Some("other".into()),
+                3 => e.stream_epoch += 1,
+                4 => e.ready = false,
+                5 => e.instance = uuid::Uuid::new_v4(),
+                _ => e.status_revision += 1,
+            };
+            e.retire_mode_changes();
+            assert!(e.outgoing.is_empty());
+            assert!(matches!(
+                l.status(),
+                Status::Finished {
+                    outcome: Outcome::Rejected(_),
+                    ..
+                }
+            ));
+        }
+    }
+}
+#[test]
+fn mode_disable_requires_exact_false_receipt_and_unknown_blocks_both_targets() {
+    let (mut e, l, _d) = setup_target(false);
+    inspect_off(&mut e, idle_off_value());
+    e.before_mode_writes().unwrap();
+    let r = e.outgoing.pop_front().unwrap();
+    e.receive(ServerMessage::ok(r.id, json!({"session_id":"s","on":true})))
+        .unwrap();
+    assert!(matches!(
+        l.status(),
+        Status::Finished {
+            outcome: Outcome::Unknown,
+            ..
+        }
+    ));
+    for on in [false, true] {
+        let mut next = l.status().action().unwrap().clone();
+        next.on = on;
+        next.operation = uuid::Uuid::new_v4();
+        assert!(l.reserve(next).is_err());
+    }
 }

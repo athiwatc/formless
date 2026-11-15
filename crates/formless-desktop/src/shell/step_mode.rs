@@ -2,10 +2,23 @@ use super::*;
 use crate::step_mode::Action;
 impl Shell {
     pub(super) fn mode_enable_action(&self) -> Option<Action> {
+        self.mode_change_action(true)
+    }
+    pub(super) fn mode_disable_action(&self) -> Option<Action> {
+        self.mode_change_action(false)
+    }
+    fn mode_change_action(&self, on: bool) -> Option<Action> {
         if self.destination != Destination::Chat
             || !self.client_connected
             || !self.client_snapshot_ready
-            || self.client_step_mode != Some(false)
+            || self.client_step_mode != Some(!on)
+        {
+            return None;
+        }
+        if !on
+            && (self.run_state() != RunState::Idle
+                || self.client_recovery.is_some()
+                || !matches!(&self.client_steps, crate::steps::Inventory::Snapshot(s) if s.prompts.is_empty() && !s.more))
         {
             return None;
         }
@@ -20,6 +33,7 @@ impl Shell {
             view_epoch: client.stream_epoch(),
             operation: uuid::Uuid::new_v4(),
             session_id: self.sidebar.active_id()?.into(),
+            on,
         })
     }
     pub(super) fn mode_notice(&self) -> Option<String> {
@@ -32,7 +46,7 @@ impl Shell {
             return None;
         }
         Some(format!(
-            "Step-mode enable for Session {}: {}",
+            "Step-mode change for Session {}: {}",
             action.session_id,
             status.notice()?
         ))
@@ -49,10 +63,20 @@ impl Shell {
         }
     }
     pub fn enable_mode(&mut self, action: Action, window: &mut Window, cx: &mut Context<Self>) {
+        if action.on {
+            self.change_mode(action, window, cx)
+        }
+    }
+    pub fn disable_mode(&mut self, action: Action, window: &mut Window, cx: &mut Context<Self>) {
+        if !action.on {
+            self.change_mode(action, window, cx)
+        }
+    }
+    fn change_mode(&mut self, action: Action, window: &mut Window, cx: &mut Context<Self>) {
         if self.background_inert(window) || self.current_modal(self.layout(window)).is_some() {
             return;
         }
-        let Some(current) = self.mode_enable_action() else {
+        let Some(current) = self.mode_change_action(action.on) else {
             return;
         };
         if !action.valid()
@@ -73,7 +97,12 @@ impl Shell {
             return;
         }
         self.invalidate_forecast(cx);
-        let result = self.client.as_ref().unwrap().enable_step_mode(action);
+        let client = self.client.as_ref().unwrap();
+        let result = if action.on {
+            client.enable_step_mode(action)
+        } else {
+            client.disable_step_mode(action)
+        };
         match result {
             Ok(()) => {
                 self.client_step_mode = None;
@@ -88,6 +117,10 @@ impl Shell {
     #[cfg(feature = "test-support")]
     pub fn step_mode_enable_target(&self) -> Option<Action> {
         self.mode_enable_action()
+    }
+    #[cfg(feature = "test-support")]
+    pub fn step_mode_disable_target(&self) -> Option<Action> {
+        self.mode_disable_action()
     }
     #[cfg(feature = "test-support")]
     pub fn sampled_step_mode(&self) -> Option<bool> {

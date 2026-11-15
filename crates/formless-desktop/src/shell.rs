@@ -4307,7 +4307,8 @@ impl Shell {
                 h_flex().min_w_0().w_full().flex_wrap().items_center().gap_2().px_2().py_1()
                     .child(readable("step-mode-state",if on {"Step mode: On (sampled)"} else {"Step mode: Off (sampled)"}).text_sm())
                     .when_some(self.mode_enable_action(),|row,action|row.child(div().id("step-mode-enable-anchor").anchor_scroll(Some(self.mode_enable_anchor.clone())).child(Button::new("step-mode-enable").track_focus(&self.mode_enable_focus).label("Enable Step mode").on_click(cx.listener(move|this,_,window,cx|this.enable_mode(action.clone(),window,cx))))))
-                    .child(readable("step-mode-help","For this daemon; waiting prompts and approvals still need review.").min_w_0().max_w_full().text_xs())
+                    .when_some(self.mode_disable_action(),|row,action|row.child(div().id("step-mode-disable-anchor").anchor_scroll(Some(self.mode_enable_anchor.clone())).child(Button::new("step-mode-disable").track_focus(&self.mode_enable_focus).label("Disable Step mode").on_click(cx.listener(move|this,_,window,cx|this.disable_mode(action.clone(),window,cx))))))
+                    .child(readable("step-mode-help",if on {"Off stops future pauses; waiting Steps and approvals still need review."} else {"For this daemon; waiting prompts and approvals still need review."}).min_w_0().max_w_full().text_xs())
             ))
             .when_some(self.client_steps.summary(), |region, summary| region.child(
                 readable("daemon-step-inventory", summary).text_sm().px_2().py_1().max_h(px(120.)).overflow_y_hidden()
