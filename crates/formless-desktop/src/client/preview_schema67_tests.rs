@@ -308,9 +308,13 @@ async fn preview_schema67_real_core_browses_edits_reviews_and_keeps_lost_referen
     assert_eq!(st.list_messages(&sid).unwrap().len(), 1);
     assert_eq!(st.pending_attachment_inventory(&sid).unwrap(), vec![row]);
     assert_eq!(st.queued_count(&sid).unwrap(), 0);
+    drop(st);
+    // Owned fixture writer only; query-only readers cannot VACUUM INTO.
+    let st = formless_core::Store::open(&paths.db_file()).unwrap();
     let backup = dir.0.join("schema67-backup.db");
     st.backup_into(&backup).unwrap();
-    let report = formless_core::backup_verification::inspect(&backup).unwrap();
+    drop(st);
+    let report = formless_core::backup_verification::verify(&paths, &backup).unwrap();
     assert_eq!(report.schema_version, 67);
     assert!(!report.tables.contains_key("database_identity"));
     assert!(!report.tables.contains_key("reviewed_reference_successes"));
