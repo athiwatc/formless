@@ -1,5 +1,6 @@
 use super::*;
 use crate::reference_detach::{Action, Outcome, Status};
+#[cfg(feature = "test-support")]
 use serde_json::Value;
 const FIRST: usize = BASE + 4;
 const CANCEL: usize = FIRST + PAGE_SIZE;

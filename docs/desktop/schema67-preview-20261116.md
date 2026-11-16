@@ -32,7 +32,9 @@ in this preview's ancestry or source. Their complete implementation and evidence
 remain on the full prototype branch. They are not reverted or deleted there.
 The two reviewed GUI-only packaging scripts are copied unchanged from `8cd88cf`;
 the graph/artifact guard therefore accompanies this preview without bringing its
-schema changes. No new runtime feature or enabling switch is introduced.
+schema changes. The existing test-support-only import guard in the reference
+view is also carried over, fixing GUI-only lint without behavior changes.
+No new runtime feature or enabling switch is introduced.
 
 ## Compatibility evidence and exact limits
 
