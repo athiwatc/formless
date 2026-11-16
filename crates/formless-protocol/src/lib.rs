@@ -35,7 +35,25 @@ pub const FEATURES: &[&str] = &[
     "pending_attachment_inventory_v1",
     "reviewed_attachment_send_v1",
     "reviewed_reference_detach_v1",
+    "session_model_compare_set_v1",
 ];
+
+/// Explicit nullable pair; both keys must be present even when inheriting.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionModelSelection {
+    #[serde(deserialize_with = "required_selection_value")]
+    pub model: Option<String>,
+    #[serde(deserialize_with = "required_selection_value")]
+    pub reasoning_effort: Option<String>,
+}
+fn required_selection_value<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<String>, D::Error> {
+    Option::<String>::deserialize(d)
+}
+pub const SESSION_MODEL_MAX_BYTES: usize = 512;
+pub const SESSION_EFFORT_MAX_BYTES: usize = 64;
 
 /// Complete pending-attachment metadata inventory limits. No file bodies are read.
 pub const PENDING_ATTACHMENT_MAX_ENTRIES: usize = 64;
@@ -1913,6 +1931,15 @@ pub enum Request {
         id: String,
         model: Option<String>,
         reasoning_effort: Option<String>,
+    },
+    /// Atomic metadata-only update of the complete reviewed pair in schema67.
+    /// Both stored values must still match expected, including NULL. Returns
+    /// SessionInfo. Does not rewrite auto, start a Run or invoke model tests.
+    /// Mismatch is an error; clients must not fall back to SetSessionModel.
+    CompareSetSessionModel {
+        id: String,
+        expected: SessionModelSelection,
+        desired: SessionModelSelection,
     },
     /// Local-only preview; does not freeze Tools, upload files or start a Run.
     ForecastRun {
@@ -4016,6 +4043,37 @@ mod reviewed_reference_detach_tests {
             assert!(serde_json::from_value::<Request>(missing).is_err());
         }
         assert!(FEATURES.contains(&"reviewed_reference_detach_v1"));
+        assert_eq!(PROTOCOL_VERSION, 1);
+    }
+}
+
+#[cfg(test)]
+mod session_selection_cas_tests {
+    use super::*;
+    #[test]
+    fn session_selection_cas_requires_explicit_complete_nullable_pairs() {
+        let value = serde_json::json!({"type":"compare_set_session_model","id":"s","expected":{"model":null,"reasoning_effort":null},"desired":{"model":"role:reviewer","reasoning_effort":"high"}});
+        assert_eq!(
+            serde_json::to_value(serde_json::from_value::<Request>(value.clone()).unwrap())
+                .unwrap(),
+            value
+        );
+        for side in ["expected", "desired"] {
+            for key in ["model", "reasoning_effort"] {
+                let mut bad = value.clone();
+                bad[side].as_object_mut().unwrap().remove(key);
+                assert!(serde_json::from_value::<Request>(bad).is_err());
+            }
+            let mut bad = value.clone();
+            bad[side]["extra"] = serde_json::json!(1);
+            assert!(serde_json::from_value::<Request>(bad).is_err());
+        }
+        for key in ["id", "expected", "desired"] {
+            let mut bad = value.clone();
+            bad.as_object_mut().unwrap().remove(key);
+            assert!(serde_json::from_value::<Request>(bad).is_err());
+        }
+        assert!(FEATURES.contains(&"session_model_compare_set_v1"));
         assert_eq!(PROTOCOL_VERSION, 1);
     }
 }

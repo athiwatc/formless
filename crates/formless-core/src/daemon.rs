@@ -2159,6 +2159,20 @@ impl Daemon {
                 self.broadcast(Event::SessionUpdated { session: s.clone() });
                 Ok(serde_json::to_value(s)?)
             }
+            Request::CompareSetSessionModel {
+                id,
+                expected,
+                desired,
+            } => {
+                let session =
+                    self.with_store(|st| st.compare_set_session_model(&id, &expected, &desired))?;
+                // Explicit metadata API: no optional paid probe, Run or message.
+                // A running Run retains the selection it already sampled.
+                self.broadcast(Event::SessionUpdated {
+                    session: session.clone(),
+                });
+                Ok(serde_json::to_value(session)?)
+            }
             Request::SetSessionModel {
                 id,
                 model,
@@ -19115,3 +19129,7 @@ mod step_inventory;
 #[cfg(test)]
 #[path = "pending_attachment_inventory_tests.rs"]
 mod pending_attachment_inventory_tests;
+
+#[cfg(test)]
+#[path = "session_selection_daemon_tests.rs"]
+mod session_selection_daemon_tests;

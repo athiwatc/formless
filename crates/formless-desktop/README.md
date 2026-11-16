@@ -569,8 +569,10 @@ checks that path and older-peer fallback without a native launch.
 Session details also edits the selected Session's model/`role:name` and
 reasoning-effort overrides. Blank inherits the configured default. Each Save
 preserves the confirmed companion value, freshly checks the pair and blocks
-new work preparation while pending. Saving may start the daemon's configured
-paid background model test; the form keeps this notice visible. It does not
+new work preparation while pending. Saving requires the daemon's atomic
+model/effort capability and compares both stored values inside the write
+transaction. Unsupported peers receive no setting request. Saving does not
+start a Provider test or conversation Run. It does not
 automatically fetch a catalog or validate provider support. See the
 [model selection contract](../../docs/desktop/session-model-selection-20261115.md)
 for partial-reply, stale callback, no-op and unknown-outcome limits.
@@ -579,8 +581,8 @@ for partial-reply, stale callback, no-op and unknown-outcome limits.
 The Model field offers **Read catalog (contacts provider)**. This explicit read
 uses the configured default provider and includes configured aliases, Roles and
 recent selectors. Typing filters the bounded local snapshot after reading;
-choosing a row fills the draft without saving. Save remains separate and may
-start the configured paid model test. No read is automatic or replayed after
+choosing a row fills the draft without saving. Save remains separate and does
+not start a Provider test. No read is automatic or replayed after
 reconnect. See the [catalog contract](../../docs/desktop/model-catalog-20261116.md)
 for limits and headless validation scope.
 

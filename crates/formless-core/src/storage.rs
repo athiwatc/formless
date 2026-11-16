@@ -8705,3 +8705,6 @@ mod reviewed_reference_store;
 #[cfg(test)]
 #[path = "preview_schema_compat_tests.rs"]
 mod preview_schema_compat_tests;
+
+#[path = "session_selection_store.rs"]
+mod session_selection_store;

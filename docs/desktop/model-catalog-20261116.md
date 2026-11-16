@@ -35,7 +35,7 @@ physical connection must
 still match. Composition, retired forms, pending metadata writes, changed
 fields, changed queries and stale callbacks cannot overwrite a later draft.
 Choosing a row sends no setting request. Explicit Save retains the model/effort
-paired-read guards and visible paid-test notice documented in
+atomic paired-value check and metadata-only save behavior documented in
 [model selection](session-model-selection-20261115.md).
 
 At most one catalog RPC is outstanding in a connection. Closing and reopening

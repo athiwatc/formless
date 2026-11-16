@@ -94,3 +94,9 @@ recorded licensing/notice/SDK distribution, signing/notarization and clean
 install/update acceptance remain open. The existing foreground approval
 `proud-river-57508678` and uncertain launch remain untouched. This is a concrete
 preview integration candidate, not completion/merge/release approval for #1753.
+
+The subsequent [atomic model/effort save](session-model-cas-20261116.md) is an
+additive schema-67 product increment on a separate branch from the frozen
+preview. It closes the stale read/write window without importing prototype
+schema changes, journaling, provisioning or recovery machinery. Both frozen
+preview and prototype branches remain preserved.

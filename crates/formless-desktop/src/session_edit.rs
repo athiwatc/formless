@@ -21,8 +21,8 @@ impl Instructions {
     }
 }
 
-pub const MAX_MODEL_BYTES: usize = 512;
-pub const MAX_EFFORT_BYTES: usize = 64;
+pub const MAX_MODEL_BYTES: usize = formless_protocol::SESSION_MODEL_MAX_BYTES;
+pub const MAX_EFFORT_BYTES: usize = formless_protocol::SESSION_EFFORT_MAX_BYTES;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelSelection {
     pub model: Option<String>,
@@ -277,10 +277,16 @@ impl Change {
     }
     pub fn request(&self, id: &str) -> Request {
         match self {
-            Self::Selection { desired, .. } => Request::SetSessionModel {
+            Self::Selection { expected, desired } => Request::CompareSetSessionModel {
                 id: id.into(),
-                model: desired.model.clone(),
-                reasoning_effort: desired.reasoning_effort.clone(),
+                expected: formless_protocol::SessionModelSelection {
+                    model: expected.model.clone(),
+                    reasoning_effort: expected.reasoning_effort.clone(),
+                },
+                desired: formless_protocol::SessionModelSelection {
+                    model: desired.model.clone(),
+                    reasoning_effort: desired.reasoning_effort.clone(),
+                },
             },
             Self::Name(name) => Request::RenameSession {
                 id: id.into(),
@@ -461,15 +467,15 @@ mod model_tests {
         let m = metadata();
         let c = Change::from_input(Field::Model, " role:reviewer ", &m).unwrap();
         assert!(
-            matches!(c.request("s"),Request::SetSessionModel{id,model:Some(model),reasoning_effort:Some(e)}if id=="s"&&model=="role:reviewer"&&e=="low")
+            matches!(c.request("s"),Request::CompareSetSessionModel{id,expected,desired}if id=="s"&&expected.model.as_deref()==Some("old-model")&&desired.model.as_deref()==Some("role:reviewer")&&desired.reasoning_effort.as_deref()==Some("low"))
         );
         let e = Change::from_input(Field::Effort, " high ", &m).unwrap();
         assert!(
-            matches!(e.request("s"),Request::SetSessionModel{model:Some(model),reasoning_effort:Some(e),..}if model=="old-model"&&e=="high")
+            matches!(e.request("s"),Request::CompareSetSessionModel{desired,..}if desired.model.as_deref()==Some("old-model")&&desired.reasoning_effort.as_deref()==Some("high"))
         );
         let clear = Change::from_input(Field::Model, "  ", &m).unwrap();
         assert!(
-            matches!(clear.request("s"),Request::SetSessionModel{model:None,reasoning_effort:Some(e),..}if e=="low")
+            matches!(clear.request("s"),Request::CompareSetSessionModel{desired,..}if desired.model.is_none()&&desired.reasoning_effort.as_deref()==Some("low"))
         );
         let mut ack = m.clone();
         ack.selection.as_mut().unwrap().model = None;

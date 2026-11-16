@@ -73,7 +73,7 @@ fn session_model_role_and_effort_preserve_confirmed_companion_unsaved_fields_and
             .find("session-model-cost")
             .value()
             .unwrap()
-            .contains("paid background model test"));
+            .contains("does not run a Provider test"));
         assert!(window.find("session-model-paid-footer").visible());
         let input = s.read(cx).session_edit_input().unwrap();
         input.update(cx, |i, cx| i.set_value(" role:reviewer ", window, cx));
@@ -81,7 +81,7 @@ fn session_model_role_and_effort_preserve_confirmed_companion_unsaved_fields_and
         window.click("session-edit-save", cx);
         let (op, change) = saved(&s, cx);
         assert!(
-            matches!(change.request(&sessions[1].id),formless_protocol::Request::SetSessionModel{id,model:Some(m),reasoning_effort:Some(e)}if id==sessions[1].id&&m=="role:reviewer"&&e=="low")
+            matches!(change.request(&sessions[1].id),formless_protocol::Request::CompareSetSessionModel{id,desired,..}if id==sessions[1].id&&desired.model.as_deref()==Some("role:reviewer")&&desired.reasoning_effort.as_deref()==Some("low"))
         );
         sessions[1].model = Some("role:reviewer".into());
         ack(&s, window, cx, &sessions[1], op);
@@ -102,7 +102,7 @@ fn session_model_role_and_effort_preserve_confirmed_companion_unsaved_fields_and
         window.click("session-edit-save", cx);
         let (_op, change) = saved(&s, cx);
         assert!(
-            matches!(change.request(&sessions[1].id),formless_protocol::Request::SetSessionModel{model:Some(m),reasoning_effort:Some(e),..}if m=="role:reviewer"&&e=="high")
+            matches!(change.request(&sessions[1].id),formless_protocol::Request::CompareSetSessionModel{desired,..}if desired.model.as_deref()==Some("role:reviewer")&&desired.reasoning_effort.as_deref()==Some("high"))
         );
         assert_eq!(s.read(cx).composer(), &composer);
         assert_eq!(
@@ -189,7 +189,7 @@ fn session_model_composition_and_reloaded_form_revision_reject_stale_saves(
     });
 }
 #[gpui_kit::test]
-fn session_model_form_and_paid_test_notice_are_reachable_at_200_percent_minimum_window(
+fn session_model_form_and_cost_notice_are_reachable_at_200_percent_minimum_window(
     cx: &mut TestAppContext,
 ) {
     let (h, s, _) = setup(cx);
@@ -326,7 +326,7 @@ fn session_model_profile_replacement_with_reused_ids_and_connection_needs_explic
             window.click("session-edit-save", cx);
             let (_op, c) = saved(&s, cx);
             assert!(
-                matches!(c.request(&other[1].id),formless_protocol::Request::SetSessionModel{model:Some(m),..}if m=="role:new-profile")
+                matches!(c.request(&other[1].id),formless_protocol::Request::CompareSetSessionModel{desired,..}if desired.model.as_deref()==Some("role:new-profile"))
             );
         });
     }

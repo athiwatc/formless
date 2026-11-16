@@ -157,7 +157,7 @@ impl Shell {
             i.replace_text_in_range(Some(0..end), &fill.selector, window, cx)
         });
         input.update(cx, |i, cx| i.focus(window, cx));
-        p.catalog.notice="Choice filled the Model draft only. Review it, then use Save to request a setting change. Saving may run a paid model test.".into();
+        p.catalog.notice="Choice filled the Model draft only. Review it, then use Save to request a setting change. Saving does not run a Provider test.".into();
         p.frames = 2;
         cx.notify();
     }

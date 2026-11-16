@@ -1054,7 +1054,7 @@ impl Shell {
         body = body.child(tabs);
         if matches!(panel.field, Field::Model | Field::Effort) {
             body=body.child(readable("session-model-help","Per-Session override for future Runs. Enter a model ID, alias or role:name; blank inherits the default. A running Run keeps its current model. This form does not validate provider/model/Role availability. Changing one field preserves the last confirmed other value; unsaved edits in that other field are not applied."))
-                .child(readable("session-model-cost","Saving may start the daemon's configured paid background model test. No conversation message or Run is started by this form. No model-catalog request is made automatically."));
+                .child(readable("session-model-cost","Changing the model affects future Run costs. Saving does not run a Provider test or start a conversation Run. No model-catalog request is made automatically."));
             if let Some(choice) = panel.metadata.as_ref().and_then(|m| m.selection.as_ref()) {
                 body = body.child(readable(
                     "session-model-confirmed",
@@ -1389,7 +1389,7 @@ impl Shell {
                     .flex_shrink_0(),
             )
             .child(body)
-            .when(matches!(panel.field,Field::Model|Field::Effort),|dialog|dialog.child(readable("session-model-paid-footer","Saving may run a paid model test.").text_sm().flex_shrink_0()))
+            .when(matches!(panel.field,Field::Model|Field::Effort),|dialog|dialog.child(readable("session-model-paid-footer","Saving does not run a Provider test.").text_sm().flex_shrink_0()))
             .child(
                 h_flex()
                     .flex_shrink_0()
@@ -1412,7 +1412,7 @@ impl Shell {
                                 _ if panel.field == Field::Instructions => {
                                     "Save Session standing instructions"
                                 }
-                                _ if matches!(panel.field,Field::Model|Field::Effort) => "Save Session model and reasoning effort; configured paid model test may run",
+                                _ if matches!(panel.field,Field::Model|Field::Effort) => "Save Session model and reasoning effort; no Provider test is started",
                                 _ => "Save displayed Session field",
                             })
                             .primary()

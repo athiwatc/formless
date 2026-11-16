@@ -13,6 +13,7 @@ fn engine() -> Engine {
     Engine {
         instance: uuid::Uuid::new_v4(),
         ready: true,
+        session_model_cas_available: true,
         connection: 2,
         epoch: 3,
         generation: 4,
@@ -57,7 +58,7 @@ fn session_model_fresh_pair_writes_exact_selection_once_and_already_selected_is_
     inspect(&mut e, json!([session()]));
     let r = e.outgoing.pop_front().unwrap();
     assert!(
-        matches!(r.request,Request::SetSessionModel{id,model:Some(model),reasoning_effort:Some(e)}if id=="s"&&model=="role:reviewer"&&e=="low")
+        matches!(r.request,Request::CompareSetSessionModel{id,expected,desired}if id=="s"&&expected.model.as_deref()==Some("old-model")&&expected.reasoning_effort.as_deref()==Some("low")&&desired.model.as_deref()==Some("role:reviewer")&&desired.reasoning_effort.as_deref()==Some("low"))
     );
     e.command(command(op, c.clone()));
     assert!(e.outgoing.is_empty());
@@ -211,7 +212,7 @@ fn session_model_unrelated_metadata_events_preserve_the_same_paired_baseline() {
     inspect(&mut e, json!([session()]));
     assert!(matches!(
         e.outgoing.pop_front().unwrap().request,
-        Request::SetSessionModel { .. }
+        Request::CompareSetSessionModel { .. }
     ));
 }
 
@@ -298,4 +299,185 @@ fn model_catalog_worker_does_not_display_provider_errors_or_accept_unbounded_rep
         e.updates.last(),
         Some(Update::ModelCatalog { result: Err(_), .. })
     ));
+}
+
+#[test]
+fn session_selection_cas_missing_capability_rejects_before_read_and_never_falls_back() {
+    let mut e = engine();
+    e.session_model_cas_available = false;
+    e.command(command(uuid::Uuid::new_v4(), change()));
+    assert!(e.outgoing.is_empty());
+    assert!(e.updates.iter().any(|u|matches!(u,Update::SessionEdited{outcome:Outcome::Rejected(text),..}if text.contains("atomic"))));
+    for features in [json!([]), json!(["session_model_compare_set_v1"])] {
+        let mut e = Engine::default();
+        e.begin();
+        let ping = e.outgoing.pop_front().unwrap();
+        e.receive(ServerMessage::ok(
+            ping.id,
+            json!({"min_protocol":1,"max_protocol":1,"features":features}),
+        ))
+        .unwrap();
+        assert_eq!(
+            e.session_model_cas_available,
+            features.as_array().unwrap().len() == 1
+        );
+    }
+}
+
+#[cfg(feature = "daemon-tests")]
+#[path = "../../../formless-core/tests/support/env.rs"]
+mod credential_env;
+#[cfg(feature = "daemon-tests")]
+#[tokio::test]
+async fn session_selection_cas_real_core_rejects_writer_between_native_read_and_write() {
+    let _env = credential_env::EnvGuard::isolated();
+    let root =
+        std::env::temp_dir().join(format!("fl-native-selection-cas-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&root).unwrap();
+    let paths = formless_core::Paths::from_dirs(root.join("data"), root.join("config")).unwrap();
+    let mut cfg = formless_core::Config::default();
+    cfg.provider.auto_test_models = false;
+    cfg.naming.enabled = false;
+    cfg.skills.auto_create = false;
+    cfg.save(&paths).unwrap();
+    let st = formless_core::Store::open(&paths.db_file()).unwrap();
+    let sid = st.create_session(None).unwrap().id;
+    st.set_session_model(&sid, Some("old-model".into()), Some("low".into()))
+        .unwrap();
+    drop(st);
+    let daemon = Arc::new(formless_core::daemon::Daemon::new(paths.clone()).unwrap());
+    let (stream, server) = tokio::io::duplex(128 * 1024);
+    let (tx, mut commands) = queue::channel(QUEUE);
+    let (updates, rx) = mpsc::sync_channel(QUEUE);
+    let (stop, mut cancelled) = watch::channel(false);
+    let ready = Arc::new(AtomicBool::new(false));
+    let epoch = AtomicU64::new(0);
+    let connection = AtomicU64::new(0);
+    let mut retained = Retained {
+        instance: uuid::Uuid::new_v4(),
+        ..Default::default()
+    };
+    let driver = tokio::spawn({
+        let sid = sid.clone();
+        let ready = ready.clone();
+        async move {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !ready.load(Ordering::Acquire) {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let operation = uuid::Uuid::new_v4();
+            let change = Change::Selection {
+                expected: crate::session_edit::ModelSelection {
+                    model: Some("old-model".into()),
+                    reasoning_effort: Some("low".into()),
+                },
+                desired: crate::session_edit::ModelSelection {
+                    model: Some("role:reviewer".into()),
+                    reasoning_effort: Some("low".into()),
+                },
+            };
+            tx.send(Command::EditSession {
+                connection: 0,
+                operation,
+                session_id: sid,
+                change,
+            })
+            .await
+            .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async move {
+                loop {
+                    while let Ok(update) = rx.try_recv() {
+                        if let Update::SessionEdited { operation: found, outcome, .. } = update {
+                            if found == operation {
+                                assert!(matches!(outcome, Outcome::Rejected(text) if text.contains("changed")));
+                                return;
+                            }
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            }).await.unwrap();
+            stop.send(true).unwrap();
+            (tx, stop)
+        }
+    });
+    let peer = tokio::spawn({
+        let file = paths.db_file();
+        async move {
+            let mut r = BufReader::new(server);
+            let mut writes = 0;
+            loop {
+                let mut line = String::new();
+                if r.read_line(&mut line).await.unwrap() == 0 {
+                    break;
+                }
+                let request: RequestEnvelope = serde_json::from_str(&line).unwrap();
+                match &request.request {
+                    Request::Ping | Request::Subscribe { .. } | Request::ListSessions => {}
+                    Request::CompareSetSessionModel {
+                        id,
+                        expected,
+                        desired,
+                    } => {
+                        writes += 1;
+                        assert_eq!(expected.model.as_deref(), Some("old-model"));
+                        assert_eq!(expected.reasoning_effort.as_deref(), Some("low"));
+                        assert_eq!(desired.model.as_deref(), Some("role:reviewer"));
+                        let external = formless_core::Store::open(&file).unwrap();
+                        external
+                            .set_session_model(id, Some("old-model".into()), Some("medium".into()))
+                            .unwrap();
+                    }
+                    other => panic!("unbound/fallback/Provider-starting request {other:?}"),
+                }
+                let result = if let Request::Subscribe { deltas: false, .. } = &request.request {
+                    Ok(json!({"subscribed":true}))
+                } else {
+                    daemon
+                        .handle(request.request)
+                        .await
+                        .map_err(|e| e.to_string())
+                };
+                let response = match result {
+                    Ok(value) => ServerMessage::ok(request.id, value),
+                    Err(error) => ServerMessage::err(request.id, error),
+                };
+                let mut bytes = serde_json::to_vec(&response).unwrap();
+                bytes.push(b'\n');
+                r.get_mut().write_all(&bytes).await.unwrap();
+            }
+            writes
+        }
+    });
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        connected(
+            stream,
+            &mut commands,
+            &updates,
+            &mut cancelled,
+            &mut retained,
+            ConnectionState {
+                ready: &ready,
+                epoch: &epoch,
+                connection: &connection,
+            },
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let _sender = driver.await.unwrap();
+    assert_eq!(peer.await.unwrap(), 1);
+    let st = formless_core::Store::open_reader(&paths.db_file()).unwrap();
+    let row = st.get_session(&sid).unwrap().unwrap();
+    assert_eq!(row.model.as_deref(), Some("old-model"));
+    assert_eq!(row.reasoning_effort.as_deref(), Some("medium"));
+    assert!(st.list_messages(&sid).unwrap().is_empty());
+    assert_eq!(st.queued_count(&sid).unwrap(), 0);
+    drop(st);
+    std::fs::remove_dir_all(root).unwrap();
 }

@@ -10,26 +10,30 @@ claim that a saved ID/effort is supported by its provider. The explicit
 unsupported values can still fail when used. The palette description includes model/Role and effort so
 these controls are discoverable from the composer through Session details.
 
-The existing daemon setter replaces model and effort together. Each Save uses
+The native compare-set API replaces model and effort together. Each Save uses
 the new displayed field and the last confirmed companion, not an unsaved edit
 in the other field. Both nullable values must be explicitly exposed by a
 complete reply; unavailable or oversized stored values never become a blank
 clear. Model IDs are bounded to 512 bytes and effort to 64; line/control and
 directional-formatting characters are refused. Legacy `auto` can be inspected,
 but a native replacement must choose an explicit model/Role or inheritance,
-because the daemon may rewrite `auto` during a setter.
+because the legacy setter may rewrite `auto`; this API never rewrites it.
 
 Before any setter, the actor reads the persisted Session list again. It checks
 one exact target and the entire expected pair. A changed or unsupported pair
 rejects without a setting write. If the desired pair already matches, the
 receipt says it was observed: no setter or model test is started. Observed
 paired-value changes or deletion retire unsent work; unrelated name/tag changes
-do not. This is a read/compare/set guard, not an atomic compare-and-swap against
-unseen external activity. The existing protocol and daemon are unchanged.
+do not. The additive `session_model_compare_set_v1` API repeats the complete
+comparison and writes both values in one existing schema-67 SQLite IMMEDIATE
+transaction. An external writer changing either value after the read causes
+rejection. Older peers receive no setting request or legacy-setter fallback.
+See the [atomic save contract](session-model-cas-20261116.md).
 
-The model setter may start a configured paid background model test. That fact
-is visible in both the scrolling help and a fixed footer next to Save, with a
-matching accessible Save label. It starts no conversation message/Run by itself.
+Native Save does not run a Provider test, append a message or start a Run,
+even when automatic model testing is configured. Help, footer and accessible
+Save labels state that behavior. The legacy API used by other clients retains
+its configured testing behavior.
 A running Run keeps its original model; a later Run uses the saved selection.
 The private fixture explicitly disables automatic model tests. No real paid
 provider request or user Profile is used by validation.
@@ -41,7 +45,9 @@ receipt is pending. Setter acknowledgements must expose both exact values.
 Malformed positive replies stay Unknown. Connection loss retires the form;
 there is no automatic retry. Explicit reload and an unchanged Save reread the
 pair and avoid another setter. There is no durable model-setting idempotency
-ledger or promise across process restarts/unseen intervening changes.
+ledger or promise across process restarts. A compare-set checks current values,
+not revision history: intervening changes that restore the same pair are not
+detected, and another writer can change the pair after a successful save.
 
 Forms and rendered saves bind the Client instance as well as the form
 revision. A new Profile attachment retires all metadata saves, retains drafts

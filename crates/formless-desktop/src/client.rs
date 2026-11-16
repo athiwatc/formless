@@ -897,6 +897,7 @@ impl Preparation {
 #[derive(Default)]
 struct Engine {
     reference_detach_available: bool,
+    session_model_cas_available: bool,
     reviewed_send_available: bool,
     instance: uuid::Uuid,
     reader: reader::Reader,
@@ -1906,7 +1907,9 @@ impl Engine {
                 change,
             } if self.ready => {
                 if change.is_selection() && self.pending.values().any(|p|matches!(p,Pending::EditSession{operation:op,session_id:id,..}|Pending::InspectModelSelection{operation:op,session_id:id,..} if *op==operation && id==&session_id)) {return;}
-                let error = if connection != self.connection {
+                let error = if change.is_selection() && !self.session_model_cas_available {
+                    Some("Update the daemon for atomic model/effort changes. No setting was sent.".into())
+                } else if connection != self.connection {
                     Some("Connection changed; reload Session details before editing.".into())
                 } else if session_id.is_empty() || session_id.len() > 256 {
                     Some("Invalid Session identity; no change was sent.".into())
@@ -2293,6 +2296,10 @@ impl Engine {
                             .into(),
                     );
                 }
+                self.session_model_cas_available =
+                    result["features"].as_array().is_some_and(|features| {
+                        features.iter().any(|f| f == "session_model_compare_set_v1")
+                    });
                 self.reference_detach_available =
                     result["features"].as_array().is_some_and(|features| {
                         features.iter().any(|f| f == "reviewed_reference_detach_v1")

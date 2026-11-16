@@ -135,8 +135,9 @@ parity and platform, performance and distribution acceptance remain open.
 
 The [Session model selection report](session-model-selection-20261115.md) adds
 bounded manual model/Role and effort overrides through Session details. The
-existing setter may trigger a configured paid model test, so its form has a
-persistent visible notice. Complete paired values are freshly checked; work
+native [atomic save](session-model-cas-20261116.md) requires an advertised
+capability and compares both nullable values inside a schema-67 transaction.
+Saving starts no Provider test or Run. Complete paired values are freshly checked; work
 preparation waits for the setting receipt. Read-only no-ops, missing metadata,
 stale form callbacks and physical reconnect are covered headlessly. This does
 not establish provider availability, catalog/Role editing, native usability or

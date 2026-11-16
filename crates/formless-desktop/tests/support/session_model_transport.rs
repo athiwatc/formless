@@ -40,7 +40,9 @@ async fn session_model_lost_ack_reconnect_and_explicit_unchanged_save_never_repe
                 }
                 let r: RequestEnvelope = serde_json::from_str(&line).unwrap();
                 let value = match r.request {
-                    Request::Ping => json!({"min_protocol":1,"max_protocol":1}),
+                    Request::Ping => {
+                        json!({"min_protocol":1,"max_protocol":1,"features":["session_model_compare_set_v1"]})
+                    }
                     Request::Subscribe { deltas: false, .. } => json!({"subscribed":true}),
                     Request::ListSessions => {
                         if gate_peer.swap(false, Ordering::SeqCst) {
@@ -53,11 +55,15 @@ async fn session_model_lost_ack_reconnect_and_explicit_unchanged_save_never_repe
                         assert_eq!(id, session.id);
                         json!({"session":session,"messages":[],"running":false,"step_mode":false,"pending_steps":{"prompts":[],"more":false},"pending_events":[]})
                     }
-                    Request::SetSessionModel {
+                    Request::CompareSetSessionModel {
                         id,
-                        model,
-                        reasoning_effort,
+                        expected,
+                        desired,
                     } => {
+                        assert_eq!(expected.model, session.model);
+                        assert_eq!(expected.reasoning_effort, session.reasoning_effort);
+                        let model = desired.model;
+                        let reasoning_effort = desired.reasoning_effort;
                         assert_eq!(id, session.id);
                         assert_eq!(model.as_deref(), Some("role:reviewer"));
                         assert_eq!(reasoning_effort.as_deref(), Some("low"));
