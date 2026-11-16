@@ -21,8 +21,8 @@ struct Fixture {
     provider: tokio::task::JoinHandle<()>,
     calls: Arc<AtomicUsize>,
 }
-fn response(n: usize) -> axum::response::Response {
-    let value = if n.is_multiple_of(2) {
+fn response(n: usize, tool_call: bool) -> axum::response::Response {
+    let value = if tool_call {
         json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":format!("private-call-{n}"),"type":"function","function":{"name":"native_approval_fixture","arguments":"{}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1}})
     } else {
         json!({"choices":[{"delta":{"content":format!("Private flow {} complete",n/2+1)},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}})
@@ -37,6 +37,9 @@ fn response(n: usize) -> axum::response::Response {
 }
 impl Fixture {
     fn start() -> Self {
+        Self::start_mode(false)
+    }
+    fn start_mode(multiple: bool) -> Self {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -51,7 +54,7 @@ impl Fixture {
         let marker = root.join("approved-marker.txt");
         let calls = Arc::new(AtomicUsize::new(0));
         let (daemon,server,provider,endpoint,session,tool)=runtime.block_on(async{
-            let app=axum::Router::new().route("/models",axum::routing::get(||async{axum::Json(json!({"data":[{"id":"approval-private"}]}))})).route("/chat/completions",axum::routing::post({let calls=calls.clone();move||{let calls=calls.clone();async move{let n=calls.fetch_add(1,Ordering::SeqCst);assert!(n<4,"unexpected extra provider work");response(n)}}}));
+            let app=axum::Router::new().route("/models",axum::routing::get(||async{axum::Json(json!({"data":[{"id":"approval-private"}]}))})).route("/chat/completions",axum::routing::post({let calls=calls.clone();move|axum::Json(body):axum::Json<Value>|{let calls=calls.clone();async move{let n=calls.fetch_add(1,Ordering::SeqCst);assert!(n<4,"unexpected extra provider work");let tool_call=if multiple{!body["messages"].as_array().unwrap().iter().any(|m|m["role"]=="tool")}else{n.is_multiple_of(2)};response(n,tool_call)}}}));
             let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();let base=format!("http://{}",listener.local_addr().unwrap());let provider=tokio::spawn(async move{axum::serve(listener,app).await.unwrap()});
             let paths=formless_core::Paths::from_dirs(root.join("d"),root.join("c")).unwrap();let mut config=formless_core::Config::default();config.provider.base_url=base;config.provider.api_style="openai".into();config.provider.model="approval-private".into();config.provider.max_retries=0;config.provider.auto_test_models=false;config.provider.model_context_tokens.insert("approval-private".into(),100_000);config.security.secure=true;config.naming.enabled=false;config.skills.auto_create=false;config.tools.approval_summaries=false;config.daemon.idle_grace_secs=3600;config.save(&paths).unwrap();
             let store=formless_core::Store::open(&paths.db_file()).unwrap();let project=root.join("project");std::fs::create_dir(&project).unwrap();let session=store.create_session(Some("Native approval private flow".into())).unwrap();store.set_session_cwd(&session.id,project.to_str()).unwrap();
@@ -289,6 +292,190 @@ fn native_security_approval_once_then_deny_reaches_real_daemon_without_persistin
     }
     step(cx, handle, |_, cx| {
         shell.update(cx, |s, cx| s.connect_recording_daemon(cx))
+    });
+    f.finish();
+}
+
+fn activate(window: &mut Window, cx: &mut App, id: &'static str) {
+    for _ in 0..40 {
+        settle_frames(window, cx);
+        if window.find(id).focused() == Some(true) {
+            assert!(window.find(id).visible());
+            window.press("space", cx);
+            return;
+        }
+        window.press("tab", cx);
+    }
+    panic!("approval control not reachable: {id}");
+}
+fn load_current(cx: &mut TestAppContext, h: WindowHandle<Root>, s: &Entity<Shell>) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut reloads = 0;
+    loop {
+        pump(cx, h, s);
+        let ready = step(cx, h, |w, cx| {
+            s.read(cx).approval_target().is_some()
+                && w.find("approval-allow-once").disabled() != Some(true)
+        });
+        if ready {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "multi approval inventory did not stabilize"
+        );
+        step(cx, h, |w, cx| {
+            if w.find("approval-reload").disabled() != Some(true) {
+                reloads += 1;
+                assert!(reloads <= 8);
+                activate(w, cx, "approval-reload");
+            }
+        });
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+#[gpui_kit::test]
+fn native_multiple_security_approvals_decide_only_the_selected_session_and_never_grant_the_other(
+    cx: &mut TestAppContext,
+) {
+    let env = credential_env::EnvGuard::isolated();
+    env.set("FORMLESS_API_KEY", "private-multiple-approval-fixture");
+    env.set("NO_PROXY", "127.0.0.1,localhost");
+    let f = Fixture::start_mode(true);
+    let other = f
+        .runtime
+        .block_on(f.daemon.handle(Request::CreateSession {
+            name: Some("Second private approval Session".into()),
+        }))
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let snapshot = |id: &str| {
+        f.runtime
+            .block_on(f.daemon.handle(Request::GetSession { id: id.into() }))
+            .unwrap()
+    };
+    let (h, s) = open(cx, WIDE, 0, 0);
+    step(cx, h, |_, cx| {
+        s.update(cx, |s, cx| s.connect_daemon(f.endpoint.clone(), cx))
+    });
+    until(cx, h, &s, "two approval Sessions", |s| {
+        s.sidebar().rows().iter().any(|r| r.id == f.session)
+            && s.sidebar().rows().iter().any(|r| r.id == other)
+    });
+    step(cx, h, |w, cx| w.click(session_row_id(&f.session), cx));
+    until(cx, h, &s, "approval current Session", |s| {
+        s.step_mode_enable_target().is_some()
+    });
+    let composer = step(cx, h, |w, cx| {
+        s.update(cx, |s, cx| s.focus_section(PageSection::Composer, w, cx));
+        w.input("Unsent multi approval draft ไทย😀", cx);
+        s.read(cx).composer().clone()
+    });
+    f.send();
+    f.runtime
+        .block_on(f.daemon.handle(Request::SendMessage {
+            session_id: other.clone(),
+            content: "Second private fixture request".into(),
+            mode: SendMode::Send,
+            client_msg_id: Some(uuid::Uuid::new_v4().to_string()),
+        }))
+        .unwrap();
+    f.wait("two simultaneous approvals", || {
+        f.pending().as_array().unwrap().len() == 2
+    });
+    assert_eq!(f.calls.load(Ordering::SeqCst), 2);
+    assert!(!f.marker.exists());
+    step(cx, h, |w, cx| {
+        s.update(cx, |s, cx| s.run_command(Command::Approvals, w, cx));
+    });
+    load_current(cx, h, &s);
+    let chosen = step(cx, h, |w, cx| {
+        assert!(w
+            .find("approval-selection")
+            .value()
+            .unwrap()
+            .contains("Request 1 of 2"));
+        activate(w, cx, "approval-next");
+        let (_, prompt) = s.read(cx).approval_target().unwrap();
+        assert!(w
+            .find("approval-selection")
+            .value()
+            .unwrap()
+            .contains("Request 2 of 2"));
+        assert_eq!(w.find("approval-review-close").focused(), Some(true));
+        assert_eq!(
+            composer.read(cx).value().as_ref(),
+            "Unsent multi approval draft ไทย😀"
+        );
+        let chosen = (prompt.id().to_string(), prompt.session().to_string());
+        activate(w, cx, "approval-allow-once");
+        chosen
+    });
+    until(
+        cx,
+        h,
+        &s,
+        "selected allow receipt",
+        |s| matches!(s.approval_review_status(),Status::Finished{action,outcome:Outcome::Accepted{audit_recorded:true}}if action.allow&&action.prompt.id()==chosen.0),
+    );
+    f.wait("selected Run completed only", || {
+        snapshot(&chosen.1)["running"] == false && f.pending().as_array().unwrap().len() == 1
+    });
+    assert_eq!(f.calls.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        std::fs::read_to_string(&f.marker).unwrap(),
+        "native approved"
+    );
+    std::fs::remove_file(&f.marker).unwrap();
+    let remaining = f.pending()[0]["session_id"].as_str().unwrap().to_string();
+    assert_ne!(remaining, chosen.1);
+    assert_eq!(snapshot(&remaining)["running"], true);
+    step(cx, h, |w, cx| activate(w, cx, "approval-reload"));
+    load_current(cx, h, &s);
+    step(cx, h, |w, cx| {
+        let (_, prompt) = s.read(cx).approval_target().unwrap();
+        assert_eq!(prompt.session(), remaining);
+        assert_ne!(prompt.id(), chosen.0);
+        assert!(!f.marker.exists());
+        activate(w, cx, "approval-deny");
+    });
+    until(
+        cx,
+        h,
+        &s,
+        "other deny receipt",
+        |s| matches!(s.approval_review_status(),Status::Finished{action,outcome:Outcome::Accepted{audit_recorded:true}}if !action.allow&&action.prompt.session()==remaining),
+    );
+    f.wait("both explicit Runs idle", || {
+        snapshot(&f.session)["running"] == false
+            && snapshot(&other)["running"] == false
+            && f.pending().as_array().unwrap().is_empty()
+    });
+    assert_eq!(f.calls.load(Ordering::SeqCst), 4);
+    assert!(!f.marker.exists(), "denied other Tool must not write");
+    let grants = f
+        .runtime
+        .block_on(f.daemon.handle(Request::ListApprovals))
+        .unwrap();
+    assert!(!grants
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|g| g["tool_id"].as_str() == Some(&f.tool)));
+    eprintln!(
+        "private_multiple_approval_case {}",
+        json!({"initial_pending":2,"selected_approval":chosen.0,"selected_session":chosen.1,"remaining_session":remaining,"provider_calls":f.calls.load(Ordering::SeqCst),"final_pending":f.pending().as_array().unwrap().len(),"denied_marker_absent":!f.marker.exists(),"persistent_grant":false})
+    );
+    step(cx, h, |w, cx| {
+        assert_eq!(s.read(cx).composer(), &composer);
+        assert_eq!(
+            composer.read(cx).value().as_ref(),
+            "Unsent multi approval draft ไทย😀"
+        );
+        w.click("approval-review-close", cx);
+        s.update(cx, |s, cx| s.connect_recording_daemon(cx));
     });
     f.finish();
 }

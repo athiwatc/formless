@@ -5,6 +5,67 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex};
 pub const MAX_PROMPT_BYTES: usize = 16 * 1024;
 pub const MAX_OPERATIONS: usize = 256;
+pub const MAX_APPROVALS: usize = 16;
+pub const MAX_INVENTORY_BYTES: usize = 64 * 1024;
+// Count serialized bytes without allocating an oversized serialized copy.
+fn bounded_bytes(value: &Value, limit: usize) -> Result<usize, &'static str> {
+    struct Counter {
+        bytes: usize,
+        limit: usize,
+    }
+    impl std::io::Write for Counter {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            let next = self.bytes.saturating_add(data.len());
+            if next > self.limit {
+                return Err(std::io::Error::other("native approval limit"));
+            }
+            self.bytes = next;
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter { bytes: 0, limit };
+    serde_json::to_writer(&mut counter, value)
+        .map_err(|_| "Approval evidence exceeds native bounds; use Formless TUI.")?;
+    Ok(counter.bytes)
+}
+/// A complete bounded inventory. Unsupported rows are never silently omitted.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Inventory {
+    prompts: Vec<Prompt>,
+}
+impl Inventory {
+    pub fn from_list(value: &Value) -> Result<Self, &'static str> {
+        let rows = value
+            .as_array()
+            .ok_or("Approval inventory is unavailable; use Formless TUI.")?;
+        if rows.len() > MAX_APPROVALS {
+            return Err("Too many pending approvals for native review; use Formless TUI.");
+        }
+        bounded_bytes(value, MAX_INVENTORY_BYTES)?;
+        let mut ids = HashSet::new();
+        let mut prompts = Vec::with_capacity(rows.len());
+        for raw in rows {
+            let prompt = Prompt::from_raw(raw)?;
+            if !ids.insert(prompt.id.clone()) {
+                return Err("Duplicate approval identities; reload or use Formless TUI.");
+            }
+            prompts.push(prompt);
+        }
+        Ok(Self { prompts })
+    }
+    pub fn prompts(&self) -> &[Prompt] {
+        &self.prompts
+    }
+    pub fn is_empty(&self) -> bool {
+        self.prompts.is_empty()
+    }
+    pub fn find(&self, id: &str) -> Option<&Prompt> {
+        self.prompts.iter().find(|p| p.id() == id)
+    }
+}
 fn directional(c: char) -> bool {
     matches!(c,'\u{061c}'|'\u{200e}'|'\u{200f}'|'\u{202a}'..='\u{202e}'|'\u{2066}'..='\u{2069}')
 }
@@ -20,6 +81,8 @@ pub struct Prompt {
     raw: Arc<Value>,
 }
 impl Prompt {
+    /// Single-prompt utility; intentionally refuses implicit selection from several rows.
+    /// The production reader uses Inventory for explicit selection.
     pub fn from_list(value: &Value) -> Result<Option<Self>, &'static str> {
         let rows = value
             .as_array()
@@ -28,9 +91,11 @@ impl Prompt {
             return Ok(None);
         }
         if rows.len() != 1 {
-            return Err("Native review requires one pending approval. Review multiple approvals in Formless TUI.");
+            return Err("This single-prompt parser cannot choose among multiple approvals.");
         }
-        let raw = &rows[0];
+        Self::from_raw(&rows[0]).map(Some)
+    }
+    fn from_raw(raw: &Value) -> Result<Self, &'static str> {
         let object = raw
             .as_object()
             .ok_or("Invalid approval; use Formless TUI.")?;
@@ -51,10 +116,7 @@ impl Prompt {
             "path_options",
         ];
         if object.keys().any(|k| !KEYS.contains(&k.as_str()))
-            || serde_json::to_vec(raw)
-                .map_err(|_| "Invalid approval")?
-                .len()
-                > MAX_PROMPT_BYTES
+            || bounded_bytes(raw, MAX_PROMPT_BYTES).is_err()
         {
             return Err("Approval contains unsupported or oversized data; use Formless TUI.");
         }
@@ -111,13 +173,13 @@ impl Prompt {
         {
             return Err("Approval call has unsupported fields; use Formless TUI.");
         }
-        Ok(Some(Self {
+        Ok(Self {
             id: approval_id,
             session: session_id,
             tool: tool_name,
             version,
             raw: Arc::new(raw.clone()),
-        }))
+        })
     }
     pub fn id(&self) -> &str {
         &self.id
@@ -136,7 +198,7 @@ impl Prompt {
         json.chars().map(|c|if matches!(c,'\u{061c}'|'\u{200e}'|'\u{200f}'|'\u{202a}'..='\u{202e}'|'\u{2066}'..='\u{2069}'){format!("\\u{:04x}",c as u32)}else{c.to_string()}).collect()
     }
     // Prompt construction is sealed: all decision evidence was validated by
-    // from_list and remains immutable behind Arc; callers cannot alter fields.
+    // from_raw and remains immutable behind Arc; callers cannot alter fields.
     fn valid(&self) -> bool {
         identity(&self.id) && identity(&self.session) && self.version > 0
     }
@@ -346,6 +408,19 @@ pub fn fixture_inventory() -> Value {
      "context":{"run_id":"run-fixture","call":{"arguments":{"message":"ไทย 漢字 😀"},"urls":[],"paths":["/private-fixture/only"],"truncated":false,"note":"Redacted evidence"},"sources":[],"scope_warnings":[]}
     }])
 }
+#[cfg(any(test, feature = "test-support", feature = "daemon-tests"))]
+#[doc(hidden)]
+pub fn fixture_multiple() -> Value {
+    let mut value = fixture_inventory();
+    let mut other = value[0].clone();
+    other["approval_id"] = serde_json::json!("approval-fixture-2");
+    other["session_id"] = serde_json::json!("approval-session-2");
+    other["context"]["run_id"] = serde_json::json!("run-fixture-2");
+    other["context"]["call"]["arguments"] =
+        serde_json::json!({"message":"Second requested payload"});
+    value.as_array_mut().unwrap().push(other);
+    value
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,6 +434,65 @@ mod tests {
             prompt: Prompt::from_list(&fixture_inventory()).unwrap().unwrap(),
             allow: true,
         }
+    }
+    #[test]
+    fn inventory_preserves_distinct_complete_prompts_and_selects_only_by_unique_id() {
+        let value = fixture_multiple();
+        let inventory = Inventory::from_list(&value).unwrap();
+        assert_eq!(inventory.prompts().len(), 2);
+        assert_eq!(inventory.prompts()[1].session(), "approval-session-2");
+        assert_eq!(
+            serde_json::from_str::<Value>(&inventory.prompts()[1].display()).unwrap(),
+            value[1]
+        );
+        assert!(inventory.find("unknown").is_none());
+        assert_eq!(
+            inventory.find("approval-fixture-2"),
+            Some(&inventory.prompts()[1])
+        );
+        assert!(Inventory::from_list(&serde_json::json!([]))
+            .unwrap()
+            .is_empty());
+    }
+    #[test]
+    fn inventory_never_drops_duplicate_unsupported_or_oversized_authority() {
+        for mode in 0..6 {
+            let mut value = fixture_multiple();
+            match mode {
+                0 => value[1]["approval_id"] = value[0]["approval_id"].clone(),
+                1 => value[1]["context"]["call"]["truncated"] = serde_json::json!(true),
+                2 => value[1]["new_authority"] = serde_json::json!(true),
+                3 => value[1]["batch"] = serde_json::json!({}),
+                4 => {
+                    let row = value[0].clone();
+                    value = serde_json::json!(vec![row; MAX_APPROVALS + 1]);
+                }
+                _ => value[1]["detail"] = serde_json::json!("x".repeat(MAX_PROMPT_BYTES)),
+            };
+            assert!(Inventory::from_list(&value).is_err(), "{mode}");
+        }
+        let mut rows = Vec::new();
+        for n in 0..MAX_APPROVALS {
+            let mut row = fixture_inventory()[0].clone();
+            row["approval_id"] = serde_json::json!(format!("id-{n}"));
+            row["detail"] = serde_json::json!("x".repeat(5000));
+            assert!(Prompt::from_raw(&row).is_ok());
+            rows.push(row);
+        }
+        assert!(
+            Inventory::from_list(&serde_json::json!(rows)).is_err(),
+            "aggregate limit must apply even when each prompt is valid"
+        );
+    }
+    #[test]
+    fn bounded_counter_checks_serialized_utf8_and_escapes_without_partial_acceptance() {
+        let v = serde_json::json!("é");
+        assert_eq!(bounded_bytes(&v, 4), Ok(4));
+        assert!(bounded_bytes(&v, 3).is_err());
+        let v = serde_json::json!("\n\"");
+        let size = serde_json::to_vec(&v).unwrap().len();
+        assert_eq!(bounded_bytes(&v, size), Ok(size));
+        assert!(bounded_bytes(&v, size - 1).is_err());
     }
     #[test]
     fn native_decisions_are_explicit_once_and_never_widen_or_remember() {

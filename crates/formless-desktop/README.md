@@ -116,9 +116,10 @@ questions are available in the Profile-wide Questions command/header entry,
 with structured single/multi-choice and multiline free text. Their Session
 identity stays explicit even while another Session is displayed. Existing
 security approvals are available through the Profile-wide Approvals command.
-One complete, bounded Tool request supports explicit Allow once or Deny, after
-a fresh exact inventory comparison. Multiple requests, batches, promotions and
-wider scopes retain their TUI handoff. The desktop never starts a daemon
+A bounded inventory of complete Tool requests supports explicit one-at-a-time
+selection, Allow once or Deny, after a fresh exact identity/evidence comparison.
+Batches, promotions, unsupported/mixed inventories and wider scopes retain
+their TUI handoff. The desktop never starts a daemon
 or reads its database, credentials or configuration files.
 
 The current protocol has no snapshot watermark or token offset. This client
@@ -565,3 +566,12 @@ choosing a row fills the draft without saving. Save remains separate and may
 start the configured paid model test. No read is automatic or replayed after
 reconnect. See the [catalog contract](../../docs/desktop/model-catalog-20261116.md)
 for limits and headless validation scope.
+
+
+The Approvals dialog now selects one request at a time from up to 16 complete
+supported Tool requests, with 64 KiB total serialized evidence and 16 KiB per
+request. Previous/Next grants nothing and returns focus to Close. Decisions
+freshly find the selected unique approval ID and compare all its evidence;
+reordering unrelated requests cannot retarget the decision. Unsupported or
+duplicate rows reject the whole native inventory. See the
+[multiple-request review contract](../../docs/desktop/multiple-approvals-20261116.md).

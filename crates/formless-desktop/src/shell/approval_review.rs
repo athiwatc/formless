@@ -1,5 +1,5 @@
 use super::*;
-use crate::approvals::{Action, Prompt, Status};
+use crate::approvals::{Action, Inventory, Prompt, Status};
 
 pub(super) struct Panel {
     instance: uuid::Uuid,
@@ -10,6 +10,8 @@ pub(super) struct Panel {
     submitted: bool,
     retired: bool,
     prompt: Option<Prompt>,
+    inventory: Inventory,
+    selected: usize,
     notice: String,
     observed: Status,
     details: String,
@@ -76,6 +78,8 @@ impl Shell {
             submitted: false,
             retired: true,
             prompt: None,
+            inventory: Inventory::default(),
+            selected: 0,
             notice: String::new(),
             observed: Status::Idle,
             details: String::new(),
@@ -87,7 +91,7 @@ impl Shell {
             rows: gpui_kit::UniformListScrollHandle::new(),
             rows_focus: cx.focus_handle().tab_stop(true),
             rows_anchor: gpui_kit::ScrollAnchor::for_handle(scroll.clone()),
-            controls: (0..4)
+            controls: (0..6)
                 .map(|_| {
                     (
                         cx.focus_handle(),
@@ -134,6 +138,8 @@ impl Shell {
         p.submitted = false;
         p.retired = true;
         p.prompt = None;
+        p.inventory = Inventory::default();
+        p.selected = 0;
         p.details.clear();
         p.starts = Box::default();
         p.rows = gpui_kit::UniformListScrollHandle::new();
@@ -155,7 +161,7 @@ impl Shell {
         connection: u64,
         operation: uuid::Uuid,
         revision: u64,
-        result: Result<Option<Prompt>, String>,
+        result: Result<Inventory, String>,
         cx: &mut Context<Self>,
     ) {
         let Some(p) = &self.approval_panel else {
@@ -178,8 +184,8 @@ impl Shell {
         }
         p.minimum_revision = revision;
         match result {
-            Ok(Some(prompt))=>{p.details=prompt.display();p.prompt=Some(prompt);p.retired=false;p.layout=None;p.notice="Review the complete requested authority below. No decision has been sent.".into();},
-            Ok(None)=>p.notice="No pending Tool security approval in this read. Other decisions may still require Formless TUI.".into(),
+            Ok(inventory) if !inventory.is_empty()=>{let prompt=inventory.prompts()[0].clone();p.details=prompt.display();p.prompt=Some(prompt);p.inventory=inventory;p.selected=0;p.retired=false;p.layout=None;p.notice="Review the complete requested authority below. No decision has been sent.".into();},
+            Ok(_)=>p.notice="No pending Tool security approval in this read. Other decisions may still require Formless TUI.".into(),
             Err(e)=>p.notice=crate::questions::preview(&e,500),
         }
         p.frames = 2;
@@ -203,6 +209,47 @@ impl Shell {
         if !p.submitted {
             p.notice="Approval inventory changed. Reload before deciding; earlier evidence is read-only.".into();
         }
+        cx.notify();
+    }
+    fn select_approval(
+        &mut self,
+        revision: uuid::Uuid,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.modal != Some(Modal::Approvals) || self.approval_composing(window, cx) {
+            return;
+        }
+        let Some(p) = &self.approval_panel else {
+            return;
+        };
+        if p.revision != revision
+            || !self.approval_owner_current(p)
+            || p.reading
+            || p.submitted
+            || p.retired
+            || index == p.selected
+            || self.client.as_ref().unwrap().approval_status().blocked()
+        {
+            return;
+        }
+        let Some(prompt) = p.inventory.prompts().get(index).cloned() else {
+            return;
+        };
+        let p = self.approval_panel.as_mut().unwrap();
+        p.revision = uuid::Uuid::new_v4();
+        p.selected = index;
+        p.scroll.set_offset(point(px(0.), px(0.)));
+        p.details = prompt.display();
+        p.prompt = Some(prompt);
+        p.layout = None;
+        p.error = None;
+        p.starts = Box::default();
+        p.rows = gpui_kit::UniformListScrollHandle::new();
+        p.notice="Review this selected request's complete authority. Selection grants nothing; Allow once or Deny is a separate explicit action.".into();
+        p.frames = 2;
+        p.close.focus(window, cx);
         cx.notify();
     }
     pub fn submit_approval(
@@ -444,8 +491,67 @@ impl Shell {
         .text_size(cx.theme().mono_font_size);
         let mut body=v_flex().id("approval-review-body").test_support().flex_1().min_h_0().overflow_y_scroll().track_scroll(&p.scroll).gap_2()
             .child(readable("approval-review-scope","Profile-wide Tool call review. Allow once grants only this call's exact requested authority. Deny is not remembered. No persistent grant or path widening."))
-            .child(readable("approval-review-limits","Arguments are daemon-redacted evidence; code_preview is not full code. Wider scopes, multiple/batched approvals and other decision types require Formless TUI."))
+            .child(readable("approval-review-limits","Arguments are daemon-redacted evidence; code_preview is not full code. Review one selected request at a time. Wider scopes, batches, unsupported/mixed inventories and other decision types require Formless TUI."))
             .child(readable("approval-review-notice",p.notice.clone()));
+        if p.inventory.prompts().len() > 1 {
+            let prompt = p.prompt.as_ref().unwrap();
+            body = body.child(readable(
+                "approval-selection",
+                format!(
+                    "Request {} of {} · Session {} · Tool {} version {} · approval {}",
+                    p.selected + 1,
+                    p.inventory.prompts().len(),
+                    prompt.session(),
+                    prompt.tool(),
+                    prompt.version(),
+                    prompt.id()
+                ),
+            ));
+            let mut navigation = h_flex().flex_wrap().gap_2();
+            for (slot, id, label, index, edge) in [
+                (
+                    4,
+                    "approval-previous",
+                    "Previous request",
+                    p.selected.saturating_sub(1),
+                    p.selected == 0,
+                ),
+                (
+                    5,
+                    "approval-next",
+                    "Next request",
+                    p.selected + 1,
+                    p.selected + 1 >= p.inventory.prompts().len(),
+                ),
+            ] {
+                navigation = navigation.child(
+                    div()
+                        .id(SharedString::from(format!("{id}-anchor")))
+                        .anchor_scroll(Some(p.controls[slot].1.clone()))
+                        .child(
+                            Button::new(id)
+                                .label(label)
+                                .track_focus(&p.controls[slot].0)
+                                .disabled(
+                                    edge || !self.approval_owner_current(p)
+                                        || p.reading
+                                        || p.submitted
+                                        || p.retired
+                                        || self
+                                            .client
+                                            .as_ref()
+                                            .unwrap()
+                                            .approval_status()
+                                            .blocked(),
+                                )
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.select_approval(revision, index, window, cx)
+                                })),
+                        ),
+                );
+            }
+            body = body.child(navigation);
+        }
         if let Some(notice) = p.observed.notice() {
             let target = p
                 .observed
@@ -630,6 +736,16 @@ impl Shell {
                     .pt(px(16.))
                     .child(dialog),
             )
+    }
+    #[cfg(feature = "test-support")]
+    pub fn select_presented_approval(
+        &mut self,
+        revision: uuid::Uuid,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_approval(revision, index, window, cx);
     }
     #[cfg(feature = "test-support")]
     pub fn approval_target(&self) -> Option<(uuid::Uuid, Prompt)> {

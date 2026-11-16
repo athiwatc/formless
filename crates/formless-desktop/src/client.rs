@@ -62,7 +62,7 @@ pub enum Update {
         connection: u64,
         operation: uuid::Uuid,
         revision: u64,
-        result: Result<Option<crate::approvals::Prompt>, String>,
+        result: Result<crate::approvals::Inventory, String>,
     },
     ApprovalInvalidated {
         client: uuid::Uuid,
@@ -2205,7 +2205,7 @@ impl Engine {
             } => {
                 let result = if revision == self.approval_revision {
                     result.and_then(|v| {
-                        crate::approvals::Prompt::from_list(&v).map_err(str::to_string)
+                        crate::approvals::Inventory::from_list(&v).map_err(str::to_string)
                     })
                 } else {
                     Err("Approvals changed while reading; reload the current inventory.".into())
@@ -2222,7 +2222,8 @@ impl Engine {
                 let exact = result
                     .as_ref()
                     .ok()
-                    .and_then(|v| crate::approvals::Prompt::from_list(v).ok().flatten())
+                    .and_then(|v| crate::approvals::Inventory::from_list(v).ok())
+                    .and_then(|inventory| inventory.find(dispatch.action().prompt.id()).cloned())
                     .is_some_and(|p| p == dispatch.action().prompt);
                 if !self.approval_current(&dispatch)
                     || !dispatch.reserved()

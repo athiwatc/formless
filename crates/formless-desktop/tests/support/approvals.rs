@@ -1,5 +1,7 @@
 use super::*;
-use formless_desktop::approvals::{fixture_inventory, Outcome, Prompt, Status};
+use formless_desktop::approvals::{
+    fixture_inventory, fixture_multiple, Inventory, Outcome, Status,
+};
 use formless_desktop::client::{Command as Wire, Update};
 use serde_json::json;
 fn setup(cx: &mut TestAppContext) -> (WindowHandle<Root>, Entity<Shell>) {
@@ -31,7 +33,7 @@ fn ready(
         };
         let (connection, operation) = (*connection, *operation);
         let client = shell.read(cx).live_stream_instance().unwrap();
-        let result = Prompt::from_list(&value).map_err(str::to_string);
+        let result = Inventory::from_list(&value).map_err(str::to_string);
         shell.update(cx, |s, cx| {
             s.apply_client_update(
                 Update::ApprovalInventory {
@@ -203,5 +205,154 @@ fn approval_controls_and_evidence_are_keyboard_reachable_at_200_percent(cx: &mut
         let commands = shell.update(cx, |s, _| s.take_client_commands());
         assert_eq!(commands.len(), 1);
         assert!(matches!(&commands[0],Wire::DecideApproval(d)if !d.action().allow));
+    });
+}
+
+fn activate(window: &mut Window, cx: &mut App, id: &'static str) {
+    for _ in 0..40 {
+        settle_frames(window, cx);
+        if window.find(id).focused() == Some(true) {
+            assert!(window.find(id).visible());
+            window.press("space", cx);
+            return;
+        }
+        window.press("tab", cx);
+    }
+    panic!("approval control not keyboard reachable: {id}");
+}
+#[gpui_kit::test]
+fn multiple_approval_selection_retires_cached_decisions_and_never_approves_by_navigation(
+    cx: &mut TestAppContext,
+) {
+    let (h, s) = setup(cx);
+    ready(cx, h, &s, fixture_multiple());
+    step(cx, h, |w, cx| {
+        let old = s.read(cx).approval_target().unwrap();
+        let composer = s.read(cx).composer().clone();
+        let draft = composer.read(cx).value().to_string();
+        activate(w, cx, "approval-next");
+        let current = s.read(cx).approval_target().unwrap();
+        assert_eq!(current.1.id(), "approval-fixture-2");
+        assert_ne!(old.0, current.0);
+        assert_eq!(w.find("approval-review-close").focused(), Some(true));
+        assert!(w
+            .find("approval-selection")
+            .value()
+            .unwrap()
+            .contains("Request 2 of 2"));
+        activate(w, cx, "approval-previous");
+        let revisited = s.read(cx).approval_target().unwrap();
+        assert_eq!(revisited.1, old.1);
+        assert_ne!(revisited.0, old.0);
+        s.update(cx, |s, cx| {
+            s.submit_approval(old.0, old.1.clone(), true, w, cx)
+        });
+        s.update(cx, |s, cx| s.select_presented_approval(old.0, 1, w, cx));
+        assert_eq!(
+            s.read(cx).approval_target().unwrap().1.id(),
+            "approval-fixture"
+        );
+        assert!(s.update(cx, |s, _| s.take_client_commands()).is_empty());
+        activate(w, cx, "approval-next");
+        let current = s.read(cx).approval_target().unwrap();
+        s.update(cx, |s, cx| s.submit_approval(old.0, old.1, true, w, cx));
+        s.update(cx, |s, cx| s.select_presented_approval(old.0, 0, w, cx));
+        assert_eq!(
+            s.read(cx).approval_target().unwrap().1.id(),
+            "approval-fixture-2"
+        );
+        assert!(s.update(cx, |s, _| s.take_client_commands()).is_empty());
+        activate(w, cx, "approval-deny");
+        let mut commands = s.update(cx, |s, _| s.take_client_commands());
+        assert_eq!(commands.len(), 1);
+        let Wire::DecideApproval(dispatch) = commands.remove(0) else {
+            panic!("one selected decision")
+        };
+        assert_eq!(dispatch.action().prompt.id(), "approval-fixture-2");
+        assert!(!dispatch.action().allow);
+        s.update(cx, |s, cx| s.select_presented_approval(current.0, 0, w, cx));
+        assert_eq!(
+            s.read(cx).approval_target().unwrap().1.id(),
+            "approval-fixture-2"
+        );
+        assert!(s.update(cx, |s, _| s.take_client_commands()).is_empty());
+        assert_eq!(composer.read(cx).value().as_ref(), draft);
+    });
+}
+#[gpui_kit::test]
+fn multiple_approval_navigation_is_keyboard_reachable_at_200_percent_and_ime_guarded(
+    cx: &mut TestAppContext,
+) {
+    let (h, s) = setup(cx);
+    let mut value = fixture_multiple();
+    for n in 3..=formless_desktop::approvals::MAX_APPROVALS {
+        let mut row = value[0].clone();
+        row["approval_id"] = json!(format!("approval-fixture-{n}"));
+        row["session_id"] = json!(format!("session-{n}"));
+        value.as_array_mut().unwrap().push(row);
+    }
+    ready(cx, h, &s, value);
+    cx.simulate_window_resize(h.into(), MINIMUM);
+    step(cx, h, |w, cx| {
+        s.update(cx, |s, cx| s.set_text_scale(TextScale::LARGEST, w, cx));
+        for n in 2..=formless_desktop::approvals::MAX_APPROVALS {
+            activate(w, cx, "approval-next");
+            assert_eq!(
+                s.read(cx).approval_target().unwrap().1.id(),
+                format!("approval-fixture-{n}")
+            );
+            assert_eq!(w.find("approval-review-close").focused(), Some(true));
+        }
+        assert_eq!(w.find("approval-next").disabled(), Some(true));
+        let (rev, prompt) = s.read(cx).approval_target().unwrap();
+        let input = s.read(cx).composer().clone();
+        input.update(cx, |i, cx| {
+            i.replace_and_mark_text_in_range(None, "かな", None, w, cx)
+        });
+        s.update(cx, |s, cx| s.select_presented_approval(rev, 0, w, cx));
+        assert_eq!(s.read(cx).approval_target().unwrap().1, prompt);
+        input.update(cx, |i, cx| i.unmark_text(w, cx));
+        activate(w, cx, "approval-previous");
+        assert_eq!(
+            s.read(cx).approval_target().unwrap().1.id(),
+            "approval-fixture-15"
+        );
+        assert!(s.update(cx, |s, _| s.take_client_commands()).is_empty());
+    });
+}
+
+#[gpui_kit::test]
+fn multiple_approval_unknown_receipt_blocks_other_requests_even_after_explicit_reload(
+    cx: &mut TestAppContext,
+) {
+    let (h, s) = setup(cx);
+    ready(cx, h, &s, fixture_multiple());
+    step(cx, h, |w, cx| {
+        activate(w, cx, "approval-allow-once");
+        let mut commands = s.update(cx, |s, _| s.take_client_commands());
+        let Wire::DecideApproval(d) = commands.remove(0) else {
+            panic!("decision")
+        };
+        s.update(cx, |s, cx| s.finish_recorded_approval(&d, json!({}), cx));
+        assert!(matches!(
+            s.read(cx).approval_review_status(),
+            Status::Finished {
+                outcome: Outcome::Unknown,
+                ..
+            }
+        ));
+        activate(w, cx, "approval-reload");
+    });
+    ready(cx, h, &s, fixture_multiple());
+    step(cx, h, |w, cx| {
+        let (rev, _) = s.read(cx).approval_target().unwrap();
+        s.update(cx, |s, cx| s.select_presented_approval(rev, 1, w, cx));
+        assert_eq!(
+            s.read(cx).approval_target().unwrap().1.id(),
+            "approval-fixture"
+        );
+        assert_eq!(w.find("approval-next").disabled(), Some(true));
+        assert_eq!(w.find("approval-allow-once").disabled(), Some(true));
+        assert!(s.update(cx, |s, _| s.take_client_commands()).is_empty());
     });
 }

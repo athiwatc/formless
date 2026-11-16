@@ -66,7 +66,7 @@ fn exact_profile_approval_revalidates_once_and_never_writes_persistent_authority
     }
 }
 #[test]
-fn missing_changed_or_multiple_authority_never_reaches_a_decision_write() {
+fn missing_changed_or_duplicate_authority_never_reaches_a_decision_write() {
     for mode in 0..6 {
         let (mut e, l, _d) = setup(true);
         let mut v = fixture_inventory();
@@ -209,7 +209,7 @@ fn read_slots_retire_with_a_result_at_both_possible_write_and_receipt_boundaries
     });
     let r = e.outgoing.pop_front().unwrap();
     e.receive(ServerMessage::ok(r.id, json!([]))).unwrap();
-    assert!(e.updates.iter().any(|u|matches!(u,Update::ApprovalInventory{operation,revision,result:Ok(None),..}if *operation==fresh&&*revision==e.approval_revision)));
+    assert!(e.updates.iter().any(|u|matches!(u,Update::ApprovalInventory{operation,revision,result:Ok(inventory),..}if *operation==fresh&&*revision==e.approval_revision&&inventory.is_empty())));
 }
 #[test]
 fn lost_possible_write_owner_is_unknown_and_blocks_explicit_retry() {
@@ -331,4 +331,113 @@ fn client_queue_failure_foreign_ownership_and_synchronous_context_cancel_are_dis
         }
     ));
     assert!(c.decide_approval(action()).is_err());
+}
+
+#[test]
+fn multiple_approval_recheck_finds_the_exact_reviewed_id_after_unrelated_turnover() {
+    for allow in [false, true] {
+        for turnover in 0..3 {
+            let value = crate::approvals::fixture_multiple();
+            let inventory = crate::approvals::Inventory::from_list(&value).unwrap();
+            let prompt = inventory.prompts()[1].clone();
+            let ledger = Arc::new(Ledger::default());
+            let client = uuid::Uuid::new_v4();
+            let dispatch = ledger
+                .reserve(Decision {
+                    client,
+                    connection: 2,
+                    epoch: 3,
+                    operation: uuid::Uuid::new_v4(),
+                    prompt: prompt.clone(),
+                    allow,
+                })
+                .unwrap();
+            let mut e = Engine {
+                instance: client,
+                connection: 2,
+                epoch: 3,
+                ready: true,
+                ..Default::default()
+            };
+            e.command(Command::DecideApproval(dispatch.clone()));
+            let fresh = match turnover {
+                0 => {
+                    let mut v = value.clone();
+                    v.as_array_mut().unwrap().reverse();
+                    v[1]["detail"] = json!("unrelated request changed");
+                    v
+                }
+                1 => json!([value[1].clone()]),
+                _ => {
+                    let mut v = value.clone();
+                    let mut other = value[0].clone();
+                    other["approval_id"] = json!("third-unrelated-approval");
+                    other["session_id"] = json!("third-session");
+                    v.as_array_mut().unwrap().push(other);
+                    v
+                }
+            };
+            inspect(&mut e, fresh);
+            e.before_approval_writes().unwrap();
+            let request = e.outgoing.pop_front().unwrap();
+            assert!(
+                matches!(request.request,Request::ApprovalDecision{approval_id,approved,scope:formless_protocol::ApprovalScope::Once,paths,remember_denial:false}if approval_id==prompt.id()&&approved==allow&&paths.is_empty())
+            );
+            assert!(e.outgoing.is_empty());
+        }
+    }
+}
+
+#[test]
+fn multiple_approval_recheck_rejects_changed_missing_duplicate_and_unsupported_targets() {
+    for mode in 0..5 {
+        let (mut e, ledger, _) = setup(true);
+        let mut value = crate::approvals::fixture_multiple();
+        match mode {
+            0 => {
+                value.as_array_mut().unwrap().remove(0);
+            }
+            1 => value[0]["context"]["call"]["arguments"] = json!({"changed":true}),
+            2 => value[1]["approval_id"] = value[0]["approval_id"].clone(),
+            3 => value[1]["context"]["call"]["truncated"] = json!(true),
+            _ => value[1]["new_authority"] = json!(true),
+        }
+        inspect(&mut e, value);
+        assert!(e.outgoing.is_empty());
+        assert!(matches!(
+            ledger.status(),
+            Status::Finished {
+                outcome: Outcome::Rejected(_),
+                ..
+            }
+        ));
+    }
+}
+#[test]
+fn an_unrelated_complete_pending_request_does_not_turn_one_decision_into_a_batch() {
+    let (mut e, ledger, _) = setup(true);
+    inspect(&mut e, crate::approvals::fixture_multiple());
+    e.before_approval_writes().unwrap();
+    let request = e.outgoing.pop_front().unwrap();
+    assert!(
+        matches!(request.request,Request::ApprovalDecision{approval_id,..}if approval_id=="approval-fixture")
+    );
+    e.receive(ServerMessage::ok(
+        request.id,
+        json!({"resolved":true,"audit_recorded":true}),
+    ))
+    .unwrap();
+    assert!(matches!(
+        ledger.status(),
+        Status::Finished {
+            outcome: Outcome::Accepted { .. },
+            ..
+        }
+    ));
+    assert!(
+        !e.outgoing
+            .iter()
+            .any(|r| matches!(r.request, Request::ApprovalDecision { .. })),
+        "a receipt must not decide the next request"
+    );
 }
