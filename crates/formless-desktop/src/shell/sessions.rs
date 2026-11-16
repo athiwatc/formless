@@ -1101,9 +1101,6 @@ impl Shell {
                         .child(Textarea::new(input).aria_label(aria)),
                 );
         }
-        if panel.field == Field::Model {
-            body = body.child(self.render_model_catalog(ready, cx));
-        }
         body = body
             .child(
                 h_flex()
@@ -1177,6 +1174,9 @@ impl Shell {
                     .aria_value(panel.notice.clone())
                     .child(panel.notice.clone()),
             );
+        if panel.field == Field::Model {
+            body = body.child(self.render_model_catalog(ready, cx));
+        }
         let can_export = self.client_connected
             && !busy
             && !panel.retired
