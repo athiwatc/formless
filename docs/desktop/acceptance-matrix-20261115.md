@@ -168,3 +168,10 @@ native/Core workflows at `032703d` from the preserved schema-68/69 durable
 prototype. It retains current-main schema compatibility without enabling
 journaling, Queue or streaming. Its owned-fixture/in-memory pairing evidence
 does not clear native/platform, hosted, distribution or whole-epic acceptance.
+
+The [offline preview acceptance increment](preview-offline-acceptance-20261116.md)
+adds bounded-row/headless-history performance measurements and preserves nine
+exact Pathfinder source notice headers with archive/source bindings. It changes
+no Core/schema or native runtime behavior and retains full-term/scope warnings.
+These local dev measurements and notice preservation do not clear native,
+release-performance, licensing or distribution acceptance.

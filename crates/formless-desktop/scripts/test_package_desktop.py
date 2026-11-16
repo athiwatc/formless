@@ -145,6 +145,55 @@ class Packaging(unittest.TestCase):
         self.assertEqual(receipt["revision"], "fixture revision")
         self.assertEqual(receipt["sha256"], package.digest(source))
 
+    def source_header_fixture(self):
+        root, upstream, lock, metadata, document, snapshot = self.reviewed_fixture()
+        source = root / "src/example.rs"
+        source.parent.mkdir()
+        header = b"// Copyright fixture owner.\n// Terms: fixture declared license.\n"
+        source.write_bytes(header + b"\nfn fixture() {}\n")
+        snapshot.write_bytes(header)
+        record = document["packages"][0]["files"][0]
+        record.update(role="published-source-header", source="src/example.rs leading comments",
+                      sha256=package.digest(snapshot), published_source="src/example.rs",
+                      published_source_sha256=package.digest(source), prefix_bytes=len(header))
+        document["packages"][0]["collection_limitations"] = ["Full terms review remains open"]
+        (upstream / "UPSTREAM.json").write_text(json.dumps(document))
+        return root, upstream, lock, metadata, document, snapshot, source
+
+    def test_published_source_headers_keep_exact_bytes_provenance_and_limitations(self):
+        root, upstream, lock, metadata, _, snapshot, _ = self.source_header_fixture()
+        destination = self.root / "header-out"
+        inventory = package.collect_notices([metadata], {"test-id"}, destination, upstream, lock)[0]
+        self.assertEqual((destination / inventory["notice_files"][0]).read_bytes(), snapshot.read_bytes())
+        receipt = inventory["notice_sources"][0]
+        self.assertEqual(receipt["role"], "published-source-header")
+        self.assertEqual(receipt["published_source"], "src/example.rs")
+        self.assertEqual(receipt["prefix_bytes"], snapshot.stat().st_size)
+        self.assertEqual(inventory["notice_review_limitations"], ["Full terms review remains open"])
+
+    def test_published_source_headers_refuse_drift_or_unbound_prefixes(self):
+        for changed in ["source", "snapshot", "path", "missing", "length", "bool", "short", "symlink"]:
+            with self.subTest(changed=changed):
+                root, upstream, lock, metadata, document, snapshot, source = self.source_header_fixture()
+                record = document["packages"][0]["files"][0]
+                if changed == "source":
+                    source.write_bytes(source.read_bytes() + b"// changed\n")
+                elif changed == "snapshot":
+                    snapshot.write_bytes(b"invented header")
+                    record["sha256"] = package.digest(snapshot)
+                elif changed == "path": record["published_source"] = "../outside.rs"
+                elif changed == "missing": record.pop("published_source")
+                elif changed == "length": record["prefix_bytes"] = source.stat().st_size + 1
+                elif changed == "bool": record["prefix_bytes"] = True
+                elif changed == "short": record["prefix_bytes"] = 1
+                else:
+                    original = source.with_suffix(".original")
+                    source.rename(original)
+                    source.symlink_to(original)
+                (upstream / "UPSTREAM.json").write_text(json.dumps(document))
+                with self.assertRaises(ValueError):
+                    package.collect_notices([metadata], {"test-id"}, root / "out", upstream, lock)
+
     def test_reviewed_notice_input_changes_fail_closed(self):
         for changed in ["lock", "vcs", "repository", "license", "bytes"]:
             with self.subTest(changed=changed):

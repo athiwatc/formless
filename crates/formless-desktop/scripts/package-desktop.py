@@ -139,6 +139,20 @@ def reviewed_notices(package, root, upstream, entry):
     result = []
     for notice in entry.get("files", []):
         source = verified_notice(upstream, notice)
+        if notice.get("role") == "published-source-header":
+            # Preserve an exact leading source comment, not a synthesized grant
+            # or a claim that the publisher supplied a standalone notice file.
+            if not isinstance(notice.get("published_source"), str):
+                raise ValueError("missing published source header path")
+            published = verified_notice(root, {
+                "local": notice.get("published_source"),
+                "sha256": notice.get("published_source_sha256"),
+            })
+            size = notice.get("prefix_bytes")
+            if type(size) is not int or not 0 < size <= published.stat().st_size:
+                raise ValueError("invalid published source header length")
+            if published.read_bytes()[:size] != source.read_bytes():
+                raise ValueError("published source header differs from source")
         if entry["source_kind"] == "workspace":
             if digest(upstream.parent.parents[1] / "LICENSE") != notice["sha256"]:
                 raise ValueError("workspace license changed; refresh notice review")
@@ -146,7 +160,9 @@ def reviewed_notices(package, root, upstream, entry):
             url=notice.get("url"), revision=notice.get("revision", entry.get("revision")),
             role=notice.get("role", "pinned-release-notice"),
             git_blob=notice.get("git_blob"), registry_checksum=entry.get("registry_checksum"),
-            reviewed_local=notice["local"])))
+            reviewed_local=notice["local"],
+            **({key: notice[key] for key in ("published_source", "published_source_sha256", "prefix_bytes")}
+               if notice.get("role") == "published-source-header" else {}))))
     return result
 
 
