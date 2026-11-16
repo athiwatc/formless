@@ -30,7 +30,8 @@ choices again.
 
 Choosing a row replaces only the current Model input through its native text
 edit path, preserves undo and focuses that input. The current exact input text,
-form revision, catalog revision, Client instance and physical connection must
+form revision, catalog revision, displayed page/filter, Client instance and
+physical connection must
 still match. Composition, retired forms, pending metadata writes, changed
 fields, changed queries and stale callbacks cannot overwrite a later draft.
 Choosing a row sends no setting request. Explicit Save retains the model/effort
@@ -48,7 +49,8 @@ that new form state. No catalog cache is persisted across launches.
 Validation uses bounded decoder/actor tests, GPUI TestPlatform and a private real
 daemon with a local fake provider. It covers explicit-only requests, pagination,
 filtering, exact Role fill, separate Save, undo, simulated 200% keyboard access,
-marked text, stale query/field/read callbacks, late read/reload and Profile
+marked text, captured stale-page/query/field/read callbacks, the actual
+outstanding read arriving after Reload, and Profile
 replacement. The real-daemon case counts exactly one explicit provider catalog
 GET, observes no POST to the Run endpoint and checks that only explicit Save
 persists the Role selection. Automatic model tests are disabled in that fixture;

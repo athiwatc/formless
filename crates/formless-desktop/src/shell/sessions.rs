@@ -202,7 +202,7 @@ impl Shell {
             notice: String::new(),
             focus: cx.focus_handle(),
             cancel: cx.focus_handle(),
-            controls: (0..29)
+            controls: (0..17 + crate::model_catalog::PAGE_SIZE)
                 .map(|_| {
                     (
                         cx.focus_handle(),

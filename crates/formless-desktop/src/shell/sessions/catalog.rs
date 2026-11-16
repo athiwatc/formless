@@ -23,6 +23,22 @@ struct Fill {
     catalog: uuid::Uuid,
     basis: String,
     selector: String,
+    page: usize,
+    filter: String,
+}
+impl Fill {
+    fn present(p: &Panel, selector: &str, cx: &App) -> Self {
+        Self {
+            instance: p.instance,
+            connection: p.connection,
+            form: p.revision,
+            catalog: p.catalog.revision.unwrap(),
+            basis: p.input.as_ref().unwrap().read(cx).value().to_string(),
+            selector: selector.into(),
+            page: p.catalog.page,
+            filter: p.catalog.filter.clone(),
+        }
+    }
 }
 impl Shell {
     fn catalog_ready(&self) -> bool {
@@ -118,6 +134,8 @@ impl Shell {
             || p.connection != fill.connection
             || p.revision != fill.form
             || p.catalog.revision != Some(fill.catalog)
+            || p.catalog.page != fill.page
+            || p.catalog.filter != fill.filter
             || p.catalog.pending.is_some()
             || p.catalog
                 .value
@@ -177,7 +195,7 @@ impl Shell {
         let mut body=v_flex().gap_2().child(readable("session-catalog-help","Explicit read contacts the default provider; no Run or model test. Includes configured aliases, Roles and recent selectors. Model draft edits then filter locally; clear it to show all. Choosing a row only fills the draft."))
             .child(div().id("session-catalog-read-anchor").pt_1().anchor_scroll(Some(p.controls[14].1.clone())).child(Button::new("session-catalog-read").label("Read catalog (contacts provider)").disabled(!ready||p.catalog.pending.is_some()).track_focus(&p.controls[14].0).on_click(cx.listener(move|this,_,window,cx|this.read_model_catalog(read,window,cx)))))
             .child(readable("session-catalog-notice",p.catalog.notice.clone()));
-        if let (Some(c), Some(revision), Some(input)) =
+        if let (Some(c), Some(revision), Some(_input)) =
             (&p.catalog.value, p.catalog.revision, &p.input)
         {
             let matches = c.matches(&p.catalog.filter);
@@ -201,14 +219,7 @@ impl Shell {
                 .enumerate()
             {
                 let choice = &c.choices[*index];
-                let fill = Fill {
-                    instance: p.instance,
-                    connection: p.connection,
-                    form: p.revision,
-                    catalog: revision,
-                    basis: input.read(cx).value().to_string(),
-                    selector: choice.selector.clone(),
-                };
+                let fill = Fill::present(p, &choice.selector, cx);
                 body = body.child(
                     div()
                         .id(SharedString::from(format!(
@@ -273,7 +284,26 @@ impl Shell {
 }
 
 #[cfg(feature = "test-support")]
+#[derive(Clone)]
+pub struct CatalogChoiceForTest(Fill);
+#[cfg(feature = "test-support")]
 impl Shell {
+    pub fn capture_catalog_choice(&self, selector: &str, cx: &App) -> CatalogChoiceForTest {
+        CatalogChoiceForTest(Fill::present(
+            self.session_editor.as_ref().unwrap(),
+            selector,
+            cx,
+        ))
+    }
+    pub fn fill_captured_catalog_choice(
+        &mut self,
+        ticket: CatalogChoiceForTest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.fill_model_catalog(ticket.0, window, cx);
+    }
+
     pub fn read_presented_session_catalog(
         &mut self,
         form: uuid::Uuid,
@@ -319,6 +349,8 @@ impl Shell {
                 catalog,
                 basis: basis.into(),
                 selector: selector.into(),
+                page: p.catalog.page,
+                filter: p.catalog.filter.clone(),
             },
             window,
             cx,

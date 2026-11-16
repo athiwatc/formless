@@ -182,6 +182,12 @@ fn catalog_profile_replacement_rejects_old_read_and_requires_reload(cx: &mut Tes
 #[gpui_kit::test]
 fn catalog_keyboard_at_200_percent_preserves_undo_and_refuses_stale_read(cx: &mut TestAppContext) {
     let (h, s) = setup(cx);
+    step(cx, h, |w, cx| {
+        s.read(cx)
+            .session_edit_input()
+            .unwrap()
+            .update(cx, |i, cx| i.set_value("ไทย😀", w, cx))
+    });
     let owner = read(h, &s, cx);
     reply(h, &s, cx, owner, catalog());
     step(cx, h, |w, cx| {
@@ -212,17 +218,41 @@ fn catalog_read_can_complete_while_another_field_is_shown_but_not_after_reload(
     let owner = read(h, &s, cx);
     step(cx, h, |w, cx| click(w, cx, "session-edit-effort"));
     reply(h, &s, cx, owner, catalog());
-    step(cx, h, |w, cx| {
+    let second = step(cx, h, |w, cx| {
         assert_eq!(s.read(cx).session_catalog_revision(), Some(owner.1));
         click(w, cx, "session-edit-model");
         click(w, cx, "session-catalog-read");
         let commands = s.update(cx, |s, _| s.take_client_commands());
-        assert!(matches!(&commands[..], [Wire::ReadModelCatalog { .. }]));
+        let [Wire::ReadModelCatalog { operation, .. }] = &commands[..] else {
+            panic!("second read")
+        };
+        let second = (s.read(cx).session_catalog_instance(), *operation);
         click(w, cx, "session-edit-reload");
         assert!(s.read(cx).session_catalog_revision().is_none());
+        second
     });
-    reply(h, &s, cx, owner, catalog());
+    reply(h, &s, cx, second, catalog());
     step(cx, h, |_, cx| {
         assert!(s.read(cx).session_catalog_revision().is_none())
+    });
+}
+
+#[gpui_kit::test]
+fn catalog_queued_choice_cannot_fill_a_different_displayed_page(cx: &mut TestAppContext) {
+    let (h, s) = setup(cx);
+    let owner = read(h, &s, cx);
+    reply(h, &s, cx, owner, catalog());
+    step(cx, h, |w, cx| {
+        let ticket = s.read(cx).capture_catalog_choice("alias", cx);
+        let input = s.read(cx).session_edit_input().unwrap();
+        let before = input.read(cx).value().to_string();
+        click(w, cx, "session-catalog-next");
+        s.update(cx, |s, cx| s.fill_captured_catalog_choice(ticket, w, cx));
+        assert_eq!(
+            input.read(cx).value().as_ref(),
+            before,
+            "a queued choice from the previous catalog page must not overwrite the current draft"
+        );
+        assert!(s.update(cx, |s, _| s.take_client_commands()).is_empty());
     });
 }
