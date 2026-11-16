@@ -575,3 +575,14 @@ freshly find the selected unique approval ID and compare all its evidence;
 reordering unrelated requests cannot retarget the decision. Unsupported or
 duplicate rows reject the whole native inventory. See the
 [multiple-request review contract](../../docs/desktop/multiple-approvals-20261116.md).
+
+
+Session details → **Read pending files** explicitly reads the complete stored
+metadata for that Session's next user message. It pages through all accepted
+records and copies the complete JSON, including private daemon paths and future
+metadata fields. Attachment paths are not opened. Other clients or a Send may
+change or consume the list; read again explicitly. Unsupported daemons and
+oversized/corrupt inventories show unavailable, never a fabricated empty list.
+This is inspection only; attach, remove, drop/image paste and uncertain-write
+reconciliation remain in Formless TUI. See the
+[pending-file inventory contract](../../docs/desktop/pending-files-20261116.md).

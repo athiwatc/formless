@@ -49,3 +49,5 @@ pub mod step_mode;
 pub mod approvals;
 
 pub mod model_catalog;
+
+pub mod pending_files;

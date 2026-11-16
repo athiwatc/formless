@@ -852,3 +852,101 @@ fn native_model_catalog_read_fill_and_save_follow_real_daemon_without_starting_w
     });
     f.finish();
 }
+
+#[gpui_kit::test]
+fn native_pending_inventory_reads_shared_metadata_without_consuming_and_refreshes_after_send(
+    cx: &mut TestAppContext,
+) {
+    let env = credential_env::EnvGuard::isolated();
+    env.set("FORMLESS_API_KEY", "private-pending-inventory-key");
+    let f = Fixture::start();
+    let held = f
+        .runtime
+        .block_on(f.daemon.handle(Request::AttachFile {
+            session_id: f.session.clone(),
+            name: "private pending.txt".into(),
+            data_b64: "aGVsbG8=".into(),
+            mime: None,
+        }))
+        .unwrap();
+    let directory = f.root.join("pending-dir");
+    std::fs::create_dir(&directory).unwrap();
+    f.runtime
+        .block_on(f.daemon.handle(Request::AttachPath {
+            session_id: f.session.clone(),
+            path: "pending-dir".into(),
+            root: Some(f.root.to_str().unwrap().into()),
+        }))
+        .unwrap();
+    let (h, s) = open(cx, WIDE, 0, 0);
+    step(cx, h, |_, cx| {
+        s.update(cx, |s, cx| s.connect_daemon(f.endpoint.clone(), cx))
+    });
+    until(cx, h, &s, "pending Session", |s, _| {
+        s.sidebar().rows().iter().any(|r| r.id == f.session)
+    });
+    step(cx, h, |w, cx| w.click(session_row_id(&f.session), cx));
+    until(cx, h, &s, "pending canonical baseline", |s, _| {
+        s.step_mode_enable_target().is_some()
+    });
+    step(cx, h, |w, cx| {
+        s.update(cx, |s, cx| s.run_command(Command::SessionDetails, w, cx));
+    });
+    until(cx, h, &s, "pending metadata form", |s, _| {
+        s.session_edit_input().is_some()
+    });
+    let read = |cx: &mut TestAppContext, expected| {
+        step(cx, h, |w, cx| {
+            super::model_catalog_tests::click(w, cx, "pending-files-read")
+        });
+        until(cx, h, &s, "complete pending inventory", |s, _| {
+            s.pending_files_count() == Some(expected)
+        });
+    };
+    read(cx, 2);
+    assert_eq!(f.calls.load(Ordering::SeqCst), 0);
+    let snapshot = f
+        .runtime
+        .block_on(f.daemon.handle(Request::ListPendingAttachments {
+            session_id: f.session.clone(),
+        }))
+        .unwrap();
+    assert_eq!(snapshot["attachments"].as_array().unwrap().len(), 2);
+    assert_eq!(snapshot["attachments"][0]["id"], held["id"]);
+    f.runtime
+        .block_on(f.daemon.handle(Request::DetachFile {
+            session_id: f.session.clone(),
+            id: held["id"].as_str().unwrap().into(),
+        }))
+        .unwrap();
+    pump(cx, h, &s);
+    assert_eq!(
+        step(cx, h, |_, cx| s.read(cx).pending_files_count()),
+        Some(2),
+        "read remains an explicitly dated snapshot"
+    );
+    read(cx, 1);
+    assert_eq!(f.calls.load(Ordering::SeqCst), 0);
+    let _ = f.send();
+    f.wait("one explicit provider Run", || {
+        f.calls.load(Ordering::SeqCst) == 1
+    });
+    read(cx, 0);
+    let messages = f.snapshot()["messages"].as_array().unwrap().clone();
+    assert!(messages.iter().any(|m| m["meta"]
+        .as_str()
+        .is_some_and(|meta| meta.contains("pending-dir"))));
+    f.complete[0].notify_one();
+    f.wait("pending fixture Run idle", || {
+        f.snapshot()["running"] == false
+    });
+    assert_eq!(f.calls.load(Ordering::SeqCst), 1);
+    eprintln!(
+        "pending_inventory_case {}",
+        json!({"initial":2,"after_peer_detach":1,"after_explicit_send":0,"provider_posts":1,"reads_consume_nothing":true})
+    );
+    step(cx, h, |_, cx| {
+        s.update(cx, |s, cx| s.connect_recording_daemon(cx))
+    });
+    f.finish();
+}

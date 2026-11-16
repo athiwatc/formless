@@ -2843,6 +2843,25 @@ impl Daemon {
                 let _ = self.with_store(|st| st.audit("user", "relay.disconnect", &cid));
                 Ok(json!({ "disconnected": true }))
             }
+            Request::ListPendingAttachments { session_id } => {
+                if session_id.is_empty()
+                    || session_id.len() > 256
+                    || session_id.chars().any(char::is_control)
+                {
+                    return Err(anyhow::Error::new(RequestFailure::invalid(
+                        "invalid Session identity",
+                    )));
+                }
+                self.with_reader(|st| {
+                    st.read_transaction(|st| {
+                        st.get_session(&session_id)?
+                            .filter(|_| !st.session_deleted(&session_id).unwrap_or(true))
+                            .context(RequestFailure::not_found("session not found"))?;
+                        let attachments = st.pending_attachment_inventory(&session_id)?;
+                        Ok(json!({"session_id":session_id,"attachments":attachments}))
+                    })
+                })
+            }
             Request::DetachFile { session_id, id } => {
                 let gone = self.with_store(|st| {
                     st.transaction(|st| {
@@ -18976,3 +18995,7 @@ mod provider_url_tests;
 
 #[path = "step_inventory.rs"]
 mod step_inventory;
+
+#[cfg(test)]
+#[path = "pending_attachment_inventory_tests.rs"]
+mod pending_attachment_inventory_tests;

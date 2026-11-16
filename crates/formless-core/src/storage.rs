@@ -6126,6 +6126,42 @@ impl Store {
         Ok(rows)
     }
 
+    /// Strict bounded metadata read: never silently omits corrupt rows.
+    /// The SQL projection avoids loading an oversized individual metadata value.
+    pub fn pending_attachment_inventory(&self, session_id: &str) -> Result<Vec<Value>> {
+        let max_rows = formless_protocol::PENDING_ATTACHMENT_MAX_ENTRIES;
+        let max_bytes = formless_protocol::PENDING_ATTACHMENT_METADATA_BYTES;
+        let mut stmt=self.ps("SELECT length(CAST(att AS BLOB)), CASE WHEN length(CAST(att AS BLOB))<=?2 THEN att ELSE NULL END FROM pending_attachments WHERE session_id=?1 ORDER BY rowid LIMIT ?3")?;
+        let rows = stmt.query_map(
+            params![session_id, max_bytes as i64, (max_rows + 1) as i64],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+        )?;
+        let mut out = Vec::new();
+        let mut bytes = 0usize;
+        for row in rows {
+            let (size, text) = row?;
+            if out.len() >= max_rows || size < 0 || size as u64 > max_bytes as u64 {
+                return Err(anyhow!(
+                    "pending attachment inventory exceeds metadata bounds"
+                ));
+            }
+            let text = text.context("pending attachment metadata unavailable")?;
+            bytes = bytes.saturating_add(text.len());
+            if bytes > max_bytes {
+                return Err(anyhow!(
+                    "pending attachment inventory exceeds metadata bounds"
+                ));
+            }
+            let value: Value =
+                serde_json::from_str(&text).context("pending attachment metadata is corrupt")?;
+            if !value.is_object() {
+                return Err(anyhow!("pending attachment metadata is not a record"));
+            }
+            out.push(value);
+        }
+        Ok(out)
+    }
+
     /// Take the Session's held attachments (they go with its next message).
     pub fn take_pending_attachments(&self, session_id: &str) -> Result<Vec<Value>> {
         let out = self.pending_attachments(session_id)?;
@@ -8658,3 +8694,7 @@ mod thinking_metadata_tests;
 #[cfg(test)]
 #[path = "applied_proposal_read_tests.rs"]
 mod applied_proposal_read_tests;
+
+#[cfg(test)]
+#[path = "pending_attachment_inventory_storage_tests.rs"]
+mod pending_attachment_inventory_tests;

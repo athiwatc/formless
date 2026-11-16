@@ -7564,3 +7564,6 @@ mod session_model_tests;
 
 #[path = "support/model_catalog.rs"]
 mod model_catalog_tests;
+
+#[path = "support/pending_files.rs"]
+mod pending_files_tests;

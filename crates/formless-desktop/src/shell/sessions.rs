@@ -1,4 +1,5 @@
 mod catalog;
+mod pending_files;
 use super::*;
 use crate::questions::preview;
 use crate::session_edit::{Change, Field, Metadata, Outcome, MAX_INPUT};
@@ -32,6 +33,7 @@ pub(super) struct ExportSavePrompt {
 pub(super) struct Panel {
     pub export: session_export::State,
     catalog: catalog::State,
+    pending_files: pending_files::State,
     revision: uuid::Uuid,
     instance: uuid::Uuid,
     model: String,
@@ -68,6 +70,7 @@ impl Shell {
     ) {
         if let Some(panel) = &mut self.session_editor {
             panel.catalog = catalog::State::default();
+            panel.pending_files = pending_files::State::default();
             let unknown = matches!(panel.waiting, Some(Waiting::Write(_)));
             panel.instance = instance;
             panel.connection = connection;
@@ -183,6 +186,7 @@ impl Shell {
         self.session_editor = Some(Panel {
             export: session_export::State::default(),
             catalog: catalog::State::default(),
+            pending_files: pending_files::State::default(),
             revision: uuid::Uuid::new_v4(),
             instance: self.client.as_ref().unwrap().instance(),
             model: String::new(),
@@ -202,7 +206,7 @@ impl Shell {
             notice: String::new(),
             focus: cx.focus_handle(),
             cancel: cx.focus_handle(),
-            controls: (0..17 + crate::model_catalog::PAGE_SIZE)
+            controls: (0..21 + crate::model_catalog::PAGE_SIZE)
                 .map(|_| {
                     (
                         cx.focus_handle(),
@@ -353,6 +357,7 @@ impl Shell {
         }
         let operation = uuid::Uuid::new_v4();
         panel.catalog = catalog::State::default();
+        panel.pending_files = pending_files::State::default();
         panel.connection = client.connection();
         panel.instance = client.instance();
         panel.revision = uuid::Uuid::new_v4();
@@ -609,6 +614,7 @@ impl Shell {
             if client.instance() != panel.instance || client.connection() != panel.connection {
                 let unknown = matches!(panel.waiting, Some(Waiting::Write(_)));
                 panel.catalog = catalog::State::default();
+                panel.pending_files = pending_files::State::default();
                 panel.connection = client.connection();
                 panel.instance = client.instance();
                 panel.revision = uuid::Uuid::new_v4();
@@ -1275,6 +1281,7 @@ impl Shell {
                 .disabled(self.export_save_prompt.is_some() || !self.export_save_current(&id, connection, revision))
                 .track_focus(&panel.controls[11].0)
                 .on_click(cx.listener(move |this, _, window, cx| this.save_session_export(&id, connection, revision, window, cx)))));
+        body = body.child(self.render_pending_files(cx));
         let expected_toggle = panel
             .metadata
             .as_ref()

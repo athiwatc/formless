@@ -32,7 +32,12 @@ pub const FEATURES: &[&str] = &[
     "unsupported_error",
     "dropped_event_kinds",
     "future_transcript_attempts_v1",
+    "pending_attachment_inventory_v1",
 ];
+
+/// Complete pending-attachment metadata inventory limits. No file bodies are read.
+pub const PENDING_ATTACHMENT_MAX_ENTRIES: usize = 64;
+pub const PENDING_ATTACHMENT_METADATA_BYTES: usize = 64 * 1024;
 
 /// A daemon-lifetime producer boundary, sampled AFTER a canonical snapshot.
 /// This admits future attempt starts only; it cannot replay an active prefix
@@ -2304,6 +2309,13 @@ pub enum Request {
     DisconnectRelayClient {
         cid: String,
     },
+    /// Read the complete pending metadata for this Session's next user message.
+    /// Returns `{session_id, attachments}`; bounded by the inventory constants.
+    /// Overflow/corrupt metadata is an error, never a partial or empty success.
+    /// Reads no attachment bytes and mutates/consumes nothing.
+    ListPendingAttachments {
+        session_id: String,
+    },
     /// Take back a pending attachment before the message is sent: `id` is
     /// the attachment's id (or, for a referenced path, the path). Returns
     /// `{removed}`.
@@ -3920,5 +3932,26 @@ mod future_attempt_wire_tests {
             );
             assert_eq!(value["type"], "transcript_attempt");
         }
+    }
+}
+
+#[cfg(test)]
+mod pending_attachment_inventory_wire_tests {
+    use super::*;
+    #[test]
+    fn pending_inventory_is_an_additive_advertised_request() {
+        let request = Request::ListPendingAttachments {
+            session_id: "s".into(),
+        };
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"type":"list_pending_attachments","session_id":"s"})
+        );
+        assert!(
+            matches!(serde_json::from_value::<Request>(value).unwrap(),Request::ListPendingAttachments{session_id}if session_id=="s")
+        );
+        assert!(FEATURES.contains(&"pending_attachment_inventory_v1"));
+        assert_eq!(PROTOCOL_VERSION, 1);
     }
 }

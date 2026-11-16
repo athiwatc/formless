@@ -2258,6 +2258,15 @@ impl Shell {
                 session_id,
                 outcome,
             } => self.session_edit_outcome(connection, operation, &session_id, outcome, window, cx),
+            ClientUpdate::PendingAttachments {
+                client,
+                connection,
+                operation,
+                session_id,
+                result,
+            } => {
+                self.pending_files_received(client, connection, operation, &session_id, result, cx)
+            }
             ClientUpdate::ModelCatalog {
                 instance,
                 connection,

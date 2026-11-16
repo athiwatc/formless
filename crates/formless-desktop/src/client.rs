@@ -141,6 +141,13 @@ pub enum Update {
         session_id: String,
         outcome: session_edit::Outcome,
     },
+    PendingAttachments {
+        client: uuid::Uuid,
+        connection: u64,
+        operation: uuid::Uuid,
+        session_id: String,
+        result: Result<crate::pending_files::Report, String>,
+    },
     ModelCatalog {
         instance: uuid::Uuid,
         connection: u64,
@@ -175,6 +182,11 @@ pub enum Update {
 }
 
 pub enum Command {
+    ReadPendingAttachments {
+        connection: u64,
+        operation: uuid::Uuid,
+        session_id: String,
+    },
     ReadModelCatalog {
         connection: u64,
         operation: uuid::Uuid,
@@ -517,6 +529,7 @@ impl Client {
                 | Command::EditSession { .. }
                 | Command::ReadSessionDetails { .. }
                 | Command::ReadModelCatalog { .. }
+                | Command::ReadPendingAttachments { .. }
                 | Command::SearchProfile { .. }
                 | Command::ExportSession { .. }
                 | Command::ReadSessionUsage { .. }
@@ -673,6 +686,10 @@ fn advance_epoch(epoch: &AtomicU64) {
 
 #[derive(Debug)]
 enum Pending {
+    AttachmentInventory {
+        operation: uuid::Uuid,
+        session_id: String,
+    },
     ModelCatalog {
         operation: uuid::Uuid,
     },
@@ -1278,6 +1295,50 @@ impl Engine {
             return;
         }
         match command {
+            Command::ReadPendingAttachments {
+                connection,
+                operation,
+                session_id,
+            } => {
+                let error = if !self.ready
+                    || connection != self.connection
+                    || operation.is_nil()
+                    || session_id.is_empty()
+                    || session_id.len() > 256
+                    || session_id.chars().any(char::is_control)
+                {
+                    Some("Connection or Session changed; read pending files again explicitly.")
+                } else if self
+                    .pending
+                    .values()
+                    .filter(|p| matches!(p, Pending::AttachmentInventory { .. }))
+                    .count()
+                    >= 2
+                {
+                    Some("Two pending-file reads remain outstanding. Wait or reconnect.")
+                } else {
+                    None
+                };
+                if let Some(error) = error {
+                    self.updates.push(Update::PendingAttachments {
+                        client: self.instance,
+                        connection: self.connection,
+                        operation,
+                        session_id,
+                        result: Err(error.into()),
+                    });
+                } else {
+                    self.request(
+                        Request::ListPendingAttachments {
+                            session_id: session_id.clone(),
+                        },
+                        Pending::AttachmentInventory {
+                            operation,
+                            session_id,
+                        },
+                    );
+                }
+            }
             Command::ReadModelCatalog {
                 connection,
                 operation,
@@ -2137,6 +2198,19 @@ impl Engine {
                         }),
                     }
                 }
+            }
+            Pending::AttachmentInventory {
+                operation,
+                session_id,
+            } => {
+                let result=result.map_err(|_|"Pending-file inventory unavailable. Use Formless TUI or a daemon supporting pending_attachment_inventory_v1.".into()).and_then(|value|crate::pending_files::Report::decode(&session_id,value));
+                self.updates.push(Update::PendingAttachments {
+                    client: self.instance,
+                    connection: self.connection,
+                    operation,
+                    session_id,
+                    result,
+                });
             }
             Pending::ModelCatalog { operation } => {
                 self.updates.push(Update::ModelCatalog{instance:self.instance,connection:self.connection,operation,result:result.map_err(|_|"Catalog read failed. Provider details are not displayed; check configuration in Formless TUI.".into()).and_then(crate::model_catalog::Catalog::decode)});
@@ -4872,3 +4946,7 @@ mod approval_tests;
 #[cfg(test)]
 #[path = "client/session_model_tests.rs"]
 mod session_model_tests;
+
+#[cfg(test)]
+#[path = "client/pending_files_tests.rs"]
+mod pending_files_tests;
