@@ -12,8 +12,8 @@ The action binds Client UUID, physical connection, epoch, form revision,
 accepted-read revision, Session, index and a fresh operation UUID. The Session
 whose details were opened may differ from the active conversation. Composition
 and modal checks apply both when arming and confirming. Stale Confirm/Cancel
-callbacks cannot target a later review. Navigation, closing/reloading/editing the
-form, Profile replacement and context invalidation retire unwritten reservations.
+callbacks cannot target a later review. Navigation, closing/reloading the form, changing its field or saving metadata,
+Profile replacement and context invalidation retire unwritten reservations.
 A request that may have been written cannot be cancelled this way.
 
 The worker negotiates `reviewed_reference_detach_v1` and uses only

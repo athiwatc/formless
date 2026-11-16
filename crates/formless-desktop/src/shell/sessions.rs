@@ -85,13 +85,18 @@ impl Shell {
         if let Some(panel) = &mut self.session_editor {
             panel.catalog = catalog::State::default();
             panel.pending_files = pending_files::State::default();
-            let unknown = reference_unknown || matches!(panel.waiting, Some(Waiting::Write(_)));
+            let save_unknown = matches!(panel.waiting, Some(Waiting::Write(_)));
             panel.instance = instance;
             panel.connection = connection;
             panel.revision = uuid::Uuid::new_v4();
             panel.waiting = None;
             panel.retired = true;
-            panel.notice=if unknown {"Profile attachment changed; the previous Profile's save/reference-removal outcome is unknown. It was not replayed. Drafts are kept read-only; copy them before reloading the new Profile's current values."} else {"Profile attachment changed. Previous metadata and drafts are kept read-only; copy them before reloading the new Profile's current values. Nothing was replayed."}.into();
+            panel.notice = match (save_unknown, reference_unknown) {
+                (true, false) => "Profile attachment changed; the previous Profile's save outcome is unknown. It was not replayed. Drafts are kept read-only; copy them before reloading the new Profile's current values.",
+                (false, true) => "Profile attachment changed; the previous Profile's reference-removal outcome is unknown. It was not replayed. Drafts are kept read-only; copy them before reloading the new Profile's current values.",
+                (true, true) => "Profile attachment changed; the previous Profile's save outcome is unknown and its reference-removal outcome is unknown. Neither was replayed. Drafts are kept read-only; copy them before reloading the new Profile's current values.",
+                (false, false) => "Profile attachment changed. Previous metadata and drafts are kept read-only; copy them before reloading the new Profile's current values. Nothing was replayed.",
+            }.into();
             panel.export.retire(
                 "Profile attachment changed. Read another export; nothing was replayed or saved.",
             );
