@@ -8701,3 +8701,7 @@ mod pending_attachment_inventory_tests;
 
 #[path = "reviewed_reference_store.rs"]
 mod reviewed_reference_store;
+
+#[cfg(test)]
+#[path = "preview_schema_compat_tests.rs"]
+mod preview_schema_compat_tests;

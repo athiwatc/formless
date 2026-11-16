@@ -161,3 +161,9 @@ keeps written errors/lost replies Unknown without replay. This increment needs
 independent review; stored-file removal, attachment/reference additions and
 durable reconciliation remain. It does not restore Queue or clear native,
 hosted, performance or distribution acceptance.
+
+The [schema-67 preview candidate](schema67-preview-20261116.md) separates ordinary
+native/Core workflows at `032703d` from the preserved schema-68/69 durable
+prototype. It retains current-main schema compatibility without enabling
+journaling, Queue or streaming. Its owned-fixture/in-memory pairing evidence
+does not clear native/platform, hosted, distribution or whole-epic acceptance.

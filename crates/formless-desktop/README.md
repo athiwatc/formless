@@ -610,3 +610,13 @@ receipts remain Unknown and block new work in that Client; replacing a Profile
 or restarting is not a safe retry. Queue ownership, attachment mutations and
 durable reconciliation remain unfinished. See the
 [native send-review contract](../../docs/desktop/native-send-review-20261116.md).
+
+## Schema-67 preview candidate
+
+This branch retains the reviewed ordinary client/Core workflows through
+`032703d`, using the same schema 67 as verified main. The complete later durable
+journal/identity prototype is preserved separately at `8cd88cf`; it is excluded
+from this preview. No existing prototype database can be downgraded by this
+client/Core pairing. Streaming and Queue remain disabled; Unknown guards remain
+Client-lifetime. The client-only packager is carried over unchanged.
+See [the exact split, compatibility tests and remaining gates](../../docs/desktop/schema67-preview-20261116.md).

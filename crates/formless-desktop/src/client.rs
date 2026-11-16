@@ -5289,3 +5289,7 @@ mod pending_files_tests;
 
 #[cfg(test)]
 mod reference_tests;
+
+#[cfg(all(test, feature = "daemon-tests"))]
+#[path = "client/preview_schema67_tests.rs"]
+mod preview_schema67_tests;

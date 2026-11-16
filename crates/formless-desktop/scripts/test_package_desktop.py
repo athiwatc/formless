@@ -26,6 +26,52 @@ class Packaging(unittest.TestCase):
     def metadata(self, root, **fields):
         return dict(id="test-id", name="fixture", version="1.0", manifest_path=str(root / "Cargo.toml"), license="MIT", repository=None, **fields)
 
+    def shipping_metadata(self):
+        return dict(packages=[dict(id="desktop", name="formless-desktop"),
+                              dict(id="kit", name="gpui-kit"), dict(id="protocol", name="formless-protocol")],
+                    resolve=dict(root="desktop", nodes=[
+                        dict(id="desktop", features=["gui"], deps=[dict(pkg="kit", dep_kinds=[dict(kind=None)]),dict(pkg="protocol",dep_kinds=[dict(kind="build")])]),
+                        dict(id="kit", features=[], deps=[]), dict(id="protocol",features=[],deps=[])]))
+
+    def test_shipping_graph_is_gui_only_and_checks_transitive_normal_and_build_edges(self):
+        metadata=self.shipping_metadata()
+        receipt=package.shipping_graph(metadata)
+        self.assertEqual(receipt["normal_and_build_package_ids"],["desktop","kit","protocol"])
+        self.assertEqual(receipt["features"],["gui"])
+        package.verify_shipping_artifacts(metadata,{"desktop","kit","protocol"},["gui"])
+        for name in package.SERVER_PACKAGES:
+            with self.subTest(name=name):
+                metadata=self.shipping_metadata();metadata["packages"].append(dict(id="server",name=name))
+                metadata["resolve"]["nodes"][-1]["deps"]=[dict(pkg="server",dep_kinds=[dict(kind=None)])]
+                metadata["resolve"]["nodes"].append(dict(id="server",features=[],deps=[]))
+                with self.assertRaisesRegex(ValueError,"server package"):
+                    package.shipping_graph(metadata)
+
+    def test_shipping_graph_refuses_feature_and_resolution_ambiguity(self):
+        for features in [[],["default","gui"],["gui","daemon-tests"],["gui","test-support"],["gui","thai-breaks"],["gui","ax-dump"]]:
+            with self.subTest(features=features):
+                metadata=self.shipping_metadata();metadata["resolve"]["nodes"][0]["features"]=features
+                with self.assertRaisesRegex(ValueError,"only gui"):
+                    package.shipping_graph(metadata)
+        for change in ["root","unresolved","kind","kit","duplicate"]:
+            metadata=self.shipping_metadata()
+            if change=="root":metadata["resolve"]["root"]="missing"
+            elif change=="unresolved":metadata["resolve"]["nodes"].pop()
+            elif change=="kind":metadata["resolve"]["nodes"][0]["deps"][0]["dep_kinds"]=[dict(kind="future")]
+            elif change=="kit":metadata["resolve"]["nodes"][1]["features"]=["test-support"]
+            else:metadata["packages"].append(metadata["packages"][0].copy())
+            with self.subTest(change=change),self.assertRaises(ValueError):
+                package.shipping_graph(metadata)
+
+    def test_shipping_graph_ignores_dev_only_edges_but_refuses_server_build_artifacts(self):
+        metadata=self.shipping_metadata();metadata["packages"].append(dict(id="server",name="formless-core"))
+        metadata["resolve"]["nodes"].append(dict(id="server",features=[],deps=[]))
+        metadata["resolve"]["nodes"][0]["deps"].append(dict(pkg="server",dep_kinds=[dict(kind="dev")]))
+        self.assertNotIn("server",package.shipping_graph(metadata)["normal_and_build_package_ids"])
+        for built,features in [({"desktop","server"},["gui"]),({"desktop","missing"},["gui"]),({"kit"},["gui"]),({"desktop"},["gui","daemon-tests"]),({"desktop"},None)]:
+            with self.subTest(built=built,features=features),self.assertRaises(ValueError):
+                package.verify_shipping_artifacts(metadata,built,features)
+
     def test_lowercase_and_embedded_notices_retain_paths_and_hashes(self):
         root = self.root / "crate"
         (root / "data").mkdir(parents=True)
@@ -268,6 +314,33 @@ class Packaging(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "cleanliness changed"):
             package.ensure_source(repository, commit, False, stage)
 
+    def test_server_graph_is_refused_before_build_or_staging(self):
+        repository=self.root / "repo"
+        scripts=repository / "crates/formless-desktop/scripts"
+        scripts.mkdir(parents=True)
+        metadata=self.shipping_metadata()
+        metadata["packages"][-1]["name"]="formless-core"
+        def command(arguments,_cwd):
+            if arguments[:3]==["git","rev-parse","HEAD"]:return "expected-commit"
+            if arguments[:2]==["git","show"]:return "1700000000"
+            if arguments[:2]==["git","status"]:return ""
+            if arguments==["rustc","-vV"]:return "host: aarch64-apple-darwin"
+            if arguments[:2]==["cargo","metadata"]:
+                self.assertIn("--no-default-features",arguments)
+                self.assertEqual(arguments[arguments.index("--features")+1],"gui")
+                return json.dumps(metadata)
+            self.fail(f"unexpected command: {arguments}")
+        output=self.root / "refused-output"
+        with patch.object(package,"__file__",str(scripts / "package-desktop.py")), \
+                patch.object(package.sys,"platform","darwin"), \
+                patch.object(package,"run",side_effect=command), \
+                patch.object(package.subprocess,"Popen") as popen:
+            with self.assertRaisesRegex(ValueError,"server package"):
+                package.package(argparse.Namespace(output=str(output),allow_dirty=False,offline=True,profile="dev"))
+            popen.assert_not_called()
+        self.assertFalse(output.exists())
+        self.assertEqual(list(self.root.glob("formless-package-*")),[])
+
     def test_late_source_change_prevents_publication_of_staged_bundle(self):
         repository = self.root / "repo"
         desktop = repository / "crates/formless-desktop"
@@ -284,8 +357,9 @@ class Packaging(unittest.TestCase):
             manifest_path=str(desktop / "Cargo.toml"), license="Apache-2.0",
             repository=None,
         )])
-        artifact = dict(reason="compiler-artifact", package_id="fixture-id",
-                        target=dict(name="formless-desktop"), executable=str(binary))
+        metadata["resolve"] = dict(root="fixture-id", nodes=[dict(id="fixture-id", features=["gui"], deps=[])])
+        artifact = dict(reason="compiler-artifact", package_id="fixture-id", features=["gui"], profile=dict(test=False),
+                        target=dict(name="formless-desktop", kind=["bin"]), executable=str(binary))
         revisions = iter(["expected-commit", "expected-commit", "changed-commit"])
 
         def command(arguments, _cwd):

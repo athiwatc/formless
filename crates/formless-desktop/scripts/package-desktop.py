@@ -224,6 +224,62 @@ def collect_notices(packages, built, destination, upstream=None, lockfile=None):
     return inventory
 
 
+# The development bundle is a native client, not a Core/schema-upgrade rollout.
+# Keep the feature set explicit; adding a default feature must not silently
+# change which capability reaches a packaged binary.
+SHIPPING_FEATURES = ["gui"]
+SERVER_PACKAGES = {"formless-core", "formless-runtime", "formless-tui", "formless"}
+
+
+def shipping_graph(metadata):
+    packages = {p["id"]: p for p in metadata["packages"]}
+    resolve = metadata.get("resolve") or {}
+    root = resolve.get("root")
+    nodes = {n["id"]: n for n in resolve.get("nodes", [])}
+    if len(packages) != len(metadata["packages"]) or len(nodes) != len(resolve.get("nodes", [])):
+        raise ValueError("shipping graph contains duplicate package identities")
+    if root not in packages or root not in nodes or packages[root]["name"] != "formless-desktop":
+        raise ValueError("shipping graph has no resolved desktop root")
+    if sorted(nodes[root].get("features", [])) != SHIPPING_FEATURES:
+        raise ValueError("shipping graph must enable only gui; validation/default/diagnostic features are refused")
+    reached = set()
+    pending = [root]
+    while pending:
+        current = pending.pop()
+        if current in reached:
+            continue
+        if current not in nodes or current not in packages:
+            raise ValueError("shipping graph contains an unresolved dependency")
+        reached.add(current)
+        if packages[current]["name"] in SERVER_PACKAGES:
+            raise ValueError("shipping graph includes server package: " + packages[current]["name"])
+        if packages[current]["name"] == "gpui-kit" and "test-support" in nodes[current].get("features", []):
+            raise ValueError("shipping graph includes the GPUI test harness")
+        for edge in nodes[current].get("deps", []):
+            kinds = edge.get("dep_kinds", [])
+            if not kinds or any(kind.get("kind") not in (None, "build", "dev") for kind in kinds):
+                raise ValueError("shipping graph contains an unknown dependency kind")
+            if any(kind.get("kind") in (None, "build") for kind in kinds):
+                pending.append(edge["pkg"])
+    return dict(root_package_id=root, features=SHIPPING_FEATURES.copy(),
+                normal_and_build_package_ids=sorted(reached),
+                server_packages_in_graph=[], gpui_test_harness=False)
+
+
+def verify_shipping_artifacts(metadata, built, root_features):
+    packages = {p["id"]: p for p in metadata["packages"]}
+    if sorted(root_features or []) != SHIPPING_FEATURES:
+        raise ValueError("desktop artifact must enable only gui")
+    root = (metadata.get("resolve") or {}).get("root")
+    if root not in built:
+        raise ValueError("desktop root artifact missing from build")
+    for identity in built:
+        if identity not in packages:
+            raise ValueError("build reported an unknown package")
+        if packages[identity]["name"] in SERVER_PACKAGES:
+            raise ValueError("build reported a server artifact: " + packages[identity]["name"])
+
+
 def package(args):
     desktop = Path(__file__).resolve().parents[1]
     repository = desktop.parents[1]
@@ -241,21 +297,28 @@ def package(args):
         raise ValueError("unsupported packaging host: " + sys.platform)
     rustc = run(["rustc", "-vV"], repository)
     host = next(line.removeprefix("host: ") for line in rustc.splitlines() if line.startswith("host: "))
-    common = ["--manifest-path", "crates/formless-desktop/Cargo.toml", "--locked"]
+    common = ["--manifest-path", "crates/formless-desktop/Cargo.toml", "--locked",
+              "--no-default-features", "--features", ",".join(SHIPPING_FEATURES)]
     if args.offline:
         common.append("--offline")
-    command = ["cargo", "build", *common, "--message-format=json-render-diagnostics"]
+    metadata = json.loads(run(["cargo", "metadata", *common, "--format-version", "1", "--filter-platform", host], repository))
+    graph = shipping_graph(metadata)  # Refuse server/validation inputs before a build.
+    command = ["cargo", "build", *common, "--bin", "formless-desktop", "--message-format=json-render-diagnostics"]
     if args.profile == "release":
         command.append("--release")
     built = set()
     binary = None
+    root_features = None
     with subprocess.Popen(command, cwd=repository, stdout=subprocess.PIPE, text=True) as process:
         for line in process.stdout:
             event = json.loads(line)
             if event.get("reason") == "compiler-artifact":
                 built.add(event["package_id"])
-                if event["target"]["name"] == "formless-desktop" and event.get("executable"):
+                if event["package_id"] == graph["root_package_id"] and event["target"]["name"] == "formless-desktop" and event.get("executable"):
+                    if binary is not None or event["target"].get("kind") != ["bin"] or event.get("profile", {}).get("test") is not False:
+                        raise ValueError("ambiguous or test desktop executable artifact")
                     binary = Path(event["executable"])
+                    root_features = event.get("features")
             elif event.get("reason") == "compiler-message" and event.get("message", {}).get("rendered"):
                 print(event["message"]["rendered"], end="", file=sys.stderr)
         code = process.wait()
@@ -263,6 +326,7 @@ def package(args):
         raise ValueError("desktop build failed; no package published")
     if binary is None or not binary.is_file():
         raise ValueError("Cargo did not report the desktop executable")
+    verify_shipping_artifacts(metadata, built, root_features)
     ensure_source(repository, commit, dirty)
     with binary.open("rb") as source:
         magic = source.read(4)
@@ -270,7 +334,6 @@ def package(args):
              "windows": magic.startswith(b"MZ"), "linux": magic == b"\x7fELF"}[platform]
     if not valid:
         raise ValueError("binary format does not match the native packaging host")
-    metadata = json.loads(run(["cargo", "metadata", *common, "--format-version", "1", "--filter-platform", host], repository))
     relative = binary.resolve().relative_to(Path(metadata["target_directory"]).resolve())
     targets = run(["rustc", "--print", "target-list"], repository).splitlines()
     if relative.parts[0] in targets and relative.parts[0] != host:
@@ -314,6 +377,8 @@ def package(args):
                       "lockfile_sha256": digest(desktop / "Cargo.lock"), "build_command": command,
                       "distribution": "development only; no distribution signing performed",
                       "native_acceptance": False,
+                      "shipping_graph": graph,
+                      "server_build_artifacts": [],
                       "upstream_notice_manifest_sha256": digest(upstream / "UPSTREAM.json") if (upstream / "UPSTREAM.json").is_file() else None,
                       "toolchain_notice_manifest_sha256": toolchain_manifest,
                       "archive_timestamp_source": "git commit time, UTC, normalized to ZIP range/granularity",
