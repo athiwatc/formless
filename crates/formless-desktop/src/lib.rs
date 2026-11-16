@@ -47,3 +47,5 @@ pub mod step_decision;
 pub mod step_mode;
 
 pub mod approvals;
+
+pub mod model_catalog;

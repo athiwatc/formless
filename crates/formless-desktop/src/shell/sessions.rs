@@ -1,3 +1,4 @@
+mod catalog;
 use super::*;
 use crate::questions::preview;
 use crate::session_edit::{Change, Field, Metadata, Outcome, MAX_INPUT};
@@ -30,6 +31,7 @@ pub(super) struct ExportSavePrompt {
 
 pub(super) struct Panel {
     pub export: session_export::State,
+    catalog: catalog::State,
     revision: uuid::Uuid,
     instance: uuid::Uuid,
     model: String,
@@ -65,6 +67,7 @@ impl Shell {
         connection: u64,
     ) {
         if let Some(panel) = &mut self.session_editor {
+            panel.catalog = catalog::State::default();
             let unknown = matches!(panel.waiting, Some(Waiting::Write(_)));
             panel.instance = instance;
             panel.connection = connection;
@@ -179,6 +182,7 @@ impl Shell {
         };
         self.session_editor = Some(Panel {
             export: session_export::State::default(),
+            catalog: catalog::State::default(),
             revision: uuid::Uuid::new_v4(),
             instance: self.client.as_ref().unwrap().instance(),
             model: String::new(),
@@ -198,7 +202,7 @@ impl Shell {
             notice: String::new(),
             focus: cx.focus_handle(),
             cancel: cx.focus_handle(),
-            controls: (0..14)
+            controls: (0..29)
                 .map(|_| {
                     (
                         cx.focus_handle(),
@@ -263,6 +267,10 @@ impl Shell {
                                 cx.notify();
                             });
                         } else {
+                            if panel.field == Field::Model && panel.accepted != text {
+                                panel.catalog.filter = text.clone();
+                                panel.catalog.page = 0;
+                            }
                             panel.accepted = text;
                         }
                     }
@@ -344,6 +352,7 @@ impl Shell {
             return;
         }
         let operation = uuid::Uuid::new_v4();
+        panel.catalog = catalog::State::default();
         panel.connection = client.connection();
         panel.instance = client.instance();
         panel.revision = uuid::Uuid::new_v4();
@@ -599,6 +608,7 @@ impl Shell {
         if let Some(client) = &self.client {
             if client.instance() != panel.instance || client.connection() != panel.connection {
                 let unknown = matches!(panel.waiting, Some(Waiting::Write(_)));
+                panel.catalog = catalog::State::default();
                 panel.connection = client.connection();
                 panel.instance = client.instance();
                 panel.revision = uuid::Uuid::new_v4();
@@ -1090,6 +1100,9 @@ impl Shell {
                         .anchor_scroll(Some(panel.input_anchor.clone()))
                         .child(Textarea::new(input).aria_label(aria)),
                 );
+        }
+        if panel.field == Field::Model {
+            body = body.child(self.render_model_catalog(ready, cx));
         }
         body = body
             .child(

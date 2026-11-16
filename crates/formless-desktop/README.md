@@ -556,3 +556,12 @@ paid background model test; the form keeps this notice visible. It does not
 automatically fetch a catalog or validate provider support. See the
 [model selection contract](../../docs/desktop/session-model-selection-20261115.md)
 for partial-reply, stale callback, no-op and unknown-outcome limits.
+
+
+The Model field offers **Read catalog (contacts provider)**. This explicit read
+uses the configured default provider and includes configured aliases, Roles and
+recent selectors. Typing filters the bounded local snapshot after reading;
+choosing a row fills the draft without saving. Save remains separate and may
+start the configured paid model test. No read is automatic or replayed after
+reconnect. See the [catalog contract](../../docs/desktop/model-catalog-20261116.md)
+for limits and headless validation scope.

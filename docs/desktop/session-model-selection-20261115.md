@@ -4,9 +4,10 @@ Session details now includes Model and Effort fields. Model accepts a bounded
 model ID, configured alias or `role:name`; blank clears only that override and
 inherits the configured default. Surrounding input whitespace is trimmed.
 Effort is provider-specific; blank inherits.
-The form does not enumerate models, fetch a catalog, edit Roles/providers or
-claim that a saved ID/effort is supported by its provider. Unsupported values
-can fail when used. The palette description includes model/Role and effort so
+The form does not automatically fetch a catalog, edit Roles/providers or
+claim that a saved ID/effort is supported by its provider. The explicit
+[Read catalog action](model-catalog-20261116.md) offers bounded suggestions;
+unsupported values can still fail when used. The palette description includes model/Role and effort so
 these controls are discoverable from the composer through Session details.
 
 The existing daemon setter replaces model and effort together. Each Save uses
@@ -62,6 +63,6 @@ physically reconnects and verifies that explicit unchanged Save is read-only.
 These are headless checks, not native IME/VoiceOver/NVDA/clipboard/scaling,
 Windows/Linux execution, paid-test execution or performance acceptance.
 
-Full catalog discovery, Role/provider editing and the other required composer
-attachment/reference workflows remain separate work. Production streaming
+Per-provider catalog management, Role/provider editing and the other required
+composer attachment/reference workflows remain separate work. Production streaming
 stays disabled, and publication still requires independent exact-head review.

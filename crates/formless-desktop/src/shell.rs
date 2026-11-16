@@ -2258,6 +2258,14 @@ impl Shell {
                 session_id,
                 outcome,
             } => self.session_edit_outcome(connection, operation, &session_id, outcome, window, cx),
+            ClientUpdate::ModelCatalog {
+                instance,
+                connection,
+                operation,
+                result,
+            } => {
+                self.model_catalog_received(instance, connection, operation, result, cx);
+            }
             ClientUpdate::SessionDetails {
                 connection,
                 operation,

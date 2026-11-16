@@ -46,6 +46,7 @@ struct Fixture {
     session: String,
     calls: Arc<AtomicUsize>,
     models: Arc<Mutex<Vec<String>>>,
+    catalog_calls: Arc<AtomicUsize>,
     complete: Vec<Arc<Notify>>,
     extra: Arc<Notify>,
 }
@@ -60,6 +61,7 @@ impl Fixture {
         let extra = Arc::new(Notify::new());
         let calls = Arc::new(AtomicUsize::new(0));
         let models = Arc::new(Mutex::new(Vec::new()));
+        let catalog_calls = Arc::new(AtomicUsize::new(0));
         #[cfg(unix)]
         let temp = std::path::PathBuf::from("/tmp");
         #[cfg(windows)]
@@ -75,7 +77,13 @@ impl Fixture {
             let app = axum::Router::new()
                 .route(
                     "/models",
-                    axum::routing::get(|| async { axum::Json(json!({"data":[{"id":"v1-test"}]})) }),
+                    axum::routing::get({
+                        let calls = catalog_calls.clone();
+                        move || {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            async { axum::Json(json!({"data":[{"id":"v1-test"}]})) }
+                        }
+                    }),
                 )
                 .route(
                     "/messages",
@@ -178,6 +186,7 @@ impl Fixture {
             session,
             calls,
             models,
+            catalog_calls,
             complete,
             extra,
         }
@@ -743,6 +752,103 @@ fn native_session_model_role_effort_and_clear_follow_real_daemon_next_run_contra
         assert_eq!(shell.read(cx).composer(), &composer);
         assert_eq!(composer.read(cx).value().as_ref(), "Model draft ไทย 😀");
         shell.update(cx, |s, cx| s.connect_recording_daemon(cx));
+    });
+    f.finish();
+}
+
+#[gpui_kit::test]
+fn native_model_catalog_read_fill_and_save_follow_real_daemon_without_starting_work(
+    cx: &mut TestAppContext,
+) {
+    let env = credential_env::EnvGuard::isolated();
+    env.set("FORMLESS_API_KEY", "private-catalog-key");
+    let f = Fixture::start();
+    let (h, s) = open(cx, WIDE, 0, 0);
+    step(cx, h, |_, cx| {
+        s.update(cx, |s, cx| s.connect_daemon(f.endpoint.clone(), cx))
+    });
+    until(cx, h, &s, "catalog Session list", |s, _| {
+        s.sidebar().rows().iter().any(|r| r.id == f.session)
+    });
+    step(cx, h, |w, cx| w.click(session_row_id(&f.session), cx));
+    until(cx, h, &s, "catalog canonical baseline", |s, _| {
+        s.step_mode_enable_target().is_some()
+    });
+    let before = f.catalog_calls.load(Ordering::SeqCst);
+    step(cx, h, |w, cx| {
+        s.update(cx, |s, cx| s.run_command(Command::SessionDetails, w, cx));
+    });
+    until(cx, h, &s, "catalog metadata", |s, _| {
+        s.session_edit_input().is_some()
+    });
+    step(cx, h, |w, cx| {
+        w.click("session-edit-model", cx);
+        s.read(cx)
+            .session_edit_input()
+            .unwrap()
+            .update(cx, |i, cx| i.set_value("review", w, cx));
+    });
+    assert_eq!(
+        f.catalog_calls.load(Ordering::SeqCst),
+        before,
+        "opening and typing do not request a catalog"
+    );
+    step(cx, h, |w, cx| {
+        super::model_catalog_tests::click(w, cx, "session-catalog-read")
+    });
+    until(cx, h, &s, "catalog response", |s, _| {
+        s.session_catalog_revision().is_some()
+    });
+    assert_eq!(f.catalog_calls.load(Ordering::SeqCst), before + 1);
+    step(cx, h, |w, cx| {
+        let i = s.read(cx).session_edit_input().unwrap();
+        i.update(cx, |i, cx| i.set_value("desktop-fixture", w, cx));
+    });
+    step(cx, h, |w, cx| {
+        assert!(w
+            .find("session-catalog-count")
+            .value()
+            .unwrap()
+            .contains("1 matching choices"));
+        super::model_catalog_tests::click(w, cx, "session-catalog-choice-0");
+        assert_eq!(
+            s.read(cx)
+                .session_edit_input()
+                .unwrap()
+                .read(cx)
+                .value()
+                .as_ref(),
+            "role:desktop-fixture"
+        );
+    });
+    assert!(
+        f.snapshot()["session"]["model"].is_null(),
+        "a fill is not a save"
+    );
+    assert_eq!(
+        f.calls.load(Ordering::SeqCst),
+        0,
+        "catalog and fill start neither Run nor automatic test"
+    );
+    step(cx, h, |w, cx| w.click("session-edit-save", cx));
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        pump(cx, h, &s);
+        if step(cx, h, |w, _| {
+            w.find("session-edit-notice")
+                .value()
+                .is_some_and(|v| v.starts_with("Saved and acknowledged"))
+        }) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "catalog selection save");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(f.snapshot()["session"]["model"], "role:desktop-fixture");
+    assert_eq!(f.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(f.catalog_calls.load(Ordering::SeqCst), before + 1);
+    step(cx, h, |_, cx| {
+        s.update(cx, |s, cx| s.connect_recording_daemon(cx))
     });
     f.finish();
 }

@@ -7561,3 +7561,6 @@ mod credential_env;
 
 #[path = "support/session_model.rs"]
 mod session_model_tests;
+
+#[path = "support/model_catalog.rs"]
+mod model_catalog_tests;

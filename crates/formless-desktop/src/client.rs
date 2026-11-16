@@ -141,6 +141,12 @@ pub enum Update {
         session_id: String,
         outcome: session_edit::Outcome,
     },
+    ModelCatalog {
+        instance: uuid::Uuid,
+        connection: u64,
+        operation: uuid::Uuid,
+        result: Result<crate::model_catalog::Catalog, String>,
+    },
     SessionDetails {
         connection: u64,
         operation: uuid::Uuid,
@@ -169,6 +175,10 @@ pub enum Update {
 }
 
 pub enum Command {
+    ReadModelCatalog {
+        connection: u64,
+        operation: uuid::Uuid,
+    },
     DecideStep(crate::step_decision::Dispatch),
     EnableStepMode(crate::step_mode::Dispatch),
     DisableStepMode(crate::step_mode::Dispatch),
@@ -506,6 +516,7 @@ impl Client {
                 | Command::AnswerQuestion { .. }
                 | Command::EditSession { .. }
                 | Command::ReadSessionDetails { .. }
+                | Command::ReadModelCatalog { .. }
                 | Command::SearchProfile { .. }
                 | Command::ExportSession { .. }
                 | Command::ReadSessionUsage { .. }
@@ -662,6 +673,9 @@ fn advance_epoch(epoch: &AtomicU64) {
 
 #[derive(Debug)]
 enum Pending {
+    ModelCatalog {
+        operation: uuid::Uuid,
+    },
     ApprovalRead {
         operation: uuid::Uuid,
         revision: u64,
@@ -1264,6 +1278,32 @@ impl Engine {
             return;
         }
         match command {
+            Command::ReadModelCatalog {
+                connection,
+                operation,
+            } => {
+                let error = if !self.ready || connection != self.connection || operation.is_nil() {
+                    Some("Connection changed; read the catalog again explicitly.")
+                } else if self
+                    .pending
+                    .values()
+                    .any(|p| matches!(p, Pending::ModelCatalog { .. }))
+                {
+                    Some("A catalog read is still outstanding. Wait for its reply.")
+                } else {
+                    None
+                };
+                if let Some(error) = error {
+                    self.updates.push(Update::ModelCatalog {
+                        instance: self.instance,
+                        connection: self.connection,
+                        operation,
+                        result: Err(error.into()),
+                    });
+                } else {
+                    self.request(Request::ListModels, Pending::ModelCatalog { operation });
+                }
+            }
             Command::ReadInvocations {
                 connection,
                 operation,
@@ -2097,6 +2137,9 @@ impl Engine {
                         }),
                     }
                 }
+            }
+            Pending::ModelCatalog { operation } => {
+                self.updates.push(Update::ModelCatalog{instance:self.instance,connection:self.connection,operation,result:result.map_err(|_|"Catalog read failed. Provider details are not displayed; check configuration in Formless TUI.".into()).and_then(crate::model_catalog::Catalog::decode)});
             }
             Pending::Invocations { operation } => {
                 self.updates.push(Update::Invocations {

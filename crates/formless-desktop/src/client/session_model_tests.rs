@@ -216,3 +216,88 @@ fn session_model_unrelated_metadata_events_preserve_the_same_paired_baseline() {
         Request::SetSessionModel { .. }
     ));
 }
+
+#[test]
+fn model_catalog_worker_is_explicit_bounded_and_bound_to_the_physical_connection() {
+    let mut e = engine();
+    assert!(e.outgoing.is_empty());
+    let op = uuid::Uuid::new_v4();
+    e.command(Command::ReadModelCatalog {
+        connection: 2,
+        operation: op,
+    });
+    e.command(Command::ReadModelCatalog {
+        connection: 2,
+        operation: uuid::Uuid::new_v4(),
+    });
+    assert_eq!(e.outgoing.len(), 1);
+    let r = e.outgoing.pop_front().unwrap();
+    assert!(matches!(r.request, Request::ListModels));
+    assert!(e
+        .updates
+        .iter()
+        .any(|u| matches!(u, Update::ModelCatalog { result: Err(_), .. })));
+    e.receive(ServerMessage::ok(
+        r.id,
+        json!({"models":["m"],"aliases":{},"roles":[],"recent":[],"error":null}),
+    ))
+    .unwrap();
+    assert!(e.updates.iter().any(|u|matches!(u,Update::ModelCatalog{instance,connection:2,operation,result:Ok(c)}if *instance==e.instance&&*operation==op&&c.choices[0].selector=="m")));
+    assert!(
+        e.outgoing.is_empty(),
+        "a catalog response must not initiate a setter, probe, forecast or Run"
+    );
+    for connection in [0, 3] {
+        e.command(Command::ReadModelCatalog {
+            connection,
+            operation: uuid::Uuid::new_v4(),
+        });
+        assert!(e.outgoing.is_empty());
+    }
+    e.command(Command::ReadModelCatalog {
+        connection: 2,
+        operation: uuid::Uuid::nil(),
+    });
+    assert!(e.outgoing.is_empty());
+    e.ready = false;
+    e.command(Command::ReadModelCatalog {
+        connection: 2,
+        operation: uuid::Uuid::new_v4(),
+    });
+    assert!(e.outgoing.is_empty());
+}
+#[test]
+fn model_catalog_worker_does_not_display_provider_errors_or_accept_unbounded_replies() {
+    let mut e = engine();
+    let op = uuid::Uuid::new_v4();
+    e.command(Command::ReadModelCatalog {
+        connection: 2,
+        operation: op,
+    });
+    let r = e.outgoing.pop_front().unwrap();
+    e.receive(ServerMessage::err(r.id, "private-provider-token".into()))
+        .unwrap();
+    let notice = e
+        .updates
+        .iter()
+        .find_map(|u| match u {
+            Update::ModelCatalog { result: Err(e), .. } => Some(e),
+            _ => None,
+        })
+        .unwrap();
+    assert!(!notice.contains("private-provider-token"));
+    e.command(Command::ReadModelCatalog {
+        connection: 2,
+        operation: uuid::Uuid::new_v4(),
+    });
+    let r = e.outgoing.pop_front().unwrap();
+    e.receive(ServerMessage::ok(
+        r.id,
+        json!({"models":["m".repeat(513)],"aliases":{},"roles":[],"recent":[],"error":null}),
+    ))
+    .unwrap();
+    assert!(matches!(
+        e.updates.last(),
+        Some(Update::ModelCatalog { result: Err(_), .. })
+    ));
+}
