@@ -54,9 +54,12 @@ credential, Session trust, security and provider rules still apply. An accepted
 send starts provider work under those rules. Validation rejection before the
 append starts no Run; this is distinct from failures after transaction commit.
 
-## Native workflow still required
+## Native workflow at this boundary commit
 
-The production native composer is deliberately unchanged in this increment.
+At boundary commit `a8e6bda` the production native composer was deliberately
+unchanged. The successor [native confirmation contract](native-send-review-20261116.md)
+documents its integration; the rest of this section records the boundary's
+original required follow-up.
 Its existing legacy Send/Steer/Queue path therefore does not yet provide this
 attachment-review guarantee. Session details remains an explicit metadata
 inspection, not mandatory send review. The operation must first receive source

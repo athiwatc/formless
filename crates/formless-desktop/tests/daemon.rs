@@ -228,14 +228,21 @@ async fn until(client: &Client, stage: &'static str, mut predicate: impl FnMut(U
             };
             eprintln!("{stage}: {summary}");
             // This headless fixture has no editable GUI state. It commits a
-            // current quote only when no consent is required, or after the
-            // test explicitly confirmed it. It never manufactures consent.
+            // current quote only after the test caller explicitly confirms
+            // pending metadata, or after separately required cost consent.
+            // It never manufactures a required cost confirmation.
             match &update {
                 Update::Prepared(prepared)
-                    if !prepared.quote.confirmation_required
-                        && prepared.epoch == client.epoch() =>
+                    if !prepared.needs_review() && prepared.epoch == client.epoch() =>
                 {
                     client.send(Command::CommitPrepared(prepared.id)).unwrap();
+                }
+                Update::Prepared(prepared)
+                    if prepared.attachments.is_some()
+                        && !prepared.quote.confirmation_required
+                        && prepared.epoch == client.epoch() =>
+                {
+                    client.send(Command::ConfirmPrepared(prepared.id)).unwrap();
                 }
                 Update::PreparationReady { id, epoch } if *epoch == client.epoch() => {
                     client.send(Command::CommitPrepared(*id)).unwrap();

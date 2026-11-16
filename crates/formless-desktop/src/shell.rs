@@ -1810,6 +1810,24 @@ impl Shell {
             .unwrap_or_default()
     }
 
+    #[cfg(feature = "test-support")]
+    pub fn client_status_notice(&self) -> &str {
+        &self.client_status
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn send_review_open(&self) -> bool {
+        self.forecast
+            .as_ref()
+            .is_some_and(|d| d.prepared.attachments.is_some())
+    }
+
+    pub fn client_identity(&self) -> Option<(uuid::Uuid, u64)> {
+        self.client
+            .as_ref()
+            .map(|client| (client.instance(), client.connection()))
+    }
+
     pub fn client_epoch(&self) -> Option<u64> {
         self.client.as_ref().map(Client::epoch)
     }
@@ -1902,6 +1920,52 @@ impl Shell {
         self.settle(window, cx);
     }
 
+    fn cancel_presented_forecast(
+        &mut self,
+        id: uuid::Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.forecast.as_ref().is_some_and(|d| d.prepared.id == id) {
+            self.cancel_forecast(window, cx);
+        }
+    }
+    fn copy_presented_forecast(
+        &self,
+        id: uuid::Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(dialog) = self.forecast.as_ref().filter(|d| d.prepared.id == id) else {
+            return false;
+        };
+        if self.current_modal(self.layout(window)) != Some(Modal::Forecast)
+            || !self.preparation_current(&dialog.prepared, window, cx)
+        {
+            return false;
+        }
+        cx.write_to_clipboard(ClipboardItem::new_string(dialog.details.clone()));
+        true
+    }
+    #[cfg(feature = "test-support")]
+    pub fn copy_send_review_for_test(
+        &self,
+        id: uuid::Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.copy_presented_forecast(id, window, cx)
+    }
+    #[cfg(feature = "test-support")]
+    pub fn cancel_send_review_for_test(
+        &mut self,
+        id: uuid::Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.cancel_presented_forecast(id, window, cx);
+    }
+
     fn preparation_current(
         &self,
         prepared: &forecast::Prepared,
@@ -1910,10 +1974,11 @@ impl Shell {
     ) -> bool {
         self.client_connected
             && self.client_snapshot_ready
-            && self
-                .client
-                .as_ref()
-                .is_some_and(|client| client.epoch() == prepared.epoch)
+            && self.client.as_ref().is_some_and(|client| {
+                client.epoch() == prepared.epoch
+                    && client.instance() == prepared.client
+                    && client.connection() == prepared.connection
+            })
             && self.client_generation == prepared.generation
             && self.sidebar.active_id() == Some(prepared.session_id.as_str())
             && self.draft(cx).as_ref() == prepared.draft_basis
@@ -1926,7 +1991,10 @@ impl Shell {
                     .client_recovery
                     .as_ref()
                     .is_some_and(|run| run.recoverable()),
-                "Send" | "Steer" | "Queue" => true,
+                "Send" | "Steer" => prepared.attachments.as_ref().is_some_and(|report| {
+                    report.session_id() == prepared.session_id
+                        && prepared.draft_basis.len() <= forecast::MAX_REVIEW_DRAFT_BYTES
+                }),
                 _ => false,
             }
     }
@@ -1939,7 +2007,9 @@ impl Shell {
         else {
             return;
         };
-        if !self.preparation_current(&dialog.prepared, window, cx) {
+        if self.current_modal(self.layout(window)) != Some(Modal::Forecast)
+            || !self.preparation_current(&dialog.prepared, window, cx)
+        {
             self.cancel_forecast(window, cx);
             return;
         }
@@ -2448,7 +2518,7 @@ impl Shell {
                 self.resource_pages.insert(destination, page);
             }
             ClientUpdate::Action { session_id, result } => {
-                let notice = match result { Ok(()) => "Daemon acknowledged the action. Draft kept; edit or clear it before the next message.".to_string(), Err(error) => format!("Daemon rejected the action: {error}. Draft kept.") };
+                let notice = match result { Ok(()) => "Daemon acknowledged the action. Draft kept; edit or clear it before the next message.".to_string(), Err(error) => format!("Action result: {error}. Draft kept.") };
                 if self.sidebar.active_id() == Some(session_id.as_str()) {
                     self.composer_notice = Some(notice.clone().into());
                 }
@@ -2465,7 +2535,8 @@ impl Shell {
             ClientUpdate::Notice(notice) => self.client_status = notice,
             ClientUpdate::Prepared(prepared) => {
                 // A retired queued update must not cancel a newer forecast.
-                if self.client_epoch() != Some(prepared.epoch)
+                if self.client_identity() != Some((prepared.client, prepared.connection))
+                    || self.client_epoch() != Some(prepared.epoch)
                     || self.client_generation != prepared.generation
                     || self.sidebar.active_id() != Some(prepared.session_id.as_str())
                     || !self.client_connected
@@ -2484,15 +2555,14 @@ impl Shell {
                     self.composer_notice = Some("The action changed while its forecast loaded. Nothing was started; draft kept.".into());
                     return;
                 }
-                if !prepared.quote.confirmation_required {
+                if !prepared.needs_review() {
                     self.commit_prepared(prepared.id, window, cx);
                 } else {
                     self.palette = None;
                     self.viewer = None;
                     self.prefs.close_overlays();
-                    let summary = forecast::summary(&prepared.quote);
-                    let details = serde_json::to_string_pretty(&prepared.quote)
-                        .expect("forecast is serializable");
+                    let summary = prepared.summary();
+                    let details = prepared.details();
                     self.forecast = Some(ForecastDialog {
                         prepared,
                         summary,
@@ -2509,7 +2579,10 @@ impl Shell {
                     .as_ref()
                     .filter(|dialog| dialog.prepared.id == id && dialog.prepared.epoch == epoch)
                 {
-                    if self.preparation_current(&dialog.prepared, window, cx) {
+                    if dialog.waiting
+                        && self.current_modal(self.layout(window)) == Some(Modal::Forecast)
+                        && self.preparation_current(&dialog.prepared, window, cx)
+                    {
                         self.commit_prepared(id, window, cx);
                     } else {
                         self.cancel_forecast(window, cx);
@@ -3019,6 +3092,9 @@ impl Shell {
         if self.client.is_some() && self.client_connected && !self.client_snapshot_ready {
             actions.disabled_reason = Some("Waiting for a current Session snapshot");
         }
+        if self.client.is_some() {
+            actions.secondary = None;
+        }
         actions
     }
 
@@ -3027,6 +3103,11 @@ impl Shell {
     fn submit(&mut self, secondary: bool, cx: &mut Context<Self>) {
         let actions = self.composer_actions(cx);
         if actions.disabled_reason.is_some() {
+            return;
+        }
+        if secondary && self.client.is_some() {
+            self.composer_notice = Some("Queue is unavailable until deferred attachment ownership is supported. Use Formless TUI; nothing was queued and the draft was kept.".into());
+            cx.notify();
             return;
         }
         // Only an unfinished composition can leave the composer over its
@@ -5434,7 +5515,11 @@ impl Shell {
                     })
                     .w_full()),
             )
-            .child(readable("composer-send-keys", if self.enter_sends {
+            .child(readable("composer-send-keys", if self.enter_sends && self.client.is_some() {
+                format!("Enter: {primary_label} · Shift+Enter: newline · Queue: TUI · Review: ≤64 KiB")
+            } else if self.client.is_some() {
+                format!("Enter / Shift+Enter: newline · {modified_enter}: {primary_label} · Queue: TUI · Review: ≤64 KiB")
+            } else if self.enter_sends {
                 format!("Enter: {primary_label} · Shift+Enter: newline · {modified_enter}: Queue during a Run")
             } else {
                 format!("Enter / Shift+Enter: newline · {modified_enter}: {primary_label} · Queue remains a separate button")
@@ -5907,11 +5992,11 @@ impl Render for Shell {
         self.reveal_question_focus(window, cx);
         self.reveal_step_focus(window, cx);
         self.reveal_approval_focus(window, cx);
-        if self
-            .forecast
-            .as_ref()
-            .is_some_and(|dialog| self.client_epoch() != Some(dialog.prepared.epoch))
-        {
+        if self.forecast.as_ref().is_some_and(|dialog| {
+            self.client_epoch() != Some(dialog.prepared.epoch)
+                || self.client_identity()
+                    != Some((dialog.prepared.client, dialog.prepared.connection))
+        }) {
             self.forecast = None;
         }
         // State replacement has no Window parameter. Finish the modal
@@ -6056,17 +6141,15 @@ impl Shell {
                     .label("Cancel")
                     .tooltip("Cancel and keep the draft")
                     .track_focus(&self.forecast_cancel_focus)
-                    .on_click(cx.listener(|this, _, window, cx| this.cancel_forecast(window, cx))),
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.cancel_presented_forecast(id, window, cx)
+                    })),
             )
             .child(
                 Button::new("forecast-copy")
                     .label("Copy details")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        if let Some(dialog) = &this.forecast {
-                            cx.write_to_clipboard(ClipboardItem::new_string(
-                                dialog.details.clone(),
-                            ));
-                        }
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.copy_presented_forecast(id, window, cx);
                     })),
             )
             .child(
@@ -6079,7 +6162,7 @@ impl Shell {
                     })),
             );
         let panel = v_flex().id("forecast-dialog").test_support().role(Role::Dialog)
-            .aria_label(title.clone()).aria_description("Modal. Local forecast, not a spending limit. Arrow and Page keys read the forecast. Tab reaches confirmation; Escape cancels and keeps the draft.")
+            .aria_label(title.clone()).aria_description("Modal. Review the exact draft and complete pending-file metadata before Send or Steer. Local forecast is not a spending limit. Arrow and Page keys read all details. Tab reaches confirmation; Escape cancels and keeps the draft.")
             .map(modal_dialog).key_context(FORECAST_CONTEXT)
             .on_action(cx.listener(|this, _: &CloseForecast, window, cx| this.cancel_forecast(window, cx)))
             .on_action(cx.listener(|this, _: &ScrollViewerUp, _, cx| this.scroll_forecast(1., false, cx)))
@@ -6099,7 +6182,7 @@ impl Shell {
                     .test_support().role(Role::Label).aria_value("Confirming… Escape cancels.")
                     .child("Confirming… Escape cancels.")))
                 .child(readable("forecast-session", format!("Session: {}", dialog.prepared.session_id)))
-                .child(readable("forecast-estimate-help", "Local estimates are not a spending limit. Nothing starts until this confirmation is acknowledged and the draft is rechecked."))
+                .child(readable("forecast-estimate-help", "Local estimates are not a spending limit. Confirming sends only after this draft and review are rechecked. A failed or missing send receipt may mean it was persisted; it is never automatically retried."))
                 .children(dialog.summary.iter().enumerate().map(|(index, text)| readable(SharedString::from(format!("forecast-detail-{index}")), text.clone()).text_sm())))
             .child(footer).focus_trap("forecast-dialog", &self.forecast_focus);
         div()
@@ -6117,7 +6200,9 @@ impl Shell {
                     .size_full()
                     .bg(cx.theme().overlay)
                     .occlude()
-                    .on_click(cx.listener(|this, _, window, cx| this.cancel_forecast(window, cx))),
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.cancel_presented_forecast(id, window, cx)
+                    })),
             )
             .child(
                 h_flex()

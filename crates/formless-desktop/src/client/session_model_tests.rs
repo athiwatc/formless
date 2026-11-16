@@ -158,10 +158,8 @@ fn session_model_pending_read_and_write_block_new_forecasts_and_work_but_not_sto
         );
     }
     let mut e = engine();
-    e.command(Command::Intent(Intent::SendMessage {
+    e.command(Command::Intent(Intent::ResumeRun {
         session_id: "s".into(),
-        content: "already sent".into(),
-        mode: SendMode::Send,
     }));
     e.outgoing.clear();
     e.command(command(uuid::Uuid::new_v4(), change()));

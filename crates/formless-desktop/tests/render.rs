@@ -984,6 +984,9 @@ mod render {
                             let mut quote = fixture::run_forecast(&session_id, true);
                             quote.warnings = vec!["Forecast warning ไทย 漢字 😀. Estimates are uncertain.".repeat(10); 12];
                             Box::new(formless_desktop::forecast::Prepared {
+                                client:state.client_identity().unwrap().0,
+                                connection:state.client_identity().unwrap().1,
+                                attachments:Some(formless_desktop::pending_files::Report::decode(&session_id,serde_json::json!({"session_id":session_id,"attachments":[]})).unwrap()),
                                 id: uuid::Uuid::new_v4(),
                                 epoch: state.client_epoch().unwrap(),
                                 generation,

@@ -150,7 +150,8 @@ impl Entry {
 
 pub const NO_COMPOSER: &str = "Only Chat has a composer";
 pub const COMPOSING: &str = "Finish composing text first";
-pub const NO_SECONDARY: &str = "Queue is only available while a Run is in progress";
+pub const NO_SECONDARY: &str =
+    "Queue is unavailable in this view or Run; native Queue requires Formless TUI";
 pub const NO_RUN: &str = "No Run is in progress";
 pub const NO_RECOVERY: &str = "No confirmed paused or interrupted Run is available";
 pub const LARGEST: &str = "Text is already at its largest size";

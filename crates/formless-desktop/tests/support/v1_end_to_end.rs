@@ -271,7 +271,17 @@ fn until(
         if step(cx, handle, |_, cx| ready(shell.read(cx), cx)) {
             break;
         }
-        assert!(Instant::now() < deadline, "view deadline: {label}");
+        if Instant::now() >= deadline {
+            let status = step(cx, handle, |_, cx| {
+                format!(
+                    "status={}; composer={:?}; Session={:?}",
+                    shell.read(cx).client_status_notice(),
+                    shell.read(cx).composer_notice(),
+                    shell.read(cx).sidebar().active_id()
+                )
+            });
+            panic!("view deadline: {label}; {status}");
+        }
         std::thread::sleep(Duration::from_millis(5));
     }
 }
@@ -1034,4 +1044,215 @@ fn reviewed_attachment_send_idle_admission_uses_exact_metadata_and_only_one_fake
         drop(reader);
     });
     f.finish();
+}
+
+#[gpui_kit::test]
+fn native_composer_confirms_pending_files_and_retains_unknown_after_a_peer_changes_them(
+    cx: &mut TestAppContext,
+) {
+    let env = credential_env::EnvGuard::isolated();
+    env.set("FORMLESS_API_KEY", "private-native-review-key");
+    for peer_change in [false, true] {
+        let f = Fixture::start();
+        f.runtime
+            .block_on(f.daemon.handle(Request::AttachFile {
+                session_id: f.session.clone(),
+                name: "review me ไทย.txt".into(),
+                data_b64: "aGVsbG8=".into(),
+                mime: Some("text/plain".into()),
+            }))
+            .unwrap();
+        let (h, s) = open(cx, WIDE, 0, 0);
+        step(cx, h, |_, cx| {
+            s.update(cx, |s, cx| s.connect_daemon(f.endpoint.clone(), cx))
+        });
+        until(cx, h, &s, "native review Session", |s, _| {
+            s.sidebar().rows().iter().any(|r| r.id == f.session)
+        });
+        step(cx, h, |w, cx| w.click(session_row_id(&f.session), cx));
+        until(cx, h, &s, "native review baseline", |s, _| {
+            s.step_mode_enable_target().is_some()
+        });
+        step(cx, h, |w, cx| {
+            s.update(cx, |s, cx| s.focus_section(PageSection::Composer, w, cx));
+            w.input("native reviewed draft ไทย😀", cx);
+            settle_frames(w, cx);
+        });
+        pump(cx, h, &s);
+        step(cx, h, |w, cx| {
+            assert_eq!(s.read(cx).draft(cx).as_ref(), "native reviewed draft ไทย😀");
+            assert_ne!(w.find("composer-primary").disabled(), Some(true));
+            let enter = s.update(cx, |s, cx| s.command_state(w, cx).enter_sends);
+            w.press(
+                if enter {
+                    "enter"
+                } else {
+                    formless_desktop::commands::composer_submit_key()
+                },
+                cx,
+            );
+        });
+        until(cx, h, &s, "mandatory native review", |s, _| {
+            s.send_review_open()
+        });
+        assert_eq!(
+            f.calls.load(Ordering::SeqCst),
+            0,
+            "opening review cannot start work"
+        );
+        step(cx, h, |w, cx| {
+            assert_eq!(w.find("forecast-cancel").focused(), Some(true));
+            assert!(s.read(cx).background_inert(w));
+            w.click("forecast-copy", cx);
+            let details: Value =
+                serde_json::from_str(&cx.read_from_clipboard().unwrap().text().unwrap()).unwrap();
+            assert_eq!(details["draft"], "native reviewed draft ไทย😀");
+            assert_eq!(
+                details["pending_files"]["attachments"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                1
+            );
+        });
+        if peer_change {
+            f.runtime
+                .block_on(f.daemon.handle(Request::AttachFile {
+                    session_id: f.session.clone(),
+                    name: "peer added.txt".into(),
+                    data_b64: "aGVsbG8=".into(),
+                    mime: None,
+                }))
+                .unwrap();
+        }
+        step(cx, h, |w, cx| {
+            w.click("forecast-confirm", cx);
+        });
+        if peer_change {
+            until(cx, h, &s, "unknown reviewed result", |s, _| {
+                s.composer_notice()
+                    .is_some_and(|n| n.contains("outcome is unknown"))
+            });
+            assert_eq!(f.calls.load(Ordering::SeqCst), 0);
+            let pending = f
+                .runtime
+                .block_on(f.daemon.handle(Request::ListPendingAttachments {
+                    session_id: f.session.clone(),
+                }))
+                .unwrap();
+            assert_eq!(pending["attachments"].as_array().unwrap().len(), 2);
+            assert!(f.snapshot()["messages"].as_array().unwrap().is_empty());
+            step(cx, h, |w, cx| {
+                settle_frames(w, cx);
+                s.update(cx, |s, cx| s.focus_section(PageSection::Composer, w, cx));
+                let enter = s.update(cx, |s, cx| s.command_state(w, cx).enter_sends);
+                w.press(
+                    if enter {
+                        "enter"
+                    } else {
+                        formless_desktop::commands::composer_submit_key()
+                    },
+                    cx,
+                );
+            });
+            until(cx, h, &s, "unknown retry refused", |s, _| {
+                s.client_status_notice()
+                    .starts_with("A previous action's outcome is unknown.")
+            });
+            pump(cx, h, &s);
+            assert!(!step(cx, h, |_, cx| s.read(cx).send_review_open()));
+            assert_eq!(f.calls.load(Ordering::SeqCst), 0);
+        } else {
+            until(cx, h, &s, "native send acknowledgement", |s, _| {
+                s.composer_notice()
+                    .is_some_and(|n| n.contains("acknowledged"))
+            });
+            f.wait("native reviewed provider request", || {
+                f.calls.load(Ordering::SeqCst) == 1
+            });
+            let messages = f.snapshot()["messages"].as_array().unwrap().clone();
+            let msg = messages.iter().find(|m| m["role"] == "user").unwrap();
+            assert_eq!(msg["content"], "native reviewed draft ไทย😀");
+            assert!(msg["meta"].as_str().unwrap().contains("review me"));
+            assert_eq!(
+                step(cx, h, |_, cx| s.read(cx).draft(cx).to_string()),
+                "native reviewed draft ไทย😀"
+            );
+            until(cx, h, &s, "native Steer state", |s, _| {
+                s.sidebar()
+                    .active_row()
+                    .is_some_and(|r| r.run_state == formless_desktop::model::RunState::Running)
+            });
+            step(cx, h, |w, cx| {
+                let input = s.read(cx).composer().clone();
+                input.update(cx, |input, cx| {
+                    input.set_value("native steer draft ไทย😀", w, cx)
+                });
+                s.update(cx, |s, cx| s.focus_section(PageSection::Composer, w, cx));
+            });
+            pump(cx, h, &s);
+            step(cx, h, |w, cx| {
+                let enter = s.update(cx, |s, cx| s.command_state(w, cx).enter_sends);
+                w.press(
+                    if enter {
+                        "enter"
+                    } else {
+                        formless_desktop::commands::composer_submit_key()
+                    },
+                    cx,
+                );
+            });
+            until(cx, h, &s, "native empty Steer review", |s, _| {
+                s.send_review_open()
+            });
+            assert_eq!(f.calls.load(Ordering::SeqCst), 1);
+            step(cx, h, |w, cx| {
+                w.click("forecast-copy", cx);
+                let copied: Value =
+                    serde_json::from_str(&cx.read_from_clipboard().unwrap().text().unwrap())
+                        .unwrap();
+                assert_eq!(copied["pending_files"]["attachments"], json!([]));
+                assert_eq!(copied["draft"], "native steer draft ไทย😀");
+                w.click("forecast-confirm", cx);
+            });
+            until(cx, h, &s, "native Steer acknowledgement", |s, _| {
+                s.composer_notice()
+                    .is_some_and(|n| n.contains("acknowledged"))
+            });
+            let messages = f.snapshot()["messages"].as_array().unwrap().clone();
+            let steer = messages
+                .iter()
+                .find(|m| m["content"] == "native steer draft ไทย😀")
+                .unwrap();
+            let metadata: Value = serde_json::from_str(steer["meta"].as_str().unwrap()).unwrap();
+            assert!(metadata["steer"]["run_id"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty()));
+            assert!(metadata.get("attachments").is_none());
+            f.complete[0].notify_one();
+            f.wait("native Steer provider extension", || {
+                f.calls.load(Ordering::SeqCst) == 2
+            });
+            f.extra.notify_one();
+            f.complete[1].notify_one();
+            f.wait("native reviewed idle", || f.snapshot()["running"] == false);
+            assert_eq!(f.calls.load(Ordering::SeqCst), 2);
+        }
+        assert_eq!(
+            step(cx, h, |_, cx| s.read(cx).draft(cx).to_string()),
+            if peer_change {
+                "native reviewed draft ไทย😀"
+            } else {
+                "native steer draft ไทย😀"
+            }
+        );
+        eprintln!(
+            "native_send_review_case {}",
+            json!({"peer_changed":peer_change,"provider_posts":f.calls.load(Ordering::SeqCst),"draft_preserved":true,"confirmation_required":true,"automatic_replay":false})
+        );
+        step(cx, h, |_, cx| {
+            s.update(cx, |s, cx| s.connect_recording_daemon(cx))
+        });
+        f.finish();
+    }
 }

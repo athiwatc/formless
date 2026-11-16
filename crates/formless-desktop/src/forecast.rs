@@ -5,8 +5,14 @@ use formless_protocol::{ForecastInput, ForecastRange, RunForecast};
 
 use crate::model::{send_mode_label, Intent};
 
+/// Native confirmation renders complete text rather than an abbreviated draft.
+/// Larger drafts remain editable but use the TUI until a bounded full-text review exists.
+pub const MAX_REVIEW_DRAFT_BYTES: usize = 64 * 1024;
 #[derive(Debug, Clone)]
 pub struct Prepared {
+    pub client: uuid::Uuid,
+    pub connection: u64,
+    pub attachments: Option<crate::pending_files::Report>,
     pub id: uuid::Uuid,
     pub epoch: u64,
     pub generation: u64,
@@ -15,6 +21,41 @@ pub struct Prepared {
     /// The view rechecks the exact draft, including for Resume, before commit.
     pub draft_basis: String,
     pub quote: RunForecast,
+}
+
+impl Prepared {
+    pub fn needs_review(&self) -> bool {
+        self.attachments.is_some() || self.quote.confirmation_required
+    }
+    pub fn summary(&self) -> Vec<String> {
+        let mut lines = summary(&self.quote);
+        if let Some(report) = &self.attachments {
+            lines.push(format!("Pending files: {}. Confirmation sends the complete metadata below with this exact draft. A changed inventory is rejected atomically.",report.rows.len()));
+            lines.push("Private paths and draft text are included in Copy details. Referenced file contents can change even when metadata matches. Queue is unavailable; use Formless TUI for deferred messages.".into());
+            lines.push(format!(
+                "Exact draft (JSON escaped): {}",
+                escape_directional(&serde_json::to_string(&self.draft_basis).unwrap())
+            ));
+            for (index, value) in report.expected().iter().enumerate() {
+                lines.push(format!(
+                    "Pending metadata {} (complete JSON): {}",
+                    index + 1,
+                    escape_directional(&value.to_string())
+                ));
+            }
+        }
+        lines
+    }
+    pub fn details(&self) -> String {
+        if let Some(report) = &self.attachments {
+            escape_directional(&serde_json::json!({"forecast":self.quote,"draft":self.draft_basis,"pending_files":serde_json::from_str::<serde_json::Value>(&report.copy()).unwrap()}).to_string())
+        } else {
+            serde_json::to_string_pretty(&self.quote).expect("serializable forecast")
+        }
+    }
+}
+fn escape_directional(text: &str) -> String {
+    text.chars().map(|c| if matches!(c,'\u{061c}'|'\u{200e}'|'\u{200f}'|'\u{202a}'..='\u{202e}'|'\u{2066}'..='\u{2069}') {format!("\\u{:04x}",c as u32)} else {c.to_string()}).collect()
 }
 
 pub fn label(intent: &Intent) -> &'static str {

@@ -86,6 +86,12 @@ impl Report {
         }
         Ok(Self { rows, raw: value })
     }
+    pub(crate) fn expected(&self) -> Vec<Value> {
+        self.raw["attachments"]
+            .as_array()
+            .expect("validated inventory")
+            .clone()
+    }
     pub fn session_id(&self) -> &str {
         self.raw["session_id"]
             .as_str()

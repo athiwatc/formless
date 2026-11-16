@@ -32,7 +32,10 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufRea
 use tokio::sync::{mpsc as queue, watch};
 
 mod delivery;
+#[cfg(test)]
+mod native_send_tests;
 mod reader;
+mod send_review;
 pub use reader::{StreamBatch, StreamOwner, StreamStatus};
 
 use crate::forecast;
@@ -686,6 +689,12 @@ fn advance_epoch(epoch: &AtomicU64) {
 
 #[derive(Debug)]
 enum Pending {
+    SendInventory(Box<Preparation>),
+    ReviewedAction {
+        action: Action,
+        work: Box<Preparation>,
+        sent: bool,
+    },
     AttachmentInventory {
         operation: uuid::Uuid,
         session_id: String,
@@ -795,12 +804,16 @@ struct Action {
 #[derive(Debug)]
 enum PreparationStage {
     Forecast,
+    NeedsReview,
     NeedsConsent(String),
     Ready,
 }
 
 #[derive(Debug)]
 struct Preparation {
+    client: uuid::Uuid,
+    connection: u64,
+    attachments: Option<crate::pending_files::Report>,
     id: uuid::Uuid,
     epoch: u64,
     generation: u64,
@@ -814,6 +827,8 @@ struct Preparation {
 impl Preparation {
     fn current(&self, engine: &Engine) -> bool {
         engine.ready
+            && self.client == engine.instance
+            && self.connection == engine.connection
             && self.epoch == engine.epoch
             && self.generation == engine.generation
             && self.active == engine.active
@@ -825,6 +840,7 @@ impl Preparation {
 /// replaces this on reconnect; selection generations belong to the window.
 #[derive(Default)]
 struct Engine {
+    reviewed_send_available: bool,
     instance: uuid::Uuid,
     reader: reader::Reader,
     stream_epoch: u64,
@@ -1128,16 +1144,25 @@ impl Engine {
             intent.starts_work()
                 && uncertain.iter().any(|action| {
                     action.question_id.is_none() && action.session_id == intent.session_id() && !self.pending.values().any(|pending|
-                matches!(pending, Pending::Action(pending) | Pending::Answer(pending) if pending == action))
+                matches!(pending, Pending::Action(pending) | Pending::Answer(pending) | Pending::ReviewedAction{action:pending,..} if pending == action))
                 })
         })
     }
     fn sync_epoch(&mut self, epoch: u64) {
         self.epoch = epoch;
-        let (generation, active, status_revision) =
-            (self.generation, self.active.as_ref(), self.status_revision);
+        let (generation, active, status_revision, client, connection) = (
+            self.generation,
+            self.active.as_ref(),
+            self.status_revision,
+            self.instance,
+            self.connection,
+        );
+        let ready = self.ready;
         let current = |work: &Preparation| {
-            work.epoch == epoch
+            ready
+                && work.epoch == epoch
+                && work.client == client
+                && work.connection == connection
                 && work.generation == generation
                 && work.active.as_ref() == active
                 && work.status_revision == status_revision
@@ -1145,12 +1170,30 @@ impl Engine {
         if self.prepared.as_ref().is_some_and(|work| !current(work)) {
             self.prepared = None;
         }
+        let cancelled: Vec<_> = self
+            .pending
+            .values()
+            .filter_map(|p| match p {
+                Pending::ReviewedAction {
+                    action,
+                    work,
+                    sent: false,
+                } if !current(work) => Some(action.clone()),
+                _ => None,
+            })
+            .collect();
         self.pending.retain(|_, pending| match pending {
-            Pending::Forecast(work) | Pending::Consent(work) => current(work),
+            Pending::Forecast(work) | Pending::Consent(work) | Pending::SendInventory(work) => {
+                current(work)
+            }
+            Pending::ReviewedAction { work, sent, .. } => *sent || current(work),
             _ => true,
         });
         self.outgoing
             .retain(|request| self.pending.contains_key(&request.id));
+        for action in cancelled {
+            self.updates.push(Update::Action{session_id:action.session_id,result:Err("Review changed before writing; no reviewed message was sent. Review again explicitly".into())});
+        }
     }
     fn request(&mut self, request: Request, pending: Pending) {
         self.next_id = self
@@ -1753,7 +1796,7 @@ impl Engine {
                     Some("Connection changed; reload Session details before editing.".into())
                 } else if session_id.is_empty() || session_id.len() > 256 {
                     Some("Invalid Session identity; no change was sent.".into())
-                } else if change.is_selection() && self.pending.values().any(|p|matches!(p,Pending::Action(a) if a.session_id==session_id)) {
+                } else if change.is_selection() && self.pending.values().any(|p|matches!(p,Pending::Action(a)|Pending::ReviewedAction{action:a,..} if a.session_id==session_id)) {
                     Some("Wait for the Session's previous action receipt before changing its model. No setting was sent.".into())
                 } else if self.pending.values().any(|pending| matches!(pending, Pending::EditSession { session_id: id, .. } | Pending::InspectModelSelection {session_id:id,..} if id == &session_id)) {
                     Some("A metadata change for this Session is already waiting.".into())
@@ -1799,20 +1842,39 @@ impl Engine {
                 draft_basis,
                 epoch,
             } if self.ready => {
-                if epoch != self.epoch || !intent.starts_work() {
+                if epoch != self.epoch
+                    || !intent.starts_work()
+                    || self.active.as_deref() != Some(intent.session_id())
+                {
                     self.updates.push(Update::Notice(
                         "The action changed before its forecast was requested. Draft kept.".into(),
                     ));
                     return;
                 }
                 if self.prepared.is_some() || self.pending.values().any(|pending| matches!(pending,
-                    Pending::Forecast(_) | Pending::Consent(_)
-                ) || matches!(pending, Pending::Action(action) if action.session_id == intent.session_id())) {
+                    Pending::Forecast(_) | Pending::Consent(_) | Pending::SendInventory(_)
+                ) || matches!(pending, Pending::Action(action) | Pending::ReviewedAction{action,..} if action.session_id == intent.session_id())) {
                     self.updates.push(Update::Notice("Finish or cancel the current action first. Draft kept.".into()));
                     return;
                 }
-                let input = forecast::input(&intent);
+                if let Intent::SendMessage { content, mode, .. } = &intent {
+                    if !self.reviewed_send_available {
+                        self.updates.push(Update::PreparationFailed{id:uuid::Uuid::new_v4(),epoch,error:"This daemon does not advertise atomic pending-file review. Update the daemon or use Formless TUI; no legacy Send fallback was attempted".into()});
+                        return;
+                    }
+                    if *mode == formless_protocol::SendMode::Queue
+                        || content != &draft_basis
+                        || content.trim().is_empty()
+                        || content.len() > crate::forecast::MAX_REVIEW_DRAFT_BYTES
+                    {
+                        self.updates.push(Update::PreparationFailed{id:uuid::Uuid::new_v4(),epoch,error:"Queue attachment ownership is unavailable; Send/Steer require the exact draft within the native 64 KiB review limit. Use Formless TUI for Queue or larger messages".into()});
+                        return;
+                    }
+                }
                 let work = Preparation {
+                    client: self.instance,
+                    connection: self.connection,
+                    attachments: None,
                     id: uuid::Uuid::new_v4(),
                     epoch,
                     generation: self.generation,
@@ -1822,13 +1884,7 @@ impl Engine {
                     intent,
                     stage: PreparationStage::Forecast,
                 };
-                self.request(
-                    Request::ForecastRun {
-                        input,
-                        for_send: true,
-                    },
-                    Pending::Forecast(Box::new(work)),
-                );
+                self.start_send_review(Box::new(work));
             }
             Command::ConfirmPrepared(id) if self.ready => {
                 let Some(work) = self.prepared.take() else {
@@ -1845,6 +1901,15 @@ impl Engine {
                         },
                         Pending::Consent(work),
                     ),
+                    PreparationStage::NeedsReview => {
+                        let mut work = work;
+                        work.stage = PreparationStage::Ready;
+                        self.updates.push(Update::PreparationReady {
+                            id: work.id,
+                            epoch: work.epoch,
+                        });
+                        self.prepared = Some(work);
+                    }
                     _ => self.prepared = Some(work),
                 }
             }
@@ -1861,29 +1926,24 @@ impl Engine {
                 }
                 // The view revalidated its exact draft/IME state before this
                 // commit. Neither a quote nor a consent ACK starts work itself.
-                self.command(Command::Intent(work.intent));
+                if matches!(work.intent, Intent::SendMessage { .. }) {
+                    self.commit_reviewed_send(work);
+                } else {
+                    self.command(Command::Intent(work.intent));
+                }
             }
             Command::Intent(intent) if self.ready => {
                 if intent.starts_work() && self.pending.values().any(|pending|
-                    matches!(pending, Pending::Action(action) if action.session_id == intent.session_id())) {
+                    matches!(pending, Pending::Action(action) | Pending::ReviewedAction{action,..} if action.session_id == intent.session_id())) {
                     self.updates.push(Update::Notice("Wait for the previous action's acknowledgement; the draft was kept.".into()));
                     return;
                 }
                 let action_id = uuid::Uuid::new_v4();
                 let (session_id, request) = match intent {
-                    Intent::SendMessage {
-                        session_id,
-                        content,
-                        mode,
-                    } => (
-                        session_id.clone(),
-                        Request::SendMessage {
-                            session_id,
-                            content,
-                            mode,
-                            client_msg_id: Some(action_id.to_string()),
-                        },
-                    ),
+                    Intent::SendMessage { .. } => {
+                        self.updates.push(Update::Notice("No message sent. Read and confirm pending-file metadata through the composer review first.".into()));
+                        return;
+                    }
                     Intent::InterruptRun { session_id } => {
                         (session_id.clone(), Request::InterruptRun { session_id })
                     }
@@ -2119,6 +2179,15 @@ impl Engine {
                             .into(),
                     );
                 }
+                self.reviewed_send_available =
+                    result["features"].as_array().is_some_and(|features| {
+                        [
+                            "pending_attachment_inventory_v1",
+                            "reviewed_attachment_send_v1",
+                        ]
+                        .iter()
+                        .all(|required| features.iter().any(|feature| feature == required))
+                    });
                 self.reader.available = result["features"].as_array().is_some_and(|features| {
                     features
                         .iter()
@@ -2524,6 +2593,12 @@ impl Engine {
                 self.emit_questions();
                 self.dirty_session = true;
             }
+            Pending::SendInventory(work) => self.send_inventory_loaded(work, result),
+            Pending::ReviewedAction { action, .. } => {
+                self.dirty_session = true;
+                self.dirty_list = true;
+                self.updates.push(Update::Action {session_id: action.session_id, result: if result.as_ref().is_ok_and(send_review::acknowledged) {Ok(())} else {Err("Reviewed message outcome is unknown. It may be persisted. It was not retried; check this Session in Formless TUI before starting more work".into())}});
+            }
             Pending::Forecast(mut work) => {
                 if !work.current(self) {
                     return Ok(());
@@ -2543,11 +2618,16 @@ impl Engine {
                             PreparationStage::NeedsConsent(
                                 quote.confirmation_id.clone().expect("validated consent id"),
                             )
+                        } else if work.attachments.is_some() {
+                            PreparationStage::NeedsReview
                         } else {
                             PreparationStage::Ready
                         };
                         self.updates
                             .push(Update::Prepared(Box::new(forecast::Prepared {
+                                client: work.client,
+                                connection: work.connection,
+                                attachments: work.attachments.clone(),
                                 id: work.id,
                                 epoch: work.epoch,
                                 generation: work.generation,
@@ -2793,6 +2873,12 @@ async fn connected<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
                 }
             }
         }
+        for pending in engine.pending.values_mut() {
+            if let Pending::ReviewedAction { action, sent, .. } = pending {
+                uncertain.insert(action.clone());
+                *sent = true;
+            }
+        }
         write_requests(&mut writer, &mut engine)
             .await
             .map_err(|e| e.to_string())?;
@@ -2817,6 +2903,8 @@ async fn connected<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
                 Some(Command::Select { session_id, generation }) => { *active = (session_id.clone(), generation); engine.select(session_id, generation); }
                 Some(Command::Page(destination)) => { *page = Some(destination); engine.load_page(destination); }
                 Some(command) if engine.blocked_by_unknown(&command, uncertain) => {
+                    let target=match &command {Command::Intent(intent)|Command::Review{intent,..}=>Some(intent.session_id().to_string()),Command::CommitPrepared(id)=>engine.prepared.as_ref().filter(|p|p.id==*id).map(|p|p.intent.session_id().to_string()),_=>None};
+                    if let Some(session_id)=target {engine.updates.push(Update::Action{session_id,result:Err("A previous action's outcome is unknown. No new action was sent; check the Session in Formless TUI before retrying".into())});}
                     engine.updates.push(Update::Notice("A previous action's outcome is unknown. It was not retried: deduplication does not survive reconnect. Check this Session in the TUI before starting more work.".into()));
                 }
                 Some(command) => engine.command(command),
@@ -2828,6 +2916,7 @@ async fn connected<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
                     engine.sync_epoch(epoch.load(Ordering::Acquire));
                     let answered = match &message { ServerMessage::Response { id, ok, result, .. } => match engine.pending.get(id) {
                         Some(Pending::Action(action)) => Some(action.clone()),
+                        Some(Pending::ReviewedAction {action,..}) if *ok && result.as_ref().is_some_and(send_review::acknowledged) => Some(action.clone()),
                         Some(Pending::Answer(action)) if !ok || result.as_ref().and_then(|value| value["answered"].as_bool()).is_some() => Some(action.clone()),
                         _ => None }, _ => None };
                     engine.receive(message)?;
@@ -3206,10 +3295,10 @@ mod tests {
             assert!(engine.prepared.is_none());
             engine.command(Command::ConfirmPrepared(id));
             engine.command(Command::CommitPrepared(id));
-            assert!(!engine
-                .outgoing
-                .iter()
-                .any(|r| matches!(r.request, Request::SendMessage { .. })));
+            assert!(!engine.outgoing.iter().any(|r| matches!(
+                r.request,
+                Request::SendMessage { .. } | Request::SendReviewedMessage { .. }
+            )));
             assert_eq!(engine.stream_epoch, stream_epoch);
         }
         let mut engine = ready();
@@ -3218,7 +3307,7 @@ mod tests {
             intent: Intent::SendMessage {
                 session_id: "a".into(),
                 content: "draft".into(),
-                mode: SendMode::Queue,
+                mode: SendMode::Steer,
             },
             draft_basis: "draft".into(),
             epoch: engine.epoch,
@@ -3239,15 +3328,26 @@ mod tests {
     }
 
     fn prepare(engine: &mut Engine, required: bool) -> uuid::Uuid {
+        engine.active = Some("a".into());
         engine.command(Command::Review {
             intent: Intent::SendMessage {
                 session_id: "a".into(),
                 content: "keep exact draft ไทย".into(),
-                mode: SendMode::Queue,
+                mode: SendMode::Steer,
             },
             draft_basis: "keep exact draft ไทย".into(),
             epoch: engine.epoch,
         });
+        let inventory = engine.outgoing.pop_back().unwrap();
+        assert!(matches!(
+            inventory.request,
+            Request::ListPendingAttachments { .. }
+        ));
+        respond(
+            engine,
+            inventory.id,
+            json!({"session_id":"a","attachments":[]}),
+        );
         let request = engine.outgoing.pop_back().unwrap();
         assert!(matches!(
             request.request,
@@ -3274,6 +3374,11 @@ mod tests {
             let mut engine = ready();
             let id = prepare(&mut engine, required);
             assert!(engine.outgoing.is_empty(), "a quote must not send");
+            engine.command(Command::CommitPrepared(id));
+            assert!(
+                engine.outgoing.is_empty(),
+                "review cannot be skipped, even when no price consent is needed"
+            );
             if required {
                 engine.command(Command::CommitPrepared(id));
                 assert!(engine.outgoing.is_empty(), "consent cannot be skipped");
@@ -3283,6 +3388,9 @@ mod tests {
                 respond(&mut engine, request.id, json!({"confirmed":true}));
                 assert!(engine.outgoing.is_empty(), "a consent ACK must not send");
                 assert!(engine.updates.iter().any(|update| matches!(update, Update::PreparationReady { id: got, .. } if *got == id)));
+            }
+            if !required {
+                engine.command(Command::ConfirmPrepared(id));
             }
             engine.command(Command::CommitPrepared(uuid::Uuid::new_v4()));
             assert!(engine.outgoing.is_empty());
@@ -3294,7 +3402,7 @@ mod tests {
                 "duplicate commits must not replay"
             );
             assert!(
-                matches!(&engine.outgoing[0].request, Request::SendMessage { content, mode: SendMode::Queue, .. } if content == "keep exact draft ไทย")
+                matches!(&engine.outgoing[0].request, Request::SendReviewedMessage { content, mode: SendMode::Steer, .. } if content == "keep exact draft ไทย")
             );
         }
     }
@@ -3315,10 +3423,10 @@ mod tests {
             }
             respond(&mut engine, confirm.id, json!({"confirmed":true}));
             engine.command(Command::CommitPrepared(id));
-            assert!(!engine
-                .outgoing
-                .iter()
-                .any(|request| matches!(request.request, Request::SendMessage { .. })));
+            assert!(!engine.outgoing.iter().any(|request| matches!(
+                request.request,
+                Request::SendMessage { .. } | Request::SendReviewedMessage { .. }
+            )));
             assert!(!engine
                 .updates
                 .iter()
@@ -3337,6 +3445,7 @@ mod tests {
     #[test]
     fn malformed_forecasts_and_rejected_consent_keep_the_action_uncommitted() {
         let mut engine = ready();
+        engine.active = Some("a".into());
         engine.command(Command::Review {
             intent: Intent::ResumeRun {
                 session_id: "a".into(),
@@ -3443,7 +3552,7 @@ mod tests {
         respond(
             &mut engine,
             ping.id,
-            json!({"min_protocol":1,"max_protocol":1}),
+            json!({"min_protocol":1,"max_protocol":1,"features":["pending_attachment_inventory_v1","reviewed_attachment_send_v1"]}),
         );
         let subscribe = engine.outgoing.pop_front().unwrap();
         assert!(matches!(
@@ -4303,15 +4412,21 @@ mod tests {
         assert!(engine.outgoing.is_empty());
         engine = ready();
         engine.command(Command::Intent(intent()));
-        engine.command(Command::Intent(intent()));
+        assert!(
+            engine.outgoing.is_empty(),
+            "raw Send cannot bypass native review"
+        );
+        let id = prepare(&mut engine, false);
+        engine.command(Command::CommitPrepared(id));
+        assert!(engine.outgoing.is_empty());
+        engine.command(Command::ConfirmPrepared(id));
+        engine.command(Command::CommitPrepared(id));
+        engine.command(Command::CommitPrepared(id));
         assert_eq!(engine.outgoing.len(), 1);
         let request = engine.outgoing.pop_front().unwrap();
         assert!(matches!(
             request.request,
-            Request::SendMessage {
-                client_msg_id: Some(_),
-                ..
-            }
+            Request::SendReviewedMessage { .. }
         ));
         engine.command(Command::Intent(Intent::InterruptRun {
             session_id: "a".into(),
@@ -4320,7 +4435,11 @@ mod tests {
             engine.outgoing.back().unwrap().request,
             Request::InterruptRun { .. }
         ));
-        respond(&mut engine, request.id, json!({"sent":true}));
+        respond(
+            &mut engine,
+            request.id,
+            json!({"steered":true,"run_id":"run"}),
+        );
         assert!(engine
             .updates
             .iter()
@@ -4429,10 +4548,18 @@ mod tests {
     }
 
     async fn disconnect_after_unacknowledged_send() -> Retained {
+        let retained = scripted_reviewed_send_response(None).await;
+        assert!(retained
+            .uncertain
+            .iter()
+            .any(|action| action.session_id == "a"));
+        retained
+    }
+    async fn scripted_reviewed_send_response(ack: Option<Result<Value, String>>) -> Retained {
         let (stream, server) = tokio::io::duplex(8192);
         let (command_tx, mut commands) = queue::channel(QUEUE);
         let _keep_commands_open = command_tx.clone();
-        let (updates, _rx) = mpsc::sync_channel(QUEUE);
+        let (updates, rx) = mpsc::sync_channel(QUEUE);
         let (_stop, mut cancelled) = watch::channel(false);
         let ready = AtomicBool::new(false);
         let epoch = AtomicU64::new(0);
@@ -4444,10 +4571,23 @@ mod tests {
             let mut server = BufReader::new(server);
             loop {
                 let mut line = String::new();
-                server.read_line(&mut line).await.unwrap();
+                loop {
+                    tokio::select! {
+                        count=server.read_line(&mut line)=>{assert_ne!(count.unwrap(),0);break;},
+                        _=tokio::time::sleep(Duration::from_millis(1))=>{
+                            for update in rx.try_iter() {match update {
+                                Update::Prepared(p)=>command_tx.try_send(Command::ConfirmPrepared(p.id)).unwrap(),
+                                Update::PreparationReady{id,..}=>command_tx.try_send(Command::CommitPrepared(id)).unwrap(),
+                                _=>{},
+                            }}
+                        }
+                    }
+                }
                 let request: RequestEnvelope = serde_json::from_str(&line).unwrap();
                 let result = match request.request {
-                    Request::Ping => json!({"min_protocol":1,"max_protocol":1}),
+                    Request::Ping => {
+                        json!({"min_protocol":1,"max_protocol":1,"features":["pending_attachment_inventory_v1","reviewed_attachment_send_v1"]})
+                    }
                     Request::Subscribe { deltas, .. } => {
                         assert!(!deltas);
                         json!({"subscribed":true})
@@ -4455,17 +4595,36 @@ mod tests {
                     Request::ListSessions => json!([]),
                     Request::GetSession { .. } => {
                         command_tx
-                            .send(Command::Intent(Intent::SendMessage {
-                                session_id: "a".into(),
-                                content: "one action".into(),
-                                mode: SendMode::Send,
-                            }))
+                            .send(Command::Review {
+                                intent: Intent::SendMessage {
+                                    session_id: "a".into(),
+                                    content: "one action".into(),
+                                    mode: SendMode::Send,
+                                },
+                                draft_basis: "one action".into(),
+                                epoch: 0,
+                            })
                             .await
                             .unwrap();
                         snapshot("a", "known")
                     }
-                    Request::SendMessage { client_msg_id, .. } => {
-                        assert!(client_msg_id.is_some());
+                    Request::ListPendingAttachments { session_id } => {
+                        serde_json::json!({"session_id":session_id,"attachments":[]})
+                    }
+                    Request::ForecastRun { .. } => {
+                        serde_json::to_value(crate::fixture::run_forecast("a", false)).unwrap()
+                    }
+                    Request::SendReviewedMessage { client_msg_id, .. } => {
+                        assert!(!client_msg_id.is_empty());
+                        if let Some(ack) = ack {
+                            let reply = match ack {
+                                Ok(value) => ServerMessage::ok(request.id, value),
+                                Err(error) => ServerMessage::err(request.id, error),
+                            };
+                            let mut frame = serde_json::to_vec(&reply).unwrap();
+                            frame.push(b'\n');
+                            server.get_mut().write_all(&frame).await.unwrap();
+                        }
                         break;
                     }
                     other => panic!("unexpected request {other:?}"),
@@ -4476,7 +4635,8 @@ mod tests {
                 );
                 server.get_mut().write_all(line.as_bytes()).await.unwrap();
             }
-            // Drop the peer without acknowledging the send.
+            // Keep the update consumer alive in this task's result until EOF.
+            rx
         });
         let result = tokio::time::timeout(
             Duration::from_secs(2),
@@ -4497,11 +4657,43 @@ mod tests {
         .unwrap();
         assert!(result.unwrap_err().contains("disconnected"));
         peer.await.unwrap();
-        assert!(retained
-            .uncertain
-            .iter()
-            .any(|action| action.session_id == "a"));
         retained
+    }
+
+    #[tokio::test]
+    async fn reviewed_error_malformed_or_lost_receipts_remain_unknown_but_exact_success_retires_it()
+    {
+        for response in [
+            None,
+            Some(Err("pending attachments changed".into())),
+            Some(Err("postcommit launch failed".into())),
+            Some(Ok(serde_json::json!({"started":true}))),
+            Some(Ok(serde_json::json!({"queued":true}))),
+            Some(Ok(serde_json::json!({"started":true,"run_id":"r"}))),
+        ] {
+            let accepted = response
+                .as_ref()
+                .is_some_and(|v| v.as_ref().is_ok_and(send_review::acknowledged));
+            let retained = scripted_reviewed_send_response(response).await;
+            assert_eq!(retained.uncertain.len(), usize::from(!accepted));
+            let mut engine = ready();
+            engine.active = Some("a".into());
+            assert_eq!(
+                engine.blocked_by_unknown(
+                    &Command::Review {
+                        intent: Intent::SendMessage {
+                            session_id: "a".into(),
+                            content: "one action".into(),
+                            mode: SendMode::Send
+                        },
+                        draft_basis: "one action".into(),
+                        epoch: engine.epoch
+                    },
+                    &retained.uncertain
+                ),
+                !accepted
+            );
+        }
     }
 
     #[tokio::test]
@@ -4825,10 +5017,8 @@ mod tests {
                                 assert!(!other_session_sent);
                                 other_session_sent = true;
                                 command_tx
-                                    .send(Command::Intent(Intent::SendMessage {
+                                    .send(Command::Intent(Intent::ResumeRun {
                                         session_id: "b".into(),
-                                        content: "new action in another Session".into(),
-                                        mode: SendMode::Send,
                                     }))
                                     .await
                                     .unwrap();
@@ -4860,7 +5050,7 @@ mod tests {
                             command_tx.send(Command::Refresh).await.unwrap();
                             continue;
                         }
-                        Request::SendMessage { session_id, .. } => {
+                        Request::ResumeRun { session_id } => {
                             assert_eq!(session_id, "b",
                                 "an unrelated response allowed retrying an unacknowledged Send across connections");
                             assert!(other_session_sent && !other_session_acknowledged);

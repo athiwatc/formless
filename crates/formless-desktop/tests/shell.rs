@@ -184,6 +184,15 @@ fn daemon_quote(
     let state = shell.read(cx);
     let session_id = state.sidebar().active_id().unwrap().to_string();
     Box::new(formless_desktop::forecast::Prepared {
+        client: state.client_identity().unwrap().0,
+        connection: state.client_identity().unwrap().1,
+        attachments: Some(
+            formless_desktop::pending_files::Report::decode(
+                &session_id,
+                serde_json::json!({"session_id":session_id,"attachments":[]}),
+            )
+            .unwrap(),
+        ),
         id: uuid::Uuid::new_v4(),
         epoch: state.client_epoch().unwrap(),
         generation: state.client_generation(),
@@ -246,7 +255,7 @@ fn native_forecast_requires_ack_and_current_draft_before_commit(cx: &mut TestApp
                 &cx.read_from_clipboard().unwrap().text().unwrap()
             )
             .unwrap(),
-            serde_json::to_value(&prepared.quote).unwrap()
+            serde_json::from_str::<serde_json::Value>(&prepared.details()).unwrap()
         );
         window.click("forecast-confirm", cx);
         window.render_frame(cx);
@@ -7567,3 +7576,6 @@ mod model_catalog_tests;
 
 #[path = "support/pending_files.rs"]
 mod pending_files_tests;
+
+#[path = "support/native_send.rs"]
+mod native_send_tests;

@@ -17,7 +17,7 @@ cargo run --locked -- --connect /path/to/profile/daemon.sock
 cargo test --no-default-features --features daemon-tests --test daemon --locked
 ```
 
-This mode loads real Sessions, supports New Session, Send/Steer/Queue/Stop and
+This mode loads real Sessions, supports New Session, Send/Steer/Stop (Queue uses Formless TUI) and
 Resume/Abandon for a confirmed paused or interrupted Run,
 and displays read-only Tools, recorded Run Metrics, Proposals and Settings.
 Session details (palette or Sessions > Details) edits name, tags, pin, archive or standing instructions using
@@ -136,9 +136,14 @@ rejection, transport failure and navigation. Send deduplication in the daemon
 is connection-scoped: after an unacknowledged action, the client blocks another
 send for that Session in this window. Review the outcome and continue through
 the existing TUI. The same unknown-outcome guard blocks Resume. Resume uses the
-existing daemon admission path. Send/Steer/Queue and Resume first request the
-daemon's forecast. Required consent opens a native dialog with Cancel focused,
-bounded estimates/warnings, keyboard scrolling and copyable quote details.
+existing daemon admission path. Send/Steer require the complete pending-file
+inventory and daemon forecast, then explicit native confirmation even when the
+inventory is empty or no cost consent is required. Cancel starts focused; the
+full bounded draft/metadata, estimates and warnings are scrollable and copyable.
+The confirmed message uses the daemon's atomic reviewed-send operation with no
+legacy fallback. Queue and drafts above 64 KiB require Formless TUI. Resume
+retains its existing forecast/cost-consent path. See the
+[native send-review contract](../../docs/desktop/native-send-review-20261116.md).
 Neither the quote nor the consent ACK starts work by itself: the view rechecks
 the exact draft, selection and IME state before committing the prepared action.
 Editing, cancellation, navigation or reconnect retires pending preparations;
@@ -450,16 +455,17 @@ at most 32 KiB or 400 lines of its block, follows the end of a block that
 is being streamed, and has Start, Earlier, Later and End controls when
 there is more. In the Sessions list, Up/Down move
 the selection and Enter opens it. In the composer, Enter is the primary
-action, Shift+Enter adds a line, Cmd/Ctrl+Enter is Queue during a Run.
+action and Shift+Enter adds a line. The synthetic fixture also demonstrates
+Cmd/Ctrl+Enter for Queue during a Run; daemon-backed Queue is unavailable.
 In fixture mode, composer actions are recorded in the status line and never sent.
 In daemon mode they retain the existing forecast/consent and acknowledgement
 path described above.
 
 Commands offers Use Enter for newlines / Use Enter to send. The default
-remains Enter for Send/Steer, Shift+Enter for a newline, and Cmd/Ctrl+Enter
-for Queue during a Run. In newline mode, Enter and Shift+Enter insert newlines,
-Cmd/Ctrl+Enter invokes Send/Steer, and Queue remains a separate button. The
-composer displays the current keys. Changing this per-window choice preserves
+remains Enter for Send/Steer and Shift+Enter for a newline. In newline mode,
+Enter and Shift+Enter insert newlines and Cmd/Ctrl+Enter invokes Send/Steer.
+Queue remains a synthetic-fixture demonstration; daemon-backed deferred
+messages require Formless TUI. The composer displays the current keys. Changing this per-window choice preserves
 the draft, selection and undo/redo; it survives Session switches. When desktop
 preferences are enabled, Save desktop preferences persists the choice for
 later launches. Finish active input-method composition before changing
@@ -586,3 +592,10 @@ oversized/corrupt inventories show unavailable, never a fabricated empty list.
 This is inspection only; attach, remove, drop/image paste and uncertain-write
 reconciliation remain in Formless TUI. See the
 [pending-file inventory contract](../../docs/desktop/pending-files-20261116.md).
+
+The daemon-backed composer now confirms complete pending metadata atomically
+with Send/Steer, including an empty inventory. Failed/missing/malformed send
+receipts remain Unknown and block new work in that Client; replacing a Profile
+or restarting is not a safe retry. Queue ownership, attachment mutations and
+durable reconciliation remain unfinished. See the
+[native send-review contract](../../docs/desktop/native-send-review-20261116.md).

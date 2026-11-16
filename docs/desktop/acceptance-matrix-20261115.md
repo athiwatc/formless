@@ -142,10 +142,11 @@ stale form callbacks and physical reconnect are covered headlessly. This does
 not establish provider availability, catalog/Role editing, native usability or
 other composer parity, and the latest local increment still needs review.
 
-The [reviewed-send boundary](reviewed-send-20261116.md) adds an optional daemon
-operation that compares complete pending metadata and consumes it with message
-append under one transaction. Changed inventories fail closed; Queue/deferred
-sends are unsupported. This endpoint is not yet used by the native composer:
-mandatory attachment/send review and safe deferred ownership remain required.
-Existing native Send behavior, disabled production streaming and all native,
-hosted, performance and distribution gates remain unchanged.
+The [reviewed-send boundary](reviewed-send-20261116.md) compares complete pending
+metadata and consumes it with message append under one transaction. The
+[native confirmation path](native-send-review-20261116.md) now uses it after
+explicit review of the full bounded draft and inventory, including empty
+inventories. Unsupported peers fail closed and uncertain responses are retained
+without replay. Queue/deferred ownership, attachment mutations and durable
+reconciliation remain required. Native, hosted, performance and distribution
+gates remain open and production streaming remains disabled.
