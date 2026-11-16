@@ -683,7 +683,18 @@ mod pipeline_daemon_tests;
 #[path = "daemon_send_dedupe_tests.rs"]
 mod send_dedupe_tests;
 
+#[path = "reviewed_send.rs"]
+mod reviewed_send;
+#[cfg(test)]
+#[path = "reviewed_send_tests.rs"]
+mod reviewed_send_tests;
+
 type SendKey = (Option<u64>, String, String);
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum SendReceiptKind {
+    Legacy,
+    Reviewed,
+}
 type SendOutcome = std::result::Result<Value, CachedSendFailure>;
 #[derive(Clone, Debug)]
 struct CachedSendFailure {
@@ -883,8 +894,8 @@ pub struct Daemon {
     config_edit: StdMutex<()>,
     mcp_import_candidates:
         StdMutex<HashMap<String, (std::time::Instant, crate::mcp_catalog::Candidate)>>,
-    /// `SendMessage` keys seen in the last 10 minutes and their outcome.
-    sent_keys: StdMutex<HashMap<SendKey, SentEntry>>,
+    /// Legacy/reviewed Send keys seen in the last 10 minutes and their outcome.
+    sent_keys: StdMutex<HashMap<(SendKey, SendReceiptKind), SentEntry>>,
     /// Per-Session provider context, extended step by step (SPEC §11).
     contexts: StdMutex<HashMap<String, ContextCache>>,
     /// One naming inference at a time: bounds CPU and keeps at most one
@@ -2274,77 +2285,33 @@ impl Daemon {
                 mode,
                 client_msg_id,
             } => {
-                let Some(key) = client_msg_id else {
-                    return self.send_message(session_id, content, mode).await;
-                };
-                let who = current_client();
-                let key = (who.as_ref().map(|(conn, _)| *conn), session_id.clone(), key);
-                // Claim before executing. A concurrent duplicate gets the same
-                // receiver even while the first send has not finished yet.
-                let (mut outcome, owner) = {
-                    let mut sent = self.sent_keys.locked();
-                    sent.retain(|_, entry| {
-                        entry.outcome.borrow().is_none()
-                            || entry.at.elapsed() < std::time::Duration::from_secs(600)
-                    });
-                    if let Some(entry) = sent.get(&key) {
-                        (entry.outcome.clone(), None)
-                    } else {
-                        let (tx, rx) = tokio::sync::watch::channel(None);
-                        sent.insert(
-                            key.clone(),
-                            SentEntry {
-                                at: std::time::Instant::now(),
-                                outcome: rx.clone(),
-                            },
-                        );
-                        (rx, Some(tx))
-                    }
-                };
-                if let Some(tx) = owner {
-                    let this = self.clone();
-                    // A dropped reply/waiter must not cancel a send after it
-                    // appended the message. Preserve attribution in this task.
-                    tokio::spawn(async move {
-                        use futures_util::FutureExt;
-                        let execute = async {
-                            match std::panic::AssertUnwindSafe(
-                                this.send_message(session_id, content, mode),
-                            )
-                            .catch_unwind()
-                            .await
-                            {
-                                Ok(result) => result.map_err(CachedSendFailure::capture),
-                                Err(panic) => {
-                                    let why = panic_text(&panic);
-                                    tracing::error!("panic while handling SendMessage: {why}");
-                                    Err(CachedSendFailure::capture(
-                                        RequestFailure::internal(format!(
-                                            "internal error while handling SendMessage: {why}"
-                                        ))
-                                        .into(),
-                                    ))
-                                }
-                            }
-                        };
-                        let result = match who {
-                            Some(who) => CLIENT.scope(who, execute).await,
-                            None => execute.await,
-                        };
-                        if let Some(entry) = this.sent_keys.locked().get_mut(&key) {
-                            entry.at = std::time::Instant::now();
-                        }
-                        let _ = tx.send(Some(result));
-                    });
+                self.send_message_once(session_id, content, mode, client_msg_id, None)
+                    .await
+            }
+            Request::SendReviewedMessage {
+                session_id,
+                content,
+                mode,
+                expected_attachments,
+                client_msg_id,
+            } => {
+                if client_msg_id.is_empty()
+                    || client_msg_id.len() > 256
+                    || client_msg_id.chars().any(char::is_control)
+                {
+                    return Err(RequestFailure::invalid(
+                        "a bounded nonempty reviewed-send action identity is required",
+                    )
+                    .into());
                 }
-                loop {
-                    if let Some(result) = outcome.borrow().clone() {
-                        return result.map_err(CachedSendFailure::into_error);
-                    }
-                    outcome.changed().await.context(RequestFailure::internal(
-                        "internal error: SendMessage outcome was lost",
-                    ))?;
-                }
+                self.send_message_once(
+                    session_id,
+                    content,
+                    mode,
+                    Some(client_msg_id),
+                    Some(expected_attachments),
+                )
+                .await
             }
 
             Request::RunFiles { session_id, run_id } => {
@@ -5116,6 +5083,99 @@ impl Daemon {
         tracing::warn!("run for deleted session {session_id} did not stop within 5s");
     }
 
+    /// Share the existing per-connection send receipt and detached execution
+    /// semantics with the explicit attachment-review operation.
+    async fn send_message_once(
+        self: &Arc<Self>,
+        session_id: String,
+        content: String,
+        mode: SendMode,
+        client_msg_id: Option<String>,
+        review: Option<Vec<Value>>,
+    ) -> Result<Value> {
+        let Some(key) = client_msg_id else {
+            return self
+                .send_message_with_review(session_id, content, mode, review)
+                .await;
+        };
+        let who = current_client();
+        // Legacy and reviewed operations must never replay one another's ACK.
+        let key = (
+            (who.as_ref().map(|(conn, _)| *conn), session_id.clone(), key),
+            if review.is_some() {
+                SendReceiptKind::Reviewed
+            } else {
+                SendReceiptKind::Legacy
+            },
+        );
+        // Claim before executing. A concurrent duplicate gets the same
+        // receiver even while the first send has not finished yet.
+        let (mut outcome, owner) = {
+            let mut sent = self.sent_keys.locked();
+            sent.retain(|_, entry| {
+                entry.outcome.borrow().is_none()
+                    || entry.at.elapsed() < std::time::Duration::from_secs(600)
+            });
+            if let Some(entry) = sent.get(&key) {
+                (entry.outcome.clone(), None)
+            } else {
+                let (tx, rx) = tokio::sync::watch::channel(None);
+                sent.insert(
+                    key.clone(),
+                    SentEntry {
+                        at: std::time::Instant::now(),
+                        outcome: rx.clone(),
+                    },
+                );
+                (rx, Some(tx))
+            }
+        };
+        if let Some(tx) = owner {
+            let this = self.clone();
+            // A dropped reply/waiter must not cancel a send after it
+            // appended the message. Preserve attribution in this task.
+            tokio::spawn(async move {
+                use futures_util::FutureExt;
+                let execute = async {
+                    match std::panic::AssertUnwindSafe(
+                        this.send_message_with_review(session_id, content, mode, review),
+                    )
+                    .catch_unwind()
+                    .await
+                    {
+                        Ok(result) => result.map_err(CachedSendFailure::capture),
+                        Err(panic) => {
+                            let why = panic_text(&panic);
+                            tracing::error!("panic while handling SendMessage: {why}");
+                            Err(CachedSendFailure::capture(
+                                RequestFailure::internal(format!(
+                                    "internal error while handling SendMessage: {why}"
+                                ))
+                                .into(),
+                            ))
+                        }
+                    }
+                };
+                let result = match who {
+                    Some(who) => CLIENT.scope(who, execute).await,
+                    None => execute.await,
+                };
+                if let Some(entry) = this.sent_keys.locked().get_mut(&key) {
+                    entry.at = std::time::Instant::now();
+                }
+                let _ = tx.send(Some(result));
+            });
+        }
+        loop {
+            if let Some(result) = outcome.borrow().clone() {
+                return result.map_err(CachedSendFailure::into_error);
+            }
+            outcome.changed().await.context(RequestFailure::internal(
+                "internal error: SendMessage outcome was lost",
+            ))?;
+        }
+    }
+
     /// A Run that stopped mid-batch leaves tool calls without results,
     /// which providers reject. Answer them (never re-run: the outcome is
     /// unknown, SPEC §9.5) before the next Run builds its context.
@@ -5125,6 +5185,26 @@ impl Daemon {
         content: String,
         mode: SendMode,
     ) -> Result<serde_json::Value> {
+        self.send_message_with_review(session_id, content, mode, None)
+            .await
+    }
+
+    async fn send_message_with_review(
+        self: &Arc<Self>,
+        session_id: String,
+        content: String,
+        mode: SendMode,
+        review: Option<Vec<Value>>,
+    ) -> Result<Value> {
+        if let Some(expected) = &review {
+            reviewed_send::validate(&session_id, expected)?;
+            if mode == SendMode::Queue {
+                return Err(RequestFailure::invalid(
+                    "reviewed attachment sending does not support Queue; nothing was queued",
+                )
+                .into());
+            }
+        }
         self.with_store(|st| st.get_session(&session_id))?
             .context(RequestFailure::not_found("session not found"))?;
         let _admission = self.forecast_admission.locked();
@@ -5138,6 +5218,12 @@ impl Daemon {
             })
             || (control.is_none() && self.session_is_publishing(&session_id));
         if queue {
+            if review.is_some() {
+                return Err(RequestFailure::busy(
+                    "Run cannot accept the reviewed message now; nothing was queued or consumed",
+                )
+                .into());
+            }
             self.with_store(|st| st.enqueue_message(&session_id, &content))?;
             self.queue_changed(&session_id);
             return Ok(json!({"queued":true}));
@@ -5147,11 +5233,17 @@ impl Daemon {
                 let step = self
                     .with_reader(|st| st.run_steps(&control.run_id))
                     .unwrap_or(0);
-                let msg = self.append_user_message_meta(
-                    &session_id,
-                    &content,
-                    Some(("steer", json!({"step":step,"run_id":control.run_id}))),
-                )?;
+                let extra = Some(("steer", json!({"step":step,"run_id":control.run_id})));
+                let msg = if let Some(expected) = review.as_deref() {
+                    self.with_store(|st| {
+                        st.transaction(|st| {
+                            reviewed_send::check(st, &session_id, Some(expected))?;
+                            Self::append_user_message_store(st, &session_id, &content, extra)
+                        })
+                    })?
+                } else {
+                    self.append_user_message_meta(&session_id, &content, extra)?
+                };
                 control.steering.accepted(msg.seq);
                 let _ = control.steer_tx.send(msg.seq);
                 self.broadcast(Event::MessageAppended {
@@ -5170,6 +5262,7 @@ impl Daemon {
                 };
                 let (msg, run_id, admission) = self.with_store(|st| {
                     st.transaction(|st| {
+                        reviewed_send::check(st, &session_id, review.as_deref())?;
                         let forecast = self.consented_forecast(st, &cfg, &input)?;
                         #[cfg(test)]
                         if let Some(hook) = self.forecast_admission_test.locked().clone() {
@@ -14679,6 +14772,7 @@ impl Daemon {
                     }
                     let session = match &env.request {
                         Request::SendMessage { session_id, .. }
+                        | Request::SendReviewedMessage { session_id, .. }
                         | Request::StartPipelineRun { session_id, .. } => Some(session_id.as_str()),
                         _ => None,
                     };
@@ -14690,7 +14784,9 @@ impl Daemon {
                     );
                     if matches!(
                         &env.request,
-                        Request::SendMessage { .. } | Request::StartPipelineRun { .. }
+                        Request::SendMessage { .. }
+                            | Request::SendReviewedMessage { .. }
+                            | Request::StartPipelineRun { .. }
                     ) {
                         if cut.is_some_and(|at| at > arrived) {
                             let resp = ServerMessage::err(
@@ -14943,7 +15039,7 @@ impl Daemon {
         while relay_controls.join_next().await.is_some() {}
         self.sent_keys
             .locked()
-            .retain(|(client, _, _), _| *client != Some(conn));
+            .retain(|((client, _, _), _), _| *client != Some(conn));
         if let Some(writer) = writer {
             writer.abort();
             let _ = writer.await;

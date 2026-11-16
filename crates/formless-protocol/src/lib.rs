@@ -33,6 +33,7 @@ pub const FEATURES: &[&str] = &[
     "dropped_event_kinds",
     "future_transcript_attempts_v1",
     "pending_attachment_inventory_v1",
+    "reviewed_attachment_send_v1",
 ];
 
 /// Complete pending-attachment metadata inventory limits. No file bodies are read.
@@ -1931,6 +1932,18 @@ pub enum Request {
         /// reply) returns the first outcome instead of sending twice (#891).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         client_msg_id: Option<String>,
+    },
+    /// Append only if the complete, ordered pending metadata still matches
+    /// the reviewed inventory. Comparison and consumption share a transaction.
+    /// Queue/deferred sends are unsupported; never fall back to SendMessage.
+    /// This binds metadata, not mutable referenced file contents or permission.
+    SendReviewedMessage {
+        session_id: String,
+        content: String,
+        mode: SendMode,
+        expected_attachments: Vec<serde_json::Value>,
+        /// Required per-action key; same connection-local retention as SendMessage.
+        client_msg_id: String,
     },
     /// Start an idle Session with immutable Run-only pipeline options. Older
     /// daemons must reject this request; clients never silently drop policy.
@@ -3952,6 +3965,28 @@ mod pending_attachment_inventory_wire_tests {
             matches!(serde_json::from_value::<Request>(value).unwrap(),Request::ListPendingAttachments{session_id}if session_id=="s")
         );
         assert!(FEATURES.contains(&"pending_attachment_inventory_v1"));
+        assert_eq!(PROTOCOL_VERSION, 1);
+    }
+}
+
+#[cfg(test)]
+mod reviewed_attachment_send_tests {
+    use super::*;
+    #[test]
+    fn reviewed_send_is_an_explicit_additive_operation_with_required_expected_metadata_and_identity(
+    ) {
+        let value = serde_json::json!({"type":"send_reviewed_message","session_id":"s","content":"draft ไทย😀","mode":"send","expected_attachments":[],"client_msg_id":"one-action"});
+        let request: Request = serde_json::from_value(value.clone()).unwrap();
+        assert!(
+            matches!(&request, Request::SendReviewedMessage {expected_attachments, ..} if expected_attachments.is_empty())
+        );
+        assert_eq!(serde_json::to_value(&request).unwrap(), value);
+        for field in ["expected_attachments", "client_msg_id"] {
+            let mut missing = value.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<Request>(missing).is_err());
+        }
+        assert!(FEATURES.contains(&"reviewed_attachment_send_v1"));
         assert_eq!(PROTOCOL_VERSION, 1);
     }
 }

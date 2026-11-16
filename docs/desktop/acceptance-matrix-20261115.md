@@ -141,3 +141,11 @@ preparation waits for the setting receipt. Read-only no-ops, missing metadata,
 stale form callbacks and physical reconnect are covered headlessly. This does
 not establish provider availability, catalog/Role editing, native usability or
 other composer parity, and the latest local increment still needs review.
+
+The [reviewed-send boundary](reviewed-send-20261116.md) adds an optional daemon
+operation that compares complete pending metadata and consumes it with message
+append under one transaction. Changed inventories fail closed; Queue/deferred
+sends are unsupported. This endpoint is not yet used by the native composer:
+mandatory attachment/send review and safe deferred ownership remain required.
+Existing native Send behavior, disabled production streaming and all native,
+hosted, performance and distribution gates remain unchanged.

@@ -950,3 +950,88 @@ fn native_pending_inventory_reads_shared_metadata_without_consuming_and_refreshe
     });
     f.finish();
 }
+
+#[test]
+fn reviewed_attachment_send_idle_admission_uses_exact_metadata_and_only_one_fake_provider_run() {
+    use formless_protocol::{RequestEnvelope, ServerMessage, PROTOCOL_VERSION};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let env = credential_env::EnvGuard::isolated();
+    env.set("FORMLESS_API_KEY", "private-reviewed-send-key");
+    let f = Fixture::start();
+    f.runtime.block_on(async {
+        let socket = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                #[cfg(unix)]
+                let opened = tokio::net::UnixStream::connect(&f.endpoint.0).await;
+                #[cfg(windows)]
+                let opened = tokio::net::windows::named_pipe::ClientOptions::new().open(&f.endpoint.0);
+                match opened {
+                    Ok(socket) => break socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(231) => tokio::time::sleep(Duration::from_millis(10)).await,
+                    Err(error) => panic!("private reviewed IPC: {error}"),
+                }
+            }
+        }).await.unwrap();
+        let mut reader = BufReader::new(socket);
+        let mut id = 0;
+        macro_rules! rpc {
+            ($request:expr) => {{
+                id += 1;
+                let mut bytes = serde_json::to_vec(&RequestEnvelope {id, protocol: PROTOCOL_VERSION, request: $request}).unwrap();
+                bytes.push(b'\n');
+                reader.get_mut().write_all(&bytes).await.unwrap();
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        let mut line = String::new();
+                        assert_ne!(reader.read_line(&mut line).await.unwrap(), 0);
+                        if let ServerMessage::Response {id: got, ok, result, error} = serde_json::from_str::<ServerMessage>(&line).unwrap() {
+                            assert_eq!(got, id);
+                            break if ok {Ok(result.unwrap())} else {Err(error.unwrap())};
+                        }
+                    }
+                }).await.unwrap()
+            }};
+        }
+        macro_rules! inventory { () => { rpc!(Request::ListPendingAttachments {session_id: f.session.clone()}).unwrap()["attachments"].as_array().unwrap().clone() }; }
+        let empty = inventory!();
+        assert!(empty.is_empty());
+        // A peer changes shared pending state after the review read.
+        f.daemon.handle(Request::AttachFile {session_id:f.session.clone(),name:"reviewed.txt".into(),data_b64:"aGVsbG8=".into(),mime:Some("text/plain".into())}).await.unwrap();
+        let request = |key: &str, expected| Request::SendReviewedMessage {
+            session_id: f.session.clone(), content: "Private reviewed answer".into(), mode: SendMode::Send,
+            client_msg_id: key.into(), expected_attachments: expected,
+        };
+        assert!(rpc!(request("stale-empty", empty)).unwrap_err().contains("pending attachments changed"));
+        assert_eq!(f.calls.load(Ordering::SeqCst), 0);
+        let before = rpc!(Request::GetSession {id:f.session.clone()}).unwrap();
+        assert!(before["messages"].as_array().unwrap().is_empty());
+        let expected = inventory!();
+        assert_eq!(expected.len(), 1);
+        let ack = rpc!(request("explicit-reviewed-action", expected.clone())).unwrap();
+        assert_eq!(ack["started"], true);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while f.calls.load(Ordering::SeqCst) != 1 {tokio::time::sleep(Duration::from_millis(5)).await;}
+        }).await.unwrap();
+        assert!(inventory!().is_empty());
+        let snapshot = rpc!(Request::GetSession {id:f.session.clone()}).unwrap();
+        let persisted = snapshot["messages"].as_array().unwrap().iter().find(|m| m["role"] == "user").unwrap();
+        let metadata: Value = serde_json::from_str(persisted["meta"].as_str().unwrap()).unwrap();
+        assert_eq!(metadata["attachments"], json!(expected));
+        assert_eq!(persisted["content"], "Private reviewed answer");
+        assert_eq!(rpc!(request("explicit-reviewed-action", vec![])).unwrap(), ack);
+        assert!(rpc!(request("different-action-stale", expected)).is_err());
+        f.complete[0].notify_one();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if rpc!(Request::GetSession {id:f.session.clone()}).unwrap()["running"] == false {break;}
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }).await.unwrap();
+        assert_eq!(f.calls.load(Ordering::SeqCst), 1);
+        let snapshot = rpc!(Request::GetSession {id:f.session.clone()}).unwrap();
+        assert_eq!(snapshot["messages"].as_array().unwrap().iter().filter(|m| m["role"] == "user").count(), 1);
+        eprintln!("reviewed_attachment_send_case {}", json!({"real_ipc":true,"stale_empty_rejected":true,"consumed":1,"user_messages":1,"provider_posts":1,"replay_does_not_send":true}));
+        drop(reader);
+    });
+    f.finish();
+}
