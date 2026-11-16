@@ -223,6 +223,7 @@ fn command_queue_failure_is_known_unsent_and_a_foreign_client_cannot_dispatch_it
     let (_, updates) = mpsc::sync_channel(1);
     let (stop, _) = watch::channel(false);
     let client = Client {
+        reference_ledger: Arc::new(crate::reference_detach::Ledger::default()),
         step_ledger: Arc::new(model::Ledger::default()),
         mode_ledger: Arc::new(crate::step_mode::Ledger::default()),
         approval_ledger: Arc::new(crate::approvals::Ledger::default()),

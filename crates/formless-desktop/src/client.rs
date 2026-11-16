@@ -185,6 +185,7 @@ pub enum Update {
 }
 
 pub enum Command {
+    DetachReference(crate::reference_detach::Dispatch),
     ReadPendingAttachments {
         connection: u64,
         operation: uuid::Uuid,
@@ -273,6 +274,7 @@ pub enum Command {
 pub struct Endpoint(pub PathBuf);
 
 pub struct Client {
+    reference_ledger: Arc<crate::reference_detach::Ledger>,
     step_ledger: Arc<crate::step_decision::Ledger>,
     mode_ledger: Arc<crate::step_mode::Ledger>,
     approval_ledger: Arc<crate::approvals::Ledger>,
@@ -353,6 +355,7 @@ impl Client {
             }
         });
         Self {
+            reference_ledger: Arc::new(crate::reference_detach::Ledger::default()),
             step_ledger: Arc::new(crate::step_decision::Ledger::default()),
             mode_ledger: Arc::new(crate::step_mode::Ledger::default()),
             approval_ledger: Arc::new(crate::approvals::Ledger::default()),
@@ -475,7 +478,57 @@ impl Client {
             self.approval_ledger.reserve(action)?,
         ))
     }
+    pub fn reference_status(&self) -> crate::reference_detach::Status {
+        self.reference_ledger.status()
+    }
+    pub fn cancel_unsent_reference(&self) {
+        self.reference_ledger
+            .cancel_unsent("Reference review changed before writing; nothing was removed.");
+    }
+    pub fn detach_reference(
+        &self,
+        action: crate::reference_detach::Action,
+    ) -> Result<(), &'static str> {
+        if !self.is_ready()
+            || action.client != self.instance()
+            || action.connection != self.connection()
+            || action.epoch != self.epoch()
+        {
+            return Err("Reference review or connection changed; no removal was queued.");
+        }
+        self.send(Command::DetachReference(
+            self.reference_ledger.reserve(action)?,
+        ))
+    }
+    #[cfg(feature = "test-support")]
+    pub fn finish_recorded_reference(
+        &self,
+        d: &crate::reference_detach::Dispatch,
+        result: Result<Value, String>,
+        ok: bool,
+    ) {
+        assert!(self.recorded.is_some() && d.owned_by(&self.reference_ledger));
+        assert!(d.before_write());
+        d.finish(crate::reference_detach::decode(d.action(), result, ok));
+    }
     pub fn send(&self, command: Command) -> Result<(), &'static str> {
+        let reference = self.reference_status();
+        if reference.blocked()
+            && matches!(&command,Command::Review{intent,..}|Command::Intent(intent) if intent.starts_work() && reference.action().is_some_and(|a|a.session_id==intent.session_id()))
+        {
+            return Err("Reference removal is pending or unknown; no new work was queued. Continue in Formless TUI if its outcome is unknown.");
+        }
+        if let Command::DetachReference(d) = &command {
+            if !d.owned_by(&self.reference_ledger)
+                || !self.is_ready()
+                || d.action().client != self.instance()
+                || d.action().connection != self.connection()
+                || d.action().epoch != self.epoch()
+            {
+                d.reject("Reference review or connection changed; no removal was queued.");
+                return Err("Reference review or connection changed; no removal was queued.");
+            }
+        }
         if matches!(&command,Command::EditSession{change,..} if change.is_selection()) {
             self.invalidate_context();
         }
@@ -606,6 +659,7 @@ impl Client {
     /// Synchronous invalidation cannot be lost to the bounded command queue.
     pub fn invalidate_context(&self) {
         advance_epoch(&self.epoch);
+        self.cancel_unsent_reference();
         self.step_ledger
             .cancel_unsent("Review context changed before writing; no Step decision was sent.");
         self.approval_ledger
@@ -627,6 +681,7 @@ impl Client {
         let (_, updates) = mpsc::sync_channel(QUEUE);
         let (stop, _) = watch::channel(false);
         Self {
+            reference_ledger: Arc::new(crate::reference_detach::Ledger::default()),
             step_ledger: Arc::new(crate::step_decision::Ledger::default()),
             mode_ledger: Arc::new(crate::step_mode::Ledger::default()),
             approval_ledger: Arc::new(crate::approvals::Ledger::default()),
@@ -689,6 +744,7 @@ fn advance_epoch(epoch: &AtomicU64) {
 
 #[derive(Debug)]
 enum Pending {
+    DetachReference(crate::reference_detach::Dispatch),
     SendInventory(Box<Preparation>),
     ReviewedAction {
         action: Action,
@@ -840,6 +896,7 @@ impl Preparation {
 /// replaces this on reconnect; selection generations belong to the window.
 #[derive(Default)]
 struct Engine {
+    reference_detach_available: bool,
     reviewed_send_available: bool,
     instance: uuid::Uuid,
     reader: reader::Reader,
@@ -866,6 +923,34 @@ struct Engine {
 }
 
 impl Engine {
+    fn reference_current(&self, d: &crate::reference_detach::Dispatch) -> bool {
+        let a = d.action();
+        self.ready
+            && a.valid()
+            && a.client == self.instance
+            && a.connection == self.connection
+            && a.epoch == self.epoch
+    }
+    fn retire_reference_writes(&mut self) {
+        let ids = self
+            .pending
+            .iter()
+            .filter_map(|(id, p)| match p {
+                Pending::DetachReference(d)
+                    if !d.sent() && (!d.reserved() || !self.reference_current(d)) =>
+                {
+                    Some(*id)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for id in ids {
+            self.outgoing.retain(|r| r.id != id);
+            if let Some(Pending::DetachReference(d)) = self.pending.remove(&id) {
+                d.reject("Reference context changed before writing; nothing was removed.");
+            }
+        }
+    }
     fn approval_current(&self, d: &crate::approvals::Dispatch) -> bool {
         let a = d.action();
         self.ready
@@ -1131,6 +1216,11 @@ impl Engine {
         self.updates.push(Update::Questions(state));
     }
     fn blocked_by_unknown(&self, command: &Command, uncertain: &HashSet<Action>) -> bool {
+        if let Command::DetachReference(d) = command {
+            return uncertain
+                .iter()
+                .any(|a| a.question_id.is_none() && a.session_id == d.action().session_id);
+        }
         let intent = match command {
             Command::Intent(intent) | Command::Review { intent, .. } => Some(intent),
             Command::CommitPrepared(id) => self
@@ -1144,7 +1234,7 @@ impl Engine {
             intent.starts_work()
                 && uncertain.iter().any(|action| {
                     action.question_id.is_none() && action.session_id == intent.session_id() && !self.pending.values().any(|pending|
-                matches!(pending, Pending::Action(pending) | Pending::Answer(pending) | Pending::ReviewedAction{action:pending,..} if pending == action))
+                matches!(pending, Pending::Action(pending) | Pending::Answer(pending) | Pending::ReviewedAction{action:pending,..} if pending == action) || matches!(pending,Pending::DetachReference(d) if d.action().operation==action.id && d.action().session_id==action.session_id))
                 })
         })
     }
@@ -1301,6 +1391,21 @@ impl Engine {
     }
 
     fn command(&mut self, command: Command) {
+        let work = match &command {
+            Command::Review { intent, .. } | Command::Intent(intent) => Some(intent),
+            Command::ConfirmPrepared(id) | Command::CommitPrepared(id) => self
+                .prepared
+                .as_ref()
+                .filter(|p| p.id == *id)
+                .map(|p| &p.intent),
+            _ => None,
+        };
+        if work.is_some_and(|intent| intent.starts_work() && self.pending.values().any(|p|matches!(p,Pending::DetachReference(d)if d.action().session_id==intent.session_id()))) {
+            self.updates.push(Update::Notice(
+                "Wait for the reference-removal receipt before starting work. Draft kept.".into(),
+            ));
+            return;
+        }
         let model_pending = self.pending.values().any(|p| {
             matches!(p, Pending::InspectModelSelection { .. })
                 || matches!(p,Pending::EditSession{change,..} if change.is_selection())
@@ -1338,6 +1443,15 @@ impl Engine {
             return;
         }
         match command {
+            Command::DetachReference(d) => {
+                if !self.reference_detach_available || !self.reference_current(&d) || !d.reserved() {
+                    d.reject("Atomic reference removal is unavailable or this review changed. Update the daemon or use Formless TUI; nothing was removed.");
+                } else if self.pending.values().any(|p|matches!(p,Pending::Action(a)|Pending::ReviewedAction{action:a,..} if a.session_id==d.action().session_id)) {
+                    d.reject("Wait for the Session's action receipt before removing a reference. Nothing was removed.");
+                } else if !self.pending.values().any(|p|matches!(p,Pending::DetachReference(old) if old.action().operation==d.action().operation)) {
+                    self.request(d.action().request(),Pending::DetachReference(d));
+                }
+            }
             Command::ReadPendingAttachments {
                 connection,
                 operation,
@@ -2179,6 +2293,10 @@ impl Engine {
                             .into(),
                     );
                 }
+                self.reference_detach_available =
+                    result["features"].as_array().is_some_and(|features| {
+                        features.iter().any(|f| f == "reviewed_reference_detach_v1")
+                    });
                 self.reviewed_send_available =
                     result["features"].as_array().is_some_and(|features| {
                         [
@@ -2593,6 +2711,13 @@ impl Engine {
                 self.emit_questions();
                 self.dirty_session = true;
             }
+            Pending::DetachReference(d) => {
+                d.finish(crate::reference_detach::decode(
+                    d.action(),
+                    result,
+                    response_ok,
+                ));
+            }
             Pending::SendInventory(work) => self.send_inventory_loaded(work, result),
             Pending::ReviewedAction { action, .. } => {
                 self.dirty_session = true;
@@ -2853,6 +2978,7 @@ async fn connected<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
             engine.question_recovery_limit = limit;
             engine.emit_questions();
         }
+        engine.retire_reference_writes();
         engine.before_approval_writes()?;
         engine.retire_step_reviews(false);
         engine.retire_mode_changes();
@@ -2871,6 +2997,21 @@ async fn connected<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
                         "Fork reservation changed before writing; nothing was retried.".into(),
                     );
                 }
+            }
+        }
+        engine.retire_reference_writes();
+        for pending in engine.pending.values() {
+            if let Pending::DetachReference(d) = pending {
+                if !d.sent() && !d.before_write() {
+                    return Err(
+                        "Reference reservation retired before writing; nothing was retried.".into(),
+                    );
+                }
+                uncertain.insert(Action {
+                    id: d.action().operation,
+                    session_id: d.action().session_id.clone(),
+                    question_id: None,
+                });
             }
         }
         for pending in engine.pending.values_mut() {
@@ -2903,6 +3044,8 @@ async fn connected<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
                 Some(Command::Select { session_id, generation }) => { *active = (session_id.clone(), generation); engine.select(session_id, generation); }
                 Some(Command::Page(destination)) => { *page = Some(destination); engine.load_page(destination); }
                 Some(command) if engine.blocked_by_unknown(&command, uncertain) => {
+                    if let Command::DetachReference(d)=&command {d.reject("A previous Session action is unknown. No reference removal was sent; continue in Formless TUI.");}
+
                     let target=match &command {Command::Intent(intent)|Command::Review{intent,..}=>Some(intent.session_id().to_string()),Command::CommitPrepared(id)=>engine.prepared.as_ref().filter(|p|p.id==*id).map(|p|p.intent.session_id().to_string()),_=>None};
                     if let Some(session_id)=target {engine.updates.push(Update::Action{session_id,result:Err("A previous action's outcome is unknown. No new action was sent; check the Session in Formless TUI before retrying".into())});}
                     engine.updates.push(Update::Notice("A previous action's outcome is unknown. It was not retried: deduplication does not survive reconnect. Check this Session in the TUI before starting more work.".into()));
@@ -2915,6 +3058,7 @@ async fn connected<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
                     engine.sync_stream_epoch(stream_epoch.load(Ordering::Acquire));
                     engine.sync_epoch(epoch.load(Ordering::Acquire));
                     let answered = match &message { ServerMessage::Response { id, ok, result, .. } => match engine.pending.get(id) {
+                        Some(Pending::DetachReference(d)) if *ok && result.as_ref().is_some_and(|v|crate::reference_detach::acknowledged(d.action(),v))=>Some(Action{id:d.action().operation,session_id:d.action().session_id.clone(),question_id:None}),
                         Some(Pending::Action(action)) => Some(action.clone()),
                         Some(Pending::ReviewedAction {action,..}) if *ok && result.as_ref().is_some_and(send_review::acknowledged) => Some(action.clone()),
                         Some(Pending::Answer(action)) if !ok || result.as_ref().and_then(|value| value["answered"].as_bool()).is_some() => Some(action.clone()),
@@ -3509,6 +3653,7 @@ mod tests {
         let (_, updates) = mpsc::sync_channel(QUEUE);
         let (stop, _) = watch::channel(false);
         let client = Client {
+            reference_ledger: Arc::new(crate::reference_detach::Ledger::default()),
             step_ledger: Arc::new(crate::step_decision::Ledger::default()),
             mode_ledger: Arc::new(crate::step_mode::Ledger::default()),
             approval_ledger: Arc::new(crate::approvals::Ledger::default()),
@@ -3865,6 +4010,7 @@ mod tests {
         let (_, updates) = mpsc::sync_channel(QUEUE);
         let (stop, _) = watch::channel(false);
         let client = Client {
+            reference_ledger: Arc::new(crate::reference_detach::Ledger::default()),
             step_ledger: Arc::new(crate::step_decision::Ledger::default()),
             mode_ledger: Arc::new(crate::step_mode::Ledger::default()),
             approval_ledger: Arc::new(crate::approvals::Ledger::default()),
@@ -5140,3 +5286,6 @@ mod session_model_tests;
 #[cfg(test)]
 #[path = "client/pending_files_tests.rs"]
 mod pending_files_tests;
+
+#[cfg(test)]
+mod reference_tests;

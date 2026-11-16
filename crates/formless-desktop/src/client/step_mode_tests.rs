@@ -208,6 +208,7 @@ fn mode_enable_queue_failure_is_unsent_and_foreign_dispatch_cannot_be_sent() {
     let (_, updates) = mpsc::sync_channel(1);
     let (stop, _) = watch::channel(false);
     let client = Client {
+        reference_ledger: Arc::new(crate::reference_detach::Ledger::default()),
         step_ledger: Arc::new(crate::step_decision::Ledger::default()),
         mode_ledger: Arc::new(Ledger::default()),
         approval_ledger: Arc::new(crate::approvals::Ledger::default()),
@@ -264,6 +265,7 @@ fn mode_enable_view_retirement_cancels_unsent_synchronously_but_draft_edits_do_n
     let (_, updates) = mpsc::sync_channel(4);
     let (stop, _) = watch::channel(false);
     let client = Client {
+        reference_ledger: Arc::new(crate::reference_detach::Ledger::default()),
         step_ledger: Arc::new(crate::step_decision::Ledger::default()),
         mode_ledger: Arc::new(Ledger::default()),
         approval_ledger: Arc::new(crate::approvals::Ledger::default()),

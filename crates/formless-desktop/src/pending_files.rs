@@ -86,6 +86,19 @@ impl Report {
         }
         Ok(Self { rows, raw: value })
     }
+    pub fn is_reference(&self, index: u32) -> bool {
+        self.raw["attachments"]
+            .as_array()
+            .and_then(|a| a.get(index as usize))
+            .is_some_and(|row| row["reference"] == true)
+    }
+    pub fn reference_metadata(&self, index: u32) -> Option<String> {
+        let row = self.raw["attachments"].as_array()?.get(index as usize)?;
+        if row["reference"] != true {
+            return None;
+        }
+        Some(serde_json::to_string(row).ok()?.chars().map(|c|if matches!(c,'\u{061c}'|'\u{200e}'|'\u{200f}'|'\u{202a}'..='\u{202e}'|'\u{2066}'..='\u{2069}'){format!("\\u{:04x}",c as u32)}else{c.to_string()}).collect())
+    }
     pub(crate) fn expected(&self) -> Vec<Value> {
         self.raw["attachments"]
             .as_array()

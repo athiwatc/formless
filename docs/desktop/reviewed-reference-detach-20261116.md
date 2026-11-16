@@ -62,7 +62,15 @@ inventory is not authoritative operation reconciliation. The current envelope
 does not prove a failure happened before commit; no blanket safe-retry claim is
 made. Receipts do not freeze file contents or prove that a user saw a review.
 
-## Native integration still required
+## Native integration successor
+
+The subsequent [native reference-controls increment](native-reference-controls-20261116.md)
+implements selection, Cancel-first confirmation and Client-lifetime Unknown
+handling using this boundary. It needs its own independent source review and
+acceptance; it does not make the receipt cache durable or clear native gates.
+The following describes the boundary-only state at `d28c7cf`.
+
+### Historical boundary-only state
 
 This increment adds the protocol/storage/daemon boundary and tests. No native
 Remove control is exposed yet; existing Session details remains read-only

@@ -51,3 +51,5 @@ pub mod approvals;
 pub mod model_catalog;
 
 pub mod pending_files;
+
+pub mod reference_detach;

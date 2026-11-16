@@ -148,9 +148,13 @@ retains its existing forecast/cost-consent path. See the
 The daemon also provides an optional
 [reviewed reference-removal boundary](../../docs/desktop/reviewed-reference-detach-20261116.md):
 it compares complete pending metadata and removes one selected reference
-occurrence without touching its target or artifact files. Native Remove controls
-are not exposed yet; their confirmation and unknown-outcome handling remain
-required. Existing inspection and Send/Steer behavior are unchanged by that API.
+occurrence without touching its target or artifact files. Session details now
+provides [native reference review and confirmation](../../docs/desktop/native-reference-controls-20261116.md)
+with Cancel focused first, exact selected metadata and conservative Unknown
+handling. Unknown blocks further native removal and new work for its Session;
+fresh reads and reconnect never resolve or replay it. Stored-file removal and
+reference/attachment additions still require TUI. Client restart/replacement loses
+the local guard and is not a safe retry mechanism.
 Neither the quote nor the consent ACK starts work by itself: the view rechecks
 the exact draft, selection and IME state before committing the prepared action.
 Editing, cancellation, navigation or reconnect retires pending preparations;

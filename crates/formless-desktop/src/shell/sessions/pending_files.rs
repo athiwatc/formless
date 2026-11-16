@@ -1,5 +1,6 @@
 use super::*;
 use crate::pending_files::{Report, PAGE_SIZE};
+mod removal;
 const BASE: usize = 17 + crate::model_catalog::PAGE_SIZE;
 #[derive(Default)]
 pub(super) struct State {
@@ -8,6 +9,19 @@ pub(super) struct State {
     report: Option<Report>,
     notice: String,
     page: usize,
+    armed: Option<Review>,
+    observed: crate::reference_detach::Status,
+}
+#[derive(Clone)]
+struct Review {
+    action: crate::reference_detach::Action,
+    text: SharedString,
+}
+impl std::ops::Deref for Review {
+    type Target = crate::reference_detach::Action;
+    fn deref(&self) -> &Self::Target {
+        &self.action
+    }
 }
 #[derive(Clone, Copy)]
 struct Owner {
@@ -45,6 +59,13 @@ impl Shell {
         if !self.pending_files_current(owner)
             || self.current_modal(self.layout(window)) != Some(Modal::SessionEditor)
             || !self.keep_session_edit_input(window, cx)
+        {
+            return;
+        }
+        if self
+            .client
+            .as_ref()
+            .is_some_and(|c| c.reference_status().busy())
         {
             return;
         }
@@ -132,6 +153,7 @@ impl Shell {
             return;
         }
         if let Some(r) = &p.pending_files.report {
+            p.pending_files.armed = None;
             p.pending_files.page = page.min(r.rows.len().saturating_sub(1) / PAGE_SIZE);
             p.frames = 2;
             cx.notify();
@@ -153,8 +175,8 @@ impl Shell {
         let p = self.session_editor.as_ref().unwrap();
         let owner = Owner::of(p);
         let ready = self.pending_files_current(owner);
-        let mut body=v_flex().gap_2().child(readable("pending-files-help","Pending files belong to this Session's next user message and are shared across clients. Read a metadata snapshot; attachment paths are not opened, and this does not attach/remove files or start a Run. Metadata includes private daemon paths. Use Formless TUI to manage attachments. The snapshot is not a send/recovery guarantee."))
-            .child(div().id("pending-files-read-anchor").pt_1().anchor_scroll(Some(p.controls[BASE].1.clone())).child(Button::new("pending-files-read").label("Read pending files").disabled(!ready||p.pending_files.pending.is_some()).track_focus(&p.controls[BASE].0).on_click(cx.listener(move|this,_,window,cx|this.read_pending_files(owner,window,cx)))))
+        let mut body=v_flex().gap_2().child(readable("pending-files-help","Pending files belong to this Session's next user message and are shared across clients. Read a metadata snapshot; attachment paths are not opened, and this does not attach/remove files or start a Run. Metadata includes private daemon paths. References can be reviewed for removal below. Stored files and attachment additions require Formless TUI. Reading/copying does not remove anything and is not a recovery guarantee."))
+            .child(div().id("pending-files-read-anchor").pt_1().anchor_scroll(Some(p.controls[BASE].1.clone())).child(Button::new("pending-files-read").label("Read pending files").disabled(!ready||p.pending_files.pending.is_some()||self.client.as_ref().is_some_and(|c|c.reference_status().busy())).track_focus(&p.controls[BASE].0).on_click(cx.listener(move|this,_,window,cx|this.read_pending_files(owner,window,cx)))))
             .child(readable("pending-files-notice",p.pending_files.notice.clone()));
         if let (Some(r), Some(revision)) = (&p.pending_files.report, p.pending_files.revision) {
             let page = p
@@ -245,6 +267,7 @@ impl Shell {
                         })),
                 ),
         )
+        .child(self.render_reference_removal(cx))
     }
 }
 #[cfg(feature = "test-support")]

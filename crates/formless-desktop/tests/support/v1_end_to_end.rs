@@ -1303,3 +1303,191 @@ fn reviewed_reference_detach_over_real_ipc_removes_one_duplicate_without_touchin
     });
     f.finish();
 }
+
+#[gpui_kit::test]
+fn native_reference_confirmation_uses_real_ipc_and_unknown_never_replays(cx: &mut TestAppContext) {
+    use formless_desktop::reference_detach::{Outcome, Status};
+    let env = credential_env::EnvGuard::isolated();
+    env.set("FORMLESS_API_KEY", "private-native-reference-key");
+    for peer_changed in [false, true] {
+        let f = Fixture::start();
+        let directory = f.root.join("native-reference");
+        std::fs::create_dir(&directory).unwrap();
+        let marker = directory.join("keep.txt");
+        std::fs::write(&marker, b"keep target").unwrap();
+        f.runtime.block_on(async {
+            f.daemon
+                .handle(Request::AttachFile {
+                    session_id: f.session.clone(),
+                    name: "keep stored.txt".into(),
+                    data_b64: "aGVsbG8=".into(),
+                    mime: None,
+                })
+                .await
+                .unwrap();
+            for _ in 0..2 {
+                f.daemon
+                    .handle(Request::AttachPath {
+                        session_id: f.session.clone(),
+                        path: "native-reference".into(),
+                        root: Some(f.root.to_str().unwrap().into()),
+                    })
+                    .await
+                    .unwrap();
+            }
+        });
+        let inventory = || {
+            f.runtime
+                .block_on(f.daemon.handle(Request::ListPendingAttachments {
+                    session_id: f.session.clone(),
+                }))
+                .unwrap()
+        };
+        let before = inventory();
+        let stored = std::path::PathBuf::from(before["attachments"][0]["path"].as_str().unwrap());
+        let records = || {
+            formless_core::storage::Store::open_reader(&f.root.join("d/formless.db"))
+                .unwrap()
+                .list_artifacts()
+                .unwrap()
+        };
+        let (h, s) = open(cx, WIDE, 0, 0);
+        step(cx, h, |_, cx| {
+            s.update(cx, |s, cx| s.connect_daemon(f.endpoint.clone(), cx))
+        });
+        until(cx, h, &s, "reference Session", |s, _| {
+            s.sidebar().rows().iter().any(|r| r.id == f.session)
+        });
+        step(cx, h, |w, cx| w.click(session_row_id(&f.session), cx));
+        until(cx, h, &s, "reference baseline", |s, _| {
+            s.step_mode_enable_target().is_some()
+        });
+        step(cx, h, |w, cx| {
+            s.update(cx, |s, cx| s.run_command(Command::SessionDetails, w, cx))
+        });
+        until(cx, h, &s, "reference metadata", |s, _| {
+            s.session_edit_input().is_some()
+        });
+        let read = |cx: &mut TestAppContext, count| {
+            step(cx, h, |w, cx| {
+                super::model_catalog_tests::click(w, cx, "pending-files-read")
+            });
+            until(cx, h, &s, "reference inventory", |s, _| {
+                s.pending_files_count() == Some(count)
+            });
+        };
+        read(cx, 3);
+        step(cx, h, |w, cx| {
+            assert!(w.try_find("reference-review-0").is_none());
+            super::model_catalog_tests::click(w, cx, "reference-review-2");
+            settle_frames(w, cx);
+            assert_eq!(w.find("reference-cancel").focused(), Some(true));
+            let text = w
+                .find("reference-removal-target")
+                .value()
+                .unwrap()
+                .to_string();
+            assert!(text.contains("reference 3"));
+            assert!(text.contains("native-reference"));
+        });
+        assert_eq!(inventory(), before, "arming cannot remove metadata");
+        if peer_changed {
+            f.runtime
+                .block_on(f.daemon.handle(Request::AttachFile {
+                    session_id: f.session.clone(),
+                    name: "peer.txt".into(),
+                    data_b64: "aGVsbG8=".into(),
+                    mime: None,
+                }))
+                .unwrap();
+        }
+        let artifacts = records(); // A peer AttachFile intentionally adds its own artifact before removal.
+        step(cx, h, |w, cx| {
+            super::model_catalog_tests::click(w, cx, "reference-confirm")
+        });
+        until(cx, h, &s, "reference receipt", |s, _| {
+            matches!(s.reference_status(), Status::Finished { .. })
+        });
+        let status = step(cx, h, |_, cx| s.read(cx).reference_status());
+        assert_eq!(
+            matches!(
+                status,
+                Status::Finished {
+                    outcome: Outcome::Unknown,
+                    ..
+                }
+            ),
+            peer_changed
+        );
+        assert_eq!(
+            matches!(
+                status,
+                Status::Finished {
+                    outcome: Outcome::Removed,
+                    ..
+                }
+            ),
+            !peer_changed
+        );
+        assert_eq!(step(cx, h, |_, cx| s.read(cx).pending_files_count()), None);
+        let after = inventory();
+        assert_eq!(
+            after["attachments"].as_array().unwrap().len(),
+            if peer_changed { 4 } else { 2 }
+        );
+        if !peer_changed {
+            assert_eq!(
+                after["attachments"],
+                json!([before["attachments"][0], before["attachments"][1]])
+            );
+        }
+        read(cx, if peer_changed { 4 } else { 2 });
+        if peer_changed {
+            step(cx, h, |w, cx| {
+                assert_eq!(w.find("reference-review-1").disabled(), Some(true));
+                w.click("session-edit-cancel", cx);
+            });
+            step(cx, h, |w, cx| {
+                s.update(cx, |s, cx| {
+                    s.run_command(Command::GoTo(Destination::Chat), w, cx)
+                });
+                s.update(cx, |s, cx| s.focus_section(PageSection::Composer, w, cx));
+                w.input("keep uncertain draft", cx);
+                settle_frames(w, cx);
+            });
+            step(cx, h, |w, cx| {
+                let enter = s.update(cx, |s, cx| s.command_state(w, cx).enter_sends);
+                w.press(
+                    if enter {
+                        "enter"
+                    } else {
+                        formless_desktop::commands::composer_submit_key()
+                    },
+                    cx,
+                );
+            });
+            until(cx, h, &s, "reference Unknown prevents work", |s, _| {
+                s.composer_notice()
+                    .is_some_and(|n| n.contains("Reference removal is pending or unknown"))
+            });
+            assert_eq!(
+                step(cx, h, |_, cx| s.read(cx).draft(cx).to_string()),
+                "keep uncertain draft"
+            );
+            assert_eq!(inventory(), after);
+        }
+        assert_eq!(records(), artifacts);
+        assert_eq!(std::fs::read(&stored).unwrap(), b"hello");
+        assert_eq!(std::fs::read(&marker).unwrap(), b"keep target");
+        assert!(f.snapshot()["messages"].as_array().unwrap().is_empty());
+        assert_eq!(f.calls.load(Ordering::SeqCst), 0);
+        eprintln!(
+            "native_reference_case {}",
+            json!({"peer_changed":peer_changed,"initial":3,"remaining":if peer_changed{4}else{2},"selected_index":2,"confirmed":true,"automatic_replay":false,"provider_posts":0,"target_and_stored_unchanged":true,"artifact_records_unchanged":true})
+        );
+        step(cx, h, |_, cx| {
+            s.update(cx, |s, cx| s.connect_recording_daemon(cx))
+        });
+        f.finish();
+    }
+}

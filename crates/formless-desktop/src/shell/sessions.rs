@@ -68,16 +68,30 @@ impl Shell {
         instance: uuid::Uuid,
         connection: u64,
     ) {
+        if let Some(client) = &self.client {
+            client.cancel_unsent_reference();
+        }
+
+        let reference_unknown = self.client.as_ref().is_some_and(|c| {
+            matches!(
+                c.reference_status(),
+                crate::reference_detach::Status::Sent(_)
+                    | crate::reference_detach::Status::Finished {
+                        outcome: crate::reference_detach::Outcome::Unknown,
+                        ..
+                    }
+            )
+        });
         if let Some(panel) = &mut self.session_editor {
             panel.catalog = catalog::State::default();
             panel.pending_files = pending_files::State::default();
-            let unknown = matches!(panel.waiting, Some(Waiting::Write(_)));
+            let unknown = reference_unknown || matches!(panel.waiting, Some(Waiting::Write(_)));
             panel.instance = instance;
             panel.connection = connection;
             panel.revision = uuid::Uuid::new_v4();
             panel.waiting = None;
             panel.retired = true;
-            panel.notice=if unknown {"Profile attachment changed; the previous Profile's save outcome is unknown. It was not replayed. Drafts are kept read-only; copy them before reloading the new Profile's current values."} else {"Profile attachment changed. Previous metadata and drafts are kept read-only; copy them before reloading the new Profile's current values. Nothing was replayed."}.into();
+            panel.notice=if unknown {"Profile attachment changed; the previous Profile's save/reference-removal outcome is unknown. It was not replayed. Drafts are kept read-only; copy them before reloading the new Profile's current values."} else {"Profile attachment changed. Previous metadata and drafts are kept read-only; copy them before reloading the new Profile's current values. Nothing was replayed."}.into();
             panel.export.retire(
                 "Profile attachment changed. Read another export; nothing was replayed or saved.",
             );
@@ -206,7 +220,7 @@ impl Shell {
             notice: String::new(),
             focus: cx.focus_handle(),
             cancel: cx.focus_handle(),
-            controls: (0..21 + crate::model_catalog::PAGE_SIZE)
+            controls: (0..31 + crate::model_catalog::PAGE_SIZE)
                 .map(|_| {
                     (
                         cx.focus_handle(),
@@ -321,6 +335,10 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(client) = &self.client {
+            client.cancel_unsent_reference();
+        }
+
         if self.session_editor.as_ref().unwrap().waiting.is_some()
             || !self.keep_session_edit_input(window, cx)
         {
@@ -340,6 +358,10 @@ impl Shell {
     }
 
     fn reload_session_details(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(client) = &self.client {
+            client.cancel_unsent_reference();
+        }
+
         if !self.keep_session_edit_input(window, cx) {
             return;
         }
@@ -385,6 +407,10 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(client) = &self.client {
+            client.cancel_unsent_reference();
+        }
+
         let Some(panel) = self.session_editor.as_mut() else {
             return;
         };
@@ -571,6 +597,10 @@ impl Shell {
     }
 
     fn close_session_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(client) = &self.client {
+            client.cancel_unsent_reference();
+        }
+
         if let Some(input) = self
             .session_editor
             .as_ref()

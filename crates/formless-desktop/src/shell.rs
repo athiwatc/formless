@@ -2090,6 +2090,7 @@ impl Shell {
         self.sync_step_status(cx);
         self.sync_mode_status(cx);
         self.sync_approval_status(cx);
+        self.sync_reference_status(cx);
         self.validate_stream_view(cx);
         let updates: Vec<_> = self
             .client

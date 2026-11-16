@@ -7579,3 +7579,6 @@ mod pending_files_tests;
 
 #[path = "support/native_send.rs"]
 mod native_send_tests;
+
+#[path = "support/reference_controls.rs"]
+mod reference_control_tests;

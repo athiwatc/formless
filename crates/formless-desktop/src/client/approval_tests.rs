@@ -270,6 +270,7 @@ fn client_queue_failure_foreign_ownership_and_synchronous_context_cancel_are_dis
     let (_, updates) = mpsc::sync_channel(1);
     let (stop, _) = watch::channel(false);
     let c = Client {
+        reference_ledger: Arc::new(crate::reference_detach::Ledger::default()),
         step_ledger: Arc::new(crate::step_decision::Ledger::default()),
         mode_ledger: Arc::new(crate::step_mode::Ledger::default()),
         approval_ledger: Arc::new(Ledger::default()),
