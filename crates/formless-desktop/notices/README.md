@@ -63,3 +63,9 @@ receipts and unresolved probes; missing-file reports are preserved.
 
 See the [licensing scope and release report](../../../docs/desktop/licensing-scope-20261115.md)
 for authoritative references, locked archive evidence and owner decisions.
+
+The [local preview audit](../../../docs/desktop/preview-license-local-audit-20261116.md)
+records the remaining22 affected release identities and technical evidence.
+It finds no further substantiated packaging omission and does not remove any
+empty-collection or scope flag. Existing complete Apache text is already bundled
+with toolchain notices; presence alone does not select or clear a package license.

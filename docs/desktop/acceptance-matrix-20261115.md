@@ -175,3 +175,9 @@ exact Pathfinder source notice headers with archive/source bindings. It changes
 no Core/schema or native runtime behavior and retains full-term/scope warnings.
 These local dev measurements and notice preservation do not clear native,
 release-performance, licensing or distribution acceptance.
+
+The [local licensing audit](preview-license-local-audit-20261116.md) verifies22
+locked affected releases and existing collected references without finding a
+further packaging omission. It distinguishes available terms/source notices
+from unresolved historical attribution,license choice and SDK scope. The two
+empty collections and all20 scope-warning packages remain release gates.
