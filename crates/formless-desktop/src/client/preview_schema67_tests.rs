@@ -2,8 +2,6 @@
 use super::*;
 use crate::reference_detach::{Action as Removal, Ledger, Outcome, Status};
 use serde_json::json;
-#[path = "../../../formless-core/tests/support/env.rs"]
-mod credential_env;
 struct Directory(std::path::PathBuf);
 impl Directory {
     fn new() -> Self {

@@ -5300,3 +5300,8 @@ mod reference_tests;
 #[cfg(all(test, feature = "daemon-tests"))]
 #[path = "client/preview_schema67_tests.rs"]
 mod preview_schema67_tests;
+
+// Both in-memory Core bridge fixtures share one environment-isolation lock.
+#[cfg(all(test, feature = "daemon-tests"))]
+#[path = "../../formless-core/tests/support/env.rs"]
+mod credential_env;

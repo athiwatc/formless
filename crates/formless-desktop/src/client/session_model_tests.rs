@@ -325,9 +325,6 @@ fn session_selection_cas_missing_capability_rejects_before_read_and_never_falls_
 }
 
 #[cfg(feature = "daemon-tests")]
-#[path = "../../../formless-core/tests/support/env.rs"]
-mod credential_env;
-#[cfg(feature = "daemon-tests")]
 #[tokio::test]
 async fn session_selection_cas_real_core_rejects_writer_between_native_read_and_write() {
     let _env = credential_env::EnvGuard::isolated();
