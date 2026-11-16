@@ -15,6 +15,13 @@ recorded, that identity also matches.
 This verifies bytes and existing provenance records, not new upstream ancestry,
 complete rights chains or legal applicability. No external source was fetched.
 
+The inventory's `notice_filename_candidates` field records heuristic filename
+matches, not confirmed standalone notices. Its two matches,
+`objc2-foundation 0.3.2`'s `src/copying.rs` and `src/tests/copying.rs`, are explicitly
+classified as Rust source-code false positives. They are not collected or counted
+as license notices. The earlier frozen raw audit called this heuristic field
+`standalone_notice_paths`; that historical label does not establish a notice.
+
 ## Missing collections versus unresolved legal scope
 
 | Release/group | Verified local facts | Remaining distribution decision/evidence |
