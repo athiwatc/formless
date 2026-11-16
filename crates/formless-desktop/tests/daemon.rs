@@ -210,6 +210,9 @@ async fn until(client: &Client, stage: &'static str, mut predicate: impl FnMut(U
                     outcome,
                     ..
                 } => format!("metadata {session_id}: {outcome:?}"),
+                Update::ModelCatalog { result, .. } => {
+                    format!("catalog read: ok={}", result.is_ok())
+                }
                 Update::SessionDetails {
                     session_id, result, ..
                 } => format!("metadata read {session_id}: ok={}", result.is_ok()),
