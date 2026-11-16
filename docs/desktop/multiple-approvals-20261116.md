@@ -36,7 +36,13 @@ has any pending/unknown approval outcome; Reload does not clear that ledger.
 A successful decision does not automatically select or decide another request.
 Reload explicitly for a fresh inventory. Spent operation/approval receipts
 remain Client-lifetime and bounded to 256 operations, with no durable restart
-deduplication and no automatic replay after disconnect.
+deduplication and no automatic replay after disconnect. Profile replacement
+closes the review; reopen explicitly for a fresh inventory in the new Profile.
+Captured callbacks cannot act on that new review even if it reuses request IDs
+and a connection counter. Physical reconnect within the same Client uses
+explicit Reload; neither path replays a decision. Deferred dismissal settles
+the cached modal and returns focus to the page. Opening a fresh review always
+focuses its own Close handle, including replacement/reopen between frames.
 
 Validation covers inventory and aggregate bounds, duplicate/unsupported rows,
 exact selection under unrelated inventory turnover, no batch decision,

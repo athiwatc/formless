@@ -127,7 +127,7 @@ async fn approval_lost_ack_retains_unknown_after_fresh_empty_inventory_and_never
     until(
         &client,
         "fresh-empty-approval-inventory",
-        |u| matches!(u,Update::ApprovalInventory{operation,result:Ok(None),..}if operation==op),
+        |u| matches!(u,Update::ApprovalInventory{operation,result:Ok(inventory),..}if operation==op&&inventory.is_empty()),
     )
     .await;
     assert!(client.decide_approval(action()).is_err());

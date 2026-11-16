@@ -5905,10 +5905,11 @@ impl Render for Shell {
         {
             self.forecast = None;
         }
-        // Snapshot replacement has no Window parameter. Finish the modal
+        // State replacement has no Window parameter. Finish the modal
         // dismissal/focus fallback here, before stale rows can be drawn.
         if (self.modal == Some(Modal::Viewer) && self.viewer.is_none())
             || (self.modal == Some(Modal::Forecast) && self.forecast.is_none())
+            || (self.modal == Some(Modal::Approvals) && self.approval_panel.is_none())
         {
             self.settle(window, cx);
         }

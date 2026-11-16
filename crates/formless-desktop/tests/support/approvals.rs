@@ -356,3 +356,66 @@ fn multiple_approval_unknown_receipt_blocks_other_requests_even_after_explicit_r
         assert!(s.update(cx, |s, _| s.take_client_commands()).is_empty());
     });
 }
+
+#[gpui_kit::test]
+fn multiple_approval_profile_replacement_closes_review_and_refuses_callbacks_when_ids_repeat(
+    cx: &mut TestAppContext,
+) {
+    for intervening_frame in [false, true] {
+        let (h, s) = setup(cx);
+        ready(cx, h, &s, fixture_multiple());
+        let old = step(cx, h, |_, cx| s.read(cx).approval_target().unwrap());
+        step(cx, h, |w, cx| {
+            s.update(cx, |s, cx| s.connect_recording_daemon(cx));
+            if intervening_frame {
+                settle_frames(w, cx);
+                assert!(w.try_find("approval-review-dialog").is_none());
+                assert!(
+                    s.read(cx).focused_section(w, cx).is_some(),
+                    "closed review must return focus to the page"
+                );
+            } else {
+                assert!(s.read(cx).approval_target().is_none());
+            }
+            s.update(cx, |s, cx| {
+                s.submit_approval(old.0, old.1.clone(), true, w, cx)
+            });
+            s.update(cx, |s, cx| s.select_presented_approval(old.0, 1, w, cx));
+            assert!(s.update(cx, |s, _| s.take_client_commands()).is_empty());
+            s.update(cx, |s, cx| {
+                s.apply_client_update(
+                    Update::Connection {
+                        ready: true,
+                        notice: "Explicit new Profile fixture connection".into(),
+                    },
+                    w,
+                    cx,
+                )
+            });
+            s.update(cx, |s, cx| {
+                assert!(s.run_command(Command::Approvals, w, cx).is_none());
+            });
+        });
+        ready(cx, h, &s, fixture_multiple());
+        step(cx, h, |w, cx| {
+            let current = s.read(cx).approval_target().unwrap();
+            assert_ne!(w.find("approval-allow-once").disabled(), Some(true));
+            assert_eq!(
+                w.find("approval-review-close").focused(),
+                Some(true),
+                "a fresh review must focus its new Close handle after Profile replacement"
+            );
+            assert_ne!(current.0, old.0);
+            assert_eq!(current.1, old.1);
+            s.update(cx, |s, cx| {
+                s.submit_approval(old.0, old.1.clone(), true, w, cx)
+            });
+            assert!(s.update(cx, |s, _| s.take_client_commands()).is_empty());
+            activate(w, cx, "approval-deny");
+            let commands = s.update(cx, |s, _| s.take_client_commands());
+            assert!(
+                matches!(&commands[..],[Wire::DecideApproval(d)]if !d.action().allow&&d.action().prompt==current.1)
+            );
+        });
+    }
+}

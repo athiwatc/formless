@@ -105,6 +105,9 @@ impl Shell {
             frames: 2,
         });
         self.settle(window, cx);
+        // Profile replacement can close and reopen the same modal between frames.
+        // Always focus this new form's safe default, even if the modal kind matches.
+        self.focus_modal(Modal::Approvals, window, cx);
         self.read_approvals(revision, window, cx);
     }
     fn read_approvals(
