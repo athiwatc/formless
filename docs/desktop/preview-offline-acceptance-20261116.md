@@ -24,9 +24,13 @@ are means of 1,000-call batches, not individual-hit tail latency.
 A second case builds 100 and 1,000 rows, asks only five rows for accessible text
 and checks that both retain the same accessible-byte total. Setup includes
 source clones; the five-row conversion timing excludes full history setup.
-Memory/CPU measurements from an explicitly timed headless example process are
-recorded separately from Cargo build time. No renderer, OS accessibility service,
-window, transport listener or production streaming path runs.
+The example records in-process monotonic operation timings separately from
+Cargo build time. An extended `/usr/bin/time -l` wrapper completed the model
+cases but then failed reading `kern.clockrate` with Operation not permitted.
+That resource operation is not retried or replaced with another counter path;
+CPU/RSS profiling remains blocked. Its partial log is not a passing resource
+measurement. No renderer, OS accessibility service, window, transport listener
+or production streaming path runs.
 
 Exploratory bounded-row cold medians ranged from about 1.4 to 7.3 ms; the
 structured 400-line window was about 1.7 ms. A 1,000-row history took about
