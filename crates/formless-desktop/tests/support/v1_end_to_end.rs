@@ -1256,3 +1256,50 @@ fn native_composer_confirms_pending_files_and_retains_unknown_after_a_peer_chang
         f.finish();
     }
 }
+
+#[test]
+fn reviewed_reference_detach_over_real_ipc_removes_one_duplicate_without_touching_files_or_provider(
+) {
+    use formless_protocol::{RequestEnvelope, ServerMessage, PROTOCOL_VERSION};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let env = credential_env::EnvGuard::isolated();
+    env.set("FORMLESS_API_KEY", "private-reference-detach-key");
+    let f = Fixture::start();
+    let directory = f.root.join("reference-dir");
+    std::fs::create_dir(&directory).unwrap();
+    let marker = directory.join("keep.txt");
+    std::fs::write(&marker, b"keep reference target").unwrap();
+    f.runtime.block_on(async {
+        f.daemon.handle(Request::AttachFile{session_id:f.session.clone(),name:"keep stored.txt".into(),data_b64:"aGVsbG8=".into(),mime:Some("text/plain".into())}).await.unwrap();
+        for _ in 0..2 {f.daemon.handle(Request::AttachPath{session_id:f.session.clone(),path:"reference-dir".into(),root:Some(f.root.to_str().unwrap().into())}).await.unwrap();}
+        let socket=tokio::time::timeout(Duration::from_secs(10),async {loop {
+            #[cfg(unix)]let opened=tokio::net::UnixStream::connect(&f.endpoint.0).await;
+            #[cfg(windows)]let opened=tokio::net::windows::named_pipe::ClientOptions::new().open(&f.endpoint.0);
+            match opened {Ok(socket)=>break socket,Err(error) if error.kind()==std::io::ErrorKind::NotFound || error.raw_os_error()==Some(231)=>tokio::time::sleep(Duration::from_millis(10)).await,Err(error)=>panic!("private reference IPC: {error}")}
+        }}).await.unwrap();
+        let mut reader=BufReader::new(socket);let mut id=0;
+        macro_rules! rpc {($request:expr)=>{{
+            id+=1;let mut frame=serde_json::to_vec(&RequestEnvelope{id,protocol:PROTOCOL_VERSION,request:$request}).unwrap();frame.push(b'\n');reader.get_mut().write_all(&frame).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(10),async{loop {let mut line=String::new();assert_ne!(reader.read_line(&mut line).await.unwrap(),0);if let ServerMessage::Response{id:got,ok,result,error}=serde_json::from_str::<ServerMessage>(&line).unwrap(){assert_eq!(got,id);break if ok{Ok(result.unwrap())}else{Err(error.unwrap())};}}}).await.unwrap()
+        }};}
+        let ping=rpc!(Request::Ping).unwrap();assert!(ping["features"].as_array().unwrap().iter().any(|v|v=="reviewed_reference_detach_v1"));
+        let before=rpc!(Request::ListPendingAttachments{session_id:f.session.clone()}).unwrap()["attachments"].as_array().unwrap().clone();
+        assert_eq!(before.len(),3);assert_eq!(before[1],before[2]);assert_eq!(before[1]["reference"],true);
+        let stored=std::path::PathBuf::from(before[0]["path"].as_str().unwrap());let records=||formless_core::storage::Store::open_reader(&f.root.join("d/formless.db")).unwrap().list_artifacts().unwrap();let artifacts=records();
+        let request=|op:&str,expected,index|Request::DetachReviewedReference{session_id:f.session.clone(),expected_attachments:expected,index,operation_id:op.into()};
+        let ack=rpc!(request("selected-duplicate",before.clone(),2)).unwrap();
+        assert_eq!(ack,json!({"removed":true,"session_id":f.session,"index":2,"operation_id":"selected-duplicate"}));
+        assert_eq!(rpc!(request("selected-duplicate",before.clone(),2)).unwrap(),ack);
+        let remaining=rpc!(Request::ListPendingAttachments{session_id:f.session.clone()}).unwrap()["attachments"].as_array().unwrap().clone();
+        assert_eq!(remaining,vec![before[0].clone(),before[1].clone()]);
+        assert!(rpc!(request("stale",before,1)).unwrap_err().contains("pending attachments changed"));
+        assert!(rpc!(request("stored-not-supported",remaining.clone(),0)).is_err());
+        assert_eq!(rpc!(Request::ListPendingAttachments{session_id:f.session.clone()}).unwrap()["attachments"],json!(remaining));
+        assert_eq!(records(),artifacts);
+        assert_eq!(std::fs::read(&stored).unwrap(),b"hello");assert_eq!(std::fs::read(&marker).unwrap(),b"keep reference target");
+        let snapshot=rpc!(Request::GetSession{id:f.session.clone()}).unwrap();assert!(snapshot["messages"].as_array().unwrap().is_empty());assert_eq!(snapshot["running"],false);assert_eq!(f.calls.load(Ordering::SeqCst),0);
+        eprintln!("reviewed_reference_detach_case {}",json!({"initial":3,"remaining":2,"selected_index":2,"replay_removes_no_second_row":true,"stale_rejected":true,"stored_rejected":true,"artifact_records_unchanged":true,"reference_target_unchanged":true,"stored_body_unchanged":true,"provider_posts":0}));
+        drop(reader);
+    });
+    f.finish();
+}

@@ -34,6 +34,7 @@ pub const FEATURES: &[&str] = &[
     "future_transcript_attempts_v1",
     "pending_attachment_inventory_v1",
     "reviewed_attachment_send_v1",
+    "reviewed_reference_detach_v1",
 ];
 
 /// Complete pending-attachment metadata inventory limits. No file bodies are read.
@@ -2329,6 +2330,16 @@ pub enum Request {
     ListPendingAttachments {
         session_id: String,
     },
+    /// Remove exactly one reviewed pending reference by its position in the
+    /// complete inventory. Never reads/deletes reference targets or artifacts.
+    /// Returns `{removed:true,session_id,index,operation_id}`. No legacy fallback.
+    DetachReviewedReference {
+        session_id: String,
+        expected_attachments: Vec<serde_json::Value>,
+        index: u32,
+        /// One identity per user action; receipts are connection-local/10 min.
+        operation_id: String,
+    },
     /// Take back a pending attachment before the message is sent: `id` is
     /// the attachment's id (or, for a referenced path, the path). Returns
     /// `{removed}`.
@@ -3987,6 +3998,24 @@ mod reviewed_attachment_send_tests {
             assert!(serde_json::from_value::<Request>(missing).is_err());
         }
         assert!(FEATURES.contains(&"reviewed_attachment_send_v1"));
+        assert_eq!(PROTOCOL_VERSION, 1);
+    }
+}
+
+#[cfg(test)]
+mod reviewed_reference_detach_tests {
+    use super::*;
+    #[test]
+    fn reviewed_reference_detach_is_additive_and_requires_position_inventory_and_identity() {
+        let value = serde_json::json!({"type":"detach_reviewed_reference","session_id":"s","expected_attachments":[],"index":0,"operation_id":"one"});
+        let request: Request = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(request).unwrap(), value);
+        for field in ["expected_attachments", "index", "operation_id"] {
+            let mut missing = value.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<Request>(missing).is_err());
+        }
+        assert!(FEATURES.contains(&"reviewed_reference_detach_v1"));
         assert_eq!(PROTOCOL_VERSION, 1);
     }
 }

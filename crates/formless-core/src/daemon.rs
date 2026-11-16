@@ -689,6 +689,12 @@ mod reviewed_send;
 #[path = "reviewed_send_tests.rs"]
 mod reviewed_send_tests;
 
+#[path = "reviewed_reference_detach.rs"]
+mod reviewed_reference_detach;
+#[cfg(test)]
+#[path = "reviewed_reference_detach_tests.rs"]
+mod reviewed_reference_detach_tests;
+
 type SendKey = (Option<u64>, String, String);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum SendReceiptKind {
@@ -896,6 +902,7 @@ pub struct Daemon {
         StdMutex<HashMap<String, (std::time::Instant, crate::mcp_catalog::Candidate)>>,
     /// Legacy/reviewed Send keys seen in the last 10 minutes and their outcome.
     sent_keys: StdMutex<HashMap<(SendKey, SendReceiptKind), SentEntry>>,
+    reference_detaches: reviewed_reference_detach::Receipts,
     /// Per-Session provider context, extended step by step (SPEC §11).
     contexts: StdMutex<HashMap<String, ContextCache>>,
     /// One naming inference at a time: bounds CPU and keeps at most one
@@ -1112,6 +1119,7 @@ impl Daemon {
             config_edit: StdMutex::new(()),
             mcp_import_candidates: StdMutex::new(HashMap::new()),
             sent_keys: StdMutex::new(HashMap::new()),
+            reference_detaches: Default::default(),
             mcp: Default::default(),
             modules: StdMutex::new(None),
             // `provider.proxy` applies from start-up (restart to change it).
@@ -2829,6 +2837,17 @@ impl Daemon {
                     })
                 })
             }
+            Request::DetachReviewedReference {
+                session_id,
+                expected_attachments,
+                index,
+                operation_id,
+            } => self.detach_reviewed_reference(
+                session_id,
+                expected_attachments,
+                index,
+                operation_id,
+            ),
             Request::DetachFile { session_id, id } => {
                 let gone = self.with_store(|st| {
                     st.transaction(|st| {
@@ -15040,6 +15059,7 @@ impl Daemon {
         self.sent_keys
             .locked()
             .retain(|((client, _, _), _), _| *client != Some(conn));
+        self.reference_detaches.retire_connection(conn);
         if let Some(writer) = writer {
             writer.abort();
             let _ = writer.await;

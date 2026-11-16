@@ -144,6 +144,13 @@ The confirmed message uses the daemon's atomic reviewed-send operation with no
 legacy fallback. Queue and drafts above 64 KiB require Formless TUI. Resume
 retains its existing forecast/cost-consent path. See the
 [native send-review contract](../../docs/desktop/native-send-review-20261116.md).
+
+The daemon also provides an optional
+[reviewed reference-removal boundary](../../docs/desktop/reviewed-reference-detach-20261116.md):
+it compares complete pending metadata and removes one selected reference
+occurrence without touching its target or artifact files. Native Remove controls
+are not exposed yet; their confirmation and unknown-outcome handling remain
+required. Existing inspection and Send/Steer behavior are unchanged by that API.
 Neither the quote nor the consent ACK starts work by itself: the view rechecks
 the exact draft, selection and IME state before committing the prepared action.
 Editing, cancellation, navigation or reconnect retires pending preparations;

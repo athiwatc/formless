@@ -150,3 +150,11 @@ inventories. Unsupported peers fail closed and uncertain responses are retained
 without replay. Queue/deferred ownership, attachment mutations and durable
 reconciliation remain required. Native, hosted, performance and distribution
 gates remain open and production streaming remains disabled.
+
+The [reviewed reference-removal boundary](reviewed-reference-detach-20261116.md)
+compares a complete inventory and removes one selected reference occurrence
+under one transaction, leaving targets and artifacts untouched. Bounded
+connection-local receipts suppress duplicate operations within their retention
+window. Native reference-removal selection/confirmation and unknown-outcome
+guards are still required before exposing a Remove control; this does not
+restore Queue or clear native/distribution acceptance.

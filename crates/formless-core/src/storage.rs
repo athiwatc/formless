@@ -8698,3 +8698,6 @@ mod applied_proposal_read_tests;
 #[cfg(test)]
 #[path = "pending_attachment_inventory_storage_tests.rs"]
 mod pending_attachment_inventory_tests;
+
+#[path = "reviewed_reference_store.rs"]
+mod reviewed_reference_store;
