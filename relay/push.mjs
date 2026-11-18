@@ -5,6 +5,7 @@
 // (WebCrypto only).
 
 const enc = new TextEncoder();
+const PUSH_TIMEOUT_MS = 10_000;
 
 export function b64u(bytes) {
   let s = "";
@@ -31,11 +32,23 @@ export async function vapidAuth(endpoint, publicKey, privateKey, subject) {
  * refused our VAPID signature). `vapid` is from `loadVapid`. */
 export async function sendPush(sub, vapid) {
   const auth = await vapidAuth(sub.endpoint, vapid.publicKey, vapid.key, vapid.subject);
-  const res = await fetch(sub.endpoint, {
-    method: "POST",
-    headers: { authorization: auth, ttl: "3600", urgency: "high", "content-length": "0" },
-  });
-  return res.status;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new DOMException("push timed out", "TimeoutError")), PUSH_TIMEOUT_MS);
+  try {
+    const res = await fetch(sub.endpoint, {
+      method: "POST",
+      headers: { authorization: auth, ttl: "3600", urgency: "high", "content-length": "0" },
+      signal: controller.signal,
+    });
+    // The status still identifies an expired subscription even if cleanup fails.
+    if (res.body) await res.body.cancel().catch(() => controller.abort());
+    return res.status;
+  } catch (error) {
+    if (controller.signal.aborted) throw controller.signal.reason;
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /** The browsers' push services (#837). A self-hosted relay adds its own
