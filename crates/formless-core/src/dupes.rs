@@ -71,23 +71,27 @@ fn schema_fields(schema: &str) -> Option<BTreeSet<String>> {
                 | "then"
                 | "else"
                 | "patternProperties"
+                | "propertyNames"
                 | "dependentSchemas"
                 | "dependencies"
         )
     }) || schema.get("type").is_some_and(|kind| kind != "object")
+        || ["additionalProperties", "unevaluatedProperties"]
+            .iter()
+            .any(|name| schema.get(*name).is_some_and(|policy| policy != false))
     {
         return None;
     }
-    match schema.get("properties") {
-        Some(properties) => Some(properties.as_object()?.keys().cloned().collect()),
-        None if schema
-            .get("required")
-            .is_none_or(|required| required.as_array().is_some_and(Vec::is_empty)) =>
-        {
-            Some(BTreeSet::new())
+    let mut fields = match schema.get("properties") {
+        Some(properties) => properties.as_object()?.keys().cloned().collect(),
+        None => BTreeSet::new(),
+    };
+    if let Some(required) = schema.get("required") {
+        for field in required.as_array()? {
+            fields.insert(field.as_str()?.to_owned());
         }
-        None => None,
     }
+    Some(fields)
 }
 
 fn jaccard(a: &BTreeSet<String>, b: &BTreeSet<String>) -> f64 {

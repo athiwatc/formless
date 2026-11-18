@@ -99,6 +99,14 @@ fn only_known_input_fields_contribute_to_duplicate_scoring() {
         ),
         ("unreadable", "also unreadable"),
         (r#"{"properties":null}"#, r#"{"properties":{}}"#),
+        (
+            r#"{"type":"object","properties":{},"required":["url"]}"#,
+            r#"{"type":"object","required":["channel"]}"#,
+        ),
+        (
+            r#"{"type":"object","additionalProperties":{"type":"string"}}"#,
+            r#"{"type":"object","additionalProperties":false}"#,
+        ),
     ] {
         let a = tool(
             "fetch_page",
