@@ -1019,6 +1019,7 @@ mod tests {
         }
         for (source, numbers) in [
             ("let value = 1_000 / 1.5", vec!["1_000", "1.5"]),
+            ("0..len", vec!["0."]),
             ("[...5, ....5]", vec!["5", ".5"]),
             ("item1 / α\u{301}2", vec![]),
             ("return\u{feff}2", vec!["2"]),
@@ -1106,7 +1107,7 @@ mod tests {
                 "{tokens:?}"
             );
         }
-        for lang in ["js", "python", "go", "c", "json", "toml", "sql", "css"] {
+        for lang in ["python", "go", "c", "json", "toml", "sql", "css"] {
             assert_eq!(
                 toks(lang, "0..len"),
                 vec![("0..len".into(), number)],
