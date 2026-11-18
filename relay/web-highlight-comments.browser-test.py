@@ -85,6 +85,11 @@ def check(page):
       for source,comments in [
         ('cat <<EOF\nhello;#literal\nEOF\nprintf done;# real',['# real']),
         ('cat <<\'FIRST\' <<-E"ND"\n\n# data\nFIRST\n\tsecond |# data\n\tEND\ntrue;# outside',['# outside']),
+        ("cat <<$'E\\x4fF'\nhello;#literal\nEOF\nprintf done;# real",['# real']),
+        ("cat <<EOF\nleft\\\nEOF\nhello;#literal\nEOF\nprintf done;# real",['# real']),
+        ("cat <<EOF\nE\\\nOF\nprintf done;# real",['# real']),
+        ("cat <<'EOF'\nleft\\\nEOF\nprintf done;# real",['# real']),
+        ("cat <<EOF\r\nhello;#literal\r\nEOF\r\nprintf done;# real\r",['# real\r']),
         ("cat <<''\n# data\n\ntrue;# outside",['# outside']),
         ('cat <<EOF\n# literal through the end',[]),
         ('cat <<< literal\ntrue;# outside',['# outside']),
@@ -99,10 +104,13 @@ def check(page):
         ("printf '%s' foo\\\n#literal\nprintf done;# real",['# real']),
         ("printf '%s' foo;\\\n# continued boundary",['# continued boundary']),
         ("echo 'a\n;# inside quote';# outside",['# outside']),
+        ("printf '%s' $'it\\'s #inside' # outside",['# outside']),
       ]:cases.append(('bash',source,comments))
     for kind in ['block','fence']:
       for lang,source,comments in cases:
         actual=render(page,source,lang,kind)
-        assert actual=={'text':source,'comments':comments},(kind,lang,source,actual,comments)
+        text=source.replace('\r\n','\n').removesuffix('\r') if kind=='fence' else source
+        expected_comments=[c.removesuffix('\r') for c in comments] if kind=='fence' else comments
+        assert actual=={'text':text,'comments':expected_comments},(kind,lang,source,actual,expected_comments)
     print(f'PASS {len(cases)} comment/source controls through both shipped codeBlock and Markdown fence DOM ({2*len(cases)} views)')
 run(Path(__file__).resolve().parent,hook,check,args.app)

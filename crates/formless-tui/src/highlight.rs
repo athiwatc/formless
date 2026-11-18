@@ -499,6 +499,8 @@ enum ShellContext {
 struct HereDoc {
     delimiter: String,
     strip_tabs: bool,
+    quoted: bool,
+    continued: String,
 }
 
 struct ShellComments {
@@ -507,6 +509,7 @@ struct ShellComments {
     here_docs: VecDeque<HereDoc>,
     in_here_doc: bool,
     line_boundary: bool,
+    ansi_quote: bool,
 }
 
 impl ShellComments {
@@ -541,6 +544,52 @@ impl ShellComments {
             .take_while(|&&c| c == '\\')
             .count()
             .is_multiple_of(2)
+    }
+
+    fn ansi_escape(chars: &[char], end: &mut usize) -> Option<char> {
+        let c = *chars.get(*end)?;
+        *end += 1;
+        let (radix, digits) = match c {
+            'a' => return Some('\x07'),
+            'b' => return Some('\x08'),
+            'e' | 'E' => return Some('\x1b'),
+            'f' => return Some('\x0c'),
+            'n' => return Some('\n'),
+            'r' => return Some('\r'),
+            't' => return Some('\t'),
+            'v' => return Some('\x0b'),
+            '\\' | '\'' | '"' | '?' => return Some(c),
+            'c' => {
+                let c = chars.get(*end)?.to_ascii_uppercase();
+                *end += 1;
+                return c.is_ascii().then(|| char::from((c as u8) ^ 0x40));
+            }
+            '0'..='7' => {
+                *end -= 1;
+                (8, 3)
+            }
+            'x' => (16, 2),
+            'u' => (16, 4),
+            'U' => (16, 8),
+            _ => {
+                *end -= 1;
+                return Some('\\');
+            }
+        };
+        let start = *end;
+        let mut value = 0;
+        while *end - start < digits {
+            let Some(digit) = chars.get(*end).and_then(|c| c.to_digit(radix)) else {
+                break;
+            };
+            value = value * radix + digit;
+            *end += 1;
+        }
+        if *end == start {
+            *end -= 1;
+            return Some('\\');
+        }
+        char::from_u32(if radix == 8 { value % 256 } else { value })
     }
 
     fn context(&self) -> ShellContext {
@@ -684,6 +733,7 @@ impl ShellComments {
     }
 
     fn end_line(&mut self, chars: &[char], ended_by_comment: bool, in_string: bool) {
+        let chars = chars.strip_suffix(&['\r']).unwrap_or(chars);
         let continued = !ended_by_comment && Self::escaped(chars);
         self.line_boundary = !continued || self.comment(&chars[..chars.len() - 1]);
         if !continued && !in_string {
@@ -715,6 +765,8 @@ impl ShellComments {
         }
         let start = end;
         let mut quote = None;
+        let mut quoted = false;
+        let mut ansi_quote = false;
         let mut delimiter = String::new();
         if chars.get(end) == Some(&'#') {
             return None;
@@ -726,13 +778,23 @@ impl ShellComments {
             end += 1;
             if quote == Some(c) {
                 quote = None;
+                ansi_quote = false;
+            } else if quote.is_none() && c == '$' && chars.get(end) == Some(&'\'') {
+                quote = Some('\'');
+                quoted = true;
+                ansi_quote = true;
+                end += 1;
             } else if quote.is_none() && "\"'".contains(c) {
                 quote = Some(c);
+                quoted = true;
+            } else if c == '\\' && ansi_quote {
+                delimiter.push(Self::ansi_escape(chars, &mut end)?);
             } else if c == '\\'
                 && quote != Some('\'')
                 && (quote.is_none() || chars.get(end).is_some_and(|c| "\\\"$`".contains(*c)))
             {
                 delimiter.push(*chars.get(end)?);
+                quoted = true;
                 end += 1;
             } else {
                 delimiter.push(c);
@@ -744,6 +806,8 @@ impl ShellComments {
         self.here_docs.push_back(HereDoc {
             delimiter,
             strip_tabs,
+            quoted,
+            continued: String::new(),
         });
         Some(end)
     }
@@ -752,7 +816,25 @@ impl ShellComments {
         if !self.in_here_doc {
             return false;
         }
-        let doc = self.here_docs.front().expect("active here document");
+        let doc = self.here_docs.front_mut().expect("active here document");
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if !doc.quoted
+            && !line
+                .bytes()
+                .rev()
+                .take_while(|&b| b == b'\\')
+                .count()
+                .is_multiple_of(2)
+        {
+            doc.continued.push_str(&line[..line.len() - 1]);
+            return true;
+        }
+        let line = if doc.continued.is_empty() {
+            line
+        } else {
+            doc.continued.push_str(line);
+            &doc.continued
+        };
         if (if doc.strip_tabs {
             line.trim_start_matches('\t')
         } else {
@@ -761,6 +843,8 @@ impl ShellComments {
         {
             self.here_docs.pop_front();
             self.in_here_doc = !self.here_docs.is_empty();
+        } else {
+            doc.continued.clear();
         }
         true
     }
@@ -861,6 +945,7 @@ impl Highlighter {
                 here_docs: VecDeque::new(),
                 in_here_doc: false,
                 line_boundary: true,
+                ansi_quote: false,
             }),
             raw_backticks: matches!(name.as_str(), "go" | "golang"),
             color,
@@ -933,9 +1018,11 @@ impl Highlighter {
         // just past the delimiter, or None when it runs past the line.
         let raw_backticks = self.raw_backticks;
         let shell = self.shell.is_some();
-        let close_at = |from: usize, close: &str| -> Option<usize> {
-            let escapes =
-                !(l.raw_strings || raw_backticks && close == "`" || shell && close == "'");
+        let posix_shell = self.shell.as_ref().is_some_and(|shell| shell.posix);
+        let close_at = |from: usize, close: &str, ansi_quote: bool| -> Option<usize> {
+            let escapes = !(l.raw_strings
+                || raw_backticks && close == "`"
+                || posix_shell && close == "'" && !ansi_quote);
             let mut j = from;
             while j < chars.len() {
                 if escapes && chars[j] == '\\' {
@@ -951,7 +1038,8 @@ impl Highlighter {
         };
         while i < chars.len() {
             if let Some(close) = self.in_str.clone() {
-                let stop = close_at(i, &close);
+                let ansi_quote = self.shell.as_ref().is_some_and(|shell| shell.ansi_quote);
+                let stop = close_at(i, &close, ansi_quote);
                 push(Tok::Str, &chars[i..stop.unwrap_or(chars.len())]);
                 if stop.is_some() {
                     self.in_str = None;
@@ -996,7 +1084,7 @@ impl Highlighter {
                 let hashes = chars[r + 1..].iter().take_while(|&&h| h == '#').count();
                 if chars.get(r + 1 + hashes) == Some(&'"') {
                     let close = format!("\"{}", "#".repeat(hashes));
-                    let stop = close_at(r + 2 + hashes, &close);
+                    let stop = close_at(r + 2 + hashes, &close, false);
                     push(Tok::Str, &chars[i..stop.unwrap_or(chars.len())]);
                     if stop.is_none() {
                         self.in_str = Some(close);
@@ -1024,11 +1112,16 @@ impl Highlighter {
                 }
                 shell.track(&chars, i);
                 if l.quotes.contains(&c) && !ShellComments::escaped(&chars[..i]) {
+                    let ansi_quote = c == '\''
+                        && i > 0
+                        && chars[i - 1] == '$'
+                        && !ShellComments::escaped(&chars[..i - 1]);
                     let close = c.to_string();
-                    let stop = close_at(i + 1, &close);
+                    let stop = close_at(i + 1, &close, ansi_quote);
                     push(Tok::Str, &chars[i..stop.unwrap_or(chars.len())]);
                     if stop.is_none() {
                         self.in_str = Some(close);
+                        shell.ansi_quote = ansi_quote;
                     }
                     i = stop.unwrap_or(chars.len());
                     continue;
@@ -1083,7 +1176,7 @@ impl Highlighter {
             // Strings that may span lines: `"""`, backticks (#876).
             if let Some(delim) = l.multiline.iter().find(|d| at(i, d)) {
                 let n = delim.chars().count();
-                let stop = close_at(i + n, delim);
+                let stop = close_at(i + n, delim, false);
                 push(Tok::Str, &chars[i..stop.unwrap_or(chars.len())]);
                 if stop.is_none() {
                     self.in_str = Some(delim.to_string());
@@ -1493,6 +1586,11 @@ mod tests {
                 "cat <<'FIRST' <<-E\"ND\"\n\n# data\nFIRST\n\tsecond |# data\n\tEND\ntrue;# outside",
                 &["# outside"],
             ),
+            ("cat <<$'E\\x4fF'\nhello;#literal\nEOF\nprintf done;# real", &["# real"]),
+            ("cat <<EOF\nleft\\\nEOF\nhello;#literal\nEOF\nprintf done;# real", &["# real"]),
+            ("cat <<EOF\nE\\\nOF\nprintf done;# real", &["# real"]),
+            ("cat <<'EOF'\nleft\\\nEOF\nprintf done;# real", &["# real"]),
+            ("cat <<EOF\r\nhello;#literal\r\nEOF\r\nprintf done;# real\r", &["# real\r"]),
             ("cat <<''\n# data\n\ntrue;# outside", &["# outside"]),
             ("cat <<< literal\ntrue;# outside", &["# outside"]),
             ("cat \\<< literal\ntrue;# outside", &["# outside"]),
@@ -1512,6 +1610,7 @@ mod tests {
             ("printf '%s' foo\\\n#literal\nprintf done;# real", &["# real"]),
             ("printf '%s' foo;\\\n# continued boundary", &["# continued boundary"]),
             ("echo 'a\n;# inside quote';# outside", &["# outside"]),
+            ("printf '%s' $'it\\'s #inside' # outside", &["# outside"]),
         ] {
             let mut highlighter = Highlighter::new("bash", true).unwrap();
             let mut comments = Vec::new();

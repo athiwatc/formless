@@ -1540,6 +1540,10 @@
     jsonc: "json", json5: "json", yaml: "config", yml: "config", toml: "config", ini: "conf", env: "config", dotenv: "config", properties: "conf",
     sqlite: "sql", postgres: "sql", postgresql: "sql", mysql: "sql", xml: "html", svg: "html", vue: "html", svelte: "html", scss: "css", less: "css",
   };
+  const SHELL_ANSI_ESCAPES = {
+    a: "\x07", b: "\b", e: "\x1b", E: "\x1b", f: "\f", n: "\n", r: "\r", t: "\t", v: "\v",
+    "\\": "\\", "'": "'", '"': '"', "?": "?",
+  };
   function shellCommentState(code, posix) {
     // Track shell words that can contain punctuation from command separators.
     const contexts = [];
@@ -1642,12 +1646,32 @@
       return (/\s/.test(previous) || separator) && !escaped(at - 1);
     };
     const endLine = (at, endedByComment) => {
+      if (code[at - 1] === "\r") at--;
       const continued = !endedByComment && escaped(at);
       lineBoundary = !continued || comment(at - 1);
       if (!continued) {
         if (context() === "regex" && !regexDepth) replace("condition");
         inHereDoc = hereDocIndex < hereDocs.length;
       }
+    };
+    const ansiEscape = (at) => {
+      const c = code[at];
+      if (!c || c === "\n" || c === "\r") return null;
+      if (Object.hasOwn(SHELL_ANSI_ESCAPES, c)) return [SHELL_ANSI_ESCAPES[c], at + 1];
+      if (c === "c") {
+        const control = code[at + 1];
+        if (!control || control === "\n" || control === "\r" || control.charCodeAt(0) > 127) return null;
+        return [String.fromCharCode(control.toUpperCase().charCodeAt(0) ^ 0x40), at + 2];
+      }
+      const octal = /[0-7]/.test(c);
+      const start = at + Number(!octal);
+      const size = ({ x: 2, u: 4, U: 8 })[c];
+      const digits = octal ? code.slice(start, start + 3).match(/^[0-7]+/) :
+        size ? code.slice(start, start + size).match(/^[0-9a-f]+/i) : null;
+      if (!digits) return ["\\", at];
+      const value = parseInt(digits[0], octal ? 8 : 16);
+      if (value > 0x10ffff || value >= 0xd800 && value <= 0xdfff) return null;
+      return [String.fromCodePoint(octal ? value % 256 : value), start + digits[0].length];
     };
     const hereDoc = (at) => {
       if (!posix || !["command", "case-body"].includes(context()) || escaped(at) ||
@@ -1659,35 +1683,55 @@
       while (code[end] === " " || code[end] === "\t") end++;
       const start = end;
       let quote = "", delimiter = "";
+      let quoted = false, ansiQuote = false;
       if (code[end] === "#") return at;
       while (end < code.length && code[end] !== "\n") {
         const c = code[end];
         if (!quote && /[\s;|&()<>]/.test(c)) break;
         end++;
-        if (quote === c) quote = "";
-        else if (!quote && "\"'".includes(c)) quote = c;
-        else if (c === "\\" && quote !== "'" && (!quote || /[\\"$`]/.test(code[end] ?? ""))) {
+        if (quote === c) {
+          quote = "";
+          ansiQuote = false;
+        } else if (!quote && c === "$" && code[end] === "'") {
+          quote = "'";
+          quoted = ansiQuote = true;
+          end++;
+        } else if (!quote && "\"'".includes(c)) {
+          quote = c;
+          quoted = true;
+        } else if (c === "\\" && ansiQuote) {
+          const escapedChar = ansiEscape(end);
+          if (!escapedChar) return at;
+          delimiter += escapedChar[0];
+          end = escapedChar[1];
+        } else if (c === "\\" && quote !== "'" && (!quote || /[\\"$`]/.test(code[end] ?? ""))) {
           if (end === code.length || code[end] === "\n") return at;
           delimiter += code[end++];
+          quoted = true;
         } else delimiter += c;
       }
       if (end === start || quote) return at;
-      hereDocs.push({ delimiter, stripTabs });
+      hereDocs.push({ delimiter, stripTabs, quoted, continued: "" });
       return end;
     };
     const literalLine = (at) => {
       if (!inHereDoc) return null;
       const next = code.indexOf("\n", at);
       const end = next < 0 ? code.length : next;
-      const { delimiter, stripTabs } = hereDocs[hereDocIndex];
-      const line = code.slice(at, end);
-      if ((stripTabs ? line.replace(/^\t+/, "") : line) === delimiter) {
+      const doc = hereDocs[hereDocIndex];
+      const contentEnd = end - Number(code[end - 1] === "\r");
+      if (!doc.quoted && escaped(contentEnd)) {
+        doc.continued += code.slice(at, contentEnd - 1);
+        return end;
+      }
+      const line = doc.continued + code.slice(at, contentEnd);
+      if ((doc.stripTabs ? line.replace(/^\t+/, "") : line) === doc.delimiter) {
         hereDocIndex++;
         if (hereDocIndex === hereDocs.length) {
           hereDocIndex = hereDocs.length = 0;
           inHereDoc = false;
         }
-      }
+      } else doc.continued = "";
       return end;
     };
     return { track, trackWord, comment, endLine, hereDoc, literalLine, escaped };
@@ -1787,7 +1831,9 @@
           code.startsWith(c.repeat(3), i);
         const delimiter = triple ? c.repeat(3) : c;
         const multiline = shell || triple || c === "`";
-        const escapes = !(L === HL.go && c === "`") && !(kotlin && triple) && !(shell && c === "'");
+        const ansiQuote = shell && c === "'" && code[i - 1] === "$" && !shell.escaped(i - 1);
+        const escapes = !(L === HL.go && c === "`") && !(kotlin && triple) &&
+          !(shell && lang !== "fish" && c === "'" && !ansiQuote);
         let j = i + delimiter.length;
         while (j < code.length && !code.startsWith(delimiter, j) && (code[j] !== "\n" || multiline)) {
           j += escapes && code[j] === "\\" ? 2 : 1;
