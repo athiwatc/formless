@@ -721,22 +721,42 @@ impl Highlighter {
             // `/https:\/\//` is not a comment (#877).
             if l.regex && c == '/' && !at(i, "//") && !at(i, "/*") {
                 let before = chars[..i].iter().rev().find(|c| !c.is_whitespace());
-                let prev_word: String = {
+                let (prev_word, before_word) = {
                     let end = chars[..i]
                         .iter()
                         .rposition(|c| !c.is_whitespace())
                         .map_or(0, |e| e + 1);
                     let start = chars[..end]
                         .iter()
-                        .rposition(|c| !(c.is_alphanumeric() || *c == '_'))
+                        .rposition(|c| !(c.is_alphanumeric() || "_$".contains(*c)))
                         .map_or(0, |s| s + 1);
-                    chars[start..end].iter().collect()
+                    let word: String = chars[start..end].iter().collect();
+                    let before = chars[..start].iter().copied().rfind(|c| !c.is_whitespace());
+                    (word, before)
                 };
-                let value_expected = before.is_none_or(|b| "=(,:[!&|?{};+-*%<>~^".contains(*b))
-                    || matches!(
+                // A property name after a dot or a private-name marker
+                // stays an operand even when it spells a keyword.
+                let after_keyword = !matches!(before_word, Some('.' | '#'))
+                    && matches!(
                         prev_word.as_str(),
-                        "return" | "typeof" | "case" | "in" | "of" | "yield"
+                        "await"
+                            | "case"
+                            | "delete"
+                            | "do"
+                            | "else"
+                            | "extends"
+                            | "in"
+                            | "instanceof"
+                            | "new"
+                            | "of"
+                            | "return"
+                            | "throw"
+                            | "typeof"
+                            | "void"
+                            | "yield"
                     );
+                let value_expected =
+                    before.is_none_or(|b| "=(,:[!&|?{};+-*%<>~^".contains(*b)) || after_keyword;
                 if value_expected {
                     let (mut j, mut class) = (i + 1, false);
                     let mut closed = None;
@@ -1203,6 +1223,54 @@ mod tests {
 
     /// Nested Rust comments, raw strings, JS regexes, YAML `;` and
     /// unknown languages (#877).
+    #[test]
+    fn js_regex_literals_after_expression_keywords_preserve_the_rest_of_the_line() {
+        let regex = r"/https:\/\//gi";
+        for keyword in [
+            "await",
+            "throw",
+            "void",
+            "else",
+            "delete",
+            "new",
+            "do",
+            "instanceof",
+            "extends",
+        ] {
+            let source = format!("{keyword} {regex}; next(); // outside");
+            let tokens = toks("js", &source);
+            assert!(
+                tokens.contains(&(regex.into(), Some(Color::Green))),
+                "{source}: {tokens:?}"
+            );
+            assert!(
+                tokens.contains(&("next".into(), Some(Color::Blue))),
+                "{source}: {tokens:?}"
+            );
+            let comments: Vec<_> = tokens
+                .iter()
+                .filter(|(_, color)| *color == Some(Color::DarkGray))
+                .map(|(text, _)| text.as_str())
+                .collect();
+            assert_eq!(comments, ["// outside"], "{source}");
+        }
+        for source in [
+            "throw value / 2 / 3",
+            "await value / 2 / 3",
+            "object.throw / 2 / 3",
+            "object?.await / 2 / 3",
+            "this.#delete / 2 / 3",
+            "$await / 2 / 3",
+            "f(awaited / 2 / 3)",
+        ] {
+            let tokens = toks("js", source);
+            assert!(
+                tokens.iter().all(|(_, color)| *color != Some(Color::Green)),
+                "{source}: {tokens:?}"
+            );
+        }
+    }
+
     #[test]
     fn traps_that_used_to_mis_colour() {
         let t = toks("rust", "/* a /* b */ still comment */ let x = 1;");
