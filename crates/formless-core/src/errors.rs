@@ -121,15 +121,45 @@ fn retry_after(raw: &str) -> Option<u64> {
 pub fn explain(raw: &str, ctx: &ErrorContext) -> ErrorExplained {
     let t = raw.to_lowercase();
     let code = status(raw);
-    let host = ctx
-        .base_url
-        .split("://")
-        .nth(1)
-        .unwrap_or(ctx.base_url)
-        .split('/')
-        .next()
-        .unwrap_or_default();
-    let parsed_url = reqwest::Url::parse(ctx.base_url).ok();
+    let parsed_url = reqwest::Url::parse(ctx.base_url)
+        .ok()
+        .filter(|url| matches!(url.scheme(), "http" | "https") && url.has_host());
+    let host = parsed_url
+        .as_ref()
+        .and_then(|url| {
+            let host = url.host_str()?;
+            Some(match url.port() {
+                Some(port) => format!("{host}:{port}"),
+                None => host.to_string(),
+            })
+        })
+        .unwrap_or_else(|| "the configured endpoint".to_string());
+    let display_endpoint = || match parsed_url.as_ref() {
+        Some(_) => crate::rate_limits::display_endpoint(ctx.base_url),
+        None => "(invalid endpoint)".to_string(),
+    };
+    // Keep the existing diagnostic text while masking echoes of the
+    // configured URL and its normalized spelling when they carry credentials.
+    let private_endpoint = parsed_url.as_ref().is_none_or(|url| {
+        !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+    });
+    let details = if private_endpoint && !ctx.base_url.is_empty() {
+        let endpoint = display_endpoint();
+        let details = raw.replace(ctx.base_url, &endpoint);
+        if let Some(url) = parsed_url
+            .as_ref()
+            .filter(|url| url.as_str() != ctx.base_url)
+        {
+            details.replace(url.as_str(), &endpoint)
+        } else {
+            details
+        }
+    } else {
+        raw.to_string()
+    };
     let local = parsed_url
         .as_ref()
         .and_then(|url| url.host_str())
@@ -143,7 +173,7 @@ pub fn explain(raw: &str, ctx: &ErrorContext) -> ErrorExplained {
     } else if t.starts_with("budget:") {
         (
             "budget",
-            raw.trim_start_matches("budget:").trim().to_string(),
+            details.trim_start_matches("budget:").trim().to_string(),
             Some(
                 "Resume to continue past it this once, or raise the limit in Settings (limits.*)"
                     .to_string(),
@@ -244,7 +274,7 @@ pub fn explain(raw: &str, ctx: &ErrorContext) -> ErrorExplained {
         };
         (
             "unreachable",
-            format!("Can't reach {}.", ctx.base_url),
+            format!("Can't reach {}.", display_endpoint()),
             Some(hint.to_string()),
         )
     } else if code.is_some_and(|c| c >= 500) {
@@ -276,7 +306,7 @@ pub fn explain(raw: &str, ctx: &ErrorContext) -> ErrorExplained {
         category: category.into(),
         message,
         action,
-        details: raw.to_string(),
+        details,
     }
 }
 
@@ -323,6 +353,53 @@ mod tests {
             model: "gpt-x",
             alternatives: vec![],
         }
+    }
+
+    #[test]
+    fn error_explanations_name_endpoints_without_url_credentials() {
+        let base = "https://fixture-user:fixture-pass@example.test:9443/v1?api_key=fixture-query#fixture-fragment";
+        for (raw, category, message) in [
+            (
+                "401 Unauthorized",
+                "auth",
+                "The API key was rejected by example.test:9443.",
+            ),
+            (
+                "429 Too Many Requests",
+                "rate_limit",
+                "example.test:9443 is rate limiting or out of quota.",
+            ),
+            (
+                "503 Service Unavailable",
+                "server",
+                "example.test:9443 had a server error.",
+            ),
+            (
+                "connection refused",
+                "unreachable",
+                "Can't reach https://example.test:9443/v1.",
+            ),
+        ] {
+            let detail = format!("{raw}\nEndpoint {base}");
+            let explained = explain(&detail, &ctx(base));
+            assert_eq!(explained.category, category);
+            assert_eq!(explained.message, message);
+            assert_eq!(
+                explained.details,
+                format!("{raw}\nEndpoint https://example.test:9443/v1")
+            );
+        }
+        let local = explain(
+            "connection refused",
+            &ctx("http://fixture-user:fixture-pass@localhost:11434/v1?key=fixture-query"),
+        );
+        assert_eq!(local.message, "Can't reach http://localhost:11434/v1.");
+        assert!(local.action.unwrap().contains("ollama serve"));
+        let invalid = explain(
+            "connection refused",
+            &ctx("not an endpoint?key=fixture-query"),
+        );
+        assert_eq!(invalid.message, "Can't reach (invalid endpoint).");
     }
 
     #[test]
