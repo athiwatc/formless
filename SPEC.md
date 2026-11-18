@@ -5075,6 +5075,12 @@ undo, redo and replacements invalidate prior asynchronous editor previews.
     uses the browser Notification API, asked for on the first message
     you send;
   - `off` does nothing.
+  In tmux, enable `set -g focus-events on` so the TUI receives focus
+  reports from a compatible outer terminal. For the desktop escape
+  sequence, also enable `set -g allow-passthrough on` on tmux versions
+  with that option. The `on` setting forwards sequences from visible
+  panes. Reattach tmux clients after changing focus reporting.
+
   The web tab title also counts unseen alerts (`(2) Formless`) until you
   come back. Interrupted Runs never notify.
 
