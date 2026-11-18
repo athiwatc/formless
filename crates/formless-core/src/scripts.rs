@@ -93,7 +93,7 @@ fn shape(chars: &[char], i: &mut usize, out: &mut String, nested: bool) -> Optio
     while *i < chars.len() {
         let c = chars[*i];
         let next = chars.get(*i + 1).copied();
-        if c.is_whitespace() {
+        if js_space(c) {
             // Keep one separator between words so `a b` and `ab` differ.
             if out.chars().last().is_some_and(js_word_char) && next.is_some_and(js_word_char) {
                 out.push(' ');
@@ -181,8 +181,12 @@ fn js_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_' || c == '$'
 }
 
+fn js_space(c: char) -> bool {
+    c.is_whitespace() || c == '\u{feff}'
+}
+
 fn js_word_boundary(c: char) -> bool {
-    c.is_whitespace() || c.is_ascii_punctuation() && !js_word_char(c)
+    js_space(c) || c.is_ascii_punctuation() && !js_word_char(c)
 }
 
 fn digits_end(chars: &[char], mut end: usize, radix: u32) -> usize {
@@ -278,7 +282,7 @@ fn regex_allowed(out: &str) -> bool {
     let prefix = out.trim_end_matches(js_word_char);
     let word = &out[prefix.len()..];
     let boundary = prefix.chars().last().is_none_or(js_word_boundary);
-    let prefix = prefix.trim_end();
+    let prefix = prefix.trim_end_matches(js_space);
     let member = prefix.ends_with('#') || prefix.ends_with('.') && !prefix.ends_with("...");
     boundary
         && !member
@@ -406,6 +410,8 @@ mod tests {
             assert_ne!(fingerprint(a), fingerprint(b), "{a}");
         }
         let normal = fingerprint("return 42;");
+        assert_eq!(fingerprint("return\u{feff}1;"), normal);
+        assert_eq!(fingerprint("return\u{feff}2;"), normal);
         for value in [
             ".5",
             "1.",
