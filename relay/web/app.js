@@ -754,16 +754,15 @@
     $("menu-btn").classList.toggle("hidden", S.view !== "chat");
     syncSidebar();
     const conn = $("conn");
-    conn.title = "";
-    conn.onclick = null;
+    const retry = $("conn-retry");
+    if (!S.reconnect && document.activeElement === retry) focusReturn($("notes-btn"));
+    retry.hidden = !S.reconnect;
     const localConnected = S.local && S.ws?.readyState === 1 && S.daemonOnline;
     if (S.reconnect) {
       // Visible backoff with a manual retry (SPEC §12).
       const secs = Math.max(0, Math.ceil((S.reconnect.at - Date.now()) / 1000));
-      conn.className = "pill off clickable";
+      conn.className = "pill off";
       conn.textContent = (S.local ? "daemon" : "relay") + " offline · retry in " + secs + "s";
-      conn.title = "Retry now";
-      conn.onclick = retryNow;
     } else if (!navigator.onLine && !localConnected) {
       conn.className = "pill off";
       conn.textContent = "offline · daemon unreachable";
@@ -3785,9 +3784,12 @@
     // Context fill (SPEC §10.6): amber above 70%, red above 90%.
     const fill = S.contextFill && S.contextFill[S.current];
     const pct = fill && fill.size > 0 && fill.used > 0 ? Math.floor(fill.used * 100 / fill.size) : null;
-    $("status-context").classList.toggle("hidden", pct == null);
-    $("status-context").textContent = pct == null ? "" : " │ ctx " + pct + "%";
-    $("status-context").className = "clickable " + (pct >= 90 ? "err" : pct >= 70 ? "warn" : "muted") + (pct == null ? " hidden" : "");
+    const contextButton = $("status-context");
+    if (pct == null && document.activeElement === contextButton) focusReturn(modelButton);
+    contextButton.hidden = pct == null;
+    contextButton.textContent = pct == null ? "" : " │ ctx " + pct + "%";
+    contextButton.setAttribute("aria-label", pct == null ? "Context window" : "Context window (" + pct + "% used)");
+    contextButton.className = "linkish " + (pct >= 90 ? "err" : pct >= 70 ? "warn" : "muted");
     const waiting = S.approvals.length;
     const asking = S.pendingQuestion && !S.questionOpen ? 1 : 0;
     $("status-approvals").classList.toggle("hidden", !waiting && !asking);
@@ -4286,6 +4288,7 @@
   }
   $("status-model").onclick = () => openModelPicker();
   $("status-context").onclick = () => showContext();
+  $("conn-retry").onclick = () => retryNow();
   for (const id of ["tools-filter", "tools-sort", "tools-quick"]) $(id).addEventListener("input", () => renderTools());
   // The Sort menu picks a column in its natural order.
   $("tools-sort").addEventListener("input", () => { S.toolSort = { key: $("tools-sort").value, reverse: false }; renderTools(); });
@@ -7604,23 +7607,26 @@
     };
   }
 
-  // Reconnect after S.backoff, visibly: the pill counts down and a tap
-  // retries at once.
+  // Reconnect after S.backoff, with a countdown and a manual retry.
   function scheduleReconnect(fn) {
     clearTimeout(S.reconnect && S.reconnect.timer);
     // Full jitter, so tabs that lost the relay together don't return in waves.
     const delay = 250 + Math.floor(Math.random() * (S.backoff - 250));
-    S.reconnect = { at: Date.now() + delay, fn, timer: setTimeout(() => { S.reconnect = null; fn(); }, delay) };
+    S.reconnect = { at: Date.now() + delay, fn, timer: setTimeout(retryNow, delay) };
     S.backoff = Math.min(S.backoff * 2, 15000);
     renderChrome();
   }
   function retryNow() {
     if (!S.reconnect) return;
     const fn = S.reconnect.fn;
+    cancelReconnect();
+    fn();
+  }
+  function cancelReconnect() {
+    if (!S.reconnect) return;
     clearTimeout(S.reconnect.timer);
     S.reconnect = null;
     renderChrome();
-    fn();
   }
   setInterval(() => { if (S.reconnect) renderChrome(); }, 1000);
   // A heartbeat, so the daemon can tell a vanished browser from an idle
@@ -7636,8 +7642,7 @@
     if (S.forgetting) return;
     S.forgetting = true;
     S.userClosed = true;
-    clearTimeout(S.reconnect?.timer);
-    S.reconnect = null;
+    cancelReconnect();
     try { sessionStorage.removeItem("formless_secret"); } catch (_) {}
     let warning = "";
     try {
@@ -7955,10 +7960,9 @@
     if (!document.querySelector('meta[name="formless-local"]') || !frag.local) return;
     S.linkedSession = frag.s || null;
     const token = frag.local;
-    clearTimeout(S.reconnect && S.reconnect.timer);
-    S.reconnect = null;
     const old = S.ws;
     S.ws = null;
+    cancelReconnect();
     if (old) old.close();
     connectLocal(token);
   });
