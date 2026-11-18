@@ -126,8 +126,8 @@ reference in your configuration and run
 `docker compose pull && docker compose stop`. Verify the same volume
 backups while the containers are stopped, then run `docker compose up -d`.
 
-Upgrade the image itself. The container's daemon user cannot replace the
-binary installed under `/usr/local/bin` using `formless update`.
+Replace the image to upgrade. `formless update` reports the available
+version and suggests commands for a host installation.
 
 To roll back, recreate the container using your previous image tag or
 digest. Check the release notes for data format compatibility before
@@ -159,8 +159,9 @@ in the daemon log and in `formless doctor`, which also says where the key
 comes from (env, file, fallback file or keychain) without showing it. A
 leading BOM and surrounding whitespace are ignored.
 
-There is no keychain in the container; the key is never written to the
-volumes.
+A key supplied through the read-only mount stays in that file. Protect
+`/config` backups, which can contain the relay pairing secret and key files
+created by Formless setup.
 
 ## Using it from a browser
 
