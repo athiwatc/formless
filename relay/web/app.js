@@ -5180,19 +5180,27 @@
     return Uint8Array.from(b, (c) => c.charCodeAt(0));
   }
   async function pushOn() {
+    if (S.forgetting || S.pushRemoval || S.pushEnabling) return;
+    S.pushEnabling = true;
     try {
       const r = await fetch("push/key");
       if (!r.ok) return toast("This relay hasn't set up notifications.", true);
       const { key } = await r.json();
       if ((await Notification.requestPermission()) !== "granted") return toast("Notifications are blocked for this site.", true);
       const reg = await navigator.serviceWorker.ready;
-      const sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64uToBytes(key) });
+      if (S.forgetting || S.pushRemoval) return;
+      S.pushSubscribe = reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64uToBytes(key) });
+      const sub = await S.pushSubscribe;
+      if (S.forgetting || S.pushRemoval) return;
       S.ws.send(JSON.stringify({ relay: "push_subscribe", sub: sub.toJSON() }));
       note("This device gets a notification when an approval or question waits.");
     } catch (e) {
       toast("Couldn't turn on notifications: " + e.message, true);
+    } finally {
+      S.pushSubscribe = null;
+      S.pushEnabling = false;
+      if (!S.forgetting) renderView();
     }
-    renderView();
   }
   /** Re-register only an existing opt-in after an authenticated connection.
    * Room-v3 migration never copies subscriptions from an unverified old room. */
@@ -5202,20 +5210,78 @@
     try {
       const reg = await navigator.serviceWorker.getRegistration();
       const sub = reg && await reg.pushManager.getSubscription();
-      if (sub && S.ws === ws && S.room === room && S.channel && S.daemonOnline && ws.readyState === 1) {
+      if (sub && !S.forgetting && !S.pushRemoval && S.ws === ws && S.room === room && S.channel && S.daemonOnline && ws.readyState === 1) {
         ws.send(JSON.stringify({ relay: "push_subscribe", sub: sub.toJSON() }));
       }
     } catch (_) { /* No permission request or automatic new subscription. */ }
   }
-  async function pushOff(sub) {
+  const PUSH_CLEANUP_MS = 1500;
+  async function boundedPushCleanup(promise) {
+    let timer;
     try {
-      if (S.ws) S.ws.send(JSON.stringify({ relay: "push_unsubscribe", endpoint: sub.endpoint }));
-      await sub.unsubscribe();
-      note("Notifications are off on this device.");
-    } catch (e) {
-      toast(e.message, true);
+      return await Promise.race([promise, new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error("Notification cleanup timed out")), PUSH_CLEANUP_MS);
+      })]);
+    } finally { clearTimeout(timer); }
+  }
+  function removeRelayPush(endpoint) {
+    const ws = S.ws;
+    if (!S.relayReady || ws?.readyState !== 1) return Promise.resolve(false);
+    return new Promise((resolve) => {
+      const id = crypto.randomUUID();
+      const done = (confirmed) => {
+        clearTimeout(timer);
+        ws.removeEventListener("close", closed);
+        S.pushRemovalAck = null;
+        resolve(confirmed);
+      };
+      const closed = () => done(false);
+      const timer = setTimeout(closed, PUSH_CLEANUP_MS);
+      S.pushRemovalAck = (socket, ack) => { if (ws === socket && ack === id) done(true); };
+      ws.addEventListener("close", closed, { once: true });
+      try { ws.send(JSON.stringify({ relay: "push_unsubscribe", endpoint, id })); }
+      catch (_) { closed(); }
+    });
+  }
+  async function browserPushSubscription() {
+    if (!("serviceWorker" in navigator)) return null;
+    const reg = await navigator.serviceWorker.getRegistration();
+    return reg?.pushManager ? reg.pushManager.getSubscription() : null;
+  }
+  function removePushSubscription(knownSub) {
+    if (S.pushRemoval) return S.pushRemoval;
+    S.pushRemoval = (async () => {
+      let sub = knownSub;
+      try {
+        if (!sub) {
+          if (S.pushSubscribe) sub = await boundedPushCleanup(S.pushSubscribe.catch(() => null));
+          sub ||= await boundedPushCleanup(browserPushSubscription());
+        }
+      } catch (_) {
+        return "Could not check this browser's notification subscription or confirm its removal.";
+      }
+      if (!sub) return "";
+      const [remote, local] = await Promise.all([
+        removeRelayPush(sub.endpoint).catch(() => false),
+        boundedPushCleanup((async () => {
+          if (await sub.unsubscribe()) return true;
+          return (await browserPushSubscription())?.endpoint !== sub.endpoint;
+        })()).catch(() => false),
+      ]);
+      return [
+        !local && "Could not confirm that notifications are off in this browser. Check this site's notification permissions.",
+        !remote && "The relay did not confirm removal of the notification subscription.",
+      ].filter(Boolean).join(" ");
+    })().finally(() => { S.pushRemoval = null; });
+    return S.pushRemoval;
+  }
+  async function pushOff(sub) {
+    const warning = await removePushSubscription(sub);
+    if (!S.forgetting) {
+      if (warning) { toast(warning, true); note(warning, true); }
+      else note("Notifications are off on this device.");
+      renderView();
     }
-    renderView();
   }
 
   // ============================================================ actions
@@ -5337,7 +5403,12 @@
         h("td", { class: "muted" }, "since " + relTime(c.first_seen) + " · active " + relTime(c.last_seen)),
         h("td", null, h("button", { class: "btn small danger", type: "button", onclick: async () => {
           if (!(await ask({ title: "Disconnect this browser?", text: "It can reconnect with the pairing link. To revoke access for good, run formless relay enable --rotate.", ok: "Disconnect", danger: true }))) return;
-          if (await act({ type: "disconnect_relay_client", cid: c.cid }, "Disconnected")) refreshSettings();
+          const result = await act({ type: "disconnect_relay_client", cid: c.cid });
+          if (!result) return;
+          if (result.disconnected === true) toast("Disconnected");
+          else if (result.disconnected === false) toast("That browser is already disconnected.");
+          else toast("The daemon did not confirm disconnection.", true);
+          refreshSettings();
         } }, "Disconnect"))))))
         : h("p", { class: "muted" }, "No browsers on the relay right now."));
   }
@@ -7174,7 +7245,8 @@
             control: async (text) => {
               const value = JSON.parse(text);
               if (value.relay === "transport") return;
-              if (value.relay === "push_subscribed" || value.relay === "push_unsubscribed") return;
+              if (value.relay === "push_subscribed") return;
+              if (value.relay === "push_unsubscribed") { S.pushRemovalAck?.(ws, value.id); return; }
               if (value.relay === "ready") {
                 if (value.g !== packet.g) throw new Error("stale room readiness");
                 S.relayRoomReady = true;
@@ -7380,12 +7452,26 @@
     $("pair").classList.remove("hidden");
     $("secret").focus();
   }
-  function forget() {
+  async function forget() {
+    if (S.forgetting) return;
+    S.forgetting = true;
     S.userClosed = true;
+    clearTimeout(S.reconnect?.timer);
+    S.reconnect = null;
     try { sessionStorage.removeItem("formless_secret"); } catch (_) {}
+    let warning = "";
+    try {
+      if (!S.local) {
+        toast("Turning off notifications and forgetting this device…");
+        warning = await removePushSubscription();
+      }
+    } catch (_) {
+      warning = "Could not confirm removal of this browser's notification subscription.";
+    }
     if (S.ws) S.ws.close();
     S.ws = null;
-    history.replaceState(null, "", location.pathname);
+    // Carry only cleanup feedback across the reload that discards the page's state.
+    history.replaceState(warning ? { forgetWarning: warning } : null, "", location.pathname);
     location.reload();
   }
 
@@ -7698,6 +7784,10 @@
   });
 
   (function init() {
+    if (history.state?.forgetWarning) {
+      $("pair-error").textContent = history.state.forgetWarning;
+      history.replaceState(null, "", location.pathname);
+    }
     const frag = hashParams();
     if (frag.malformed) {
       history.replaceState(null, "", location.pathname);

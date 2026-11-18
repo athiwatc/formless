@@ -15,7 +15,7 @@
 // broadcast fallback is admitted; matching endpoint versions are required.
 //
 // Web Push (opt-in): a browser sends {"relay":"push_subscribe","sub"} or
-// {"relay":"push_unsubscribe","endpoint"} in the clear (a subscription is
+// {"relay":"push_unsubscribe","endpoint","id"?} in the clear (a subscription is
 // not Session data); the room keeps them. The daemon sends {"relay":"push"}
 // when an approval or question waits, and the room sends each subscription
 // a payload-free VAPID push (push.mjs).
@@ -277,7 +277,12 @@ export class RelayRoom {
       }
       if(att.role==="client"&&current?.ready&&packet?.relay==="push_unsubscribe"&&typeof packet.endpoint==="string"){
         wireBytes(packet.endpoint,LIMITS.preReady);
-        return await this.boundedPush(n.sid,async()=>{await this.state.storage.delete(await this.subKey(packet.endpoint));this.sendControl(ws,{relay:"push_unsubscribed"});});
+        const id=packet.id;
+        if(id!==undefined&&(typeof id!=="string"||!/^[a-f0-9-]{36}$/.test(id)))throw new TransportError("invalid push request id");
+        return await this.boundedPush(n.sid,async()=>{
+          await this.state.storage.delete(await this.subKey(packet.endpoint));
+          this.sendControl(ws,{relay:"push_unsubscribed",id});
+        });
       }
       const p=peers.find(p=>p.cid===cid);if(!p||p.ready)throw new TransportError("unexpected unready control");
       if(att.role==="daemon"&&packet.g!==p.g)throw new TransportError("stale handshake generation");
