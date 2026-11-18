@@ -105,6 +105,8 @@ without redesign.
 | Daemon Core | Long-lived process owning loop, Tools, Sessions, state. |
 | Relay | Hosted encrypted intermediary for the Web frontend (v2, §12). |
 
+<a id="4-provider-v1-openai-compatible-only"></a>
+
 ## 4. Provider
 
 ### 4.1 Scope
@@ -269,7 +271,7 @@ without redesign.
   automatic compaction is audited with it (`compaction.window`).
 - An assistant turn's text before its tool calls (a preamble such as
   "Let me check the file first") is kept in the history sent back to the
-  model, on both API styles.
+  model across all three API styles.
 - Tool arguments the model sends as JSON-encoded strings where the
   schema expects an object or array (some models do this for nested
   values) are parsed before validation, for built-ins and registry Tools
