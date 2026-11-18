@@ -45,6 +45,9 @@ test('search retains original accent and case in NFC and decomposed snippets', (
   assert.deepEqual(renderSnippet('cafe\u0301 cafe', 'cafe'), ['cafe\u0301']);
   assert.deepEqual(renderSnippet('🚀 İ was in İstanbul; later in Zürich', 'istanbul zurich'), ['İstanbul', 'Zürich']);
   assert.deepEqual(renderSnippet('각, 가', '가'), ['가']);
+  assert.deepEqual(renderSnippet('αγάπη αγαπη', 'αγαπη'), ['αγαπη']);
+  assert.deepEqual(renderSnippet('foo\u034fbar', 'bar'), ['bar']);
+  assert.deepEqual(renderSnippet('foo\u0301bar', 'bar'), []);
 });
 
 test('punctuation-only queries retain literal matching and plain-text markup', () => {

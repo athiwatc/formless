@@ -1367,7 +1367,7 @@
       hits.length + " hit" + (hits.length === 1 ? "" : "s") + " for “" + query + "”"));
     const literal = query.trim();
     const words = literal.match(/[\p{Alphabetic}\p{Number}]+/gu);
-    const terms = words && new Set(words.map((word) => foldMap(word, Infinity).folded).filter(Boolean));
+    const terms = words && new Set(words.map((word) => foldMap(word, foldSearchCharacter).folded).filter(Boolean));
     for (const hit of hits) {
       const snippet = h("div");
       const text = hit.snippet || "";
@@ -1386,13 +1386,21 @@
     }
   }
 
+  function foldSearchCharacter(ch) {
+    // Standalone combining characters that unicode61 treats as diacritics.
+    if (/[\u0300-\u0304\u0306-\u030c\u030f\u0311\u031b\u0323-\u0328\u032d-\u032e\u0330-\u0331]/u.test(ch)) return "";
+    const base = ch.normalize("NFD").replace(/\p{M}/gu, "");
+    // unicode61's precomposed diacritic table folds to ASCII Latin.
+    return (/^[A-Za-z]$/.test(base) ? base : ch).toLowerCase();
+  }
+
   function searchHighlightRanges(text, literal, terms) {
     if (!terms) {
       // The daemon searches literally when the query has no word terms.
       const start = literal ? text.indexOf(literal) : -1;
       return start < 0 ? [] : [[start, start + literal.length]];
     }
-    const { folded, from } = foldMap(text, Infinity);
+    const { folded, from } = foldMap(text, foldSearchCharacter);
     const remaining = new Set(terms);
     const spans = [];
     // Approximate unicode61's boundaries, highlighting the first visible
@@ -5121,14 +5129,14 @@
   /** `text` folded for matching with, per folded UTF-16 unit, the offset
    * of the original character it came from (#789): decomposed, marks
    * dropped, lower-cased one character at a time, so `İ` stays one
-   * letter and NFC/NFD spellings match each other. Settings uses the
-   * two-unit limit. Session search retains complete expansions. */
-  function foldMap(text, unitsPerCharacter = 2) {
+   * letter and NFC/NFD spellings match each other. The default is the
+   * Settings fold. Session search supplies its own tokenizer fold. */
+  function foldMap(text, foldCharacter = (ch) => ch.normalize("NFD").replace(/\p{M}/gu, "").toLowerCase().slice(0, 2)) {
     let folded = "";
     const from = [];
     let at = 0;
     for (const ch of text) {
-      const f = ch.normalize("NFD").replace(/\p{M}/gu, "").toLowerCase().slice(0, unitsPerCharacter);
+      const f = foldCharacter(ch);
       for (let k = 0; k < f.length; k++) from.push(at);
       folded += f;
       at += ch.length;
