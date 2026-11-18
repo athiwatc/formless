@@ -2169,7 +2169,7 @@ pattern (§4.4).
     `fetchChunks(url, opts, size, cb)` (a truly streamed body in bounded
     memory) require `net`. They support HTTP(S) and check the scope on each
     redirect. The configured connection and total deadlines apply to both
-    APIs, with one total budget for redirects and body reads (§16).
+    APIs, with one total budget for redirects and body reads (§13).
   - **Native caps (#604).** Outside the JS heap limit, whole-value reads
     stop at `tools.max_read_bytes` (`fs.read`: checked before reading;
     `fetch`: by `Content-Length` and while reading), process output at
@@ -2258,16 +2258,18 @@ pattern (§4.4).
   - `clipboard.read()` and `clipboard.write(text)` require `clipboard:read`
     and `clipboard:write` respectively. `notify(title, body)` and its alias
     `notifications.send(title, body)` require `notify` (§7.4).
-  - `harness.read()` requires `harness:read`. `harness.call(op, args, reason)`
-    requires the applicable `harness:<scope>` and uses the approval flow in
-    §7.13.
+  - `harness.read()` and `harness.call("read", {}, "")` require `harness:read`.
+    Mutations through `harness.call(op, args, reason)` require the applicable
+    `harness:<scope>` and follow the approval flow in §7.13.
   - `llm.complete(prompt, {system, model, role, schema})` uses the `llm`
     Capability. It makes a non-streaming completion and returns text by
     default or a validated JSON value with `schema` (§4.2). `agents.run(task,
     {system, model, role})` uses `agent` and returns the sub-agent's final text
     (§7.6). In both calls a nonempty `role` takes precedence over `model`.
     A Role selects its configured provider and model. An explicit model or
-    Role must fit any scope on the Capability (§7.4).
+    Role must fit any scope on the Capability (§7.4). When both options are
+    omitted, the first entry of a scoped grant is used. An unscoped grant
+    inherits the Session's selection.
   - `requireModule(name)` and its alias `modules.load(name)` load shared
     JavaScript modules. `modules.list()` lists names available to the
     Invocation. These helpers use the supplied module registry (§7.6) and
@@ -2321,8 +2323,8 @@ pattern (§4.4).
 
 - A Tool may invoke other Tools via `tools.call`. Nested Invocations are
   recorded and measured like top-level ones. Composition cannot launder
-  permissions: the called Tool runs under **its own** declared Capabilities
-  and the outer Tool's Capabilities also apply. Nesting depth is bounded by
+  permissions. Each Tool runs under its own declared Capabilities and the
+  called Tool goes through its own approval checks. Nesting depth is bounded by
   the sandbox implementation (cycle-safe), faults tagged as Invocation
   failures.
 - Shared JS modules (v2): `create_module` stores versioned, immutable
