@@ -86,7 +86,7 @@ mod history_match;
 fn is_word(g: &str) -> bool {
     g.chars()
         .next()
-        .is_some_and(|c| c.is_alphanumeric() || c == '_')
+        .is_some_and(|c| c.is_alphanumeric() || c == '_' || text::unspaced_symbol(c))
 }
 
 fn unspaced(g: &str) -> bool {
@@ -1585,7 +1585,10 @@ mod tests {
             ("\u{3105}", "\u{3106}"),
             ("\u{31f0}", "\u{31f1}"),
             ("\u{1980}", "\u{1981}"),
+            ("\u{19e0}", "\u{19e1}"),
             ("\u{1a20}", "\u{1a21}"),
+            ("\u{3190}", "\u{3191}"),
+            ("\u{31c0}", "\u{31c1}"),
             ("\u{aa80}", "\u{aa81}"),
         ] {
             let source = format!("{first}{second}");
@@ -1605,6 +1608,9 @@ mod tests {
         assert_eq!(hangul.cursor_byte(), 0);
         hangul.word_right();
         assert_eq!(hangul.cursor_byte(), "ㄱㄴ".len());
+        let mut punctuation = InputLine::from("hello 世界。");
+        punctuation.delete_word_back();
+        assert_eq!(&*punctuation, "hello 世");
     }
     #[test]
     fn command_intent_is_part_of_undo_redo_and_transcript_history_snapshots() {
