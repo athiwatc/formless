@@ -11762,7 +11762,7 @@ impl RenderedRollback {
                 .collect::<String>()
                 == text
         };
-        matches(self.selected_row, &format!("› v{}", self.version))
+        matches(self.selected_row, &format!("› v{} ", self.version))
             && matches(self.hint_row, self.hint)
     }
 }
@@ -11778,7 +11778,7 @@ fn draw_rollback_picker(f: &mut Frame, app: &App, pick: &RollbackPick) -> Option
     let count = d.versions.len();
     let selected = pick.idx.min(count.saturating_sub(1));
     let selected_version = d.versions.get(selected);
-    let selected_width = selected_version.map_or(0, |v| 3 + v.version.to_string().len());
+    let selected_width = selected_version.map_or(0, |v| 4 + v.version.to_string().len());
     if area.height < 4 || inner_width < 12.max(selected_width) {
         app.rollback_page_rows.set(1);
         let message = if d.versions.is_empty() {
@@ -19225,7 +19225,6 @@ pub fn run_with(paths: Paths, start: Option<&str>) -> Result<()> {
                     CtEvent::FocusGained => app.focused = true,
                     CtEvent::FocusLost => app.focused = false,
                     CtEvent::Resize(_, _) => app.invalidate_rollback_viewport(),
-                    _ => {}
                 }
                 wait = Duration::ZERO;
                 if started.elapsed() > Duration::from_millis(100) {
