@@ -996,7 +996,8 @@
     withTranscriptLayout(() => {
       root.setAttribute("data-visual-viewport", "");
       root.toggleAttribute("data-viewport-zoomed", zoomed);
-      root.toggleAttribute("data-viewport-short", viewport.height < fontSize * 24);
+      const keyboardShrankViewport = !zoomed && viewport.height < root.clientHeight - fontSize * 3;
+      root.toggleAttribute("data-viewport-short", viewport.height < fontSize * 28 || keyboardShrankViewport);
       root.toggleAttribute("data-viewport-composing", composing);
       viewportVariable("--visual-left", viewport.left);
       viewportVariable("--visual-top", viewport.top);

@@ -18,8 +18,9 @@ import pathlib
 import threading
 from playwright.sync_api import sync_playwright
 
+from browser_fixture import artifact_dir, chromium_executable
+
 ROOT=pathlib.Path(__file__).resolve().parent
-os.environ.setdefault('PLAYWRIGHT_BROWSERS_PATH','/workspace/.formless-browsers')
 PASSES=0
 
 
@@ -427,8 +428,7 @@ def geometry_checks(page,name,out,context):
 
 def run_engine(p,name,url,out):
     start=PASSES;reports=[]
-    chromium_path=os.environ.get('FORMLESS_CHROMIUM_EXECUTABLE') or ('/usr/bin/chromium' if pathlib.Path('/usr/bin/chromium').is_file() else None)
-    browser=p.chromium.launch(executable_path=chromium_path,headless=True,args=['--no-sandbox']) if name=='chromium' else p.webkit.launch(headless=True)
+    browser=p.chromium.launch(executable_path=chromium_executable(p),headless=True,args=['--no-sandbox']) if name=='chromium' else p.webkit.launch(headless=True)
     for coarse in [True,False]:
         context=browser.new_context(viewport={'width':390,'height':844} if coarse else {'width':1280,'height':900},is_mobile=coarse,has_touch=coarse,reduced_motion='reduce',service_workers='block')
         context.add_init_script(INIT);context.route('**/app.js',expose_script)
@@ -451,7 +451,7 @@ def run_engine(p,name,url,out):
 
 
 def run():
-    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('artifacts',nargs='?',default='/tmp/formless-815-browser');parser.add_argument('--browser',choices=['all','chromium','webkit'],default='all')
+    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('artifacts',nargs='?',default=artifact_dir('/tmp/formless-815-browser'));parser.add_argument('--browser',choices=['all','chromium','webkit'],default=os.environ.get('FORMLESS_BROWSER_TEST_ENGINE','all'))
     args=parser.parse_args();out=pathlib.Path(args.artifacts);out.mkdir(parents=True,exist_ok=True)
     server=http.server.ThreadingHTTPServer(('127.0.0.1',0),functools.partial(QuietHandler,directory=str(ROOT/'web')));threading.Thread(target=server.serve_forever,daemon=True).start();reports=[]
     try:

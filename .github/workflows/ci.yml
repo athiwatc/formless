@@ -122,6 +122,32 @@ jobs:
       - name: Relay and web regression tests
         run: node --test relay/*.test.mjs 2>&1 | tee "$CI_DIR/logs/relay.log"
 
+      - name: Relay test inventory
+        run: python3 -B relay/browser_suite.py --check-inventory
+
+      - name: Relay Chromium and loopback push regression tests
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          if ! command -v pdftoppm >/dev/null || ! command -v pdftotext >/dev/null; then
+            echo 'The Linux browser checks require Poppler tools (pdftoppm and pdftotext).' >&2
+            exit 1
+          fi
+          python3 -m venv "$CI_DIR/browser-python"
+          python="$CI_DIR/browser-python/bin/python"
+          export PLAYWRIGHT_BROWSERS_PATH="$CI_DIR/browser-engines"
+          "$python" -m pip install --disable-pip-version-check --no-cache-dir 'playwright==1.62.0'
+          "$python" -m playwright install chromium --no-shell --no-progress
+          FORMLESS_CHROMIUM_EXECUTABLE=$("$python" -c 'from playwright.sync_api import sync_playwright; p = sync_playwright().start(); print(p.chromium.executable_path); p.stop()')
+          export FORMLESS_CHROMIUM_EXECUTABLE
+          "$FORMLESS_CHROMIUM_EXECUTABLE" --version
+          settings_fixture="$CI_DIR/browser-settings.json"
+          FORMLESS_SETTINGS_FIXTURE="$settings_fixture" cargo test --locked -p formless-core --test settings_inventory \
+            2>&1 | tee "$CI_DIR/logs/browser-settings-fixture.log"
+          "$python" -B relay/browser_suite.py --settings-fixture "$settings_fixture" \
+            --output "$CI_DIR/browser" --failure-artifacts "$CI_DIR/logs/browser-failures" \
+            2>&1 | tee "$CI_DIR/logs/browser.log"
+
       - name: Relay wire conformance
         run: node relay/conformance.mjs 2>&1 | tee "$CI_DIR/logs/conformance.log"
 
