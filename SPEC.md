@@ -3660,12 +3660,15 @@ refresh a cache, nightly cleanup.
     leading-wildcard flag. For example, `0 9 */2 * 1` runs on Mondays
     with odd day-of-month numbers, rather than every 48 hours. Invalid field
     values and range endpoints identify their field in both entry points.
+    A repeated local minute during a clock change can match at both actual
+    instants. Cron skips local minutes that the clock passes over.
     `at` is RFC 3339, `YYYY-MM-DD HH:MM` or `in 30m|2h|1d`.
   - The user uses `AddJob` or `formless jobs add PROMPT --every … |
     --cron … | --at …`. A user's schedule may be plain English: "every
     weekday at 9am", "every 2 hours", "every 15 minutes", "daily at
     18:30", "hourly", "every monday and friday at noon", "every weekend
-    at 8pm", "yearly"/"annually"/"every year at 9am" (January 1).
+    at 8pm", "every monday morning" (09:00), and
+    "yearly"/"annually"/"every year at 9am" (January 1).
     Clock suffixes accept `am`/`pm`, `a.m.`/`p.m.` and `am.`/`pm.`,
     case-insensitively; a dotted minute separator such as `9.30am` remains
     unsupported. Natural schedules are stored as cron.
