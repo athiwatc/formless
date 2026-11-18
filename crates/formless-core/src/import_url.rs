@@ -376,17 +376,19 @@ mod fetch_tests {
             drop(socket);
         });
         let url = format!("http://fixture-name:fixture-secret@{addr}/closed");
-        let error = tokio::time::timeout(std::time::Duration::from_secs(3), get_json(&url, true))
-            .await
-            .unwrap()
-            .unwrap_err();
+        let (response, accepted) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            tokio::join!(get_json(&url, true), server)
+        })
+        .await
+        .expect("the request and fixture listener should finish");
+        accepted.unwrap();
+        let error = response.unwrap_err();
         let message = format!("{error:#}");
         assert!(message.contains(&format!("http://{addr}/closed")));
         assert!(
             !message.contains("fixture-name") && !message.contains("fixture-secret"),
             "{message}"
         );
-        server.await.unwrap();
     }
 
     #[test]
