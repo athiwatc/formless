@@ -5802,14 +5802,34 @@
     const [m, hr, dom, mon, dow] = f;
     const step = m.match(/^\*\/(\d+)$/);
     if (step && hr === "*" && dom === "*" && mon === "*" && dow === "*") return "every " + step[1] + " minutes";
+    const hourStep = hr.match(/^\*\/(\d+)$/);
+    if (hourStep && /^\d+$/.test(m) && dom === "*" && mon === "*" && dow === "*") {
+      const hours = Number(hourStep[1]), minute = Number(m);
+      if (hours < 1 || hours > 0xffffffff || minute > 59) return e;
+      const mm = String(minute).padStart(2, "0");
+      if (hours === 1) return minute === 0 ? "every hour" : "every hour at minute " + mm;
+      if (hours >= 24) return "every day at 0:" + mm;
+      const interval = "every " + hours + " hours";
+      if (24 % hours !== 0) return interval + " starting at 0:" + mm + " each day";
+      return minute === 0 ? interval : interval + " at minute " + mm;
+    }
     if (/^\d+$/.test(m) && hr === "*" && dom === "*" && mon === "*" && dow === "*") return Number(m) === 0 ? "every hour" : "every hour at minute " + m.padStart(2, "0");
     if (!/^\d+$/.test(m) || !/^\d+$/.test(hr)) return e;
     const time = hr + ":" + m.padStart(2, "0");
     if (dom === "1" && mon === "1" && dow === "*") return "every year on January 1 at " + time;
     if (mon !== "*") return e;
     if (dom === "*" && dow === "*") return "every day at " + time;
-    if (dom === "*" && dow === "1-5") return "every weekday at " + time;
-    if (dom === "*" && /^[0-7](,[0-7])*$/.test(dow)) return "every " + dow.split(",").map((d) => DAYS[Number(d) % 7]).join(", ") + " at " + time;
+    if (dom === "*" && Number(m) <= 59 && Number(hr) <= 23) {
+      const numericDays = dow.replace(/\b[a-z]{3}\b/gi, (day) => {
+        const index = DAYS.findIndex((name) => name.slice(0, 3).toLowerCase() === day.toLowerCase());
+        return index < 0 ? day : String(index);
+      });
+      if (numericDays === "1-5") return "every weekday at " + time;
+      if (/^[0-7](,[0-7])*$/.test(numericDays)) {
+        const days = new Set(numericDays.split(",").map((d) => DAYS[Number(d) % 7]));
+        return "every " + [...days].join(", ") + " at " + time;
+      }
+    }
     if (/^\d+$/.test(dom) && dow === "*") return "on day " + dom + " of each month at " + time;
     return e;
   }
