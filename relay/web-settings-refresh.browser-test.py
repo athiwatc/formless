@@ -25,6 +25,7 @@ HOOK = """
                   after: {text: 'Fixture description', flags: []}};
   request = command => {
     const {type} = command, conn = connection;
+    if (type === 'list_invocations') return Promise.resolve([]);
     const count = (active.get(conn) || 0) + 1;
     active.set(conn, count);
     maximum = Math.max(maximum, count);
