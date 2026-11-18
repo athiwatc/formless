@@ -1827,7 +1827,6 @@ struct App {
     /// The chat's inner area in the last frame, and the OSC 8 links
     /// painted over it (SPEC §10.2).
     chat_area: Option<Rect>,
-    painted_links: Vec<links::Painted>,
     hyperlinks: bool,
     /// Path words already checked against the filesystem: their
     /// `file://` target when the file exists.
@@ -2154,7 +2153,6 @@ impl App {
             drafts: HashMap::new(),
             target_flash: None,
             chat_area: None,
-            painted_links: Vec::new(),
             path_cache: HashMap::new(),
             image_proto,
             pane_widths: pane_widths(&cfg.tui.pane_widths),
@@ -19225,8 +19223,10 @@ pub fn run_with(paths: Paths, start: Option<&str>) -> Result<()> {
             ))
             .is_ok();
     let mut terminal = Terminal::new(CrosstermBackend::new(out))?;
+    let mut painted_links = links::PaintCache::default();
     let result = (|| -> Result<()> {
         while !app.should_quit {
+            painted_links.recover_terminal(&mut stdout())?;
             app.tick = app.tick.wrapping_add(1);
             app.drain_daemon();
             app.user_commands_tick();
@@ -19237,7 +19237,7 @@ pub fn run_with(paths: Paths, start: Option<&str>) -> Result<()> {
             let _ = motion_cursor.sync(&mut stdout(), app.animations);
             if std::mem::take(&mut app.force_redraw) {
                 terminal.clear()?;
-                app.painted_links.clear();
+                painted_links.clear();
             }
             if !app.notifications.is_empty() {
                 let mode = Config::load(&app.paths)
@@ -19253,21 +19253,7 @@ pub fn run_with(paths: Paths, start: Option<&str>) -> Result<()> {
             }
             app.chat_area = None;
             let frame = terminal.draw(|f| draw(f, &mut app))?;
-            // Clickable links: repaint them with OSC 8 when they change.
-            if let Some(proto) = app.image_proto {
-                if app.image_placed != app.painted_images {
-                    if app.painted_images.is_empty() {
-                        let _ = images::paint(&mut stdout(), proto, &app.image_placed);
-                        app.painted_images = app.image_placed.clone();
-                    } else {
-                        // Old thumbnails stay on screen until cleared:
-                        // redraw from scratch, then paint the new ones.
-                        app.painted_images.clear();
-                        app.force_redraw = true;
-                    }
-                }
-            }
-            if app.hyperlinks {
+            let found = if app.hyperlinks {
                 let base = app.work_dir();
                 let cache = &mut app.path_cache;
                 let mut resolve = |p: &str| {
@@ -19281,13 +19267,27 @@ pub fn run_with(paths: Paths, start: Option<&str>) -> Result<()> {
                         })
                         .clone()
                 };
-                let found = app
-                    .chat_area
+                app.chat_area
                     .map(|a| links::scan(frame.buffer, a, &mut resolve))
-                    .unwrap_or_default();
-                if found != app.painted_links {
-                    let _ = links::paint(&mut stdout(), frame.buffer, &found);
-                    app.painted_links = found;
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let links_ready = painted_links
+                .update(&mut stdout(), frame.buffer, found)
+                .is_ok();
+            // Defer new thumbnails when a link repaint will retry on their cells.
+            if let Some(proto) = app.image_proto.filter(|_| links_ready) {
+                if app.image_placed != app.painted_images {
+                    if app.painted_images.is_empty() {
+                        let _ = images::paint(&mut stdout(), proto, &app.image_placed);
+                        app.painted_images = app.image_placed.clone();
+                    } else {
+                        // Old thumbnails stay on screen until cleared:
+                        // redraw from scratch, then paint the new ones.
+                        app.painted_images.clear();
+                        app.force_redraw = true;
+                    }
                 }
             }
             // Handle everything queued before the next draw, so a burst of
@@ -19311,6 +19311,7 @@ pub fn run_with(paths: Paths, start: Option<&str>) -> Result<()> {
         }
         Ok(())
     })();
+    let _ = painted_links.recover_terminal(&mut stdout());
     app.flush_wizard_draft(true);
     app.save_drafts();
     if app.enhanced_keys {
@@ -19541,7 +19542,6 @@ mod tests {
             drafts: HashMap::new(),
             target_flash: None,
             chat_area: None,
-            painted_links: Vec::new(),
             path_cache: HashMap::new(),
             image_proto: None,
             pane_widths: (22, 26),
