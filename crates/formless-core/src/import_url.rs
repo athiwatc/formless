@@ -20,39 +20,53 @@ pub enum Source {
 /// Check the URL (https only) and map GitHub pages to what holds the file:
 /// a gist page to its id, a `github.com/…/blob/…` page to its raw file.
 pub fn resolve(url: &str) -> Result<Source> {
+    resolve_with_label(url).map(|(source, _)| source)
+}
+
+fn display_url(url: &reqwest::Url) -> String {
+    let mut url = url.clone();
+    let _ = url.set_password(None);
+    let _ = url.set_username("");
+    url.to_string()
+}
+
+fn resolve_with_label(url: &str) -> Result<(Source, String)> {
     let url = url.trim();
     let parsed = reqwest::Url::parse(url).context("invalid bundle URL")?;
     if parsed.scheme() != "https" {
         bail!("only https:// URLs can be imported");
     }
-    // Only the ordinary service authority maps to its API/raw endpoint.
-    // Preserve explicit non-default ports and userinfo on direct URLs.
-    if parsed.port().is_some() || !parsed.username().is_empty() || parsed.password().is_some() {
-        return Ok(Source::Direct(url.to_string()));
-    }
+    let label = if !parsed.username().is_empty() || parsed.password().is_some() {
+        display_url(&parsed)
+    } else {
+        url.to_string()
+    };
     let host = parsed.host_str().unwrap_or_default();
     let host = host.strip_prefix("www.").unwrap_or(host);
     let path = parsed.path().strip_prefix('/').unwrap_or(parsed.path());
-    match host {
-        "gist.github.com" | "gist.githubusercontent.com" => {
+    // Rewritten targets only use the standard service port. Userinfo stays
+    // with direct requests and is never carried to the API/raw authority.
+    let source = match (parsed.port(), host) {
+        (None, "gist.github.com" | "gist.githubusercontent.com") => {
             let id = path
                 .split('/')
                 .filter(|s| !s.is_empty())
                 .find(|s| s.len() >= 20 && s.chars().all(|c| c.is_ascii_hexdigit()))
-                .ok_or_else(|| anyhow!("no gist id in {url}"))?;
-            Ok(Source::Gist(id.to_string()))
+                .ok_or_else(|| anyhow!("no gist id in {label}"))?;
+            Source::Gist(id.to_string())
         }
-        "github.com" if path.split('/').nth(2) == Some("blob") => {
+        (None, "github.com") if path.split('/').nth(2) == Some("blob") => {
             let parts: Vec<&str> = path.splitn(4, '/').collect();
-            Ok(Source::Direct(format!(
+            Source::Direct(format!(
                 "https://raw.githubusercontent.com/{}/{}/{}",
                 parts[0],
                 parts[1],
                 parts.get(3).unwrap_or(&"")
-            )))
+            ))
         }
-        _ => Ok(Source::Direct(url.to_string())),
-    }
+        _ => Source::Direct(url.to_string()),
+    };
+    Ok((source, label))
 }
 
 /// A Tool bundle (`formless.tool/1`) or a registry export
@@ -188,8 +202,9 @@ fn gist_metadata_error(error: anyhow::Error) -> anyhow::Error {
 /// bundle URL can't make the daemon reach its own network (#825).
 async fn get_json(url: &str, allow_private: bool) -> Result<Value> {
     use futures_util::StreamExt;
-    let mut url = reqwest::Url::parse(url).with_context(|| format!("bad URL {url}"))?;
+    let mut url = reqwest::Url::parse(url).context("invalid bundle URL")?;
     for _ in 0..=5 {
+        let label = display_url(&url);
         let client = checked_client(&url, allow_private)?;
         let resp = client
             .get(url.clone())
@@ -200,36 +215,41 @@ async fn get_json(url: &str, allow_private: bool) -> Result<Value> {
             .timeout(std::time::Duration::from_secs(20))
             .send()
             .await
-            .with_context(|| format!("fetch {url}"))?;
+            .map_err(reqwest::Error::without_url)
+            .with_context(|| format!("fetch {label}"))?;
         if resp.status().is_redirection() {
             let next = resp
                 .headers()
                 .get(reqwest::header::LOCATION)
                 .and_then(|v| v.to_str().ok())
-                .ok_or_else(|| anyhow!("{url}: redirect without a Location"))?;
+                .ok_or_else(|| anyhow!("{label}: redirect without a Location"))?;
             url = url
                 .join(next)
-                .with_context(|| format!("bad redirect from {url}"))?;
+                .with_context(|| format!("bad redirect from {label}"))?;
             continue;
         }
         if !resp.status().is_success() {
-            bail!("{url}: HTTP {}", resp.status());
+            bail!("{label}: HTTP {}", resp.status());
         }
         if resp.content_length().unwrap_or(0) > MAX_BYTES as u64 {
-            return Err(DownloadTooLarge(url.to_string()).into());
+            return Err(DownloadTooLarge(label).into());
         }
         // Read as a stream and stop at the cap, whatever the server says.
         let mut body = Vec::new();
         let mut stream = resp.bytes_stream();
         while let Some(chunk) = stream.next().await {
-            body.extend_from_slice(&chunk.with_context(|| format!("read {url}"))?);
+            body.extend_from_slice(
+                &chunk
+                    .map_err(reqwest::Error::without_url)
+                    .with_context(|| format!("read {label}"))?,
+            );
             if body.len() > MAX_BYTES {
-                return Err(DownloadTooLarge(url.to_string()).into());
+                return Err(DownloadTooLarge(label).into());
             }
         }
-        return crate::bundle_json::parse(&body, url.as_str());
+        return crate::bundle_json::parse(&body, &label);
     }
-    bail!("{url}: too many redirects")
+    bail!("{}: too many redirects", display_url(&url))
 }
 
 /// A client for one hop: https only, pinned to the host's checked
@@ -237,11 +257,11 @@ async fn get_json(url: &str, allow_private: bool) -> Result<Value> {
 fn checked_client(url: &reqwest::Url, allow_private: bool) -> Result<reqwest::Client> {
     use std::net::ToSocketAddrs;
     if url.scheme() != "https" && !allow_private {
-        bail!("only https:// URLs can be imported ({url})");
+        bail!("only https:// URLs can be imported ({})", display_url(url));
     }
     let host = url
         .host_str()
-        .ok_or_else(|| anyhow!("{url} has no host"))?
+        .ok_or_else(|| anyhow!("{} has no host", display_url(url)))?
         .trim_matches(['[', ']'])
         .to_string();
     let port = url.port_or_known_default().unwrap_or(443);
@@ -271,7 +291,8 @@ pub async fn fetch(url: &str) -> Result<Value> {
 
 /// [`fetch`]; `allow_private` lets tests use a local server.
 pub async fn fetch_from(url: &str, allow_private: bool) -> Result<Value> {
-    let (file, bundle) = match resolve(url)? {
+    let (source, label) = resolve_with_label(url)?;
+    let (file, bundle) = match source {
         Source::Direct(u) => (None, get_json(&u, allow_private).await?),
         Source::Gist(id) => {
             let gist = get_json(&format!("https://api.github.com/gists/{id}"), allow_private)
@@ -288,12 +309,63 @@ pub async fn fetch_from(url: &str, allow_private: bool) -> Result<Value> {
         }
     };
     check_bundle(&bundle)?;
-    Ok(serde_json::json!({ "source": url.trim(), "file": file, "bundle": bundle }))
+    Ok(serde_json::json!({ "source": label, "file": file, "bundle": bundle }))
 }
 
 #[cfg(test)]
 mod fetch_tests {
     use super::*;
+
+    #[test]
+    fn source_labels_drop_userinfo_and_keep_ordinary_url_spelling() {
+        let direct = "https://fixture-user:fixture-secret@example.invalid/t.json?version=2";
+        let (source, label) = resolve_with_label(direct).unwrap();
+        assert_eq!(source, Source::Direct(direct.into()));
+        assert_eq!(label, "https://example.invalid/t.json?version=2");
+        let (_, label) = resolve_with_label("HTTPS://Example.Invalid:443/t.json").unwrap();
+        assert_eq!(label, "HTTPS://Example.Invalid:443/t.json");
+    }
+
+    #[tokio::test]
+    async fn fetch_diagnostics_drop_userinfo_on_original_and_redirected_urls() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let destination = format!("http://redirect-name:redirect-secret@{addr}/denied");
+        let app = axum::Router::new()
+            .route(
+                "/denied",
+                axum::routing::get(|| async { axum::http::StatusCode::UNAUTHORIZED }),
+            )
+            .route("/invalid", axum::routing::get(|| async { "{invalid" }))
+            .route(
+                "/redirect",
+                axum::routing::get(move || async move {
+                    axum::response::Redirect::temporary(&destination)
+                }),
+            );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        for (path, diagnostic_path, marker) in [
+            ("denied", "denied", "HTTP 401"),
+            ("invalid", "invalid", "not a JSON bundle"),
+            ("redirect", "denied", "HTTP 401"),
+        ] {
+            let input = format!("http://fixture-name:fixture-secret@{addr}/{path}");
+            let error = get_json(&input, true).await.unwrap_err();
+            let message = format!("{error:#}");
+            assert!(message.contains(&format!("http://{addr}/{diagnostic_path}")));
+            assert!(message.contains(marker), "{message}");
+            for credential in [
+                "fixture-name",
+                "fixture-secret",
+                "redirect-name",
+                "redirect-secret",
+            ] {
+                assert!(!message.contains(credential), "{message}");
+            }
+        }
+        server.abort();
+        let _ = server.await;
+    }
 
     #[test]
     fn gist_prefers_complete_bundle_over_truncated_earlier_files() {
