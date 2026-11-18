@@ -1519,27 +1519,6 @@
 
   // Tiny tokenizer-highlighter, mirroring the TUI's (crates/formless-tui/src/highlight.rs).
   const W = (s) => new Set(s.split(" "));
-  const HL = {
-    rust: { lc: ["//"], bc: ["/*", "*/"], q: "\"", kw: W("as async await break const continue crate dyn else enum extern fn for if impl in let loop match mod move mut pub ref return static struct trait type unsafe use where while"), lit: W("true false self Self None Some Ok Err super") },
-    js: { lc: ["//"], bc: ["/*", "*/"], q: "\"'`", kw: W("as async await break case catch class const continue debugger default delete do else enum export extends finally for from function if implements import in instanceof interface let new of private protected public readonly return static switch throw try type typeof var void while with yield"), lit: W("true false null undefined NaN this super") },
-    py: { lc: ["#"], hashAnywhere: true, q: "\"'", kw: W("and as assert async await break case class continue def del elif else except finally for from global if import in is lambda match nonlocal not or pass raise return try while with yield"), lit: W("True False None self cls") },
-    go: { lc: ["//"], bc: ["/*", "*/"], q: "\"`'", kw: W("break case chan const continue default defer else fallthrough for func go goto if import interface map package range return select struct switch type var"), lit: W("true false nil iota") },
-    sh: { lc: ["#"], q: "\"'", kw: W("alias case cd do done echo elif else end esac exit export fi for function if in local return set source then unset while"), lit: W("true false") },
-    c: { lc: ["//"], bc: ["/*", "*/"], q: "\"'", kw: W("abstract auto break case catch class const continue default do else enum extends extern final for fun func goto if implements import include interface let namespace new override package private protected public return sizeof static struct switch template throw throws try typedef union using val var virtual void volatile while"), lit: W("true false null nullptr nil this self super") },
-    json: { q: "\"", kw: W(""), lit: W("true false null") },
-    config: { lc: ["#"], q: "\"'", kw: W(""), lit: W("true false null yes no on off"), key: true },
-    conf: { lc: ["#", ";"], q: "\"'", kw: W(""), lit: W("true false null yes no on off"), key: true },
-    sql: { lc: ["--"], bc: ["/*", "*/"], q: "'", ci: true, kw: W("add all alter and as asc begin by case commit create default delete desc distinct drop else end exists foreign from group having in index inner insert into is join key left like limit not offset on or order outer primary references returning right select set table then union update values when where with"), lit: W("null true false") },
-    html: { bc: ["<!--", "-->"], q: "\"'", kw: W(""), lit: W(""), tags: true },
-    css: { bc: ["/*", "*/"], q: "\"'", kw: W("important media import supports keyframes"), lit: W("") },
-  };
-  const HL_ALIAS = {
-    rs: "rust", javascript: "js", jsx: "js", mjs: "js", cjs: "js", ts: "js", typescript: "js", tsx: "js",
-    python: "py", python3: "py", golang: "go", bash: "sh", zsh: "sh", fish: "sh", shell: "sh", console: "sh", powershell: "sh", ps: "sh",
-    h: "c", cpp: "c", "c++": "c", cc: "c", hpp: "c", java: "c", kotlin: "c", kt: "c", swift: "c", cs: "c", csharp: "c", scala: "c", dart: "c", php: "c", zig: "c",
-    jsonc: "json", json5: "json", yaml: "config", yml: "config", toml: "config", ini: "conf", env: "config", dotenv: "config", properties: "conf",
-    sqlite: "sql", postgres: "sql", postgresql: "sql", mysql: "sql", xml: "html", svg: "html", vue: "html", svelte: "html", scss: "css", less: "css",
-  };
   const JS_REGEX_KEYWORDS = W("await case delete do else extends in instanceof new of return throw typeof void yield");
   const JS_IDENT_CONTINUE = /[\p{ID_Continue}$\u200c\u200d]/u;
   const JS_LINE_END = /[\n\r\u2028\u2029]/;
@@ -1608,6 +1587,28 @@
     return start;
   }
 
+
+  const HL = {
+    rust: { lc: ["//"], bc: ["/*", "*/"], q: "\"", kw: W("as async await break const continue crate dyn else enum extern fn for if impl in let loop match mod move mut pub ref return static struct trait type unsafe use where while"), lit: W("true false self Self None Some Ok Err super") },
+    js: { lc: ["//"], bc: ["/*", "*/"], q: "\"'`", kw: W("as async await break case catch class const continue debugger default delete do else enum export extends finally for from function if implements import in instanceof interface let new of private protected public readonly return static switch throw try type typeof var void while with yield"), lit: W("true false null undefined NaN this super") },
+    py: { lc: ["#"], hashAnywhere: true, q: "\"'", kw: W("and as assert async await break case class continue def del elif else except finally for from global if import in is lambda match nonlocal not or pass raise return try while with yield"), lit: W("True False None self cls") },
+    go: { lc: ["//"], bc: ["/*", "*/"], q: "\"`'", kw: W("break case chan const continue default defer else fallthrough for func go goto if import interface map package range return select struct switch type var"), lit: W("true false nil iota") },
+    sh: { lc: ["#"], q: "\"'", kw: W("alias case cd do done echo elif else end esac exit export fi for function if in local return set source then unset while"), lit: W("true false") },
+    c: { lc: ["//"], bc: ["/*", "*/"], q: "\"'", kw: W("abstract auto break case catch class const continue default do else enum extends extern final for fun func goto if implements import include interface let namespace new override package private protected public return sizeof static struct switch template throw throws try typedef union using val var virtual void volatile while"), lit: W("true false null nullptr nil this self super") },
+    json: { q: "\"", kw: W(""), lit: W("true false null") },
+    config: { lc: ["#"], q: "\"'", kw: W(""), lit: W("true false null yes no on off"), key: true },
+    conf: { lc: ["#", ";"], q: "\"'", kw: W(""), lit: W("true false null yes no on off"), key: true },
+    sql: { lc: ["--"], bc: ["/*", "*/"], q: "'", ci: true, kw: W("add all alter and as asc begin by case commit create default delete desc distinct drop else end exists foreign from group having in index inner insert into is join key left like limit not offset on or order outer primary references returning right select set table then union update values when where with"), lit: W("null true false") },
+    html: { bc: ["<!--", "-->"], q: "\"'", kw: W(""), lit: W(""), tags: true },
+    css: { bc: ["/*", "*/"], q: "\"'", kw: W("important media import supports keyframes"), lit: W("") },
+  };
+  const HL_ALIAS = {
+    rs: "rust", javascript: "js", jsx: "js", mjs: "js", cjs: "js", ts: "js", typescript: "js", tsx: "js",
+    python: "py", python3: "py", golang: "go", bash: "sh", zsh: "sh", fish: "sh", shell: "sh", console: "sh", powershell: "sh", ps: "sh",
+    h: "c", cpp: "c", "c++": "c", cc: "c", hpp: "c", java: "c", kotlin: "c", kt: "c", swift: "c", cs: "c", csharp: "c", scala: "c", dart: "c", php: "c", zig: "c",
+    jsonc: "json", json5: "json", yaml: "config", yml: "config", toml: "config", ini: "conf", env: "config", dotenv: "config", properties: "conf",
+    sqlite: "sql", postgres: "sql", postgresql: "sql", mysql: "sql", xml: "html", svg: "html", vue: "html", svelte: "html", scss: "css", less: "css",
+  };
   function highlight(code, lang) {
     lang = (lang || "").toLowerCase();
     if (lang === "diff" || lang === "patch") {
@@ -1674,14 +1675,6 @@
           continue;
         }
       }
-      if (c === "/" && jsComments) {
-        const stop = jsRegexEnd(code, i, jsComments, typescript);
-        if (stop !== i) {
-          tok("tok-str", code.slice(i, stop));
-          i = stop;
-          continue;
-        }
-      }
       if (L.q.includes(c)) {
         const triple = (L === HL.py || (c === '"' && (lang === "java" || kotlin))) &&
           code.startsWith(c.repeat(3), i);
@@ -1707,6 +1700,14 @@
         tok("tok-num", number);
         i += number.length;
         continue;
+      }
+      if (c === "/" && jsComments) {
+        const stop = jsRegexEnd(code, i, jsComments, typescript);
+        if (stop !== i) {
+          tok("tok-str", code.slice(i, stop));
+          i = stop;
+          continue;
+        }
       }
       if (L.tags && c === "<") {
         const m = code.slice(i).match(/^<\/?[\w:-]+/);
