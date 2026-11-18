@@ -477,6 +477,7 @@ pub(crate) struct Highlighter {
     in_block: usize,
     /// Inside a string that runs past the line: what closes it.
     in_str: Option<String>,
+    js_typescript: bool,
 }
 
 /// Rust-shaped literals only. A dot before another dot or an identifier
@@ -557,6 +558,32 @@ fn rust_number_end(chars: &[char], start: usize) -> usize {
     end
 }
 
+// After a contextual `await`, an apparent closing slash can instead be the
+// second division operator. Check the flags and the next operand token.
+fn js_regex_suffix(flags: &[char], mut suffix: &[char], typescript: bool) -> bool {
+    if !flags.iter().all(|c| "dgimsuvy".contains(*c)) {
+        return false;
+    }
+    loop {
+        let whitespace = suffix.iter().take_while(|c| c.is_whitespace()).count();
+        suffix = &suffix[whitespace..];
+        if !suffix.starts_with(&['/', '*']) {
+            break;
+        }
+        let Some(end) = suffix[2..].windows(2).position(|pair| pair == ['*', '/']) else {
+            return true;
+        };
+        suffix = &suffix[end + 4..];
+    }
+    let word: String = suffix
+        .iter()
+        .take_while(|c| c.is_alphanumeric() || "_$".contains(**c))
+        .collect();
+    (matches!(word.as_str(), "" | "in" | "instanceof")
+        || typescript && matches!(word.as_str(), "as" | "satisfies"))
+        && !matches!(suffix.first(), Some('"' | '\''))
+}
+
 impl Highlighter {
     pub(crate) fn new(name: &str, color: bool) -> Option<Self> {
         let name = name.to_ascii_lowercase();
@@ -567,6 +594,7 @@ impl Highlighter {
             color,
             in_block: 0,
             in_str: None,
+            js_typescript: matches!(name.as_str(), "ts" | "tsx" | "typescript"),
         })
     }
 
@@ -595,6 +623,7 @@ impl Highlighter {
                 .all(|(k, p)| chars.get(k) == Some(&p))
         };
         let mut toks: Vec<(Tok, String)> = Vec::new();
+        let mut js_block_comments = Vec::new();
         let mut push = |tok: Tok, s: &[char]| {
             if let Some((t, last)) = toks.last_mut() {
                 if std::mem::discriminant(t) == std::mem::discriminant(&tok) {
@@ -670,14 +699,21 @@ impl Highlighter {
                     }
                 }
                 push(Tok::Comment, &chars[i..j]);
+                if l.regex {
+                    js_block_comments.push((i, j));
+                }
                 i = j;
                 continue;
             }
             if let Some((open, _)) = l.block_comment {
                 if at(i, open) {
                     self.in_block = 1;
-                    push(Tok::Comment, &chars[i..i + open.chars().count()]);
-                    i += open.chars().count();
+                    let end = i + open.chars().count();
+                    push(Tok::Comment, &chars[i..end]);
+                    if l.regex {
+                        js_block_comments.push((i, end));
+                    }
+                    i = end;
                     continue;
                 }
             }
@@ -720,23 +756,54 @@ impl Highlighter {
             // A JS regex literal where a value is expected, so the `//` in
             // `/https:\/\//` is not a comment (#877).
             if l.regex && c == '/' && !at(i, "//") && !at(i, "/*") {
-                let before = chars[..i].iter().rev().find(|c| !c.is_whitespace());
-                let prev_word: String = {
-                    let end = chars[..i]
+                let token_end = |mut end| loop {
+                    end = chars[..end]
                         .iter()
                         .rposition(|c| !c.is_whitespace())
                         .map_or(0, |e| e + 1);
-                    let start = chars[..end]
-                        .iter()
-                        .rposition(|c| !(c.is_alphanumeric() || *c == '_'))
-                        .map_or(0, |s| s + 1);
-                    chars[start..end].iter().collect()
+                    match js_block_comments.binary_search_by_key(&end, |&(_, end)| end) {
+                        Ok(comment) => end = js_block_comments[comment].0,
+                        Err(_) => break end,
+                    }
                 };
-                let value_expected = before.is_none_or(|b| "=(,:[!&|?{};+-*%<>~^".contains(*b))
-                    || matches!(
+                let end = token_end(i);
+                let before = chars[..end].last();
+                let start = chars[..end]
+                    .iter()
+                    .rposition(|c| !(c.is_alphanumeric() || "_$".contains(*c)))
+                    .map_or(0, |s| s + 1);
+                let prev_word: String = chars[start..end].iter().collect();
+                // A property name after a dot or a private-name marker
+                // stays an operand even when it spells a keyword.
+                let word_boundary = chars[..start]
+                    .last()
+                    .is_none_or(|c| c.is_whitespace() || c.is_ascii_punctuation());
+                let before_word = &chars[..token_end(start)];
+                let member_name = before_word.ends_with(&['#'])
+                    || before_word.ends_with(&['.']) && !before_word.ends_with(&['.', '.', '.']);
+                let after_keyword = word_boundary
+                    && !member_name
+                    && matches!(
                         prev_word.as_str(),
-                        "return" | "typeof" | "case" | "in" | "of" | "yield"
+                        "await"
+                            | "case"
+                            | "delete"
+                            | "do"
+                            | "else"
+                            | "extends"
+                            | "in"
+                            | "instanceof"
+                            | "new"
+                            | "of"
+                            | "return"
+                            | "throw"
+                            | "typeof"
+                            | "void"
+                            | "yield"
                     );
+                let value_expected =
+                    before.is_none_or(|b| "=(,:[!&|?{};+-*%<>~^".contains(*b)) || after_keyword;
+                let contextual_await = after_keyword && prev_word == "await";
                 if value_expected {
                     let (mut j, mut class) = (i + 1, false);
                     let mut closed = None;
@@ -753,13 +820,22 @@ impl Highlighter {
                         }
                         j += 1;
                     }
-                    if let Some(mut end) = closed {
+                    if let Some(flags) = closed {
+                        let mut end = flags;
                         while end < chars.len() && chars[end].is_ascii_alphabetic() {
                             end += 1;
                         }
-                        push(Tok::Str, &chars[i..end]);
-                        i = end;
-                        continue;
+                        if !contextual_await
+                            || js_regex_suffix(
+                                &chars[flags..end],
+                                &chars[end..],
+                                self.js_typescript,
+                            )
+                        {
+                            push(Tok::Str, &chars[i..end]);
+                            i = end;
+                            continue;
+                        }
                     }
                 }
             }
@@ -1258,6 +1334,84 @@ mod tests {
 
     /// Nested Rust comments, raw strings, JS regexes, YAML `;` and
     /// unknown languages (#877).
+    #[test]
+    fn js_regex_literals_after_expression_keywords_preserve_the_rest_of_the_line() {
+        let regex = r"/https:\/\//gi";
+        for keyword in [
+            "await",
+            "throw",
+            "void",
+            "else",
+            "delete",
+            "new",
+            "do",
+            "instanceof",
+            "extends",
+        ] {
+            let source = format!("{keyword} {regex}; next(); // outside");
+            let tokens = toks("js", &source);
+            assert!(
+                tokens.contains(&(regex.into(), Some(Color::Green))),
+                "{source}: {tokens:?}"
+            );
+            assert!(
+                tokens.contains(&("next".into(), Some(Color::Blue))),
+                "{source}: {tokens:?}"
+            );
+            let comments: Vec<_> = tokens
+                .iter()
+                .filter(|(_, color)| *color == Some(Color::DarkGray))
+                .map(|(text, _)| text.as_str())
+                .collect();
+            assert_eq!(comments, ["// outside"], "{source}");
+        }
+        for source in [
+            "throw value / 2 / 3",
+            "await value / 2 / 3",
+            "const await = 48; return await / 2 / 3",
+            "return await / 2 / /* rhs */ 3",
+            "return await /x/factor",
+            "object.throw / 2 / 3",
+            "object./* comment *//* more */throw / 2 / 3",
+            "object?.await / 2 / 3",
+            "object?. /* note */ await / 2 / 3",
+            "this.#delete / 2 / 3",
+            "$await / 2 / 3",
+            "a\u{301}await / 2 / 3",
+            "π\u{200c}await / 2 / 3",
+            "f(awaited / 2 / 3)",
+        ] {
+            let tokens = toks("js", source);
+            assert!(
+                tokens.iter().all(|(_, color)| *color != Some(Color::Green)),
+                "{source}: {tokens:?}"
+            );
+        }
+        for source in [
+            format!("await /* note */ {regex};"),
+            format!("throw /* reason */ {regex};"),
+            format!("return {regex} /* operator */ instanceof RegExp"),
+            format!("const result = await {regex} in object"),
+            format!("return [...typeof {regex}];"),
+        ] {
+            assert!(
+                toks("js", &source).contains(&(regex.into(), Some(Color::Green))),
+                "{source}"
+            );
+        }
+        for lang in ["ts", "tsx", "typescript"] {
+            for source in [
+                format!("return {regex} as RegExp"),
+                format!("return await {regex} satisfies RegExp"),
+            ] {
+                assert!(
+                    toks(lang, &source).contains(&(regex.into(), Some(Color::Green))),
+                    "{lang}: {source}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn traps_that_used_to_mis_colour() {
         let t = toks("rust", "/* a /* b */ still comment */ let x = 1;");
