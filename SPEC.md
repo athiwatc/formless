@@ -105,15 +105,17 @@ without redesign.
 | Daemon Core | Long-lived process owning loop, Tools, Sessions, state. |
 | Relay | Hosted encrypted intermediary for the Web frontend (v2, §12). |
 
-## 4. Provider (v1: OpenAI-compatible only)
+<a id="4-provider-v1-openai-compatible-only"></a>
+
+## 4. Provider
 
 ### 4.1 Scope
 
-- v1 supports exactly one provider type: any **OpenAI-compatible** endpoint
-  speaking **Chat Completions**: `POST {base_url}/chat/completions` with
-  Bearer auth and SSE streaming, and `GET {base_url}/models` for discovery.
-- `base_url` is used **verbatim** (the daemon appends only `/chat/completions`
-  and `/models`); non-`/v1` layouts work. Free-form extra headers (e.g.
+- `provider.api_style = "chat"` uses **OpenAI-compatible Chat Completions**
+  by default. It sends `POST {base_url}/chat/completions` with Bearer auth
+  and SSE streaming, and uses `GET {base_url}/models` for discovery.
+- Configure `base_url` with the endpoint's path prefix. The daemon appends
+  the path for the selected API style without adding `/v1`. Extra headers (e.g.
   organisation/project) are configurable per provider and sent on every call.
 - v2: `provider.api_style = "responses"` speaks the Responses API
   (`POST {base_url}/responses`, converted input/tools, streamed
@@ -214,7 +216,7 @@ without redesign.
 ### 4.2 Configuration and selection
 
 - **Provider presets** (`presets.rs`): OpenAI, Anthropic
-  (OpenAI-compatible endpoint), OpenRouter, Google Gemini
+  (native Messages API), OpenRouter, Google Gemini
   (OpenAI-compatible), Groq, Ollama (local) and LM Studio (local). Each
   preset gives the base URL and `api_style`, where to get a key, the
   environment variable that often holds one, and a default model that is
@@ -269,7 +271,7 @@ without redesign.
   automatic compaction is audited with it (`compaction.window`).
 - An assistant turn's text before its tool calls (a preamble such as
   "Let me check the file first") is kept in the history sent back to the
-  model, on both API styles.
+  model across all three API styles.
 - Tool arguments the model sends as JSON-encoded strings where the
   schema expects an object or array (some models do this for nested
   values) are parsed before validation, for built-ins and registry Tools
@@ -459,10 +461,12 @@ without redesign.
 
 ### 4.3 Endpoint probe (onboarding gate)
 
-Before the first Session, the wizard probes the endpoint: connectivity,
-streaming, and a **test tool-call**. If tool-calling is unsupported, session
-start is refused with a clear explanation. Native tool-calling is required
-in v1; a prompt-based (text/JSON) fallback is explicitly out (§17).
+Before the first Session, the wizard checks connectivity, streaming, and a
+**test tool-call**. The original v1 scope required native tool calling.
+The current probe accepts either native or [prompt-based tool calling](#41-scope).
+When the prompt fallback succeeds, the wizard saves `provider.tool_mode = "prompt"`.
+A result with neither mode demonstrated blocks Session start. Probe errors
+also block completion and show the reported cause.
 Thinking-mode endpoints that reject a forced `tool_choice` are re-probed
 with `tool_choice` omitted; a voluntary test tool-call still passes.
 The probe also makes one real streamed request and reports `streaming`
@@ -2153,23 +2157,23 @@ pattern (§4.4).
 ### 7.5 QuickJS runtime and host API
 
 - Engine: QuickJS-NG via `rquickjs`, embedded in-process. Tools are
-  single-file plain JS; the daemon provides the entire API surface (bare JS
-  has no ambient authority of any kind). The surface is deliberately
-  **near-minimal**: it offers only effects JS cannot produce itself.
-  Everything else (URL parsing, base64-to-bytes, hashing, compression,
-  formats) is written by the agent, typically as shared modules.
+  single-file plain JavaScript. QuickJS provides ECMAScript built-ins such
+  as `JSON`. The runtime installs the host APIs listed here. Tools can
+  implement helpers such as URL parsing, hashing and format conversion in
+  shared JavaScript modules.
   - `run(input)` may be `async`; the returned Promise is settled before the
     Invocation ends. A Tool reports failure by **throwing**. A returned
-    object whose `error` field is truthy is recorded as a failure too (§8.1),
-    so swallowed errors cannot inflate the success rate.
+    object whose `error` field is truthy is recorded as a failure too (§8.1)
+    unless the output schema declares an `error` property.
   - Data options take `encoding: "utf8"` (default) or `"base64"`, so any
     binary data crosses the boundary as a string. Text chunks never split a
     UTF-8 character.
   - `fetch(url, {method, headers, body, bodyEncoding, encoding})` →
     `{status, ok, url, headers, body, text(), json()}` and
     `fetchChunks(url, opts, size, cb)` (a truly streamed body in bounded
-    memory) — gated by `net`. http(s) only; redirects are followed, each hop
-    scope-checked; no request timeout.
+    memory) require `net`. They support HTTP(S) and check the scope on each
+    redirect. The configured connection and total deadlines apply to both
+    APIs, with one total budget for redirects and body reads (§13).
   - **Native caps (#604).** Outside the JS heap limit, whole-value reads
     stop at `tools.max_read_bytes` (`fs.read`: checked before reading;
     `fetch`: by `Content-Length` and while reading), process output at
@@ -2177,17 +2181,20 @@ pattern (§4.4).
     so the child never blocks), logs at `tools.max_log_bytes`, and `emit`
     at `tools.max_emit_bytes`. Over a cap is a `resource` failure naming
     the setting and the streaming alternative.
-  - `fs.read/write/append` (whole-value), `fs.exists`, `fs.stat` (`{type,
-    size, modified_ms}` or null), `fs.list(dir, {details})`, and
+  - `fs.read` (whole-value), `fs.exists`, `fs.stat` (`{type,
+    size, modified_ms, readonly?}` or null), `fs.list(dir, {details})`, and
     `fs.readChunks(path, size, cb, {encoding})` / `fs.readLines` (streaming)
-    — gated by `fs:read`; `fs.write/append/mkdir/remove/rename` — gated by
-    `fs:write` (both paths for rename). Writes create missing parent dirs.
+    — gated by `fs:read`. `fs.write/append/mkdir/rename` and
+    `fs.remove(path, {recursive})` require `fs:write` (both paths for rename).
+    `fs.stat` includes `readonly` for on-disk entries. Writes create missing
+    parent dirs. Removal is recursive when `recursive` is true.
   - `env.get(key)` — gated by `env`. `process.run(cmd, args, {cwd, env,
     stdin, stdinEncoding, encoding, timeout_ms})` → `{code, signal, stdout,
     stderr, timed_out, killed, truncated}` — gated by `process`, no shell,
     stdin closed unless given. An optional integer `timeout_ms` from 0 to
     86400000 terminates the owned process group/job on expiry and returns
     `timed_out: true`; omission preserves cancellation-only execution.
+    `timeoutMs` is an alias used when `timeout_ms` is absent or null.
   - `process.spawn(cmd, args, opts)` takes the same options and checks as
     `process.run`, returning an Invocation-local handle. `handle.read(size)`
     blocks for the next available `{stream: "stdout"|"stderr", data, eof:
@@ -2245,20 +2252,34 @@ pattern (§4.4).
     global throttle table. Clients match IDs exactly; legacy ID-less updates may
     match only one unambiguous running call. Progress is ignored in smoke tests,
     replays and dry runs.
-  - `tools.call(name, input)` — composition (§7.6). Returns a Promise of
+  - `tools.call(name, input)` uses the nested Tool checks in §7.6 or
+    `mcp:<server>` for MCP calls (§7.9). It returns a Promise of
     the nested Tool's output, so several run in parallel under
     `Promise.all` (§7.12). Every call must settle before `run` is done: a
     Tool that returns while a call is still pending fails ("await every
     call"), because a forgotten `await` would otherwise pass a Promise off
     as data.
-  - v2: `clipboard.read/write` (gated by `clipboard:*`), `notify(title,
-    body)` (gated by `notify`), `llm.complete(prompt, {system, model})`
-    (gated by `llm`; one non-streaming completion via the daemon's
-    configured provider, with the Session's model and reasoning effort
-    unless `model` is given), `agents.run(task, {system, model})` (gated by
-    `agent`; §7.6 sub-agents), and `requireModule(name)` for shared JS
-    modules (§7.6). In smoke tests these are stubbed; in optimiser
-    replay the side-effecting ones are denied.
+  - `clipboard.read()` and `clipboard.write(text)` require `clipboard:read`
+    and `clipboard:write` respectively. `notify(title, body)` and its alias
+    `notifications.send(title, body)` require `notify` (§7.4).
+  - `harness.read()` and `harness.call("read", {}, "")` require `harness:read`.
+    Mutations through `harness.call(op, args, reason)` require the applicable
+    `harness:<scope>` and follow the approval flow in §7.13.
+  - `llm.complete(prompt, {system, model, role, schema})` uses the `llm`
+    Capability. It makes a non-streaming completion and returns text by
+    default or a validated JSON value with `schema` (§4.2). `agents.run(task,
+    {system, model, role})` uses `agent` and returns the sub-agent's final text
+    (§7.6). In both calls a nonempty `role` takes precedence over `model`.
+    A Role selects its configured provider and model. An explicit model or
+    Role must fit any scope on the Capability (§7.4). When both options are
+    omitted, the first entry of a scoped grant is used. An unscoped grant
+    inherits the Session's selection.
+  - `requireModule(name)` and its alias `modules.load(name)` load shared
+    JavaScript modules. `modules.list()` lists names available to the
+    Invocation. These helpers use the supplied module registry (§7.6) and
+    require no Capability.
+  - `emit(chunk)` appends to the Invocation's output artifact, subject to
+    `tools.max_emit_bytes` (§7.12). It requires no Capability.
   - `store.get(key, {ns})`, `store.set(key, json, {ns})`,
     `store.delete(key, {ns})` and `store.list(prefix, {ns})` keep small
     state between Invocations: caches, cursors, tokens and rate-limit
@@ -2281,8 +2302,9 @@ pattern (§4.4).
     Root functions, symbols and `toJSON` methods returning `undefined` are
     rejected rather than silently becoming null; an absent `run` return
     deliberately becomes null. A result's `toJSON` is invoked only once.
-  - `console`, timers, `JSON`, `cryptoRandom()` (UUID), `randomBytes(n)`
-    (base64). Nothing else.
+  - `console.log/info/warn/error` write capped Invocation logs. `sleep(ms)`,
+    `setTimeout`, `clearTimeout`, `setInterval`, `clearInterval`,
+    `cryptoRandom()` (UUID) and `randomBytes(n)` (base64) require no Capability.
 
     `sleep(ms)` and `randomBytes(n)` require finite non-negative safe-integer
     numbers. Invalid inputs throw; requests over `tools.max_sleep_secs` or
@@ -2305,8 +2327,8 @@ pattern (§4.4).
 
 - A Tool may invoke other Tools via `tools.call`. Nested Invocations are
   recorded and measured like top-level ones. Composition cannot launder
-  permissions: the called Tool runs under **its own** declared Capabilities
-  and the outer Tool's Capabilities also apply. Nesting depth is bounded by
+  permissions. Each Tool runs under its own declared Capabilities and the
+  called Tool goes through its own approval checks. Nesting depth is bounded by
   the sandbox implementation (cycle-safe), faults tagged as Invocation
   failures.
 - Shared JS modules (v2): `create_module` stores versioned, immutable
@@ -2333,10 +2355,10 @@ pattern (§4.4).
     roll back), used by, code, "Edit code" and "Delete". Delete warns,
     naming the Tools that load it.
 - Sub-agents (v2; v2.2 makes them a Capability only): a Tool with the
-  `agent` Capability calls `agents.run(task, {system, model})` to run a
-  sub-agent — its own provider loop over the same Tools, with no step
-  limit (it ends on a final answer, a fault or cancellation) — and
-  receives only its final text. There is no sub-agent built-in, so
+  `agent` Capability calls `agents.run(task, {system, model, role})` to run a
+  sub-agent. Its provider loop runs over the same Tools and ends on a final
+  answer, a fault, cancellation or its turn limit (§4.6). The Tool receives
+  the sub-agent's final text. There is no sub-agent built-in, so
   delegation is always a measured, approval-gated Invocation; parallel
   delegation is several such calls in one turn, which run concurrently.
   The sub-agent's own Tool calls pass the same approval pre-pass as the
@@ -4483,7 +4505,9 @@ run_tool = "network_policy"     # a registry Tool, or…
 - **Token and cost chart.** `UsageByDay {since, by}` sums provider token
   use (prompt, completion, cached) per UTC day, or with `by` = "model",
   "role" or "session" per that key over the range, priced with
-  `provider.prices` (no cost when a model in the bucket has no price). The
+  `provider.prices` (no cost when a model in the bucket has no price). Session
+  rows carry the stable `session_id` and display the Session name in `key`.
+  They use the ID as the label when the Session record is missing. The
   TUI Metrics view charts it for the selected range: a bar per day (or key)
   split into cached, fresh prompt and completion tokens, with totals and
   cost; `b` cycles the breakdown.
@@ -6637,8 +6661,8 @@ order. No since means all history; durations use the shared checked parser
 and one UTC RFC3339 cutoff matching the existing stored TEXT representation.
 Human tables fit terminal columns and show unknown cost as `-`; JSON preserves
 the complete array and null costs. Cost is the daemon's current estimate, not a
-billing guarantee. Session grouping currently uses display names and merges
-equal-named Sessions (#1585); this caller cannot recover missing identities.
+billing guarantee. Session groups use the ID for attribution and display the
+current name when available. JSON includes the stable `session_id` (§10.4).
 Unknown grouping keys and invalid/overflowing/unrepresentable durations fail
 before contact. Aggregation, pricing and recording remain unchanged.
 
