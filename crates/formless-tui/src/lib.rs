@@ -12658,8 +12658,17 @@ fn input_height(app: &App, width: u16) -> u16 {
     rows.clamp(1, 8) as u16 + 2
 }
 
+/// The status paragraph advances one grapheme at a time. Measuring a whole
+/// string can undercount ligatures that the widget renders in separate cells.
+fn status_width(span: &Span<'_>) -> usize {
+    use unicode_segmentation::UnicodeSegmentation;
+
+    span.content.graphemes(true).map(text::width).sum()
+}
+
 fn status_left(app: &App, width: usize) -> Vec<Span<'static>> {
     let sep = Span::styled(" │ ", ui::dim(app.color));
+    let separator_width = status_width(&sep);
     let activity = if let Some((since, _)) = app.offline {
         Span::styled(
             format!(
@@ -12714,10 +12723,10 @@ fn status_left(app: &App, width: usize) -> Vec<Span<'static>> {
             )
         });
     let waiting = app.approvals.len() + app.promotions.len();
-    let reserved = activity.width()
+    let reserved = status_width(&activity)
         + context
             .as_ref()
-            .map_or(0, |span| sep.width() + span.width());
+            .map_or(0, |span| separator_width + status_width(span));
     // Keep pending approvals on their existing status path. Ordinary fields
     // share only the space left after reserving activity and context.
     let mut room = if waiting > 0 {
@@ -12737,7 +12746,7 @@ fn status_left(app: &App, width: usize) -> Vec<Span<'static>> {
             format!("{}: {}", i18n::tr("profile"), app.paths.profile),
             ui::dim(app.color),
         );
-        let needed = profile.width() + sep.width();
+        let needed = status_width(&profile) + separator_width;
         if needed <= room {
             left.push(profile);
             left.push(sep.clone());
@@ -12779,7 +12788,7 @@ fn status_left(app: &App, width: usize) -> Vec<Span<'static>> {
         (true, usage),
     ] {
         let Some(field) = field else { continue };
-        let delimiter_width = if separated { sep.width() } else { 0 };
+        let delimiter_width = if separated { separator_width } else { 0 };
         let available = room.saturating_sub(delimiter_width);
         if available == 0 {
             break;
@@ -12787,12 +12796,10 @@ fn status_left(app: &App, width: usize) -> Vec<Span<'static>> {
         if separated {
             left.push(sep.clone());
         }
-        let field_width = field.width();
+        let field_width = status_width(&field);
         if field_width > available {
-            left.push(Span::styled(
-                text::truncate(&field.content, available),
-                field.style,
-            ));
+            let prefix = text::take_width(&field.content, available - 1);
+            left.push(Span::styled(format!("{prefix}…"), field.style));
             break;
         }
         left.push(field);
@@ -12820,10 +12827,10 @@ fn compact_status(
     context: Option<Span<'static>>,
     width: usize,
 ) -> Vec<Span<'static>> {
-    let context = context.filter(|span| span.width() <= width);
+    let context = context.filter(|span| status_width(span) <= width);
     let room = context
         .as_ref()
-        .map_or(width, |span| width.saturating_sub(span.width() + 1));
+        .map_or(width, |span| width.saturating_sub(status_width(span) + 1));
     let prefix = text::take_width(&activity.content, room).trim_end();
     let mut spans = Vec::new();
     if !prefix.is_empty() {
@@ -12841,7 +12848,7 @@ fn compact_status(
 fn draw_status(f: &mut Frame, area: Rect, app: &App) {
     let width = area.width as usize;
     let mut spans = status_left(app, width);
-    let used: usize = spans.iter().map(|s| s.width()).sum();
+    let used: usize = spans.iter().map(status_width).sum();
     // Notes show as toasts; the right side is this view's key hints,
     // from one table, trimmed by importance to fit (SPEC §10.5).
     let tip = format!("{} ", keys::line(app.view, width.saturating_sub(used + 3)));

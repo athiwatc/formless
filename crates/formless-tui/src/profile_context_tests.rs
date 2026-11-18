@@ -54,6 +54,25 @@ fn narrow_status_shows_context_beside_activity_with_long_identity() {
 }
 
 #[test]
+fn narrow_status_reserves_context_using_rendered_grapheme_widths() {
+    let mut app = status_app();
+    app.color = false;
+    app.sessions[0].name = "لا".repeat(15);
+    app.model_label.clear();
+    let context = ui::status_text(false, SemanticTone::Bad, "ctx 91%");
+    let nominal = format!(" ● ready │ {} │ {context}", app.sessions[0].name);
+    let width = u16::try_from(text::width(&nominal)).unwrap();
+    let text = screen(
+        |frame| draw_status(frame, Rect::new(0, 0, width, 1), &app),
+        width,
+        1,
+    );
+    assert!(text.contains("● ready"), "{text}");
+    assert!(text.contains(&context), "{text}");
+    assert!(text.contains('…'), "{text}");
+}
+
+#[test]
 fn ordinary_status_truncates_session_and_model_on_complete_graphemes() {
     let mut app = status_app();
     app.color = false;
@@ -70,7 +89,7 @@ fn ordinary_status_truncates_session_and_model_on_complete_graphemes() {
         assert!(long.starts_with(prefix));
         assert!(prefix.starts_with("界e\u{301}"));
         assert!(!prefix.ends_with('e'), "split grapheme: {prefix:?}");
-        assert!(spans.iter().map(Span::width).sum::<usize>() <= 45);
+        assert!(spans.iter().map(status_width).sum::<usize>() <= 45);
     }
 }
 
@@ -94,7 +113,7 @@ fn ordinary_status_fits_tiny_rows_and_keeps_context_warning_style() {
         for width in 0..=25 {
             let spans = status_left(&app, width);
             assert!(
-                spans.iter().map(Span::width).sum::<usize>() <= width,
+                spans.iter().map(status_width).sum::<usize>() <= width,
                 "width={width}"
             );
             if width >= context.width() {
