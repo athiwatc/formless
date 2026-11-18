@@ -328,12 +328,58 @@ struct Stream {
     carry: Vec<u8>,
 }
 
+#[derive(Default)]
+struct LogBuffer {
+    lines: Vec<String>,
+    bytes: usize,
+    limit_reached: Option<usize>,
+    omitted_effects: usize,
+}
+
+impl LogBuffer {
+    fn push(&mut self, message: &str, dry_run_effect: bool, cap: usize) {
+        let prefix = if dry_run_effect {
+            "[dry run] would "
+        } else {
+            ""
+        };
+        // Empty lines still occupy a slot in the buffer.
+        let bytes = (prefix.len() + message.len()).max(1);
+        if self.limit_reached.is_some() || bytes > cap.saturating_sub(self.bytes) {
+            self.limit_reached.get_or_insert(cap);
+            self.omitted_effects = self
+                .omitted_effects
+                .saturating_add(usize::from(dry_run_effect));
+            return;
+        }
+        self.lines.push(format!("{prefix}{message}"));
+        self.bytes += bytes;
+    }
+
+    fn snapshot(&self) -> Vec<String> {
+        let mut lines = self.lines.clone();
+        if let Some(cap) = self.limit_reached {
+            let mut marker = format!(
+                "[log limit of {cap} bytes reached (tools.max_log_bytes); later lines dropped]"
+            );
+            if self.omitted_effects > 0 {
+                marker.push_str(&format!(
+                    " [dry run] {} further would-be effects omitted",
+                    self.omitted_effects
+                ));
+            }
+            lines.push(marker);
+        }
+        lines
+    }
+}
+
 struct State {
     read_consents: Mutex<std::collections::HashSet<PathBuf>>,
     caps: Capabilities,
     mode: HostMode,
     ops: Arc<dyn HostOps>,
-    logs: Mutex<Vec<String>>,
+    logs: Mutex<LogBuffer>,
     /// Smoke/Replay write overlay: discarded writes stay readable within
     /// the same run so write-then-read tools work (§8.4).
     overlay: Overlay,
@@ -1238,11 +1284,16 @@ fn modified_ms(m: &std::fs::Metadata) -> Option<u64> {
 }
 
 impl State {
+    fn append_log(&self, message: &str, dry_run_effect: bool) {
+        if let Ok(mut logs) = self.logs.lock() {
+            let cap = usize::try_from(MAX_LOG_BYTES.load(Ordering::Relaxed)).unwrap_or(usize::MAX);
+            logs.push(message, dry_run_effect, cap);
+        }
+    }
+
     /// A dry run's would-be effect, kept in the logs (SPEC §10.4).
     fn would(&self, what: String) {
-        if let Ok(mut g) = self.logs.lock() {
-            g.push(format!("[dry run] would {what}"));
-        }
+        self.append_log(&what, true);
     }
 
     /// Smoke-mode stub: remember that the Tool has seen fake data.
@@ -1255,16 +1306,7 @@ impl State {
         match op {
             "log" => {
                 if let Some(m) = a["msg"].as_str() {
-                    if let Ok(mut g) = self.logs.lock() {
-                        // Past the cap, lines are dropped, once said (#604).
-                        let used: usize = g.iter().map(String::len).sum();
-                        let cap = MAX_LOG_BYTES.load(Ordering::Relaxed) as usize;
-                        if used + m.len() <= cap {
-                            g.push(m.to_string());
-                        } else if g.last().is_none_or(|l| !l.starts_with("[log limit")) {
-                            g.push(format!("[log limit of {cap} bytes reached (tools.max_log_bytes); later lines dropped]"));
-                        }
-                    }
+                    self.append_log(m, false);
                 }
                 Ok(Value::Null)
             }
@@ -3201,7 +3243,7 @@ pub fn execute(req: &ExecRequest, ops: Arc<dyn HostOps>) -> Result<ExecOutcome, 
         caps: req.caps.clone(),
         mode: req.mode,
         ops,
-        logs: Mutex::new(Vec::new()),
+        logs: Mutex::new(LogBuffer::default()),
         overlay: req.overlay.clone().unwrap_or_else(new_overlay),
         modules: req.modules.clone(),
         streams: Mutex::new(HashMap::new()),
@@ -3228,7 +3270,7 @@ pub fn execute(req: &ExecRequest, ops: Arc<dyn HostOps>) -> Result<ExecOutcome, 
     let err = |e: &dyn std::fmt::Display| {
         let mut x = classify(&e.to_string(), cancelled.load(Ordering::SeqCst));
         x.after_stub = state.stubbed.load(Ordering::SeqCst);
-        x.logs = state.logs.lock().map(|l| l.clone()).unwrap_or_default();
+        x.logs = state.logs.lock().map(|l| l.snapshot()).unwrap_or_default();
         x
     };
     let runtime = Runtime::new().map_err(|e| err(&e))?;
@@ -3401,7 +3443,6 @@ pub fn execute(req: &ExecRequest, ops: Arc<dyn HostOps>) -> Result<ExecOutcome, 
         return Err(error);
     }
     let parsed: Value = serde_json::from_str(&result_json).map_err(|e| err(&e))?;
-    let logs = state.logs.lock().map(|g| g.clone()).unwrap_or_default();
     if !parsed["ok"].as_bool().unwrap_or(false) {
         let mut error = err(&parsed["error"].as_str().unwrap_or("tool error"));
         error.nested = serde_json::from_value(parsed["nested"].clone()).ok();
@@ -3413,6 +3454,7 @@ pub fn execute(req: &ExecRequest, ops: Arc<dyn HostOps>) -> Result<ExecOutcome, 
             "tool returned an error result (throw instead of returning {{error}}): {msg}"
         )));
     }
+    let logs = state.logs.lock().map(|l| l.snapshot()).unwrap_or_default();
     Ok(ExecOutcome { output, logs })
 }
 
@@ -3424,6 +3466,28 @@ pub fn execute_anyhow(req: &ExecRequest, ops: Arc<dyn HostOps>) -> Result<ExecOu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn log_buffer_counts_empty_lines_and_retains_tool_text() {
+        let mut logs = LogBuffer::default();
+        let tool_text = "[log limit from Tool output]";
+        let cap = tool_text.len() + 1;
+        logs.push(tool_text, false, cap);
+        logs.push("", false, cap);
+        logs.push("", false, cap);
+        logs.push("later", false, cap);
+
+        assert_eq!(
+            logs.snapshot(),
+            [
+                tool_text.to_owned(),
+                String::new(),
+                format!(
+                    "[log limit of {cap} bytes reached (tools.max_log_bytes); later lines dropped]"
+                ),
+            ],
+        );
+    }
 
     #[test]
     fn whole_read_limit_errors_distinguish_exact_byte_counts() {
