@@ -1391,7 +1391,8 @@
     if (/[\u0300-\u0304\u0306-\u030c\u030f\u0311\u031b\u0323-\u0328\u032d-\u032e\u0330-\u0331]/u.test(ch)) return "";
     const base = ch.normalize("NFD").replace(/\p{M}/gu, "");
     // unicode61's precomposed diacritic table folds to ASCII Latin.
-    return (/^[A-Za-z]$/.test(base) ? base : ch).toLowerCase();
+    const lower = (/^[A-Za-z]$/.test(base) ? base : ch).toLowerCase();
+    return lower === "ς" ? "σ" : lower;
   }
 
   function searchHighlightRanges(text, literal, terms) {
@@ -1403,11 +1404,9 @@
     const { folded, from } = foldMap(text, foldSearchCharacter);
     const remaining = new Set(terms);
     const spans = [];
-    // Approximate unicode61's boundaries, highlighting the first visible
-    // prefix per term. Multiple prefixes at one position share a mark.
+    // Approximate unicode61's boundaries within this snippet. Highlight the
+    // first visible prefix per term, sharing a mark for overlapping prefixes.
     for (const { 0: word, index } of folded.matchAll(/[\p{L}\p{N}\p{Co}]+/gu)) {
-      // A trimmed snippet may start partway through a word after the ellipsis.
-      if (from[index] === 1 && text.startsWith("…")) continue;
       let end = index;
       for (const term of remaining) {
         if (!word.startsWith(term)) continue;
