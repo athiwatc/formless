@@ -17,7 +17,7 @@ const CLOSE_LINK: &str = "\x1b]8;;\x1b\\";
 // Terminate a partial control string before closing the current hyperlink.
 const RECOVER_LINK: &str = "\x1b\\\x1b]8;;\x1b\\";
 
-/// One visible link: row, first and last column, and its target.
+/// One visible link with inclusive leading-cell bounds and its target.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Painted {
     pub y: u16,
@@ -285,16 +285,28 @@ pub fn scan(
     area: Rect,
     resolve: &mut dyn FnMut(&str) -> Option<String>,
 ) -> Vec<Painted> {
-    // One char per cell; wide chars leave an empty continuation cell.
     let rows: Vec<(u16, Vec<u16>, Vec<char>)> = (area.top()..area.bottom())
         .map(|y| {
             let mut xs = Vec::new();
             let mut text = Vec::new();
-            for x in area.left()..area.right() {
-                for c in buf[(x, y)].symbol().chars().take(1) {
-                    xs.push(x);
+            let mut last_end = area.left();
+            // Walk from the buffer's left edge so a glyph crossing into the
+            // chat area can never contribute a stray continuation space.
+            for (cols, cell) in row_cells(buf, y, buf.area.left()..area.right()) {
+                if cols.start < area.left() || cols.end > area.right() {
+                    continue;
+                }
+                if cols.start > last_end {
+                    // Unpainted cells break a token. Wide continuation cells
+                    // are already included in the preceding glyph's range.
+                    xs.push(last_end);
+                    text.push(' ');
+                }
+                for c in cell.symbol().chars() {
+                    xs.push(cols.start);
                     text.push(c);
                 }
+                last_end = cols.end;
             }
             (y, xs, text)
         })
@@ -317,15 +329,24 @@ pub fn scan(
             let mut pieces = vec![(i, a, run_end(chars, a))];
             loop {
                 let &(r, pa, pb) = pieces.last().expect("one piece");
-                let (_, _, rc) = &rows[r];
+                let (ry, rxs, rc) = &rows[r];
                 let alone = first_ink(rc) == Some(pa) && last_ink(rc).map(|l| l + 1) == Some(pb);
-                let Some((_, _, next)) = rows.get(r + 1) else {
-                    break;
-                };
-                if !alone || pb - pa < 16 || first_ink(next) != Some(a) {
+                if !alone {
                     break;
                 }
-                pieces.push((r + 1, a, run_end(next, a)));
+                let last_x = rxs[pb - 1];
+                let width =
+                    usize::from(last_x - rxs[pa]) + buf[(last_x, *ry)].symbol().width().max(1);
+                let Some((_, next_xs, next)) = rows.get(r + 1) else {
+                    break;
+                };
+                let Some(next_start) = first_ink(next) else {
+                    break;
+                };
+                if width < 16 || next_xs[next_start] != xs[a] {
+                    break;
+                }
+                pieces.push((r + 1, next_start, run_end(next, next_start)));
             }
             let target = if pieces.len() == 1 {
                 url
@@ -740,6 +761,135 @@ mod tests {
         let s = String::from_utf8(out).unwrap();
         assert!(s.contains("\x1b]8;;https://x.dev\x1b\\"), "{s:?}");
         assert!(s.ends_with("\x1b8") || s.contains("\x1b]8;;\x1b\\"));
+    }
+
+    #[test]
+    fn scan_and_paint_preserve_wide_url_glyphs() {
+        let area = Rect::new(0, 0, 42, 1);
+        let mut buf = Buffer::empty(area);
+        let url = "https://ja.wikipedia.org/wiki/日本";
+        buf.set_string(
+            0,
+            0,
+            format!("see {url} now"),
+            ratatui::style::Style::default(),
+        );
+
+        let links = scan(&buf, area, &mut |_| None);
+        let x1 = 4 + url.width() as u16 - 2;
+        assert_eq!(buf[(x1, 0)].symbol(), "本");
+        assert_eq!(
+            links,
+            [Painted {
+                y: 0,
+                x0: 4,
+                x1,
+                url: url.to_owned(),
+            }]
+        );
+
+        let mut out = Vec::new();
+        paint(&mut out, &buf, &links, &[]).unwrap();
+        let painted = String::from_utf8(out).unwrap();
+        let (_, after_target) = painted.split_once(&format!("\x1b]8;;{url}\x1b\\")).unwrap();
+        let (visible, _) = after_target.split_once(CLOSE_LINK).unwrap();
+        assert_eq!(visible.matches('日').count(), 1);
+        assert_eq!(visible.matches('本').count(), 1);
+        assert!(visible.find('日').unwrap() < visible.find('本').unwrap());
+        assert!(!visible.contains(' '));
+    }
+
+    #[test]
+    fn scan_resolves_a_wide_unicode_file_path_with_a_line_suffix() {
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir(&dir).unwrap();
+        let name = "設計📄.md";
+        let file = dir.join(name);
+        std::fs::write(&file, b"fixture").unwrap();
+        let canonical = file.canonicalize().unwrap();
+        let area = Rect::new(0, 0, 32, 1);
+        let mut buf = Buffer::empty(area);
+        buf.set_string(
+            0,
+            0,
+            format!("see {name}:42"),
+            ratatui::style::Style::default(),
+        );
+
+        let links = scan(&buf, area, &mut |word| {
+            let path = dir.join(word).canonicalize().ok()?;
+            file_url(&path)
+        });
+        let resolved = links.first().and_then(|link| {
+            let target = url::Url::parse(&link.url).ok()?;
+            target.to_file_path().ok()?.canonicalize().ok()
+        });
+        std::fs::remove_file(file).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].x0, 4);
+        assert_eq!(links[0].x1, 4 + name.width() as u16 + 2);
+        assert_eq!(resolved, Some(canonical));
+    }
+
+    #[test]
+    fn skipped_cells_do_not_join_separate_tokens() {
+        let area = Rect::new(0, 0, 36, 1);
+        let mut buf = Buffer::empty(area);
+        let url = "https://example.test";
+        let gap = url.width() as u16;
+        buf.set_string(0, 0, url, ratatui::style::Style::default());
+        buf[(gap, 0)].set_skip(true);
+        buf.set_string(gap + 1, 0, "/other", ratatui::style::Style::default());
+        let links = scan(&buf, area, &mut |_| None);
+        assert_eq!(
+            links,
+            [Painted {
+                y: 0,
+                x0: 0,
+                x1: gap - 1,
+                url: url.to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn wrapped_urls_use_terminal_columns_and_keep_complete_graphemes() {
+        let area = Rect::new(2, 1, 20, 2);
+        let mut buf = Buffer::empty(area);
+        let first = "https://x/日本語";
+        let second = "文e\u{301}❤️👩‍💻";
+        let x0 = 6;
+        assert_eq!(first.width(), 16);
+        buf.set_string(x0, 1, first, ratatui::style::Style::default());
+        buf.set_string(x0, 2, second, ratatui::style::Style::default());
+        let target = format!("{first}{second}");
+
+        let links = scan(&buf, area, &mut |_| None);
+        assert_eq!(
+            links,
+            [
+                Painted {
+                    y: 1,
+                    x0,
+                    x1: area.right() - 2,
+                    url: target.clone(),
+                },
+                Painted {
+                    y: 2,
+                    x0,
+                    x1: x0 + "文e\u{301}❤️".width() as u16,
+                    url: target,
+                },
+            ]
+        );
+        for (link, text) in links.iter().zip([first, second]) {
+            let visible: String = link_cells(&buf, link)
+                .map(|(_, cell)| cell.symbol())
+                .collect();
+            assert_eq!(visible, text);
+        }
     }
 
     #[test]
