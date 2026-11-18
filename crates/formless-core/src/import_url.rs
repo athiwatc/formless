@@ -367,6 +367,28 @@ mod fetch_tests {
         let _ = server.await;
     }
 
+    #[tokio::test]
+    async fn connection_failure_keeps_userinfo_out_of_the_error_chain() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            drop(socket);
+        });
+        let url = format!("http://fixture-name:fixture-secret@{addr}/closed");
+        let error = tokio::time::timeout(std::time::Duration::from_secs(3), get_json(&url, true))
+            .await
+            .unwrap()
+            .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains(&format!("http://{addr}/closed")));
+        assert!(
+            !message.contains("fixture-name") && !message.contains("fixture-secret"),
+            "{message}"
+        );
+        server.await.unwrap();
+    }
+
     #[test]
     fn gist_prefers_complete_bundle_over_truncated_earlier_files() {
         let bundle = serde_json::json!({"format":"formless.tool/1","name":"fixture"});
