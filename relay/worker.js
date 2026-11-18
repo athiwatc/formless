@@ -334,19 +334,34 @@ export const SECURITY_HEADERS = {
   "x-content-type-options": "nosniff",
   "referrer-policy": "no-referrer",
   "cache-control": "no-cache",
+  "strict-transport-security": "max-age=31536000; includeSubDomains",
+  "permissions-policy": "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
+  "cross-origin-opener-policy": "same-origin",
 };
+
+function withSecurityHeaders(response, protocol) {
+  // The assets binding may return an immutable header guard.
+  const result = new Response(response.body, response);
+  for (const [name, value] of Object.entries(SECURITY_HEADERS)) {
+    if (name === "strict-transport-security" && protocol !== "https:") continue;
+    result.headers.set(name, value);
+  }
+  return result;
+}
 
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     if (url.pathname === "/push/key") {
       const { vapid } = await pushFor(env);
-      return vapid ? Response.json({ key: vapid.publicKey }) : new Response("push is not set up on this relay", { status: 404 });
+      const response = vapid ? Response.json({ key: vapid.publicKey }) : new Response("push is not set up on this relay", { status: 404 });
+      return withSecurityHeaders(response, url.protocol);
     }
     if (url.pathname === "/health") {
       const push = await pushFor(env);
       const state = push.state === "ok" && refused ? "misconfigured" : push.state;
-      return Response.json({ ok: true, service: "formless-relay", version: 2, push: state, push_problem: push.reason || refused || undefined });
+      const response = Response.json({ ok: true, service: "formless-relay", version: 2, push: state, push_problem: push.reason || refused || undefined });
+      return withSecurityHeaders(response, url.protocol);
     }
     const m = url.pathname.match(/^\/relay\/([a-f0-9]{32})$/);
     if (m) {
@@ -354,8 +369,6 @@ export default {
       return stub.fetch(request);
     }
     const asset = await env.ASSETS.fetch(request);
-    const res = new Response(asset.body, asset);
-    for (const [k, v] of Object.entries(SECURITY_HEADERS)) res.headers.set(k, v);
-    return res;
+    return withSecurityHeaders(asset, url.protocol);
   },
 };
