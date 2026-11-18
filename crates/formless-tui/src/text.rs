@@ -26,18 +26,21 @@ pub(crate) fn next_cluster(s: &str, i: usize) -> usize {
         .map_or(s.len(), |g| i + g.len())
 }
 
-/// Scripts written without spaces between words (Thai, Lao, Khmer,
-/// Myanmar, Chinese, Japanese): any cluster boundary may break a line or
-/// end a word step.
+/// Script blocks that use cluster boundaries for soft wrapping and word steps.
 pub(crate) fn unspaced(c: char) -> bool {
     matches!(c as u32,
         0x0E00..=0x0EFF // Thai, Lao
         | 0x1000..=0x109F // Myanmar
-        | 0x1780..=0x17FF // Khmer
-        | 0x3000..=0x30FF // CJK punctuation, kana
+        | 0x1780..=0x17FF | 0x19E0..=0x19FF // Khmer and Khmer Symbols
+        | 0x1980..=0x19DF // New Tai Lue
+        | 0x1A20..=0x1AAF // Tai Tham
+        | 0x3000..=0x312F // CJK punctuation, kana, Bopomofo
+        | 0x3190..=0x31FF // Kanbun, Bopomofo Extended, CJK Strokes, Katakana Phonetic Extensions
         | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF // ideographs
+        | 0xA9E0..=0xA9FF | 0xAA60..=0xAA7F // Myanmar Extended-B and A
+        | 0xAA80..=0xAADF // Tai Viet
         | 0xFF00..=0xFFEF // fullwidth forms
-        | 0x20000..=0x2FFFF)
+        | 0x20000..=0x323AF) // Supplementary ideographs, including Extensions G and H
 }
 
 /// The longest prefix of `s` that fits `max` columns, cut between

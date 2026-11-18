@@ -1888,6 +1888,24 @@ mod tests {
             out.join("").replace(' ', ""),
             "我喜欢用中文写很长的句子来测试换行"
         );
+        for (first, second) in [
+            ("\u{30000}\u{e0100}", "\u{31350}"),
+            ("\u{31f0}", "\u{31f1}"),
+            ("\u{1980}", "\u{1981}"),
+            ("\u{1a20}", "\u{1a21}"),
+            ("\u{aa80}", "\u{aa81}"),
+        ] {
+            let prefix = format!("word {first}");
+            let source = format!("{prefix}{second}");
+            let cols = crate::text::width(&prefix);
+            assert_eq!(
+                lines(&source, cols),
+                [prefix, second.to_owned()],
+                "{source}"
+            );
+        }
+        let hangul = lines("word ㄱㄴ", crate::text::width("word ㄱ"));
+        assert_eq!(hangul, ["word", "ㄱㄴ"]);
         let family = "👨\u{200d}👩\u{200d}👧\u{200d}👦";
         let rows = hard_wrap(vec![Span::raw(family.repeat(3))], 3);
         for r in &rows {

@@ -1580,6 +1580,31 @@ mod tests {
         let mut i = InputLine::from("hello 世界");
         i.delete_word_back();
         assert_eq!(&*i, "hello 世");
+        for (first, second) in [
+            ("\u{30000}\u{e0100}", "\u{31350}"),
+            ("\u{3105}", "\u{3106}"),
+            ("\u{31f0}", "\u{31f1}"),
+            ("\u{1980}", "\u{1981}"),
+            ("\u{1a20}", "\u{1a21}"),
+            ("\u{aa80}", "\u{aa81}"),
+        ] {
+            let source = format!("{first}{second}");
+            let mut input = InputLine::from(source.as_str());
+            input.word_left();
+            assert_eq!(input.cursor_byte(), first.len(), "{source}");
+            input.word_left();
+            assert_eq!(input.cursor_byte(), 0, "{source}");
+            input.word_right();
+            assert_eq!(input.cursor_byte(), first.len(), "{source}");
+            input.end();
+            input.delete_word_back();
+            assert_eq!(&*input, first, "{source}");
+        }
+        let mut hangul = InputLine::from("ㄱㄴ");
+        hangul.word_left();
+        assert_eq!(hangul.cursor_byte(), 0);
+        hangul.word_right();
+        assert_eq!(hangul.cursor_byte(), "ㄱㄴ".len());
     }
     #[test]
     fn command_intent_is_part_of_undo_redo_and_transcript_history_snapshots() {
