@@ -459,10 +459,12 @@ without redesign.
 
 ### 4.3 Endpoint probe (onboarding gate)
 
-Before the first Session, the wizard probes the endpoint: connectivity,
-streaming, and a **test tool-call**. If tool-calling is unsupported, session
-start is refused with a clear explanation. Native tool-calling is required
-in v1; a prompt-based (text/JSON) fallback is explicitly out (§17).
+Before the first Session, the wizard checks connectivity, streaming, and a
+**test tool-call**. The original v1 scope (§17) required native tool calling.
+The current probe accepts either native or [prompt-based tool calling](#41-scope).
+When the prompt fallback succeeds, the wizard saves `provider.tool_mode = "prompt"`.
+A result with neither mode demonstrated blocks Session start. Probe errors
+also block completion and show the reported cause.
 Thinking-mode endpoints that reject a forced `tool_choice` are re-probed
 with `tool_choice` omitted; a voluntary test tool-call still passes.
 The probe also makes one real streamed request and reports `streaming`
