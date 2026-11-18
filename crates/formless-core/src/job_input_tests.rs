@@ -180,6 +180,7 @@ fn cron_matches_real_instants_through_local_clock_changes() {
         for (case, tz) in [
             ("new_york", "EST5EDT,M3.2.0/2,M11.1.0/2"),
             ("lord_howe", "LHST-10:30LHDT-11,M10.1.0/2,M4.1.0/2"),
+            ("same_hour", "STD0DST-2,M3.2.0/1:10,M3.2.0/3:30"),
         ] {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
@@ -207,6 +208,13 @@ fn cron_matches_real_instants_through_local_clock_changes() {
         local
     };
     let next = |expr: &str, after: &str| Cron::parse(expr).unwrap().next_after(local(after));
+    if case == "same_hour" {
+        assert_eq!(
+            next("15 3 * * *", "2026-03-08T01:00:00+00:00"),
+            Some(local("2026-03-08T03:15:00+02:00")),
+        );
+        return;
+    }
     if case == "lord_howe" {
         assert_eq!(
             next("* * * * *", "2026-04-05T01:59:45+11:00"),

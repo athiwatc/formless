@@ -117,19 +117,7 @@ impl Cron {
             if self.matches(&t) {
                 return Some(t);
             }
-            let minutes = if self.hour[t.hour() as usize] {
-                1
-            } else {
-                60 - t.minute()
-            };
-            let next = t.checked_add_signed(Duration::minutes(i64::from(minutes)))?;
-            // A clock change inside the skip can reach another matching hour
-            // earlier than the projected boundary (including fractional hours).
-            t = if next.offset() == t.offset() {
-                next
-            } else {
-                next_local_minute(&t)?
-            };
+            t = next_local_minute(&t)?;
         }
         None
     }
@@ -138,17 +126,18 @@ impl Cron {
 // Work from absolute seconds. Rebuilding a wall-clock value would discard
 // both occurrences of a repeated local minute as ambiguous.
 fn next_local_minute(after: &DateTime<Local>) -> Option<DateTime<Local>> {
-    let at_or_after = Local
-        .timestamp_opt(after.timestamp().checked_add(1)?, 0)
+    let seconds = i64::from(60 - after.second());
+    let candidate = Local
+        .timestamp_opt(after.timestamp().checked_add(seconds)?, 0)
         .single()?;
-    let seconds = (60 - at_or_after.second()) % 60;
-    let candidate = at_or_after.checked_add_signed(Duration::seconds(i64::from(seconds)))?;
     if candidate.second() == 0 {
         return Some(candidate);
     }
     // A historical offset change can include seconds. Look for the next
     // local minute boundary without skipping over it on the new offset.
-    let mut current = at_or_after;
+    let mut current = Local
+        .timestamp_opt(after.timestamp().checked_add(1)?, 0)
+        .single()?;
     while current.second() != 0 {
         current = current.checked_add_signed(Duration::seconds(1))?;
     }
