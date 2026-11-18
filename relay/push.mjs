@@ -33,18 +33,31 @@ export async function vapidAuth(endpoint, publicKey, privateKey, subject) {
 export async function sendPush(sub, vapid) {
   const auth = await vapidAuth(sub.endpoint, vapid.publicKey, vapid.key, vapid.subject);
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(new DOMException("push timed out", "TimeoutError")), PUSH_TIMEOUT_MS);
+  const timeout = new DOMException("push timed out", "TimeoutError");
+  let timer;
+  const deadline = new Promise(resolve => {
+    timer = setTimeout(() => {
+      resolve(null);
+      controller.abort(timeout);
+    }, PUSH_TIMEOUT_MS);
+  });
   try {
-    const res = await fetch(sub.endpoint, {
+    const request = fetch(sub.endpoint, {
       method: "POST",
       headers: { authorization: auth, ttl: "3600", urgency: "high", "content-length": "0" },
       signal: controller.signal,
     });
-    // The status still identifies an expired subscription even if cleanup fails.
-    if (res.body) await res.body.cancel().catch(() => controller.abort());
+    const res = await Promise.race([request, deadline]);
+    if (!res) throw timeout;
+    if (res.body) {
+      // Cleanup shares the request deadline. A received 404 or 410 still
+      // identifies an expired subscription if cleanup fails or stalls.
+      const cleaned = await Promise.race([res.body.cancel().catch(() => controller.abort()), deadline]);
+      if (cleaned === null) console.error("relay: push response cleanup timed out");
+    }
     return res.status;
   } catch (error) {
-    if (controller.signal.aborted) throw controller.signal.reason;
+    if (controller.signal.reason === timeout) throw timeout;
     throw error;
   } finally {
     clearTimeout(timer);

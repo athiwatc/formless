@@ -96,6 +96,8 @@ test("a hung subscription times out while healthy deliveries use bounded slots",
   assert.ok(signal, "the push request needs a cancellation signal");
   await firstHealthy.promise;
   await push("question");
+  // Let the healthy cleanup continuations clear their timers before ticking.
+  await new Promise(resolve => setImmediate(resolve));
   t.mock.timers.tick(9_999);
   assert.equal(signal.aborted, false);
   t.mock.timers.tick(1);
@@ -108,6 +110,38 @@ test("a hung subscription times out while healthy deliveries use bounded slots",
   for (const name of names) assert.equal(calls.get(name), 2, name);
   assert.deepEqual(errors, ["relay: push timed out"]);
   assert.deepEqual((await storage.list({ prefix: "push:" })).get("push:0"), subscription("unresponsive"));
+});
+
+test("stalled body cancellation releases the fan-out and preserves an expired status", { timeout: 3_000 }, async t => {
+  const { push, storage } = await setup(t, ["expired", "healthy"]);
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const errors = [];
+  t.mock.method(console, "error", message => errors.push(message));
+  const cleanup = Promise.withResolvers();
+  const calls = [];
+  t.mock.method(globalThis, "fetch", async (endpoint, { signal }) => {
+    const name = new URL(endpoint).pathname.split("/").at(-1);
+    calls.push(name);
+    if (name === "healthy") return new Response(null, { status: 201 });
+    return new Response(new ReadableStream({
+      cancel() {
+        cleanup.resolve(signal);
+        return new Promise(() => {});
+      },
+    }), { status: 410 });
+  });
+
+  const delivery = push("approval");
+  const signal = await cleanup.promise;
+  await push("question");
+  t.mock.timers.tick(10_000);
+  await delivery;
+
+  assert.equal(signal.aborted, true);
+  assert.equal(calls.filter(name => name === "expired").length, 1);
+  assert.equal(calls.filter(name => name === "healthy").length, 2);
+  assert.equal((await storage.list({ prefix: "push:" })).has("push:0"), false);
+  assert.deepEqual(errors, ["relay: push response cleanup timed out"]);
 });
 
 test("a queued push still runs when the previous pass cannot list subscriptions", { timeout: 3_000 }, async t => {
