@@ -3056,6 +3056,49 @@ impl Store {
             && expected == known
             && main >= self.run_steps(run_id)?)
     }
+
+    /// Check coverage for the distinct Runs allocated by a branch comparison.
+    /// Aggregate requests and usage separately so their rows cannot multiply.
+    fn forecast_usage_complete_for_runs(&self, run_ids: &[String]) -> Result<bool> {
+        if run_ids.is_empty() {
+            return Ok(true);
+        }
+        let ids = serde_json::to_string(run_ids)?;
+        let mut stmt = self.ps(
+            "WITH wanted(id) AS MATERIALIZED (SELECT value FROM json_each(?1)),
+             requests AS (
+                 SELECT c.run_id, SUM(c.expected) AS expected,
+                        SUM(CASE WHEN c.source='run' THEN c.expected ELSE 0 END) AS main
+                 FROM wanted AS w CROSS JOIN forecast_request_counts AS c ON c.run_id=w.id
+                 GROUP BY c.run_id
+             ),
+             usage AS (
+                 SELECT u.run_id, COUNT(*) AS recorded, SUM(u.usage_complete) AS covered
+                 FROM wanted AS w CROSS JOIN run_usage AS u ON u.run_id=w.id
+                 GROUP BY u.run_id
+             )
+             SELECT COALESCE(c.expected,0), COALESCE(c.main,0),
+                    COALESCE(u.recorded,0), COALESCE(u.covered,0), r.steps
+             FROM wanted AS w
+             LEFT JOIN requests AS c ON c.run_id=w.id
+             LEFT JOIN usage AS u ON u.run_id=w.id
+             LEFT JOIN runs AS r ON r.id=w.id",
+        )?;
+        let mut rows = stmt.query(params![ids])?;
+        let mut complete = true;
+        while let Some(row) = rows.next()? {
+            let expected: i64 = row.get(0)?;
+            let main: i64 = row.get(1)?;
+            let recorded: i64 = row.get(2)?;
+            let covered: i64 = row.get(3)?;
+            // Match run_steps' zero fallback for a missing or invalid value.
+            let steps: i64 = row.get(4).unwrap_or_default();
+            complete &=
+                expected > 0 && expected == recorded && expected == covered && main >= steps;
+        }
+        Ok(complete)
+    }
+
     pub fn forecast_models(&self, run_id: &str) -> Result<Vec<(String, String)>> {
         let mut stmt = self
             .ps("SELECT DISTINCT provider,model FROM run_usage WHERE run_id=?1 AND source='run'")?;
