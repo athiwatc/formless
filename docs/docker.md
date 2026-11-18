@@ -55,7 +55,10 @@ base_url = "https://openrouter.ai/api/v1"
 model = "anthropic/claude-sonnet-5.5"
 ```
 
-copy it into the config volume, restart, and check:
+Copy it into a new config volume, restart, and check. **The copy command
+replaces all of `/config/config.toml`, including any unrelated settings.**
+Use the key-specific commands below if the volume already has settings
+you want to keep.
 
 ```sh
 docker exec -i formless sh -c 'cat > /config/config.toml' < config.toml
@@ -63,8 +66,32 @@ docker restart formless
 docker exec formless formless doctor
 ```
 
-Later changes: `docker exec formless formless config set provider.model …`
-(the daemon validates and applies them), or edit the file the same way.
+The doctor command can contact the configured provider and report network
+problems or failures from other checks.
+
+### Update an existing provider configuration
+
+On a running container, use the daemon-validated `config set` command to
+change only the provider keys you need. For example:
+
+```sh
+docker exec formless formless config set provider.base_url 'https://openrouter.ai/api/v1' &&
+  docker exec formless formless config set provider.model 'anthropic/claude-sonnet-5.5'
+```
+
+These are separate updates. If the first succeeds and the second fails,
+the first value stays saved. Check each command's output for an environment
+override. When one applies, the daemon reports the value it uses even though
+the new value was saved. To inspect the values the CLI loads inside the
+container, including its environment overrides, run:
+
+```sh
+docker exec formless formless config get provider.base_url
+docker exec formless formless config get provider.model
+```
+
+Successful setting validation confirms the configuration values. Provider
+connectivity and model availability still depend on the endpoint.
 
 ## Volumes
 
