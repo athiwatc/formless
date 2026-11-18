@@ -472,6 +472,7 @@ pub(crate) struct Highlighter {
     lang: &'static Lang,
     rust_numbers: bool,
     python_comments: bool,
+    shell_comments: bool,
     raw_backticks: bool,
     color: bool,
     /// Open block comments (more than one only where they nest).
@@ -565,6 +566,10 @@ impl Highlighter {
             lang,
             rust_numbers: matches!(name.as_str(), "rust" | "rs"),
             python_comments: matches!(name.as_str(), "py" | "python" | "python3"),
+            shell_comments: matches!(
+                name.as_str(),
+                "sh" | "bash" | "zsh" | "fish" | "shell" | "console"
+            ),
             raw_backticks: matches!(name.as_str(), "go" | "golang"),
             color,
             in_block: 0,
@@ -584,6 +589,25 @@ impl Highlighter {
             Tok::Type => fg(c, Color::Cyan),
             Tok::Call | Tok::Key => fg(c, Color::Blue),
         }
+    }
+
+    fn hash_starts_comment(&self, prefix: &[char]) -> bool {
+        let Some((&previous, before)) = prefix.split_last() else {
+            return true;
+        };
+        if self.python_comments {
+            return true;
+        }
+        let boundary = previous.is_whitespace()
+            || self.shell_comments && matches!(previous, ';' | '|' | '&' | '(');
+        boundary
+            && (!self.shell_comments
+                || before
+                    .iter()
+                    .rev()
+                    .take_while(|&&c| c == '\\')
+                    .count()
+                    .is_multiple_of(2))
     }
 
     /// Highlight one line; open block comments and multi-line strings
@@ -699,7 +723,7 @@ impl Highlighter {
                 }
             }
             if l.line_comments.iter().any(|p| at(i, p))
-                && (c != '#' || self.python_comments || i == 0 || chars[i - 1].is_whitespace())
+                && (c != '#' || self.hash_starts_comment(&chars[..i]))
             {
                 push(Tok::Comment, &chars[i..]);
                 break;
@@ -1102,6 +1126,41 @@ mod tests {
             assert!(
                 toks(lang, "value # comment")
                     .contains(&("# comment".into(), Some(Color::DarkGray))),
+                "{lang}"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_hash_comments_follow_unescaped_word_boundaries() {
+        for lang in ["sh", "bash", "zsh", "fish", "shell", "console"] {
+            for (source, expected) in [
+                ("echo a;# done", "# done"),
+                ("true|# note", "# note"),
+                ("true&# note", "# note"),
+                ("echo a &&# note", "# note"),
+                ("(# note", "# note"),
+                ("echo a; # spaced", "# spaced"),
+                (r"echo a\;#literal", ""),
+                (r"echo a\ #literal", ""),
+                (r"echo a\\;# note", "# note"),
+                ("echo foo#bar", ""),
+                ("echo ${#arr} $#", ""),
+                ("echo 'a;# quoted'", ""),
+            ] {
+                let comments: String = toks(lang, source)
+                    .into_iter()
+                    .filter(|(_, color)| *color == Some(Color::DarkGray))
+                    .map(|(text, _)| text)
+                    .collect();
+                assert_eq!(comments, expected, "{lang}: {source}");
+            }
+        }
+        for lang in ["yaml", "toml", "ini", "powershell", "ruby"] {
+            assert!(
+                toks(lang, "a|# literal")
+                    .iter()
+                    .all(|(_, color)| *color != Some(Color::DarkGray)),
                 "{lang}"
             );
         }

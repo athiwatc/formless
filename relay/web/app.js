@@ -1550,6 +1550,17 @@
     }
     const L = HL[HL_ALIAS[lang] || lang];
     if (!L) return null;
+    const shellComments = ["sh", "bash", "zsh", "fish", "shell", "console"].includes(lang);
+    const hashStartsComment = (at) => {
+      const previous = code[at - 1];
+      if (L.hashAnywhere || at === 0 || previous === "\n") return true;
+      if (!/\s/.test(previous) && !(shellComments && ";|&(".includes(previous))) return false;
+      if (!shellComments) return true;
+      // An escaped separator is still part of the shell word.
+      let start = at - 1;
+      while (start > 0 && code[start - 1] === "\\") start--;
+      return (at - 1 - start) % 2 === 0;
+    };
     const kotlin = lang === "kotlin" || lang === "kt";
     const out = [];
     let plain = "";
@@ -1580,7 +1591,7 @@
         i = stop;
         continue;
       }
-      if ((L.lc || []).some((p) => code.startsWith(p, i)) && (c !== "#" || L.hashAnywhere || i === 0 || /\s/.test(code[i - 1]))) {
+      if ((L.lc || []).some((p) => code.startsWith(p, i)) && (c !== "#" || hashStartsComment(i))) {
         const end = code.indexOf("\n", i);
         const stop = end < 0 ? code.length : end;
         tok("tok-com", code.slice(i, stop));
