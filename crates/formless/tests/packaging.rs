@@ -146,7 +146,9 @@ fn the_image_and_packages_carry_what_they_need() {
     let aur = std::fs::read_to_string(root().join("packaging/aur/PKGBUILD.in")).unwrap();
     assert!(aur.contains("'dbus'") && aur.contains("/usr/share/licenses/"));
     let release = std::fs::read_to_string(root().join(".github/workflows/release.yml")).unwrap();
-    assert!(release.contains("needs: [build, linux, linux-install-test, docker]"));
+    let publish = release.split_once("\n  publish:\n").unwrap().1;
+    let publish = publish.split_once("\n  docker-publish:\n").unwrap().0;
+    assert!(publish.contains("needs: [version-check, build, linux, linux-install-test, docker]"));
 }
 
 fn sh() -> &'static str {
