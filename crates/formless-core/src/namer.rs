@@ -931,7 +931,7 @@ mod tests {
         std::fs::create_dir_all(models_dir(&paths)).unwrap();
         std::fs::write(spec.gguf_path(&paths), b"full").unwrap();
         std::fs::write(spec.tokenizer_path(&paths), b"{}").unwrap();
-        let staging_name = |filename| {
+        let staging_name = |filename: &str| {
             models_dir(&paths).join(format!("{filename}.download-{}.part", uuid::Uuid::new_v4()))
         };
         let abandoned = staging_name(
