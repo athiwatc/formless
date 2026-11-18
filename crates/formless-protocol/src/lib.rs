@@ -3608,6 +3608,7 @@ mod tests {
 
     #[test]
     fn shell_launcher_and_interpreter_aliases_require_extra_confirmation() {
+        let reason = broad_capability("process:bash").unwrap();
         for spec in [
             "process:pkexec",
             "process:/usr/bin/pkexec",
@@ -3630,11 +3631,7 @@ mod tests {
             "process:py3",
             r"process:C:\Python311\pythonw.exe",
         ] {
-            assert_eq!(
-                broad_capability(spec),
-                broad_capability("process:bash"),
-                "{spec}"
-            );
+            assert_eq!(broad_capability(spec), Some(reason), "{spec}");
         }
         for spec in ["process:ls", "process:pytest", "process:nodejs-helper"] {
             assert_eq!(broad_capability(spec), None, "{spec}");
