@@ -4580,7 +4580,10 @@ mod tests {
         let request = engine.outgoing.pop_front().unwrap();
         assert!(matches!(
             request.request,
-            Request::SendReviewedMessage { .. }
+            Request::SendReviewedMessage {
+                mode: SendMode::Steer,
+                ..
+            }
         ));
         engine.command(Command::Intent(Intent::InterruptRun {
             session_id: "a".into(),
@@ -4592,7 +4595,7 @@ mod tests {
         respond(
             &mut engine,
             request.id,
-            json!({"started":true,"run_id":"run"}),
+            json!({"steered":true,"run_id":"run"}),
         );
         assert!(engine
             .updates
