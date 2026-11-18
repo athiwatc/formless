@@ -1042,7 +1042,7 @@ QuickJS-NG runs in-process. Bare JS has no ambient authority: the daemon provide
 | API | Gated by | Purpose |
 |---|---|---|
 | `fetch(url, {method, headers, body, bodyEncoding, encoding})` → `{status, ok, url, headers, body, text(), json()}` | `net` | HTTP; redirects followed, every hop scope-checked |
-| `fetchChunks(url, opts, size, cb)` | `net` | Stream arbitrarily large bodies in bounded memory |
+| `fetchChunks(url, opts, size, cb)` | `net` | Stream large bodies in bounded memory. The whole request, including body reads, is limited by `tools.fetch_timeout_secs` regardless of chunk size. |
 | `fs.read(path, {encoding})` / `fs.write` / `fs.append` | `fs:read` / `fs:write` | Whole-value access for small data |
 | `fs.exists` / `fs.stat` / `fs.list(dir, {details})` | `fs:read` | Existence, metadata, directory listing |
 | `fs.mkdir` / `fs.remove(path, {recursive})` / `fs.rename(from, to)` | `fs:write` | Tree changes |
