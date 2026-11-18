@@ -762,6 +762,9 @@ pub struct ApprovalBatch {
 /// (SPEC §7.2).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RegistryChange {
+    /// Identity of this operation. Older daemons and stored records omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_id: Option<String>,
     pub tool_id: String,
     pub name: String,
     /// created, updated, retired, restored or rolled_back.
@@ -2639,6 +2642,11 @@ pub enum Request {
     /// retired, an update or rollback rolled back, a retire or restore
     /// reversed. `{undone, tool}`; an error when there is nothing to undo.
     UndoRegistryChange,
+    /// Revert only the registry change identified by a specific event.
+    /// A separate request prevents older daemons from treating it as global Undo.
+    UndoRegistryChangeIfCurrent {
+        change_id: String,
+    },
     /// Switch a Tool off (or back on) without retiring it.
     SetToolDisabled {
         id: String,

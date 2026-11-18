@@ -501,8 +501,14 @@
   }
   /** A toast; `action` ({label, run, ms}) adds a button and keeps it up for `ms`. */
   function toast(text, err, action) {
+    const button = action && h("button", { class: "btn small", type: "button", onclick: () => {
+      if (button.disabled) return;
+      button.disabled = true;
+      t.remove();
+      action.run();
+    } }, action.label);
     const t = h("div", { class: "toast" + (err ? " err" : ""), role: err ? "alert" : "status" }, text,
-      action ? h("button", { class: "btn small", type: "button", onclick: () => { t.remove(); action.run(); } }, action.label) : null);
+      button);
     $("toasts").append(t);
     setTimeout(() => t.remove(), action ? action.ms : err ? 6000 : 3500);
   }
@@ -6923,10 +6929,13 @@
       }
       case "registry_changed": {
         refreshDescriptionReviews();
-        // Every registry change offers Undo for a few seconds (SPEC §7.2).
+        // Only daemons advertising a change identity can undo this toast safely.
         const c = ev.change;
         toast(c.author + " " + (c.action === "rolled_back" ? "rolled " + c.name + " back to v" + c.to_version : c.action + " " + c.name + (c.action === "retired" || c.action === "restored" ? "" : " v" + c.to_version)), false,
-          { label: "Undo", ms: 10000, run: async () => { const r = await act({ type: "undo_registry_change" }); if (r) toast("Undone: " + r.undone); } });
+          c.change_id ? { label: "Undo", ms: 10000, run: async () => {
+            const r = await act({ type: "undo_registry_change_if_current", change_id: c.change_id });
+            if (r) toast("Undone: " + r.undone);
+          } } : null);
         break;
       }
       case "module_deleted":

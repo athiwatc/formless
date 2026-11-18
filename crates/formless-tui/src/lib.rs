@@ -23827,6 +23827,7 @@ mod tests {
         let mut app = test_app();
         app.on_event(Event::RegistryChanged {
             change: formless_protocol::RegistryChange {
+                change_id: None,
                 tool_id: "t".into(),
                 name: "fetch_page".into(),
                 action: "updated".into(),
