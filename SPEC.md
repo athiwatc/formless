@@ -460,7 +460,7 @@ without redesign.
 ### 4.3 Endpoint probe (onboarding gate)
 
 Before the first Session, the wizard checks connectivity, streaming, and a
-**test tool-call**. The original v1 scope (§17) required native tool calling.
+**test tool-call**. The original v1 scope required native tool calling.
 The current probe accepts either native or [prompt-based tool calling](#41-scope).
 When the prompt fallback succeeds, the wizard saves `provider.tool_mode = "prompt"`.
 A result with neither mode demonstrated blocks Session start. Probe errors
