@@ -7576,27 +7576,29 @@ impl Daemon {
             if !mode_on || self.subscriber_count() == 0 {
                 break;
             }
-            // Serialize this second mode read and waiter registration with
-            // conditional Step-off without holding mode while taking the subscriber lock.
-            let mode = self.step_sessions.locked();
-            if !mode.contains(session_id) {
-                break;
-            }
-            let step_id = uuid::Uuid::new_v4().to_string();
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            let prompt = Event::StepPending {
-                session_id: session_id.to_string(),
-                run_id: run_id.to_string(),
-                step_id: step_id.clone(),
-                tool_name: tc.name.clone(),
-                arguments: tc.arguments.clone(),
-                index,
-                count,
+            let (step_id, prompt, rx) = {
+                // Serialize this second mode read and waiter registration with
+                // conditional Step-off without holding mode while taking the subscriber lock.
+                let mode = self.step_sessions.locked();
+                if !mode.contains(session_id) {
+                    break;
+                }
+                let step_id = uuid::Uuid::new_v4().to_string();
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let prompt = Event::StepPending {
+                    session_id: session_id.to_string(),
+                    run_id: run_id.to_string(),
+                    step_id: step_id.clone(),
+                    tool_name: tc.name.clone(),
+                    arguments: tc.arguments.clone(),
+                    index,
+                    count,
+                };
+                self.step_waiters
+                    .locked()
+                    .insert(step_id.clone(), step_inventory::Waiter::new(&prompt, tx));
+                (step_id, prompt, rx)
             };
-            self.step_waiters
-                .locked()
-                .insert(step_id.clone(), step_inventory::Waiter::new(&prompt, tx));
-            drop(mode);
             let waiting = step_inventory::Waiting {
                 daemon: self,
                 session: session_id,
