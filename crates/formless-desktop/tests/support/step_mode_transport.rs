@@ -40,19 +40,28 @@ async fn mode_lost_ack_case(on: bool) {
                 }
                 let request: RequestEnvelope = serde_json::from_str(&line).unwrap();
                 let value = match request.request {
-                    Request::Ping => json!({"min_protocol":1,"max_protocol":1}),
+                    Request::Ping => {
+                        json!({"min_protocol":1,"max_protocol":1,"features":["idle_step_off_v1"]})
+                    }
                     Request::Subscribe { deltas: false, .. } => json!({"subscribed":true}),
                     Request::ListSessions => json!([session]),
                     Request::GetSession { id } => {
                         assert_eq!(id, session.id);
-                        json!({"session":{"id":id},"messages":[],"running":false,"step_mode":state.load(Ordering::SeqCst),"pending_events":[],"pending_steps":{"prompts":[],"more":false}})
+                        json!({"session":{"id":id},"messages":[],"running":false,"step_mode":state.load(Ordering::SeqCst),"pending_events":[],"unfinished_run":null,"pending_steps":{"prompts":[],"more":false}})
                     }
                     Request::SetStepMode {
                         session_id,
-                        on: target,
-                    } if target == on => {
+                        on: true,
+                    } if on => {
                         assert_eq!(session_id, session.id);
-                        state.store(on, Ordering::SeqCst);
+                        state.store(true, Ordering::SeqCst);
+                        count.fetch_add(1, Ordering::SeqCst);
+                        write.shutdown().await.unwrap();
+                        break;
+                    }
+                    Request::DisableStepModeIfIdle { session_id } if !on => {
+                        assert_eq!(session_id, session.id);
+                        state.store(false, Ordering::SeqCst);
                         count.fetch_add(1, Ordering::SeqCst);
                         write.shutdown().await.unwrap();
                         break;

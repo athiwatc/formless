@@ -2611,6 +2611,27 @@ impl Store {
         Ok(())
     }
 
+    /// Read the live Session and latest Run status with strict SQL errors.
+    /// `None` means the Session is unavailable, not that it has no Run.
+    pub(crate) fn idle_step_off_status(&self, session_id: &str) -> Result<Option<bool>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT (SELECT status FROM runs WHERE session_id=sessions.id
+                     ORDER BY created_at DESC, rowid DESC LIMIT 1)
+               FROM sessions WHERE id=?1 AND deleted_at IS NULL",
+                params![session_id],
+                |row| {
+                    let status = row.get::<_, Option<String>>(0)?;
+                    Ok(matches!(
+                        status.as_deref(),
+                        None | Some("completed" | "abandoned" | "failed")
+                    ))
+                },
+            )
+            .optional()?)
+    }
+
     /// The Session's last Run when it stopped unfinished (interrupted or
     /// paused): (id, status, reason).
     pub fn unfinished_last_run(

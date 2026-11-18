@@ -4728,6 +4728,9 @@ impl Daemon {
                 }
                 Ok(json!({"session_id": session_id, "on": on}))
             }
+            Request::DisableStepModeIfIdle { session_id } => {
+                self.disable_step_mode_if_idle(&session_id)
+            }
             Request::StepDecision {
                 step_id,
                 action,
@@ -7569,7 +7572,14 @@ impl Daemon {
         let mut skipped = std::collections::HashSet::new();
         let count = calls.len();
         for (index, tc) in calls.iter_mut().enumerate() {
-            if !self.step_sessions.locked().contains(session_id) || self.subscriber_count() == 0 {
+            let mode_on = self.step_sessions.locked().contains(session_id);
+            if !mode_on || self.subscriber_count() == 0 {
+                break;
+            }
+            // Serialize this second mode read and waiter registration with
+            // conditional Step-off without holding mode while taking the subscriber lock.
+            let mode = self.step_sessions.locked();
+            if !mode.contains(session_id) {
                 break;
             }
             let step_id = uuid::Uuid::new_v4().to_string();
@@ -7586,6 +7596,7 @@ impl Daemon {
             self.step_waiters
                 .locked()
                 .insert(step_id.clone(), step_inventory::Waiter::new(&prompt, tx));
+            drop(mode);
             let waiting = step_inventory::Waiting {
                 daemon: self,
                 session: session_id,

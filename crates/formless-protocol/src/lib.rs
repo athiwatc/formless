@@ -24,6 +24,8 @@ pub const MIN_PROTOCOL_VERSION: u32 = 1;
 pub const REVIEWED_SEND_MODE_FEATURE: &str = "reviewed_send_mode_v1";
 /// A Steer review identifies one active Run and dispatch checks that identity.
 pub const REVIEWED_STEER_RUN_FEATURE: &str = "reviewed_steer_run_v1";
+/// Disable Step mode only if the Session is still idle at the daemon.
+pub const IDLE_STEP_OFF_FEATURE: &str = "idle_step_off_v1";
 
 /// Run IDs displayed and sent by the exact Steer review use a bounded ASCII form.
 pub fn valid_reviewed_run_id(id: &str) -> bool {
@@ -50,6 +52,7 @@ pub const FEATURES: &[&str] = &[
     "reviewed_attachment_send_v1",
     REVIEWED_SEND_MODE_FEATURE,
     REVIEWED_STEER_RUN_FEATURE,
+    IDLE_STEP_OFF_FEATURE,
     "reviewed_reference_detach_v1",
     "session_model_compare_set_v1",
 ];
@@ -2196,6 +2199,11 @@ pub enum Request {
         session_id: String,
         on: bool,
     },
+    /// Turn Step mode off only for a live, idle Session without recovery or
+    /// waiting Steps. Returns `{session_id,on:false}`. Starts no work.
+    DisableStepModeIfIdle {
+        session_id: String,
+    },
     /// Answer a `StepPending`: `action` is "continue", "skip", "edit"
     /// (run it with `arguments`, a JSON object as text) or "all" (run this
     /// and the rest of the Run without pausing).
@@ -4016,6 +4024,24 @@ mod future_attempt_wire_tests {
             );
             assert_eq!(value["type"], "transcript_attempt");
         }
+    }
+}
+
+#[cfg(test)]
+mod idle_step_off_wire_tests {
+    use super::*;
+
+    #[test]
+    fn idle_step_off_requires_a_session_and_uses_its_own_capability() {
+        let value = serde_json::json!({"type":"disable_step_mode_if_idle","session_id":"s"});
+        let request = serde_json::from_value::<Request>(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(request).unwrap(), value);
+        assert!(serde_json::from_value::<Request>(
+            serde_json::json!({"type":"disable_step_mode_if_idle"})
+        )
+        .is_err());
+        assert!(FEATURES.contains(&IDLE_STEP_OFF_FEATURE));
+        assert_eq!(PROTOCOL_VERSION, 1);
     }
 }
 

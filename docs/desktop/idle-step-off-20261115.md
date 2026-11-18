@@ -11,9 +11,10 @@ The typed action binds Client, physical connection, selected Session, selection
 generation, view epoch, operation UUID and explicit target boolean. The worker
 reads GetSession again before any write. Disable requires the same Session,
 strict running=false, no unfinished Run, known complete empty pending_steps
-and sampled mode=true. Missing, malformed, partial or legacy metadata rejects
-the write. If a fresh read already shows Off, the result is read-only and no
-setting is sent. Enable remains compatible with peers lacking Step inventory.
+and sampled mode=true. `unfinished_run` must explicitly be null. Missing,
+malformed, partial or legacy metadata rejects the write. If a fresh read already
+shows Off, the result is read-only. Disable requires `idle_step_off_v1`. An older
+peer receives no Disable request. Enable continues to use the existing API.
 
 Both directions share the existing status revision and reservation ledger.
 Observed Run/Step changes, deletion, navigation and reconnect retire unsent
@@ -22,11 +23,16 @@ lost or malformed receipts remain Unknown, block both directions for that
 Client and never replay. Deduplication retains at most 256 spent operation
 UUIDs for the Client lifetime and is not durable across process restart.
 
-This is a fresh-read/observed-event guard, not an atomic idle-only daemon
-transaction. Another client can start work after the read or change the mode
-before this setting applies. The explicit setting affects future Tool calls
-that observe it; it does not cancel or release an existing Step waiter. The
-existing SetStepMode protocol and daemon implementation are unchanged.
+`DisableStepModeIfIdle` repeats the idle check at the mutation boundary. It
+holds the daemon's Run admission lock while checking active and publishing
+Runs, and its Store writer lock while checking Session existence and the latest
+persisted Run status. A running, recoverable or unrecognized latest status
+blocks Disable. The mode and waiter locks serialize the empty-waiter check with
+registration and prevent removing the mode underneath a waiting Step. The RPC
+never grants approval or releases a waiter. Other clients retain the existing
+`SetStepMode` API, and a later explicit Enable can still change the mode. The
+check covers work admitted by this daemon and does not coordinate external
+writers to the Profile database.
 
 Focused actor/model tests cover false receipts, exclusive shared reservations,
 changed owners and missing/busy/pending/incomplete state. TestPlatform checks

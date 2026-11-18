@@ -228,8 +228,8 @@ mode disables the control, and an uncertain write blocks further native mode cha
 for that Client without replay. See the [enable report](../../docs/desktop/step-mode-enable-20261115.md)
 for ownership, receipt limits and validation. Idle Disable now changes future
 Step pauses after a fresh idle/empty-inventory read; it does not release waiting
-Steps or approve Tools. Its observed-event fences are not an atomic idle
-guarantee against other clients. See the
+Steps or approve Tools. The daemon checks idle state again under its admission
+lock and refuses changes while a Run or Step is pending. See the
 [idle Step-off report](../../docs/desktop/idle-step-off-20261115.md).
 Native OS acceptance and full Step
 and security-approval parity remain open. See the

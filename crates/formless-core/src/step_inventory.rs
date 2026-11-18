@@ -1,4 +1,4 @@
-//! Read-only recovery inventory for Step prompts; no new decision authority.
+//! Step inventory and conditional mode changes. Neither grants decision authority.
 use super::*;
 use formless_protocol::{PendingStep, PendingSteps, MAX_PENDING_STEPS, STEP_PREVIEW_BYTES};
 
@@ -62,6 +62,46 @@ impl Drop for Waiting<'_> {
 }
 
 impl Daemon {
+    pub(super) fn disable_step_mode_if_idle(&self, session_id: &str) -> Result<Value> {
+        if session_id.is_empty()
+            || session_id.len() > 256
+            || session_id.chars().any(char::is_control)
+        {
+            return Err(RequestFailure::invalid("invalid Session identity").into());
+        }
+        // Run startup, Resume and queue drain share this admission lock.
+        let _admission = self.forecast_admission.locked();
+        if self.runs.locked().contains_key(session_id) || self.session_is_publishing(session_id) {
+            return Err(RequestFailure::busy("Session is active. Step mode was kept.").into());
+        }
+        self.with_store(|store| {
+            let idle = store
+                .idle_step_off_status(session_id)?
+                .context(RequestFailure::not_found("session not found"))?;
+            if !idle {
+                return Err(RequestFailure::busy(
+                    "Session has unfinished or unknown Run state. Step mode was kept.",
+                )
+                .into());
+            }
+
+            // Hold the Store through the effect and use the same lock order
+            // as Step prompt registration to exclude a new waiter.
+            let mut mode = self.step_sessions.locked();
+            let waiters = self.step_waiters.locked();
+            if waiters
+                .values()
+                .any(|waiter| waiter.prompt.session_id == session_id)
+            {
+                return Err(
+                    RequestFailure::busy("Session has waiting Steps. Step mode was kept.").into(),
+                );
+            }
+            mode.remove(session_id);
+            Ok(json!({"session_id":session_id,"on":false}))
+        })
+    }
+
     pub(super) fn pending_steps_snapshot(&self, session: &str) -> PendingSteps {
         let waiters = self.step_waiters.locked();
         // Keep the lowest identities with bounded scratch memory, regardless
@@ -164,6 +204,137 @@ mod tests {
             .await
             .expect("Step resolution deadline")
     }
+    #[tokio::test]
+    async fn idle_step_off_rejects_newly_admitted_and_publishing_runs() {
+        let _env = crate::credential_env::EnvGuard::isolated();
+        let f = Fixture::new();
+        f.daemon.step_sessions.locked().insert(f.session.clone());
+        let snapshot = f
+            .daemon
+            .handle(Request::GetSession {
+                id: f.session.clone(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(snapshot["running"], false);
+        let request = || Request::DisableStepModeIfIdle {
+            session_id: f.session.clone(),
+        };
+        let (steer_tx, _rx) = mpsc::unbounded_channel();
+        f.daemon.runs.locked().insert(
+            f.session.clone(),
+            RunCtl {
+                run_id: "new-run".into(),
+                cancel: CancellationToken::new(),
+                cancel_flag: Arc::new(AtomicBool::new(false)),
+                steer_tx,
+                steering: Arc::new(Default::default()),
+                retry: Arc::new(Default::default()),
+            },
+        );
+        assert!(f
+            .daemon
+            .handle(request())
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("Session is active"));
+        assert!(f.daemon.step_sessions.locked().contains(&f.session));
+        let publish = f.daemon.begin_run_publication(&f.session, "new-run");
+        f.daemon.runs.locked().remove(&f.session);
+        assert!(f
+            .daemon
+            .handle(request())
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("Session is active"));
+        assert!(f.daemon.step_sessions.locked().contains(&f.session));
+        drop(publish);
+        assert_eq!(
+            f.daemon.handle(request()).await.unwrap(),
+            json!({"session_id":f.session,"on":false})
+        );
+        assert!(!f.daemon.step_sessions.locked().contains(&f.session));
+        assert!(!f.daemon.runs.locked().contains_key(&f.session));
+        assert_eq!(
+            f.daemon
+                .with_reader(|st| st.queued_count(&f.session))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_step_off_checks_storage_and_preserves_waiting_steps() {
+        let _env = crate::credential_env::EnvGuard::isolated();
+        let f = Fixture::new();
+        let request = || Request::DisableStepModeIfIdle {
+            session_id: f.session.clone(),
+        };
+        f.daemon
+            .step_sessions
+            .locked()
+            .extend([f.session.clone(), f.other.clone()]);
+        let run = f.daemon.with_store(|st| st.create_run(&f.session)).unwrap();
+        for status in ["running", "paused", "interrupted", "unrecognized"] {
+            f.daemon
+                .with_store(|st| st.set_run_status(&run, status))
+                .unwrap();
+            assert!(f
+                .daemon
+                .handle(request())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("unfinished or unknown"));
+            assert!(f.daemon.step_sessions.locked().contains(&f.session));
+        }
+        f.daemon
+            .with_store(|st| st.set_run_status(&run, "completed"))
+            .unwrap();
+        let mut rx = f.subscribe();
+        let cancel = CancellationToken::new();
+        let waiter = f.start(cancel.clone());
+        let id = pending(&mut rx).await;
+        assert!(f
+            .daemon
+            .handle(request())
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("waiting Steps"));
+        assert!(f.daemon.step_sessions.locked().contains(&f.session));
+        assert_eq!(
+            f.daemon.pending_steps_snapshot(&f.session).prompts[0].step_id,
+            id
+        );
+        cancel.cancel();
+        assert!(waiter.await.unwrap().is_err());
+        assert_eq!(f.daemon.handle(request()).await.unwrap()["on"], false);
+        assert_eq!(f.daemon.handle(request()).await.unwrap()["on"], false);
+        assert!(f.daemon.step_sessions.locked().contains(&f.other));
+        f.daemon
+            .with_store(|st| st.soft_delete_session(&f.session))
+            .unwrap();
+        assert!(f
+            .daemon
+            .handle(request())
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("session not found"));
+        for id in ["missing", "", "invalid\n"] {
+            assert!(f
+                .daemon
+                .handle(Request::DisableStepModeIfIdle {
+                    session_id: id.into()
+                })
+                .await
+                .is_err());
+        }
+    }
+
     #[tokio::test]
     async fn reconnect_snapshot_recovers_identity_and_resolved_authority_is_removed() {
         let _env = crate::credential_env::EnvGuard::isolated();

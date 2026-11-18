@@ -5,6 +5,12 @@ fn setup() -> (Engine, Arc<Ledger>, Dispatch) {
     setup_target(true)
 }
 fn setup_target(on: bool) -> (Engine, Arc<Ledger>, Dispatch) {
+    setup_target_with_capability(on, true)
+}
+fn setup_target_with_capability(
+    on: bool,
+    idle_step_off_available: bool,
+) -> (Engine, Arc<Ledger>, Dispatch) {
     let instance = uuid::Uuid::new_v4();
     let l = Arc::new(Ledger::default());
     let d = l
@@ -20,6 +26,7 @@ fn setup_target(on: bool) -> (Engine, Arc<Ledger>, Dispatch) {
         .unwrap();
     let mut e = Engine {
         instance,
+        idle_step_off_available,
         ready: true,
         connection: 1,
         generation: 2,
@@ -351,6 +358,7 @@ fn mode_enable_observed_session_delete_retires_inspection_before_any_setting() {
 fn idle_off_value() -> Value {
     let mut v = value(true);
     v["pending_steps"] = json!({"prompts":[],"more":false});
+    v["unfinished_run"] = Value::Null;
     v
 }
 fn inspect_off(e: &mut Engine, value: Value) {
@@ -358,6 +366,36 @@ fn inspect_off(e: &mut Engine, value: Value) {
     assert!(matches!(r.request,Request::GetSession{id} if id=="s"));
     e.receive(ServerMessage::ok(r.id, value)).unwrap();
 }
+#[test]
+fn mode_disable_refuses_older_peer_without_falling_back_and_enable_still_reads() {
+    let (e, ledger, _) = setup_target_with_capability(false, false);
+    assert!(e.outgoing.is_empty());
+    assert!(matches!(
+        ledger.status(),
+        Status::Finished {
+            outcome: Outcome::Rejected(_),
+            ..
+        }
+    ));
+    let (e, _, _) = setup_target_with_capability(true, false);
+    assert!(matches!(e.outgoing[0].request, Request::GetSession { .. }));
+
+    for features in [json!([]), json!(["idle_step_off_v1"])] {
+        let mut e = Engine::default();
+        e.begin();
+        let ping = e.outgoing.pop_front().unwrap();
+        e.receive(ServerMessage::ok(
+            ping.id,
+            json!({"min_protocol":1,"max_protocol":1,"features":features}),
+        ))
+        .unwrap();
+        assert_eq!(
+            e.idle_step_off_available,
+            !features.as_array().unwrap().is_empty()
+        );
+    }
+}
+
 #[test]
 fn mode_disable_requires_a_fresh_idle_empty_inventory_and_writes_only_false_once() {
     let (mut e, l, d) = setup_target(false);
@@ -369,7 +407,7 @@ fn mode_disable_requires_a_fresh_idle_empty_inventory_and_writes_only_false_once
     e.before_mode_writes().unwrap();
     assert_eq!(e.status_revision, revision);
     let r = e.outgoing.pop_front().unwrap();
-    assert!(matches!(r.request,Request::SetStepMode{session_id,on:false} if session_id=="s"));
+    assert!(matches!(r.request,Request::DisableStepModeIfIdle{session_id} if session_id=="s"));
     e.command(Command::DisableStepMode(d.clone()));
     assert!(e.outgoing.is_empty());
     e.receive(ServerMessage::ok(
@@ -389,7 +427,7 @@ fn mode_disable_requires_a_fresh_idle_empty_inventory_and_writes_only_false_once
 }
 #[test]
 fn mode_disable_rejects_running_recoverable_pending_missing_and_partial_state() {
-    for field in 0..9 {
+    for field in 0..10 {
         let (mut e, l, _d) = setup_target(false);
         let mut v = idle_off_value();
         match field {
@@ -407,7 +445,10 @@ fn mode_disable_rejects_running_recoverable_pending_missing_and_partial_state() 
             }
             6 => v["pending_steps"] = json!({"prompts":[],"more":"false"}),
             7 => v["session"]["id"] = json!("other"),
-            _ => v["step_mode"] = json!("true"),
+            8 => v["step_mode"] = json!("true"),
+            _ => {
+                v.as_object_mut().unwrap().remove("unfinished_run");
+            }
         }
         inspect_off(&mut e, v);
         assert!(e.outgoing.is_empty(), "{field}");

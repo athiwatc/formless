@@ -911,6 +911,7 @@ struct Engine {
     reference_detach_available: bool,
     session_model_cas_available: bool,
     reviewed_send_available: bool,
+    idle_step_off_available: bool,
     reviewed_steer_run_available: bool,
     instance: uuid::Uuid,
     reader: reader::Reader,
@@ -1071,6 +1072,8 @@ impl Engine {
         if self.pending.values().any(|p|matches!(p,Pending::ModeInspect{dispatch:d,..}|Pending::ModeCommit{dispatch:d,..} if d.action().operation==dispatch.action().operation)){return;}
         if dispatch.action().on != on || !self.mode_current(&dispatch) || !dispatch.reserved() {
             dispatch.reject("Session view or mode target changed; no setting was sent.");
+        } else if !on && !self.idle_step_off_available {
+            dispatch.reject("This daemon cannot safely disable Step mode only while idle. Update the daemon or use Formless TUI.");
         } else {
             self.request(
                 Request::GetSession {
@@ -2350,6 +2353,12 @@ impl Engine {
                         .iter()
                         .all(|required| features.iter().any(|feature| feature == required))
                     });
+                self.idle_step_off_available =
+                    result["features"].as_array().is_some_and(|features| {
+                        features
+                            .iter()
+                            .any(|feature| feature == formless_protocol::IDLE_STEP_OFF_FEATURE)
+                    });
                 self.reviewed_steer_run_available =
                     result["features"].as_array().is_some_and(|features| {
                         features
@@ -2478,18 +2487,21 @@ impl Engine {
                             self.invalidate_mode_metadata()?;
                         }
                         Some(_) => {
-                            let idle = value.is_some_and(|v| v["running"].as_bool() == Some(false) && v["unfinished_run"].is_null() && matches!(crate::steps::Inventory::decode(&dispatch.action().session_id,v.get("pending_steps")),crate::steps::Inventory::Snapshot(p) if p.prompts.is_empty() && !p.more));
+                            let idle = value.is_some_and(|v| v["running"].as_bool() == Some(false) && v.get("unfinished_run").is_some_and(Value::is_null) && matches!(crate::steps::Inventory::decode(&dispatch.action().session_id,v.get("pending_steps")),crate::steps::Inventory::Snapshot(p) if p.prompts.is_empty() && !p.more));
                             if !dispatch.action().on && !idle {
                                 dispatch.reject("Disable requires a fresh idle Session and complete empty Step inventory. No setting was sent.");
                                 self.invalidate_mode_metadata()?;
                             } else {
-                                self.request(
+                                let session_id = dispatch.action().session_id.clone();
+                                let request = if dispatch.action().on {
                                     Request::SetStepMode {
-                                        session_id: dispatch.action().session_id.clone(),
-                                        on: dispatch.action().on,
-                                    },
-                                    Pending::ModeCommit { dispatch, revision },
-                                );
+                                        session_id,
+                                        on: true,
+                                    }
+                                } else {
+                                    Request::DisableStepModeIfIdle { session_id }
+                                };
+                                self.request(request, Pending::ModeCommit { dispatch, revision });
                             }
                         }
                         None => {
