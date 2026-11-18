@@ -21,7 +21,8 @@ function setup(actualRefresh = false) {
   });
   const c = vm.createContext({S:{current:'s',running:new Set(),sessions:[],liveTools:[],invocations:[],ws:{},conn:1,channel:{}}, h, $:() => box,
     forecastRevision:0, scheduleForecast() {}, note: text => notes.push(text), branchSummaryEvent() {}, notifyFor() {}, renderLive() {}, renderStatus() {}, renderComposer() {}, renderRunBanner() {}, renderRunTools() {}, renderPlan() {}, renderHistory() {}, setActivity() {}, isRunning:() => true,
-    document: { activeElement: null }, runningRefresh: null, reconcileChildren: (parent, nodes) => parent.replaceChildren(...nodes),
+    document: { activeElement: null }, runningRefresh: null, runningExposure: null,
+    reconcileChildren: (parent, nodes) => parent.replaceChildren(...nodes),
     request: async () => [], Date});
   installEventRenderFixture(c, fn);
   vm.runInContext(['runningTool','reconcileInvocationProgress','progressDiagnostic','isRunningConnection',
