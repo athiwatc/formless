@@ -1550,6 +1550,7 @@
     }
     const L = HL[HL_ALIAS[lang] || lang];
     if (!L) return null;
+    const kotlin = lang === "kotlin" || lang === "kt";
     const out = [];
     let plain = "";
     const tok = (cls, s) => {
@@ -1586,15 +1587,36 @@
         i = stop;
         continue;
       }
+      const prevWord = i > 0 && word.test(code[i - 1]);
+      if (L === HL.rust && !prevWord &&
+          (c === "r" || ((c === "b" || c === "c") && code[i + 1] === "r"))) {
+        const prefixEnd = i + (c === "r" ? 1 : 2);
+        let opener = prefixEnd;
+        while (code[opener] === "#") opener++;
+        if (code[opener] === '"') {
+          const delimiter = '"' + code.slice(prefixEnd, opener);
+          const end = code.indexOf(delimiter, opener + 1);
+          const stop = end < 0 ? code.length : end + delimiter.length;
+          tok("tok-str", code.slice(i, stop));
+          i = stop;
+          continue;
+        }
+      }
       if (L.q.includes(c)) {
-        let j = i + 1;
-        while (j < code.length && code[j] !== c && (code[j] !== "\n" || c === "`")) j += code[j] === "\\" ? 2 : 1;
-        const stop = Math.min(j + 1, code.length);
+        const triple = (L === HL.py || (c === '"' && (lang === "java" || kotlin))) &&
+          code.startsWith(c.repeat(3), i);
+        const delimiter = triple ? c.repeat(3) : c;
+        const multiline = triple || c === "`";
+        const escapes = !(L === HL.go && c === "`") && !(kotlin && triple);
+        let j = i + delimiter.length;
+        while (j < code.length && !code.startsWith(delimiter, j) && (code[j] !== "\n" || multiline)) {
+          j += escapes && code[j] === "\\" ? 2 : 1;
+        }
+        const stop = Math.min(j + delimiter.length, code.length);
         tok("tok-str", code.slice(i, stop));
         i = stop;
         continue;
       }
-      const prevWord = i > 0 && word.test(code[i - 1]);
       if (/\d/.test(c) && !prevWord) {
         const m = code.slice(i).match(/^[\d][\w.]*/);
         tok("tok-num", m[0]);

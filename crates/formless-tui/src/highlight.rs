@@ -472,6 +472,7 @@ pub(crate) struct Highlighter {
     lang: &'static Lang,
     rust_numbers: bool,
     python_comments: bool,
+    raw_backticks: bool,
     color: bool,
     /// Open block comments (more than one only where they nest).
     in_block: usize,
@@ -564,6 +565,7 @@ impl Highlighter {
             lang,
             rust_numbers: matches!(name.as_str(), "rust" | "rs"),
             python_comments: matches!(name.as_str(), "py" | "python" | "python3"),
+            raw_backticks: matches!(name.as_str(), "go" | "golang"),
             color,
             in_block: 0,
             in_str: None,
@@ -624,10 +626,12 @@ impl Highlighter {
         }
         // Where the string closed by `close` ends, scanning from `from`:
         // just past the delimiter, or None when it runs past the line.
+        let raw_backticks = self.raw_backticks;
         let close_at = |from: usize, close: &str| -> Option<usize> {
+            let escapes = !(l.raw_strings || raw_backticks && close == "`");
             let mut j = from;
             while j < chars.len() {
-                if chars[j] == '\\' {
+                if escapes && chars[j] == '\\' {
                     j += 2;
                     continue;
                 }
@@ -640,14 +644,7 @@ impl Highlighter {
         };
         while i < chars.len() {
             if let Some(close) = self.in_str.clone() {
-                // Raw strings (`"#…` closers) have no escapes.
-                let stop = if l.raw_strings {
-                    (i..chars.len())
-                        .find(|&j| at(j, &close))
-                        .map(|j| j + close.chars().count())
-                } else {
-                    close_at(i, &close)
-                };
+                let stop = close_at(i, &close);
                 push(Tok::Str, &chars[i..stop.unwrap_or(chars.len())]);
                 if stop.is_some() {
                     self.in_str = None;
@@ -683,26 +680,16 @@ impl Highlighter {
             }
             let c = chars[i];
             let word_start = i == 0 || !(chars[i - 1].is_alphanumeric() || chars[i - 1] == '_');
-            // Rust raw strings: `r"…"`, `r#"…"#`, `br#"…"#` (#877).
+            // Rust raw strings, including byte and C strings.
             if l.raw_strings
                 && word_start
-                && (c == 'r' || (c == 'b' && chars.get(i + 1) == Some(&'r')))
+                && (c == 'r' || (matches!(c, 'b' | 'c') && chars.get(i + 1) == Some(&'r')))
             {
-                let r = i + usize::from(c == 'b');
+                let r = i + usize::from(c != 'r');
                 let hashes = chars[r + 1..].iter().take_while(|&&h| h == '#').count();
                 if chars.get(r + 1 + hashes) == Some(&'"') {
                     let close = format!("\"{}", "#".repeat(hashes));
-                    let from = r + 2 + hashes;
-                    let mut j = from;
-                    let stop = loop {
-                        if j >= chars.len() {
-                            break None;
-                        }
-                        if at(j, &close) {
-                            break Some(j + close.chars().count());
-                        }
-                        j += 1;
-                    };
+                    let stop = close_at(r + 2 + hashes, &close);
                     push(Tok::Str, &chars[i..stop.unwrap_or(chars.len())]);
                     if stop.is_none() {
                         self.in_str = Some(close);
@@ -1199,6 +1186,71 @@ mod tests {
         // One-line strings are unchanged.
         let t = toks("python", "x = \"a\" + 'b'");
         assert!(t.contains(&("\"a\"".into(), Some(Color::Green))));
+    }
+
+    #[test]
+    fn rust_raw_c_strings_include_the_prefix_and_close_without_escapes() {
+        for literal in ["cr\"foo\\\"", "cr#\"say \"hi\"\"#", "cr##\"say \"# hi\"##"] {
+            let source = format!("let s = {literal}; let after = 1;");
+            let tokens = toks("rust", &source);
+            assert!(
+                tokens.contains(&(literal.into(), Some(Color::Green))),
+                "{tokens:?}"
+            );
+            assert_eq!(
+                tokens
+                    .iter()
+                    .filter(|(s, c)| s == "let" && *c == Some(Color::Magenta))
+                    .count(),
+                2
+            );
+            assert_eq!(
+                tokens.iter().map(|(s, _)| s.as_str()).collect::<String>(),
+                source
+            );
+        }
+
+        let mut rust = Highlighter::new("rs", true).unwrap();
+        rust.line("let s = cr##\"first");
+        assert!(all_str(&mut rust, "not closed by \"# or a keyword"));
+        let end = rust.line("last\\\"##; let after = 2;");
+        assert_eq!(end[0].content, "last\\\"##");
+        assert_eq!(end[0].style.fg, Some(Color::Green));
+        assert!(end
+            .iter()
+            .any(|s| s.content == "let" && s.style.fg == Some(Color::Magenta)));
+    }
+
+    #[test]
+    fn go_backticks_close_after_backslashes_and_js_backticks_still_escape() {
+        for literal in ["`C:\\`", "`\\\\server\\share\\`"] {
+            let source = format!("s := {literal}; return s");
+            let tokens = toks("go", &source);
+            assert!(
+                tokens.contains(&(literal.into(), Some(Color::Green))),
+                "{tokens:?}"
+            );
+            assert!(
+                tokens.contains(&("return".into(), Some(Color::Magenta))),
+                "{tokens:?}"
+            );
+        }
+        let mut go = Highlighter::new("golang", true).unwrap();
+        go.line("s := `first");
+        let end = go.line("last\\`; return s");
+        assert_eq!(end[0].content, "last\\`");
+        assert_eq!(end[0].style.fg, Some(Color::Green));
+        assert!(end
+            .iter()
+            .any(|s| s.content == "return" && s.style.fg == Some(Color::Magenta)));
+
+        let mut js = Highlighter::new("js", true).unwrap();
+        js.line("const s = `C:\\`");
+        assert!(all_str(&mut js, "let still in the template"));
+        let end = js.line("`; let after = 1;");
+        assert!(end
+            .iter()
+            .any(|s| s.content == "let" && s.style.fg == Some(Color::Magenta)));
     }
 
     /// Nested Rust comments, raw strings, JS regexes, YAML `;` and
