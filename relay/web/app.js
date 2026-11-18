@@ -1141,26 +1141,87 @@
   }
 
   // Running Invocations across Sessions (SPEC §6.3): cancel or abandon.
-  async function refreshRunning() {
-    const revision = S.invocationRefresh = (S.invocationRefresh || 0) + 1;
-    const connection = [S.ws, S.conn, S.channel];
-    const list = await request({ type: "list_invocations" }).catch(() => null);
-    if (!list || revision !== S.invocationRefresh || connection[0] !== S.ws || connection[1] !== S.conn || connection[2] !== S.channel) return;
+  let runningRefresh = null;
+  let runningExposure = null;
+  function isRunningConnection(connection) {
+    return connection?.ws === S.ws && connection?.conn === S.conn && connection?.channel === S.channel;
+  }
+  function syncRunningExposure(visible) {
+    const exposed = !!S.channel && (S.local || S.relayReady) && !document.hidden && S.view === "chat"
+      && (visible ?? sidebarVisible($("sidebar")));
+    if (!exposed) runningExposure = null;
+    else if (!isRunningConnection(runningExposure)) {
+      runningExposure = { ws: S.ws, conn: S.conn, channel: S.channel };
+      refreshRunning(false);
+    }
+    return exposed;
+  }
+  function refreshRunning(queueAnother = true) {
+    if (!S.channel) return Promise.resolve();
+    if (isRunningConnection(runningRefresh)) {
+      // Events and completed actions may invalidate an in-flight snapshot.
+      // Polls and simultaneous visibility changes can share that snapshot.
+      if (queueAnother) runningRefresh.again = true;
+      return runningRefresh.promise;
+    }
+    const refresh = { ws: S.ws, conn: S.conn, channel: S.channel, again: false };
+    runningRefresh = refresh;
+    refresh.promise = drainRunningRefresh(refresh);
+    return refresh.promise;
+  }
+  async function drainRunningRefresh(refresh) {
+    try {
+      do {
+        refresh.again = false;
+        const list = await request({ type: "list_invocations" }).catch(() => null);
+        if (runningRefresh !== refresh || !isRunningConnection(refresh)) return;
+        if (list && !refresh.again) renderRunningList(list);
+      } while (refresh.again);
+    } finally {
+      if (runningRefresh === refresh) runningRefresh = null;
+    }
+  }
+  function runningRow(i, row) {
+    if (!row) {
+      row = h("div", { class: "running-item" });
+      row.append(
+        h("button", { class: "linklike", type: "button", title: "Open its session", onclick: () => openSession(row.invocation.session_id) }),
+        h("button", { class: "btn ghost small", type: "button", title: "Cancel (user-cancelled)", onclick: () => {
+          const invocation = row.invocation;
+          return act({ type: "cancel_invocation", handle: invocation.handle }, "Cancelled " + invocation.tool_name).then(() => refreshRunning());
+        } }, "Cancel"),
+        h("button", { class: "btn ghost small", type: "button", title: "Stop waiting for it", onclick: () => {
+          const invocation = row.invocation;
+          return act({ type: "abandon_invocation", handle: invocation.handle }, "Abandoned " + invocation.tool_name).then(() => refreshRunning());
+        } }, "Abandon"));
+    }
+    row.invocation = i;
+    row.classList.toggle("stalled", !!i.stalled);
+    const session = S.sessions.find((x) => x.id === i.session_id);
+    row.firstElementChild.replaceChildren(h("strong", null, i.tool_name),
+      " · " + uiFormat(Math.round(i.elapsed_ms / 1000)) + "s" + (session ? " · " + session.name : "") +
+      (i.stalled ? " · silent " + uiFormat(Math.round(i.silent_ms / 1000)) + "s" : "") + progressDiagnostic(i) + (i.abandoned ? " · abandoned" : ""));
+    row.lastElementChild.hidden = !!i.abandoned;
+    return row;
+  }
+  function renderRunningList(list) {
     S.invocations = list;
     reconcileInvocationProgress(list);
     const box = $("running");
+    const focused = document.activeElement;
+    const focusedRow = focused?.closest("#running .running-item");
+    const previous = new Map([...box.children].filter(node => node.invocation).map(row => [row.invocation.handle, row]));
+    const rows = list.map(i => runningRow(i, previous.get(i.handle)));
+    const heading = box.firstElementChild?.tagName === "H4" ? box.firstElementChild : h("h4", null, "Running tools");
+    reconcileChildren(box, rows.length ? [heading, ...rows] : rows);
     box.classList.toggle("hidden", !list.length);
-    box.replaceChildren(...(list.length ? [h("h4", null, "Running tools")] : []), ...list.map((i) => {
-      const s = S.sessions.find((x) => x.id === i.session_id);
-      return h("div", { class: "running-item" + (i.stalled ? " stalled" : "") },
-        h("button", { class: "linklike", type: "button", title: "Open its session", onclick: () => openSession(i.session_id) },
-          h("strong", null, i.tool_name), " · " + uiFormat(Math.round(i.elapsed_ms / 1000)) + "s" + (s ? " · " + s.name : "") +
-          (i.stalled ? " · silent " + uiFormat(Math.round(i.silent_ms / 1000)) + "s" : "") + progressDiagnostic(i) + (i.abandoned ? " · abandoned" : "")),
-        h("button", { class: "btn ghost small", type: "button", title: "Cancel (user-cancelled)", onclick: () => act({ type: "cancel_invocation", handle: i.handle }, "Cancelled " + i.tool_name).then(refreshRunning) }, "Cancel"),
-        i.abandoned ? null : h("button", { class: "btn ghost small", type: "button", title: "Stop waiting for it", onclick: () => act({ type: "abandon_invocation", handle: i.handle }, "Abandoned " + i.tool_name).then(refreshRunning) }, "Abandon"));
-    }));
+    if (focusedRow && (document.activeElement !== focused || !focusVisible(focused))) {
+      const target = focusVisible(focused) ? focused
+        : focusedRow.isConnected ? focusedRow.firstElementChild : $("new-session");
+      focusReturn(target);
+    }
   }
-  setInterval(() => { if (S.channel && S.invocations && S.invocations.length) refreshRunning(); }, 2000);
+  setInterval(() => { if (syncRunningExposure() && S.invocations?.length) refreshRunning(false); }, 2000);
 
   function sessionRows(sessions, visible, tree) {
     if (!tree) return visible.map(session => ({ session, depth: 0, note: "" }));
@@ -6850,15 +6911,19 @@
 
   // Read CSS visibility so viewport and container-query layouts agree.
   let sidebarLastFocus = null;
+  function sidebarVisible(sidebar) {
+    return !!(sidebar.getClientRects().length
+      && !sidebar.closest(".hidden, [hidden]") && getComputedStyle(sidebar).visibility !== "hidden");
+  }
   function syncSidebar() {
     const sidebar = $("sidebar"), menu = $("menu-btn");
-    const visible = !!(sidebar.getClientRects().length
-      && !sidebar.closest(".hidden, [hidden]") && getComputedStyle(sidebar).visibility !== "hidden");
+    const visible = sidebarVisible(sidebar);
     menu.setAttribute("aria-expanded", String(visible));
     const focused = document.activeElement;
     const previous = focused === document.body ? sidebarLastFocus : focused;
     if (!focusVisible(sidebar) && sidebar.contains(previous)) focusReturn(menu);
     else if (!focusVisible(menu) && previous === menu) focusReturn(visible ? $("new-session") : null);
+    syncRunningExposure(visible);
   }
   function setSidebar(open, { focus = false } = {}) {
     $("sidebar").classList.toggle("open", open);
@@ -6894,6 +6959,7 @@
     }
   }
   document.addEventListener("visibilitychange", () => {
+    syncRunningExposure();
     if (!document.hidden) { unseen = 0; document.title = baseTitle; }
   });
   /** Ask once, from a user gesture (sending a message). */

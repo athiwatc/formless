@@ -11,12 +11,21 @@ const fn = name => {
 };
 function setup(actualRefresh = false) {
   const notes = [], box = { classList: { toggle() {} }, children: [], replaceChildren(...children) { this.children = children; } };
-  const h = (tag, props, ...children) => ({ tag, props, children: children.flat(Infinity).filter(x => x != null) });
+  const h = (tag, props, ...children) => ({
+    tag, props, children: children.flat(Infinity).filter(x => x != null),
+    classList: { toggle() {} },
+    append(...nodes) { this.children.push(...nodes); },
+    replaceChildren(...nodes) { this.children = nodes; },
+    get firstElementChild() { return this.children[0]; },
+    get lastElementChild() { return this.children.at(-1); },
+  });
   const c = vm.createContext({S:{current:'s',running:new Set(),sessions:[],liveTools:[],invocations:[],ws:{},conn:1,channel:{}}, h, $:() => box,
     forecastRevision:0, scheduleForecast() {}, note: text => notes.push(text), branchSummaryEvent() {}, notifyFor() {}, renderLive() {}, renderStatus() {}, renderComposer() {}, renderRunBanner() {}, renderRunTools() {}, renderPlan() {}, renderHistory() {}, setActivity() {}, isRunning:() => true,
+    document: { activeElement: null }, runningRefresh: null, reconcileChildren: (parent, nodes) => parent.replaceChildren(...nodes),
     request: async () => [], Date});
   installEventRenderFixture(c, fn);
-  vm.runInContext(['runningTool','reconcileInvocationProgress','progressDiagnostic','refreshRunning','onEvent'].map(fn).join('\n'),c);
+  vm.runInContext(['runningTool','reconcileInvocationProgress','progressDiagnostic','isRunningConnection',
+    'refreshRunning','drainRunningRefresh','runningRow','renderRunningList','onEvent'].map(fn).join('\n'),c);
   if (!actualRefresh) c.refreshRunning = () => {};
   return {c, notes, box};
 }
@@ -81,18 +90,32 @@ test('actual reconnect refresh restores distinct bars and diagnostic labels from
   assert.equal(c.S.liveTools.length,2);
   assert.equal(c.S.liveTools[0].status,'ok','older snapshot cannot revive a completed ID');
 });
-test('late refresh from replaced connection or older request never overwrites live identity', async () => {
+test('refreshes coalesce, preserve event invalidation, and reject old connection replies', async () => {
   const {c} = setup(true), resolvers = [];
   c.request = () => new Promise(resolve => resolvers.push(resolve));
-  const old = c.refreshRunning(), current = c.refreshRunning();
-  resolvers[1]([row('b')]); await current;
-  resolvers[0]([row('a')]); await old;
+  const pending = c.refreshRunning(false);
+  assert.equal(c.refreshRunning(false), pending);
+  assert.equal(c.refreshRunning(), pending);
+  assert.equal(c.refreshRunning(), pending);
+  assert.equal(resolvers.length, 1);
+  resolvers[0]([row('a')]);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(c.S.liveTools.length, 0, 'invalidated snapshot did not restore old progress');
+  assert.equal(resolvers.length, 2);
+  resolvers[1]([row('b')]);
+  await pending;
   assert.equal(c.S.liveTools.length,1);
   assert.equal(c.S.liveTools[0].invocationId,'b');
-  const replaced = c.refreshRunning(); c.S.channel = {};
-  resolvers[2]([row('a')]); await replaced;
+  const old = c.refreshRunning();
+  c.S.channel = {};
+  const current = c.refreshRunning(false);
+  resolvers[3]([row('b', { last_label: 'new connection' })]);
+  await current;
+  resolvers[2]([row('a')]);
+  await old;
   assert.equal(c.S.liveTools.length,1);
   assert.equal(c.S.liveTools[0].invocationId,'b');
+  assert.equal(c.S.liveTools[0].progress.label,'new connection');
 });
 test('pending before start retains handle, progress and stall while start fills exact metadata', () => {
   const {c} = setup();
