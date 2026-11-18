@@ -70,20 +70,35 @@ pub(crate) fn is_bidi_control(c: char) -> bool {
 /// `s` with every bidi control shown as `⟨U+202E⟩`, so a name like
 /// `report\u{202E}fdp.exe` in an approval can't display reversed (#791).
 pub(crate) fn escape_bidi(s: &str) -> std::borrow::Cow<'_, str> {
-    if !s.chars().any(is_bidi_control) {
+    escape_controls(s, is_bidi_control)
+}
+
+/// Make invisible formatting visible in an identifier or other exact value
+/// the user is deciding about. Ordinary prose uses `escape_bidi`.
+pub(crate) fn escape_approval_controls(s: &str) -> std::borrow::Cow<'_, str> {
+    escape_controls(s, |c| {
+        is_bidi_control(c)
+            || matches!(
+                c,
+                '\u{00AD}' | '\u{180E}' | '\u{200B}'..='\u{200D}' | '\u{2060}'..='\u{2064}'
+                    | '\u{FEFF}' | '\u{E0000}'..='\u{E007F}'
+            )
+    })
+}
+
+fn escape_controls(s: &str, escape: fn(char) -> bool) -> std::borrow::Cow<'_, str> {
+    if !s.chars().any(escape) {
         return std::borrow::Cow::Borrowed(s);
     }
-    std::borrow::Cow::Owned(
-        s.chars()
-            .map(|c| {
-                if is_bidi_control(c) {
-                    format!("⟨U+{:04X}⟩", c as u32)
-                } else {
-                    c.to_string()
-                }
-            })
-            .collect(),
-    )
+    let mut shown = String::with_capacity(s.len());
+    for c in s.chars() {
+        if escape(c) {
+            shown.push_str(&format!("⟨U+{:04X}⟩", u32::from(c)));
+        } else {
+            shown.push(c);
+        }
+    }
+    std::borrow::Cow::Owned(shown)
 }
 
 /// [`escape_bidi`] over every span of a line.
@@ -113,5 +128,25 @@ mod tests {
         ));
         // Arabic text itself is untouched.
         assert_eq!(escape_bidi("مرحبا"), "مرحبا");
+    }
+
+    #[test]
+    fn approval_controls_are_shown_in_exact_values() {
+        for code in [
+            0xad, 0x180e, 0x200b, 0x200c, 0x200d, 0x2060, 0x2061, 0x2062, 0x2063, 0x2064, 0x202e,
+            0xfeff, 0xe0000, 0xe0061, 0xe007f,
+        ] {
+            let c = char::from_u32(code).unwrap();
+            assert_eq!(
+                escape_approval_controls(&format!("a{c}z")),
+                format!("a⟨U+{code:04X}⟩z")
+            );
+        }
+        let prose = "می\u{200c}خواهم 👩\u{200d}💻";
+        assert_eq!(escape_bidi(prose), prose);
+        assert!(matches!(
+            escape_approval_controls("path ✈\u{fe0f}"),
+            std::borrow::Cow::Borrowed(_)
+        ));
     }
 }

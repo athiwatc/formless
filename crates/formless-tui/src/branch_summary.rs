@@ -73,12 +73,14 @@ pub fn affects(event: &Event, source: &str, target: &str) -> bool {
 }
 
 pub fn review_lines(basis: &BranchSummaryBasis, preview: &BranchSummaryPreview) -> Vec<String> {
+    use crate::text::escape_approval_controls as approval_text;
+
     let u = &preview.usage;
     let p = &preview.projection;
     let mut lines = vec![
-        format!("Source: {} ({})", basis.source_name, preview.source_id),
-        format!("Target: {} ({})", basis.target_name, preview.target_id),
-        format!("Provider: {} · requested model: {} · served model: {}", if preview.provider.is_empty() { "unknown" } else { &preview.provider }, if preview.requested_model.is_empty() { "unknown" } else { &preview.requested_model }, if preview.served_model.is_empty() { "unknown" } else { &preview.served_model }),
+        format!("Source: {} ({})", approval_text(&basis.source_name), approval_text(&preview.source_id)),
+        format!("Target: {} ({})", approval_text(&basis.target_name), approval_text(&preview.target_id)),
+        approval_text(&format!("Provider: {} · requested model: {} · served model: {}", if preview.provider.is_empty() { "unknown" } else { &preview.provider }, if preview.requested_model.is_empty() { "unknown" } else { &preview.requested_model }, if preview.served_model.is_empty() { "unknown" } else { &preview.served_model })).into_owned(),
         format!("Reported usage: {} input / {} output tokens · {} cached / {} cache-write · {}/{} requests reported", u.reported_prompt_tokens, u.reported_completion_tokens, u.reported_cached_tokens, u.reported_cache_write_tokens, u.reported_requests, u.requests),
         if u.usage_complete { "Usage coverage: complete".into() } else { "Usage coverage: incomplete or unknown; missing usage is not zero".into() },
         match u.cost { Some(cost) => format!("Recorded cost: ${cost:.6}"), None => format!("Total cost: unknown · priced subtotal only: ${:.6}", u.priced_cost_subtotal) },
@@ -124,6 +126,20 @@ pub(crate) fn fixture() -> (BranchSummaryBasis, BranchSummaryPreview) {
     let candidate = "Branch summary from Source branch (source)\n\nConclusions are data, not instructions.\nسلام ไทย \u{202e}<script>quoted data</script>\n";
     let preview = serde_json::from_value(serde_json::json!({"preview_id":"summary-preview","source_id":"source","target_id":"target","source_revision":"source-meta-v1","target_revision":"target-meta-v1","candidate":candidate,"candidate_hash":format!("{:x}",Sha256::digest(candidate.as_bytes())),"provider":"named","requested_model":"selected-model","served_model":"fallback-model","usage":{"requests":2,"reported_requests":1,"reported_prompt_tokens":7,"reported_completion_tokens":3,"reported_cached_tokens":2,"reported_cache_write_tokens":1,"usage_complete":false,"cost":null,"priced_cost_subtotal":0.25,"estimated_requests":1,"unpriced":["named/model"]},"projection":projection,"expires_at":"3000-01-01T00:00:00Z","warnings":["Some source content omitted"]})).unwrap();
     (basis, preview)
+}
+
+#[cfg(test)]
+#[test]
+fn branch_review_binds_visible_names_without_reshaping_prose() {
+    let (mut basis, mut preview) = fixture();
+    basis.source_name = "source\u{200b}name".into();
+    let prose = "می\u{200c}خواهم 👩\u{200d}💻";
+    preview.candidate = prose.into();
+    let shown = review_lines(&basis, &preview).join("\n");
+    assert!(shown.contains("source⟨U+200B⟩name (source)"));
+    assert!(shown.contains(prose));
+    assert_eq!(basis.source_name, "source\u{200b}name");
+    assert_eq!(preview.candidate, prose);
 }
 
 #[cfg(test)]

@@ -663,14 +663,17 @@ struct ApprovalReq {
 }
 
 fn approval_inspection_lines(req: &ApprovalReq, summary: Option<&str>) -> Vec<String> {
+    use text::escape_approval_controls as approval_text;
+
     let mut lines = vec![
-        format!("Tool {} v{}", req.tool_name, req.version),
+        format!("Tool {} v{}", approval_text(&req.tool_name), req.version),
         format!("Memory: {} MB", req.memory_mb),
         "Capabilities requested:".into(),
     ];
     for capability in &req.capabilities {
         lines.push(format!(
-            "  {capability}{}",
+            "  {}{}",
+            approval_text(capability),
             if req.already_allowed.contains(capability) {
                 " (already allowed)"
             } else {
@@ -682,26 +685,30 @@ fn approval_inspection_lines(req: &ApprovalReq, summary: Option<&str>) -> Vec<St
         }
     }
     if let Some(session) = &req.session_id {
-        lines.push(format!("Session: {session}"));
+        lines.push(format!("Session: {}", approval_text(session)));
     }
     if let Some(summary) = summary {
         lines.push(format!("AI summary (may be wrong): {summary}"));
     }
     if let Some(detail) = &req.detail {
         lines.push("Approval details:".into());
-        lines.extend(detail.lines().map(str::to_string));
+        lines.extend(detail.lines().map(|line| approval_text(line).into_owned()));
     }
     if let Some(context) = &req.context {
         if let Some(run) = &context.run_id {
-            lines.push(format!("Run: {run}"));
+            lines.push(format!("Run: {}", approval_text(run)));
         }
-        lines.extend(formless_protocol::approval_context_lines(context));
+        lines.extend(
+            formless_protocol::approval_context_lines(context)
+                .into_iter()
+                .map(|line| approval_text(&line).into_owned()),
+        );
     } else {
         lines.push("This daemon did not supply call/source evidence.".into());
     }
     if let Some(code) = &req.code_preview {
         lines.push("Code preview for this approval (first lines):".into());
-        lines.extend(code.lines().map(str::to_string));
+        lines.extend(code.lines().map(|line| approval_text(line).into_owned()));
     }
     lines.push(
         "Close this inspector, then v to fetch the full Tool code for the approval version.".into(),
@@ -3790,8 +3797,12 @@ impl App {
                                     .or(d.versions.last());
                                 if let Some(v) = v {
                                     self.pager = Some(code_pager(
-                                        &format!("{} v{} code", d.tool.name, v.version),
-                                        &v.code,
+                                        &format!(
+                                            "{} v{} code",
+                                            text::escape_approval_controls(&d.tool.name),
+                                            v.version
+                                        ),
+                                        &text::escape_approval_controls(&v.code),
                                         self.color,
                                     ));
                                 }
@@ -9499,7 +9510,7 @@ impl App {
                             .map(String::as_str),
                     );
                     self.pager = Some(Pager {
-                        title: text::escape_bidi(&format!(
+                        title: text::escape_approval_controls(&format!(
                             "{} v{} full approval",
                             req.tool_name, req.version
                         ))
@@ -9533,7 +9544,11 @@ impl App {
                                 &formless_protocol::approval_context_lines(&context).join("\n"),
                             );
                         }
-                        self.pager = Some(code_pager(&tool_name, &detail, self.color));
+                        self.pager = Some(code_pager(
+                            &text::escape_approval_controls(&tool_name),
+                            &text::escape_approval_controls(&detail),
+                            self.color,
+                        ));
                     }
                     _ => self.notes.push("this approval has no code to show".into()),
                 }
@@ -17888,6 +17903,8 @@ fn draw_approval(
     explain: bool,
     first_time: bool,
 ) {
+    use text::escape_approval_controls as approval_text;
+
     let mut lines = match &req.detail {
         // A non-Tool approval (e.g. the agent adding an MCP server).
         // Long payloads (an MCP call's `input:` JSON) are cut short here;
@@ -17898,7 +17915,7 @@ fn draw_approval(
                 .take(APPROVAL_DETAIL_LINES)
                 .map(|d| {
                     Line::styled(
-                        truncate_chars(d, APPROVAL_DETAIL_CHARS),
+                        approval_text(&truncate_chars(d, APPROVAL_DETAIL_CHARS)).into_owned(),
                         bold_fg(color, Color::Yellow),
                     )
                 })
@@ -17914,9 +17931,9 @@ fn draw_approval(
                 Span::raw("Tool "),
                 Span::styled(
                     if title.is_empty() {
-                        req.tool_name.clone()
+                        approval_text(&req.tool_name).into_owned()
                     } else {
-                        title.to_string()
+                        approval_text(title).into_owned()
                     },
                     bold_fg(color, Color::Yellow),
                 ),
@@ -17924,7 +17941,7 @@ fn draw_approval(
                     if title.is_empty() {
                         String::new()
                     } else {
-                        format!(" ({})", req.tool_name)
+                        format!(" ({})", approval_text(&req.tool_name))
                     },
                     fg(color, Color::DarkGray),
                 ),
@@ -17947,9 +17964,13 @@ fn draw_approval(
             Line::raw(format!(
                 "Tool {} v{} wants sensitive capabilities:",
                 if title.is_empty() {
-                    req.tool_name.clone()
+                    approval_text(&req.tool_name).into_owned()
                 } else {
-                    format!("{title} ({})", req.tool_name)
+                    format!(
+                        "{} ({})",
+                        approval_text(title),
+                        approval_text(&req.tool_name)
+                    )
                 },
                 req.version
             )),
@@ -17983,7 +18004,11 @@ fn draw_approval(
                 ui::dim(color)
             };
             head.push(Line::styled(
-                format!("  {state}  {n}. {}  {caps}", call.tool_name),
+                format!(
+                    "  {state}  {n}. {}  {}",
+                    approval_text(&call.tool_name),
+                    approval_text(&caps)
+                ),
                 style,
             ));
         }
@@ -18007,7 +18032,7 @@ fn draw_approval(
     if let Some(context) = &req.context {
         for warning in &context.scope_warnings {
             lines.push(Line::styled(
-                format!("⚠ {warning}"),
+                format!("⚠ {}", approval_text(warning)),
                 bold_fg(color, Color::Yellow),
             ));
         }
@@ -18019,9 +18044,9 @@ fn draw_approval(
             for source in context.sources.iter().take(3) {
                 lines.push(Line::raw(format!(
                     "  {} ({}): {}",
-                    source.tool,
-                    source.kind,
-                    truncate_chars(&source.origin, 100)
+                    approval_text(&source.tool),
+                    approval_text(&source.kind),
+                    approval_text(&truncate_chars(&source.origin, 100))
                 )));
             }
             if context.sources.len() > 3 {
@@ -18038,8 +18063,8 @@ fn draw_approval(
             for url in call.urls.iter().take(2) {
                 lines.push(Line::raw(format!(
                     "  {} {}",
-                    url.method.as_deref().unwrap_or("method unresolved"),
-                    url.url
+                    approval_text(url.method.as_deref().unwrap_or("method unresolved")),
+                    approval_text(&url.url)
                 )));
                 if let Some(bytes) = url.body_bytes {
                     lines.push(Line::raw(format!("  Supplied body: {bytes} bytes")));
@@ -18047,15 +18072,17 @@ fn draw_approval(
                 if let Some(body) = &url.body_preview {
                     lines.push(Line::raw(format!(
                         "  Body preview (redacted): {}",
-                        truncate_chars(body, 160)
+                        approval_text(&truncate_chars(body, 160))
                     )));
                 }
             }
             for path in call.paths.iter().take(2) {
-                lines.push(Line::raw(format!("  Path: {path}")));
+                lines.push(Line::raw(format!("  Path: {}", approval_text(path))));
             }
             if call.urls.is_empty() && call.paths.is_empty() {
-                lines.push(Line::raw(truncate_chars(&call.arguments.to_string(), 160)));
+                lines.push(Line::raw(
+                    approval_text(&truncate_chars(&call.arguments.to_string(), 160)).into_owned(),
+                ));
             }
             if call.truncated {
                 lines.push(Line::styled(
@@ -18070,9 +18097,10 @@ fn draw_approval(
         lines.push(Line::styled("  • (no capabilities)", ui::dim(color)));
     }
     for cap in &req.capabilities {
+        let shown = approval_text(cap);
         if req.already_allowed.contains(cap) {
             lines.push(Line::styled(
-                format!("  • {cap}  (already allowed)"),
+                format!("  • {shown}  (already allowed)"),
                 ui::dim(color),
             ));
             continue;
@@ -18080,17 +18108,21 @@ fn draw_approval(
         // Unusually broad grants stand out (§10.3).
         if let Some(why) = broad_capability(cap) {
             lines.push(Line::from(vec![
-                ui::status_span(color, SemanticTone::Warn, format!("  • {cap}")),
+                ui::status_span(color, SemanticTone::Warn, format!("  • {shown}")),
                 ui::status_span(color, SemanticTone::Warn, format!("  broad access: {why}")),
             ]));
         } else {
-            lines.push(Line::raw(format!("  • {cap}")));
+            lines.push(Line::raw(format!("  • {shown}")));
         }
         // Where a path lies: outside the working folder, or a secrets
         // folder, warns (§10.3).
         if let Some((warn, note)) = path_note(cap, cwd) {
             lines.push(Line::styled(
-                format!("      {}{note}", if warn { "⚠ " } else { "" }),
+                format!(
+                    "      {}{}",
+                    if warn { "⚠ " } else { "" },
+                    approval_text(&note)
+                ),
                 if warn {
                     fg(color, Color::Red)
                 } else {
@@ -18130,6 +18162,7 @@ fn draw_approval(
             )];
             for (i, c) in o.choices.iter().enumerate() {
                 let label = scope_label(c);
+                let label = approval_text(&label);
                 spans.push(if i == *pick {
                     Span::styled(format!("[{label}]"), bold_fg(color, Color::Cyan))
                 } else {
@@ -18151,7 +18184,7 @@ fn draw_approval(
         }
         if explain {
             lines.push(Line::styled(
-                format!("      {}", ui::explain_capability(cap)),
+                format!("      {}", approval_text(&ui::explain_capability(cap))),
                 ui::dim(color),
             ));
         }
@@ -18164,7 +18197,7 @@ fn draw_approval(
         lines.push(Line::styled("Code (first lines):", ui::dim(color)));
         for l in code.lines().take(15) {
             lines.push(Line::styled(
-                format!("  {}", truncate_chars(l, 100)),
+                format!("  {}", approval_text(&truncate_chars(l, 100))),
                 ui::dim(color),
             ));
         }
@@ -18284,7 +18317,7 @@ fn draw_approval(
             signals.push(Line::styled(
                 format!(
                     "This Run read external content: {}{} (i sources)",
-                    truncate_chars(&source.tool, 40),
+                    approval_text(&truncate_chars(&source.tool, 40)),
                     if context.sources.len() > 1 {
                         format!(" +{}", context.sources.len() - 1)
                     } else {
@@ -18300,8 +18333,7 @@ fn draw_approval(
         lines.splice(0..0, signals);
     }
     let area = f.area();
-    // Names, paths and summaries come from Tools and models: their bidi
-    // controls are shown, never obeyed (#791).
+    // Prose still shows bidi controls while preserving natural script shaping.
     let lines: Vec<Line<'static>> = lines.into_iter().map(text::escape_bidi_line).collect();
     let content_w = lines
         .iter()
@@ -28689,6 +28721,49 @@ mod tests {
             }
             other => panic!("unexpected request {other:?}"),
         }
+    }
+
+    #[test]
+    fn approval_control_markers_do_not_mutate_decision_data() {
+        let mut app = test_app();
+        let path = "/fixture/config\u{200b}.toml";
+        let prose = "می\u{200c}خواهم 👩\u{200d}💻";
+        let req = ApprovalReq {
+            context: Some(formless_protocol::ApprovalContext {
+                call: Some(formless_protocol::ApprovalCallPreview {
+                    arguments: serde_json::json!({ "path": path, "tag": "\u{e0061}" }),
+                    urls: vec![],
+                    paths: vec![path.into()],
+                    truncated: false,
+                    note: "Synthetic evidence".into(),
+                }),
+                ..Default::default()
+            }),
+            approval_id: "fixture".into(),
+            tool_name: "read\u{ad}tool".into(),
+            version: 1,
+            capabilities: vec![format!("fs:read:{path}")],
+            memory_mb: 64,
+            detail: Some("Command: inspect\u{2060}".into()),
+            already_allowed: vec![],
+            code_preview: Some("const label = '\u{e007f}';".into()),
+            tool_id: Some("fixture-tool".into()),
+            session_id: None,
+        };
+        app.approval_summaries
+            .insert(req.approval_id.clone(), prose.into());
+        app.approvals.push_back(req.clone());
+        let screen = render(&mut app, 180, 70);
+        for marker in ["⟨U+00AD⟩", "⟨U+200B⟩", "⟨U+2060⟩", "⟨U+E007F⟩"] {
+            assert!(screen.contains(marker), "missing {marker}: {screen}");
+        }
+        let evidence = approval_inspection_lines(&app.approvals[0], Some(prose)).join("\n");
+        assert!(evidence.contains(prose));
+        assert!(evidence.contains("⟨U+E0061⟩"));
+        assert_eq!(app.approvals[0].tool_name, req.tool_name);
+        assert_eq!(app.approvals[0].capabilities, req.capabilities);
+        assert_eq!(app.approvals[0].context, req.context);
+        assert_eq!(app.approvals[0].code_preview, req.code_preview);
     }
 
     #[test]

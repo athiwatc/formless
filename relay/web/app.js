@@ -1312,8 +1312,9 @@
   }
   function branchSummaryReviewText(basis, preview) {
     const usage = preview.usage, projection = preview.projection;
-    const lines = ["Source: " + basis.source_name + " (" + preview.source_id + ")", "Target: " + basis.target_name + " (" + preview.target_id + ")",
-      "Provider: " + (preview.provider || "unknown") + " · requested model: " + (preview.requested_model || "unknown") + " · served model: " + (preview.served_model || "unknown"),
+    const lines = [approvalText("Source: " + basis.source_name + " (" + preview.source_id + ")"),
+      approvalText("Target: " + basis.target_name + " (" + preview.target_id + ")"),
+      approvalText("Provider: " + (preview.provider || "unknown") + " · requested model: " + (preview.requested_model || "unknown") + " · served model: " + (preview.served_model || "unknown")),
       "Reported usage: " + usage.reported_prompt_tokens + " input / " + usage.reported_completion_tokens + " output tokens · " + usage.reported_cached_tokens + " cached / " + usage.reported_cache_write_tokens + " cache-write · " + usage.reported_requests + "/" + usage.requests + " requests reported",
       usage.usage_complete ? "Usage coverage: complete" : "Usage coverage: incomplete or unknown; missing usage is not zero",
       usage.cost != null ? "Recorded cost: " + uiMoney(usage.cost, 6) : "Total cost: unknown · priced subtotal only: " + uiMoney(usage.priced_cost_subtotal, 6),
@@ -1350,7 +1351,7 @@
     if (basis.source_id !== source || basis.target_id !== stamp.target || !basis.source_revision || !basis.target_revision) {
       preparing = false; invalidateBranchSummary(); return note("Branch summary basis did not match the requested source and target.", true);
     }
-    pendingBody.textContent = "Source: " + basis.source_name + " → Target: " + basis.target_name + " · " + basis.provider + " / " + basis.requested_model + ". Started generation may finish and record usage after review is closed.";
+    pendingBody.textContent = approvalText("Source: " + basis.source_name + " → Target: " + basis.target_name + " · " + basis.provider + " / " + basis.requested_model) + ". Started generation may finish and record usage after review is closed.";
     const result = await act({ type: "prepare_branch_summary", source_id: source, target_id: stamp.target, source_revision: basis.source_revision, target_revision: basis.target_revision }, null, 120000);
     preparing = false;
     cancelAsk(stamp.generateTag);
@@ -3878,8 +3879,8 @@
       if (c.kind === "folder") return "folder " + name + "/";
       return (c.kind === "repo" ? "whole repo " : "project ") + c.path + (c.label ? " (" + c.label + ")" : "");
     };
-    const sel = h("select", { "aria-label": "Grant scope for " + cap },
-      opt.choices.map((c, i) => h("option", { value: String(i) }, label(c))));
+    const sel = h("select", { "aria-label": "Grant scope for " + approvalText(cap) },
+      opt.choices.map((c, i) => h("option", { value: String(i) }, approvalText(label(c)))));
     sel.value = String(req.picks[cap] || 0);
     sel.onchange = () => { req.picks[cap] = Number(sel.value); };
     return h("div", { class: "muted path-note" }, "Grant: ", sel, " (for Always, Session or Hour; Once allows just this call)");
@@ -3897,10 +3898,18 @@
    * are written out as `⟨U+202E⟩`, never obeyed, so `report\u202Efdp.exe`
    * can't pass for `reportexe.pdf` (#791). */
   const BIDI = /[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/g;
+  const APPROVAL_CONTROLS = /[\u00AD\u061C\u180E\u200B-\u200F\u202A-\u202E\u2060-\u2064\u2066-\u2069\uFEFF\u{E0000}-\u{E007F}]/gu;
+  function visibleCodePoint(c) {
+    return "⟨U+" + c.codePointAt(0).toString(16).toUpperCase().padStart(4, "0") + "⟩";
+  }
+  // Exact values in a decision show invisible formatting. Prose uses showBidi.
+  function approvalText(value) {
+    return String(value ?? "").replace(APPROVAL_CONTROLS, visibleCodePoint);
+  }
   function showBidi(root) {
     const walk = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
     for (let n = walk.nextNode(); n; n = walk.nextNode()) {
-      if (BIDI.test(n.data)) n.data = n.data.replace(BIDI, (c) => "⟨U+" + c.charCodeAt(0).toString(16).toUpperCase().padStart(4, "0") + "⟩");
+      if (BIDI.test(n.data)) n.data = n.data.replace(BIDI, visibleCodePoint);
       BIDI.lastIndex = 0;
     }
   }
@@ -3908,16 +3917,16 @@
     if (!context) return null;
     const call = context.call;
     return h("div", { class: "approval-context" },
-      (context.scope_warnings || []).map(warning => h("p", { class: "error scope-warning" }, "⚠ " + warning)),
+      (context.scope_warnings || []).map(warning => h("p", { class: "error scope-warning" }, "⚠ " + approvalText(warning))),
       (context.sources || []).length ? h("section", { class: "attention source-taint" },
         h("strong", null, "This Run read external content:"),
-        h("ul", null, context.sources.map(source => h("li", null, source.tool + " (" + source.kind + "): " + source.origin)))) : null,
+        h("ul", null, context.sources.map(source => h("li", null, approvalText(source.tool + " (" + source.kind + "): " + source.origin))))) : null,
       call ? h("details", { open: true, class: "call-preview" }, h("summary", null, "Resolved call arguments (redacted)"),
-        (call.urls || []).map(url => h("div", null, h("strong", null, url.method || "Method unresolved"), " ", h("code", null, url.url),
+        (call.urls || []).map(url => h("div", null, h("strong", null, approvalText(url.method || "Method unresolved")), " ", h("code", null, approvalText(url.url)),
           url.body_bytes != null ? h("p", null, "Supplied body: " + url.body_bytes + " bytes") : null,
-          url.body_preview != null ? h("pre", null, "Body preview (redacted): " + url.body_preview) : null)),
-        (call.paths || []).map(path => h("p", null, "Path: ", h("code", null, path))),
-        h("pre", null, JSON.stringify(call.arguments, null, 2)),
+          url.body_preview != null ? h("pre", null, "Body preview (redacted): " + approvalText(url.body_preview)) : null)),
+        (call.paths || []).map(path => h("p", null, "Path: ", h("code", null, approvalText(path)))),
+        h("pre", null, approvalText(JSON.stringify(call.arguments, null, 2))),
         call.truncated ? h("p", { class: "error" }, "Preview truncated; omitted values remain unresolved here.") : null,
         h("p", { class: "muted" }, call.note)) : null);
   }
@@ -3949,14 +3958,14 @@
           const answered = ((S.batchAnswers || {})[req.batch.batch_id] || {})[i + 1];
           const now = i + 1 === req.batch.index;
           return h("li", { class: now ? "now" : "muted" },
-            h("span", { class: "batch-state" }, answered || (now ? "▶ now" : "waiting")), " ", h("strong", null, c.tool_name), " ",
-            (c.new_capabilities.length ? c.new_capabilities : c.capabilities).map((cap) => h("span", { class: "tag" + (isBroad(cap) ? " broad" : "") }, cap)));
+            h("span", { class: "batch-state" }, answered || (now ? "▶ now" : "waiting")), " ", h("strong", null, approvalText(c.tool_name)), " ",
+            (c.new_capabilities.length ? c.new_capabilities : c.capabilities).map((cap) => h("span", { class: "tag" + (isBroad(cap) ? " broad" : "") }, approvalText(cap))));
         }))) : null,
       // What it does in plain words: AI-written, so labelled (SPEC §10.3).
       req.summary && (!req.detail || req.tool_id) ? h("div", { class: "ai-summary" }, h("span", { class: "ai-label" }, "AI summary · may be wrong; the Capabilities are what counts"), h("p", null, req.summary)) : null,
-      req.detail ? h("p", { class: "detail-text" }, req.detail) : null,
-      !req.detail || req.tool_id ? h("p", null, "Tool ", h("strong", null, toolTitleByName(req.tool_name) || req.tool_name),
-          toolTitleByName(req.tool_name) ? h("span", { class: "muted" }, " (" + req.tool_name + ")") : null,
+      req.detail ? h("p", { class: "detail-text" }, approvalText(req.detail)) : null,
+      !req.detail || req.tool_id ? h("p", null, "Tool ", h("strong", null, approvalText(toolTitleByName(req.tool_name) || req.tool_name)),
+          toolTitleByName(req.tool_name) ? h("span", { class: "muted" }, " (" + approvalText(req.tool_name) + ")") : null,
           req.version ? " v" + req.version : "",
           promo ? " is ready to be promoted." : " wants sensitive capabilities:") : null,
       promo && req.reason ? h("p", { class: "muted" }, req.reason) : null,
@@ -3964,12 +3973,12 @@
       h("ul", { "aria-label": promo ? "Capabilities" : "Capabilities requested" },
         (req.capabilities.length ? req.capabilities : ["(no capabilities)"]).map((c) =>
           (req.already || []).includes(c)
-            ? h("li", { class: "muted" }, h("span", { class: "tag" }, c), " already allowed")
-            : h("li", null, h("span", { class: "tag" + (isBroad(c) ? " broad" : "") }, c), isBroad(c) ? h("span", { class: "error" }, " broad access: " + broadWhy(c)) : (req.already || []).length ? h("span", null, " new") : null,
-              ((n) => n ? h("div", { class: n[0] ? "error path-note" : "muted path-note" }, (n[0] ? "⚠ " : "") + n[1]) : null)(pathNote(c, ((S.sessions.find((s) => s.id === req.session_id) || {}).cwd) || null)),
+            ? h("li", { class: "muted" }, h("span", { class: "tag" }, approvalText(c)), " already allowed")
+            : h("li", null, h("span", { class: "tag" + (isBroad(c) ? " broad" : "") }, approvalText(c)), isBroad(c) ? h("span", { class: "error" }, " broad access: " + broadWhy(c)) : (req.already || []).length ? h("span", null, " new") : null,
+              ((n) => n ? h("div", { class: n[0] ? "error path-note" : "muted path-note" }, (n[0] ? "⚠ " : "") + approvalText(n[1])) : null)(pathNote(c, ((S.sessions.find((s) => s.id === req.session_id) || {}).cwd) || null)),
               scopePicker(req, c))),
         req.detail && !req.tool_id ? null : h("li", null, h("span", { class: "tag" }, "memory " + req.memory_mb + " MB"))),
-      req.code ? h("details", { class: "chip" }, h("summary", null, "Code (first lines)"), h("pre", { class: "diff" }, req.code)) : null,
+      req.code ? h("details", { class: "chip" }, h("summary", null, "Code (first lines)"), h("pre", { class: "diff" }, approvalText(req.code))) : null,
       h("p", { class: "muted" }, promo
         ? "The new version replaces the current one; rollback stays available."
         : "Approve lasts for this Tool until its capabilities widen. Allow once covers this call only.")));
