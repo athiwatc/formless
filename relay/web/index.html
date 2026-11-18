@@ -47,8 +47,7 @@
     </nav>
     <div class="spacer"></div>
     <span id="conn" class="pill" aria-live="polite">connecting…</span>
-    <button class="icon-btn" id="notes-btn" type="button" aria-label="Activity log" aria-expanded="false" aria-controls="notes-panel" aria-describedby="notes-unread">◔<span id="notes-badge" class="badge hidden" aria-hidden="true"></span></button>
-    <span id="notes-unread" class="sr-only">0 unread</span>
+    <button class="icon-btn" id="notes-btn" type="button" aria-label="Activity log, 0 unread" aria-expanded="false" aria-controls="notes-panel">◔<span id="notes-badge" class="badge hidden" aria-hidden="true"></span></button>
     <select id="theme" aria-label="Theme" title="Theme">
       <option value="auto">Auto</option>
       <option value="light">Light</option>
@@ -178,6 +177,8 @@
       <section id="view-settings" class="view hidden" aria-label="Settings">
         <div class="view-head"><h2>Settings</h2></div>
         <input id="settings-filter" class="settings-filter" type="search" placeholder="Filter settings: a key, a word from a description…" aria-label="Filter settings" autocomplete="off" spellcheck="false" autocapitalize="none" autocorrect="off" inputmode="search">
+        <div id="settings-filter-status" class="muted" role="status"></div>
+        <button id="settings-filter-clear" class="btn small ghost" type="button" hidden>Clear filter</button>
         <div id="settings"></div>
       </section>
     </main>

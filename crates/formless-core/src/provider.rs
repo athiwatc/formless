@@ -17,7 +17,7 @@ use crate::Paths;
 /// bootstrap prompt and the optimiser so they never drift apart.
 macro_rules! host_api_doc {
     () => {
-        "Tool code is plain JavaScript defining `function run(input) { ... }` (or `async function run`) returning the output value. On failure, throw an Error: a returned {error: ...} is counted as a failure unless output_schema declares an error property, and swallowing errors hides broken Tools from measurement. Host API (all Capability-gated; data options take encoding \"utf8\" (default) or \"base64\" for binary): fetch(url, {method, headers, body, bodyEncoding, encoding}) -> {status, ok, url, headers, body, text(), json()} (redirects followed only within the granted hosts); fetchChunks(url, opts, size, cb) streams the body in chunks and returns status; fs.read(path, {encoding}), fs.write(path, data, {encoding}), fs.append(path, data, {encoding}), fs.exists(path), fs.stat(path) -> {type, size, modified_ms} or null, fs.list(dir, {details}) -> names or [{name, type, size}], fs.mkdir(path), fs.remove(path, {recursive}), fs.rename(from, to), fs.readChunks(path, size, cb, {encoding}), fs.readLines(path, cb); env.get(key); process.run(cmd, argsArray, {cwd, env, stdin, stdinEncoding, encoding, timeout_ms}) -> {code, signal, stdout, stderr, timed_out, killed, truncated} (no shell; optional timeout kills its group); process.spawn(cmd, argsArray, opts) takes the same options and returns a handle: read(size) -> {stream, data, eof} with stdout/stderr distinguishable, wait()/kill() -> {code, signal, timed_out, killed, truncated}, close(). Read chunks and emit them while work runs; wait discards unread output (truncated: true). Always wait or close in finally; handles cannot outlive this Invocation; tools.call(name, input) -> Promise of the Tool's output (always await it; several in Promise.all run in parallel, and a Tool that returns with a call still pending fails); clipboard.read(), clipboard.write(text); notify(title, body); harness.read() (providers, roles, MCP servers, skills, settings; never keys) and harness.call(op, args, reason) for mcp.add/remove, skills.add/remove/enable, models.set, providers.upsert/remove (no keys; upsert takes base_url or a preset: openai, anthropic, openrouter, gemini, groq, ollama, lmstudio), roles.upsert/delete, config.set: each change is shown to the user with your reason and needs their approval; store.get(key, {ns}), store.set(key, jsonValue, {ns}), store.delete(key, {ns}), store.list(prefix, {ns}) persist small state between Invocations (\"store\" = this Tool's own, \"store:<ns>\" = a shared namespace; 64 KB per value); llm.complete(prompt, {system, model, role, schema}) -> text without schema, or a parsed JSON value validated against schema; agents.run(task, {system, model, role}) -> text (role: a configured Role by name, see the Roles list; it picks the provider and model); requireModule(name) / modules.load(name), modules.list(); emit(chunk) streams large output to an artifact; progress(fraction, label) shows how far long work has got (fraction 0..1 or null; no Capability needed); console.log, sleep(ms), setTimeout/setInterval/clearTimeout (real timers; run() may await them), cryptoRandom(), randomBytes(n) -> base64 of exactly n bytes. sleep(ms) and randomBytes(n) require finite non-negative safe-integer numbers; invalid inputs and requests above tools.max_sleep_secs/tools.max_random_bytes throw instead of coercing or clamping. Nothing else exists: anything more (URL parsing, base64 decoding to bytes, hashing, compression, formats) you write in JS."
+        "Tool code is plain JavaScript defining `function run(input) { ... }` (or `async function run`) returning the output value. On failure, throw an Error: a returned {error: ...} is counted as a failure unless output_schema declares an error property, and swallowing errors hides broken Tools from measurement. Host API (declare the required Capabilities for privileged effects; data options take encoding \"utf8\" (default) or \"base64\" for binary): fetch(url, {method, headers, body, bodyEncoding, encoding}) -> {status, ok, url, headers, body, text(), json()} (scope is checked on every redirect and configured connection and total deadlines apply); fetchChunks(url, opts, size, cb) streams the body in chunks and returns status; fs.read(path, {encoding}), fs.write(path, data, {encoding}), fs.append(path, data, {encoding}), fs.exists(path), fs.stat(path) -> {type, size, modified_ms, readonly?} or null, fs.list(dir, {details}) -> names or [{name, type, size}], fs.mkdir(path), fs.remove(path, {recursive}), fs.rename(from, to), fs.readChunks(path, size, cb, {encoding}), fs.readLines(path, cb); env.get(key); process.run(cmd, argsArray, {cwd, env, stdin, stdinEncoding, encoding, timeout_ms}) -> {code, signal, stdout, stderr, timed_out, killed, truncated} (no shell; optional timeout kills its group; timeoutMs is an alias); process.spawn(cmd, argsArray, opts) takes the same options and returns a handle: read(size) -> {stream, data, eof} with stdout/stderr distinguishable, wait()/kill() -> {code, signal, timed_out, killed, truncated}, close(). Read chunks and emit them while work runs; wait discards unread output (truncated: true). Always wait or close in finally; handles cannot outlive this Invocation; tools.call(name, input) -> Promise of the Tool's output (always await it; several in Promise.all run in parallel, and a Tool that returns with a call still pending fails); clipboard.read(), clipboard.write(text); notify(title, body) or notifications.send(title, body) with the notify Capability; harness.read() (providers, roles, MCP servers, skills, settings; never keys) and harness.call(op, args, reason) for mcp.add/remove, skills.add/remove/enable, models.set, providers.upsert/remove (no keys; upsert takes base_url or a preset: openai, anthropic, openrouter, gemini, groq, ollama, lmstudio), roles.upsert/delete, config.set: each change is shown to the user with your reason and needs their approval; store.get(key, {ns}), store.set(key, jsonValue, {ns}), store.delete(key, {ns}), store.list(prefix, {ns}) persist small state between Invocations (\"store\" = this Tool's own, \"store:<ns>\" = a shared namespace; 64 KB per value); llm.complete(prompt, {system, model, role, schema}) -> text without schema, or a parsed JSON value validated against schema; agents.run(task, {system, model, role}) -> text (in both calls a nonempty role takes precedence over model and selects a configured Role's provider and model); Unprivileged helpers include requireModule(name) / modules.load(name), modules.list(); emit(chunk) streams large output to an artifact; progress(fraction, label) shows how far long work has got (fraction 0..1 or null); console.log/info/warn/error, sleep(ms), setTimeout/clearTimeout/setInterval/clearInterval (real timers; run() may await them), cryptoRandom(), randomBytes(n) -> base64 of exactly n bytes. sleep(ms) and randomBytes(n) require finite non-negative safe-integer numbers; invalid inputs and requests above tools.max_sleep_secs/tools.max_random_bytes throw instead of coercing or clamping. QuickJS provides standard JavaScript built-ins such as JSON. Write other helpers such as URL parsing, hashing and format conversion in JavaScript modules."
     };
 }
 pub(crate) use host_api_doc;
@@ -4886,10 +4886,16 @@ fn provider_http_error(status: reqwest::StatusCode, text: &str, wait: Option<Dur
     }
 }
 
-/// How long the server asked us to wait: `Retry-After` (seconds or an
-/// HTTP date), else the longest `x-ratelimit-reset-*` (`"1s"`, `"6m0s"`,
-/// `"20ms"`).
+/// Prefer `Retry-After` (seconds or an HTTP date). Otherwise use the longest
+/// provider reset, expressed as a duration or a future timestamp.
 fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    retry_after_at(headers, chrono::Utc::now())
+}
+
+fn retry_after_at(
+    headers: &reqwest::header::HeaderMap,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<Duration> {
     let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
     if let Some(v) = header("retry-after") {
         if let Ok(secs) = v.trim().parse::<f64>() {
@@ -4898,13 +4904,21 @@ fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
             }
         }
         if let Ok(at) = chrono::DateTime::parse_from_rfc2822(v.trim()) {
-            let wait = at.signed_duration_since(chrono::Utc::now());
+            let wait = at.signed_duration_since(now);
             return Some(wait.to_std().unwrap_or_default());
         }
     }
-    ["x-ratelimit-reset-requests", "x-ratelimit-reset-tokens"]
+    headers
         .iter()
-        .filter_map(|h| header(h).and_then(parse_reset_duration))
+        .filter(|(name, _)| crate::rate_limits::is_reset_header(name.as_str()))
+        .filter_map(|(_, raw)| {
+            let raw = raw.to_str().ok()?.trim();
+            if let Some(at) = crate::rate_limits::absolute_reset_at(raw) {
+                let wait = at.signed_duration_since(now).to_std().ok()?;
+                return (!wait.is_zero()).then_some(wait);
+            }
+            parse_reset_duration(raw)
+        })
         .max()
 }
 
@@ -4920,6 +4934,9 @@ fn retry_seconds(seconds: f64) -> Option<Duration> {
 /// Unit durations (`"1d 2h"`, `"1m30s"`, `"20ms"`, `"0.5s"`) or bare seconds.
 fn parse_reset_duration(text: &str) -> Option<Duration> {
     let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
     if let Ok(secs) = text.parse::<f64>() {
         return retry_seconds(secs);
     }
@@ -6081,6 +6098,84 @@ mod tests {
         h.insert("retry-after", HeaderValue::from_str(&at).unwrap());
         let wait = retry_after(&h).unwrap();
         assert!(wait > Duration::from_secs(25) && wait <= Duration::from_secs(30));
+    }
+
+    #[test]
+    fn retry_hints_cover_each_provider_reset_bucket() {
+        use reqwest::header::{HeaderMap, HeaderValue};
+        let now: chrono::DateTime<chrono::Utc> = "2026-11-15T00:00:00Z".parse().unwrap();
+        let future = now + chrono::TimeDelta::seconds(40);
+        let epoch_seconds = future.timestamp().to_string();
+        let epoch_millis = future.timestamp_millis().to_string();
+        for name in [
+            "x-ratelimit-reset",
+            "x-ratelimit-reset-requests",
+            "x-ratelimit-reset-tokens",
+            "x-ratelimit-reset-input-tokens",
+            "x-ratelimit-reset-output-tokens",
+            "anthropic-ratelimit-requests-reset",
+            "anthropic-ratelimit-tokens-reset",
+            "anthropic-ratelimit-input-tokens-reset",
+            "anthropic-ratelimit-output-tokens-reset",
+        ] {
+            for raw in [
+                "40s",
+                "2026-11-15T01:00:40+01:00",
+                &epoch_seconds,
+                &epoch_millis,
+            ] {
+                let mut headers = HeaderMap::new();
+                headers.insert(name, HeaderValue::from_str(raw).unwrap());
+                assert_eq!(
+                    retry_after_at(&headers, now),
+                    Some(Duration::from_secs(40)),
+                    "{name}: {raw}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn retry_hints_choose_longest_valid_reset_unless_retry_after_is_valid() {
+        use reqwest::header::{HeaderMap, HeaderValue};
+        let now: chrono::DateTime<chrono::Utc> = "2026-11-15T00:00:00Z".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        for (name, raw) in [
+            (
+                "anthropic-ratelimit-input-tokens-reset",
+                "2026-11-14T23:59:59Z",
+            ),
+            (
+                "anthropic-ratelimit-output-tokens-reset",
+                "2026-11-15T00:00:00Z",
+            ),
+            ("x-ratelimit-reset-requests", "unavailable"),
+            ("x-ratelimit-reset-tokens", ""),
+            ("x-ratelimit-reset-unknown", "5d"),
+            ("x-ratelimit-remaining-tokens", "5d"),
+        ] {
+            headers.insert(name, HeaderValue::from_static(raw));
+        }
+        headers.insert(
+            "x-ratelimit-reset",
+            HeaderValue::from_str(&(now.timestamp() - 1).to_string()).unwrap(),
+        );
+        assert_eq!(retry_after_at(&headers, now), None);
+        headers.append(
+            "x-ratelimit-reset-requests",
+            HeaderValue::from_static("6m0s"),
+        );
+        headers.insert(
+            "anthropic-ratelimit-requests-reset",
+            HeaderValue::from_static("2026-11-15T00:06:00.250Z"),
+        );
+        headers.insert("retry-after", HeaderValue::from_static("malformed"));
+        assert_eq!(
+            retry_after_at(&headers, now),
+            Some(Duration::from_millis(360_250))
+        );
+        headers.insert("retry-after", HeaderValue::from_static("7"));
+        assert_eq!(retry_after_at(&headers, now), Some(Duration::from_secs(7)));
     }
 
     #[test]

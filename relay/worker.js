@@ -26,6 +26,8 @@ import { isConfigFailure, loadVapid, sendPush, validSubscription } from "./push.
 import { RoomBudget } from "./room-budget.mjs";
 import { LIMITS, TransportError, wireBytes, randomMessageID, validateFragment } from "./web/transport.mjs";
 const MAX_SUBSCRIPTIONS = 10;
+// Leave room for other outbound I/O during a push event.
+const MAX_PUSH_IN_FLIGHT = 4;
 function handshake(text) {
   wireBytes(text, LIMITS.preReady);
   let value; try { value=JSON.parse(text); } catch (_) { throw new TransportError("invalid handshake"); }
@@ -49,7 +51,7 @@ function pushFor(env) {
 export class RelayRoom {
   constructor(state, env) {
     this.state=state;this.env=env;this.gone=new WeakSet();this.budget=new RoomBudget(state.storage?.sql);
-    this.scheduledAlarm=null;this.alarmPending=false;this.alarmWanted=null;this.pushJobs=new Set();this.pushPending=false;this.failed=false;
+    this.scheduledAlarm=null;this.alarmPending=false;this.alarmWanted=null;this.pushJobs=new Set();this.pushPending=false;this.pushAgain=false;this.failed=false;
     // Read an existing alarm before initialization schedules anything. A wake
     // for an already-due alarm must not postpone that handler in a constructor.
     const finish=at=>{this.scheduledAlarm=at??null;this.reconcile();};
@@ -197,25 +199,47 @@ export class RelayRoom {
   }
 
   async pushAll() {
-    if(this.pushPending)return;
-    this.pushPending=true;
+    if (this.pushPending) {
+      this.pushAgain = true;
+      return;
+    }
+    this.pushPending = true;
     try {
+      do {
+        this.pushAgain = false;
+        try {
+          await this.pushOnce();
+        } catch {
+          console.error("relay: push fan-out failed");
+        }
+      } while (this.pushAgain);
+    } finally {
+      this.pushPending = false;
+    }
+  }
+
+  async pushOnce() {
     const { vapid } = await pushFor(this.env);
     if (!vapid) return;
     const subs = await this.state.storage.list({ prefix: "push:", limit: MAX_SUBSCRIPTIONS });
-    await Promise.all([...subs].filter(([,sub])=>validSubscription(sub,this.env.ALLOW_LOCAL_PUSH==="1",this.env.PUSH_HOSTS)).map(async ([key, sub]) => {
-      try {
-        const status = await sendPush(sub, vapid);
-        if (status === 404 || status === 410) await this.state.storage.delete(key);
-        else if (isConfigFailure(status) && !refused) {
-          refused = "a push service answered " + status + ": check that VAPID_PUBLIC_KEY and VAPID_PRIVATE_JWK are one pair";
-          console.error("relay: " + refused);
-        } else if (status < 300) refused = null;
-      } catch (e) {
-        console.error("relay: push failed: " + (e && e.message));
+    const eligible = [...subs].filter(([, sub]) => validSubscription(sub, this.env.ALLOW_LOCAL_PUSH === "1", this.env.PUSH_HOSTS));
+    let index = 0;
+    const deliver = async () => {
+      while (index < eligible.length) {
+        const [key, sub] = eligible[index++];
+        try {
+          const status = await sendPush(sub, vapid);
+          if (status === 404 || status === 410) await this.state.storage.delete(key);
+          else if (isConfigFailure(status) && !refused) {
+            refused = "a push service answered " + status + ": check that VAPID_PUBLIC_KEY and VAPID_PRIVATE_JWK are one pair";
+            console.error("relay: " + refused);
+          } else if (status < 300) refused = null;
+        } catch (error) {
+          console.error(error?.name === "TimeoutError" ? "relay: push timed out" : "relay: push failed");
+        }
       }
-    }));
-    } finally { this.pushPending=false; }
+    };
+    await Promise.allSettled(Array.from({ length: Math.min(MAX_PUSH_IN_FLIGHT, eligible.length) }, deliver));
   }
   async boundedPush(sid,work){
     if(this.pushJobs.has(sid)||this.pushJobs.size>=4)throw new TransportError("push control work limit");
@@ -315,19 +339,34 @@ export const SECURITY_HEADERS = {
   "x-content-type-options": "nosniff",
   "referrer-policy": "no-referrer",
   "cache-control": "no-cache",
+  "strict-transport-security": "max-age=31536000; includeSubDomains",
+  "permissions-policy": "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
+  "cross-origin-opener-policy": "same-origin",
 };
+
+function withSecurityHeaders(response, protocol) {
+  // The assets binding may return an immutable header guard.
+  const result = new Response(response.body, response);
+  for (const [name, value] of Object.entries(SECURITY_HEADERS)) {
+    if (name === "strict-transport-security" && protocol !== "https:") continue;
+    result.headers.set(name, value);
+  }
+  return result;
+}
 
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     if (url.pathname === "/push/key") {
       const { vapid } = await pushFor(env);
-      return vapid ? Response.json({ key: vapid.publicKey }) : new Response("push is not set up on this relay", { status: 404 });
+      const response = vapid ? Response.json({ key: vapid.publicKey }) : new Response("push is not set up on this relay", { status: 404 });
+      return withSecurityHeaders(response, url.protocol);
     }
     if (url.pathname === "/health") {
       const push = await pushFor(env);
       const state = push.state === "ok" && refused ? "misconfigured" : push.state;
-      return Response.json({ ok: true, service: "formless-relay", version: 2, push: state, push_problem: push.reason || refused || undefined });
+      const response = Response.json({ ok: true, service: "formless-relay", version: 2, push: state, push_problem: push.reason || refused || undefined });
+      return withSecurityHeaders(response, url.protocol);
     }
     const m = url.pathname.match(/^\/relay\/([a-f0-9]{32})$/);
     if (m) {
@@ -335,8 +374,6 @@ export default {
       return stub.fetch(request);
     }
     const asset = await env.ASSETS.fetch(request);
-    const res = new Response(asset.body, asset);
-    for (const [k, v] of Object.entries(SECURITY_HEADERS)) res.headers.set(k, v);
-    return res;
+    return withSecurityHeaders(asset, url.protocol);
   },
 };
