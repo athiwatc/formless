@@ -140,11 +140,12 @@ class ReleasePublication(unittest.TestCase):
                 (root / subdir).mkdir(parents=True)
             (root / "target/debian/fixture.deb").touch()
             (root / "target/generate-rpm/fixture.rpm").touch()
-            (root / "bin/dpkg").write_text("#!/bin/sh\nexit 0\n")
+            for command in ("dpkg", "sha256sum"):
+                (root / "bin" / command).write_text("#!/bin/sh\nexit 0\n")
             (root / "bin/cargo").write_text('#!/bin/sh\nprintf "%s\\n" "$@" >> args\n')
             for command in (root / "bin").iterdir():
                 command.chmod(0o755)
-            for kind, tag in (("false", "v0.2.0"), ("true", "v0.2.0-rc.1-hotfix")):
+            for kind, tag in (("", "main"), ("false", "v0.2.0"), ("true", "v0.2.0-rc.1-hotfix")):
                 with self.subTest(tag=tag):
                     args = root / "args"
                     args.write_text("")
