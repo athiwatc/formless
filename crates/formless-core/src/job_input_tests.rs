@@ -206,7 +206,7 @@ fn cron_matches_real_instants_through_local_clock_changes() {
         assert_eq!(local.offset(), at.offset(), "{case}: {text}");
         local
     };
-    let next = |expr, after| Cron::parse(expr).unwrap().next_after(local(after));
+    let next = |expr: &str, after: &str| Cron::parse(expr).unwrap().next_after(local(after));
     if case == "lord_howe" {
         assert_eq!(
             next("* * * * *", "2026-04-05T01:59:45+11:00"),
