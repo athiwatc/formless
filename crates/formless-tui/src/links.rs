@@ -298,6 +298,7 @@ pub fn paint(out: &mut impl Write, buf: &Buffer, links: &[Painted]) -> std::io::
         SetUnderlineColor,
     };
     use crossterm::{cursor, QueueableCommand};
+    const CLOSE_LINK: &str = "\x1b]8;;\x1b\\";
     const ATTRIBUTES: [(Modifier, Attribute); 9] = [
         (Modifier::BOLD, Attribute::Bold),
         (Modifier::DIM, Attribute::Dim),
@@ -313,30 +314,41 @@ pub fn paint(out: &mut impl Write, buf: &Buffer, links: &[Painted]) -> std::io::
         return Ok(());
     }
     out.queue(cursor::SavePosition)?;
-    for l in links {
-        out.queue(cursor::MoveTo(l.x0, l.y))?;
-        out.queue(Print(format!("\x1b]8;;{}\x1b\\", l.url)))?;
-        for x in l.x0..=l.x1 {
-            let cell = &buf[(x, l.y)];
-            out.queue(SetAttribute(Attribute::Reset))?;
-            out.queue(SetForegroundColor(cell.fg.into()))?;
-            out.queue(SetBackgroundColor(cell.bg.into()))?;
-            if cell.underline_color != Color::Reset {
-                out.queue(SetUnderlineColor(cell.underline_color.into()))?;
-            }
-            for (modifier, attribute) in ATTRIBUTES {
-                if cell.modifier.contains(modifier) {
-                    out.queue(SetAttribute(attribute))?;
+    let result = (|| {
+        for link in links {
+            out.queue(cursor::MoveTo(link.x0, link.y))?;
+            out.queue(Print(format!("\x1b]8;;{}\x1b\\", link.url)))?;
+            for x in link.x0..=link.x1 {
+                let cell = &buf[(x, link.y)];
+                out.queue(SetAttribute(Attribute::Reset))?;
+                out.queue(SetForegroundColor(cell.fg.into()))?;
+                out.queue(SetBackgroundColor(cell.bg.into()))?;
+                if cell.underline_color != Color::Reset {
+                    out.queue(SetUnderlineColor(cell.underline_color.into()))?;
                 }
+                for (modifier, attribute) in ATTRIBUTES {
+                    if cell.modifier.contains(modifier) {
+                        out.queue(SetAttribute(attribute))?;
+                    }
+                }
+                out.queue(Print(cell.symbol()))?;
             }
-            out.queue(Print(cell.symbol()))?;
+            out.queue(Print(CLOSE_LINK))?;
         }
-        out.queue(Print("\x1b]8;;\x1b\\"))?;
+        out.queue(SetAttribute(Attribute::Reset))?;
+        out.queue(ResetColor)?;
+        out.queue(cursor::RestorePosition)?;
+        out.flush()
+    })();
+    if result.is_err() {
+        // Best effort before the next frame writes unrelated cells.
+        let _ = out.queue(Print(CLOSE_LINK));
+        let _ = out.queue(SetAttribute(Attribute::Reset));
+        let _ = out.queue(ResetColor);
+        let _ = out.queue(cursor::RestorePosition);
+        let _ = out.flush();
     }
-    out.queue(SetAttribute(Attribute::Reset))?;
-    out.queue(ResetColor)?;
-    out.queue(cursor::RestorePosition)?;
-    out.flush()
+    result
 }
 
 /// Whether to emit OSC 8: `tui.hyperlinks` is "on", "off" or "auto"
@@ -711,5 +723,43 @@ mod tests {
             );
         }
         assert_eq!(painted.contains("\x1b[58;5;37m"), crate::colors_enabled());
+    }
+
+    #[test]
+    fn interrupted_paint_closes_the_link_and_can_be_retried() {
+        #[derive(Default)]
+        struct FailInsideLink {
+            bytes: Vec<u8>,
+            failed: bool,
+        }
+
+        const OPEN: &[u8] = b"\x1b]8;;https://x.test\x1b\\";
+        impl Write for FailInsideLink {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if !self.failed && self.bytes.ends_with(OPEN) {
+                    self.failed = true;
+                    return Err(std::io::ErrorKind::BrokenPipe.into());
+                }
+                self.bytes.write(bytes)
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let area = Rect::new(0, 0, 20, 1);
+        let mut buf = Buffer::empty(area);
+        buf.set_string(0, 0, "https://x.test", ratatui::style::Style::default());
+        let found = scan(&buf, area, &mut |_| None);
+        let mut cache = PaintCache::default();
+        let mut out = FailInsideLink::default();
+        let error = cache.update(&mut out, &buf, found.clone()).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        assert!(out.bytes.ends_with(b"\x1b]8;;\x1b\\\x1b[0m\x1b[0m\x1b8"));
+
+        out.bytes.clear();
+        cache.update(&mut out, &buf, found).unwrap();
+        assert!(out.bytes.windows(OPEN.len()).any(|bytes| bytes == OPEN));
     }
 }
