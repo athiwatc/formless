@@ -6136,11 +6136,12 @@ the only exceptions are file-only blocks it lists (`provider.auth`,
   Sessions, optimisation and Compaction, connections to a
   [user-enabled Relay](README.md#37-browser-access-via-the-relay-v2) and
   explicit commands such as `formless update check`. Optimiser paths redact
-  secrets (§8.3). In builds with embedded model support, an eligible naming
-  attempt can download the selected [catalogue model](README.md#7-sessions-runs-and-steer)
-  weights and tokenizer when they are missing. Automatic naming and downloads
-  are enabled by default. Set `naming.auto_download = false` to disable automatic
-  downloads or `naming.enabled = false` to disable automatic naming.
+  secrets (§8.3). In builds with embedded model support, naming an untitled
+  or provisionally named Session with suitable user text can download weights
+  or a tokenizer when the selected [catalogue model](README.md#local-naming-models)
+  needs them. Automatic naming and downloads are enabled by default. Set
+  `naming.auto_download = false` to disable automatic downloads or
+  `naming.enabled = false` to disable automatic naming.
 - **Recording:** Invocation inputs/outputs are recorded for metrics + replay,
   with secret-pattern redaction (API keys, bearer tokens, configured
   patterns), capped at `metrics.retention_per_tool` (default 200/Tool).
