@@ -27248,6 +27248,10 @@ mod tests {
         app.current = Some("mention-session".into());
         let (client, sent) = DaemonClient::recording();
         app.client = Some(client);
+        std::fs::write(root.join(".psql_history"), "synthetic fixture").unwrap();
+        app.input.set("read @.psql_history");
+        assert!(render(&mut app, 180, 24).contains("[@.psql_history · not sent: credential]"));
+        assert!(app.forecast_input().attachments.is_empty());
         app.input.set("read @\"my notes/report.md\"");
         assert!(render(&mut app, 180, 24).contains("[@my notes/report.md]"));
         let input = app.forecast_input();

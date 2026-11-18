@@ -996,7 +996,14 @@ mod tests {
         assert!(path_exposure_with_home(&project, Some(&home)).is_none());
         std::fs::write(project.join("id_ed25519.pub"), "synthetic public fixture").unwrap();
         assert!(path_exposure_with_home(&project, Some(&home)).is_none());
-        for name in [".pgpass", "PGPASS.CONF", "ID_DSA"] {
+        for name in [
+            ".pgpass",
+            "PGPASS.CONF",
+            "ID_DSA",
+            ".psql_history",
+            "psql_history",
+            ".mysql_history",
+        ] {
             let sample = project.join(name);
             std::fs::write(&sample, "synthetic credential fixture").unwrap();
             assert!(

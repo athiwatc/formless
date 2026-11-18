@@ -269,8 +269,20 @@ async fn mentions_never_take_credentials_or_leave_the_folder() {
     }
     let outside = attach("../outside.txt").await.unwrap_err().to_string();
     assert!(outside.contains("outside"), "{outside}");
+    std::fs::create_dir(root.join("keys/id_rsa_directory.pub")).unwrap();
+    let directory_error = attach("keys/id_rsa_directory.pub")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(directory_error.contains("credential"), "{directory_error}");
     for name in allowed {
-        assert!(attach(name).await.is_ok(), "{name} should attach");
+        let attachment = attach(name)
+            .await
+            .unwrap_or_else(|e| panic!("{name} should attach: {e}"));
+        assert_eq!(
+            attachment["reference"], false,
+            "{name} should attach inline"
+        );
     }
     #[cfg(windows)]
     assert!(credential_path(std::path::Path::new("keys/id_rsa:named.pub")).is_some());
