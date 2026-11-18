@@ -16,6 +16,10 @@ mod job_schedule_tests;
 #[path = "pin_batch_tests.rs"]
 mod pin_batch_tests;
 
+#[cfg(test)]
+#[path = "run_id_lookup_tests.rs"]
+mod run_id_lookup_tests;
+
 /// A usage bucket's key, provider, model, prompt, completion, cache read and
 /// write tokens, reported cost, and whether the cost is explicitly unknown.
 pub type GroupedUsage = (
@@ -100,6 +104,32 @@ pub const UNASKED_KEEP: i64 = 2000;
 
 fn now() -> String {
     chrono::Utc::now().to_rfc3339()
+}
+
+const RUN_INSPECT_EXACT: &str = "SELECT id,session_id,status,error,steps,created_at,updated_at,
+    start_message_seq,end_message_seq,
+    (SELECT COUNT(*) FROM invocations WHERE run_id=runs.id),
+    (SELECT COALESCE(SUM(prompt_tokens),0) FROM run_usage WHERE run_id=runs.id),
+    (SELECT COALESCE(SUM(completion_tokens),0) FROM run_usage WHERE run_id=runs.id)
+    FROM runs WHERE id=?1";
+const RUN_ID_PREFIX_RANGE: &str = "SELECT id FROM runs WHERE id>=?1 AND id<?2 ORDER BY id LIMIT 2";
+const RUN_ID_PREFIX_TAIL: &str = "SELECT id FROM runs WHERE id>=?1 ORDER BY id LIMIT 2";
+const RUN_ID_PREFIX_OTHER_ENCODING: &str =
+    "SELECT id FROM runs WHERE substr(id,1,length(?1))=?1 LIMIT 2";
+
+/// The exclusive upper bound for a literal prefix in SQLite's BINARY
+/// ordering on Formless's UTF-8 databases. A prefix made entirely of the
+/// maximum scalar has no upper bound.
+fn run_id_prefix_end(prefix: &str) -> Option<String> {
+    let mut upper = prefix.trim_end_matches(char::MAX).to_owned();
+    let last = upper.pop()?;
+    let next = if last == '\u{d7ff}' {
+        '\u{e000}'
+    } else {
+        char::from_u32(last as u32 + 1)?
+    };
+    upper.push(next);
+    Some(upper)
 }
 
 fn make_snippet(content: &str, needle_lower: &str) -> String {
@@ -3055,6 +3085,40 @@ impl Store {
             && expected == known
             && main >= self.run_steps(run_id)?)
     }
+
+    /// Check coverage for a branch's allocated Runs in one statement.
+    /// Each aggregate streams one Run's indexed rows. Packing each pair keeps
+    /// one scan per child table and avoids sorting the matched history.
+    fn forecast_usage_complete_for_runs(&self, run_ids: &[String]) -> Result<bool> {
+        if run_ids.is_empty() {
+            return Ok(true);
+        }
+        let ids = serde_json::to_string(run_ids)?;
+        let mut stmt = self.ps("SELECT
+                 (SELECT json_array(
+                     COALESCE(SUM(expected),0),
+                     COALESCE(SUM(CASE WHEN source='run' THEN expected ELSE 0 END),0))
+                  FROM forecast_request_counts WHERE run_id=w.value),
+                 (SELECT json_array(COUNT(*),COALESCE(SUM(usage_complete),0))
+                  FROM run_usage WHERE run_id=w.value),
+                 r.steps
+             FROM json_each(?1) AS w LEFT JOIN runs AS r ON r.id=w.value")?;
+        let mut rows = stmt.query(params![ids])?;
+        let mut complete = true;
+        while let Some(row) = rows.next()? {
+            let read_counts = |column| -> Result<(i64, i64)> {
+                Ok(serde_json::from_str(row.get_ref(column)?.as_str()?)?)
+            };
+            let (expected, main) = read_counts(0)?;
+            let (recorded, covered) = read_counts(1)?;
+            // Match run_steps' zero fallback for a missing or invalid value.
+            let steps: i64 = row.get(2).unwrap_or_default();
+            complete &=
+                expected > 0 && expected == recorded && expected == covered && main >= steps;
+        }
+        Ok(complete)
+    }
+
     pub fn forecast_models(&self, run_id: &str) -> Result<Vec<(String, String)>> {
         let mut stmt = self
             .ps("SELECT DISTINCT provider,model FROM run_usage WHERE run_id=?1 AND source='run'")?;
@@ -3098,35 +3162,61 @@ impl Store {
         Ok((cost.filter(|_| any), peak, cached))
     }
 
+    pub(crate) fn count_runs_for_session(&self, session_id: &str) -> Result<i64> {
+        Ok(self
+            .ps("SELECT COUNT(*) FROM runs WHERE session_id=?1")?
+            .query_row(params![session_id], |r| r.get(0))?)
+    }
+
     pub fn run_metrics(&self, limit: usize) -> Result<Vec<formless_protocol::RunMetricsInfo>> {
         self.run_metrics_for(None, limit, None)
     }
 
-    /// The newest `limit` Runs, of one Session or all.
-    /// Resolve literal prefixes, preferring an exact identity. No LIKE wildcards.
+    /// Resolve literal prefixes, preferring an exact identity.
     pub fn inspect_run(&self, query: &str) -> Result<Option<serde_json::Value>> {
-        let mut stmt = self.ps("SELECT id FROM runs WHERE id=?1 OR substr(id,1,length(?1))=?1 ORDER BY (id=?1) DESC LIMIT 2")?;
-        let ids: Vec<String> = stmt
-            .query_map(params![query], |r| r.get(0))?
-            .collect::<rusqlite::Result<_>>()?;
-        let Some(id) = ids.first() else {
+        if query.is_empty() {
+            let any_run: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM runs WHERE id IS NOT NULL)",
+                [],
+                |row| row.get(0),
+            )?;
+            anyhow::ensure!(!any_run, "ambiguous Run id");
             return Ok(None);
-        };
-        anyhow::ensure!(
-            !query.is_empty() && (ids.len() == 1 || id == query),
-            "ambiguous Run id"
-        );
-        self.conn.query_row("SELECT id,session_id,status,error,steps,created_at,updated_at,start_message_seq,end_message_seq,
-            (SELECT COUNT(*) FROM invocations WHERE run_id=runs.id),
-            (SELECT COALESCE(SUM(prompt_tokens),0) FROM run_usage WHERE run_id=runs.id),
-            (SELECT COALESCE(SUM(completion_tokens),0) FROM run_usage WHERE run_id=runs.id)
-            FROM runs WHERE id=?1", params![id], |r| Ok(serde_json::json!({
-                "run_id":r.get::<_,String>(0)?, "session_id":r.get::<_,String>(1)?,
-                "status":r.get::<_,String>(2)?, "error":r.get::<_,Option<String>>(3)?,
-                "steps":r.get::<_,i64>(4)?, "created_at":r.get::<_,String>(5)?, "updated_at":r.get::<_,String>(6)?,
-                "start_message_seq":r.get::<_,Option<i64>>(7)?, "end_message_seq":r.get::<_,Option<i64>>(8)?,
-                "tool_calls":r.get::<_,i64>(9)?, "prompt_tokens":r.get::<_,i64>(10)?, "completion_tokens":r.get::<_,i64>(11)?
-            }))).optional().map_err(Into::into)
+        }
+        self.read_transaction(|st| {
+            if let Some(exact) = st.inspect_exact_run(query)? {
+                return Ok(Some(exact));
+            }
+            let encoding: String = st.ps("PRAGMA encoding")?.query_row([], |row| row.get(0))?;
+            let (sql, upper) = match encoding.as_str() {
+                "UTF-8" => match run_id_prefix_end(query) {
+                    Some(upper) => (RUN_ID_PREFIX_RANGE, Some(upper)),
+                    None => (RUN_ID_PREFIX_TAIL, None),
+                },
+                // Restored databases can use UTF-16, whose binary byte order
+                // differs from the scalar ordering used for the upper bound.
+                _ => (RUN_ID_PREFIX_OTHER_ENCODING, None),
+            };
+            let mut stmt = st.ps(sql)?;
+            let binds = rusqlite::params_from_iter(std::iter::once(query).chain(upper.as_deref()));
+            let mut ids = stmt.query(binds)?;
+            let Some(first) = ids.next()? else {
+                return Ok(None);
+            };
+            let id: String = first.get(0)?;
+            anyhow::ensure!(ids.next()?.is_none(), "ambiguous Run id");
+            st.inspect_exact_run(&id)
+        })
+    }
+
+    fn inspect_exact_run(&self, id: &str) -> Result<Option<serde_json::Value>> {
+        self.ps(RUN_INSPECT_EXACT)?.query_row(params![id], |r| Ok(serde_json::json!({
+            "run_id":r.get::<_,String>(0)?, "session_id":r.get::<_,String>(1)?,
+            "status":r.get::<_,String>(2)?, "error":r.get::<_,Option<String>>(3)?,
+            "steps":r.get::<_,i64>(4)?, "created_at":r.get::<_,String>(5)?, "updated_at":r.get::<_,String>(6)?,
+            "start_message_seq":r.get::<_,Option<i64>>(7)?, "end_message_seq":r.get::<_,Option<i64>>(8)?,
+            "tool_calls":r.get::<_,i64>(9)?, "prompt_tokens":r.get::<_,i64>(10)?, "completion_tokens":r.get::<_,i64>(11)?
+        }))).optional().map_err(Into::into)
     }
 
     pub fn run_metrics_for(
@@ -4168,16 +4258,30 @@ impl Store {
     /// Active Tools whose current code requires the module (by name).
     pub fn module_dependents(&self, name: &str) -> Result<Vec<String>> {
         let lower = name.to_lowercase();
+        let patterns = ["requiremodule", "modules.load"]
+            .map(|function| ["\"", "'", "`"].map(|q| format!("{function}({q}{lower}{q}")));
+        let mut stmt = self.ps("SELECT t.name, v.code FROM tools AS t
+             LEFT JOIN tool_versions AS v ON v.tool_id=t.id AND v.version=t.current_version
+             WHERE t.retired=0 ORDER BY t.name_lower")?;
+        let tools = stmt.query_map([], |r| {
+            let name: String = r.get(0)?;
+            // Keep reporting a missing current version, even for a Tool
+            // that would not have matched the module reference.
+            let code: String = r
+                .get::<_, Option<String>>(1)?
+                .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+            Ok((name, code))
+        })?;
         let mut out = Vec::new();
-        for t in self.list_tools(false)? {
-            if let Some((_, v)) = self.get_tool_current(&t.id)? {
-                let code = v.code.to_lowercase();
-                if ["\"", "'", "`"].iter().any(|q| {
-                    code.contains(&format!("requiremodule({q}{lower}{q}"))
-                        || code.contains(&format!("modules.load({q}{lower}{q}"))
-                }) {
-                    out.push(t.name);
-                }
+        for tool in tools {
+            let (name, code) = tool?;
+            let code = code.to_lowercase();
+            if patterns
+                .iter()
+                .flatten()
+                .any(|pattern| code.contains(pattern))
+            {
+                out.push(name);
             }
         }
         Ok(out)
@@ -4312,12 +4416,10 @@ impl Store {
     }
 
     pub fn applied_proposals(&self) -> Result<Vec<PromptProposalInfo>> {
-        // Oldest first, as with the reversed full-history read. Equal timestamps
-        // previously had no SQL tie guarantee; explicitly retain the reversed
-        // table-insertion order observed by that read, independent of query plan.
-        // Non-applied content/rationale are intentionally not decoded here.
+        // Append guidance in application order. Legacy rows without an
+        // application timestamp use their creation time and existing tie order.
         let mut stmt = self.ps(
-            "SELECT id,kind,content,rationale,status,baseline_score,candidate_score,eval_total,est_tokens,created_at,applied_at FROM prompt_proposals WHERE status='applied' ORDER BY created_at ASC, rowid DESC",
+            "SELECT id,kind,content,rationale,status,baseline_score,candidate_score,eval_total,est_tokens,created_at,applied_at FROM prompt_proposals WHERE status='applied' ORDER BY COALESCE(applied_at,created_at) ASC, rowid DESC",
         )?;
         let rows = stmt
             .query_map([], Self::proposal_row)?
@@ -4388,7 +4490,7 @@ impl Store {
     }
 
     /// Effective system prompt: frozen bootstrap + applied guidance
-    /// proposals as versioned sections (oldest first). Memory proposals
+    /// proposals as versioned sections (first applied first). Memory proposals
     /// are in the memory store instead.
     pub fn effective_system_prompt(&self, base: &str) -> Result<String> {
         let applied: Vec<_> = self
