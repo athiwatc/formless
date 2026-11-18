@@ -42,7 +42,7 @@ platform app-dirs (SPEC §9.4).
      review before promotion. Reruns use the workflow at the original tag
      commit, so these safeguards apply to tags that include them;
    - renders the Homebrew formula, AUR `PKGBUILD` and winget manifests
-     for the version (`scripts/render-packaging.sh`, which fails on a
+     for stable releases (`scripts/render-packaging.sh`, which fails on a
      missing checksum, an unfilled placeholder, a version that isn't
      Cargo.toml's, or a Windows zip without the path the manifest names) and attaches them to the GitHub Release,
      whose notes (what `formless update` shows) are the version's
@@ -52,10 +52,15 @@ platform app-dirs (SPEC §9.4).
      assets succeed. A version tag with a different image is preserved.
      Only the highest stable repository tag can advance `:latest`
      ([Docker guide](../docs/docker.md));
-   - publishes to the tap, winget and the AUR **only when their secrets
-     exist** (below), each on its own: one failing doesn't stop the
+   - publishes stable releases to the tap, winget and the AUR **only when
+     their secrets exist** (below). One failing doesn't stop the
      others, the job summary lists each channel's result, and a re-run
      is safe.
+
+A tag such as `v0.2.0-rc.1` publishes a GitHub prerelease with binaries,
+packages and checksums and a versioned Docker image. The stable GitHub
+latest release and Docker `:latest` stay on stable versions. The workflow
+skips the Homebrew tap, winget and the AUR for prereleases.
 
 ## Test-only release timing baseline
 
