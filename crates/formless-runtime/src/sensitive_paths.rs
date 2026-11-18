@@ -315,6 +315,12 @@ fn builtin(path: &Path) -> Option<&'static str> {
     }
     if matches!(
         name.as_str(),
+        ".psql_history" | "psql_history" | ".mysql_history"
+    ) {
+        return Some("database client history");
+    }
+    if matches!(
+        name.as_str(),
         "login data"
             | "login data for account"
             | "logins.json"
@@ -328,7 +334,14 @@ fn builtin(path: &Path) -> Option<&'static str> {
     }
     if matches!(
         name.as_str(),
-        "api_key" | "oauth_tokens.json" | "relay_secret" | ".netrc" | "_netrc" | ".git-credentials"
+        "api_key"
+            | "oauth_tokens.json"
+            | "relay_secret"
+            | ".netrc"
+            | "_netrc"
+            | ".git-credentials"
+            | ".pgpass"
+            | "pgpass.conf"
     ) || name.ends_with(".keychain")
         || name.ends_with(".keychain-db")
     {
@@ -365,6 +378,11 @@ mod tests {
             "server.key",
             ".bash_history",
             "fish_history",
+            ".PSQL_HISTORY",
+            "psql_history",
+            ".mysql_history",
+            ".pgpass",
+            "postgresql/PGPASS.CONF",
             "Profiles/default/logins.json",
             "Chrome/Profile/Login Data",
         ] {

@@ -16851,18 +16851,24 @@ pub fn credential_path(path: &std::path::Path) -> Option<&'static str> {
             formless_runtime::sensitive_paths::PathPolicy::default().classify(path, path),
             Ok(formless_runtime::sensitive_paths::PathDecision::Ordinary)
         );
+    // On Windows the suffix must belong to the filename, not a named stream.
+    let public_key_name = name.ends_with(".pub") && (!cfg!(windows) || !name.contains(':'));
+    let private_key_name = !public_key_name
+        && ["id_rsa", "id_ed25519", "id_ecdsa", "id_dsa"]
+            .into_iter()
+            .any(|prefix| name.starts_with(prefix));
     let secret_file = [
         ".netrc",
         ".npmrc",
         ".pypirc",
         "credentials",
         ".git-credentials",
+        ".pgpass",
+        "pgpass.conf",
     ]
     .contains(&name.as_str())
         || ((name == ".env" || name.starts_with(".env.")) && !env_template)
-        || name.starts_with("id_rsa")
-        || name.starts_with("id_ed25519")
-        || name.starts_with("id_ecdsa")
+        || private_key_name
         || name.ends_with(".pem")
         || name.ends_with(".key")
         || name.ends_with(".p12")

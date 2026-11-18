@@ -222,9 +222,32 @@ async fn mentions_never_take_credentials_or_leave_the_folder() {
     let (paths, sid) = setup("mention");
     let root = paths.data_dir.parent().unwrap().join("project");
     std::fs::create_dir_all(root.join(".ssh")).unwrap();
-    std::fs::write(root.join(".ssh/id_rsa"), "PRIVATE").unwrap();
-    std::fs::write(root.join(".env"), "TOKEN=1").unwrap();
-    std::fs::write(root.join("notes.txt"), "fine").unwrap();
+    std::fs::create_dir_all(root.join("keys")).unwrap();
+    let denied = [
+        ".ssh/id_rsa",
+        ".ssh/id_ed25519.pub",
+        ".env",
+        "keys/ID_DSA",
+        "keys/id_rsa.bak",
+        "keys/id_ed25519",
+        "keys/id_ecdsa.old",
+        ".pgpass",
+        "PGPASS.CONF",
+        ".psql_history",
+        "psql_history",
+        ".mysql_history",
+    ];
+    let allowed = [
+        "notes.txt",
+        "keys/id_dsa.pub",
+        "keys/id_rsa.pub",
+        "keys/id_ed25519.pub",
+        "keys/id_ed25519_sk.PUB",
+        "keys/id_ecdsa.pub",
+    ];
+    for name in denied.iter().chain(&allowed) {
+        std::fs::write(root.join(name), "synthetic fixture").unwrap();
+    }
     let outside = paths.data_dir.parent().unwrap().join("outside.txt");
     std::fs::write(&outside, "elsewhere").unwrap();
     let daemon = Arc::new(Daemon::new(paths.clone()).unwrap());
@@ -240,14 +263,17 @@ async fn mentions_never_take_credentials_or_leave_the_folder() {
             .await
         }
     };
-    for bad in [".ssh/id_rsa", ".env", "../outside.txt"] {
+    for bad in denied {
         let e = attach(bad).await.unwrap_err().to_string();
-        assert!(
-            e.contains("credential") || e.contains("outside"),
-            "{bad}: {e}"
-        );
+        assert!(e.contains("credential"), "{bad}: {e}");
     }
-    assert!(attach("notes.txt").await.is_ok());
+    let outside = attach("../outside.txt").await.unwrap_err().to_string();
+    assert!(outside.contains("outside"), "{outside}");
+    for name in allowed {
+        assert!(attach(name).await.is_ok(), "{name} should attach");
+    }
+    #[cfg(windows)]
+    assert!(credential_path(std::path::Path::new("keys/id_rsa:named.pub")).is_some());
     assert!(credential_path(std::path::Path::new("/home/u/.aws/credentials")).is_some());
     assert!(credential_path(std::path::Path::new("/home/u/src/main.rs")).is_none());
 }
