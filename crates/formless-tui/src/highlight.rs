@@ -477,6 +477,7 @@ pub(crate) struct Highlighter {
     in_block: usize,
     /// Inside a string that runs past the line: what closes it.
     in_str: Option<String>,
+    js_typescript: bool,
 }
 
 /// Rust-shaped literals only. A dot before another dot or an identifier
@@ -557,9 +558,9 @@ fn rust_number_end(chars: &[char], start: usize) -> usize {
     end
 }
 
-// In a keyword context, an apparent closing slash can instead be the
+// After a contextual `await`, an apparent closing slash can instead be the
 // second division operator. Check the flags and the next operand token.
-fn js_regex_suffix(flags: &[char], mut suffix: &[char]) -> bool {
+fn js_regex_suffix(flags: &[char], mut suffix: &[char], typescript: bool) -> bool {
     if !flags.iter().all(|c| "dgimsuvy".contains(*c)) {
         return false;
     }
@@ -574,14 +575,13 @@ fn js_regex_suffix(flags: &[char], mut suffix: &[char]) -> bool {
         };
         suffix = &suffix[end + 4..];
     }
-    let word = suffix
+    let word: String = suffix
         .iter()
         .take_while(|c| c.is_alphanumeric() || "_$".contains(**c))
-        .count();
-    matches!(
-        &suffix[..word],
-        [] | ['i', 'n'] | ['i', 'n', 's', 't', 'a', 'n', 'c', 'e', 'o', 'f']
-    ) && !matches!(suffix.first(), Some('"' | '\''))
+        .collect();
+    (matches!(word.as_str(), "" | "in" | "instanceof")
+        || typescript && matches!(word.as_str(), "as" | "satisfies"))
+        && !matches!(suffix.first(), Some('"' | '\''))
 }
 
 impl Highlighter {
@@ -594,6 +594,7 @@ impl Highlighter {
             color,
             in_block: 0,
             in_str: None,
+            js_typescript: matches!(name.as_str(), "ts" | "tsx" | "typescript"),
         })
     }
 
@@ -777,9 +778,11 @@ impl Highlighter {
                 let word_boundary = chars[..start]
                     .last()
                     .is_none_or(|c| c.is_whitespace() || c.is_ascii_punctuation());
-                let before_word = chars[..token_end(start)].last();
+                let before_word = &chars[..token_end(start)];
+                let member_name = before_word.ends_with(&['#'])
+                    || before_word.ends_with(&['.']) && !before_word.ends_with(&['.', '.', '.']);
                 let after_keyword = word_boundary
-                    && !matches!(before_word, Some('.' | '#'))
+                    && !member_name
                     && matches!(
                         prev_word.as_str(),
                         "await"
@@ -800,6 +803,7 @@ impl Highlighter {
                     );
                 let value_expected =
                     before.is_none_or(|b| "=(,:[!&|?{};+-*%<>~^".contains(*b)) || after_keyword;
+                let contextual_await = after_keyword && prev_word == "await";
                 if value_expected {
                     let (mut j, mut class) = (i + 1, false);
                     let mut closed = None;
@@ -821,7 +825,13 @@ impl Highlighter {
                         while end < chars.len() && chars[end].is_ascii_alphabetic() {
                             end += 1;
                         }
-                        if !after_keyword || js_regex_suffix(&chars[flags..end], &chars[end..]) {
+                        if !contextual_await
+                            || js_regex_suffix(
+                                &chars[flags..end],
+                                &chars[end..],
+                                self.js_typescript,
+                            )
+                        {
                             push(Tok::Str, &chars[i..end]);
                             i = end;
                             continue;
@@ -1327,11 +1337,23 @@ mod tests {
             format!("throw /* reason */ {regex};"),
             format!("return {regex} /* operator */ instanceof RegExp"),
             format!("const result = await {regex} in object"),
+            format!("return [...typeof {regex}];"),
         ] {
             assert!(
                 toks("js", &source).contains(&(regex.into(), Some(Color::Green))),
                 "{source}"
             );
+        }
+        for lang in ["ts", "tsx", "typescript"] {
+            for source in [
+                format!("return {regex} as RegExp"),
+                format!("return await {regex} satisfies RegExp"),
+            ] {
+                assert!(
+                    toks(lang, &source).contains(&(regex.into(), Some(Color::Green))),
+                    "{lang}: {source}"
+                );
+            }
         }
     }
 
