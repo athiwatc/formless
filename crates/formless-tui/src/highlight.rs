@@ -505,6 +505,8 @@ struct HereDoc {
 
 struct ShellComments {
     posix: bool,
+    ansi_quotes: bool,
+    localized_quotes: bool,
     contexts: Vec<ShellContext>,
     here_docs: VecDeque<HereDoc>,
     in_here_doc: bool,
@@ -793,7 +795,8 @@ impl ShellComments {
                 ansi_quote = false;
             } else if quote.is_none()
                 && c == '$'
-                && chars.get(end).is_some_and(|c| "\"'".contains(*c))
+                && (self.ansi_quotes && chars.get(end) == Some(&'\'')
+                    || self.localized_quotes && chars.get(end) == Some(&'"'))
             {
                 quote = chars.get(end).copied();
                 quoted = true;
@@ -957,6 +960,8 @@ impl Highlighter {
             )
             .then(|| ShellComments {
                 posix: name != "fish",
+                ansi_quotes: matches!(name.as_str(), "bash" | "zsh"),
+                localized_quotes: name == "bash",
                 contexts: Vec::new(),
                 here_docs: VecDeque::new(),
                 in_here_doc: false,
@@ -1128,7 +1133,8 @@ impl Highlighter {
                 }
                 shell.track(&chars, i);
                 if l.quotes.contains(&c) && !ShellComments::escaped(&chars[..i]) {
-                    let ansi_quote = c == '\''
+                    let ansi_quote = shell.ansi_quotes
+                        && c == '\''
                         && i > 0
                         && chars[i - 1] == '$'
                         && !ShellComments::escaped(&chars[..i - 1]);
@@ -1642,6 +1648,22 @@ mod tests {
                 );
             }
             assert_eq!(comments, expected, "{source}");
+        }
+    }
+
+    #[test]
+    fn shell_quote_extensions_respect_the_dialect() {
+        for (lang, delimiter) in [("sh", "$\"EOF\""), ("zsh", "$\"EOF\""), ("sh", "$'EOF'")] {
+            let mut highlighter = Highlighter::new(lang, true).unwrap();
+            highlighter.line(&format!("cat <<{delimiter}"));
+            assert_eq!(
+                highlighter.line("hello;#literal"),
+                vec![Span::raw("hello;#literal")]
+            );
+            assert_eq!(highlighter.line("$EOF"), vec![Span::raw("$EOF")]);
+            assert!(highlighter.line("true;# outside").into_iter().any(|span| {
+                span.content == "# outside" && span.style.fg == Some(Color::DarkGray)
+            }));
         }
     }
 

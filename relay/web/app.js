@@ -1544,7 +1544,7 @@
     a: "\x07", b: "\b", e: "\x1b", E: "\x1b", f: "\f", n: "\n", r: "\r", t: "\t", v: "\v",
     "\\": "\\", "'": "'", '"': '"', "?": "?",
   };
-  function shellCommentState(code, posix) {
+  function shellCommentState(code, lang) {
     // Track shell words that can contain punctuation from command separators.
     const contexts = [];
     const hereDocs = [];
@@ -1552,6 +1552,7 @@
     let inHereDoc = false;
     let lineBoundary = true;
     let regexDepth = 0;
+    const ansiQuotes = lang === "bash" || lang === "zsh";
     const context = () => contexts.at(-1) ?? "command";
     const replace = (mode) => { contexts[contexts.length - 1] = mode; };
     const escaped = (at) => {
@@ -1616,7 +1617,7 @@
       }
     };
     const trackWord = (at, word) => {
-      if (!posix || !["case", "in", "esac"].includes(word)) return;
+      if (lang === "fish" || !["case", "in", "esac"].includes(word)) return;
       const previous = code[at - 1], next = code[at + word.length];
       if ((previous && !/[\s;|&({)]/.test(previous)) ||
           (next && !/[\s;|&()]/.test(next)) || escaped(at - 1)) return;
@@ -1675,7 +1676,7 @@
       return [String.fromCodePoint(value), start + digits[0].length];
     };
     const hereDoc = (at) => {
-      if (!posix || !["command", "case-body"].includes(context()) || escaped(at) ||
+      if (lang === "fish" || !["command", "case-body"].includes(context()) || escaped(at) ||
           code[at + 1] !== "<" || code[at + 2] === "<" ||
           (code[at - 1] === "<" && !escaped(at - 1))) return at;
       let end = at + 2;
@@ -1699,7 +1700,7 @@
         if (quote === c) {
           quote = "";
           ansiQuote = false;
-        } else if (!quote && c === "$" && (code[end] === "'" || code[end] === '"')) {
+        } else if (!quote && c === "$" && (ansiQuotes && code[end] === "'" || lang === "bash" && code[end] === '"')) {
           quote = code[end++];
           quoted = true;
           ansiQuote = quote === "'";
@@ -1749,7 +1750,7 @@
       } else doc.continued = "";
       return end;
     };
-    return { track, trackWord, comment, endLine, hereDoc, literalLine, escaped };
+    return { track, trackWord, comment, endLine, hereDoc, literalLine, escaped, ansiQuotes };
   }
 
   function highlight(code, lang) {
@@ -1763,7 +1764,7 @@
     const L = HL[HL_ALIAS[lang] || lang];
     if (!L) return null;
     const shell = ["sh", "bash", "zsh", "fish", "shell", "console"].includes(lang)
-      ? shellCommentState(code, lang !== "fish") : null;
+      ? shellCommentState(code, lang) : null;
     const kotlin = lang === "kotlin" || lang === "kt";
     const out = [];
     let plain = "";
@@ -1846,7 +1847,7 @@
           code.startsWith(c.repeat(3), i);
         const delimiter = triple ? c.repeat(3) : c;
         const multiline = shell || triple || c === "`";
-        const ansiQuote = shell && c === "'" && code[i - 1] === "$" && !shell.escaped(i - 1);
+        const ansiQuote = shell?.ansiQuotes && c === "'" && code[i - 1] === "$" && !shell.escaped(i - 1);
         const escapes = !(L === HL.go && c === "`") && !(kotlin && triple) &&
           !(shell && lang !== "fish" && c === "'" && !ansiQuote);
         let j = i + delimiter.length;

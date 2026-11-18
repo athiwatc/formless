@@ -82,6 +82,8 @@ def check(page):
         ]:cases.append((lang,source,comments))
       for lang in ['yaml','toml','ini','powershell']:
         cases.append((lang,'a|# literal',[]))
+      for lang,delimiter in [('sh','$"EOF"'),('zsh','$"EOF"'),('sh',"$'EOF'")]:
+        cases.append((lang,f'cat <<{delimiter}\nhello;#literal\n$EOF\ntrue;# outside',['# outside']))
       for source,comments in [
         ('cat <<EOF\nhello;#literal\nEOF\nprintf done;# real',['# real']),
         ('cat <<\'FIRST\' <<-E"ND"\n\n# data\nFIRST\n\tsecond |# data\n\tEND\ntrue;# outside',['# outside']),
