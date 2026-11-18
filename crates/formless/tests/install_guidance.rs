@@ -428,6 +428,72 @@ fn zsh_discovery_hint_is_quoted_and_omitted_for_known_fpath() {
         !text.contains("fpath=("),
         "directory is already discoverable: {text}"
     );
-    let text = fixture.success(fixture.command(Some("/bin/bash")).output().unwrap());
-    assert!(text.contains("XDG_DATA_HOME/XDG_DATA_DIRS"), "{text}");
+}
+
+#[test]
+fn bash_and_fish_hints_use_their_configured_completion_search_paths() {
+    let fixture = Fixture::new();
+    let share = fixture.prefix.join("share");
+    let system_dirs = format!("{}/missing::{}/", fixture.dir.display(), share.display());
+    let user_bash_dirs = format!(
+        "{}/missing:{}/bash-completion/",
+        fixture.dir.display(),
+        share.display()
+    );
+    let user_config = fixture.dir.join("fish user settings");
+    let colon_prefix = fixture.dir.join("prefix:with colon");
+    let bash = Some("/bin/bash");
+    let fish = Some("/usr/bin/fish");
+    let output = |command: &mut Command| fixture.success(command.output().unwrap());
+
+    let hint = output(&mut fixture.command(bash));
+    assert!(hint.contains("Bash completions are in"), "{hint}");
+    assert!(
+        hint.contains("BASH_COMPLETION_USER_DIR") && hint.contains("XDG_DATA_DIRS"),
+        "{hint}"
+    );
+    assert!(
+        !output(fixture.command(bash).env("XDG_DATA_DIRS", &system_dirs))
+            .contains("Bash completions are in")
+    );
+    assert!(!output(
+        fixture
+            .command(bash)
+            .env("BASH_COMPLETION_USER_DIR", &user_bash_dirs)
+    )
+    .contains("Bash completions are in"));
+    assert!(!output(fixture.command(bash).env("XDG_DATA_HOME", &share))
+        .contains("Bash completions are in"));
+    assert!(output(
+        fixture
+            .command(bash)
+            .env("XDG_DATA_HOME", &share)
+            .env("BASH_COMPLETION_USER_DIR", "/somewhere-else")
+    )
+    .contains("Bash completions are in"));
+
+    let hint = output(fixture.command(fish).env("XDG_CONFIG_HOME", &user_config));
+    assert!(hint.contains("Fish completions are in"), "{hint}");
+    assert!(
+        hint.contains(&format!("{}/fish/completions", user_config.display())),
+        "{hint}"
+    );
+    assert!(!output(fixture.command(fish).env("XDG_DATA_HOME", &share))
+        .contains("Fish completions are in"));
+    assert!(
+        !output(fixture.command(fish).env("XDG_DATA_DIRS", &system_dirs))
+            .contains("Fish completions are in")
+    );
+    for (shell, hint) in [
+        (bash, "Bash completions are in"),
+        (fish, "Fish completions are in"),
+    ] {
+        assert!(!output(
+            fixture
+                .command(shell)
+                .env("PREFIX", &colon_prefix)
+                .env("XDG_DATA_HOME", colon_prefix.join("share"))
+        )
+        .contains(hint));
+    }
 }
