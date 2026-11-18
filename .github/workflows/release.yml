@@ -188,11 +188,22 @@ jobs:
         run: bash scripts/ci-storage-budget.sh install-package-tools
       - name: Packages
         shell: bash
+        env:
+          PRERELEASE: ${{ needs.version-check.outputs.prerelease }}
         run: |
-          cargo deb -p formless-bin --no-build --output target/debian/
+          deb_version=()
+          rpm_version=()
+          if [[ "$PRERELEASE" == true ]]; then
+            version="${GITHUB_REF_NAME#v}"
+            suffix="${version#*-}"
+            package_version="${version%%-*}~${suffix//-/+}"
+            deb_version=(--deb-version "$package_version-1")
+            rpm_version=(--set-metadata "version=\"$package_version\"")
+          fi
+          cargo deb -p formless-bin --no-build --output target/debian/ "${deb_version[@]}"
           # --output recognizes directories only when they already exist.
           mkdir -p target/generate-rpm
-          cargo generate-rpm -p crates/formless --output target/generate-rpm
+          cargo generate-rpm -p crates/formless --output target/generate-rpm "${rpm_version[@]}"
           cp target/debian/*.deb target/generate-rpm/*.rpm dist/
           cd dist && for f in *; do sha256sum "$f" > "$f.sha256"; done
           # The recorded dependencies, for the log.

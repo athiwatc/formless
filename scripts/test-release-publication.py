@@ -130,6 +130,39 @@ class ReleasePublication(unittest.TestCase):
         for path in ("packaging-out/aur/PKGBUILD", "packaging-out/homebrew/formless.rb", "packaging-out/winget/*.yaml"):
             self.assertIn("${{ " + stable + f" && '{path}' || ''" + " }}", release)
 
+    def test_prerelease_binary_packages_use_versions_that_sort_before_stable(self):
+        workflow = (ROOT / ".github/workflows/release.yml").read_text()
+        packages = workflow.split("      - name: Packages\n", 1)[1].split("      - uses:", 1)[0]
+        run = dedent(packages.split("        run: |\n", 1)[1])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for subdir in ("target/debian", "target/generate-rpm", "dist", "bin"):
+                (root / subdir).mkdir(parents=True)
+            (root / "target/debian/fixture.deb").touch()
+            (root / "target/generate-rpm/fixture.rpm").touch()
+            (root / "bin/dpkg").write_text("#!/bin/sh\nexit 0\n")
+            (root / "bin/cargo").write_text('#!/bin/sh\nprintf "%s\\n" "$@" >> args\n')
+            for command in (root / "bin").iterdir():
+                command.chmod(0o755)
+            for kind, tag in (("false", "v0.2.0"), ("true", "v0.2.0-rc.1-hotfix")):
+                with self.subTest(tag=tag):
+                    args = root / "args"
+                    args.write_text("")
+                    subprocess.run(
+                        ["bash", "-e", "-c", run], cwd=root,
+                        env={"PATH": f'{root / "bin"}:{os.environ["PATH"]}', "PRERELEASE": kind,
+                             "GITHUB_REF_NAME": tag}, check=True, timeout=5,
+                    )
+                    actual = args.read_text().splitlines()
+                    if kind == "true":
+                        self.assertIn("--deb-version", actual)
+                        self.assertIn("0.2.0~rc.1+hotfix-1", actual)
+                        self.assertIn("--set-metadata", actual)
+                        self.assertIn('version="0.2.0~rc.1+hotfix"', actual)
+                    else:
+                        self.assertNotIn("--deb-version", actual)
+                        self.assertNotIn("--set-metadata", actual)
+
     def test_new_version_push_and_latest_uses_the_verified_manifest(self):
         registry = Mock()
         registry.manifest.side_effect = [None, (TESTED, MANIFEST), (TESTED, MANIFEST)]

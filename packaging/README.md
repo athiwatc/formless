@@ -58,7 +58,9 @@ platform app-dirs (SPEC §9.4).
      is safe.
 
 A tag such as `v0.2.0-rc.1` publishes a GitHub prerelease with binaries,
-packages and checksums and a versioned Docker image. The stable GitHub
+packages and checksums and a versioned Docker image. Debian and RPM use
+`0.2.0~rc.1` with the normal package revision so it sorts before `0.2.0`.
+The stable GitHub
 latest release and Docker `:latest` stay on stable versions. The workflow
 skips the Homebrew tap, winget and the AUR for prereleases.
 
