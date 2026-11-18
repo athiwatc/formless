@@ -1540,6 +1540,159 @@
     jsonc: "json", json5: "json", yaml: "config", yml: "config", toml: "config", ini: "conf", env: "config", dotenv: "config", properties: "conf",
     sqlite: "sql", postgres: "sql", postgresql: "sql", mysql: "sql", xml: "html", svg: "html", vue: "html", svelte: "html", scss: "css", less: "css",
   };
+  function shellCommentState(code, posix) {
+    // Track shell words that can contain punctuation from command separators.
+    const contexts = [];
+    const hereDocs = [];
+    let hereDocIndex = 0;
+    let inHereDoc = false;
+    let lineBoundary = true;
+    let regexDepth = 0;
+    const context = () => contexts.at(-1) ?? "command";
+    const replace = (mode) => { contexts[contexts.length - 1] = mode; };
+    const escaped = (at) => {
+      let start = at;
+      while (start > 0 && code[start - 1] === "\\") start--;
+      return (at - start) % 2 !== 0;
+    };
+    const commandPosition = (at) => {
+      let end = at - 1;
+      while (end >= 0 && code[end] !== "\n") {
+        if (/\s/.test(code[end])) {
+          end--;
+          continue;
+        }
+        if (";|&({)".includes(code[end])) return !escaped(end);
+        let start = end;
+        while (start > 0 && !/[\s;|&({)]/.test(code[start - 1])) start--;
+        if (!/^(if|elif|then|else|do|while|until|!|time)$/.test(code.slice(start, end + 1))) return false;
+        end = start - 1;
+      }
+      return lineBoundary;
+    };
+    const track = (at) => {
+      const current = code[at], previous = code[at - 1], next = code[at + 1];
+      const mode = context();
+      if ((current === "\\" && mode !== "regex-start") || escaped(at)) return;
+      if (mode === "regex-start") {
+        if (!/\s/.test(current)) {
+          regexDepth = Number(current === "(");
+          replace("regex");
+        }
+      } else if (mode === "regex") {
+        if (current === "(") regexDepth++;
+        else if (current === ")") regexDepth = Math.max(0, regexDepth - 1);
+        else if (!regexDepth && /\s/.test(current)) replace("condition");
+      } else if (mode === "condition" && current === "~" && previous === "=" &&
+                 (!code[at - 2] || /\s/.test(code[at - 2]))) {
+        replace("regex-start");
+      } else if (mode === "condition" && current === "]" && next === "]" &&
+                 (!previous || /\s/.test(previous)) && (!code[at + 2] || /[\s;|&)]/.test(code[at + 2]))) {
+        contexts.pop();
+      } else if ((mode === "parameter" && current === "}") ||
+                 ((mode === "pattern" || mode === "command") && current === ")")) {
+        contexts.pop();
+      } else if ((mode === "case-pattern" || mode === "case-pattern-alternative") && current === ")") {
+        replace("case-body");
+      } else if (mode === "case-body" && previous === ";" &&
+                 ((current === ";" && next !== "&") || current === "&")) {
+        replace("case-pattern");
+      } else if (current === "{" && previous === "$" && !escaped(at - 1)) {
+        contexts.push("parameter");
+      } else if (current === "(" && (mode === "pattern" || (previous && "@!?+*$".includes(previous) && !escaped(at - 1)))) {
+        contexts.push(mode !== "pattern" && previous === "$" && next !== "(" ? "command" : "pattern");
+      } else if (mode === "case-pattern" && "(|".includes(current)) {
+        replace("case-pattern-alternative");
+      } else if (current === "(" && (mode === "command" || mode === "case-body")) {
+        contexts.push(next === "(" ? "pattern" : "command");
+      } else if (current === "[" && next === "[" && (mode === "command" || mode === "case-body") &&
+                 (!previous || /[\s;|&(]/.test(previous)) && (!code[at + 2] || /\s/.test(code[at + 2])) &&
+                 commandPosition(at)) {
+        contexts.push("condition");
+      }
+    };
+    const trackWord = (at, word) => {
+      if (!posix || !["case", "in", "esac"].includes(word)) return;
+      const previous = code[at - 1], next = code[at + word.length];
+      if ((previous && !/[\s;|&({)]/.test(previous)) ||
+          (next && !/[\s;|&()]/.test(next)) || escaped(at - 1)) return;
+      const mode = context();
+      if ((mode === "command" || mode === "case-body") && word === "case" && commandPosition(at)) {
+        contexts.push("case-header");
+      } else if (mode === "case-header" && word === "in") {
+        replace("case-pattern");
+      } else if ((mode === "case-pattern" && word === "esac") ||
+                 (mode === "case-body" && word === "esac" && commandPosition(at))) {
+        contexts.pop();
+      }
+    };
+    const comment = (at) => {
+      const mode = context();
+      if (mode === "parameter" || mode === "pattern" || mode === "regex") return false;
+      const previous = code[at - 1], before = code[at - 2];
+      if (at === 0 || previous === "\n") return lineBoundary;
+      let separator = false;
+      if (mode === "command" || mode === "case-body") separator = ";|&(".includes(previous);
+      else if (mode === "case-pattern" || mode === "case-pattern-alternative") {
+        separator = "|(".includes(previous) || before === ";" && ";&".includes(previous);
+      }
+      else if (mode === "condition" || mode === "regex-start") {
+        separator = before === previous && "|&".includes(previous) && !escaped(at - 2);
+      }
+      return (/\s/.test(previous) || separator) && !escaped(at - 1);
+    };
+    const endLine = (at, endedByComment) => {
+      const continued = !endedByComment && escaped(at);
+      lineBoundary = !continued || comment(at - 1);
+      if (!continued) {
+        if (context() === "regex" && !regexDepth) replace("condition");
+        inHereDoc = hereDocIndex < hereDocs.length;
+      }
+    };
+    const hereDoc = (at) => {
+      if (!posix || !["command", "case-body"].includes(context()) || escaped(at) ||
+          code[at + 1] !== "<" || code[at + 2] === "<" ||
+          (code[at - 1] === "<" && !escaped(at - 1))) return at;
+      let end = at + 2;
+      const stripTabs = code[end] === "-";
+      if (stripTabs) end++;
+      while (code[end] === " " || code[end] === "\t") end++;
+      const start = end;
+      let quote = "", delimiter = "";
+      if (code[end] === "#") return at;
+      while (end < code.length && code[end] !== "\n") {
+        const c = code[end];
+        if (!quote && /[\s;|&()<>]/.test(c)) break;
+        end++;
+        if (quote === c) quote = "";
+        else if (!quote && "\"'".includes(c)) quote = c;
+        else if (c === "\\" && quote !== "'" && (!quote || /[\\"$`]/.test(code[end] ?? ""))) {
+          if (end === code.length || code[end] === "\n") return at;
+          delimiter += code[end++];
+        } else delimiter += c;
+      }
+      if (end === start || quote) return at;
+      hereDocs.push({ delimiter, stripTabs });
+      return end;
+    };
+    const literalLine = (at) => {
+      if (!inHereDoc) return null;
+      const next = code.indexOf("\n", at);
+      const end = next < 0 ? code.length : next;
+      const { delimiter, stripTabs } = hereDocs[hereDocIndex];
+      const line = code.slice(at, end);
+      if ((stripTabs ? line.replace(/^\t+/, "") : line) === delimiter) {
+        hereDocIndex++;
+        if (hereDocIndex === hereDocs.length) {
+          hereDocIndex = hereDocs.length = 0;
+          inHereDoc = false;
+        }
+      }
+      return end;
+    };
+    return { track, trackWord, comment, endLine, hereDoc, literalLine, escaped };
+  }
+
   function highlight(code, lang) {
     lang = (lang || "").toLowerCase();
     if (lang === "diff" || lang === "patch") {
@@ -1550,29 +1703,8 @@
     }
     const L = HL[HL_ALIAS[lang] || lang];
     if (!L) return null;
-    const shellComments = ["sh", "bash", "zsh", "fish", "shell", "console"].includes(lang);
-    const shellWordClosers = [];
-    const shellEscaped = (at) => {
-      let start = at;
-      while (start > 0 && code[start - 1] === "\\") start--;
-      return (at - start) % 2 !== 0;
-    };
-    const trackShellWord = (at) => {
-      if (shellEscaped(at)) return;
-      const current = code[at], previous = code[at - 1], next = code[at + 1], after = code[at + 2];
-      const closer = shellWordClosers[shellWordClosers.length - 1];
-      if ((current === "}" || current === ")") && closer === current) shellWordClosers.pop();
-      else if (current === "]" && closer === "]" && next === "]" && (!previous || /\s/.test(previous)) && (!after || /[\s;|&)]/.test(after))) shellWordClosers.pop();
-      else if (current === "{" && previous === "$" && !shellEscaped(at - 1)) shellWordClosers.push("}");
-      else if (current === "(" && (closer === ")" || ((previous && "@!?+*".includes(previous)) || (closer && previous === "$")) && !shellEscaped(at - 1))) shellWordClosers.push(")");
-      else if (current === "[" && !closer && next === "[" && (!previous || /[\s;|&(]/.test(previous)) && (!after || /\s/.test(after))) shellWordClosers.push("]");
-    };
-    const hashStartsComment = (at) => {
-      const previous = code[at - 1];
-      if (L.hashAnywhere || at === 0 || previous === "\n") return true;
-      const boundary = /\s/.test(previous) || shellComments && !shellWordClosers.length && ";|&(".includes(previous);
-      return boundary && (!shellComments || !shellEscaped(at - 1));
-    };
+    const shell = ["sh", "bash", "zsh", "fish", "shell", "console"].includes(lang)
+      ? shellCommentState(code, lang !== "fish") : null;
     const kotlin = lang === "kotlin" || lang === "kt";
     const out = [];
     let plain = "";
@@ -1583,7 +1715,17 @@
     const word = /[\p{L}\p{N}_$]/u;
     let i = 0;
     let lineStart = true;
+    let endedByComment = false;
     while (i < code.length) {
+      if (lineStart && shell) {
+        const end = shell.literalLine(i);
+        if (end !== null) {
+          const next = end + Number(end < code.length);
+          plain += code.slice(i, next);
+          i = next;
+          continue;
+        }
+      }
       const c = code[i];
       if (lineStart && L.key) {
         const m = code.slice(i).match(/^([ \t]*)([\w.\-"'\[\] ]+?)(?=\s*[:=])/);
@@ -1596,6 +1738,10 @@
         }
       }
       lineStart = c === "\n";
+      if (lineStart && shell) {
+        shell.endLine(i, endedByComment);
+        endedByComment = false;
+      }
       if (L.bc && code.startsWith(L.bc[0], i)) {
         const end = code.indexOf(L.bc[1], i + L.bc[0].length);
         const stop = end < 0 ? code.length : end + L.bc[1].length;
@@ -1603,13 +1749,23 @@
         i = stop;
         continue;
       }
-      if (shellComments && "{}()[]".includes(c)) trackShellWord(i);
-      if ((L.lc || []).some((p) => code.startsWith(p, i)) && (c !== "#" || hashStartsComment(i))) {
+      if ((L.lc || []).some((p) => code.startsWith(p, i)) &&
+          (c !== "#" || (shell ? shell.comment(i) : L.hashAnywhere || i === 0 || /\s/.test(code[i - 1])))) {
         const end = code.indexOf("\n", i);
         const stop = end < 0 ? code.length : end;
         tok("tok-com", code.slice(i, stop));
         i = stop;
+        endedByComment = true;
         continue;
+      }
+      if (shell && c !== "\n") {
+        const end = c === "<" ? shell.hereDoc(i) : i;
+        if (end !== i) {
+          plain += code.slice(i, end);
+          i = end;
+          continue;
+        }
+        shell.track(i);
       }
       const prevWord = i > 0 && word.test(code[i - 1]);
       if (L === HL.rust && !prevWord &&
@@ -1626,12 +1782,12 @@
           continue;
         }
       }
-      if (L.q.includes(c)) {
+      if (L.q.includes(c) && (!shell || !shell.escaped(i))) {
         const triple = (L === HL.py || (c === '"' && (lang === "java" || kotlin))) &&
           code.startsWith(c.repeat(3), i);
         const delimiter = triple ? c.repeat(3) : c;
-        const multiline = triple || c === "`";
-        const escapes = !(L === HL.go && c === "`") && !(kotlin && triple);
+        const multiline = shell || triple || c === "`";
+        const escapes = !(L === HL.go && c === "`") && !(kotlin && triple) && !(shell && c === "'");
         let j = i + delimiter.length;
         while (j < code.length && !code.startsWith(delimiter, j) && (code[j] !== "\n" || multiline)) {
           j += escapes && code[j] === "\\" ? 2 : 1;
@@ -1659,6 +1815,7 @@
       if (/[\p{L}_$]/u.test(c) && !prevWord) {
         const m = code.slice(i).match(/^[\p{L}\p{N}_$]+/u);
         const w = m[0];
+        shell?.trackWord(i, w);
         const k = L.ci ? w.toLowerCase() : w;
         const cls = L.kw.has(k) ? "tok-kw" : L.lit.has(k) ? "tok-lit" : code[i + w.length] === "(" ? "tok-fn"
           : !L.ci && !L.tags && /^\p{Lu}/u.test(w) && /\p{Ll}/u.test(w) ? "tok-type" : null;

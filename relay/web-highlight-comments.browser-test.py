@@ -72,6 +72,7 @@ def check(page):
           ('echo a &&# note',['# note']),('(# note',['# note']),('echo a; # spaced',['# spaced']),
           (r'echo a\;#literal',[]),(r'echo a\ #literal',[]),(r'echo a\\;# note',['# note']),
           ('echo foo#bar',[]),('echo ${#arr} $#',[]),("echo 'a;# quoted'",[]),
+          ('echo [[ value;# outside',['# outside']),
           ('echo ${unset:-x;#literal};# outside',['# outside']),
           ('echo ${outer:-${inner:-x|#literal}};# outside',['# outside']),
           ('[[ "#foo" == @(other|#foo) ]];# outside',['# outside']),
@@ -81,6 +82,24 @@ def check(page):
         ]:cases.append((lang,source,comments))
       for lang in ['yaml','toml','ini','powershell']:
         cases.append((lang,'a|# literal',[]))
+      for source,comments in [
+        ('cat <<EOF\nhello;#literal\nEOF\nprintf done;# real',['# real']),
+        ('cat <<\'FIRST\' <<-E"ND"\n\n# data\nFIRST\n\tsecond |# data\n\tEND\ntrue;# outside',['# outside']),
+        ("cat <<''\n# data\n\ntrue;# outside",['# outside']),
+        ('cat <<EOF\n# literal through the end',[]),
+        ('cat <<< literal\ntrue;# outside',['# outside']),
+        (r'cat \<< literal'+'\ntrue;# outside',['# outside']),
+        ('cat <<EOF # header \\\n# data\nEOF\n# outside',['# header \\', '# outside']),
+        ('echo ${unset:-$(case a in a) { :; };; esac) x;#literal};# outside',['# outside']),
+        ('echo ${unset:-$(if true; then case a in (esac) :;; esac; fi) x;#literal};# outside',['# outside']),
+        ('echo ${unset:-$(echo hi;# inside\n) x;#literal};# outside',['# inside','# outside']),
+        ('[[ a == a ||# condition\n b == c ]];# outside',['# condition','# outside']),
+        ('[[ a =~ (a||#literal) ]];# outside',['# outside']),
+        ('if [[ a =~ a||#literal ]]; then :; fi;# outside',['# outside']),
+        ("printf '%s' foo\\\n#literal\nprintf done;# real",['# real']),
+        ("printf '%s' foo;\\\n# continued boundary",['# continued boundary']),
+        ("echo 'a\n;# inside quote';# outside",['# outside']),
+      ]:cases.append(('bash',source,comments))
     for kind in ['block','fence']:
       for lang,source,comments in cases:
         actual=render(page,source,lang,kind)
