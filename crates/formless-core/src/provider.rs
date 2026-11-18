@@ -4886,10 +4886,16 @@ fn provider_http_error(status: reqwest::StatusCode, text: &str, wait: Option<Dur
     }
 }
 
-/// How long the server asked us to wait: `Retry-After` (seconds or an
-/// HTTP date), else the longest `x-ratelimit-reset-*` (`"1s"`, `"6m0s"`,
-/// `"20ms"`).
+/// Prefer `Retry-After` (seconds or an HTTP date). Otherwise use the longest
+/// provider reset, expressed as a duration or a future RFC3339 timestamp.
 fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    retry_after_at(headers, chrono::Utc::now())
+}
+
+fn retry_after_at(
+    headers: &reqwest::header::HeaderMap,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<Duration> {
     let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
     if let Some(v) = header("retry-after") {
         if let Ok(secs) = v.trim().parse::<f64>() {
@@ -4898,13 +4904,21 @@ fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
             }
         }
         if let Ok(at) = chrono::DateTime::parse_from_rfc2822(v.trim()) {
-            let wait = at.signed_duration_since(chrono::Utc::now());
+            let wait = at.signed_duration_since(now);
             return Some(wait.to_std().unwrap_or_default());
         }
     }
-    ["x-ratelimit-reset-requests", "x-ratelimit-reset-tokens"]
+    headers
         .iter()
-        .filter_map(|h| header(h).and_then(parse_reset_duration))
+        .filter(|(name, _)| crate::rate_limits::is_reset_header(name.as_str()))
+        .filter_map(|(_, raw)| {
+            let raw = raw.to_str().ok()?.trim();
+            if let Ok(at) = chrono::DateTime::parse_from_rfc3339(raw) {
+                let wait = at.signed_duration_since(now).to_std().ok()?;
+                return (!wait.is_zero()).then_some(wait);
+            }
+            parse_reset_duration(raw)
+        })
         .max()
 }
 
@@ -6081,6 +6095,71 @@ mod tests {
         h.insert("retry-after", HeaderValue::from_str(&at).unwrap());
         let wait = retry_after(&h).unwrap();
         assert!(wait > Duration::from_secs(25) && wait <= Duration::from_secs(30));
+    }
+
+    #[test]
+    fn retry_hints_cover_each_provider_reset_bucket() {
+        use reqwest::header::{HeaderMap, HeaderValue};
+        let now = "2026-11-15T00:00:00Z".parse().unwrap();
+        for name in [
+            "x-ratelimit-reset",
+            "x-ratelimit-reset-requests",
+            "x-ratelimit-reset-tokens",
+            "x-ratelimit-reset-input-tokens",
+            "x-ratelimit-reset-output-tokens",
+            "anthropic-ratelimit-requests-reset",
+            "anthropic-ratelimit-tokens-reset",
+            "anthropic-ratelimit-input-tokens-reset",
+            "anthropic-ratelimit-output-tokens-reset",
+        ] {
+            for raw in ["40s", "2026-11-15T01:00:40+01:00"] {
+                let mut headers = HeaderMap::new();
+                headers.insert(name, HeaderValue::from_static(raw));
+                assert_eq!(
+                    retry_after_at(&headers, now),
+                    Some(Duration::from_secs(40)),
+                    "{name}: {raw}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn retry_hints_choose_longest_valid_reset_unless_retry_after_is_valid() {
+        use reqwest::header::{HeaderMap, HeaderValue};
+        let now = "2026-11-15T00:00:00Z".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        for (name, raw) in [
+            (
+                "anthropic-ratelimit-input-tokens-reset",
+                "2026-11-14T23:59:59Z",
+            ),
+            (
+                "anthropic-ratelimit-output-tokens-reset",
+                "2026-11-15T00:00:00Z",
+            ),
+            ("x-ratelimit-reset-requests", "unavailable"),
+            ("x-ratelimit-reset-unknown", "5d"),
+            ("x-ratelimit-remaining-tokens", "5d"),
+        ] {
+            headers.insert(name, HeaderValue::from_static(raw));
+        }
+        assert_eq!(retry_after_at(&headers, now), None);
+        headers.append(
+            "x-ratelimit-reset-requests",
+            HeaderValue::from_static("6m0s"),
+        );
+        headers.insert(
+            "anthropic-ratelimit-requests-reset",
+            HeaderValue::from_static("2026-11-15T00:06:00.250Z"),
+        );
+        headers.insert("retry-after", HeaderValue::from_static("malformed"));
+        assert_eq!(
+            retry_after_at(&headers, now),
+            Some(Duration::from_millis(360_250))
+        );
+        headers.insert("retry-after", HeaderValue::from_static("7"));
+        assert_eq!(retry_after_at(&headers, now), Some(Duration::from_secs(7)));
     }
 
     #[test]

@@ -62,29 +62,26 @@ fn display_endpoint(base: &str) -> String {
     }
 }
 
+fn header_parts(header: &str) -> Option<(&str, &str)> {
+    let (field, kind) = if let Some(short) = header.strip_prefix("x-ratelimit-") {
+        short.split_once('-').unwrap_or((short, "requests"))
+    } else {
+        let (kind, field) = header
+            .strip_prefix("anthropic-ratelimit-")?
+            .rsplit_once('-')?;
+        (field, kind)
+    };
+    (matches!(field, "limit" | "remaining" | "reset") && KINDS.contains(&kind))
+        .then_some((field, kind))
+}
+
 fn canonical(header: &str) -> Option<String> {
-    if let Some(short) = header.strip_prefix("x-ratelimit-") {
-        for field in ["limit", "remaining", "reset"] {
-            if short == field {
-                return Some(format!("{field}-requests"));
-            }
-            for kind in KINDS {
-                if short == format!("{field}-{kind}") {
-                    return Some(short.into());
-                }
-            }
-        }
-    }
-    if let Some(short) = header.strip_prefix("anthropic-ratelimit-") {
-        for kind in KINDS {
-            for field in ["limit", "remaining", "reset"] {
-                if short == format!("{kind}-{field}") {
-                    return Some(format!("{field}-{kind}"));
-                }
-            }
-        }
-    }
-    None
+    let (field, kind) = header_parts(header)?;
+    Some(format!("{field}-{kind}"))
+}
+
+pub(crate) fn is_reset_header(header: &str) -> bool {
+    matches!(header_parts(header), Some(("reset", _)))
 }
 
 fn duration_millis(raw: &str) -> Option<i64> {
