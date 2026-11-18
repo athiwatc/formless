@@ -274,7 +274,7 @@ fn release_tags_must_match_the_cargo_version() {
 
 #[cfg(unix)]
 #[test]
-fn source_installer_writes_a_complete_optional_manual() {
+fn source_installer_installs_the_manual_and_reports_completion_discovery() {
     use std::os::unix::fs::PermissionsExt;
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -311,7 +311,7 @@ chmod 755 "$destination"
     )
     .unwrap();
     std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let install = |mode| {
+    let install = |mode, shell_env: &[(&str, &str)]| {
         std::process::Command::new(sh())
             .arg(root().join("scripts/install.sh"))
             .env_clear()
@@ -319,11 +319,12 @@ chmod 755 "$destination"
             .env("PREFIX", &prefix)
             .env("FORMLESS_FROM_SOURCE", "1")
             .env("FIXTURE_MAN", mode)
+            .envs(shell_env.iter().copied())
             .output()
             .unwrap()
     };
     let page = prefix.join("share/man/man1/formless.1");
-    let output = install("success");
+    let output = install("success", &[]);
     assert!(output.status.success(), "{output:?}");
     assert_eq!(std::fs::read_to_string(&page).unwrap(), ".TH FORMLESS 1\n");
     assert_eq!(
@@ -331,7 +332,7 @@ chmod 755 "$destination"
         0o644
     );
     for mode in ["empty", "failure"] {
-        let output = install(mode);
+        let output = install(mode, &[]);
         assert!(output.status.success(), "{output:?}");
         assert!(String::from_utf8_lossy(&output.stderr)
             .contains("could not install the optional man page"));
@@ -341,6 +342,44 @@ chmod 755 "$destination"
             1
         );
     }
+    let share = prefix.join("share");
+    let system_dirs = format!("{}/missing::{}/", dir.display(), share.display());
+    let user_bash_dirs = format!(
+        "{}/missing:{}/bash-completion/",
+        dir.display(),
+        share.display()
+    );
+    let user_config = dir.join("fish user settings");
+    let shell_output = |env: &[(&str, &str)]| {
+        let output = install("success", env);
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let bash = ("SHELL", "/bin/bash");
+    assert!(shell_output(&[bash]).contains("Bash completions are in"));
+    assert!(
+        !shell_output(&[bash, ("XDG_DATA_DIRS", &system_dirs)]).contains("Bash completions are in")
+    );
+    assert!(
+        !shell_output(&[bash, ("BASH_COMPLETION_USER_DIR", &user_bash_dirs)])
+            .contains("Bash completions are in")
+    );
+    let data_home = ("XDG_DATA_HOME", share.to_str().unwrap());
+    assert!(!shell_output(&[bash, data_home]).contains("Bash completions are in"));
+    assert!(shell_output(&[
+        bash,
+        data_home,
+        ("BASH_COMPLETION_USER_DIR", "/somewhere-else")
+    ])
+    .contains("Bash completions are in"));
+    let fish = ("SHELL", "/usr/bin/fish");
+    let fish_hint = shell_output(&[fish, ("XDG_CONFIG_HOME", user_config.to_str().unwrap())]);
+    assert!(fish_hint.contains("Fish completions are in"));
+    assert!(fish_hint.contains(&format!("{}/fish/completions", user_config.display())));
+    assert!(!shell_output(&[fish, data_home]).contains("Fish completions are in"));
+    assert!(
+        !shell_output(&[fish, ("XDG_DATA_DIRS", &system_dirs)]).contains("Fish completions are in")
+    );
     std::fs::remove_dir_all(dir).unwrap();
 }
 
