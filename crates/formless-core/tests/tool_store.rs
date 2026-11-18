@@ -126,8 +126,34 @@ fn profile_quota_is_atomic_across_writers_and_leaves_harness_updates_available()
         "INSERT INTO tool_kv(namespace,key,value,updated_at) VALUES('harness:registry','last_change',?1,'')",
         [json!("x".repeat(8 * 1024)).to_string()],
     ).unwrap();
+    let legacy = json!("λ".repeat(32_767));
+    conn.execute(
+        "WITH RECURSIVE seed(i) AS (
+           VALUES(0) UNION ALL SELECT i+1 FROM seed WHERE i<80
+         )
+         INSERT INTO tool_kv(namespace,key,value,updated_at)
+         SELECT 'shared:legacy', CAST(i AS TEXT), ?1, '' FROM seed",
+        [legacy.to_string()],
+    )
+    .unwrap();
     drop(conn);
     let store = Store::open(&database).unwrap();
+    // The old data exceeds both quotas. Upgrade preserves it and allows
+    // deletes to make room.
+    assert!(store
+        .kv_set("shared:legacy", "new", &Value::Null)
+        .unwrap_err()
+        .to_string()
+        .contains("namespace is full"));
+    assert!(store
+        .kv_set("test:new", "new", &Value::Null)
+        .unwrap_err()
+        .to_string()
+        .contains("profile Tool store is full"));
+    assert_eq!(store.kv_get("shared:legacy", "0").unwrap(), Some(legacy));
+    for i in 0..81 {
+        assert!(store.kv_delete("shared:legacy", &i.to_string()).unwrap());
+    }
 
     let first = Store::open(&database).unwrap();
     let second = Store::open(&database).unwrap();
@@ -140,12 +166,27 @@ fn profile_quota_is_atomic_across_writers_and_leaves_harness_updates_available()
             writer.kv_set(namespace, "cursor", &payload)
         })
     };
-    let a = write(first, "test:other-draft");
-    let b = write(second, "shared:cache-extra");
+    let test_namespace = "test:other-draft";
+    let shared_namespace = "shared:cache-extra";
+    let a = write(first, test_namespace);
+    let b = write(second, shared_namespace);
     let results = [a.join().unwrap(), b.join().unwrap()];
     assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    let winner = if results[0].is_ok() {
+        test_namespace
+    } else {
+        shared_namespace
+    };
     let error = results.into_iter().find_map(Result::err).unwrap();
     assert!(error.to_string().contains("profile Tool store is full"));
+    assert!(store
+        .kv_set(winner, "cursor", &json!("x".repeat(52 * 1024)))
+        .unwrap_err()
+        .to_string()
+        .contains("profile Tool store is full"));
+    store
+        .kv_set(winner, "cursor", &json!("x".repeat(47 * 1024)))
+        .unwrap();
     store
         .kv_set(
             "harness:registry",
@@ -158,30 +199,6 @@ fn profile_quota_is_atomic_across_writers_and_leaves_harness_updates_available()
         .kv_set("shared:cache-extra", "new", &json!("x".repeat(48 * 1024)))
         .unwrap();
 
-    // A legacy namespace that exceeded its cap remains readable and can
-    // recover using deletes. The counter also follows those deletes.
-    let conn = rusqlite::Connection::open(&database).unwrap();
-    let legacy = json!("λ".repeat(32_767));
-    conn.execute(
-        "WITH RECURSIVE seed(i) AS (
-           VALUES(0) UNION ALL SELECT i+1 FROM seed WHERE i<80
-         )
-         INSERT INTO tool_kv(namespace,key,value,updated_at)
-         SELECT 'shared:legacy', CAST(i AS TEXT), ?1, '' FROM seed",
-        [legacy.to_string()],
-    )
-    .unwrap();
-    assert!(store
-        .kv_set("shared:legacy", "new", &Value::Null)
-        .unwrap_err()
-        .to_string()
-        .contains("namespace is full"));
-    assert_eq!(store.kv_get("shared:legacy", "0").unwrap(), Some(legacy));
-    assert!(store.kv_delete("shared:legacy", "0").unwrap());
-    conn.execute("DELETE FROM tool_kv WHERE namespace='shared:legacy'", [])
-        .unwrap();
-    drop(conn);
-    assert!(store.kv_delete("shared:cache-00", "001").unwrap());
     store.kv_set("shared:legacy", "new", &Value::Null).unwrap();
     drop(store);
     std::fs::remove_dir_all(dir).unwrap();

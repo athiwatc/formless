@@ -316,25 +316,25 @@ CREATE TABLE IF NOT EXISTS tool_kv (
 // Count existing data once and keep the profile admission check independent
 // of the number of keys. A rollback reverts both the payload and its charge.
 const SCHEMA_V68_TOOL_STORE_USAGE: &str = "
-CREATE TABLE tool_store_profile_usage (
+CREATE TABLE IF NOT EXISTS tool_store_profile_usage (
   singleton INTEGER PRIMARY KEY CHECK(singleton=1),
   bytes INTEGER NOT NULL CHECK(bytes>=0));
-INSERT INTO tool_store_profile_usage
+INSERT OR IGNORE INTO tool_store_profile_usage
   SELECT 1, COALESCE(SUM(octet_length(namespace)+octet_length(key)+octet_length(value)),0)
   FROM tool_kv WHERE namespace NOT GLOB 'harness:*';
-CREATE TRIGGER tool_store_usage_insert AFTER INSERT ON tool_kv
+CREATE TRIGGER IF NOT EXISTS tool_store_usage_insert AFTER INSERT ON tool_kv
 WHEN new.namespace NOT GLOB 'harness:*'
 BEGIN
   UPDATE tool_store_profile_usage
     SET bytes=bytes+octet_length(new.namespace)+octet_length(new.key)+octet_length(new.value);
 END;
-CREATE TRIGGER tool_store_usage_delete AFTER DELETE ON tool_kv
+CREATE TRIGGER IF NOT EXISTS tool_store_usage_delete AFTER DELETE ON tool_kv
 WHEN old.namespace NOT GLOB 'harness:*'
 BEGIN
   UPDATE tool_store_profile_usage
     SET bytes=bytes-octet_length(old.namespace)-octet_length(old.key)-octet_length(old.value);
 END;
-CREATE TRIGGER tool_store_usage_update AFTER UPDATE OF namespace, key, value ON tool_kv
+CREATE TRIGGER IF NOT EXISTS tool_store_usage_update AFTER UPDATE OF namespace, key, value ON tool_kv
 WHEN old.namespace NOT GLOB 'harness:*' OR new.namespace NOT GLOB 'harness:*'
 BEGIN
   UPDATE tool_store_profile_usage SET bytes=bytes
