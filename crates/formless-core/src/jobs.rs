@@ -2,7 +2,7 @@
 //! periodically (`cron`, local time).
 
 use anyhow::{anyhow, bail, Context, Result};
-use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, TimeZone, Timelike};
+use chrono::{DateTime, Datelike, Duration, Local, TimeZone, Timelike};
 
 /// A parsed 5-field cron expression: minute hour day-of-month month
 /// day-of-week (0 or 7 = Sunday). Supports `*`, numbers, `a-b`, lists
@@ -96,7 +96,7 @@ impl Cron {
         })
     }
 
-    fn matches_date(&self, date: NaiveDate) -> bool {
+    fn matches_date(&self, date: &impl Datelike) -> bool {
         let day = self.dom[date.day() as usize];
         let wd = self.dow[date.weekday().num_days_from_sunday() as usize];
         // Cron rule: with both day fields restricted, either may match.
@@ -108,9 +108,7 @@ impl Cron {
     }
 
     fn matches(&self, t: &DateTime<Local>) -> bool {
-        self.minute[t.minute() as usize]
-            && self.hour[t.hour() as usize]
-            && self.matches_date(t.date_naive())
+        self.minute[t.minute() as usize] && self.hour[t.hour() as usize] && self.matches_date(t)
     }
 
     /// The first matching local minute strictly after `after`.
@@ -128,7 +126,7 @@ impl Cron {
             let possible = [utc_date.pred_opt(), Some(utc_date), tomorrow]
                 .into_iter()
                 .flatten()
-                .any(|date| self.matches_date(date));
+                .any(|date| self.matches_date(&date));
             if !possible {
                 let midnight = tomorrow?.and_hms_opt(0, 0, 0)?.and_utc();
                 let before = (midnight - Duration::seconds(1)).with_timezone(&Local);
