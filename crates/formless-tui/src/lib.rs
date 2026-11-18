@@ -6579,7 +6579,10 @@ impl App {
                 || (mention.starts_with("~/")
                     && directories::BaseDirs::new()
                         .is_some_and(|b| path.starts_with(b.home_dir())));
-            if !inside || formless_core::daemon::credential_path(&path).is_some() {
+            if !inside
+                || formless_core::daemon::credential_path(&path).is_some()
+                || formless_core::daemon::credential_path(&candidate).is_some()
+            {
                 continue;
             }
             let Ok(meta) = path.metadata() else {
@@ -27252,6 +27255,12 @@ mod tests {
         app.input.set("read @.psql_history");
         assert!(render(&mut app, 180, 24).contains("[@.psql_history · not sent: credential]"));
         assert!(app.forecast_input().attachments.is_empty());
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("my", root.join("psql_history")).unwrap();
+            app.input.set("read @psql_history");
+            assert!(app.forecast_input().attachments.is_empty());
+        }
         app.input.set("read @\"my notes/report.md\"");
         assert!(render(&mut app, 180, 24).contains("[@my notes/report.md]"));
         let input = app.forecast_input();

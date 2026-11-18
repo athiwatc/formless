@@ -16845,7 +16845,12 @@ pub fn credential_path(path: &std::path::Path) -> Option<&'static str> {
             return Some(why);
         }
     }
-    let name = path.file_name()?.to_string_lossy().to_lowercase();
+    let filename = path.file_name()?.to_string_lossy().to_lowercase();
+    let name = if cfg!(windows) {
+        filename.split(':').next().unwrap_or_default()
+    } else {
+        filename.as_str()
+    };
     let env_template = formless_runtime::sensitive_paths::is_env_template_file(path)
         && matches!(
             formless_runtime::sensitive_paths::PathPolicy::default().classify(path, path),
@@ -16857,7 +16862,7 @@ pub fn credential_path(path: &std::path::Path) -> Option<&'static str> {
         .into_iter()
         .any(|prefix| name.starts_with(prefix))
         && !(name.ends_with(".pub")
-            && (!cfg!(windows) || !name.contains(':'))
+            && name == filename.as_str()
             && path.symlink_metadata().is_ok_and(|meta| meta.is_file()));
     let secret_file = [
         ".netrc",
@@ -16871,7 +16876,7 @@ pub fn credential_path(path: &std::path::Path) -> Option<&'static str> {
         "psql_history",
         ".mysql_history",
     ]
-    .contains(&name.as_str())
+    .contains(&name)
         || ((name == ".env" || name.starts_with(".env.")) && !env_template)
         || private_key_name
         || name.ends_with(".pem")

@@ -285,7 +285,16 @@ async fn mentions_never_take_credentials_or_leave_the_folder() {
         );
     }
     #[cfg(windows)]
-    assert!(credential_path(std::path::Path::new("keys/id_rsa:named.pub")).is_some());
+    for name in [
+        "keys/id_rsa:named.pub",
+        ".pgpass:history",
+        ".psql_history:history",
+    ] {
+        assert!(
+            credential_path(std::path::Path::new(name)).is_some(),
+            "{name}"
+        );
+    }
     assert!(credential_path(std::path::Path::new("/home/u/.aws/credentials")).is_some());
     assert!(credential_path(std::path::Path::new("/home/u/src/main.rs")).is_none());
 }
