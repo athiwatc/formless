@@ -60,13 +60,29 @@ class ReleasePublication(unittest.TestCase):
                 for row in expected:
                     self.assertIn(row, text)
 
+    def test_summary_preserves_partial_docker_publication(self):
+        with tempfile.TemporaryDirectory() as directory:
+            summary = Path(directory) / "summary"
+            result = subprocess.run(
+                ["bash", str(ROOT / "scripts/release-channel-summary.sh"),
+                 "success", "skipped", "skipped", "skipped", "failure"],
+                env={**os.environ, "GITHUB_STEP_SUMMARY": str(summary),
+                     "DOCKER_VERSION": "published", "DOCKER_LATEST": ""},
+                capture_output=True, text=True, timeout=5,
+            )
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertIn("| Docker (ghcr.io) | version published (job failure, latest unverified) |",
+                          summary.read_text())
+
     def test_new_version_push_and_latest_uses_the_verified_manifest(self):
         registry = Mock()
         registry.manifest.side_effect = [None, (TESTED, MANIFEST), (TESTED, MANIFEST)]
         with patch.object(image, "docker", return_value=TESTED) as docker, patch.object(
             image, "newest_stable_tag", return_value="v9.8.7"
         ):
-            self.assertEqual(image.publish(registry, "v9.8.7", "local-test", TESTED), "promoted")
+            output = io.StringIO()
+            self.assertEqual(image.publish(registry, "v9.8.7", "local-test", TESTED, output), "promoted")
+        self.assertEqual(output.getvalue(), "version=published\n")
         commands = [call.args for call in docker.call_args_list]
         self.assertIn(("image", "tag", TESTED, REF + ":v9.8.7"), commands)
         self.assertIn(("image", "push", REF + ":v9.8.7"), commands)
@@ -83,7 +99,7 @@ class ReleasePublication(unittest.TestCase):
             with self.subTest(version=version), patch.object(image, "docker", return_value=TESTED) as docker, patch.object(
                 image, "newest_stable_tag", return_value="v9.8.7"
             ):
-                self.assertEqual(image.publish(registry, version, "local-test", TESTED),
+                self.assertEqual(image.publish(registry, version, "local-test", TESTED, io.StringIO()),
                                  "skipped (not the highest stable tag)")
                 docker.assert_called_once_with("image", "inspect", "--format", "{{.Id}}", "local-test")
                 registry.manifest.assert_called_once_with(version)
@@ -94,7 +110,7 @@ class ReleasePublication(unittest.TestCase):
             registry.manifest.return_value = (MANIFEST, TESTED)
             with self.subTest(local_id=local_id), patch.object(image, "docker", return_value=local_id) as docker:
                 with self.assertRaisesRegex(ValueError, "different image|smoke-tested image"):
-                    image.publish(registry, "v9.8.7", "local-test", TESTED)
+                    image.publish(registry, "v9.8.7", "local-test", TESTED, io.StringIO())
                 docker.assert_called_once_with("image", "inspect", "--format", "{{.Id}}", "local-test")
                 if local_id == MANIFEST:
                     registry.manifest.assert_not_called()
@@ -110,7 +126,7 @@ class ReleasePublication(unittest.TestCase):
 
         with patch.object(image, "docker", side_effect=docker_fixture) as docker:
             with self.assertRaises(subprocess.CalledProcessError):
-                image.publish(registry, "v9.8.7", "local-test", TESTED)
+                image.publish(registry, "v9.8.7", "local-test", TESTED, io.StringIO())
         self.assertEqual(docker.call_args.args, ("image", "rm", REF + ":v9.8.7"))
         self.assertFalse(any(call.args[0] == "buildx" for call in docker.call_args_list))
 
@@ -130,6 +146,49 @@ class ReleasePublication(unittest.TestCase):
                 else:
                     with self.assertRaises(HTTPError):
                         registry.manifest("v0.1.0")
+
+    def test_registry_refreshes_a_pull_token_once_after_expiry(self):
+        body = json.dumps({"schemaVersion": 2, "mediaType": image.MANIFEST_TYPES[0],
+                           "config": {"digest": TESTED}}).encode()
+        digest = "sha256:" + hashlib.sha256(body).hexdigest()
+        headers = Message()
+        headers["Docker-Content-Digest"] = digest
+
+        def expired():
+            return HTTPError("https://ghcr.io/fixture", 401, "expired", {}, io.BytesIO(b""))
+
+        for last_result in ((body, headers), expired()):
+            with self.subTest(last_result=type(last_result)), patch.object(image, "registry_response") as request:
+                request.side_effect = [
+                    (b'{"token":"initial"}', Message()), expired(),
+                    (b'{"token":"fresh"}', Message()), last_result,
+                ]
+                registry = image.Registry("fixture", "fixture")
+                if isinstance(last_result, HTTPError):
+                    with self.assertRaises(HTTPError):
+                        registry.manifest("v0.1.0")
+                else:
+                    self.assertEqual(registry.manifest("v0.1.0"), (TESTED, digest))
+                self.assertEqual(request.call_count, 4)
+                self.assertEqual(request.call_args_list[1].args[2], "Bearer initial")
+                self.assertEqual(request.call_args_list[3].args[2], "Bearer fresh")
+
+    def test_failed_latest_still_records_the_verified_version(self):
+        registry = Mock()
+        registry.manifest.return_value = (TESTED, MANIFEST)
+
+        def docker_fixture(*args):
+            if args[0] == "buildx":
+                raise subprocess.CalledProcessError(1, args)
+            return TESTED
+
+        output = io.StringIO()
+        with patch.object(image, "docker", side_effect=docker_fixture), patch.object(
+            image, "newest_stable_tag", return_value="v9.8.7"
+        ):
+            with self.assertRaises(subprocess.CalledProcessError):
+                image.publish(registry, "v9.8.7", "local-test", TESTED, output)
+        self.assertEqual(output.getvalue(), "version=published\n")
 
     def test_registry_manifest_requires_supported_format_and_matching_digest(self):
         body = json.dumps({"schemaVersion": 2, "mediaType": image.MANIFEST_TYPES[0],
@@ -184,8 +243,10 @@ class ReleasePublication(unittest.TestCase):
         self.assertIn("merge-multiple: true", docker)
         self.assertIn("fetch-depth: 0", docker)
         self.assertIn("queue: max", docker)
+        self.assertIn("version: v0.31.0", docker)
         self.assertNotIn("contents: write", docker)
         self.assertIn("DOCKER: ${{ needs.docker-publish.result }}", workflow)
+        self.assertIn("DOCKER_VERSION: ${{ needs.docker-publish.outputs.version }}", workflow)
 
     def test_release_and_baseline_build_and_check_oci_identity(self):
         dockerfile = (ROOT / "Dockerfile").read_text()

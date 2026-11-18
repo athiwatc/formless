@@ -45,10 +45,14 @@ class Registry:
     def __init__(self, username, token):
         self.opener = build_opener(NoRedirect)
         auth = base64.b64encode(f"{username}:{token}".encode()).decode()
+        self.basic_authorization = "Basic " + auth
+        self.refresh()
+
+    def refresh(self):
         path = "token?" + urlencode(
             {"service": "ghcr.io", "scope": f"repository:{REPOSITORY}:pull"}
         )
-        body, _ = registry_response(self.opener, path, "Basic " + auth)
+        body, _ = registry_response(self.opener, path, self.basic_authorization)
         parsed = json.loads(body)
         credential = parsed.get("token") or parsed.get("access_token")
         if not isinstance(credential, str) or not re.fullmatch(r"[\x21-\x7e]+", credential):
@@ -56,6 +60,15 @@ class Registry:
         self.authorization = "Bearer " + credential
 
     def manifest(self, tag):
+        try:
+            return self._manifest(tag)
+        except HTTPError as error:
+            if error.code != 401:
+                raise
+        self.refresh()
+        return self._manifest(tag)
+
+    def _manifest(self, tag):
         path = f"v2/{REPOSITORY}/manifests/{tag}"
         try:
             body, headers = registry_response(
@@ -101,24 +114,28 @@ def newest_stable_tag():
     return next((tag for tag in tags.splitlines() if STABLE.fullmatch(tag)), None)
 
 
-def publish(registry, version, image, tested_id):
+def publish(registry, version, image, tested_id, output):
     image_id = docker("image", "inspect", "--format", "{{.Id}}", image)
     if image_id != tested_id:
         raise ValueError("loaded image does not match the smoke-tested image")
     ref = f"{IMAGE}:{version}"
     manifest = registry.manifest(version)
-    if manifest is None:
-        docker("image", "tag", tested_id, ref)
-        try:
+    tagged_here = False
+    try:
+        if manifest is None:
+            docker("image", "tag", tested_id, ref)
+            tagged_here = True
             if docker("image", "inspect", "--format", "{{.Id}}", ref) != tested_id:
                 raise ValueError("version tag did not retain the smoke-tested image")
             docker("image", "push", ref)
             manifest = registry.manifest(version)
-        finally:
+        if manifest is None or manifest[0] != tested_id:
+            raise ValueError(f"refusing to replace or promote {ref} with a different image")
+        print(f"Docker version {version} resolves to {manifest[1]}.")
+        print("version=published", file=output, flush=True)
+    finally:
+        if tagged_here:
             docker("image", "rm", ref)
-    if manifest is None or manifest[0] != tested_id:
-        raise ValueError(f"refusing to replace or promote {ref} with a different image")
-    print(f"Docker version {version} resolves to {manifest[1]}.")
     if STABLE.fullmatch(version) and version == newest_stable_tag():
         docker(
             "buildx", "imagetools", "create", "--prefer-index=false",
@@ -145,9 +162,9 @@ def main():
     if not DIGEST.fullmatch(tested_id):
         raise ValueError("invalid smoke-tested image ID")
     registry = Registry(os.environ["GHCR_USERNAME"], os.environ.pop("GHCR_TOKEN"))
-    decision = publish(registry, version, os.environ["RELEASE_IMAGE"], tested_id)
-    print(f"Docker latest: {decision}.")
     with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+        decision = publish(registry, version, os.environ["RELEASE_IMAGE"], tested_id, output)
+        print(f"Docker latest: {decision}.")
         print(f"latest={decision}", file=output)
 
 

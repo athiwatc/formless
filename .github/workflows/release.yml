@@ -290,7 +290,7 @@ jobs:
       contents: read
     outputs:
       artifact-id: ${{ steps.image-upload.outputs.artifact-id }}
-      image-id: ${{ steps.image-identity.outputs.image-id }}
+      image-id: ${{ steps.smoke.outputs.image-id }}
       image: ${{ steps.image-identity.outputs.image }}
     env:
       RELEASE_IMAGE: formless:release-${{ github.run_id }}-${{ github.run_attempt }}
@@ -322,12 +322,15 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - name: Smoke private container with positive RPC proof
+        id: smoke
         shell: bash
         run: |
-          test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.version" }}' "$RELEASE_IMAGE")" = "$GITHUB_REF_NAME"
-          test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$RELEASE_IMAGE")" = "$GITHUB_SHA"
-          docker run --rm --network none "$RELEASE_IMAGE" --version
-          docker run -d --network none --name "$RELEASE_CONTAINER" "$RELEASE_IMAGE"
+          image_id=$(docker image inspect --format '{{.Id}}' "$RELEASE_IMAGE")
+          [[ "$image_id" =~ ^sha256:[0-9a-f]{64}$ ]]
+          test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.version" }}' "$image_id")" = "$GITHUB_REF_NAME"
+          test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$image_id")" = "$GITHUB_SHA"
+          docker run --rm --network none "$image_id" --version
+          docker run -d --network none --name "$RELEASE_CONTAINER" "$image_id"
           python3 - <<'PY'
           import json, os, subprocess, time
           name = os.environ["RELEASE_CONTAINER"]
@@ -349,17 +352,19 @@ jobs:
           else:
               raise SystemExit("private container daemon never answered status within 30s: " + last)
           PY
+          printf 'image-id=%s\n' "$image_id" >> "$GITHUB_OUTPUT"
       - name: Archive the smoke-tested image
         id: image-identity
         shell: bash
+        env:
+          TESTED_IMAGE_ID: ${{ steps.smoke.outputs.image-id }}
         run: |
           set -euo pipefail
-          image_id=$(docker image inspect --format '{{.Id}}' "$RELEASE_IMAGE")
-          [[ "$image_id" =~ ^sha256:[0-9a-f]{64}$ ]]
+          test "$(docker image inspect --format '{{.Id}}' "$RELEASE_IMAGE")" = "$TESTED_IMAGE_ID"
           archive_dir=$(mktemp -d "$RUNNER_TEMP/formless-release-image.XXXXXX")
           echo "RELEASE_IMAGE_ARCHIVE=$archive_dir" >> "$GITHUB_ENV"
           docker image save --output "$archive_dir/image.tar" "$RELEASE_IMAGE"
-          printf 'image-id=%s\nimage=%s\n' "$image_id" "$RELEASE_IMAGE" >> "$GITHUB_OUTPUT"
+          printf 'image=%s\n' "$RELEASE_IMAGE" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         id: image-upload
         with:
@@ -491,6 +496,7 @@ jobs:
       contents: read
       packages: write
     outputs:
+      version: ${{ steps.push.outputs.version }}
       latest: ${{ steps.push.outputs.latest }}
     timeout-minutes: 30
     needs: [docker, publish]
@@ -525,6 +531,8 @@ jobs:
         shell: bash
         run: docker image load --input "$DOCKER_PUBLISH_DIR/image.tar"
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+        with:
+          version: v0.31.0
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
@@ -562,5 +570,6 @@ jobs:
           WINGET: ${{ needs.publish.outputs.winget }}
           AUR: ${{ needs.publish.outputs.aur }}
           DOCKER: ${{ needs.docker-publish.result }}
+          DOCKER_VERSION: ${{ needs.docker-publish.outputs.version }}
           DOCKER_LATEST: ${{ needs.docker-publish.outputs.latest }}
         run: bash scripts/release-channel-summary.sh "$RELEASE" "$TAP" "$WINGET" "$AUR" "$DOCKER"

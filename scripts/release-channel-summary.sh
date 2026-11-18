@@ -23,7 +23,16 @@ docker_state() {
                 'skipped (not the highest stable tag)') echo 'published (latest skipped: not the highest stable tag)' ;;
                 *) echo 'published' ;;
             esac ;;
-        failure|cancelled) state "$1" ;;
+        failure|cancelled)
+            if [ "${DOCKER_VERSION:-}" = published ]; then
+                case "${DOCKER_LATEST:-}" in
+                    promoted) echo "version published and latest promoted (job $1)" ;;
+                    'skipped (not the highest stable tag)') echo "version published and latest skipped (job $1)" ;;
+                    *) echo "version published (job $1, latest unverified)" ;;
+                esac
+            else
+                state "$1"
+            fi ;;
         *) echo 'not run (required publication steps did not complete)' ;;
     esac
 }

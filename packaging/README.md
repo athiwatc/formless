@@ -35,7 +35,12 @@ platform app-dirs (SPEC §9.4).
       are nonempty, mode 644 and owned by the installed package;
    - waits for native builds/tests and Linux package install checks before
      building the Docker image and checking that its daemon answers. The
-     smoke-tested image is archived for seven days for publication;
+     smoke-tested image is archived for seven days for publication. If the
+     archive expires before publication, start a fresh release workflow run
+     for the same version tag to rebuild and smoke-test the image. A rebuild
+     with a different image preserves an existing version tag and requires
+     review before promotion. Reruns use the workflow at the original tag
+     commit, so these safeguards apply to tags that include them;
    - renders the Homebrew formula, AUR `PKGBUILD` and winget manifests
      for the version (`scripts/render-packaging.sh`, which fails on a
      missing checksum, an unfilled placeholder, a version that isn't
