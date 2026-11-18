@@ -9715,6 +9715,7 @@ impl App {
         if self.vim_mode
             && self.view == View::Chat
             && self.vim_input.mode == vim::Mode::Normal
+            && !self.vim_input.waiting_for_argument()
             && self.current_question().is_none()
             && self.find.is_none()
             && (self.approvals.is_empty() || self.input_focus)
