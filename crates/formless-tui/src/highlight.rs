@@ -557,6 +557,33 @@ fn rust_number_end(chars: &[char], start: usize) -> usize {
     end
 }
 
+// In a keyword context, an apparent closing slash can instead be the
+// second division operator. Check the flags and the next operand token.
+fn js_regex_suffix(flags: &[char], mut suffix: &[char]) -> bool {
+    if !flags.iter().all(|c| "dgimsuvy".contains(*c)) {
+        return false;
+    }
+    loop {
+        let whitespace = suffix.iter().take_while(|c| c.is_whitespace()).count();
+        suffix = &suffix[whitespace..];
+        if !suffix.starts_with(&['/', '*']) {
+            break;
+        }
+        let Some(end) = suffix[2..].windows(2).position(|pair| pair == ['*', '/']) else {
+            return true;
+        };
+        suffix = &suffix[end + 4..];
+    }
+    let word = suffix
+        .iter()
+        .take_while(|c| c.is_alphanumeric() || "_$".contains(**c))
+        .count();
+    matches!(
+        &suffix[..word],
+        [] | ['i', 'n'] | ['i', 'n', 's', 't', 'a', 'n', 'c', 'e', 'o', 'f']
+    ) && !matches!(suffix.first(), Some('"' | '\''))
+}
+
 impl Highlighter {
     pub(crate) fn new(name: &str, color: bool) -> Option<Self> {
         let name = name.to_ascii_lowercase();
@@ -595,6 +622,7 @@ impl Highlighter {
                 .all(|(k, p)| chars.get(k) == Some(&p))
         };
         let mut toks: Vec<(Tok, String)> = Vec::new();
+        let mut js_block_comments = Vec::new();
         let mut push = |tok: Tok, s: &[char]| {
             if let Some((t, last)) = toks.last_mut() {
                 if std::mem::discriminant(t) == std::mem::discriminant(&tok) {
@@ -670,14 +698,21 @@ impl Highlighter {
                     }
                 }
                 push(Tok::Comment, &chars[i..j]);
+                if l.regex {
+                    js_block_comments.push((i, j));
+                }
                 i = j;
                 continue;
             }
             if let Some((open, _)) = l.block_comment {
                 if at(i, open) {
                     self.in_block = 1;
-                    push(Tok::Comment, &chars[i..i + open.chars().count()]);
-                    i += open.chars().count();
+                    let end = i + open.chars().count();
+                    push(Tok::Comment, &chars[i..end]);
+                    if l.regex {
+                        js_block_comments.push((i, end));
+                    }
+                    i = end;
                     continue;
                 }
             }
@@ -720,23 +755,31 @@ impl Highlighter {
             // A JS regex literal where a value is expected, so the `//` in
             // `/https:\/\//` is not a comment (#877).
             if l.regex && c == '/' && !at(i, "//") && !at(i, "/*") {
-                let before = chars[..i].iter().rev().find(|c| !c.is_whitespace());
-                let (prev_word, before_word) = {
-                    let end = chars[..i]
+                let token_end = |mut end| loop {
+                    end = chars[..end]
                         .iter()
                         .rposition(|c| !c.is_whitespace())
                         .map_or(0, |e| e + 1);
-                    let start = chars[..end]
-                        .iter()
-                        .rposition(|c| !(c.is_alphanumeric() || "_$".contains(*c)))
-                        .map_or(0, |s| s + 1);
-                    let word: String = chars[start..end].iter().collect();
-                    let before = chars[..start].iter().copied().rfind(|c| !c.is_whitespace());
-                    (word, before)
+                    match js_block_comments.binary_search_by_key(&end, |&(_, end)| end) {
+                        Ok(comment) => end = js_block_comments[comment].0,
+                        Err(_) => break end,
+                    }
                 };
+                let end = token_end(i);
+                let before = chars[..end].last();
+                let start = chars[..end]
+                    .iter()
+                    .rposition(|c| !(c.is_alphanumeric() || "_$".contains(*c)))
+                    .map_or(0, |s| s + 1);
+                let prev_word: String = chars[start..end].iter().collect();
                 // A property name after a dot or a private-name marker
                 // stays an operand even when it spells a keyword.
-                let after_keyword = !matches!(before_word, Some('.' | '#'))
+                let word_boundary = chars[..start]
+                    .last()
+                    .is_none_or(|c| c.is_whitespace() || c.is_ascii_punctuation());
+                let before_word = chars[..token_end(start)].last();
+                let after_keyword = word_boundary
+                    && !matches!(before_word, Some('.' | '#'))
                     && matches!(
                         prev_word.as_str(),
                         "await"
@@ -773,13 +816,16 @@ impl Highlighter {
                         }
                         j += 1;
                     }
-                    if let Some(mut end) = closed {
+                    if let Some(flags) = closed {
+                        let mut end = flags;
                         while end < chars.len() && chars[end].is_ascii_alphabetic() {
                             end += 1;
                         }
-                        push(Tok::Str, &chars[i..end]);
-                        i = end;
-                        continue;
+                        if !after_keyword || js_regex_suffix(&chars[flags..end], &chars[end..]) {
+                            push(Tok::Str, &chars[i..end]);
+                            i = end;
+                            continue;
+                        }
                     }
                 }
             }
@@ -1257,16 +1303,34 @@ mod tests {
         for source in [
             "throw value / 2 / 3",
             "await value / 2 / 3",
+            "const await = 48; return await / 2 / 3",
+            "return await / 2 / /* rhs */ 3",
+            "return await /x/factor",
             "object.throw / 2 / 3",
+            "object./* comment *//* more */throw / 2 / 3",
             "object?.await / 2 / 3",
+            "object?. /* note */ await / 2 / 3",
             "this.#delete / 2 / 3",
             "$await / 2 / 3",
+            "a\u{301}await / 2 / 3",
+            "π\u{200c}await / 2 / 3",
             "f(awaited / 2 / 3)",
         ] {
             let tokens = toks("js", source);
             assert!(
                 tokens.iter().all(|(_, color)| *color != Some(Color::Green)),
                 "{source}: {tokens:?}"
+            );
+        }
+        for source in [
+            format!("await /* note */ {regex};"),
+            format!("throw /* reason */ {regex};"),
+            format!("return {regex} /* operator */ instanceof RegExp"),
+            format!("const result = await {regex} in object"),
+        ] {
+            assert!(
+                toks("js", &source).contains(&(regex.into(), Some(Color::Green))),
+                "{source}"
             );
         }
     }
