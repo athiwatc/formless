@@ -137,8 +137,13 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           set -euo pipefail
-          if ! command -v pdftoppm >/dev/null || ! command -v pdftotext >/dev/null; then
-            echo 'The Linux browser checks require Poppler tools (pdftoppm and pdftotext).' >&2
+          missing_poppler=()
+          for tool in pdftoppm pdftotext; do
+            command -v "$tool" >/dev/null || missing_poppler+=("$tool")
+          done
+          if ((${#missing_poppler[@]})); then
+            printf 'Required Poppler tools missing from PATH (%s).\n' "${missing_poppler[*]}" >&2
+            echo 'See the Linux relay browser checks section in docs/self-hosted-ci.md for runner prerequisites.' >&2
             exit 1
           fi
           python3 -c 'import sys; assert sys.version_info >= (3, 10), "Chromium tests require Python 3.10+"'
