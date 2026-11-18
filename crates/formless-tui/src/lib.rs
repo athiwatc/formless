@@ -5098,6 +5098,7 @@ impl App {
                 None
             }
             KeyCode::Enter => {
+                self.invalidate_rollback_viewport();
                 self.notes.push(format!(
                     "press Enter again to roll {name} back to v{version}"
                 ));
@@ -11573,6 +11574,7 @@ impl App {
 }
 
 fn draw(f: &mut Frame, app: &mut App) {
+    app.invalidate_rollback_viewport();
     app.click_targets.borrow_mut().clear();
     app.draft_hits.borrow_mut().clear();
     app.refresh_toasts();
@@ -11635,6 +11637,7 @@ fn draw(f: &mut Frame, app: &mut App) {
             draw_mention_popup(f, chunks[2], m, app.color);
         }
     }
+    let mut rollback = None;
     if let Some((req, promotion)) = modal {
         let more = app.approvals.len() + app.promotions.len() - 1;
         let title = app
@@ -11683,7 +11686,7 @@ fn draw(f: &mut Frame, app: &mut App) {
             !app.seen.approval_help,
         );
     } else if let Some(pick) = &app.rollback_pick {
-        draw_rollback_picker(f, app, pick);
+        rollback = draw_rollback_picker(f, app, pick);
     } else if let Some(o) = &app.model_overlay {
         draw_model_overlay(f, o, app.color);
     }
@@ -11735,17 +11738,40 @@ fn draw(f: &mut Frame, app: &mut App) {
         );
     }
     external_editor_ui::draw_confirmation(f, app);
+    if let Some(target) = rollback.filter(|target| target.is_visible(f.buffer_mut())) {
+        app.rollback_visible_version.set(Some(target.version));
+    }
 }
 
-fn draw_rollback_picker(f: &mut Frame, app: &App, pick: &RollbackPick) {
-    app.invalidate_rollback_viewport();
-    let Some(d) = app
+struct RenderedRollback {
+    version: i64,
+    column: u16,
+    selected_row: u16,
+    hint_row: u16,
+    hint: &'static str,
+}
+
+impl RenderedRollback {
+    fn is_visible(&self, buffer: &ratatui::buffer::Buffer) -> bool {
+        // Later overlays can cover the selection or footer. Check the
+        // rendered cells before allowing a key to confirm the version.
+        let matches = |row, text: &str| {
+            let width = text::width(text) as u16;
+            (self.column..self.column.saturating_add(width))
+                .filter_map(|column| buffer.cell((column, row)).map(|cell| cell.symbol()))
+                .collect::<String>()
+                == text
+        };
+        matches(self.selected_row, &format!("› v{}", self.version))
+            && matches(self.hint_row, self.hint)
+    }
+}
+
+fn draw_rollback_picker(f: &mut Frame, app: &App, pick: &RollbackPick) -> Option<RenderedRollback> {
+    let d = app
         .tool_detail
         .as_ref()
-        .filter(|d| d.tool.id == pick.tool_id)
-    else {
-        return;
-    };
+        .filter(|d| d.tool.id == pick.tool_id)?;
     let area = f.area();
     let w = 64.min(area.width.saturating_sub(2)).max(1);
     let inner_width = usize::from(w.saturating_sub(2));
@@ -11762,7 +11788,7 @@ fn draw_rollback_picker(f: &mut Frame, app: &App, pick: &RollbackPick) {
         };
         f.render_widget(Clear, area);
         f.render_widget(Paragraph::new(message), area);
-        return;
+        return None;
     }
     let compact = area.height < 7;
     let rows = usize::from(area.height) - if compact { 3 } else { 6 };
@@ -11771,6 +11797,7 @@ fn draw_rollback_picker(f: &mut Frame, app: &App, pick: &RollbackPick) {
         .saturating_sub(rows - 1)
         .min(count.saturating_sub(rows));
     let mut lines = Vec::new();
+    let mut selected_row = 0;
     if !compact && count > 0 {
         lines.push(Line::raw(""));
         let columns = "VER  AUTHOR      CREATED            CALLS  SUCCESS";
@@ -11806,14 +11833,14 @@ fn draw_rollback_picker(f: &mut Frame, app: &App, pick: &RollbackPick) {
             )
         };
         let style = if i == selected {
+            selected_row = lines.len() as u16;
             bold_fg(app.color, Color::Yellow)
         } else {
             Style::default()
         };
         lines.push(Line::styled(text, style));
     }
-    if let Some(version) = selected_version {
-        app.rollback_visible_version.set(Some(version.version));
+    let hint = if let Some(version) = selected_version {
         if !compact {
             lines.push(Line::raw(""));
         }
@@ -11833,9 +11860,11 @@ fn draw_rollback_picker(f: &mut Frame, app: &App, pick: &RollbackPick) {
             short
         };
         lines.push(Line::styled(hint, ui::dim(app.color)));
+        Some(hint)
     } else {
         lines.push(Line::styled("No versions · Esc cancel", ui::dim(app.color)));
-    }
+        None
+    };
     let h = (lines.len() as u16 + 2).min(area.height);
     let rect = Rect {
         x: area.x + area.width.saturating_sub(w) / 2,
@@ -11843,15 +11872,24 @@ fn draw_rollback_picker(f: &mut Frame, app: &App, pick: &RollbackPick) {
         width: w,
         height: h,
     };
-    f.render_widget(Clear, rect);
-    f.render_widget(
-        Paragraph::new(lines).block(ui::panel(
-            format!(" Roll back {} ", d.tool.name),
-            app.color,
-            Color::Yellow,
-        )),
-        rect,
+    let panel = ui::panel(
+        format!(" Roll back {} ", d.tool.name),
+        app.color,
+        Color::Yellow,
     );
+    let inner = panel.inner(rect);
+    let rendered = selected_version
+        .zip(hint)
+        .map(|(version, hint)| RenderedRollback {
+            version: version.version,
+            column: inner.x,
+            selected_row: inner.y + selected_row,
+            hint_row: inner.y + lines.len() as u16 - 1,
+            hint,
+        });
+    f.render_widget(Clear, rect);
+    f.render_widget(Paragraph::new(lines).block(panel), rect);
+    rendered
 }
 
 /// The model list with the filter line, matched chars highlighted and
@@ -22293,6 +22331,7 @@ mod tests {
             app.rollback_pick.as_ref().unwrap().armed_version == Some(1),
             "first Enter only arms"
         );
+        let _ = render(&mut app, 100, 30);
         app.key(key(KeyCode::Enter));
         assert!(app.rollback_pick.is_none());
         assert!(
@@ -22403,6 +22442,48 @@ mod tests {
             restored.contains("› v39") && restored.contains("Enter again to confirm"),
             "{restored}"
         );
+        app.key(key(KeyCode::Enter));
+        assert!(app.rollback_pick.is_none());
+        assert!(app
+            .notes
+            .last()
+            .unwrap()
+            .contains("rolled page_title back to v39"));
+    }
+
+    #[test]
+    fn rollback_picker_waits_for_the_confirmation_frame_and_foreground() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut app = rollback_test_app(40);
+        app.key(key(KeyCode::Char('b')));
+        let _ = render(&mut app, 80, 20);
+        app.key(key(KeyCode::Enter));
+        let notes = app.notes.len();
+        app.key(key(KeyCode::Enter));
+        assert_eq!(app.notes.len(), notes);
+        assert_eq!(app.rollback_pick.as_ref().unwrap().armed_version, Some(39));
+
+        let confirmed = render(&mut app, 80, 20);
+        assert!(confirmed.contains("Enter again to confirm"), "{confirmed}");
+        app.on_event(Event::PromotionApprovalRequested {
+            promotion_id: "background-approval".into(),
+            tool_name: "fixture".into(),
+            reason: "fixture".into(),
+            capabilities: vec![],
+            memory_mb: 64,
+        });
+        let obscured = render(&mut app, 80, 20);
+        assert!(!obscured.contains("Enter again to confirm"), "{obscured}");
+        let notes = app.notes.len();
+        app.key(key(KeyCode::Enter));
+        assert_eq!(app.notes.len(), notes);
+        assert_eq!(app.rollback_pick.as_ref().unwrap().armed_version, Some(39));
+
+        app.on_event(Event::PromotionApprovalResolved {
+            promotion_id: "background-approval".into(),
+        });
+        let restored = render(&mut app, 80, 20);
+        assert!(restored.contains("Enter again to confirm"), "{restored}");
         app.key(key(KeyCode::Enter));
         assert!(app.rollback_pick.is_none());
         assert!(app
