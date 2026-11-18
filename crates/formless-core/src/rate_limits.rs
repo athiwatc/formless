@@ -111,22 +111,29 @@ fn duration_millis(raw: &str) -> Option<i64> {
         .then(|| total.ceil() as i64)
 }
 
-fn reset_at(raw: &str, at: DateTime<Utc>) -> Option<DateTime<Utc>> {
+pub(crate) fn absolute_reset_at(raw: &str) -> Option<DateTime<Utc>> {
     if let Ok(date) = DateTime::parse_from_rfc3339(raw.trim()) {
         return Some(date.with_timezone(&Utc));
     }
-    if let Ok(epoch) = raw.trim().parse::<f64>() {
-        // A small bare number may mean relative seconds. Without a unit we
-        // cannot distinguish that from an old epoch; retain a labelled raw
-        // value rather than silently treating it as an expired 1970 reset.
-        let millis = if epoch >= 100_000_000_000.0 {
-            epoch
-        } else {
-            epoch * 1000.0
-        };
-        if millis.is_finite() && millis >= 1_000_000_000_000.0 && millis < i64::MAX as f64 {
-            return DateTime::from_timestamp_millis(millis.ceil() as i64);
-        }
+    let epoch: f64 = raw.trim().parse().ok()?;
+    let millis = if epoch >= 100_000_000_000.0 {
+        epoch
+    } else {
+        epoch * 1000.0
+    };
+    if (1_000_000_000_000.0..i64::MAX as f64).contains(&millis) {
+        return DateTime::from_timestamp_millis(millis.ceil() as i64);
+    }
+    None
+}
+
+fn reset_at(raw: &str, at: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    if let Some(date) = absolute_reset_at(raw) {
+        return Some(date);
+    }
+    if raw.trim().parse::<f64>().is_ok() {
+        // A small bare number may mean relative seconds. Retain a labelled
+        // raw value in the snapshot rather than guessing.
         return None;
     }
     at.checked_add_signed(TimeDelta::try_milliseconds(duration_millis(raw)?)?)
