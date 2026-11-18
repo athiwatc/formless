@@ -83,6 +83,11 @@ impl Vim {
     pub(crate) fn waiting_for_argument(&self) -> bool {
         self.unsupported == Unsupported::AwaitingArgument
     }
+    pub(crate) fn cancel_pending_argument(&mut self) {
+        if self.waiting_for_argument() {
+            self.unsupported = Unsupported::None;
+        }
+    }
     fn await_unsupported_argument(&mut self) -> Outcome {
         self.pending.clear();
         self.unsupported = Unsupported::AwaitingArgument;
@@ -159,7 +164,9 @@ impl Vim {
             }
             return Outcome::Pass;
         }
-        if waiting_for_argument {
+        // Enter can be a replacement argument. Consuming it also prevents
+        // an unsupported prefix from submitting the composer draft.
+        if waiting_for_argument && matches!(key.code, KeyCode::Char(_) | KeyCode::Enter) {
             self.unsupported = Unsupported::Reported;
             return Outcome::Handled;
         }
