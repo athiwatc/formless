@@ -95,7 +95,8 @@ def run_engine(p, engine, url, artifacts):
     page.goto(url)
     page.wait_for_function('!!window.__motion992')
     page.evaluate(r'''() => {
-      const d=__motion992;d.S.view='chat';d.S.current='motion-fixture';d.S.channel={};d.S.daemonOnline=true;
+      const d=__motion992;d.S.view='chat';d.S.current='motion-fixture';d.S.daemonOnline=true;
+      d.S.ws={readyState:1};d.S.channel={local:true};d.S.local=true;
       document.querySelector('#pair').classList.add('hidden');document.querySelector('#app').classList.remove('hidden');
       d.renderAll();
       const samples=document.createElement('div');samples.id='motion-samples';

@@ -106,7 +106,8 @@ def run_engine(p, engine, url, out):
         page.wait_for_function('!!window.__locale1040')
         check(page.locator('html').get_attribute('lang') == ('th' if native.startswith('th') else 'en'), engine+' startup language '+native)
         page.evaluate(r'''stamp=>{
-          const d=__locale1040;d.S.view='chat';d.S.current='locale-fixture';d.S.channel={};d.S.daemonOnline=true;
+          const d=__locale1040;d.S.view='chat';d.S.current='locale-fixture';d.S.daemonOnline=true;
+          d.S.ws={readyState:1};d.S.channel={local:true};d.S.local=true;
           d.S.sessions=[{id:'locale-fixture',name:'Locale fixture',updated_at:stamp}];
           d.S.messages=[{id:'locale-message',seq:1,role:'assistant',content:'Raw source 12345.67',created_at:stamp,meta:'{}'}];
           d.S.notes=[{at:Date.parse(stamp),text:'Locale fixture note',err:false}];
