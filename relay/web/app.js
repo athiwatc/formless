@@ -1477,13 +1477,52 @@
     /~~(?=\S)([\s\S]*?\S)~~/.source, // 5 strike
     /\*(?=[^\s*])((?:\\[\s\S]|[^*\\]|\*\*[^*]+\*\*)*?(?:\\\S|[^\\\s*]))\*/.source, // 6 em
     /(?<![\w\\])_(?=[^\s_])([^_]*?[^\s_])_(?!\w)/.source, // 7 em
-    /!\[([^\]]*)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/.source, // 8,9 image
-    /\[((?:[^\]\\]|\\.)+)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/.source, // 10,11 link
-    /<((?:[hH][tT][tT][pP][sS]?:\/\/|[mM][aA][iI][lL][tT][oO]:)[^>\s]+)>/.source, // 12 autolink
-    /([hH][tT][tT][pP][sS]?:\/\/[^\s<]*[^\s<.,:;"')\]!?*_~])/.source, // 13 bare url
-    /\$(?=\S)([^$\n]*?\S)\$(?!\d)/.source, // 14 math
-    /\\([\\`*_{}\[\]()#+\-.!~|$<>])/.source, // 15 escape
+    /!\[([^\]]*)\]\(/.source, // 8 image label
+    /\[((?:[^\]\\]|\\.)+)\]\(/.source, // 9 link label
+    /<((?:[hH][tT][tT][pP][sS]?:\/\/|[mM][aA][iI][lL][tT][oO]:)[^>\s]+)>/.source, // 10 autolink
+    /([hH][tT][tT][pP][sS]?:\/\/[^\s<]*[^\s<.,:;"'!?*_~])/.source, // 11 bare url
+    /\$(?=\S)([^$\n]*?\S)\$(?!\d)/.source, // 12 math
+    /\\([\\`*_{}\[\]()#+\-.!~|$<>])/.source, // 13 escape
   ].join("|"), "g");
+
+  function inlineDestination(text, start) {
+    let end = start, depth = 0;
+    for (; end < text.length; end++) {
+      const c = text[end], next = text[end + 1];
+      if (/\s/.test(c)) break;
+      if (c === "\\" && next !== undefined && "()\\".includes(next)) {
+        end++;
+      } else if (c === "(") {
+        depth++;
+      } else if (c === ")") {
+        if (depth === 0) break;
+        depth--;
+      }
+    }
+    if (end === start || depth !== 0) return null;
+    const closing = text[end] === ")" ? ")" : /^\s+"[^"]*"\)/.exec(text.slice(end))?.[0];
+    if (!closing) return null;
+    const url = text.slice(start, end).replace(/\\([()\\])/g, "$1");
+    return { url, end: end + closing.length };
+  }
+
+  function bareUrlEnd(url) {
+    let parens = 0, brackets = 0, end = url.length;
+    for (const c of url) {
+      if (c === "(") parens++;
+      else if (c === ")") parens--;
+      else if (c === "[") brackets++;
+      else if (c === "]") brackets--;
+    }
+    for (; end > 0; end--) {
+      const c = url[end - 1];
+      if (c === ")" && parens < 0) parens++;
+      else if (c === "]" && brackets < 0) brackets++;
+      else if (!".,:;\"'!?*_~".includes(c)) break;
+    }
+    return end;
+  }
+
   function link(url, kids) {
     if (!SAFE_URL.test(url)) return kids;
     return h("a", { href: url, target: "_blank", rel: "noopener noreferrer" }, kids);
@@ -1503,14 +1542,31 @@
       else if (m[3] != null || m[4] != null) out.push(h("strong", null, inline(m[3] != null ? m[3] : m[4], depth + 1)));
       else if (m[5] != null) out.push(h("del", null, inline(m[5], depth + 1)));
       else if (m[6] != null || m[7] != null) out.push(h("em", null, inline(m[6] != null ? m[6] : m[7], depth + 1)));
-      // Remote images are blocked by the CSP (img-src 'self' data:), so an
-      // image is shown as a labelled link instead.
-      else if (m[9] != null) out.push(link(m[9], h("span", { class: "img-link" }, "🖼 " + (m[8] || "image"))));
-      else if (m[11] != null) out.push(link(m[11], inline(m[10], depth + 1)));
-      else if (m[12] != null) out.push(link(m[12], m[12].replace(/^mailto:/i, "")));
-      else if (m[13] != null) out.push(link(m[13], m[13]));
-      else if (m[14] != null) out.push(h("span", { class: "math" }, m[14]));
-      else if (m[15] != null) out.push(m[15]);
+      else if (m[8] != null || m[9] != null) {
+        const dest = inlineDestination(text, re.lastIndex);
+        if (!dest) {
+          // Resume after the first literal character of a malformed prefix.
+          out.push(text[m.index]);
+          re.lastIndex = m.index + 1;
+        } else {
+          re.lastIndex = dest.end;
+          // Remote images use a labelled link because of the image CSP.
+          const kids = m[8] != null ? h("span", { class: "img-link" }, "🖼 " + (m[8] || "image"))
+            : inline(m[9], depth + 1);
+          out.push(link(dest.url, kids));
+        }
+      } else if (m[10] != null) out.push(link(m[10], m[10].replace(/^mailto:/i, "")));
+      else if (m[11] != null) {
+        const end = bareUrlEnd(m[11]);
+        if (end > m[11].indexOf("://") + 3) {
+          const url = m[11].slice(0, end);
+          out.push(link(url, url));
+          re.lastIndex = m.index + end;
+        } else {
+          out.push(m[11]);
+        }
+      } else if (m[12] != null) out.push(h("span", { class: "math" }, m[12]));
+      else if (m[13] != null) out.push(m[13]);
       last = re.lastIndex;
     }
     if (last < text.length) out.push(text.slice(last));
