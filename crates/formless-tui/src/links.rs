@@ -2,9 +2,9 @@
 //! chat area are repainted wrapped in OSC 8 hyperlinks, so terminals that
 //! support them make them clickable. Ratatui's cells can't hold the escape
 //! sequences (they'd count toward the width), so the repaint goes straight
-//! to the terminal, and only when the visible links change.
+//! to the terminal when the visible links or their rendered cells change.
 
-use ratatui::buffer::Buffer;
+use ratatui::buffer::{Buffer, Cell};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier};
 use std::io::Write;
@@ -16,6 +16,40 @@ pub struct Painted {
     pub x0: u16,
     pub x1: u16,
     pub url: String,
+}
+
+#[derive(Default)]
+pub struct PaintCache {
+    area: Rect,
+    links: Vec<Painted>,
+    cells: Vec<Cell>,
+}
+
+impl PaintCache {
+    pub fn clear(&mut self) {
+        self.links.clear();
+        self.cells.clear();
+    }
+
+    pub fn update(
+        &mut self,
+        out: &mut impl Write,
+        buf: &Buffer,
+        links: Vec<Painted>,
+    ) -> std::io::Result<()> {
+        let cells = links
+            .iter()
+            .flat_map(|link| (link.x0..=link.x1).map(move |x| &buf[(x, link.y)]));
+        if self.area == buf.area && self.links == links && self.cells.iter().eq(cells.clone()) {
+            return Ok(());
+        }
+        self.clear();
+        paint(out, buf, &links)?;
+        self.area = buf.area;
+        self.cells.extend(cells.cloned());
+        self.links = links;
+        Ok(())
+    }
 }
 
 /// Encode the native absolute file path, including Windows drive/UNC/verbatim
@@ -261,8 +295,20 @@ pub fn scan(
 pub fn paint(out: &mut impl Write, buf: &Buffer, links: &[Painted]) -> std::io::Result<()> {
     use crossterm::style::{
         Attribute, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
+        SetUnderlineColor,
     };
     use crossterm::{cursor, QueueableCommand};
+    const ATTRIBUTES: [(Modifier, Attribute); 9] = [
+        (Modifier::BOLD, Attribute::Bold),
+        (Modifier::DIM, Attribute::Dim),
+        (Modifier::ITALIC, Attribute::Italic),
+        (Modifier::UNDERLINED, Attribute::Underlined),
+        (Modifier::REVERSED, Attribute::Reverse),
+        (Modifier::CROSSED_OUT, Attribute::CrossedOut),
+        (Modifier::HIDDEN, Attribute::Hidden),
+        (Modifier::SLOW_BLINK, Attribute::SlowBlink),
+        (Modifier::RAPID_BLINK, Attribute::RapidBlink),
+    ];
     if links.is_empty() {
         return Ok(());
     }
@@ -273,22 +319,15 @@ pub fn paint(out: &mut impl Write, buf: &Buffer, links: &[Painted]) -> std::io::
         for x in l.x0..=l.x1 {
             let cell = &buf[(x, l.y)];
             out.queue(SetAttribute(Attribute::Reset))?;
-            out.queue(SetForegroundColor(to_ct(cell.fg)))?;
-            out.queue(SetBackgroundColor(to_ct(cell.bg)))?;
-            if cell.modifier.contains(Modifier::BOLD) {
-                out.queue(SetAttribute(Attribute::Bold))?;
+            out.queue(SetForegroundColor(cell.fg.into()))?;
+            out.queue(SetBackgroundColor(cell.bg.into()))?;
+            if cell.underline_color != Color::Reset {
+                out.queue(SetUnderlineColor(cell.underline_color.into()))?;
             }
-            if cell.modifier.contains(Modifier::DIM) {
-                out.queue(SetAttribute(Attribute::Dim))?;
-            }
-            if cell.modifier.contains(Modifier::ITALIC) {
-                out.queue(SetAttribute(Attribute::Italic))?;
-            }
-            if cell.modifier.contains(Modifier::UNDERLINED) {
-                out.queue(SetAttribute(Attribute::Underlined))?;
-            }
-            if cell.modifier.contains(Modifier::REVERSED) {
-                out.queue(SetAttribute(Attribute::Reverse))?;
+            for (modifier, attribute) in ATTRIBUTES {
+                if cell.modifier.contains(modifier) {
+                    out.queue(SetAttribute(attribute))?;
+                }
             }
             out.queue(Print(cell.symbol()))?;
         }
@@ -298,31 +337,6 @@ pub fn paint(out: &mut impl Write, buf: &Buffer, links: &[Painted]) -> std::io::
     out.queue(ResetColor)?;
     out.queue(cursor::RestorePosition)?;
     out.flush()
-}
-
-fn to_ct(c: Color) -> crossterm::style::Color {
-    use crossterm::style::Color as C;
-    match c {
-        Color::Reset => C::Reset,
-        Color::Black => C::Black,
-        Color::Red => C::DarkRed,
-        Color::Green => C::DarkGreen,
-        Color::Yellow => C::DarkYellow,
-        Color::Blue => C::DarkBlue,
-        Color::Magenta => C::DarkMagenta,
-        Color::Cyan => C::DarkCyan,
-        Color::Gray => C::Grey,
-        Color::DarkGray => C::DarkGrey,
-        Color::LightRed => C::Red,
-        Color::LightGreen => C::Green,
-        Color::LightYellow => C::Yellow,
-        Color::LightBlue => C::Blue,
-        Color::LightMagenta => C::Magenta,
-        Color::LightCyan => C::Cyan,
-        Color::White => C::White,
-        Color::Rgb(r, g, b) => C::Rgb { r, g, b },
-        Color::Indexed(i) => C::AnsiValue(i),
-    }
 }
 
 /// Whether to emit OSC 8: `tui.hyperlinks` is "on", "off" or "auto"
@@ -612,5 +626,90 @@ mod tests {
         let s = String::from_utf8(out).unwrap();
         assert!(s.contains("\x1b]8;;https://x.dev\x1b\\"), "{s:?}");
         assert!(s.ends_with("\x1b8") || s.contains("\x1b]8;;\x1b\\"));
+    }
+
+    #[test]
+    fn link_repaints_when_find_restylings_leave_it_in_place() {
+        use ratatui::{style::Style, text::Line};
+
+        let area = Rect::new(0, 0, 36, 1);
+        let mut buf = Buffer::empty(area);
+        let source = Line::raw("https://example.test/repo");
+        buf.set_line(0, 0, &source, area.width);
+        let found = scan(&buf, area, &mut |_| None);
+        assert_eq!(found.len(), 1);
+        let mut cache = PaintCache::default();
+        let mut out = Vec::new();
+        cache.update(&mut out, &buf, found.clone()).unwrap();
+        assert!(!out.is_empty());
+
+        out.clear();
+        buf[(35, 0)].set_fg(Color::Yellow);
+        cache.update(&mut out, &buf, found.clone()).unwrap();
+        assert!(
+            out.is_empty(),
+            "a cell outside the link cannot invalidate it"
+        );
+
+        let (highlighted, count) = crate::highlight_matches(source.clone(), "repo", |_| {
+            Style::default().bg(Color::Yellow)
+        });
+        assert_eq!(count, 1);
+        buf.set_line(0, 0, &highlighted, area.width);
+        assert_eq!(scan(&buf, area, &mut |_| None), found);
+        cache.update(&mut out, &buf, found.clone()).unwrap();
+        let painted = std::str::from_utf8(&out).unwrap();
+        assert!(painted.contains("\x1b]8;;https://example.test/repo\x1b\\"));
+        assert_eq!(painted.contains("\x1b[48;5;3m"), crate::colors_enabled());
+
+        out.clear();
+        buf.reset();
+        buf.set_line(0, 0, &source, area.width);
+        cache.update(&mut out, &buf, found.clone()).unwrap();
+        assert!(
+            !out.is_empty(),
+            "dismissing find restores the unstyled link"
+        );
+
+        out.clear();
+        cache.clear();
+        cache.update(&mut out, &buf, found.clone()).unwrap();
+        assert!(!out.is_empty(), "full redraw invalidates painted links");
+
+        out.clear();
+        buf.resize(Rect::new(0, 0, 38, 1));
+        cache.update(&mut out, &buf, found).unwrap();
+        assert!(!out.is_empty(), "resize invalidates painted links");
+    }
+
+    #[test]
+    fn paint_preserves_strike_hidden_blink_and_underline_color() {
+        use ratatui::style::Style;
+
+        let area = Rect::new(0, 0, 20, 1);
+        let mut buf = Buffer::empty(area);
+        buf.set_string(0, 0, "https://x.test", Style::default());
+        buf[(0, 0)].set_style(
+            Style::default()
+                .underline_color(Color::Indexed(37))
+                .add_modifier(
+                    Modifier::UNDERLINED
+                        | Modifier::CROSSED_OUT
+                        | Modifier::HIDDEN
+                        | Modifier::SLOW_BLINK,
+                ),
+        );
+        buf[(1, 0)].set_style(Style::default().add_modifier(Modifier::RAPID_BLINK));
+        let found = scan(&buf, area, &mut |_| None);
+        let mut out = Vec::new();
+        paint(&mut out, &buf, &found).unwrap();
+        let painted = std::str::from_utf8(&out).unwrap();
+        for attribute in ["\x1b[4m", "\x1b[9m", "\x1b[8m", "\x1b[5m", "\x1b[6m"] {
+            assert!(
+                painted.contains(attribute),
+                "missing {attribute:?} in {painted:?}"
+            );
+        }
+        assert_eq!(painted.contains("\x1b[58;5;37m"), crate::colors_enabled());
     }
 }

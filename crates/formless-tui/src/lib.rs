@@ -1827,7 +1827,6 @@ struct App {
     /// The chat's inner area in the last frame, and the OSC 8 links
     /// painted over it (SPEC §10.2).
     chat_area: Option<Rect>,
-    painted_links: Vec<links::Painted>,
     hyperlinks: bool,
     /// Path words already checked against the filesystem: their
     /// `file://` target when the file exists.
@@ -2153,7 +2152,6 @@ impl App {
             drafts: HashMap::new(),
             target_flash: None,
             chat_area: None,
-            painted_links: Vec::new(),
             path_cache: HashMap::new(),
             image_proto,
             pane_widths: pane_widths(&cfg.tui.pane_widths),
@@ -19057,6 +19055,7 @@ pub fn run_with(paths: Paths, start: Option<&str>) -> Result<()> {
             ))
             .is_ok();
     let mut terminal = Terminal::new(CrosstermBackend::new(out))?;
+    let mut painted_links = links::PaintCache::default();
     let result = (|| -> Result<()> {
         while !app.should_quit {
             app.tick = app.tick.wrapping_add(1);
@@ -19069,7 +19068,7 @@ pub fn run_with(paths: Paths, start: Option<&str>) -> Result<()> {
             let _ = motion_cursor.sync(&mut stdout(), app.animations);
             if std::mem::take(&mut app.force_redraw) {
                 terminal.clear()?;
-                app.painted_links.clear();
+                painted_links.clear();
             }
             if !app.notifications.is_empty() {
                 let mode = Config::load(&app.paths)
@@ -19085,7 +19084,6 @@ pub fn run_with(paths: Paths, start: Option<&str>) -> Result<()> {
             }
             app.chat_area = None;
             let frame = terminal.draw(|f| draw(f, &mut app))?;
-            // Clickable links: repaint them with OSC 8 when they change.
             if let Some(proto) = app.image_proto {
                 if app.image_placed != app.painted_images {
                     if app.painted_images.is_empty() {
@@ -19117,10 +19115,9 @@ pub fn run_with(paths: Paths, start: Option<&str>) -> Result<()> {
                     .chat_area
                     .map(|a| links::scan(frame.buffer, a, &mut resolve))
                     .unwrap_or_default();
-                if found != app.painted_links {
-                    let _ = links::paint(&mut stdout(), frame.buffer, &found);
-                    app.painted_links = found;
-                }
+                let _ = painted_links.update(&mut stdout(), frame.buffer, found);
+            } else {
+                painted_links.clear();
             }
             // Handle everything queued before the next draw, so a burst of
             // scroll events costs one frame, not one frame each.
@@ -19373,7 +19370,6 @@ mod tests {
             drafts: HashMap::new(),
             target_flash: None,
             chat_area: None,
-            painted_links: Vec::new(),
             path_cache: HashMap::new(),
             image_proto: None,
             pane_widths: (22, 26),
