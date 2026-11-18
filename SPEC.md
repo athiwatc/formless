@@ -2153,15 +2153,14 @@ pattern (§4.4).
 ### 7.5 QuickJS runtime and host API
 
 - Engine: QuickJS-NG via `rquickjs`, embedded in-process. Tools are
-  single-file plain JS; the daemon provides the entire API surface (bare JS
-  has no ambient authority of any kind). The surface is deliberately
-  **near-minimal**: it offers only effects JS cannot produce itself.
-  Everything else (URL parsing, base64-to-bytes, hashing, compression,
-  formats) is written by the agent, typically as shared modules.
+  single-file plain JavaScript. QuickJS provides ECMAScript built-ins such
+  as `JSON`. The runtime installs the host APIs listed here. Tools can
+  implement helpers such as URL parsing, hashing and format conversion in
+  shared JavaScript modules.
   - `run(input)` may be `async`; the returned Promise is settled before the
     Invocation ends. A Tool reports failure by **throwing**. A returned
-    object whose `error` field is truthy is recorded as a failure too (§8.1),
-    so swallowed errors cannot inflate the success rate.
+    object whose `error` field is truthy is recorded as a failure too (§8.1)
+    unless the output schema declares an `error` property.
   - Data options take `encoding: "utf8"` (default) or `"base64"`, so any
     binary data crosses the boundary as a string. Text chunks never split a
     UTF-8 character.
@@ -2177,11 +2176,13 @@ pattern (§4.4).
     so the child never blocks), logs at `tools.max_log_bytes`, and `emit`
     at `tools.max_emit_bytes`. Over a cap is a `resource` failure naming
     the setting and the streaming alternative.
-  - `fs.read/write/append` (whole-value), `fs.exists`, `fs.stat` (`{type,
+  - `fs.read` (whole-value), `fs.exists`, `fs.stat` (`{type,
     size, modified_ms}` or null), `fs.list(dir, {details})`, and
     `fs.readChunks(path, size, cb, {encoding})` / `fs.readLines` (streaming)
-    — gated by `fs:read`; `fs.write/append/mkdir/remove/rename` — gated by
-    `fs:write` (both paths for rename). Writes create missing parent dirs.
+    — gated by `fs:read`. `fs.write/append/mkdir/rename` and
+    `fs.remove(path, {recursive})` require `fs:write` (both paths for rename).
+    Writes create missing parent dirs. Removal is recursive when
+    `recursive` is true.
   - `env.get(key)` — gated by `env`. `process.run(cmd, args, {cwd, env,
     stdin, stdinEncoding, encoding, timeout_ms})` → `{code, signal, stdout,
     stderr, timed_out, killed, truncated}` — gated by `process`, no shell,
@@ -2245,20 +2246,32 @@ pattern (§4.4).
     global throttle table. Clients match IDs exactly; legacy ID-less updates may
     match only one unambiguous running call. Progress is ignored in smoke tests,
     replays and dry runs.
-  - `tools.call(name, input)` — composition (§7.6). Returns a Promise of
+  - `tools.call(name, input)` uses the nested Tool checks in §7.6 or
+    `mcp:<server>` for MCP calls (§7.9). It returns a Promise of
     the nested Tool's output, so several run in parallel under
     `Promise.all` (§7.12). Every call must settle before `run` is done: a
     Tool that returns while a call is still pending fails ("await every
     call"), because a forgotten `await` would otherwise pass a Promise off
     as data.
-  - v2: `clipboard.read/write` (gated by `clipboard:*`), `notify(title,
-    body)` (gated by `notify`), `llm.complete(prompt, {system, model})`
-    (gated by `llm`; one non-streaming completion via the daemon's
-    configured provider, with the Session's model and reasoning effort
-    unless `model` is given), `agents.run(task, {system, model})` (gated by
-    `agent`; §7.6 sub-agents), and `requireModule(name)` for shared JS
-    modules (§7.6). In smoke tests these are stubbed; in optimiser
-    replay the side-effecting ones are denied.
+  - `clipboard.read()` and `clipboard.write(text)` require `clipboard:read`
+    and `clipboard:write` respectively. `notify(title, body)` and its alias
+    `notifications.send(title, body)` require `notify` (§7.4).
+  - `harness.read()` requires `harness:read`. `harness.call(op, args, reason)`
+    requires the applicable `harness:<scope>` and uses the approval flow in
+    §7.13.
+  - `llm.complete(prompt, {system, model, role, schema})` uses the `llm`
+    Capability. It makes a non-streaming completion and returns text by
+    default or a validated JSON value with `schema` (§4.2). `agents.run(task,
+    {system, model, role})` uses `agent` and returns the sub-agent's final text
+    (§7.6). In both calls a nonempty `role` takes precedence over `model`.
+    A Role selects its configured provider and model. An explicit model or
+    Role must fit any scope on the Capability (§7.4).
+  - `requireModule(name)` and its alias `modules.load(name)` load shared
+    JavaScript modules. `modules.list()` lists names available to the
+    Invocation. These helpers use the supplied module registry (§7.6) and
+    require no Capability.
+  - `emit(chunk)` appends to the Invocation's output artifact, subject to
+    `tools.max_emit_bytes` (§7.12). It requires no Capability.
   - `store.get(key, {ns})`, `store.set(key, json, {ns})`,
     `store.delete(key, {ns})` and `store.list(prefix, {ns})` keep small
     state between Invocations: caches, cursors, tokens and rate-limit
@@ -2281,8 +2294,9 @@ pattern (§4.4).
     Root functions, symbols and `toJSON` methods returning `undefined` are
     rejected rather than silently becoming null; an absent `run` return
     deliberately becomes null. A result's `toJSON` is invoked only once.
-  - `console`, timers, `JSON`, `cryptoRandom()` (UUID), `randomBytes(n)`
-    (base64). Nothing else.
+  - `console.log/info/warn/error` write capped Invocation logs. `sleep(ms)`,
+    `setTimeout`, `clearTimeout`, `setInterval`, `clearInterval`,
+    `cryptoRandom()` (UUID) and `randomBytes(n)` (base64) require no Capability.
 
     `sleep(ms)` and `randomBytes(n)` require finite non-negative safe-integer
     numbers. Invalid inputs throw; requests over `tools.max_sleep_secs` or
@@ -2333,7 +2347,7 @@ pattern (§4.4).
     roll back), used by, code, "Edit code" and "Delete". Delete warns,
     naming the Tools that load it.
 - Sub-agents (v2; v2.2 makes them a Capability only): a Tool with the
-  `agent` Capability calls `agents.run(task, {system, model})` to run a
+  `agent` Capability calls `agents.run(task, {system, model, role})` to run a
   sub-agent — its own provider loop over the same Tools, with no step
   limit (it ends on a final answer, a fault or cancellation) — and
   receives only its final text. There is no sub-agent built-in, so

@@ -3534,6 +3534,70 @@ mod tests {
     }
 
     #[test]
+    fn quickjs_prelude_installs_the_documented_globals() {
+        let runtime = Runtime::new().unwrap();
+        let context = Context::full(&runtime).unwrap();
+        context.with(|ctx| {
+            let names = || -> Vec<String> {
+                let json: String = ctx
+                    .eval("JSON.stringify(Reflect.ownKeys(globalThis).map(String))")
+                    .unwrap();
+                serde_json::from_str(&json).unwrap()
+            };
+            let before = names();
+            ctx.eval::<(), _>(PRELUDE).unwrap();
+            let mut installed = names();
+            installed.retain(|key| !before.contains(key));
+            installed.sort();
+
+            // Keep the public additions in sync with SPEC §7.5 and the
+            // bootstrap's host_api_doc. The __ names are internal helpers.
+            assert_eq!(
+                installed,
+                [
+                    "__addTimer",
+                    "__call",
+                    "__fmt",
+                    "__formatValue",
+                    "__moduleCache",
+                    "__nonnegativeSafeInteger",
+                    "__processReq",
+                    "__progressLabel",
+                    "__req",
+                    "__res",
+                    "__runTimers",
+                    "__settleCall",
+                    "agents",
+                    "clearInterval",
+                    "clearTimeout",
+                    "clipboard",
+                    "console",
+                    "cryptoRandom",
+                    "emit",
+                    "env",
+                    "fetch",
+                    "fetchChunks",
+                    "fs",
+                    "harness",
+                    "llm",
+                    "modules",
+                    "notifications",
+                    "notify",
+                    "process",
+                    "progress",
+                    "randomBytes",
+                    "requireModule",
+                    "setInterval",
+                    "setTimeout",
+                    "sleep",
+                    "store",
+                    "tools",
+                ]
+            );
+        });
+    }
+
+    #[test]
     fn progress_label_json_bridge_preserves_codepoints_within_utf16_budget() {
         // Evaluate only the host prelude with a recording JSON bridge. No Tool
         // source, Run, host dispatch or progress scheduler is started.
