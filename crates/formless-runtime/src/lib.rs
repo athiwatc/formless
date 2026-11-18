@@ -190,6 +190,14 @@ impl FetchTimeouts {
             total_ms: FETCH_TIMEOUT_MS.load(Ordering::Relaxed),
         }
     }
+
+    fn settings(self) -> String {
+        format!(
+            "tools.fetch_connect_timeout_secs={}s, tools.fetch_timeout_secs={}s",
+            self.connect_ms as f64 / 1_000.0,
+            self.total_ms as f64 / 1_000.0
+        )
+    }
 }
 
 /// Set the native caps: `tools.max_read_bytes`,
@@ -1039,11 +1047,7 @@ fn fetch_error(
     };
     let mut message = format!("{kind}: {}", parts.join(": "));
     if timeout || connect {
-        message.push_str(&format!(
-            " ({phase}, configured tools.fetch_connect_timeout_secs={}s, tools.fetch_timeout_secs={}s)",
-            timeouts.connect_ms as f64 / 1_000.0,
-            timeouts.total_ms as f64 / 1_000.0
-        ));
+        message.push_str(&format!(" ({phase}, configured {})", timeouts.settings()));
     }
     message
 }
@@ -1053,7 +1057,10 @@ fn fetch_error(
 /// Like reqwest's own policy: 303 (and 301/302 after a POST) become a
 /// bodiless GET, and credentials are not sent on to another host.
 fn send_request(req: FetchRequest) -> Result<reqwest::blocking::Response, String> {
-    send_request_with_resolver(req, &dns::resolve)
+    let timeouts = req.timeouts;
+    send_request_with_resolver(req, &|host, port, deadline| {
+        dns::resolve(host, port, deadline, timeouts)
+    })
 }
 
 fn send_request_with_resolver(
@@ -3571,7 +3578,7 @@ mod tests {
             url,
             scope,
             std::time::Instant::now() + std::time::Duration::from_secs(2),
-            &dns::resolve,
+            &|host, port, deadline| dns::resolve(host, port, deadline, FetchTimeouts::configured()),
         )
     }
 
