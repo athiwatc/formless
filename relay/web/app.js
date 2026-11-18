@@ -1524,15 +1524,21 @@
   const JS_IDENT_CONTINUE = /[\p{ID_Continue}$\u200c\u200d]/u;
   const JS_LINE_END = /[\n\r\u2028\u2029]/;
 
-  function jsRegexEnd(code, start, comments, lang) {
-    if ((lang === "jsx" || lang === "tsx") && code[start - 1] === "<") {
-      const closingTag = /(?:[\p{ID_Start}_$][\p{ID_Continue}$.:-]*)?\s*>/uy;
-      closingTag.lastIndex = start + 1;
-      if (closingTag.test(code)) return start;
-    }
+  function jsxClosingTagEnd(code, start) {
+    const closingTag = /(?:[\p{ID_Start}_$][\p{ID_Continue}$.:-]*)?\s*>/uy;
+    closingTag.lastIndex = start + 1;
+    if (!closingTag.test(code)) return start;
+    const end = closingTag.lastIndex;
+    // After a JSX tag, division needs a right operand. A member dot
+    // or expression terminator instead permits a regex comparison.
+    const regexSuffix = /^[dgimsuvy]*(?:\.(?![0-9])|\s*(?:[;,)\]}]|$))/;
+    return code[end] === "/" && regexSuffix.test(code.slice(end + 1)) ? start : end;
+  }
+
+  function jsRegexEnd(code, start, state, lang) {
     const tokenEnd = (at) => {
       while (at > 0) {
-        const commentStart = comments.get(at);
+        const commentStart = state.comments.get(at);
         if (commentStart !== undefined) at = commentStart;
         else if (/\s/.test(code[at - 1])) at--;
         else break;
@@ -1542,7 +1548,7 @@
     const before = tokenEnd(start);
     const last = code[before - 1];
     // A closing brace or postfix operator can end a division operand.
-    if (last === "}" || code.slice(Math.max(0, before - 2), before) === "++" ||
+    if (before === state.jsxTagEnd || last === "}" || code.slice(Math.max(0, before - 2), before) === "++" ||
         code.slice(Math.max(0, before - 2), before) === "--") return start;
     let keyword = "";
     if (before > 0 && !"=(,:[!&|?{;+-*%<>~^".includes(last)) {
@@ -1568,8 +1574,12 @@
       else if (c === "/" && !inClass) {
         // A guessed closer after a contextual identifier can instead open
         // a real comment after the first divisor.
-        if (contextual && (code[end + 1] === "/" ||
-            (code[end + 1] === "*" && code.indexOf("*/", end + 2) >= 0))) return start;
+        if (contextual) {
+          const adjacentComment = code.startsWith("//", end + 1) ||
+            (code.startsWith("/*", end + 1) && code.indexOf("*/", end + 3) >= 0);
+          if (!adjacentComment && (code[end + 1] === "/" ||
+              (code[end + 1] === "*" && code.indexOf("*/", end + 2) >= 0))) return start;
+        }
         end++;
         while (end < code.length && /[a-z]/i.test(code[end])) {
           if (!"dgimsuvy".includes(code[end])) return start;
@@ -1631,7 +1641,7 @@
     const L = HL[HL_ALIAS[lang] || lang];
     if (!L) return null;
     const kotlin = lang === "kotlin" || lang === "kt";
-    const jsComments = L === HL.js ? new Map() : null;
+    const js = L === HL.js ? { comments: new Map(), jsxTagEnd: -1 } : null;
     const out = [];
     let plain = "";
     const tok = (cls, s) => {
@@ -1657,7 +1667,7 @@
       if (L.bc && code.startsWith(L.bc[0], i)) {
         const end = code.indexOf(L.bc[1], i + L.bc[0].length);
         const stop = end < 0 ? code.length : end + L.bc[1].length;
-        jsComments?.set(stop, i);
+        js?.comments.set(stop, i);
         tok("tok-com", code.slice(i, stop));
         i = stop;
         continue;
@@ -1665,7 +1675,7 @@
       if ((L.lc || []).some((p) => code.startsWith(p, i)) && (c !== "#" || L.hashAnywhere || i === 0 || /\s/.test(code[i - 1]))) {
         const end = code.indexOf("\n", i);
         const stop = end < 0 ? code.length : end;
-        jsComments?.set(stop, i);
+        js?.comments.set(stop, i);
         tok("tok-com", code.slice(i, stop));
         i = stop;
         continue;
@@ -1711,12 +1721,17 @@
         i += number.length;
         continue;
       }
-      if (c === "/" && jsComments) {
-        const stop = jsRegexEnd(code, i, jsComments, lang);
-        if (stop !== i) {
-          tok("tok-str", code.slice(i, stop));
-          i = stop;
-          continue;
+      if (c === "/" && js) {
+        const tag = (lang === "jsx" || lang === "tsx") && code[i - 1] === "<"
+          ? jsxClosingTagEnd(code, i) : i;
+        if (tag !== i) js.jsxTagEnd = tag;
+        else {
+          const stop = jsRegexEnd(code, i, js, lang);
+          if (stop !== i) {
+            tok("tok-str", code.slice(i, stop));
+            i = stop;
+            continue;
+          }
         }
       }
       if (L.tags && c === "<") {
