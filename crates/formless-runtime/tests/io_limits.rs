@@ -138,3 +138,53 @@ fn reads_output_and_logs_stop_at_their_caps() {
     assert!(logged.logs.last().unwrap().starts_with("[log limit"));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn dry_run_effects_share_log_budget_on_success_and_error() {
+    formless_runtime::set_io_limits(1_000, 2_000, 300);
+    for after_logging in [
+        "return store.get('fixture');",
+        "throw new Error('fixture failure');",
+    ] {
+        let req = ExecRequest {
+            output_schema: None,
+            code: format!(
+                r#"function run() {{
+                    console.log('é'.repeat(100));
+                    store.set('fixture', 10);
+                    console.warn('x'.repeat(70));
+                    console.error('small later line');
+                    for (let i = 0; i < 5; i++) store.set('fixture', i);
+                    {after_logging}
+                }}"#,
+            ),
+            input: json!({}),
+            caps: Capabilities::parse(&["store".into()]).unwrap(),
+            memory_mb: 64,
+            mode: HostMode::DryRun,
+            cancel: Arc::new(AtomicBool::new(false)),
+            overlay: None,
+            activity: None,
+            modules: Arc::new(Vec::new()),
+        };
+        let logs = match execute(&req, Arc::new(NoHostOps)) {
+            Ok(outcome) => {
+                assert!(after_logging.starts_with("return"));
+                assert_eq!(outcome.output, 4);
+                outcome.logs
+            }
+            Err(error) => {
+                assert!(error.message.contains("fixture failure"), "{error}");
+                error.logs
+            }
+        };
+        assert_eq!(
+            logs,
+            [
+                "é".repeat(100),
+                "[dry run] would store fixture = 10".into(),
+                "[log limit of 300 bytes reached (tools.max_log_bytes); later lines dropped] [dry run] 5 further would-be effects omitted".into(),
+            ],
+        );
+    }
+}
