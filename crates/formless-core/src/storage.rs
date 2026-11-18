@@ -16,9 +16,8 @@ mod job_schedule_tests;
 #[path = "pin_batch_tests.rs"]
 mod pin_batch_tests;
 
-/// Token use for one key and model: (key, model, prompt, completion,
-/// cached, provider-reported USD when every request reported one).
-/// (key, provider, model, prompt, completion, cached, cache-write, reported cost).
+/// A usage bucket's key, provider, model, prompt, completion, cache read and
+/// write tokens, reported cost, and whether the cost is explicitly unknown.
 pub type GroupedUsage = (
     String,
     String,
@@ -6199,28 +6198,56 @@ impl Store {
     }
 
     /// Token use since `since` grouped by `by` ("model", "provider",
-    /// "purpose", "role", "session", else the UTC day), then by provider
-    /// and model for pricing.
+    /// "purpose", "role", the immutable "session" ID, else the UTC day),
+    /// then by provider and model for pricing.
     pub fn usage_grouped(&self, since: Option<&str>, by: &str) -> Result<Vec<GroupedUsage>> {
+        self.query_usage_groups(since, by, |usage, _| usage)
+    }
+
+    pub(crate) fn usage_grouped_with_labels(
+        &self,
+        since: Option<&str>,
+        by: &str,
+    ) -> Result<Vec<(GroupedUsage, Option<String>)>> {
+        self.query_usage_groups(since, by, |usage, label| (usage, label))
+    }
+
+    fn query_usage_groups<T>(
+        &self,
+        since: Option<&str>,
+        by: &str,
+        project: impl Fn(GroupedUsage, Option<String>) -> T,
+    ) -> Result<Vec<T>> {
         let key = match by {
             "model" => "u.model",
             "provider" => "CASE u.provider WHEN '' THEN 'default' ELSE u.provider END",
             "purpose" => "u.source",
-            "session" => "COALESCE(s.name, u.session_id)",
+            "session" => "u.session_id",
             "role" => "COALESCE((SELECT t.role FROM task_stats t WHERE t.run_id=u.run_id LIMIT 1), 'main')",
             _ => "substr(u.created_at, 1, 10)",
+        };
+        let (label, join, order) = if by == "session" {
+            (
+                "COALESCE(s.name, u.session_id)",
+                "LEFT JOIN sessions s ON s.id=u.session_id",
+                // Keep alphabetical labels on token-count ties. The ID
+                // makes buckets with an identical label stay contiguous.
+                "10, 1",
+            )
+        } else {
+            ("NULL", "", "1")
         };
         let mut stmt = self.ps(&format!(
             "SELECT {key}, u.provider, u.model, SUM(u.prompt_tokens), SUM(u.completion_tokens),
                SUM(u.cached_tokens), SUM(u.cache_write_tokens),
-               CASE WHEN COUNT(u.cost)=COUNT(*) THEN SUM(u.cost) END, MAX(u.cost_unknown)
-             FROM run_usage u LEFT JOIN sessions s ON s.id=u.session_id
+               CASE WHEN COUNT(u.cost)=COUNT(*) THEN SUM(u.cost) END, MAX(u.cost_unknown), {label}
+             FROM run_usage u {join}
              WHERE ?1 IS NULL OR u.created_at >= ?1
-             GROUP BY 1, 2, 3, (u.cost IS NULL), u.cost_unknown ORDER BY 1"
+             GROUP BY 1, 2, 3, (u.cost IS NULL), u.cost_unknown ORDER BY {order}"
         ))?;
         let rows = stmt
             .query_map(params![since], |r| {
-                Ok((
+                let usage = (
                     r.get(0)?,
                     r.get(1)?,
                     r.get(2)?,
@@ -6230,9 +6257,10 @@ impl Store {
                     r.get(6)?,
                     r.get(7)?,
                     r.get(8)?,
-                ))
+                );
+                Ok(project(usage, r.get(9)?))
             })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+            .collect::<rusqlite::Result<_>>()?;
         Ok(rows)
     }
 
