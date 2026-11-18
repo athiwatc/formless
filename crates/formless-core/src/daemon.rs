@@ -700,6 +700,7 @@ type SendKey = (Option<u64>, String, String);
 enum SendReceiptKind {
     Legacy,
     Reviewed,
+    ReviewedSteer,
 }
 type SendOutcome = std::result::Result<Value, CachedSendFailure>;
 #[derive(Clone, Debug)]
@@ -2317,21 +2318,39 @@ impl Daemon {
                 expected_attachments,
                 client_msg_id,
             } => {
-                if client_msg_id.is_empty()
-                    || client_msg_id.len() > 256
-                    || client_msg_id.chars().any(char::is_control)
-                {
-                    return Err(RequestFailure::invalid(
-                        "a bounded nonempty reviewed-send action identity is required",
-                    )
-                    .into());
-                }
+                reviewed_send::validate_key(&client_msg_id)?;
                 self.send_message_once(
                     session_id,
                     content,
                     mode,
                     Some(client_msg_id),
-                    Some(expected_attachments),
+                    Some(reviewed_send::Review {
+                        expected_attachments,
+                        run_id: None,
+                    }),
+                )
+                .await
+            }
+            Request::SendReviewedSteer {
+                session_id,
+                run_id,
+                content,
+                expected_attachments,
+                client_msg_id,
+            } => {
+                reviewed_send::validate_key(&client_msg_id)?;
+                if !formless_protocol::valid_reviewed_run_id(&run_id) {
+                    return Err(RequestFailure::invalid("invalid reviewed Run identity").into());
+                }
+                self.send_message_once(
+                    session_id,
+                    content,
+                    SendMode::Steer,
+                    Some(client_msg_id),
+                    Some(reviewed_send::Review {
+                        expected_attachments,
+                        run_id: Some(run_id),
+                    }),
                 )
                 .await
             }
@@ -2833,23 +2852,20 @@ impl Daemon {
                 Ok(json!({ "disconnected": true }))
             }
             Request::ListPendingAttachments { session_id } => {
-                if session_id.is_empty()
-                    || session_id.len() > 256
-                    || session_id.chars().any(char::is_control)
-                {
-                    return Err(anyhow::Error::new(RequestFailure::invalid(
-                        "invalid Session identity",
-                    )));
-                }
-                self.with_reader(|st| {
-                    st.read_transaction(|st| {
-                        st.get_session(&session_id)?
-                            .filter(|_| !st.session_deleted(&session_id).unwrap_or(true))
-                            .context(RequestFailure::not_found("session not found"))?;
-                        let attachments = st.pending_attachment_inventory(&session_id)?;
-                        Ok(json!({"session_id":session_id,"attachments":attachments}))
-                    })
-                })
+                let attachments = reviewed_send::inventory(self, &session_id)?;
+                Ok(json!({"session_id":session_id,"attachments":attachments}))
+            }
+            Request::ReadSteerReview { session_id } => {
+                let _admission = self.forecast_admission.locked();
+                let run_id = self
+                    .runs
+                    .locked()
+                    .get(&session_id)
+                    .and_then(reviewed_send::steerable_run_id)
+                    .map(str::to_string)
+                    .context(RequestFailure::busy("Session has no steerable Run"))?;
+                let attachments = reviewed_send::inventory(self, &session_id)?;
+                Ok(json!({"session_id":session_id,"run_id":run_id,"attachments":attachments}))
             }
             Request::DetachReviewedReference {
                 session_id,
@@ -5124,7 +5140,7 @@ impl Daemon {
         content: String,
         mode: SendMode,
         client_msg_id: Option<String>,
-        review: Option<Vec<Value>>,
+        review: Option<reviewed_send::Review>,
     ) -> Result<Value> {
         let Some(key) = client_msg_id else {
             return self
@@ -5135,10 +5151,10 @@ impl Daemon {
         // Legacy and reviewed operations must never replay one another's ACK.
         let key = (
             (who.as_ref().map(|(conn, _)| *conn), session_id.clone(), key),
-            if review.is_some() {
-                SendReceiptKind::Reviewed
-            } else {
-                SendReceiptKind::Legacy
+            match &review {
+                Some(review) if review.run_id.is_some() => SendReceiptKind::ReviewedSteer,
+                Some(_) => SendReceiptKind::Reviewed,
+                None => SendReceiptKind::Legacy,
             },
         );
         // Claim before executing. A concurrent duplicate gets the same
@@ -5227,10 +5243,10 @@ impl Daemon {
         session_id: String,
         content: String,
         mode: SendMode,
-        review: Option<Vec<Value>>,
+        review: Option<reviewed_send::Review>,
     ) -> Result<Value> {
-        if let Some(expected) = &review {
-            reviewed_send::validate(&session_id, expected)?;
+        if let Some(review) = &review {
+            reviewed_send::validate(&session_id, &review.expected_attachments)?;
             if mode == SendMode::Queue {
                 return Err(RequestFailure::invalid(
                     "reviewed attachment sending does not support Queue; nothing was queued",
@@ -5245,7 +5261,12 @@ impl Daemon {
         let control = self.runs.locked().get(&session_id).cloned();
         // A Run can start or finish after the client confirms. Classify under
         // the same admission lock as the ensuing append and Run admission.
-        if review.is_some() {
+        if let Some(review) = &review {
+            if let Some(expected_run) = &review.run_id {
+                if control.as_ref().map(|run| &run.run_id) != Some(expected_run) {
+                    return Err(RequestFailure::busy("Reviewed Run is no longer active").into());
+                }
+            }
             let mismatch = match (mode, control.is_some()) {
                 (SendMode::Send, true) => Some("Session became active. Review a Steer instead."),
                 (SendMode::Steer, false) => Some("Session became idle. Review a new Send instead."),
@@ -5273,13 +5294,16 @@ impl Daemon {
             self.queue_changed(&session_id);
             return Ok(json!({"queued":true}));
         }
+        let expected = review
+            .as_ref()
+            .map(|review| review.expected_attachments.as_slice());
         match control {
             Some(control) => {
                 let step = self
                     .with_reader(|st| st.run_steps(&control.run_id))
                     .unwrap_or(0);
                 let extra = Some(("steer", json!({"step":step,"run_id":control.run_id})));
-                let msg = if let Some(expected) = review.as_deref() {
+                let msg = if let Some(expected) = expected {
                     self.with_store(|st| {
                         st.transaction(|st| {
                             reviewed_send::check(st, &session_id, Some(expected))?;
@@ -5307,7 +5331,7 @@ impl Daemon {
                 };
                 let (msg, run_id, admission) = self.with_store(|st| {
                     st.transaction(|st| {
-                        reviewed_send::check(st, &session_id, review.as_deref())?;
+                        reviewed_send::check(st, &session_id, expected)?;
                         let forecast = self.consented_forecast(st, &cfg, &input)?;
                         #[cfg(test)]
                         if let Some(hook) = self.forecast_admission_test.locked().clone() {
@@ -14818,6 +14842,7 @@ impl Daemon {
                     let session = match &env.request {
                         Request::SendMessage { session_id, .. }
                         | Request::SendReviewedMessage { session_id, .. }
+                        | Request::SendReviewedSteer { session_id, .. }
                         | Request::StartPipelineRun { session_id, .. } => Some(session_id.as_str()),
                         _ => None,
                     };
@@ -14831,6 +14856,7 @@ impl Daemon {
                         &env.request,
                         Request::SendMessage { .. }
                             | Request::SendReviewedMessage { .. }
+                            | Request::SendReviewedSteer { .. }
                             | Request::StartPipelineRun { .. }
                     ) {
                         if cut.is_some_and(|at| at > arrived) {

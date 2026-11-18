@@ -201,7 +201,7 @@ impl Drop for Attempt {
 // request handler just to obtain the existing canonical snapshot.
 impl Daemon {
     pub(super) fn transcript_snapshot(&self, id: String) -> Result<Value> {
-        let (session, messages, queued, last, latest_run, last_recap, running) =
+        let (session, messages, queued, last, latest_run, last_recap, running, steerable_run_id) =
             self.with_store(|st| {
                 st.read_transaction(|st| {
                     let s = st
@@ -223,9 +223,13 @@ impl Daemon {
                     if let Some(hook) = self.session_snapshot_test.locked().clone() {
                         hook();
                     }
-                    let running =
-                        self.runs.locked().contains_key(&id) || self.session_is_publishing(&id);
-                    Ok((s, m, q, l, latest, last_recap, running))
+                    let runs = self.runs.locked();
+                    let control = runs.get(&id);
+                    let running = control.is_some() || self.session_is_publishing(&id);
+                    let steerable_run_id = control
+                        .and_then(reviewed_send::steerable_run_id)
+                        .map(str::to_string);
+                    Ok((s, m, q, l, latest, last_recap, running, steerable_run_id))
                 })
             })?;
         // An unfinished last Run (interrupted/paused) gets a banner
@@ -238,7 +242,7 @@ impl Daemon {
         let (queued, (plan, plan_state)) = queued;
         let texts: Vec<&str> = queued.iter().map(|q| q.content.as_str()).collect();
         Ok(
-            json!({"session": session, "messages": messages, "queued": texts, "queued_items": queued, "plan": plan, "plan_state": plan_state, "last_recap": last_recap, "step_mode": self.step_sessions.locked().contains(&id), "unfinished_run": last_run, "running": running,
+            json!({"session": session, "messages": messages, "queued": texts, "queued_items": queued, "plan": plan, "plan_state": plan_state, "last_recap": last_recap, "step_mode": self.step_sessions.locked().contains(&id), "unfinished_run": last_run, "running": running, "steerable_run_id": steerable_run_id,
                 "latest_run": latest_run, "pending_events": self.pending_attention.locked().clone(), "pending_steps": self.pending_steps_snapshot(&id) }),
         )
     }

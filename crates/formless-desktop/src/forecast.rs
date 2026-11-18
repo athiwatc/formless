@@ -30,6 +30,11 @@ impl Prepared {
     pub fn summary(&self) -> Vec<String> {
         let mut lines = summary(&self.quote);
         if let Some(report) = &self.attachments {
+            if self.label == "Steer" {
+                if let Some(run_id) = report.steer_run_id() {
+                    lines.push(format!("Target Run: {run_id}. If this Run ends or is replaced, the message is refused."));
+                }
+            }
             lines.push(format!("Pending files: {}. Confirmation sends the complete metadata below with this exact draft. A changed inventory is rejected atomically.",report.rows.len()));
             lines.push("Private paths and draft text are included in Copy details. Referenced file contents can change even when metadata matches. Queue is unavailable; use Formless TUI for deferred messages.".into());
             lines.push(format!(

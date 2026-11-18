@@ -48,8 +48,16 @@ The preview client requires `reviewed_send_mode_v1` alongside the inventory and
 reviewed-send capabilities. Older peers can still be used for other supported
 workflows. They receive no native Send or Steer preparation or mutation from
 this client. The matching Core rejects a reviewed Send if the Session has become
-active and rejects a reviewed Steer if it has become idle. This prevents changing
-the confirmed mode after review. Exact Run identity binding remains open.
+active and rejects a reviewed Steer if it has become idle. This prevents changing the confirmed mode after review.
+
+Exact Steer additionally requires `reviewed_steer_run_v1`. The Session snapshot
+supplies a live `steerable_run_id`, and `ReadSteerReview` returns the current Run
+and bounded pending metadata. The client compares those identities before
+requesting a forecast and displays the target Run in the confirmation and copied
+details. Navigation, connection replacement, observed status changes and a
+snapshot with a different Run retire the review. `SendReviewedSteer` carries the
+exact Run and inventory. Core rejects a replacement even when metadata is
+unchanged. The client requires the same Run ID in the success reply.
 
 ## Ownership and uncertain outcomes
 

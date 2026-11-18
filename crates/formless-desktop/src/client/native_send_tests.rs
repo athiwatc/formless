@@ -23,6 +23,7 @@ fn intent(mode: SendMode) -> Intent {
 fn review(e: &mut Engine) {
     e.command(Command::Review {
         intent: intent(SendMode::Send),
+        expected_run_id: None,
         draft_basis: "exact ไทย😀".into(),
         epoch: e.epoch,
     });
@@ -60,6 +61,7 @@ fn native_send_requires_exact_draft_active_session_capabilities_and_rejects_raw_
     assert!(e.outgoing.is_empty());
     e.command(Command::Review {
         intent: intent(SendMode::Queue),
+        expected_run_id: None,
         draft_basis: "exact ไทย😀".into(),
         epoch: e.epoch,
     });
@@ -75,6 +77,7 @@ fn native_send_requires_exact_draft_active_session_capabilities_and_rejects_raw_
         }
         e.command(Command::Review {
             intent: intent(SendMode::Send),
+            expected_run_id: None,
             draft_basis: basis,
             epoch: 7,
         });
@@ -91,6 +94,7 @@ fn native_send_never_truncates_an_over_limit_draft_to_make_it_reviewable() {
             content: content.clone(),
             mode: SendMode::Send,
         },
+        expected_run_id: None,
         draft_basis: content,
         epoch: e.epoch,
     });
@@ -266,4 +270,47 @@ fn native_send_requires_a_matching_well_formed_run_receipt_to_clear_unknown() {
     assert!(send_review::acknowledged(SendMode::Steer, &steered));
     assert!(!send_review::acknowledged(SendMode::Send, &steered));
     assert!(!send_review::acknowledged(SendMode::Queue, &steered));
+}
+
+#[test]
+fn native_steer_rejects_missing_capability_snapshot_identity_and_replacement_before_forecast() {
+    for (feature, expected_run, reviewed_run, available) in [
+        (false, Some("run-a"), Some("run-a"), false),
+        (true, None, Some("run-a"), false),
+        (true, Some("run-a"), None, false),
+        (true, Some("run-a"), Some("run-b"), false),
+        (true, Some("run-a"), Some("run-a"), true),
+    ] {
+        let mut e = engine();
+        e.reviewed_steer_run_available = feature;
+        e.command(Command::Review {
+            intent: intent(SendMode::Steer),
+            expected_run_id: expected_run.map(str::to_string),
+            draft_basis: "exact ไทย😀".into(),
+            epoch: e.epoch,
+        });
+        if feature && expected_run.is_some() {
+            let request = e.outgoing.pop_front().unwrap();
+            assert!(
+                matches!(&request.request, Request::ReadSteerReview { session_id } if session_id == "a")
+            );
+            let mut report = inventory();
+            if let Some(run_id) = reviewed_run {
+                report["run_id"] = json!(run_id);
+            }
+            reply(&mut e, request.id, report);
+        }
+        if available {
+            assert!(matches!(
+                e.outgoing.pop_front().unwrap().request,
+                Request::ForecastRun { .. }
+            ));
+        } else {
+            assert!(e.outgoing.is_empty());
+            assert!(e
+                .updates
+                .iter()
+                .any(|u| matches!(u, Update::PreparationFailed { .. })));
+        }
+    }
 }

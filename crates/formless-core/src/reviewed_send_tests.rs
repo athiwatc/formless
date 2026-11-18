@@ -281,6 +281,72 @@ async fn reviewed_send_rejects_both_run_state_changes_before_any_write() {
 }
 
 #[tokio::test]
+async fn reviewed_send_exact_steer_refuses_replacement_and_separates_legacy_receipts() {
+    let _env = crate::credential_env::EnvGuard::isolated();
+    let f = Fixture::new();
+    f.add(&record("same-inventory"));
+    let expected = f.read();
+    let inspect = || Request::ReadSteerReview {
+        session_id: f.sid.clone(),
+    };
+    let snapshot = || Request::GetSession { id: f.sid.clone() };
+    let review = f.daemon.handle(inspect()).await.unwrap();
+    assert_eq!(review["session_id"], f.sid);
+    assert_eq!(review["attachments"], json!(expected));
+    let old_run = review["run_id"].as_str().unwrap();
+    assert_eq!(
+        f.daemon.handle(snapshot()).await.unwrap()["steerable_run_id"],
+        old_run
+    );
+    f.daemon.runs.locked().get_mut(&f.sid).unwrap().run_id = "replacement-run".into();
+    let replacement = f.daemon.handle(inspect()).await.unwrap();
+    assert_eq!(replacement["run_id"], "replacement-run");
+    assert_eq!(replacement["attachments"], review["attachments"]);
+    let steer = |run: &str, key: &str| Request::SendReviewedSteer {
+        session_id: f.sid.clone(),
+        run_id: run.into(),
+        content: "bound message ไทย".into(),
+        expected_attachments: expected.clone(),
+        client_msg_id: key.into(),
+    };
+    let error = f.daemon.handle(steer(old_run, "stale")).await.unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("Reviewed Run is no longer active"));
+    f.untouched(&expected);
+    // A v1 failure under this same key cannot supply the bound RPC's receipt.
+    assert!(f
+        .daemon
+        .handle(f.request("shared-key", Vec::new()))
+        .await
+        .is_err());
+    let receipt = f
+        .daemon
+        .handle(steer("replacement-run", "shared-key"))
+        .await
+        .unwrap();
+    assert_eq!(receipt, json!({"steered":true,"run_id":"replacement-run"}));
+    assert_eq!(
+        f.daemon
+            .handle(steer("replacement-run", "shared-key"))
+            .await
+            .unwrap(),
+        receipt
+    );
+    let messages = f.daemon.with_reader(|st| st.list_messages(&f.sid)).unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].content, "bound message ไทย");
+    let metadata: Value = serde_json::from_str(messages[0].meta.as_deref().unwrap()).unwrap();
+    assert_eq!(metadata["attachments"], json!(expected));
+    assert_eq!(metadata["steer"]["run_id"], "replacement-run");
+    assert!(f.read().is_empty());
+    f.daemon.close_run_steering(&f.sid, "replacement-run");
+    assert!(f.daemon.handle(inspect()).await.is_err());
+    assert!(f.daemon.handle(snapshot()).await.unwrap()["steerable_run_id"].is_null());
+    f.finish().await;
+}
+
+#[tokio::test]
 async fn reviewed_send_never_replays_a_legacy_send_ack_with_the_same_key() {
     let _env = crate::credential_env::EnvGuard::isolated();
     let f = Fixture::new();

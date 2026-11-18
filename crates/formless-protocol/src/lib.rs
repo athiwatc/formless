@@ -22,6 +22,17 @@ pub const MIN_PROTOCOL_VERSION: u32 = 1;
 
 /// A reviewed Send requires idle state and a reviewed Steer requires an active Run.
 pub const REVIEWED_SEND_MODE_FEATURE: &str = "reviewed_send_mode_v1";
+/// A Steer review identifies one active Run and dispatch checks that identity.
+pub const REVIEWED_STEER_RUN_FEATURE: &str = "reviewed_steer_run_v1";
+
+/// Run IDs displayed and sent by the exact Steer review use a bounded ASCII form.
+pub fn valid_reviewed_run_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 256
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
 
 /// Named optional capabilities, advertised by `Ping` and `Status`.
 pub const FEATURES: &[&str] = &[
@@ -38,6 +49,7 @@ pub const FEATURES: &[&str] = &[
     "pending_attachment_inventory_v1",
     "reviewed_attachment_send_v1",
     REVIEWED_SEND_MODE_FEATURE,
+    REVIEWED_STEER_RUN_FEATURE,
     "reviewed_reference_detach_v1",
     "session_model_compare_set_v1",
 ];
@@ -1979,6 +1991,16 @@ pub enum Request {
         /// Required per-action key; same connection-local retention as SendMessage.
         client_msg_id: String,
     },
+    /// Steer one exact Run using the complete ordered inventory from its review.
+    /// Replies with `{steered:true,run_id}`. Replacements, closed Runs and
+    /// changed inventory reject. Callers must not substitute another send RPC.
+    SendReviewedSteer {
+        session_id: String,
+        run_id: String,
+        content: String,
+        expected_attachments: Vec<serde_json::Value>,
+        client_msg_id: String,
+    },
     /// Start an idle Session with immutable Run-only pipeline options. Older
     /// daemons must reject this request; clients never silently drop policy.
     StartPipelineRun {
@@ -2361,6 +2383,11 @@ pub enum Request {
     /// Overflow/corrupt metadata is an error, never a partial or empty success.
     /// Reads no attachment bytes and mutates/consumes nothing.
     ListPendingAttachments {
+        session_id: String,
+    },
+    /// Read the current steerable Run and complete pending attachment metadata.
+    /// Returns `{session_id,run_id,attachments}` without consuming anything.
+    ReadSteerReview {
         session_id: String,
     },
     /// Remove exactly one reviewed pending reference by its position in the
@@ -4031,6 +4058,30 @@ mod reviewed_attachment_send_tests {
             assert!(serde_json::from_value::<Request>(missing).is_err());
         }
         assert!(FEATURES.contains(&"reviewed_attachment_send_v1"));
+        assert_eq!(PROTOCOL_VERSION, 1);
+    }
+    #[test]
+    fn exact_steer_requires_run_id_and_separate_optional_operations() {
+        let value = serde_json::json!({"type":"send_reviewed_steer","session_id":"s","run_id":"run-a","content":"exact","expected_attachments":[],"client_msg_id":"one"});
+        let request = serde_json::from_value::<Request>(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(request).unwrap(), value);
+        for field in ["run_id", "expected_attachments", "client_msg_id"] {
+            let mut missing = value.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<Request>(missing).is_err());
+        }
+        let read = Request::ReadSteerReview {
+            session_id: "s".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(read).unwrap(),
+            serde_json::json!({"type":"read_steer_review","session_id":"s"})
+        );
+        assert!(valid_reviewed_run_id("run-a"));
+        for invalid in ["", "a b", "a\n", "a\u{202e}", &"a".repeat(257)] {
+            assert!(!valid_reviewed_run_id(invalid));
+        }
+        assert!(FEATURES.contains(&REVIEWED_STEER_RUN_FEATURE));
         assert_eq!(PROTOCOL_VERSION, 1);
     }
 }

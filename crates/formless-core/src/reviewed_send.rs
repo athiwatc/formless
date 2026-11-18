@@ -1,10 +1,50 @@
 //! Metadata compare-and-append boundary. No file paths or bodies are opened here.
 use super::*;
 
-pub(super) fn validate(session: &str, expected: &[Value]) -> Result<()> {
+pub(super) struct Review {
+    pub(super) expected_attachments: Vec<Value>,
+    pub(super) run_id: Option<String>,
+}
+
+pub(super) fn steerable_run_id(control: &RunCtl) -> Option<&str> {
+    (control.steering.accepts()
+        && !control.cancel.is_cancelled()
+        && !control.cancel_flag.load(Ordering::SeqCst)
+        && formless_protocol::valid_reviewed_run_id(&control.run_id))
+    .then_some(&control.run_id)
+}
+
+pub(super) fn validate_key(key: &str) -> Result<()> {
+    if key.is_empty() || key.len() > 256 || key.chars().any(char::is_control) {
+        return Err(RequestFailure::invalid(
+            "a bounded nonempty reviewed-send action identity is required",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn validate_session(session: &str) -> Result<()> {
     if session.is_empty() || session.len() > 256 || session.chars().any(char::is_control) {
         return Err(RequestFailure::invalid("invalid Session identity").into());
     }
+    Ok(())
+}
+
+pub(super) fn inventory(daemon: &Daemon, session: &str) -> Result<Vec<Value>> {
+    validate_session(session)?;
+    daemon.with_reader(|st| {
+        st.read_transaction(|st| {
+            st.get_session(session)?
+                .filter(|_| !st.session_deleted(session).unwrap_or(true))
+                .context(RequestFailure::not_found("session not found"))?;
+            st.pending_attachment_inventory(session)
+        })
+    })
+}
+
+pub(super) fn validate(session: &str, expected: &[Value]) -> Result<()> {
+    validate_session(session)?;
     if expected.len() > PENDING_ATTACHMENT_MAX_ENTRIES || expected.iter().any(|v| !v.is_object()) {
         return Err(RequestFailure::invalid(
             "reviewed attachment metadata exceeds bounds or is invalid",

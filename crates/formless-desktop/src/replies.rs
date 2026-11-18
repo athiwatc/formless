@@ -75,6 +75,8 @@ pub struct SessionSnapshot {
     pub step_mode: Option<bool>,
     /// Whether a Run is in progress, as the daemon says at reply time.
     pub running: bool,
+    /// Live target sampled with the running flag. Older peers may omit it.
+    pub steerable_run_id: Option<String>,
     /// Recovery state sampled by the daemon, never inferred from an old badge.
     pub unfinished_run: Option<UnfinishedRun>,
     /// The timeline, in sequence order; each block's id is its message's
@@ -163,6 +165,10 @@ pub fn session_snapshot(
         });
     }
     let running: bool = field(result, "running", "running")?;
+    let steerable_run_id = result["steerable_run_id"]
+        .as_str()
+        .filter(|id| running && formless_protocol::valid_reviewed_run_id(id))
+        .map(str::to_string);
     let unfinished_run: Option<UnfinishedRun> = result
         .get("unfinished_run")
         .filter(|value| !value.is_null())
@@ -197,6 +203,7 @@ pub fn session_snapshot(
         step_mode: result.get("step_mode").and_then(serde_json::Value::as_bool),
         session_id,
         running,
+        steerable_run_id,
         unfinished_run,
         blocks,
         hidden,

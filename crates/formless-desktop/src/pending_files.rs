@@ -105,6 +105,11 @@ impl Report {
             .expect("validated inventory")
             .clone()
     }
+    pub fn steer_run_id(&self) -> Option<&str> {
+        self.raw["run_id"]
+            .as_str()
+            .filter(|id| formless_protocol::valid_reviewed_run_id(id))
+    }
     pub fn session_id(&self) -> &str {
         self.raw["session_id"]
             .as_str()

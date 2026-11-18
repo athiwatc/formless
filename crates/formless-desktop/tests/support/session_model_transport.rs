@@ -117,6 +117,7 @@ async fn session_model_lost_ack_reconnect_and_explicit_unchanged_save_never_repe
                 content: "draft remains unsent".into(),
                 mode: formless_protocol::SendMode::Send,
             },
+            expected_run_id: None,
             draft_basis: "draft remains unsent".into(),
             epoch: client.epoch(),
         })

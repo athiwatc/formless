@@ -144,3 +144,78 @@ fn native_send_foreign_profile_or_inventory_cannot_commit_or_cancel_a_newer_revi
         assert!(s.update(cx, |s, _| s.take_client_commands()).is_empty());
     });
 }
+
+#[gpui_kit::test]
+fn native_steer_presents_the_snapshot_run_and_retires_review_on_replacement(
+    cx: &mut TestAppContext,
+) {
+    let (h, s) = setup(cx);
+    let set_run = |run_id: &str, w: &mut Window, cx: &mut App| {
+        s.update(cx, |shell, cx| {
+            let generation = shell.client_generation();
+            let id = shell.sidebar().active_id().unwrap().to_string();
+            let value =
+                json!({"session":{"id":id},"messages":[],"running":true,"steerable_run_id":run_id});
+            shell.apply_client_update(
+                Update::Snapshot {
+                    generation,
+                    snapshot: replies::session_snapshot(&id, &value).unwrap(),
+                },
+                w,
+                cx,
+            );
+        });
+        settle_frames(w, cx);
+    };
+    let mut p = step(cx, h, |w, cx| {
+        set_run("run-a", w, cx);
+        w.click("composer-primary", cx);
+        let commands = s.update(cx, |shell, _| shell.take_client_commands());
+        assert!(matches!(commands.as_slice(), [Wire::Review {
+            intent: formless_desktop::model::Intent::SendMessage { mode: SendMode::Steer, .. },
+            expected_run_id: Some(id), ..
+        }] if id == "run-a"));
+        daemon_quote(&s, cx, false)
+    });
+    p.label = "Steer";
+    p.attachments = Some(
+        Report::decode(
+            &p.session_id,
+            json!({"session_id":p.session_id,"run_id":"run-a","attachments":[]}),
+        )
+        .unwrap(),
+    );
+    let prepared_id = p.id;
+    let target_line = p
+        .summary()
+        .iter()
+        .position(|line| line.contains("Target Run: run-a"))
+        .unwrap();
+    present(h, &s, cx, p);
+    step(cx, h, |w, cx| {
+        assert!(s.read(cx).send_review_open());
+        assert!(w
+            .find(format!("forecast-detail-{target_line}"))
+            .value()
+            .unwrap()
+            .contains("Target Run: run-a"));
+        set_run("run-b", w, cx);
+        assert!(!s.read(cx).send_review_open());
+        let epoch = s.read(cx).client_epoch().unwrap();
+        s.update(cx, |shell, cx| {
+            shell.apply_client_update(
+                Update::PreparationReady {
+                    id: prepared_id,
+                    epoch,
+                },
+                w,
+                cx,
+            )
+        });
+        assert!(s
+            .update(cx, |shell, _| shell.take_client_commands())
+            .iter()
+            .all(|c| !matches!(c, Wire::CommitPrepared(_))));
+        assert_eq!(s.read(cx).draft(cx).as_ref(), "exact native ไทย😀");
+    });
+}

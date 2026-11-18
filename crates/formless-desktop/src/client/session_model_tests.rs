@@ -142,6 +142,7 @@ fn session_model_pending_read_and_write_block_new_forecasts_and_work_but_not_sto
         };
         e.command(Command::Review {
             intent: intent.clone(),
+            expected_run_id: None,
             draft_basis: "kept draft".into(),
             epoch: 3,
         });

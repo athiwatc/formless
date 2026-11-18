@@ -757,6 +757,7 @@ pub struct Shell {
     client_step_mode: Option<bool>,
     client_steps: crate::steps::Inventory,
     client_recovery: Option<crate::replies::UnfinishedRun>,
+    client_steerable_run_id: Option<String>,
     client_sessions: Vec<SessionInfo>,
     forecast: Option<ForecastDialog>,
     forecast_composing: bool,
@@ -1011,6 +1012,7 @@ impl Shell {
             client_step_mode: None,
             client_steps: Default::default(),
             client_recovery: None,
+            client_steerable_run_id: None,
             client_sessions: Vec::new(),
             forecast: None,
             forecast_composing: false,
@@ -1759,7 +1761,8 @@ impl Shell {
             if intent.starts_work() {
                 let draft = self.draft(cx).to_string();
                 if let Some(client) = &self.client {
-                    if let Err(error) = client.review(intent, draft) {
+                    let run_id = self.client_steerable_run_id.clone();
+                    if let Err(error) = client.review_for_run(intent, draft, run_id) {
                         self.composer_notice = Some(format!("{error} Draft kept.").into());
                     }
                 }
@@ -1869,6 +1872,7 @@ impl Shell {
         self.mode_observed = Default::default();
         self.client_connected = false;
         self.client_snapshot_ready = false;
+        self.client_steerable_run_id = None;
         self.client_status = "Connecting to the local Daemon Core…".into();
         self.client_attention = false;
         self.client_questions = crate::questions::State::default();
@@ -1994,6 +1998,10 @@ impl Shell {
                 "Send" | "Steer" => prepared.attachments.as_ref().is_some_and(|report| {
                     report.session_id() == prepared.session_id
                         && prepared.draft_basis.len() <= forecast::MAX_REVIEW_DRAFT_BYTES
+                        && (prepared.label == "Send"
+                            || report.steer_run_id().is_some_and(|run_id| {
+                                self.client_steerable_run_id.as_deref() == Some(run_id)
+                            }))
                 }),
                 _ => false,
             }
@@ -2063,6 +2071,7 @@ impl Shell {
             .retire("Session changed. Read recorded usage explicitly for the open Session.");
         self.invalidate_forecast(cx);
         self.client_snapshot_ready = false;
+        self.client_steerable_run_id = None;
         self.client_recovery = None;
         self.client_steps = Default::default();
         self.client_step_mode = None;
@@ -2156,6 +2165,12 @@ impl Shell {
         self.client_steps = snapshot.steps.clone();
         self.client_step_mode = snapshot.step_mode;
         self.client_recovery = snapshot.unfinished_run.take();
+        if self.client_steerable_run_id.is_some()
+            && self.client_steerable_run_id != snapshot.steerable_run_id
+        {
+            self.invalidate_forecast(cx);
+        }
+        self.client_steerable_run_id = snapshot.steerable_run_id.take();
         if !self.client_snapshot_ready {
             self.client_status =
                 "Connected · canonical messages · live token streaming unavailable".into();
@@ -2252,6 +2267,7 @@ impl Shell {
                         self.settle(window, cx);
                     }
                     self.client_snapshot_ready = false;
+                    self.client_steerable_run_id = None;
                     self.sidebar
                         .replace(&self.client_sessions, &HashSet::new(), false);
                     self.rebuild_directory(cx);
@@ -2435,6 +2451,7 @@ impl Shell {
                     return;
                 }
                 self.client_snapshot_ready = false;
+                self.client_steerable_run_id = None;
                 self.client_recovery = None;
                 self.client_steps = Default::default();
                 self.client_step_mode = None;
@@ -2477,6 +2494,7 @@ impl Shell {
                     return;
                 }
                 self.client_snapshot_ready = false;
+                self.client_steerable_run_id = None;
                 self.client_steps = Default::default();
                 self.client_step_mode = None;
                 self.sidebar.set_run_state(&session_id, RunState::Unknown);

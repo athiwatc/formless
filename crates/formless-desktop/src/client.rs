@@ -242,6 +242,7 @@ pub enum Command {
     Intent(Intent),
     Review {
         intent: Intent,
+        expected_run_id: Option<String>,
         draft_basis: String,
         epoch: u64,
     },
@@ -667,8 +668,18 @@ impl Client {
     }
 
     pub fn review(&self, intent: Intent, draft_basis: String) -> Result<(), &'static str> {
+        self.review_for_run(intent, draft_basis, None)
+    }
+
+    pub(crate) fn review_for_run(
+        &self,
+        intent: Intent,
+        draft_basis: String,
+        expected_run_id: Option<String>,
+    ) -> Result<(), &'static str> {
         self.send(Command::Review {
             intent,
+            expected_run_id,
             draft_basis,
             epoch: self.epoch(),
         })
@@ -870,6 +881,7 @@ struct Preparation {
     client: uuid::Uuid,
     connection: u64,
     attachments: Option<crate::pending_files::Report>,
+    expected_run_id: Option<String>,
     id: uuid::Uuid,
     epoch: u64,
     generation: u64,
@@ -899,6 +911,7 @@ struct Engine {
     reference_detach_available: bool,
     session_model_cas_available: bool,
     reviewed_send_available: bool,
+    reviewed_steer_run_available: bool,
     instance: uuid::Uuid,
     reader: reader::Reader,
     stream_epoch: u64,
@@ -1956,6 +1969,7 @@ impl Engine {
             }
             Command::Review {
                 intent,
+                expected_run_id,
                 draft_basis,
                 epoch,
             } if self.ready => {
@@ -1979,6 +1993,19 @@ impl Engine {
                         self.updates.push(Update::PreparationFailed{id:uuid::Uuid::new_v4(),epoch,error:"This daemon does not support reviewed pending files and Send/Steer mode checks. Update the daemon or use Formless TUI".into()});
                         return;
                     }
+                    if *mode == formless_protocol::SendMode::Steer
+                        && (!self.reviewed_steer_run_available
+                            || !expected_run_id
+                                .as_deref()
+                                .is_some_and(formless_protocol::valid_reviewed_run_id))
+                    {
+                        self.updates.push(Update::PreparationFailed {
+                            id: uuid::Uuid::new_v4(),
+                            epoch,
+                            error: "Steer needs a current Run identity and a matching daemon. Refresh the Session or use Formless TUI. Draft kept.".into(),
+                        });
+                        return;
+                    }
                     if *mode == formless_protocol::SendMode::Queue
                         || content != &draft_basis
                         || content.trim().is_empty()
@@ -1992,6 +2019,15 @@ impl Engine {
                     client: self.instance,
                     connection: self.connection,
                     attachments: None,
+                    expected_run_id: expected_run_id.filter(|_| {
+                        matches!(
+                            intent,
+                            Intent::SendMessage {
+                                mode: formless_protocol::SendMode::Steer,
+                                ..
+                            }
+                        )
+                    }),
                     id: uuid::Uuid::new_v4(),
                     epoch,
                     generation: self.generation,
@@ -2313,6 +2349,12 @@ impl Engine {
                         ]
                         .iter()
                         .all(|required| features.iter().any(|feature| feature == required))
+                    });
+                self.reviewed_steer_run_available =
+                    result["features"].as_array().is_some_and(|features| {
+                        features
+                            .iter()
+                            .any(|feature| feature == formless_protocol::REVIEWED_STEER_RUN_FEATURE)
                     });
                 self.reader.available = result["features"].as_array().is_some_and(|features| {
                     features
@@ -3449,7 +3491,9 @@ mod tests {
             engine.command(Command::CommitPrepared(id));
             assert!(!engine.outgoing.iter().any(|r| matches!(
                 r.request,
-                Request::SendMessage { .. } | Request::SendReviewedMessage { .. }
+                Request::SendMessage { .. }
+                    | Request::SendReviewedMessage { .. }
+                    | Request::SendReviewedSteer { .. }
             )));
             assert_eq!(engine.stream_epoch, stream_epoch);
         }
@@ -3461,6 +3505,7 @@ mod tests {
                 content: "draft".into(),
                 mode: SendMode::Steer,
             },
+            expected_run_id: Some("run".into()),
             draft_basis: "draft".into(),
             epoch: engine.epoch,
         });
@@ -3487,18 +3532,16 @@ mod tests {
                 content: "keep exact draft ไทย".into(),
                 mode: SendMode::Steer,
             },
+            expected_run_id: Some("run".into()),
             draft_basis: "keep exact draft ไทย".into(),
             epoch: engine.epoch,
         });
         let inventory = engine.outgoing.pop_back().unwrap();
-        assert!(matches!(
-            inventory.request,
-            Request::ListPendingAttachments { .. }
-        ));
+        assert!(matches!(inventory.request, Request::ReadSteerReview { .. }));
         respond(
             engine,
             inventory.id,
-            json!({"session_id":"a","attachments":[]}),
+            json!({"session_id":"a","run_id":"run","attachments":[]}),
         );
         let request = engine.outgoing.pop_back().unwrap();
         assert!(matches!(
@@ -3554,7 +3597,7 @@ mod tests {
                 "duplicate commits must not replay"
             );
             assert!(
-                matches!(&engine.outgoing[0].request, Request::SendReviewedMessage { content, mode: SendMode::Steer, .. } if content == "keep exact draft ไทย")
+                matches!(&engine.outgoing[0].request, Request::SendReviewedSteer { content, run_id, .. } if content == "keep exact draft ไทย" && run_id == "run")
             );
         }
     }
@@ -3577,7 +3620,9 @@ mod tests {
             engine.command(Command::CommitPrepared(id));
             assert!(!engine.outgoing.iter().any(|request| matches!(
                 request.request,
-                Request::SendMessage { .. } | Request::SendReviewedMessage { .. }
+                Request::SendMessage { .. }
+                    | Request::SendReviewedMessage { .. }
+                    | Request::SendReviewedSteer { .. }
             )));
             assert!(!engine
                 .updates
@@ -3602,6 +3647,7 @@ mod tests {
             intent: Intent::ResumeRun {
                 session_id: "a".into(),
             },
+            expected_run_id: None,
             draft_basis: "retained".into(),
             epoch: 0,
         });
@@ -3645,6 +3691,7 @@ mod tests {
                 intent: Intent::ResumeRun {
                     session_id: "a".into()
                 },
+                expected_run_id: None,
                 draft_basis: String::new(),
                 epoch: 0
             },
@@ -3705,7 +3752,7 @@ mod tests {
         respond(
             &mut engine,
             ping.id,
-            json!({"min_protocol":1,"max_protocol":1,"features":["pending_attachment_inventory_v1","reviewed_attachment_send_v1","reviewed_send_mode_v1"]}),
+            json!({"min_protocol":1,"max_protocol":1,"features":["pending_attachment_inventory_v1","reviewed_attachment_send_v1","reviewed_send_mode_v1","reviewed_steer_run_v1"]}),
         );
         let subscribe = engine.outgoing.pop_front().unwrap();
         assert!(matches!(
@@ -4578,13 +4625,7 @@ mod tests {
         engine.command(Command::CommitPrepared(id));
         assert_eq!(engine.outgoing.len(), 1);
         let request = engine.outgoing.pop_front().unwrap();
-        assert!(matches!(
-            request.request,
-            Request::SendReviewedMessage {
-                mode: SendMode::Steer,
-                ..
-            }
-        ));
+        assert!(matches!(request.request, Request::SendReviewedSteer { .. }));
         engine.command(Command::Intent(Intent::InterruptRun {
             session_id: "a".into(),
         }));
@@ -4705,14 +4746,17 @@ mod tests {
     }
 
     async fn disconnect_after_unacknowledged_send() -> Retained {
-        let retained = scripted_reviewed_send_response(None).await;
+        let retained = scripted_reviewed_send_response(SendMode::Send, None).await;
         assert!(retained
             .uncertain
             .iter()
             .any(|action| action.session_id == "a"));
         retained
     }
-    async fn scripted_reviewed_send_response(ack: Option<Result<Value, String>>) -> Retained {
+    async fn scripted_reviewed_send_response(
+        mode: SendMode,
+        ack: Option<Result<Value, String>>,
+    ) -> Retained {
         let (stream, server) = tokio::io::duplex(8192);
         let (command_tx, mut commands) = queue::channel(QUEUE);
         let _keep_commands_open = command_tx.clone();
@@ -4743,7 +4787,7 @@ mod tests {
                 let request: RequestEnvelope = serde_json::from_str(&line).unwrap();
                 let result = match request.request {
                     Request::Ping => {
-                        json!({"min_protocol":1,"max_protocol":1,"features":["pending_attachment_inventory_v1","reviewed_attachment_send_v1","reviewed_send_mode_v1"]})
+                        json!({"min_protocol":1,"max_protocol":1,"features":["pending_attachment_inventory_v1","reviewed_attachment_send_v1","reviewed_send_mode_v1","reviewed_steer_run_v1"]})
                     }
                     Request::Subscribe { deltas, .. } => {
                         assert!(!deltas);
@@ -4756,8 +4800,9 @@ mod tests {
                                 intent: Intent::SendMessage {
                                     session_id: "a".into(),
                                     content: "one action".into(),
-                                    mode: SendMode::Send,
+                                    mode,
                                 },
+                                expected_run_id: (mode == SendMode::Steer).then(|| "run-a".into()),
                                 draft_basis: "one action".into(),
                                 epoch: 0,
                             })
@@ -4768,11 +4813,31 @@ mod tests {
                     Request::ListPendingAttachments { session_id } => {
                         serde_json::json!({"session_id":session_id,"attachments":[]})
                     }
+                    Request::ReadSteerReview { session_id } => {
+                        assert_eq!(mode, SendMode::Steer);
+                        json!({"session_id":session_id,"run_id":"run-a","attachments":[]})
+                    }
                     Request::ForecastRun { .. } => {
                         serde_json::to_value(crate::fixture::run_forecast("a", false)).unwrap()
                     }
-                    Request::SendReviewedMessage { client_msg_id, .. } => {
-                        assert!(!client_msg_id.is_empty());
+                    request @ (Request::SendReviewedMessage { .. }
+                    | Request::SendReviewedSteer { .. }) => {
+                        match request {
+                            Request::SendReviewedMessage {
+                                client_msg_id,
+                                mode: SendMode::Send,
+                                ..
+                            } if mode == SendMode::Send => assert!(!client_msg_id.is_empty()),
+                            Request::SendReviewedSteer {
+                                client_msg_id,
+                                run_id,
+                                ..
+                            } if mode == SendMode::Steer => {
+                                assert_eq!(run_id, "run-a");
+                                assert!(!client_msg_id.is_empty());
+                            }
+                            other => panic!("incorrect reviewed write {other:?}"),
+                        }
                         if let Some(ack) = ack {
                             let reply = match ack {
                                 Ok(value) => ServerMessage::ok(request.id, value),
@@ -4829,7 +4894,7 @@ mod tests {
             (Some(Ok(json!({"steered":true,"run_id":"r"}))), false),
             (Some(Ok(json!({"started":true,"run_id":"r"}))), true),
         ] {
-            let retained = scripted_reviewed_send_response(response).await;
+            let retained = scripted_reviewed_send_response(SendMode::Send, response).await;
             assert_eq!(retained.uncertain.len(), usize::from(!accepted));
             let mut engine = ready();
             engine.active = Some("a".into());
@@ -4841,6 +4906,7 @@ mod tests {
                             content: "one action".into(),
                             mode: SendMode::Send
                         },
+                        expected_run_id: None,
                         draft_basis: "one action".into(),
                         epoch: engine.epoch
                     },
@@ -4848,6 +4914,15 @@ mod tests {
                 ),
                 !accepted
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn reviewed_steer_requires_the_matching_run_receipt_to_clear_unknown() {
+        for (run_id, accepted) in [("replacement", false), ("run-a", true)] {
+            let ack = Ok(json!({"steered":true,"run_id":run_id}));
+            let retained = scripted_reviewed_send_response(SendMode::Steer, Some(ack)).await;
+            assert_eq!(retained.uncertain.len(), usize::from(!accepted));
         }
     }
 

@@ -213,6 +213,7 @@ async fn reference_framed_lost_failed_and_malformed_receipts_keep_unknown_and_ex
                         content: "kept".into(),
                         mode: formless_protocol::SendMode::Send
                     },
+                    expected_run_id: None,
                     draft_basis: "kept".into(),
                     epoch: 0
                 },
@@ -402,6 +403,7 @@ async fn reconnect_keeps_reference_unknown(retained: &mut Retained, original: &R
                 intent: Intent::ResumeRun {
                     session_id: a.session_id,
                 },
+                expected_run_id: None,
                 draft_basis: "kept".into(),
                 epoch: 0,
             })

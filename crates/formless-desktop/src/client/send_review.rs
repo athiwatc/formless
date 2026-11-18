@@ -25,21 +25,25 @@ pub(super) fn acknowledged(mode: formless_protocol::SendMode, value: &Value) -> 
 impl Preparation {
     pub(super) fn acknowledges_reviewed_send(&self, value: &Value) -> bool {
         matches!(&self.intent, Intent::SendMessage { mode, .. } if acknowledged(*mode, value))
+            && self
+                .expected_run_id
+                .as_deref()
+                .is_none_or(|run_id| value["run_id"].as_str() == Some(run_id))
     }
 }
 
 impl Engine {
     pub(super) fn start_send_review(&mut self, work: Box<Preparation>) {
-        if matches!(work.intent, Intent::SendMessage { .. }) {
-            self.request(
-                Request::ListPendingAttachments {
-                    session_id: work.intent.session_id().into(),
-                },
-                Pending::SendInventory(work),
-            );
-        } else {
-            self.request_send_forecast(work);
-        }
+        let session_id = work.intent.session_id().into();
+        let request = match &work.intent {
+            Intent::SendMessage {
+                mode: formless_protocol::SendMode::Steer,
+                ..
+            } => Request::ReadSteerReview { session_id },
+            Intent::SendMessage { .. } => Request::ListPendingAttachments { session_id },
+            _ => return self.request_send_forecast(work),
+        };
+        self.request(request, Pending::SendInventory(work));
     }
     fn request_send_forecast(&mut self, work: Box<Preparation>) {
         self.request(
@@ -58,11 +62,27 @@ impl Engine {
         if !work.current(self) {
             return;
         }
-        match result.and_then(|v| crate::pending_files::Report::decode(work.intent.session_id(),v)) {
-            Ok(report) => {work.attachments=Some(report); self.request_send_forecast(work);}
-            Err(_) => self.updates.push(Update::PreparationFailed {id:work.id,epoch:work.epoch,error:"Complete pending-file metadata is unavailable, unsupported or above bounds. Nothing was sent. Update the daemon or use Formless TUI; no legacy Send fallback was attempted".into()}),
+        let result = result.and_then(|value| {
+            crate::pending_files::Report::decode(work.intent.session_id(), value)
+        });
+        match result {
+            Ok(report) if work.expected_run_id.as_deref().is_none_or(|id| report.steer_run_id() == Some(id)) => {
+                work.attachments = Some(report);
+                self.request_send_forecast(work);
+            }
+            Ok(_) => self.updates.push(Update::PreparationFailed {
+                id: work.id,
+                epoch: work.epoch,
+                error: "The Run changed before review. Refresh the Session before steering. Draft kept.".into(),
+            }),
+            Err(_) => self.updates.push(Update::PreparationFailed {
+                id: work.id,
+                epoch: work.epoch,
+                error: "Complete pending-file metadata or the reviewed Run is unavailable. Refresh the Session, update the daemon, or use Formless TUI. Draft kept.".into(),
+            }),
         }
     }
+
     pub(super) fn commit_reviewed_send(&mut self, work: Box<Preparation>) {
         let Intent::SendMessage {
             session_id,
@@ -79,17 +99,34 @@ impl Engine {
         else {
             return;
         };
-        if *mode == formless_protocol::SendMode::Queue {
-            return;
-        }
-        self.request(
-            Request::SendReviewedMessage {
+        let request = match mode {
+            formless_protocol::SendMode::Send => Request::SendReviewedMessage {
                 session_id: session_id.clone(),
                 content: content.clone(),
                 mode: *mode,
                 expected_attachments: report.expected(),
                 client_msg_id: work.id.to_string(),
             },
+            formless_protocol::SendMode::Steer => {
+                let Some(run_id) = work
+                    .expected_run_id
+                    .as_deref()
+                    .filter(|id| report.steer_run_id() == Some(*id))
+                else {
+                    return;
+                };
+                Request::SendReviewedSteer {
+                    session_id: session_id.clone(),
+                    run_id: run_id.into(),
+                    content: content.clone(),
+                    expected_attachments: report.expected(),
+                    client_msg_id: work.id.to_string(),
+                }
+            }
+            formless_protocol::SendMode::Queue => return,
+        };
+        self.request(
+            request,
             Pending::ReviewedAction {
                 action: Action {
                     id: work.id,
