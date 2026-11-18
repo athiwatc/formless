@@ -13,6 +13,10 @@ use std::io::Write;
 use std::ops::Range;
 use unicode_width::UnicodeWidthStr;
 
+const CLOSE_LINK: &str = "\x1b]8;;\x1b\\";
+// Terminate a partial control string before closing the current hyperlink.
+const RECOVER_LINK: &str = "\x1b\\\x1b]8;;\x1b\\";
+
 /// One visible link: row, first and last column, and its target.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Painted {
@@ -37,6 +41,19 @@ impl PaintCache {
         self.cells.clear();
         self.covered.clear();
         self.retry = false;
+    }
+
+    pub fn recover_terminal(&self, out: &mut impl Write) -> std::io::Result<()> {
+        if self.retry {
+            use crossterm::style::{Attribute, Print, ResetColor, SetAttribute};
+            use crossterm::QueueableCommand;
+            // A previous write error can also block best-effort closure.
+            out.queue(Print(RECOVER_LINK))?;
+            out.queue(SetAttribute(Attribute::Reset))?;
+            out.queue(ResetColor)?;
+            out.flush()?;
+        }
+        Ok(())
     }
 
     pub fn update(
@@ -395,7 +412,6 @@ fn paint(
 ) -> std::io::Result<()> {
     use crossterm::style::{Attribute, Print, ResetColor, SetAttribute};
     use crossterm::{cursor, QueueableCommand};
-    const CLOSE_LINK: &str = "\x1b]8;;\x1b\\";
     if links.is_empty() && plain.is_empty() {
         return Ok(());
     }
@@ -428,7 +444,7 @@ fn paint(
     })();
     if result.is_err() {
         // Best effort before the next frame writes unrelated cells.
-        let _ = out.queue(Print(CLOSE_LINK));
+        let _ = out.queue(Print(RECOVER_LINK));
         let _ = out.queue(SetAttribute(Attribute::Reset));
         let _ = out.queue(ResetColor);
         let _ = out.queue(cursor::RestorePosition);
@@ -942,7 +958,7 @@ mod tests {
     struct FailAfter {
         bytes: Vec<u8>,
         suffix: &'static [u8],
-        failed: bool,
+        failures_left: usize,
     }
 
     impl FailAfter {
@@ -950,15 +966,15 @@ mod tests {
             Self {
                 bytes: Vec::new(),
                 suffix,
-                failed: false,
+                failures_left: 1,
             }
         }
     }
 
     impl Write for FailAfter {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            if !self.failed && self.bytes.ends_with(self.suffix) {
-                self.failed = true;
+            if self.failures_left > 0 && self.bytes.ends_with(self.suffix) {
+                self.failures_left -= 1;
                 return Err(std::io::ErrorKind::BrokenPipe.into());
             }
             self.bytes.write(bytes)
@@ -1010,5 +1026,34 @@ mod tests {
         out.clear();
         cache.update(&mut out, &buf, Vec::new()).unwrap();
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn recovers_before_any_new_frame_when_the_emergency_close_also_fails() {
+        let area = Rect::new(0, 0, 20, 1);
+        let mut buf = Buffer::empty(area);
+        buf.set_string(0, 0, "https://x.test", ratatui::style::Style::default());
+        let found = scan(&buf, area, &mut |_| None);
+        let mut cache = PaintCache::default();
+        let mut out = FailAfter::new(b"h");
+        out.failures_left = 2;
+        assert!(cache.update(&mut out, &buf, found).is_err());
+        assert_eq!(out.failures_left, 0);
+        assert!(!std::str::from_utf8(&out.bytes)
+            .unwrap()
+            .contains(CLOSE_LINK));
+
+        let mut recovering = FailAfter::new(b"");
+        assert!(cache.recover_terminal(&mut recovering).is_err());
+        assert!(recovering.bytes.is_empty());
+        cache.recover_terminal(&mut recovering).unwrap();
+        assert!(recovering.bytes.starts_with(RECOVER_LINK.as_bytes()));
+
+        let mut plain = Vec::new();
+        cache.update(&mut plain, &buf, Vec::new()).unwrap();
+        assert!(plain.starts_with(b"\x1b7\x1b]8;;\x1b\\"));
+        plain.clear();
+        cache.recover_terminal(&mut plain).unwrap();
+        assert!(plain.is_empty());
     }
 }

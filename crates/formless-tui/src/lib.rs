@@ -19058,6 +19058,7 @@ pub fn run_with(paths: Paths, start: Option<&str>) -> Result<()> {
     let mut painted_links = links::PaintCache::default();
     let result = (|| -> Result<()> {
         while !app.should_quit {
+            painted_links.recover_terminal(&mut stdout())?;
             app.tick = app.tick.wrapping_add(1);
             app.drain_daemon();
             app.user_commands_tick();
@@ -19104,8 +19105,11 @@ pub fn run_with(paths: Paths, start: Option<&str>) -> Result<()> {
             } else {
                 Vec::new()
             };
-            let _ = painted_links.update(&mut stdout(), frame.buffer, found);
-            if let Some(proto) = app.image_proto {
+            let links_ready = painted_links
+                .update(&mut stdout(), frame.buffer, found)
+                .is_ok();
+            // Defer new thumbnails when a link repaint will retry on their cells.
+            if let Some(proto) = app.image_proto.filter(|_| links_ready) {
                 if app.image_placed != app.painted_images {
                     if app.painted_images.is_empty() {
                         let _ = images::paint(&mut stdout(), proto, &app.image_placed);
@@ -19139,6 +19143,7 @@ pub fn run_with(paths: Paths, start: Option<&str>) -> Result<()> {
         }
         Ok(())
     })();
+    let _ = painted_links.recover_terminal(&mut stdout());
     app.flush_wizard_draft(true);
     app.save_drafts();
     if app.enhanced_keys {
