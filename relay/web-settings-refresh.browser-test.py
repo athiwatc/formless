@@ -53,7 +53,8 @@ HOOK = """
       S.local = true;
       S.daemonOnline = true;
     },
-    setView, refreshSettings,
+    setView, refreshSettings, showPair,
+    connecting() { S.ws.readyState = 0; },
     auditOlder: () => { loadAudit(true); },
     events(...types) { types.forEach(type => onEvent({type})); },
     hold(type) { holdType = type; },
@@ -127,7 +128,7 @@ def exercise(page, url, app):
     assert result["calls"].count("list_providers") == 1
     assert "list_audit" not in result["calls"]
 
-    # Leaving the view stops the remaining private lists from dispatching.
+    # Leaving the view stops the remaining Settings-only lists from dispatching.
     page.evaluate("""() => {
       const f = __settingsRefreshFixture;
       f.reset();
@@ -170,6 +171,23 @@ def exercise(page, url, app):
     result = after_requests(page)
     expect(page.locator("html")).to_have_attribute("lang", "th")
     assert result["auditPages"] == 2 and result["audit"] == ["audit-head", "audit-tail"]
+
+    # Re-pairing can hide the app or replace the socket before it sets a new channel.
+    page.evaluate("""() => {
+      const f = __settingsRefreshFixture;
+      f.reset();
+      f.setView('settings');
+      f.showPair();
+      f.events('jobs_changed');
+    }""")
+    assert after_requests(page)["calls"] == BACKGROUND
+    page.evaluate("""() => {
+      const f = __settingsRefreshFixture;
+      f.reset();
+      f.connecting();
+      return f.refreshSettings();
+    }""")
+    assert after_requests(page)["calls"] == []
 
 
 def main():

@@ -5484,12 +5484,12 @@
   let auditSeq = 0;
   async function loadAudit(older) {
     const seq = ++auditSeq;
-    const connection = { ws: S.ws, channel: S.channel };
+    const ws = S.ws, channel = S.channel;
     const filter = S.auditFilter || null;
     const last = older && S.audit && S.audit.length ? S.audit[S.audit.length - 1] : null;
     const before = last ? (last.cursor || last.created_at) : null;
     const page = (await request({ type: "list_audit", filter, limit: 50, before }).catch(() => null)) || [];
-    if (seq !== auditSeq || filter !== (S.auditFilter || null) || !isSettingsConnection(connection)) return;
+    if (seq !== auditSeq || filter !== (S.auditFilter || null) || ws !== S.ws || channel !== S.channel) return;
     S.audit = older ? (S.audit || []).concat(page) : page;
     S.auditPages = older ? (S.auditPages || 1) + 1 : 1;
     renderView();
@@ -5921,14 +5921,17 @@
   const settingsBackground = ["settings", "status", "descriptionReviews"];
   const settingsDomains = [...settingsBackground, ...Object.keys(settingsLists), "audit"];
   let settingsRefresh = null;
+  function settingsConnectionReady() {
+    return S.ws?.readyState === 1 && !!S.channel && (S.local || S.relayReady);
+  }
   function isSettingsConnection(connection) {
-    return connection?.ws === S.ws && connection?.channel === S.channel;
+    return settingsConnectionReady() && connection?.ws === S.ws && connection?.channel === S.channel;
   }
   function refreshSettings() {
     return requestSettingsRefresh(settingsDomains);
   }
   function requestSettingsRefresh(domains) {
-    if (!S.channel) return Promise.resolve();
+    if (!settingsConnectionReady()) return Promise.resolve();
     if (!isSettingsConnection(settingsRefresh)) {
       settingsRefresh = { ws: S.ws, channel: S.channel, dirty: new Set(), pending: null };
     }
@@ -5939,7 +5942,8 @@
     return refresh.pending;
   }
   async function drainSettingsRefresh(refresh) {
-    const allowed = (domain) => S.view === "settings" || settingsBackground.includes(domain);
+    const allowed = (domain) => settingsBackground.includes(domain)
+      || (S.view === "settings" && !$("app").classList.contains("hidden"));
     try {
       while (isSettingsConnection(refresh)) {
         const batch = settingsDomains.filter(domain => allowed(domain) && refresh.dirty.has(domain));
