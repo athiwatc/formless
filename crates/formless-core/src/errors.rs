@@ -117,7 +117,7 @@ fn status(raw: &str) -> Option<u16> {
         let label = clause.trim_end_matches(':');
         expects_status = matches!(
             label,
-            "provider error" | "provider request failed after retries"
+            "provider error" | "provider request failed after retries" | "GET /models failed"
         ) || label.starts_with("POST /") && label.ends_with(" failed")
             || label.ends_with("; initial authentication failure");
     }
@@ -485,6 +485,7 @@ mod tests {
                 format!("provider error: {status_text}: {{}}"),
                 format!("provider request failed after retries: {status_text}"),
                 format!("POST /chat/completions failed: {status_text}"),
+                format!("GET /models failed: {status_text}: unavailable"),
                 format!("outer context: provider error: {status_text} (retry after 2s): {{}}"),
                 format!("outer context: HTTP status error ({status_text}) for url (https://private.invalid/v1)"),
                 format!("outer context: HTTP status client error ({status_text}) for url (https://private.invalid:443)"),
