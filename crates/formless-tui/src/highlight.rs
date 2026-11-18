@@ -5,7 +5,6 @@
 //! config formats and tags for markup. Block comments carry across lines.
 //! Unknown languages return `None` and the caller falls back to plain code.
 
-use formless_core::scripts::javascript_number_end;
 use ratatui::prelude::*;
 
 use super::fg;
@@ -800,7 +799,7 @@ impl Highlighter {
                         }));
             if js_number || !l.regex && c.is_ascii_digit() && word_start {
                 let j = if js_number {
-                    javascript_number_end(&chars, i)
+                    formless_core::scripts::javascript_number_end(&chars, i)
                 } else if self.rust_numbers {
                     rust_number_end(&chars, i)
                 } else {
@@ -992,6 +991,46 @@ mod tests {
             .into_iter()
             .map(|s| (s.content.to_string(), s.style.fg))
             .collect()
+    }
+
+    #[test]
+    fn javascript_numeric_literals_keep_member_calls() {
+        for (source, number, method) in [
+            ("1.5.toFixed(2)", "1.5", "toFixed"),
+            ("1..toString()", "1.", "toString"),
+            ("0x1f.toString(16)", "0x1f", "toString"),
+            ("1e2.toFixed(2)", "1e2", "toFixed"),
+            ("1e+2.toPrecision(2)", "1e+2", "toPrecision"),
+            ("2_000n.toString()", "2_000n", "toString"),
+            ("077.valueOf()", "077", "valueOf"),
+            (".5.toFixed(2)", ".5", "toFixed"),
+        ] {
+            for lang in ["js", "javascript", "tsx", "typescript"] {
+                let tokens = toks(lang, source);
+                assert!(
+                    tokens.contains(&(number.into(), Some(Color::LightYellow))),
+                    "{lang} {source}: {tokens:?}"
+                );
+                assert!(
+                    tokens.contains(&(method.into(), Some(Color::Blue))),
+                    "{lang} {source}: {tokens:?}"
+                );
+            }
+        }
+        for (source, numbers) in [
+            ("let value = 1_000 / 1.5", vec!["1_000", "1.5"]),
+            ("[...5, ....5]", vec!["5", ".5"]),
+            ("item1 / α\u{301}2", vec![]),
+            ("return\u{feff}2", vec!["2"]),
+        ] {
+            let tokens = toks("js", source);
+            let actual: Vec<_> = tokens
+                .iter()
+                .filter(|(_, color)| *color == Some(Color::LightYellow))
+                .map(|(text, _)| text.as_str())
+                .collect();
+            assert_eq!(actual, numbers, "{source}: {tokens:?}");
+        }
     }
 
     #[test]
@@ -1218,46 +1257,6 @@ mod tests {
 
     /// Nested Rust comments, raw strings, JS regexes, YAML `;` and
     /// unknown languages (#877).
-    #[test]
-    fn javascript_numeric_literals_keep_member_calls() {
-        for (source, number, method) in [
-            ("1.5.toFixed(2)", "1.5", "toFixed"),
-            ("1..toString()", "1.", "toString"),
-            ("0x1f.toString(16)", "0x1f", "toString"),
-            ("1e2.toFixed(2)", "1e2", "toFixed"),
-            ("1e+2.toPrecision(2)", "1e+2", "toPrecision"),
-            ("2_000n.toString()", "2_000n", "toString"),
-            ("077.valueOf()", "077", "valueOf"),
-            (".5.toFixed(2)", ".5", "toFixed"),
-        ] {
-            for lang in ["js", "javascript", "tsx", "typescript"] {
-                let tokens = toks(lang, source);
-                assert!(
-                    tokens.contains(&(number.into(), Some(Color::LightYellow))),
-                    "{lang} {source}: {tokens:?}"
-                );
-                assert!(
-                    tokens.contains(&(method.into(), Some(Color::Blue))),
-                    "{lang} {source}: {tokens:?}"
-                );
-            }
-        }
-        for (source, numbers) in [
-            ("let value = 1_000 / 1.5", vec!["1_000", "1.5"]),
-            ("[...5, ....5]", vec!["5", ".5"]),
-            ("item1 / α\u{301}2", vec![]),
-            ("return\u{feff}2", vec!["2"]),
-        ] {
-            let tokens = toks("js", source);
-            let actual: Vec<_> = tokens
-                .iter()
-                .filter(|(_, color)| *color == Some(Color::LightYellow))
-                .map(|(text, _)| text.as_str())
-                .collect();
-            assert_eq!(actual, numbers, "{source}: {tokens:?}");
-        }
-    }
-
     #[test]
     fn traps_that_used_to_mis_colour() {
         let t = toks("rust", "/* a /* b */ still comment */ let x = 1;");
