@@ -35,6 +35,9 @@ test('search marks present term prefixes in snippet order, once per term', () =>
   assert.deepEqual(renderSnippet('app apple Apple', 'app apple APP'), ['app', 'apple']);
   assert.deepEqual(renderSnippet('Apple later Apple', 'app apple'), ['Apple']);
   assert.deepEqual(renderSnippet('upstaging only', 'stag deploy'), []);
+  assert.deepEqual(renderSnippet('…staging only', 'stag'), []);
+  assert.deepEqual(renderSnippet('…staging but then staging', 'stag'), ['stag']);
+  assert.deepEqual(renderSnippet('… staging with a known boundary', 'stag'), ['stag']);
 });
 
 test('search retains original accent and case in NFC and decomposed snippets', () => {

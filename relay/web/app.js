@@ -1398,6 +1398,8 @@
     // Approximate unicode61's boundaries, highlighting the first visible
     // prefix per term. Multiple prefixes at one position share a mark.
     for (const { 0: word, index } of folded.matchAll(/[\p{L}\p{N}\p{Co}]+/gu)) {
+      // A trimmed snippet may start partway through a word after the ellipsis.
+      if (from[index] === 1 && text.startsWith("…")) continue;
       let end = index;
       for (const term of remaining) {
         if (!word.startsWith(term)) continue;
