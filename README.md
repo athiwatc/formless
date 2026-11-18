@@ -170,10 +170,10 @@ Illustrative, not scripted: the Tools an agent builds are whatever the task need
 └──────────────┘                        └───────┬───────────────┬──────────┘
                                                 │               │
                                     ┌───────────▼─────┐   ┌─────▼──────────┐
-                                    │ QuickJS sandbox │   │ OpenAI-        │
-                                    │ one isolate per │   │ compatible     │
-                                    │ Tool, gated by  │   │ provider       │
-                                    │ Capabilities    │   │ (Chat Compl.)  │
+                                    │ QuickJS sandbox │   │Chat Completions│
+                                    │ one isolate per │   │ Responses      │
+                                    │ Tool, gated by  │   │ Anthropic      │
+                                    │ Capabilities    │   │ Messages       │
                                     └─────────────────┘   └────────────────┘
 ```
 
@@ -214,7 +214,7 @@ Illustrative, not scripted: the Tools an agent builds are whatever the task need
 |---|---|
 | A Rust stable toolchain (`rustup` recommended) — **source builds only** | the app is one Rust workspace, edition 2021 |
 | A C compiler (`cc` / `clang` / `gcc`) — **source builds only** | the QuickJS sandbox (`rquickjs`) is compiled from source |
-| An OpenAI-compatible endpoint that **supports tool calling** | it is the only provider Formless talks to |
+| A model endpoint that **supports tool calling** | Formless supports OpenAI-compatible Chat Completions or Responses, and native Anthropic Messages. The Anthropic preset selects Messages. Other built-in presets and custom OpenAI-compatible URLs start with Chat Completions. |
 | A real terminal | the default client is a full-screen TUI |
 
 Prebuilt binaries need none of the toolchain requirements. On Linux a Secret Service provider (GNOME Keyring, KWallet) keeps the API key in the OS keychain; if none is available, Formless falls back to a `0600` file in the config dir, so headless machines still work.
@@ -270,7 +270,7 @@ With no arguments `formless` launches the **TUI**, which auto-starts the daemon 
 2. **API key** — stored in the OS keychain plus a `0600` fallback file (`api_key`) in the config dir, so rebuilding a dev binary never loses it.
 3. **Model** — picked from the endpoint's model list, or typed by hand.
 4. **Reasoning effort** — for models that accept it.
-5. **Probe** — verifies connectivity, streaming and **tool calling**. If the endpoint cannot call tools the wizard refuses to continue: every Run would fail, and a prompt-mode fallback has to be chosen deliberately ([§3.8](#38-provider-options-v2)).
+5. **Probe** — checks connectivity, streaming and **tool calling**. The probe tries native calls first, then tries prompt-based calls if needed. If the prompt fallback succeeds, the wizard saves `provider.tool_mode = "prompt"` ([§3.8](#38-provider-options-v2)). A result with neither mode demonstrated blocks setup. Probe errors such as authentication failures show their own diagnostics.
 
 The result is written to `config.toml` in the config dir ([§4](#4-data-config-and-profiles)); you never need to edit it by hand. Re-run the wizard at any time with `formless doctor` for a diagnosis, or delete the config to go through it again.
 
@@ -507,6 +507,10 @@ formless config set tui.notify_min_secs 30 # validated, audited, applied at once
 formless config edit                       # $EDITOR; saved only if it still parses
 ```
 
+In tmux, `tui.notify` needs `set -g focus-events on` for the TUI to detect
+focus loss. Desktop alerts also need `set -g allow-passthrough on` on tmux
+versions with that option. See [TUI notifications in tmux](docs/troubleshooting.md#tui-notifications-in-tmux).
+
 `config get KEY` reads locally loaded effective configuration, including this
 client's applicable environment overrides. Add `--json` for one compact JSON
 value followed by a newline; strings remain quoted, including text such as
@@ -606,11 +610,13 @@ The default endpoint is the Worker in [`relay/`](relay/README.md) — self-host 
 
 ### 3.8 Provider options (v2)
 
-All of these are plain config in `[provider]`; none is a vendor-specific code path.
+Set these options in `[provider]` to select the wire format, Tool calling mode and model routing.
 
 | Setting | Effect |
 |---|---|
-| `api_style = "responses"` | speak the Responses API (`POST {base_url}/responses`) instead of Chat Completions |
+| `api_style = "chat"` | use OpenAI-compatible Chat Completions (`POST {base_url}/chat/completions`), the default |
+| `api_style = "responses"` | use the Responses API (`POST {base_url}/responses`) |
+| `api_style = "anthropic"` | use native Anthropic Messages (`POST {base_url}/messages`) with `x-api-key` by default. The Anthropic preset selects this style. See [SPEC §4.1](SPEC.md#41-scope) for request conversion and caching. |
 | `tool_mode = "prompt"` | describe Tools in the prompt and parse a JSON tool call from the reply, for models without native tool calling (onboarding detects this) |
 | `fallback_models = [...]` | models to fail over to, in order, when the selected one errors |
 | `model = "auto"` + `routing_models = [...]` | pick a model per Run from **measured** local success and latency; `routing_fast_models` / `routing_strong_models` split simple from complex tasks |
@@ -686,7 +692,7 @@ CLI with `formless docs troubleshooting`.
 | Symptom | Fix |
 |---|---|
 | `not configured; run formless for the wizard` | headless runs need a configured provider first — launch the TUI once |
-| "does not support tool-calling" during onboarding | pick another model or endpoint; tool calling is mandatory |
+| Onboarding reports neither native nor prompt-based tool calling | Press Enter to pick another model in the wizard. For a saved provider, check a candidate with `/test` or `formless providers test default --model MODEL` and [set `provider.tool_mode = "prompt"`](#38-provider-options-v2) if the model works through the fallback. |
 | TUI renders garbage or does not respond | it needs a real TTY; run it interactively rather than through a pipe |
 
 ### 3.11 CLI reference
@@ -1040,7 +1046,7 @@ QuickJS-NG runs in-process. Bare JS has no ambient authority: the daemon provide
 | API | Gated by | Purpose |
 |---|---|---|
 | `fetch(url, {method, headers, body, bodyEncoding, encoding})` → `{status, ok, url, headers, body, text(), json()}` | `net` | HTTP; redirects followed, every hop scope-checked |
-| `fetchChunks(url, opts, size, cb)` | `net` | Stream arbitrarily large bodies in bounded memory |
+| `fetchChunks(url, opts, size, cb)` | `net` | Stream large bodies in bounded memory. The whole request, including body reads, is limited by `tools.fetch_timeout_secs` regardless of chunk size. |
 | `fs.read(path, {encoding})` / `fs.write` / `fs.append` | `fs:read` / `fs:write` | Whole-value access for small data |
 | `fs.exists` / `fs.stat` / `fs.list(dir, {details})` | `fs:read` | Existence, metadata, directory listing |
 | `fs.mkdir` / `fs.remove(path, {recursive})` / `fs.rename(from, to)` | `fs:write` | Tree changes |

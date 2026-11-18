@@ -1436,20 +1436,61 @@
     box.classList.remove("hidden");
     box.append(h("div", { class: "muted", style: "padding:0.25rem 0.5rem;font-size:0.75rem" },
       hits.length + " hit" + (hits.length === 1 ? "" : "s") + " for “" + query + "”"));
-    const lower = query.toLowerCase();
+    const literal = query.trim();
+    const words = literal.match(/[\p{Alphabetic}\p{Number}]+/gu);
+    const terms = words && new Set(words.map((word) => foldMap(word, foldSearchCharacter).folded).filter(Boolean));
     for (const hit of hits) {
       const snippet = h("div");
       const text = hit.snippet || "";
-      const at = text.toLowerCase().indexOf(lower);
-      if (at >= 0 && lower) {
-        snippet.append(text.slice(0, at), h("mark", null, text.slice(at, at + query.length)), text.slice(at + query.length));
-      } else snippet.append(text);
+      let cursor = 0;
+      for (const [start, end] of searchHighlightRanges(text, literal, terms)) {
+        if (cursor < start) snippet.append(text.slice(cursor, start));
+        snippet.append(h("mark", null, text.slice(start, end)));
+        cursor = end;
+      }
+      if (cursor < text.length) snippet.append(text.slice(cursor));
       box.append(h("div", {
         class: "hit", tabindex: 0,
         onclick: () => openSession(hit.session_id),
         onkeydown: (e) => { if (e.key === "Enter") openSession(hit.session_id); },
       }, h("div", { class: "meta" }, hit.session_name + " · #" + hit.seq + " " + hit.role), snippet));
     }
+  }
+
+  function foldSearchCharacter(ch) {
+    // Standalone combining characters that unicode61 treats as diacritics.
+    if (/[\u0300-\u0304\u0306-\u030c\u030f\u0311\u031b\u0323-\u0328\u032d-\u032e\u0330-\u0331]/u.test(ch)) return "";
+    const base = ch.normalize("NFD").replace(/\p{M}/gu, "");
+    // unicode61's precomposed diacritic table folds to ASCII Latin.
+    const lower = (/^[A-Za-z]$/.test(base) ? base : ch).toLowerCase();
+    return lower === "ς" ? "σ" : lower;
+  }
+
+  function searchHighlightRanges(text, literal, terms) {
+    if (!terms) {
+      // The daemon searches literally when the query has no word terms.
+      const start = literal ? text.indexOf(literal) : -1;
+      return start < 0 ? [] : [[start, start + literal.length]];
+    }
+    const { folded, from } = foldMap(text, foldSearchCharacter);
+    const remaining = new Set(terms);
+    const spans = [];
+    // Approximate unicode61's boundaries within this snippet. Highlight the
+    // first visible prefix per term, sharing a mark for overlapping prefixes.
+    for (const { 0: word, index } of folded.matchAll(/[\p{L}\p{N}\p{Co}]+/gu)) {
+      let end = index;
+      for (const term of remaining) {
+        if (!word.startsWith(term)) continue;
+        const stop = index + term.length;
+        // A prefix must cover the complete original character.
+        if (from[stop] === from[stop - 1]) continue;
+        remaining.delete(term);
+        end = Math.max(end, stop);
+      }
+      if (end > index) spans.push([from[index], from[end]]);
+      if (!remaining.size) break;
+    }
+    return spans;
   }
 
   // ---------------------------------------------------------- markdown
@@ -1520,14 +1561,18 @@
     config: { lc: ["#"], q: "\"'", kw: W(""), lit: W("true false null yes no on off"), key: true },
     conf: { lc: ["#", ";"], q: "\"'", kw: W(""), lit: W("true false null yes no on off"), key: true },
     sql: { lc: ["--"], bc: ["/*", "*/"], q: "'", ci: true, kw: W("add all alter and as asc begin by case commit create default delete desc distinct drop else end exists foreign from group having in index inner insert into is join key left like limit not offset on or order outer primary references returning right select set table then union update values when where with"), lit: W("null true false") },
+    lua: { lc: ["--"], q: "\"'", kw: W("and case class data do else elseif end for function if import in instance let local module not of or repeat return then until where while"), lit: W("true false nil True False Nothing") },
     html: { bc: ["<!--", "-->"], q: "\"'", kw: W(""), lit: W(""), tags: true },
     css: { bc: ["/*", "*/"], q: "\"'", kw: W("important media import supports keyframes"), lit: W("") },
   };
   const HL_ALIAS = {
     rs: "rust", javascript: "js", jsx: "js", mjs: "js", cjs: "js", ts: "js", typescript: "js", tsx: "js",
     python: "py", python3: "py", golang: "go", bash: "sh", zsh: "sh", fish: "sh", shell: "sh", console: "sh", powershell: "sh", ps: "sh",
+    dockerfile: "sh", docker: "sh", make: "sh", makefile: "sh", mk: "sh", ruby: "sh", rb: "sh", perl: "sh", pl: "sh", elixir: "sh", ex: "sh", exs: "sh", r: "sh",
     h: "c", cpp: "c", "c++": "c", cc: "c", hpp: "c", java: "c", kotlin: "c", kt: "c", swift: "c", cs: "c", csharp: "c", scala: "c", dart: "c", php: "c", zig: "c",
+    "c#": "c", "f#": "c", fsharp: "c", objc: "c", haskell: "lua", hs: "lua",
     jsonc: "json", json5: "json", yaml: "config", yml: "config", toml: "config", ini: "conf", env: "config", dotenv: "config", properties: "conf",
+    cfg: "conf", editorconfig: "conf", gitconfig: "conf",
     sqlite: "sql", postgres: "sql", postgresql: "sql", mysql: "sql", xml: "html", svg: "html", vue: "html", svelte: "html", scss: "css", less: "css",
   };
   function highlight(code, lang) {
@@ -1551,6 +1596,27 @@
     let lineStart = true;
     while (i < code.length) {
       const c = code[i];
+      if (L === HL.js && (c === "." || /\d/.test(c))) {
+        lineStart = false;
+        if (c === "." && code.startsWith("...", i)) {
+          plain += "...";
+          i += 3;
+          continue;
+        }
+        const before = code[i - 1];
+        const boundary = !before || /\s/.test(before) || before.charCodeAt(0) < 128 && !word.test(before);
+        if (c === "." ? /\d/.test(code[i + 1] ?? "") : boundary) {
+          const end = javascriptNumberEnd(code, i);
+          tok("tok-num", code.slice(i, end));
+          i = end;
+          continue;
+        }
+        if (c !== ".") {
+          plain += c;
+          i++;
+          continue;
+        }
+      }
       if (lineStart && L.key) {
         const m = code.slice(i).match(/^([ \t]*)([\w.\-"'\[\] ]+?)(?=\s*[:=])/);
         if (m && m[2].trim() && !(L.lc || []).some((p) => m[2].trim().startsWith(p))) {
@@ -1610,6 +1676,38 @@
     }
     if (plain) out.push(plain);
     return out;
+  }
+
+  function javascriptNumberEnd(code, start) {
+    const radix = code[start] === "0" && {
+      x: /[0-9a-f]/i, o: /[0-7]/, b: /[01]/,
+    }[code[start + 1]?.toLowerCase()];
+    const digitsEnd = (at, digit = /[0-9]/) => {
+      while (at < code.length && digit.test(code[at])) {
+        at++;
+        if (code[at] === "_" && at + 1 < code.length && digit.test(code[at + 1])) at++;
+      }
+      return at;
+    };
+    if (radix) {
+      const digits = start + 2;
+      const end = digitsEnd(digits, radix);
+      return end === digits ? start + 1 : end + Number(code[end] === "n");
+    }
+    let end = digitsEnd(start);
+    if (code[start] === "0" && end > start + 1 && /^[0-7]+$/.test(code.slice(start, end))) return end;
+    const fraction = code[end] === ".";
+    if (fraction) end = digitsEnd(end + 1);
+    let exponent = false;
+    if (code[end] === "e" || code[end] === "E") {
+      const digits = end + 1 + Number(code[end + 1] === "+" || code[end + 1] === "-");
+      const exponentEnd = digitsEnd(digits);
+      if (exponentEnd > digits) {
+        end = exponentEnd;
+        exponent = true;
+      }
+    }
+    return end + Number(!fraction && !exponent && code[end] === "n");
   }
 
   function copyButton(text) {
@@ -4299,7 +4397,8 @@
       return th;
     }))));
     const body = h("tbody");
-    if (!tools.length) body.append(h("tr", null, h("td", { class: "empty", colspan: cols.length }, "No Tools yet — the agent builds them with create_tool.")));
+    if (!tools.length) body.append(h("tr", null, h("td", { class: "empty", colspan: cols.length },
+      opts.emptyMessage || "No Tools yet — the agent builds them with create_tool.")));
     for (const t of tools) {
       body.append(h("tr", {
         class: opts.selected === t.id ? "selected" : null, tabindex: 0,
@@ -4348,7 +4447,8 @@
   function renderTools() {
     const rows = visibleTools();
     $("tools-count").textContent = "(" + (rows.length === S.tools.length ? S.tools.length : rows.length + "/" + S.tools.length) + ")";
-    toolsTable($("tools-table"), rows, { selected: S.selectedTool, onselect: selectTool, sortable: true });
+    toolsTable($("tools-table"), rows, { selected: S.selectedTool, onselect: selectTool, sortable: true,
+      emptyMessage: S.tools.length ? "No Tools match the current filters." : null });
     const box = $("tool-detail");
     box.replaceChildren();
     const d = S.toolDetail;
@@ -5194,7 +5294,9 @@
     const parents = new Set();
     for (const m of $("settings").querySelectorAll("mark.find")) { parents.add(m.parentNode); m.replaceWith(m.textContent); }
     for (const p of parents) p.normalize();
-    for (const sec of $("settings").querySelectorAll("section")) {
+    const sections = $("settings").querySelectorAll("section");
+    let visibleSections = 0;
+    for (const sec of sections) {
       const titleHit = keys.length && hit(sec.querySelector("h3") || sec);
       let shown = 0;
       for (const dt of sec.querySelectorAll("dl.kv > dt")) {
@@ -5210,19 +5312,29 @@
         if (ok) shown++;
       }
       const hasRows = sec.querySelector("dl.kv > dt, tbody > tr");
-      sec.classList.toggle("hidden", !!keys.length && !titleHit && (hasRows ? !shown : !hit(sec)));
+      const hidden = !!keys.length && !titleHit && (hasRows ? !shown : !hit(sec));
+      sec.classList.toggle("hidden", hidden);
+      if (!hidden) visibleSections++;
     }
+    const noMatch = keys.length > 0 && sections.length > 0 && visibleSections === 0;
+    const status = $("settings-filter-status");
+    const message = noMatch ? "No Settings match the current filter." : "";
+    if (status.textContent !== message) status.textContent = message;
+    const clear = $("settings-filter-clear");
+    if (!noMatch && document.activeElement === clear) $("settings-filter").focus({ preventScroll: true });
+    clear.hidden = !noMatch;
   }
   /** `text` folded for matching with, per folded UTF-16 unit, the offset
    * of the original character it came from (#789): decomposed, marks
    * dropped, lower-cased one character at a time, so `İ` stays one
-   * letter and NFC/NFD spellings match each other. */
-  function foldMap(text) {
+   * letter and NFC/NFD spellings match each other. The default is the
+   * Settings fold. Session search supplies its own tokenizer fold. */
+  function foldMap(text, foldCharacter = (ch) => ch.normalize("NFD").replace(/\p{M}/gu, "").toLowerCase().slice(0, 2)) {
     let folded = "";
     const from = [];
     let at = 0;
     for (const ch of text) {
-      const f = ch.normalize("NFD").replace(/\p{M}/gu, "").toLowerCase().slice(0, 2);
+      const f = foldCharacter(ch);
       for (let k = 0; k < f.length; k++) from.push(at);
       folded += f;
       at += ch.length;
@@ -5259,6 +5371,12 @@
     }
   }
   $("settings-filter").addEventListener("input", filterSettings);
+  $("settings-filter-clear").addEventListener("click", () => {
+    const input = $("settings-filter");
+    input.value = "";
+    input.focus({ preventScroll: true });
+    filterSettings();
+  });
 
   /** Web Push (SPEC §12): opt in per device. The relay keeps this
    * browser's subscription and, when an approval or question waits, sends
