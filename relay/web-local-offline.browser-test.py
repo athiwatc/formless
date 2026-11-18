@@ -113,13 +113,14 @@ def check(page):
         expect(retry).to_have_count(0)
         expect(activity).to_be_focused()
 
+    page.clock.install()
     assert page.evaluate('__fixture.scheduled()') == 'conn-retry'
+    page.clock.run_for(250)
     page.wait_for_function('__fixture.retries() === 3')
     expect(retry).to_have_count(0)
     expect(activity).to_be_focused()
-    page.evaluate('__fixture.state({online:false,reconnect:true})')
-    retry.focus()
-    page.evaluate('__fixture.cancel()')
+    page.evaluate('() => { __fixture.scheduled(); __fixture.cancel(); }')
+    page.clock.run_for(250)
     expect(retry).to_have_count(0)
     expect(activity).to_be_focused()
     assert page.evaluate('__fixture.retries()') == 3
