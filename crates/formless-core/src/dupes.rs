@@ -53,15 +53,41 @@ fn name_tokens(name: &str) -> BTreeSet<String> {
         .collect()
 }
 
-fn schema_fields(schema: &str) -> BTreeSet<String> {
-    serde_json::from_str::<serde_json::Value>(schema)
-        .ok()
-        .and_then(|v| {
-            v["properties"]
-                .as_object()
-                .map(|p| p.keys().cloned().collect())
-        })
-        .unwrap_or_default()
+fn schema_fields(schema: &str) -> Option<BTreeSet<String>> {
+    let value = serde_json::from_str::<serde_json::Value>(schema).ok()?;
+    let schema = value.as_object()?;
+    // A list of top-level properties cannot describe composed or dynamic
+    // input shapes. Leave their field similarity unknown.
+    if schema.keys().any(|keyword| {
+        matches!(
+            keyword.as_str(),
+            "$ref"
+                | "$dynamicRef"
+                | "$recursiveRef"
+                | "allOf"
+                | "anyOf"
+                | "oneOf"
+                | "if"
+                | "then"
+                | "else"
+                | "patternProperties"
+                | "dependentSchemas"
+                | "dependencies"
+        )
+    }) || schema.get("type").is_some_and(|kind| kind != "object")
+    {
+        return None;
+    }
+    match schema.get("properties") {
+        Some(properties) => Some(properties.as_object()?.keys().cloned().collect()),
+        None if schema
+            .get("required")
+            .is_none_or(|required| required.as_array().is_some_and(Vec::is_empty)) =>
+        {
+            Some(BTreeSet::new())
+        }
+        None => None,
+    }
 }
 
 fn jaccard(a: &BTreeSet<String>, b: &BTreeSet<String>) -> f64 {
@@ -100,10 +126,9 @@ pub fn similarity(
     }
     let name = jaccard(&name_tokens(&a.0.name), &name_tokens(&b.0.name));
     let desc = jaccard(&words(&a.0.description), &words(&b.0.description));
-    let fields = fields_alike(
-        &schema_fields(&a.1.input_schema),
-        &schema_fields(&b.1.input_schema),
-    );
+    let fields = schema_fields(&a.1.input_schema)
+        .zip(schema_fields(&b.1.input_schema))
+        .map_or(0.0, |(a, b)| fields_alike(&a, &b));
     let score = 0.4 * name + 0.3 * desc + 0.3 * fields;
     let mut why = Vec::new();
     if name >= 0.5 {
