@@ -3,7 +3,17 @@ name: docs
 on:
   push:
     branches: [main]
-    paths: ['README.md', 'SPEC.md', 'GLOSSARY.md', 'CHANGELOG.md', 'docs/**/*.md', '.github/workflows/docs.yml', 'scripts/check-doc-links.py', 'scripts/test-doc-links.py']
+    paths:
+      - README.md
+      - SPEC.md
+      - GLOSSARY.md
+      - CHANGELOG.md
+      - 'docs/**/*.md'
+      - packaging/README.md
+      - 'relay/*.md'
+      - .github/workflows/docs.yml
+      - scripts/check-doc-links.py
+      - scripts/test-doc-links.py
   schedule:
     - cron: '17 8 * * 1'
   workflow_dispatch:
@@ -56,4 +66,5 @@ jobs:
           test -x "$binary"
           env -u FORMLESS_LINK_GITHUB_TOKEN "$binary" --version
           python3 scripts/test-doc-links.py
-          python3 scripts/check-doc-links.py "$binary" README.md SPEC.md GLOSSARY.md CHANGELOG.md 'docs/**/*.md'
+          python3 scripts/check-doc-links.py "$binary" README.md SPEC.md GLOSSARY.md CHANGELOG.md \
+            'docs/**/*.md' packaging/README.md 'relay/*.md'
