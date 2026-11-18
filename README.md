@@ -1307,7 +1307,7 @@ application data/config and logs use private temporary directories cleaned after
 the job. Test debug artifacts are removed before release compilation to limit disk use.
 Release packaging remains in `release.yml`, and live external-link checks run
 in `docs.yml`. Linux CI also runs every relay Chromium suite and the loopback
-push check. The runner needs Python venv support, Chromium's shared libraries
+push check. The runner needs Python 3.10+ with venv support, Chromium's shared libraries
 and Poppler tools. CI downloads its pinned Playwright Chromium into the job
 directory and includes screenshots and logs from failed suites in the diagnostic
 artifact. See the [relay browser instructions](relay/README.md#browser-regressions)

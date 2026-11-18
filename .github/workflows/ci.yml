@@ -133,12 +133,18 @@ jobs:
             echo 'The Linux browser checks require Poppler tools (pdftoppm and pdftotext).' >&2
             exit 1
           fi
+          python3 -c 'import sys; assert sys.version_info >= (3, 10), "Chromium tests require Python 3.10+"'
           python3 -m venv "$CI_DIR/browser-python"
           python="$CI_DIR/browser-python/bin/python"
           export PLAYWRIGHT_BROWSERS_PATH="$CI_DIR/browser-engines"
           "$python" -m pip install --disable-pip-version-check --no-cache-dir 'playwright==1.62.0'
           "$python" -m playwright install chromium --no-shell --no-progress
-          FORMLESS_CHROMIUM_EXECUTABLE=$("$python" -c 'from playwright.sync_api import sync_playwright; p = sync_playwright().start(); print(p.chromium.executable_path); p.stop()')
+          FORMLESS_CHROMIUM_EXECUTABLE=$("$python" - <<'PY'
+          from playwright.sync_api import sync_playwright
+          with sync_playwright() as playwright:
+              print(playwright.chromium.executable_path)
+          PY
+          )
           export FORMLESS_CHROMIUM_EXECUTABLE
           "$FORMLESS_CHROMIUM_EXECUTABLE" --version
           settings_fixture="$CI_DIR/browser-settings.json"
