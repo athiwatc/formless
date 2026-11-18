@@ -170,10 +170,10 @@ Illustrative, not scripted: the Tools an agent builds are whatever the task need
 └──────────────┘                        └───────┬───────────────┬──────────┘
                                                 │               │
                                     ┌───────────▼─────┐   ┌─────▼──────────┐
-                                    │ QuickJS sandbox │   │ OpenAI-        │
-                                    │ one isolate per │   │ compatible     │
-                                    │ Tool, gated by  │   │ provider       │
-                                    │ Capabilities    │   │ (Chat Compl.)  │
+                                    │ QuickJS sandbox │   │Chat Completions│
+                                    │ one isolate per │   │ Responses      │
+                                    │ Tool, gated by  │   │ Anthropic      │
+                                    │ Capabilities    │   │ Messages       │
                                     └─────────────────┘   └────────────────┘
 ```
 
@@ -214,7 +214,7 @@ Illustrative, not scripted: the Tools an agent builds are whatever the task need
 |---|---|
 | A Rust stable toolchain (`rustup` recommended) — **source builds only** | the app is one Rust workspace, edition 2021 |
 | A C compiler (`cc` / `clang` / `gcc`) — **source builds only** | the QuickJS sandbox (`rquickjs`) is compiled from source |
-| An OpenAI-compatible endpoint that **supports tool calling** | it is the only provider Formless talks to |
+| A model endpoint that **supports tool calling** | Formless supports OpenAI-compatible Chat Completions or Responses, and native Anthropic Messages. The Anthropic preset selects Messages. Other built-in presets and custom OpenAI-compatible URLs start with Chat Completions. |
 | A real terminal | the default client is a full-screen TUI |
 
 Prebuilt binaries need none of the toolchain requirements. On Linux a Secret Service provider (GNOME Keyring, KWallet) keeps the API key in the OS keychain; if none is available, Formless falls back to a `0600` file in the config dir, so headless machines still work.
@@ -606,11 +606,13 @@ The default endpoint is the Worker in [`relay/`](relay/README.md) — self-host 
 
 ### 3.8 Provider options (v2)
 
-All of these are plain config in `[provider]`; none is a vendor-specific code path.
+Set these options in `[provider]` to select the wire format, Tool calling mode and model routing.
 
 | Setting | Effect |
 |---|---|
-| `api_style = "responses"` | speak the Responses API (`POST {base_url}/responses`) instead of Chat Completions |
+| `api_style = "chat"` | use OpenAI-compatible Chat Completions (`POST {base_url}/chat/completions`), the default |
+| `api_style = "responses"` | use the Responses API (`POST {base_url}/responses`) |
+| `api_style = "anthropic"` | use native Anthropic Messages (`POST {base_url}/messages`) with `x-api-key` by default. The Anthropic preset selects this style. See [SPEC §4.1](SPEC.md#41-scope) for request conversion and caching. |
 | `tool_mode = "prompt"` | describe Tools in the prompt and parse a JSON tool call from the reply, for models without native tool calling (onboarding detects this) |
 | `fallback_models = [...]` | models to fail over to, in order, when the selected one errors |
 | `model = "auto"` + `routing_models = [...]` | pick a model per Run from **measured** local success and latency; `routing_fast_models` / `routing_strong_models` split simple from complex tasks |
