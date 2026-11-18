@@ -97,8 +97,17 @@ fn profile_quota_is_atomic_across_writers_and_leaves_harness_updates_available()
     std::fs::create_dir(&dir).unwrap();
     let database = dir.join("test.db");
     let store = Store::open(&database).unwrap();
-    // Seed data as an earlier version could have stored it.
+    // Create the v67 Tool store and verify the upgrade seeds its charge.
+    drop(store);
     let conn = rusqlite::Connection::open(&database).unwrap();
+    conn.execute_batch(
+        "DROP TRIGGER tool_store_usage_insert;
+         DROP TRIGGER tool_store_usage_delete;
+         DROP TRIGGER tool_store_usage_update;
+         DROP TABLE tool_store_profile_usage;
+         PRAGMA user_version=67;",
+    )
+    .unwrap();
     conn.execute(
         "WITH RECURSIVE seed(i) AS (
              VALUES(0) UNION ALL SELECT i+1 FROM seed WHERE i<798
@@ -108,7 +117,17 @@ fn profile_quota_is_atomic_across_writers_and_leaves_harness_updates_available()
         [json!("x".repeat(65_534)).to_string()],
     )
     .unwrap();
+    conn.execute(
+        "UPDATE tool_kv SET namespace='test:draft' WHERE namespace='shared:cache-01'",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO tool_kv(namespace,key,value,updated_at) VALUES('harness:registry','last_change',?1,'')",
+        [json!("x".repeat(8 * 1024)).to_string()],
+    ).unwrap();
     drop(conn);
+    let store = Store::open(&database).unwrap();
 
     let first = Store::open(&database).unwrap();
     let second = Store::open(&database).unwrap();
@@ -121,19 +140,49 @@ fn profile_quota_is_atomic_across_writers_and_leaves_harness_updates_available()
             writer.kv_set(namespace, "cursor", &payload)
         })
     };
-    let a = write(first, "tool:instance-a");
+    let a = write(first, "test:other-draft");
     let b = write(second, "shared:cache-extra");
     let results = [a.join().unwrap(), b.join().unwrap()];
     assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
     let error = results.into_iter().find_map(Result::err).unwrap();
     assert!(error.to_string().contains("profile Tool store is full"));
     store
-        .kv_set("harness:registry", "last_change", &json!("receipt"))
+        .kv_set(
+            "harness:registry",
+            "last_change",
+            &json!("x".repeat(10 * 1024)),
+        )
         .unwrap();
     assert!(store.kv_delete("shared:cache-00", "000").unwrap());
     store
         .kv_set("shared:cache-extra", "new", &json!("x".repeat(48 * 1024)))
         .unwrap();
+
+    // A legacy namespace that exceeded its cap remains readable and can
+    // recover using deletes. The counter also follows those deletes.
+    let conn = rusqlite::Connection::open(&database).unwrap();
+    let legacy = json!("λ".repeat(32_767));
+    conn.execute(
+        "WITH RECURSIVE seed(i) AS (
+           VALUES(0) UNION ALL SELECT i+1 FROM seed WHERE i<80
+         )
+         INSERT INTO tool_kv(namespace,key,value,updated_at)
+         SELECT 'shared:legacy', CAST(i AS TEXT), ?1, '' FROM seed",
+        [legacy.to_string()],
+    )
+    .unwrap();
+    assert!(store
+        .kv_set("shared:legacy", "new", &Value::Null)
+        .unwrap_err()
+        .to_string()
+        .contains("namespace is full"));
+    assert_eq!(store.kv_get("shared:legacy", "0").unwrap(), Some(legacy));
+    assert!(store.kv_delete("shared:legacy", "0").unwrap());
+    conn.execute("DELETE FROM tool_kv WHERE namespace='shared:legacy'", [])
+        .unwrap();
+    drop(conn);
+    assert!(store.kv_delete("shared:cache-00", "001").unwrap());
+    store.kv_set("shared:legacy", "new", &Value::Null).unwrap();
     drop(store);
     std::fs::remove_dir_all(dir).unwrap();
 }
@@ -173,7 +222,7 @@ fn storage_reports_payload_bytes_and_retains_unreferenced_shared_data() {
         .append_message_meta(&session.id, "user", content, Some("{}".into()))
         .unwrap();
     let inv = store
-        .start_invocation(&tool.id, version, None, None, None)
+        .start_invocation(&tool.id, version, None, None, None, "")
         .unwrap();
     store
         .finish_invocation(&inv, &tool.id, "success", "", "漢字", "ascii", 0, 10)

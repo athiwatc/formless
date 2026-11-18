@@ -2266,8 +2266,9 @@ pattern (§4.4).
     - `store` gates the Tool's own namespace, and `store:<ns>` gates a
       shared namespace other Tools can name too.
     - Limits: 64 KiB per serialized JSON value, 5 MiB of keys and values
-      per namespace, and 50 MiB across a profile's Tool namespaces
-      including namespace names. Keys are 1–256 UTF-8 bytes, and `list`
+      per namespace, and 50 MiB across a profile's Tool and test
+      namespaces, including the stored namespace names. Keys are 1–256
+      UTF-8 bytes, and `list`
       returns at most 1000 keys. Delete keys to make room when a quota is
       reached.
     - Values live in the `tool_kv` table (schema v23). They are never

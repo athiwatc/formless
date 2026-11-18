@@ -313,6 +313,38 @@ CREATE TABLE IF NOT EXISTS tool_kv (
   updated_at TEXT NOT NULL, PRIMARY KEY (namespace, key));
 ";
 
+// Count existing data once and keep the profile admission check independent
+// of the number of keys. A rollback reverts both the payload and its charge.
+const SCHEMA_V68_TOOL_STORE_USAGE: &str = "
+CREATE TABLE tool_store_profile_usage (
+  singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+  bytes INTEGER NOT NULL CHECK(bytes>=0));
+INSERT INTO tool_store_profile_usage
+  SELECT 1, COALESCE(SUM(octet_length(namespace)+octet_length(key)+octet_length(value)),0)
+  FROM tool_kv WHERE namespace NOT GLOB 'harness:*';
+CREATE TRIGGER tool_store_usage_insert AFTER INSERT ON tool_kv
+WHEN new.namespace NOT GLOB 'harness:*'
+BEGIN
+  UPDATE tool_store_profile_usage
+    SET bytes=bytes+octet_length(new.namespace)+octet_length(new.key)+octet_length(new.value);
+END;
+CREATE TRIGGER tool_store_usage_delete AFTER DELETE ON tool_kv
+WHEN old.namespace NOT GLOB 'harness:*'
+BEGIN
+  UPDATE tool_store_profile_usage
+    SET bytes=bytes-octet_length(old.namespace)-octet_length(old.key)-octet_length(old.value);
+END;
+CREATE TRIGGER tool_store_usage_update AFTER UPDATE OF namespace, key, value ON tool_kv
+WHEN old.namespace NOT GLOB 'harness:*' OR new.namespace NOT GLOB 'harness:*'
+BEGIN
+  UPDATE tool_store_profile_usage SET bytes=bytes
+    - CASE WHEN old.namespace NOT GLOB 'harness:*'
+           THEN octet_length(old.namespace)+octet_length(old.key)+octet_length(old.value) ELSE 0 END
+    + CASE WHEN new.namespace NOT GLOB 'harness:*'
+           THEN octet_length(new.namespace)+octet_length(new.key)+octet_length(new.value) ELSE 0 END;
+END;
+";
+
 /// Full-text index over message content (SPEC §5.1 search), kept in step
 /// with `messages` by triggers and backfilled once.
 /// Orchestration scripts (SPEC §7.12). Nested Invocations link to theirs
@@ -411,7 +443,7 @@ impl ModelStat {
 const SESSION_SUMMARY: &str = "s.*";
 
 /// Schema version this build writes (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 67;
+pub const SCHEMA_VERSION: i64 = 68;
 
 /// Add a column, tolerating only "it already exists" (a step that was
 /// partly applied by an older build); every other error is real.
@@ -822,6 +854,7 @@ const MIGRATIONS: [(i64, MigrationStep); 67] = [
         add_column(c, "sessions", "plan_state TEXT")?;
         Ok(c.execute_batch(run_state_storage::SCHEMA)?)
     }),
+    (68, |c| Ok(c.execute_batch(SCHEMA_V68_TOOL_STORE_USAGE)?)),
 ];
 
 /// Empty schema at a stamped historical version, for offline backup inspection.
@@ -5016,11 +5049,12 @@ impl Store {
             }
             // Tool data has its own budget so filling it cannot block harness
             // bookkeeping such as saving a registry Undo receipt.
-            if namespace.starts_with("tool:") || namespace.starts_with("shared:") {
+            if !namespace.starts_with("harness:") {
                 let used: i64 = st.ps(
-                    "SELECT COALESCE(SUM(octet_length(namespace)+octet_length(key)+octet_length(value)),0)
-                     FROM tool_kv WHERE (namespace GLOB 'tool:*' OR namespace GLOB 'shared:*')
-                     AND NOT (namespace=?1 AND key=?2)",
+                    "SELECT bytes - COALESCE((
+                       SELECT octet_length(namespace)+octet_length(key)+octet_length(value)
+                       FROM tool_kv WHERE namespace=?1 AND key=?2
+                     ),0) FROM tool_store_profile_usage WHERE singleton=1",
                 )?.query_row(params![namespace, key], |r| r.get(0))?;
                 if used + new_bytes + namespace.len() as i64 > KV_MAX_PROFILE {
                     anyhow::bail!(
@@ -5056,7 +5090,7 @@ impl Store {
 
             let mut usage = st.ps(
                 "SELECT namespace, SUM(octet_length(namespace)+octet_length(key)+octet_length(value))
-                 FROM tool_kv WHERE namespace GLOB 'tool:*' OR namespace GLOB 'shared:*'
+                 FROM tool_kv WHERE namespace NOT GLOB 'harness:*'
                  GROUP BY namespace",
             )?;
             let mut rows = usage.query([])?;
