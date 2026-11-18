@@ -79,20 +79,25 @@ function fixture() {
     'tools-filter': { value: '' },
     'tools-quick': { value: '' },
     'tools-sort': { value: 'name', options: ['name', 'rate', 'used', 'calls'].map((value) => ({ value })) },
+    'tools-count': { textContent: '' },
+    'tools-table': new Node('table'),
+    'tool-detail': new Node('div'),
   };
   const context = vm.createContext({
     Node,
     document: { createElement: (tag) => new Node(tag) },
-    S: { tools, toolSort: { key: 'name', reverse: false }, selectedTool: null },
+    S: { tools, modules: [], toolSort: { key: 'name', reverse: false }, selectedTool: null },
     $: (id) => controls[id],
     uiFormat: (value) => String(value),
     rateCell: (rate) => rate == null ? DASH : String(rate),
     relTime: (ts) => String(ts || ''),
     bar: (rate) => 'bar:' + String(rate),
+    selectTool: () => {},
+    toolDetailFailure: () => null,
   });
   vm.runInContext([
     constStatement('TOOL_COLS'),
-    ...['configureTextInput', 'h', 'fuzzyMatch', 'toolStatusDot', 'toolLabel', 'toolsTable', 'visibleTools'].map(fn),
+    ...['configureTextInput', 'h', 'fuzzyMatch', 'toolStatusDot', 'toolLabel', 'toolsTable', 'visibleTools', 'renderTools'].map(fn),
   ].join('\n'), context);
   return { context, controls };
 }
@@ -219,6 +224,26 @@ test('sortable headers show one shared direction for every column and both rever
   setup.context.toolsTable(table, scrambled, { selected: null, onselect() {}, sortable: true });
   assert.deepEqual(idsOf(table), scrambled.map((tool) => tool.id));
   expectHeaders(table, 'name', false);
+});
+
+test('filtered-empty Tools keep count and selection while an empty registry keeps its guidance', () => {
+  const { context, controls } = fixture();
+  context.S.selectedTool = 'alpha';
+  controls['tools-filter'].value = 'no matching tool';
+  context.renderTools();
+  assert.equal(controls['tools-count'].textContent, '(0/6)');
+  assert.match(controls['tools-table'].textContent, /No Tools match the current filters/);
+  assert.equal(context.S.selectedTool, 'alpha');
+  controls['tools-filter'].value = '';
+  context.renderTools();
+  const selected = controls['tools-table'].children[1].children.find(row => row.className === 'selected');
+  assert.equal(nameOf(selected), 'alpha');
+  context.S.tools = [];
+  context.renderTools();
+  assert.match(controls['tools-table'].textContent, /No Tools yet — the agent builds them with create_tool/);
+  const metrics = new Node('table');
+  context.toolsTable(metrics, [], { bars: true });
+  assert.match(metrics.textContent, /No Tools yet — the agent builds them with create_tool/);
 });
 
 test('a header click sorts naturally and the next click on that header reverses', () => {
