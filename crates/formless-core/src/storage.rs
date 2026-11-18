@@ -3057,44 +3057,33 @@ impl Store {
             && main >= self.run_steps(run_id)?)
     }
 
-    /// Check coverage for the distinct Runs allocated by a branch comparison.
-    /// Aggregate requests and usage separately so their rows cannot multiply.
-    /// The indexed IN filters let SQLite group in Run ID order using the
-    /// existing indexes, without sorting the matching child rows first.
+    /// Check coverage for a branch's allocated Runs in one statement.
+    /// Each aggregate streams one Run's indexed rows. Packing each pair keeps
+    /// one scan per child table and avoids sorting the matched history.
     fn forecast_usage_complete_for_runs(&self, run_ids: &[String]) -> Result<bool> {
         if run_ids.is_empty() {
             return Ok(true);
         }
         let ids = serde_json::to_string(run_ids)?;
-        let mut stmt = self.ps(
-            "WITH wanted(id) AS MATERIALIZED (SELECT value FROM json_each(?1)),
-             requests AS (
-                 SELECT c.run_id, SUM(c.expected) AS expected,
-                        SUM(CASE WHEN c.source='run' THEN c.expected ELSE 0 END) AS main
-                 FROM forecast_request_counts AS c WHERE c.run_id IN (SELECT id FROM wanted)
-                 GROUP BY c.run_id
-             ),
-             usage AS (
-                 SELECT u.run_id, COUNT(*) AS recorded, SUM(u.usage_complete) AS covered
-                 FROM run_usage AS u WHERE u.run_id IN (SELECT id FROM wanted)
-                 GROUP BY u.run_id
-             )
-             SELECT COALESCE(c.expected,0), COALESCE(c.main,0),
-                    COALESCE(u.recorded,0), COALESCE(u.covered,0), r.steps
-             FROM wanted AS w
-             LEFT JOIN requests AS c ON c.run_id=w.id
-             LEFT JOIN usage AS u ON u.run_id=w.id
-             LEFT JOIN runs AS r ON r.id=w.id",
-        )?;
+        let mut stmt = self.ps("SELECT
+                 (SELECT json_array(
+                     COALESCE(SUM(expected),0),
+                     COALESCE(SUM(CASE WHEN source='run' THEN expected ELSE 0 END),0))
+                  FROM forecast_request_counts WHERE run_id=w.value),
+                 (SELECT json_array(COUNT(*),COALESCE(SUM(usage_complete),0))
+                  FROM run_usage WHERE run_id=w.value),
+                 r.steps
+             FROM json_each(?1) AS w LEFT JOIN runs AS r ON r.id=w.value")?;
         let mut rows = stmt.query(params![ids])?;
         let mut complete = true;
         while let Some(row) = rows.next()? {
-            let expected: i64 = row.get(0)?;
-            let main: i64 = row.get(1)?;
-            let recorded: i64 = row.get(2)?;
-            let covered: i64 = row.get(3)?;
+            let read_counts = |column| -> Result<(i64, i64)> {
+                Ok(serde_json::from_str(row.get_ref(column)?.as_str()?)?)
+            };
+            let (expected, main) = read_counts(0)?;
+            let (recorded, covered) = read_counts(1)?;
             // Match run_steps' zero fallback for a missing or invalid value.
-            let steps: i64 = row.get(4).unwrap_or_default();
+            let steps: i64 = row.get(2).unwrap_or_default();
             complete &=
                 expected > 0 && expected == recorded && expected == covered && main >= steps;
         }
