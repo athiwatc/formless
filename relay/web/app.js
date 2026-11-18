@@ -2398,12 +2398,16 @@
   function storedSessionModel(session) {
     return session?.model || S.settings?.provider?.model || "";
   }
+  let modelPickerSequence = 0;
   async function openModelPicker() {
     const session = S.sessions.find((x) => x.id === S.current);
     const model = storedSessionModel(session);
     const efforts = ["", "low", "medium", "high"];
-    const input = h("input", { type: "text", placeholder: "Filter models, or type a model id", "aria-label": "Filter models", autocomplete: "off", spellcheck: "false" });
-    const list = h("ul", { class: "picker-list", role: "listbox" });
+    // The scrollable results are navigated from the input, including in
+    // browsers that otherwise add scroll containers to the Tab order.
+    const list = h("ul", { id: "model-picker-" + ++modelPickerSequence, class: "picker-list", role: "listbox", "aria-label": "Models", tabindex: -1, hidden: true });
+    const input = h("input", { type: "text", placeholder: "Filter models, or type a model id", "aria-label": "Filter models", autocomplete: "off", spellcheck: "false",
+      role: "combobox", "aria-autocomplete": "list", "aria-controls": list.id, "aria-expanded": "false" });
     const effort = h("select", { "aria-label": "Reasoning effort" },
       efforts.map((e) => h("option", { value: e }, e || "default (provider)")));
     effort.value = (session && session.reasoning_effort) || "";
@@ -2429,7 +2433,7 @@
       matches = items.map((item, n) => ({ item, n, m: fuzzyMatch(q, item.id) }))
         .filter((x) => x.m)
         .sort((a, b) => (q.trim() ? b.m[0] - a.m[0] : 0) || a.n - b.n)
-        .map((x) => ({ item: x.item, pos: new Set(x.m[1]) }));
+        .map((x) => ({ item: x.item, optionId: list.id + "-option-" + x.n, pos: new Set(x.m[1]) }));
       sel = Math.min(sel, Math.max(0, matches.length - 1));
       const sources = multiSource();
       // At most 200 rows, in a window that keeps the selection.
@@ -2437,17 +2441,25 @@
       list.replaceChildren(...matches.slice(first, first + 200).map((x, n) => {
         const i = first + n;
         const id = [...x.item.id].map((ch, n) => x.pos.has(n) ? h("mark", null, ch) : ch);
-        const li = h("li", { role: "option", "aria-selected": String(i === sel), class: i === sel ? "sel" : null },
+        const li = h("li", { id: x.optionId, role: "option", "aria-selected": String(i === sel), class: i === sel ? "sel" : null,
+          "aria-posinset": i + 1, "aria-setsize": matches.length },
           h("span", { class: "picker-id" }, id),
           x.item.recent ? h("span", { class: "picker-tag" }, "recent") : null,
           sources && x.item.source ? h("span", { class: "muted" }, x.item.source) : null,
           modelDetail(meta[x.item.id], tests[x.item.id]) ? h("span", { class: "muted" }, modelDetail(meta[x.item.id], tests[x.item.id])) : null);
-        li.onclick = () => { sel = i; draw(); };
+        li.onclick = () => { sel = i; draw(); input.focus({ preventScroll: true }); };
         li.ondblclick = () => { sel = i; finish(false); };
         return li;
       }));
       const selNode = list.children[sel - first];
-      if (selNode) selNode.scrollIntoView({ block: "nearest" });
+      list.hidden = !matches.length;
+      input.setAttribute("aria-expanded", String(!list.hidden));
+      if (selNode) {
+        input.setAttribute("aria-activedescendant", selNode.id);
+        selNode.scrollIntoView({ block: "nearest" });
+      } else {
+        input.removeAttribute("aria-activedescendant");
+      }
       // Only the efforts the highlighted model accepts (SPEC §4.2).
       const accepted = (meta[choice()] || {}).efforts;
       const offer = Array.isArray(accepted) ? [""].concat(["minimal", "low", "medium", "high"].filter((e) => accepted.includes(e))) : efforts;
