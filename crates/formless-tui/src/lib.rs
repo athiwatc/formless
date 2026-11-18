@@ -9315,6 +9315,16 @@ impl App {
         if key.kind == KeyEventKind::Release {
             return;
         }
+        if key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+        {
+            // Some application shortcuts act before they reach Vim.
+            self.vim_input.cancel_pending_argument();
+            if let Some(editor) = &mut self.editor {
+                editor.vim.cancel_pending_argument();
+            }
+        }
         if self.hunk_review_is_visible() {
             self.hunk_review_key(key);
             return;
@@ -9726,6 +9736,7 @@ impl App {
         if self.vim_mode
             && self.view == View::Chat
             && self.vim_input.mode == vim::Mode::Normal
+            && !self.vim_input.waiting_for_argument()
             && self.current_question().is_none()
             && self.find.is_none()
             && (self.approvals.is_empty() || self.input_focus)
@@ -19817,12 +19828,47 @@ mod tests {
         app.key(key(KeyCode::Esc));
         assert_eq!(app.editor.as_ref().unwrap().text(), "αβ文");
         assert_eq!(app.editor.as_ref().unwrap().vim.mode, vim::Mode::Normal);
+        app.key(key(KeyCode::Char('r')));
+        assert!(app.editor.as_ref().unwrap().vim.waiting_for_argument());
         app.key(KeyEvent::new(KeyCode::Char('_'), KeyModifiers::CONTROL));
         assert_eq!(app.editor.as_ref().unwrap().text(), "α");
+        assert!(!app.editor.as_ref().unwrap().vim.waiting_for_argument());
         assert_eq!(app.editor.as_ref().unwrap().review_base_version, Some(7));
         app.key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::ALT));
         assert_eq!(app.editor.as_ref().unwrap().text(), "αβ文");
         assert_eq!(app.editor.as_ref().unwrap().vim.mode, vim::Mode::Normal);
+    }
+
+    #[test]
+    fn composer_vim_pending_arguments_preserve_shortcuts_and_guard_focused_calls() {
+        let mut app = test_app();
+        app.vim_mode = true;
+        app.key(key(KeyCode::Esc));
+        assert_eq!(app.view, View::Chat);
+        app.key(key(KeyCode::Char('r')));
+        assert!(app.vim_input.waiting_for_argument());
+        app.key(key(KeyCode::Tab));
+        assert_ne!(app.view, View::Chat);
+        assert!(!app.vim_input.waiting_for_argument());
+
+        app.view = View::Chat;
+        app.key(key(KeyCode::Char('r')));
+        app.call_focus = Some("synthetic-call".into());
+        let notes = app.notes.len();
+        app.key(key(KeyCode::Char('e')));
+        assert_eq!(app.call_focus.as_deref(), Some("synthetic-call"));
+        assert_eq!(app.notes.len(), notes);
+        assert!(!app.vim_input.waiting_for_argument());
+        assert!(app.input.is_empty());
+
+        app.call_focus = None;
+        app.input.set("draft");
+        app.key(key(KeyCode::Char('r')));
+        app.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.input.is_empty());
+        assert!(!app.vim_input.waiting_for_argument());
+        app.key(key(KeyCode::Char('i')));
+        assert_eq!(app.vim_input.mode, vim::Mode::Insert);
     }
 
     #[test]
