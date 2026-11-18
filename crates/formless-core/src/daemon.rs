@@ -3329,13 +3329,7 @@ impl Daemon {
                     Some((run_id, _)) => Some(self.usage_info(None, Some(&run_id), &cfg)?),
                     None => None,
                 };
-                let runs = self.with_reader(|st| {
-                    Ok(st
-                        .run_metrics(100_000)?
-                        .into_iter()
-                        .filter(|r| r.session_id == session_id)
-                        .count())
-                })?;
+                let runs = self.with_reader(|st| st.count_runs_for_session(&session_id))?;
                 Ok(json!({"last_run": last_run, "total": total, "runs": runs}))
             }
             Request::GetArtifact { id, offset, length } => {
@@ -3674,32 +3668,55 @@ impl Daemon {
             Request::UsageByDay { since, by } => {
                 let by = by.unwrap_or_default();
                 let cfg = self.config()?;
-                let rows = self.with_reader(|st| st.usage_grouped(since.as_deref(), &by))?;
+                let rows =
+                    self.with_reader(|st| st.usage_grouped_with_labels(since.as_deref(), &by))?;
                 // Merge the per-model rows of each key, pricing as we go
                 // (no cost when a model in it has no price).
-                let mut out: Vec<(String, i64, i64, i64, Option<f64>)> = Vec::new();
-                for (key, provider, model, p, c, cached, cw, reported, unknown) in rows {
+                struct UsageBucket {
+                    key: String,
+                    label: Option<String>,
+                    prompt: i64,
+                    completion: i64,
+                    cached: i64,
+                    cost: Option<f64>,
+                }
+                let mut out: Vec<UsageBucket> = Vec::new();
+                for ((key, provider, model, p, c, cached, cw, reported, unknown), label) in rows {
                     let price =
                         cfg.cost_of_known(&provider, &model, p, c, cached, cw, reported, unknown);
-                    match out.last_mut().filter(|o| o.0 == key) {
-                        Some(o) => {
-                            o.1 += p;
-                            o.2 += c;
-                            o.3 += cached;
-                            o.4 = o.4.zip(price).map(|(a, b)| a + b);
+                    match out.last_mut().filter(|bucket| bucket.key == key) {
+                        Some(bucket) => {
+                            bucket.prompt += p;
+                            bucket.completion += c;
+                            bucket.cached += cached;
+                            bucket.cost = bucket.cost.zip(price).map(|(a, b)| a + b);
                         }
-                        None => out.push((key, p, c, cached, price)),
+                        None => out.push(UsageBucket {
+                            key,
+                            label,
+                            prompt: p,
+                            completion: c,
+                            cached,
+                            cost: price,
+                        }),
                     }
                 }
                 if !by.is_empty() {
-                    out.sort_by_key(|o| std::cmp::Reverse(o.1 + o.2));
+                    out.sort_by_key(|bucket| std::cmp::Reverse(bucket.prompt + bucket.completion));
                 }
                 Ok(json!(out
                     .into_iter()
-                    .map(|(key, p, c, cached, cost)| json!({
-                        "key": key, "prompt_tokens": p, "completion_tokens": c,
-                        "cached_tokens": cached, "cost": cost,
-                    }))
+                    .map(|bucket| {
+                        let mut row = json!({
+                            "key": bucket.label.as_deref().unwrap_or(&bucket.key),
+                            "prompt_tokens": bucket.prompt, "completion_tokens": bucket.completion,
+                            "cached_tokens": bucket.cached, "cost": bucket.cost,
+                        });
+                        if bucket.label.is_some() {
+                            row["session_id"] = json!(bucket.key);
+                        }
+                        row
+                    })
                     .collect::<Vec<_>>()))
             }
             Request::ListToolMetrics { since } => {
@@ -4485,11 +4502,10 @@ impl Daemon {
                 Ok(out)
             }
             Request::RetireTool { id } => {
-                let t = self
-                    .with_store(|st| st.set_tool_retired(&id, true))?
-                    .context(RequestFailure::not_found("tool not found"))?;
+                let t = self.change_registry("retired", "user", |st| {
+                    Self::set_registry_retired(st, &id, true)
+                })?;
                 let _ = self.with_store(|st| st.audit("user", "tool.retire", &t.name));
-                self.note_registry_change(&t, "retired", t.current_version, "user");
                 self.broadcast(Event::ToolUpdated { tool: t.clone() });
                 Ok(serde_json::to_value(t)?)
             }
@@ -4531,11 +4547,10 @@ impl Daemon {
                 Ok(serde_json::to_value(t)?)
             }
             Request::RestoreTool { id } => {
-                let t = self
-                    .with_store(|st| st.set_tool_retired(&id, false))?
-                    .context(RequestFailure::not_found("tool not found"))?;
+                let t = self.change_registry("restored", "user", |st| {
+                    Self::set_registry_retired(st, &id, false)
+                })?;
                 let _ = self.with_store(|st| st.audit("user", "tool.restore", &t.name));
-                self.note_registry_change(&t, "restored", t.current_version, "user");
                 self.broadcast(Event::ToolUpdated { tool: t.clone() });
                 Ok(serde_json::to_value(t)?)
             }
@@ -4546,38 +4561,26 @@ impl Daemon {
                 }
                 Ok(json!({"purged": existed}))
             }
-            Request::UndoRegistryChange => {
-                let change: RegistryChange = self
-                    .with_reader(|st| st.kv_get(REGISTRY_NS, LAST_CHANGE))?
-                    .and_then(|v| serde_json::from_value(v).ok())
-                    .context("nothing to undo in the Tool registry")?;
-                let id = change.tool_id.as_str();
-                let t = match change.action.as_str() {
-                    // A new Tool is retired, not purged: restorable.
-                    "created" | "restored" => {
-                        self.with_store(|st| st.set_tool_retired(id, true))?
-                    }
-                    "retired" => self.with_store(|st| st.set_tool_retired(id, false))?,
-                    _ => self.with_store(|st| st.rollback_tool(id, change.from_version))?,
-                }
-                .context(RequestFailure::not_found("that Tool no longer exists"))?;
-                self.with_store(|st| st.kv_set(REGISTRY_NS, LAST_CHANGE, &Value::Null))?;
-                let undone = change.summary();
-                let _ = self.with_store(|st| st.audit("user", "tool.undo", &undone));
-                self.broadcast(Event::ToolUpdated { tool: t.clone() });
-                Ok(json!({"undone": undone, "tool": t}))
+            Request::UndoRegistryChange => self.undo_registry_change(None),
+            Request::UndoRegistryChangeIfCurrent { change_id } => {
+                self.undo_registry_change(Some(&change_id))
             }
             Request::RollbackTool { id, version } => {
-                let before = self
-                    .with_reader(|st| st.get_tool_current(&id))?
-                    .map_or(0, |(i, _)| i.current_version);
-                let t = self
-                    .with_store(|st| st.rollback_tool(&id, version))?
-                    .context(RequestFailure::not_found("tool/version not found"))?;
+                let t = self.change_registry("rolled_back", "user", |st| {
+                    let current = st
+                        .tool_info(&id)?
+                        .context(RequestFailure::not_found("tool/version not found"))?;
+                    if current.current_version == version {
+                        return Ok((current, None));
+                    }
+                    let tool = st
+                        .rollback_tool(&id, version)?
+                        .context(RequestFailure::not_found("tool/version not found"))?;
+                    Ok((tool, Some(current.current_version)))
+                })?;
                 let _ = self.with_store(|st| {
                     st.audit("user", "tool.rollback", &format!("{} v{version}", t.name))
                 });
-                self.note_registry_change(&t, "rolled_back", before, "user");
                 self.broadcast(Event::ToolUpdated { tool: t.clone() });
                 Ok(serde_json::to_value(t)?)
             }
@@ -5033,10 +5036,55 @@ impl Daemon {
             .to_string())
     }
 
-    /// Remember the newest registry change, the one `UndoRegistryChange`
-    /// reverts, and tell clients (they offer Undo).
-    fn note_registry_change(&self, t: &ToolInfo, action: &str, from_version: i64, author: &str) {
+    fn set_registry_retired(
+        st: &Store,
+        id: &str,
+        retired: bool,
+    ) -> Result<(ToolInfo, Option<i64>)> {
+        let current = st
+            .tool_info(id)?
+            .context(RequestFailure::not_found("tool not found"))?;
+        if current.retired == retired {
+            return Ok((current, None));
+        }
+        let tool = st
+            .set_tool_retired(id, retired)?
+            .context(RequestFailure::not_found("tool not found"))?;
+        Ok((tool, Some(current.current_version)))
+    }
+
+    fn change_registry(
+        &self,
+        action: &str,
+        author: &str,
+        write: impl FnOnce(&Store) -> Result<(ToolInfo, Option<i64>)>,
+    ) -> Result<ToolInfo> {
+        let (tool, change) = self.with_store(|st| {
+            st.transaction(|st| {
+                let (tool, before) = write(st)?;
+                // Preserve the previous receipt when this request changed no state.
+                let change = before
+                    .map(|version| Self::record_registry_change(st, &tool, action, version, author))
+                    .transpose()?;
+                Ok((tool, change))
+            })
+        })?;
+        if let Some(change) = change {
+            self.broadcast(Event::RegistryChanged { change });
+        }
+        Ok(tool)
+    }
+
+    /// Save the Undo identity in the same transaction as the Tool mutation.
+    fn record_registry_change(
+        st: &Store,
+        t: &ToolInfo,
+        action: &str,
+        from_version: i64,
+        author: &str,
+    ) -> Result<RegistryChange> {
         let change = RegistryChange {
+            change_id: Some(uuid::Uuid::new_v4().to_string()),
             tool_id: t.id.clone(),
             name: t.name.clone(),
             action: action.into(),
@@ -5045,10 +5093,49 @@ impl Daemon {
             author: author.into(),
             at: chrono::Utc::now().to_rfc3339(),
         };
-        if let Ok(v) = serde_json::to_value(&change) {
-            let _ = self.with_store(|st| st.kv_set(REGISTRY_NS, LAST_CHANGE, &v));
-        }
-        self.broadcast(Event::RegistryChanged { change });
+        st.kv_set(REGISTRY_NS, LAST_CHANGE, &serde_json::to_value(&change)?)?;
+        Ok(change)
+    }
+
+    fn undo_registry_change(&self, expected: Option<&str>) -> Result<Value> {
+        let (tool, undone) = self.with_store(|st| {
+            st.transaction(|st| {
+                let unavailable = || {
+                    if expected.is_some() {
+                        "Undo is no longer available for that Tool change"
+                    } else {
+                        "nothing to undo in the Tool registry"
+                    }
+                };
+                let change: RegistryChange = st
+                    .kv_get(REGISTRY_NS, LAST_CHANGE)?
+                    .and_then(|v| serde_json::from_value(v).ok())
+                    .with_context(unavailable)?;
+                if let Some(expected) = expected {
+                    anyhow::ensure!(change.change_id.as_deref() == Some(expected), unavailable());
+                    let current = st.tool_info(&change.tool_id)?.with_context(unavailable)?;
+                    anyhow::ensure!(current.current_version == change.to_version, unavailable());
+                    match change.action.as_str() {
+                        "retired" => anyhow::ensure!(current.retired, unavailable()),
+                        "created" | "restored" => anyhow::ensure!(!current.retired, unavailable()),
+                        _ => {}
+                    }
+                }
+                let id = change.tool_id.as_str();
+                let tool = match change.action.as_str() {
+                    // A new Tool is retired, not purged: restorable.
+                    "created" | "restored" => st.set_tool_retired(id, true)?,
+                    "retired" => st.set_tool_retired(id, false)?,
+                    _ => st.rollback_tool(id, change.from_version)?,
+                }
+                .context(RequestFailure::not_found("that Tool no longer exists"))?;
+                st.kv_delete(REGISTRY_NS, LAST_CHANGE)?;
+                Ok((tool, change.summary()))
+            })
+        })?;
+        let _ = self.with_store(|st| st.audit("user", "tool.undo", &undone));
+        self.broadcast(Event::ToolUpdated { tool: tool.clone() });
+        Ok(json!({"undone": undone, "tool": tool}))
     }
 
     /// Attribute only the exact operation result owned by this Run. Reading
@@ -8091,10 +8178,9 @@ impl Daemon {
                 let reason = args["reason"].as_str().unwrap_or_default();
                 match self.with_store(|st| st.get_tool_by_name(name)) {
                     Ok(Some((info, _))) => {
-                        if let Ok(Some(t)) =
-                            self.with_store(|st| st.set_tool_retired(&info.id, true))
-                        {
-                            self.note_registry_change(&t, "retired", t.current_version, "agent");
+                        if let Ok(t) = self.change_registry("retired", "agent", |st| {
+                            Self::set_registry_retired(st, &info.id, true)
+                        }) {
                             self.note_tool_change(
                                 run_id,
                                 ToolChange {
@@ -10088,24 +10174,37 @@ impl Daemon {
             return Err(crate::tool_compatibility::SchemaChangeBlocked(preflight).into());
         }
         let smoke_note = self.smoke_gate(&d, cfg, cancel).await?;
-        let (info, version, compatibility) = self
+        let (info, version, compatibility, change) = self
             .with_store(|st| {
                 let write = |st: &Store| {
-                    st.create_tool_version_with_schema_report(
-                        &d.name,
-                        &d.description,
-                        &d.input_schema.to_string(),
-                        &d.output_schema.to_string(),
-                        &d.code,
-                        &d.caps,
-                        d.memory_mb,
-                        author,
-                        policy,
-                    )
+                    let (mut info, version, compatibility) = st
+                        .create_tool_version_with_schema_report(
+                            &d.name,
+                            &d.description,
+                            &d.input_schema.to_string(),
+                            &d.output_schema.to_string(),
+                            &d.code,
+                            &d.caps,
+                            d.memory_mb,
+                            author,
+                            policy,
+                        )?;
+                    // A new version keeps the Tool's title and tags unless given.
+                    if let Some(title) = tool_title(args) {
+                        info = st.set_tool_title(&info.id, &title)?.unwrap_or(info);
+                    }
+                    if let Some(tags) = args["tags"].as_array() {
+                        let tags = toolreg::normalize_tags(tags.iter().filter_map(Value::as_str));
+                        info = st.set_tool_tags(&info.id, &tags)?.unwrap_or(info);
+                    }
+                    let before = compatibility.base_version;
+                    let action = if before == 0 { "created" } else { "updated" };
+                    let change = Self::record_registry_change(st, &info, action, before, author)?;
+                    Ok((info, version, compatibility, change))
                 };
                 match expected.as_ref() {
                     Some((id, version)) => st.with_current_tool(id, *version, write),
-                    None => write(st),
+                    None => st.transaction(write),
                 }
             })
             .map_err(|error| {
@@ -10115,26 +10214,9 @@ impl Daemon {
                     error
                 }
             })?;
-        let before = compatibility.base_version;
-        // A new version keeps the Tool's title and tags unless given.
-        let info = match tool_title(args) {
-            Some(title) => self
-                .with_store(|st| st.set_tool_title(&info.id, &title))?
-                .unwrap_or(info),
-            None => info,
-        };
-        let info = match args["tags"].as_array() {
-            Some(tags) => {
-                let tags = toolreg::normalize_tags(tags.iter().filter_map(Value::as_str));
-                self.with_store(|st| st.set_tool_tags(&info.id, &tags))?
-                    .unwrap_or(info)
-            }
-            None => info,
-        };
         let _ = self
             .with_store(|st| st.audit(author, "tool.create", &format!("{} v{version}", d.name)));
-        let action = if before == 0 { "created" } else { "updated" };
-        self.note_registry_change(&info, action, before, author);
+        self.broadcast(Event::RegistryChanged { change });
         self.broadcast(Event::ToolUpdated { tool: info.clone() });
         Ok((info, version, smoke_note, compatibility))
     }

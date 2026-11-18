@@ -637,6 +637,31 @@ pub fn broad_capability(spec: &str) -> Option<&'static str> {
     }
     if let Some(key) = spec.strip_prefix("env:") {
         let k = key.to_uppercase();
+        let schema_role = matches!(
+            k.as_str(),
+            "PRIMARY_KEY"
+                | "FOREIGN_KEY"
+                | "UNIQUE_KEY"
+                | "CANDIDATE_KEY"
+                | "SORT_KEY"
+                | "PARTITION_KEY"
+        );
+        // Preserve warnings for compact credential spellings as well.
+        let credential_key = !schema_role && k.split('_').any(|part| part == "KEY")
+            || [
+                "APIKEY",
+                "ACCESSKEY",
+                "ENCRYPTIONKEY",
+                "SIGNINGKEY",
+                "HMACKEY",
+                "CLIENTKEY",
+                "ACCOUNTKEY",
+                "MASTERKEY",
+                "SESSIONKEY",
+                "SHAREDKEY",
+            ]
+            .iter()
+            .any(|ending| k.ends_with(ending));
         let secret = [
             "TOKEN",
             "SECRET",
@@ -648,7 +673,7 @@ pub fn broad_capability(spec: &str) -> Option<&'static str> {
         ]
         .iter()
         .any(|w| k.contains(w))
-            || k.ends_with("KEY")
+            || credential_key
             || k.ends_with("_PAT");
         if secret {
             return Some("a secret from your environment");
@@ -762,6 +787,9 @@ pub struct ApprovalBatch {
 /// (SPEC §7.2).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RegistryChange {
+    /// Identity of this operation. Older daemons and stored records omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_id: Option<String>,
     pub tool_id: String,
     pub name: String,
     /// created, updated, retired, restored or rolled_back.
@@ -2639,6 +2667,11 @@ pub enum Request {
     /// retired, an update or rollback rolled back, a retire or restore
     /// reversed. `{undone, tool}`; an error when there is nothing to undo.
     UndoRegistryChange,
+    /// Revert only the registry change identified by a specific event.
+    /// A separate request prevents older daemons from treating it as global Undo.
+    UndoRegistryChangeIfCurrent {
+        change_id: String,
+    },
     /// Switch a Tool off (or back on) without retiring it.
     SetToolDisabled {
         id: String,
@@ -3730,6 +3763,48 @@ mod tests {
             "env:LANG",
         ] {
             assert!(broad_capability(scoped).is_none(), "{scoped}");
+        }
+    }
+
+    #[test]
+    fn environment_key_grants_use_credential_name_boundaries() {
+        for name in [
+            "AWS_ACCESS_KEY_ID",
+            "aws_access_key_id",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "KEY",
+            "OPENAI_API_KEY",
+            "OPENAIAPIKEY",
+            "ACCESSKEY",
+            "ENCRYPTIONKEY",
+            "SIGNINGKEY",
+            "HMACKEY",
+            "PRIMARY_KEY_TOKEN",
+            "SSH_AUTH_SOCK",
+        ] {
+            assert_eq!(
+                broad_capability(&format!("env:{name}")),
+                Some("a secret from your environment"),
+                "{name}"
+            );
+        }
+        for name in [
+            "MONKEY",
+            "TURKEY",
+            "DONKEY",
+            "HOCKEY",
+            "JOCKEY",
+            "HOTKEY",
+            "PRIMARY_KEY",
+            "foreign_key",
+            "UNIQUE_KEY",
+            "CANDIDATE_KEY",
+            "SORT_KEY",
+            "PARTITION_KEY",
+            "HOME",
+        ] {
+            assert_eq!(broad_capability(&format!("env:{name}")), None, "{name}");
         }
     }
 
