@@ -346,6 +346,7 @@ INSERT INTO messages_fts(messages_fts) VALUES ('rebuild');
 /// Largest stored value (JSON bytes) and namespace total.
 pub const KV_MAX_VALUE: usize = 64 * 1024;
 pub const KV_MAX_NAMESPACE: i64 = 5 * 1024 * 1024;
+const KV_MAX_PROFILE: i64 = 50 * 1024 * 1024;
 
 /// Token use of one model: (model, prompt, completion, cached,
 /// provider-reported USD when every request reported one).
@@ -2904,9 +2905,9 @@ impl Store {
                 .unwrap_or(0))
         };
         Ok(serde_json::json!({
-            "messages": sum("SELECT SUM(length(content) + COALESCE(length(meta),0)) FROM messages")?,
-            "invocations": sum("SELECT SUM(length(input) + length(output) + length(error)) FROM invocations")?,
-            "tool_versions": sum("SELECT SUM(length(code) + length(input_schema) + length(output_schema)) FROM tool_versions")?,
+            "messages": sum("SELECT SUM(octet_length(content) + COALESCE(octet_length(meta),0)) FROM messages")?,
+            "invocations": sum("SELECT SUM(octet_length(input) + octet_length(output) + octet_length(error)) FROM invocations")?,
+            "tool_versions": sum("SELECT SUM(octet_length(code) + octet_length(input_schema) + octet_length(output_schema)) FROM tool_versions")?,
             "run_files": sum("SELECT SUM(COALESCE(length(before),0)) FROM run_files")?,
         }))
     }
@@ -4994,29 +4995,86 @@ impl Store {
     /// Store a JSON value, within the size caps.
     pub fn kv_set(&self, namespace: &str, key: &str, value: &Value) -> Result<()> {
         if key.is_empty() || key.len() > 256 {
-            anyhow::bail!("store keys must be 1-256 characters");
+            anyhow::bail!("store keys must be 1-256 UTF-8 bytes");
         }
         let text = value.to_string();
         if text.len() > KV_MAX_VALUE {
-            anyhow::bail!("store value is larger than {} KB", KV_MAX_VALUE / 1024);
+            anyhow::bail!("store value is larger than {} KiB", KV_MAX_VALUE / 1024);
         }
-        let used: i64 = self.conn.query_row(
-            "SELECT COALESCE(SUM(length(value)+length(key)),0) FROM tool_kv WHERE namespace=?1 AND key!=?2",
-            params![namespace, key],
-            |r| r.get(0),
-        )?;
-        if used + (text.len() + key.len()) as i64 > KV_MAX_NAMESPACE {
-            anyhow::bail!(
-                "store namespace is full ({} MB); delete keys first",
-                KV_MAX_NAMESPACE / 1024 / 1024
-            );
-        }
-        self.ex(
-            "INSERT INTO tool_kv(namespace,key,value,updated_at) VALUES(?1,?2,?3,?4)
-             ON CONFLICT(namespace,key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
-            params![namespace, key, text, now()],
-        )?;
-        Ok(())
+        let new_bytes = (text.len() + key.len()) as i64;
+        // Keep admission and the write under the same SQLite writer lock.
+        self.transaction(|st| {
+            let used: i64 = st.ps(
+                "SELECT COALESCE(SUM(octet_length(value)+octet_length(key)),0)
+                 FROM tool_kv WHERE namespace=?1 AND key!=?2",
+            )?.query_row(params![namespace, key], |r| r.get(0))?;
+            if used + new_bytes > KV_MAX_NAMESPACE {
+                anyhow::bail!(
+                    "store namespace is full ({} MiB); delete keys first",
+                    KV_MAX_NAMESPACE / 1024 / 1024
+                );
+            }
+            // Tool data has its own budget so filling it cannot block harness
+            // bookkeeping such as saving a registry Undo receipt.
+            if namespace.starts_with("tool:") || namespace.starts_with("shared:") {
+                let used: i64 = st.ps(
+                    "SELECT COALESCE(SUM(octet_length(namespace)+octet_length(key)+octet_length(value)),0)
+                     FROM tool_kv WHERE (namespace GLOB 'tool:*' OR namespace GLOB 'shared:*')
+                     AND NOT (namespace=?1 AND key=?2)",
+                )?.query_row(params![namespace, key], |r| r.get(0))?;
+                if used + new_bytes + namespace.len() as i64 > KV_MAX_PROFILE {
+                    anyhow::bail!(
+                        "profile Tool store is full ({} MiB); delete keys first",
+                        KV_MAX_PROFILE / 1024 / 1024
+                    );
+                }
+            }
+            st.ex(
+                "INSERT INTO tool_kv(namespace,key,value,updated_at) VALUES(?1,?2,?3,?4)
+                 ON CONFLICT(namespace,key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+                params![namespace, key, text, now()],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Logical Tool payload bytes, orphaned shared namespace count and bytes.
+    pub(crate) fn tool_store_usage(&self) -> Result<(i64, usize, i64)> {
+        self.read_transaction(|st| {
+            let mut specs = st.ps(
+                "SELECT DISTINCT cap.value FROM tool_versions v,
+                 json_each(CASE WHEN json_valid(v.capabilities) THEN v.capabilities ELSE '[]' END) cap
+                 WHERE cap.type='text'",
+            )?;
+            let declared: std::collections::HashSet<String> = specs
+                .query_map([], |row| row.get::<_, String>(0))?
+                .filter_map(|row| match row {
+                    Ok(spec) => spec.trim().strip_prefix("store:").map(|ns| Ok(ns.to_owned())),
+                    Err(error) => Some(Err(error)),
+                })
+                .collect::<rusqlite::Result<_>>()?;
+
+            let mut usage = st.ps(
+                "SELECT namespace, SUM(octet_length(namespace)+octet_length(key)+octet_length(value))
+                 FROM tool_kv WHERE namespace GLOB 'tool:*' OR namespace GLOB 'shared:*'
+                 GROUP BY namespace",
+            )?;
+            let mut rows = usage.query([])?;
+            let (mut total_bytes, mut orphaned_count, mut orphaned_bytes) = (0, 0, 0);
+            while let Some(row) = rows.next()? {
+                let namespace: String = row.get(0)?;
+                let bytes: i64 = row.get(1)?;
+                total_bytes += bytes;
+                if namespace
+                    .strip_prefix("shared:")
+                    .is_some_and(|shared| !declared.contains(shared))
+                {
+                    orphaned_count += 1;
+                    orphaned_bytes += bytes;
+                }
+            }
+            Ok((total_bytes, orphaned_count, orphaned_bytes))
+        })
     }
 
     pub fn kv_delete(&self, namespace: &str, key: &str) -> Result<bool> {

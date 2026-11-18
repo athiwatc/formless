@@ -79,6 +79,7 @@ pub(crate) fn migration_backups(paths: &Paths) -> Vec<PathBuf> {
 pub fn usage(paths: &Paths, store: &Store) -> Result<Value> {
     let (artifact_count, artifact_bytes) = crate::artifacts::usage(store)?;
     let inside = store.content_bytes()?;
+    let (tool_store_bytes, orphaned_namespaces, orphaned_bytes) = store.tool_store_usage()?;
     let snapshots = store.run_file_usage()?;
     let mcp_logs = path_bytes(&paths.data_dir.join("mcp"));
     let backups = path_bytes(&backup_dir(paths))
@@ -91,6 +92,7 @@ pub fn usage(paths: &Paths, store: &Store) -> Result<Value> {
         json!({"kind": "sessions", "bytes": inside["messages"], "detail": "messages, inside the database", "inside_db": true}),
         json!({"kind": "invocation logs", "bytes": inside["invocations"], "detail": "Tool inputs and outputs, inside the database", "inside_db": true}),
         json!({"kind": "tool versions", "bytes": inside["tool_versions"], "detail": "every version's code, inside the database", "inside_db": true}),
+        json!({"kind": "Tool store", "bytes": tool_store_bytes, "orphaned_namespaces": orphaned_namespaces, "orphaned_bytes": orphaned_bytes, "detail": format!("inside the database, {orphaned_namespaces} shared namespaces without a Tool version ({} retained)", human_bytes(orphaned_bytes as u64)), "inside_db": true}),
         json!({"kind": "file snapshots", "bytes": snapshots.retained_bytes.saturating_add(snapshots.after_state_bytes), "rows": snapshots.rows, "retained_files": snapshots.retained_files, "before_bytes": snapshots.before_bytes, "metadata_bytes": snapshots.metadata_bytes, "after_state_bytes": snapshots.after_state_bytes, "detail": format!("{} recorded paths, {} retained snapshots, inside the database", snapshots.rows, snapshots.retained_files), "inside_db": true}),
         json!({"kind": "artifacts", "bytes": artifact_bytes, "detail": format!("{artifact_count} stored outputs")}),
         json!({"kind": "logs", "bytes": crate::logs::log_usage(paths) + mcp_logs, "detail": "daemon and MCP server logs"}),

@@ -2265,10 +2265,15 @@ pattern (§4.4).
     state.
     - `store` gates the Tool's own namespace, and `store:<ns>` gates a
       shared namespace other Tools can name too.
-    - Limits: 64 KB per value, 5 MB per namespace, keys of 1–256
-      characters, and `list` returns at most 1000 keys.
+    - Limits: 64 KiB per serialized JSON value, 5 MiB of keys and values
+      per namespace, and 50 MiB across a profile's Tool namespaces
+      including namespace names. Keys are 1–256 UTF-8 bytes, and `list`
+      returns at most 1000 keys. Delete keys to make room when a quota is
+      reached.
     - Values live in the `tool_kv` table (schema v23). They are never
       exported in bundles, and purging a Tool deletes its own namespace.
+      `formless storage` reports the count and size of shared namespaces
+      that no stored Tool version declares. Their values are retained.
     - Smoke tests and replay use an in-memory store that is thrown away.
   - Rejected Promises still unhandled when `run` completes fail the
     Invocation with the rejection message, including floating nested calls
