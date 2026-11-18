@@ -45,6 +45,13 @@ HOOK = """
       onEvent({type:'session_updated', session: {...S.sessions.find(s => s.id === id), ...fields}});
     },
     event(type, session_id) { onEvent({type, session_id, id: session_id, run_id: 'fixture-run'}); },
+    addPinned() {
+      S.sessions.push(...Array.from({length: 40}, (_, index) => ({
+        id: 'overflow-' + index, name: 'Another pinned Session ' + index, pinned: true,
+        updated_at: '2026-11-18T18:00:25Z',
+      })));
+      renderSessions();
+    },
     actions: () => actions,
   };
 """
@@ -78,11 +85,20 @@ def update(page, session_id, **fields):
 
 def open_menu(page, session_id):
     target = row(page, session_id)
-    target.locator(".session-open").focus()
+    opener = target.locator(".session-open")
+    expect(opener).to_be_visible()
+    opener.focus()
     target.get_by_role("button", name="Session actions").press("ArrowDown")
     menu = page.get_by_role("menu", name="Session actions")
     expect(menu).to_be_visible()
     return menu
+
+
+def in_sidebar(control):
+    return control.evaluate("""el => {
+        const item = el.getBoundingClientRect(), list = document.querySelector('#sessions').getBoundingClientRect();
+        return item.top >= list.top && item.bottom <= list.bottom;
+    }""")
 
 
 def check_ordering(page):
@@ -134,6 +150,9 @@ def check_focus(page):
     page.clock.fast_forward(60_000)
     expect(row(page, "b").locator(".running")).to_have_count(1)
     expect(opener).to_be_focused()
+    page.evaluate("__sessionSidebarFixture.addPinned()")
+    expect(opener).to_be_focused()
+    assert in_sidebar(opener), "Focus was restored below the scrolled Session list"
 
 
 def check_menu(page):
@@ -159,6 +178,19 @@ def check_menu(page):
         {"type": "set_session_pinned", "id": "b", "pinned": False},
     ]
     expect(row(page, "b").get_by_role("button", name="Session actions")).to_be_focused()
+
+    popup = open_menu(page, "b")
+    page.evaluate("__sessionSidebarFixture.addPinned()")
+    expect(popup).to_be_visible()
+    popup.get_by_role("menuitem", name="Pin", exact=True).press("Escape")
+    expect(trigger).to_be_focused()
+    assert in_sidebar(trigger), "Escape focused a trigger outside the scrolled Session list"
+
+    popup = open_menu(page, "b")
+    page.set_viewport_size({"width": 390, "height": 844})
+    expect(popup).to_have_count(0)
+    assert page.evaluate("document.activeElement !== document.body")
+    page.set_viewport_size({"width": 1200, "height": 900})
 
     popup = open_menu(page, "b")
     page.evaluate("__sessionSidebarFixture.event('session_deleted', 'b')")

@@ -825,7 +825,10 @@
     if (popover) { popover.remove(); popover = null; }
     popoverTrigger = null;
     // Keep the expanded trigger visible until focus-within takes over.
-    if (restore) focusReturn(trigger);
+    if (restore) {
+      focusReturn(trigger);
+      if (document.activeElement === trigger) revealSessionControl(trigger);
+    }
     if (trigger) {
       trigger.removeAttribute("aria-expanded");
       trigger.removeAttribute("aria-controls");
@@ -952,9 +955,13 @@
       else if (rect.bottom < bottom) container.scrollTop += rect.bottom - bottom;
     }
   }
+  function revealSessionControl(control) {
+    const list = $("sessions");
+    if (list.contains(control) && focusVisible(control)) revealViewportControl(control, list, safeViewportBounds());
+  }
   function positionPopover() {
     if (!popover) return;
-    if (!popoverTrigger?.isConnected || !popoverTrigger.getClientRects().length) return closePopover();
+    if (!focusVisible(popoverTrigger)) return closePopover();
     const gap = (parseFloat(getComputedStyle(document.documentElement).fontSize) || 16) * .5;
     const bounds = safeViewportBounds(gap);
     popover.style.minWidth = "0";
@@ -1483,12 +1490,14 @@
       const pinLabel = session.pinned ? "Unpin" : "Pin", archiveLabel = session.archived ? "Unarchive" : "Archive";
       if (pin.textContent !== pinLabel) pin.textContent = pinLabel;
       if (archive.textContent !== archiveLabel) archive.textContent = archiveLabel;
+      revealSessionControl(menu);
       positionPopover();
     } else if (menuSession) closePopover();
     if (replacementFocus) {
       const control = replacementFocus.querySelector("." + focusedControl);
       if (focusedControl === "menu" && !focusVisible(control)) replacementFocus.querySelector(".session-open").focus({ preventScroll: true });
       control.focus({ preventScroll: true });
+      revealSessionControl(document.activeElement);
     }
   }
 
