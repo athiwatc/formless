@@ -1365,20 +1365,52 @@
     box.classList.remove("hidden");
     box.append(h("div", { class: "muted", style: "padding:0.25rem 0.5rem;font-size:0.75rem" },
       hits.length + " hit" + (hits.length === 1 ? "" : "s") + " for “" + query + "”"));
-    const lower = query.toLowerCase();
+    const literal = query.trim();
+    const words = literal.match(/[\p{Alphabetic}\p{Number}]+/gu);
+    const terms = words && new Set(words.map((word) => foldMap(word).folded).filter(Boolean));
     for (const hit of hits) {
       const snippet = h("div");
       const text = hit.snippet || "";
-      const at = text.toLowerCase().indexOf(lower);
-      if (at >= 0 && lower) {
-        snippet.append(text.slice(0, at), h("mark", null, text.slice(at, at + query.length)), text.slice(at + query.length));
-      } else snippet.append(text);
+      let cursor = 0;
+      for (const [start, end] of searchHighlightRanges(text, literal, terms)) {
+        if (cursor < start) snippet.append(text.slice(cursor, start));
+        snippet.append(h("mark", null, text.slice(start, end)));
+        cursor = end;
+      }
+      if (cursor < text.length) snippet.append(text.slice(cursor));
       box.append(h("div", {
         class: "hit", tabindex: 0,
         onclick: () => openSession(hit.session_id),
         onkeydown: (e) => { if (e.key === "Enter") openSession(hit.session_id); },
       }, h("div", { class: "meta" }, hit.session_name + " · #" + hit.seq + " " + hit.role), snippet));
     }
+  }
+
+  function searchHighlightRanges(text, literal, terms) {
+    if (!terms) {
+      // The daemon searches literally when the query has no word terms.
+      const start = literal ? text.indexOf(literal) : -1;
+      return start < 0 ? [] : [[start, start + literal.length]];
+    }
+    const { folded, from } = foldMap(text);
+    const remaining = new Set(terms);
+    const spans = [];
+    // Approximate unicode61's boundaries, highlighting the first visible
+    // prefix per term. Multiple prefixes at one position share a mark.
+    for (const { 0: word, index } of folded.matchAll(/[\p{L}\p{N}\p{Co}]+/gu)) {
+      let end = index;
+      for (const term of remaining) {
+        if (!word.startsWith(term)) continue;
+        const stop = index + term.length;
+        // A prefix must cover the complete original character.
+        if (from[stop] === from[stop - 1]) continue;
+        remaining.delete(term);
+        end = Math.max(end, stop);
+      }
+      if (end > index) spans.push([from[index], from[end]]);
+      if (!remaining.size) break;
+    }
+    return spans;
   }
 
   // ---------------------------------------------------------- markdown
@@ -5093,7 +5125,7 @@
     const from = [];
     let at = 0;
     for (const ch of text) {
-      const f = ch.normalize("NFD").replace(/\p{M}/gu, "").toLowerCase().slice(0, 2);
+      const f = ch.normalize("NFD").replace(/\p{M}/gu, "").toLowerCase();
       for (let k = 0; k < f.length; k++) from.push(at);
       folded += f;
       at += ch.length;
