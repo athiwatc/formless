@@ -546,23 +546,30 @@ impl ShellComments {
             .is_multiple_of(2)
     }
 
-    fn ansi_escape(chars: &[char], end: &mut usize) -> Option<char> {
+    fn ansi_escape(chars: &[char], end: &mut usize, bytes: &mut Vec<u8>) -> Option<()> {
         let c = *chars.get(*end)?;
         *end += 1;
+        let simple = match c {
+            'a' => Some(7),
+            'b' => Some(8),
+            'e' | 'E' => Some(27),
+            'f' => Some(12),
+            'n' => Some(b'\n'),
+            'r' => Some(b'\r'),
+            't' => Some(b'\t'),
+            'v' => Some(11),
+            '\\' | '\'' | '"' | '?' => Some(c as u8),
+            _ => None,
+        };
+        if let Some(byte) = simple {
+            bytes.push(byte);
+            return Some(());
+        }
         let (radix, digits) = match c {
-            'a' => return Some('\x07'),
-            'b' => return Some('\x08'),
-            'e' | 'E' => return Some('\x1b'),
-            'f' => return Some('\x0c'),
-            'n' => return Some('\n'),
-            'r' => return Some('\r'),
-            't' => return Some('\t'),
-            'v' => return Some('\x0b'),
-            '\\' | '\'' | '"' | '?' => return Some(c),
             'c' => {
                 let c = chars.get(*end)?.to_ascii_uppercase();
                 *end += 1;
-                return c.is_ascii().then(|| char::from((c as u8) ^ 0x40));
+                return c.is_ascii().then(|| bytes.push((c as u8) ^ 0x40));
             }
             '0'..='7' => {
                 *end -= 1;
@@ -573,7 +580,8 @@ impl ShellComments {
             'U' => (16, 8),
             _ => {
                 *end -= 1;
-                return Some('\\');
+                bytes.push(b'\\');
+                return Some(());
             }
         };
         let start = *end;
@@ -587,9 +595,13 @@ impl ShellComments {
         }
         if *end == start {
             *end -= 1;
-            return Some('\\');
+            bytes.push(b'\\');
+        } else if matches!(c, 'u' | 'U') {
+            bytes.extend_from_slice(char::from_u32(value)?.encode_utf8(&mut [0; 4]).as_bytes());
+        } else {
+            bytes.push(value as u8);
         }
-        char::from_u32(if radix == 8 { value % 256 } else { value })
+        Some(())
     }
 
     fn context(&self) -> ShellContext {
@@ -767,7 +779,7 @@ impl ShellComments {
         let mut quote = None;
         let mut quoted = false;
         let mut ansi_quote = false;
-        let mut delimiter = String::new();
+        let mut delimiter = Vec::new();
         if chars.get(end) == Some(&'#') {
             return None;
         }
@@ -779,30 +791,34 @@ impl ShellComments {
             if quote == Some(c) {
                 quote = None;
                 ansi_quote = false;
-            } else if quote.is_none() && c == '$' && chars.get(end) == Some(&'\'') {
-                quote = Some('\'');
+            } else if quote.is_none()
+                && c == '$'
+                && chars.get(end).is_some_and(|c| "\"'".contains(*c))
+            {
+                quote = chars.get(end).copied();
                 quoted = true;
-                ansi_quote = true;
+                ansi_quote = quote == Some('\'');
                 end += 1;
             } else if quote.is_none() && "\"'".contains(c) {
                 quote = Some(c);
                 quoted = true;
             } else if c == '\\' && ansi_quote {
-                delimiter.push(Self::ansi_escape(chars, &mut end)?);
+                Self::ansi_escape(chars, &mut end, &mut delimiter)?;
             } else if c == '\\'
                 && quote != Some('\'')
                 && (quote.is_none() || chars.get(end).is_some_and(|c| "\\\"$`".contains(*c)))
             {
-                delimiter.push(*chars.get(end)?);
+                delimiter.extend_from_slice(chars.get(end)?.encode_utf8(&mut [0; 4]).as_bytes());
                 quoted = true;
                 end += 1;
             } else {
-                delimiter.push(c);
+                delimiter.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes());
             }
         }
-        if end == start || quote.is_some() {
+        if end == start || quote.is_some() || delimiter.contains(&0) {
             return None;
         }
+        let delimiter = String::from_utf8(delimiter).ok()?;
         self.here_docs.push_back(HereDoc {
             delimiter,
             strip_tabs,
@@ -1587,6 +1603,8 @@ mod tests {
                 &["# outside"],
             ),
             ("cat <<$'E\\x4fF'\nhello;#literal\nEOF\nprintf done;# real", &["# real"]),
+            ("cat <<$'caf\\303\\251'\nhello;#literal\ncafé\nprintf done;# real", &["# real"]),
+            ("cat <<$\"EOF\"\nhello;#literal\nEOF\nprintf done;# real", &["# real"]),
             ("cat <<EOF\nleft\\\nEOF\nhello;#literal\nEOF\nprintf done;# real", &["# real"]),
             ("cat <<EOF\nE\\\nOF\nprintf done;# real", &["# real"]),
             ("cat <<'EOF'\nleft\\\nEOF\nprintf done;# real", &["# real"]),

@@ -86,6 +86,8 @@ def check(page):
         ('cat <<EOF\nhello;#literal\nEOF\nprintf done;# real',['# real']),
         ('cat <<\'FIRST\' <<-E"ND"\n\n# data\nFIRST\n\tsecond |# data\n\tEND\ntrue;# outside',['# outside']),
         ("cat <<$'E\\x4fF'\nhello;#literal\nEOF\nprintf done;# real",['# real']),
+        ("cat <<$'caf\\303\\251'\nhello;#literal\ncafé\nprintf done;# real",['# real']),
+        ('cat <<$"EOF"\nhello;#literal\nEOF\nprintf done;# real',['# real']),
         ("cat <<EOF\nleft\\\nEOF\nhello;#literal\nEOF\nprintf done;# real",['# real']),
         ("cat <<EOF\nE\\\nOF\nprintf done;# real",['# real']),
         ("cat <<'EOF'\nleft\\\nEOF\nprintf done;# real",['# real']),

@@ -1670,8 +1670,9 @@
         size ? code.slice(start, start + size).match(/^[0-9a-f]+/i) : null;
       if (!digits) return ["\\", at];
       const value = parseInt(digits[0], octal ? 8 : 16);
+      if (octal || c === "x") return [value % 256, start + digits[0].length];
       if (value > 0x10ffff || value >= 0xd800 && value <= 0xdfff) return null;
-      return [String.fromCodePoint(octal ? value % 256 : value), start + digits[0].length];
+      return [String.fromCodePoint(value), start + digits[0].length];
     };
     const hereDoc = (at) => {
       if (!posix || !["command", "case-body"].includes(context()) || escaped(at) ||
@@ -1682,35 +1683,49 @@
       if (stripTabs) end++;
       while (code[end] === " " || code[end] === "\t") end++;
       const start = end;
-      let quote = "", delimiter = "";
+      const bytes = [];
+      const encoder = new TextEncoder();
+      const append = (content) => {
+        if (typeof content === "number") bytes.push(content);
+        else bytes.push(...encoder.encode(content));
+      };
+      let quote = "";
       let quoted = false, ansiQuote = false;
       if (code[end] === "#") return at;
       while (end < code.length && code[end] !== "\n") {
-        const c = code[end];
+        const c = String.fromCodePoint(code.codePointAt(end));
         if (!quote && /[\s;|&()<>]/.test(c)) break;
-        end++;
+        end += c.length;
         if (quote === c) {
           quote = "";
           ansiQuote = false;
-        } else if (!quote && c === "$" && code[end] === "'") {
-          quote = "'";
-          quoted = ansiQuote = true;
-          end++;
+        } else if (!quote && c === "$" && (code[end] === "'" || code[end] === '"')) {
+          quote = code[end++];
+          quoted = true;
+          ansiQuote = quote === "'";
         } else if (!quote && "\"'".includes(c)) {
           quote = c;
           quoted = true;
         } else if (c === "\\" && ansiQuote) {
           const escapedChar = ansiEscape(end);
           if (!escapedChar) return at;
-          delimiter += escapedChar[0];
+          append(escapedChar[0]);
           end = escapedChar[1];
         } else if (c === "\\" && quote !== "'" && (!quote || /[\\"$`]/.test(code[end] ?? ""))) {
           if (end === code.length || code[end] === "\n") return at;
-          delimiter += code[end++];
+          const escapedChar = String.fromCodePoint(code.codePointAt(end));
+          append(escapedChar);
+          end += escapedChar.length;
           quoted = true;
-        } else delimiter += c;
+        } else append(c);
       }
-      if (end === start || quote) return at;
+      if (end === start || quote || bytes.includes(0)) return at;
+      let delimiter;
+      try {
+        delimiter = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(Uint8Array.from(bytes));
+      } catch {
+        return at;
+      }
       hereDocs.push({ delimiter, stripTabs, quoted, continued: "" });
       return end;
     };
