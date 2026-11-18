@@ -686,6 +686,9 @@
   function composerEnterSends() {
     return typeof S.enterSends === "boolean" ? S.enterSends : !inputTouchMode();
   }
+  function enterModeHint(enterSends) {
+    return enterSends ? "Enter: sends" : "Enter: newline";
+  }
   function updateEnterSendsControl() {
     const input = $("enter-sends");
     if (input) input.checked = composerEnterSends();
@@ -2816,6 +2819,9 @@
     if (await act({type:"resume_run",session_id:sid})) { S.unfinished = null; renderRunBanner(); }
   }
 
+  function welcomeEnterHint(enterSends) {
+    return enterModeHint(enterSends) + (enterSends ? "" : " · Use the " + tr("Send") + " button");
+  }
   function welcome() {
     // The same examples as the TUI's empty Session (1–4 there).
     const examples = [
@@ -2828,7 +2834,8 @@
       h("h2", null, h("span", { class: "mark" }, "◇ "), "Formless"),
       h("p", { class: "muted" }, "It builds the Tools a task needs and keeps them, so it gets more capable the more you use it."),
       h("div", { class: "examples" }, examples.map((ex) => h("button", { type: "button", onclick: () => { $("input").value = ex; $("input").focus(); autosize(); } }, ex))),
-      h("p", { class: "muted" }, "Enter sends · /help commands · /model switch model · @ reference a file"));
+      h("p", { class: "muted" }, h("span", { class: "welcome-enter-hint" }, welcomeEnterHint(composerEnterSends())),
+        " · /help commands · /model switch model · @ reference a file"));
   }
 
   function runningTool(name, invocationId = null, depth = null, handle = null) {
@@ -3721,9 +3728,14 @@
     $("stop-btn").textContent = tr("Stop");
     $("input").placeholder = tr(running ? "Steer, or Ctrl/⌘+Enter to queue…" : "Message Formless…");
     const enterSends = composerEnterSends();
+    const welcomeHint = historyRender.welcome?.querySelector(".welcome-enter-hint");
+    if (welcomeHint) {
+      const hint = welcomeEnterHint(enterSends);
+      if (welcomeHint.textContent !== hint) welcomeHint.textContent = hint;
+    }
     $("input").setAttribute("enterkeyhint", enterSends ? "send" : "enter");
     $("compose-hint").replaceChildren(
-      h("span", { class: "compose-enter-pref", title: "Enter sends: " + (enterSends ? "on" : "off") + " · This browser Settings" }, enterSends ? "Enter: sends · Settings" : "Enter: newline · Settings"),
+      h("span", { class: "compose-enter-pref", title: "Enter sends: " + (enterSends ? "on" : "off") + " · This browser Settings" }, enterModeHint(enterSends) + " · Settings"),
       h("span", { class: "compose-key-help" }, " · Shift+Enter newline · Ctrl/⌘+Enter queue · /help · ? shortcuts"));
     const mode = $("compose-mode");
     mode.replaceChildren();
