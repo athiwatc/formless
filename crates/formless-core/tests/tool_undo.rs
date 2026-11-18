@@ -47,6 +47,38 @@ async fn the_newest_registry_change_can_be_undone() {
         })
         .await
         .unwrap();
+    // Older daemons saved this record without an identity. Keep legacy Undo
+    // available after upgrade, but do not let a guarded request use it.
+    let store = Store::open(&paths.db_file()).unwrap();
+    let mut legacy = store
+        .kv_get("harness:registry", "last_change")
+        .unwrap()
+        .unwrap();
+    let change_id = legacy
+        .as_object_mut()
+        .unwrap()
+        .remove("change_id")
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_owned();
+    store
+        .kv_set("harness:registry", "last_change", &legacy)
+        .unwrap();
+    assert!(daemon
+        .handle(Request::UndoRegistryChangeIfCurrent { change_id })
+        .await
+        .is_err());
+    assert_eq!(
+        store
+            .get_tool_current(&id)
+            .unwrap()
+            .unwrap()
+            .0
+            .current_version,
+        2
+    );
+    drop(store);
     let r = undo().await.unwrap();
     assert_eq!(r["undone"], "user updated echo_text v2");
     assert_eq!(r["tool"]["current_version"], 1);
@@ -204,6 +236,23 @@ async fn a_guarded_undo_cannot_revert_another_clients_change_or_be_repeated() {
     assert!(stale.contains("no longer available"), "{stale}");
     assert!(check(&a) && check(&b), "stale Undo changes neither Tool");
 
+    let (no_op, event) = exchange(&mut client_a, Request::RetireTool { id: b.clone() }).await;
+    assert_eq!(no_op.unwrap()["retired"], true);
+    assert!(event.is_none(), "repeated retirement publishes no receipt");
+    let (no_op, event) = exchange(
+        &mut client_a,
+        Request::RollbackTool {
+            id: b.clone(),
+            version: 1,
+        },
+    )
+    .await;
+    assert_eq!(no_op.unwrap()["current_version"], 1);
+    assert!(
+        event.is_none(),
+        "same-version rollback publishes no receipt"
+    );
+
     let change_id = change_b.change_id.unwrap();
     let undo = || Request::UndoRegistryChangeIfCurrent {
         change_id: change_id.clone(),
@@ -223,6 +272,26 @@ async fn a_guarded_undo_cannot_revert_another_clients_change_or_be_repeated() {
     assert_eq!(success.unwrap()["tool"]["id"], b);
     assert!(rejected.unwrap_err().contains("no longer available"));
     assert!(check(&a) && !check(&b), "only B was restored");
+
+    let (result, restored) = exchange(&mut client_a, Request::RestoreTool { id: a.clone() }).await;
+    assert_eq!(result.unwrap()["retired"], false);
+    let restored = restored.unwrap();
+    assert_eq!(
+        exchange(&mut client_b, Request::Ping).await.1,
+        Some(restored.clone())
+    );
+    let (no_op, event) = exchange(&mut client_b, Request::RestoreTool { id: a.clone() }).await;
+    assert_eq!(no_op.unwrap()["retired"], false);
+    assert!(event.is_none(), "repeated restoration publishes no receipt");
+    let (result, _) = exchange(
+        &mut client_a,
+        Request::UndoRegistryChangeIfCurrent {
+            change_id: restored.change_id.unwrap(),
+        },
+    )
+    .await;
+    assert_eq!(result.unwrap()["tool"]["retired"], true);
+
     assert!(exchange(&mut client_b, Request::Shutdown).await.0.is_ok());
     tokio::time::timeout(Duration::from_secs(5), server)
         .await

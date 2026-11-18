@@ -4550,13 +4550,16 @@ impl Daemon {
             }
             Request::RollbackTool { id, version } => {
                 let t = self.change_registry("rolled_back", "user", |st| {
-                    let before = st
-                        .get_tool_current(&id)?
-                        .map_or(0, |(i, _)| i.current_version);
+                    let current = st
+                        .tool_info(&id)?
+                        .context(RequestFailure::not_found("tool/version not found"))?;
+                    if current.current_version == version {
+                        return Ok((current, None));
+                    }
                     let tool = st
                         .rollback_tool(&id, version)?
                         .context(RequestFailure::not_found("tool/version not found"))?;
-                    Ok((tool, before))
+                    Ok((tool, Some(current.current_version)))
                 })?;
                 let _ = self.with_store(|st| {
                     st.audit("user", "tool.rollback", &format!("{} v{version}", t.name))
@@ -5016,28 +5019,42 @@ impl Daemon {
             .to_string())
     }
 
-    fn set_registry_retired(st: &Store, id: &str, retired: bool) -> Result<(ToolInfo, i64)> {
+    fn set_registry_retired(
+        st: &Store,
+        id: &str,
+        retired: bool,
+    ) -> Result<(ToolInfo, Option<i64>)> {
+        let current = st
+            .tool_info(id)?
+            .context(RequestFailure::not_found("tool not found"))?;
+        if current.retired == retired {
+            return Ok((current, None));
+        }
         let tool = st
             .set_tool_retired(id, retired)?
             .context(RequestFailure::not_found("tool not found"))?;
-        let version = tool.current_version;
-        Ok((tool, version))
+        Ok((tool, Some(current.current_version)))
     }
 
     fn change_registry(
         &self,
         action: &str,
         author: &str,
-        write: impl FnOnce(&Store) -> Result<(ToolInfo, i64)>,
+        write: impl FnOnce(&Store) -> Result<(ToolInfo, Option<i64>)>,
     ) -> Result<ToolInfo> {
         let (tool, change) = self.with_store(|st| {
             st.transaction(|st| {
                 let (tool, before) = write(st)?;
-                let change = Self::record_registry_change(st, &tool, action, before, author)?;
+                // Preserve the previous receipt when this request changed no state.
+                let change = before
+                    .map(|version| Self::record_registry_change(st, &tool, action, version, author))
+                    .transpose()?;
                 Ok((tool, change))
             })
         })?;
-        self.broadcast(Event::RegistryChanged { change });
+        if let Some(change) = change {
+            self.broadcast(Event::RegistryChanged { change });
+        }
         Ok(tool)
     }
 
@@ -5079,9 +5096,7 @@ impl Daemon {
                     .with_context(unavailable)?;
                 if let Some(expected) = expected {
                     anyhow::ensure!(change.change_id.as_deref() == Some(expected), unavailable());
-                    let (current, _) = st
-                        .get_tool_current(&change.tool_id)?
-                        .with_context(unavailable)?;
+                    let current = st.tool_info(&change.tool_id)?.with_context(unavailable)?;
                     anyhow::ensure!(current.current_version == change.to_version, unavailable());
                     match change.action.as_str() {
                         "retired" => anyhow::ensure!(current.retired, unavailable()),

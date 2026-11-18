@@ -599,6 +599,8 @@
     $("ask-fields").disabled = $("ask-ok").disabled = $("ask-cancel").disabled = saving;
     $("ask-ok").textContent = saving ? "Saving…" : askOptions.ok || "OK";
     $("ask-saving").textContent = saving ? "Saving…" : "";
+    const dialog = activeDialog();
+    if (saving && dialog?.node === $("ask-backdrop")) focusDialog(dialog);
   }
   function recordValue(field, message) {
     const value = field.value.trim();
@@ -4010,7 +4012,7 @@
   }
   function focusVisible(el) {
     return !!(el && el !== document.body && el.isConnected && typeof el.focus === "function"
-      && !el.disabled && !el.closest("[inert], .hidden, [hidden]") && el.getClientRects().length
+      && !el.matches(":disabled") && !el.closest("[inert], .hidden, [hidden]") && el.getClientRects().length
       && getComputedStyle(el).visibility !== "hidden");
   }
   function dialogItems(node) {
@@ -5290,7 +5292,7 @@
       S.pushSubscribe = reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64uToBytes(key) });
       const sub = await S.pushSubscribe;
       if (S.forgetting || S.pushRemoval) return;
-      S.ws.send(JSON.stringify({ relay: "push_subscribe", sub: sub.toJSON() }));
+      registerRelayPush(S.ws, sub);
       note("This device gets a notification when an approval or question waits.");
     } catch (e) {
       toast("Couldn't turn on notifications: " + e.message, true);
@@ -5309,11 +5311,29 @@
       const reg = await navigator.serviceWorker.getRegistration();
       const sub = reg && await reg.pushManager.getSubscription();
       if (sub && !S.forgetting && !S.pushRemoval && S.ws === ws && S.room === room && S.channel && S.daemonOnline && ws.readyState === 1) {
-        ws.send(JSON.stringify({ relay: "push_subscribe", sub: sub.toJSON() }));
+        registerRelayPush(ws, sub);
       }
     } catch (_) { /* No permission request or automatic new subscription. */ }
   }
   const PUSH_CLEANUP_MS = 1500;
+  function registerRelayPush(ws, sub) {
+    if (ws?.readyState !== 1) throw new Error("not connected to the relay");
+    if (S.pushRegistration?.socket === ws) return;
+    let resolve;
+    const settled = new Promise((done) => { resolve = done; });
+    const finish = (socket) => {
+      if (socket !== ws) return;
+      ws.removeEventListener("close", closed);
+      if (S.pushRegistration === pending) S.pushRegistration = null;
+      resolve();
+    };
+    const closed = () => finish(ws);
+    const pending = { socket: ws, settled, finish };
+    S.pushRegistration = pending;
+    ws.addEventListener("close", closed, { once: true });
+    try { ws.send(JSON.stringify({ relay: "push_subscribe", sub: sub.toJSON() })); }
+    catch (error) { finish(ws); throw error; }
+  }
   async function boundedPushCleanup(promise) {
     let timer;
     try {
@@ -5322,9 +5342,14 @@
       })]);
     } finally { clearTimeout(timer); }
   }
-  function removeRelayPush(endpoint) {
+  async function removeRelayPush(endpoint) {
     const ws = S.ws;
-    if (!S.relayReady || ws?.readyState !== 1) return Promise.resolve(false);
+    if (!S.relayReady || ws?.readyState !== 1) return false;
+    // A registration already sent by this socket can still be writing. The
+    // relay permits only one push write per socket at a time.
+    const registration = S.pushRegistration;
+    if (registration?.socket === ws) await boundedPushCleanup(registration.settled);
+    if (S.ws !== ws || !S.relayReady || ws.readyState !== 1) return false;
     return new Promise((resolve) => {
       const id = crypto.randomUUID();
       const done = (confirmed) => {
@@ -7366,7 +7391,7 @@
             control: async (text) => {
               const value = JSON.parse(text);
               if (value.relay === "transport") return;
-              if (value.relay === "push_subscribed") return;
+              if (value.relay === "push_subscribed") { S.pushRegistration?.finish(ws); return; }
               if (value.relay === "push_unsubscribed") { S.pushRemovalAck?.(ws, value.id); return; }
               if (value.relay === "ready") {
                 if (value.g !== packet.g) throw new Error("stale room readiness");

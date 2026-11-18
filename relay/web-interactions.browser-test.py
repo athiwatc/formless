@@ -85,7 +85,8 @@ HOOK = r"""
   F.push = (mode) => {
     F.reveal("settings");
     S.local=false; S.relayReady=mode !== "offline";
-    let subscription={endpoint:"https://push-fixture.invalid/only",async unsubscribe(){
+    let subscription={endpoint:"https://push-fixture.invalid/only",toJSON(){return {endpoint:this.endpoint};},async unsubscribe(){
+      F.localStarted = true;
       await window.recordInteraction("local");
       if (mode==="local-failure") throw new Error("synthetic failure");
       subscription=null;
@@ -97,6 +98,7 @@ HOOK = r"""
       send(text) {
         const {relay,id} = JSON.parse(text);
         void window.recordInteraction(relay);
+        if (relay === "push_subscribe") { F.pushSent = true; return; }
         S.pushRemovalAck?.(this,"unrelated-id");
         if (mode==="timeout") return;
         setTimeout(async ()=> {
@@ -104,9 +106,21 @@ HOOK = r"""
           S.pushRemovalAck?.(this,id);
         },70);
       }
-      close() { void window.recordInteraction("closed"); this.dispatchEvent(new Event("close")); }
+      close() {
+        if (this.readyState !== 3) {
+          this.readyState=3;
+          void window.recordInteraction("closed");
+        }
+        this.dispatchEvent(new Event("close"));
+      }
     }
     S.ws=new FixtureSocket();
+    F.finishRegistration = async () => {
+      await window.recordInteraction("relay-registered");
+      S.pushRegistration?.finish(S.ws);
+    };
+    F.closePushSocket = () => S.ws.close();
+    if (mode.startsWith("registration-")) void restorePushSubscription(S.ws);
     sessionStorage.setItem("formless_secret","synthetic-pairing-marker");
     S.settings={};
     renderSettings();
@@ -150,6 +164,8 @@ def keyboard(page):
     assert calls(page, "interrupt_run") == []
     composer.focus()
     composer.dispatch_event("keydown", {"key": "Escape", "repeat": True, "bubbles": True})
+    for ime in ({"isComposing": True}, {"keyCode": 229}):
+        composer.dispatch_event("keydown", {"key": "Escape", "bubbles": True, **ime})
     assert calls(page, "interrupt_run") == []
     page.keyboard.press("Escape")
     assert len(calls(page, "interrupt_run")) == 1
@@ -162,6 +178,9 @@ def keyboard(page):
     expect(composer).to_have_value("Editing fixture")
     expect(toggle).to_be_focused()
     composer.focus()
+    for ime in ({"isComposing": True}, {"keyCode": 229}):
+        composer.dispatch_event("keydown", {"key": "Escape", "bubbles": True, **ime})
+        expect(composer).to_have_value("Editing fixture")
     page.keyboard.press("Escape")
     expect(composer).to_have_value("")
     assert len(calls(page, "interrupt_run")) == 1
@@ -292,12 +311,16 @@ def records(page):
     expect(ok).to_have_text("Saving…")
     expect(ok).to_be_disabled()
     expect(page.locator("#ask-cancel")).to_be_disabled()
+    expect(page.locator("#ask-form")).to_be_focused()
+    page.keyboard.press("Tab")
+    expect(page.locator("#ask-form")).to_be_focused()
     page.locator("#ask-form").dispatch_event("submit")
     page.keyboard.press("Escape")
     expect(dialog).to_be_visible()
     assert len(calls(page, "add_job")) == 2
     page.evaluate('__interaction.finish({error:"Connection interrupted"})')
     expect(error).to_contain_text("Save was not confirmed")
+    expect(ok).to_be_focused()
     expect(task).to_have_value("Keep this task")
     expect(page.get_by_label("When", exact=True)).to_have_value("2027-01-01T10:00")
     ok.click()
@@ -376,19 +399,30 @@ def push(page, mode):
     actions = []
     page.expose_function("recordInteraction", lambda action: actions.append(action))
     page.evaluate("mode=>__interaction.push(mode)", mode)
+    if mode.startswith("registration-"):
+        page.wait_for_function("__interaction.pushSent")
     page.get_by_role("button", name="Disconnect and forget this device").click()
+    if mode.startswith("registration-"):
+        page.wait_for_function("__interaction.localStarted")
+        assert "push_subscribe" in actions and "push_unsubscribe" not in actions, actions
+        if mode == "registration-ready":
+            page.evaluate("__interaction.finishRegistration()")
+        elif mode == "registration-close":
+            page.evaluate("__interaction.closePushSocket()")
     expect(page.locator("#pair")).to_be_visible()
     assert page.evaluate("sessionStorage.getItem('formless_secret')") is None
     feedback = page.locator("#pair-error")
-    assert "local" in actions and actions[-1] == "closed", actions
-    if mode in ("offline", "timeout"):
+    assert "local" in actions and (mode == "offline" or "closed" in actions), actions
+    if mode in ("offline", "timeout", "registration-close", "registration-timeout"):
         expect(feedback).to_contain_text("relay did not confirm removal")
-        if mode == "offline":
-            assert "push_unsubscribe" not in actions
-        else:
+        if mode == "timeout":
             assert "push_unsubscribe" in actions and "relay-ack" not in actions
+        else:
+            assert "push_unsubscribe" not in actions
     else:
         assert actions.index("push_unsubscribe") < actions.index("relay-ack") < actions.index("closed"), actions
+        if mode == "registration-ready":
+            assert actions.index("push_subscribe") < actions.index("relay-registered") < actions.index("push_unsubscribe"), actions
         if mode == "local-failure":
             expect(feedback).to_contain_text("Could not confirm that notifications are off in this browser")
             assert "relay did not confirm" not in feedback.inner_text()
@@ -402,6 +436,9 @@ CASES = {
     "2189-push-offline": lambda page: push(page, "offline"),
     "2189-push-timeout": lambda page: push(page, "timeout"),
     "2189-local-push-failure": lambda page: push(page, "local-failure"),
+    "2189-forget-during-registration": lambda page: push(page, "registration-ready"),
+    "2189-registration-socket-close": lambda page: push(page, "registration-close"),
+    "2189-registration-ack-timeout": lambda page: push(page, "registration-timeout"),
     "2190-relay-disconnect": devices,
     "2191-2193-keyboard": keyboard,
     "2194-grants-all-fail": lambda page: grants(page, "all-fail"),

@@ -966,13 +966,14 @@ test('late old-generation basis cannot cancel a newer summary operation', {timeo
 test('relay reconnect registers only existing push opt-in on the current authenticated room', async () => {
   const subscription={toJSON:()=>({endpoint:'https://push.example/private'})};
   const registration=deferred();
-  const c=setup(['restorePushSubscription'],{navigator:{serviceWorker:{getRegistration:()=>registration.promise}}});
-  const frames=[];const ws={readyState:1,send:frame=>frames.push(JSON.parse(frame))};
+  const c=setup(['restorePushSubscription','registerRelayPush'],{navigator:{serviceWorker:{getRegistration:()=>registration.promise}}});
+  const frames=[];const ws={readyState:1,addEventListener(){},removeEventListener(){},send:frame=>frames.push(JSON.parse(frame))};
   Object.assign(c.S,{ws,room:'new-v3-room',channel:{},daemonOnline:true});
   const current=c.restorePushSubscription(ws);
   registration.resolve({pushManager:{getSubscription:async()=>subscription}});
   await current;
   assert.deepEqual(frames,[{relay:'push_subscribe',sub:{endpoint:'https://push.example/private'}}]);
+  c.S.pushRegistration.finish(ws);
   for(const change of ['socket','room','channel']){
     const held=deferred();c.navigator.serviceWorker.getRegistration=()=>held.promise;
     Object.assign(c.S,{ws,room:'new-v3-room',channel:{},daemonOnline:true});

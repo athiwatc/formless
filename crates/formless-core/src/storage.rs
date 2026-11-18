@@ -3644,7 +3644,7 @@ impl Store {
 
     // --- Tools (SPEC §7, §8) ---
 
-    fn tool_info(&self, id: &str) -> Result<Option<ToolInfo>> {
+    pub(crate) fn tool_info(&self, id: &str) -> Result<Option<ToolInfo>> {
         let mut stmt = self.ps("SELECT * FROM tools WHERE id=?1")?;
         let mut rows = stmt.query_map(params![id], |r| {
             Ok((
