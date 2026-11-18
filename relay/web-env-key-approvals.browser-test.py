@@ -73,6 +73,7 @@ def check(page):
         ('OPENAI_API_KEY', 'session'),
         ('OPENAIAPIKEY', 'hour'),
         ('ENCRYPTIONKEY', 'always'),
+        ('HMACKEY', 'session'),
         ('PRIMARY_KEY_TOKEN', 'session'),
         ('SSH_AUTH_SOCK', 'hour'),
     ]:

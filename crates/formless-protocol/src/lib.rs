@@ -653,6 +653,7 @@ pub fn broad_capability(spec: &str) -> Option<&'static str> {
                 "ACCESSKEY",
                 "ENCRYPTIONKEY",
                 "SIGNINGKEY",
+                "HMACKEY",
                 "CLIENTKEY",
                 "ACCOUNTKEY",
                 "MASTERKEY",
@@ -3770,6 +3771,7 @@ mod tests {
             "ACCESSKEY",
             "ENCRYPTIONKEY",
             "SIGNINGKEY",
+            "HMACKEY",
             "PRIMARY_KEY_TOKEN",
             "SSH_AUTH_SOCK",
         ] {
