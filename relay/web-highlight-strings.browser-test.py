@@ -26,6 +26,8 @@ RUST = [
     literal('rust', 'cr##"first\nreturn "#\nlast"##', 'let s = ', '; let n = 1;', ['let', 'let']),
     literal('rust', 'r#"no closer\nlet still_inside = 1', 'let s = ', '', ['let']),
     literal('rust', r'"say \"hi\""', 'let s = c', '; let n = 1;', ['let', 'let']),
+    literal('rust', r'r"foo\"', 'for _ in 0..', '.len() { let n = 1; }', ['for', 'in', 'let']),
+    literal('rust', 'cr#"say "hi""#', 'let n = 0..', '.to_bytes().len();', ['let']),
 ]
 GO = [
     literal('go', r'`C:\`', 's := ', '; return s', ['return']),
@@ -41,6 +43,7 @@ TRIPLE = [
     literal('python', '"""escaped \\""" inside\nreturn 1\n"""', 'x = ', '\nreturn x', ['return']),
     literal('java', '"""\n    return 1;\n    """', 'String s = ', '; return s;', ['return']),
     literal('kt', '"""raw\\\nreturn 1\nlast\\"""', 'val s = ', '\nreturn s', ['val', 'return']),
+    literal('kotlin', '"""quote""""', 'val s = ', '; val after = 1', ['val', 'val']),
 ]
 
 

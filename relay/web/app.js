@@ -1612,15 +1612,20 @@
         while (j < code.length && !code.startsWith(delimiter, j) && (code[j] !== "\n" || multiline)) {
           j += escapes && code[j] === "\\" ? 2 : 1;
         }
-        const stop = Math.min(j + delimiter.length, code.length);
+        let stop = Math.min(j + delimiter.length, code.length);
+        // Kotlin includes any content quotes adjacent to the raw closer.
+        if (kotlin && triple) while (code[stop] === '"') stop++;
         tok("tok-str", code.slice(i, stop));
         i = stop;
         continue;
       }
       if (/\d/.test(c) && !prevWord) {
         const m = code.slice(i).match(/^[\d][\w.]*/);
-        tok("tok-num", m[0]);
-        i += m[0].length;
+        // A raw literal can start immediately after a Rust range operator.
+        const range = L === HL.rust ? m[0].indexOf("..") : -1;
+        const number = range < 0 ? m[0] : m[0].slice(0, range);
+        tok("tok-num", number);
+        i += number.length;
         continue;
       }
       if (L.tags && c === "<") {
