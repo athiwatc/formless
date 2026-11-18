@@ -33,12 +33,9 @@ platform app-dirs (SPEC §9.4).
    - installs the packages in clean Debian, Ubuntu and Rocky containers
       and runs `formless --version`, checking that all three completion files
       are nonempty, mode 644 and owned by the installed package;
-    - waits for native builds/tests and Linux package install checks before
-      building the Docker image, running it and checking the daemon answers, then
-     pushes `ghcr.io/athiwatc/formless:<tag>` and `:latest` (`Dockerfile`,
-     [docs/docker.md](../docs/docker.md)); nothing is published if that
-     fails. The push tags the same immutable local image used by the smoke
-     check; it does not rebuild the image for publication;
+   - waits for native builds/tests and Linux package install checks before
+     building the Docker image and checking that its daemon answers. The
+     smoke-tested image is archived for seven days for publication;
    - renders the Homebrew formula, AUR `PKGBUILD` and winget manifests
      for the version (`scripts/render-packaging.sh`, which fails on a
      missing checksum, an unfilled placeholder, a version that isn't
@@ -46,6 +43,10 @@ platform app-dirs (SPEC §9.4).
      whose notes (what `formless update` shows) are the version's
      `CHANGELOG.md` section (`scripts/release-notes.sh`) followed by
      GitHub's generated list of changes;
+   - publishes the archived Docker image after the GitHub Release and its
+     assets succeed. A version tag with a different image is preserved.
+     Only the highest stable repository tag can advance `:latest`
+     ([Docker guide](../docs/docker.md));
    - publishes to the tap, winget and the AUR **only when their secrets
      exist** (below), each on its own: one failing doesn't stop the
      others, the job summary lists each channel's result, and a re-run

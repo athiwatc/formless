@@ -405,6 +405,9 @@ jobs:
           provenance: false
           sbom: false
           tags: ${{ env.BASELINE_IMAGE_TAG }}
+          labels: |
+            org.opencontainers.image.version=${{ github.ref_name }}
+            org.opencontainers.image.revision=${{ github.sha }}
       - name: Record exact build toolchain
         shell: bash
         run: |
@@ -414,6 +417,8 @@ jobs:
       - name: Smoke private container with positive RPC proof
         shell: bash
         run: |
+          test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.version" }}' "$BASELINE_IMAGE_TAG")" = "$GITHUB_REF_NAME"
+          test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$BASELINE_IMAGE_TAG")" = "$GITHUB_SHA"
           docker run --rm --network none "$BASELINE_IMAGE_TAG" --version
           docker run -d --network none --name "$BASELINE_CONTAINER" "$BASELINE_IMAGE_TAG"
           python3 - <<'PY'

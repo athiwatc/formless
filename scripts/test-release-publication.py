@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 """Nonpublishing regression fixtures for image identity and channel verdicts."""
+from email.message import Message
+import hashlib
+import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -7,91 +11,191 @@ import re
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import Mock, patch
+from urllib.error import HTTPError
 
 ROOT = Path(__file__).resolve().parents[1]
+spec = importlib.util.spec_from_file_location("release_image", ROOT / "scripts/push-release-image.py")
+image = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(image)
+TESTED = "sha256:" + "a" * 64
+MANIFEST = "sha256:" + "b" * 64
+REF = "ghcr.io/athiwatc/formless"
 
 
 class ReleasePublication(unittest.TestCase):
+    def test_preflight_checks_tag_before_reading_registry_credentials(self):
+        for version, code in (("v0.1.0", 0), ("v0.1.0-rc.1", 0), ("v0.1.0+metadata", 1)):
+            with self.subTest(version=version):
+                result = subprocess.run(
+                    [image.sys.executable, str(ROOT / "scripts/push-release-image.py"), "--check-version"],
+                    env={"GITHUB_REF_NAME": version}, capture_output=True, text=True, timeout=5,
+                )
+                self.assertEqual(result.returncode, code, result.stderr)
+
     def test_summary_outcomes(self):
-        for outcomes, code, expected in [
-            (["success"] * 4, 0, ["| GitHub Release | published |", "| AUR | published |"]),
-            (["failure", "skipped", "skipped", "skipped"], 1,
-             ["| GitHub Release | FAILED |", "| AUR | not run (earlier step failed or cancelled) |"]),
-            (["skipped"] * 4, 1, ["| GitHub Release | not run (earlier step failed or cancelled) |"]),
-            (["success", "skipped", "success", "skipped"], 0,
-             ["| Homebrew tap | skipped (no secret) |", "| winget | published |"]),
-            (["success", "failure", "success", "cancelled"], 1,
-             ["| Homebrew tap | FAILED |", "| AUR | cancelled |"]),
+        for outcomes, latest, code, expected in [
+            (["success"] * 5, "promoted", 0,
+             ["| GitHub Release | published |", "| AUR | published |",
+              "| Docker (ghcr.io) | published (latest promoted) |"]),
+            (["failure", "skipped", "skipped", "skipped", "skipped"], "", 1,
+             ["| GitHub Release | FAILED |", "| AUR | not run (earlier step failed or cancelled) |",
+              "| Docker (ghcr.io) | not run (required publication steps did not complete) |"]),
+            (["success", "skipped", "success", "skipped", "success"],
+             "skipped (not the highest stable tag)", 0,
+             ["| Homebrew tap | skipped (no secret) |", "| winget | published |",
+              "| Docker (ghcr.io) | published (latest skipped: not the highest stable tag) |"]),
+            (["success", "failure", "success", "cancelled", "failure"], "", 1,
+             ["| Homebrew tap | FAILED |", "| AUR | cancelled |", "| Docker (ghcr.io) | FAILED |"]),
         ]:
             with self.subTest(outcomes=outcomes), tempfile.TemporaryDirectory() as directory:
                 summary = Path(directory) / "summary"
-                result = subprocess.run(["bash", str(ROOT / "scripts/release-channel-summary.sh"), *outcomes],
-                                        env={**os.environ, "GITHUB_STEP_SUMMARY": str(summary)},
-                                        capture_output=True, text=True, timeout=5)
+                result = subprocess.run(
+                    ["bash", str(ROOT / "scripts/release-channel-summary.sh"), *outcomes],
+                    env={**os.environ, "GITHUB_STEP_SUMMARY": str(summary), "DOCKER_LATEST": latest},
+                    capture_output=True, text=True, timeout=5,
+                )
                 self.assertEqual(result.returncode, code, result.stderr)
                 text = summary.read_text()
                 for row in expected:
                     self.assertIn(row, text)
-                self.assertIn("pushed by prerequisite Docker job", text)
-                if outcomes[0] != "success":
-                    self.assertNotIn("skipped (no secret)", text)
-                    self.assertNotIn("| GitHub Release | published |", text)
 
-    def push_fixture(self, mode):
+    def test_new_version_push_and_latest_uses_the_verified_manifest(self):
+        registry = Mock()
+        registry.manifest.side_effect = [None, (TESTED, MANIFEST), (TESTED, MANIFEST)]
+        with patch.object(image, "docker", return_value=TESTED) as docker, patch.object(
+            image, "newest_stable_tag", return_value="v9.8.7"
+        ):
+            self.assertEqual(image.publish(registry, "v9.8.7", "local-test", TESTED), "promoted")
+        commands = [call.args for call in docker.call_args_list]
+        self.assertIn(("image", "tag", TESTED, REF + ":v9.8.7"), commands)
+        self.assertIn(("image", "push", REF + ":v9.8.7"), commands)
+        self.assertIn(("image", "rm", REF + ":v9.8.7"), commands)
+        self.assertEqual(commands[-1], ("buildx", "imagetools", "create", "--prefer-index=false",
+                                        "--tag", REF + ":latest", REF + "@" + MANIFEST))
+        self.assertEqual([call.args for call in registry.manifest.call_args_list],
+                         [("v9.8.7",), ("v9.8.7",), ("latest",)])
+
+    def test_old_and_prerelease_reruns_preserve_version_and_latest(self):
+        for version in ("v9.8.6", "v10.0.0-rc.1"):
+            registry = Mock()
+            registry.manifest.return_value = (TESTED, MANIFEST)
+            with self.subTest(version=version), patch.object(image, "docker", return_value=TESTED) as docker, patch.object(
+                image, "newest_stable_tag", return_value="v9.8.7"
+            ):
+                self.assertEqual(image.publish(registry, version, "local-test", TESTED),
+                                 "skipped (not the highest stable tag)")
+                docker.assert_called_once_with("image", "inspect", "--format", "{{.Id}}", "local-test")
+                registry.manifest.assert_called_once_with(version)
+
+    def test_mismatched_local_or_registry_image_refuses_mutation(self):
+        for local_id in (TESTED, MANIFEST):
+            registry = Mock()
+            registry.manifest.return_value = (MANIFEST, TESTED)
+            with self.subTest(local_id=local_id), patch.object(image, "docker", return_value=local_id) as docker:
+                with self.assertRaisesRegex(ValueError, "different image|smoke-tested image"):
+                    image.publish(registry, "v9.8.7", "local-test", TESTED)
+                docker.assert_called_once_with("image", "inspect", "--format", "{{.Id}}", "local-test")
+                if local_id == MANIFEST:
+                    registry.manifest.assert_not_called()
+
+    def test_failed_version_push_does_not_promote_and_cleans_local_tag(self):
+        registry = Mock()
+        registry.manifest.return_value = None
+
+        def docker_fixture(*args):
+            if args[:2] == ("image", "push"):
+                raise subprocess.CalledProcessError(1, args)
+            return TESTED
+
+        with patch.object(image, "docker", side_effect=docker_fixture) as docker:
+            with self.assertRaises(subprocess.CalledProcessError):
+                image.publish(registry, "v9.8.7", "local-test", TESTED)
+        self.assertEqual(docker.call_args.args, ("image", "rm", REF + ":v9.8.7"))
+        self.assertFalse(any(call.args[0] == "buildx" for call in docker.call_args_list))
+
+    def test_registry_absence_and_failure_are_distinct(self):
+        for status, code, absence in [(404, "MANIFEST_UNKNOWN", True),
+                                      (404, "NAME_UNKNOWN", True),
+                                      (404, "DENIED", False),
+                                      (401, "UNAUTHORIZED", False),
+                                      (503, "UNAVAILABLE", False)]:
+            with self.subTest(status=status, code=code), patch.object(image, "registry_response") as request:
+                request.return_value = (b'{"token":"fixture"}', Message())
+                registry = image.Registry("fixture", "fixture")
+                request.side_effect = HTTPError("https://ghcr.io/fixture", status, code, {},
+                                                io.BytesIO(json.dumps({"errors": [{"code": code}]}).encode()))
+                if absence:
+                    self.assertIsNone(registry.manifest("v0.1.0"))
+                else:
+                    with self.assertRaises(HTTPError):
+                        registry.manifest("v0.1.0")
+
+    def test_registry_manifest_requires_supported_format_and_matching_digest(self):
+        body = json.dumps({"schemaVersion": 2, "mediaType": image.MANIFEST_TYPES[0],
+                           "config": {"digest": TESTED}}).encode()
+        expected = "sha256:" + hashlib.sha256(body).hexdigest()
+        headers = Message()
+        headers["Docker-Content-Digest"] = expected
+        with patch.object(image, "registry_response") as request:
+            request.return_value = (b'{"token":"fixture"}', Message())
+            registry = image.Registry("fixture", "fixture")
+            request.return_value = (body, headers)
+            self.assertEqual(registry.manifest("v0.1.0"), (TESTED, expected))
+            headers.replace_header("Docker-Content-Digest", TESTED)
+            with self.assertRaisesRegex(ValueError, "unverified"):
+                registry.manifest("v0.1.0")
+
+    def test_version_order_ignores_prereleases_and_nonversion_tags(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            docker = root / "docker"
-            # This fixture cannot run Docker or publish; it records exact commands.
-            docker.write_text('''#!/usr/bin/env python3
-import json, os, sys
-args=sys.argv[1:]
-with open(os.environ['DOCKER_TRACE'],'a') as trace: trace.write(json.dumps(args)+'\\n')
-mode=os.environ['DOCKER_MODE']
-if args[:2]==['image','inspect']:
- print('sha256:'+('b' if mode=='mismatch' and args[-1].startswith('ghcr.io/') else 'a')*64)
-elif args[0]=='push' and mode=='failure': sys.exit(9)
-elif args[0] not in ['tag','push','image']: sys.exit(10)
-''')
-            docker.chmod(0o700)
-            trace = root / "trace"
-            result = subprocess.run(["bash", str(ROOT / "scripts/push-release-image.sh")],
-                                    env={**os.environ, "PATH": str(root) + ":" + os.environ["PATH"],
-                                         "DOCKER_TRACE": str(trace), "DOCKER_MODE": mode,
-                                         "RELEASE_IMAGE": "formless:private-fixture", "GITHUB_REF_NAME": "v9.8.7"},
-                                    capture_output=True, text=True, timeout=5)
-            return result, [json.loads(line) for line in trace.read_text().splitlines()]
+            def git(*args):
+                return subprocess.run(
+                    ["git", "-C", directory, *args], stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, text=True, check=True,
+                )
 
-    def test_pushes_same_immutable_image_without_rebuilding_and_removes_local_tags(self):
-        result, calls = self.push_fixture("success")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        tags = ["ghcr.io/athiwatc/formless:v9.8.7", "ghcr.io/athiwatc/formless:latest"]
-        self.assertEqual([call for call in calls if call[0] == "tag"],
-                         [["tag", "sha256:" + "a" * 64, tag] for tag in tags])
-        self.assertEqual([call for call in calls if call[0] == "push"], [["push", tag] for tag in tags])
-        self.assertEqual(calls[-1], ["image", "rm", *tags])
-        self.assertFalse(any("build" in call for call in calls))
+            git("init")
+            git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "Fixture")
+            for tag in ("v2.0.0-rc.1", "v1.9.0", "v1.10.0", "v99", "v0002.0.0"):
+                git("tag", tag)
+            with patch.object(image.subprocess, "check_output", side_effect=lambda args, **_: git(*args[1:]).stdout):
+                self.assertEqual(image.newest_stable_tag(), "v1.10.0")
 
-    def test_identity_mismatch_and_push_failure_stop_publication_and_clean_local_tags(self):
-        result, calls = self.push_fixture("mismatch")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertFalse(any(call[0] == "push" for call in calls))
-        self.assertEqual(calls[-1][:2], ["image", "rm"])
-        result, calls = self.push_fixture("failure")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(len([call for call in calls if call[0] == "push"]), 1)
-        self.assertEqual(calls[-1][:2], ["image", "rm"])
-
-    def test_workflow_dependencies_gate_all_publication_and_report_real_release_outcome(self):
+    def test_workflow_keeps_public_images_behind_smoke_and_github_assets(self):
         workflow = (ROOT / ".github/workflows/release.yml").read_text()
-        docker = workflow.split("\n  docker:\n", 1)[1].split("\n  publish:\n", 1)[0]
-        needs = re.search(r"^    needs: \[(.+)\]$", docker, re.M).group(1)
-        self.assertEqual(set(needs.split(", ")), {"version-check", "build", "linux", "linux-install-test"})
-        self.assertEqual(docker.count("uses: docker/build-push-action@"), 1)
-        self.assertIn("load: true", docker)
-        self.assertNotIn("push: true", docker)
-        self.assertLess(docker.index("Smoke private container"), docker.index("bash scripts/push-release-image.sh"))
-        self.assertRegex(workflow, r"uses: softprops/action-gh-release@[0-9a-f]{40} #[^\n]+\n        id: release")
-        self.assertIn("'${{ steps.release.outcome }}'", workflow)
+        build = workflow.split("\n  docker:\n", 1)[1].split("\n  publish:\n", 1)[0]
+        release = workflow.split("\n  publish:\n", 1)[1].split("\n  docker-publish:\n", 1)[0]
+        docker = workflow.split("\n  docker-publish:\n", 1)[1].split("\n  channel-summary:\n", 1)[0]
+        dependencies = re.search(r"^    needs: \[(.+)\]$", build, re.M).group(1)
+        self.assertEqual(set(dependencies.split(", ")), {"version-check", "build", "linux", "linux-install-test"})
+        self.assertEqual(build.count("uses: docker/build-push-action@"), 1)
+        self.assertIn("load: true", build)
+        self.assertNotIn("packages: write", build)
+        self.assertNotIn("push: true", build)
+        self.assertLess(build.index("Smoke private container"), build.index("docker image save"))
+        self.assertIn("needs: [build, linux, linux-install-test, docker]", release)
+        self.assertIn("fail_on_unmatched_files: true", release)
+        self.assertRegex(release, r"uses: softprops/action-gh-release@[0-9a-f]{40} #[^\n]+\n        id: release")
+        self.assertIn("release: ${{ steps.release.outcome }}", release)
+        self.assertIn("needs: [docker, publish]", docker)
+        self.assertIn("if: needs.publish.outputs.release == 'success'", docker)
+        self.assertIn("artifact-ids: ${{ env.IMAGE_ARTIFACT_ID }}", docker)
+        self.assertIn("merge-multiple: true", docker)
+        self.assertIn("fetch-depth: 0", docker)
+        self.assertIn("queue: max", docker)
+        self.assertNotIn("contents: write", docker)
+        self.assertIn("DOCKER: ${{ needs.docker-publish.result }}", workflow)
+
+    def test_release_and_baseline_build_and_check_oci_identity(self):
+        dockerfile = (ROOT / "Dockerfile").read_text()
+        self.assertIn('org.opencontainers.image.source="https://github.com/athiwatc/formless"', dockerfile)
+        self.assertIn('org.opencontainers.image.licenses="Apache-2.0"', dockerfile)
+        for workflow in ("release.yml", "release-baseline.yml"):
+            text = (ROOT / ".github/workflows" / workflow).read_text()
+            for label, field in (("version", "ref_name"), ("revision", "sha")):
+                self.assertIn(f"org.opencontainers.image.{label}=${{{{ github.{field} }}}}", text)
+                self.assertIn(f'index .Config.Labels "org.opencontainers.image.{label}"', text)
 
     def test_release_uses_immutable_action_revisions(self):
         workflow = (ROOT / ".github/workflows/release.yml").read_text()

@@ -12,6 +12,10 @@ COPY . .
 RUN cargo build --release --locked --bin formless
 
 FROM debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3
+LABEL org.opencontainers.image.source="https://github.com/athiwatc/formless" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.title="formless" \
+      org.opencontainers.image.description="A tool-building AI agent harness"
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates git tini libdbus-1-3 \
     && rm -rf /var/lib/apt/lists/* \

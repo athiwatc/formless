@@ -28,6 +28,9 @@ jobs:
       - name: Tag matches Cargo.toml
         if: startsWith(github.ref, 'refs/tags/v')
         run: scripts/release-check.sh "$GITHUB_REF_NAME"
+      - name: Tag is compatible with Docker version tags
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: python3 scripts/push-release-image.py --check-version
       - name: Tag has release notes
         if: startsWith(github.ref, 'refs/tags/v')
         run: scripts/release-notes.sh "$GITHUB_REF_NAME" > /dev/null
@@ -285,7 +288,10 @@ jobs:
   docker:
     permissions:
       contents: read
-      packages: write
+    outputs:
+      artifact-id: ${{ steps.image-upload.outputs.artifact-id }}
+      image-id: ${{ steps.image-identity.outputs.image-id }}
+      image: ${{ steps.image-identity.outputs.image }}
     env:
       RELEASE_IMAGE: formless:release-${{ github.run_id }}-${{ github.run_attempt }}
       RELEASE_CONTAINER: formless-release-${{ github.run_id }}-${{ github.run_attempt }}
@@ -310,11 +316,16 @@ jobs:
           context: .
           load: true
           tags: ${{ env.RELEASE_IMAGE }}
+          labels: |
+            org.opencontainers.image.version=${{ github.ref_name }}
+            org.opencontainers.image.revision=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - name: Smoke private container with positive RPC proof
         shell: bash
         run: |
+          test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.version" }}' "$RELEASE_IMAGE")" = "$GITHUB_REF_NAME"
+          test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$RELEASE_IMAGE")" = "$GITHUB_SHA"
           docker run --rm --network none "$RELEASE_IMAGE" --version
           docker run -d --network none --name "$RELEASE_CONTAINER" "$RELEASE_IMAGE"
           python3 - <<'PY'
@@ -338,14 +349,24 @@ jobs:
           else:
               raise SystemExit("private container daemon never answered status within 30s: " + last)
           PY
-      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Push the smoke-tested image
+      - name: Archive the smoke-tested image
+        id: image-identity
         shell: bash
-        run: bash scripts/push-release-image.sh
+        run: |
+          set -euo pipefail
+          image_id=$(docker image inspect --format '{{.Id}}' "$RELEASE_IMAGE")
+          [[ "$image_id" =~ ^sha256:[0-9a-f]{64}$ ]]
+          archive_dir=$(mktemp -d "$RUNNER_TEMP/formless-release-image.XXXXXX")
+          echo "RELEASE_IMAGE_ARCHIVE=$archive_dir" >> "$GITHUB_ENV"
+          docker image save --output "$archive_dir/image.tar" "$RELEASE_IMAGE"
+          printf 'image-id=%s\nimage=%s\n' "$image_id" "$RELEASE_IMAGE" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        id: image-upload
+        with:
+          name: docker-image-${{ github.run_attempt }}
+          path: ${{ env.RELEASE_IMAGE_ARCHIVE }}/image.tar
+          if-no-files-found: error
+          retention-days: 7
       - name: Always remove owned smoke fixture
         if: always()
         shell: bash
@@ -356,9 +377,18 @@ jobs:
           if docker image inspect "$RELEASE_IMAGE" >/dev/null 2>&1; then
             docker image rm "$RELEASE_IMAGE"
           fi
+          if [[ -n "${RELEASE_IMAGE_ARCHIVE:-}" ]]; then
+            rm -f -- "$RELEASE_IMAGE_ARCHIVE/image.tar"
+            rmdir -- "$RELEASE_IMAGE_ARCHIVE"
+          fi
   publish:
     permissions:
       contents: write
+    outputs:
+      release: ${{ steps.release.outcome }}
+      tap: ${{ steps.tap.outcome }}
+      winget: ${{ steps.winget.outcome }}
+      aur: ${{ steps.aur.outcome }}
     timeout-minutes: 15
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [build, linux, linux-install-test, docker]
@@ -370,6 +400,7 @@ jobs:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: assets
+          pattern: formless-*
           merge-multiple: true
       - name: Render Homebrew, AUR and winget files
         run: scripts/render-packaging.sh "${GITHUB_REF_NAME#v}" assets packaging-out
@@ -382,6 +413,7 @@ jobs:
         with:
           body_path: release-notes.md
           generate_release_notes: true
+          fail_on_unmatched_files: true
           files: |
             assets/formless-*.tar.gz
             assets/formless-*.zip
@@ -449,10 +481,86 @@ jobs:
           commit_email: 731394+athiwatc@users.noreply.github.com
           ssh_private_key: ${{ secrets.AUR_SSH_KEY }}
           commit_message: formless ${{ github.ref_name }}
-      - name: Channel summary
-        if: always()
+  docker-publish:
+    # All version tags share this group. Check the newest stable tag only
+    # after admission, so a queued older run cannot roll back latest.
+    concurrency:
+      group: release-docker-publication
+      queue: max
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      latest: ${{ steps.push.outputs.latest }}
+    timeout-minutes: 30
+    needs: [docker, publish]
+    if: needs.publish.outputs.release == 'success'
+    runs-on: [self-hosted, Linux, X64]
+    env:
+      RELEASE_IMAGE: ${{ needs.docker.outputs.image }}
+      TESTED_IMAGE_ID: ${{ needs.docker.outputs.image-id }}
+      IMAGE_ARTIFACT_ID: ${{ needs.docker.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Isolate publication files and credentials
         shell: bash
-        run: >-
-          bash scripts/release-channel-summary.sh
-          '${{ steps.release.outcome }}' '${{ steps.tap.outcome }}'
-          '${{ steps.winget.outcome }}' '${{ steps.aur.outcome }}'
+        run: |
+          set -euo pipefail
+          [[ "$IMAGE_ARTIFACT_ID" =~ ^[0-9]+$ ]]
+          [[ "$RELEASE_IMAGE" =~ ^formless:release-[0-9]+-[0-9]+$ ]]
+          [[ "$TESTED_IMAGE_ID" =~ ^sha256:[0-9a-f]{64}$ ]]
+          publish_dir=$(mktemp -d "$RUNNER_TEMP/formless-docker-publish.XXXXXX")
+          echo "DOCKER_PUBLISH_DIR=$publish_dir" >> "$GITHUB_ENV"
+          mkdir "$publish_dir/docker"
+          echo "DOCKER_CONFIG=$publish_dir/docker" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          artifact-ids: ${{ env.IMAGE_ARTIFACT_ID }}
+          path: ${{ env.DOCKER_PUBLISH_DIR }}
+          merge-multiple: true
+      - name: Load the archived image
+        shell: bash
+        run: docker image load --input "$DOCKER_PUBLISH_DIR/image.tar"
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Publish the verified image
+        id: push
+        env:
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_TOKEN: ${{ github.token }}
+        run: python3 scripts/push-release-image.py
+      - name: Always remove owned publish fixture
+        if: always() && env.DOCKER_PUBLISH_DIR != ''
+        shell: bash
+        run: |
+          if docker image inspect "$RELEASE_IMAGE" >/dev/null 2>&1; then
+            docker image rm "$RELEASE_IMAGE"
+          fi
+          # The login action uses this isolated config in its post step.
+          rm -f -- "$DOCKER_PUBLISH_DIR/image.tar"
+  channel-summary:
+    if: always() && startsWith(github.ref, 'refs/tags/v')
+    needs: [publish, docker-publish]
+    runs-on: [self-hosted, Linux, X64]
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Channel summary
+        shell: bash
+        env:
+          RELEASE: ${{ needs.publish.outputs.release }}
+          TAP: ${{ needs.publish.outputs.tap }}
+          WINGET: ${{ needs.publish.outputs.winget }}
+          AUR: ${{ needs.publish.outputs.aur }}
+          DOCKER: ${{ needs.docker-publish.result }}
+          DOCKER_LATEST: ${{ needs.docker-publish.outputs.latest }}
+        run: bash scripts/release-channel-summary.sh "$RELEASE" "$TAP" "$WINGET" "$AUR" "$DOCKER"
