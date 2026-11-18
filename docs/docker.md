@@ -94,27 +94,37 @@ can't write its database), and `docker logs formless` says so.
 
 ## Upgrading and rolling back
 
-Keep the previous image tag or digest and back up both volumes before
-upgrading. Wait for active Runs to finish before stopping the container.
-Runs still in flight may be interrupted. Enabled, approved jobs keep their
-schedule in the data volume, and missed firings of a due job coalesce into
-one execution after the daemon restarts.
+Keep the previous image tag or digest. Wait for active Runs to finish
+before stopping the container. Runs still in flight may be interrupted.
+Enabled, approved jobs keep their schedule in the data volume, and missed
+firings of a due job coalesce into one execution after the daemon restarts.
 
-Set `image` to the next pinned release, then pull it before stopping or
-removing the existing container.
+Set `image` to the next pinned release, then pull it before stopping the
+existing container.
 
 ```sh
 image=ghcr.io/athiwatc/formless:vX.Y.Z
-docker pull "$image" && docker stop formless && docker rm formless
+docker pull "$image" && docker stop formless
+```
+
+Stop any other containers using the same volumes. While those containers
+are stopped, make and verify backups of both volumes. This preserves the
+database, configuration, and external files together. Then remove the
+stopped container.
+
+```sh
+docker rm formless
 ```
 
 Run the same `docker run` command from [Start it](#start-it) with the new
 `image`, the same `formless-data` and `formless-config` volumes, and the
-existing secret mount. After the container is healthy, verify it with
+existing secret mount. In a fresh shell, set `secret_file` to the existing
+host path of that mount. After the container is healthy, verify it with
 `docker exec formless formless --version` and
 `docker exec formless formless doctor`. With Compose, update the image
-reference in your configuration, then run
-`docker compose pull && docker compose up -d`.
+reference in your configuration and run
+`docker compose pull && docker compose stop`. Verify the same volume
+backups while the containers are stopped, then run `docker compose up -d`.
 
 Upgrade the image itself. The container's daemon user cannot replace the
 binary installed under `/usr/local/bin` using `formless update`.
