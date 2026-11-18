@@ -323,6 +323,7 @@ impl std::error::Error for ExecError {}
 /// An open streamed HTTP body (`fetchChunks`).
 struct Stream {
     resp: reqwest::blocking::Response,
+    timeouts: FetchTimeouts,
     enc: Enc,
     /// Bytes read but not yet handed out (an incomplete UTF-8 sequence).
     carry: Vec<u8>,
@@ -947,7 +948,7 @@ fn http_client(timeouts: FetchTimeouts) -> Result<reqwest::blocking::Client, Str
     }
     let client = client_builder(timeouts)
         .build()
-        .map_err(|e| fetch_error(&e))?;
+        .map_err(|e| fetch_error(&e, timeouts, "building HTTP client"))?;
     *slot = Some((timeouts, client.clone()));
     Ok(client)
 }
@@ -1007,9 +1008,13 @@ fn cancellable_work<T: Send + 'static>(
     }
 }
 
-/// Preserve the error chain and distinguish deadline expiry from connection
-/// failure, including reqwest timeout errors wrapped in a body's io::Error.
-fn fetch_error(error: &(dyn std::error::Error + 'static)) -> String {
+/// Report the request's configured budgets without guessing which timer
+/// expired. A timeout may be wrapped in the response body's io::Error.
+fn fetch_error(
+    error: &(dyn std::error::Error + 'static),
+    timeouts: FetchTimeouts,
+    phase: &str,
+) -> String {
     let mut timeout = false;
     let mut connect = false;
     let mut parts = Vec::new();
@@ -1032,7 +1037,15 @@ fn fetch_error(error: &(dyn std::error::Error + 'static)) -> String {
     } else {
         "fetch failed"
     };
-    format!("{kind}: {}", parts.join(": "))
+    let mut message = format!("{kind}: {}", parts.join(": "));
+    if timeout || connect {
+        message.push_str(&format!(
+            " ({phase}, configured tools.fetch_connect_timeout_secs={}s, tools.fetch_timeout_secs={}s)",
+            timeouts.connect_ms as f64 / 1_000.0,
+            timeouts.total_ms as f64 / 1_000.0
+        ));
+    }
+    message
 }
 
 /// Send a fetch, following up to 10 redirects. Every hop is scope-checked,
@@ -1081,7 +1094,10 @@ fn send_request_with_dependencies(
         let client = client_for(&req.url, &pinned, req.timeouts)?;
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
-            return Err("fetch timed out: tools.fetch_timeout_secs total deadline expired".into());
+            return Err(format!(
+                "fetch timed out: tools.fetch_timeout_secs total deadline expired (configured budget {}s)",
+                req.timeouts.total_ms as f64 / 1_000.0
+            ));
         }
         // Request-level timeout is forwarded to async reqwest and stays active
         // through the whole body, even when a peer trickles bytes forever.
@@ -1094,7 +1110,9 @@ fn send_request_with_dependencies(
         if let Some(body) = &req.body {
             builder = builder.body(body.clone());
         }
-        let resp = builder.send().map_err(|e| fetch_error(&e))?;
+        let resp = builder
+            .send()
+            .map_err(|e| fetch_error(&e, req.timeouts, "sending request"))?;
         let status = resp.status().as_u16();
         let location = resp.headers().get(LOCATION).and_then(|v| v.to_str().ok());
         let (true, Some(location)) = (matches!(status, 301 | 302 | 303 | 307 | 308), location)
@@ -2120,6 +2138,7 @@ impl State {
             );
         }
         let req = self.build_request(a, parsed, scope)?;
+        let timeouts = req.timeouts;
         let ops = self.ops.clone();
         let (mut meta, bytes) = self.cancellable(move || {
             let mut resp = send_request(req)?;
@@ -2141,7 +2160,7 @@ impl State {
             (&mut resp)
                 .take(cap + 1)
                 .read_to_end(&mut bytes)
-                .map_err(|e| fetch_error(&e))?;
+                .map_err(|e| fetch_error(&e, timeouts, "reading response body"))?;
             if bytes.len() as u64 > cap {
                 return Err(over_limit(
                     "fetch",
@@ -2169,6 +2188,7 @@ impl State {
             );
         }
         let req = self.build_request(a, parsed, scope)?;
+        let timeouts = req.timeouts;
         let resp = self.cancellable(move || send_request(req))?;
         let mut meta = Self::response_meta(&resp);
         if let Some(url) = meta["url"].as_str() {
@@ -2179,6 +2199,7 @@ impl State {
             id,
             Stream {
                 resp,
+                timeouts,
                 enc,
                 carry: Vec::new(),
             },
@@ -2203,7 +2224,10 @@ impl State {
                 let mut chunk = vec![0u8; size - buf.len()];
                 let n = match s.resp.read(&mut chunk) {
                     Ok(n) => n,
-                    Err(e) => return Ok((s, Err(fetch_error(&e)))),
+                    Err(e) => {
+                        let error = fetch_error(&e, s.timeouts, "reading response body");
+                        return Ok((s, Err(error)));
+                    }
                 };
                 if n == 0 {
                     eof = true;
@@ -4817,6 +4841,7 @@ mod tests {
             for body in [false, true] {
                 let (addr, accepted, server) = stalled_http_peer(body, false);
                 let req = timeout_request(host, addr, 150);
+                let timeouts = req.timeouts;
                 let client = prepared_timeout_client(&req, addr);
                 let started = std::time::Instant::now();
                 let result =
@@ -4824,7 +4849,7 @@ mod tests {
                         let mut bytes = Vec::new();
                         response
                             .read_to_end(&mut bytes)
-                            .map_err(|e| fetch_error(&e))?;
+                            .map_err(|e| fetch_error(&e, timeouts, "reading response body"))?;
                         Ok(())
                     });
                 accepted
@@ -4835,12 +4860,24 @@ mod tests {
                     error.starts_with("fetch timed out:"),
                     "{host}, body={body}: {error}"
                 );
+                assert!(
+                    error.contains("tools.fetch_connect_timeout_secs=0.1s"),
+                    "{error}"
+                );
+                assert!(error.contains("tools.fetch_timeout_secs=0.15s"), "{error}");
+                let phase = if body {
+                    "reading response body"
+                } else {
+                    "sending request"
+                };
+                assert!(error.contains(phase), "{error}");
                 assert!(started.elapsed() < std::time::Duration::from_secs(2));
                 server.join().unwrap();
             }
         }
         let (addr, accepted, server) = stalled_http_peer(true, true);
         let req = timeout_request("127.0.0.1", addr, 150);
+        let timeouts = req.timeouts;
         let client = prepared_timeout_client(&req, addr);
         let started = std::time::Instant::now();
         let mut response = send_prepared_timeout_request(req, addr, &client).unwrap();
@@ -4849,7 +4886,7 @@ mod tests {
             .unwrap();
         let error = response.read_to_end(&mut Vec::new()).unwrap_err();
         assert!(
-            fetch_error(&error).starts_with("fetch timed out:"),
+            fetch_error(&error, timeouts, "reading response body").starts_with("fetch timed out:"),
             "{error}"
         );
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
@@ -4864,6 +4901,31 @@ mod tests {
             .err()
             .unwrap();
         assert!(error.starts_with("fetch connection failed:"), "{error}");
+        assert!(
+            error.contains("tools.fetch_connect_timeout_secs=0.1s"),
+            "{error}"
+        );
+        assert!(error.contains("tools.fetch_timeout_secs=0.15s"), "{error}");
+    }
+
+    #[test]
+    fn explicit_total_deadline_reports_the_request_budget() {
+        let addr = "127.0.0.1:1".parse().unwrap();
+        let req = timeout_request("127.0.0.1", addr, 1);
+        let client = prepared_timeout_client(&req, addr);
+        let error = send_request_with_dependencies(
+            req,
+            &|_, _, _| unreachable!("literal address never uses DNS"),
+            &|_, _, _| {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                Ok(client.clone())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            "fetch timed out: tools.fetch_timeout_secs total deadline expired (configured budget 0.001s)"
+        );
     }
 
     #[test]
@@ -4871,6 +4933,7 @@ mod tests {
         for body in [false, true] {
             let (addr, accepted, server) = stalled_http_peer(body, false);
             let req = timeout_request("127.0.0.1", addr, 200);
+            let timeouts = req.timeouts;
             let client = prepared_timeout_client(&req, addr);
             let cancel = Arc::new(AtomicBool::new(false));
             let flag = cancel.clone();
@@ -4881,7 +4944,7 @@ mod tests {
                         |mut response| {
                             response
                                 .read_to_end(&mut Vec::new())
-                                .map_err(|e| fetch_error(&e))?;
+                                .map_err(|e| fetch_error(&e, timeouts, "reading response body"))?;
                             Ok(())
                         },
                     );
