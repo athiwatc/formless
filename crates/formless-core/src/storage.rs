@@ -3086,6 +3086,40 @@ impl Store {
             && expected == known
             && main >= self.run_steps(run_id)?)
     }
+
+    /// Check coverage for a branch's allocated Runs in one statement.
+    /// Each aggregate streams one Run's indexed rows. Packing each pair keeps
+    /// one scan per child table and avoids sorting the matched history.
+    fn forecast_usage_complete_for_runs(&self, run_ids: &[String]) -> Result<bool> {
+        if run_ids.is_empty() {
+            return Ok(true);
+        }
+        let ids = serde_json::to_string(run_ids)?;
+        let mut stmt = self.ps("SELECT
+                 (SELECT json_array(
+                     COALESCE(SUM(expected),0),
+                     COALESCE(SUM(CASE WHEN source='run' THEN expected ELSE 0 END),0))
+                  FROM forecast_request_counts WHERE run_id=w.value),
+                 (SELECT json_array(COUNT(*),COALESCE(SUM(usage_complete),0))
+                  FROM run_usage WHERE run_id=w.value),
+                 r.steps
+             FROM json_each(?1) AS w LEFT JOIN runs AS r ON r.id=w.value")?;
+        let mut rows = stmt.query(params![ids])?;
+        let mut complete = true;
+        while let Some(row) = rows.next()? {
+            let read_counts = |column| -> Result<(i64, i64)> {
+                Ok(serde_json::from_str(row.get_ref(column)?.as_str()?)?)
+            };
+            let (expected, main) = read_counts(0)?;
+            let (recorded, covered) = read_counts(1)?;
+            // Match run_steps' zero fallback for a missing or invalid value.
+            let steps: i64 = row.get(2).unwrap_or_default();
+            complete &=
+                expected > 0 && expected == recorded && expected == covered && main >= steps;
+        }
+        Ok(complete)
+    }
+
     pub fn forecast_models(&self, run_id: &str) -> Result<Vec<(String, String)>> {
         let mut stmt = self
             .ps("SELECT DISTINCT provider,model FROM run_usage WHERE run_id=?1 AND source='run'")?;
