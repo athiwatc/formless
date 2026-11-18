@@ -442,7 +442,14 @@
     }
     if (cap.startsWith("env:")) {
       const k = cap.slice(4).toUpperCase();
-      if (["TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "PRIVATE", "AUTH"].some((w) => k.includes(w)) || k.endsWith("KEY") || k.endsWith("_PAT")) return "a secret from your environment";
+      const schemaRole = ["PRIMARY_KEY", "FOREIGN_KEY", "UNIQUE_KEY", "CANDIDATE_KEY", "SORT_KEY", "PARTITION_KEY"].includes(k);
+      const credentialKey = (!schemaRole && k.split("_").includes("KEY")) ||
+        ["APIKEY", "ACCESSKEY", "ENCRYPTIONKEY", "SIGNINGKEY", "CLIENTKEY", "ACCOUNTKEY",
+          "MASTERKEY", "SESSIONKEY", "SHAREDKEY"].some((ending) => k.endsWith(ending));
+      if (credentialKey || k.endsWith("_PAT") ||
+          ["TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "PRIVATE", "AUTH"].some((w) => k.includes(w))) {
+        return "a secret from your environment";
+      }
     }
     return null;
   }
