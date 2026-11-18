@@ -1367,7 +1367,7 @@
       hits.length + " hit" + (hits.length === 1 ? "" : "s") + " for “" + query + "”"));
     const literal = query.trim();
     const words = literal.match(/[\p{Alphabetic}\p{Number}]+/gu);
-    const terms = words && new Set(words.map((word) => foldMap(word).folded).filter(Boolean));
+    const terms = words && new Set(words.map((word) => foldMap(word, Infinity).folded).filter(Boolean));
     for (const hit of hits) {
       const snippet = h("div");
       const text = hit.snippet || "";
@@ -1392,7 +1392,7 @@
       const start = literal ? text.indexOf(literal) : -1;
       return start < 0 ? [] : [[start, start + literal.length]];
     }
-    const { folded, from } = foldMap(text);
+    const { folded, from } = foldMap(text, Infinity);
     const remaining = new Set(terms);
     const spans = [];
     // Approximate unicode61's boundaries, highlighting the first visible
@@ -5121,13 +5121,14 @@
   /** `text` folded for matching with, per folded UTF-16 unit, the offset
    * of the original character it came from (#789): decomposed, marks
    * dropped, lower-cased one character at a time, so `İ` stays one
-   * letter and NFC/NFD spellings match each other. */
-  function foldMap(text) {
+   * letter and NFC/NFD spellings match each other. Settings uses the
+   * two-unit limit. Session search retains complete expansions. */
+  function foldMap(text, unitsPerCharacter = 2) {
     let folded = "";
     const from = [];
     let at = 0;
     for (const ch of text) {
-      const f = ch.normalize("NFD").replace(/\p{M}/gu, "").toLowerCase();
+      const f = ch.normalize("NFD").replace(/\p{M}/gu, "").toLowerCase().slice(0, unitsPerCharacter);
       for (let k = 0; k < f.length; k++) from.push(at);
       folded += f;
       at += ch.length;
