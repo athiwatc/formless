@@ -13,8 +13,13 @@ ROOT = Path(__file__).resolve().parent
 OVERRIDE = "local/" + "long-model-name-" * 10 + "fixture"
 DEFAULT = "default/model"
 HOOK = """
-  act = async req => req.type === 'list_models' ? {models: ['fixture-model']} : null;
+  const modelFixtureCalls = [];
+  act = async req => {
+    modelFixtureCalls.push(req.type);
+    return req.type === 'list_models' ? {models: ['fixture-model']} : null;
+  };
   window.__modelFixture = {
+    calls: modelFixtureCalls,
     show() {
       $('pair').classList.add('hidden');
       $('app').classList.remove('hidden');
@@ -54,6 +59,7 @@ def start(page, url):
 
 
 def model_picker(page):
+    expect(page.locator('#status-model')).to_have_count(1)
     button = page.get_by_role('button', name=f'Change model ({OVERRIDE})', exact=True)
     expect(button).to_have_count(1)
     expect(button).to_be_visible()
@@ -74,9 +80,18 @@ def main():
                 menu = page.locator('#menu-btn')
                 expect(menu).to_be_hidden()
                 button = model_picker(page)
-                button.focus()
+                page.locator('#input').focus()
+                for _ in range(30):
+                    page.keyboard.press('Tab')
+                    if page.evaluate('document.activeElement.id === "status-model"'):
+                        break
+                expect(button).to_be_focused()
 
+                page.evaluate('__modelFixture.setReading(0.85)')
                 page.set_viewport_size({'width': 720, 'height': 900})
+                assert page.evaluate('matchMedia("(max-width: 51.25rem)").matches')
+                assert page.evaluate('''() => document.querySelector('#app').clientWidth
+                    > 51.25 * parseFloat(getComputedStyle(document.documentElement).fontSize)''')
                 expect(menu).to_be_visible()
                 expect(button).to_be_focused()
 
@@ -103,6 +118,7 @@ def main():
                 expect(empty).to_have_text('Model unavailable')
                 empty.press('Space')
                 expect(picker.get_by_text('Current model unavailable', exact=True)).to_be_visible()
+                assert page.evaluate('__modelFixture.calls') == ['list_models', 'list_models']
                 page.close()
 
                 touch = browser.new_page(viewport={'width': 390, 'height': 844}, is_mobile=True, has_touch=True)
@@ -112,6 +128,7 @@ def main():
                 assert bounds and bounds['width'] >= 24 and bounds['height'] >= 24, bounds
                 target.tap()
                 expect(touch.get_by_text(f'Current selection: {OVERRIDE}', exact=True)).to_be_visible()
+                assert touch.evaluate('__modelFixture.calls') == ['list_models']
                 browser.close()
                 print('PASS model picker visibility, keyboard focus, full model text, and touch activation')
         finally:
