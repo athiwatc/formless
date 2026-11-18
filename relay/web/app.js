@@ -933,13 +933,15 @@
     try { return measure(); }
     finally { if (hidden) { if (display) node.style.setProperty("display", display, priority); else node.style.removeProperty("display"); node.style.visibility = visibility; } }
   }
-  function revealViewportControl(node, container, bounds) {
+  function revealViewportControl(node, container, bounds, { partial = false } = {}) {
     if (!node || !container || !container.contains(node)) return;
     const rect = node.getBoundingClientRect(), box = container.getBoundingClientRect();
     const top = Math.max(bounds.top, box.top) + 1, bottom = Math.min(bounds.bottom, box.bottom) - 1;
     if (rect.height <= bottom - top) {
       if (rect.top < top) container.scrollTop -= top - rect.top;
       else if (rect.bottom > bottom) container.scrollTop += rect.bottom - bottom;
+    } else if (partial && (rect.bottom <= top || rect.top >= bottom)) {
+      container.scrollTop += rect.top - top;
     }
   }
   function positionPopover() {
@@ -1044,9 +1046,12 @@
       }
       positionPopover();
       const focused = document.activeElement;
-      const focusScrollport = activeDialog()?.node.querySelector(".modal")
-        || focused?.closest(".pair-card, .topbar, .statusbar");
+      const focusScrollport = activeDialog()?.node.querySelector(".modal") || focused?.closest(".pair-card");
       if (focusScrollport) revealViewportControl(focused, focusScrollport, bounds);
+      else {
+        const chrome = focused?.closest(".topbar, .statusbar");
+        if (chrome) revealViewportControl(focused, chrome, safeViewportBounds(), { partial: true });
+      }
     }, { newContent: false });
     // A viewport pan changes which block the user is looking at. Adopt that
     // new visible block rather than compensating away the user's pinch/pan.

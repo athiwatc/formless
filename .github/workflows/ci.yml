@@ -140,9 +140,14 @@ jobs:
           "$python" -m pip install --disable-pip-version-check --no-cache-dir 'playwright==1.62.0'
           "$python" -m playwright install chromium --no-shell --no-progress
           FORMLESS_CHROMIUM_EXECUTABLE=$("$python" - <<'PY'
-          from playwright.sync_api import sync_playwright
-          with sync_playwright() as playwright:
-              print(playwright.chromium.executable_path)
+          import asyncio
+          from playwright.async_api import async_playwright
+
+          async def chromium_path():
+              async with async_playwright() as playwright:
+                  print(playwright.chromium.executable_path)
+
+          asyncio.run(chromium_path())
           PY
           )
           export FORMLESS_CHROMIUM_EXECUTABLE

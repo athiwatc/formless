@@ -9,6 +9,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 
 
 ROOT = Path(__file__).resolve().parent
@@ -37,6 +38,29 @@ def discover_suites():
     return browsers, dev
 
 
+def signal_group(group, sig):
+    try:
+        os.killpg(group, sig)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def stop_suite(process):
+    if signal_group(process.pid, signal.SIGTERM):
+        deadline = time.monotonic() + TERMINATION_GRACE_SECONDS
+        while time.monotonic() < deadline:
+            # Reap the leader separately. Other processes can still occupy
+            # the group, including Playwright's driver shutting down Chromium.
+            process.poll()
+            if not signal_group(process.pid, 0):
+                break
+            time.sleep(0.05)
+        else:
+            signal_group(process.pid, signal.SIGKILL)
+    process.wait()
+
+
 def run_suite(path, output, failures, settings_fixture):
     browser = path.name.endswith(BROWSER_SUFFIX)
     folder = output / path.stem
@@ -55,18 +79,7 @@ def run_suite(path, output, failures, settings_fixture):
             try:
                 status = process.wait(timeout=SUITE_TIMEOUT_SECONDS)
             except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(process.pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-                try:
-                    process.wait(timeout=TERMINATION_GRACE_SECONDS)
-                except subprocess.TimeoutExpired:
-                    try:
-                        os.killpg(process.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                    process.wait()
+                stop_suite(process)
                 status = 124
                 log.write(f"\nTimed out after {SUITE_TIMEOUT_SECONDS} seconds.\n".encode())
     print(f"{'PASS' if status == 0 else 'FAIL'} {path.name}", flush=True)
