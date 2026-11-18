@@ -3131,9 +3131,17 @@ impl Store {
         self.run_metrics_for(None, limit, None)
     }
 
-    /// Resolve literal prefixes, preferring an exact identity. No LIKE wildcards.
+    /// Resolve literal prefixes, preferring an exact identity.
     pub fn inspect_run(&self, query: &str) -> Result<Option<serde_json::Value>> {
-        anyhow::ensure!(!query.is_empty(), "ambiguous Run id");
+        if query.is_empty() {
+            let any_run: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM runs WHERE id IS NOT NULL)",
+                [],
+                |row| row.get(0),
+            )?;
+            anyhow::ensure!(!any_run, "ambiguous Run id");
+            return Ok(None);
+        }
         self.read_transaction(|st| {
             if let Some(exact) = st.inspect_exact_run(query)? {
                 return Ok(Some(exact));

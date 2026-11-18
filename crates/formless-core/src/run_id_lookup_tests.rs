@@ -33,7 +33,7 @@ fn exact_and_prefix_run_queries_search_the_primary_key() {
 #[test]
 fn run_lookup_prefers_exact_ids_and_bounds_literal_prefixes() {
     let store = Store::open_in_memory().unwrap();
-    assert!(store.inspect_run("").is_err());
+    assert!(store.inspect_run("").unwrap().is_none());
     let session = store.create_session(None).unwrap();
     let ids = [
         "a",
@@ -53,6 +53,11 @@ fn run_lookup_prefers_exact_ids_and_bounds_literal_prefixes() {
             params![id, session.id],
         ).unwrap();
     }
+    assert!(store
+        .inspect_run("")
+        .unwrap_err()
+        .to_string()
+        .contains("ambiguous Run id"));
     for (query, expected) in [
         ("a", "a"),
         ("ab1", "ab1"),
