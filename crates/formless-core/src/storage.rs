@@ -3059,6 +3059,8 @@ impl Store {
 
     /// Check coverage for the distinct Runs allocated by a branch comparison.
     /// Aggregate requests and usage separately so their rows cannot multiply.
+    /// The indexed IN filters let SQLite group in Run ID order using the
+    /// existing indexes, without sorting the matching child rows first.
     fn forecast_usage_complete_for_runs(&self, run_ids: &[String]) -> Result<bool> {
         if run_ids.is_empty() {
             return Ok(true);
@@ -3069,12 +3071,12 @@ impl Store {
              requests AS (
                  SELECT c.run_id, SUM(c.expected) AS expected,
                         SUM(CASE WHEN c.source='run' THEN c.expected ELSE 0 END) AS main
-                 FROM wanted AS w CROSS JOIN forecast_request_counts AS c ON c.run_id=w.id
+                 FROM forecast_request_counts AS c WHERE c.run_id IN (SELECT id FROM wanted)
                  GROUP BY c.run_id
              ),
              usage AS (
                  SELECT u.run_id, COUNT(*) AS recorded, SUM(u.usage_complete) AS covered
-                 FROM wanted AS w CROSS JOIN run_usage AS u ON u.run_id=w.id
+                 FROM run_usage AS u WHERE u.run_id IN (SELECT id FROM wanted)
                  GROUP BY u.run_id
              )
              SELECT COALESCE(c.expected,0), COALESCE(c.main,0),
