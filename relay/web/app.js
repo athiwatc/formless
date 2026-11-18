@@ -440,6 +440,29 @@
       const home = parts.length === 0 || (["Users", "home"].includes(parts[0]) && parts.length <= 2) || (parts.length === 1 && parts[0] === "root");
       if (p === "" || p === "~" || home) return "writing anywhere in your files";
     }
+    if (cap.startsWith("process:")) {
+      // Match the protocol's executable and first-argument split, including
+      // Windows drive-letter paths and optional scopes.
+      const grant = cap.slice(8);
+      const separator = grant.lastIndexOf(":");
+      const scope = grant.slice(separator + 1);
+      const executable = separator > 1 && scope && !/[\\/]/.test(scope)
+        ? grant.slice(0, separator) : grant;
+      const base = executable.split(/[\\/]/).pop()
+        .replace(/[A-Z]/g, (letter) => letter.toLowerCase()).replace(/(?:\.exe)+$/, "");
+      const stem = base.replace(/[0-9.]+$/, "");
+      if (["sh", "bash", "zsh", "fish", "dash", "ksh", "csh", "tcsh", "mksh", "ash", "cmd", "powershell", "pwsh", "osascript", "env", "xargs", "sudo", "doas", "pkexec", "su", "runuser", "nodejs"].includes(base)
+          || ["python", "pythonw", "py", "pyw", "node", "deno", "bun", "perl", "ruby", "php", "lua", "tclsh"].includes(stem)) {
+        return "an interpreter or shell: it can run any program, like bare process";
+      }
+      if (["curl", "wget", "ssh", "scp", "rsync", "nc", "ncat"].includes(base)) {
+        return "it can reach any host and write files, like net plus fs:write";
+      }
+      if (base === "git") return "git runs hooks and settings from the repository it works in, even for read-only sub-commands";
+      if (base === "find") return "find can run any program (-exec)";
+      if (base === "tar") return "tar can run any program (--to-command) and write anywhere";
+      if (["make", "cmake", "ninja"].includes(base)) return "a build tool runs whatever the build files say";
+    }
     if (cap.startsWith("env:")) {
       const k = cap.slice(4).toUpperCase();
       if (["TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "PRIVATE", "AUTH"].some((w) => k.includes(w)) || k.endsWith("KEY") || k.endsWith("_PAT")) return "a secret from your environment";
@@ -3915,7 +3938,7 @@
       // The first approval ever: what this is and how to undo it (#394).
       !promo && !prefs.get("seen.approvalHelp", false) ? h("p", { class: "first-approval" },
         "First approval? Tools run in a sandbox with no access at all; each Capability below (files, network, programs…) is something this Tool asks to use. Always lets it keep using them, Once allows just this call, Deny says no. Change your mind any time: /approvals lists what you allowed, /revoke takes it back.") : null,
-      req.broadConfirm ? h("p", { class: "error broad-confirm" }, "This grants broad access. Press the same button (or key) again to confirm, or allow it once.") : null,
+      req.broadConfirm ? h("p", { class: "error broad-confirm", role: "alert" }, "This grants broad access. Press the same button (or key) again to confirm, or allow it once.") : null,
       // A parallel batch: every held call, each answered on its own (§5.2).
       req.batch ? h("div", { class: "batch-list" },
         h("strong", null, "Call " + req.batch.index + " of " + req.batch.calls.length + " held in this batch: answer each one"),
@@ -4218,12 +4241,11 @@
     // Granting broad access beyond this call takes a second press (§10.3).
     const head = S.approvals[0];
     if (!head || head.deciding) return;
-    if (approved && head && head.kind !== "promotion" && scope !== "once") {
-      const broad = (head.capabilities || []).filter((c) => !(head.already || []).includes(c) && isBroad(c));
-      if (broad.length && head.broadConfirm !== (scope || "always")) {
+    if (approved && head.kind !== "promotion" && scope !== "once") {
+      const broad = (head.capabilities || []).some((c) => !(head.already || []).includes(c) && isBroad(c));
+      if (broad && head.broadConfirm !== (scope || "always")) {
         head.broadConfirm = scope || "always";
         renderApproval();
-        toast("Broad access (" + broad.join(", ") + "): press again to grant it", true);
         return;
       }
     }
