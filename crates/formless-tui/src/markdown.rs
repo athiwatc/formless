@@ -1897,17 +1897,20 @@ mod tests {
             ("\u{31c0}", "\u{31c1}"),
             ("\u{aa80}", "\u{aa81}"),
         ] {
-            let prefix = format!("word {first}");
+            let prefix = format!("abcdefghijklmnop {first}");
             let source = format!("{prefix}{second}");
-            let cols = crate::text::width(&prefix);
+            let cols = crate::text::width(&prefix) + 2;
             assert_eq!(
                 lines(&source, cols),
-                [prefix, second.to_owned()],
+                [format!("  {prefix}"), format!("  {second}")],
                 "{source}"
             );
         }
-        let hangul = lines("word ㄱㄴ", crate::text::width("word ㄱ"));
-        assert_eq!(hangul, ["word", "ㄱㄴ"]);
+        let hangul = lines(
+            "abcdefghijklmnop ㄱㄴ",
+            crate::text::width("  abcdefghijklmnop ㄱ"),
+        );
+        assert_eq!(hangul, ["  abcdefghijklmnop", "  ㄱㄴ"]);
         let family = "👨\u{200d}👩\u{200d}👧\u{200d}👦";
         let rows = hard_wrap(vec![Span::raw(family.repeat(3))], 3);
         for r in &rows {
