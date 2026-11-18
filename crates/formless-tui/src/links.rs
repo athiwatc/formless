@@ -3,11 +3,15 @@
 //! support them make them clickable. Ratatui's cells can't hold the escape
 //! sequences (they'd count toward the width), so the repaint goes straight
 //! to the terminal when the visible links or their rendered cells change.
+//! Cells leaving a link are repainted with no hyperlink active.
 
 use ratatui::buffer::{Buffer, Cell};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier};
+use std::collections::{BTreeSet, HashSet};
 use std::io::Write;
+use std::ops::Range;
+use unicode_width::UnicodeWidthStr;
 
 /// One visible link: row, first and last column, and its target.
 #[derive(Debug, Clone, PartialEq)]
@@ -23,12 +27,16 @@ pub struct PaintCache {
     area: Rect,
     links: Vec<Painted>,
     cells: Vec<Cell>,
+    covered: HashSet<(u16, u16)>,
+    retry: bool,
 }
 
 impl PaintCache {
     pub fn clear(&mut self) {
         self.links.clear();
         self.cells.clear();
+        self.covered.clear();
+        self.retry = false;
     }
 
     pub fn update(
@@ -37,19 +45,76 @@ impl PaintCache {
         buf: &Buffer,
         links: Vec<Painted>,
     ) -> std::io::Result<()> {
+        if self.area != buf.area {
+            // Ratatui clears the terminal before drawing into a resized buffer.
+            self.clear();
+            self.area = buf.area;
+        }
         let cells = links
             .iter()
             .flat_map(|link| (link.x0..=link.x1).map(move |x| &buf[(x, link.y)]));
-        if self.area == buf.area && self.links == links && self.cells.iter().eq(cells.clone()) {
+        if !self.retry && self.links == links && self.cells.iter().eq(cells.clone()) {
             return Ok(());
         }
-        self.clear();
-        paint(out, buf, &links)?;
-        self.area = buf.area;
+        let covered = links
+            .iter()
+            .flat_map(|link| {
+                link_cells(buf, link).flat_map(move |(cols, _)| cols.map(move |x| (x, link.y)))
+            })
+            .collect::<HashSet<_>>();
+        let removed = self
+            .covered
+            .difference(&covered)
+            .copied()
+            .collect::<HashSet<_>>();
+        let rows = removed.iter().map(|&(_, y)| y).collect::<BTreeSet<_>>();
+        let mut plain = Vec::new();
+        for y in rows {
+            // A replacement glyph can begin before the old span and still
+            // cover it. Repaint the entire glyph from its leading column.
+            for (cols, _) in row_cells(buf, y, buf.area.left()..buf.area.right()) {
+                if cols.clone().any(|x| removed.contains(&(x, y))) {
+                    plain.push((cols.start, y));
+                }
+            }
+        }
+        if let Err(error) = paint(out, buf, &links, &plain) {
+            // Writes can fail partway through either pass. Retry and account
+            // for every cell that could still be linked on the terminal.
+            self.covered.extend(covered);
+            self.retry = true;
+            return Err(error);
+        }
+        self.retry = false;
+        self.covered = covered;
+        self.cells.clear();
         self.cells.extend(cells.cloned());
         self.links = links;
         Ok(())
     }
+}
+
+fn row_cells(
+    buf: &Buffer,
+    y: u16,
+    columns: Range<u16>,
+) -> impl Iterator<Item = (Range<u16>, &Cell)> {
+    let mut next = columns.start;
+    columns.filter_map(move |x| {
+        if x < next {
+            return None;
+        }
+        let cell = &buf[(x, y)];
+        let width = u16::try_from(cell.symbol().width())
+            .unwrap_or(u16::MAX)
+            .max(1);
+        next = x.saturating_add(width).min(buf.area.right());
+        (!cell.skip).then_some((x..next, cell))
+    })
+}
+
+fn link_cells<'a>(buf: &'a Buffer, link: &Painted) -> impl Iterator<Item = (Range<u16>, &'a Cell)> {
+    row_cells(buf, link.y, link.x0..link.x1.saturating_add(1))
 }
 
 /// Encode the native absolute file path, including Windows drive/UNC/verbatim
@@ -290,15 +355,11 @@ pub fn scan(
     out
 }
 
-/// Repaint `links` with OSC 8 around their cells, keeping each cell's
-/// colours and modifiers.
-pub fn paint(out: &mut impl Write, buf: &Buffer, links: &[Painted]) -> std::io::Result<()> {
+fn paint_cell(out: &mut impl Write, cell: &Cell) -> std::io::Result<()> {
     use crossterm::style::{
-        Attribute, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
-        SetUnderlineColor,
+        Attribute, Print, SetAttribute, SetBackgroundColor, SetForegroundColor, SetUnderlineColor,
     };
-    use crossterm::{cursor, QueueableCommand};
-    const CLOSE_LINK: &str = "\x1b]8;;\x1b\\";
+    use crossterm::QueueableCommand;
     const ATTRIBUTES: [(Modifier, Attribute); 9] = [
         (Modifier::BOLD, Attribute::Bold),
         (Modifier::DIM, Attribute::Dim),
@@ -310,28 +371,53 @@ pub fn paint(out: &mut impl Write, buf: &Buffer, links: &[Painted]) -> std::io::
         (Modifier::SLOW_BLINK, Attribute::SlowBlink),
         (Modifier::RAPID_BLINK, Attribute::RapidBlink),
     ];
-    if links.is_empty() {
+    out.queue(SetAttribute(Attribute::Reset))?;
+    out.queue(SetForegroundColor(cell.fg.into()))?;
+    out.queue(SetBackgroundColor(cell.bg.into()))?;
+    if cell.underline_color != Color::Reset {
+        out.queue(SetUnderlineColor(cell.underline_color.into()))?;
+    }
+    for (modifier, attribute) in ATTRIBUTES {
+        if cell.modifier.contains(modifier) {
+            out.queue(SetAttribute(attribute))?;
+        }
+    }
+    out.queue(Print(cell.symbol()))?;
+    Ok(())
+}
+
+/// Restore the current glyphs at expired positions before drawing the links.
+fn paint(
+    out: &mut impl Write,
+    buf: &Buffer,
+    links: &[Painted],
+    plain: &[(u16, u16)],
+) -> std::io::Result<()> {
+    use crossterm::style::{Attribute, Print, ResetColor, SetAttribute};
+    use crossterm::{cursor, QueueableCommand};
+    const CLOSE_LINK: &str = "\x1b]8;;\x1b\\";
+    if links.is_empty() && plain.is_empty() {
         return Ok(());
     }
     out.queue(cursor::SavePosition)?;
     let result = (|| {
+        if !plain.is_empty() {
+            out.queue(Print(CLOSE_LINK))?;
+            for &(x, y) in plain {
+                out.queue(cursor::MoveTo(x, y))?;
+                paint_cell(out, &buf[(x, y)])?;
+            }
+        }
         for link in links {
             out.queue(cursor::MoveTo(link.x0, link.y))?;
             out.queue(Print(format!("\x1b]8;;{}\x1b\\", link.url)))?;
-            for x in link.x0..=link.x1 {
-                let cell = &buf[(x, link.y)];
-                out.queue(SetAttribute(Attribute::Reset))?;
-                out.queue(SetForegroundColor(cell.fg.into()))?;
-                out.queue(SetBackgroundColor(cell.bg.into()))?;
-                if cell.underline_color != Color::Reset {
-                    out.queue(SetUnderlineColor(cell.underline_color.into()))?;
+            let mut x = link.x0;
+            for (cols, cell) in link_cells(buf, link) {
+                if x != cols.start {
+                    out.queue(cursor::MoveTo(cols.start, link.y))?;
                 }
-                for (modifier, attribute) in ATTRIBUTES {
-                    if cell.modifier.contains(modifier) {
-                        out.queue(SetAttribute(attribute))?;
-                    }
-                }
-                out.queue(Print(cell.symbol()))?;
+                paint_cell(out, cell)?;
+                x = cols.end;
             }
             out.queue(Print(CLOSE_LINK))?;
         }
@@ -527,7 +613,7 @@ mod tests {
             original.len()
         );
         let mut out = Vec::new();
-        paint(&mut out, &buf, &links).unwrap();
+        paint(&mut out, &buf, &links, &[]).unwrap();
         let painted = String::from_utf8(out).unwrap();
         assert!(
             painted.contains(&format!("\x1b]8;;{target}\x1b\\")),
@@ -634,7 +720,7 @@ mod tests {
             }]
         );
         let mut out = Vec::new();
-        paint(&mut out, &buf, &links).unwrap();
+        paint(&mut out, &buf, &links, &[]).unwrap();
         let s = String::from_utf8(out).unwrap();
         assert!(s.contains("\x1b]8;;https://x.dev\x1b\\"), "{s:?}");
         assert!(s.ends_with("\x1b8") || s.contains("\x1b]8;;\x1b\\"));
@@ -714,7 +800,7 @@ mod tests {
         buf[(1, 0)].set_style(Style::default().add_modifier(Modifier::RAPID_BLINK));
         let found = scan(&buf, area, &mut |_| None);
         let mut out = Vec::new();
-        paint(&mut out, &buf, &found).unwrap();
+        paint(&mut out, &buf, &found, &[]).unwrap();
         let painted = std::str::from_utf8(&out).unwrap();
         for attribute in ["\x1b[4m", "\x1b[9m", "\x1b[8m", "\x1b[5m", "\x1b[6m"] {
             assert!(
@@ -726,34 +812,172 @@ mod tests {
     }
 
     #[test]
+    fn repaints_unchanged_suffix_after_the_url_prefix_is_removed() {
+        use ratatui::style::Style;
+
+        let area = Rect::new(0, 0, 36, 2);
+        let text = "https://example.test/repo";
+        let mut before = Buffer::empty(area);
+        before.set_string(0, 1, text, Style::default());
+        let mut cache = PaintCache::default();
+        let mut out = Vec::new();
+        cache
+            .update(&mut out, &before, scan(&before, area, &mut |_| None))
+            .unwrap();
+
+        let mut after = before.clone();
+        after.set_string(0, 1, "--------", Style::default());
+        assert!(before.diff(&after).iter().all(|(x, _, _)| *x < 8));
+        let found = scan(&after, area, &mut |_| None);
+        assert!(found.is_empty());
+        out.clear();
+        cache.update(&mut out, &after, found).unwrap();
+        let painted = std::str::from_utf8(&out).unwrap();
+        assert!(painted.starts_with("\x1b7\x1b]8;;\x1b\\"));
+        assert!(painted.contains(&format!("\x1b[2;{}H", text.len())));
+        assert!(!painted.contains("\x1b]8;;https://"));
+        assert!(!painted.contains(&format!("\x1b[2;{}H", text.len() + 1)));
+        assert!(!painted.contains("\x1b[1;"), "unrelated row was repainted");
+    }
+
+    #[test]
+    fn disabling_repaints_present_links_plain_and_reenable_restores_them() {
+        use ratatui::style::Style;
+
+        let area = Rect::new(0, 0, 30, 1);
+        let mut buf = Buffer::empty(area);
+        buf.set_string(
+            0,
+            0,
+            "https://example.test",
+            Style::default().add_modifier(Modifier::CROSSED_OUT),
+        );
+        let found = scan(&buf, area, &mut |_| None);
+        assert_eq!(found.len(), 1);
+        let mut cache = PaintCache::default();
+        let mut out = Vec::new();
+        cache.update(&mut out, &buf, found.clone()).unwrap();
+
+        out.clear();
+        cache.update(&mut out, &buf, Vec::new()).unwrap();
+        let painted = std::str::from_utf8(&out).unwrap();
+        assert!(painted.starts_with("\x1b7\x1b]8;;\x1b\\"));
+        assert!(
+            painted.contains("\x1b[9mh"),
+            "plain repaint must preserve the style"
+        );
+        assert!(!painted.contains("\x1b]8;;https://"));
+
+        out.clear();
+        cache.update(&mut out, &buf, Vec::new()).unwrap();
+        assert!(out.is_empty());
+        cache.update(&mut out, &buf, found).unwrap();
+        assert!(std::str::from_utf8(&out)
+            .unwrap()
+            .contains("\x1b]8;;https://example.test\x1b\\"));
+    }
+
+    #[test]
+    fn removed_span_covers_old_and_new_wide_glyphs_at_its_edges() {
+        use ratatui::style::Style;
+
+        let area = Rect::new(0, 0, 9, 1);
+        let mut buf = Buffer::empty(area);
+        buf.set_string(2, 0, "x界", Style::default());
+        let mut cache = PaintCache::default();
+        let mut out = Vec::new();
+        // The end of the scanned link is the leading column of 界.
+        let found = vec![Painted {
+            y: 0,
+            x0: 2,
+            x1: 3,
+            url: "https://example.test".into(),
+        }];
+        cache.update(&mut out, &buf, found).unwrap();
+
+        buf.reset();
+        buf.set_string(1, 0, "界xy", Style::default());
+        out.clear();
+        cache.update(&mut out, &buf, Vec::new()).unwrap();
+        let painted = std::str::from_utf8(&out).unwrap();
+        assert!(painted.contains("\x1b[1;2H") && painted.contains('界'));
+        assert!(
+            !painted.contains("\x1b[1;3H"),
+            "do not overwrite the wide continuation"
+        );
+        assert!(
+            painted.contains("\x1b[1;5H") && painted.contains('y'),
+            "clear the old wide tail"
+        );
+    }
+
+    #[test]
+    fn moving_a_link_repaints_only_the_exposed_columns_plain() {
+        let area = Rect::new(0, 0, 8, 1);
+        let mut buf = Buffer::empty(area);
+        buf.set_string(0, 0, "abcdefgh", ratatui::style::Style::default());
+        let mut cache = PaintCache::default();
+        let mut out = Vec::new();
+        let mut link = Painted {
+            y: 0,
+            x0: 1,
+            x1: 3,
+            url: "https://old.test".into(),
+        };
+        cache.update(&mut out, &buf, vec![link.clone()]).unwrap();
+        out.clear();
+        link.x0 = 2;
+        link.x1 = 4;
+        link.url = "https://new.test".into();
+        cache.update(&mut out, &buf, vec![link]).unwrap();
+        let painted = std::str::from_utf8(&out).unwrap();
+        let (plain, linked) = painted
+            .split_once("\x1b[1;3H\x1b]8;;https://new.test\x1b\\")
+            .unwrap();
+        assert!(plain.starts_with("\x1b7\x1b]8;;\x1b\\\x1b[1;2H"));
+        assert_eq!(plain.matches('H').count(), 1);
+        assert!(plain.ends_with('b') && linked.contains('e'));
+    }
+
+    struct FailAfter {
+        bytes: Vec<u8>,
+        suffix: &'static [u8],
+        failed: bool,
+    }
+
+    impl FailAfter {
+        fn new(suffix: &'static [u8]) -> Self {
+            Self {
+                bytes: Vec::new(),
+                suffix,
+                failed: false,
+            }
+        }
+    }
+
+    impl Write for FailAfter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if !self.failed && self.bytes.ends_with(self.suffix) {
+                self.failed = true;
+                return Err(std::io::ErrorKind::BrokenPipe.into());
+            }
+            self.bytes.write(bytes)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
     fn interrupted_paint_closes_the_link_and_can_be_retried() {
-        #[derive(Default)]
-        struct FailInsideLink {
-            bytes: Vec<u8>,
-            failed: bool,
-        }
-
         const OPEN: &[u8] = b"\x1b]8;;https://x.test\x1b\\";
-        impl Write for FailInsideLink {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                if !self.failed && self.bytes.ends_with(OPEN) {
-                    self.failed = true;
-                    return Err(std::io::ErrorKind::BrokenPipe.into());
-                }
-                self.bytes.write(bytes)
-            }
-
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
         let area = Rect::new(0, 0, 20, 1);
         let mut buf = Buffer::empty(area);
         buf.set_string(0, 0, "https://x.test", ratatui::style::Style::default());
         let found = scan(&buf, area, &mut |_| None);
         let mut cache = PaintCache::default();
-        let mut out = FailInsideLink::default();
+        let mut out = FailAfter::new(OPEN);
         let error = cache.update(&mut out, &buf, found.clone()).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
         assert!(out.bytes.ends_with(b"\x1b]8;;\x1b\\\x1b[0m\x1b[0m\x1b8"));
@@ -761,5 +985,30 @@ mod tests {
         out.bytes.clear();
         cache.update(&mut out, &buf, found).unwrap();
         assert!(out.bytes.windows(OPEN.len()).any(|bytes| bytes == OPEN));
+    }
+
+    #[test]
+    fn interrupted_writes_preserve_cleanup_even_if_the_link_is_gone() {
+        let area = Rect::new(0, 0, 20, 1);
+        let mut buf = Buffer::empty(area);
+        buf.set_string(0, 0, "https://x.test", ratatui::style::Style::default());
+        let found = scan(&buf, area, &mut |_| None);
+        let mut cache = PaintCache::default();
+
+        let mut partial_link = FailAfter::new(b"h");
+        assert!(cache.update(&mut partial_link, &buf, found).is_err());
+        let mut partial_cleanup = FailAfter::new(b"\x1b[1;1H");
+        assert!(cache
+            .update(&mut partial_cleanup, &buf, Vec::new())
+            .is_err());
+
+        let mut out = Vec::new();
+        cache.update(&mut out, &buf, Vec::new()).unwrap();
+        let painted = std::str::from_utf8(&out).unwrap();
+        assert!(painted.starts_with("\x1b7\x1b]8;;\x1b\\\x1b[1;1H"));
+        assert!(!painted.contains("\x1b]8;;https://"));
+        out.clear();
+        cache.update(&mut out, &buf, Vec::new()).unwrap();
+        assert!(out.is_empty());
     }
 }

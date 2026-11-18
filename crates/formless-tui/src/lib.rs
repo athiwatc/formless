@@ -19084,20 +19084,7 @@ pub fn run_with(paths: Paths, start: Option<&str>) -> Result<()> {
             }
             app.chat_area = None;
             let frame = terminal.draw(|f| draw(f, &mut app))?;
-            if let Some(proto) = app.image_proto {
-                if app.image_placed != app.painted_images {
-                    if app.painted_images.is_empty() {
-                        let _ = images::paint(&mut stdout(), proto, &app.image_placed);
-                        app.painted_images = app.image_placed.clone();
-                    } else {
-                        // Old thumbnails stay on screen until cleared:
-                        // redraw from scratch, then paint the new ones.
-                        app.painted_images.clear();
-                        app.force_redraw = true;
-                    }
-                }
-            }
-            if app.hyperlinks {
+            let found = if app.hyperlinks {
                 let base = app.work_dir();
                 let cache = &mut app.path_cache;
                 let mut resolve = |p: &str| {
@@ -19111,13 +19098,25 @@ pub fn run_with(paths: Paths, start: Option<&str>) -> Result<()> {
                         })
                         .clone()
                 };
-                let found = app
-                    .chat_area
+                app.chat_area
                     .map(|a| links::scan(frame.buffer, a, &mut resolve))
-                    .unwrap_or_default();
-                let _ = painted_links.update(&mut stdout(), frame.buffer, found);
+                    .unwrap_or_default()
             } else {
-                painted_links.clear();
+                Vec::new()
+            };
+            let _ = painted_links.update(&mut stdout(), frame.buffer, found);
+            if let Some(proto) = app.image_proto {
+                if app.image_placed != app.painted_images {
+                    if app.painted_images.is_empty() {
+                        let _ = images::paint(&mut stdout(), proto, &app.image_placed);
+                        app.painted_images = app.image_placed.clone();
+                    } else {
+                        // Old thumbnails stay on screen until cleared:
+                        // redraw from scratch, then paint the new ones.
+                        app.painted_images.clear();
+                        app.force_redraw = true;
+                    }
+                }
             }
             // Handle everything queued before the next draw, so a burst of
             // scroll events costs one frame, not one frame each.
