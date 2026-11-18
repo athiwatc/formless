@@ -1449,14 +1449,18 @@
     config: { lc: ["#"], q: "\"'", kw: W(""), lit: W("true false null yes no on off"), key: true },
     conf: { lc: ["#", ";"], q: "\"'", kw: W(""), lit: W("true false null yes no on off"), key: true },
     sql: { lc: ["--"], bc: ["/*", "*/"], q: "'", ci: true, kw: W("add all alter and as asc begin by case commit create default delete desc distinct drop else end exists foreign from group having in index inner insert into is join key left like limit not offset on or order outer primary references returning right select set table then union update values when where with"), lit: W("null true false") },
+    lua: { lc: ["--"], q: "\"'", kw: W("and case class data do else elseif end for function if import in instance let local module not of or repeat return then until where while"), lit: W("true false nil True False Nothing") },
     html: { bc: ["<!--", "-->"], q: "\"'", kw: W(""), lit: W(""), tags: true },
     css: { bc: ["/*", "*/"], q: "\"'", kw: W("important media import supports keyframes"), lit: W("") },
   };
   const HL_ALIAS = {
     rs: "rust", javascript: "js", jsx: "js", mjs: "js", cjs: "js", ts: "js", typescript: "js", tsx: "js",
     python: "py", python3: "py", golang: "go", bash: "sh", zsh: "sh", fish: "sh", shell: "sh", console: "sh", powershell: "sh", ps: "sh",
+    dockerfile: "sh", docker: "sh", make: "sh", makefile: "sh", mk: "sh", ruby: "sh", rb: "sh", perl: "sh", pl: "sh", elixir: "sh", ex: "sh", exs: "sh", r: "sh",
     h: "c", cpp: "c", "c++": "c", cc: "c", hpp: "c", java: "c", kotlin: "c", kt: "c", swift: "c", cs: "c", csharp: "c", scala: "c", dart: "c", php: "c", zig: "c",
+    "c#": "c", "f#": "c", fsharp: "c", objc: "c", haskell: "lua", hs: "lua",
     jsonc: "json", json5: "json", yaml: "config", yml: "config", toml: "config", ini: "conf", env: "config", dotenv: "config", properties: "conf",
+    cfg: "conf", editorconfig: "conf", gitconfig: "conf",
     sqlite: "sql", postgres: "sql", postgresql: "sql", mysql: "sql", xml: "html", svg: "html", vue: "html", svelte: "html", scss: "css", less: "css",
   };
   function highlight(code, lang) {
@@ -1480,6 +1484,27 @@
     let lineStart = true;
     while (i < code.length) {
       const c = code[i];
+      if (L === HL.js && (c === "." || /\d/.test(c))) {
+        lineStart = false;
+        if (c === "." && code.startsWith("...", i)) {
+          plain += "...";
+          i += 3;
+          continue;
+        }
+        const before = code[i - 1];
+        const boundary = !before || /\s/.test(before) || before.charCodeAt(0) < 128 && !word.test(before);
+        if (c === "." ? /\d/.test(code[i + 1] ?? "") : boundary) {
+          const end = javascriptNumberEnd(code, i);
+          tok("tok-num", code.slice(i, end));
+          i = end;
+          continue;
+        }
+        if (c !== ".") {
+          plain += c;
+          i++;
+          continue;
+        }
+      }
       if (lineStart && L.key) {
         const m = code.slice(i).match(/^([ \t]*)([\w.\-"'\[\] ]+?)(?=\s*[:=])/);
         if (m && m[2].trim() && !(L.lc || []).some((p) => m[2].trim().startsWith(p))) {
@@ -1539,6 +1564,38 @@
     }
     if (plain) out.push(plain);
     return out;
+  }
+
+  function javascriptNumberEnd(code, start) {
+    const radix = code[start] === "0" && {
+      x: /[0-9a-f]/i, o: /[0-7]/, b: /[01]/,
+    }[code[start + 1]?.toLowerCase()];
+    const digitsEnd = (at, digit = /[0-9]/) => {
+      while (at < code.length && digit.test(code[at])) {
+        at++;
+        if (code[at] === "_" && at + 1 < code.length && digit.test(code[at + 1])) at++;
+      }
+      return at;
+    };
+    if (radix) {
+      const digits = start + 2;
+      const end = digitsEnd(digits, radix);
+      return end === digits ? start + 1 : end + Number(code[end] === "n");
+    }
+    let end = digitsEnd(start);
+    if (code[start] === "0" && end > start + 1 && /^[0-7]+$/.test(code.slice(start, end))) return end;
+    const fraction = code[end] === ".";
+    if (fraction) end = digitsEnd(end + 1);
+    let exponent = false;
+    if (code[end] === "e" || code[end] === "E") {
+      const digits = end + 1 + Number(code[end + 1] === "+" || code[end + 1] === "-");
+      const exponentEnd = digitsEnd(digits);
+      if (exponentEnd > digits) {
+        end = exponentEnd;
+        exponent = true;
+      }
+    }
+    return end + Number(!fraction && !exponent && code[end] === "n");
   }
 
   function copyButton(text) {

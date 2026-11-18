@@ -3329,13 +3329,7 @@ impl Daemon {
                     Some((run_id, _)) => Some(self.usage_info(None, Some(&run_id), &cfg)?),
                     None => None,
                 };
-                let runs = self.with_reader(|st| {
-                    Ok(st
-                        .run_metrics(100_000)?
-                        .into_iter()
-                        .filter(|r| r.session_id == session_id)
-                        .count())
-                })?;
+                let runs = self.with_reader(|st| st.count_runs_for_session(&session_id))?;
                 Ok(json!({"last_run": last_run, "total": total, "runs": runs}))
             }
             Request::GetArtifact { id, offset, length } => {
@@ -3674,32 +3668,55 @@ impl Daemon {
             Request::UsageByDay { since, by } => {
                 let by = by.unwrap_or_default();
                 let cfg = self.config()?;
-                let rows = self.with_reader(|st| st.usage_grouped(since.as_deref(), &by))?;
+                let rows =
+                    self.with_reader(|st| st.usage_grouped_with_labels(since.as_deref(), &by))?;
                 // Merge the per-model rows of each key, pricing as we go
                 // (no cost when a model in it has no price).
-                let mut out: Vec<(String, i64, i64, i64, Option<f64>)> = Vec::new();
-                for (key, provider, model, p, c, cached, cw, reported, unknown) in rows {
+                struct UsageBucket {
+                    key: String,
+                    label: Option<String>,
+                    prompt: i64,
+                    completion: i64,
+                    cached: i64,
+                    cost: Option<f64>,
+                }
+                let mut out: Vec<UsageBucket> = Vec::new();
+                for ((key, provider, model, p, c, cached, cw, reported, unknown), label) in rows {
                     let price =
                         cfg.cost_of_known(&provider, &model, p, c, cached, cw, reported, unknown);
-                    match out.last_mut().filter(|o| o.0 == key) {
-                        Some(o) => {
-                            o.1 += p;
-                            o.2 += c;
-                            o.3 += cached;
-                            o.4 = o.4.zip(price).map(|(a, b)| a + b);
+                    match out.last_mut().filter(|bucket| bucket.key == key) {
+                        Some(bucket) => {
+                            bucket.prompt += p;
+                            bucket.completion += c;
+                            bucket.cached += cached;
+                            bucket.cost = bucket.cost.zip(price).map(|(a, b)| a + b);
                         }
-                        None => out.push((key, p, c, cached, price)),
+                        None => out.push(UsageBucket {
+                            key,
+                            label,
+                            prompt: p,
+                            completion: c,
+                            cached,
+                            cost: price,
+                        }),
                     }
                 }
                 if !by.is_empty() {
-                    out.sort_by_key(|o| std::cmp::Reverse(o.1 + o.2));
+                    out.sort_by_key(|bucket| std::cmp::Reverse(bucket.prompt + bucket.completion));
                 }
                 Ok(json!(out
                     .into_iter()
-                    .map(|(key, p, c, cached, cost)| json!({
-                        "key": key, "prompt_tokens": p, "completion_tokens": c,
-                        "cached_tokens": cached, "cost": cost,
-                    }))
+                    .map(|bucket| {
+                        let mut row = json!({
+                            "key": bucket.label.as_deref().unwrap_or(&bucket.key),
+                            "prompt_tokens": bucket.prompt, "completion_tokens": bucket.completion,
+                            "cached_tokens": bucket.cached, "cost": bucket.cost,
+                        });
+                        if bucket.label.is_some() {
+                            row["session_id"] = json!(bucket.key);
+                        }
+                        row
+                    })
                     .collect::<Vec<_>>()))
             }
             Request::ListToolMetrics { since } => {
