@@ -270,7 +270,7 @@ With no arguments `formless` launches the **TUI**, which auto-starts the daemon 
 2. **API key** — stored in the OS keychain plus a `0600` fallback file (`api_key`) in the config dir, so rebuilding a dev binary never loses it.
 3. **Model** — picked from the endpoint's model list, or typed by hand.
 4. **Reasoning effort** — for models that accept it.
-5. **Probe** — verifies connectivity, streaming and **tool calling**. If the endpoint cannot call tools the wizard refuses to continue: every Run would fail, and a prompt-mode fallback has to be chosen deliberately ([§3.8](#38-provider-options-v2)).
+5. **Probe** — checks connectivity, streaming and **tool calling**. The probe tries native calls first, then tries prompt-based calls if needed. If the prompt fallback succeeds, the wizard saves `provider.tool_mode = "prompt"` ([§3.8](#38-provider-options-v2)). A result with neither mode demonstrated blocks setup. Probe errors such as authentication failures show their own diagnostics.
 
 The result is written to `config.toml` in the config dir ([§4](#4-data-config-and-profiles)); you never need to edit it by hand. Re-run the wizard at any time with `formless doctor` for a diagnosis, or delete the config to go through it again.
 
@@ -688,7 +688,7 @@ CLI with `formless docs troubleshooting`.
 | Symptom | Fix |
 |---|---|
 | `not configured; run formless for the wizard` | headless runs need a configured provider first — launch the TUI once |
-| "does not support tool-calling" during onboarding | pick another model or endpoint; tool calling is mandatory |
+| Onboarding reports neither native nor prompt-based tool calling | Press Enter to pick another model in the wizard. For a saved provider, check a candidate with `/test` or `formless providers test default --model MODEL` and [set `provider.tool_mode = "prompt"`](#38-provider-options-v2) if the model works through the fallback. |
 | TUI renders garbage or does not respond | it needs a real TTY; run it interactively rather than through a pipe |
 
 ### 3.11 CLI reference
