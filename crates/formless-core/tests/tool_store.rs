@@ -6,6 +6,9 @@ use formless_runtime::Capabilities;
 use serde_json::{json, Value};
 use std::sync::{Arc, Barrier};
 
+#[path = "support/sqlite_encoding.rs"]
+mod sqlite_encoding;
+
 #[test]
 fn store_capabilities_parse_and_are_not_sensitive() {
     let c = Capabilities::parse(&["store".into(), "store:cache".into()]).unwrap();
@@ -50,8 +53,17 @@ fn kv_storage_caps() {
 
 #[test]
 fn namespace_quota_counts_bytes_and_keeps_overwrite_and_delete_available() {
+    for encoding in sqlite_encoding::ENCODINGS {
+        check_namespace_quota(encoding);
+    }
+}
+
+fn check_namespace_quota(encoding: &str) {
     for payload in ["a".repeat(65_534), "λ".repeat(32_767)] {
-        let store = Store::open_in_memory().unwrap();
+        let dir = std::env::temp_dir().join(format!("fl-kv-namespace-{}", uuid::Uuid::new_v4()));
+        let database = dir.join("test.db");
+        sqlite_encoding::create_database(&database, encoding);
+        let store = Store::open(&database).unwrap();
         let value = Value::String(payload);
         let key = "\0🦀".to_owned() + &"é".repeat(5);
         assert_eq!(key.len(), 15);
@@ -79,8 +91,13 @@ fn namespace_quota_counts_bytes_and_keeps_overwrite_and_delete_available() {
         assert!(store.kv_set("shared:cache", "extra", &Value::Null).is_err());
         assert!(store.kv_delete("shared:cache", &key).unwrap());
         store.kv_set("shared:cache", "extra", &Value::Null).unwrap();
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
     }
+}
 
+#[test]
+fn tool_store_key_limit_is_in_utf8_bytes() {
     let store = Store::open_in_memory().unwrap();
     let key = "🦀".repeat(64);
     store.kv_set("tool:a", &key, &Value::Null).unwrap();
@@ -93,9 +110,15 @@ fn namespace_quota_counts_bytes_and_keeps_overwrite_and_delete_available() {
 
 #[test]
 fn profile_quota_is_atomic_across_writers_and_leaves_harness_updates_available() {
+    for encoding in sqlite_encoding::ENCODINGS {
+        check_profile_quota(encoding);
+    }
+}
+
+fn check_profile_quota(encoding: &str) {
     let dir = std::env::temp_dir().join(format!("fl-kv-quota-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir(&dir).unwrap();
     let database = dir.join("test.db");
+    sqlite_encoding::create_database(&database, encoding);
     let store = Store::open(&database).unwrap();
     // Create the v67 Tool store and verify the upgrade seeds its charge.
     drop(store);
@@ -155,6 +178,30 @@ fn profile_quota_is_atomic_across_writers_and_leaves_harness_updates_available()
         assert!(store.kv_delete("shared:legacy", &i.to_string()).unwrap());
     }
 
+    // The v67 fixture has 799 full-size values with three-byte keys. Only
+    // the 64 draft rows have a shorter namespace. Fill the remaining quota
+    // exactly, reject one extra byte, and reclaim it for the writer race.
+    let seeded_bytes = 799 * (65_536 + 3 + "shared:cache-00".len())
+        - 64 * ("shared:cache-00".len() - "test:draft".len());
+    let namespace = "shared:boundary";
+    let key = "limit";
+    let remaining = 50 * 1024 * 1024 - seeded_bytes - namespace.len() - key.len() - 2;
+    let boundary = "x".repeat(remaining);
+    let error = store
+        .kv_set(namespace, key, &json!(boundary.clone() + "x"))
+        .unwrap_err();
+    assert!(error.to_string().contains("profile Tool store is full"));
+    store.kv_set(namespace, key, &json!(boundary)).unwrap();
+    let conn = rusqlite::Connection::open(&database).unwrap();
+    let charge: i64 = conn
+        .query_row("SELECT bytes FROM tool_store_profile_usage", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(charge, 50 * 1024 * 1024);
+    drop(conn);
+    assert!(store.kv_delete(namespace, key).unwrap());
+
     let first = Store::open(&database).unwrap();
     let second = Store::open(&database).unwrap();
     let start = Arc::new(Barrier::new(2));
@@ -209,6 +256,12 @@ fn profile_quota_is_atomic_across_writers_and_leaves_harness_updates_available()
 
 #[test]
 fn storage_reports_payload_bytes_and_retains_unreferenced_shared_data() {
+    for encoding in sqlite_encoding::ENCODINGS {
+        check_storage_report(encoding);
+    }
+}
+
+fn check_storage_report(encoding: &str) {
     let dir = std::env::temp_dir().join(format!("fl-kv-usage-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir(&dir).unwrap();
     let paths = Paths {
@@ -216,6 +269,7 @@ fn storage_reports_payload_bytes_and_retains_unreferenced_shared_data() {
         config_dir: dir.join("config"),
         profile: "test-kv-usage".into(),
     };
+    sqlite_encoding::create_database(&paths.db_file(), encoding);
     let store = Store::open(&paths.db_file()).unwrap();
     let cap = Capabilities::parse(&["store:retained".into()]).unwrap();
     let code = "function run(){return '🦀';}";
@@ -259,7 +313,9 @@ fn storage_reports_payload_bytes_and_retains_unreferenced_shared_data() {
     store.kv_set("shared:retained", "payload", &raw).unwrap();
     store.kv_set("shared:unclaimed", "payload", &raw).unwrap();
 
-    let content_bytes = store.content_bytes().unwrap();
+    let reader = Store::open_reader(&paths.db_file()).unwrap();
+    let content_bytes = reader.content_bytes().unwrap();
+    drop(reader);
     assert_eq!(content_bytes["messages"], content.len() + 2);
     assert_eq!(content_bytes["invocations"], "漢字".len() + "ascii".len());
     assert_eq!(content_bytes["tool_versions"], 2 * (code.len() + 4));
@@ -284,6 +340,16 @@ fn storage_reports_payload_bytes_and_retains_unreferenced_shared_data() {
         store.kv_get("shared:retained", "payload").unwrap(),
         Some(raw)
     );
+    let backup = formless_core::housekeeping::backup(&paths, &store, 1).unwrap();
+    let restored = Paths::from_dirs(dir.join("restore"), dir.join("restore-config")).unwrap();
+    formless_core::housekeeping::restore(&restored, &backup).unwrap();
+    let reopened = Store::open(&restored.db_file()).unwrap();
+    assert_eq!(
+        reopened.content_bytes().unwrap()["messages"],
+        content.len() + 2
+    );
+    assert!(reopened.kv_delete("shared:retained", "payload").unwrap());
+    drop(reopened);
     drop(store);
     std::fs::remove_dir_all(dir).unwrap();
 }

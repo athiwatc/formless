@@ -4,7 +4,7 @@ use formless_protocol::{
     TemplateInfo, ToolInfo, ToolMetricsInfo, ToolVersionInfo,
 };
 use formless_runtime::Capabilities;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{functions::FunctionFlags, params, types::ValueRef, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
@@ -349,28 +349,28 @@ CREATE TABLE IF NOT EXISTS tool_store_profile_usage (
   singleton INTEGER PRIMARY KEY CHECK(singleton=1),
   bytes INTEGER NOT NULL CHECK(bytes>=0));
 INSERT OR IGNORE INTO tool_store_profile_usage
-  SELECT 1, COALESCE(SUM(octet_length(namespace)+octet_length(key)+octet_length(value)),0)
+  SELECT 1, COALESCE(SUM(formless_utf8_bytes(namespace)+formless_utf8_bytes(key)+formless_utf8_bytes(value)),0)
   FROM tool_kv WHERE namespace NOT GLOB 'harness:*';
 CREATE TRIGGER IF NOT EXISTS tool_store_usage_insert AFTER INSERT ON tool_kv
 WHEN new.namespace NOT GLOB 'harness:*'
 BEGIN
   UPDATE tool_store_profile_usage
-    SET bytes=bytes+octet_length(new.namespace)+octet_length(new.key)+octet_length(new.value);
+    SET bytes=bytes+formless_utf8_bytes(new.namespace)+formless_utf8_bytes(new.key)+formless_utf8_bytes(new.value);
 END;
 CREATE TRIGGER IF NOT EXISTS tool_store_usage_delete AFTER DELETE ON tool_kv
 WHEN old.namespace NOT GLOB 'harness:*'
 BEGIN
   UPDATE tool_store_profile_usage
-    SET bytes=bytes-octet_length(old.namespace)-octet_length(old.key)-octet_length(old.value);
+    SET bytes=bytes-formless_utf8_bytes(old.namespace)-formless_utf8_bytes(old.key)-formless_utf8_bytes(old.value);
 END;
 CREATE TRIGGER IF NOT EXISTS tool_store_usage_update AFTER UPDATE OF namespace, key, value ON tool_kv
 WHEN old.namespace NOT GLOB 'harness:*' OR new.namespace NOT GLOB 'harness:*'
 BEGIN
   UPDATE tool_store_profile_usage SET bytes=bytes
     - CASE WHEN old.namespace NOT GLOB 'harness:*'
-           THEN octet_length(old.namespace)+octet_length(old.key)+octet_length(old.value) ELSE 0 END
+           THEN formless_utf8_bytes(old.namespace)+formless_utf8_bytes(old.key)+formless_utf8_bytes(old.value) ELSE 0 END
     + CASE WHEN new.namespace NOT GLOB 'harness:*'
-           THEN octet_length(new.namespace)+octet_length(new.key)+octet_length(new.value) ELSE 0 END;
+           THEN formless_utf8_bytes(new.namespace)+formless_utf8_bytes(new.key)+formless_utf8_bytes(new.value) ELSE 0 END;
 END;
 ";
 
@@ -893,6 +893,7 @@ pub(crate) fn schema_at(version: i64) -> Result<Connection> {
         return Err(anyhow!("unsupported backup schema v{version}"));
     }
     let conn = Connection::open_in_memory()?;
+    register_utf8_bytes(&conn)?;
     for (target, step) in MIGRATIONS {
         if target <= version {
             step(&conn)?;
@@ -901,11 +902,34 @@ pub(crate) fn schema_at(version: i64) -> Result<Connection> {
     Ok(conn)
 }
 
+fn register_utf8_bytes(conn: &Connection) -> Result<()> {
+    // SQLite's octet_length counts bytes in the database encoding. Rusqlite
+    // exposes TEXT as UTF-8, so this uses the same units as Rust's str::len
+    // even for restored UTF-16 profiles, including embedded NULs.
+    conn.create_scalar_function(
+        "formless_utf8_bytes",
+        1,
+        FunctionFlags::SQLITE_UTF8
+            | FunctionFlags::SQLITE_DETERMINISTIC
+            | FunctionFlags::SQLITE_INNOCUOUS,
+        |ctx| match ctx.get_raw(0) {
+            ValueRef::Null => Ok(None),
+            ValueRef::Text(bytes) | ValueRef::Blob(bytes) => Ok(Some(bytes.len() as i64)),
+            value => Err(rusqlite::Error::InvalidFunctionParameterType(
+                0,
+                value.data_type(),
+            )),
+        },
+    )?;
+    Ok(())
+}
+
 /// Bring the schema to [`SCHEMA_VERSION`] (SPEC §9.4). An existing
 /// database is backed up first; each step runs in its own transaction
 /// together with its version bump, so a failure leaves the database at
 /// the last completed version.
 fn migrate(conn: &Connection, file: Option<&Path>) -> Result<()> {
+    register_utf8_bytes(conn)?;
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if version > SCHEMA_VERSION {
         return Err(anyhow!(
@@ -1295,6 +1319,7 @@ impl Store {
     pub fn open_reader(file: &Path) -> Result<Self> {
         let conn = Connection::open(file).with_context(|| format!("open db {}", file.display()))?;
         conn.execute_batch(READER_PRAGMAS)?;
+        register_utf8_bytes(&conn)?;
         conn.set_prepared_statement_cache_capacity(STMT_CACHE);
         Ok(Self {
             conn,
@@ -2967,9 +2992,9 @@ impl Store {
                 .unwrap_or(0))
         };
         Ok(serde_json::json!({
-            "messages": sum("SELECT SUM(octet_length(content) + COALESCE(octet_length(meta),0)) FROM messages")?,
-            "invocations": sum("SELECT SUM(octet_length(input) + octet_length(output) + octet_length(error)) FROM invocations")?,
-            "tool_versions": sum("SELECT SUM(octet_length(code) + octet_length(input_schema) + octet_length(output_schema)) FROM tool_versions")?,
+            "messages": sum("SELECT SUM(formless_utf8_bytes(content) + COALESCE(formless_utf8_bytes(meta),0)) FROM messages")?,
+            "invocations": sum("SELECT SUM(formless_utf8_bytes(input) + formless_utf8_bytes(output) + formless_utf8_bytes(error)) FROM invocations")?,
+            "tool_versions": sum("SELECT SUM(formless_utf8_bytes(code) + formless_utf8_bytes(input_schema) + formless_utf8_bytes(output_schema)) FROM tool_versions")?,
             "run_files": sum("SELECT SUM(COALESCE(length(before),0)) FROM run_files")?,
         }))
     }
@@ -5139,7 +5164,7 @@ impl Store {
         // Keep admission and the write under the same SQLite writer lock.
         self.transaction(|st| {
             let used: i64 = st.ps(
-                "SELECT COALESCE(SUM(octet_length(value)+octet_length(key)),0)
+                "SELECT COALESCE(SUM(formless_utf8_bytes(value)+formless_utf8_bytes(key)),0)
                  FROM tool_kv WHERE namespace=?1 AND key!=?2",
             )?.query_row(params![namespace, key], |r| r.get(0))?;
             if used + new_bytes > KV_MAX_NAMESPACE {
@@ -5153,7 +5178,7 @@ impl Store {
             if !namespace.starts_with("harness:") {
                 let used: i64 = st.ps(
                     "SELECT bytes - COALESCE((
-                       SELECT octet_length(namespace)+octet_length(key)+octet_length(value)
+                       SELECT formless_utf8_bytes(namespace)+formless_utf8_bytes(key)+formless_utf8_bytes(value)
                        FROM tool_kv WHERE namespace=?1 AND key=?2
                      ),0) FROM tool_store_profile_usage WHERE singleton=1",
                 )?.query_row(params![namespace, key], |r| r.get(0))?;
@@ -5190,7 +5215,7 @@ impl Store {
                 .collect::<rusqlite::Result<_>>()?;
 
             let mut usage = st.ps(
-                "SELECT namespace, SUM(octet_length(namespace)+octet_length(key)+octet_length(value))
+                "SELECT namespace, SUM(formless_utf8_bytes(namespace)+formless_utf8_bytes(key)+formless_utf8_bytes(value))
                  FROM tool_kv WHERE namespace NOT GLOB 'harness:*'
                  GROUP BY namespace",
             )?;
