@@ -1800,8 +1800,9 @@ pub struct NamingCfg {
     /// Embedded model id ("qwen2.5-0.5b" or "lfm2.5-350m"); empty uses
     /// the heuristic title only.
     pub model: String,
-    /// Fetch the model into the data dir on first use (once, in the
-    /// background). Off: install with `formless naming pull`.
+    /// Fetch the model in the background when naming needs it. After a
+    /// failure, a later naming attempt may retry after cooldown.
+    /// Off: install with `formless naming pull`.
     pub auto_download: bool,
     /// Give up on a single inference after this long and use the
     /// heuristic title instead.

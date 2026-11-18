@@ -1407,7 +1407,7 @@ Contributions are welcome, whether it is a bug report, a Tool, a client improvem
 
 Apache-2.0. See `Cargo.toml` and the license text referenced there.
 
-Formless downloads model weights at runtime. The [local naming models](#local-naming-models) table links to the Apache-2.0 license for Qwen2.5-0.5B-Instruct and the LFM Open License v1.0 for LFM2.5-350M.
+Formless downloads model weights at runtime. The [local naming models](#local-naming-models) table links to the Apache-2.0 license for Qwen2.5-0.5B-Instruct and the LFM Open License v1.0 for LFM2.5-350M, which has terms for commercial use.
 
 ---
 
