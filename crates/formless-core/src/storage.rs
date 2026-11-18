@@ -3163,6 +3163,12 @@ impl Store {
         Ok((cost.filter(|_| any), peak, cached))
     }
 
+    pub(crate) fn count_runs_for_session(&self, session_id: &str) -> Result<i64> {
+        Ok(self
+            .ps("SELECT COUNT(*) FROM runs WHERE session_id=?1")?
+            .query_row(params![session_id], |r| r.get(0))?)
+    }
+
     pub fn run_metrics(&self, limit: usize) -> Result<Vec<formless_protocol::RunMetricsInfo>> {
         self.run_metrics_for(None, limit, None)
     }
@@ -4253,16 +4259,30 @@ impl Store {
     /// Active Tools whose current code requires the module (by name).
     pub fn module_dependents(&self, name: &str) -> Result<Vec<String>> {
         let lower = name.to_lowercase();
+        let patterns = ["requiremodule", "modules.load"]
+            .map(|function| ["\"", "'", "`"].map(|q| format!("{function}({q}{lower}{q}")));
+        let mut stmt = self.ps("SELECT t.name, v.code FROM tools AS t
+             LEFT JOIN tool_versions AS v ON v.tool_id=t.id AND v.version=t.current_version
+             WHERE t.retired=0 ORDER BY t.name_lower")?;
+        let tools = stmt.query_map([], |r| {
+            let name: String = r.get(0)?;
+            // Keep reporting a missing current version, even for a Tool
+            // that would not have matched the module reference.
+            let code: String = r
+                .get::<_, Option<String>>(1)?
+                .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+            Ok((name, code))
+        })?;
         let mut out = Vec::new();
-        for t in self.list_tools(false)? {
-            if let Some((_, v)) = self.get_tool_current(&t.id)? {
-                let code = v.code.to_lowercase();
-                if ["\"", "'", "`"].iter().any(|q| {
-                    code.contains(&format!("requiremodule({q}{lower}{q}"))
-                        || code.contains(&format!("modules.load({q}{lower}{q}"))
-                }) {
-                    out.push(t.name);
-                }
+        for tool in tools {
+            let (name, code) = tool?;
+            let code = code.to_lowercase();
+            if patterns
+                .iter()
+                .flatten()
+                .any(|pattern| code.contains(pattern))
+            {
+                out.push(name);
             }
         }
         Ok(out)
