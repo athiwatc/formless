@@ -495,7 +495,7 @@
   function note(text, err) {
     S.notes.push({ text, err: !!err, at: Date.now() });
     if (S.notes.length > 200) S.notes.shift();
-    if ($("notes-panel").classList.contains("hidden")) S.unread++;
+    if ($("notes-panel").classList.contains("hidden")) S.unread = Math.min(S.notes.length, S.unread + 1);
     renderNotes();
     renderStatus();
   }
@@ -1293,6 +1293,9 @@
 
   function renderSessions() {
     const list = $("sessions");
+    const focused = document.activeElement;
+    const focusedRow = focused?.closest("#sessions [data-session-id]");
+    const focusedControl = focusedRow && ["mark", "session-open", "menu"].find((name) => focused.classList.contains(name));
     list.replaceChildren();
     S.marked = S.marked || new Set();
     if (S.marked.size) {
@@ -1332,26 +1335,37 @@
     const appendRows = (visible) => {
       for (const row of sessionRows(S.sessions, visible, !!S.sessionTree)) {
         const s = row.session;
+        const running = S.running.has(s.id);
+        const paused = !running && s.last_run_status === "paused";
+        const state = [s.pinned && "Pinned", running && "Running", paused && "Paused"].filter(Boolean).join(", ");
+        const stateId = "session-state-" + s.id;
         const menu = h("button", {
           class: "icon-btn menu", type: "button", "aria-label": "Session actions", "aria-haspopup": "menu",
           onkeydown: (e) => menuTriggerKey(e, (last) => sessionMenu(menu, s, last)),
           onclick: (e) => { e.stopPropagation(); sessionMenu(menu, s); },
         }, "⋯");
-        list.append(h("li", {
+        const item = h("li", {
           class: "session" + (s.id === S.current ? " active" : ""),
-          tabindex: 0,
-          onclick: () => openSession(s.id),
-          onkeydown: (e) => { if (e.key === "Enter") openSession(s.id); },
+          "data-session-id": s.id,
         },
         h("input", { type: "checkbox", class: "mark", "aria-label": "Select " + s.name, checked: S.marked.has(s.id),
-          onclick: (e) => { e.stopPropagation(); if (e.target.checked) S.marked.add(s.id); else S.marked.delete(s.id); renderSessions(); } }),
-        S.running.has(s.id) ? h("span", { class: "running", title: "running" })
-          : s.last_run_status === "paused" ? h("span", { class: "state", title: "paused" }, "⏸") : null,
-        h("span", { class: "name", title: s.name, style: "padding-inline-start:" + (row.depth * 0.75) + "rem" }, s.pinned ? "★ " : null, row.depth ? "↳ " : null, s.name,
-          row.note ? h("span", { class: "muted lineage", title: row.note }, " · " + row.note) : null,
-          s.preview ? h("span", { class: "preview", title: s.preview }, s.preview) : null),
-        h("span", { class: "when", title: (s.message_count || 0) + " messages" + (s.model ? " · " + s.model : "") }, relTime(s.updated_at)),
-        menu));
+          onchange: (e) => { if (e.target.checked) S.marked.add(s.id); else S.marked.delete(s.id); renderSessions(); } }),
+        h("button", { class: "session-open", type: "button", "aria-label": s.name,
+          "aria-current": s.id === S.current ? "true" : null, "aria-describedby": state ? stateId : null,
+          onclick: () => openSession(s.id) },
+          running ? h("span", { class: "running", title: "running", "aria-hidden": "true" })
+            : paused ? h("span", { class: "state", title: "paused", "aria-hidden": "true" }, "⏸") : null,
+          h("span", { class: "name", title: s.name, style: "padding-inline-start:" + (row.depth * 0.75) + "rem" }, s.pinned ? "★ " : null, row.depth ? "↳ " : null, s.name,
+            row.note ? h("span", { class: "muted lineage", title: row.note }, " · " + row.note) : null,
+            s.preview ? h("span", { class: "preview", title: s.preview }, s.preview) : null),
+          h("span", { class: "when", title: (s.message_count || 0) + " messages" + (s.model ? " · " + s.model : "") }, relTime(s.updated_at))),
+        state ? h("span", { id: stateId, class: "sr-only" }, state) : null, menu);
+        list.append(item);
+        if (focusedRow?.dataset.sessionId === s.id && focusedControl) {
+          const control = item.querySelector("." + focusedControl);
+          if (focusedControl === "menu" && !focusVisible(control)) item.querySelector(".session-open").focus({ preventScroll: true });
+          control.focus({ preventScroll: true });
+        }
       }
     };
     appendRows(active);
@@ -3702,6 +3716,15 @@
     const badge = $("notes-badge");
     badge.textContent = S.unread > 99 ? "99+" : String(S.unread);
     badge.classList.toggle("hidden", !S.unread);
+    const unread = S.unread + " unread";
+    if ($("notes-unread").textContent !== unread) $("notes-unread").textContent = unread;
+  }
+
+  function setActivityDrawer(open) {
+    $("notes-panel").classList.toggle("hidden", !open);
+    $("notes-btn").setAttribute("aria-expanded", String(open));
+    if (open) { S.unread = 0; renderStatus(); }
+    (open ? $("notes-close") : $("notes-btn")).focus({ preventScroll: true });
   }
 
   function renderNotes() {
@@ -4085,7 +4108,7 @@
     if (e.key === "Escape") {
       e.preventDefault();
       e.stopImmediatePropagation();
-      dismissDialog(top);
+      if (!e.repeat) dismissDialog(top);
     } else if (e.key === "Tab") {
       const items = dialogItems(top.node);
       const first = items[0], last = items[items.length - 1];
@@ -5821,6 +5844,7 @@
     closeSidebar();
     if (!stay && S.view !== "chat") setView("chat");
     S.current = id;
+    renderSessions();
     S.sessionLoad = { id, status: "pending" };
     const snapshot = S.sessionSnapshot = { events: [] };
     S.messages = [];
@@ -7419,12 +7443,8 @@
   $("generate-proposal").onclick = () => { act({ type: "generate_proposal" }, "Generating and measuring a proposal…"); };
   $("stop-btn").onclick = stop;
   $("menu-btn").onclick = () => setSidebar(!$("sidebar").classList.contains("open"), { focus: true });
-  $("notes-btn").onclick = () => {
-    const panel = $("notes-panel");
-    panel.classList.toggle("hidden");
-    if (!panel.classList.contains("hidden")) { S.unread = 0; renderStatus(); }
-  };
-  $("notes-close").onclick = () => $("notes-panel").classList.add("hidden");
+  $("notes-btn").onclick = () => setActivityDrawer($("notes-panel").classList.contains("hidden"));
+  $("notes-close").onclick = () => setActivityDrawer(false);
   // Attachments (SPEC §5.6): stored by the daemon, sent with the next message.
   /** Upload `file` in pieces (#909): the daemon checks the size first, then
    * each piece is read, encoded and sent on its own, so neither side holds
@@ -7540,10 +7560,6 @@
     if (paletteKey(e) || mentionKey(e)) return;
     if (e.key === "?" && !$("input").value && !e.ctrlKey && !e.metaKey) { e.preventDefault(); return showHelp(); }
     if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); submit(false); }
-    else if (e.key === "Escape") {
-      if (S.editMessageId) cancelEdit();
-      else stop();
-    }
   });
   coarsePointer.addEventListener("change", () => {
     syncInputTouchMode();
@@ -7617,11 +7633,15 @@
       if (sc) { e.preventDefault(); sc.run(e.key); return; }
     }
     if (e.key === "Escape") {
-      if (modalOpen) { S.approvalLater = true; renderApproval(); }
-      else if (!$("ask-backdrop").classList.contains("hidden")) closeAsk(null);
-      else if (popover) closePopover();
-      else if (!$("notes-panel").classList.contains("hidden")) $("notes-panel").classList.add("hidden");
-      else closeSidebar();
+      e.preventDefault();
+      if (e.repeat) return;
+      if (popover) closePopover();
+      else if (!$("notes-panel").classList.contains("hidden")) setActivityDrawer(false);
+      else if ($("sidebar").classList.contains("open")) closeSidebar();
+      else if (e.target === $("input")) {
+        if (S.editMessageId) cancelEdit();
+        else stop();
+      }
     }
   });
   // Tick elapsed timers (activity + running Tools) once a second.
