@@ -276,7 +276,12 @@ fn release_tags_must_match_the_cargo_version() {
 #[test]
 fn source_installer_writes_a_complete_optional_manual() {
     use std::os::unix::fs::PermissionsExt;
-    let dir = std::env::temp_dir().join(format!("fl source install {}", uuid::Uuid::new_v4()));
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir =
+        std::env::temp_dir().join(format!("fl source install {}-{unique}", std::process::id()));
     std::fs::create_dir(&dir).unwrap();
     let prefix = dir.join("install prefix");
     let cargo = dir.join("cargo");
