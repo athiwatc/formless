@@ -2,7 +2,7 @@
 //! periodically (`cron`, local time).
 
 use anyhow::{anyhow, bail, Context, Result};
-use chrono::{DateTime, Datelike, Duration, Local, TimeZone, Timelike};
+use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, TimeZone, Timelike};
 
 /// A parsed 5-field cron expression: minute hour day-of-month month
 /// day-of-week (0 or 7 = Sunday). Supports `*`, numbers, `a-b`, lists
@@ -96,28 +96,51 @@ impl Cron {
         })
     }
 
-    fn matches(&self, t: &DateTime<Local>) -> bool {
-        let day = self.dom[t.day() as usize];
-        let wd = self.dow[t.weekday().num_days_from_sunday() as usize];
+    fn matches_date(&self, date: NaiveDate) -> bool {
+        let day = self.dom[date.day() as usize];
+        let wd = self.dow[date.weekday().num_days_from_sunday() as usize];
         // Cron rule: with both day fields restricted, either may match.
         let day_ok = match (self.dom_any, self.dow_any) {
             (false, false) => day || wd,
             _ => day && wd,
         };
-        self.minute[t.minute() as usize]
-            && self.hour[t.hour() as usize]
-            && self.month[t.month() as usize]
-            && day_ok
+        self.month[date.month() as usize] && day_ok
     }
 
-    /// The first matching minute strictly after `after` (within ~4 years).
+    fn matches(&self, t: &DateTime<Local>) -> bool {
+        self.minute[t.minute() as usize]
+            && self.hour[t.hour() as usize]
+            && self.matches_date(t.date_naive())
+    }
+
+    /// The first matching local minute strictly after `after`.
     pub fn next_after(&self, after: DateTime<Local>) -> Option<DateTime<Local>> {
         let mut t = next_local_minute(&after)?;
-        for _ in 0..(4 * 366 * 24 * 60) {
-            if self.matches(&t) {
-                return Some(t);
+        // Month, day, and weekday patterns repeat over a Gregorian cycle.
+        // An extra UTC date covers the partial day at the start.
+        const SEARCH_DAYS: usize = 146_097 + 1;
+        for _ in 0..SEARCH_DAYS {
+            let utc_date = t.naive_utc().date();
+            let tomorrow = utc_date.succ_opt();
+            // All supported UTC offsets are shorter than a day. If none of
+            // these local dates can match, even a clock change cannot make
+            // this UTC date contain a matching local minute.
+            let possible = [utc_date.pred_opt(), Some(utc_date), tomorrow]
+                .into_iter()
+                .flatten()
+                .any(|date| self.matches_date(date));
+            if !possible {
+                let midnight = tomorrow?.and_hms_opt(0, 0, 0)?.and_utc();
+                let before = (midnight - Duration::seconds(1)).with_timezone(&Local);
+                t = next_local_minute(&before)?;
+                continue;
             }
-            t = next_local_minute(&t)?;
+            while t.naive_utc().date() == utc_date {
+                if self.matches(&t) {
+                    return Some(t);
+                }
+                t = next_local_minute(&t)?;
+            }
         }
         None
     }

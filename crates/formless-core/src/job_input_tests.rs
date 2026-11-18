@@ -181,6 +181,9 @@ fn cron_matches_real_instants_through_local_clock_changes() {
             ("new_york", "EST5EDT,M3.2.0/2,M11.1.0/2"),
             ("lord_howe", "LHST-10:30LHDT-11,M10.1.0/2,M4.1.0/2"),
             ("same_hour", "STD0DST-2,M3.2.0/1:10,M3.2.0/3:30"),
+            ("sparse", "UTC0"),
+            ("local_ahead", "LST-14"),
+            ("local_behind", "LST11"),
         ] {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
@@ -208,6 +211,32 @@ fn cron_matches_real_instants_through_local_clock_changes() {
         local
     };
     let next = |expr: &str, after: &str| Cron::parse(expr).unwrap().next_after(local(after));
+    if case == "local_ahead" {
+        assert_eq!(
+            next("0 0 1 1 *", "2026-11-18T08:00:00+14:00"),
+            Some(local("2027-01-01T00:00:00+14:00")),
+        );
+        return;
+    }
+    if case == "local_behind" {
+        assert_eq!(
+            next("0 23 1 1 *", "2026-11-18T08:00:00-11:00"),
+            Some(local("2027-01-01T23:00:00-11:00")),
+        );
+        return;
+    }
+    if case == "sparse" {
+        assert_eq!(
+            next("0 9 1 1 */7", "2026-11-18T08:00:00+00:00"),
+            Some(local("2034-01-01T09:00:00+00:00")),
+        );
+        assert_eq!(
+            next("0 0 29 2 *", "2096-03-01T00:00:00+00:00"),
+            Some(local("2104-02-29T00:00:00+00:00")),
+        );
+        assert_eq!(next("0 0 31 2 *", "2026-11-18T08:00:00+00:00"), None);
+        return;
+    }
     if case == "same_hour" {
         assert_eq!(
             next("15 3 * * *", "2026-03-08T01:00:00+00:00"),
