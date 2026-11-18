@@ -57,8 +57,8 @@ model = "anthropic/claude-sonnet-5.5"
 
 Copy it into a new config volume, restart, and check. **The copy command
 replaces all of `/config/config.toml`, including any unrelated settings.**
-Use the key-specific commands below if the volume already has settings
-you want to keep.
+Follow [the existing-volume instructions](#update-an-existing-provider-configuration)
+if the volume already has settings you want to keep.
 
 ```sh
 docker exec -i formless sh -c 'cat > /config/config.toml' < config.toml
@@ -71,19 +71,23 @@ problems or failures from other checks.
 
 ### Update an existing provider configuration
 
-On a running container, use the daemon-validated `config set` command to
-change only the provider keys you need. For example:
+To change `provider.base_url`, edit that key in the volume's existing
+`config.toml`, keeping the other settings, and restart the container.
+The endpoint is a file-only setting.
+
+To change the model on a running container, use the daemon-validated
+`config set` command:
 
 ```sh
-docker exec formless formless config set provider.base_url 'https://openrouter.ai/api/v1' &&
-  docker exec formless formless config set provider.model 'anthropic/claude-sonnet-5.5'
+docker exec formless formless config set provider.model 'anthropic/claude-sonnet-5.5'
 ```
 
-These are separate updates. If the first succeeds and the second fails,
-the first value stays saved. Check each command's output for an environment
-override. When one applies, the daemon reports the value it uses even though
-the new value was saved. To inspect the values the CLI loads inside the
-container, including its environment overrides, run:
+Changing the endpoint and model in this order makes two separate updates.
+If the model update fails, the earlier endpoint edit stays saved.
+`FORMLESS_BASE_URL` and `FORMLESS_MODEL` can override the saved settings.
+If an environment override applies to the model, `config set` reports the
+model the daemon uses. To inspect what the CLI loads inside the container,
+including its environment overrides, run:
 
 ```sh
 docker exec formless formless config get provider.base_url
