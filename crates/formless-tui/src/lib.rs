@@ -12658,92 +12658,54 @@ fn input_height(app: &App, width: u16) -> u16 {
     rows.clamp(1, 8) as u16 + 2
 }
 
-fn draw_status(f: &mut Frame, area: Rect, app: &App) {
-    let sep = || Span::styled(" │ ", ui::dim(app.color));
-    let mut left: Vec<Span> = vec![Span::raw(" ")];
-    if app.paths.profile != "default" {
-        left.push(Span::styled(
-            format!("{}: {}", i18n::tr("profile"), app.paths.profile),
-            ui::dim(app.color),
-        ));
-        left.push(sep());
-    }
-    if let Some((since, _)) = app.offline {
-        left.push(Span::styled(
+/// The status paragraph advances one grapheme at a time. Measuring a whole
+/// string can undercount ligatures that the widget renders in separate cells.
+fn status_width(span: &Span<'_>) -> usize {
+    use unicode_segmentation::UnicodeSegmentation;
+
+    span.content.graphemes(true).map(text::width).sum()
+}
+
+fn status_left(app: &App, width: usize) -> Vec<Span<'static>> {
+    let sep = Span::styled(" │ ", ui::dim(app.color));
+    let separator_width = status_width(&sep);
+    let activity = if let Some((since, _)) = app.offline {
+        Span::styled(
             format!(
                 "⚠ {} ({})",
                 i18n::tr("reconnecting to the daemon…"),
                 format_elapsed(since.elapsed())
             ),
             bold_fg(app.color, Color::Red),
-        ));
+        )
     } else if let Some(pull) = &app.pull_status {
-        left.push(Span::styled(
-            format!("⇣ {pull}"),
-            bold_fg(app.color, Color::Cyan),
-        ));
+        Span::styled(format!("⇣ {pull}"), bold_fg(app.color, Color::Cyan))
     } else if let Some(activity) = app.activity_text() {
-        left.push(Span::styled(activity, bold_fg(app.color, Color::Yellow)));
+        Span::styled(activity, bold_fg(app.color, Color::Yellow))
     } else if app.running() {
-        left.push(Span::styled(
+        Span::styled(
             format!("● {}", i18n::tr("running")),
             bold_fg(app.color, Color::Yellow),
-        ));
+        )
     } else {
-        left.push(Span::styled(
+        Span::styled(
             format!("● {}", i18n::tr("ready")),
             fg(app.color, Color::Green),
-        ));
-    }
-    left.push(sep());
-    left.push(Span::styled(
-        app.sessions
-            .iter()
-            .find(|s| Some(&s.id) == app.current.as_ref())
-            .map(|s| s.name.clone())
-            .unwrap_or_else(|| i18n::tr("no session").into()),
-        bold_fg(app.color, Color::Cyan),
-    ));
-    if let Some(dir) = app
+        )
+    };
+    let context = app
         .current
         .as_ref()
-        .and_then(|id| app.sessions.iter().find(|s| &s.id == id))
-        .and_then(|s| s.cwd.as_deref())
-    {
-        left.push(Span::styled(
-            format!(" {}", short_dir(dir)),
-            ui::dim(app.color),
-        ));
-    }
-    if !app.others.is_empty() {
-        left.push(Span::styled(
-            format!(" · also open in {}", others_text(&app.others)),
-            fg(app.color, Color::Magenta),
-        ));
-    }
-    if !app.model_label.is_empty() {
-        left.push(sep());
-        left.push(Span::styled(app.model_label.clone(), ui::dim(app.color)));
-    }
-    if let Some(u) = app
-        .current
-        .as_ref()
-        .and_then(|s| app.run_usage.get(s))
-        .filter(|u| u.steps > 0)
-    {
-        left.push(sep());
-        left.push(Span::styled(usage_text(u), ui::dim(app.color)));
-    }
-    if let Some(&(used, size)) = app.current.as_ref().and_then(|s| app.context_fill.get(s)) {
-        if size > 0 && used > 0 {
+        .and_then(|s| app.context_fill.get(s))
+        .filter(|&&(used, size)| size > 0 && used > 0)
+        .map(|&(used, size)| {
             let pct = used * 100 / size;
             let style = match pct {
                 90.. => bold_fg(app.color, Color::Red),
                 70.. => fg(app.color, Color::Yellow),
                 _ => ui::dim(app.color),
             };
-            left.push(sep());
-            left.push(Span::styled(
+            Span::styled(
                 if pct >= 70 {
                     ui::status_text(
                         app.color,
@@ -12758,22 +12720,137 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
                     format!("ctx {pct}%")
                 },
                 style,
-            ));
+            )
+        });
+    let waiting = app.approvals.len() + app.promotions.len();
+    let reserved = status_width(&activity)
+        + context
+            .as_ref()
+            .map_or(0, |span| separator_width + status_width(span));
+    // Keep pending approvals on their existing status path. Ordinary fields
+    // share only the space left after reserving activity and context.
+    let mut room = if waiting > 0 {
+        usize::MAX
+    } else if reserved <= width {
+        width - reserved
+    } else {
+        return compact_status(activity, context, width);
+    };
+    let mut left = Vec::new();
+    if room > 0 {
+        left.push(Span::raw(" "));
+        room -= 1;
+    }
+    if app.paths.profile != "default" {
+        let profile = Span::styled(
+            format!("{}: {}", i18n::tr("profile"), app.paths.profile),
+            ui::dim(app.color),
+        );
+        let needed = status_width(&profile) + separator_width;
+        if needed <= room {
+            left.push(profile);
+            left.push(sep.clone());
+            room -= needed;
         }
     }
-    let waiting = app.approvals.len() + app.promotions.len();
+    left.push(activity);
+
+    let session = app
+        .sessions
+        .iter()
+        .find(|s| Some(&s.id) == app.current.as_ref());
+    let name = Span::styled(
+        session.map_or_else(|| i18n::tr("no session").into(), |s| s.name.clone()),
+        bold_fg(app.color, Color::Cyan),
+    );
+    let directory = session
+        .and_then(|s| s.cwd.as_deref())
+        .map(|dir| Span::styled(format!(" {}", short_dir(dir)), ui::dim(app.color)));
+    let peers = (!app.others.is_empty()).then(|| {
+        Span::styled(
+            format!(" · also open in {}", others_text(&app.others)),
+            fg(app.color, Color::Magenta),
+        )
+    });
+    let model = (!app.model_label.is_empty())
+        .then(|| Span::styled(app.model_label.clone(), ui::dim(app.color)));
+    let usage = app
+        .current
+        .as_ref()
+        .and_then(|s| app.run_usage.get(s))
+        .filter(|u| u.steps > 0)
+        .map(|u| Span::styled(usage_text(u), ui::dim(app.color)));
+    for (separated, field) in [
+        (true, Some(name)),
+        (false, directory),
+        (false, peers),
+        (true, model),
+        (true, usage),
+    ] {
+        let Some(field) = field else { continue };
+        let delimiter_width = if separated { separator_width } else { 0 };
+        let available = room.saturating_sub(delimiter_width);
+        if available == 0 {
+            break;
+        }
+        if separated {
+            left.push(sep.clone());
+        }
+        let field_width = status_width(&field);
+        if field_width > available {
+            let prefix = text::take_width(&field.content, available - 1);
+            left.push(Span::styled(format!("{prefix}…"), field.style));
+            break;
+        }
+        left.push(field);
+        room -= delimiter_width + field_width;
+    }
+    if let Some(context) = context {
+        left.push(sep.clone());
+        left.push(context);
+    }
     if waiting > 0 {
-        left.push(sep());
+        left.push(sep);
         left.push(Span::styled(
             format!("⚠ {waiting} awaiting approval"),
             bold_fg(app.color, Color::Red),
         ));
     }
+    left
+}
+
+/// When the ordinary activity and context cannot fit with their usual
+/// separator, keep the full context label where possible and use a clipped
+/// activity prefix. At smaller widths, show as much activity as fits.
+fn compact_status(
+    activity: Span<'static>,
+    context: Option<Span<'static>>,
+    width: usize,
+) -> Vec<Span<'static>> {
+    let context = context.filter(|span| status_width(span) <= width);
+    let room = context
+        .as_ref()
+        .map_or(width, |span| width.saturating_sub(status_width(span) + 1));
+    let prefix = text::take_width(&activity.content, room).trim_end();
+    let mut spans = Vec::new();
+    if !prefix.is_empty() {
+        spans.push(Span::styled(prefix.to_owned(), activity.style));
+    }
+    if let Some(context) = context {
+        if !spans.is_empty() {
+            spans.push(Span::raw(" "));
+        }
+        spans.push(context);
+    }
+    spans
+}
+
+fn draw_status(f: &mut Frame, area: Rect, app: &App) {
     let width = area.width as usize;
-    let used: usize = left.iter().map(|s| s.width()).sum();
+    let mut spans = status_left(app, width);
+    let used: usize = spans.iter().map(status_width).sum();
     // Notes show as toasts; the right side is this view's key hints,
     // from one table, trimmed by importance to fit (SPEC §10.5).
-    let mut spans = left;
     let tip = format!("{} ", keys::line(app.view, width.saturating_sub(used + 3)));
     if tip.len() > 1 {
         spans.push(Span::raw(
