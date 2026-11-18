@@ -11,6 +11,7 @@
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
+use std::time::Duration;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::Paths;
@@ -119,11 +120,23 @@ pub const fn embedded_available() -> bool {
     cfg!(feature = "embedded-llm")
 }
 
+const DOWNLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+// Enough time for the larger weights at about 60 KB/s.
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
+
+fn download_client(idle_timeout: Duration, timeout: Duration) -> Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .user_agent(concat!("formless/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(Duration::from_secs(30))
+        .read_timeout(idle_timeout)
+        .timeout(timeout)
+        .build()?)
+}
+
 /// Fetch missing model files. Hold a per-model lock across both files so
 /// the daemon and CLI can share one download, including across processes.
 pub async fn download(paths: &Paths, spec: &ModelSpec) -> Result<()> {
     use std::fs::{OpenOptions, TryLockError};
-    use std::time::Duration;
 
     let models = models_dir(paths);
     std::fs::create_dir_all(&models)?;
@@ -137,19 +150,20 @@ pub async fn download(paths: &Paths, spec: &ModelSpec) -> Result<()> {
         .truncate(false)
         .open(&lock_path)
         .with_context(|| format!("open model download lock {}", lock_path.display()))?;
+    let deadline = tokio::time::Instant::now() + DOWNLOAD_TIMEOUT;
     loop {
         match lock.try_lock() {
             Ok(()) => break,
+            Err(TryLockError::WouldBlock) if tokio::time::Instant::now() >= deadline => {
+                bail!("timed out waiting for the {} download lock", spec.id)
+            }
             Err(TryLockError::WouldBlock) => tokio::time::sleep(Duration::from_millis(100)).await,
             Err(TryLockError::Error(error)) => {
                 return Err(error).with_context(|| format!("lock model {}", spec.id))
             }
         }
     }
-    let http = reqwest::Client::builder()
-        .user_agent(concat!("formless/", env!("CARGO_PKG_VERSION")))
-        .connect_timeout(std::time::Duration::from_secs(30))
-        .build()?;
+    let http = download_client(DOWNLOAD_IDLE_TIMEOUT, DOWNLOAD_TIMEOUT)?;
     fetch_verified(
         &http,
         spec.tokenizer_url,
@@ -901,6 +915,60 @@ mod tests {
         assert_eq!(spec("Qwen2.5-0.5B").unwrap().arch, Arch::Qwen2);
         assert_eq!(spec("lfm2.5-350m").unwrap().arch, Arch::Lfm2);
         assert!(spec("nope").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_stalled_body_times_out_and_the_next_fetch_can_install() {
+        use futures_util::{stream, StreamExt};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let weights = b"verified weights";
+        let calls = Arc::new(AtomicUsize::new(0));
+        let app = axum::Router::new().route(
+            "/w",
+            axum::routing::get({
+                let calls = calls.clone();
+                move || {
+                    let first = calls.fetch_add(1, Ordering::Relaxed) == 0;
+                    async move {
+                        if first {
+                            let chunk = Ok::<_, std::io::Error>(weights[..3].to_vec());
+                            axum::body::Body::from_stream(
+                                stream::once(async { chunk }).chain(stream::pending()),
+                            )
+                        } else {
+                            axum::body::Body::from(weights.as_slice())
+                        }
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/w", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let dir = std::env::temp_dir().join(format!("fl-namer-stall-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("test.gguf");
+        let checksum = format!("{:x}", Sha256::digest(weights));
+        let http = download_client(Duration::from_millis(200), Duration::from_secs(5)).unwrap();
+        let error = fetch_verified(&http, &url, &checksum, None, &dest)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<reqwest::Error>()
+                .is_some_and(reqwest::Error::is_timeout),
+            "{error:#}"
+        );
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        fetch_verified(&http, &url, &checksum, None, &dest)
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert_eq!(std::fs::read(&dest).unwrap(), weights);
+        server.abort();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]

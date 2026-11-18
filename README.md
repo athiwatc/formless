@@ -202,7 +202,7 @@ Illustrative, not scripted: the Tools an agent builds are whatever the task need
 | Async runtime | [Tokio](https://tokio.rs/) |
 | Local storage | SQLite via [`rusqlite`](https://github.com/rusqlite/rusqlite) |
 | HTTP and streaming | [`reqwest`](https://docs.rs/reqwest) with rustls |
-| Local session naming | [Candle](https://github.com/huggingface/candle) with [LFM2.5-230M](https://huggingface.co/LiquidAI/LFM2.5-230M) |
+| Local session naming | [Candle](https://github.com/huggingface/candle) with [Qwen2.5-0.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF) or [LFM2.5-350M](https://huggingface.co/LiquidAI/LFM2.5-350M-GGUF) |
 
 ---
 
@@ -1179,10 +1179,19 @@ formless memory rm m1a2b3c4
 * **Session** — a resumable conversation plus Run history; many run concurrently against one Daemon Core. Deleting a Session removes payloads but keeps anonymised tallies.
 * **Run** — one unit of work: user message → final answer. No step cap by default; it ends on completion, fault or interruption.
 * **Steer** — a user message sent while a Run is active, injected at the next step boundary.
-* **Auto-naming** — when an `Untitled` Session finishes its first Run, the daemon gives it a short title (for example "Fixing Rust Error E0502"). A small model, [LFM2.5-230M](https://huggingface.co/LiquidAI/LFM2.5-230M) (153 MB, Q4_K_M), runs in-process on the CPU, so naming spends no provider tokens and sends nothing off the machine. It runs in the background, never delays a Run, and never replaces a name you set. The model downloads once into `<data dir>/models/` on first use (pinned revision, SHA-256 verified) or with `formless naming pull`. Until it is installed, or if it fails or exceeds `naming.timeout_secs`, the title is the first few words of your message. Set `naming.enabled = false` to turn naming off, or `naming.auto_download = false` to keep the model off the network. The model is licensed under the [LFM Open License v1.0](https://huggingface.co/LiquidAI/LFM2.5-230M/blob/main/LICENSE), which limits commercial use above a revenue threshold; building without the default `embedded-llm` cargo feature removes it and leaves only first-words titles.
+* **Auto-naming** — when an `Untitled` Session finishes its first Run, the daemon gives it a short title (for example "Fixing Rust Error E0502"). The model runs in the background on the CPU and keeps the conversation on the machine. It never delays a Run or replaces a name you set. Model files download into `<data dir>/models/` on first use or with `formless naming pull` and are verified against pinned SHA-256 checksums. Downloads time out after 60 seconds without data or two hours per file. After a failed automatic download, a later naming attempt can retry once five minutes have passed. Until the model is installed, or if naming fails or exceeds `naming.timeout_secs`, the daemon uses the first few words of your message. Set `naming.enabled = false` to turn naming off. Set `naming.auto_download = false` to use installed weights and download new ones only with an explicit pull. Builds without the default `embedded-llm` Cargo feature use first-words titles.
 * **Compaction** — a persisted summary checkpoint that replaces old history and Tool output as context grows, so long Sessions keep going without losing the trail.
 * **Artifacts** — large Tool output is written to an artifact file; only a bounded preview enters model context.
 * **Tracked path changes** — `/files` lists paths captured by live host filesystem operations, including directories created with `fs.mkdir`. `/rewind` attempts safe restoration and reports skipped paths with reasons. Programs launched by Tools and MCP tools can write outside this tracking; when those capabilities are invoked, file notes and recaps warn that untracked writes are possible, including when no paths were captured. Counts describe tracked paths only. Paths whose recovery images expired remain listed with the reason; rewind never substitutes an older Run silently. Windows restoration also requires retained original objects and live object or directory proofs where applicable. Lost or expired proofs, including process-local proofs lost on restart, leave those paths read-only rather than reconstructing authority from stored hashes.
+
+#### Local naming models
+
+Set `naming.model` to select a model. Sizes are decimal MB rounded to two places and cover the GGUF weights only. The tokenizer is downloaded separately.
+
+| Model ID | Model | Quantization | Weights | License |
+| --- | --- | --- | --- | --- |
+| `qwen2.5-0.5b` | Qwen2.5-0.5B-Instruct (default) | `Q4_0` | 428.73 MB | [Apache-2.0](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/blob/9217f5db79a29953eb74d5343926648285ec7e67/LICENSE) |
+| `lfm2.5-350m` | LFM2.5-350M | `Q4_K_M` | 229.31 MB | [LFM Open License v1.0](https://huggingface.co/LiquidAI/LFM2.5-350M-GGUF/blob/657e078c94084481950a2d555a941481f715536b/LICENSE) |
 
 ### Context and compaction
 
@@ -1398,7 +1407,7 @@ Contributions are welcome, whether it is a bug report, a Tool, a client improvem
 
 Apache-2.0. See `Cargo.toml` and the license text referenced there.
 
-The optional session-naming model, LFM2.5-230M, is not part of this repository or the binary. It is downloaded at runtime and covered by Liquid AI's [LFM Open License v1.0](https://huggingface.co/LiquidAI/LFM2.5-230M/blob/main/LICENSE) ([§7](#7-sessions-runs-and-steer)).
+Formless downloads model weights at runtime. The [local naming models](#local-naming-models) table links to the Apache-2.0 license for Qwen2.5-0.5B-Instruct and the LFM Open License v1.0 for LFM2.5-350M.
 
 ---
 
@@ -1413,7 +1422,7 @@ The optional session-naming model, LFM2.5-230M, is not part of this repository o
 ## Acknowledgments
 
 - [Best-README-Template](https://github.com/othneildrew/Best-README-Template) for the README structure this page follows.
-- [Liquid AI](https://www.liquid.ai/) for LFM2.5-230M, the optional local session-naming model.
+- [Qwen](https://huggingface.co/Qwen) for Qwen2.5-0.5B-Instruct and [Liquid AI](https://www.liquid.ai/) for LFM2.5-350M, the local session-naming models.
 - The Rust, [ratatui](https://ratatui.rs/), [rquickjs](https://github.com/DelSkayn/rquickjs), [Tokio](https://tokio.rs/) and SQLite communities.
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
