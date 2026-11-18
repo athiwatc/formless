@@ -1520,10 +1520,16 @@
   // Tiny tokenizer-highlighter, mirroring the TUI's (crates/formless-tui/src/highlight.rs).
   const W = (s) => new Set(s.split(" "));
   const JS_REGEX_KEYWORDS = W("await case delete do else extends in instanceof new of return throw typeof void yield");
+  const JS_CONTEXTUAL_REGEX_KEYWORDS = W("await of yield");
   const JS_IDENT_CONTINUE = /[\p{ID_Continue}$\u200c\u200d]/u;
   const JS_LINE_END = /[\n\r\u2028\u2029]/;
 
-  function jsRegexEnd(code, start, comments, typescript) {
+  function jsRegexEnd(code, start, comments, lang) {
+    if ((lang === "jsx" || lang === "tsx") && code[start - 1] === "<") {
+      const closingTag = /(?:[\p{ID_Start}_$][\p{ID_Continue}$.:-]*)?\s*>/uy;
+      closingTag.lastIndex = start + 1;
+      if (closingTag.test(code)) return start;
+    }
     const tokenEnd = (at) => {
       while (at > 0) {
         const commentStart = comments.get(at);
@@ -1549,6 +1555,7 @@
       const splitSurrogate = /[\udc00-\udfff]/.test(code[wordStart - 1] ?? "");
       if (!JS_REGEX_KEYWORDS.has(keyword) || member || splitSurrogate) return start;
     }
+    const contextual = JS_CONTEXTUAL_REGEX_KEYWORDS.has(keyword);
     let inClass = false;
     for (let end = start + 1; end < code.length; end++) {
       const c = code[end];
@@ -1559,13 +1566,16 @@
       } else if (c === "[") inClass = true;
       else if (c === "]") inClass = false;
       else if (c === "/" && !inClass) {
+        // A guessed closer after a contextual identifier can instead open
+        // a real comment after the first divisor.
+        if (contextual && (code[end + 1] === "/" ||
+            (code[end + 1] === "*" && code.indexOf("*/", end + 2) >= 0))) return start;
         end++;
         while (end < code.length && /[a-z]/i.test(code[end])) {
           if (!"dgimsuvy".includes(code[end])) return start;
           end++;
         }
-        if (keyword === "await") {
-          // In ordinary scripts await can be an identifier on the left of division.
+        if (contextual) {
           let next = end;
           for (;;) {
             while (next < code.length && /\s/.test(code[next]) && !JS_LINE_END.test(code[next])) next++;
@@ -1577,6 +1587,7 @@
           let wordEnd = next;
           while (wordEnd < code.length && JS_IDENT_CONTINUE.test(code[wordEnd])) wordEnd++;
           const word = code.slice(next, wordEnd);
+          const typescript = lang === "ts" || lang === "tsx" || lang === "typescript";
           if (word && word !== "in" && word !== "instanceof" &&
               !(typescript && (word === "as" || word === "satisfies"))) return start;
           if (code[next] === "'" || code[next] === '"') return start;
@@ -1621,7 +1632,6 @@
     if (!L) return null;
     const kotlin = lang === "kotlin" || lang === "kt";
     const jsComments = L === HL.js ? new Map() : null;
-    const typescript = lang === "ts" || lang === "tsx" || lang === "typescript";
     const out = [];
     let plain = "";
     const tok = (cls, s) => {
@@ -1702,7 +1712,7 @@
         continue;
       }
       if (c === "/" && jsComments) {
-        const stop = jsRegexEnd(code, i, jsComments, typescript);
+        const stop = jsRegexEnd(code, i, jsComments, lang);
         if (stop !== i) {
           tok("tok-str", code.slice(i, stop));
           i = stop;
