@@ -152,7 +152,7 @@ Illustrative, not scripted: the Tools an agent builds are whatever the task need
 2. **Measured, never vibes.** Self-Optimisation is triggered and judged only by recorded Invocation outcomes. No silent or untested mutation, ever.
 3. **Opt-in Run step controls.** Runs have no step cap by default. Existing [step controls](#run-controls) let you choose a pause threshold.
 4. **Deny by default.** Tools run sandboxed with only their declared Capabilities. The runtime offers nothing a Tool was not granted.
-5. **Local-first, zero telemetry.** Nothing leaves the machine except calls to the configured provider endpoint.
+5. **Local-first.** The daemon stores Sessions and Tools locally. See [network activity, naming controls and telemetry](#10-security-and-privacy).
 6. **One core, many clients.** All behaviour lives in the Daemon Core. TUI, CLI and future frontends are interchangeable clients of one protocol.
 7. **Everything is versioned and reversible.** Tools, promotions, config and Session checkpoints keep history; destructive actions are user-only and confirmed.
 
@@ -1263,7 +1263,8 @@ Only the primary metric triggers; the rest inform the optimiser's context.
 * **Deny by default.** A Capability is a ceiling the runtime enforces; it is never exceeded.
 * **Approvals.** Broad or sensitive Capabilities prompt before first use — modal in the TUI, fail-closed in headless mode.
 * **Single-user trust boundary.** Local access control is the socket/pipe file permissions on the data dir (`0700`).
-* **Local-first.** Zero telemetry and no phone-home: nothing leaves the machine except calls to the configured provider endpoint, and `formless update check` only runs when you ask it to ([§3.12](#312-updating)).
+* **Local-first.** Network activity includes calls to configured providers, connections to a [user-enabled relay](#37-browser-access-via-the-relay-v2), and [local naming model](#7-sessions-runs-and-steer) downloads. In builds with embedded model support, automatic naming and downloads are enabled by default. When an eligible Session needs a title and the selected catalogue model is missing, the daemon can download its weights and tokenizer in the background. Set `naming.auto_download = false` to disable automatic downloads or `naming.enabled = false` to disable automatic naming.
+* **Zero telemetry.** `formless update check` runs on request ([§3.12](#312-updating)).
 * **Imports are never auto-trusted.** Capabilities are displayed, approval applies, metrics start at zero, and the author is recorded as `import`.
 * **Data lifecycle.** `formless reset` wipes config, keychain entry and data dir; Session deletion removes payloads but keeps anonymised tallies; only a Tool purge deletes tallies.
 
