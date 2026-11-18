@@ -150,14 +150,14 @@ install_guidance() {
       if [ -f "$completion_dir/completions/formless" ] &&
           ! completion_path_contains "$completion_dir" "$bash_user_dirs" '' &&
           ! completion_path_contains "$completion_dir" "$data_dirs" /bash-completion; then
-        printf '\nBash completions are in %s. Add that directory to BASH_COMPLETION_USER_DIR or add %s/share to XDG_DATA_DIRS.\n' "$completion_dir" "$PREFIX"
+        printf '\nBash completions are in %s. If they are unavailable, add that directory to BASH_COMPLETION_USER_DIR or add %s/share to XDG_DATA_DIRS.\n' "$completion_dir" "$PREFIX"
       fi
       ;;
     fish)
       completion_dir="$PREFIX/share/fish/vendor_completions.d"
       if [ -f "$completion_dir/formless.fish" ] &&
           ! completion_path_contains "$completion_dir" "$data_home:$data_dirs" /fish/vendor_completions.d; then
-        printf '\nFish completions are in %s/formless.fish. Link that file into %s/fish/completions or add %s/share to XDG_DATA_DIRS.\n' "$completion_dir" "${XDG_CONFIG_HOME:-${HOME:-~}/.config}" "$PREFIX"
+        printf '\nFish completions are in %s/formless.fish. If they are unavailable, link that file into %s/fish/completions or add %s/share to XDG_DATA_DIRS.\n' "$completion_dir" "${XDG_CONFIG_HOME:-${HOME:-~}/.config}" "$PREFIX"
       fi
       ;;
   esac
