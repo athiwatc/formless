@@ -516,6 +516,8 @@
   // -------------------------------------------------------- ask dialogs
   let askResolve = null;
   let askTag = null;
+  let askOptions = null;
+  let askSaving = false;
   const askQueue = [];
   /** Promise-based prompt/confirm: resolves the text (input) or true, or null. */
   function ask(opts) {
@@ -542,10 +544,12 @@
     const { opts, resolve } = askQueue.shift();
     askResolve = resolve;
     askTag = opts.tag || null;
+    askOptions = opts;
     rememberFocus("ask-backdrop");
     $("ask-title").textContent = opts.title;
     $("ask-text").textContent = opts.text || "";
     $("ask-body").replaceChildren(...(opts.body ? [opts.body] : []));
+    $("ask-form").setAttribute("autocomplete", opts.secretFields ? "off" : "on");
     const input = $("ask-input");
     configureAskInput(input, opts);
     input.classList.toggle("hidden", !opts.input);
@@ -564,13 +568,18 @@
     if (opts.input && activeDialog()?.node === $("ask-backdrop")) input.select();
   }
   function closeAsk(value) {
+    if (askSaving) return;
     // Callers pass/capture the resolved value before the shared DOM is cleared.
     $("ask-input").value = "";
+    for (const field of askOptions?.secretFields || []) field.value = "";
+    $("ask-body").replaceChildren();
+    showAskError("");
     $("ask-backdrop").classList.add("hidden");
     restoreFocus("ask-backdrop");
     const resolve = askResolve;
     askResolve = null;
     askTag = null;
+    askOptions = null;
     if (resolve) resolve(value);
     showNextAsk();
   }
@@ -580,9 +589,49 @@
     }
     if (askTag === tag) closeAsk(null);
   }
-  $("ask-form").addEventListener("submit", (e) => {
+  function showAskError(message) {
+    const error = $("ask-error");
+    error.classList.toggle("hidden", !message);
+    error.textContent = message;
+  }
+  function setAskSaving(saving) {
+    askSaving = saving;
+    $("ask-fields").disabled = $("ask-ok").disabled = $("ask-cancel").disabled = saving;
+    $("ask-ok").textContent = saving ? "Saving…" : askOptions.ok || "OK";
+    $("ask-saving").textContent = saving ? "Saving…" : "";
+  }
+  function recordValue(field, message) {
+    const value = field.value.trim();
+    if (!value) throw Object.assign(new Error(message), { field });
+    return value;
+  }
+  $("ask-form").addEventListener("submit", async (e) => {
     e.preventDefault();
-    closeAsk($("ask-input").classList.contains("hidden") ? true : $("ask-input").value);
+    if (!askOptions || askSaving) return;
+    if (!askOptions.saveRequest) {
+      return closeAsk($("ask-input").classList.contains("hidden") ? true : $("ask-input").value);
+    }
+    const opts = askOptions;
+    showAskError("");
+    let req;
+    try { req = opts.saveRequest(); }
+    catch (error) { showAskError(error.message); error.field?.focus(); return; }
+    if (!req) return closeAsk(null);
+    const focused = document.activeElement;
+    setAskSaving(true);
+    try {
+      const result = await request(req, opts.timeoutMs);
+      setAskSaving(false);
+      closeAsk(result ?? true);
+    } catch (error) {
+      setAskSaving(false);
+      // Daemon errors can echo request fields. Secret-bearing forms use
+      // field-specific guidance without including the server's error text.
+      showAskError(error.daemonResponse
+        ? opts.saveError || error.message
+        : "Save was not confirmed. Check the connection and whether the record was saved before trying again.");
+      if (activeDialog()?.node === $("ask-backdrop")) focusDialog(activeDialog(), focused);
+    }
   });
   $("ask-cancel").onclick = () => closeAsk(null);
 
@@ -5088,8 +5137,7 @@
             h("div", { class: "muted" }, m.scope + " · " + (m.session_id ? "from session " + m.session_id.slice(0, 8) : m.author) + (m.enabled ? "" : " · off"))),
           h("td", null,
             h("button", { class: "btn small", type: "button", onclick: async () => {
-              const text = await ask({ title: "Edit memory", inputKind: "prose", input: true, value: m.text, ok: "Save" });
-              if (text && text !== m.text) { await act({ type: "upsert_memory", id: m.id, text }, "Saved"); refreshSettings(); }
+              await editMemory(m);
             } }, "Edit"),
             h("button", { class: "btn small", type: "button", onclick: () => act({ type: "upsert_memory", id: m.id, enabled: !m.enabled }, m.enabled ? "Disabled" : "Enabled").then(refreshSettings) }, m.enabled ? "Disable" : "Enable"),
             h("button", { class: "btn small danger", type: "button", onclick: async () => {
@@ -5097,10 +5145,7 @@
             } }, "Delete")))))))
         : h("p", { class: "muted" }, "None yet."),
       h("div", { class: "detail-actions" },
-        h("button", { class: "btn small", type: "button", onclick: async () => {
-          const text = await ask({ title: "Add a memory", inputKind: "prose", input: true, placeholder: "e.g. Use pnpm, not npm", ok: "Add" });
-          if (text) { await act({ type: "upsert_memory", text }, "Added"); refreshSettings(); }
-        } }, "Add"))));
+        h("button", { class: "btn small", type: "button", onclick: () => editMemory(null) }, "Add"))));
     const thinking = h("input", { type: "checkbox", onchange: (e) => setThinking(e.target.checked) });
     thinking.checked = S.showThinking;
     const enterSends = h("input", { id: "enter-sends", type: "checkbox", onchange: e => setEnterSends(e.target.checked) });
@@ -5648,9 +5693,9 @@
     const name = h("input", { type: "text", placeholder: "github", spellcheck: "false" });
     const transport = h("select", null, h("option", { value: "stdio" }, "Command (stdio)"), h("option", { value: "http" }, "URL (HTTP)"));
     const command = h("input", { type: "text", placeholder: "npx -y @modelcontextprotocol/server-github", spellcheck: "false" });
-    const env = h("textarea", { rows: 2, placeholder: "KEY=value, one per line", spellcheck: "false" });
+    const env = h("textarea", { rows: 2, placeholder: "KEY=value, one per line", spellcheck: "false", autocomplete: "off" });
     const url = h("input", { type: "text", placeholder: "https://example.com/mcp", spellcheck: "false" });
-    const headers = h("textarea", { rows: 2, placeholder: "Header: value, one per line", spellcheck: "false" });
+    const headers = h("textarea", { rows: 2, placeholder: "Header: value, one per line", spellcheck: "false", autocomplete: "off" });
     const stdio = [field("Command", command), field("Environment", env)];
     const http = [field("URL", url), field("Headers", headers)];
     const sync = () => {
@@ -5660,20 +5705,26 @@
     transport.onchange = sync;
     sync();
     const body = h("div", { class: "try-form" }, field("Name", name), field("Connect with", transport), stdio, http);
-    if (!(await ask({ title: "Add MCP server", text: "It starts now and its tools are listed; they're asked about before first use.", body, ok: "Add and test" }))) return;
-    const server = { transport: transport.value };
-    if (transport.value === "stdio") {
-      const words = splitArgs(command.value.trim());
-      if (!words.length) return toast("A command is needed.", true);
-      Object.assign(server, { command: words[0], args: words.slice(1), env: pairs(env.value, "=") });
-    } else {
-      if (!url.value.trim()) return toast("A URL is needed.", true);
-      Object.assign(server, { url: url.value.trim(), headers: pairs(headers.value, ":") });
-    }
-    toast("Connecting to " + name.value.trim() + "…");
-    const r = await act({ type: "add_mcp_server", name: name.value.trim(), server }, null, 120000);
+    const r = await ask({ title: "Add MCP server", text: "It starts now and its tools are listed; they're asked about before first use.", body, ok: "Add and test",
+      timeoutMs: 120000, secretFields: [command, env, url, headers],
+      saveError: "Could not save the MCP server. Check the name, connection type, and command or URL.",
+      saveRequest: () => {
+        const serverName = recordValue(name, "An MCP server name is needed.");
+        if (!/^[a-z0-9_-]+$/i.test(serverName) || serverName.includes("__")) {
+          throw Object.assign(new Error("Use letters, digits, '-' and '_' in the server name, with no double underscore."), { field: name });
+        }
+        const server = { transport: transport.value };
+        if (transport.value === "stdio") {
+          const words = splitArgs(recordValue(command, "A command is needed."));
+          if (!words[0]) throw Object.assign(new Error("A command is needed."), { field: command });
+          Object.assign(server, { command: words[0], args: words.slice(1), env: pairs(env.value, "=") });
+        } else {
+          Object.assign(server, { url: recordValue(url, "A URL is needed."), headers: pairs(headers.value, ":") });
+        }
+        return { type: "add_mcp_server", name: serverName, server };
+      } });
     if (!r) return;
-    if (r.error) note("Added " + r.added + ", but it didn't connect: " + r.error + " (Restart retries)", true);
+    if (r.error) note("Saved " + r.added + ", but it didn't connect. Check its settings and use Restart to retry.", true);
     else note("Added " + r.added + ": " + (r.tools || []).length + " tools");
     refreshSettings();
   }
@@ -5684,9 +5735,10 @@
     const subdir = h("input", { type: "text", placeholder: "subfolder (optional)", spellcheck: "false" });
     const ref = h("input", { type: "text", placeholder: "branch or tag (optional)", spellcheck: "false" });
     const body = h("div", { class: "try-form" }, field("Path, zip or git URL", source), field("Subfolder", subdir), field("Git ref", ref));
-    if (!(await ask({ title: "Add skill", text: "Paths are on the daemon's machine.", body, ok: "Add" }))) return;
-    if (!source.value.trim()) return toast("A source is needed.", true);
-    const r = await act({ type: "add_skill", source: source.value.trim(), subdir: subdir.value.trim() || null, git_ref: ref.value.trim() || null }, null, 120000);
+    const r = await ask({ title: "Add skill", text: "Paths are on the daemon's machine.", body, ok: "Add", timeoutMs: 120000,
+      secretFields: [source], saveError: "Could not add the skill. Check the source, subfolder, and Git ref.",
+      saveRequest: () => ({ type: "add_skill", source: recordValue(source, "A source is needed."),
+        subdir: subdir.value.trim() || null, git_ref: ref.value.trim() || null }) });
     if (r) { note("Added skill " + (r.name || "")); await reviewSkill(r.name); refreshSettings(); }
   }
   /** A `formless.skill/1` or `formless.skills/1` bundle from this browser
@@ -5764,16 +5816,27 @@
     const body = h("div", { class: "try-form" }, field("Task", prompt), field("Schedule", when),
       fields.time, fields.day, fields.at, fields.cron, preview, field("Session", session),
       h("p", { class: "muted" }, "It runs with the Session's model; pick a Session set to the model or Role you want."));
-    if (!(await ask({ title: "New job", body, ok: "Schedule" }))) return;
-    const s = schedule();
-    if (!prompt.value.trim()) return toast("The job needs a task.", true);
-    if (!s.cron && !s.at) return toast("Pick when it runs.", true);
-    const j = await act({ type: "add_job", prompt: prompt.value.trim(), session_id: session.value || null, cron: s.cron || null, at: s.at || null });
+    const j = await ask({ title: "New job", body, ok: "Schedule", saveRequest: () => {
+      const task = recordValue(prompt, "The job needs a task.");
+      const s = schedule();
+      if (!s.cron && !s.at) recordValue(when.value === "once" ? at : cron, "Pick when it runs.");
+      return { type: "add_job", prompt: task, session_id: session.value || null, cron: s.cron || null, at: s.at || null };
+    } });
     if (j) { note("Scheduled: next run " + uiFormat(new Date(j.next_run))); refreshSettings(); }
   }
   /** A labelled form field for ask() bodies. */
   function field(label, input) {
     return h("label", { class: "try-field" }, h("span", null, label), input);
+  }
+  async function editMemory(memory) {
+    const result = await ask({ title: memory ? "Edit memory" : "Add a memory", inputKind: "prose", input: true,
+      value: memory?.text, placeholder: "e.g. Use pnpm, not npm", ok: memory ? "Save" : "Add", saveRequest: () => {
+        const input = $("ask-input");
+        recordValue(input, "Enter a memory first.");
+        if (input.value === memory?.text) return null;
+        return { type: "upsert_memory", id: memory?.id, text: input.value };
+      } });
+    if (result) { toast(memory ? "Saved" : "Added"); refreshSettings(); }
   }
   async function testProvider(name) {
     toast("Testing " + name + "…");
@@ -5787,10 +5850,13 @@
     // Write-only: an existing key is never sent back; blank keeps it.
     const key = h("input", { type: "password", value: "", placeholder: p && p.has_key ? "stored · leave blank to keep" : "API key (stored in the keychain)", autocomplete: "off" });
     const body = h("div", { class: "try-form" }, field("Name", name), field("Base URL", base), field("Model", model), field("API key", key));
-    if (!(await ask({ title: p ? "Edit provider " + p.name : "Add provider", body, ok: "Save" }))) return;
-    const r = await act({ type: "upsert_provider", name: name.value.trim(), base_url: base.value.trim(), model: model.value.trim() || null, api_key: key.value || null }, "Saved " + name.value.trim());
-    key.value = "";
-    if (r) refreshSettings();
+    const r = await ask({ title: p ? "Edit provider " + p.name : "Add provider", body, ok: "Save",
+      secretFields: [key, base], saveError: "Could not save the provider. Check the name, base URL, and key storage on the daemon.",
+      saveRequest: () => ({
+        type: "upsert_provider", name: recordValue(name, "A provider name is needed."),
+        base_url: recordValue(base, "A base URL is needed."), model: model.value.trim() || null, api_key: key.value || null,
+      }) });
+    if (r) { toast("Saved " + name.value.trim()); refreshSettings(); }
   }
   async function editRole(existing, r, providers) {
     const name = h("input", { type: "text", value: existing, disabled: !!existing, placeholder: "fast", spellcheck: "false" });
@@ -5799,9 +5865,11 @@
     const model = h("input", { type: "text", value: r.model || "", placeholder: "model (blank = the provider's default)", spellcheck: "false" });
     const effort = h("select", null, ["", "minimal", "low", "medium", "high"].map((e) => h("option", { value: e, selected: (r.reasoning_effort || "") === e }, e || "default effort")));
     const body = h("div", { class: "try-form" }, field("Name", name), field("Description", desc), field("Provider", prov), field("Model", model), field("Reasoning effort", effort));
-    if (!(await ask({ title: existing ? "Edit role " + existing : "Add role", body, ok: "Save" }))) return;
-    const role = Object.assign({}, r, { description: desc.value.trim(), provider: prov.value === "default" ? null : prov.value, model: model.value.trim(), reasoning_effort: effort.value || null });
-    if (await act({ type: "upsert_role", name: name.value.trim(), role }, "Saved role " + name.value.trim())) refreshSettings();
+    const saved = await ask({ title: existing ? "Edit role " + existing : "Add role", body, ok: "Save", saveRequest: () => {
+      const role = Object.assign({}, r, { description: desc.value.trim(), provider: prov.value === "default" ? null : prov.value, model: model.value.trim(), reasoning_effort: effort.value || null });
+      return { type: "upsert_role", name: recordValue(name, "A Role name is needed."), role };
+    } });
+    if (saved) { toast("Saved role " + name.value.trim()); refreshSettings(); }
   }
   async function refreshSettings() {
     S.mcpServers = (await request({ type: "list_mcp_servers" }).catch(() => null)) || [];
