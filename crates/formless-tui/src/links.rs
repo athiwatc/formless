@@ -289,16 +289,24 @@ pub fn scan(
         .map(|y| {
             let mut xs = Vec::new();
             let mut text = Vec::new();
+            let mut last_end = area.left();
             // Walk from the buffer's left edge so a glyph crossing into the
             // chat area can never contribute a stray continuation space.
             for (cols, cell) in row_cells(buf, y, buf.area.left()..area.right()) {
                 if cols.start < area.left() || cols.end > area.right() {
                     continue;
                 }
+                if cols.start > last_end {
+                    // Unpainted cells break a token. Wide continuation cells
+                    // are already included in the preceding glyph's range.
+                    xs.push(last_end);
+                    text.push(' ');
+                }
                 for c in cell.symbol().chars() {
                     xs.push(cols.start);
                     text.push(c);
                 }
+                last_end = cols.end;
             }
             (y, xs, text)
         })
@@ -823,6 +831,27 @@ mod tests {
         assert_eq!(links[0].x0, 4);
         assert_eq!(links[0].x1, 4 + name.width() as u16 + 2);
         assert_eq!(resolved, Some(canonical));
+    }
+
+    #[test]
+    fn skipped_cells_do_not_join_separate_tokens() {
+        let area = Rect::new(0, 0, 36, 1);
+        let mut buf = Buffer::empty(area);
+        let url = "https://example.test";
+        let gap = url.width() as u16;
+        buf.set_string(0, 0, url, ratatui::style::Style::default());
+        buf[(gap, 0)].set_skip(true);
+        buf.set_string(gap + 1, 0, "/other", ratatui::style::Style::default());
+        let links = scan(&buf, area, &mut |_| None);
+        assert_eq!(
+            links,
+            [Painted {
+                y: 0,
+                x0: 0,
+                x1: gap - 1,
+                url: url.to_owned(),
+            }]
+        );
     }
 
     #[test]
