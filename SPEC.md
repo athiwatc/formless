@@ -2167,8 +2167,9 @@ pattern (§4.4).
   - `fetch(url, {method, headers, body, bodyEncoding, encoding})` →
     `{status, ok, url, headers, body, text(), json()}` and
     `fetchChunks(url, opts, size, cb)` (a truly streamed body in bounded
-    memory) — gated by `net`. http(s) only; redirects are followed, each hop
-    scope-checked; no request timeout.
+    memory) require `net`. They support HTTP(S) and check the scope on each
+    redirect. The configured connection and total deadlines apply to both
+    APIs, with one total budget for redirects and body reads (§16).
   - **Native caps (#604).** Outside the JS heap limit, whole-value reads
     stop at `tools.max_read_bytes` (`fs.read`: checked before reading;
     `fetch`: by `Content-Length` and while reading), process output at
@@ -2177,18 +2178,19 @@ pattern (§4.4).
     at `tools.max_emit_bytes`. Over a cap is a `resource` failure naming
     the setting and the streaming alternative.
   - `fs.read` (whole-value), `fs.exists`, `fs.stat` (`{type,
-    size, modified_ms}` or null), `fs.list(dir, {details})`, and
+    size, modified_ms, readonly?}` or null), `fs.list(dir, {details})`, and
     `fs.readChunks(path, size, cb, {encoding})` / `fs.readLines` (streaming)
     — gated by `fs:read`. `fs.write/append/mkdir/rename` and
     `fs.remove(path, {recursive})` require `fs:write` (both paths for rename).
-    Writes create missing parent dirs. Removal is recursive when
-    `recursive` is true.
+    `fs.stat` includes `readonly` for on-disk entries. Writes create missing
+    parent dirs. Removal is recursive when `recursive` is true.
   - `env.get(key)` — gated by `env`. `process.run(cmd, args, {cwd, env,
     stdin, stdinEncoding, encoding, timeout_ms})` → `{code, signal, stdout,
     stderr, timed_out, killed, truncated}` — gated by `process`, no shell,
     stdin closed unless given. An optional integer `timeout_ms` from 0 to
     86400000 terminates the owned process group/job on expiry and returns
     `timed_out: true`; omission preserves cancellation-only execution.
+    `timeoutMs` is an alias used when `timeout_ms` is absent or null.
   - `process.spawn(cmd, args, opts)` takes the same options and checks as
     `process.run`, returning an Invocation-local handle. `handle.read(size)`
     blocks for the next available `{stream: "stdout"|"stderr", data, eof:
@@ -2348,9 +2350,9 @@ pattern (§4.4).
     naming the Tools that load it.
 - Sub-agents (v2; v2.2 makes them a Capability only): a Tool with the
   `agent` Capability calls `agents.run(task, {system, model, role})` to run a
-  sub-agent — its own provider loop over the same Tools, with no step
-  limit (it ends on a final answer, a fault or cancellation) — and
-  receives only its final text. There is no sub-agent built-in, so
+  sub-agent. Its provider loop runs over the same Tools and ends on a final
+  answer, a fault, cancellation or its turn limit (§4.6). The Tool receives
+  the sub-agent's final text. There is no sub-agent built-in, so
   delegation is always a measured, approval-gated Invocation; parallel
   delegation is several such calls in one turn, which run concurrently.
   The sub-agent's own Tool calls pass the same approval pre-pass as the
