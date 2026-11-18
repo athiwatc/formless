@@ -140,13 +140,16 @@ class ReleasePublication(unittest.TestCase):
                 (root / subdir).mkdir(parents=True)
             (root / "target/debian/fixture.deb").touch()
             (root / "target/generate-rpm/fixture.rpm").touch()
-            for command in ("dpkg", "sha256sum"):
-                (root / "bin" / command).write_text("#!/bin/sh\nexit 0\n")
+            (root / "bin/dpkg").write_text("#!/bin/sh\nexit 0\n")
+            (root / "bin/sha256sum").write_text('#!/bin/sh\nprintf "digest  %s\\n" "$1"\n')
             (root / "bin/cargo").write_text('#!/bin/sh\nprintf "%s\\n" "$@" >> args\n')
             for command in (root / "bin").iterdir():
                 command.chmod(0o755)
             for kind, tag in (("", "main"), ("false", "v0.2.0"), ("true", "v0.2.0-rc.1-hotfix")):
                 with self.subTest(tag=tag):
+                    dist = root / "dist"
+                    for file in dist.iterdir():
+                        file.unlink()
                     args = root / "args"
                     args.write_text("")
                     subprocess.run(
@@ -160,9 +163,14 @@ class ReleasePublication(unittest.TestCase):
                         self.assertIn("0.2.0~rc.1+hotfix-1", actual)
                         self.assertIn("--set-metadata", actual)
                         self.assertIn('version="0.2.0~rc.1+hotfix"', actual)
+                        names = ["formless_0.2.0-rc.1-hotfix_amd64.deb", "formless-0.2.0-rc.1-hotfix.x86_64.rpm"]
                     else:
                         self.assertNotIn("--deb-version", actual)
                         self.assertNotIn("--set-metadata", actual)
+                        names = ["fixture.deb", "fixture.rpm"]
+                    for name in names:
+                        self.assertTrue((dist / name).is_file())
+                        self.assertEqual((dist / (name + ".sha256")).read_text(), f"digest  {name}\n")
 
     def test_new_version_push_and_latest_uses_the_verified_manifest(self):
         registry = Mock()

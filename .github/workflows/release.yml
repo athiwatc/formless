@@ -204,7 +204,14 @@ jobs:
           # --output recognizes directories only when they already exist.
           mkdir -p target/generate-rpm
           cargo generate-rpm -p crates/formless --output target/generate-rpm "${rpm_version[@]}"
-          cp target/debian/*.deb target/generate-rpm/*.rpm dist/
+          if [[ "$PRERELEASE" == true ]]; then
+            # Use the tag's characters in asset names so checksum sidecars
+            # match the downloaded names after GitHub's filename normalization.
+            cp target/debian/*.deb "dist/formless_${version}_amd64.deb"
+            cp target/generate-rpm/*.rpm "dist/formless-${version}.x86_64.rpm"
+          else
+            cp target/debian/*.deb target/generate-rpm/*.rpm dist/
+          fi
           cd dist && for f in *; do sha256sum "$f" > "$f.sha256"; done
           # The recorded dependencies, for the log.
           dpkg -I ./*.deb | sed -n '/Depends/p'
