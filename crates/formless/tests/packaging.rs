@@ -272,6 +272,73 @@ fn release_tags_must_match_the_cargo_version() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+#[cfg(unix)]
+#[test]
+fn source_installer_writes_a_complete_optional_manual() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("fl source install {}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let prefix = dir.join("install prefix");
+    let cargo = dir.join("cargo");
+    std::fs::write(
+        &cargo,
+        r#"#!/bin/sh
+set -eu
+test "$1" = install
+while [ "$1" != --root ]; do shift; done
+destination="$2/bin/formless"
+cat > "$destination" <<'BIN'
+#!/bin/sh
+case "$1" in
+  man)
+    case "$FIXTURE_MAN" in
+      success) printf '.TH FORMLESS 1\n' ;;
+      empty) exit 0 ;;
+      failure) printf 'partial text\n'; exit 2 ;;
+    esac
+    ;;
+  completions) printf '# fixture completion for %s\n' "$2" ;;
+  *) exit 1 ;;
+esac
+BIN
+chmod 755 "$destination"
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let install = |mode| {
+        std::process::Command::new(sh())
+            .arg(root().join("scripts/install.sh"))
+            .env_clear()
+            .env("PATH", format!("{}:/usr/bin:/bin", dir.display()))
+            .env("PREFIX", &prefix)
+            .env("FORMLESS_FROM_SOURCE", "1")
+            .env("FIXTURE_MAN", mode)
+            .output()
+            .unwrap()
+    };
+    let page = prefix.join("share/man/man1/formless.1");
+    let output = install("success");
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(std::fs::read_to_string(&page).unwrap(), ".TH FORMLESS 1\n");
+    assert_eq!(
+        std::fs::metadata(&page).unwrap().permissions().mode() & 0o777,
+        0o644
+    );
+    for mode in ["empty", "failure"] {
+        let output = install(mode);
+        assert!(output.status.success(), "{output:?}");
+        assert!(String::from_utf8_lossy(&output.stderr)
+            .contains("could not install the optional man page"));
+        assert_eq!(std::fs::read_to_string(&page).unwrap(), ".TH FORMLESS 1\n");
+        assert_eq!(
+            std::fs::read_dir(page.parent().unwrap()).unwrap().count(),
+            1
+        );
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// install.sh under dash with only sha256sum (no shasum) on PATH: accepts
 /// a version without the v, replaces the binary atomically, leaves the old
 /// one intact when verification fails, and checks HOME/PREFIX first (#840).
