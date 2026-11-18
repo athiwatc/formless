@@ -72,6 +72,12 @@ def check(page):
           ('echo a &&# note',['# note']),('(# note',['# note']),('echo a; # spaced',['# spaced']),
           (r'echo a\;#literal',[]),(r'echo a\ #literal',[]),(r'echo a\\;# note',['# note']),
           ('echo foo#bar',[]),('echo ${#arr} $#',[]),("echo 'a;# quoted'",[]),
+          ('echo ${unset:-x;#literal};# outside',['# outside']),
+          ('echo ${outer:-${inner:-x|#literal}};# outside',['# outside']),
+          ('[[ "#foo" == @(other|#foo) ]];# outside',['# outside']),
+          ('[[ "#foo" =~ (other|#foo) ]];# outside',['# outside']),
+          ('echo @(other|#foo);# outside',['# outside']),
+          (r'echo ${name:-x\};#literal};# outside',['# outside']),
         ]:cases.append((lang,source,comments))
       for lang in ['yaml','toml','ini','powershell']:
         cases.append((lang,'a|# literal',[]))

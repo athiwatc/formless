@@ -473,6 +473,7 @@ pub(crate) struct Highlighter {
     rust_numbers: bool,
     python_comments: bool,
     shell_comments: bool,
+    shell_word_closers: Vec<char>,
     raw_backticks: bool,
     color: bool,
     /// Open block comments (more than one only where they nest).
@@ -570,6 +571,7 @@ impl Highlighter {
                 name.as_str(),
                 "sh" | "bash" | "zsh" | "fish" | "shell" | "console"
             ),
+            shell_word_closers: Vec::new(),
             raw_backticks: matches!(name.as_str(), "go" | "golang"),
             color,
             in_block: 0,
@@ -591,6 +593,58 @@ impl Highlighter {
         }
     }
 
+    fn shell_escaped(prefix: &[char]) -> bool {
+        !prefix
+            .iter()
+            .rev()
+            .take_while(|&&c| c == '\\')
+            .count()
+            .is_multiple_of(2)
+    }
+
+    // A delimiter in a parameter default, extended glob or conditional
+    // expression need not delimit a shell command.
+    fn track_shell_word(&mut self, chars: &[char], i: usize) {
+        let prefix = &chars[..i];
+        if Self::shell_escaped(prefix) {
+            return;
+        }
+        let closer = self.shell_word_closers.last().copied();
+        let previous = prefix.last().copied();
+        match chars[i] {
+            '}' | ')' if closer == Some(chars[i]) => {
+                self.shell_word_closers.pop();
+            }
+            ']' if closer == Some(']')
+                && chars.get(i + 1) == Some(&']')
+                && previous.is_none_or(char::is_whitespace)
+                && chars
+                    .get(i + 2)
+                    .is_none_or(|c| c.is_whitespace() || ";|&)".contains(*c)) =>
+            {
+                self.shell_word_closers.pop();
+            }
+            '{' if previous == Some('$') && !Self::shell_escaped(&prefix[..i - 1]) => {
+                self.shell_word_closers.push('}')
+            }
+            '(' if closer == Some(')')
+                || previous
+                    .is_some_and(|c| "@!?+*".contains(c) || closer.is_some() && c == '$')
+                    && !Self::shell_escaped(&prefix[..i - 1]) =>
+            {
+                self.shell_word_closers.push(')')
+            }
+            '[' if closer.is_none()
+                && chars.get(i + 1) == Some(&'[')
+                && previous.is_none_or(|c| c.is_whitespace() || ";|&(".contains(c))
+                && chars.get(i + 2).is_none_or(|c| c.is_whitespace()) =>
+            {
+                self.shell_word_closers.push(']')
+            }
+            _ => {}
+        }
+    }
+
     fn hash_starts_comment(&self, prefix: &[char]) -> bool {
         let Some((&previous, before)) = prefix.split_last() else {
             return true;
@@ -599,15 +653,10 @@ impl Highlighter {
             return true;
         }
         let boundary = previous.is_whitespace()
-            || self.shell_comments && matches!(previous, ';' | '|' | '&' | '(');
-        boundary
-            && (!self.shell_comments
-                || before
-                    .iter()
-                    .rev()
-                    .take_while(|&&c| c == '\\')
-                    .count()
-                    .is_multiple_of(2))
+            || self.shell_comments
+                && self.shell_word_closers.is_empty()
+                && matches!(previous, ';' | '|' | '&' | '(');
+        boundary && (!self.shell_comments || !Self::shell_escaped(before))
     }
 
     /// Highlight one line; open block comments and multi-line strings
@@ -721,6 +770,9 @@ impl Highlighter {
                     i = stop.unwrap_or(chars.len());
                     continue;
                 }
+            }
+            if self.shell_comments && "{}()[]".contains(c) {
+                self.track_shell_word(&chars, i);
             }
             if l.line_comments.iter().any(|p| at(i, p))
                 && (c != '#' || self.hash_starts_comment(&chars[..i]))
@@ -1147,6 +1199,12 @@ mod tests {
                 ("echo foo#bar", ""),
                 ("echo ${#arr} $#", ""),
                 ("echo 'a;# quoted'", ""),
+                ("echo ${unset:-x;#literal};# outside", "# outside"),
+                ("echo ${outer:-${inner:-x|#literal}};# outside", "# outside"),
+                (r##"[[ "#foo" == @(other|#foo) ]];# outside"##, "# outside"),
+                (r##"[[ "#foo" =~ (other|#foo) ]];# outside"##, "# outside"),
+                ("echo @(other|#foo);# outside", "# outside"),
+                (r"echo ${name:-x\};#literal};# outside", "# outside"),
             ] {
                 let comments: String = toks(lang, source)
                     .into_iter()

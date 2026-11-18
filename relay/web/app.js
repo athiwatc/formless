@@ -1551,15 +1551,27 @@
     const L = HL[HL_ALIAS[lang] || lang];
     if (!L) return null;
     const shellComments = ["sh", "bash", "zsh", "fish", "shell", "console"].includes(lang);
+    const shellWordClosers = [];
+    const shellEscaped = (at) => {
+      let start = at;
+      while (start > 0 && code[start - 1] === "\\") start--;
+      return (at - start) % 2 !== 0;
+    };
+    const trackShellWord = (at) => {
+      if (shellEscaped(at)) return;
+      const current = code[at], previous = code[at - 1], next = code[at + 1], after = code[at + 2];
+      const closer = shellWordClosers[shellWordClosers.length - 1];
+      if ((current === "}" || current === ")") && closer === current) shellWordClosers.pop();
+      else if (current === "]" && closer === "]" && next === "]" && (!previous || /\s/.test(previous)) && (!after || /[\s;|&)]/.test(after))) shellWordClosers.pop();
+      else if (current === "{" && previous === "$" && !shellEscaped(at - 1)) shellWordClosers.push("}");
+      else if (current === "(" && (closer === ")" || ((previous && "@!?+*".includes(previous)) || (closer && previous === "$")) && !shellEscaped(at - 1))) shellWordClosers.push(")");
+      else if (current === "[" && !closer && next === "[" && (!previous || /[\s;|&(]/.test(previous)) && (!after || /\s/.test(after))) shellWordClosers.push("]");
+    };
     const hashStartsComment = (at) => {
       const previous = code[at - 1];
       if (L.hashAnywhere || at === 0 || previous === "\n") return true;
-      if (!/\s/.test(previous) && !(shellComments && ";|&(".includes(previous))) return false;
-      if (!shellComments) return true;
-      // An escaped separator is still part of the shell word.
-      let start = at - 1;
-      while (start > 0 && code[start - 1] === "\\") start--;
-      return (at - 1 - start) % 2 === 0;
+      const boundary = /\s/.test(previous) || shellComments && !shellWordClosers.length && ";|&(".includes(previous);
+      return boundary && (!shellComments || !shellEscaped(at - 1));
     };
     const kotlin = lang === "kotlin" || lang === "kt";
     const out = [];
@@ -1591,6 +1603,7 @@
         i = stop;
         continue;
       }
+      if (shellComments && "{}()[]".includes(c)) trackShellWord(i);
       if ((L.lc || []).some((p) => code.startsWith(p, i)) && (c !== "#" || hashStartsComment(i))) {
         const end = code.indexOf("\n", i);
         const stop = end < 0 ? code.length : end;
