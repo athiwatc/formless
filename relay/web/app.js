@@ -1540,6 +1540,74 @@
     jsonc: "json", json5: "json", yaml: "config", yml: "config", toml: "config", ini: "conf", env: "config", dotenv: "config", properties: "conf",
     sqlite: "sql", postgres: "sql", postgresql: "sql", mysql: "sql", xml: "html", svg: "html", vue: "html", svelte: "html", scss: "css", less: "css",
   };
+  const JS_REGEX_KEYWORDS = W("await case delete do else extends in instanceof new of return throw typeof void yield");
+  const JS_IDENT_CONTINUE = /[\p{ID_Continue}$\u200c\u200d]/u;
+  const JS_LINE_END = /[\n\r\u2028\u2029]/;
+
+  function jsRegexEnd(code, start, comments, typescript) {
+    const tokenEnd = (at) => {
+      while (at > 0) {
+        const commentStart = comments.get(at);
+        if (commentStart !== undefined) at = commentStart;
+        else if (/\s/.test(code[at - 1])) at--;
+        else break;
+      }
+      return at;
+    };
+    const before = tokenEnd(start);
+    const last = code[before - 1];
+    // A closing brace or postfix operator can end a division operand.
+    if (last === "}" || code.slice(Math.max(0, before - 2), before) === "++" ||
+        code.slice(Math.max(0, before - 2), before) === "--") return start;
+    let keyword = "";
+    if (before > 0 && !"=(,:[!&|?{;+-*%<>~^".includes(last)) {
+      let wordStart = before;
+      while (wordStart > 0 && JS_IDENT_CONTINUE.test(code[wordStart - 1])) wordStart--;
+      keyword = code.slice(wordStart, before);
+      const prefix = tokenEnd(wordStart);
+      const previous = code[prefix - 1];
+      const member = previous === "#" || (previous === "." && !code.startsWith("...", prefix - 3));
+      const splitSurrogate = /[\udc00-\udfff]/.test(code[wordStart - 1] ?? "");
+      if (!JS_REGEX_KEYWORDS.has(keyword) || member || splitSurrogate) return start;
+    }
+    let inClass = false;
+    for (let end = start + 1; end < code.length; end++) {
+      const c = code[end];
+      if (JS_LINE_END.test(c)) break;
+      if (c === "\\") {
+        end++;
+        if (end === code.length || JS_LINE_END.test(code[end])) break;
+      } else if (c === "[") inClass = true;
+      else if (c === "]") inClass = false;
+      else if (c === "/" && !inClass) {
+        end++;
+        while (end < code.length && /[a-z]/i.test(code[end])) {
+          if (!"dgimsuvy".includes(code[end])) return start;
+          end++;
+        }
+        if (keyword === "await") {
+          // In ordinary scripts await can be an identifier on the left of division.
+          let next = end;
+          for (;;) {
+            while (next < code.length && /\s/.test(code[next]) && !JS_LINE_END.test(code[next])) next++;
+            if (!code.startsWith("/*", next)) break;
+            const close = code.indexOf("*/", next + 2);
+            if (close < 0 || JS_LINE_END.test(code.slice(next, close))) return end;
+            next = close + 2;
+          }
+          let wordEnd = next;
+          while (wordEnd < code.length && JS_IDENT_CONTINUE.test(code[wordEnd])) wordEnd++;
+          const word = code.slice(next, wordEnd);
+          if (word && word !== "in" && word !== "instanceof" &&
+              !(typescript && (word === "as" || word === "satisfies"))) return start;
+          if (code[next] === "'" || code[next] === '"') return start;
+        }
+        return end;
+      }
+    }
+    return start;
+  }
+
   function highlight(code, lang) {
     lang = (lang || "").toLowerCase();
     if (lang === "diff" || lang === "patch") {
@@ -1551,6 +1619,8 @@
     const L = HL[HL_ALIAS[lang] || lang];
     if (!L) return null;
     const kotlin = lang === "kotlin" || lang === "kt";
+    const jsComments = L === HL.js ? new Map() : null;
+    const typescript = lang === "ts" || lang === "tsx" || lang === "typescript";
     const out = [];
     let plain = "";
     const tok = (cls, s) => {
@@ -1576,6 +1646,7 @@
       if (L.bc && code.startsWith(L.bc[0], i)) {
         const end = code.indexOf(L.bc[1], i + L.bc[0].length);
         const stop = end < 0 ? code.length : end + L.bc[1].length;
+        jsComments?.set(stop, i);
         tok("tok-com", code.slice(i, stop));
         i = stop;
         continue;
@@ -1583,6 +1654,7 @@
       if ((L.lc || []).some((p) => code.startsWith(p, i)) && (c !== "#" || L.hashAnywhere || i === 0 || /\s/.test(code[i - 1]))) {
         const end = code.indexOf("\n", i);
         const stop = end < 0 ? code.length : end;
+        jsComments?.set(stop, i);
         tok("tok-com", code.slice(i, stop));
         i = stop;
         continue;
@@ -1597,6 +1669,14 @@
           const delimiter = '"' + code.slice(prefixEnd, opener);
           const end = code.indexOf(delimiter, opener + 1);
           const stop = end < 0 ? code.length : end + delimiter.length;
+          tok("tok-str", code.slice(i, stop));
+          i = stop;
+          continue;
+        }
+      }
+      if (c === "/" && jsComments) {
+        const stop = jsRegexEnd(code, i, jsComments, typescript);
+        if (stop !== i) {
           tok("tok-str", code.slice(i, stop));
           i = stop;
           continue;

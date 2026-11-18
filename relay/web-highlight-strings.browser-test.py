@@ -13,8 +13,8 @@ from browser_fixture import chromium_executable
 ROOT = Path(__file__).resolve().parent
 
 
-def literal(lang, value, before, after, keywords):
-    return lang, before + value + after, [value], keywords
+def literal(lang, value, before, after, keywords, comments=None):
+    return lang, before + value + after, [value], keywords, comments or []
 
 
 RUST = [
@@ -46,6 +46,34 @@ TRIPLE = [
     literal('kotlin', '"""quote""""', 'val s = ', '; val after = 1', ['val', 'val']),
 ]
 
+URL_RE = r'/https:\/\//gi'
+REGEX = [
+    literal('javascript', URL_RE, 'const re = ', '; let z = 1; // outside',
+            ['const', 'let'], ['// outside']),
+    literal('JS', r'/\/*/', 'const re = ', '; let z = 1;', ['const', 'let']),
+    literal('jsx', r'/[/\]]/u', '', '; let z = 1;', ['let']),
+    literal('mjs', URL_RE, 'return ', '; let z = 1;', ['return', 'let']),
+    literal('cjs', URL_RE, 'throw /* before */ ', '; let z = 1;',
+            ['throw', 'let'], ['/* before */']),
+    literal('js', URL_RE, 'await ', '; let z = 1;', ['await', 'let']),
+    literal('js', URL_RE, 'void ', '; let z = 1;', ['void', 'let']),
+    literal('js', URL_RE, 'return [...typeof ', '];', ['return', 'typeof']),
+    literal('ts', URL_RE, 'return await ', ' as RegExp;', ['return', 'await', 'as']),
+    literal('tsx', URL_RE, 'await ', ' satisfies RegExp;', ['await']),
+    literal('js', URL_RE, 'const re = // explanation \t\n', '; let z = 1;',
+            ['const', 'let'], ['// explanation \t']),
+    literal('js', URL_RE, 'await ', ' /* multi\nline */ let z = 1;',
+            ['await', 'let'], ['/* multi\nline */']),
+    ('js', 'let q = a / b / c; // outside', [], ['let'], ['// outside']),
+    ('js', 'obj./* member */throw / a / b;', [], ['throw'], ['/* member */']),
+    ('js', 'obj?. /* member */ await / a / b;', [], ['await'], ['/* member */']),
+    ('js', 'const await = 48; return await / 2 / 3;', [], ['const', 'await', 'return', 'await'], []),
+    ('js', 'const q = α\u0301await / 2 / 3;', [], ['const', 'await'], []),
+    ('js', 'n++ / left / right;', [], [], []),
+    ('js', 'const n = {value: 1} / left / right;', [], ['const'], []),
+    ('rust', 'let n = /value/;', [], ['let'], []),
+]
+
 
 class QuietHandler(http.server.SimpleHTTPRequestHandler):
     def log_message(self, *_):
@@ -62,7 +90,7 @@ def expose(route, app):
 
 def check(page, cases):
     for view in ('block', 'fence'):
-        for lang, source, strings, keywords in cases:
+        for lang, source, strings, keywords, comments in cases:
             actual = page.evaluate(r'''({view, lang, source}) => {
                 const fixture = window.__literalFixture;
                 const node = view === 'fence'
@@ -70,9 +98,10 @@ def check(page, cases):
                     : fixture.codeBlock(source, lang);
                 const code = node.querySelector('pre code');
                 const tokens = selector => [...code.querySelectorAll(selector)].map(el => el.textContent);
-                return {text: code.textContent, strings: tokens('.tok-str'), keywords: tokens('.tok-kw')};
+                return {text: code.textContent, strings: tokens('.tok-str'),
+                    keywords: tokens('.tok-kw'), comments: tokens('.tok-com')};
             }''', {'view': view, 'lang': lang, 'source': source})
-            expected = {'text': source, 'strings': strings, 'keywords': keywords}
+            expected = {'text': source, 'strings': strings, 'keywords': keywords, 'comments': comments}
             assert actual == expected, (view, lang, source, actual, expected)
     print(f'PASS {len(cases)} string cases through code blocks and Markdown fences')
 
@@ -80,9 +109,10 @@ def check(page, cases):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--app', type=Path, default=ROOT / 'web/app.js')
-    parser.add_argument('--case', choices=['all', 'rust', 'go', 'triple'], default='all')
+    parser.add_argument('--case', choices=['all', 'rust', 'go', 'triple', 'regex'], default='all')
     args = parser.parse_args()
-    cases = {'all': RUST + GO + TRIPLE, 'rust': RUST, 'go': GO, 'triple': TRIPLE}[args.case]
+    cases = {'all': RUST + GO + TRIPLE + REGEX,
+             'rust': RUST, 'go': GO, 'triple': TRIPLE, 'regex': REGEX}[args.case]
     handler = functools.partial(QuietHandler, directory=str(ROOT / 'web'))
     with http.server.ThreadingHTTPServer(('127.0.0.1', 0), handler) as server:
         thread = threading.Thread(target=server.serve_forever, daemon=True)
