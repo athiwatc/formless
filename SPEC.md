@@ -105,15 +105,17 @@ without redesign.
 | Daemon Core | Long-lived process owning loop, Tools, Sessions, state. |
 | Relay | Hosted encrypted intermediary for the Web frontend (v2, §12). |
 
-## 4. Provider (v1: OpenAI-compatible only)
+<a id="4-provider-v1-openai-compatible-only"></a>
+
+## 4. Provider
 
 ### 4.1 Scope
 
-- v1 supports exactly one provider type: any **OpenAI-compatible** endpoint
-  speaking **Chat Completions**: `POST {base_url}/chat/completions` with
-  Bearer auth and SSE streaming, and `GET {base_url}/models` for discovery.
-- `base_url` is used **verbatim** (the daemon appends only `/chat/completions`
-  and `/models`); non-`/v1` layouts work. Free-form extra headers (e.g.
+- `provider.api_style = "chat"` uses **OpenAI-compatible Chat Completions**
+  by default. It sends `POST {base_url}/chat/completions` with Bearer auth
+  and SSE streaming, and uses `GET {base_url}/models` for discovery.
+- Configure `base_url` with the endpoint's path prefix. The daemon appends
+  the path for the selected API style without adding `/v1`. Extra headers (e.g.
   organisation/project) are configurable per provider and sent on every call.
 - v2: `provider.api_style = "responses"` speaks the Responses API
   (`POST {base_url}/responses`, converted input/tools, streamed
@@ -214,7 +216,7 @@ without redesign.
 ### 4.2 Configuration and selection
 
 - **Provider presets** (`presets.rs`): OpenAI, Anthropic
-  (OpenAI-compatible endpoint), OpenRouter, Google Gemini
+  (native Messages API), OpenRouter, Google Gemini
   (OpenAI-compatible), Groq, Ollama (local) and LM Studio (local). Each
   preset gives the base URL and `api_style`, where to get a key, the
   environment variable that often holds one, and a default model that is
@@ -269,7 +271,7 @@ without redesign.
   automatic compaction is audited with it (`compaction.window`).
 - An assistant turn's text before its tool calls (a preamble such as
   "Let me check the file first") is kept in the history sent back to the
-  model, on both API styles.
+  model across all three API styles.
 - Tool arguments the model sends as JSON-encoded strings where the
   schema expects an object or array (some models do this for nested
   values) are parsed before validation, for built-ins and registry Tools
