@@ -67,12 +67,14 @@ fn schema_fields(schema: &str) -> Option<BTreeSet<String>> {
                 | "allOf"
                 | "anyOf"
                 | "oneOf"
+                | "not"
                 | "if"
                 | "then"
                 | "else"
                 | "patternProperties"
                 | "propertyNames"
                 | "dependentSchemas"
+                | "dependentRequired"
                 | "dependencies"
         )
     }) || schema.get("type").is_some_and(|kind| kind != "object")
@@ -90,6 +92,12 @@ fn schema_fields(schema: &str) -> Option<BTreeSet<String>> {
         for field in required.as_array()? {
             fields.insert(field.as_str()?.to_owned());
         }
+    }
+    let minimum = schema
+        .get("minProperties")
+        .map_or(Some(0), serde_json::Value::as_u64)?;
+    if minimum > fields.len() as u64 {
+        return None;
     }
     Some(fields)
 }

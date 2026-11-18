@@ -101,8 +101,9 @@ fn only_known_input_fields_contribute_to_duplicate_scoring() {
         (r#"{"properties":null}"#, r#"{"properties":{}}"#),
         (
             r#"{"type":"object","properties":{},"required":["url"]}"#,
-            r#"{"type":"object","required":["channel"]}"#,
+            "{}",
         ),
+        (r#"{"type":"object","minProperties":1}"#, "{}"),
         (
             r#"{"type":"object","additionalProperties":{"type":"string"}}"#,
             r#"{"type":"object","additionalProperties":false}"#,
