@@ -1847,6 +1847,7 @@ struct App {
     switcher: Option<(String, usize)>,
     switcher_page_rows: std::cell::Cell<usize>,
     rollback_page_rows: std::cell::Cell<usize>,
+    rollback_visible_version: std::cell::Cell<Option<i64>>,
     /// `/quit` while Runs are working asks first (SPEC §10.5).
     quit_confirm: bool,
     /// `?` in an approval: explain each capability under it.
@@ -2163,6 +2164,7 @@ impl App {
             switcher: None,
             switcher_page_rows: std::cell::Cell::new(10),
             rollback_page_rows: std::cell::Cell::new(10),
+            rollback_visible_version: std::cell::Cell::new(None),
             on_start: cfg.tui.on_start.clone(),
             approval_code: None,
             image_placed: Vec::new(),
@@ -5035,6 +5037,10 @@ impl App {
         }
     }
 
+    fn invalidate_rollback_viewport(&self) {
+        self.rollback_visible_version.set(None);
+    }
+
     fn rollback_key(&mut self, key: KeyEvent) {
         let Some(pick) = self.rollback_pick.take() else {
             return;
@@ -5073,6 +5079,9 @@ impl App {
         }
         let version = d.versions[pick.idx].version;
         let next = match key.code {
+            // A queued Enter after a resize or a change of selection can
+            // reach the handler before the chosen version has been drawn.
+            KeyCode::Enter if self.rollback_visible_version.get() != Some(version) => Some(pick),
             KeyCode::Enter if version == current => {
                 self.notes.push(format!("v{version} is already current"));
                 Some(RollbackPick {
@@ -10149,6 +10158,7 @@ impl App {
                                     .position(|v| v.version == tool.current_version)
                                     .unwrap_or(d.versions.len() - 1)
                                     .saturating_sub(1);
+                                self.invalidate_rollback_viewport();
                                 self.rollback_pick = Some(RollbackPick {
                                     tool_id: tool.id,
                                     idx,
@@ -11728,6 +11738,7 @@ fn draw(f: &mut Frame, app: &mut App) {
 }
 
 fn draw_rollback_picker(f: &mut Frame, app: &App, pick: &RollbackPick) {
+    app.invalidate_rollback_viewport();
     let Some(d) = app
         .tool_detail
         .as_ref()
@@ -11738,7 +11749,11 @@ fn draw_rollback_picker(f: &mut Frame, app: &App, pick: &RollbackPick) {
     let area = f.area();
     let w = 64.min(area.width.saturating_sub(2)).max(1);
     let inner_width = usize::from(w.saturating_sub(2));
-    if area.height < 4 || inner_width < 12 {
+    let count = d.versions.len();
+    let selected = pick.idx.min(count.saturating_sub(1));
+    let selected_version = d.versions.get(selected);
+    let selected_width = selected_version.map_or(0, |v| 3 + v.version.to_string().len());
+    if area.height < 4 || inner_width < 12.max(selected_width) {
         app.rollback_page_rows.set(1);
         let message = if d.versions.is_empty() {
             "No versions · Esc cancel"
@@ -11752,8 +11767,6 @@ fn draw_rollback_picker(f: &mut Frame, app: &App, pick: &RollbackPick) {
     let compact = area.height < 7;
     let rows = usize::from(area.height) - if compact { 3 } else { 6 };
     app.rollback_page_rows.set(rows);
-    let count = d.versions.len();
-    let selected = pick.idx.min(count.saturating_sub(1));
     let start = selected
         .saturating_sub(rows - 1)
         .min(count.saturating_sub(rows));
@@ -11799,7 +11812,8 @@ fn draw_rollback_picker(f: &mut Frame, app: &App, pick: &RollbackPick) {
         };
         lines.push(Line::styled(text, style));
     }
-    if let Some(version) = d.versions.get(selected) {
+    if let Some(version) = selected_version {
+        app.rollback_visible_version.set(Some(version.version));
         if !compact {
             lines.push(Line::raw(""));
         }
@@ -19172,6 +19186,7 @@ pub fn run_with(paths: Paths, start: Option<&str>) -> Result<()> {
                     CtEvent::Paste(text) => app.paste(&text),
                     CtEvent::FocusGained => app.focused = true,
                     CtEvent::FocusLost => app.focused = false,
+                    CtEvent::Resize(_, _) => app.invalidate_rollback_viewport(),
                     _ => {}
                 }
                 wait = Duration::ZERO;
@@ -19422,6 +19437,7 @@ mod tests {
             switcher: None,
             switcher_page_rows: std::cell::Cell::new(10),
             rollback_page_rows: std::cell::Cell::new(10),
+            rollback_visible_version: std::cell::Cell::new(None),
             on_start: "last".into(),
             approval_code: None,
             image_placed: Vec::new(),
@@ -22271,6 +22287,7 @@ mod tests {
             "{screen}"
         );
         app.key(key(KeyCode::Up));
+        let _ = render(&mut app, 100, 30);
         app.key(key(KeyCode::Enter));
         assert!(
             app.rollback_pick.as_ref().unwrap().armed_version == Some(1),
@@ -22340,6 +22357,7 @@ mod tests {
         let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
         let mut app = rollback_test_app(40);
         app.key(key(KeyCode::Char('b')));
+        let _ = render(&mut app, 80, 20);
         app.key(key(KeyCode::Enter));
         assert_eq!(app.rollback_pick.as_ref().unwrap().armed_version, Some(39));
         app.tool_detail.as_mut().unwrap().versions.truncate(28);
@@ -22359,6 +22377,39 @@ mod tests {
         app.key(key(KeyCode::Enter));
         assert!(app.rollback_pick.is_none());
         assert!(app.notes.last().unwrap().contains("press Enter again"));
+    }
+
+    #[test]
+    fn rollback_picker_only_accepts_enter_for_a_visible_version() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut app = rollback_test_app(40);
+        app.key(key(KeyCode::Char('b')));
+        app.key(key(KeyCode::Enter));
+        assert_eq!(app.rollback_pick.as_ref().unwrap().armed_version, None);
+
+        let _ = render(&mut app, 80, 20);
+        app.key(key(KeyCode::Enter));
+        let notes = app.notes.len();
+        app.invalidate_rollback_viewport();
+        app.key(key(KeyCode::Enter));
+        let _ = render(&mut app, 80, 3);
+        app.key(key(KeyCode::Enter));
+        app.key(key(KeyCode::Enter));
+        assert_eq!(app.notes.len(), notes);
+        assert_eq!(app.rollback_pick.as_ref().unwrap().armed_version, Some(39));
+
+        let restored = render(&mut app, 80, 4);
+        assert!(
+            restored.contains("› v39") && restored.contains("Enter again to confirm"),
+            "{restored}"
+        );
+        app.key(key(KeyCode::Enter));
+        assert!(app.rollback_pick.is_none());
+        assert!(app
+            .notes
+            .last()
+            .unwrap()
+            .contains("rolled page_title back to v39"));
     }
 
     #[test]
