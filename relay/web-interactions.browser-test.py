@@ -8,6 +8,7 @@ import argparse
 import functools
 import http.server
 from pathlib import Path
+import re
 import threading
 
 from playwright.sync_api import expect, sync_playwright
@@ -139,17 +140,17 @@ def calls(page, kind):
 
 def keyboard(page):
     page.evaluate('__interaction.keyboard()')
-    toggle = page.get_by_role("button", name="Activity log", exact=True)
+    toggle = page.get_by_role("button", name=re.compile(r"^Activity log, \d+ unread$"))
     close = page.get_by_role("button", name="Close Activity", exact=True)
     composer = page.locator("#input")
     expect(toggle).to_have_attribute("aria-controls", "notes-panel")
     expect(toggle).to_have_attribute("aria-expanded", "false")
-    expect(toggle).to_have_accessible_description("105 unread")
+    expect(toggle).to_have_accessible_name("Activity log, 105 unread")
     expect(page.locator("#notes-badge")).to_have_text("99+")
 
     toggle.click()
     expect(toggle).to_have_attribute("aria-expanded", "true")
-    expect(toggle).to_have_accessible_description("0 unread")
+    expect(toggle).to_have_accessible_name("Activity log, 0 unread")
     expect(close).to_be_focused()
     close.click()
     expect(toggle).to_be_focused()

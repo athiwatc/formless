@@ -3865,8 +3865,9 @@
     const badge = $("notes-badge");
     badge.textContent = S.unread > 99 ? "99+" : String(S.unread);
     badge.classList.toggle("hidden", !S.unread);
-    const unread = S.unread + " unread";
-    if ($("notes-unread").textContent !== unread) $("notes-unread").textContent = unread;
+    const activityToggle = $("notes-btn");
+    const activityLabel = "Activity log, " + S.unread + " unread";
+    if (activityToggle.getAttribute("aria-label") !== activityLabel) activityToggle.setAttribute("aria-label", activityLabel);
   }
 
   function setActivityDrawer(open) {
