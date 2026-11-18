@@ -1144,27 +1144,29 @@
   let runningRefresh = null;
   let runningExposure = null;
   function isRunningConnection(connection) {
-    return connection?.ws === S.ws && connection?.conn === S.conn && connection?.channel === S.channel;
+    // The Session subscription can assign S.conn after this transport is ready.
+    return connection?.ws === S.ws && connection?.channel === S.channel;
   }
   function syncRunningExposure(visible) {
-    const exposed = !!S.channel && (S.local || S.relayReady) && !document.hidden && S.view === "chat"
+    const exposed = S.ws?.readyState === 1 && !!S.channel && (S.local || S.relayReady) && !document.hidden && S.view === "chat"
       && (visible ?? sidebarVisible($("sidebar")));
     if (!exposed) runningExposure = null;
     else if (!isRunningConnection(runningExposure)) {
-      runningExposure = { ws: S.ws, conn: S.conn, channel: S.channel };
-      refreshRunning(false);
+      runningExposure = { ws: S.ws, channel: S.channel, loaded: false };
+      // A snapshot already in flight can predate this exposure.
+      refreshRunning();
     }
     return exposed;
   }
   function refreshRunning(queueAnother = true) {
     if (!S.channel) return Promise.resolve();
     if (isRunningConnection(runningRefresh)) {
-      // Events and completed actions may invalidate an in-flight snapshot.
-      // Polls and simultaneous visibility changes can share that snapshot.
+      // Events, completed actions and a newly exposed panel may invalidate
+      // an in-flight snapshot. Timer ticks can share the current request.
       if (queueAnother) runningRefresh.again = true;
       return runningRefresh.promise;
     }
-    const refresh = { ws: S.ws, conn: S.conn, channel: S.channel, again: false };
+    const refresh = { ws: S.ws, channel: S.channel, again: false };
     runningRefresh = refresh;
     refresh.promise = drainRunningRefresh(refresh);
     return refresh.promise;
@@ -1175,7 +1177,10 @@
         refresh.again = false;
         const list = await request({ type: "list_invocations" }).catch(() => null);
         if (runningRefresh !== refresh || !isRunningConnection(refresh)) return;
-        if (list && !refresh.again) renderRunningList(list);
+        if (Array.isArray(list) && !refresh.again) {
+          renderRunningList(list);
+          if (isRunningConnection(runningExposure)) runningExposure.loaded = true;
+        }
       } while (refresh.again);
     } finally {
       if (runningRefresh === refresh) runningRefresh = null;
@@ -1221,7 +1226,9 @@
       focusReturn(target);
     }
   }
-  setInterval(() => { if (syncRunningExposure() && S.invocations?.length) refreshRunning(false); }, 2000);
+  setInterval(() => {
+    if (syncRunningExposure() && (!runningExposure.loaded || S.invocations?.length)) refreshRunning(false);
+  }, 2000);
 
   function sessionRows(sessions, visible, tree) {
     if (!tree) return visible.map(session => ({ session, depth: 0, note: "" }));

@@ -53,6 +53,7 @@ HOOK = """
       fixtureHidden = hidden;
       document.dispatchEvent(new Event('visibilitychange'));
     },
+    identify() { S.conn++; },
     event(type) {
       onEvent({type, session_id: S.current, invocation_id: 'fixture-call', handle: 'fixture-handle',
                tool_name: 'fixture-tool', silent_secs: 30, ok: true});
@@ -118,7 +119,7 @@ def exercise(page, url, app):
     menu.click()
     expect(menu).to_have_attribute("aria-expanded", "true")
     wait_requests(page, 2)
-    page.evaluate("() => { __runningFixture.syncSidebar(); __runningFixture.hide(false); }")
+    page.evaluate("() => { __runningFixture.identify(); __runningFixture.syncSidebar(); __runningFixture.hide(false); }")
     assert page.evaluate("__runningFixture.count()") == 2
     page.evaluate("() => { __runningFixture.event('invocation_stalled'); __runningFixture.event('invocation_stalled'); }")
     assert page.evaluate("__runningFixture.count()") == 2
@@ -185,6 +186,18 @@ def exercise(page, url, app):
     wait_requests(page, 11)
     reply(page, 11)
     expect(panel).to_be_hidden()
+
+    # A pre-exposure response may be stale, even when its list is empty.
+    page.evaluate("() => { __runningFixture.hide(true); __runningFixture.event('invocation_pending'); }")
+    wait_requests(page, 12)
+    page.evaluate("__runningFixture.hide(false)")
+    reply(page, 12, {**ROW, "tool_name": "pre-exposure snapshot"})
+    wait_requests(page, 13)
+    expect(panel).to_be_hidden()
+    page.evaluate("__runningFixture.fail(13)")
+    tick(page, 14)
+    reply(page, 14)
+    tick(page, 14)
 
 
 def main():
