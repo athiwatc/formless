@@ -504,6 +504,27 @@ def run():
             check(page.locator('.popover').count()==0,'mobile nonfocusable outside click closes menu')
             check(page.evaluate('document.activeElement!==document.body && !document.activeElement.closest("#sidebar:not(.open)")'),'mobile outside click does not leave focus in closed drawer')
             check(page.locator('#sessions .menu').evaluate_all('(items)=>items.every(e=>getComputedStyle(e).visibility==="hidden")'),'closed mobile drawer menu descendants are hidden from Tab navigation')
+            # At large text size the toolbar wraps into its own scrollport.
+            # Drawer dismissal must bring an obscured return target back into view.
+            page.set_viewport_size({'width':320,'height':740})
+            toolbar = page.locator('.topbar')
+            for trigger, panel, to_end in [('#notes-btn','#notes-panel:not(.hidden)',False),
+                                           ('#menu-btn','#sidebar.open',True)]:
+                page.locator(trigger).click()
+                page.locator(panel).wait_for()
+                toolbar.evaluate('(e,toEnd)=>e.scrollTop=toEnd?e.scrollHeight:0',to_end)
+                check(toolbar.evaluate('''(e,selector)=>{
+                    const bounds=e.getBoundingClientRect(), button=document.querySelector(selector).getBoundingClientRect();
+                    return button.bottom<=bounds.top || button.top>=bounds.bottom;
+                }''',trigger),'scrolled toolbar clips open drawer trigger '+trigger)
+                page.keyboard.press('Escape')
+                page.locator(panel).wait_for(state='hidden')
+                page.wait_for_function('''selector=>{
+                    const target=document.querySelector(selector);
+                    const button=target.getBoundingClientRect(), bounds=target.closest('.topbar').getBoundingClientRect();
+                    return target===document.activeElement && button.top>=bounds.top && button.bottom<=bounds.bottom;
+                }''',arg=trigger)
+                check(page.locator(trigger).evaluate('e=>e===document.activeElement'),'closing drawer reveals restored toolbar focus '+trigger)
             check(not errors,'no browser page errors: '+repr(errors))
             page.screenshot(path=str(OUT/'final-state.png'))
             context.close();browser.close()

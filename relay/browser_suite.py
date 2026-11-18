@@ -21,6 +21,7 @@ HELPERS = {
 BROWSER_SUFFIX = ".browser-test.py"
 DEV_SUFFIX = ".dev-test.mjs"
 SUITE_TIMEOUT_SECONDS = 120
+TERMINATION_GRACE_SECONDS = 5
 
 
 def discover_suites():
@@ -55,10 +56,17 @@ def run_suite(path, output, failures, settings_fixture):
                 status = process.wait(timeout=SUITE_TIMEOUT_SECONDS)
             except subprocess.TimeoutExpired:
                 try:
-                    os.killpg(process.pid, signal.SIGKILL)
+                    os.killpg(process.pid, signal.SIGTERM)
                 except ProcessLookupError:
                     pass
-                process.wait()
+                try:
+                    process.wait(timeout=TERMINATION_GRACE_SECONDS)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    process.wait()
                 status = 124
                 log.write(f"\nTimed out after {SUITE_TIMEOUT_SECONDS} seconds.\n".encode())
     print(f"{'PASS' if status == 0 else 'FAIL'} {path.name}", flush=True)

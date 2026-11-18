@@ -997,7 +997,8 @@
       root.setAttribute("data-visual-viewport", "");
       root.toggleAttribute("data-viewport-zoomed", zoomed);
       const keyboardShrankViewport = !zoomed && viewport.height < root.clientHeight - fontSize * 3;
-      root.toggleAttribute("data-viewport-short", viewport.height < fontSize * 28 || keyboardShrankViewport);
+      const shortViewport = viewport.height < fontSize * (zoomed ? 28 : 24);
+      root.toggleAttribute("data-viewport-short", shortViewport || keyboardShrankViewport);
       root.toggleAttribute("data-viewport-composing", composing);
       viewportVariable("--visual-left", viewport.left);
       viewportVariable("--visual-top", viewport.top);
@@ -1042,8 +1043,10 @@
         positionJump(bounds, fontSize);
       }
       positionPopover();
-      const modal = activeDialog()?.node.querySelector(".modal") || document.activeElement?.closest(".pair-card");
-      if (modal) revealViewportControl(document.activeElement, modal, bounds);
+      const focused = document.activeElement;
+      const focusScrollport = activeDialog()?.node.querySelector(".modal")
+        || focused?.closest(".pair-card, .topbar, .statusbar");
+      if (focusScrollport) revealViewportControl(focused, focusScrollport, bounds);
     }, { newContent: false });
     // A viewport pan changes which block the user is looking at. Adopt that
     // new visible block rather than compensating away the user's pinch/pan.
@@ -1803,7 +1806,9 @@
         if (d.width && d.height) { img.width = d.width; img.height = d.height; }
         img.addEventListener("click", () => box.classList.toggle("zoom"));
         img.addEventListener("load", () => {
-          if (current() && $("transcript").contains(img)) withTranscriptLayout(() => {});
+          // The decoded image may already have resized. Keep the reading
+          // anchor captured before that reflow, even after a recent scroll.
+          if (current() && $("transcript").contains(img)) settleReadingLayout();
         }, { once: true });
         update(() => {
           view.replaceChildren(img);
