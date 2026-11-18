@@ -31,6 +31,12 @@ function setup(names, extras = {}) {
   if (names.includes('renderHistory')) installHistoryFixture(context, fn);
   const dependencies = [...(names.includes('openSession') ? ['restoreSessionRunState'] : []), ...(names.includes('showNextAsk') ? ['configureAskInput', 'showAskError'] : []), ...(names.includes('scheduleForecast') ? ['renderForecastPreview'] : [])];
   if (names.includes('showNextAsk')) vm.runInContext(source.slice(source.indexOf('  let askResolve'), source.indexOf('  /** Promise-based prompt')), context);
+  if (names.includes('renderApproval') || names.includes('branchSummaryReviewText')) {
+    const start = source.indexOf('  const BIDI =');
+    const end = source.indexOf('  function showBidi(', start);
+    assert.ok(start >= 0 && end > start, 'approval text helpers');
+    vm.runInContext(source.slice(start, end), context);
+  }
   vm.runInContext([...new Set([...dependencies, ...names])].map(fn).join('\n'), context);
   return context;
 }
@@ -892,7 +898,6 @@ function summaryHarness() {
     ask(opts){const d=deferred(),prompt={opts,...d};prompts.set(opts.tag,prompt);dialogs.push(prompt);return d.promise;},
     cancelAsk(tag){const prompt=prompts.get(tag);if(prompt){prompts.delete(tag);prompt.resolve(null);}},
     act(request){const d=deferred();calls.push(JSON.parse(JSON.stringify(request)));requests.push({request,...d});return d.promise;}});
-  vm.runInContext(source.match(/^  const BIDI = .*;$/m)[0],c);
   c.S.sessions=[{id:'source',name:'Source branch'},{id:'target',name:'Target Session'}];c.S.current='target';c.S.channel='local';c.S.conn='connection1';c.S.ws={};c.S.running=new Set();
   return {c,calls,notes,events,async request(type){const item=await requests.next();assert.equal(item.request.type,type);return item;},async review(){for(;;){const prompt=await dialogs.next();if(prompt.opts.tag.startsWith('branch-summary:review:'))return prompt;}},prompts};
 }
