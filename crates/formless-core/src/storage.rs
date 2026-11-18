@@ -115,6 +115,8 @@ const RUN_INSPECT_EXACT: &str = "SELECT id,session_id,status,error,steps,created
     FROM runs WHERE id=?1";
 const RUN_ID_PREFIX_RANGE: &str = "SELECT id FROM runs WHERE id>=?1 AND id<?2 ORDER BY id LIMIT 2";
 const RUN_ID_PREFIX_TAIL: &str = "SELECT id FROM runs WHERE id>=?1 ORDER BY id LIMIT 2";
+const RUN_ID_PREFIX_OTHER_ENCODING: &str =
+    "SELECT id FROM runs WHERE substr(id,1,length(?1))=?1 LIMIT 2";
 
 /// The exclusive upper bound for a literal prefix in SQLite's BINARY
 /// ordering on Formless's UTF-8 databases. A prefix made entirely of the
@@ -3146,11 +3148,15 @@ impl Store {
             if let Some(exact) = st.inspect_exact_run(query)? {
                 return Ok(Some(exact));
             }
-            let upper = run_id_prefix_end(query);
-            let sql = if upper.is_some() {
-                RUN_ID_PREFIX_RANGE
-            } else {
-                RUN_ID_PREFIX_TAIL
+            let encoding: String = st.ps("PRAGMA encoding")?.query_row([], |row| row.get(0))?;
+            let (sql, upper) = match encoding.as_str() {
+                "UTF-8" => match run_id_prefix_end(query) {
+                    Some(upper) => (RUN_ID_PREFIX_RANGE, Some(upper)),
+                    None => (RUN_ID_PREFIX_TAIL, None),
+                },
+                // Restored databases can use UTF-16, whose binary byte order
+                // differs from the scalar ordering used for the upper bound.
+                _ => (RUN_ID_PREFIX_OTHER_ENCODING, None),
             };
             let mut stmt = st.ps(sql)?;
             let binds = rusqlite::params_from_iter(std::iter::once(query).chain(upper.as_deref()));

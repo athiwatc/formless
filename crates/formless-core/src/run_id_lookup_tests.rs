@@ -79,3 +79,24 @@ fn run_lookup_prefers_exact_ids_and_bounds_literal_prefixes() {
         .contains("ambiguous Run id"));
     assert!(store.inspect_run("missing").unwrap().is_none());
 }
+
+#[test]
+fn foreign_database_encoding_keeps_literal_run_lookup() {
+    let path = std::env::temp_dir().join(format!("fl-run-encoding-{}.db", uuid::Uuid::new_v4()));
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch("PRAGMA encoding='UTF-16le'; CREATE TABLE encoding_fixture(value);")
+        .unwrap();
+    drop(conn);
+    let store = Store::open(&path).unwrap();
+    let session = store.create_session(None).unwrap();
+    let id = "a99ff626-74d6-4fde-8bd4-1dca56cf4411";
+    store.conn.execute(
+        "INSERT INTO runs(id,session_id,status,created_at,updated_at) VALUES(?1,?2,'running','','')",
+        params![id, session.id],
+    ).unwrap();
+    assert!(store.inspect_run("Š").unwrap().is_none());
+    assert_eq!(store.inspect_run("a99").unwrap().unwrap()["run_id"], id);
+    assert_eq!(store.inspect_run(id).unwrap().unwrap()["run_id"], id);
+    drop(store);
+    std::fs::remove_file(path).unwrap();
+}
