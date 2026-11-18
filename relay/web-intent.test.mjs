@@ -24,7 +24,7 @@ function setup(names, extras = {}) {
     forecastRevision: 0, scheduleForecast() {}, invalidateBranchSummary() {}, branchSummaryEvent() {}, setTimeout: f => f(), rememberFocus() {}, restoreFocus() {},
     // These tests isolate intent/data behavior; real focus/inert behavior runs
     // against the complete shipped UI in web-focus.browser-test.py.
-    document: { activeElement: null }, focusBefore: {}, openDialog() {}, closeDialog() {}, activeDialog: () => null,
+    document: { activeElement: null }, popoverTrigger: null, focusBefore: {}, openDialog() {}, closeDialog() {}, activeDialog: () => null,
     renderChips() {}, note() {}, autosize() {},
     ...extras });
   installEventRenderFixture(context, fn);
@@ -231,6 +231,7 @@ test('a stale approval response cannot be reported as an accepted denial', async
 function node(tag, attrs, ...children) {
   const element = { tag, attrs: attrs || {}, children: [], parentNode: null, classList: { add() {} },
     get firstChild() { return this.children[0] || null; },
+    get firstElementChild() { return this.children.find(child => child && typeof child === 'object') || null; },
     get nextSibling() {
       if (!this.parentNode) return null;
       return this.parentNode.children[this.parentNode.children.indexOf(this) + 1] || null;
@@ -248,6 +249,11 @@ function node(tag, attrs, ...children) {
       if (!this.parentNode) return;
       this.parentNode.children.splice(this.parentNode.children.indexOf(this), 1);
       this.parentNode = null;
+    },
+    after(node) { this.parentNode.insertBefore(node, this.nextSibling); },
+    replaceWith(node) { this.parentNode.insertBefore(node, this); this.remove(); },
+    querySelector(selector) {
+      return this.children.find(child => child?.attrs?.class?.split(' ').includes(selector.slice(1))) || null;
     },
     replaceChildren(...kids) {
       for (const child of this.children) if (child && typeof child === 'object') child.parentNode = null;
@@ -817,7 +823,7 @@ test('lineage tree retains every visible identity with bounded cycles and explic
 
 test('web tree toggle and row actions operate on the rendered Session identity', () => {
   const list=node('ul'),opened=[];
-  const c=setup(['renderSessions','sessionRows'],{$:()=>list,h:node,relTime:()=>'',openSession:id=>opened.push(id),sessionMenu(){},bulkSessions(){}});
+  const c=setup(['renderSessions','sessionRows','compareSessions','renderSessionBulkBar'],{$:()=>list,h:node,relTime:()=>'',openSession:id=>opened.push(id),sessionMenu(){},bulkSessions(){}});
   c.S.running=new Set();c.S.sessions=[{id:'child',name:'Child',forked_from:'parent',fork_point_seq:3},{id:'parent',name:'Parent'},{id:'orphan',name:'Orphan',forked_from:'deleted',fork_point_seq:7}];
   c.renderSessions();
   const toggle=all(list).find(n=>n.tag==='button'&&plainText(n)==='Tree off');assert.ok(toggle);toggle.attrs.onclick();
@@ -826,6 +832,23 @@ test('web tree toggle and row actions operate on the rendered Session identity',
   all(rows[1]).find(n=>n.attrs?.class==='session-open').attrs.onclick();assert.deepEqual(opened,['child']);
   all(rows[1]).find(n=>n.tag==='input').attrs.onchange({target:{checked:true}});
   assert.equal(c.S.marked.has('child'),true);assert.equal(c.S.marked.has('parent'),false);
+});
+
+test('Session sidebar ordering matches daemon archive, pin and timestamp columns', () => {
+  const { compareSessions } = setup(['compareSessions']);
+  const session = (id, updated_at, pinned = false, archived = false) => ({id, updated_at, pinned, archived});
+  const values = [
+    session('archived-pinned', '2026-11-18T18:01:00+00:00', true, true),
+    session('active-new', '2026-11-18T18:02:00+00:00'),
+    session('pinned-old', '2026-11-18T18:00:00+00:00', true),
+    session('archived-recent', '2026-11-18T18:03:00+00:00', false, true),
+    session('active-unavailable', null),
+    session('pinned-new', '2026-11-18T18:00:00.123+00:00', true),
+  ];
+  assert.deepEqual(values.sort(compareSessions).map(value => value.id), [
+    'pinned-new', 'pinned-old', 'active-new', 'active-unavailable', 'archived-pinned', 'archived-recent',
+  ]);
+  assert.equal(compareSessions(values[0], {...values[0], id: 'equal-timestamp'}), 0);
 });
 
 function storedComparisonFixture() {
@@ -989,7 +1012,7 @@ test('relay reconnect registers only existing push opt-in on the current authent
 
 test('Session selection pruning retains filter-hidden IDs and removes missing IDs', () => {
   const list=node('ul');
-  const c=setup(['renderSessions','sessionRows'],{$:()=>list,h:node,relTime:()=>'',openSession(){},sessionMenu(){},bulkSessions(){}});
+  const c=setup(['renderSessions','sessionRows','compareSessions','renderSessionBulkBar'],{$:()=>list,h:node,relTime:()=>'',openSession(){},sessionMenu(){},bulkSessions(){}});
   c.S.running=new Set();
   c.S.sessions=[{id:'visible',name:'Visible',tags:['shown']},{id:'hidden',name:'Hidden',tags:['other']},{id:'archived',name:'Archived',archived:true,tags:['other']}];
   c.S.tagFilter='shown';c.S.marked=new Set(['visible','hidden','archived','deleted']);
@@ -1009,7 +1032,7 @@ test('Session selection pruning reads each loaded ID once for a large selection'
   // Isolate selection cleanup from the unchanged DOM/tree renderer. Count ID
   // reads rather than claiming an end-to-end timing improvement.
   const list=node('ul');let reads=0;
-  const c=setup(['renderSessions'],{$:()=>list,h:node,sessionRows:()=>[]});
+  const c=setup(['renderSessions','compareSessions','renderSessionBulkBar'],{$:()=>list,h:node,sessionRows:()=>[]});
   c.S.sessions=Array.from({length:4000},(_,i)=>({get id(){reads++;return 's'+i;},name:'Session '+i}));
   c.S.marked=new Set(Array.from({length:4000},(_,i)=>'s'+i));c.S.marked.add('missing');
   c.renderSessions();
