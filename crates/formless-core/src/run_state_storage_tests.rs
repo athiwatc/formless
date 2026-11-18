@@ -85,7 +85,7 @@ fn genuine_schema66_upgrade_preserves_unknown_plan_and_recovery_and_replay_evide
                 .conn
                 .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
                 .unwrap(),
-            67
+            super::super::SCHEMA_VERSION
         );
         assert_eq!(store.session_plan("s").unwrap(), vec![item("legacy task")]);
         let state = store.session_plan_state("s").unwrap().unwrap();

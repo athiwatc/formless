@@ -184,9 +184,12 @@ fn profile_quota_is_atomic_across_writers_and_leaves_harness_updates_available()
         .unwrap_err()
         .to_string()
         .contains("profile Tool store is full"));
+    let followup = json!("x".repeat(3 * 1024));
+    assert!(store.kv_set("shared:reclaimed", "key", &followup).is_err());
     store
         .kv_set(winner, "cursor", &json!("x".repeat(47 * 1024)))
         .unwrap();
+    store.kv_set("shared:reclaimed", "key", &followup).unwrap();
     store
         .kv_set(
             "harness:registry",
