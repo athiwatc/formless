@@ -4313,12 +4313,10 @@ impl Store {
     }
 
     pub fn applied_proposals(&self) -> Result<Vec<PromptProposalInfo>> {
-        // Oldest first, as with the reversed full-history read. Equal timestamps
-        // previously had no SQL tie guarantee; explicitly retain the reversed
-        // table-insertion order observed by that read, independent of query plan.
-        // Non-applied content/rationale are intentionally not decoded here.
+        // Append guidance in application order. Legacy rows without an
+        // application timestamp use their creation time and existing tie order.
         let mut stmt = self.ps(
-            "SELECT id,kind,content,rationale,status,baseline_score,candidate_score,eval_total,est_tokens,created_at,applied_at FROM prompt_proposals WHERE status='applied' ORDER BY created_at ASC, rowid DESC",
+            "SELECT id,kind,content,rationale,status,baseline_score,candidate_score,eval_total,est_tokens,created_at,applied_at FROM prompt_proposals WHERE status='applied' ORDER BY COALESCE(applied_at,created_at) ASC, rowid DESC",
         )?;
         let rows = stmt
             .query_map([], Self::proposal_row)?
@@ -4389,7 +4387,7 @@ impl Store {
     }
 
     /// Effective system prompt: frozen bootstrap + applied guidance
-    /// proposals as versioned sections (oldest first). Memory proposals
+    /// proposals as versioned sections (first applied first). Memory proposals
     /// are in the memory store instead.
     pub fn effective_system_prompt(&self, base: &str) -> Result<String> {
         let applied: Vec<_> = self
