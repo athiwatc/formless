@@ -3921,14 +3921,13 @@
         call.truncated ? h("p", { class: "error" }, "Preview truncated; omitted values remain unresolved here.") : null,
         h("p", { class: "muted" }, call.note)) : null);
   }
-  const approvalConfirmation = h("div", { class: "error broad-confirm", role: "alert" });
-  $("modal-body").after(approvalConfirmation);
   function renderApproval() {
     const req = S.approvals[0];
     if (!req) S.approvalLater = false;
+    const alert = $("modal-confirm");
     const confirmation = req?.broadConfirm && !S.approvalLater
       ? "This grants broad access. Press the same button (or key) again to confirm, or allow it once." : "";
-    if (approvalConfirmation.textContent !== confirmation) approvalConfirmation.textContent = confirmation;
+    if (alert.textContent !== confirmation) alert.textContent = confirmation;
     $("modal-backdrop").classList.toggle("hidden", !req || !!S.approvalLater);
     if (!req || S.approvalLater) return restoreFocus("modal-backdrop");
     const promo = req.kind === "promotion";
@@ -4250,7 +4249,7 @@
       if (broad && head.broadConfirm !== (scope || "always")) {
         head.broadConfirm = scope || "always";
         renderApproval();
-        approvalConfirmation.scrollIntoView({ block: "nearest" });
+        $("modal-confirm").scrollIntoView({ block: "nearest" });
         return;
       }
     }
@@ -7890,9 +7889,12 @@
       return;
     }
     const modalOpen = layer?.node === $("modal-backdrop");
+    if (modalOpen && e.repeat && e.key === "Enter") {
+      e.preventDefault();
+      return;
+    }
     if (modalOpen && !e.ctrlKey && !e.metaKey && !e.altKey) {
-      // A held key is one decision, including Enter on a focused button.
-      if (e.repeat && ["Enter", "y", "o", "s", "1", "n", "N"].includes(e.key)) {
+      if (e.repeat && ["y", "o", "s", "1", "n", "N"].includes(e.key)) {
         e.preventDefault();
         return;
       }

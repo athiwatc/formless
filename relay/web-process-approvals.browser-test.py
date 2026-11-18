@@ -108,6 +108,17 @@ def check(page):
         page.keyboard.press(key)
         check_decision(scope)
 
+    queue('process:bash')
+    page.locator('#modal-approve').focus()
+    page.keyboard.down('Enter')
+    page.keyboard.down('Control')
+    page.keyboard.down('Enter')
+    assert confirm.is_visible() and decisions() == []
+    page.keyboard.up('Enter')
+    page.keyboard.up('Control')
+    page.keyboard.press('Enter')
+    check_decision('always')
+
     page.set_viewport_size({'width': 460, 'height': 430})
     queue('process:curl', detail='Long fixture explanation.\n' * 60)
     click('hour')
