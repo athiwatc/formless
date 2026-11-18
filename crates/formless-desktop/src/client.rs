@@ -4820,9 +4820,9 @@ mod tests {
                     Request::ForecastRun { .. } => {
                         serde_json::to_value(crate::fixture::run_forecast("a", false)).unwrap()
                     }
-                    request @ (Request::SendReviewedMessage { .. }
+                    wire_request @ (Request::SendReviewedMessage { .. }
                     | Request::SendReviewedSteer { .. }) => {
-                        match request {
+                        match wire_request {
                             Request::SendReviewedMessage {
                                 client_msg_id,
                                 mode: SendMode::Send,

@@ -340,7 +340,32 @@ async fn reviewed_send_exact_steer_refuses_replacement_and_separates_legacy_rece
     assert_eq!(metadata["attachments"], json!(expected));
     assert_eq!(metadata["steer"]["run_id"], "replacement-run");
     assert!(f.read().is_empty());
-    f.daemon.close_run_steering(&f.sid, "replacement-run");
+    f.add(&expected[0]);
+    f.daemon.runs.locked().get_mut(&f.sid).unwrap().run_id = "third-run".into();
+    let error = f
+        .daemon
+        .handle(steer("third-run", "shared-key"))
+        .await
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("already belongs to a different Run"));
+    assert_eq!(f.read(), expected);
+    assert_eq!(
+        f.daemon
+            .with_reader(|st| st.list_messages(&f.sid))
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        f.daemon
+            .handle(steer("replacement-run", "shared-key"))
+            .await
+            .unwrap(),
+        receipt
+    );
+    f.daemon.close_run_steering(&f.sid, "third-run");
     assert!(f.daemon.handle(inspect()).await.is_err());
     assert!(f.daemon.handle(snapshot()).await.unwrap()["steerable_run_id"].is_null());
     f.finish().await;

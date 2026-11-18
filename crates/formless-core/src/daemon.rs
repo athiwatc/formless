@@ -723,6 +723,7 @@ impl CachedSendFailure {
     }
 }
 struct SentEntry {
+    steer_run_id: Option<String>,
     at: std::time::Instant,
     outcome: tokio::sync::watch::Receiver<Option<SendOutcome>>,
 }
@@ -5148,6 +5149,7 @@ impl Daemon {
                 .await;
         };
         let who = current_client();
+        let steer_run_id = review.as_ref().and_then(|review| review.run_id.as_deref());
         // Legacy and reviewed operations must never replay one another's ACK.
         let key = (
             (who.as_ref().map(|(conn, _)| *conn), session_id.clone(), key),
@@ -5166,12 +5168,19 @@ impl Daemon {
                     || entry.at.elapsed() < std::time::Duration::from_secs(600)
             });
             if let Some(entry) = sent.get(&key) {
+                if entry.steer_run_id.as_deref() != steer_run_id {
+                    return Err(RequestFailure::invalid(
+                        "Reviewed Steer action identity already belongs to a different Run",
+                    )
+                    .into());
+                }
                 (entry.outcome.clone(), None)
             } else {
                 let (tx, rx) = tokio::sync::watch::channel(None);
                 sent.insert(
                     key.clone(),
                     SentEntry {
+                        steer_run_id: steer_run_id.map(str::to_string),
                         at: std::time::Instant::now(),
                         outcome: rx.clone(),
                     },

@@ -41,18 +41,19 @@ The preview now advertises `reviewed_send_mode_v1`. It checks the requested
 mode while holding the existing Run admission lock. Send requires an idle
 Session. Steer requires an active Run that can still accept steering. A change
 between idle and active after review rejects before message append, inventory
-consumption or Run admission. The check binds the mode and current availability.
-It does not bind a Steer to a particular Run identity if another active Run has
-already replaced it. Legacy `SendMessage` keeps its existing behavior.
+consumption or Run admission. The mode-only RPC checks current availability.
+Legacy `SendMessage` keeps its existing behavior.
 
 `reviewed_steer_run_v1` also advertises `ReadSteerReview` and `SendReviewedSteer`.
 The first returns one live steerable Run and the complete pending inventory. The
 second requires its Run ID and refuses an ended or replaced Run under the same
 admission lock, before comparing and consuming metadata. Bound Steer has its own
-receipt namespace. A legacy or mode-only receipt cannot acknowledge it. It
-retains the existing interruption cut and steering closure checks. As with
-existing steering, an Interrupt that races an already admitted append is
-best effort. No schema change or new durable receipt is involved.
+receipt namespace. A legacy or mode-only receipt cannot acknowledge it. The
+same key and Run replay the first outcome. Reusing the key for another Run
+rejects while the original receipt is retained. Bound Steer retains the existing
+interruption cut and steering closure checks. An Interrupt that races an
+already admitted append remains best effort. No schema change or new durable
+receipt is involved.
 
 The operation shares existing detached Send execution and receipt retention:
 one action key on one connection waits for/replays its first outcome, including

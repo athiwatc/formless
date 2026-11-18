@@ -236,6 +236,7 @@ fn reference_pending_blocks_a_previously_prepared_commit_and_its_confirmation() 
             client: a.client,
             connection: 0,
             attachments: Some((*a.report).clone()),
+            expected_run_id: None,
             id,
             epoch: 0,
             generation: 0,
