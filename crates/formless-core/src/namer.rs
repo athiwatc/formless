@@ -119,11 +119,33 @@ pub const fn embedded_available() -> bool {
     cfg!(feature = "embedded-llm")
 }
 
-/// Fetch the model + tokenizer if missing. Each file is streamed to a
-/// `.part` file, SHA-256 verified, then renamed into place, so a crash
-/// mid-download never leaves a file that looks installed.
+/// Fetch missing model files. Hold a per-model lock across both files so
+/// the daemon and CLI can share one download, including across processes.
 pub async fn download(paths: &Paths, spec: &ModelSpec) -> Result<()> {
-    std::fs::create_dir_all(models_dir(paths))?;
+    use std::fs::{OpenOptions, TryLockError};
+    use std::time::Duration;
+
+    let models = models_dir(paths);
+    std::fs::create_dir_all(&models)?;
+    let lock_path = models.join(format!("{}.lock", spec.file_stem()));
+    // Keep the lock file in place so concurrent callers always lock the
+    // same inode. A cancelling or exiting process releases the lock.
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("open model download lock {}", lock_path.display()))?;
+    loop {
+        match lock.try_lock() {
+            Ok(()) => break,
+            Err(TryLockError::WouldBlock) => tokio::time::sleep(Duration::from_millis(100)).await,
+            Err(TryLockError::Error(error)) => {
+                return Err(error).with_context(|| format!("lock model {}", spec.id))
+            }
+        }
+    }
     let http = reqwest::Client::builder()
         .user_agent(concat!("formless/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(std::time::Duration::from_secs(30))
@@ -146,6 +168,14 @@ pub async fn download(paths: &Paths, spec: &ModelSpec) -> Result<()> {
     .await
 }
 
+struct DownloadPart(PathBuf);
+
+impl Drop for DownloadPart {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 async fn fetch_verified(
     http: &reqwest::Client,
     url: &str,
@@ -155,14 +185,21 @@ async fn fetch_verified(
 ) -> Result<()> {
     use futures_util::StreamExt;
     use tokio::io::AsyncWriteExt;
-    match std::fs::metadata(dest) {
-        Ok(m) if bytes.is_none_or(|b| m.len() == b) => return Ok(()),
-        Ok(_) => std::fs::remove_file(dest)?,
-        Err(_) => {}
+    if std::fs::metadata(dest)
+        .is_ok_and(|meta| meta.is_file() && bytes.is_none_or(|b| meta.len() == b))
+    {
+        return Ok(());
     }
-    let part = dest.with_extension("part");
     let resp = http.get(url).send().await?.error_for_status()?;
-    let mut file = tokio::fs::File::create(&part).await?;
+    // A unique file also avoids sharing an inode with an older downloader
+    // that still writes the fixed .part name.
+    let part = dest.with_extension(format!("{}.part", uuid::Uuid::new_v4()));
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&part)?;
+    let part = DownloadPart(part);
+    let mut file = tokio::fs::File::from_std(file);
     let mut hasher = Sha256::new();
     let mut body = resp.bytes_stream();
     while let Some(chunk) = body.next().await {
@@ -174,10 +211,9 @@ async fn fetch_verified(
     drop(file);
     let got = format!("{:x}", hasher.finalize());
     if got != sha256 {
-        let _ = tokio::fs::remove_file(&part).await;
         bail!("checksum mismatch for {url}: expected {sha256}, got {got}");
     }
-    tokio::fs::rename(&part, dest).await?;
+    tokio::fs::rename(&part.0, dest).await?;
     Ok(())
 }
 
@@ -857,9 +893,96 @@ mod tests {
         std::fs::write(spec.gguf_path(&paths), b"full").unwrap();
         std::fs::write(spec.tokenizer_path(&paths), b"{}").unwrap();
         assert!(!spec.installed(&paths), "a short file is not installed");
+        let mut bad_spec = spec;
+        bad_spec.gguf_sha256 = "invalid-fixture-checksum";
+        assert!(download(&paths, &bad_spec)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("checksum mismatch"));
+        assert_eq!(std::fs::read(spec.gguf_path(&paths)).unwrap(), b"full");
+        assert!(std::fs::read_dir(models_dir(&paths)).unwrap().all(|file| {
+            file.unwrap()
+                .path()
+                .extension()
+                .is_none_or(|extension| extension != "part")
+        }));
         download(&paths, &spec).await.unwrap();
         assert!(spec.installed(&paths));
         assert_eq!(std::fs::read(spec.gguf_path(&paths)).unwrap(), weights);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn overlapping_model_downloads_share_one_verified_installation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::sync::Notify;
+
+        let weights = b"verified weights";
+        let requested = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let count = Arc::new(AtomicUsize::new(0));
+        let app = axum::Router::new()
+            .route(
+                "/w",
+                axum::routing::get({
+                    let (requested, release, count) =
+                        (requested.clone(), release.clone(), count.clone());
+                    move || {
+                        let (requested, release, count) =
+                            (requested.clone(), release.clone(), count.clone());
+                        async move {
+                            if count.fetch_add(1, Ordering::Relaxed) == 0 {
+                                requested.notify_one();
+                                release.notified().await;
+                            }
+                            weights.as_slice()
+                        }
+                    }
+                }),
+            )
+            .route("/t", axum::routing::get(|| async { "{}" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let spec = ModelSpec {
+            id: "test-model",
+            gguf_url: Box::leak(format!("{base}/w").into_boxed_str()),
+            gguf_sha256: Box::leak(format!("{:x}", Sha256::digest(weights)).into_boxed_str()),
+            gguf_bytes: weights.len() as u64,
+            tokenizer_url: Box::leak(format!("{base}/t").into_boxed_str()),
+            tokenizer_sha256: Box::leak(format!("{:x}", Sha256::digest(b"{}")).into_boxed_str()),
+            ..QWEN2_5_0_5B
+        };
+        let root = std::env::temp_dir().join(format!("fl-namer-race-{}", uuid::Uuid::new_v4()));
+        let paths = Paths::from_dirs(root.join("d"), root.join("c")).unwrap();
+        let first = tokio::spawn({
+            let paths = paths.clone();
+            async move { download(&paths, &spec).await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), requested.notified())
+            .await
+            .unwrap();
+        let mut second = Box::pin(download(&paths, &spec));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut second)
+                .await
+                .is_err(),
+            "the second caller waits for the first install"
+        );
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            first.await.unwrap().unwrap();
+            second.await.unwrap();
+        })
+        .await
+        .unwrap();
+        assert_eq!(count.load(Ordering::Relaxed), 1);
+        assert_eq!(std::fs::read(spec.gguf_path(&paths)).unwrap(), weights);
+        assert_eq!(std::fs::read(spec.tokenizer_path(&paths)).unwrap(), b"{}");
+        server.abort();
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
