@@ -2988,8 +2988,35 @@ fn daemon_cmd(paths: Paths, action: DaemonAction) -> Result<()> {
             }
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(async {
+                #[cfg(unix)]
+                let stop_signal = {
+                    use tokio::signal::unix::{signal, SignalKind};
+                    let mut terminate = signal(SignalKind::terminate())?;
+                    let mut interrupt = signal(SignalKind::interrupt())?;
+                    async move {
+                        tokio::select! {
+                            _ = terminate.recv() => {}
+                            _ = interrupt.recv() => {}
+                        }
+                    }
+                };
+                #[cfg(windows)]
+                let stop_signal = {
+                    let mut interrupt = tokio::signal::windows::ctrl_c()?;
+                    async move {
+                        interrupt.recv().await;
+                    }
+                };
                 let d = Arc::new(Daemon::new(paths)?);
-                d.serve().await
+                let serve = d.clone().serve();
+                tokio::pin!(serve);
+                tokio::select! {
+                    result = &mut serve => result,
+                    _ = stop_signal => {
+                        d.request_shutdown();
+                        serve.await
+                    }
+                }
             })
         }
         DaemonAction::InstallService { dry_run } => {

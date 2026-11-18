@@ -63,6 +63,9 @@ can't write its database), and `docker logs formless` says so.
   the daemon returns its PID and version. `docker ps` shows the result.
   Release smoke tests require a successful `daemon status --json` reply
   with a positive PID and version before publishing the image.
+- `docker stop` sends SIGTERM through tini. Formless uses the same shutdown
+  path as `formless daemon stop` to stop its MCP servers and remove the
+  daemon socket and PID marker.
 
 ## The API key
 
