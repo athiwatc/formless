@@ -245,6 +245,14 @@ fn release_tags_must_match_the_cargo_version() {
 
     let release = std::fs::read_to_string(root().join(".github/workflows/release.yml")).unwrap();
     assert!(release.contains("scripts/release-check.sh \"$GITHUB_REF_NAME\""));
+    let preflight = release
+        .split_once("\n  version-check:\n")
+        .unwrap()
+        .1
+        .split_once("\n  build:\n")
+        .unwrap()
+        .0;
+    assert!(preflight.contains("scripts/release-notes.sh \"$GITHUB_REF_NAME\""));
     for job in ["build", "linux", "docker"] {
         assert!(
             job_needs_version_check(&release, job),
@@ -256,12 +264,24 @@ fn release_tags_must_match_the_cargo_version() {
             && release.contains("body_path: release-notes.md")
     );
 
+    let notes_script = root().join("scripts/release-notes.sh");
+    let actual_notes = std::process::Command::new(sh())
+        .arg(&notes_script)
+        .arg(&tag)
+        .output()
+        .unwrap();
+    assert!(
+        actual_notes.status.success() && !actual_notes.stdout.is_empty(),
+        "workspace version {tag} has release notes: {}",
+        String::from_utf8_lossy(&actual_notes.stderr)
+    );
+
     let dir = std::env::temp_dir().join(format!("fl-notes-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let cl = dir.join("CHANGELOG.md");
     std::fs::write(&cl, "## [Unreleased]\n- next\n\n## [0.2.0] - 2026-01-01\n\n### Fixed\n- a bug\n\n## [0.1.0]\n- first\n").unwrap();
     let notes = std::process::Command::new(sh())
-        .arg(root().join("scripts/release-notes.sh"))
+        .arg(&notes_script)
         .args(["v0.2.0", cl.to_str().unwrap()])
         .output()
         .unwrap();
