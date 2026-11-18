@@ -176,6 +176,28 @@ impl Drop for DownloadPart {
     }
 }
 
+/// Only the holder of the per-model lock may clean up this destination's staging files.
+fn clear_abandoned_downloads(directory: &std::path::Path, prefix: &str) -> Result<()> {
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(id) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix(prefix))
+            .and_then(|name| name.strip_suffix(".part"))
+        else {
+            continue;
+        };
+        if uuid::Uuid::parse_str(id)
+            .is_ok_and(|uuid| uuid.get_version_num() == 4 && uuid.to_string() == id)
+            && entry.file_type()?.is_file()
+        {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
 async fn fetch_verified(
     http: &reqwest::Client,
     url: &str,
@@ -185,15 +207,31 @@ async fn fetch_verified(
 ) -> Result<()> {
     use futures_util::StreamExt;
     use tokio::io::AsyncWriteExt;
-    if std::fs::metadata(dest)
-        .is_ok_and(|meta| meta.is_file() && bytes.is_none_or(|b| meta.len() == b))
-    {
-        return Ok(());
+    let directory = dest
+        .parent()
+        .context("model download has no parent directory")?;
+    let filename = dest
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("invalid model filename")?;
+    let prefix = format!("{filename}.download-");
+    clear_abandoned_downloads(directory, &prefix)?;
+    match std::fs::metadata(dest) {
+        Ok(meta) if !meta.is_file() => {
+            bail!(
+                "model download destination is not a file: {}",
+                dest.display()
+            )
+        }
+        Ok(meta) if bytes.is_none_or(|b| meta.len() == b) => return Ok(()),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).with_context(|| format!("inspect {}", dest.display())),
     }
     let resp = http.get(url).send().await?.error_for_status()?;
     // A unique file also avoids sharing an inode with an older downloader
     // that still writes the fixed .part name.
-    let part = dest.with_extension(format!("{}.part", uuid::Uuid::new_v4()));
+    let part = directory.join(format!("{prefix}{}.part", uuid::Uuid::new_v4()));
     let file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -213,7 +251,8 @@ async fn fetch_verified(
     if got != sha256 {
         bail!("checksum mismatch for {url}: expected {sha256}, got {got}");
     }
-    tokio::fs::rename(&part.0, dest).await?;
+    // Commit synchronously before relinquishing the lock on cancellation.
+    std::fs::rename(&part.0, dest)?;
     Ok(())
 }
 
@@ -892,6 +931,21 @@ mod tests {
         std::fs::create_dir_all(models_dir(&paths)).unwrap();
         std::fs::write(spec.gguf_path(&paths), b"full").unwrap();
         std::fs::write(spec.tokenizer_path(&paths), b"{}").unwrap();
+        let staging_name = |filename| {
+            models_dir(&paths).join(format!("{filename}.download-{}.part", uuid::Uuid::new_v4()))
+        };
+        let abandoned = staging_name(
+            spec.gguf_path(&paths)
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap(),
+        );
+        let unrelated = staging_name("another-model.gguf");
+        let legacy = spec.gguf_path(&paths).with_extension("part");
+        for path in [&abandoned, &unrelated, &legacy] {
+            std::fs::write(path, "synthetic partial").unwrap();
+        }
         assert!(!spec.installed(&paths), "a short file is not installed");
         let mut bad_spec = spec;
         bad_spec.gguf_sha256 = "invalid-fixture-checksum";
@@ -901,12 +955,15 @@ mod tests {
             .to_string()
             .contains("checksum mismatch"));
         assert_eq!(std::fs::read(spec.gguf_path(&paths)).unwrap(), b"full");
-        assert!(std::fs::read_dir(models_dir(&paths)).unwrap().all(|file| {
-            file.unwrap()
-                .path()
-                .extension()
-                .is_none_or(|extension| extension != "part")
-        }));
+        let staged = std::fs::read_dir(models_dir(&paths))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "part")
+            })
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(staged, std::collections::HashSet::from([unrelated, legacy]));
         download(&paths, &spec).await.unwrap();
         assert!(spec.installed(&paths));
         assert_eq!(std::fs::read(spec.gguf_path(&paths)).unwrap(), weights);
@@ -923,13 +980,14 @@ mod tests {
         let weights = b"verified weights";
         let requested = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
-        let count = Arc::new(AtomicUsize::new(0));
+        let tokenizer_count = Arc::new(AtomicUsize::new(0));
+        let weights_count = Arc::new(AtomicUsize::new(0));
         let app = axum::Router::new()
             .route(
-                "/w",
+                "/t",
                 axum::routing::get({
                     let (requested, release, count) =
-                        (requested.clone(), release.clone(), count.clone());
+                        (requested.clone(), release.clone(), tokenizer_count.clone());
                     move || {
                         let (requested, release, count) =
                             (requested.clone(), release.clone(), count.clone());
@@ -938,12 +996,21 @@ mod tests {
                                 requested.notify_one();
                                 release.notified().await;
                             }
-                            weights.as_slice()
+                            "{}"
                         }
                     }
                 }),
             )
-            .route("/t", axum::routing::get(|| async { "{}" }));
+            .route(
+                "/w",
+                axum::routing::get({
+                    let count = weights_count.clone();
+                    move || {
+                        count.fetch_add(1, Ordering::Relaxed);
+                        async move { weights.as_slice() }
+                    }
+                }),
+            );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -979,7 +1046,8 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(count.load(Ordering::Relaxed), 1);
+        assert_eq!(tokenizer_count.load(Ordering::Relaxed), 1);
+        assert_eq!(weights_count.load(Ordering::Relaxed), 1);
         assert_eq!(std::fs::read(spec.gguf_path(&paths)).unwrap(), weights);
         assert_eq!(std::fs::read(spec.tokenizer_path(&paths)).unwrap(), b"{}");
         server.abort();
