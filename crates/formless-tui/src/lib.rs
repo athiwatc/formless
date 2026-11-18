@@ -423,12 +423,12 @@ enum ImportKind {
     Session,
 }
 
-/// Choosing a version to roll a Tool back to; `armed` after the first
-/// Enter, so a second one confirms.
+/// Choosing a version to roll a Tool back to. The first Enter arms that
+/// version so a second Enter can confirm it.
 struct RollbackPick {
     tool_id: String,
     idx: usize,
-    armed: bool,
+    armed_version: Option<i64>,
 }
 
 /// `/model`: pick a model and reasoning effort for the current Session,
@@ -5066,7 +5066,7 @@ impl App {
         ) {
             self.rollback_pick = Some(RollbackPick {
                 idx: index,
-                armed: false,
+                armed_version: None,
                 ..pick
             });
             return;
@@ -5075,9 +5075,12 @@ impl App {
         let next = match key.code {
             KeyCode::Enter if version == current => {
                 self.notes.push(format!("v{version} is already current"));
-                Some(pick)
+                Some(RollbackPick {
+                    armed_version: None,
+                    ..pick
+                })
             }
-            KeyCode::Enter if pick.armed => {
+            KeyCode::Enter if pick.armed_version == Some(version) => {
                 self.fire(Request::RollbackTool {
                     id: pick.tool_id,
                     version,
@@ -5090,7 +5093,7 @@ impl App {
                     "press Enter again to roll {name} back to v{version}"
                 ));
                 Some(RollbackPick {
-                    armed: true,
+                    armed_version: Some(version),
                     ..pick
                 })
             }
@@ -10149,7 +10152,7 @@ impl App {
                                 self.rollback_pick = Some(RollbackPick {
                                     tool_id: tool.id,
                                     idx,
-                                    armed: false,
+                                    armed_version: None,
                                 });
                             }
                             Some(d) if d.tool.id == tool.id => self
@@ -11733,19 +11736,38 @@ fn draw_rollback_picker(f: &mut Frame, app: &App, pick: &RollbackPick) {
         return;
     };
     let area = f.area();
-    let rows = (area.height as usize).saturating_sub(6).max(1);
+    let w = 64.min(area.width.saturating_sub(2)).max(1);
+    let inner_width = usize::from(w.saturating_sub(2));
+    if area.height < 4 || inner_width < 12 {
+        app.rollback_page_rows.set(1);
+        let message = if d.versions.is_empty() {
+            "No versions · Esc cancel"
+        } else {
+            "Resize for rollback · Esc cancel"
+        };
+        f.render_widget(Clear, area);
+        f.render_widget(Paragraph::new(message), area);
+        return;
+    }
+    let compact = area.height < 7;
+    let rows = usize::from(area.height) - if compact { 3 } else { 6 };
     app.rollback_page_rows.set(rows);
-    let start = pick
-        .idx
-        .min(d.versions.len().saturating_sub(1))
-        .saturating_sub(rows - 1);
-    let mut lines = vec![
-        Line::raw(""),
-        Line::styled(
-            "  VER  AUTHOR      CREATED            CALLS  SUCCESS",
-            ui::dim(app.color),
-        ),
-    ];
+    let count = d.versions.len();
+    let selected = pick.idx.min(count.saturating_sub(1));
+    let start = selected
+        .saturating_sub(rows - 1)
+        .min(count.saturating_sub(rows));
+    let mut lines = Vec::new();
+    if !compact && count > 0 {
+        lines.push(Line::raw(""));
+        let columns = "VER  AUTHOR      CREATED            CALLS  SUCCESS";
+        let header = if count > rows {
+            format!("  {}/{}  {columns}", selected + 1, count)
+        } else {
+            format!("  {columns}")
+        };
+        lines.push(Line::styled(header, ui::dim(app.color)));
+    }
     for (i, v) in d.versions.iter().enumerate().skip(start).take(rows) {
         let m = d
             .version_metrics
@@ -11757,32 +11779,49 @@ fn draw_rollback_picker(f: &mut Frame, app: &App, pick: &RollbackPick) {
         } else {
             ""
         };
-        let text = format!(
-            "{} v{:<3} {:<11} {:<18} {:>5}  {}{current}",
-            if i == pick.idx { "›" } else { " " },
-            v.version,
-            truncate_chars(&v.author, 11),
-            ui::clock_time(&v.created_at).unwrap_or_else(|| truncate_chars(&v.created_at, 18)),
-            m.map_or(0, |m| m.total),
-            ui::rate_display(app.color, m.and_then(|m| m.success_rate)),
-        );
-        let style = if i == pick.idx {
+        let marker = if i == selected { "›" } else { " " };
+        let text = if compact {
+            format!("{marker} v{} ({}/{count}){current}", v.version, i + 1)
+        } else {
+            format!(
+                "{marker} v{:<3} {:<11} {:<18} {:>5}  {}{current}",
+                v.version,
+                truncate_chars(&v.author, 11),
+                ui::clock_time(&v.created_at).unwrap_or_else(|| truncate_chars(&v.created_at, 18)),
+                m.map_or(0, |m| m.total),
+                ui::rate_display(app.color, m.and_then(|m| m.success_rate)),
+            )
+        };
+        let style = if i == selected {
             bold_fg(app.color, Color::Yellow)
         } else {
             Style::default()
         };
         lines.push(Line::styled(text, style));
     }
-    lines.push(Line::raw(""));
-    lines.push(Line::styled(
-        if pick.armed {
-            "  Enter again to confirm · Esc cancel"
+    if let Some(version) = d.versions.get(selected) {
+        if !compact {
+            lines.push(Line::raw(""));
+        }
+        let armed = pick.armed_version == Some(version.version)
+            && version.version != d.tool.current_version;
+        let (full, short) = if armed {
+            ("  Enter again to confirm · Esc cancel", "Enter again")
         } else {
-            "  ↑/↓ PgUp/PgDn Home/End · Enter roll back · Esc cancel"
-        },
-        ui::dim(app.color),
-    ));
-    let w = 64.min(area.width.saturating_sub(2)).max(1);
+            (
+                "  ↑/↓ PgUp/PgDn Home/End · Enter roll back · Esc cancel",
+                "↑↓ Enter Esc",
+            )
+        };
+        let hint = if text::width(full) <= inner_width {
+            full
+        } else {
+            short
+        };
+        lines.push(Line::styled(hint, ui::dim(app.color)));
+    } else {
+        lines.push(Line::styled("No versions · Esc cancel", ui::dim(app.color)));
+    }
     let h = (lines.len() as u16 + 2).min(area.height);
     let rect = Rect {
         x: area.x + area.width.saturating_sub(w) / 2,
@@ -22189,13 +22228,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn rollback_picker_chooses_any_version_and_confirms() {
-        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+    fn rollback_test_app(count: i64) -> App {
         let mut app = test_app();
         let tool: ToolInfo = serde_json::from_value(serde_json::json!({
             "id": "t1", "name": "page_title", "description": "", "retired": false,
-            "current_version": 3, "capabilities": [], "memory_mb": 256, "invocations": 9,
+            "current_version": count, "capabilities": [], "memory_mb": 256, "invocations": 9,
             "success_rate": 0.5, "needs_attention": false, "created_at": "", "updated_at": ""
         }))
         .unwrap();
@@ -22206,7 +22243,7 @@ mod tests {
         };
         app.tool_detail = Some(
             serde_json::from_value(serde_json::json!({
-                "tool": tool, "versions": [version(1), version(2), version(3)],
+                "tool": tool, "versions": (1..=count).map(version).collect::<Vec<_>>(),
                 "metrics": {"total": 0, "success": 0, "failure": 0, "denied": 0, "cancelled": 0,
                     "validation_failures": 0, "success_rate": null, "retry_rate": null,
                     "p50_ms": null, "p95_ms": null},
@@ -22215,6 +22252,13 @@ mod tests {
         );
         app.tools = vec![tool];
         app.view = View::Tools;
+        app
+    }
+
+    #[test]
+    fn rollback_picker_chooses_any_version_and_confirms() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut app = rollback_test_app(3);
         app.key(key(KeyCode::Char('b')));
         assert_eq!(
             app.rollback_pick.as_ref().map(|p| p.idx),
@@ -22229,7 +22273,7 @@ mod tests {
         app.key(key(KeyCode::Up));
         app.key(key(KeyCode::Enter));
         assert!(
-            app.rollback_pick.as_ref().unwrap().armed,
+            app.rollback_pick.as_ref().unwrap().armed_version == Some(1),
             "first Enter only arms"
         );
         app.key(key(KeyCode::Enter));
@@ -22243,6 +22287,78 @@ mod tests {
         app.key(key(KeyCode::Char('b')));
         app.key(key(KeyCode::Char('x')));
         assert!(app.rollback_pick.is_none());
+    }
+
+    #[test]
+    fn rollback_picker_keeps_the_confirmation_footer_after_resize() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut app = rollback_test_app(40);
+        app.key(key(KeyCode::Char('b')));
+        let normal = render(&mut app, 80, 20);
+        assert!(normal.contains("› v39"), "{normal}");
+        assert!(normal.contains("39/40"), "{normal}");
+        assert!(normal.contains("Enter roll back · Esc cancel"), "{normal}");
+        app.key(key(KeyCode::Enter));
+        for height in 4..=7 {
+            let compact = render(&mut app, 80, height);
+            assert!(compact.contains("› v39"), "{compact}");
+            assert!(
+                compact.contains("Enter again to confirm · Esc cancel"),
+                "{compact}"
+            );
+        }
+        let narrow = render(&mut app, 32, 5);
+        assert!(narrow.contains("Enter again"), "{narrow}");
+        let tiny = render(&mut app, 80, 3);
+        assert!(tiny.contains("Resize for rollback"), "{tiny}");
+        let restored = render(&mut app, 80, 20);
+        assert!(
+            restored.contains("Enter again to confirm · Esc cancel"),
+            "{restored}"
+        );
+    }
+
+    #[test]
+    fn rollback_picker_keeps_every_arrow_selection_in_the_viewport() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut app = rollback_test_app(40);
+        app.key(key(KeyCode::Char('b')));
+        for version in (1..39).rev() {
+            app.key(key(KeyCode::Up));
+            let screen = render(&mut app, 80, 20);
+            assert!(screen.contains(&format!("› v{version} ")), "{screen}");
+        }
+        for version in 2..=40 {
+            app.key(key(KeyCode::Down));
+            let screen = render(&mut app, 80, 20);
+            assert!(screen.contains(&format!("› v{version} ")), "{screen}");
+        }
+    }
+
+    #[test]
+    fn rollback_picker_rearms_for_a_different_version_after_refresh() {
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let mut app = rollback_test_app(40);
+        app.key(key(KeyCode::Char('b')));
+        app.key(key(KeyCode::Enter));
+        assert_eq!(app.rollback_pick.as_ref().unwrap().armed_version, Some(39));
+        app.tool_detail.as_mut().unwrap().versions.truncate(28);
+        let changed = render(&mut app, 80, 20);
+        assert!(changed.contains("› v28"), "{changed}");
+        assert!(
+            changed.contains("Enter roll back · Esc cancel"),
+            "{changed}"
+        );
+        app.key(key(KeyCode::Enter));
+        assert_eq!(app.rollback_pick.as_ref().unwrap().armed_version, Some(28));
+        assert!(app.notes.last().unwrap().contains("press Enter again"));
+
+        app.tool_detail.as_mut().unwrap().versions.clear();
+        let empty = render(&mut app, 80, 20);
+        assert!(empty.contains("No versions · Esc cancel"), "{empty}");
+        app.key(key(KeyCode::Enter));
+        assert!(app.rollback_pick.is_none());
+        assert!(app.notes.last().unwrap().contains("press Enter again"));
     }
 
     #[test]
