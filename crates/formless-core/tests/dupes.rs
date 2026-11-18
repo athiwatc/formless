@@ -94,6 +94,10 @@ fn only_known_input_fields_contribute_to_duplicate_scoring() {
             r#"{"oneOf":[{"properties":{"channel":{}}}]}"#,
         ),
         (
+            r#"{"type":"object","const":{"url":"fixture"}}"#,
+            r#"{"type":"object","enum":[{"channel":"fixture"}]}"#,
+        ),
+        (
             r##"{"$ref":"#/$defs/url","$defs":{"url":{"properties":{"url":{}}}}}"##,
             "{}",
         ),

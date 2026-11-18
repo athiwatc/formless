@@ -67,6 +67,8 @@ fn schema_fields(schema: &str) -> Option<BTreeSet<String>> {
                 | "allOf"
                 | "anyOf"
                 | "oneOf"
+                | "const"
+                | "enum"
                 | "not"
                 | "if"
                 | "then"
