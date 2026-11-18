@@ -59,8 +59,10 @@ can't write its database), and `docker logs formless` says so.
   `docker build -t formless .`.
 - Bases are pinned by digest in the `Dockerfile`; a release updates them
   together.
-- `HEALTHCHECK` reports healthy while the daemon answers on its socket
-  (`docker ps` shows it).
+- `HEALTHCHECK` runs `formless daemon status --check` and succeeds when
+  the daemon returns its PID and version. `docker ps` shows the result.
+  Release smoke tests require a successful `daemon status --json` reply
+  with a positive PID and version before publishing the image.
 
 ## The API key
 

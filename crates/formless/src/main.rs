@@ -1799,6 +1799,9 @@ enum DaemonAction {
         /// JSON even when the daemon isn't running ({"running": false})
         #[arg(long)]
         json: bool,
+        /// Exit successfully when the daemon returns a live process status
+        #[arg(long, conflicts_with = "json")]
+        check: bool,
     },
 }
 
@@ -3036,7 +3039,23 @@ fn daemon_cmd(paths: Paths, action: DaemonAction) -> Result<()> {
         DaemonAction::Restart { force } => {
             formless_tui::client::restart_daemon(&paths, force, |line| println!("{line}"))
         }
-        DaemonAction::Status { json } => {
+        DaemonAction::Status { check: true, .. } => {
+            let status = formless_tui::client::request_once_within(
+                &paths,
+                Request::Status,
+                std::time::Duration::from_secs(5),
+            )
+            .context("daemon status check failed")?;
+            anyhow::ensure!(
+                status["pid"].as_u64().is_some_and(|pid| pid > 0)
+                    && status["version"]
+                        .as_str()
+                        .is_some_and(|version| !version.is_empty()),
+                "daemon status did not identify a live process"
+            );
+            Ok(())
+        }
+        DaemonAction::Status { json, check: false } => {
             if daemon_reachable(&paths) {
                 let v = formless_tui::client::request_once(&paths, Request::Status)?;
                 if json {
