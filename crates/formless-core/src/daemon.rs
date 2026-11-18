@@ -3329,13 +3329,7 @@ impl Daemon {
                     Some((run_id, _)) => Some(self.usage_info(None, Some(&run_id), &cfg)?),
                     None => None,
                 };
-                let runs = self.with_reader(|st| {
-                    Ok(st
-                        .run_metrics(100_000)?
-                        .into_iter()
-                        .filter(|r| r.session_id == session_id)
-                        .count())
-                })?;
+                let runs = self.with_reader(|st| st.count_runs_for_session(&session_id))?;
                 Ok(json!({"last_run": last_run, "total": total, "runs": runs}))
             }
             Request::GetArtifact { id, offset, length } => {
