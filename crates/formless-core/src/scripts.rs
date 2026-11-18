@@ -149,7 +149,7 @@ fn shape(chars: &[char], i: &mut usize, out: &mut String, nested: bool) -> Optio
         } else if chars[*i..].starts_with(&['.', '.', '.']) {
             out.push_str("...");
             *i += 3;
-        } else if (c.is_ascii_digit() && !out.chars().last().is_some_and(js_word_char))
+        } else if (c.is_ascii_digit() && out.chars().last().is_none_or(js_word_boundary))
             || (c == '.' && next.is_some_and(|c| c.is_ascii_digit()))
         {
             if c == '.' && out.chars().last().is_some_and(js_word_char) {
@@ -179,6 +179,10 @@ fn shape(chars: &[char], i: &mut usize, out: &mut String, nested: bool) -> Optio
 
 fn js_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_' || c == '$'
+}
+
+fn js_word_boundary(c: char) -> bool {
+    c.is_whitespace() || c.is_ascii_punctuation() && !js_word_char(c)
 }
 
 fn digits_end(chars: &[char], mut end: usize, radix: u32) -> usize {
@@ -273,10 +277,7 @@ fn regex_allowed(out: &str) -> bool {
     }
     let prefix = out.trim_end_matches(js_word_char);
     let word = &out[prefix.len()..];
-    let boundary = prefix
-        .chars()
-        .last()
-        .is_none_or(|c| c.is_whitespace() || c.is_ascii_punctuation());
+    let boundary = prefix.chars().last().is_none_or(js_word_boundary);
     let prefix = prefix.trim_end();
     let member = prefix.ends_with('#') || prefix.ends_with('.') && !prefix.ends_with("...");
     boundary
@@ -426,6 +427,10 @@ mod tests {
             fingerprint("value2.toString()"),
             fingerprint("value3.toString()")
         );
+        assert_ne!(
+            fingerprint("1.5.α\u{301}1()"),
+            fingerprint("1.5.α\u{301}2()")
+        );
     }
 
     #[test]
@@ -503,7 +508,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unterminated_regex_keeps_the_exact_source() {
+    fn an_uncertain_regex_keeps_the_exact_source() {
         for source in [
             "throw /unfinished\nreturn tools.find(q)",
             "return /unfinished\\",
