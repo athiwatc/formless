@@ -5243,6 +5243,18 @@ impl Daemon {
         let _admission = self.forecast_admission.locked();
         self.with_reader(|st| Self::ensure_session_description_trust(st, &session_id))?;
         let control = self.runs.locked().get(&session_id).cloned();
+        // A Run can start or finish after the client confirms. Classify under
+        // the same admission lock as the ensuing append and Run admission.
+        if review.is_some() {
+            let mismatch = match (mode, control.is_some()) {
+                (SendMode::Send, true) => Some("Session became active. Review a Steer instead."),
+                (SendMode::Steer, false) => Some("Session became idle. Review a new Send instead."),
+                _ => None,
+            };
+            if let Some(reason) = mismatch {
+                return Err(RequestFailure::busy(reason).into());
+            }
+        }
         let queue = mode == SendMode::Queue && control.is_some()
             || control.as_ref().is_some_and(|control| {
                 !control.steering.accepts()

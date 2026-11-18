@@ -20,6 +20,9 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// The oldest protocol this build still accepts.
 pub const MIN_PROTOCOL_VERSION: u32 = 1;
 
+/// A reviewed Send requires idle state and a reviewed Steer requires an active Run.
+pub const REVIEWED_SEND_MODE_FEATURE: &str = "reviewed_send_mode_v1";
+
 /// Named optional capabilities, advertised by `Ping` and `Status`.
 pub const FEATURES: &[&str] = &[
     "setting_env_override",
@@ -34,6 +37,7 @@ pub const FEATURES: &[&str] = &[
     "future_transcript_attempts_v1",
     "pending_attachment_inventory_v1",
     "reviewed_attachment_send_v1",
+    REVIEWED_SEND_MODE_FEATURE,
     "reviewed_reference_detach_v1",
     "session_model_compare_set_v1",
 ];
@@ -1963,7 +1967,9 @@ pub enum Request {
     },
     /// Append only if the complete, ordered pending metadata still matches
     /// the reviewed inventory. Comparison and consumption share a transaction.
-    /// Queue/deferred sends are unsupported; never fall back to SendMessage.
+    /// Queue/deferred sends are unsupported. When `reviewed_send_mode_v1` is
+    /// advertised, a change between idle and active rejects the reviewed mode.
+    /// Never fall back to SendMessage.
     /// This binds metadata, not mutable referenced file contents or permission.
     SendReviewedMessage {
         session_id: String,

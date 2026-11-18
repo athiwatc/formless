@@ -37,6 +37,14 @@ queueing, consuming or appending. Deferred Queue attachment ownership needs a
 separate design: checking metadata now would not bind attachments consumed when
 a queued message eventually drains. There is no fallback to legacy Queue.
 
+The preview now advertises `reviewed_send_mode_v1`. It checks the requested
+mode while holding the existing Run admission lock. Send requires an idle
+Session. Steer requires an active Run that can still accept steering. A change
+between idle and active after review rejects before message append, inventory
+consumption or Run admission. The check binds the mode and current availability.
+It does not bind a Steer to a particular Run identity if another active Run has
+already replaced it. Legacy `SendMessage` keeps its existing behavior.
+
 The operation shares existing detached Send execution and receipt retention:
 one action key on one connection waits for/replays its first outcome, including
 failure, for ten minutes after completion. In-flight claims do not expire.

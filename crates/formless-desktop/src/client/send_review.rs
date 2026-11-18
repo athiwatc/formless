@@ -1,6 +1,7 @@
 use super::*;
 
-pub(super) fn acknowledged(value: &Value) -> bool {
+pub(super) fn acknowledged(mode: formless_protocol::SendMode, value: &Value) -> bool {
+    use formless_protocol::SendMode;
     let flag = |key| match value.get(key) {
         None => Some(false),
         Some(Value::Bool(v)) => Some(*v),
@@ -9,11 +10,22 @@ pub(super) fn acknowledged(value: &Value) -> bool {
     let (Some(started), Some(steered)) = (flag("started"), flag("steered")) else {
         return false;
     };
-    started != steered
+    let matches_mode = match mode {
+        SendMode::Send => started && !steered,
+        SendMode::Steer => steered && !started,
+        SendMode::Queue => false,
+    };
+    matches_mode
         && value.get("queued").is_none_or(|v| v == false)
         && value["run_id"]
             .as_str()
             .is_some_and(|s| !s.is_empty() && s.len() <= 256 && !s.chars().any(char::is_control))
+}
+
+impl Preparation {
+    pub(super) fn acknowledges_reviewed_send(&self, value: &Value) -> bool {
+        matches!(&self.intent, Intent::SendMessage { mode, .. } if acknowledged(*mode, value))
+    }
 }
 
 impl Engine {

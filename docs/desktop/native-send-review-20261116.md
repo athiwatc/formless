@@ -44,6 +44,13 @@ Queue demonstration. The daemon endpoint also rejects implicit deferral when
 a Run can no longer accept steering. Deferred attachment ownership is required
 engineering before Queue can be restored safely.
 
+The preview client requires `reviewed_send_mode_v1` alongside the inventory and
+reviewed-send capabilities. Older peers can still be used for other supported
+workflows. They receive no native Send or Steer preparation or mutation from
+this client. The matching Core rejects a reviewed Send if the Session has become
+active and rejects a reviewed Steer if it has become idle. This prevents changing
+the confirmed mode after review. Exact Run identity binding remains open.
+
 ## Ownership and uncertain outcomes
 
 Preparations and unwritten sends bind the Client UUID, physical connection,
@@ -56,8 +63,9 @@ and draft equality are rechecked immediately before the view commits.
 These local fences are not an atomic guarantee against unobserved external
 changes; the daemon transaction provides the pending-metadata comparison.
 
-Only a well-formed successful started/steered acknowledgement with a bounded
-Run ID clears the reviewed action's retained unknown identity. A failed or
+A successful acknowledgement clears the retained unknown identity only when
+its started or steered flag matches the reviewed mode and it includes a bounded
+Run ID. A reply for the other mode leaves the outcome Unknown. A failed or
 missing response, malformed success, queued response, timeout or partial write
 remains Unknown. Even an error can occur after message persistence. The Client
 blocks new work for that Session, preserves the draft and directs inspection

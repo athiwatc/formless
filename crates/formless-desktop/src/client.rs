@@ -1976,7 +1976,7 @@ impl Engine {
                 }
                 if let Intent::SendMessage { content, mode, .. } = &intent {
                     if !self.reviewed_send_available {
-                        self.updates.push(Update::PreparationFailed{id:uuid::Uuid::new_v4(),epoch,error:"This daemon does not advertise atomic pending-file review. Update the daemon or use Formless TUI; no legacy Send fallback was attempted".into()});
+                        self.updates.push(Update::PreparationFailed{id:uuid::Uuid::new_v4(),epoch,error:"This daemon does not support reviewed pending files and Send/Steer mode checks. Update the daemon or use Formless TUI".into()});
                         return;
                     }
                     if *mode == formless_protocol::SendMode::Queue
@@ -2309,6 +2309,7 @@ impl Engine {
                         [
                             "pending_attachment_inventory_v1",
                             "reviewed_attachment_send_v1",
+                            formless_protocol::REVIEWED_SEND_MODE_FEATURE,
                         ]
                         .iter()
                         .all(|required| features.iter().any(|feature| feature == required))
@@ -2726,10 +2727,10 @@ impl Engine {
                 ));
             }
             Pending::SendInventory(work) => self.send_inventory_loaded(work, result),
-            Pending::ReviewedAction { action, .. } => {
+            Pending::ReviewedAction { action, work, .. } => {
                 self.dirty_session = true;
                 self.dirty_list = true;
-                self.updates.push(Update::Action {session_id: action.session_id, result: if result.as_ref().is_ok_and(send_review::acknowledged) {Ok(())} else {Err("Reviewed message outcome is unknown. It may be persisted. It was not retried; check this Session in Formless TUI before starting more work".into())}});
+                self.updates.push(Update::Action {session_id: action.session_id, result: if result.as_ref().is_ok_and(|value| work.acknowledges_reviewed_send(value)) {Ok(())} else {Err("Reviewed message outcome is unknown. It may be persisted. It was not retried; check this Session in Formless TUI before starting more work".into())}});
             }
             Pending::Forecast(mut work) => {
                 if !work.current(self) {
@@ -3067,7 +3068,7 @@ async fn connected<S: tokio::io::AsyncRead + AsyncWrite + Unpin>(
                     let answered = match &message { ServerMessage::Response { id, ok, result, .. } => match engine.pending.get(id) {
                         Some(Pending::DetachReference(d)) if *ok && result.as_ref().is_some_and(|v|crate::reference_detach::acknowledged(d.action(),v))=>Some(Action{id:d.action().operation,session_id:d.action().session_id.clone(),question_id:None}),
                         Some(Pending::Action(action)) => Some(action.clone()),
-                        Some(Pending::ReviewedAction {action,..}) if *ok && result.as_ref().is_some_and(send_review::acknowledged) => Some(action.clone()),
+                        Some(Pending::ReviewedAction {action,work,..}) if *ok && result.as_ref().is_some_and(|value| work.acknowledges_reviewed_send(value)) => Some(action.clone()),
                         Some(Pending::Answer(action)) if !ok || result.as_ref().and_then(|value| value["answered"].as_bool()).is_some() => Some(action.clone()),
                         _ => None }, _ => None };
                     engine.receive(message)?;
@@ -3704,7 +3705,7 @@ mod tests {
         respond(
             &mut engine,
             ping.id,
-            json!({"min_protocol":1,"max_protocol":1,"features":["pending_attachment_inventory_v1","reviewed_attachment_send_v1"]}),
+            json!({"min_protocol":1,"max_protocol":1,"features":["pending_attachment_inventory_v1","reviewed_attachment_send_v1","reviewed_send_mode_v1"]}),
         );
         let subscribe = engine.outgoing.pop_front().unwrap();
         assert!(matches!(
@@ -4591,7 +4592,7 @@ mod tests {
         respond(
             &mut engine,
             request.id,
-            json!({"steered":true,"run_id":"run"}),
+            json!({"started":true,"run_id":"run"}),
         );
         assert!(engine
             .updates
@@ -4739,7 +4740,7 @@ mod tests {
                 let request: RequestEnvelope = serde_json::from_str(&line).unwrap();
                 let result = match request.request {
                     Request::Ping => {
-                        json!({"min_protocol":1,"max_protocol":1,"features":["pending_attachment_inventory_v1","reviewed_attachment_send_v1"]})
+                        json!({"min_protocol":1,"max_protocol":1,"features":["pending_attachment_inventory_v1","reviewed_attachment_send_v1","reviewed_send_mode_v1"]})
                     }
                     Request::Subscribe { deltas, .. } => {
                         assert!(!deltas);
@@ -4816,17 +4817,15 @@ mod tests {
     #[tokio::test]
     async fn reviewed_error_malformed_or_lost_receipts_remain_unknown_but_exact_success_retires_it()
     {
-        for response in [
-            None,
-            Some(Err("pending attachments changed".into())),
-            Some(Err("postcommit launch failed".into())),
-            Some(Ok(serde_json::json!({"started":true}))),
-            Some(Ok(serde_json::json!({"queued":true}))),
-            Some(Ok(serde_json::json!({"started":true,"run_id":"r"}))),
+        for (response, accepted) in [
+            (None, false),
+            (Some(Err("pending attachments changed".into())), false),
+            (Some(Err("postcommit launch failed".into())), false),
+            (Some(Ok(json!({"started":true}))), false),
+            (Some(Ok(json!({"queued":true}))), false),
+            (Some(Ok(json!({"steered":true,"run_id":"r"}))), false),
+            (Some(Ok(json!({"started":true,"run_id":"r"}))), true),
         ] {
-            let accepted = response
-                .as_ref()
-                .is_some_and(|v| v.as_ref().is_ok_and(send_review::acknowledged));
             let retained = scripted_reviewed_send_response(response).await;
             assert_eq!(retained.uncertain.len(), usize::from(!accepted));
             let mut engine = ready();

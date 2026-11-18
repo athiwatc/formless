@@ -235,6 +235,52 @@ async fn reviewed_send_queue_closing_cancelled_deleted_and_invalid_inputs_fail_w
 }
 
 #[tokio::test]
+async fn reviewed_send_rejects_both_run_state_changes_before_any_write() {
+    let _env = crate::credential_env::EnvGuard::isolated();
+    let f = Fixture::new();
+    f.add(&record("confirmed"));
+    let expected = f.read();
+
+    let ping = f.daemon.handle(Request::Ping).await.unwrap();
+    assert!(ping["features"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|feature| feature == formless_protocol::REVIEWED_SEND_MODE_FEATURE));
+
+    // An idle Send was confirmed before another client started a Run.
+    let mut send = f.request("confirmed-idle", expected.clone());
+    let Request::SendReviewedMessage { mode, .. } = &mut send else {
+        unreachable!();
+    };
+    *mode = SendMode::Send;
+    let error = f.daemon.handle(send).await.unwrap_err();
+    assert!(error.to_string().contains("Session became active"));
+    f.untouched(&expected);
+
+    // A Steer was confirmed before the Run ended. The hook keeps a
+    // regression from appending or launching real Provider work.
+    f.daemon.runs.locked().remove(&f.sid);
+    *f.daemon.forecast_admission_test.locked() = Some(Arc::new(|| {
+        panic!("reviewed Steer entered new Run admission");
+    }));
+    let error = f
+        .daemon
+        .handle(f.request("confirmed-active", expected.clone()))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("Session became idle"));
+    f.untouched(&expected);
+    assert!(f
+        .daemon
+        .with_reader(|st| st.last_run(&f.sid))
+        .unwrap()
+        .is_none());
+    assert!(f.daemon.runs.locked().is_empty());
+    f.finish().await;
+}
+
+#[tokio::test]
 async fn reviewed_send_never_replays_a_legacy_send_ack_with_the_same_key() {
     let _env = crate::credential_env::EnvGuard::isolated();
     let f = Fixture::new();

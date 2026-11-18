@@ -212,7 +212,41 @@ fn native_send_all_owners_retire_unwritten_work_but_cannot_discard_a_written_rec
     }
 }
 #[test]
-fn native_send_requires_a_specific_well_formed_run_receipt_to_clear_unknown() {
+fn native_send_requires_mode_checks_before_requesting_a_review() {
+    for supports_mode in [false, true] {
+        let mut e = Engine::default();
+        e.begin();
+        let ping = e.outgoing.pop_front().unwrap();
+        let mut features = vec![
+            "pending_attachment_inventory_v1",
+            "reviewed_attachment_send_v1",
+        ];
+        if supports_mode {
+            features.push("reviewed_send_mode_v1");
+        }
+        reply(
+            &mut e,
+            ping.id,
+            json!({"min_protocol":1,"max_protocol":1,"features":features}),
+        );
+        let subscribe = e.outgoing.pop_front().unwrap();
+        reply(&mut e, subscribe.id, json!({"subscribed":true}));
+        e.active = Some("a".into());
+        review(&mut e);
+        if supports_mode {
+            assert!(matches!(
+                e.outgoing.pop_front().unwrap().request,
+                Request::ListPendingAttachments { .. }
+            ));
+        } else {
+            assert!(e.outgoing.is_empty());
+            assert!(e.updates.iter().any(|u|matches!(u, Update::PreparationFailed {error,..} if error.contains("mode checks"))));
+        }
+    }
+}
+
+#[test]
+fn native_send_requires_a_matching_well_formed_run_receipt_to_clear_unknown() {
     for value in [
         json!({}),
         json!({"started":true}),
@@ -221,12 +255,15 @@ fn native_send_requires_a_specific_well_formed_run_receipt_to_clear_unknown() {
         json!({"steered":true,"started":"bad","run_id":"r"}),
         json!({"started":true,"run_id":"r\n"}),
     ] {
-        assert!(!send_review::acknowledged(&value));
+        for mode in [SendMode::Send, SendMode::Steer, SendMode::Queue] {
+            assert!(!send_review::acknowledged(mode, &value));
+        }
     }
-    for value in [
-        json!({"started":true,"run_id":"r"}),
-        json!({"steered":true,"run_id":"r","future":true}),
-    ] {
-        assert!(send_review::acknowledged(&value));
-    }
+    let started = json!({"started":true,"run_id":"r"});
+    assert!(send_review::acknowledged(SendMode::Send, &started));
+    assert!(!send_review::acknowledged(SendMode::Steer, &started));
+    let steered = json!({"steered":true,"run_id":"r","future":true});
+    assert!(send_review::acknowledged(SendMode::Steer, &steered));
+    assert!(!send_review::acknowledged(SendMode::Send, &steered));
+    assert!(!send_review::acknowledged(SendMode::Queue, &steered));
 }
