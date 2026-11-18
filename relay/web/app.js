@@ -940,8 +940,9 @@
     if (rect.height <= bottom - top) {
       if (rect.top < top) container.scrollTop -= top - rect.top;
       else if (rect.bottom > bottom) container.scrollTop += rect.bottom - bottom;
-    } else if (partial && (rect.bottom <= top || rect.top >= bottom)) {
-      container.scrollTop += rect.top - top;
+    } else if (partial) {
+      if (rect.top > top) container.scrollTop += rect.top - top;
+      else if (rect.bottom < bottom) container.scrollTop += rect.bottom - bottom;
     }
   }
   function positionPopover() {

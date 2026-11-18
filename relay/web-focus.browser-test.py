@@ -513,11 +513,17 @@ def run():
                                                ('#menu-btn','#sidebar.open',True)]:
                     page.locator(trigger).click()
                     page.locator(panel).wait_for()
-                    toolbar.evaluate('(e,toEnd)=>e.scrollTop=toEnd?e.scrollHeight:0',to_end)
-                    check(toolbar.evaluate('''(e,selector)=>{
+                    sliver = height == 160 and not to_end
+                    toolbar.evaluate('''(e,{toEnd,sliver,selector})=>{
+                        if (!sliver) { e.scrollTop=toEnd?e.scrollHeight:0; return; }
+                        const button=document.querySelector(selector).getBoundingClientRect();
+                        e.scrollTop += button.top-e.getBoundingClientRect().bottom+4;
+                    }''',{'toEnd':to_end,'sliver':sliver,'selector':trigger})
+                    check(toolbar.evaluate('''(e,{sliver,selector})=>{
                         const bounds=e.getBoundingClientRect(), button=document.querySelector(selector).getBoundingClientRect();
-                        return button.bottom<=bounds.top || button.top>=bounds.bottom;
-                    }''',trigger),'scrolled toolbar clips open drawer trigger '+trigger)
+                        const overlap=Math.min(button.bottom,bounds.bottom)-Math.max(button.top,bounds.top);
+                        return sliver ? overlap>0 && overlap<8 : overlap<=0;
+                    }''',{'sliver':sliver,'selector':trigger}),'scrolled toolbar clips open drawer trigger '+trigger)
                     page.keyboard.press('Escape')
                     page.locator(panel).wait_for(state='hidden')
                     page.wait_for_function('''selector=>{
