@@ -86,10 +86,13 @@ def check(page):
     decision = page.evaluate('__fixture.decisions[0]')
     assert decision['approved'] and decision['scope'] == 'session', decision
     assert decision['paths'] == {CAP: FOLDER}, decision
-    exact_review = page.evaluate('prose => __fixture.review({source_name:"source\\u200bname", target_name:"target"},'
-                                 '{source_id:"s", target_id:"t", usage:{cost:0}, projection:{}, candidate:prose})',
-                                 SUMMARY)
+    exact_review = page.evaluate(
+        '({prose, model}) => __fixture.review({source_name:"source\\u200bname", target_name:"target"},'
+        '{source_id:"s", target_id:"t", usage:{cost:0, unpriced:[model]}, projection:{}, candidate:prose})',
+        {'prose': SUMMARY, 'model': 'named/model\U000e0061'},
+    )
     assert 'source⟨U+200B⟩name (s)' in exact_review
+    assert 'Unpriced: named/model⟨U+E0061⟩' in exact_review
     assert SUMMARY in exact_review
 
 

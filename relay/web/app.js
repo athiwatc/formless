@@ -1322,7 +1322,7 @@
     if (projection.metadata_omitted) lines.push("Source metadata omitted from generation.");
     if (projection.attachment_bodies_omitted) lines.push("Attachment bodies omitted from generation.");
     if (usage.estimated_requests) lines.push(usage.estimated_requests + " request prices estimated from local prices");
-    if ((usage.unpriced || []).length) lines.push("Unpriced: " + usage.unpriced.join(", "));
+    if ((usage.unpriced || []).length) lines.push("Unpriced: " + approvalText(usage.unpriced.join(", ")));
     lines.push(...(preview.warnings || []).map(warning => "Note: " + warning),
       "Insert appends one note to the target Session; it does not merge transcripts or start a Run.", "Exact candidate note (data):", "", preview.candidate);
     return lines.join("\n");

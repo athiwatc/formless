@@ -99,7 +99,10 @@ pub fn review_lines(basis: &BranchSummaryBasis, preview: &BranchSummaryPreview) 
         ));
     }
     if !u.unpriced.is_empty() {
-        lines.push(format!("Unpriced: {}", u.unpriced.join(", ")));
+        lines.push(format!(
+            "Unpriced: {}",
+            approval_text(&u.unpriced.join(", "))
+        ));
     }
     lines.extend(
         preview
@@ -135,8 +138,10 @@ fn branch_review_binds_visible_names_without_reshaping_prose() {
     basis.source_name = "source\u{200b}name".into();
     let prose = "می\u{200c}خواهم 👩\u{200d}💻";
     preview.candidate = prose.into();
+    preview.usage.unpriced = vec!["named/model\u{e0061}".into()];
     let shown = review_lines(&basis, &preview).join("\n");
     assert!(shown.contains("source⟨U+200B⟩name (source)"));
+    assert!(shown.contains("Unpriced: named/model⟨U+E0061⟩"));
     assert!(shown.contains(prose));
     assert_eq!(basis.source_name, "source\u{200b}name");
     assert_eq!(preview.candidate, prose);
