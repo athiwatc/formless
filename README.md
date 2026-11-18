@@ -507,6 +507,10 @@ formless config set tui.notify_min_secs 30 # validated, audited, applied at once
 formless config edit                       # $EDITOR; saved only if it still parses
 ```
 
+In tmux, `tui.notify` needs `set -g focus-events on` for the TUI to detect
+focus loss. Desktop alerts also need `set -g allow-passthrough on` on tmux
+versions with that option. See [TUI notifications in tmux](docs/troubleshooting.md#tui-notifications-in-tmux).
+
 `config get KEY` reads locally loaded effective configuration, including this
 client's applicable environment overrides. Add `--json` for one compact JSON
 value followed by a newline; strings remain quoted, including text such as
