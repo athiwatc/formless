@@ -89,14 +89,13 @@ pub fn recurrence_key(source: &str, uses: &[String]) -> String {
 /// Append the shape of code from `*i` to `out`. Inside an interpolation
 /// (`nested`), stops after the `}` that closes it.
 fn shape(chars: &[char], i: &mut usize, out: &mut String, nested: bool) -> Option<()> {
-    let ident = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
     let mut depth = 0usize;
     while *i < chars.len() {
         let c = chars[*i];
         let next = chars.get(*i + 1).copied();
         if c.is_whitespace() {
             // Keep one separator between words so `a b` and `ab` differ.
-            if out.chars().last().is_some_and(ident) && next.is_some_and(ident) {
+            if out.chars().last().is_some_and(js_word_char) && next.is_some_and(js_word_char) {
                 out.push(' ');
             }
             *i += 1;
@@ -118,22 +117,7 @@ fn shape(chars: &[char], i: &mut usize, out: &mut String, nested: bool) -> Optio
             return None;
         } else if c == '/' && regex_allowed(out) {
             // A regex literal: its `//`, `/*` and quotes are text.
-            let mut class = false;
-            *i += 1;
-            while *i < chars.len() && chars[*i] != '\n' {
-                match chars[*i] {
-                    '\\' => *i += 1,
-                    '[' => class = true,
-                    ']' => class = false,
-                    '/' if !class => break,
-                    _ => {}
-                }
-                *i += 1;
-            }
-            *i += 1;
-            while *i < chars.len() && chars[*i].is_ascii_alphabetic() {
-                *i += 1;
-            }
+            *i = regex_end(chars, *i)?;
             out.push('R');
         } else if c == '`' {
             // Template text is blanked; interpolations are code.
@@ -162,10 +146,17 @@ fn shape(chars: &[char], i: &mut usize, out: &mut String, nested: bool) -> Optio
             }
             *i += 1;
             out.push('S');
-        } else if c.is_ascii_digit() && !out.chars().last().is_some_and(ident) {
-            while *i < chars.len() && (chars[*i].is_ascii_alphanumeric() || chars[*i] == '.') {
-                *i += 1;
+        } else if chars[*i..].starts_with(&['.', '.', '.']) {
+            out.push_str("...");
+            *i += 3;
+        } else if (c.is_ascii_digit() && !out.chars().last().is_some_and(js_word_char))
+            || (c == '.' && next.is_some_and(|c| c.is_ascii_digit()))
+        {
+            if c == '.' && out.chars().last().is_some_and(js_word_char) {
+                // The normalized digit cannot be joined to a preceding word.
+                out.push(' ');
             }
+            *i = number_end(chars, *i);
             out.push('0');
         } else {
             if nested {
@@ -186,6 +177,91 @@ fn shape(chars: &[char], i: &mut usize, out: &mut String, nested: bool) -> Optio
     Some(())
 }
 
+fn js_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '$'
+}
+
+fn digits_end(chars: &[char], mut end: usize, radix: u32) -> usize {
+    while chars.get(end).is_some_and(|c| c.is_digit(radix)) {
+        end += 1;
+        if chars.get(end) == Some(&'_') && chars.get(end + 1).is_some_and(|c| c.is_digit(radix)) {
+            end += 1;
+        }
+    }
+    end
+}
+
+/// Consume the literal's fraction, exponent or radix digits before leaving
+/// any member punctuation and name for the main tokenizer.
+fn number_end(chars: &[char], start: usize) -> usize {
+    let radix = match chars.get(start..start + 2) {
+        Some(['0', 'x' | 'X']) => 16,
+        Some(['0', 'o' | 'O']) => 8,
+        Some(['0', 'b' | 'B']) => 2,
+        _ => 10,
+    };
+    if radix != 10 {
+        let digits = start + 2;
+        let end = digits_end(chars, digits, radix);
+        return if end == digits {
+            start + 1
+        } else {
+            end + usize::from(chars.get(end) == Some(&'n'))
+        };
+    }
+    let mut end = digits_end(chars, start, 10);
+    // Legacy octal literals are legal in non-strict scripts. Their following
+    // dot starts member access, just as with an explicit radix.
+    if chars[start] == '0'
+        && end > start + 1
+        && chars[start..end].iter().all(|c| ('0'..='7').contains(c))
+    {
+        return end;
+    }
+    let fraction = chars.get(end) == Some(&'.');
+    if fraction {
+        end = digits_end(chars, end + 1, 10);
+    }
+    let mut exponent = false;
+    if matches!(chars.get(end), Some('e' | 'E')) {
+        let digits = end + 1 + usize::from(matches!(chars.get(end + 1), Some('+' | '-')));
+        let exponent_end = digits_end(chars, digits, 10);
+        if exponent_end > digits {
+            end = exponent_end;
+            exponent = true;
+        }
+    }
+    end + usize::from(!fraction && !exponent && chars.get(end) == Some(&'n'))
+}
+
+fn regex_end(chars: &[char], start: usize) -> Option<usize> {
+    let mut class = false;
+    let mut end = start + 1;
+    let line_end = |c| matches!(c, '\n' | '\r' | '\u{2028}' | '\u{2029}');
+    loop {
+        let c = *chars.get(end)?;
+        if line_end(c) {
+            return None;
+        }
+        end += 1;
+        match c {
+            '\\' if line_end(*chars.get(end)?) => return None,
+            '\\' => end += 1,
+            '[' => class = true,
+            ']' => class = false,
+            '/' if !class => break,
+            _ => {}
+        }
+    }
+    while let Some(c) = chars.get(end).filter(|c| c.is_ascii_alphabetic()) {
+        if !"dgimsuvy".contains(*c) {
+            return None;
+        }
+        end += 1;
+    }
+    Some(end)
+}
+
 /// Whether a `/` here starts a regex rather than dividing: it follows an
 /// operator, an opening bracket, the start, or a keyword like `return`.
 fn regex_allowed(out: &str) -> bool {
@@ -195,18 +271,34 @@ fn regex_allowed(out: &str) -> bool {
     if "=(,:[!&|?{};+-*%<>~^".contains(last) {
         return true;
     }
-    let word: String = out
+    let prefix = out.trim_end_matches(js_word_char);
+    let word = &out[prefix.len()..];
+    let boundary = prefix
         .chars()
-        .rev()
-        .take_while(|c| c.is_alphanumeric() || *c == '_')
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    matches!(
-        word.as_str(),
-        "return" | "typeof" | "case" | "in" | "of" | "yield" | "await"
-    )
+        .last()
+        .is_none_or(|c| c.is_whitespace() || c.is_ascii_punctuation());
+    let prefix = prefix.trim_end();
+    let member = prefix.ends_with('#') || prefix.ends_with('.') && !prefix.ends_with("...");
+    boundary
+        && !member
+        && matches!(
+            word,
+            "await"
+                | "case"
+                | "delete"
+                | "do"
+                | "else"
+                | "extends"
+                | "in"
+                | "instanceof"
+                | "new"
+                | "of"
+                | "return"
+                | "throw"
+                | "typeof"
+                | "void"
+                | "yield"
+        )
 }
 
 #[cfg(test)]
@@ -263,6 +355,76 @@ mod tests {
         assert_eq!(
             recurrence_key(a, &uses(&["b", "a"])),
             recurrence_key(a, &uses(&["a", "b"]))
+        );
+    }
+
+    #[test]
+    fn fingerprint_preserves_code_after_keyword_regexes() {
+        for (prefix, suffix) in [
+            ("throw", ";"),
+            ("void", ";"),
+            ("if (ok) f(); else", ";"),
+            ("delete", ";"),
+            ("new", ";"),
+            ("do", "; while (ok);"),
+            ("value instanceof", ";"),
+            ("class Example extends", " {}"),
+        ] {
+            let a = format!(r"{prefix} /https:\/\//gi{suffix} return await tools.grep(q)");
+            let b = a.replace("tools.grep", "tools.find");
+            let other_regex = format!("{prefix} /pattern/{suffix} return await tools.grep(q)");
+            assert_ne!(fingerprint(&a), fingerprint(&b), "{prefix}");
+            assert_eq!(fingerprint(&a), fingerprint(&other_regex), "{prefix}");
+        }
+        for prefix in [
+            "throw value",
+            "obj.throw",
+            "obj?.new",
+            "obj./* note */void",
+            "this.#delete",
+            "$throw",
+            "α\u{301}throw",
+        ] {
+            let a = format!("{prefix} / left / scale; return await tools.grep(q)");
+            let b = a.replace("left", "right");
+            assert_ne!(fingerprint(&a), fingerprint(&b), "{prefix}");
+        }
+    }
+
+    #[test]
+    fn fingerprint_preserves_numeric_member_calls() {
+        for (a, b) in [
+            ("1.5.toFixed(2)", "1.5.toExponential(2)"),
+            ("1..toString()", "1..valueOf()"),
+            ("0x1f.toString(16)", "0x1f.toFixed(0)"),
+            ("1e2.toFixed(2)", "1e2.toPrecision(2)"),
+            ("1e+2.toFixed(2)", "1e+2.toPrecision(2)"),
+            ("0b101n.toString(2)", "0b101n.valueOf(2)"),
+            ("077.toString()", "077.valueOf()"),
+        ] {
+            assert_ne!(fingerprint(a), fingerprint(b), "{a}");
+        }
+        let normal = fingerprint("return 42;");
+        for value in [
+            ".5",
+            "1.",
+            "1.5e3",
+            "1.e+2",
+            "2e-3",
+            "1_234.5_6e7_8",
+            "0x1_f",
+            "0B1_0",
+            "0o7_0",
+            "2_0n",
+            "0x1Fn",
+        ] {
+            assert_eq!(fingerprint(&format!("return {value};")), normal, "{value}");
+        }
+        assert_eq!(fingerprint("1..toString()"), fingerprint("0o7.toString()"));
+        assert_eq!(fingerprint("077.toString()"), fingerprint("0o7.toString()"));
+        assert_ne!(
+            fingerprint("value2.toString()"),
+            fingerprint("value3.toString()")
         );
     }
 
@@ -338,6 +500,17 @@ mod tests {
             fingerprint("let x = ++count / 2"),
             fingerprint("let x=++count/3")
         );
+    }
+
+    #[test]
+    fn an_unterminated_regex_keeps_the_exact_source() {
+        for source in [
+            "throw /unfinished\nreturn tools.find(q)",
+            "return /unfinished\\",
+            "void /x/z",
+        ] {
+            assert_ne!(fingerprint(source), fingerprint(&format!(" {source}")));
+        }
     }
 
     #[test]
