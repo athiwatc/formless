@@ -1365,20 +1365,61 @@
     box.classList.remove("hidden");
     box.append(h("div", { class: "muted", style: "padding:0.25rem 0.5rem;font-size:0.75rem" },
       hits.length + " hit" + (hits.length === 1 ? "" : "s") + " for “" + query + "”"));
-    const lower = query.toLowerCase();
+    const literal = query.trim();
+    const words = literal.match(/[\p{Alphabetic}\p{Number}]+/gu);
+    const terms = words && new Set(words.map((word) => foldMap(word, foldSearchCharacter).folded).filter(Boolean));
     for (const hit of hits) {
       const snippet = h("div");
       const text = hit.snippet || "";
-      const at = text.toLowerCase().indexOf(lower);
-      if (at >= 0 && lower) {
-        snippet.append(text.slice(0, at), h("mark", null, text.slice(at, at + query.length)), text.slice(at + query.length));
-      } else snippet.append(text);
+      let cursor = 0;
+      for (const [start, end] of searchHighlightRanges(text, literal, terms)) {
+        if (cursor < start) snippet.append(text.slice(cursor, start));
+        snippet.append(h("mark", null, text.slice(start, end)));
+        cursor = end;
+      }
+      if (cursor < text.length) snippet.append(text.slice(cursor));
       box.append(h("div", {
         class: "hit", tabindex: 0,
         onclick: () => openSession(hit.session_id),
         onkeydown: (e) => { if (e.key === "Enter") openSession(hit.session_id); },
       }, h("div", { class: "meta" }, hit.session_name + " · #" + hit.seq + " " + hit.role), snippet));
     }
+  }
+
+  function foldSearchCharacter(ch) {
+    // Standalone combining characters that unicode61 treats as diacritics.
+    if (/[\u0300-\u0304\u0306-\u030c\u030f\u0311\u031b\u0323-\u0328\u032d-\u032e\u0330-\u0331]/u.test(ch)) return "";
+    const base = ch.normalize("NFD").replace(/\p{M}/gu, "");
+    // unicode61's precomposed diacritic table folds to ASCII Latin.
+    const lower = (/^[A-Za-z]$/.test(base) ? base : ch).toLowerCase();
+    return lower === "ς" ? "σ" : lower;
+  }
+
+  function searchHighlightRanges(text, literal, terms) {
+    if (!terms) {
+      // The daemon searches literally when the query has no word terms.
+      const start = literal ? text.indexOf(literal) : -1;
+      return start < 0 ? [] : [[start, start + literal.length]];
+    }
+    const { folded, from } = foldMap(text, foldSearchCharacter);
+    const remaining = new Set(terms);
+    const spans = [];
+    // Approximate unicode61's boundaries within this snippet. Highlight the
+    // first visible prefix per term, sharing a mark for overlapping prefixes.
+    for (const { 0: word, index } of folded.matchAll(/[\p{L}\p{N}\p{Co}]+/gu)) {
+      let end = index;
+      for (const term of remaining) {
+        if (!word.startsWith(term)) continue;
+        const stop = index + term.length;
+        // A prefix must cover the complete original character.
+        if (from[stop] === from[stop - 1]) continue;
+        remaining.delete(term);
+        end = Math.max(end, stop);
+      }
+      if (end > index) spans.push([from[index], from[end]]);
+      if (!remaining.size) break;
+    }
+    return spans;
   }
 
   // ---------------------------------------------------------- markdown
@@ -5144,13 +5185,14 @@
   /** `text` folded for matching with, per folded UTF-16 unit, the offset
    * of the original character it came from (#789): decomposed, marks
    * dropped, lower-cased one character at a time, so `İ` stays one
-   * letter and NFC/NFD spellings match each other. */
-  function foldMap(text) {
+   * letter and NFC/NFD spellings match each other. The default is the
+   * Settings fold. Session search supplies its own tokenizer fold. */
+  function foldMap(text, foldCharacter = (ch) => ch.normalize("NFD").replace(/\p{M}/gu, "").toLowerCase().slice(0, 2)) {
     let folded = "";
     const from = [];
     let at = 0;
     for (const ch of text) {
-      const f = ch.normalize("NFD").replace(/\p{M}/gu, "").toLowerCase().slice(0, 2);
+      const f = foldCharacter(ch);
       for (let k = 0; k < f.length; k++) from.push(at);
       folded += f;
       at += ch.length;
