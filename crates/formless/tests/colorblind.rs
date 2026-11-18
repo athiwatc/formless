@@ -3,7 +3,7 @@
 use formless_core::{Config, Paths, Store};
 use std::{
     io::Read,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
     time::{Duration, Instant},
 };
@@ -19,26 +19,37 @@ struct Fixture {
     paths: Paths,
     provider: std::net::TcpListener,
 }
+
+fn create_fixture_root(parent: &Path, nonce: u128) -> PathBuf {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(false);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+
+    // Parallel fixtures can observe the same clock tick. Claim the directory
+    // exclusively so the daemon and its database belong to one fixture.
+    for attempt in 0..100 {
+        let root = parent.join(format!("f635-{}-{nonce:x}-{attempt}", std::process::id()));
+        match builder.create(&root) {
+            Ok(()) => return root,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => panic!("create private fixture directory: {error}"),
+        }
+    }
+    panic!("could not reserve a private fixture directory");
+}
+
 impl Fixture {
     fn new() -> Self {
         #[cfg(unix)]
         let temp = PathBuf::from("/tmp");
         #[cfg(not(unix))]
         let temp = std::env::temp_dir();
-        let root = temp.join(format!(
-            "f635-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
-        }
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = create_fixture_root(&temp, nonce);
         let paths = Paths {
             data_dir: root.join("d"),
             config_dir: root.join("c"),
@@ -161,6 +172,15 @@ impl Drop for Fixture {
         let _ = std::fs::remove_dir_all(&self.root);
     }
 }
+
+#[test]
+fn fixture_roots_with_the_same_timestamp_are_distinct() {
+    let fixture = Fixture::new();
+    let first = create_fixture_root(&fixture.root, 0);
+    let second = create_fixture_root(&fixture.root, 0);
+    assert_ne!(first, second);
+}
+
 fn finish(child: Child) -> Output {
     let mut child = Owned(child);
     let mut stdout = child.0.stdout.take().unwrap();
