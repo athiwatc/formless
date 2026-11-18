@@ -4319,9 +4319,16 @@
 
   // --------------------------------------------------- approvals (§10.3)
   const capFamily = (c) => String(c).split(":")[0];
+  let approvalListSeq = 0;
   async function refreshApprovals() {
+    const seq = ++approvalListSeq;
     const list = await act({ type: "list_approvals" });
-    if (list) { S.grants = list; S.grantsSelected = new Set(); renderApprovals(); }
+    if (seq !== approvalListSeq || !Array.isArray(list)) return false;
+    S.grants = list;
+    S.grantsSelected = new Set();
+    S.unconfirmedGrants?.clear();
+    renderApprovals();
+    return true;
   }
   const grantKey = (g) => [g.tool_id, g.capability, g.scope, g.session_id || ""].join("|");
   function shownGrants() {
@@ -4362,18 +4369,64 @@
   }
   async function revokeGrants(grants) {
     if (!grants.length) return toast("Select grants to revoke first.", true);
-    const trusted = grants.filter((g) => g.trusted).map((g) => g.capability);
-    if (grants.length > 1 && !(await ask({ title: "Revoke " + grants.length + " grants?", text: trusted.length
-      ? "Their Tools ask again on their next call, except for what your trusted folders/hosts still allow: " + [...new Set(trusted)].join(", ") + "."
-      : "Their Tools ask again on their next call.", ok: "Revoke", danger: true }))) return;
-    const still = new Set();
-    for (const g of grants) {
-      const r = await act({ type: "revoke_grant", tool_id: g.tool_id, capability: g.capability, scope: g.scope, session_id: g.session_id || null });
-      ((r && r.still_trusted) || []).forEach((c) => still.add(c));
+    if (S.revokingGrants) return;
+    S.revokingGrants = true;
+    const feedback = $("revocation-feedback");
+    try {
+      // A lost response may have followed a write. Re-read before retrying
+      // any unconfirmed grant so the user can review what still exists.
+      if (grants.some((g) => S.unconfirmedGrants?.has(grantKey(g)))) {
+        if (await refreshApprovals()) return toast("Grant list refreshed. Review it before retrying.");
+        return toast("Refresh the grants before retrying.", true);
+      }
+      const trusted = grants.filter((g) => g.trusted).map((g) => g.capability);
+      if (grants.length > 1 && !(await ask({ title: "Revoke " + grants.length + " grants?", text: trusted.length
+        ? "Their Tools ask again on their next call, except for what your trusted folders/hosts still allow: " + [...new Set(trusted)].join(", ") + "."
+        : "Their Tools ask again on their next call.", ok: "Revoke", danger: true }))) return;
+      const still = new Set(), revoked = new Set(), unconfirmed = new Set(), failures = [];
+      for (const g of grants) {
+        const key = grantKey(g);
+        try {
+          const r = await request({ type: "revoke_grant", tool_id: g.tool_id, capability: g.capability, scope: g.scope, session_id: g.session_id || null });
+          if (r?.revoked !== true) throw new Error("The daemon did not confirm revocation.");
+          revoked.add(key);
+          if (Array.isArray(r.still_trusted)) r.still_trusted.forEach((c) => still.add(c));
+        } catch (e) {
+          unconfirmed.add(key);
+          failures.push(g.tool_name + " · " + g.capability + " (" + g.scope
+            + (g.session_id ? " " + g.session_id.slice(0, 8) : "") + "): " + e.message);
+        }
+      }
+      S.unconfirmedGrants = new Set([...(S.unconfirmedGrants || []), ...unconfirmed]);
+      S.grants = (S.grants || []).filter((g) => !revoked.has(grantKey(g)));
+      for (const key of revoked) S.grantsSelected.delete(key);
+      renderApprovals();
+      const revokedText = "Revoked " + revoked.size + " grant" + (revoked.size === 1 ? "" : "s");
+      const summary = failures.length ? (revoked.size ? revokedText + ". " : "")
+        + failures.length + (failures.length === 1 ? " revocation unconfirmed." : " revocations unconfirmed.") : revokedText;
+      toast(summary, failures.length > 0);
+      feedback.replaceChildren(...(failures.length ? [
+        h("p", { class: "error" }, summary),
+        h("ul", null, failures.map((message) => h("li", null, message))),
+      ] : []));
+      if (still.size) note("Still allowed without asking by your trusted folders/hosts: " + [...still].join(", "));
+      if (await refreshApprovals()) {
+        if (failures.length) feedback.append(h("p", { class: "muted" }, "Check the updated list and retry any grants that are still shown."));
+      } else {
+        feedback.append(h("p", { class: "error" }, "The grant list could not be refreshed. Refresh it before retrying an unconfirmed revocation."),
+          h("button", { class: "btn small", type: "button", onclick: async (e) => {
+            const button = e.currentTarget;
+            button.disabled = true;
+            if (await refreshApprovals()) {
+              button.previousElementSibling.textContent = "Check the updated list and retry any grants that are still shown.";
+              button.remove();
+              focusReturn($("revoke-selected"));
+            } else button.disabled = false;
+          } }, "Refresh grants"));
+      }
+    } finally {
+      S.revokingGrants = false;
     }
-    toast("Revoked " + grants.length + " grant" + (grants.length === 1 ? "" : "s"));
-    if (still.size) note("Still allowed without asking by your trusted folders/hosts: " + [...still].join(", "));
-    refreshApprovals();
   }
   $("approvals-family").addEventListener("input", () => renderApprovals());
   $("revoke-selected").onclick = () => revokeGrants(shownGrants().filter((g) => S.grantsSelected.has(grantKey(g))));
