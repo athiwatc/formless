@@ -1480,6 +1480,27 @@
     let lineStart = true;
     while (i < code.length) {
       const c = code[i];
+      if (L === HL.js && (c === "." || /\d/.test(c))) {
+        lineStart = false;
+        if (c === "." && code.startsWith("...", i)) {
+          plain += "...";
+          i += 3;
+          continue;
+        }
+        const before = code[i - 1];
+        const boundary = !before || /\s/.test(before) || before.charCodeAt(0) < 128 && !word.test(before);
+        if (c === "." ? /\d/.test(code[i + 1] ?? "") : boundary) {
+          const end = javascriptNumberEnd(code, i);
+          tok("tok-num", code.slice(i, end));
+          i = end;
+          continue;
+        }
+        if (c !== ".") {
+          plain += c;
+          i++;
+          continue;
+        }
+      }
       if (lineStart && L.key) {
         const m = code.slice(i).match(/^([ \t]*)([\w.\-"'\[\] ]+?)(?=\s*[:=])/);
         if (m && m[2].trim() && !(L.lc || []).some((p) => m[2].trim().startsWith(p))) {
@@ -1514,7 +1535,7 @@
         continue;
       }
       const prevWord = i > 0 && word.test(code[i - 1]);
-      if (L !== HL.js && /\d/.test(c) && !prevWord) {
+      if (/\d/.test(c) && !prevWord) {
         const m = code.slice(i).match(/^[\d][\w.]*/);
         tok("tok-num", m[0]);
         i += m[0].length;
@@ -1523,21 +1544,6 @@
       if (L.tags && c === "<") {
         const m = code.slice(i).match(/^<\/?[\w:-]+/);
         if (m) { tok("tok-kw", m[0]); i += m[0].length; continue; }
-      }
-      if (L === HL.js && (c === "." || /\d/.test(c))) {
-        if (c === "." && code.startsWith("...", i)) {
-          plain += "...";
-          i += 3;
-          continue;
-        }
-        const before = code[i - 1];
-        const boundary = !before || /\s/.test(before) || before.charCodeAt(0) < 128 && !prevWord;
-        if (c === "." ? /\d/.test(code[i + 1] ?? "") : boundary) {
-          const end = javascriptNumberEnd(code, i);
-          tok("tok-num", code.slice(i, end));
-          i = end;
-          continue;
-        }
       }
       if (/[\p{L}_$]/u.test(c) && !prevWord) {
         const m = code.slice(i).match(/^[\p{L}\p{N}_$]+/u);
