@@ -4505,7 +4505,9 @@ run_tool = "network_policy"     # a registry Tool, or…
 - **Token and cost chart.** `UsageByDay {since, by}` sums provider token
   use (prompt, completion, cached) per UTC day, or with `by` = "model",
   "role" or "session" per that key over the range, priced with
-  `provider.prices` (no cost when a model in the bucket has no price). The
+  `provider.prices` (no cost when a model in the bucket has no price). Session
+  rows carry the stable `session_id` and display the Session name in `key`.
+  They use the ID as the label when the Session record is missing. The
   TUI Metrics view charts it for the selected range: a bar per day (or key)
   split into cached, fresh prompt and completion tokens, with totals and
   cost; `b` cycles the breakdown.
@@ -6659,8 +6661,8 @@ order. No since means all history; durations use the shared checked parser
 and one UTC RFC3339 cutoff matching the existing stored TEXT representation.
 Human tables fit terminal columns and show unknown cost as `-`; JSON preserves
 the complete array and null costs. Cost is the daemon's current estimate, not a
-billing guarantee. Session grouping currently uses display names and merges
-equal-named Sessions (#1585); this caller cannot recover missing identities.
+billing guarantee. Session groups use the ID for attribution and display the
+current name when available. JSON includes the stable `session_id` (§10.4).
 Unknown grouping keys and invalid/overflowing/unrepresentable durations fail
 before contact. Aggregation, pricing and recording remain unchanged.
 
