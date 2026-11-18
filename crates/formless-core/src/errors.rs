@@ -140,12 +140,21 @@ pub fn explain(raw: &str, ctx: &ErrorContext) -> ErrorExplained {
     };
     // Keep the existing diagnostic text while masking echoes of the
     // configured URL and its normalized spelling when they carry credentials.
-    let private_endpoint = parsed_url.as_ref().is_none_or(|url| {
-        !url.username().is_empty()
-            || url.password().is_some()
-            || url.query().is_some()
-            || url.fragment().is_some()
-    });
+    let private_endpoint = match parsed_url.as_ref() {
+        Some(url) => {
+            !url.username().is_empty()
+                || url.password().is_some()
+                || url.query().is_some()
+                || url.fragment().is_some()
+        }
+        None => ctx
+            .base_url
+            .trim()
+            .split_once("://")
+            .is_some_and(|(scheme, _)| {
+                scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
+            }),
+    };
     let details = if private_endpoint && !ctx.base_url.is_empty() {
         let endpoint = display_endpoint();
         let details = raw.replace(ctx.base_url, &endpoint);
@@ -400,6 +409,14 @@ mod tests {
             &ctx("not an endpoint?key=fixture-query"),
         );
         assert_eq!(invalid.message, "Can't reach (invalid endpoint).");
+        let rate_limit = "429 Too Many Requests";
+        assert_eq!(explain(rate_limit, &ctx("429")).details, rate_limit);
+        let malformed = "https://[bad-host?token=fixture-query";
+        let diagnostic = format!("connection refused: {malformed}");
+        assert_eq!(
+            explain(&diagnostic, &ctx(malformed)).details,
+            "connection refused: (invalid endpoint)"
+        );
     }
 
     #[test]
