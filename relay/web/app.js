@@ -293,6 +293,7 @@
       "Message Formless…": "พิมพ์ข้อความถึง Formless…",
       "Steer, or Ctrl/⌘+Enter to queue…": "ปรับทิศ หรือ Ctrl/⌘+Enter เพื่อรอส่ง…",
       "Resume": "ทำต่อ", "Abandon": "ทิ้ง", "Retry": "ลองใหม่", "Retry with…": "ลองใหม่กับโมเดล…",
+      "Turn started": "เริ่มรอบการสนทนา",
       "Run": "ทำ", "Edit": "แก้", "Skip": "ข้าม", "Run the rest": "ทำที่เหลือทั้งหมด",
       "What I did": "สิ่งที่ทำ", "Plan": "แผน", "Plan done": "แผนเสร็จแล้ว",
       "Queued for after this Run": "รอส่งหลังงานนี้",
@@ -366,6 +367,18 @@
   function clock(ts) {
     const t = typeof ts === "number" ? ts : Date.parse(ts);
     return Number.isFinite(t) ? uiFormat(new Date(t), { hour: "2-digit", minute: "2-digit" }) : "";
+  }
+  function turnTimestamp(ts, today) {
+    const date = new Date(typeof ts === "number" ? ts : Date.parse(ts));
+    if (!Number.isFinite(date.getTime())) return null;
+    const clockOptions = { hour: "2-digit", minute: "2-digit" };
+    const visible = uiFormat(date, date.toDateString() === today
+      ? clockOptions : { ...clockOptions, year: "numeric", month: "short", day: "numeric" });
+    const full = tr("Turn started") + " " + uiFormat(date, {
+      ...clockOptions, year: "numeric", month: "long", day: "numeric", second: "2-digit", timeZoneName: "shortOffset",
+    });
+    return h("time", { datetime: date.toISOString() },
+      h("span", { "aria-hidden": "true" }, visible), h("span", { class: "sr-only" }, full));
   }
   function elapsed(since) {
     const s = Math.floor((Date.now() - since) / 1000);
@@ -2689,6 +2702,10 @@
       const lastUser = [...S.messages].reverse().find((m) => m.role === "user");
       const lastAnswer = [...S.messages].reverse().find((m) => m.role === "assistant" && m.content);
       const active = new Set(), messageIds = new Set();
+      // Recompute the display context on normal renders, including local
+      // midnight and timezone changes, without touching stable turn nodes.
+      const today = new Date().toDateString();
+      const timeContext = [uiLocale(), today, Intl.DateTimeFormat().resolvedOptions().timeZone].join("|");
       let turn = null, group = null;
       const open = (role, when, msg) => {
         const g = speaker(role);
@@ -2699,7 +2716,7 @@
         turn = historyRender.turns.get(key);
         if (!turn) {
           const who = h("div", { class: "who " + g }, WHO[g]);
-          const time = h("time");
+          const time = h("span");
           who.append(time);
           const body = h("div");
           turn = { el: h("div", { class: "turn " + g, "data-turn-id": currentMessage.id }, who, body), who, time, body, edit: null, decorations: null, decorationKey: null };
@@ -2707,9 +2724,13 @@
         }
         turn.items = [];
         turn.message = currentMessage;
-        const stamp = when ? clock(when) : "";
-        if (turn.time.textContent !== stamp) turn.time.textContent = stamp;
-        turn.time.hidden = !when;
+        if (turn.when !== when || turn.timeContext !== timeContext) {
+          const stamp = turnTimestamp(when, today);
+          turn.time.replaceChildren(...(stamp ? [stamp] : []));
+          turn.time.hidden = !stamp;
+          turn.when = when;
+          turn.timeContext = timeContext;
+        }
         const editable = msg && msg === lastUser && !isRunning();
         if (editable && !turn.edit) {
           const entry = turn;
