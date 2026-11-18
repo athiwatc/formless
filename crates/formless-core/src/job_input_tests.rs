@@ -175,7 +175,7 @@ fn morning_combines_with_weekdays() {
 fn cron_matches_real_instants_through_local_clock_changes() {
     // A child process isolates Chrono's timezone cache and the TZ setting
     // from other tests. POSIX rules supply the fixture without host tzdata.
-    const CASE: &str = "FORMLESS_TEST_CRON_OFFSET_CASE";
+    const CASE: &str = "FL_TEST_CRON_OFFSET_CASE";
     let Some(case) = std::env::var(CASE).ok() else {
         for (case, tz) in [
             ("new_york", "EST5EDT,M3.2.0/2,M11.1.0/2"),
