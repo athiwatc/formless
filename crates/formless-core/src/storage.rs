@@ -16,6 +16,10 @@ mod job_schedule_tests;
 #[path = "pin_batch_tests.rs"]
 mod pin_batch_tests;
 
+#[cfg(test)]
+#[path = "run_id_lookup_tests.rs"]
+mod run_id_lookup_tests;
+
 /// Token use for one key and model: (key, model, prompt, completion,
 /// cached, provider-reported USD when every request reported one).
 /// (key, provider, model, prompt, completion, cached, cache-write, reported cost).
@@ -101,6 +105,30 @@ pub const UNASKED_KEEP: i64 = 2000;
 
 fn now() -> String {
     chrono::Utc::now().to_rfc3339()
+}
+
+const RUN_INSPECT_EXACT: &str = "SELECT id,session_id,status,error,steps,created_at,updated_at,
+    start_message_seq,end_message_seq,
+    (SELECT COUNT(*) FROM invocations WHERE run_id=runs.id),
+    (SELECT COALESCE(SUM(prompt_tokens),0) FROM run_usage WHERE run_id=runs.id),
+    (SELECT COALESCE(SUM(completion_tokens),0) FROM run_usage WHERE run_id=runs.id)
+    FROM runs WHERE id=?1";
+const RUN_ID_PREFIX_RANGE: &str = "SELECT id FROM runs WHERE id>=?1 AND id<?2 ORDER BY id LIMIT 2";
+const RUN_ID_PREFIX_TAIL: &str = "SELECT id FROM runs WHERE id>=?1 ORDER BY id LIMIT 2";
+
+/// The exclusive upper bound for a literal prefix in SQLite's BINARY
+/// ordering on Formless's UTF-8 databases. A prefix made entirely of the
+/// maximum scalar has no upper bound.
+fn run_id_prefix_end(prefix: &str) -> Option<String> {
+    let mut upper = prefix.trim_end_matches(char::MAX).to_owned();
+    let last = upper.pop()?;
+    let next = if last == '\u{d7ff}' {
+        '\u{e000}'
+    } else {
+        char::from_u32(last as u32 + 1)?
+    };
+    upper.push(next);
+    Some(upper)
 }
 
 fn make_snippet(content: &str, needle_lower: &str) -> String {
@@ -3103,31 +3131,39 @@ impl Store {
         self.run_metrics_for(None, limit, None)
     }
 
-    /// The newest `limit` Runs, of one Session or all.
     /// Resolve literal prefixes, preferring an exact identity. No LIKE wildcards.
     pub fn inspect_run(&self, query: &str) -> Result<Option<serde_json::Value>> {
-        let mut stmt = self.ps("SELECT id FROM runs WHERE id=?1 OR substr(id,1,length(?1))=?1 ORDER BY (id=?1) DESC LIMIT 2")?;
-        let ids: Vec<String> = stmt
-            .query_map(params![query], |r| r.get(0))?
-            .collect::<rusqlite::Result<_>>()?;
-        let Some(id) = ids.first() else {
-            return Ok(None);
-        };
-        anyhow::ensure!(
-            !query.is_empty() && (ids.len() == 1 || id == query),
-            "ambiguous Run id"
-        );
-        self.conn.query_row("SELECT id,session_id,status,error,steps,created_at,updated_at,start_message_seq,end_message_seq,
-            (SELECT COUNT(*) FROM invocations WHERE run_id=runs.id),
-            (SELECT COALESCE(SUM(prompt_tokens),0) FROM run_usage WHERE run_id=runs.id),
-            (SELECT COALESCE(SUM(completion_tokens),0) FROM run_usage WHERE run_id=runs.id)
-            FROM runs WHERE id=?1", params![id], |r| Ok(serde_json::json!({
-                "run_id":r.get::<_,String>(0)?, "session_id":r.get::<_,String>(1)?,
-                "status":r.get::<_,String>(2)?, "error":r.get::<_,Option<String>>(3)?,
-                "steps":r.get::<_,i64>(4)?, "created_at":r.get::<_,String>(5)?, "updated_at":r.get::<_,String>(6)?,
-                "start_message_seq":r.get::<_,Option<i64>>(7)?, "end_message_seq":r.get::<_,Option<i64>>(8)?,
-                "tool_calls":r.get::<_,i64>(9)?, "prompt_tokens":r.get::<_,i64>(10)?, "completion_tokens":r.get::<_,i64>(11)?
-            }))).optional().map_err(Into::into)
+        anyhow::ensure!(!query.is_empty(), "ambiguous Run id");
+        self.read_transaction(|st| {
+            if let Some(exact) = st.inspect_exact_run(query)? {
+                return Ok(Some(exact));
+            }
+            let upper = run_id_prefix_end(query);
+            let sql = if upper.is_some() {
+                RUN_ID_PREFIX_RANGE
+            } else {
+                RUN_ID_PREFIX_TAIL
+            };
+            let mut stmt = st.ps(sql)?;
+            let binds = rusqlite::params_from_iter(std::iter::once(query).chain(upper.as_deref()));
+            let mut ids = stmt.query(binds)?;
+            let Some(first) = ids.next()? else {
+                return Ok(None);
+            };
+            let id: String = first.get(0)?;
+            anyhow::ensure!(ids.next()?.is_none(), "ambiguous Run id");
+            st.inspect_exact_run(&id)
+        })
+    }
+
+    fn inspect_exact_run(&self, id: &str) -> Result<Option<serde_json::Value>> {
+        self.ps(RUN_INSPECT_EXACT)?.query_row(params![id], |r| Ok(serde_json::json!({
+            "run_id":r.get::<_,String>(0)?, "session_id":r.get::<_,String>(1)?,
+            "status":r.get::<_,String>(2)?, "error":r.get::<_,Option<String>>(3)?,
+            "steps":r.get::<_,i64>(4)?, "created_at":r.get::<_,String>(5)?, "updated_at":r.get::<_,String>(6)?,
+            "start_message_seq":r.get::<_,Option<i64>>(7)?, "end_message_seq":r.get::<_,Option<i64>>(8)?,
+            "tool_calls":r.get::<_,i64>(9)?, "prompt_tokens":r.get::<_,i64>(10)?, "completion_tokens":r.get::<_,i64>(11)?
+        }))).optional().map_err(Into::into)
     }
 
     pub fn run_metrics_for(
