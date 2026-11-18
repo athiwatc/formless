@@ -5,7 +5,7 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread
 
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import expect, sync_playwright
 
 from browser_fixture import chromium_executable
 
@@ -19,7 +19,7 @@ HOOK = r'''
   };
   window.__fixture = {
     decisions,
-    queue(capability, alreadyAllowed) {
+    queue(capability, alreadyAllowed, detail) {
       $('pair').classList.add('hidden');
       $('app').classList.remove('hidden');
       S.daemonOnline = true;
@@ -28,7 +28,7 @@ HOOK = r'''
       decisions.length = 0;
       addApproval({type: 'approval_requested', approval_id: 'fixture-approval',
         session_id: 'fixture-session', tool_name: 'fixture-tool', tool_id: 'fixture-tool',
-        version: 1, memory_mb: 64, capabilities: [capability],
+        version: 1, memory_mb: 64, capabilities: [capability], detail,
         already_allowed: alreadyAllowed ? [capability] : []});
       renderApproval();
     }
@@ -42,8 +42,8 @@ class QuietServerHandler(SimpleHTTPRequestHandler):
 
 
 def check(page):
-    def queue(capability, already_allowed=False):
-        page.evaluate('([cap, allowed]) => __fixture.queue(cap, allowed)', [capability, already_allowed])
+    def queue(capability, already_allowed=False, detail=None):
+        page.evaluate('args => __fixture.queue(...args)', [capability, already_allowed, detail])
 
     def decisions():
         return page.evaluate('__fixture.decisions')
@@ -96,6 +96,25 @@ def check(page):
     assert decisions() == [] and confirm.is_visible()
     click('once')
     check_decision('once')
+
+    for key, scope in [('y', 'always'), ('s', 'session'), ('1', 'hour'), ('Enter', 'always')]:
+        queue('process:bash')
+        page.locator('#modal-approve').focus()
+        page.keyboard.down(key)
+        assert confirm.is_visible() and decisions() == [], key
+        page.keyboard.down(key)
+        assert decisions() == [], f'holding {key} cannot confirm a lasting grant'
+        page.keyboard.up(key)
+        page.keyboard.press(key)
+        check_decision(scope)
+
+    page.set_viewport_size({'width': 460, 'height': 430})
+    queue('process:curl', detail='Long fixture explanation.\n' * 60)
+    click('hour')
+    expect(confirm).to_be_in_viewport()
+    assert decisions() == []
+    click('hour')
+    check_decision('hour')
 
 
 def run(app):

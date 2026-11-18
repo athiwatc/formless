@@ -3921,9 +3921,14 @@
         call.truncated ? h("p", { class: "error" }, "Preview truncated; omitted values remain unresolved here.") : null,
         h("p", { class: "muted" }, call.note)) : null);
   }
+  const approvalConfirmation = h("div", { class: "error broad-confirm", role: "alert" });
+  $("modal-body").after(approvalConfirmation);
   function renderApproval() {
     const req = S.approvals[0];
     if (!req) S.approvalLater = false;
+    const confirmation = req?.broadConfirm && !S.approvalLater
+      ? "This grants broad access. Press the same button (or key) again to confirm, or allow it once." : "";
+    if (approvalConfirmation.textContent !== confirmation) approvalConfirmation.textContent = confirmation;
     $("modal-backdrop").classList.toggle("hidden", !req || !!S.approvalLater);
     if (!req || S.approvalLater) return restoreFocus("modal-backdrop");
     const promo = req.kind === "promotion";
@@ -3938,7 +3943,6 @@
       // The first approval ever: what this is and how to undo it (#394).
       !promo && !prefs.get("seen.approvalHelp", false) ? h("p", { class: "first-approval" },
         "First approval? Tools run in a sandbox with no access at all; each Capability below (files, network, programs…) is something this Tool asks to use. Always lets it keep using them, Once allows just this call, Deny says no. Change your mind any time: /approvals lists what you allowed, /revoke takes it back.") : null,
-      req.broadConfirm ? h("p", { class: "error broad-confirm", role: "alert" }, "This grants broad access. Press the same button (or key) again to confirm, or allow it once.") : null,
       // A parallel batch: every held call, each answered on its own (§5.2).
       req.batch ? h("div", { class: "batch-list" },
         h("strong", null, "Call " + req.batch.index + " of " + req.batch.calls.length + " held in this batch: answer each one"),
@@ -4246,6 +4250,7 @@
       if (broad && head.broadConfirm !== (scope || "always")) {
         head.broadConfirm = scope || "always";
         renderApproval();
+        approvalConfirmation.scrollIntoView({ block: "nearest" });
         return;
       }
     }
@@ -7886,6 +7891,11 @@
     }
     const modalOpen = layer?.node === $("modal-backdrop");
     if (modalOpen && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      // A held key is one decision, including Enter on a focused button.
+      if (e.repeat && ["Enter", "y", "o", "s", "1", "n", "N"].includes(e.key)) {
+        e.preventDefault();
+        return;
+      }
       if (e.key === "y") { e.preventDefault(); decide(true); return; }
       if (e.key === "o" && S.approvals[0] && S.approvals[0].kind !== "promotion") { e.preventDefault(); decide(true, "once"); return; }
       if (e.key === "s" && S.approvals[0] && S.approvals[0].kind !== "promotion") { e.preventDefault(); decide(true, "session"); return; }
