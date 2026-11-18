@@ -1514,7 +1514,7 @@
         continue;
       }
       const prevWord = i > 0 && word.test(code[i - 1]);
-      if (/\d/.test(c) && !prevWord) {
+      if (L !== HL.js && /\d/.test(c) && !prevWord) {
         const m = code.slice(i).match(/^[\d][\w.]*/);
         tok("tok-num", m[0]);
         i += m[0].length;
@@ -1523,6 +1523,21 @@
       if (L.tags && c === "<") {
         const m = code.slice(i).match(/^<\/?[\w:-]+/);
         if (m) { tok("tok-kw", m[0]); i += m[0].length; continue; }
+      }
+      if (L === HL.js && (c === "." || /\d/.test(c))) {
+        if (c === "." && code.startsWith("...", i)) {
+          plain += "...";
+          i += 3;
+          continue;
+        }
+        const before = code[i - 1];
+        const boundary = !before || /\s/.test(before) || before.charCodeAt(0) < 128 && !prevWord;
+        if (c === "." ? /\d/.test(code[i + 1] ?? "") : boundary) {
+          const end = javascriptNumberEnd(code, i);
+          tok("tok-num", code.slice(i, end));
+          i = end;
+          continue;
+        }
       }
       if (/[\p{L}_$]/u.test(c) && !prevWord) {
         const m = code.slice(i).match(/^[\p{L}\p{N}_$]+/u);
@@ -1539,6 +1554,38 @@
     }
     if (plain) out.push(plain);
     return out;
+  }
+
+  function javascriptNumberEnd(code, start) {
+    const radix = code[start] === "0" && {
+      x: /[0-9a-f]/i, o: /[0-7]/, b: /[01]/,
+    }[code[start + 1]?.toLowerCase()];
+    const digitsEnd = (at, digit = /[0-9]/) => {
+      while (at < code.length && digit.test(code[at])) {
+        at++;
+        if (code[at] === "_" && at + 1 < code.length && digit.test(code[at + 1])) at++;
+      }
+      return at;
+    };
+    if (radix) {
+      const digits = start + 2;
+      const end = digitsEnd(digits, radix);
+      return end === digits ? start + 1 : end + Number(code[end] === "n");
+    }
+    let end = digitsEnd(start);
+    if (code[start] === "0" && end > start + 1 && /^[0-7]+$/.test(code.slice(start, end))) return end;
+    const fraction = code[end] === ".";
+    if (fraction) end = digitsEnd(end + 1);
+    let exponent = false;
+    if (code[end] === "e" || code[end] === "E") {
+      const digits = end + 1 + Number(code[end + 1] === "+" || code[end + 1] === "-");
+      const exponentEnd = digitsEnd(digits);
+      if (exponentEnd > digits) {
+        end = exponentEnd;
+        exponent = true;
+      }
+    }
+    return end + Number(!fraction && !exponent && code[end] === "n");
   }
 
   function copyButton(text) {

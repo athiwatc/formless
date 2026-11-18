@@ -156,7 +156,7 @@ fn shape(chars: &[char], i: &mut usize, out: &mut String, nested: bool) -> Optio
                 // The normalized digit cannot be joined to a preceding word.
                 out.push(' ');
             }
-            *i = number_end(chars, *i);
+            *i = javascript_number_end(chars, *i);
             out.push('0');
         } else {
             if nested {
@@ -199,9 +199,15 @@ fn digits_end(chars: &[char], mut end: usize, radix: u32) -> usize {
     end
 }
 
-/// Consume the literal's fraction, exponent or radix digits before leaving
-/// any member punctuation and name for the main tokenizer.
-fn number_end(chars: &[char], start: usize) -> usize {
+/// Return the character index after a JavaScript numeric literal, leaving any
+/// member punctuation and name for the caller. Return `start` if no literal
+/// opens there. The caller determines whether `start` is a token boundary.
+pub fn javascript_number_end(chars: &[char], start: usize) -> usize {
+    if !chars.get(start).is_some_and(|c| {
+        c.is_ascii_digit() || *c == '.' && chars.get(start + 1).is_some_and(char::is_ascii_digit)
+    }) {
+        return start;
+    }
     let radix = match chars.get(start..start + 2) {
         Some(['0', 'x' | 'X']) => 16,
         Some(['0', 'o' | 'O']) => 8,
