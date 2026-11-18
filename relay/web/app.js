@@ -4219,7 +4219,8 @@
       return th;
     }))));
     const body = h("tbody");
-    if (!tools.length) body.append(h("tr", null, h("td", { class: "empty", colspan: cols.length }, "No Tools yet — the agent builds them with create_tool.")));
+    if (!tools.length) body.append(h("tr", null, h("td", { class: "empty", colspan: cols.length },
+      opts.emptyMessage || "No Tools yet — the agent builds them with create_tool.")));
     for (const t of tools) {
       body.append(h("tr", {
         class: opts.selected === t.id ? "selected" : null, tabindex: 0,
@@ -4268,7 +4269,8 @@
   function renderTools() {
     const rows = visibleTools();
     $("tools-count").textContent = "(" + (rows.length === S.tools.length ? S.tools.length : rows.length + "/" + S.tools.length) + ")";
-    toolsTable($("tools-table"), rows, { selected: S.selectedTool, onselect: selectTool, sortable: true });
+    toolsTable($("tools-table"), rows, { selected: S.selectedTool, onselect: selectTool, sortable: true,
+      emptyMessage: S.tools.length ? "No Tools match the current filters." : null });
     const box = $("tool-detail");
     box.replaceChildren();
     const d = S.toolDetail;
@@ -5065,7 +5067,9 @@
     const parents = new Set();
     for (const m of $("settings").querySelectorAll("mark.find")) { parents.add(m.parentNode); m.replaceWith(m.textContent); }
     for (const p of parents) p.normalize();
-    for (const sec of $("settings").querySelectorAll("section")) {
+    const sections = $("settings").querySelectorAll("section");
+    let visibleSections = 0;
+    for (const sec of sections) {
       const titleHit = keys.length && hit(sec.querySelector("h3") || sec);
       let shown = 0;
       for (const dt of sec.querySelectorAll("dl.kv > dt")) {
@@ -5081,8 +5085,17 @@
         if (ok) shown++;
       }
       const hasRows = sec.querySelector("dl.kv > dt, tbody > tr");
-      sec.classList.toggle("hidden", !!keys.length && !titleHit && (hasRows ? !shown : !hit(sec)));
+      const hidden = !!keys.length && !titleHit && (hasRows ? !shown : !hit(sec));
+      sec.classList.toggle("hidden", hidden);
+      if (!hidden) visibleSections++;
     }
+    const noMatch = keys.length > 0 && sections.length > 0 && visibleSections === 0;
+    const status = $("settings-filter-status");
+    const message = noMatch ? "No Settings match the current filter." : "";
+    if (status.textContent !== message) status.textContent = message;
+    const clear = $("settings-filter-clear");
+    if (!noMatch && document.activeElement === clear) $("settings-filter").focus({ preventScroll: true });
+    clear.hidden = !noMatch;
   }
   /** `text` folded for matching with, per folded UTF-16 unit, the offset
    * of the original character it came from (#789): decomposed, marks
@@ -5130,6 +5143,12 @@
     }
   }
   $("settings-filter").addEventListener("input", filterSettings);
+  $("settings-filter-clear").addEventListener("click", () => {
+    const input = $("settings-filter");
+    input.value = "";
+    input.focus({ preventScroll: true });
+    filterSettings();
+  });
 
   /** Web Push (SPEC §12): opt in per device. The relay keeps this
    * browser's subscription and, when an approval or question waits, sends

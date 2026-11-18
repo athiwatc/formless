@@ -71,7 +71,7 @@ class Element extends Node {
 const el = (tag, props, ...kids) => { const n = new Element(tag); Object.assign(n, props); n.append(...kids); return n; };
 const texts = root => { const out = []; const walk = n => { for (const k of n.childNodes) k.nodeType === 3 ? out.push(k) : walk(k); }; walk(root); return out; };
 
-function fixture() {
+function fixture({ empty = false } = {}) {
   let clicks = 0;
   const button = el('button', {}, 'Edit');
   button.addEventListener('click', () => clicks++);
@@ -94,7 +94,14 @@ function fixture() {
       el('tr', {}, el('td', {}, 'Tea'), el('td', {}, 'other'))))),
     el('section', {}, el('h3', {}, 'Notes'), el('p', {}, 'Nothing about rows')));
   const input = el('input', { value: '' });
-  const ids = { settings: root, 'settings-filter': input };
+  const feedback = {
+    value: '', writes: 0,
+    get textContent() { return this.value; },
+    set textContent(value) { this.value = value; this.writes++; },
+  };
+  const clear = { hidden: true };
+  if (empty) root.childNodes = [];
+  const ids = { settings: root, 'settings-filter': input, 'settings-filter-status': feedback, 'settings-filter-clear': clear };
   const c = vm.createContext({ Node, $: id => ids[id], document: { createElement: tag => new Element(tag) }, uiFormat: String });
   vm.runInContext(['h', 'configureTextInput', 'foldMap', 'markWords', 'filterSettings'].map(fn).join('\n'), c);
   const original = root.textContent;
@@ -116,7 +123,7 @@ function fixture() {
   const marks = node => node.querySelectorAll('mark.find').map(m => m.textContent);
   const visible = () => [...dts(), ...root.querySelectorAll('tbody > tr')].filter(n => !n.classList.contains('hidden')).map(n => n.textContent);
   const sections = () => root.querySelectorAll('section').filter(s => !s.classList.contains('hidden')).map(s => s.querySelector('h3').textContent);
-  return { root, model, modelValue, button, clicks: () => clicks, filter, dt, marks, visible, sections, original };
+  return { root, model, modelValue, button, clicks: () => clicks, filter, dt, marks, visible, sections, original, feedback, clear };
 }
 
 test('typing and deleting a word keeps its highlight at every step, with whole text nodes', () => {
@@ -140,6 +147,27 @@ test('typing and deleting a word keeps its highlight at every step, with whole t
   assert.deepEqual(f.model.childNodes.map(n => n.textContent), ['Default model']);
   assert.equal(f.visible().length, 10);
   assert.deepEqual(f.sections(), ['Provider', 'Budget', 'Places', 'Memory', 'Notes']);
+});
+
+test('one Settings no-match message follows the visible section state', () => {
+  const f = fixture();
+  f.filter('missing');
+  assert.deepEqual(f.sections(), []);
+  assert.equal(f.feedback.textContent, 'No Settings match the current filter.');
+  assert.equal(f.clear.hidden, false);
+  f.filter('another missing term');
+  assert.equal(f.feedback.writes, 1, 'the same message is not announced again');
+  f.filter('cafe');
+  assert.deepEqual(f.sections(), ['Places', 'Memory']);
+  assert.equal(f.feedback.textContent, '');
+  assert.equal(f.clear.hidden, true);
+  f.filter('');
+  assert.deepEqual(f.sections(), ['Provider', 'Budget', 'Places', 'Memory', 'Notes']);
+  assert.equal(f.feedback.writes, 2);
+  const loading = fixture({ empty: true });
+  loading.filter('missing');
+  assert.equal(loading.feedback.textContent, '');
+  assert.equal(loading.clear.hidden, true);
 });
 
 test('row visibility folds accents, NFC/NFD and İ exactly as the highlights do', () => {
