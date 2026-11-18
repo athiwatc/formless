@@ -502,14 +502,20 @@
   function note(text, err) {
     S.notes.push({ text, err: !!err, at: Date.now() });
     if (S.notes.length > 200) S.notes.shift();
-    if ($("notes-panel").classList.contains("hidden")) S.unread++;
+    if ($("notes-panel").classList.contains("hidden")) S.unread = Math.min(S.notes.length, S.unread + 1);
     renderNotes();
     renderStatus();
   }
   /** A toast; `action` ({label, run, ms}) adds a button and keeps it up for `ms`. */
   function toast(text, err, action) {
+    const button = action && h("button", { class: "btn small", type: "button", onclick: () => {
+      if (button.disabled) return;
+      button.disabled = true;
+      t.remove();
+      action.run();
+    } }, action.label);
     const t = h("div", { class: "toast" + (err ? " err" : ""), role: err ? "alert" : "status" }, text,
-      action ? h("button", { class: "btn small", type: "button", onclick: () => { t.remove(); action.run(); } }, action.label) : null);
+      button);
     $("toasts").append(t);
     setTimeout(() => t.remove(), action ? action.ms : err ? 6000 : 3500);
   }
@@ -517,6 +523,8 @@
   // -------------------------------------------------------- ask dialogs
   let askResolve = null;
   let askTag = null;
+  let askOptions = null;
+  let askSaving = false;
   const askQueue = [];
   /** Promise-based prompt/confirm: resolves the text (input) or true, or null. */
   function ask(opts) {
@@ -543,10 +551,12 @@
     const { opts, resolve } = askQueue.shift();
     askResolve = resolve;
     askTag = opts.tag || null;
+    askOptions = opts;
     rememberFocus("ask-backdrop");
     $("ask-title").textContent = opts.title;
     $("ask-text").textContent = opts.text || "";
     $("ask-body").replaceChildren(...(opts.body ? [opts.body] : []));
+    $("ask-form").setAttribute("autocomplete", opts.secretFields ? "off" : "on");
     const input = $("ask-input");
     configureAskInput(input, opts);
     input.classList.toggle("hidden", !opts.input);
@@ -565,13 +575,18 @@
     if (opts.input && activeDialog()?.node === $("ask-backdrop")) input.select();
   }
   function closeAsk(value) {
+    if (askSaving) return;
     // Callers pass/capture the resolved value before the shared DOM is cleared.
     $("ask-input").value = "";
+    for (const field of askOptions?.secretFields || []) field.value = "";
+    $("ask-body").replaceChildren();
+    showAskError("");
     $("ask-backdrop").classList.add("hidden");
     restoreFocus("ask-backdrop");
     const resolve = askResolve;
     askResolve = null;
     askTag = null;
+    askOptions = null;
     if (resolve) resolve(value);
     showNextAsk();
   }
@@ -581,9 +596,51 @@
     }
     if (askTag === tag) closeAsk(null);
   }
-  $("ask-form").addEventListener("submit", (e) => {
+  function showAskError(message) {
+    const error = $("ask-error");
+    error.classList.toggle("hidden", !message);
+    error.textContent = message;
+  }
+  function setAskSaving(saving) {
+    askSaving = saving;
+    $("ask-fields").disabled = $("ask-ok").disabled = $("ask-cancel").disabled = saving;
+    $("ask-ok").textContent = saving ? "Saving…" : askOptions.ok || "OK";
+    $("ask-saving").textContent = saving ? "Saving…" : "";
+    const dialog = activeDialog();
+    if (saving && dialog?.node === $("ask-backdrop")) focusDialog(dialog);
+  }
+  function recordValue(field, message) {
+    const value = field.value.trim();
+    if (!value) throw Object.assign(new Error(message), { field });
+    return value;
+  }
+  $("ask-form").addEventListener("submit", async (e) => {
     e.preventDefault();
-    closeAsk($("ask-input").classList.contains("hidden") ? true : $("ask-input").value);
+    if (!askOptions || askSaving) return;
+    if (!askOptions.saveRequest) {
+      return closeAsk($("ask-input").classList.contains("hidden") ? true : $("ask-input").value);
+    }
+    const opts = askOptions;
+    showAskError("");
+    let req;
+    try { req = opts.saveRequest(); }
+    catch (error) { showAskError(error.message); error.field?.focus(); return; }
+    if (!req) return closeAsk(null);
+    const focused = document.activeElement;
+    setAskSaving(true);
+    try {
+      const result = await request(req, opts.timeoutMs);
+      setAskSaving(false);
+      closeAsk(result ?? true);
+    } catch (error) {
+      setAskSaving(false);
+      // Daemon errors can echo request fields. Secret-bearing forms use
+      // field-specific guidance without including the server's error text.
+      showAskError(error.daemonResponse
+        ? opts.saveError || error.message
+        : "Save was not confirmed. Check the connection and whether the record was saved before trying again.");
+      if (activeDialog()?.node === $("ask-backdrop")) focusDialog(activeDialog(), focused);
+    }
   });
   $("ask-cancel").onclick = () => closeAsk(null);
 
@@ -1294,6 +1351,9 @@
 
   function renderSessions() {
     const list = $("sessions");
+    const focused = document.activeElement;
+    const focusedRow = focused?.closest("#sessions [data-session-id]");
+    const focusedControl = focusedRow && ["mark", "session-open", "menu"].find((name) => focused.classList.contains(name));
     list.replaceChildren();
     S.marked = S.marked || new Set();
     if (S.marked.size) {
@@ -1333,26 +1393,37 @@
     const appendRows = (visible) => {
       for (const row of sessionRows(S.sessions, visible, !!S.sessionTree)) {
         const s = row.session;
+        const running = S.running.has(s.id);
+        const paused = !running && s.last_run_status === "paused";
+        const state = [s.pinned && "Pinned", running && "Running", paused && "Paused"].filter(Boolean).join(", ");
+        const stateId = "session-state-" + s.id;
         const menu = h("button", {
           class: "icon-btn menu", type: "button", "aria-label": "Session actions", "aria-haspopup": "menu",
           onkeydown: (e) => menuTriggerKey(e, (last) => sessionMenu(menu, s, last)),
           onclick: (e) => { e.stopPropagation(); sessionMenu(menu, s); },
         }, "⋯");
-        list.append(h("li", {
+        const item = h("li", {
           class: "session" + (s.id === S.current ? " active" : ""),
-          tabindex: 0,
-          onclick: () => openSession(s.id),
-          onkeydown: (e) => { if (e.key === "Enter") openSession(s.id); },
+          "data-session-id": s.id,
         },
         h("input", { type: "checkbox", class: "mark", "aria-label": "Select " + s.name, checked: S.marked.has(s.id),
-          onclick: (e) => { e.stopPropagation(); if (e.target.checked) S.marked.add(s.id); else S.marked.delete(s.id); renderSessions(); } }),
-        S.running.has(s.id) ? h("span", { class: "running", title: "running" })
-          : s.last_run_status === "paused" ? h("span", { class: "state", title: "paused" }, "⏸") : null,
-        h("span", { class: "name", title: s.name, style: "padding-inline-start:" + (row.depth * 0.75) + "rem" }, s.pinned ? "★ " : null, row.depth ? "↳ " : null, s.name,
-          row.note ? h("span", { class: "muted lineage", title: row.note }, " · " + row.note) : null,
-          s.preview ? h("span", { class: "preview", title: s.preview }, s.preview) : null),
-        h("span", { class: "when", title: (s.message_count || 0) + " messages" + (s.model ? " · " + s.model : "") }, relTime(s.updated_at)),
-        menu));
+          onchange: (e) => { if (e.target.checked) S.marked.add(s.id); else S.marked.delete(s.id); renderSessions(); } }),
+        h("button", { class: "session-open", type: "button", "aria-label": s.name,
+          "aria-current": s.id === S.current ? "true" : null, "aria-describedby": state ? stateId : null,
+          onclick: () => openSession(s.id) },
+          running ? h("span", { class: "running", title: "running", "aria-hidden": "true" })
+            : paused ? h("span", { class: "state", title: "paused", "aria-hidden": "true" }, "⏸") : null,
+          h("span", { class: "name", title: s.name, style: "padding-inline-start:" + (row.depth * 0.75) + "rem" }, s.pinned ? "★ " : null, row.depth ? "↳ " : null, s.name,
+            row.note ? h("span", { class: "muted lineage", title: row.note }, " · " + row.note) : null,
+            s.preview ? h("span", { class: "preview", title: s.preview }, s.preview) : null),
+          h("span", { class: "when", title: (s.message_count || 0) + " messages" + (s.model ? " · " + s.model : "") }, relTime(s.updated_at))),
+        state ? h("span", { id: stateId, class: "sr-only" }, state) : null, menu);
+        list.append(item);
+        if (focusedRow?.dataset.sessionId === s.id && focusedControl) {
+          const control = item.querySelector("." + focusedControl);
+          if (focusedControl === "menu" && !focusVisible(control)) item.querySelector(".session-open").focus({ preventScroll: true });
+          control.focus({ preventScroll: true });
+        }
       }
     };
     appendRows(active);
@@ -3801,6 +3872,16 @@
     const badge = $("notes-badge");
     badge.textContent = S.unread > 99 ? "99+" : String(S.unread);
     badge.classList.toggle("hidden", !S.unread);
+    const activityToggle = $("notes-btn");
+    const activityLabel = "Activity log, " + S.unread + " unread";
+    if (activityToggle.getAttribute("aria-label") !== activityLabel) activityToggle.setAttribute("aria-label", activityLabel);
+  }
+
+  function setActivityDrawer(open) {
+    $("notes-panel").classList.toggle("hidden", !open);
+    $("notes-btn").setAttribute("aria-expanded", String(open));
+    if (open) { S.unread = 0; renderStatus(); }
+    (open ? $("notes-close") : $("notes-btn")).focus({ preventScroll: true });
   }
 
   function renderNotes() {
@@ -4037,7 +4118,7 @@
   }
   function focusVisible(el) {
     return !!(el && el !== document.body && el.isConnected && typeof el.focus === "function"
-      && !el.disabled && !el.closest("[inert], .hidden, [hidden]") && el.getClientRects().length
+      && !el.matches(":disabled") && !el.closest("[inert], .hidden, [hidden]") && el.getClientRects().length
       && getComputedStyle(el).visibility !== "hidden");
   }
   function dialogItems(node) {
@@ -4184,7 +4265,7 @@
     if (e.key === "Escape") {
       e.preventDefault();
       e.stopImmediatePropagation();
-      dismissDialog(top);
+      if (!e.repeat) dismissDialog(top);
     } else if (e.key === "Tab") {
       const items = dialogItems(top.node);
       const first = items[0], last = items[items.length - 1];
@@ -4397,9 +4478,16 @@
 
   // --------------------------------------------------- approvals (§10.3)
   const capFamily = (c) => String(c).split(":")[0];
+  let approvalListSeq = 0;
   async function refreshApprovals() {
+    const seq = ++approvalListSeq;
     const list = await act({ type: "list_approvals" });
-    if (list) { S.grants = list; S.grantsSelected = new Set(); renderApprovals(); }
+    if (seq !== approvalListSeq || !Array.isArray(list)) return false;
+    S.grants = list;
+    S.grantsSelected = new Set();
+    S.unconfirmedGrants?.clear();
+    renderApprovals();
+    return true;
   }
   const grantKey = (g) => [g.tool_id, g.capability, g.scope, g.session_id || ""].join("|");
   function shownGrants() {
@@ -4440,18 +4528,64 @@
   }
   async function revokeGrants(grants) {
     if (!grants.length) return toast("Select grants to revoke first.", true);
-    const trusted = grants.filter((g) => g.trusted).map((g) => g.capability);
-    if (grants.length > 1 && !(await ask({ title: "Revoke " + grants.length + " grants?", text: trusted.length
-      ? "Their Tools ask again on their next call, except for what your trusted folders/hosts still allow: " + [...new Set(trusted)].join(", ") + "."
-      : "Their Tools ask again on their next call.", ok: "Revoke", danger: true }))) return;
-    const still = new Set();
-    for (const g of grants) {
-      const r = await act({ type: "revoke_grant", tool_id: g.tool_id, capability: g.capability, scope: g.scope, session_id: g.session_id || null });
-      ((r && r.still_trusted) || []).forEach((c) => still.add(c));
+    if (S.revokingGrants) return;
+    S.revokingGrants = true;
+    const feedback = $("revocation-feedback");
+    try {
+      // A lost response may have followed a write. Re-read before retrying
+      // any unconfirmed grant so the user can review what still exists.
+      if (grants.some((g) => S.unconfirmedGrants?.has(grantKey(g)))) {
+        if (await refreshApprovals()) return toast("Grant list refreshed. Review it before retrying.");
+        return toast("Refresh the grants before retrying.", true);
+      }
+      const trusted = grants.filter((g) => g.trusted).map((g) => g.capability);
+      if (grants.length > 1 && !(await ask({ title: "Revoke " + grants.length + " grants?", text: trusted.length
+        ? "Their Tools ask again on their next call, except for what your trusted folders/hosts still allow: " + [...new Set(trusted)].join(", ") + "."
+        : "Their Tools ask again on their next call.", ok: "Revoke", danger: true }))) return;
+      const still = new Set(), revoked = new Set(), unconfirmed = new Set(), failures = [];
+      for (const g of grants) {
+        const key = grantKey(g);
+        try {
+          const r = await request({ type: "revoke_grant", tool_id: g.tool_id, capability: g.capability, scope: g.scope, session_id: g.session_id || null });
+          if (r?.revoked !== true) throw new Error("The daemon did not confirm revocation.");
+          revoked.add(key);
+          if (Array.isArray(r.still_trusted)) r.still_trusted.forEach((c) => still.add(c));
+        } catch (e) {
+          unconfirmed.add(key);
+          failures.push(g.tool_name + " · " + g.capability + " (" + g.scope
+            + (g.session_id ? " " + g.session_id.slice(0, 8) : "") + "): " + e.message);
+        }
+      }
+      S.unconfirmedGrants = new Set([...(S.unconfirmedGrants || []), ...unconfirmed]);
+      S.grants = (S.grants || []).filter((g) => !revoked.has(grantKey(g)));
+      for (const key of revoked) S.grantsSelected.delete(key);
+      renderApprovals();
+      const revokedText = "Revoked " + revoked.size + " grant" + (revoked.size === 1 ? "" : "s");
+      const summary = failures.length ? (revoked.size ? revokedText + ". " : "")
+        + failures.length + (failures.length === 1 ? " revocation unconfirmed." : " revocations unconfirmed.") : revokedText;
+      toast(summary, failures.length > 0);
+      feedback.replaceChildren(...(failures.length ? [
+        h("p", { class: "error" }, summary),
+        h("ul", null, failures.map((message) => h("li", null, message))),
+      ] : []));
+      if (still.size) note("Still allowed without asking by your trusted folders/hosts: " + [...still].join(", "));
+      if (await refreshApprovals()) {
+        if (failures.length) feedback.append(h("p", { class: "muted" }, "Check the updated list and retry any grants that are still shown."));
+      } else {
+        feedback.append(h("p", { class: "error" }, "The grant list could not be refreshed. Refresh it before retrying an unconfirmed revocation."),
+          h("button", { class: "btn small", type: "button", onclick: async (e) => {
+            const button = e.currentTarget;
+            button.disabled = true;
+            if (await refreshApprovals()) {
+              button.previousElementSibling.textContent = "Check the updated list and retry any grants that are still shown.";
+              button.remove();
+              focusReturn($("revoke-selected"));
+            } else button.disabled = false;
+          } }, "Refresh grants"));
+      }
+    } finally {
+      S.revokingGrants = false;
     }
-    toast("Revoked " + grants.length + " grant" + (grants.length === 1 ? "" : "s"));
-    if (still.size) note("Still allowed without asking by your trusted folders/hosts: " + [...still].join(", "));
-    refreshApprovals();
   }
   $("approvals-family").addEventListener("input", () => renderApprovals());
   $("revoke-selected").onclick = () => revokeGrants(shownGrants().filter((g) => S.grantsSelected.has(grantKey(g))));
@@ -5113,8 +5247,7 @@
             h("div", { class: "muted" }, m.scope + " · " + (m.session_id ? "from session " + m.session_id.slice(0, 8) : m.author) + (m.enabled ? "" : " · off"))),
           h("td", null,
             h("button", { class: "btn small", type: "button", onclick: async () => {
-              const text = await ask({ title: "Edit memory", inputKind: "prose", input: true, value: m.text, ok: "Save" });
-              if (text && text !== m.text) { await act({ type: "upsert_memory", id: m.id, text }, "Saved"); refreshSettings(); }
+              await editMemory(m);
             } }, "Edit"),
             h("button", { class: "btn small", type: "button", onclick: () => act({ type: "upsert_memory", id: m.id, enabled: !m.enabled }, m.enabled ? "Disabled" : "Enabled").then(refreshSettings) }, m.enabled ? "Disable" : "Enable"),
             h("button", { class: "btn small danger", type: "button", onclick: async () => {
@@ -5122,10 +5255,7 @@
             } }, "Delete")))))))
         : h("p", { class: "muted" }, "None yet."),
       h("div", { class: "detail-actions" },
-        h("button", { class: "btn small", type: "button", onclick: async () => {
-          const text = await ask({ title: "Add a memory", inputKind: "prose", input: true, placeholder: "e.g. Use pnpm, not npm", ok: "Add" });
-          if (text) { await act({ type: "upsert_memory", text }, "Added"); refreshSettings(); }
-        } }, "Add"))));
+        h("button", { class: "btn small", type: "button", onclick: () => editMemory(null) }, "Add"))));
     const thinking = h("input", { type: "checkbox", onchange: (e) => setThinking(e.target.checked) });
     thinking.checked = S.showThinking;
     const enterSends = h("input", { id: "enter-sends", type: "checkbox", onchange: e => setEnterSends(e.target.checked) });
@@ -5276,19 +5406,27 @@
     return Uint8Array.from(b, (c) => c.charCodeAt(0));
   }
   async function pushOn() {
+    if (S.forgetting || S.pushRemoval || S.pushEnabling) return;
+    S.pushEnabling = true;
     try {
       const r = await fetch("push/key");
       if (!r.ok) return toast("This relay hasn't set up notifications.", true);
       const { key } = await r.json();
       if ((await Notification.requestPermission()) !== "granted") return toast("Notifications are blocked for this site.", true);
       const reg = await navigator.serviceWorker.ready;
-      const sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64uToBytes(key) });
-      S.ws.send(JSON.stringify({ relay: "push_subscribe", sub: sub.toJSON() }));
+      if (S.forgetting || S.pushRemoval) return;
+      S.pushSubscribe = reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64uToBytes(key) });
+      const sub = await S.pushSubscribe;
+      if (S.forgetting || S.pushRemoval) return;
+      registerRelayPush(S.ws, sub);
       note("This device gets a notification when an approval or question waits.");
     } catch (e) {
       toast("Couldn't turn on notifications: " + e.message, true);
+    } finally {
+      S.pushSubscribe = null;
+      S.pushEnabling = false;
+      if (!S.forgetting) renderView();
     }
-    renderView();
   }
   /** Re-register only an existing opt-in after an authenticated connection.
    * Room-v3 migration never copies subscriptions from an unverified old room. */
@@ -5298,20 +5436,101 @@
     try {
       const reg = await navigator.serviceWorker.getRegistration();
       const sub = reg && await reg.pushManager.getSubscription();
-      if (sub && S.ws === ws && S.room === room && S.channel && S.daemonOnline && ws.readyState === 1) {
-        ws.send(JSON.stringify({ relay: "push_subscribe", sub: sub.toJSON() }));
+      if (sub && !S.forgetting && !S.pushRemoval && S.ws === ws && S.room === room && S.channel && S.daemonOnline && ws.readyState === 1) {
+        registerRelayPush(ws, sub);
       }
     } catch (_) { /* No permission request or automatic new subscription. */ }
   }
-  async function pushOff(sub) {
+  const PUSH_CLEANUP_MS = 1500;
+  function registerRelayPush(ws, sub) {
+    if (ws?.readyState !== 1) throw new Error("not connected to the relay");
+    if (S.pushRegistration?.socket === ws) return;
+    let resolve;
+    const settled = new Promise((done) => { resolve = done; });
+    const finish = (socket) => {
+      if (socket !== ws) return;
+      ws.removeEventListener("close", closed);
+      if (S.pushRegistration === pending) S.pushRegistration = null;
+      resolve();
+    };
+    const closed = () => finish(ws);
+    const pending = { socket: ws, settled, finish };
+    S.pushRegistration = pending;
+    ws.addEventListener("close", closed, { once: true });
+    try { ws.send(JSON.stringify({ relay: "push_subscribe", sub: sub.toJSON() })); }
+    catch (error) { finish(ws); throw error; }
+  }
+  async function boundedPushCleanup(promise) {
+    let timer;
     try {
-      if (S.ws) S.ws.send(JSON.stringify({ relay: "push_unsubscribe", endpoint: sub.endpoint }));
-      await sub.unsubscribe();
-      note("Notifications are off on this device.");
-    } catch (e) {
-      toast(e.message, true);
+      return await Promise.race([promise, new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error("Notification cleanup timed out")), PUSH_CLEANUP_MS);
+      })]);
+    } finally { clearTimeout(timer); }
+  }
+  async function removeRelayPush(endpoint) {
+    const ws = S.ws;
+    if (!S.relayReady || ws?.readyState !== 1) return false;
+    // A registration already sent by this socket can still be writing. The
+    // relay permits only one push write per socket at a time.
+    const registration = S.pushRegistration;
+    if (registration?.socket === ws) await boundedPushCleanup(registration.settled);
+    if (S.ws !== ws || !S.relayReady || ws.readyState !== 1) return false;
+    return new Promise((resolve) => {
+      const id = crypto.randomUUID();
+      const done = (confirmed) => {
+        clearTimeout(timer);
+        ws.removeEventListener("close", closed);
+        S.pushRemovalAck = null;
+        resolve(confirmed);
+      };
+      const closed = () => done(false);
+      const timer = setTimeout(closed, PUSH_CLEANUP_MS);
+      S.pushRemovalAck = (socket, ack) => { if (ws === socket && ack === id) done(true); };
+      ws.addEventListener("close", closed, { once: true });
+      try { ws.send(JSON.stringify({ relay: "push_unsubscribe", endpoint, id })); }
+      catch (_) { closed(); }
+    });
+  }
+  async function browserPushSubscription() {
+    if (!("serviceWorker" in navigator)) return null;
+    const reg = await navigator.serviceWorker.getRegistration();
+    return reg?.pushManager ? reg.pushManager.getSubscription() : null;
+  }
+  function removePushSubscription(knownSub) {
+    if (S.pushRemoval) return S.pushRemoval;
+    S.pushRemoval = (async () => {
+      let sub = knownSub;
+      try {
+        if (!sub) {
+          if (S.pushSubscribe) sub = await boundedPushCleanup(S.pushSubscribe.catch(() => null));
+          sub ||= await boundedPushCleanup(browserPushSubscription());
+        }
+      } catch (_) {
+        return "Could not check this browser's notification subscription or confirm its removal.";
+      }
+      if (!sub) return "";
+      const [remote, local] = await Promise.all([
+        removeRelayPush(sub.endpoint).catch(() => false),
+        boundedPushCleanup((async () => {
+          if (await sub.unsubscribe()) return true;
+          return (await browserPushSubscription())?.endpoint !== sub.endpoint;
+        })()).catch(() => false),
+      ]);
+      return [
+        !local && "Could not confirm that notifications are off in this browser. Check this site's notification permissions.",
+        !remote && "The relay did not confirm removal of the notification subscription.",
+      ].filter(Boolean).join(" ");
+    })().finally(() => { S.pushRemoval = null; });
+    return S.pushRemoval;
+  }
+  async function pushOff(sub) {
+    const warning = await removePushSubscription(sub);
+    if (!S.forgetting) {
+      if (warning) { toast(warning, true); note(warning, true); }
+      else note("Notifications are off on this device.");
+      renderView();
     }
-    renderView();
   }
 
   // ============================================================ actions
@@ -5433,7 +5652,12 @@
         h("td", { class: "muted" }, "since " + relTime(c.first_seen) + " · active " + relTime(c.last_seen)),
         h("td", null, h("button", { class: "btn small danger", type: "button", onclick: async () => {
           if (!(await ask({ title: "Disconnect this browser?", text: "It can reconnect with the pairing link. To revoke access for good, run formless relay enable --rotate.", ok: "Disconnect", danger: true }))) return;
-          if (await act({ type: "disconnect_relay_client", cid: c.cid }, "Disconnected")) refreshSettings();
+          const result = await act({ type: "disconnect_relay_client", cid: c.cid });
+          if (!result) return;
+          if (result.disconnected === true) toast("Disconnected");
+          else if (result.disconnected === false) toast("That browser is already disconnected.");
+          else toast("The daemon did not confirm disconnection.", true);
+          refreshSettings();
         } }, "Disconnect"))))))
         : h("p", { class: "muted" }, "No browsers on the relay right now."));
   }
@@ -5620,9 +5844,9 @@
     const name = h("input", { type: "text", placeholder: "github", spellcheck: "false" });
     const transport = h("select", null, h("option", { value: "stdio" }, "Command (stdio)"), h("option", { value: "http" }, "URL (HTTP)"));
     const command = h("input", { type: "text", placeholder: "npx -y @modelcontextprotocol/server-github", spellcheck: "false" });
-    const env = h("textarea", { rows: 2, placeholder: "KEY=value, one per line", spellcheck: "false" });
+    const env = h("textarea", { rows: 2, placeholder: "KEY=value, one per line", spellcheck: "false", autocomplete: "off" });
     const url = h("input", { type: "text", placeholder: "https://example.com/mcp", spellcheck: "false" });
-    const headers = h("textarea", { rows: 2, placeholder: "Header: value, one per line", spellcheck: "false" });
+    const headers = h("textarea", { rows: 2, placeholder: "Header: value, one per line", spellcheck: "false", autocomplete: "off" });
     const stdio = [field("Command", command), field("Environment", env)];
     const http = [field("URL", url), field("Headers", headers)];
     const sync = () => {
@@ -5632,20 +5856,26 @@
     transport.onchange = sync;
     sync();
     const body = h("div", { class: "try-form" }, field("Name", name), field("Connect with", transport), stdio, http);
-    if (!(await ask({ title: "Add MCP server", text: "It starts now and its tools are listed; they're asked about before first use.", body, ok: "Add and test" }))) return;
-    const server = { transport: transport.value };
-    if (transport.value === "stdio") {
-      const words = splitArgs(command.value.trim());
-      if (!words.length) return toast("A command is needed.", true);
-      Object.assign(server, { command: words[0], args: words.slice(1), env: pairs(env.value, "=") });
-    } else {
-      if (!url.value.trim()) return toast("A URL is needed.", true);
-      Object.assign(server, { url: url.value.trim(), headers: pairs(headers.value, ":") });
-    }
-    toast("Connecting to " + name.value.trim() + "…");
-    const r = await act({ type: "add_mcp_server", name: name.value.trim(), server }, null, 120000);
+    const r = await ask({ title: "Add MCP server", text: "It starts now and its tools are listed; they're asked about before first use.", body, ok: "Add and test",
+      timeoutMs: 120000, secretFields: [command, env, url, headers],
+      saveError: "Could not save the MCP server. Check the name, connection type, and command or URL.",
+      saveRequest: () => {
+        const serverName = recordValue(name, "An MCP server name is needed.");
+        if (!/^[a-z0-9_-]+$/i.test(serverName) || serverName.includes("__")) {
+          throw Object.assign(new Error("Use letters, digits, '-' and '_' in the server name, with no double underscore."), { field: name });
+        }
+        const server = { transport: transport.value };
+        if (transport.value === "stdio") {
+          const words = splitArgs(recordValue(command, "A command is needed."));
+          if (!words[0]) throw Object.assign(new Error("A command is needed."), { field: command });
+          Object.assign(server, { command: words[0], args: words.slice(1), env: pairs(env.value, "=") });
+        } else {
+          Object.assign(server, { url: recordValue(url, "A URL is needed."), headers: pairs(headers.value, ":") });
+        }
+        return { type: "add_mcp_server", name: serverName, server };
+      } });
     if (!r) return;
-    if (r.error) note("Added " + r.added + ", but it didn't connect: " + r.error + " (Restart retries)", true);
+    if (r.error) note("Saved " + r.added + ", but it didn't connect. Check its settings and use Restart to retry.", true);
     else note("Added " + r.added + ": " + (r.tools || []).length + " tools");
     refreshSettings();
   }
@@ -5656,9 +5886,10 @@
     const subdir = h("input", { type: "text", placeholder: "subfolder (optional)", spellcheck: "false" });
     const ref = h("input", { type: "text", placeholder: "branch or tag (optional)", spellcheck: "false" });
     const body = h("div", { class: "try-form" }, field("Path, zip or git URL", source), field("Subfolder", subdir), field("Git ref", ref));
-    if (!(await ask({ title: "Add skill", text: "Paths are on the daemon's machine.", body, ok: "Add" }))) return;
-    if (!source.value.trim()) return toast("A source is needed.", true);
-    const r = await act({ type: "add_skill", source: source.value.trim(), subdir: subdir.value.trim() || null, git_ref: ref.value.trim() || null }, null, 120000);
+    const r = await ask({ title: "Add skill", text: "Paths are on the daemon's machine.", body, ok: "Add", timeoutMs: 120000,
+      secretFields: [source], saveError: "Could not add the skill. Check the source, subfolder, and Git ref.",
+      saveRequest: () => ({ type: "add_skill", source: recordValue(source, "A source is needed."),
+        subdir: subdir.value.trim() || null, git_ref: ref.value.trim() || null }) });
     if (r) { note("Added skill " + (r.name || "")); await reviewSkill(r.name); refreshSettings(); }
   }
   /** A `formless.skill/1` or `formless.skills/1` bundle from this browser
@@ -5736,16 +5967,27 @@
     const body = h("div", { class: "try-form" }, field("Task", prompt), field("Schedule", when),
       fields.time, fields.day, fields.at, fields.cron, preview, field("Session", session),
       h("p", { class: "muted" }, "It runs with the Session's model; pick a Session set to the model or Role you want."));
-    if (!(await ask({ title: "New job", body, ok: "Schedule" }))) return;
-    const s = schedule();
-    if (!prompt.value.trim()) return toast("The job needs a task.", true);
-    if (!s.cron && !s.at) return toast("Pick when it runs.", true);
-    const j = await act({ type: "add_job", prompt: prompt.value.trim(), session_id: session.value || null, cron: s.cron || null, at: s.at || null });
+    const j = await ask({ title: "New job", body, ok: "Schedule", saveRequest: () => {
+      const task = recordValue(prompt, "The job needs a task.");
+      const s = schedule();
+      if (!s.cron && !s.at) recordValue(when.value === "once" ? at : cron, "Pick when it runs.");
+      return { type: "add_job", prompt: task, session_id: session.value || null, cron: s.cron || null, at: s.at || null };
+    } });
     if (j) { note("Scheduled: next run " + uiFormat(new Date(j.next_run))); refreshSettings(); }
   }
   /** A labelled form field for ask() bodies. */
   function field(label, input) {
     return h("label", { class: "try-field" }, h("span", null, label), input);
+  }
+  async function editMemory(memory) {
+    const result = await ask({ title: memory ? "Edit memory" : "Add a memory", inputKind: "prose", input: true,
+      value: memory?.text, placeholder: "e.g. Use pnpm, not npm", ok: memory ? "Save" : "Add", saveRequest: () => {
+        const input = $("ask-input");
+        recordValue(input, "Enter a memory first.");
+        if (input.value === memory?.text) return null;
+        return { type: "upsert_memory", id: memory?.id, text: input.value };
+      } });
+    if (result) { toast(memory ? "Saved" : "Added"); refreshSettings(); }
   }
   async function testProvider(name) {
     toast("Testing " + name + "…");
@@ -5759,10 +6001,13 @@
     // Write-only: an existing key is never sent back; blank keeps it.
     const key = h("input", { type: "password", value: "", placeholder: p && p.has_key ? "stored · leave blank to keep" : "API key (stored in the keychain)", autocomplete: "off" });
     const body = h("div", { class: "try-form" }, field("Name", name), field("Base URL", base), field("Model", model), field("API key", key));
-    if (!(await ask({ title: p ? "Edit provider " + p.name : "Add provider", body, ok: "Save" }))) return;
-    const r = await act({ type: "upsert_provider", name: name.value.trim(), base_url: base.value.trim(), model: model.value.trim() || null, api_key: key.value || null }, "Saved " + name.value.trim());
-    key.value = "";
-    if (r) refreshSettings();
+    const r = await ask({ title: p ? "Edit provider " + p.name : "Add provider", body, ok: "Save",
+      secretFields: [key, base], saveError: "Could not save the provider. Check the name, base URL, and key storage on the daemon.",
+      saveRequest: () => ({
+        type: "upsert_provider", name: recordValue(name, "A provider name is needed."),
+        base_url: recordValue(base, "A base URL is needed."), model: model.value.trim() || null, api_key: key.value || null,
+      }) });
+    if (r) { toast("Saved " + name.value.trim()); refreshSettings(); }
   }
   async function editRole(existing, r, providers) {
     const name = h("input", { type: "text", value: existing, disabled: !!existing, placeholder: "fast", spellcheck: "false" });
@@ -5771,9 +6016,11 @@
     const model = h("input", { type: "text", value: r.model || "", placeholder: "model (blank = the provider's default)", spellcheck: "false" });
     const effort = h("select", null, ["", "minimal", "low", "medium", "high"].map((e) => h("option", { value: e, selected: (r.reasoning_effort || "") === e }, e || "default effort")));
     const body = h("div", { class: "try-form" }, field("Name", name), field("Description", desc), field("Provider", prov), field("Model", model), field("Reasoning effort", effort));
-    if (!(await ask({ title: existing ? "Edit role " + existing : "Add role", body, ok: "Save" }))) return;
-    const role = Object.assign({}, r, { description: desc.value.trim(), provider: prov.value === "default" ? null : prov.value, model: model.value.trim(), reasoning_effort: effort.value || null });
-    if (await act({ type: "upsert_role", name: name.value.trim(), role }, "Saved role " + name.value.trim())) refreshSettings();
+    const saved = await ask({ title: existing ? "Edit role " + existing : "Add role", body, ok: "Save", saveRequest: () => {
+      const role = Object.assign({}, r, { description: desc.value.trim(), provider: prov.value === "default" ? null : prov.value, model: model.value.trim(), reasoning_effort: effort.value || null });
+      return { type: "upsert_role", name: recordValue(name, "A Role name is needed."), role };
+    } });
+    if (saved) { toast("Saved role " + name.value.trim()); refreshSettings(); }
   }
   async function refreshSettings() {
     S.mcpServers = (await request({ type: "list_mcp_servers" }).catch(() => null)) || [];
@@ -5940,6 +6187,7 @@
     closeSidebar();
     if (!stay && S.view !== "chat") setView("chat");
     S.current = id;
+    renderSessions();
     S.sessionLoad = { id, status: "pending" };
     const snapshot = S.sessionSnapshot = { events: [] };
     S.messages = [];
@@ -7048,10 +7296,13 @@
       }
       case "registry_changed": {
         refreshDescriptionReviews();
-        // Every registry change offers Undo for a few seconds (SPEC §7.2).
+        // Only daemons advertising a change identity can undo this toast safely.
         const c = ev.change;
         toast(c.author + " " + (c.action === "rolled_back" ? "rolled " + c.name + " back to v" + c.to_version : c.action + " " + c.name + (c.action === "retired" || c.action === "restored" ? "" : " v" + c.to_version)), false,
-          { label: "Undo", ms: 10000, run: async () => { const r = await act({ type: "undo_registry_change" }); if (r) toast("Undone: " + r.undone); } });
+          c.change_id ? { label: "Undo", ms: 10000, run: async () => {
+            const r = await act({ type: "undo_registry_change_if_current", change_id: c.change_id });
+            if (r) toast("Undone: " + r.undone);
+          } } : null);
         break;
       }
       case "module_deleted":
@@ -7266,7 +7517,8 @@
             control: async (text) => {
               const value = JSON.parse(text);
               if (value.relay === "transport") return;
-              if (value.relay === "push_subscribed" || value.relay === "push_unsubscribed") return;
+              if (value.relay === "push_subscribed") { S.pushRegistration?.finish(ws); return; }
+              if (value.relay === "push_unsubscribed") { S.pushRemovalAck?.(ws, value.id); return; }
               if (value.relay === "ready") {
                 if (value.g !== packet.g) throw new Error("stale room readiness");
                 S.relayRoomReady = true;
@@ -7472,12 +7724,26 @@
     $("pair").classList.remove("hidden");
     $("secret").focus();
   }
-  function forget() {
+  async function forget() {
+    if (S.forgetting) return;
+    S.forgetting = true;
     S.userClosed = true;
+    clearTimeout(S.reconnect?.timer);
+    S.reconnect = null;
     try { sessionStorage.removeItem("formless_secret"); } catch (_) {}
+    let warning = "";
+    try {
+      if (!S.local) {
+        toast("Turning off notifications and forgetting this device…");
+        warning = await removePushSubscription();
+      }
+    } catch (_) {
+      warning = "Could not confirm removal of this browser's notification subscription.";
+    }
     if (S.ws) S.ws.close();
     S.ws = null;
-    history.replaceState(null, "", location.pathname);
+    // Carry only cleanup feedback across the reload that discards the page's state.
+    history.replaceState(warning ? { forgetWarning: warning } : null, "", location.pathname);
     location.reload();
   }
 
@@ -7535,12 +7801,8 @@
   $("generate-proposal").onclick = () => { act({ type: "generate_proposal" }, "Generating and measuring a proposal…"); };
   $("stop-btn").onclick = stop;
   $("menu-btn").onclick = () => setSidebar(!$("sidebar").classList.contains("open"), { focus: true });
-  $("notes-btn").onclick = () => {
-    const panel = $("notes-panel");
-    panel.classList.toggle("hidden");
-    if (!panel.classList.contains("hidden")) { S.unread = 0; renderStatus(); }
-  };
-  $("notes-close").onclick = () => $("notes-panel").classList.add("hidden");
+  $("notes-btn").onclick = () => setActivityDrawer($("notes-panel").classList.contains("hidden"));
+  $("notes-close").onclick = () => setActivityDrawer(false);
   // Attachments (SPEC §5.6): stored by the daemon, sent with the next message.
   /** Upload `file` in pieces (#909): the daemon checks the size first, then
    * each piece is read, encoded and sent on its own, so neither side holds
@@ -7656,10 +7918,6 @@
     if (paletteKey(e) || mentionKey(e)) return;
     if (e.key === "?" && !$("input").value && !e.ctrlKey && !e.metaKey) { e.preventDefault(); return showHelp(); }
     if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); submit(false); }
-    else if (e.key === "Escape") {
-      if (S.editMessageId) cancelEdit();
-      else stop();
-    }
   });
   coarsePointer.addEventListener("change", () => {
     syncInputTouchMode();
@@ -7733,11 +7991,15 @@
       if (sc) { e.preventDefault(); sc.run(e.key); return; }
     }
     if (e.key === "Escape") {
-      if (modalOpen) { S.approvalLater = true; renderApproval(); }
-      else if (!$("ask-backdrop").classList.contains("hidden")) closeAsk(null);
-      else if (popover) closePopover();
-      else if (!$("notes-panel").classList.contains("hidden")) $("notes-panel").classList.add("hidden");
-      else closeSidebar();
+      e.preventDefault();
+      if (e.repeat) return;
+      if (popover) closePopover();
+      else if (!$("notes-panel").classList.contains("hidden")) setActivityDrawer(false);
+      else if ($("sidebar").classList.contains("open")) closeSidebar();
+      else if (e.target === $("input")) {
+        if (S.editMessageId) cancelEdit();
+        else stop();
+      }
     }
   });
   // Tick elapsed timers (activity + running Tools) once a second.
@@ -7794,6 +8056,10 @@
   });
 
   (function init() {
+    if (history.state?.forgetWarning) {
+      $("pair-error").textContent = history.state.forgetWarning;
+      history.replaceState(null, "", location.pathname);
+    }
     const frag = hashParams();
     if (frag.malformed) {
       history.replaceState(null, "", location.pathname);

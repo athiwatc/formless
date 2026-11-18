@@ -47,6 +47,38 @@ async fn the_newest_registry_change_can_be_undone() {
         })
         .await
         .unwrap();
+    // Older daemons saved this record without an identity. Keep legacy Undo
+    // available after upgrade, but do not let a guarded request use it.
+    let store = Store::open(&paths.db_file()).unwrap();
+    let mut legacy = store
+        .kv_get("harness:registry", "last_change")
+        .unwrap()
+        .unwrap();
+    let change_id = legacy
+        .as_object_mut()
+        .unwrap()
+        .remove("change_id")
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_owned();
+    store
+        .kv_set("harness:registry", "last_change", &legacy)
+        .unwrap();
+    assert!(daemon
+        .handle(Request::UndoRegistryChangeIfCurrent { change_id })
+        .await
+        .is_err());
+    assert_eq!(
+        store
+            .get_tool_current(&id)
+            .unwrap()
+            .unwrap()
+            .0
+            .current_version,
+        2
+    );
+    drop(store);
     let r = undo().await.unwrap();
     assert_eq!(r["undone"], "user updated echo_text v2");
     assert_eq!(r["tool"]["current_version"], 1);
@@ -76,6 +108,198 @@ async fn the_newest_registry_change_can_be_undone() {
         "kept"
     );
     let _ = std::fs::remove_dir_all(dir);
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_guarded_undo_cannot_revert_another_clients_change_or_be_repeated() {
+    use formless_protocol::{
+        Event, RegistryChange, RequestEnvelope, ServerMessage, PROTOCOL_VERSION,
+    };
+    use serde_json::Value;
+    use std::time::Duration;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixStream;
+
+    async fn exchange(
+        client: &mut BufReader<UnixStream>,
+        request: Request,
+    ) -> (Result<Value, String>, Option<RegistryChange>) {
+        let line = serde_json::to_string(&RequestEnvelope {
+            id: 1,
+            protocol: PROTOCOL_VERSION,
+            request,
+        })
+        .unwrap();
+        client
+            .get_mut()
+            .write_all(format!("{line}\n").as_bytes())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut change = None;
+            loop {
+                let mut line = String::new();
+                assert_ne!(client.read_line(&mut line).await.unwrap(), 0);
+                match serde_json::from_str(&line).unwrap() {
+                    ServerMessage::Event(Event::RegistryChanged { change: latest }) => {
+                        change = Some(latest)
+                    }
+                    ServerMessage::Response {
+                        id: 1,
+                        ok,
+                        result,
+                        error,
+                    } => {
+                        return (
+                            if ok {
+                                Ok(result.unwrap_or_default())
+                            } else {
+                                Err(error.unwrap())
+                            },
+                            change,
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("daemon reply within deadline")
+    }
+
+    let uuid = uuid::Uuid::new_v4().simple().to_string();
+    let dir = std::env::temp_dir().join(format!("fl-tg-{}", &uuid[..8]));
+    let paths = Paths::from_dirs(dir.join("d"), dir.join("c")).unwrap();
+    let mut cfg = Config::default();
+    cfg.provider.base_url = "http://127.0.0.1:9".into();
+    cfg.provider.model = "fixture".into();
+    cfg.save(&paths).unwrap();
+    let store = Store::open(&paths.db_file()).unwrap();
+    let seed = |name| {
+        store
+            .create_tool_version(
+                name,
+                "fixture",
+                "{}",
+                "{}",
+                "function run(){return {};}",
+                &Capabilities::parse(&[]).unwrap(),
+                64,
+                "user",
+            )
+            .unwrap()
+            .0
+            .id
+    };
+    let a = seed("tool_a");
+    let b = seed("tool_b");
+    let check = |id: &str| store.get_tool_current(id).unwrap().unwrap().0.retired;
+    let daemon = Arc::new(formless_core::daemon::Daemon::new(paths.clone()).unwrap());
+    let server = tokio::spawn(daemon.serve());
+    let connect = || async {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(stream) = UnixStream::connect(paths.socket_path()).await {
+                    break BufReader::new(stream);
+                }
+                tokio::time::sleep(Duration::from_millis(15)).await;
+            }
+        })
+        .await
+        .unwrap()
+    };
+    let mut client_a = connect().await;
+    let mut client_b = connect().await;
+    let ping = exchange(&mut client_b, Request::Ping).await.0;
+    assert!(ping.is_ok());
+
+    let (result, change_a) = exchange(&mut client_a, Request::RetireTool { id: a.clone() }).await;
+    assert!(result.is_ok());
+    let change_a = change_a.unwrap();
+    assert_eq!(change_a.tool_id, a);
+    let (result, change_b) = exchange(&mut client_b, Request::RetireTool { id: b.clone() }).await;
+    assert!(result.is_ok());
+    let change_b = change_b.unwrap();
+    assert_eq!(change_b.tool_id, b);
+    assert_ne!(change_a.change_id, change_b.change_id);
+
+    let stale = exchange(
+        &mut client_a,
+        Request::UndoRegistryChangeIfCurrent {
+            change_id: change_a.change_id.unwrap(),
+        },
+    )
+    .await
+    .0
+    .unwrap_err();
+    assert!(stale.contains("no longer available"), "{stale}");
+    assert!(check(&a) && check(&b), "stale Undo changes neither Tool");
+
+    let (no_op, event) = exchange(&mut client_a, Request::RetireTool { id: b.clone() }).await;
+    assert_eq!(no_op.unwrap()["retired"], true);
+    assert!(event.is_none(), "repeated retirement publishes no receipt");
+    let (no_op, event) = exchange(
+        &mut client_a,
+        Request::RollbackTool {
+            id: b.clone(),
+            version: 1,
+        },
+    )
+    .await;
+    assert_eq!(no_op.unwrap()["current_version"], 1);
+    assert!(
+        event.is_none(),
+        "same-version rollback publishes no receipt"
+    );
+
+    let change_id = change_b.change_id.unwrap();
+    let undo = || Request::UndoRegistryChangeIfCurrent {
+        change_id: change_id.clone(),
+    };
+    let (first, repeated) = tokio::join!(
+        exchange(&mut client_a, undo()),
+        exchange(&mut client_b, undo())
+    );
+    let mut results = [first.0, repeated.0].into_iter();
+    let first = results.next().unwrap();
+    let repeated = results.next().unwrap();
+    let (success, rejected) = if first.is_ok() {
+        (first, repeated)
+    } else {
+        (repeated, first)
+    };
+    assert_eq!(success.unwrap()["tool"]["id"], b);
+    assert!(rejected.unwrap_err().contains("no longer available"));
+    assert!(check(&a) && !check(&b), "only B was restored");
+
+    let (result, restored) = exchange(&mut client_a, Request::RestoreTool { id: a.clone() }).await;
+    assert_eq!(result.unwrap()["retired"], false);
+    let restored = restored.unwrap();
+    assert_eq!(
+        exchange(&mut client_b, Request::Ping).await.1,
+        Some(restored.clone())
+    );
+    let (no_op, event) = exchange(&mut client_b, Request::RestoreTool { id: a.clone() }).await;
+    assert_eq!(no_op.unwrap()["retired"], false);
+    assert!(event.is_none(), "repeated restoration publishes no receipt");
+    let (result, _) = exchange(
+        &mut client_a,
+        Request::UndoRegistryChangeIfCurrent {
+            change_id: restored.change_id.unwrap(),
+        },
+    )
+    .await;
+    assert_eq!(result.unwrap()["tool"]["retired"], true);
+
+    assert!(exchange(&mut client_b, Request::Shutdown).await.0.is_ok());
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    drop(store);
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
