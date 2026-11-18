@@ -94,7 +94,13 @@ jobs:
       - name: Verify runner Python
         # setup-python's macOS builds require /Users/runner permissions.
         # Use the native Python already used by this runner's docs workflow.
-        run: python3 -c 'import sys; assert sys.version_info >= (3, 9), "Python 3.9+ is required"'
+        run: |
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            # The Debian/RPM manifest fixture parses Cargo.toml with tomllib.
+            python3 -c 'import sys; assert sys.version_info >= (3, 11), "Python 3.11+ is required on Linux"'
+          else
+            python3 -c 'import sys; assert sys.version_info >= (3, 9), "Python 3.9+ is required"'
+          fi
 
       - name: Restore Cargo dependency cache
         uses: actions/cache@v4
@@ -128,14 +134,19 @@ jobs:
       - name: Offline documentation and tooling tests
         run: |
           set -euo pipefail
-          # AUR packaging tests require GNU install and belong on Linux.
-          for suite in scripts/test-doc-links.py scripts/test-inventory.py scripts/test-eval-tool-use.py; do
+          for suite in scripts/test-doc-links.py scripts/test-inventory.py scripts/test-eval-tool-use.py \
+            scripts/test-release-check.py scripts/test-release-publication.py \
+            scripts/test-render-source-download.py scripts/test-storage-snapshot.py; do
             python3 "$suite" 2>&1 | tee "$CI_DIR/logs/$(basename "$suite").log"
           done
 
       - name: Linux AUR packaging regression tests
         if: runner.os == 'Linux'
         run: python3 scripts/test-aur-completions.py 2>&1 | tee "$CI_DIR/logs/aur-completions.log"
+
+      - name: Linux Debian and RPM packaging regression tests
+        if: runner.os == 'Linux'
+        run: python3 scripts/test-package-completions.py 2>&1 | tee "$CI_DIR/logs/package-completions.log"
 
       - name: Workspace unit, integration and doc tests
         run: cargo test --workspace --locked --no-fail-fast 2>&1 | tee "$CI_DIR/logs/rust-tests.log"

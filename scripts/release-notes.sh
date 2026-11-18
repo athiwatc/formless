@@ -1,12 +1,21 @@
 #!/bin/sh
-# Release notes for a version from CHANGELOG.md (#842): the body of its
-# `## [X.Y.Z]` section. Prints nothing when there is none (the release
-# then carries GitHub's generated notes alone).
+# Release notes for a version from CHANGELOG.md (#842). Requires a
+# nonempty `## X.Y.Z` or `## [X.Y.Z]` section.
 #   scripts/release-notes.sh 0.2.0 [CHANGELOG.md]
 set -eu
-version="${1#v}"
+tag="${1:?usage: release-notes.sh VERSION [CHANGELOG.md]}"
+version="${tag#v}"
 changelog="${2:-$(dirname "$0")/../CHANGELOG.md}"
-awk -v v="$version" '
-  /^## \[/ { if (on) exit; on = (index($0, "## [" v "]") == 1); next }
-  on { print }
-' "$changelog" | sed -e '/./,$!d'
+if ! awk -v v="$version" '
+  /^##[[:blank:]]+/ {
+    if (on) exit
+    sub(/\r$/, "")
+    on = ($2 == v || $2 == "[" v "]")
+    next
+  }
+  on && (wrote || /[^[:space:]]/) { print; wrote = 1 }
+  END { if (!wrote) exit 1 }
+' "$changelog"; then
+  echo "error: no nonempty CHANGELOG section for $version in $changelog" >&2
+  exit 1
+fi

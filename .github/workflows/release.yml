@@ -16,8 +16,7 @@ jobs:
   # smoke/install (30m) limits are provisional, not measured 2x baselines.
   # Re-size each job from its first green cold build before treating the
   # duration-sizing acceptance criterion as complete.
-  # Before any build (#842): the tag must name the Cargo.toml version, or
-  # the binaries would report another version than their release.
+  # Before any build (#842): the tag must have matching binaries and notes.
   version-check:
     if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main'
     timeout-minutes: 5
@@ -29,6 +28,9 @@ jobs:
       - name: Tag matches Cargo.toml
         if: startsWith(github.ref, 'refs/tags/v')
         run: scripts/release-check.sh "$GITHUB_REF_NAME"
+      - name: Tag has release notes
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: scripts/release-notes.sh "$GITHUB_REF_NAME" > /dev/null
   build:
     timeout-minutes: 60
     needs: version-check
