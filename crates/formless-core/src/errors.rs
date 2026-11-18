@@ -485,7 +485,6 @@ mod tests {
                 format!("provider error: {status_text}: {{}}"),
                 format!("provider request failed after retries: {status_text}"),
                 format!("POST /chat/completions failed: {status_text}"),
-                format!("GET /models failed: {status_text}: unavailable"),
                 format!("outer context: provider error: {status_text} (retry after 2s): {{}}"),
                 format!("outer context: HTTP status error ({status_text}) for url (https://private.invalid/v1)"),
                 format!("outer context: HTTP status client error ({status_text}) for url (https://private.invalid:443)"),
@@ -495,6 +494,23 @@ mod tests {
                 assert_eq!(explain(&raw, &context).category, category, "{raw}");
                 assert_eq!(is_transient(&raw), transient, "{raw}");
             }
+        }
+    }
+
+    #[test]
+    fn model_listing_errors_keep_their_existing_verdicts() {
+        let context = ctx("https://private.invalid/v1");
+        for (status_text, category, transient) in [
+            ("403 Forbidden", "auth", false),
+            ("404 Not Found", "model", false),
+            ("429 Too Many Requests", "rate_limit", true),
+            ("503 Service Unavailable", "server", true),
+        ] {
+            let raw = format!("GET /models failed: {status_text}: unavailable");
+            let code = status_text.split_once(' ').unwrap().0.parse().unwrap();
+            assert_eq!(status(&raw), Some(code), "{raw}");
+            assert_eq!(explain(&raw, &context).category, category, "{raw}");
+            assert_eq!(is_transient(&raw), transient, "{raw}");
         }
     }
 
