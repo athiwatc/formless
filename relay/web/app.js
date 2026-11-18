@@ -369,8 +369,20 @@
     return Number.isFinite(t) ? uiFormat(new Date(t), { hour: "2-digit", minute: "2-digit" }) : "";
   }
   function turnTimestamp(ts, today) {
-    const date = new Date(typeof ts === "number" ? ts : Date.parse(ts));
-    if (!Number.isFinite(date.getTime())) return null;
+    if (typeof ts !== "number") {
+      // Stored times use RFC 3339. Guard against Date treating incomplete
+      // strings as dates or rolling an impossible day into the next month.
+      const parts = typeof ts === "string" && /^(\d{4})-(\d\d)-(\d\d)[T ](\d\d):(\d\d):(\d\d)(?:\.\d+)?(?:Z|[+-]\d\d:\d\d)$/i.exec(ts);
+      if (!parts) return null;
+      const [year, month, day, hour, minute, second] = parts.slice(1).map(Number);
+      if (year < 1 || month < 1 || month > 12 || day < 1 || hour > 23 || minute > 59 || second > 59) return null;
+      const monthEnd = new Date(0);
+      monthEnd.setUTCFullYear(year, month, 0);
+      if (day > monthEnd.getUTCDate()) return null;
+    }
+    const date = new Date(ts);
+    const year = date.getUTCFullYear();
+    if (!Number.isFinite(year) || year < 1 || year > 9999) return null;
     const clockOptions = { hour: "2-digit", minute: "2-digit" };
     const visible = uiFormat(date, date.toDateString() === today
       ? clockOptions : { ...clockOptions, year: "numeric", month: "short", day: "numeric" });

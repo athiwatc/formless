@@ -29,7 +29,12 @@ HOOK = """
         message('second-0130', 'assistant', '2026-11-01T01:30:00-05:00'),
         message('later-tool', 'tool', '2026-11-02T00:01:00-05:00'),
         message('invalid', 'user', 'not a date'),
+        message('string-zero', 'user', '0'),
+        message('impossible-day', 'user', '2026-02-30T05:30:00+00:00'),
+        message('impossible-hour', 'user', '2026-11-01T24:00:00Z'),
         message('no-time', 'user', null),
+        message('precise-leap-day', 'user', '2024-02-29T14:00:00.123456789+00:00'),
+        message('epoch', 'user', 0),
       ];
       renderAll();
     },
@@ -86,8 +91,10 @@ def exercise(page, url, app):
     assert "GMT-5" in second_turn.locator(".who").aria_snapshot()
     expect(second_turn.locator('[data-message-id="later-tool"]')).to_have_count(1)
     expect(turn(page, "later-tool")).to_have_count(0)
-    expect(turn(page, "invalid").locator("time")).to_have_count(0)
-    expect(turn(page, "no-time").locator("time")).to_have_count(0)
+    for message_id in ["invalid", "string-zero", "impossible-day", "impossible-hour", "no-time"]:
+        expect(turn(page, message_id).locator("time")).to_have_count(0)
+    expect(turn(page, "precise-leap-day").locator("time")).to_have_attribute("datetime", "2024-02-29T14:00:00.123Z")
+    expect(turn(page, "epoch").locator("time")).to_have_attribute("datetime", "1970-01-01T00:00:00.000Z")
 
     page.evaluate("window.__savedTurn = document.querySelector('[data-turn-id=second-0130]')")
     page.evaluate("window.__savedStamp = window.__savedTurn.querySelector('time'); __turnTimeFixture.renderHistory()")
