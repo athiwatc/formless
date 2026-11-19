@@ -1,6 +1,6 @@
 {
   "audit": "Pinned source collection only; no claim of complete licensing obligations, asset/stdlib audit or distribution acceptance.",
-  "cargo_lock_sha256": "56d23d7f24ad4912b77bd29c54e2ae28513f96f945df62565a73deacda60d736",
+  "cargo_lock_sha256": "b0c809ca062b9983c32744c21af95fe568cc19f22abd7b72c233267c63a8ee0c",
   "packages": [
     {
       "files": [

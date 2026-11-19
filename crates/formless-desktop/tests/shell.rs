@@ -1918,6 +1918,12 @@ const COMMAND: &str = "cmd";
 #[cfg(not(target_os = "macos"))]
 const COMMAND: &str = "ctrl";
 
+// GPUI Kit binds Redo to a different key on macOS.
+#[cfg(target_os = "macos")]
+const REDO_SHORTCUT: &str = "cmd-shift-z";
+#[cfg(not(target_os = "macos"))]
+const REDO_SHORTCUT: &str = "ctrl-y";
+
 fn chord(key: &str) -> String {
     format!("{COMMAND}-{key}")
 }
@@ -2129,7 +2135,7 @@ fn undo_cannot_bring_back_another_sessions_draft(cx: &mut TestAppContext) {
             shell.read(cx).draft(cx).as_ref(),
             "for the first session only"
         );
-        window.press(&chord("shift-z"), cx);
+        window.press(REDO_SHORTCUT, cx);
     });
     step(cx, handle, |window, cx| {
         assert_eq!(
@@ -2483,12 +2489,12 @@ fn a_rejected_edit_keeps_the_earlier_undo_history_and_cannot_be_redone(cx: &mut 
         assert!(accepted.starts_with(draft.as_ref()));
         // Redo brings the typing back; a second redo would re-apply the
         // rejected paste, and is rejected again.
-        window.press(&chord("shift-z"), cx);
+        window.press(REDO_SHORTCUT, cx);
     });
     cx.run_until_parked();
     step(cx, handle, |window, cx| {
         assert!(shell.read(cx).draft(cx).as_ref() == accepted);
-        window.press(&chord("shift-z"), cx);
+        window.press(REDO_SHORTCUT, cx);
     });
     cx.run_until_parked();
     step(cx, handle, |_, cx| {
@@ -7386,7 +7392,7 @@ fn composer_escape_cancels_replaced_preedit_without_an_undo_entry(cx: &mut TestA
         assert!(shell.read(cx).last_intent().is_none());
         window.press(&chord("z"), cx);
         assert!(shell.read(cx).draft(cx).is_empty());
-        window.press(&chord("shift-z"), cx);
+        window.press(REDO_SHORTCUT, cx);
         assert_eq!(shell.read(cx).draft(cx).as_ref(), draft);
     });
 }
@@ -7595,7 +7601,7 @@ fn composer_send_key_choice_preserves_selection_and_existing_undo_redo(cx: &mut 
         });
         window.press(&chord("z"), cx);
         assert_eq!(shell.read(cx).draft(cx).as_ref(), "");
-        window.press(&chord("shift-z"), cx);
+        window.press(REDO_SHORTCUT, cx);
         assert_eq!(shell.read(cx).draft(cx).as_ref(), "original");
         window.press("shift-left", cx);
         shell.update(cx, |shell, cx| {
