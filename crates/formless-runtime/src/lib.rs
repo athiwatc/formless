@@ -1034,6 +1034,12 @@ fn fetch_error(
         }
         if let Some(e) = e.downcast_ref::<std::io::Error>() {
             timeout |= e.kind() == std::io::ErrorKind::TimedOut;
+            // A custom I/O error's source() skips the wrapped error itself.
+            // Inspect it directly to retain its type without repeating its Display.
+            if let Some(inner) = e.get_ref() {
+                next = Some(inner);
+                continue;
+            }
         }
         parts.push(e.to_string());
         next = e.source();
@@ -4902,6 +4908,32 @@ mod tests {
         let req = live("async function run() { const p = Promise.reject(new Error('later handled')); await tools.call('t', {}); p.catch(() => {}); return 7; }");
         let out = execute(&req, Arc::new(SlowOps)).unwrap();
         assert_eq!(out.output, json!(7));
+    }
+
+    #[test]
+    fn fetch_errors_keep_the_kind_of_wrapped_io_errors() {
+        let timeouts = FetchTimeouts {
+            connect_ms: 1_000,
+            total_ms: 1_200,
+        };
+        let phase = "reading response body";
+        let timeout = std::io::Error::other(std::io::Error::other(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "fixture deadline",
+        )));
+        assert_eq!(
+            fetch_error(&timeout, timeouts, phase),
+            "fetch timed out: fixture deadline (reading response body, configured tools.fetch_connect_timeout_secs=1s, tools.fetch_timeout_secs=1.2s)"
+        );
+
+        let eof = std::io::Error::other(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "operation timed out",
+        ));
+        assert_eq!(
+            fetch_error(&eof, timeouts, phase),
+            "fetch failed: operation timed out"
+        );
     }
 
     /// The peer remains connected until the request's own deadline closes it.
