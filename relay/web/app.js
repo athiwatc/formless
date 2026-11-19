@@ -1592,6 +1592,7 @@
     }
     const L = HL[HL_ALIAS[lang] || lang];
     if (!L) return null;
+    const toml = lang === "toml";
     const out = [];
     let plain = "";
     const tok = (cls, s) => {
@@ -1625,8 +1626,11 @@
         }
       }
       if (lineStart && L.key) {
-        const m = code.slice(i).match(/^([ \t]*)([\w.\-"'\[\] ]+?)(?=\s*[:=])/);
-        if (m && m[2].trim() && !(L.lc || []).some((p) => m[2].trim().startsWith(p))) {
+        const m = code.slice(i).match(/^([ \t]*)([\w.\-"'\[\] ]+?)(?=(\s*)[:=])/);
+        const key = m?.[2].trim();
+        // A multiline TOML array value can start where a key normally would.
+        if (key && !(L.lc || []).some((p) => key.startsWith(p)) &&
+            (!toml || !/^(['"])\1\1/.test(key) && !/[^\t ]/.test(m[3]))) {
           plain += m[1];
           tok("tok-key", m[2]);
           i += m[0].length;
@@ -1642,7 +1646,8 @@
         i = stop;
         continue;
       }
-      if ((L.lc || []).some((p) => code.startsWith(p, i)) && (c !== "#" || L.hashAnywhere || i === 0 || /\s/.test(code[i - 1]))) {
+      if ((L.lc || []).some((p) => code.startsWith(p, i)) &&
+          (c !== "#" || L.hashAnywhere || i === 0 || /\s/.test(code[i - 1]) || toml && L.q.includes(code[i - 1]))) {
         const end = code.indexOf("\n", i);
         const stop = end < 0 ? code.length : end;
         tok("tok-com", code.slice(i, stop));
@@ -1650,9 +1655,9 @@
         continue;
       }
       if (L.q.includes(c)) {
-        const multiline = lang === "toml" && code.startsWith(c.repeat(3), i);
+        const multiline = toml && code.startsWith(c.repeat(3), i);
         const delimiter = multiline ? c.repeat(3) : c;
-        const escapes = lang !== "toml" || c !== "'";
+        const escapes = !toml || c !== "'";
         let j = i + delimiter.length;
         while (j < code.length && !code.startsWith(delimiter, j) && (code[j] !== "\n" || c === "`" || multiline)) {
           j += code[j] === "\\" && escapes ? 2 : 1;

@@ -649,6 +649,7 @@ impl Highlighter {
             if let Some(end) = end {
                 let key = &chars[lead..end];
                 let bare = !key.is_empty()
+                    && !l.multiline.iter().any(|delimiter| at(lead, delimiter))
                     && key
                         .iter()
                         .all(|c| c.is_alphanumeric() || "_-. \"'[]".contains(*c));
@@ -761,7 +762,11 @@ impl Highlighter {
                 }
             }
             if l.line_comments.iter().any(|p| at(i, p))
-                && (c != '#' || self.python_comments || i == 0 || chars[i - 1].is_whitespace())
+                && (c != '#'
+                    || self.python_comments
+                    || i == 0
+                    || chars[i - 1].is_whitespace()
+                    || toml && l.quotes.contains(&chars[i - 1]))
             {
                 push(Tok::Comment, &chars[i..]);
                 break;
@@ -1319,7 +1324,8 @@ mod tests {
                 assert_eq!(spans[0].content, source);
                 assert_eq!(spans[0].style.fg, Some(Color::Green));
             }
-            let spans = h.line(&format!("{closing} # outside"));
+            let spacing = if delimiter.starts_with('"') { "" } else { " " };
+            let spans = h.line(&format!("{closing}{spacing}# outside"));
             assert_eq!(spans[0].content, closing);
             assert_eq!(spans[0].style.fg, Some(Color::Green));
             assert_eq!(spans.last().unwrap().content, "# outside");
@@ -1332,6 +1338,16 @@ mod tests {
                 .iter()
                 .any(|s| s.content == "\"formless\"" && s.style.fg == Some(Color::Green)));
             assert_eq!(next.last().unwrap().style.fg, Some(Color::DarkGray));
+
+            h.line("items = [");
+            let first = h.line(&format!("  {delimiter}a = b"));
+            assert!(first.iter().any(|s| {
+                s.content == format!("{delimiter}a = b") && s.style.fg == Some(Color::Green)
+            }));
+            assert!(all_str(&mut h, "# inside the array value"));
+            assert!(all_str(&mut h, delimiter));
+            h.line("]");
+            assert_eq!(h.line("# outside")[0].style.fg, Some(Color::DarkGray));
         }
     }
 
