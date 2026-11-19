@@ -3340,8 +3340,10 @@ impl Shell {
         if command == Command::ToggleEnterSends && self.background_inert(window) {
             return Some("Close the open dialog before changing send keys");
         }
-        if matches!(command, Command::SessionModel | Command::SessionPendingFiles)
-            && self.background_inert(window)
+        if matches!(
+            command,
+            Command::SessionModel | Command::SessionPendingFiles
+        ) && self.background_inert(window)
         {
             return Some("Close the open dialog before opening Session details");
         }

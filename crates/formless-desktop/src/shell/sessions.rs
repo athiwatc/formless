@@ -210,7 +210,10 @@ impl Shell {
             _ if self
                 .client_sessions
                 .iter()
-                .any(|session| session.id == id && session.archived) => Field::Archive,
+                .any(|session| session.id == id && session.archived) =>
+            {
+                Field::Archive
+            }
             _ => Field::Name,
         };
         self.session_editor = Some(Panel {
@@ -650,13 +653,9 @@ impl Shell {
                 region: Some(Region::Conversation),
             });
         } else if !self.client_connected
-            && self
-                .restore_focus
-                .as_ref()
-                .is_some_and(|origin| {
-                    origin.handle == self.composer_model_focus
-                        || origin.handle == self.chat_files_focus
-                })
+            && self.restore_focus.as_ref().is_some_and(|origin| {
+                origin.handle == self.composer_model_focus || origin.handle == self.chat_files_focus
+            })
         {
             self.restore_focus = None;
         }
@@ -1340,7 +1339,9 @@ impl Shell {
                 .disabled(self.export_save_prompt.is_some() || !self.export_save_current(&id, connection, revision))
                 .track_focus(&panel.controls[11].0)
                 .on_click(cx.listener(move |this, _, window, cx| this.save_session_export(&id, connection, revision, window, cx)))));
-        body = body.when(!panel.files_first, |body| body.child(self.render_pending_files(cx)));
+        body = body.when(!panel.files_first, |body| {
+            body.child(self.render_pending_files(cx))
+        });
         let expected_toggle = panel
             .metadata
             .as_ref()
