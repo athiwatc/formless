@@ -20,8 +20,8 @@ import tempfile
 import zipfile
 
 
-def run(arguments, cwd):
-    return subprocess.check_output(arguments, cwd=cwd, text=True).strip()
+def run(arguments, cwd, *, encoding="utf-8"):
+    return subprocess.check_output(arguments, cwd=cwd, encoding=encoding).strip()
 
 
 def digest(path):
@@ -39,7 +39,7 @@ def write_json(path, value):
 def ensure_source(repository, commit, dirty, stage=None):
     if run(["git", "rev-parse", "HEAD"], repository) != commit:
         raise ValueError("source commit changed during packaging")
-    status = ["git", "status", "--porcelain", "--untracked-files=normal"]
+    status = ["git", "status", "--porcelain", "-z", "--untracked-files=normal"]
     if stage is not None:
         try:
             relative = stage.relative_to(repository)
@@ -50,7 +50,7 @@ def ensure_source(repository, commit, dirty, stage=None):
             # directory. Exclude only that exact owned directory, not its
             # parent or unrelated new source files.
             status += ["--", ".", ":(top,literal,exclude)" + relative.as_posix()]
-    if bool(run(status, repository)) != dirty:
+    if bool(run(status, repository, encoding=None)) != dirty:
         raise ValueError("source cleanliness changed during packaging")
 
 
@@ -305,7 +305,10 @@ def package(args):
     output.parent.mkdir(parents=True, exist_ok=True)
     commit = run(["git", "rev-parse", "HEAD"], repository)
     epoch = int(run(["git", "show", "-s", "--format=%ct", commit], repository))
-    dirty = bool(run(["git", "status", "--porcelain", "--untracked-files=normal"], repository))
+    # Cleanliness only depends on whether Git reported any entries. Paths are
+    # opaque bytes here, even when a filename is not UTF-8.
+    dirty = bool(run(["git", "status", "--porcelain", "-z", "--untracked-files=normal"],
+                     repository, encoding=None))
     if dirty and not args.allow_dirty:
         raise ValueError("source changes exist; commit them or explicitly use --allow-dirty for a development bundle")
     platform = {"darwin": "macos", "win32": "windows", "linux": "linux"}.get(sys.platform)
@@ -325,7 +328,7 @@ def package(args):
     built = set()
     binary = None
     root_features = None
-    with subprocess.Popen(command, cwd=repository, stdout=subprocess.PIPE, text=True) as process:
+    with subprocess.Popen(command, cwd=repository, stdout=subprocess.PIPE, encoding="utf-8") as process:
         for line in process.stdout:
             event = json.loads(line)
             if event.get("reason") == "compiler-artifact":
@@ -368,10 +371,10 @@ def package(args):
                     "CFBundleIdentifier": "xyz.formless.desktop.development", "CFBundlePackageType": "APPL",
                     "CFBundleExecutable": executable.name, "CFBundleShortVersionString": version,
                     "CFBundleVersion": version.split("-")[0], "NSHighResolutionCapable": True}
-            load_commands = run(["otool", "-l", str(binary)], repository)
-            minimum = re.search(r"cmd LC_BUILD_VERSION.*?minos ([0-9.]+)", load_commands, re.S)
+            load_commands = run(["otool", "-l", str(binary)], repository, encoding=None)
+            minimum = re.search(rb"cmd LC_BUILD_VERSION.*?minos ([0-9.]+)", load_commands, re.S)
             if minimum:
-                info["LSMinimumSystemVersion"] = minimum.group(1)
+                info["LSMinimumSystemVersion"] = minimum.group(1).decode("ascii")
             with (bundle / "Contents/Info.plist").open("wb") as target:
                 plistlib.dump(info, target)
         else:

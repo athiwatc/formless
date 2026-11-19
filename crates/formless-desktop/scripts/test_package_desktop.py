@@ -330,11 +330,26 @@ class Packaging(unittest.TestCase):
         with patch.object(package, "run", side_effect=["other-commit"]):
             with self.assertRaisesRegex(ValueError, "commit changed"):
                 package.ensure_source(self.root, "expected-commit", False)
-        with patch.object(package, "run", side_effect=["expected-commit", " M source.rs"]):
+        with patch.object(package, "run", side_effect=["expected-commit", b"?? source-\xff\0"]) as command:
             with self.assertRaisesRegex(ValueError, "cleanliness changed"):
                 package.ensure_source(self.root, "expected-commit", False)
-        with patch.object(package, "run", side_effect=["expected-commit", ""]):
+            command.assert_called_with(["git", "status", "--porcelain", "-z", "--untracked-files=normal"],
+                                       self.root, encoding=None)
+        with patch.object(package, "run", side_effect=["expected-commit", b""]):
             package.ensure_source(self.root, "expected-commit", False)
+
+    def test_cargo_metadata_uses_strict_utf8_under_a_windows_code_page(self):
+        expected = {"target_directory": "C:/fixture/ā", "description": "日本語"}
+        output = json.dumps(expected, ensure_ascii=False).encode("utf-8")
+
+        def windows_pipe(_arguments, *, cwd, encoding=None, text=False):
+            return output.decode(encoding or "cp1252") if encoding or text else output
+
+        with patch.object(package.subprocess, "check_output", side_effect=windows_pipe):
+            self.assertEqual(json.loads(package.run(["cargo", "metadata"], self.root)), expected)
+            output = b'{"description":"\x81"}'
+            with self.assertRaises(UnicodeDecodeError):
+                package.run(["cargo", "metadata"], self.root)
 
     def test_existing_output_is_refused_before_any_build(self):
         marker = self.root / "preserved"
@@ -369,10 +384,12 @@ class Packaging(unittest.TestCase):
         scripts.mkdir(parents=True)
         metadata=self.shipping_metadata()
         metadata["packages"][-1]["name"]="formless-core"
-        def command(arguments,_cwd):
+        def command(arguments, _cwd, *, encoding="utf-8"):
             if arguments[:3]==["git","rev-parse","HEAD"]:return "expected-commit"
             if arguments[:2]==["git","show"]:return "1700000000"
-            if arguments[:2]==["git","status"]:return ""
+            if arguments[:2]==["git","status"]:
+                self.assertIsNone(encoding)
+                return b""
             if arguments==["rustc","-vV"]:return "host: aarch64-apple-darwin"
             if arguments[:2]==["cargo","metadata"]:
                 self.assertIn("--no-default-features",arguments)
@@ -398,7 +415,7 @@ class Packaging(unittest.TestCase):
         (repository / "LICENSE").write_text("fixture project terms")
         (desktop / "README.md").write_text("fixture readme")
         (desktop / "Cargo.lock").write_text("fixture locked inputs")
-        binary = repository / "target/debug/formless-desktop"
+        binary = repository / "target/debug/ā/formless-desktop"
         binary.parent.mkdir(parents=True)
         binary.write_bytes(b"\xcf\xfa\xed\xfe fixture only; never executed")
         metadata = dict(target_directory=str(repository / "target"), packages=[dict(
@@ -411,13 +428,14 @@ class Packaging(unittest.TestCase):
                         target=dict(name="formless-desktop", kind=["bin"]), executable=str(binary))
         revisions = iter(["expected-commit", "expected-commit", "changed-commit"])
 
-        def command(arguments, _cwd):
+        def command(arguments, _cwd, *, encoding="utf-8"):
             if arguments[:3] == ["git", "rev-parse", "HEAD"]:
                 return next(revisions)
             if arguments[:2] == ["git", "show"]:
                 return "1700000000"
             if arguments[:2] == ["git", "status"]:
-                return ""
+                self.assertIsNone(encoding)
+                return b""
             if arguments == ["rustc", "-vV"]:
                 return "host: aarch64-apple-darwin"
             if arguments[:2] == ["cargo", "metadata"]:
@@ -425,7 +443,8 @@ class Packaging(unittest.TestCase):
             if arguments == ["rustc", "--print", "target-list"]:
                 return "aarch64-apple-darwin"
             if arguments[:2] == ["otool", "-l"]:
-                return "cmd LC_BUILD_VERSION\nminos 13.0"
+                self.assertIsNone(encoding)
+                return b"/opaque/path-\xff:\ncmd LC_BUILD_VERSION\nminos 13.0"
             self.fail(f"unexpected command: {arguments}")
 
         output = self.root / "unpublished"
@@ -434,8 +453,14 @@ class Packaging(unittest.TestCase):
                 patch.object(package, "run", side_effect=command), \
                 patch.object(package.subprocess, "Popen") as popen:
             process = popen.return_value.__enter__.return_value
-            process.stdout = [json.dumps(artifact)]
             process.wait.return_value = 0
+
+            def windows_build_pipe(_command, *, cwd, stdout, encoding=None, text=False):
+                output = json.dumps(artifact, ensure_ascii=False).encode("utf-8")
+                process.stdout = [output.decode(encoding or "cp1252") if encoding or text else output]
+                return popen.return_value
+
+            popen.side_effect = windows_build_pipe
             with self.assertRaisesRegex(ValueError, "commit changed"):
                 package.package(argparse.Namespace(output=str(output), allow_dirty=False,
                                                    offline=True, profile="dev"))
