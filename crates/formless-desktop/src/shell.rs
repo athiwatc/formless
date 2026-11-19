@@ -5525,6 +5525,8 @@ impl Shell {
                 .child(
                     Button::new("composer-model")
                         .label(entry.label)
+                        .accessibility_label("Model or Role")
+                        .small()
                         .outline()
                         .disabled(!entry.enabled())
                         .tooltip(tooltip(&entry))

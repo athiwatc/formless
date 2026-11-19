@@ -457,7 +457,7 @@ pub fn entry(command: Command, state: &State) -> Entry {
             },
         ),
         Command::SessionModel => (
-            "Model / Role",
+            "Model",
             "Review Session model or Role".into(),
             Group::Composer,
             "Open Chat's model and reasoning effort settings for the current Session",

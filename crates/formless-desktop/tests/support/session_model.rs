@@ -32,6 +32,7 @@ fn composer_model_control_opens_the_current_session_and_preserves_the_draft(
         tab_to(window, "composer-model", cx);
         settle_frames(window, cx);
         assert!(window.find("composer-model").visible());
+        assert_eq!(window.find("composer-model").label(), Some("Model or Role"));
         assert_eq!(
             shell.read(cx).focused_section(window, cx),
             Some(PageSection::Composer)
