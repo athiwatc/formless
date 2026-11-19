@@ -37,6 +37,8 @@ use crate::forecast;
 mod approval_review;
 mod comparison;
 mod invocations;
+#[cfg(target_os = "macos")]
+mod macos_composer;
 mod preferences;
 mod profile_search;
 mod questions;
@@ -889,6 +891,8 @@ pub struct Shell {
     search_notice: Option<&'static str>,
     block_copy_notice: Option<&'static str>,
     composer: Entity<TextareaState>,
+    #[cfg(target_os = "macos")]
+    native_composer_escape: Option<macos_composer::EscapeMonitor>,
     enter_sends: bool,
     preferences: Option<crate::preferences::Store>,
     preference_notice: Option<SharedString>,
@@ -1166,6 +1170,8 @@ impl Shell {
             search_notice: None,
             block_copy_notice: None,
             composer,
+            #[cfg(target_os = "macos")]
+            native_composer_escape: None,
             enter_sends: true,
             preferences: None,
             preference_notice: None,

@@ -2190,6 +2190,8 @@ name = "formless-desktop"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "block2 0.6.2",
+ "core-foundation 0.10.1",
  "formless-core",
  "formless-protocol",
  "futures-util",
@@ -2197,6 +2199,8 @@ dependencies = [
  "icu_segmenter",
  "markdown",
  "objc",
+ "objc2 0.6.5",
+ "objc2-app-kit 0.3.2",
  "raw-window-handle",
  "serde",
  "serde_json",

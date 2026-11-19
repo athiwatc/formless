@@ -28,7 +28,7 @@ opt-level = 3
 default = ["gui"]
 # The GPUI Kit shell. Without it only the presentation model and fixture
 # build, which lets their tests run on hosts with no GUI toolchain.
-gui = ["dep:gpui-kit"]
+gui = ["dep:gpui-kit", "dep:block2", "dep:core-foundation", "dep:objc2", "dep:objc2-app-kit", "dep:raw-window-handle"]
 # The kit's headless window harness, for tests/shell.rs. A feature rather
 # than a dev-dependency: dev-dependencies cannot be optional, and one on the
 # kit would compile GPUI even for the model tests.
@@ -91,8 +91,12 @@ icu_segmenter = { version = "2.4", default-features = false, features = ["compil
 # whole family moves together and only on purpose.
 gpui-kit = { version = "=0.9.1", optional = true }
 
-# Both are already in the lockfile through the GPUI layer; `ax-dump` only
-# adds the edges from this crate.
+# All versions are already pinned by the GPUI layer. The GUI uses AppKit's
+# application-local Escape event monitor. The diagnostic walk also uses objc.
 [target.'cfg(target_os = "macos")'.dependencies]
+block2 = { version = "0.6.2", optional = true }
+core-foundation = { version = "0.10.1", optional = true }
 objc = { version = "0.2.7", optional = true }
+objc2 = { version = "0.6.5", optional = true }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["block2", "NSEvent", "NSResponder", "NSTextInputClient", "NSTextInputContext", "NSView", "NSWindow"], optional = true }
 raw-window-handle = { version = "0.6", optional = true }

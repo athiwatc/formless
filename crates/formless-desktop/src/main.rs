@@ -657,6 +657,8 @@ fn main() {
             });
             let shell = cx.new(|cx| shell::Shell::new(&sessions, &running, blocks, window, cx));
             shell.update(cx, |shell, cx| {
+                #[cfg(target_os = "macos")]
+                shell.install_native_composer_escape(window, cx);
                 if let Some(store) = preference_store {
                     shell.attach_preferences(store, window, cx);
                 }
