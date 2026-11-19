@@ -27,6 +27,7 @@ pub enum Command {
     Approvals,
     SessionDetails,
     SessionModel,
+    SessionPendingFiles,
     MarkComparisonLeft,
     CompareMarked,
     InspectRun,
@@ -194,6 +195,7 @@ pub fn keys(command: Command) -> &'static [&'static str] {
         | Command::Approvals
         | Command::SessionDetails
         | Command::SessionModel
+        | Command::SessionPendingFiles
         | Command::MarkComparisonLeft
         | Command::CompareMarked
         | Command::InspectRun
@@ -285,6 +287,7 @@ pub fn palette(state: &State) -> Vec<Entry> {
         Command::Approvals,
         Command::SessionDetails,
         Command::SessionModel,
+        Command::SessionPendingFiles,
         Command::MarkComparisonLeft,
         Command::CompareMarked,
         Command::InspectRun,
@@ -456,20 +459,35 @@ pub fn entry(command: Command, state: &State) -> Entry {
                 (!state.can_edit_session).then_some("Choose a Session while connected")
             },
         ),
-        Command::SessionModel => (
-            "Model",
-            "Review Session model or Role".into(),
-            Group::Composer,
-            "Open Chat's model and reasoning effort settings for the current Session",
-            None,
-            if !state.has_composer {
-                Some(NO_COMPOSER)
-            } else if state.composing {
-                Some(COMPOSING)
+        Command::SessionModel | Command::SessionPendingFiles => {
+            let (label, title, hint) = if command == Command::SessionModel {
+                (
+                    "Model",
+                    "Review Session model or Role",
+                    "Open Chat's model and reasoning effort settings for the current Session",
+                )
             } else {
-                (!state.can_edit_session).then_some("Choose a Session while connected")
-            },
-        ),
+                (
+                    "Pending files",
+                    "Review pending files",
+                    "Open pending attachment and reference review for the current Session",
+                )
+            };
+            (
+                label,
+                title.into(),
+                Group::Composer,
+                hint,
+                None,
+                if !state.has_composer {
+                    Some(NO_COMPOSER)
+                } else if state.composing {
+                    Some(COMPOSING)
+                } else {
+                    (!state.can_edit_session).then_some("Choose a Session while connected")
+                },
+            )
+        }
         Command::ToggleArchived => (
             "Archived",
             if state.archived_included {

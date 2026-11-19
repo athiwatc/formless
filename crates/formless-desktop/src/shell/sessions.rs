@@ -5,6 +5,12 @@ use crate::questions::preview;
 use crate::session_edit::{Change, Field, Metadata, Outcome, MAX_INPUT};
 use crate::session_export::{self, Format};
 
+pub(super) enum SessionEditorStart {
+    Details,
+    Model,
+    PendingFiles,
+}
+
 #[derive(Clone, Copy)]
 enum Waiting {
     Read(uuid::Uuid),
@@ -34,6 +40,7 @@ pub(super) struct Panel {
     pub export: session_export::State,
     catalog: catalog::State,
     pending_files: pending_files::State,
+    files_first: bool,
     revision: uuid::Uuid,
     instance: uuid::Uuid,
     model: String,
@@ -178,7 +185,7 @@ impl Shell {
 
     pub(super) fn open_session_editor(
         &mut self,
-        initial_field: Option<Field>,
+        start: SessionEditorStart,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -198,21 +205,19 @@ impl Shell {
         self.viewer = None;
         self.prefs.close_overlays();
         let scroll = ScrollHandle::new();
-        let field = initial_field.unwrap_or_else(|| {
-            if self
+        let field = match start {
+            SessionEditorStart::Model => Field::Model,
+            _ if self
                 .client_sessions
                 .iter()
-                .any(|session| session.id == id && session.archived)
-            {
-                Field::Archive
-            } else {
-                Field::Name
-            }
-        });
+                .any(|session| session.id == id && session.archived) => Field::Archive,
+            _ => Field::Name,
+        };
         self.session_editor = Some(Panel {
             export: session_export::State::default(),
             catalog: catalog::State::default(),
             pending_files: pending_files::State::default(),
+            files_first: matches!(start, SessionEditorStart::PendingFiles),
             revision: uuid::Uuid::new_v4(),
             instance: self.client.as_ref().unwrap().instance(),
             model: String::new(),
@@ -648,7 +653,10 @@ impl Shell {
             && self
                 .restore_focus
                 .as_ref()
-                .is_some_and(|origin| origin.handle == self.composer_model_focus)
+                .is_some_and(|origin| {
+                    origin.handle == self.composer_model_focus
+                        || origin.handle == self.chat_files_focus
+                })
         {
             self.restore_focus = None;
         }
@@ -1031,6 +1039,7 @@ impl Shell {
             });
         let mut body=v_flex().id("session-edit-body").test_support().flex_1().min_h_0().overflow_y_scroll().track_scroll(&panel.scroll).gap_2()
             .child(readable("session-edit-id",format!("Session: {}",panel.id)))
+            .when(panel.files_first, |body| body.child(self.render_pending_files(cx)))
             .child(readable("session-edit-help","Saves replace the current field, including changes made by another client. Cancel discards unsaved metadata edits; it does not undo a requested save. Reload also replaces these edits."));
         let mut tabs = h_flex().flex_wrap().gap_2();
         for (index, field) in [
@@ -1331,7 +1340,7 @@ impl Shell {
                 .disabled(self.export_save_prompt.is_some() || !self.export_save_current(&id, connection, revision))
                 .track_focus(&panel.controls[11].0)
                 .on_click(cx.listener(move |this, _, window, cx| this.save_session_export(&id, connection, revision, window, cx)))));
-        body = body.child(self.render_pending_files(cx));
+        body = body.when(!panel.files_first, |body| body.child(self.render_pending_files(cx)));
         let expected_toggle = panel
             .metadata
             .as_ref()

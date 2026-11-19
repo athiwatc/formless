@@ -175,8 +175,9 @@ impl Shell {
         let p = self.session_editor.as_ref().unwrap();
         let owner = Owner::of(p);
         let ready = self.pending_files_current(owner);
-        let mut body=v_flex().gap_2().child(readable("pending-files-help","Pending files belong to this Session's next user message and are shared across clients. Read a metadata snapshot; attachment paths are not opened, and this does not attach/remove files or start a Run. Metadata includes private daemon paths. References can be reviewed for removal below. Stored files and attachment additions require Formless TUI. Reading/copying does not remove anything and is not a recovery guarantee."))
+        let mut body=v_flex().gap_2()
             .child(div().id("pending-files-read-anchor").pt_1().anchor_scroll(Some(p.controls[BASE].1.clone())).child(Button::new("pending-files-read").label("Read pending files").disabled(!ready||p.pending_files.pending.is_some()||self.client.as_ref().is_some_and(|c|c.reference_status().busy())).track_focus(&p.controls[BASE].0).on_click(cx.listener(move|this,_,window,cx|this.read_pending_files(owner,window,cx)))))
+            .child(readable("pending-files-help","Pending files belong to this Session's next user message and are shared across clients. Read a metadata snapshot; attachment paths are not opened, and this does not attach/remove files or start a Run. Metadata includes private daemon paths. References can be reviewed for removal below. Stored files and attachment additions require Formless TUI. Reading/copying does not remove anything and is not a recovery guarantee."))
             .child(readable("pending-files-notice",p.pending_files.notice.clone()));
         if let (Some(r), Some(revision)) = (&p.pending_files.report, p.pending_files.revision) {
             let page = p

@@ -48,6 +48,7 @@ mod sessions;
 mod step_mode;
 mod step_review;
 mod usage;
+use self::sessions::SessionEditorStart;
 use crate::full_view;
 use crate::memory::{
     edit_span, format_bytes, limits, paste_can_never_fit, snap_to_graphemes, within_composer_limit,
@@ -187,6 +188,7 @@ pub fn bind_keys(cx: &mut App) {
                 | Command::Approvals
                 | Command::SessionDetails
                 | Command::SessionModel
+                | Command::SessionPendingFiles
                 | Command::MarkComparisonLeft
                 | Command::CompareMarked
                 | Command::InspectRun
@@ -889,12 +891,14 @@ pub struct Shell {
     theme_toggle_focus: FocusHandle,
     commands_toggle_focus: FocusHandle,
     composer_model_focus: FocusHandle,
+    chat_files_focus: FocusHandle,
     resume_focus: FocusHandle,
     abandon_focus: FocusHandle,
     resume_anchor: gpui_kit::ScrollAnchor,
     abandon_anchor: gpui_kit::ScrollAnchor,
     composer_anchor: gpui_kit::ScrollAnchor,
     composer_model_anchor: gpui_kit::ScrollAnchor,
+    chat_files_anchor: gpui_kit::ScrollAnchor,
     mode_enable_anchor: gpui_kit::ScrollAnchor,
     /// The status line is a tab stop on a reflowed page, where it can be
     /// off screen and holds nothing else that focus could bring into view.
@@ -1058,6 +1062,7 @@ impl Shell {
             abandon_anchor: gpui_kit::ScrollAnchor::for_handle(page_scroll.clone()),
             composer_anchor: gpui_kit::ScrollAnchor::for_handle(page_scroll.clone()),
             composer_model_anchor: gpui_kit::ScrollAnchor::for_handle(page_scroll.clone()),
+            chat_files_anchor: gpui_kit::ScrollAnchor::for_handle(page_scroll.clone()),
             mode_enable_anchor: gpui_kit::ScrollAnchor::for_handle(page_scroll.clone()),
             page_scroll,
             reveal_frames: 0,
@@ -1160,6 +1165,7 @@ impl Shell {
             theme_toggle_focus: cx.focus_handle(),
             commands_toggle_focus: cx.focus_handle(),
             composer_model_focus: cx.focus_handle(),
+            chat_files_focus: cx.focus_handle(),
             resume_focus: cx.focus_handle(),
             abandon_focus: cx.focus_handle(),
             status_focus: cx.focus_handle().tab_stop(true),
@@ -1674,6 +1680,8 @@ impl Shell {
             Some(&self.mode_enable_anchor)
         } else if self.composer_model_focus.is_focused(window) {
             Some(&self.composer_model_anchor)
+        } else if self.chat_files_focus.is_focused(window) {
+            Some(&self.chat_files_anchor)
         } else if self.resume_focus.is_focused(window) {
             Some(&self.resume_anchor)
         } else if self.abandon_focus.is_focused(window) {
@@ -3323,8 +3331,10 @@ impl Shell {
         if command == Command::ToggleEnterSends && self.background_inert(window) {
             return Some("Close the open dialog before changing send keys");
         }
-        if command == Command::SessionModel && self.background_inert(window) {
-            return Some("Close the open dialog before reviewing the Session model");
+        if matches!(command, Command::SessionModel | Command::SessionPendingFiles)
+            && self.background_inert(window)
+        {
+            return Some("Close the open dialog before opening Session details");
         }
         let state = self.command_state(window, cx);
         if let Some(reason) = commands::entry(command, &state).disabled_reason {
@@ -3339,6 +3349,8 @@ impl Shell {
                     format!("Send keys unchanged: {reason}.").into()
                 } else if command == Command::SessionModel {
                     format!("Model / Role: {reason}.").into()
+                } else if command == Command::SessionPendingFiles {
+                    format!("Pending files: {reason}.").into()
                 } else {
                     format!("Not sent: {reason}.").into()
                 });
@@ -3349,9 +3361,14 @@ impl Shell {
         match command {
             Command::Questions => self.open_questions(window, cx),
             Command::Approvals => self.open_approvals(window, cx),
-            Command::SessionDetails => self.open_session_editor(None, window, cx),
+            Command::SessionDetails => {
+                self.open_session_editor(SessionEditorStart::Details, window, cx)
+            }
             Command::SessionModel => {
-                self.open_session_editor(Some(crate::session_edit::Field::Model), window, cx)
+                self.open_session_editor(SessionEditorStart::Model, window, cx)
+            }
+            Command::SessionPendingFiles => {
+                self.open_session_editor(SessionEditorStart::PendingFiles, window, cx)
             }
             Command::ToggleArchived => self.toggle_archived_directory(window, cx),
             Command::Send => self.submit(false, cx),
@@ -4385,6 +4402,8 @@ impl Shell {
             .child(
                 h_flex()
                     .map(|row| if reflowed { row.px_2() } else { row.px_4() })
+                    .min_w_0()
+                    .flex_wrap()
                     .py_2()
                     .gap_2()
                     .border_b_1()
@@ -4401,6 +4420,24 @@ impl Shell {
                         readable("run-status", format!("Run: {}", run_state.label()))
                             .text_sm()
                             .text_color(cx.theme().muted_foreground),
+                    )
+                    .children(
+                        self.chat_session_button(
+                            "chat-pending-files",
+                            Command::SessionPendingFiles,
+                            cx,
+                        )
+                        .map(|button| {
+                            div()
+                                .id("chat-pending-files-anchor")
+                                .anchor_scroll(Some(self.chat_files_anchor.clone()))
+                                .child(
+                                    button
+                                        .small()
+                                        .outline()
+                                        .track_focus(&self.chat_files_focus),
+                                )
+                        }),
                     ),
             )
             .when_some(self.reading_notice, |region, notice| {
@@ -5001,7 +5038,7 @@ impl Shell {
             .iter()
             .any(|row| row.id == id && row.group == SessionGroup::Archived)
         {
-            self.open_session_editor(None, window, cx);
+            self.open_session_editor(SessionEditorStart::Details, window, cx);
         } else {
             self.sidebar.select_id(id);
             self.activate_selected(window, cx);
@@ -5494,6 +5531,33 @@ impl Shell {
         }
     }
 
+    /// A Chat control opens details only for the Session and Client it displayed.
+    fn chat_session_button(
+        &self,
+        id: &'static str,
+        command: Command,
+        cx: &mut Context<Self>,
+    ) -> Option<Button> {
+        let identity = self.client_identity()?;
+        let session = self.sidebar.active_id()?.to_owned();
+        let generation = self.composer_generation;
+        let entry = commands::entry(command, &self.commands);
+        Some(
+            Button::new(id)
+                .label(entry.label)
+                .disabled(!entry.enabled())
+                .tooltip(tooltip(&entry))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    if this.composer_generation == generation
+                        && this.sidebar.active_id() == Some(session.as_str())
+                        && this.client_identity() == Some(identity)
+                    {
+                        this.run_command(command, window, cx);
+                    }
+                })),
+        )
+    }
+
     /// The composer. `inert` takes it out of the accessibility tree; it is
     /// needed only where the composer is not inside the conversation (a
     /// reflowed page), since the conversation's flag covers what is in it.
@@ -5515,32 +5579,20 @@ impl Shell {
             .map(|_| button("composer-secondary", Command::SendSecondary, cx).outline());
         // Stop keeps its own fixed slot, apart from the primary action.
         let stop = button("composer-stop", Command::Stop, cx).danger();
-        let model = self.client_identity().zip(self.sidebar.active_id()).map(|(identity, id)| {
-            let session = id.to_owned();
-            let generation = self.composer_generation;
-            let entry = commands::entry(Command::SessionModel, &self.commands);
-            div()
-                .id("composer-model-anchor")
-                .anchor_scroll(Some(self.composer_model_anchor.clone()))
-                .child(
-                    Button::new("composer-model")
-                        .label(entry.label)
-                        .accessibility_label("Model or Role")
-                        .small()
-                        .outline()
-                        .disabled(!entry.enabled())
-                        .tooltip(tooltip(&entry))
-                        .track_focus(&self.composer_model_focus)
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            if this.composer_generation == generation
-                                && this.sidebar.active_id() == Some(session.as_str())
-                                && this.client_identity() == Some(identity)
-                            {
-                                this.run_command(Command::SessionModel, window, cx);
-                            }
-                        })),
-                )
-        });
+        let model = self
+            .chat_session_button("composer-model", Command::SessionModel, cx)
+            .map(|button| {
+                div()
+                    .id("composer-model-anchor")
+                    .anchor_scroll(Some(self.composer_model_anchor.clone()))
+                    .child(
+                        button
+                            .accessibility_label("Model or Role")
+                            .small()
+                            .outline()
+                            .track_focus(&self.composer_model_focus),
+                    )
+            });
         let modified_enter = commands::shortcut_text(commands::composer_submit_key());
         let primary_label = send_mode_label(self.commands.composer.primary);
         v_flex()

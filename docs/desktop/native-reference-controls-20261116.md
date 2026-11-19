@@ -1,6 +1,11 @@
 # Native confirmation for one pending reference occurrence
 
-Session details → Read pending files now exposes a review button for each
+In Chat, **Pending files** and **Commands → Review pending files** open the
+active Session's details with the pending-file controls first. The inventory
+read still requires **Read pending files**. Session details opened from the
+Sessions list continue to target the chosen row.
+
+**Read pending files** exposes a review button for each
 supported reference on the current eight-entry page. Stored-file entries have
 no Remove button. Selecting a reference displays its complete escaped JSON
 metadata, Session and absolute occurrence number. Cancel receives focus first;
